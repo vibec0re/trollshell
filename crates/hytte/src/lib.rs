@@ -5,3 +5,13 @@
 pub use hytte_reactive as reactive;
 pub use hytte_services as services;
 pub use hytte_ui as ui;
+
+/// Convenience re-exports for shell binaries:
+///
+/// ```ignore
+/// use hytte::prelude::*;
+/// ```
+pub mod prelude {
+    pub use hytte_reactive::{bind, bind_class, bind_text, bind_visible, Service};
+    pub use hytte_ui::{App, Anchor, Bar, BarHandle, Edge, Layer, Margin, Monitor};
+}

@@ -50,11 +50,25 @@ fn combined_windows_signal(
         let ws_list = workspaces,
         let win_list = windows =>
         match ws_list.iter().find(|ws| ws.output == connector && ws.is_active).map(|ws| ws.id) {
-            Some(id) => win_list
-                .iter()
-                .filter(|w| w.workspace_id == Some(id))
-                .cloned()
-                .collect(),
+            Some(id) => {
+                let mut filtered: Vec<Window> = win_list
+                    .iter()
+                    .filter(|w| w.workspace_id == Some(id))
+                    .cloned()
+                    .collect();
+                // niri arranges tiled windows by (column, tile-in-column),
+                // 1-based, leftmost column first. Floating windows have
+                // pos_in_scrolling_layout = None; push them after tiled
+                // ones, ordered by id for stability.
+                filtered.sort_by_key(|w| {
+                    (
+                        w.layout.pos_in_scrolling_layout.is_none(),
+                        w.layout.pos_in_scrolling_layout.unwrap_or((usize::MAX, usize::MAX)),
+                        w.id,
+                    )
+                });
+                filtered
+            }
             None => Vec::new(),
         }
     }

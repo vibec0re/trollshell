@@ -8,6 +8,7 @@
 use crate::error::{Error, Result};
 use crate::monitor::Monitor;
 use adw::prelude::*;
+use futures_signals::signal::{Mutable, Signal};
 use gtk::gdk;
 use gtk::gio;
 use hytte_reactive::registry::{self, ServiceErased};
@@ -84,8 +85,21 @@ impl AppBuilder {
                 registry::install(service, runtime::handle());
             }
 
+            // Set up the monitors Mutable + listener BEFORE handing the
+            // body the App, so the initial body sees the current set and
+            // any later body subscription receives hot-plug updates.
+            let monitors = Mutable::new(read_monitors());
+            if let Some(display) = gdk::Display::default() {
+                let model = display.monitors();
+                let writer = monitors.clone();
+                model.connect_items_changed(move |_, _, _, _| {
+                    writer.set(read_monitors());
+                });
+            }
+
             let app = App {
                 inner: inner_app.clone(),
+                monitors,
             };
             body_fn(&app);
         });
@@ -106,6 +120,7 @@ impl AppBuilder {
 /// body closure.
 pub struct App {
     inner: adw::Application,
+    monitors: Mutable<Vec<Monitor>>,
 }
 
 impl App {
@@ -122,20 +137,17 @@ impl App {
     /// Snapshot of the currently connected monitors.
     #[must_use]
     pub fn monitors(&self) -> Vec<Monitor> {
-        let Some(display) = gdk::Display::default() else {
-            return Vec::new();
-        };
-        let model = display.monitors();
-        #[allow(clippy::cast_possible_wrap)]
-        let mut out = Vec::with_capacity(model.n_items() as usize);
-        for i in 0..model.n_items() {
-            if let Some(obj) = model.item(i)
-                && let Ok(monitor) = obj.downcast::<gdk::Monitor>()
-            {
-                out.push(Monitor::new(monitor));
-            }
-        }
-        out
+        self.monitors.lock_ref().clone()
+    }
+
+    /// Signal of the current monitor list. Emits the initial value on
+    /// subscribe and again on every hot-plug (monitor connect/disconnect).
+    ///
+    /// The returned signal owns a reference to the internal state, so it
+    /// stays alive past `App` being dropped — safe to move into a
+    /// `glib::MainContext::spawn_local` future from the body closure.
+    pub fn monitors_changed(&self) -> impl Signal<Item = Vec<Monitor>> + 'static {
+        self.monitors.signal_cloned()
     }
 
     /// Underlying `adw::Application`, exposed for advanced use.
@@ -148,6 +160,23 @@ impl App {
     pub fn quit(&self) {
         self.inner.quit();
     }
+}
+
+fn read_monitors() -> Vec<Monitor> {
+    let Some(display) = gdk::Display::default() else {
+        return Vec::new();
+    };
+    let model = display.monitors();
+    #[allow(clippy::cast_possible_wrap)]
+    let mut out = Vec::with_capacity(model.n_items() as usize);
+    for i in 0..model.n_items() {
+        if let Some(obj) = model.item(i)
+            && let Ok(monitor) = obj.downcast::<gdk::Monitor>()
+        {
+            out.push(Monitor::new(monitor));
+        }
+    }
+    out
 }
 
 fn install_default_css() {

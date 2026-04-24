@@ -743,6 +743,7 @@ dependencies = [
 name = "hytte-ui"
 version = "0.1.0"
 dependencies = [
+ "futures-signals",
  "gio",
  "gtk4",
  "gtk4-layer-shell",

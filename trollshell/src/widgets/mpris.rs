@@ -4,16 +4,19 @@
 //! Hidden when no player is active. Buttons disable when the player's
 //! corresponding `can_*` flag is false. The play/pause button icon toggles
 //! based on the player's playback status.
+//!
+//! Clicking the label (not the transport buttons) toggles the Media page in
+//! the modal panel.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self, gdk, prelude::*};
 use hytte::prelude::*;
 use hytte::services::mpris::{self, PlaybackStatus};
 
 /// Build the MPRIS center-cluster widget.
-pub fn widget() -> gtk::Widget {
+pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     container.add_css_class("ts-mpris");
 
@@ -32,10 +35,20 @@ pub fn widget() -> gtk::Widget {
         &gtk::Image::from_icon_name("media-skip-forward-symbolic"),
     ));
 
-    // Label.
+    // Label — clicking it opens the Media modal page.
     let label = gtk::Label::new(None);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(60);
+
+    // Add a GestureClick on the label for modal toggle.
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+    let monitor_for_label = monitor.clone();
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        crate::modal::toggle(&monitor_for_label, crate::modal::Page::Media);
+    });
+    label.add_controller(gesture);
 
     container.append(&prev_btn);
     container.append(&play_pause_btn);

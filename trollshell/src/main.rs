@@ -1,3 +1,4 @@
+mod modal;
 mod widgets;
 
 use std::cell::RefCell;
@@ -38,6 +39,8 @@ fn main() -> hytte::ui::Result<()> {
                 let bars: RefCell<Vec<BarHandle>> = RefCell::new(Vec::new());
                 monitors_signal
                     .for_each(move |monitors| {
+                        // Close all existing modals before rebuilding.
+                        modal::close_all();
                         *bars.borrow_mut() = monitors.iter().map(build_bar).collect();
                         std::future::ready(())
                     })
@@ -53,6 +56,7 @@ fn main() -> hytte::ui::Result<()> {
 }
 
 fn build_bar(monitor: &Monitor) -> BarHandle {
+    modal::install(monitor);
     Bar::new(monitor)
         .edge(Edge::Top)
         .exclusive(true)
@@ -61,18 +65,18 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::workspaces::widget(monitor),
             widgets::window_list::widget(monitor),
         ])
-        .center([widgets::mpris::widget()])
+        .center([widgets::mpris::widget(monitor)])
         .right([
             widgets::tray::widget(),
-            widgets::bluetooth::widget(),
-            widgets::network::widget(),
-            widgets::volume::widget(),
-            widgets::brightness::widget(),
-            widgets::battery::widget(),
-            widgets::cpu::widget(),
-            widgets::memory::widget(),
-            widgets::gpu::widget(),
-            widgets::disk::widget(),
+            widgets::bluetooth::widget(monitor),
+            widgets::network::widget(monitor),
+            widgets::volume::widget(monitor),
+            widgets::brightness::widget(monitor),
+            widgets::battery::widget(monitor),
+            widgets::cpu::widget(monitor),
+            widgets::memory::widget(monitor),
+            widgets::gpu::widget(monitor),
+            widgets::disk::widget(monitor),
             widgets::clock::widget(),
         ])
         .show()

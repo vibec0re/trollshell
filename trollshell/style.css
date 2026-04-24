@@ -1,5 +1,36 @@
 /* trollshell user overrides on top of hytte-ui defaults. */
 
+/* Modal panel */
+.ts-modal {
+    background: rgba(20, 20, 22, 0.94);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.ts-modal-root {
+    padding: 0;
+}
+.ts-modal-header {
+    padding: 10px 12px 6px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ts-modal-title {
+    font-weight: 600;
+    font-size: 15px;
+}
+.ts-modal-close {
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: transparent;
+}
+.ts-modal-close:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+.ts-modal-page {
+    padding: 12px;
+}
+
 .ts-clock {
     font-feature-settings: "tnum" 1;
     padding: 0 6px;
@@ -146,10 +177,7 @@
     font-feature-settings: "tnum" 1;
 }
 
-/* Bluetooth popup */
-.ts-bluetooth-popup .ts-popup-column {
-    min-width: 220px;
-}
+/* Bluetooth device rows */
 .ts-bluetooth-device {
     padding: 4px 6px;
     border-radius: 4px;

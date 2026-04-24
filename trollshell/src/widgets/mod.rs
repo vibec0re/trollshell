@@ -9,6 +9,7 @@ pub mod memory;
 pub mod mpris;
 pub mod network;
 pub mod notifications;
+pub mod pages;
 pub mod tray;
 pub mod util;
 pub mod volume;

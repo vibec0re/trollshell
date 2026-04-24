@@ -41,30 +41,26 @@ where
 }
 
 /// Bind a bool signal to a widget's `visible` property.
-pub fn bind_visible<S>(signal: S, widget: &impl IsA<gtk::Widget>)
+pub fn bind_visible<W, S>(signal: S, widget: &W)
 where
+    W: IsA<gtk::Widget> + Clone + 'static,
     S: Signal<Item = bool> + 'static,
 {
-    bind(signal, &widget.clone().upcast::<gtk::Widget>(), |w, v| {
-        w.set_visible(v);
-    });
+    bind(signal, widget, W::set_visible);
 }
 
 /// Bind a bool signal to whether `class` is present on the widget.
-pub fn bind_class<S>(signal: S, widget: &impl IsA<gtk::Widget>, class: &str)
+pub fn bind_class<W, S>(signal: S, widget: &W, class: &str)
 where
+    W: IsA<gtk::Widget> + Clone + 'static,
     S: Signal<Item = bool> + 'static,
 {
     let class = class.to_owned();
-    bind(
-        signal,
-        &widget.clone().upcast::<gtk::Widget>(),
-        move |w, v| {
-            if v {
-                w.add_css_class(&class);
-            } else {
-                w.remove_css_class(&class);
-            }
-        },
-    );
+    bind(signal, widget, move |w, v| {
+        if v {
+            w.add_css_class(&class);
+        } else {
+            w.remove_css_class(&class);
+        }
+    });
 }

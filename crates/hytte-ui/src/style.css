@@ -47,3 +47,13 @@
 .hytte-bar-group-right button.active {
     background: rgba(255, 255, 255, 0.10);
 }
+
+/* Popup defaults */
+.hytte-popup > contents {
+    background: rgba(28, 28, 32, 0.94);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 8px 10px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}

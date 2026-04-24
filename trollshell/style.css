@@ -193,7 +193,7 @@
 }
 
 /* CPU and Memory indicators */
-.ts-cpu, .ts-memory, .ts-gpu {
+.ts-cpu, .ts-memory, .ts-gpu, .ts-battery-label {
     font-feature-settings: "tnum" 1;
 }
 

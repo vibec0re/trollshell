@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk::glib;
 use hytte::prelude::*;
-use hytte::services::{clock, networkd, niri, pipewire, resolved, tray, upower};
+use hytte::services::{clock, networkd, niri, notifications, pipewire, resolved, tray, upower};
 
 fn main() -> hytte::ui::Result<()> {
     tracing_subscriber::fmt::init();
@@ -18,6 +18,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(networkd::service())
         .with(resolved::service())
         .with(tray::service())
+        .with(notifications::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
         .run(|app| {
             // Spawn a task on the GTK main loop that owns the live set of
@@ -34,6 +35,12 @@ fn main() -> hytte::ui::Result<()> {
                     })
                     .await;
             });
+
+            // Toast container — single layer-shell window on the primary monitor.
+            // Picks the first monitor at startup; doesn't follow hot-plug in v0.4.0.
+            if let Some(primary) = app.monitors().first() {
+                widgets::notifications::install(primary);
+            }
         })
 }
 

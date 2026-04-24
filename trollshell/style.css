@@ -91,3 +91,35 @@
     margin: 2px 0;
     background: rgba(255, 255, 255, 0.08);
 }
+
+/* Notification toasts */
+.ts-toasts {
+    padding: 4px;
+}
+
+.ts-toast {
+    background: rgba(28, 28, 32, 0.94);
+    color: #f5f5f7;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 10px 12px;
+    min-width: 280px;
+    max-width: 380px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.ts-toast-critical {
+    border-color: rgba(220, 80, 80, 0.6);
+    background: rgba(48, 18, 22, 0.94);
+}
+.ts-toast-app {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 11px;
+}
+.ts-toast-summary {
+    font-weight: 600;
+    font-size: 14px;
+}
+.ts-toast-body {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 12px;
+}

@@ -76,22 +76,31 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
         let bus_name = item.bus_name.clone();
         let gesture = gtk::GestureClick::new();
         gesture.set_button(gdk::BUTTON_SECONDARY);
+        // Capture phase so we see the event before gtk::Button's own
+        // built-in click gesture has a chance to swallow it.
+        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
         let btn_weak = btn.downgrade();
-        gesture.connect_released(move |gesture, _, _, _| {
+        gesture.connect_pressed(move |gesture, _, _, _| {
+            tracing::info!(bus = %bus_name, path = %menu_path, "tray right-click");
             gesture.set_state(gtk::EventSequenceState::Claimed);
             let bus_name = bus_name.clone();
             let menu_path = menu_path.clone();
             let btn_weak = btn_weak.clone();
             glib::MainContext::default().spawn_local(async move {
                 let Some(btn) = btn_weak.upgrade() else {
+                    tracing::info!("tray button dropped before menu fetch finished");
                     return;
                 };
                 let menu = tray::fetch_menu(&bus_name, &menu_path).await;
-                let items = match menu {
-                    Some(m) => m.items,
-                    None => return,
+                let items = if let Some(m) = menu {
+                    tracing::info!(count = m.items.len(), "tray menu fetched");
+                    m.items
+                } else {
+                    tracing::info!("tray menu fetch returned None");
+                    return;
                 };
                 if items.is_empty() {
+                    tracing::info!("tray menu has zero entries");
                     return;
                 }
                 let popover = build_menu_popover(&bus_name, &menu_path, &items);
@@ -100,6 +109,8 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
             });
         });
         btn.add_controller(gesture);
+    } else {
+        tracing::debug!(item = %item.bus_name, "tray item has no menu_path");
     }
 
     btn

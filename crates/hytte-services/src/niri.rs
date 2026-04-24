@@ -140,6 +140,15 @@ fn apply_event(
                 focused_window.set(Some(window.clone()));
             }
             let mut list = windows.lock_mut();
+            // If the incoming window claims focus, clear it on every
+            // other entry so the cache has a single source of truth.
+            if window.is_focused {
+                for w in list.iter_mut() {
+                    if w.id != window.id {
+                        w.is_focused = false;
+                    }
+                }
+            }
             if let Some(existing) = list.iter_mut().find(|w| w.id == window.id) {
                 *existing = window;
             } else {
@@ -155,13 +164,14 @@ fn apply_event(
             }
         }
         Event::WindowFocusChanged { id } => {
-            let new_focused = id.and_then(|id| {
-                windows
-                    .lock_ref()
-                    .iter()
-                    .find(|w| w.id == id)
-                    .cloned()
-            });
+            // Mirror is_focused into the windows list so per-window
+            // subscribers (window-list widget) see the change too.
+            let mut list = windows.lock_mut();
+            for w in list.iter_mut() {
+                w.is_focused = Some(w.id) == id;
+            }
+            let new_focused = id.and_then(|id| list.iter().find(|w| w.id == id).cloned());
+            drop(list);
             focused_window.set(new_focused);
         }
         // TODO(v0.3+): handle WorkspaceUrgencyChanged, KeyboardLayoutSwitched, etc.

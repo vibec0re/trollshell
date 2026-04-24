@@ -3,4 +3,7 @@
 //! `hytte-services` register typed handles here at startup; widgets in
 //! `hytte-ui` subscribe to them via `bind`.
 
+pub mod registry;
 pub mod runtime;
+
+pub use registry::{Registry, Service, ServiceErased};

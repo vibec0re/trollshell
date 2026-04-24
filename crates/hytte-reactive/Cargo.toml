@@ -10,4 +10,9 @@ description = "GTK4 ↔ futures-signals bridge and service registry for hytte"
 workspace = true
 
 [dependencies]
+futures-signals = "0.3.34"
 tokio = { version = "1.52.1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+futures-executor = "0.3.32"
+futures-util = "0.3.32"

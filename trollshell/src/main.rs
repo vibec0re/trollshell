@@ -15,7 +15,7 @@ fn main() -> hytte::ui::Result<()> {
                 Bar::new(&monitor)
                     .edge(Edge::Top)
                     .exclusive(true)
-                    .left([widgets::workspaces::widget()])
+                    .left([widgets::workspaces::widget(&monitor)])
                     .right([widgets::clock::widget()])
                     .show()
                     // Leak the handle: bars live for the app lifetime.

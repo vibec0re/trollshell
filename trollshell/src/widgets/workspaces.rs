@@ -1,32 +1,36 @@
+use futures_signals::signal::SignalExt;
 use gtk::prelude::*;
 use hytte::prelude::*;
 use hytte::services::niri;
 
-pub fn widget() -> gtk::Widget {
+pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("trollshell-workspaces");
 
+    let connector = monitor.connector();
+    let connector_for_filter = connector.clone();
+    let signal = niri::workspaces().map(move |all| {
+        all.into_iter()
+            .filter(|ws| ws.output == connector_for_filter)
+            .collect::<Vec<_>>()
+    });
+
     let container_for_signal = container.clone();
-    bind(
-        niri::workspaces(),
-        &container,
-        move |_, workspaces| {
-            // Drop existing children.
-            while let Some(child) = container_for_signal.first_child() {
-                container_for_signal.remove(&child);
+    bind(signal, &container, move |_, workspaces| {
+        while let Some(child) = container_for_signal.first_child() {
+            container_for_signal.remove(&child);
+        }
+        for ws in workspaces {
+            let btn = gtk::Button::with_label(&ws.idx.to_string());
+            if ws.is_focused {
+                btn.add_css_class("focused");
             }
-            for ws in workspaces {
-                let btn = gtk::Button::with_label(&ws.id.to_string());
-                if ws.is_focused {
-                    btn.add_css_class("focused");
-                }
-                if ws.is_active {
-                    btn.add_css_class("active");
-                }
-                container_for_signal.append(&btn);
+            if ws.is_active {
+                btn.add_css_class("active");
             }
-        },
-    );
+            container_for_signal.append(&btn);
+        }
+    });
 
     container.upcast()
 }

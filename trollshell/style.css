@@ -136,3 +136,23 @@
     color: rgba(255, 255, 255, 0.85);
     font-size: 12px;
 }
+
+/* Bluetooth popup */
+.ts-bluetooth-popup .ts-popup-column {
+    min-width: 220px;
+}
+.ts-bluetooth-device {
+    padding: 4px 6px;
+    border-radius: 4px;
+    text-align: left;
+}
+.ts-bluetooth-device:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+.ts-bluetooth-device.connected {
+    background: rgba(80, 160, 255, 0.18);
+}
+.ts-bluetooth-row {
+    /* horizontal layout for icon + label inside the row button */
+    margin: 0;
+}

@@ -229,7 +229,9 @@
     border: none;
 }
 .ts-modal-root {
-    margin: 40px;
+    /* 60 px on all sides gives the box-shadow (48 px blur + 12 px y-offset)
+     * enough room to render inside the layer-shell surface. */
+    margin: 60px;
     background: @window_bg_color;
     color: @window_fg_color;
     border-radius: 12px;

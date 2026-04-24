@@ -92,7 +92,8 @@ pub fn install(monitor: &Monitor) {
     window.add_css_class("ts-modal");
     // Wider than the content so the inner .ts-modal-root's shadow has room
     // to breathe instead of being clipped by the layer-shell surface edge.
-    window.set_size_request(800, 600);
+    // 60 px margin on root × 2 sides + ~720×520 content ≈ 840×640.
+    window.set_size_request(840, 640);
 
     // ESC → close.
     let key_ctrl = gtk::EventControllerKey::new();

@@ -142,6 +142,10 @@
     font-feature-settings: "tnum" 1;
 }
 
+.ts-gpu, .ts-disk {
+    font-feature-settings: "tnum" 1;
+}
+
 /* Bluetooth popup */
 .ts-bluetooth-popup .ts-popup-column {
     min-width: 220px;

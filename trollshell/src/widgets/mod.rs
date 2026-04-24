@@ -2,6 +2,8 @@ pub mod battery;
 pub mod bluetooth;
 pub mod clock;
 pub mod cpu;
+pub mod disk;
+pub mod gpu;
 pub mod memory;
 pub mod mpris;
 pub mod network;

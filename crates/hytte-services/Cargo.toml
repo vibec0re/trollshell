@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
+nix = { version = "0.29", default-features = false, features = ["fs"] }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 futures-channel = "0.3.32"
 futures-signals = "0.3.34"

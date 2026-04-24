@@ -53,5 +53,16 @@ fn detail_widget() -> gtk::Widget {
     );
     column.append(&cores_label);
 
+    let temp_label = gtk::Label::new(None);
+    temp_label.set_xalign(0.0);
+    bind_text(
+        sensors::cpu_temp().map(|t| match t.package_celsius {
+            Some(c) => format!("Temp: {c:.0}°C"),
+            None => "Temp: —".to_string(),
+        }),
+        &temp_label,
+    );
+    column.append(&temp_label);
+
     column.upcast()
 }

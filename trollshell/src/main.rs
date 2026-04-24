@@ -65,6 +65,8 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::battery::widget(),
             widgets::cpu::widget(),
             widgets::memory::widget(),
+            widgets::gpu::widget(),
+            widgets::disk::widget(),
             widgets::clock::widget(),
         ])
         .show()

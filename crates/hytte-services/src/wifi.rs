@@ -14,20 +14,26 @@
 //! // Subscribe in widgets:
 //! wifi::station() -> impl Signal<Item = Option<Station>>
 //! wifi::networks() -> impl Signal<Item = Vec<WifiNetwork>>
+//! wifi::active_prompt() -> impl Signal<Item = Option<PromptRequest>>
 //!
 //! // Fire-and-forget commands:
 //! wifi::scan();
 //! wifi::connect_network(path);
 //! wifi::disconnect();
+//! wifi::submit_prompt(id, passphrase);
+//! wifi::cancel_prompt(id);
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
 
@@ -73,6 +79,21 @@ pub struct WifiNetwork {
     pub signal_dbm: i16,
 }
 
+// ── Prompt request ────────────────────────────────────────────────────────────
+
+/// A pending passphrase prompt request from iwd.
+#[derive(Clone, Debug)]
+pub struct PromptRequest {
+    /// Unique per request; echo back into `submit_prompt` or `cancel_prompt`.
+    pub id: u64,
+    /// iwd network object path.
+    pub network_path: String,
+    /// SSID from Network.Name (best-effort, falls back to last path segment).
+    pub ssid: String,
+    /// Network security type ("psk", "8021x", etc.).
+    pub security: String,
+}
+
 // ── Station path cache ────────────────────────────────────────────────────────
 
 /// Filled by the listen loop on station discovery; read by command helpers.
@@ -91,6 +112,16 @@ async fn set_station_path(path: &str) {
     *station_path_store().write().await = path.to_string();
 }
 
+// ── Agent waiter map (module-level OnceLock for public API access) ────────────
+
+type WaitersMap = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>;
+
+static WAITERS: OnceLock<WaitersMap> = OnceLock::new();
+
+fn waiters() -> Option<&'static WaitersMap> {
+    WAITERS.get()
+}
+
 // ── Service handle ────────────────────────────────────────────────────────────
 
 /// Shared mutable state held in the service registry.
@@ -98,6 +129,7 @@ async fn set_station_path(path: &str) {
 pub struct WifiHandles {
     pub(crate) station: Mutable<Option<Station>>,
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
+    pub(crate) prompts: Mutable<Option<PromptRequest>>,
 }
 
 impl Default for WifiHandles {
@@ -105,6 +137,7 @@ impl Default for WifiHandles {
         Self {
             station: Mutable::new(None),
             networks: Mutable::new(Vec::new()),
+            prompts: Mutable::new(None),
         }
     }
 }
@@ -121,10 +154,11 @@ impl Service for WifiService {
         let handles = WifiHandles::default();
         let station_mutable = handles.station.clone();
         let networks_mutable = handles.networks.clone();
+        let prompts_mutable = handles.prompts.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&station_mutable, &networks_mutable).await {
+                match listen(&station_mutable, &networks_mutable, &prompts_mutable).await {
                     Ok(()) => {
                         tracing::warn!("wifi watcher closed, reconnecting in 2s");
                     }
@@ -134,6 +168,7 @@ impl Service for WifiService {
                 }
                 station_mutable.set(None);
                 networks_mutable.set(Vec::new());
+                prompts_mutable.set(None);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
@@ -210,6 +245,42 @@ pub fn disconnect() {
         }
         if let Err(e) = do_station_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, "wifi disconnect failed");
+        }
+    });
+}
+
+/// Signal emitting `Some(PromptRequest)` when iwd needs a passphrase, `None`
+/// otherwise.  Only one prompt can be active at a time — v0.6.1 serialises.
+pub fn active_prompt() -> impl Signal<Item = Option<PromptRequest>> {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .prompts
+            .signal_cloned()
+    })
+}
+
+/// Submit a passphrase for the prompt with `id`.
+pub fn submit_prompt(id: u64, passphrase: &str) {
+    let pass = passphrase.to_string();
+    let Some(arc) = waiters() else { return };
+    let arc = arc.clone();
+    runtime::handle().spawn(async move {
+        let mut map = arc.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let _ = tx.send(Ok(pass));
+        }
+    });
+}
+
+/// Dismiss the prompt with `id` without submitting (signals `Error.Canceled`).
+pub fn cancel_prompt(id: u64) {
+    let Some(arc) = waiters() else { return };
+    let arc = arc.clone();
+    runtime::handle().spawn(async move {
+        let mut map = arc.lock().await;
+        if let Some(tx) = map.remove(&id) {
+            let _ = tx.send(Err("cancelled".into()));
         }
     });
 }
@@ -394,6 +465,9 @@ async fn read_networks(
 struct State {
     station: Mutable<Option<Station>>,
     networks: Mutable<Vec<WifiNetwork>>,
+    prompts: Mutable<Option<PromptRequest>>,
+    waiters: WaitersMap,
+    next_id: Arc<AtomicU64>,
     conn: Arc<Connection>,
     station_path: String,
 }
@@ -402,12 +476,18 @@ impl State {
     fn new(
         station: Mutable<Option<Station>>,
         networks: Mutable<Vec<WifiNetwork>>,
+        prompts: Mutable<Option<PromptRequest>>,
+        waiters: WaitersMap,
+        next_id: Arc<AtomicU64>,
         conn: Arc<Connection>,
         station_path: String,
     ) -> Self {
         Self {
             station,
             networks,
+            prompts,
+            waiters,
+            next_id,
             conn,
             station_path,
         }
@@ -467,11 +547,132 @@ impl State {
     }
 }
 
+// ── iwd Agent object ──────────────────────────────────────────────────────────
+
+struct IwdAgent {
+    state: State,
+}
+
+#[zbus::interface(name = "net.connman.iwd.Agent")]
+impl IwdAgent {
+    #[allow(clippy::unused_async)]
+    async fn release(&self) {
+        tracing::info!("iwd Agent::Release");
+    }
+
+    async fn request_passphrase(
+        &self,
+        network: zbus::zvariant::OwnedObjectPath,
+    ) -> zbus::fdo::Result<String> {
+        let path = network.as_str().to_string();
+        let (ssid, security) = read_network_metadata(&self.state.conn, &path).await;
+
+        let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel::<Result<String, String>>();
+        {
+            let mut waiters = self.state.waiters.lock().await;
+            waiters.insert(id, tx);
+        }
+        self.state.prompts.set(Some(PromptRequest {
+            id,
+            network_path: path,
+            ssid,
+            security,
+        }));
+
+        if let Ok(Ok(pass)) = rx.await {
+            self.state.prompts.set(None);
+            Ok(pass)
+        } else {
+            self.state.prompts.set(None);
+            Err(zbus::fdo::Error::Failed("agent cancelled".into()))
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    #[allow(unused_variables)]
+    async fn request_private_key_passphrase(
+        &self,
+        network: zbus::zvariant::OwnedObjectPath,
+    ) -> zbus::fdo::Result<String> {
+        Err(zbus::fdo::Error::Failed(
+            "hytte wifi agent does not support EAP".into(),
+        ))
+    }
+
+    #[allow(clippy::unused_async)]
+    #[allow(unused_variables)]
+    async fn request_user_name_and_password(
+        &self,
+        network: zbus::zvariant::OwnedObjectPath,
+    ) -> zbus::fdo::Result<(String, String)> {
+        Err(zbus::fdo::Error::Failed(
+            "hytte wifi agent does not support EAP".into(),
+        ))
+    }
+
+    #[allow(clippy::unused_async)]
+    #[allow(unused_variables)]
+    async fn request_user_password(
+        &self,
+        network: zbus::zvariant::OwnedObjectPath,
+        username: String,
+    ) -> zbus::fdo::Result<String> {
+        Err(zbus::fdo::Error::Failed(
+            "hytte wifi agent does not support EAP".into(),
+        ))
+    }
+
+    async fn cancel(&self, reason: String) {
+        tracing::info!(%reason, "iwd Agent::Cancel");
+        let mut waiters = self.state.waiters.lock().await;
+        for (_, tx) in waiters.drain() {
+            let _ = tx.send(Err("cancelled".into()));
+        }
+        self.state.prompts.set(None);
+    }
+}
+
+/// Read the Name and Type properties from a net.connman.iwd.Network object.
+/// Falls back to the last path segment for the SSID on any error.
+async fn read_network_metadata(conn: &Connection, path: &str) -> (String, String) {
+    let result = conn
+        .call_method(
+            Some("net.connman.iwd"),
+            path,
+            Some("org.freedesktop.DBus.Properties"),
+            "GetAll",
+            &("net.connman.iwd.Network",),
+        )
+        .await;
+
+    match result {
+        Ok(reply) => {
+            let props: HashMap<String, OwnedValue> =
+                reply.body().deserialize().unwrap_or_default();
+            let ssid = prop_str(&props, "Name");
+            let security = prop_str(&props, "Type");
+            let ssid = if ssid.is_empty() {
+                path.rsplit('/').next().unwrap_or(path).to_string()
+            } else {
+                ssid
+            };
+            (ssid, security)
+        }
+        Err(e) => {
+            tracing::debug!(path, error = %e, "read_network_metadata failed, using path fallback");
+            let ssid = path.rsplit('/').next().unwrap_or(path).to_string();
+            (ssid, String::new())
+        }
+    }
+}
+
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
 async fn listen(
     station_mutable: &Mutable<Option<Station>>,
     networks_mutable: &Mutable<Vec<WifiNetwork>>,
+    prompts_mutable: &Mutable<Option<PromptRequest>>,
 ) -> Result<()> {
     let conn = Connection::system()
         .await
@@ -517,10 +718,20 @@ async fn listen(
     };
     station_mutable.set(Some(initial_station));
 
+    // ── Set up shared agent state ─────────────────────────────────────────────
+
+    let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU64::new(1));
+    // Publish into module-level OnceLock so public API fns can reach the map.
+    let _ = WAITERS.set(waiters_arc.clone());
+
     let conn = Arc::new(conn);
     let state = State::new(
         station_mutable.clone(),
         networks_mutable.clone(),
+        prompts_mutable.clone(),
+        waiters_arc,
+        next_id,
         conn.clone(),
         station_path.clone(),
     );
@@ -541,6 +752,36 @@ async fn listen(
             st.connected_ssid = ssid;
         }
     }
+
+    // ── Register iwd Agent ────────────────────────────────────────────────────
+
+    let agent = IwdAgent {
+        state: state.clone(),
+    };
+    conn.object_server()
+        .at("/cc/hannig/trollshell/iwd_agent", agent)
+        .await
+        .context("register iwd agent object")?;
+
+    let agent_path =
+        zbus::zvariant::OwnedObjectPath::try_from("/cc/hannig/trollshell/iwd_agent")
+            .map_err(|e| anyhow!("build agent path: {e}"))?;
+
+    let agent_mgr = zbus::Proxy::new(
+        conn.as_ref(),
+        "net.connman.iwd",
+        "/net/connman/iwd",
+        "net.connman.iwd.AgentManager",
+    )
+    .await
+    .context("build AgentManager proxy")?;
+
+    agent_mgr
+        .call::<_, _, ()>("RegisterAgent", &(agent_path,))
+        .await
+        .context("RegisterAgent")?;
+
+    tracing::info!("hytte iwd agent registered");
 
     // ── Event loop ────────────────────────────────────────────────────────────
 

@@ -11,6 +11,7 @@ pub mod network;
 pub mod notif_indicator;
 pub mod notifications;
 pub mod pages;
+pub mod prompt;
 pub mod tray;
 pub mod util;
 pub mod volume;

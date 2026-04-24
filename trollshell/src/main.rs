@@ -52,6 +52,11 @@ fn main() -> hytte::ui::Result<()> {
             if let Some(primary) = app.monitors().first() {
                 widgets::notifications::install(primary);
             }
+
+            // Password prompt overlay — reacts to wifi::active_prompt() signal.
+            if let Some(primary) = app.monitors().first() {
+                widgets::prompt::install(primary);
+            }
         })
 }
 

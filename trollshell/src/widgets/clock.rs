@@ -6,7 +6,7 @@ pub fn widget() -> gtk::Widget {
     let label = gtk::Label::new(None);
     label.add_css_class("ts-clock");
     bind_text(
-        clock::now().map(|t| t.format("%a %H:%M").to_string()),
+        clock::now().map(|t| t.format("%a %d %b  %H:%M").to_string()),
         &label,
     );
     label.upcast()

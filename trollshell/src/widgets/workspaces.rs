@@ -9,9 +9,14 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let connector = monitor.connector();
     let connector_for_filter = connector.clone();
     let signal = niri::workspaces().map(move |all| {
-        all.into_iter()
+        let mut filtered: Vec<_> = all
+            .into_iter()
             .filter(|ws| ws.output == connector_for_filter)
-            .collect::<Vec<_>>()
+            .collect();
+        // Niri's WorkspacesChanged event doesn't guarantee sort order;
+        // sort by idx so the buttons always go left-to-right 1..N.
+        filtered.sort_by_key(|ws| ws.idx);
+        filtered
     });
 
     let container_for_signal = container.clone();

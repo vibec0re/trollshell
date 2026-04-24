@@ -65,9 +65,10 @@ impl AppBuilder {
         let user_style = self.user_style;
 
         inner.connect_activate(move |inner_app| {
-            // Hold the application alive without a regular toplevel.
-            // The guard is intentionally leaked; we never want to unhold.
-            let _ = inner_app.hold();
+            // Hold the application alive without a regular toplevel. `hold()`
+            // returns an `ApplicationHoldGuard` whose `Drop` releases the
+            // hold; we leak it so the hold lasts the process lifetime.
+            std::mem::forget(inner_app.hold());
 
             let Some(body_fn) = body_cell.borrow_mut().take() else {
                 return;

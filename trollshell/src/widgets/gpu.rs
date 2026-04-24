@@ -7,20 +7,33 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-gpu");
 
-    let label = gtk::Label::new(Some("--%"));
-    btn.set_child(Some(&label));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
-    // Bind label text and visibility to the gpu signal.
-    bind_text(
-        sensors::gpu().map(|g| match &g {
+    let icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/gpu.svg"));
+    icon.set_pixel_size(16);
+    row.append(&icon);
+
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("ts-indicator-bar");
+    bar.set_orientation(gtk::Orientation::Vertical);
+    bar.set_inverted(true);
+    bar.set_valign(gtk::Align::Center);
+    row.append(&bar);
+
+    btn.set_child(Some(&row));
+
+    bind(sensors::gpu(), &bar, |w, g| {
+        let load = g.as_ref().and_then(|s| s.load).unwrap_or(0.0);
+        w.set_fraction(load.clamp(0.0, 1.0));
+        let tip = match g {
             Some(state) => match state.load {
-                Some(load) => format!("{:>2.0}%", load * 100.0),
-                None => "--%".to_string(),
+                Some(l) => format!("{}: {:.0}%", state.name, l * 100.0),
+                None => state.name.clone(),
             },
-            None => "--%".to_string(),
-        }),
-        &label,
-    );
+            None => "GPU".to_string(),
+        };
+        w.set_tooltip_text(Some(&tip));
+    });
 
     // Hide the widget when no GPU is detected.
     bind_visible(sensors::gpu().map(|g| g.is_some()), &btn);

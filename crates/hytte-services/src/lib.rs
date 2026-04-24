@@ -1,6 +1,7 @@
 //! Async clients to system daemons exposed as hytte services.
 
 pub mod clock;
+pub mod mpris;
 pub mod networkd;
 pub mod niri;
 pub mod notifications;

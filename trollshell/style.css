@@ -92,6 +92,19 @@
     background: rgba(255, 255, 255, 0.08);
 }
 
+/* MPRIS media controls */
+.ts-mpris {
+    padding: 0 6px;
+}
+.ts-mpris button {
+    padding: 0 4px;
+    min-width: 22px;
+}
+.ts-mpris label {
+    padding: 0 6px;
+    color: rgba(255, 255, 255, 0.85);
+}
+
 /* Notification toasts */
 .ts-toasts {
     padding: 4px;

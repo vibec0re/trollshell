@@ -93,6 +93,27 @@ pub fn default_sink() -> impl Signal<Item = Volume> {
     })
 }
 
+/// Set the default sink's linear volume (0.0..=1.0+). Fire-and-forget;
+/// runs `wpctl set-volume` on the tokio runtime so the GTK main thread
+/// stays responsive during continuous slider drags.
+pub fn set_volume(linear: f64) {
+    hytte_reactive::runtime::handle().spawn_blocking(move || {
+        let arg = format!("{linear:.4}");
+        let _ = Command::new("wpctl")
+            .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &arg])
+            .status();
+    });
+}
+
+/// Toggle mute on the default sink.
+pub fn toggle_mute() {
+    hytte_reactive::runtime::handle().spawn_blocking(|| {
+        let _ = Command::new("wpctl")
+            .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+            .status();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse;

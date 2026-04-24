@@ -38,3 +38,12 @@
     font-weight: 600;
     font-size: 14px;
 }
+
+/* Mute toggle inside the volume popup */
+.ts-mute-btn {
+    padding: 2px 6px;
+    border-radius: 6px;
+}
+.ts-mute-btn.active {
+    background: rgba(220, 80, 80, 0.32);
+}

@@ -50,6 +50,12 @@ impl AppBuilder {
     {
         adw::init().map_err(Error::GtkInit)?;
 
+        // Default to dark for shell UI so libadwaita's @window_bg_color /
+        // @card_bg_color / @borders / @accent_color resolve to dark values.
+        // Without this, adwaita defaults to Default (follow system portal)
+        // which on many systems falls back to light.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
+
         let inner = adw::Application::builder()
             .application_id(&self.app_id)
             .flags(gio::ApplicationFlags::default())

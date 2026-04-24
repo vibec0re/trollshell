@@ -14,5 +14,4 @@ pub use monitor::Monitor;
 
 pub use gtk4_layer_shell::Layer;
 
-/// Default stylesheet, replaced with real content in Task 8.
-pub(crate) const DEFAULT_STYLESHEET: &str = "";
+pub(crate) const DEFAULT_STYLESHEET: &str = include_str!("style.css");

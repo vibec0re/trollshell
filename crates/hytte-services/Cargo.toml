@@ -22,6 +22,7 @@ niri-ipc = "25.11.0"
 tokio = { version = "1.52.1", features = ["rt"] }
 tracing = "0.1.44"
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 futures-executor = "0.3.32"

@@ -20,6 +20,10 @@
 //! mpris::play_pause(bus_name);
 //! mpris::next(bus_name);
 //! mpris::previous(bus_name);
+//! mpris::set_position(bus_name, track_id, position_us);
+//!
+//! // Art fetch (async, cached):
+//! mpris::art_for_url(url).await -> Option<Vec<u8>>
 //! ```
 
 use anyhow::{Context, Result};
@@ -27,9 +31,10 @@ use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
 
@@ -75,6 +80,18 @@ pub struct Player {
     pub can_go_next: bool,
     /// Whether the player supports `Previous`.
     pub can_go_previous: bool,
+    /// `xesam:artUrl` from metadata — `file://` or `http(s)://` URL. Empty
+    /// string when unavailable.
+    pub art_url: String,
+    /// Current playback position, microseconds. Updated by the position
+    /// poller (4 Hz while playing).
+    pub position_us: u64,
+    /// Track length, microseconds (from `mpris:length` in metadata).
+    pub length_us: u64,
+    /// Track identifier — the value of `mpris:trackid` in metadata. Needed
+    /// for `SetPosition` calls. Some players supply this as an `ObjectPath`,
+    /// some as a bare String; we store the raw string representation.
+    pub track_id: Option<String>,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -225,6 +242,109 @@ pub fn previous(bus_name: &str) {
     });
 }
 
+/// Fire-and-forget: send `SetPosition` to the given bus name.
+///
+/// `track_id` must be the same object path the player provided in
+/// `mpris:trackid`. If the track has changed by the time the call arrives,
+/// the player silently ignores it — that is the defined safe behaviour.
+pub fn set_position(bus_name: &str, track_id: &str, position_us: i64) {
+    let bus = bus_name.to_string();
+    let track_id = track_id.to_string();
+    runtime::handle().spawn(async move {
+        let conn = match Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "mpris set_position: failed to open session bus");
+                return;
+            }
+        };
+        let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(track_id.as_str()) else {
+            tracing::warn!(track = %track_id, "mpris::set_position: invalid track id");
+            return;
+        };
+        let _ = conn
+            .call_method(
+                Some(bus.as_str()),
+                "/org/mpris/MediaPlayer2",
+                Some("org.mpris.MediaPlayer2.Player"),
+                "SetPosition",
+                &(path, position_us),
+            )
+            .await;
+    });
+}
+
+// ── Art cache ─────────────────────────────────────────────────────────────────
+
+type ArtCacheInner = HashMap<String, Vec<u8>>;
+type ArtCacheHandle = Arc<RwLock<ArtCacheInner>>;
+
+#[allow(clippy::type_complexity)]
+static ART_CACHE: OnceLock<ArtCacheHandle> = OnceLock::new();
+
+fn art_cache() -> ArtCacheHandle {
+    ART_CACHE
+        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+        .clone()
+}
+
+/// Fetch album art bytes for a URL, using an in-memory cache keyed by URL.
+///
+/// Supports `file://` (read from disk) and `http(s)://` (blocking HTTP via
+/// ureq, capped at 4 MiB). Returns `None` for empty or unsupported URLs, or
+/// on fetch failure.
+pub async fn art_for_url(url: &str) -> Option<Vec<u8>> {
+    if url.is_empty() {
+        return None;
+    }
+
+    // Check cache first (cheap read lock).
+    {
+        let cache = art_cache();
+        let guard = cache.read().await;
+        if let Some(bytes) = guard.get(url) {
+            return Some(bytes.clone());
+        }
+    }
+
+    let url_owned = url.to_string();
+    let (tx, rx) = futures_channel::oneshot::channel::<Option<Vec<u8>>>();
+    runtime::handle().spawn_blocking(move || {
+        let bytes = fetch_art_blocking(&url_owned);
+        let _ = tx.send(bytes);
+    });
+
+    let bytes = rx.await.ok().flatten()?;
+
+    // Populate cache.
+    {
+        let cache = art_cache();
+        let mut guard = cache.write().await;
+        guard.insert(url.to_string(), bytes.clone());
+    }
+
+    Some(bytes)
+}
+
+/// Synchronous art fetcher, intended to run on a blocking thread via
+/// `spawn_blocking`. Handles `file://` and `http(s)://` URLs.
+fn fetch_art_blocking(url: &str) -> Option<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return std::fs::read(path).ok();
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        const MAX_BYTES: u64 = 4 * 1024 * 1024;
+        let mut resp = ureq::get(url).call().ok()?;
+        return resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_BYTES)
+            .read_to_vec()
+            .ok();
+    }
+    None
+}
+
 // ── Active-player heuristic ───────────────────────────────────────────────────
 
 fn pick_active(players: &[Player]) -> Option<Player> {
@@ -370,6 +490,62 @@ async fn watch_player(state: State, bus_name: String) {
     tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
 }
 
+/// Per-player position poller task. Ticks every 250 ms while the player is
+/// Playing, reads the `Position` property directly (it is intentionally not
+/// notified via `PropertiesChanged` in the MPRIS spec), updates `position_us`
+/// in state, and re-publishes. Self-exits when the bus name disappears from
+/// state.
+async fn poll_position(state: State, bus_name: String) {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        // Check whether the player still exists and is Playing.
+        let is_playing = {
+            let players = state.map.lock().await;
+            match players.get(&bus_name) {
+                None => return, // player unregistered — self-exit
+                Some(p) => p.status == PlaybackStatus::Playing,
+            }
+        };
+
+        if !is_playing {
+            continue;
+        }
+
+        // Read the Position property via a fresh connection (non-signalling).
+        let Ok(conn) = Connection::session().await else {
+            continue;
+        };
+        let Ok(proxy) = zbus::Proxy::new(
+            &conn,
+            bus_name.as_str(),
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.Player",
+        )
+        .await
+        else {
+            continue;
+        };
+
+        let pos: i64 = proxy.get_property("Position").await.unwrap_or(0);
+        let pos_us = u64::try_from(pos).unwrap_or(0);
+
+        // Update position in state and re-publish.
+        {
+            let mut players = state.map.lock().await;
+            if let Some(p) = players.get_mut(&bus_name) {
+                p.position_us = pos_us;
+            } else {
+                return; // unregistered while we were fetching
+            }
+        }
+        state.publish().await;
+    }
+}
+
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
 async fn listen(
@@ -412,6 +588,10 @@ async fn listen(
                 state2.register(&bus_name).await;
                 if state2.refresh_player(&bus_name).await {
                     state2.publish().await;
+                    // Spawn position poller alongside the PropertiesChanged watcher.
+                    let state3 = state2.clone();
+                    let bus3 = bus_name.clone();
+                    tokio::spawn(async move { poll_position(state3, bus3).await });
                     watch_player(state2, bus_name).await;
                 } else {
                     state2.unregister(&bus_name).await;
@@ -444,6 +624,9 @@ async fn listen(
                 state2.register(&bus_name).await;
                 if state2.refresh_player(&bus_name).await {
                     state2.publish().await;
+                    let state3 = state2.clone();
+                    let bus3 = bus_name.clone();
+                    tokio::spawn(async move { poll_position(state3, bus3).await });
                     watch_player(state2, bus_name).await;
                 } else {
                     state2.unregister(&bus_name).await;
@@ -499,7 +682,8 @@ async fn read_player_props(conn: &Connection, bus_name: &str) -> Result<Player> 
         .await
         .unwrap_or(false);
 
-    let (title, artists, album) = read_metadata(&player_proxy).await;
+    let (title, artists, album, art_url, length_us, track_id) =
+        read_metadata(&player_proxy).await;
 
     Ok(Player {
         bus_name: bus_name.to_string(),
@@ -511,21 +695,45 @@ async fn read_player_props(conn: &Connection, bus_name: &str) -> Result<Player> 
         can_play_pause,
         can_go_next,
         can_go_previous,
+        art_url,
+        position_us: 0,
+        length_us,
+        track_id,
     })
 }
 
-/// Extract `xesam:title`, `xesam:artist`, and `xesam:album` from the
-/// `Metadata` property.  Returns `(title, artists, album)` — all default
-/// to empty string on missing/malformed values.
-async fn read_metadata(player_proxy: &zbus::Proxy<'_>) -> (String, String, String) {
+/// Extract track metadata from the `Metadata` property. Returns
+/// `(title, artists, album, art_url, length_us, track_id)` — all default
+/// to empty / zero / None on missing/malformed values.
+async fn read_metadata(
+    player_proxy: &zbus::Proxy<'_>,
+) -> (String, String, String, String, u64, Option<String>) {
     let raw: OwnedValue = match player_proxy.get_property("Metadata").await {
         Ok(v) => v,
-        Err(_) => return (String::new(), String::new(), String::new()),
+        Err(_) => {
+            return (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                None,
+            )
+        }
     };
 
     let map: HashMap<String, OwnedValue> = match HashMap::try_from(raw) {
         Ok(m) => m,
-        Err(_) => return (String::new(), String::new(), String::new()),
+        Err(_) => {
+            return (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                0,
+                None,
+            )
+        }
     };
 
     let title = map
@@ -541,7 +749,19 @@ async fn read_metadata(player_proxy: &zbus::Proxy<'_>) -> (String, String, Strin
     // xesam:artist is a string array (as); handle gracefully if absent or malformed.
     let artists = parse_artist_array(map.get("xesam:artist"));
 
-    (title, artists, album)
+    // xesam:artUrl — a plain string in most players.
+    let art_url = map
+        .get("xesam:artUrl")
+        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+        .unwrap_or_default();
+
+    // mpris:length — u64 or i64 microseconds.
+    let length_us = parse_length(map.get("mpris:length"));
+
+    // mpris:trackid — ObjectPath or String.
+    let track_id = parse_track_id(map.get("mpris:trackid"));
+
+    (title, artists, album, art_url, length_us, track_id)
 }
 
 /// Parse `xesam:artist` from an `OwnedValue` that should be `as` (array of strings).
@@ -564,4 +784,39 @@ fn parse_artist_array(val: Option<&OwnedValue>) -> String {
         .collect();
 
     parts.join(", ")
+}
+
+/// Parse `mpris:length` from an `OwnedValue`. The spec says u64 but some
+/// players send i64. Saturate negatives to 0.
+fn parse_length(val: Option<&OwnedValue>) -> u64 {
+    let Some(v) = val else { return 0 };
+    let Ok(owned) = v.try_clone() else { return 0 };
+
+    // Try u64 first (spec-compliant).
+    if let Ok(n) = u64::try_from(owned.clone()) {
+        return n;
+    }
+    // Fall back to i64, saturate negatives.
+    if let Ok(n) = i64::try_from(owned) {
+        return u64::try_from(n).unwrap_or(0);
+    }
+    0
+}
+
+/// Parse `mpris:trackid` from an `OwnedValue`. May be an `ObjectPath`, a plain
+/// String, or a Variant wrapping one of those. Returns the underlying path/
+/// string as a `String`, or `None` if absent or unparseable.
+fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
+    let v = val?;
+    let Ok(owned) = v.try_clone() else { return None };
+
+    // Try ObjectPath first (most common).
+    if let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(owned.clone()) {
+        return Some(path.as_str().to_string());
+    }
+    // Try plain String.
+    if let Ok(s) = String::try_from(owned) {
+        return Some(s);
+    }
+    None
 }

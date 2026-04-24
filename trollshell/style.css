@@ -275,3 +275,20 @@
     font-size: 11px;
     margin-left: 8px;
 }
+
+/* Media page */
+.ts-media-art {
+    min-width: 220px;
+    min-height: 220px;
+}
+.ts-media-title {
+    font-weight: 600;
+    font-size: 15px;
+}
+.ts-media-artist {
+    color: rgba(255, 255, 255, 0.75);
+}
+.ts-media-album {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 12px;
+}

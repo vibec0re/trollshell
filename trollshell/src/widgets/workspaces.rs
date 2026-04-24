@@ -1,5 +1,4 @@
-use futures_signals::signal::SignalExt;
-use gtk::prelude::*;
+use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 

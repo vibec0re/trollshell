@@ -14,4 +14,8 @@ pub use monitor::Monitor;
 
 pub use gtk4_layer_shell::Layer;
 
+// Re-export so consumers don't need their own gtk/adw deps.
+pub use ::adw;
+pub use ::gtk;
+
 pub(crate) const DEFAULT_STYLESHEET: &str = include_str!("style.css");

@@ -10,9 +10,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use hytte::gtk::{self, glib, prelude::*};
+use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::notifications::{self, Notification, Urgency};
+use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::ui::{layer_window, Anchor, Margin};
 
 // ── Thread-local window storage ───────────────────────────────────────────────
@@ -107,7 +107,8 @@ pub fn install(monitor: &Monitor) {
 // ── Card builder ──────────────────────────────────────────────────────────────
 
 fn build_card(notif: &Notification) -> gtk::Widget {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    // Outer card: horizontal — [image?] [text column]
+    let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     card.add_css_class("ts-toast");
 
     let urgency_class = match notif.urgency {
@@ -117,10 +118,23 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     };
     card.add_css_class(urgency_class);
 
-    // Header row: icon + app name.
+    // Left column: thumbnail image (optional).
+    if let Some(image) = &notif.image {
+        let img = build_image(image);
+        img.add_css_class("ts-toast-image");
+        img.set_tooltip_text(Some(&notif.app_name));
+        card.append(&img);
+    }
+
+    // Right column: app name header + summary + body + actions.
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    column.set_hexpand(true);
+
+    // Header row: small app icon + app name.
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
 
-    if !notif.app_icon.is_empty() {
+    if notif.image.is_none() && !notif.app_icon.is_empty() {
+        // Only show the small header icon when there is no thumbnail.
         let icon = gtk::Image::from_icon_name(&notif.app_icon);
         icon.set_pixel_size(16);
         header.append(&icon);
@@ -133,7 +147,7 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     app_label.set_hexpand(true);
     header.append(&app_label);
 
-    card.append(&header);
+    column.append(&header);
 
     // Summary.
     if !notif.summary.is_empty() {
@@ -142,7 +156,7 @@ fn build_card(notif: &Notification) -> gtk::Widget {
         summary.set_xalign(0.0);
         summary.set_wrap(true);
         summary.set_max_width_chars(40);
-        card.append(&summary);
+        column.append(&summary);
     }
 
     // Body.
@@ -152,10 +166,31 @@ fn build_card(notif: &Notification) -> gtk::Widget {
         body.set_xalign(0.0);
         body.set_wrap(true);
         body.set_max_width_chars(40);
-        card.append(&body);
+        column.append(&body);
     }
 
+    // Action buttons (rendered only when actions are present).
+    if !notif.actions.is_empty() {
+        let actions_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        actions_row.add_css_class("ts-toast-actions");
+        for action in &notif.actions {
+            let btn = gtk::Button::with_label(&action.label);
+            btn.add_css_class("ts-toast-action");
+            let id = notif.id;
+            let key = action.key.clone();
+            btn.connect_clicked(move |_| {
+                notifications::invoke_action(id, &key);
+                notifications::dismiss(id, 2);
+            });
+            actions_row.append(&btn);
+        }
+        column.append(&actions_row);
+    }
+
+    card.append(&column);
+
     // Click anywhere on the card → dismiss (reason 2 = dismissed by user).
+    // Action buttons consume their own click events before it bubbles here.
     let id = notif.id;
     let gesture = gtk::GestureClick::new();
     gesture.connect_pressed(move |gesture, _, _, _| {
@@ -165,4 +200,48 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     card.add_controller(gesture);
 
     card.upcast()
+}
+
+// ── Image widget builder ──────────────────────────────────────────────────────
+
+fn build_image(image: &NotificationImage) -> gtk::Image {
+    let img = gtk::Image::new();
+    img.set_pixel_size(48);
+    match image {
+        NotificationImage::Raw {
+            width,
+            height,
+            rowstride,
+            has_alpha,
+            data,
+            ..
+        } => {
+            let format = if *has_alpha {
+                gdk::MemoryFormat::R8g8b8a8
+            } else {
+                gdk::MemoryFormat::R8g8b8
+            };
+            let bytes = gdk::glib::Bytes::from(data.as_slice());
+            let stride = usize::try_from(*rowstride).unwrap_or(0);
+            let texture = gdk::MemoryTexture::new(*width, *height, format, &bytes, stride);
+            img.set_paintable(Some(texture.upcast_ref::<gdk::Paintable>()));
+        }
+        NotificationImage::Path(path_or_url) => {
+            let path_str = path_or_url
+                .strip_prefix("file://")
+                .unwrap_or(path_or_url.as_str());
+            match gdk::Texture::from_filename(path_str) {
+                Ok(texture) => {
+                    img.set_paintable(Some(texture.upcast_ref::<gdk::Paintable>()));
+                }
+                Err(_) => {
+                    img.set_icon_name(Some("dialog-information-symbolic"));
+                }
+            }
+        }
+        NotificationImage::IconName(name) => {
+            img.set_icon_name(Some(name));
+        }
+    }
+    img
 }

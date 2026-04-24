@@ -276,6 +276,27 @@
     margin-left: 8px;
 }
 
+/* Notification toast image thumbnail */
+.ts-toast-image {
+    min-width: 48px;
+    min-height: 48px;
+    border-radius: 6px;
+}
+
+/* Notification action buttons row */
+.ts-toast-actions {
+    margin-top: 6px;
+}
+.ts-toast-action {
+    padding: 2px 10px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+}
+.ts-toast-action:hover {
+    background: rgba(255, 255, 255, 0.14);
+}
+
 /* Media page */
 .ts-media-art {
     min-width: 220px;

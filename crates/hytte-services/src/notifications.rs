@@ -30,6 +30,40 @@ pub enum Urgency {
     Critical,
 }
 
+/// A single action attached to a notification.
+#[derive(Clone, Debug)]
+pub struct Action {
+    /// Action key used in the `ActionInvoked` D-Bus signal.
+    pub key: String,
+    /// User-facing button label.
+    pub label: String,
+}
+
+/// An image attached to a notification.
+///
+/// Priority (highest first): `image-data` hint → `image-path` hint →
+/// `app_icon` argument.
+#[derive(Clone, Debug)]
+pub enum NotificationImage {
+    /// In-memory raw image from the `image-data` (or legacy `icon_data`) hint.
+    ///
+    /// Bytes are straight (non-premultiplied) RGBA or RGB depending on
+    /// `has_alpha`. Pass `rowstride` directly to `gdk::MemoryTexture::new`
+    /// — it may exceed `width * channels` due to alignment padding.
+    Raw {
+        width: i32,
+        height: i32,
+        rowstride: i32,
+        has_alpha: bool,
+        channels: i32,
+        data: Vec<u8>,
+    },
+    /// File path or `file://` URL.
+    Path(String),
+    /// Named icon from the icon theme (taken from the `app_icon` argument).
+    IconName(String),
+}
+
 /// A single live notification.
 #[derive(Clone, Debug)]
 pub struct Notification {
@@ -46,6 +80,10 @@ pub struct Notification {
     /// - `<0` → `None` (sticky / never expires)
     /// - `>0` → `Some(millis)` (as requested)
     pub timeout: Option<Duration>,
+    /// Action buttons to display below the notification body.
+    pub actions: Vec<Action>,
+    /// Image to display on the notification card (thumbnail).
+    pub image: Option<NotificationImage>,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -256,8 +294,6 @@ impl NotificationsIface {
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
-        // `actions` is received from callers but not rendered in v0.4.0.
-        let _ = actions;
         // Determine id: honour replaces_id or allocate a new one.
         let id = if replaces_id != 0 {
             replaces_id
@@ -291,6 +327,12 @@ impl NotificationsIface {
         // Strip any HTML-like markup from body conservatively.
         let body_clean = strip_markup(body);
 
+        // Parse actions from the flat interleaved [key, label, ...] array.
+        let parsed_actions = parse_actions(&actions);
+
+        // Parse image from hints, falling back to app_icon.
+        let image = parse_image(&hints, app_icon);
+
         let notification = Notification {
             id,
             app_name: app_name.to_string(),
@@ -299,6 +341,8 @@ impl NotificationsIface {
             body: body_clean,
             urgency,
             timeout,
+            actions: parsed_actions,
+            image,
         };
 
         // Update active list: replace in-place if same id, else push.
@@ -333,7 +377,11 @@ impl NotificationsIface {
     /// Return the capabilities this server implements.
     #[allow(clippy::unused_self)]
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["body".to_string(), "icon-static".to_string()]
+        vec![
+            "body".to_string(),
+            "icon-static".to_string(),
+            "actions".to_string(),
+        ]
     }
 
     /// Return server identification tuple.
@@ -405,6 +453,72 @@ async fn listen(active: &Mutable<Vec<Notification>>, next_id: &Arc<AtomicU32>) -
     // Park indefinitely; all work is driven by incoming D-Bus method calls.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+// ── Helper: parse actions ─────────────────────────────────────────────────────
+
+/// Parse the flat interleaved `[key1, label1, key2, label2, ...]` actions
+/// array from the `Notify` call into a `Vec<Action>`.
+fn parse_actions(raw: &[String]) -> Vec<Action> {
+    raw.chunks_exact(2)
+        .map(|chunk| Action {
+            key: chunk[0].clone(),
+            label: chunk[1].clone(),
+        })
+        .collect()
+}
+
+// ── Helper: parse image ───────────────────────────────────────────────────────
+
+/// Resolve the image for a notification.
+///
+/// Priority: `image-data` hint (or legacy `icon_data`) > `image-path` hint >
+/// `app_icon` argument.
+fn parse_image(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Option<NotificationImage> {
+    // 1. Try image-data (modern key) then icon_data (legacy underscore key).
+    for key in &["image-data", "icon_data"] {
+        if let Some(val) = hints.get(*key)
+            && let Some(img) = decode_image_data(val)
+        {
+            return Some(img);
+        }
+    }
+
+    // 2. Try image-path hint.
+    if let Some(val) = hints.get("image-path")
+        && let Ok(path) = String::try_from(val.try_clone().ok()?)
+        && !path.is_empty()
+    {
+        return Some(NotificationImage::Path(path));
+    }
+
+    // 3. Fall back to app_icon argument.
+    if app_icon.is_empty() {
+        return None;
+    }
+    if app_icon.starts_with("file://") || app_icon.starts_with('/') {
+        return Some(NotificationImage::Path(app_icon.to_string()));
+    }
+    Some(NotificationImage::IconName(app_icon.to_string()))
+}
+
+/// Decode an `image-data` / `icon_data` `OwnedValue` of type `(iiibiiay)`.
+fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
+    // The spec defines image-data as (iiibiiay):
+    //   width: i32, height: i32, rowstride: i32, has_alpha: bool,
+    //   bits_per_sample: i32, channels: i32, data: Vec<u8>
+    type ImageTuple = (i32, i32, i32, bool, i32, i32, Vec<u8>);
+    let cloned = val.try_clone().ok()?;
+    let (width, height, rowstride, has_alpha, _bits_per_sample, channels, data) =
+        ImageTuple::try_from(cloned).ok()?;
+    Some(NotificationImage::Raw {
+        width,
+        height,
+        rowstride,
+        has_alpha,
+        channels,
+        data,
+    })
 }
 
 // ── Helper: strip HTML-like markup ───────────────────────────────────────────

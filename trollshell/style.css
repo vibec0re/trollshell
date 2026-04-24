@@ -147,11 +147,7 @@
     font-feature-settings: "tnum" 1;
 }
 .ts-clock {
-    background: linear-gradient(135deg, rgba(25, 20, 40, 0.88), rgba(40, 20, 55, 0.88));
-    color: #ffffff;
-    border-radius: 8px;
-    padding: 2px 8px;
-    margin: 0;
+    padding: 2px 10px;
 }
 .ts-indicator-bar {
     min-width: 4px;

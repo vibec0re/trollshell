@@ -165,3 +165,31 @@
     /* horizontal layout for icon + label inside the row button */
     margin: 0;
 }
+
+/* Wi-Fi popup section */
+.ts-wifi-headline {
+    font-weight: 600;
+    margin-top: 4px;
+}
+.ts-wifi-list {
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.2);
+}
+.ts-wifi-row {
+    padding: 4px 6px;
+    border-radius: 0;
+    background: transparent;
+    text-align: left;
+}
+.ts-wifi-row:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.ts-wifi-row.connected {
+    background: rgba(80, 160, 255, 0.18);
+}
+.ts-wifi-suffix {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 11px;
+    margin-left: 8px;
+}

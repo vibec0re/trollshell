@@ -3,6 +3,7 @@ use hytte::prelude::*;
 use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
 use hytte::services::sensors;
+use hytte::services::wifi;
 
 use super::util::{fmt_bytes, fmt_rate};
 
@@ -143,7 +144,127 @@ fn detail_widget() -> gtk::Widget {
     );
     column.append(&conns);
 
+    append_wifi_section(&column);
+
     column.upcast()
+}
+
+fn append_wifi_section(column: &gtk::Box) {
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    separator.set_margin_top(4);
+    separator.set_margin_bottom(4);
+    column.append(&separator);
+
+    let wifi_headline = gtk::Label::new(None);
+    wifi_headline.set_xalign(0.0);
+    wifi_headline.add_css_class("ts-wifi-headline");
+    bind_text(
+        wifi::station().map(|s| match s {
+            Some(st) => match st.connected_ssid {
+                Some(ssid) => format!("Wi-Fi: {ssid}"),
+                None => match st.state {
+                    wifi::StationState::Connecting => "Wi-Fi: connecting\u{2026}".to_string(),
+                    wifi::StationState::Roaming => "Wi-Fi: roaming".to_string(),
+                    _ => "Wi-Fi: disconnected".to_string(),
+                },
+            },
+            None => "Wi-Fi: no adapter".to_string(),
+        }),
+        &wifi_headline,
+    );
+    column.append(&wifi_headline);
+
+    let scan_btn = gtk::Button::with_label("Scan");
+    scan_btn.connect_clicked(|_| wifi::scan());
+    bind(
+        wifi::station().map(|s| !s.is_some_and(|st| st.scanning)),
+        &scan_btn,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+    column.append(&scan_btn);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_min_content_height(160);
+    scrolled.set_max_content_height(240);
+    scrolled.add_css_class("ts-wifi-list");
+
+    let networks_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    scrolled.set_child(Some(&networks_box));
+    column.append(&scrolled);
+
+    let networks_box_for_signal = networks_box.clone();
+    bind(
+        wifi::networks(),
+        &networks_box,
+        move |_, nets| {
+            while let Some(child) = networks_box_for_signal.first_child() {
+                networks_box_for_signal.remove(&child);
+            }
+            for net in nets {
+                let row = build_network_row(&net);
+                networks_box_for_signal.append(&row);
+            }
+        },
+    );
+}
+
+fn build_network_row(net: &wifi::WifiNetwork) -> gtk::Widget {
+    let btn = gtk::Button::new();
+    btn.add_css_class("ts-wifi-row");
+    if net.connected {
+        btn.add_css_class("connected");
+    }
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+    let icon = gtk::Image::from_icon_name(signal_icon(net.signal_dbm));
+    row.append(&icon);
+
+    let label = gtk::Label::new(Some(&net.ssid));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+
+    let suffix = if net.connected {
+        "connected".to_string()
+    } else if net.known {
+        "known".to_string()
+    } else if net.security == "open" {
+        "open".to_string()
+    } else {
+        net.security.clone()
+    };
+    let suffix_label = gtk::Label::new(Some(&suffix));
+    suffix_label.add_css_class("ts-wifi-suffix");
+    row.append(&suffix_label);
+
+    btn.set_child(Some(&row));
+
+    let path = net.path.clone();
+    let connected = net.connected;
+    btn.connect_clicked(move |_| {
+        if connected {
+            wifi::disconnect();
+        } else {
+            wifi::connect_network(&path);
+        }
+    });
+
+    btn.upcast()
+}
+
+fn signal_icon(dbm: i16) -> &'static str {
+    if dbm >= -50 {
+        "network-wireless-signal-excellent-symbolic"
+    } else if dbm >= -60 {
+        "network-wireless-signal-good-symbolic"
+    } else if dbm >= -75 {
+        "network-wireless-signal-ok-symbolic"
+    } else {
+        "network-wireless-signal-weak-symbolic"
+    }
 }
 
 fn describe_state(s: OperationalState) -> &'static str {

@@ -12,3 +12,4 @@ pub mod resolved;
 pub mod sensors;
 pub mod tray;
 pub mod upower;
+pub mod wifi;

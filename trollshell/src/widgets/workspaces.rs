@@ -5,7 +5,7 @@ use hytte::services::niri;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    container.add_css_class("trollshell-workspaces");
+    container.add_css_class("ts-workspaces");
 
     let connector = monitor.connector();
     let connector_for_filter = connector.clone();

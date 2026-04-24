@@ -1,22 +1,22 @@
 /* trollshell user overrides on top of hytte-ui defaults. */
 
-.trollshell-clock {
+.ts-clock {
     font-feature-settings: "tnum" 1;
     padding: 0 6px;
 }
 
-.trollshell-workspaces button {
+.ts-workspaces button {
     min-width: 22px;
     padding: 2px 0;
     opacity: 0.55;
 }
 /* active = currently visible on this monitor (one per output) */
-.trollshell-workspaces button.active {
+.ts-workspaces button.active {
     opacity: 1.0;
     background: rgba(255, 255, 255, 0.10);
 }
 /* focused = the globally-focused workspace (only on the active monitor) */
-.trollshell-workspaces button.focused {
+.ts-workspaces button.focused {
     opacity: 1.0;
     background: rgba(255, 255, 255, 0.18);
 }

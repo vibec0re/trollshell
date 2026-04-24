@@ -100,29 +100,40 @@
     opacity: 1.0;
 }
 
-/* ─── Right-cluster indicator modules ────────────────────────────────── */
+/* ─── Right-cluster — whole group sits inside a single rainbow-gradient
+ *     pill; individual indicators are darker chips with no own border,
+ *     so the outer gradient shows at the top + bottom edges of each.
+ *     Matches the waybar.png look. ─────────────────────────────────── */
+
+.hytte-bar-group-right {
+    background: linear-gradient(90deg, #ff006e, #3a86ff, #aa00ef, #3a86af);
+    border-radius: 12px;
+    padding: 2px 3px;
+    margin: 0 2px;
+    box-shadow: 0 0 14px rgba(131, 56, 236, 0.35);
+}
 
 .ts-indicator {
     color: #ffffff;
-    background: linear-gradient(135deg, rgba(30, 30, 50, 0.8), rgba(50, 30, 70, 0.8));
-    border: 1px solid rgba(131, 56, 236, 0.3);
-    border-radius: 12px;
+    background: linear-gradient(135deg, rgba(25, 20, 40, 0.88), rgba(40, 20, 55, 0.88));
+    border: none;
+    border-radius: 10px;
     padding: 2px 10px;
-    margin: 0 2px;
+    margin: 0 1px;
     min-width: 22px;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+    box-shadow: none;
     transition: all 0.3s ease;
 }
 .ts-indicator:hover {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.4), rgba(58, 134, 255, 0.4));
-    box-shadow: 0 0 20px rgba(131, 56, 236, 0.6);
+    background: linear-gradient(135deg, rgba(131, 56, 236, 0.55), rgba(58, 134, 255, 0.55));
+    box-shadow: 0 0 18px rgba(131, 56, 236, 0.55);
 }
 .ts-indicator image {
     -gtk-icon-size: 16px;
 }
 .ts-volume:hover {
     background: linear-gradient(135deg, #ff006e, #8338ec);
-    box-shadow: 0 0 20px rgba(255, 0, 110, 0.6);
+    box-shadow: 0 0 20px rgba(255, 0, 110, 0.7);
 }
 
 /* ─── Tiny vertical mini bar-graphs ──────────────────────────────────── */

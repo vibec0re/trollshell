@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk::glib;
 use hytte::prelude::*;
-use hytte::services::{clock, networkd, niri, pipewire, resolved, upower};
+use hytte::services::{clock, networkd, niri, pipewire, resolved, tray, upower};
 
 fn main() -> hytte::ui::Result<()> {
     tracing_subscriber::fmt::init();
@@ -17,6 +17,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(pipewire::service())
         .with(networkd::service())
         .with(resolved::service())
+        .with(tray::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
         .run(|app| {
             // Spawn a task on the GTK main loop that owns the live set of
@@ -46,6 +47,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::window_list::widget(monitor),
         ])
         .right([
+            widgets::tray::widget(),
             widgets::network::widget(),
             widgets::volume::widget(),
             widgets::battery::widget(),

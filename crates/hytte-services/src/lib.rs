@@ -5,4 +5,5 @@ pub mod networkd;
 pub mod niri;
 pub mod pipewire;
 pub mod resolved;
+pub mod tray;
 pub mod upower;

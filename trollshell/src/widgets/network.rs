@@ -4,7 +4,7 @@ use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
 use hytte::services::sensors;
 
-use super::util::fmt_rate;
+use super::util::{fmt_bytes, fmt_rate};
 
 pub fn widget() -> gtk::Widget {
     let btn = gtk::Button::new();
@@ -105,6 +105,43 @@ fn detail_widget() -> gtk::Widget {
         &rate,
     );
     column.append(&rate);
+
+    // Cumulative totals across all non-loopback interfaces.
+    let totals = gtk::Label::new(None);
+    totals.set_xalign(0.0);
+    bind_text(
+        sensors::network().map(|net| {
+            let (rx, tx) = net
+                .interfaces
+                .iter()
+                .filter(|i| i.name != "lo")
+                .fold((0u64, 0u64), |(rx, tx), i| {
+                    (rx + i.rx_bytes_total, tx + i.tx_bytes_total)
+                });
+            format!(
+                "Total: \u{2193} {} \u{2191} {}",
+                fmt_bytes(rx),
+                fmt_bytes(tx),
+            )
+        }),
+        &totals,
+    );
+    column.append(&totals);
+
+    // TCP connection counts.
+    let conns = gtk::Label::new(None);
+    conns.set_xalign(0.0);
+    bind_text(
+        sensors::net_connections().map(|c| {
+            format!(
+                "TCP: {} established, {} listening",
+                c.established_total(),
+                c.tcp_listen + c.tcp6_listen,
+            )
+        }),
+        &conns,
+    );
+    column.append(&conns);
 
     column.upcast()
 }

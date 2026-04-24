@@ -109,6 +109,27 @@ pub struct DiskMount {
     pub usage: f64,
 }
 
+/// TCP socket-state counts from `/proc/net/{tcp,tcp6}`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetConnections {
+    /// IPv4 connections in the ESTABLISHED state.
+    pub tcp_established: u32,
+    /// IPv4 sockets in the LISTEN state.
+    pub tcp_listen: u32,
+    /// IPv6 connections in the ESTABLISHED state.
+    pub tcp6_established: u32,
+    /// IPv6 sockets in the LISTEN state.
+    pub tcp6_listen: u32,
+}
+
+impl NetConnections {
+    /// Sum of IPv4 + IPv6 ESTABLISHED.
+    #[must_use]
+    pub fn established_total(&self) -> u32 {
+        self.tcp_established + self.tcp6_established
+    }
+}
+
 // ── Service handle ────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
@@ -119,6 +140,7 @@ pub struct SensorsHandles {
     pub(crate) cpu_temp: Mutable<CpuTemp>,
     pub(crate) gpu: Mutable<Option<GpuState>>,
     pub(crate) disk: Mutable<DiskUsage>,
+    pub(crate) net_connections: Mutable<NetConnections>,
 }
 
 impl Default for SensorsHandles {
@@ -130,6 +152,7 @@ impl Default for SensorsHandles {
             cpu_temp: Mutable::new(CpuTemp::default()),
             gpu: Mutable::new(None),
             disk: Mutable::new(DiskUsage::default()),
+            net_connections: Mutable::new(NetConnections::default()),
         }
     }
 }
@@ -150,9 +173,19 @@ impl Service for SensorsService {
         let cpu_temp_writer = handles.cpu_temp.clone();
         let gpu_writer = handles.gpu.clone();
         let disk_writer = handles.disk.clone();
+        let net_conn_writer = handles.net_connections.clone();
 
         rt.spawn(async move {
-            poll_loop(cpu_writer, mem_writer, net_writer, cpu_temp_writer, gpu_writer, disk_writer).await;
+            poll_loop(
+                cpu_writer,
+                mem_writer,
+                net_writer,
+                cpu_temp_writer,
+                gpu_writer,
+                disk_writer,
+                net_conn_writer,
+            )
+            .await;
         });
 
         handles
@@ -207,6 +240,16 @@ pub fn cpu_temp() -> impl Signal<Item = CpuTemp> {
     })
 }
 
+/// Signal that emits the current TCP socket-state counts.
+pub fn net_connections() -> impl Signal<Item = NetConnections> {
+    registry::with(|r| {
+        r.get::<SensorsHandles>()
+            .expect("sensors::service() not registered")
+            .net_connections
+            .signal()
+    })
+}
+
 /// Signal that emits the current GPU state, or `None` if no GPU detected.
 pub fn gpu() -> impl Signal<Item = Option<GpuState>> {
     registry::with(|r| {
@@ -256,6 +299,7 @@ async fn poll_loop(
     cpu_temp_writer: Mutable<CpuTemp>,
     gpu_writer: Mutable<Option<GpuState>>,
     disk_writer: Mutable<DiskUsage>,
+    net_conn_writer: Mutable<NetConnections>,
 ) {
     let mut state = PollState::new();
 
@@ -336,9 +380,47 @@ async fn poll_loop(
             disk_writer.set(read_disk(&["/", "/home"]));
         }
 
+        // ── TCP socket counts (every 2 ticks) ─────────────────────────────
+        if state.tick.is_multiple_of(2) {
+            net_conn_writer.set(read_net_connections());
+        }
+
         state.tick = state.tick.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+// ── /proc/net/{tcp,tcp6} parsing ─────────────────────────────────────────────
+
+fn read_net_connections() -> NetConnections {
+    let v4 = count_tcp_states("/proc/net/tcp");
+    let v6 = count_tcp_states("/proc/net/tcp6");
+    NetConnections {
+        tcp_established: v4.0,
+        tcp_listen: v4.1,
+        tcp6_established: v6.0,
+        tcp6_listen: v6.1,
+    }
+}
+
+/// Returns `(established, listen)` counts. /proc/net/tcp* state column is the
+/// 4th whitespace-separated field, encoded as 2-char hex. 01 = ESTABLISHED,
+/// 0A = LISTEN.
+fn count_tcp_states(path: &str) -> (u32, u32) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (0, 0);
+    };
+    let mut established = 0u32;
+    let mut listen = 0u32;
+    for line in text.lines().skip(1) {
+        let Some(state) = line.split_ascii_whitespace().nth(3) else { continue };
+        match state {
+            "01" => established += 1,
+            "0A" => listen += 1,
+            _ => {}
+        }
+    }
+    (established, listen)
 }
 
 // ── /proc/stat parsing ────────────────────────────────────────────────────────

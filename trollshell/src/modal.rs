@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::ui::{layer_window, Anchor, Margin};
+use hytte::ui::{layer_window, Anchor, Layer, Margin};
 
 use crate::widgets::pages;
 
@@ -48,6 +48,14 @@ struct ModalPanel {
     title_label: gtk::Label,
     /// Which page is currently visible; None means the window is hidden.
     current: RefCell<Option<Page>>,
+    /// The monitor we're attached to — needed to rebuild the click-catcher
+    /// as a sibling layer-shell window on the same monitor each time the
+    /// modal opens.
+    monitor: Monitor,
+    /// Full-screen transparent layer-shell window that sits *behind* the
+    /// modal and intercepts every click elsewhere on the screen so we can
+    /// close the modal. Alive only while the modal is visible.
+    catcher: RefCell<Option<gtk::Window>>,
 }
 
 thread_local! {
@@ -60,10 +68,12 @@ fn monitor_key(m: &Monitor) -> String {
 }
 
 /// Build the modal for one monitor and mount it as a layer-shell window.
+#[allow(clippy::too_many_lines)]
 pub fn install(monitor: &Monitor) {
     let key = monitor_key(monitor);
 
     let window = layer_window(monitor)
+        .layer(Layer::Overlay)
         .anchor(Anchor::Top)
         .anchor(Anchor::Right)
         .margin(Margin {
@@ -77,16 +87,15 @@ pub fn install(monitor: &Monitor) {
         .namespace(format!("hytte-modal-{key}"))
         .build();
     window.add_css_class("ts-modal");
-    window.set_size_request(420, 520);
+    // Wider modal — enough room for multi-column page layouts.
+    window.set_size_request(720, 520);
 
     // ESC → close.
     let key_ctrl = gtk::EventControllerKey::new();
-    let window_for_esc = window.downgrade();
+    let key_for_esc = key.clone();
     key_ctrl.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
-            if let Some(w) = window_for_esc.upgrade() {
-                w.set_visible(false);
-            }
+            close_by_key(&key_for_esc);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -158,13 +167,16 @@ pub fn install(monitor: &Monitor) {
     // Initially hidden.
     window.set_visible(false);
 
-    // When hidden (via any path), clear the current page so the next toggle
-    // re-opens rather than thinking a page is already visible.
+    // When hidden (via any path), tear down the click-catcher and clear
+    // the current page so the next toggle re-opens.
     let key_for_hide = key.clone();
     window.connect_hide(move |_| {
         PANELS.with(|panels| {
             if let Some(panel) = panels.borrow().get(&key_for_hide) {
                 *panel.current.borrow_mut() = None;
+                if let Some(catcher) = panel.catcher.borrow_mut().take() {
+                    catcher.close();
+                }
             }
         });
     });
@@ -177,6 +189,8 @@ pub fn install(monitor: &Monitor) {
                 stack,
                 title_label,
                 current: RefCell::new(None),
+                monitor: monitor.clone(),
+                catcher: RefCell::new(None),
             },
         );
     });
@@ -188,6 +202,9 @@ pub fn uninstall(monitor: &Monitor) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {
         if let Some(panel) = panels.borrow_mut().remove(&key) {
+            if let Some(catcher) = panel.catcher.borrow_mut().take() {
+                catcher.close();
+            }
             panel.window.close();
         }
     });
@@ -197,6 +214,9 @@ pub fn uninstall(monitor: &Monitor) {
 pub fn close_all() {
     PANELS.with(|panels| {
         for (_, panel) in panels.borrow_mut().drain() {
+            if let Some(catcher) = panel.catcher.borrow_mut().take() {
+                catcher.close();
+            }
             panel.window.close();
         }
     });
@@ -223,11 +243,7 @@ pub fn open(monitor: &Monitor, page: Page) {
         let Some(panel) = panels.get(&key) else {
             return;
         };
-        panel.stack.set_visible_child_name(page.stack_name());
-        panel.title_label.set_text(page.title());
-        *panel.current.borrow_mut() = Some(page);
-        panel.window.set_visible(true);
-        panel.window.present();
+        show_panel(panel, &key, page);
     });
 }
 
@@ -256,12 +272,58 @@ pub fn toggle(monitor: &Monitor, page: Page) {
             }
             None => {
                 // Closed → open.
-                panel.stack.set_visible_child_name(page.stack_name());
-                panel.title_label.set_text(page.title());
-                *panel.current.borrow_mut() = Some(page);
-                panel.window.set_visible(true);
-                panel.window.present();
+                show_panel(panel, &key, page);
             }
         }
     });
+}
+
+/// Present the modal on `page` and install a fresh click-catcher.
+fn show_panel(panel: &ModalPanel, key: &str, page: Page) {
+    panel.stack.set_visible_child_name(page.stack_name());
+    panel.title_label.set_text(page.title());
+    *panel.current.borrow_mut() = Some(page);
+    panel.window.set_visible(true);
+    panel.window.present();
+
+    // Spawn a full-screen transparent catcher on Layer::Top (below the
+    // modal's Layer::Overlay) that closes the modal on click.
+    let catcher = build_catcher(&panel.monitor, key.to_string());
+    *panel.catcher.borrow_mut() = Some(catcher);
+}
+
+/// Build a full-screen transparent layer-shell window whose only job is to
+/// catch clicks outside the modal and close it. One-shot — destroyed when
+/// the modal hides.
+fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
+    let win = layer_window(monitor)
+        .layer(Layer::Top)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Bottom)
+        .anchor(Anchor::Left)
+        .anchor(Anchor::Right)
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::None)
+        .namespace("hytte-modal-catcher")
+        .build();
+    win.add_css_class("ts-modal-catcher");
+
+    // Transparent empty box that fills the surface and accepts input.
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    content.set_hexpand(true);
+    content.set_vexpand(true);
+    win.set_child(Some(&content));
+
+    // Any mouse press anywhere on the catcher closes the modal.
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(0); // any button
+    let modal_key_for_press = modal_key;
+    gesture.connect_pressed(move |_, _, _, _| {
+        close_by_key(&modal_key_for_press);
+    });
+    content.add_controller(gesture);
+
+    win.set_visible(true);
+    win.present();
+    win
 }

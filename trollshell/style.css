@@ -31,6 +31,30 @@
     padding: 12px;
 }
 
+/* Click-catcher: transparent full-screen layer behind the modal that
+ * closes it when clicked anywhere outside the modal surface. */
+.ts-modal-catcher,
+.ts-modal-catcher > box {
+    background: transparent;
+}
+
+/* Multi-column page grid. */
+.ts-page-grid {
+    padding: 12px;
+}
+.ts-page-grid .ts-panel {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+.ts-panel-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.85);
+    margin-bottom: 4px;
+}
+
 .ts-clock {
     font-feature-settings: "tnum" 1;
     padding: 0 6px;

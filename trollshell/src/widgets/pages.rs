@@ -31,6 +31,32 @@ fn page_box() -> gtk::Box {
     b
 }
 
+/// Two-column (or more) grid for rich modal pages. Panels attach via
+/// `grid.attach(&panel, col, row, 1, 1)`.
+fn page_grid() -> gtk::Grid {
+    let g = gtk::Grid::new();
+    g.add_css_class("ts-modal-page");
+    g.add_css_class("ts-page-grid");
+    g.set_row_spacing(12);
+    g.set_column_spacing(12);
+    g.set_column_homogeneous(true);
+    g
+}
+
+/// Card-style section with a title header. Caller appends content by
+/// calling `outer.append(&child)` on the returned Box.
+fn panel(title: &str) -> gtk::Box {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    outer.add_css_class("ts-panel");
+    outer.set_hexpand(true);
+    outer.set_vexpand(true);
+    let title_label = gtk::Label::new(Some(title));
+    title_label.add_css_class("ts-panel-title");
+    title_label.set_xalign(0.0);
+    outer.append(&title_label);
+    outer
+}
+
 // ── Media page ────────────────────────────────────────────────────────────────
 
 pub fn page_media() -> gtk::Widget {
@@ -148,12 +174,13 @@ pub fn page_media() -> gtk::Widget {
 // ── Network page ──────────────────────────────────────────────────────────────
 
 pub fn page_network() -> gtk::Widget {
-    let column = page_box();
-    column.add_css_class("ts-popup-column");
+    let grid = page_grid();
+
+    // ── Connection panel (col 0, row 0) ──────────────────────────────────────
+    let conn_panel = panel("Connection");
 
     let headline = gtk::Label::new(None);
     headline.set_xalign(0.0);
-    headline.add_css_class("ts-popup-headline");
     bind_text(
         networkd::primary().map(|p| match p {
             Some(link) => format!("{}: {}", link.name, describe_state(link.operational)),
@@ -161,7 +188,7 @@ pub fn page_network() -> gtk::Widget {
         }),
         &headline,
     );
-    column.append(&headline);
+    conn_panel.append(&headline);
 
     let links_label = gtk::Label::new(None);
     links_label.set_xalign(0.0);
@@ -175,7 +202,7 @@ pub fn page_network() -> gtk::Widget {
         }),
         &links_label,
     );
-    column.append(&links_label);
+    conn_panel.append(&links_label);
 
     let dns = gtk::Label::new(None);
     dns.set_xalign(0.0);
@@ -189,7 +216,11 @@ pub fn page_network() -> gtk::Widget {
         }),
         &dns,
     );
-    column.append(&dns);
+    conn_panel.append(&dns);
+    grid.attach(&conn_panel, 0, 0, 1, 1);
+
+    // ── Traffic panel (col 1, row 0) ─────────────────────────────────────────
+    let traffic = panel("Traffic");
 
     let rate = gtk::Label::new(None);
     rate.set_xalign(0.0);
@@ -211,7 +242,7 @@ pub fn page_network() -> gtk::Widget {
         }),
         &rate,
     );
-    column.append(&rate);
+    traffic.append(&rate);
 
     let totals = gtk::Label::new(None);
     totals.set_xalign(0.0);
@@ -232,7 +263,7 @@ pub fn page_network() -> gtk::Widget {
         }),
         &totals,
     );
-    column.append(&totals);
+    traffic.append(&totals);
 
     let conns = gtk::Label::new(None);
     conns.set_xalign(0.0);
@@ -246,11 +277,15 @@ pub fn page_network() -> gtk::Widget {
         }),
         &conns,
     );
-    column.append(&conns);
+    traffic.append(&conns);
+    grid.attach(&traffic, 1, 0, 1, 1);
 
-    append_wifi_section(&column);
+    // ── Wi-Fi panel spanning both columns (row 1) ────────────────────────────
+    let wifi_panel = panel("Wi-Fi");
+    append_wifi_section(&wifi_panel);
+    grid.attach(&wifi_panel, 0, 1, 2, 1);
 
-    column.upcast()
+    grid.upcast()
 }
 
 fn append_wifi_section(column: &gtk::Box) {
@@ -510,18 +545,18 @@ fn build_device_row(dev: &Device) -> gtk::Widget {
 
 #[allow(clippy::too_many_lines)]
 pub fn page_stats() -> gtk::Widget {
-    let column = page_box();
-    column.add_css_class("ts-popup-column");
+    let grid = page_grid();
 
-    // CPU section.
+    // ── CPU panel (col 0, row 0) ──────────────────────────────────────────────
+    let cpu = panel("CPU");
+
     let cpu_headline = gtk::Label::new(None);
     cpu_headline.set_xalign(0.0);
-    cpu_headline.add_css_class("ts-popup-headline");
     bind_text(
-        sensors::cpu().map(|c| format!("CPU {:.0}%", c.overall * 100.0)),
+        sensors::cpu().map(|c| format!("{:.0}%", c.overall * 100.0)),
         &cpu_headline,
     );
-    column.append(&cpu_headline);
+    cpu.append(&cpu_headline);
 
     let cores_label = gtk::Label::new(None);
     cores_label.set_xalign(0.0);
@@ -536,7 +571,7 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &cores_label,
     );
-    column.append(&cores_label);
+    cpu.append(&cores_label);
 
     let cpu_temp = gtk::Label::new(None);
     cpu_temp.set_xalign(0.0);
@@ -547,30 +582,27 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &cpu_temp,
     );
-    column.append(&cpu_temp);
+    cpu.append(&cpu_temp);
+    grid.attach(&cpu, 0, 0, 1, 1);
 
-    let sep1 = gtk::Separator::new(gtk::Orientation::Horizontal);
-    sep1.set_margin_top(4);
-    sep1.set_margin_bottom(4);
-    column.append(&sep1);
+    // ── Memory panel (col 1, row 0) ───────────────────────────────────────────
+    let mem = panel("Memory");
 
-    // Memory section.
     let mem_headline = gtk::Label::new(None);
     mem_headline.set_xalign(0.0);
-    mem_headline.add_css_class("ts-popup-headline");
     bind_text(
         sensors::memory().map(|m| {
             if m.total == 0 {
-                "Memory --%".to_string()
+                "--%".to_string()
             } else {
                 #[allow(clippy::cast_precision_loss)]
                 let pct = (m.used as f64 / m.total as f64) * 100.0;
-                format!("Memory {pct:.0}%")
+                format!("{pct:.0}%")
             }
         }),
         &mem_headline,
     );
-    column.append(&mem_headline);
+    mem.append(&mem_headline);
 
     let mem_used = gtk::Label::new(None);
     mem_used.set_xalign(0.0);
@@ -579,7 +611,7 @@ pub fn page_stats() -> gtk::Widget {
             .map(|m| format!("{} / {}", fmt_bytes(m.used), fmt_bytes(m.total))),
         &mem_used,
     );
-    column.append(&mem_used);
+    mem.append(&mem_used);
 
     let mem_avail = gtk::Label::new(None);
     mem_avail.set_xalign(0.0);
@@ -587,27 +619,22 @@ pub fn page_stats() -> gtk::Widget {
         sensors::memory().map(|m| format!("available: {}", fmt_bytes(m.available))),
         &mem_avail,
     );
-    column.append(&mem_avail);
+    mem.append(&mem_avail);
+    grid.attach(&mem, 1, 0, 1, 1);
 
-    let sep2 = gtk::Separator::new(gtk::Orientation::Horizontal);
-    sep2.set_margin_top(4);
-    sep2.set_margin_bottom(4);
-    column.append(&sep2);
+    // ── GPU panel (col 0, row 1) ──────────────────────────────────────────────
+    let gpu = panel("GPU");
 
-    // GPU section (hidden when no GPU).
-    let gpu_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
-
-    let gpu_headline = gtk::Label::new(None);
-    gpu_headline.set_xalign(0.0);
-    gpu_headline.add_css_class("ts-popup-headline");
+    let gpu_name = gtk::Label::new(None);
+    gpu_name.set_xalign(0.0);
     bind_text(
         sensors::gpu().map(|g| match g {
             Some(state) => state.name.clone(),
-            None => "GPU".to_string(),
+            None => "no GPU detected".to_string(),
         }),
-        &gpu_headline,
+        &gpu_name,
     );
-    gpu_section.append(&gpu_headline);
+    gpu.append(&gpu_name);
 
     let gpu_temp = gtk::Label::new(None);
     gpu_temp.set_xalign(0.0);
@@ -618,7 +645,7 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &gpu_temp,
     );
-    gpu_section.append(&gpu_temp);
+    gpu.append(&gpu_temp);
 
     let gpu_load = gtk::Label::new(None);
     gpu_load.set_xalign(0.0);
@@ -629,7 +656,7 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &gpu_load,
     );
-    gpu_section.append(&gpu_load);
+    gpu.append(&gpu_load);
 
     let gpu_mem = gtk::Label::new(None);
     gpu_mem.set_xalign(0.0);
@@ -644,23 +671,11 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &gpu_mem,
     );
-    gpu_section.append(&gpu_mem);
+    gpu.append(&gpu_mem);
+    grid.attach(&gpu, 0, 1, 1, 1);
 
-    bind_visible(sensors::gpu().map(|g| g.is_some()), &gpu_section);
-    column.append(&gpu_section);
-
-    let sep3 = gtk::Separator::new(gtk::Orientation::Horizontal);
-    sep3.set_margin_top(4);
-    sep3.set_margin_bottom(4);
-    // Only show separator when GPU section is shown.
-    bind_visible(sensors::gpu().map(|g| g.is_some()), &sep3);
-    column.append(&sep3);
-
-    // Disk section.
-    let disk_headline = gtk::Label::new(Some("Disk"));
-    disk_headline.set_xalign(0.0);
-    disk_headline.add_css_class("ts-popup-headline");
-    column.append(&disk_headline);
+    // ── Disk panel (col 1, row 1) ─────────────────────────────────────────────
+    let disk = panel("Disk");
 
     let mounts_label = gtk::Label::new(None);
     mounts_label.set_xalign(0.0);
@@ -685,9 +700,10 @@ pub fn page_stats() -> gtk::Widget {
         }),
         &mounts_label,
     );
-    column.append(&mounts_label);
+    disk.append(&mounts_label);
+    grid.attach(&disk, 1, 1, 1, 1);
 
-    column.upcast()
+    grid.upcast()
 }
 
 // ── Audio page ────────────────────────────────────────────────────────────────
@@ -758,47 +774,43 @@ pub fn page_audio() -> gtk::Widget {
 // ── Power page ────────────────────────────────────────────────────────────────
 
 pub fn page_power() -> gtk::Widget {
-    let column = page_box();
-    column.add_css_class("ts-popup-column");
+    let grid = page_grid();
 
-    // ── Battery section ───────────────────────────────────────────────────────
+    // ── Battery panel (col 0) ─────────────────────────────────────────────────
+    let battery = panel("Battery");
+
     let battery_headline = gtk::Label::new(None);
     battery_headline.set_xalign(0.0);
-    battery_headline.add_css_class("ts-popup-headline");
     bind_text(
         upower::battery().map(|b: Battery| format!("{:.0}%", b.percentage)),
         &battery_headline,
     );
-    column.append(&battery_headline);
+    battery.append(&battery_headline);
 
     let state_label = gtk::Label::new(None);
     state_label.set_xalign(0.0);
     bind_text(upower::battery().map(|b: Battery| describe_battery(&b)), &state_label);
-    column.append(&state_label);
+    battery.append(&state_label);
+    grid.attach(&battery, 0, 0, 1, 1);
 
-    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
-    sep.set_margin_top(6);
-    sep.set_margin_bottom(6);
-    column.append(&sep);
+    // ── Brightness panel (col 1) ──────────────────────────────────────────────
+    let bright = panel("Brightness");
 
-    // ── Brightness section ────────────────────────────────────────────────────
     let bright_headline = gtk::Label::new(None);
     bright_headline.set_xalign(0.0);
-    bright_headline.add_css_class("ts-popup-headline");
     bind_text(
         brightness::current().map(|b| match b {
             Some(b) => format!("{:.0}%", b.level * 100.0),
-            None => "Brightness \u{2014}".to_string(),
+            None => "no backlight".to_string(),
         }),
         &bright_headline,
     );
-    column.append(&bright_headline);
+    bright.append(&bright_headline);
 
     let bright_slider =
         gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.05, 1.0, 0.05);
     bright_slider.set_draw_value(false);
     bright_slider.set_hexpand(true);
-    bright_slider.set_size_request(200, -1);
 
     let suppress = Rc::new(Cell::new(false));
 
@@ -818,13 +830,14 @@ pub fn page_power() -> gtk::Widget {
             suppress_for_bind.set(false);
         }
     });
-    column.append(&bright_slider);
+    bright.append(&bright_slider);
 
     let device_label = gtk::Label::new(Some("Backlight"));
     device_label.set_xalign(0.0);
-    column.append(&device_label);
+    bright.append(&device_label);
+    grid.attach(&bright, 1, 0, 1, 1);
 
-    column.upcast()
+    grid.upcast()
 }
 
 // ── Battery helpers ───────────────────────────────────────────────────────────

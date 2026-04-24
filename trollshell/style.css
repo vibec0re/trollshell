@@ -1,9 +1,8 @@
-/* trollshell — neon / cyber palette ported from ../waybar.css.
+/* trollshell — neon/cyber palette on the BAR ONLY, adwaita defaults
+ * everywhere else (modals, popups, toasts, prompt dialogs).
  *
- * Primary dark:  rgba(15, 15, 35, 0.95) → rgba(25, 15, 45, 0.95)
- * Accents:       #ff006e (pink)   #8338ec (purple)
- *                #3a86ff (blue)   #06ffa5 (mint)
- *                #ffbe0b (orange) #ff4d4d (red)
+ * Palette (bar): pink #ff006e, purple #8338ec, blue #3a86ff,
+ *                mint #06ffa5, magenta #aa00ef, teal #3a86af.
  */
 
 * {
@@ -12,8 +11,8 @@
     font-weight: 500;
 }
 
-/* ─── Bar — layer-shell window itself is transparent, a rounded pill
- *     sits inside. ─────────────────────────────────────────────────────── */
+/* ─── Bar — transparent layer-shell window, floating rounded pill
+ *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
     background: transparent;
@@ -50,7 +49,7 @@
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ─── Workspaces ─────────────────────────────────────────────────────── */
+/* ─── Workspaces ─────────────────────────────────────────────────── */
 
 .ts-workspaces button {
     min-width: 22px;
@@ -77,7 +76,7 @@
     color: #ffffff;
 }
 
-/* ─── Window list ────────────────────────────────────────────────────── */
+/* ─── Window list ────────────────────────────────────────────────── */
 
 .ts-windows {
     margin-left: 8px;
@@ -100,10 +99,8 @@
     opacity: 1.0;
 }
 
-/* ─── Right-cluster — whole group sits inside a single rainbow-gradient
- *     pill; individual indicators are darker chips with no own border,
- *     so the outer gradient shows at the top + bottom edges of each.
- *     Matches the waybar.png look. ─────────────────────────────────── */
+/* ─── Right-cluster — single rainbow-gradient pill wrapping all
+ *     indicators (waybar.png look). ────────────────────────────── */
 
 .hytte-bar-group-right {
     background: linear-gradient(90deg, #ff006e, #3a86ff, #aa00ef, #3a86af);
@@ -112,7 +109,6 @@
     margin: 0 2px;
     box-shadow: 0 0 14px rgba(131, 56, 236, 0.35);
 }
-
 .ts-indicator {
     color: #ffffff;
     background: linear-gradient(135deg, rgba(25, 20, 40, 0.88), rgba(40, 20, 55, 0.88));
@@ -136,7 +132,7 @@
     box-shadow: 0 0 20px rgba(255, 0, 110, 0.7);
 }
 
-/* ─── Tiny vertical mini bar-graphs ──────────────────────────────────── */
+/* ─── Tiny vertical mini bar-graphs (white fill on trough). ─────── */
 
 .ts-cpu, .ts-memory, .ts-gpu, .ts-battery-label, .ts-clock {
     font-feature-settings: "tnum" 1;
@@ -152,21 +148,21 @@
     min-width: 4px;
     min-height: 14px;
     border-radius: 2px;
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.15);
     border: none;
     padding: 0;
 }
 .ts-indicator-bar > trough > progress {
     min-width: 4px;
     border-radius: 2px;
-    background: linear-gradient(to top, #06ffa5, #3a86ff);
+    background: #ffffff;
     border: none;
 }
 .ts-disk-mounts {
     padding: 0;
 }
 
-/* ─── Tray icons ─────────────────────────────────────────────────────── */
+/* ─── Tray + bell + MPRIS on the bar ─────────────────────────────── */
 
 .ts-tray {
     margin-right: 4px;
@@ -178,9 +174,6 @@
 .ts-tray-item image {
     -gtk-icon-size: 16px;
 }
-
-/* ─── Notification bell ──────────────────────────────────────────────── */
-
 .ts-notif-indicator .ts-notif-badge {
     color: #ffffff;
     font-size: 10px;
@@ -190,9 +183,6 @@
     min-width: 14px;
     box-shadow: 0 0 8px rgba(255, 0, 110, 0.6);
 }
-
-/* ─── MPRIS center controls ──────────────────────────────────────────── */
-
 .ts-mpris {
     padding: 0 6px;
 }
@@ -211,55 +201,64 @@
     color: rgba(255, 255, 255, 0.9);
 }
 
-/* ─── Modal panel ────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+ * Below this line: panels / popovers / toasts / prompts use libadwaita
+ * defaults — just layout, no color overrides. Colors come from
+ * @card_bg_color / @borders / @window_fg_color etc so light/dark mode
+ * follows the system automatically.
+ * ═════════════════════════════════════════════════════════════════ */
 
+/* Modal window surface is transparent; visible card is the inner
+ * root box with a margin so its shadow has room to breathe inside
+ * the layer-shell surface. */
 .ts-modal {
-    background: linear-gradient(135deg,
-        rgba(20, 15, 40, 0.96),
-        rgba(30, 15, 50, 0.96));
-    color: #ffffff;
-    border: 1px solid rgba(131, 56, 236, 0.4);
-    border-radius: 14px;
-    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6),
-                0 0 40px rgba(131, 56, 236, 0.3);
+    background: transparent;
+    box-shadow: none;
+    border: none;
 }
-.ts-modal-root { padding: 0; }
+.ts-modal-root {
+    margin: 40px;
+    background: @window_bg_color;
+    color: @window_fg_color;
+    border-radius: 12px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45);
+    border: 1px solid @borders;
+}
 .ts-modal-header {
     padding: 12px 14px 8px;
-    border-bottom: 1px solid rgba(131, 56, 236, 0.25);
+    border-bottom: 1px solid @borders;
 }
 .ts-modal-title {
-    font-weight: 700;
+    font-weight: 600;
     font-size: 15px;
 }
 .ts-modal-close {
     padding: 2px 6px;
     border-radius: 6px;
-    background: transparent;
-    transition: all 0.2s ease;
 }
-.ts-modal-close:hover {
-    background: linear-gradient(135deg, #ff006e, #8338ec);
-    box-shadow: 0 0 12px rgba(255, 0, 110, 0.5);
+.ts-modal-page {
+    padding: 12px;
 }
-.ts-modal-page { padding: 12px; }
-
 .ts-modal-catcher,
 .ts-modal-catcher > box {
     background: transparent;
 }
 
-.ts-page-grid { padding: 12px; }
+/* Card panels inside pages. */
+.ts-page-grid {
+    padding: 12px;
+}
 .ts-panel {
-    background: linear-gradient(135deg, rgba(30, 30, 50, 0.6), rgba(50, 30, 70, 0.6));
-    border: 1px solid rgba(131, 56, 236, 0.25);
+    background: @card_bg_color;
+    color: @card_fg_color;
+    border: 1px solid @card_shade_color;
     border-radius: 10px;
     padding: 10px 12px;
 }
 .ts-panel-title {
     font-weight: 600;
     font-size: 13px;
-    color: rgba(131, 56, 236, 1.0);
+    color: @accent_color;
     margin-bottom: 6px;
 }
 .ts-popup-column {
@@ -270,32 +269,26 @@
     font-size: 14px;
 }
 
-/* ─── Notification toasts ────────────────────────────────────────────── */
+/* ─── Notification toasts — use card background ─────────────────── */
 
-.ts-toasts { padding: 4px; }
+.ts-toasts {
+    padding: 4px;
+}
 .ts-toast {
-    background: linear-gradient(135deg,
-        rgba(28, 25, 50, 0.95),
-        rgba(45, 25, 60, 0.95));
-    color: #ffffff;
-    border: 1px solid rgba(131, 56, 236, 0.4);
+    background: @card_bg_color;
+    color: @card_fg_color;
+    border: 1px solid @card_shade_color;
     border-radius: 10px;
     padding: 10px 12px;
     min-width: 280px;
     max-width: 380px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5),
-                0 0 20px rgba(131, 56, 236, 0.25);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 .ts-toast-critical {
-    border-color: rgba(255, 0, 110, 0.7);
-    background: linear-gradient(135deg,
-        rgba(60, 15, 30, 0.95),
-        rgba(45, 10, 25, 0.95));
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5),
-                0 0 20px rgba(255, 0, 110, 0.5);
+    border-color: @destructive_color;
 }
 .ts-toast-app {
-    color: rgba(255, 255, 255, 0.6);
+    opacity: 0.65;
     font-size: 11px;
 }
 .ts-toast-summary {
@@ -303,7 +296,7 @@
     font-size: 14px;
 }
 .ts-toast-body {
-    color: rgba(255, 255, 255, 0.85);
+    opacity: 0.85;
     font-size: 12px;
 }
 .ts-toast-image {
@@ -311,117 +304,96 @@
     min-height: 48px;
     border-radius: 6px;
 }
-.ts-toast-actions { margin-top: 6px; }
+.ts-toast-actions {
+    margin-top: 6px;
+}
 .ts-toast-action {
     padding: 2px 12px;
     border-radius: 8px;
-    background: rgba(131, 56, 236, 0.25);
     font-size: 12px;
-    transition: all 0.2s ease;
-}
-.ts-toast-action:hover {
-    background: linear-gradient(135deg, #8338ec, #3a86ff);
-    box-shadow: 0 0 12px rgba(131, 56, 236, 0.6);
 }
 
-/* ─── Password prompt ────────────────────────────────────────────────── */
+/* ─── Password prompt ───────────────────────────────────────────── */
 
 .ts-prompt {
-    background: linear-gradient(135deg,
-        rgba(20, 15, 40, 0.97),
-        rgba(30, 15, 50, 0.97));
-    color: #ffffff;
-    border: 1px solid rgba(131, 56, 236, 0.5);
+    background: transparent;
+}
+.ts-prompt-root {
+    margin: 40px;
+    background: @window_bg_color;
+    color: @window_fg_color;
+    border: 1px solid @borders;
     border-radius: 12px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.8),
-                0 0 40px rgba(131, 56, 236, 0.4);
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
 }
 .ts-prompt-title {
-    font-weight: 700;
+    font-weight: 600;
     font-size: 15px;
 }
 .ts-prompt-subtitle {
-    color: rgba(255, 255, 255, 0.6);
+    opacity: 0.65;
     font-size: 12px;
 }
 
-/* ─── Bluetooth device rows ──────────────────────────────────────────── */
+/* ─── Bluetooth / Wi-Fi rows ────────────────────────────────────── */
 
 .ts-bluetooth-device {
     padding: 4px 8px;
     border-radius: 6px;
     text-align: left;
 }
-.ts-bluetooth-device:hover {
-    background: linear-gradient(135deg, rgba(58, 134, 255, 0.25), rgba(6, 255, 165, 0.25));
-}
 .ts-bluetooth-device.connected {
-    background: linear-gradient(135deg, rgba(58, 134, 255, 0.4), rgba(6, 255, 165, 0.4));
-    box-shadow: 0 0 10px rgba(58, 134, 255, 0.4);
+    background: alpha(@accent_color, 0.2);
 }
-
-/* ─── Wi-Fi list ─────────────────────────────────────────────────────── */
-
 .ts-wifi-headline {
     font-weight: 600;
     margin-top: 4px;
 }
 .ts-wifi-list {
-    border: 1px solid rgba(131, 56, 236, 0.25);
+    border: 1px solid @card_shade_color;
     border-radius: 6px;
-    background: rgba(0, 0, 0, 0.3);
+    background: alpha(@view_bg_color, 0.6);
 }
 .ts-wifi-row {
     padding: 4px 8px;
-    border-radius: 0;
     background: transparent;
     text-align: left;
 }
-.ts-wifi-row:hover {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.2), rgba(58, 134, 255, 0.2));
-}
 .ts-wifi-row.connected {
-    background: linear-gradient(135deg, rgba(58, 134, 255, 0.35), rgba(6, 255, 165, 0.35));
-    box-shadow: inset 0 0 8px rgba(6, 255, 165, 0.3);
+    background: alpha(@accent_color, 0.25);
 }
 .ts-wifi-suffix {
-    color: rgba(255, 255, 255, 0.55);
+    opacity: 0.55;
     font-size: 11px;
     margin-left: 8px;
 }
 
-/* ─── Notifications history page ─────────────────────────────────────── */
+/* ─── Notification history page ─────────────────────────────────── */
 
 .ts-notif-clear-btn {
     padding: 2px 10px;
     border-radius: 8px;
-    background: rgba(255, 0, 110, 0.25);
     font-size: 12px;
-    transition: all 0.2s ease;
-}
-.ts-notif-clear-btn:hover {
-    background: linear-gradient(135deg, #ff006e, #ff4d4d);
-    box-shadow: 0 0 12px rgba(255, 0, 110, 0.6);
 }
 .ts-notif-history {
-    border: 1px solid rgba(131, 56, 236, 0.25);
+    border: 1px solid @card_shade_color;
     border-radius: 8px;
-    background: rgba(0, 0, 0, 0.25);
+    background: alpha(@view_bg_color, 0.6);
 }
 .ts-notif-row {
     padding: 8px 10px;
-    border-bottom: 1px solid rgba(131, 56, 236, 0.15);
+    border-bottom: 1px solid @card_shade_color;
 }
 .ts-notif-row.critical {
-    background: linear-gradient(135deg, rgba(80, 18, 22, 0.5), rgba(60, 15, 45, 0.5));
+    background: alpha(@destructive_color, 0.15);
 }
 .ts-notif-row-app {
-    color: rgba(131, 56, 236, 0.9);
+    color: @accent_color;
     font-size: 11px;
     font-weight: 600;
 }
 .ts-notif-row-time {
-    color: rgba(255, 255, 255, 0.45);
+    opacity: 0.45;
     font-size: 11px;
 }
 .ts-notif-row-summary {
@@ -429,24 +401,25 @@
     font-size: 13px;
 }
 .ts-notif-row-body {
-    color: rgba(255, 255, 255, 0.78);
+    opacity: 0.8;
     font-size: 12px;
 }
 .ts-notif-empty {
-    color: rgba(255, 255, 255, 0.5);
+    opacity: 0.55;
     padding: 16px;
     font-size: 13px;
 }
 
-/* ─── Audio mixer (pavucontrol-style) ───────────────────────────────── */
+/* ─── Audio mixer (pavucontrol-style) ───────────────────────────── */
 
-.ts-audio-row { padding: 4px 4px; }
+.ts-audio-row {
+    padding: 4px 4px;
+}
 .ts-audio-row-name {
     min-width: 180px;
-    color: rgba(255, 255, 255, 0.92);
 }
 .ts-audio-row-name.dim {
-    color: rgba(255, 255, 255, 0.6);
+    opacity: 0.6;
 }
 .ts-audio-default-btn {
     padding: 0 4px;
@@ -454,28 +427,25 @@
     background: transparent;
 }
 .ts-audio-default-btn.active {
-    color: #06ffa5;
-    text-shadow: 0 0 8px rgba(6, 255, 165, 0.8);
+    color: @accent_color;
 }
 .ts-audio-mute-btn {
     padding: 2px 6px;
     border-radius: 6px;
 }
 .ts-audio-mute-btn.muted {
-    background: linear-gradient(135deg, rgba(255, 0, 110, 0.4), rgba(255, 77, 77, 0.4));
-    box-shadow: 0 0 10px rgba(255, 0, 110, 0.4);
+    background: alpha(@destructive_color, 0.3);
 }
 
-/* Legacy mute button (in case anywhere still references it). */
 .ts-mute-btn {
     padding: 2px 6px;
     border-radius: 6px;
 }
 .ts-mute-btn.active {
-    background: linear-gradient(135deg, rgba(255, 0, 110, 0.4), rgba(255, 77, 77, 0.4));
+    background: alpha(@destructive_color, 0.3);
 }
 
-/* ─── Media (MPRIS) page ─────────────────────────────────────────────── */
+/* ─── Media (MPRIS) page ────────────────────────────────────────── */
 
 .ts-media-art {
     min-width: 220px;
@@ -487,27 +457,24 @@
     font-size: 15px;
 }
 .ts-media-artist {
-    color: rgba(255, 255, 255, 0.78);
+    opacity: 0.78;
 }
 .ts-media-album {
-    color: rgba(255, 255, 255, 0.55);
+    opacity: 0.55;
     font-size: 12px;
 }
 
-/* ─── Tray DBusMenu popovers (right-click context menus) ─────────────── */
+/* ─── Tray DBusMenu popovers ────────────────────────────────────── */
 
-.ts-tray-menu { min-width: 180px; }
+.ts-tray-menu {
+    min-width: 180px;
+}
 .ts-tray-menu button {
     padding: 4px 12px;
     border-radius: 6px;
     background: transparent;
-    color: inherit;
     text-align: left;
-}
-.ts-tray-menu button:hover {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.3), rgba(58, 134, 255, 0.3));
 }
 .ts-tray-menu separator {
     margin: 2px 0;
-    background: rgba(131, 56, 236, 0.15);
 }

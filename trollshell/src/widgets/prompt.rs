@@ -59,7 +59,9 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
         .namespace("hytte-prompt")
         .build();
     window.add_css_class("ts-prompt");
-    window.set_size_request(380, -1);
+    // Extra room around the card so its drop-shadow isn't clipped by
+    // the layer-shell surface edge.
+    window.set_size_request(460, 260);
 
     // ── Layout ────────────────────────────────────────────────────────────────
 

@@ -90,8 +90,9 @@ pub fn install(monitor: &Monitor) {
         .namespace(format!("hytte-modal-{key}"))
         .build();
     window.add_css_class("ts-modal");
-    // Wider modal — enough room for multi-column page layouts.
-    window.set_size_request(720, 520);
+    // Wider than the content so the inner .ts-modal-root's shadow has room
+    // to breathe instead of being clipped by the layer-shell surface edge.
+    window.set_size_request(800, 600);
 
     // ESC → close.
     let key_ctrl = gtk::EventControllerKey::new();

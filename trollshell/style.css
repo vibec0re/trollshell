@@ -72,3 +72,22 @@
 .ts-mute-btn.active {
     background: rgba(220, 80, 80, 0.32);
 }
+
+/* Tray DBusMenu popovers */
+.ts-tray-menu {
+    min-width: 180px;
+}
+.ts-tray-menu button {
+    padding: 4px 12px;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+}
+.ts-tray-menu button:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+.ts-tray-menu separator {
+    margin: 2px 0;
+    background: rgba(255, 255, 255, 0.08);
+}

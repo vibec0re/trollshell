@@ -39,6 +39,19 @@
     font-size: 14px;
 }
 
+/* Window list — title buttons next to workspaces */
+.ts-windows {
+    margin-left: 8px;
+}
+.ts-windows button {
+    padding: 2px 8px;
+    opacity: 0.65;
+}
+.ts-windows button.focused {
+    opacity: 1.0;
+    background: rgba(255, 255, 255, 0.10);
+}
+
 /* Mute toggle inside the volume popup */
 .ts-mute-btn {
     padding: 2px 6px;

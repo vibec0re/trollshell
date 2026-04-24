@@ -27,6 +27,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             if ws.is_active {
                 btn.add_css_class("active");
             }
+            let id = ws.id;
+            btn.connect_clicked(move |_| niri::focus_workspace(id));
             container_for_signal.append(&btn);
         }
     });

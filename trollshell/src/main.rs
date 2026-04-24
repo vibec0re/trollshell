@@ -20,7 +20,10 @@ fn main() -> hytte::ui::Result<()> {
                     .edge(Edge::Top)
                     .exclusive(true)
                     .keyboard_interactivity(KeyboardMode::OnDemand)
-                    .left([widgets::workspaces::widget(&monitor)])
+                    .left([
+                        widgets::workspaces::widget(&monitor),
+                        widgets::window_list::widget(&monitor),
+                    ])
                     .right([
                         widgets::network::widget(),
                         widgets::volume::widget(),

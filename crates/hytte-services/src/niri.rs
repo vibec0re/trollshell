@@ -14,7 +14,7 @@
 //!   returns `impl FnMut() -> io::Result<Event>` that blocks until the next
 //!   event arrives.
 //! - `Window` does not derive `Default`, so `WindowFocusChanged { id }` is
-//!   handled by updating the cached window list and filtering for is_focused.
+//!   handled by updating the cached window list and filtering for `is_focused`.
 
 use anyhow::{anyhow, Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -160,7 +160,6 @@ pub fn service() -> NiriService {
 }
 
 /// Returns a signal that emits the current list of niri workspaces.
-#[must_use]
 pub fn workspaces() -> impl Signal<Item = Vec<Workspace>> {
     registry::with(|r| {
         r.get::<NiriHandles>()
@@ -171,7 +170,6 @@ pub fn workspaces() -> impl Signal<Item = Vec<Workspace>> {
 }
 
 /// Returns a signal that emits the currently focused window, if any.
-#[must_use]
 pub fn focused_window() -> impl Signal<Item = Option<Window>> {
     registry::with(|r| {
         r.get::<NiriHandles>()

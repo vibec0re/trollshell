@@ -20,3 +20,21 @@
     opacity: 1.0;
     background: rgba(255, 255, 255, 0.18);
 }
+
+/* Right-cluster indicator buttons */
+.ts-indicator {
+    padding: 0 6px;
+    min-width: 22px;
+}
+.ts-indicator image {
+    -gtk-icon-size: 16px;
+}
+
+/* Popup column layout */
+.ts-popup-column {
+    min-width: 180px;
+}
+.ts-popup-headline {
+    font-weight: 600;
+    font-size: 14px;
+}

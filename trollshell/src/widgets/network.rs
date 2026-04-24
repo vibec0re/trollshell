@@ -3,7 +3,6 @@ use hytte::prelude::*;
 use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
 
-#[allow(dead_code)]
 pub fn widget() -> gtk::Widget {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
@@ -27,7 +26,6 @@ pub fn widget() -> gtk::Widget {
     btn.upcast()
 }
 
-#[allow(dead_code)]
 fn icon_name(primary: Option<&Link>) -> &'static str {
     match primary.map(|l| l.operational) {
         Some(OperationalState::Routable) => "network-wired-symbolic",
@@ -39,7 +37,6 @@ fn icon_name(primary: Option<&Link>) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn detail_widget() -> gtk::Widget {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.add_css_class("ts-popup-column");
@@ -87,7 +84,6 @@ fn detail_widget() -> gtk::Widget {
     column.upcast()
 }
 
-#[allow(dead_code)]
 fn describe_state(s: OperationalState) -> &'static str {
     match s {
         OperationalState::Routable => "routable",

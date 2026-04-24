@@ -2,7 +2,6 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::upower::{self, Battery, BatteryState};
 
-#[allow(dead_code)]
 pub fn widget() -> gtk::Widget {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
@@ -34,7 +33,6 @@ pub fn widget() -> gtk::Widget {
     btn.upcast()
 }
 
-#[allow(dead_code)]
 fn detail_widget() -> gtk::Widget {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.add_css_class("ts-popup-column");
@@ -59,7 +57,6 @@ fn detail_widget() -> gtk::Widget {
     column.upcast()
 }
 
-#[allow(dead_code)]
 fn describe(b: &Battery) -> String {
     let state = match b.state {
         BatteryState::Charging => "Charging",
@@ -81,7 +78,6 @@ fn describe(b: &Battery) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
     let total = d.as_secs();
     let h = total / 3600;

@@ -2,7 +2,6 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::pipewire::{self, Volume};
 
-#[allow(dead_code)]
 pub fn widget() -> gtk::Widget {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
@@ -26,7 +25,6 @@ pub fn widget() -> gtk::Widget {
     btn.upcast()
 }
 
-#[allow(dead_code)]
 fn icon_name(v: Volume) -> &'static str {
     if v.muted {
         "audio-volume-muted-symbolic"
@@ -39,7 +37,6 @@ fn icon_name(v: Volume) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn detail_widget() -> gtk::Widget {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.add_css_class("ts-popup-column");

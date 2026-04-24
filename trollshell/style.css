@@ -1,0 +1,14 @@
+/* trollshell user overrides on top of hytte-ui defaults. */
+
+.trollshell-clock {
+    font-feature-settings: "tnum" 1;
+    padding: 0 6px;
+}
+
+.trollshell-workspaces button {
+    min-width: 22px;
+    padding: 2px 0;
+}
+.trollshell-workspaces button.focused {
+    background: rgba(255, 255, 255, 0.18);
+}

@@ -161,3 +161,12 @@ impl Drop for BarHandle {
         self.window.close();
     }
 }
+
+impl BarHandle {
+    /// Forget the handle so the bar lives for the application's lifetime.
+    /// Useful when constructing many bars in the body closure where you
+    /// don't want to track each one individually.
+    pub fn into_long_lived(self) {
+        std::mem::forget(self);
+    }
+}

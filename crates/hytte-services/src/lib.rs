@@ -1,6 +1,7 @@
 //! Async clients to system daemons exposed as hytte services.
 
 pub mod bluetooth;
+pub mod brightness;
 pub mod clock;
 pub mod mpris;
 pub mod networkd;

@@ -7,6 +7,7 @@
 use crate::layer_window::{layer_window, Anchor, Margin};
 use crate::Monitor;
 use gtk::prelude::*;
+use gtk4_layer_shell::KeyboardMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Edge {
@@ -21,6 +22,7 @@ pub struct Bar {
     edge: Edge,
     margin: Margin,
     exclusive: bool,
+    keyboard_mode: Option<KeyboardMode>,
     left: Vec<gtk::Widget>,
     center: Vec<gtk::Widget>,
     right: Vec<gtk::Widget>,
@@ -34,6 +36,7 @@ impl Bar {
             edge: Edge::Top,
             margin: Margin::default(),
             exclusive: true,
+            keyboard_mode: None,
             left: Vec::new(),
             center: Vec::new(),
             right: Vec::new(),
@@ -55,6 +58,18 @@ impl Bar {
     #[must_use]
     pub fn exclusive(mut self, on: bool) -> Self {
         self.exclusive = on;
+        self
+    }
+
+    /// Enable keyboard input for popovers spawned from bar widgets.
+    ///
+    /// Layer-shell surfaces have `KeyboardMode::None` by default, which
+    /// means popovers parented to a bar widget will not receive keyboard
+    /// input. Pass `KeyboardMode::OnDemand` to allow popovers to grab
+    /// focus when shown.
+    #[must_use]
+    pub fn keyboard_interactivity(mut self, mode: KeyboardMode) -> Self {
+        self.keyboard_mode = Some(mode);
         self
     }
 
@@ -82,14 +97,17 @@ impl Bar {
     pub fn show(self) -> BarHandle {
         let (anchor_main, anchor_perp) = perpendicular_anchors(self.edge);
 
-        let window = layer_window(&self.monitor)
+        let mut builder = layer_window(&self.monitor)
             .anchor(anchor_main)
             .anchor(anchor_perp.0)
             .anchor(anchor_perp.1)
             .margin(self.margin)
             .exclusive(self.exclusive)
-            .namespace(format!("hytte-bar-{:?}", self.edge).to_lowercase())
-            .build();
+            .namespace(format!("hytte-bar-{:?}", self.edge).to_lowercase());
+        if let Some(mode) = self.keyboard_mode {
+            builder = builder.keyboard_mode(mode);
+        }
+        let window = builder.build();
         window.add_css_class("hytte-bar");
         window.add_css_class(edge_class(self.edge));
 

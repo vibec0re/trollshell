@@ -6,7 +6,7 @@
 //! `LayerWindow` directly.
 
 use crate::Monitor;
-use gtk4_layer_shell::{Edge as LsEdge, Layer, LayerShell};
+use gtk4_layer_shell::{Edge as LsEdge, KeyboardMode, Layer, LayerShell};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Anchor {
@@ -31,6 +31,7 @@ pub struct LayerWindowBuilder {
     margin: Margin,
     namespace: String,
     exclusive: bool,
+    keyboard_mode: Option<KeyboardMode>,
 }
 
 impl LayerWindowBuilder {
@@ -64,6 +65,12 @@ impl LayerWindowBuilder {
         self
     }
 
+    #[must_use]
+    pub fn keyboard_mode(mut self, mode: KeyboardMode) -> Self {
+        self.keyboard_mode = Some(mode);
+        self
+    }
+
     /// Construct the `gtk::Window`, wire up layer-shell, but don't show.
     #[must_use]
     pub fn build(self) -> gtk::Window {
@@ -86,6 +93,10 @@ impl LayerWindowBuilder {
             window.auto_exclusive_zone_enable();
         }
 
+        if let Some(mode) = self.keyboard_mode {
+            window.set_keyboard_mode(mode);
+        }
+
         window
     }
 }
@@ -99,6 +110,7 @@ pub fn layer_window(monitor: &Monitor) -> LayerWindowBuilder {
         margin: Margin::default(),
         namespace: String::from("hytte"),
         exclusive: false,
+        keyboard_mode: None,
     }
 }
 

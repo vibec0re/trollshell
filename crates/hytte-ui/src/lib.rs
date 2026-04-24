@@ -12,7 +12,7 @@ pub use error::{Error, Result};
 pub use layer_window::{layer_window, Anchor, LayerWindowBuilder, Margin};
 pub use monitor::Monitor;
 
-pub use gtk4_layer_shell::Layer;
+pub use gtk4_layer_shell::{KeyboardMode, Layer};
 
 // Re-export so consumers don't need their own gtk/adw deps.
 pub use ::adw;

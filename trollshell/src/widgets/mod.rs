@@ -1,10 +1,13 @@
 pub mod battery;
 pub mod bluetooth;
 pub mod clock;
+pub mod cpu;
+pub mod memory;
 pub mod mpris;
 pub mod network;
 pub mod notifications;
 pub mod tray;
+pub mod util;
 pub mod volume;
 pub mod window_list;
 pub mod workspaces;

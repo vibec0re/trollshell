@@ -8,5 +8,6 @@ pub mod niri;
 pub mod notifications;
 pub mod pipewire;
 pub mod resolved;
+pub mod sensors;
 pub mod tray;
 pub mod upower;

@@ -2,6 +2,9 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
+use hytte::services::sensors;
+
+use super::util::fmt_rate;
 
 pub fn widget() -> gtk::Widget {
     let btn = gtk::Button::new();
@@ -80,6 +83,28 @@ fn detail_widget() -> gtk::Widget {
         &dns,
     );
     column.append(&dns);
+
+    let rate = gtk::Label::new(None);
+    rate.set_xalign(0.0);
+    bind_text(
+        sensors::network().map(|net| {
+            net.interfaces
+                .iter()
+                .filter(|i| i.name != "lo")
+                .map(|i| {
+                    format!(
+                        "{}: \u{2193} {} \u{2191} {}",
+                        i.name,
+                        fmt_rate(i.rx_rate_bps),
+                        fmt_rate(i.tx_rate_bps),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        &rate,
+    );
+    column.append(&rate);
 
     column.upcast()
 }

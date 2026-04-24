@@ -218,6 +218,36 @@
     margin: 0;
 }
 
+/* Audio modal rows (Output / Input / Playback sections) */
+.ts-audio-row {
+    padding: 4px 2px;
+}
+.ts-audio-row.default {
+    /* default sink / source highlight — subtle left accent */
+}
+.ts-audio-row-name {
+    min-width: 180px;
+    color: rgba(255, 255, 255, 0.92);
+}
+.ts-audio-row-name.dim {
+    color: rgba(255, 255, 255, 0.6);
+}
+.ts-audio-default-btn {
+    padding: 0 4px;
+    min-width: 16px;
+    background: transparent;
+}
+.ts-audio-default-btn.active {
+    color: #7fb8ff;
+}
+.ts-audio-mute-btn {
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+.ts-audio-mute-btn.muted {
+    background: rgba(220, 80, 80, 0.32);
+}
+
 /* Wi-Fi popup section */
 .ts-wifi-headline {
     font-weight: 600;

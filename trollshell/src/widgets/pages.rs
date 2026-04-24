@@ -15,7 +15,7 @@ use hytte::services::bluetooth::{self, Device};
 use hytte::services::brightness;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
-use hytte::services::pipewire::{self, Volume};
+use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
 use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::upower::{self, Battery, BatteryState};
@@ -710,65 +710,283 @@ pub fn page_stats() -> gtk::Widget {
 
 pub fn page_audio() -> gtk::Widget {
     let column = page_box();
-    column.add_css_class("ts-popup-column");
 
-    let headline = gtk::Label::new(None);
-    headline.set_xalign(0.0);
-    headline.add_css_class("ts-popup-headline");
-    bind_text(
-        pipewire::default_sink().map(|v: Volume| {
-            if v.muted {
-                "Muted".to_string()
-            } else {
-                format!("{:.0}%", v.linear * 100.0)
+    // ── Output section ────────────────────────────────────────────────────────
+    let output_panel = panel("Output");
+    let output_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    output_panel.append(&output_list);
+
+    let output_list_for_bind = output_list.clone();
+    bind(pipewire::sinks(), &output_list, move |_, sinks: Vec<Sink>| {
+        while let Some(child) = output_list_for_bind.first_child() {
+            output_list_for_bind.remove(&child);
+        }
+        for s in &sinks {
+            let row = sink_row(s);
+            output_list_for_bind.append(&row);
+        }
+    });
+    column.append(&output_panel);
+
+    // ── Input section ─────────────────────────────────────────────────────────
+    let input_panel = panel("Input");
+    let input_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    input_panel.append(&input_list);
+
+    let input_list_for_bind = input_list.clone();
+    bind(
+        pipewire::sources(),
+        &input_list,
+        move |_, sources: Vec<Source>| {
+            while let Some(child) = input_list_for_bind.first_child() {
+                input_list_for_bind.remove(&child);
             }
-        }),
-        &headline,
+            for s in &sources {
+                let row = source_row(s);
+                input_list_for_bind.append(&row);
+            }
+        },
     );
-    column.append(&headline);
+    column.append(&input_panel);
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // ── Playback section ──────────────────────────────────────────────────────
+    let playback_panel = panel("Playback");
+    let playback_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    playback_panel.append(&playback_list);
 
-    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
-    mute_btn.add_css_class("ts-mute-btn");
-    bind_class(
-        pipewire::default_sink().map(|v: Volume| v.muted),
-        &mute_btn,
-        "active",
+    let playback_list_for_bind = playback_list.clone();
+    bind(
+        pipewire::playback_streams(),
+        &playback_list,
+        move |_, streams: Vec<PlaybackStream>| {
+            while let Some(child) = playback_list_for_bind.first_child() {
+                playback_list_for_bind.remove(&child);
+            }
+            if streams.is_empty() {
+                let lbl = gtk::Label::new(Some("No active streams"));
+                lbl.set_xalign(0.0);
+                lbl.add_css_class("ts-audio-row-name");
+                lbl.add_css_class("dim");
+                playback_list_for_bind.append(&lbl);
+            } else {
+                for s in &streams {
+                    let row = stream_row(s);
+                    playback_list_for_bind.append(&row);
+                }
+            }
+        },
     );
-    mute_btn.connect_clicked(|_| pipewire::toggle_mute());
-    row.append(&mute_btn);
+    column.append(&playback_panel);
 
+    column.upcast()
+}
+
+fn sink_row(s: &Sink) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("ts-audio-row");
+    if s.is_default {
+        row.add_css_class("default");
+    }
+
+    // Radio indicator / default button.
+    let radio_lbl = gtk::Label::new(Some(if s.is_default { "\u{25cf}" } else { "\u{25cb}" }));
+    let radio_btn = gtk::Button::new();
+    radio_btn.set_child(Some(&radio_lbl));
+    radio_btn.add_css_class("ts-audio-default-btn");
+    if s.is_default {
+        radio_btn.add_css_class("active");
+    }
+    let sink_name_for_click = s.name.clone();
+    radio_btn.connect_clicked(move |_| {
+        pipewire::set_default_sink(&sink_name_for_click);
+    });
+    row.append(&radio_btn);
+
+    // Name / description label.
+    let desc = if s.description.len() > 40 {
+        format!("{}…", &s.description[..39])
+    } else {
+        s.description.clone()
+    };
+    let name_lbl = gtk::Label::new(Some(&desc));
+    name_lbl.set_xalign(0.0);
+    name_lbl.set_hexpand(true);
+    name_lbl.add_css_class("ts-audio-row-name");
+    if !s.is_default {
+        name_lbl.add_css_class("dim");
+    }
+    if s.description.len() > 40 {
+        name_lbl.set_tooltip_text(Some(&s.description));
+    }
+    row.append(&name_lbl);
+
+    // Volume slider.
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     slider.set_draw_value(false);
     slider.set_hexpand(true);
     slider.set_size_request(160, -1);
+    slider.set_value(s.volume);
 
-    let suppress = Rc::new(Cell::new(false));
-
-    let suppress_for_handler = suppress.clone();
-    slider.connect_value_changed(move |s| {
-        if suppress_for_handler.get() {
-            return;
-        }
-        pipewire::set_volume(s.value());
+    let sink_id = s.id;
+    slider.connect_value_changed(move |sl| {
+        pipewire::set_sink_volume(sink_id, sl.value());
     });
+    // No signal bind here — we rebuild the whole row on each poll emission.
+    row.append(&slider);
 
-    let suppress_for_bind = suppress.clone();
-    bind(pipewire::default_sink(), &slider, move |s, v: Volume| {
-        suppress_for_bind.set(true);
-        s.set_value(v.linear);
-        suppress_for_bind.set(false);
+    // Mute button.
+    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+    mute_btn.add_css_class("ts-audio-mute-btn");
+    if s.muted {
+        mute_btn.add_css_class("muted");
+    }
+    let muted_cell = Rc::new(Cell::new(s.muted));
+    mute_btn.connect_clicked(move |btn| {
+        let new_mute = !muted_cell.get();
+        muted_cell.set(new_mute);
+        pipewire::set_sink_mute(sink_id, new_mute);
+        if new_mute {
+            btn.add_css_class("muted");
+        } else {
+            btn.remove_css_class("muted");
+        }
+    });
+    row.append(&mute_btn);
+
+    row.upcast()
+}
+
+fn source_row(s: &Source) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("ts-audio-row");
+    if s.is_default {
+        row.add_css_class("default");
+    }
+
+    // Radio indicator / default button.
+    let radio_lbl = gtk::Label::new(Some(if s.is_default { "\u{25cf}" } else { "\u{25cb}" }));
+    let radio_btn = gtk::Button::new();
+    radio_btn.set_child(Some(&radio_lbl));
+    radio_btn.add_css_class("ts-audio-default-btn");
+    if s.is_default {
+        radio_btn.add_css_class("active");
+    }
+    let source_name_for_click = s.name.clone();
+    radio_btn.connect_clicked(move |_| {
+        pipewire::set_default_source(&source_name_for_click);
+    });
+    row.append(&radio_btn);
+
+    // Name / description label.
+    let desc = if s.description.len() > 40 {
+        format!("{}…", &s.description[..39])
+    } else {
+        s.description.clone()
+    };
+    let name_lbl = gtk::Label::new(Some(&desc));
+    name_lbl.set_xalign(0.0);
+    name_lbl.set_hexpand(true);
+    name_lbl.add_css_class("ts-audio-row-name");
+    if !s.is_default {
+        name_lbl.add_css_class("dim");
+    }
+    if s.description.len() > 40 {
+        name_lbl.set_tooltip_text(Some(&s.description));
+    }
+    row.append(&name_lbl);
+
+    // Volume slider.
+    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+    slider.set_draw_value(false);
+    slider.set_hexpand(true);
+    slider.set_size_request(160, -1);
+    slider.set_value(s.volume);
+
+    let source_id = s.id;
+    slider.connect_value_changed(move |sl| {
+        pipewire::set_source_volume(source_id, sl.value());
     });
     row.append(&slider);
 
-    column.append(&row);
+    // Mute button.
+    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+    mute_btn.add_css_class("ts-audio-mute-btn");
+    if s.muted {
+        mute_btn.add_css_class("muted");
+    }
+    let muted_cell = Rc::new(Cell::new(s.muted));
+    mute_btn.connect_clicked(move |btn| {
+        let new_mute = !muted_cell.get();
+        muted_cell.set(new_mute);
+        pipewire::set_source_mute(source_id, new_mute);
+        if new_mute {
+            btn.add_css_class("muted");
+        } else {
+            btn.remove_css_class("muted");
+        }
+    });
+    row.append(&mute_btn);
 
-    let device = gtk::Label::new(Some("Default sink"));
-    device.set_xalign(0.0);
-    column.append(&device);
+    row.upcast()
+}
 
-    column.upcast()
+fn stream_row(s: &PlaybackStream) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("ts-audio-row");
+
+    // Spacer matching radio button width so labels align with sink/source rows.
+    let spacer = gtk::Label::new(Some("  "));
+    spacer.add_css_class("ts-audio-default-btn");
+    row.append(&spacer);
+
+    // App name label.
+    let app_name = if s.app_name.len() > 40 {
+        format!("{}…", &s.app_name[..39])
+    } else {
+        s.app_name.clone()
+    };
+    let name_lbl = gtk::Label::new(Some(&app_name));
+    name_lbl.set_xalign(0.0);
+    name_lbl.set_hexpand(true);
+    name_lbl.add_css_class("ts-audio-row-name");
+    if s.app_name.len() > 40 {
+        name_lbl.set_tooltip_text(Some(&s.app_name));
+    }
+    row.append(&name_lbl);
+
+    // Volume slider.
+    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+    slider.set_draw_value(false);
+    slider.set_hexpand(true);
+    slider.set_size_request(160, -1);
+    slider.set_value(s.volume);
+
+    let stream_id = s.id;
+    slider.connect_value_changed(move |sl| {
+        pipewire::set_stream_volume(stream_id, sl.value());
+    });
+    row.append(&slider);
+
+    // Mute button.
+    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+    mute_btn.add_css_class("ts-audio-mute-btn");
+    if s.muted {
+        mute_btn.add_css_class("muted");
+    }
+    let muted_cell = Rc::new(Cell::new(s.muted));
+    mute_btn.connect_clicked(move |btn| {
+        let new_mute = !muted_cell.get();
+        muted_cell.set(new_mute);
+        pipewire::set_stream_mute(stream_id, new_mute);
+        if new_mute {
+            btn.add_css_class("muted");
+        } else {
+            btn.remove_css_class("muted");
+        }
+    });
+    row.append(&mute_btn);
+
+    row.upcast()
 }
 
 // ── Power page ────────────────────────────────────────────────────────────────

@@ -2,3 +2,4 @@
 
 pub mod clock;
 pub mod niri;
+pub mod upower;

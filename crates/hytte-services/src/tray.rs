@@ -214,14 +214,25 @@ async fn do_activate(bus_name: &str, object_path: &str) -> Result<()> {
 /// Calls `AboutToShow(0)` first (some apps need this to populate their menu),
 /// then calls `GetLayout(-1)` to fetch the full tree in one round-trip.
 /// Returns `None` on any error.
+///
+/// Internally dispatches the zbus work onto the hytte tokio runtime and
+/// bridges the result back via a oneshot channel, so this future is safe
+/// to await from any executor (e.g. `glib::MainContext::spawn_local`).
 pub async fn fetch_menu(bus_name: &str, menu_path: &str) -> Option<Menu> {
-    match do_fetch_menu(bus_name, menu_path).await {
-        Ok(m) => Some(m),
-        Err(e) => {
-            tracing::debug!(error = %e, bus_name, menu_path, "fetch_menu failed");
-            None
-        }
-    }
+    let bus = bus_name.to_string();
+    let path = menu_path.to_string();
+    let (tx, rx) = futures_channel::oneshot::channel();
+    runtime::handle().spawn(async move {
+        let result = match do_fetch_menu(&bus, &path).await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::debug!(error = %e, bus_name = bus, menu_path = path, "fetch_menu failed");
+                None
+            }
+        };
+        let _ = tx.send(result);
+    });
+    rx.await.ok().flatten()
 }
 
 async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {

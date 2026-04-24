@@ -728,6 +728,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-channel",
  "futures-executor",
  "futures-signals",
  "futures-util",

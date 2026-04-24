@@ -68,6 +68,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
         .center([widgets::mpris::widget(monitor)])
         .right([
             widgets::tray::widget(),
+            widgets::notif_indicator::widget(monitor),
             widgets::bluetooth::widget(monitor),
             widgets::network::widget(monitor),
             widgets::volume::widget(monitor),

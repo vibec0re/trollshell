@@ -15,6 +15,7 @@ pub enum Page {
     Stats,
     Audio,
     Power,
+    Notifications,
 }
 
 impl Page {
@@ -26,6 +27,7 @@ impl Page {
             Self::Stats => "stats",
             Self::Audio => "audio",
             Self::Power => "power",
+            Self::Notifications => "notifications",
         }
     }
 
@@ -37,6 +39,7 @@ impl Page {
             Self::Stats => "System",
             Self::Audio => "Audio",
             Self::Power => "Power",
+            Self::Notifications => "Notifications",
         }
     }
 }
@@ -159,6 +162,11 @@ pub fn install(monitor: &Monitor) {
         &pages::page_power(),
         Some(Page::Power.stack_name()),
         Page::Power.title(),
+    );
+    stack.add_titled(
+        &pages::page_notifications(),
+        Some(Page::Notifications.stack_name()),
+        Page::Notifications.title(),
     );
 
     vbox.append(&stack);

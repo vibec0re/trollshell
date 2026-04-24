@@ -14,7 +14,7 @@ use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 use zbus::{Connection, fdo};
@@ -84,6 +84,26 @@ pub struct Notification {
     pub actions: Vec<Action>,
     /// Image to display on the notification card (thumbnail).
     pub image: Option<NotificationImage>,
+    /// When the notification was first shown (Unix seconds).
+    pub created_at: u64,
+}
+
+/// A dismissed notification kept in the in-memory history ring (capped at 100).
+#[derive(Clone, Debug)]
+pub struct HistoryEntry {
+    pub id: u32,
+    pub app_name: String,
+    pub app_icon: String,
+    pub summary: String,
+    pub body: String,
+    pub urgency: Urgency,
+    pub image: Option<NotificationImage>,
+    /// Why the notification was closed: 1=expired, 2=dismissed, 3=closed-by-call, 4=undefined.
+    pub reason: u32,
+    /// When the notification was first shown (Unix seconds).
+    pub created_at: u64,
+    /// When the notification was dismissed (Unix seconds).
+    pub dismissed_at: u64,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -93,6 +113,7 @@ pub struct Notification {
 pub struct NotificationsHandles {
     pub(crate) active: Mutable<Vec<Notification>>,
     pub(crate) next_id: Arc<AtomicU32>,
+    pub(crate) history: Mutable<Vec<HistoryEntry>>,
 }
 
 impl Default for NotificationsHandles {
@@ -100,6 +121,7 @@ impl Default for NotificationsHandles {
         Self {
             active: Mutable::new(Vec::new()),
             next_id: Arc::new(AtomicU32::new(1)),
+            history: Mutable::new(Vec::new()),
         }
     }
 }
@@ -116,10 +138,11 @@ impl Service for NotificationsService {
         let handles = NotificationsHandles::default();
         let active_writer = handles.active.clone();
         let next_id = handles.next_id.clone();
+        let history_writer = handles.history.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&active_writer, &next_id).await {
+                match listen(&active_writer, &next_id, &history_writer).await {
                     Ok(()) => {
                         tracing::warn!(
                             "notifications daemon stream closed, reconnecting in 2s"
@@ -158,6 +181,27 @@ pub fn active() -> impl Signal<Item = Vec<Notification>> {
     })
 }
 
+/// Signal that emits the history of dismissed notifications, newest-first,
+/// capped at 100 entries.
+pub fn history() -> impl Signal<Item = Vec<HistoryEntry>> {
+    registry::with(|r| {
+        r.get::<NotificationsHandles>()
+            .expect("notifications::service() not registered")
+            .history
+            .signal_cloned()
+    })
+}
+
+/// Clear the in-memory notification history.
+pub fn clear_history() {
+    registry::with(|r| {
+        r.get::<NotificationsHandles>()
+            .expect("notifications::service() not registered")
+            .history
+            .set(Vec::new());
+    });
+}
+
 /// Dismiss notification `id` with the given reason.
 ///
 /// Reason codes: 1 = expired, 2 = dismissed-by-user, 3 = closed-by-call,
@@ -174,17 +218,40 @@ pub fn dismiss(id: u32, reason: u32) {
 }
 
 async fn do_dismiss(id: u32, reason: u32) -> Result<()> {
-    let active = registry::with(|r| {
+    let handles = registry::with(|r| {
         r.get::<NotificationsHandles>()
-            .map(|h| h.active.clone())
+            .map(|h| (h.active.clone(), h.history.clone()))
     });
-    let Some(active) = active else {
+    let Some((active, history)) = handles else {
         return Ok(());
     };
-    // Remove from active list.
-    {
+    // Remove from active list, capturing the notification for history.
+    let removed = {
         let mut list = active.lock_mut();
-        list.retain(|n| n.id != id);
+        let pos = list.iter().position(|n| n.id == id);
+        pos.map(|i| list.remove(i))
+    };
+    // Push to history if we found and removed the notification.
+    if let Some(n) = removed {
+        let dismissed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = HistoryEntry {
+            id: n.id,
+            app_name: n.app_name,
+            app_icon: n.app_icon,
+            summary: n.summary,
+            body: n.body,
+            urgency: n.urgency,
+            image: n.image,
+            reason,
+            created_at: n.created_at,
+            dismissed_at,
+        };
+        let mut hist = history.lock_mut();
+        hist.insert(0, entry);
+        hist.truncate(100);
     }
     // Emit the D-Bus signal.
     let conn = Connection::session()
@@ -228,6 +295,7 @@ async fn do_invoke_action(id: u32, action_key: &str) -> Result<()> {
 #[derive(Clone)]
 struct State {
     active: Mutable<Vec<Notification>>,
+    history: Mutable<Vec<HistoryEntry>>,
     next_id: Arc<AtomicU32>,
     conn: Connection,
 }
@@ -235,21 +303,46 @@ struct State {
 impl State {
     fn new(
         active: Mutable<Vec<Notification>>,
+        history: Mutable<Vec<HistoryEntry>>,
         next_id: Arc<AtomicU32>,
         conn: Connection,
     ) -> Self {
         Self {
             active,
+            history,
             next_id,
             conn,
         }
     }
 
     async fn dismiss(&self, id: u32, reason: u32) {
-        // Remove from active list.
-        {
+        // Remove from active list, capturing the notification for history.
+        let removed = {
             let mut list = self.active.lock_mut();
-            list.retain(|n| n.id != id);
+            let pos = list.iter().position(|n| n.id == id);
+            pos.map(|i| list.remove(i))
+        };
+        // Push to history if we found and removed the notification.
+        if let Some(n) = removed {
+            let dismissed_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let entry = HistoryEntry {
+                id: n.id,
+                app_name: n.app_name,
+                app_icon: n.app_icon,
+                summary: n.summary,
+                body: n.body,
+                urgency: n.urgency,
+                image: n.image,
+                reason,
+                created_at: n.created_at,
+                dismissed_at,
+            };
+            let mut hist = self.history.lock_mut();
+            hist.insert(0, entry);
+            hist.truncate(100);
         }
         // Emit the D-Bus signal.
         match SignalEmitter::new(&self.conn, "/org/freedesktop/Notifications") {
@@ -333,6 +426,12 @@ impl NotificationsIface {
         // Parse image from hints, falling back to app_icon.
         let image = parse_image(&hints, app_icon);
 
+        // Record when this notification first appeared.
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let notification = Notification {
             id,
             app_name: app_name.to_string(),
@@ -343,6 +442,7 @@ impl NotificationsIface {
             timeout,
             actions: parsed_actions,
             image,
+            created_at,
         };
 
         // Update active list: replace in-place if same id, else push.
@@ -412,12 +512,16 @@ impl NotificationsIface {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-async fn listen(active: &Mutable<Vec<Notification>>, next_id: &Arc<AtomicU32>) -> Result<()> {
+async fn listen(
+    active: &Mutable<Vec<Notification>>,
+    next_id: &Arc<AtomicU32>,
+    history: &Mutable<Vec<HistoryEntry>>,
+) -> Result<()> {
     let conn = Connection::session()
         .await
         .context("connect session bus")?;
 
-    let state = State::new(active.clone(), next_id.clone(), conn.clone());
+    let state = State::new(active.clone(), history.clone(), next_id.clone(), conn.clone());
     let iface = NotificationsIface {
         state: state.clone(),
     };

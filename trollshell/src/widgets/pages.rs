@@ -9,12 +9,14 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use chrono::{DateTime, Local};
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device};
 use hytte::services::brightness;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
+use hytte::services::notifications;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
 use hytte::services::sensors::{self, CpuLoad};
@@ -1204,3 +1206,93 @@ fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
     }
 }
 
+// ── Notifications history page ────────────────────────────────────────────────
+
+pub fn page_notifications() -> gtk::Widget {
+    let column = page_box();
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header.set_margin_bottom(6);
+    let title = gtk::Label::new(Some("History"));
+    title.add_css_class("ts-popup-headline");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    header.append(&title);
+    let clear_btn = gtk::Button::with_label("Clear all");
+    clear_btn.add_css_class("ts-notif-clear-btn");
+    clear_btn.connect_clicked(|_| notifications::clear_history());
+    header.append(&clear_btn);
+    column.append(&header);
+
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_min_content_height(380);
+    scrolled.add_css_class("ts-notif-history");
+
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    scrolled.set_child(Some(&list));
+    column.append(&scrolled);
+
+    let list_for_signal = list.clone();
+    bind(notifications::history(), &list, move |_, entries| {
+        while let Some(child) = list_for_signal.first_child() {
+            list_for_signal.remove(&child);
+        }
+        if entries.is_empty() {
+            let empty = gtk::Label::new(Some("No notifications"));
+            empty.add_css_class("ts-notif-empty");
+            empty.set_xalign(0.0);
+            list_for_signal.append(&empty);
+            return;
+        }
+        for entry in &entries {
+            list_for_signal.append(&build_history_row(entry));
+        }
+    });
+
+    column.upcast()
+}
+
+fn build_history_row(entry: &notifications::HistoryEntry) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    row.add_css_class("ts-notif-row");
+    if entry.urgency == notifications::Urgency::Critical {
+        row.add_css_class("critical");
+    }
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let app_label = gtk::Label::new(Some(&entry.app_name));
+    app_label.add_css_class("ts-notif-row-app");
+    app_label.set_xalign(0.0);
+    app_label.set_hexpand(true);
+    header.append(&app_label);
+    let time_label = gtk::Label::new(Some(&fmt_notif_time(entry.dismissed_at)));
+    time_label.add_css_class("ts-notif-row-time");
+    header.append(&time_label);
+    row.append(&header);
+
+    let summary = gtk::Label::new(Some(&entry.summary));
+    summary.add_css_class("ts-notif-row-summary");
+    summary.set_xalign(0.0);
+    summary.set_wrap(true);
+    row.append(&summary);
+
+    if !entry.body.is_empty() {
+        let body = gtk::Label::new(Some(&entry.body));
+        body.add_css_class("ts-notif-row-body");
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        row.append(&body);
+    }
+
+    row.upcast()
+}
+
+fn fmt_notif_time(unix_secs: u64) -> String {
+    let dt = DateTime::<Local>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs),
+    );
+    dt.format("%H:%M").to_string()
+}

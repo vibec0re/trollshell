@@ -34,7 +34,7 @@ pub trait ServiceErased: 'static {
 
 impl<S: Service> ServiceErased for S {
     fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle, registry: &mut Registry) {
-        let handles = (*self).start(rt);
+        let handles = self.start(rt);
         registry.insert::<S::Handles>(handles);
     }
 }
@@ -50,6 +50,7 @@ impl Registry {
         self.entries.insert(TypeId::of::<T>(), Box::new(value));
     }
 
+    #[must_use]
     pub fn get<T: 'static>(&self) -> Option<&T> {
         self.entries
             .get(&TypeId::of::<T>())
@@ -64,9 +65,10 @@ thread_local! {
 /// Run a closure with shared read access to the thread-local registry.
 ///
 /// # Panics
-/// Panics if called from a thread other than the one where services were
-/// installed (typically the GTK main thread). In practice all subscriptions
-/// happen on the main thread.
+/// Panics if a mutable borrow is already active on this thread's registry
+/// (a `RefCell` borrow conflict). In practice this never happens because
+/// the registry is only mutated during `install`, which runs before any
+/// subscriptions.
 pub fn with<R>(f: impl FnOnce(&Registry) -> R) -> R {
     REGISTRY.with(|cell| f(&cell.borrow()))
 }

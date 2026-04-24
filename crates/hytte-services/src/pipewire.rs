@@ -52,12 +52,22 @@ pub struct PlaybackStream {
     pub muted: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct RecordStream {
+    pub id: u32,
+    pub app_name: String,
+    pub source_id: u32,
+    pub volume: f64,
+    pub muted: bool,
+}
+
 #[doc(hidden)]
 pub struct PipewireHandles {
     pub(crate) sink: Mutable<Volume>,
     pub(crate) sinks: Mutable<Vec<Sink>>,
     pub(crate) sources: Mutable<Vec<Source>>,
     pub(crate) streams: Mutable<Vec<PlaybackStream>>,
+    pub(crate) record_streams: Mutable<Vec<RecordStream>>,
 }
 
 impl Default for PipewireHandles {
@@ -67,6 +77,7 @@ impl Default for PipewireHandles {
             sinks: Mutable::new(Vec::new()),
             sources: Mutable::new(Vec::new()),
             streams: Mutable::new(Vec::new()),
+            record_streams: Mutable::new(Vec::new()),
         }
     }
 }
@@ -97,12 +108,14 @@ impl Service for PipewireService {
         let sinks_writer = handles.sinks.clone();
         let sources_writer = handles.sources.clone();
         let streams_writer = handles.streams.clone();
+        let record_writer = handles.record_streams.clone();
         rt.spawn(async move {
             loop {
                 if let Some(state) = read_full_state() {
                     sinks_writer.set(state.sinks);
                     sources_writer.set(state.sources);
                     streams_writer.set(state.streams);
+                    record_writer.set(state.record_streams);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -118,6 +131,7 @@ struct FullState {
     sinks: Vec<Sink>,
     sources: Vec<Source>,
     streams: Vec<PlaybackStream>,
+    record_streams: Vec<RecordStream>,
 }
 
 fn run_cmd(args: &[&str]) -> Option<String> {
@@ -257,10 +271,14 @@ fn read_full_state() -> Option<FullState> {
     // ── Sink inputs (playback streams) ────────────────────────────────────────
     let streams = parse_playback_streams();
 
+    // ── Source outputs (record streams) ───────────────────────────────────────
+    let record_streams = parse_record_streams();
+
     Some(FullState {
         sinks,
         sources,
         streams,
+        record_streams,
     })
 }
 
@@ -291,6 +309,93 @@ fn parse_playback_streams() -> Vec<PlaybackStream> {
         return Vec::new();
     };
     parse_sink_input_blocks_with_ids(&long_out)
+}
+
+fn parse_record_streams() -> Vec<RecordStream> {
+    let Some(long_out) = run_cmd(&["pactl", "list", "source-outputs"]) else {
+        return Vec::new();
+    };
+    parse_source_output_blocks_with_ids(&long_out)
+}
+
+fn parse_source_output_blocks_with_ids(output: &str) -> Vec<RecordStream> {
+    let mut streams = Vec::new();
+    let mut current_id: Option<u32> = None;
+    let mut current_map: HashMap<String, String> = HashMap::new();
+    let mut in_properties = false;
+
+    for line in output.lines() {
+        if line.starts_with("Source Output #") {
+            if let Some(id) = current_id.take()
+                && let Some(stream) = build_record_stream(id, &current_map)
+            {
+                streams.push(stream);
+            }
+            current_map.clear();
+            in_properties = false;
+
+            if let Some(id_str) = line.strip_prefix("Source Output #") {
+                current_id = id_str.trim().parse().ok();
+            }
+            continue;
+        }
+
+        if current_id.is_none() {
+            continue;
+        }
+
+        if line.trim() == "Properties:" {
+            in_properties = true;
+            continue;
+        }
+
+        if in_properties {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let key = k.trim().to_string();
+                let val = v.trim().trim_matches('"').to_string();
+                current_map.entry(key).or_insert(val);
+            }
+        } else {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = k.trim().to_string();
+                let val = v.trim().to_string();
+                current_map.entry(key).or_insert(val);
+            }
+        }
+    }
+
+    if let Some(id) = current_id.take()
+        && let Some(stream) = build_record_stream(id, &current_map)
+    {
+        streams.push(stream);
+    }
+
+    streams
+}
+
+fn build_record_stream(id: u32, map: &HashMap<String, String>) -> Option<RecordStream> {
+    let source_id: u32 = map.get("Source")?.trim().parse().ok()?;
+    // Filter out PulseAudio's own monitoring/peek streams that GNOME-style
+    // indicators ignore. These typically have media.class = Stream/Input/Audio
+    // and media.role = "peek", or come from pavucontrol/wireplumber itself.
+    if map.get("media.role").map(String::as_str) == Some("peek") {
+        return None;
+    }
+    let app_name = map
+        .get("application.name")
+        .cloned()
+        .or_else(|| map.get("application.process.binary").cloned())
+        .unwrap_or_else(|| format!("Stream {id}"));
+    let (volume, muted) = get_volume_mute(id);
+    Some(RecordStream {
+        id,
+        app_name,
+        source_id,
+        volume,
+        muted,
+    })
 }
 
 fn parse_sink_input_blocks_with_ids(output: &str) -> Vec<PlaybackStream> {
@@ -532,6 +637,15 @@ pub fn playback_streams() -> impl Signal<Item = Vec<PlaybackStream>> {
         r.get::<PipewireHandles>()
             .expect("pipewire::service() not registered")
             .streams
+            .signal_cloned()
+    })
+}
+
+pub fn record_streams() -> impl Signal<Item = Vec<RecordStream>> {
+    registry::with(|r| {
+        r.get::<PipewireHandles>()
+            .expect("pipewire::service() not registered")
+            .record_streams
             .signal_cloned()
     })
 }

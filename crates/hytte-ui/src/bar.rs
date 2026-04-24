@@ -127,9 +127,15 @@ impl Bar {
             right.append(&w);
         }
 
+        // Pack the center group immediately to the left of the right group
+        // (instead of in the geometric middle of the bar). The right group
+        // still visually sits on the bar edge via the CenterBox end slot.
+        let end_pair = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        end_pair.append(&middle);
+        end_pair.append(&right);
+
         center_box.set_start_widget(Some(&left));
-        center_box.set_center_widget(Some(&middle));
-        center_box.set_end_widget(Some(&right));
+        center_box.set_end_widget(Some(&end_pair));
 
         window.set_child(Some(&center_box));
         window.present();

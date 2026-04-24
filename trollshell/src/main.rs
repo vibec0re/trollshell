@@ -76,6 +76,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::bluetooth::widget(monitor),
             widgets::network::widget(monitor),
             widgets::volume::widget(monitor),
+            widgets::microphone::widget(monitor),
             widgets::brightness::widget(monitor),
             widgets::battery::widget(monitor),
             widgets::cpu::widget(monitor),

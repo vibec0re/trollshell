@@ -13,6 +13,10 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     icon.set_pixel_size(16);
     row.append(&icon);
 
+    let temp_label = gtk::Label::new(None);
+    temp_label.add_css_class("ts-gpu-temp");
+    row.append(&temp_label);
+
     let bar = gtk::ProgressBar::new();
     bar.add_css_class("ts-indicator-bar");
     bar.set_orientation(gtk::Orientation::Vertical);
@@ -33,6 +37,13 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             None => "GPU".to_string(),
         };
         w.set_tooltip_text(Some(&tip));
+    });
+
+    bind(sensors::gpu(), &temp_label, |w, g| {
+        match g.as_ref().and_then(|s| s.temperature_celsius) {
+            Some(c) => w.set_label(&format!("{c:.0}°")),
+            None => w.set_label(""),
+        }
     });
 
     // Hide the widget when no GPU is detected.

@@ -13,6 +13,10 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     icon.set_pixel_size(16);
     row.append(&icon);
 
+    let temp_label = gtk::Label::new(None);
+    temp_label.add_css_class("ts-cpu-temp");
+    row.append(&temp_label);
+
     let bar = gtk::ProgressBar::new();
     bar.add_css_class("ts-indicator-bar");
     bar.set_orientation(gtk::Orientation::Vertical);
@@ -25,6 +29,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     bind(sensors::cpu(), &bar, |w, c| {
         w.set_fraction(c.overall.clamp(0.0, 1.0));
         w.set_tooltip_text(Some(&format!("CPU {:.0}%", c.overall * 100.0)));
+    });
+
+    bind(sensors::cpu_temp(), &temp_label, |w, t| match t.package_celsius {
+        Some(c) => w.set_label(&format!("{c:.0}°")),
+        None => w.set_label(""),
     });
 
     let monitor_for_click = monitor.clone();

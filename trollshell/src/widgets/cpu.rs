@@ -7,7 +7,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-cpu");
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
     let icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/cpu.svg"));
     icon.set_pixel_size(16);
@@ -15,7 +15,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
     let bar = gtk::ProgressBar::new();
     bar.add_css_class("ts-indicator-bar");
-    bar.set_size_request(42, -1);
+    bar.set_orientation(gtk::Orientation::Vertical);
+    bar.set_inverted(true); // fill from the bottom
     bar.set_valign(gtk::Align::Center);
     row.append(&bar);
 

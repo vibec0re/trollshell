@@ -197,20 +197,22 @@
     font-feature-settings: "tnum" 1;
 }
 
-/* Narrow inline progress bars for the CPU + disk bar-graph indicators. */
+/* Tiny vertical mini bar-graphs next to the CPU + disk icons. */
 .ts-indicator-bar {
-    min-height: 6px;
-    min-width: 24px;
+    min-width: 4px;
+    min-height: 14px;
 }
 .ts-indicator-bar > trough {
-    min-height: 6px;
-    border-radius: 3px;
+    min-width: 4px;
+    min-height: 14px;
+    border-radius: 2px;
     background: rgba(255, 255, 255, 0.08);
     border: none;
+    padding: 0;
 }
 .ts-indicator-bar > trough > progress {
-    min-height: 6px;
-    border-radius: 3px;
+    min-width: 4px;
+    border-radius: 2px;
     background: #7fb8ff;
     border: none;
 }

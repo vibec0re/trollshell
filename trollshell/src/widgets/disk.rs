@@ -7,15 +7,14 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-disk");
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
     let icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/disk.svg"));
     icon.set_pixel_size(16);
     row.append(&icon);
 
-    // One narrow ProgressBar per mount, rebuilt on each emission so the
-    // set of bars follows the mounts list (hot-add / hot-remove safe).
-    let mounts_container = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    // One tiny vertical bar per mount.
+    let mounts_container = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     mounts_container.add_css_class("ts-disk-mounts");
     mounts_container.set_valign(gtk::Align::Center);
     row.append(&mounts_container);
@@ -30,7 +29,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         for m in &disk.mounts {
             let bar = gtk::ProgressBar::new();
             bar.add_css_class("ts-indicator-bar");
-            bar.set_size_request(24, -1);
+            bar.set_orientation(gtk::Orientation::Vertical);
+            bar.set_inverted(true);
             bar.set_valign(gtk::Align::Center);
             bar.set_fraction(m.usage.clamp(0.0, 1.0));
             bar.set_tooltip_text(Some(&format!("{}: {:.0}%", m.path, m.usage * 100.0)));

@@ -107,16 +107,30 @@ fn apply_event(
             workspaces.set(ws);
         }
         Event::WorkspaceActivated { id, focused } => {
-            workspaces.lock_mut().iter_mut().for_each(|w| {
+            let mut ws_lock = workspaces.lock_mut();
+            // Resolve the activated workspace's output so we know which
+            // monitor's previously-active workspace to deactivate.
+            let output = ws_lock
+                .iter()
+                .find(|w| w.id == id)
+                .and_then(|w| w.output.clone());
+            for w in ws_lock.iter_mut() {
                 if w.id == id {
                     w.is_active = true;
                     if focused {
                         w.is_focused = true;
                     }
-                } else if focused {
-                    w.is_focused = false;
+                } else {
+                    // Only one workspace per output is active at a time.
+                    if w.output == output {
+                        w.is_active = false;
+                    }
+                    // Only one workspace globally is focused at a time.
+                    if focused {
+                        w.is_focused = false;
+                    }
                 }
-            });
+            }
         }
         Event::WindowsChanged { windows } => {
             // Full replacement of the window list. Update cache and focused window.

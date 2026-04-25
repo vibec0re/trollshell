@@ -114,6 +114,7 @@ mod tests {
 
     /// A signal emission applies the value, and the user-event handler is
     /// NOT re-fired while the apply runs.
+    #[ignore = "requires a display server"]
     #[gtk::test]
     fn signal_apply_does_not_refire_user_handler() {
         let ctx = glib::MainContext::default();
@@ -148,6 +149,7 @@ mod tests {
 
     /// A genuine user action still fires the user handler — the block is
     /// released between applies.
+    #[ignore = "requires a display server"]
     #[gtk::test]
     fn user_event_still_fires_after_apply() {
         let ctx = glib::MainContext::default();

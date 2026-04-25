@@ -1,5 +1,11 @@
 //! Layer-shell toast window for `org.freedesktop.Notifications`.
 //!
+//! Currently not installed — the user opted out of toast popups in favour
+//! of on-demand viewing via the Notifications drawer page. Kept around so
+//! re-enabling is one call-site change in `main.rs`.
+#![allow(dead_code)]
+
+//!
 //! Call [`install`] once after GTK initialises (before the main loop runs).
 //! It builds a single `gtk::Window` pinned to the top-right corner of the
 //! given monitor and subscribes to [`hytte::services::notifications::active`].

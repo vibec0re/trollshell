@@ -178,6 +178,12 @@ impl BarHandle {
     pub fn close(self) {
         self.window.close();
     }
+
+    /// Access the underlying layer-shell window — useful for binding
+    /// state-driven CSS classes from outside the Bar builder.
+    pub fn window(&self) -> &gtk::Window {
+        &self.window
+    }
 }
 
 impl Drop for BarHandle {

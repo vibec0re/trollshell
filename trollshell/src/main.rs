@@ -4,7 +4,8 @@ mod widgets;
 use std::cell::RefCell;
 
 use hytte::futures_signals::signal::SignalExt;
-use hytte::gtk::glib;
+use hytte::gtk;
+use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     bluetooth, brightness, clock, mpris, networkd, niri, notifications, pipewire, resolved,
@@ -47,11 +48,8 @@ fn main() -> hytte::ui::Result<()> {
                     .await;
             });
 
-            // Toast container — single layer-shell window on the primary monitor.
-            // Picks the first monitor at startup; doesn't follow hot-plug in v0.4.0.
-            if let Some(primary) = app.monitors().first() {
-                widgets::notifications::install(primary);
-            }
+            // Toast popups disabled — notifications live in the Notifications
+            // drawer page only (open on demand via the bell indicator).
 
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             if let Some(primary) = app.monitors().first() {
@@ -62,7 +60,7 @@ fn main() -> hytte::ui::Result<()> {
 
 fn build_bar(monitor: &Monitor) -> BarHandle {
     modal::install(monitor);
-    Bar::new(monitor)
+    let bar = Bar::new(monitor)
         .edge(Edge::Top)
         .exclusive(true)
         .keyboard_interactivity(KeyboardMode::OnDemand)
@@ -72,19 +70,45 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
         ])
         .center([widgets::mpris::widget(monitor)])
         .right([
-            widgets::tray::widget(),
-            widgets::bluetooth::widget(monitor),
-            widgets::network::widget(monitor),
-            widgets::volume::widget(monitor),
-            widgets::microphone::widget(monitor),
-            widgets::brightness::widget(monitor),
-            widgets::battery::widget(monitor),
-            widgets::cpu::widget(monitor),
-            widgets::memory::widget(monitor),
-            widgets::gpu::widget(monitor),
-            widgets::disk::widget(monitor),
-            widgets::clock::widget(),
-            widgets::notif_indicator::widget(monitor),
+            group([widgets::tray::widget()]),
+            group([
+                widgets::bluetooth::widget(monitor),
+                widgets::network::widget(monitor),
+            ]),
+            group([
+                widgets::volume::widget(monitor),
+                widgets::microphone::widget(monitor),
+                widgets::brightness::widget(monitor),
+            ]),
+            group([widgets::battery::widget(monitor)]),
+            group([
+                widgets::cpu::widget(monitor),
+                widgets::memory::widget(monitor),
+                widgets::gpu::widget(monitor),
+                widgets::disk::widget(monitor),
+            ]),
+            group([widgets::clock::widget()]),
+            group([widgets::notif_indicator::widget(monitor)]),
         ])
-        .show()
+        .show();
+
+    // When the drawer is open on this monitor, mark the bar window so CSS
+    // can square off the bottom-right corner (seam between bar and drawer).
+    if let Some(signal) = modal::drawer_open_signal(monitor) {
+        bind_class(signal, bar.window(), "drawer-open");
+    }
+
+    bar
+}
+
+/// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from
+/// the outer `.hytte-bar-group-right` pill shows through the gap between
+/// adjacent groups.
+fn group<const N: usize>(widgets: [gtk::Widget; N]) -> gtk::Widget {
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    b.add_css_class("ts-bar-group");
+    for w in widgets {
+        b.append(&w);
+    }
+    b.upcast()
 }

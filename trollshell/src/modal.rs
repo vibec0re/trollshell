@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::ui::{layer_window, Anchor, Layer, Margin};
+use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
 
 use crate::widgets::pages;
 
@@ -30,35 +31,23 @@ impl Page {
             Self::Notifications => "notifications",
         }
     }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Media => "Media",
-            Self::Network => "Network",
-            Self::Bluetooth => "Bluetooth",
-            Self::Stats => "System",
-            Self::Audio => "Audio",
-            Self::Power => "Power",
-            Self::Notifications => "Notifications",
-        }
-    }
 }
 
-/// Per-monitor modal panel handle. Internally owns the layer-shell window.
+/// Per-monitor drawer handle. Internally owns the layer-shell window, a
+/// `GtkRevealer` that slides the card out of the bar's bottom edge, and a
+/// persistent fullscreen click-catcher that's toggled alongside the drawer.
 struct ModalPanel {
     window: gtk::Window,
+    revealer: gtk::Revealer,
     stack: gtk::Stack,
-    title_label: gtk::Label,
-    /// Which page is currently visible; None means the window is hidden.
     current: RefCell<Option<Page>>,
-    /// The monitor we're attached to — needed to rebuild the click-catcher
-    /// as a sibling layer-shell window on the same monitor each time the
-    /// modal opens.
+    #[allow(dead_code)]
     monitor: Monitor,
-    /// Full-screen transparent layer-shell window that sits *behind* the
-    /// modal and intercepts every click elsewhere on the screen so we can
-    /// close the modal. Alive only while the modal is visible.
-    catcher: RefCell<Option<gtk::Window>>,
+    catcher: gtk::Window,
+    /// Emits `true` while the drawer is open (between `show_panel` and the
+    /// retract animation finishing). Consumers — e.g. the bar — bind CSS
+    /// classes to this so the seam between bar and drawer can restyle.
+    open_state: Mutable<bool>,
 }
 
 thread_local! {
@@ -70,18 +59,29 @@ fn monitor_key(m: &Monitor) -> String {
         .unwrap_or_else(|| format!("monitor:{:p}", m.gdk()))
 }
 
-/// Build the modal for one monitor and mount it as a layer-shell window.
+/// Build the drawer for one monitor and mount it as a layer-shell window.
 #[allow(clippy::too_many_lines)]
 pub fn install(monitor: &Monitor) {
     let key = monitor_key(monitor);
 
+    // Build the catcher FIRST so that within `Layer::Top` the catcher's
+    // surface is committed before the drawer's. Within the same layer,
+    // most Wayland compositors stack the most-recently-mapped surface on
+    // top, so `show_panel` re-maps catcher → drawer on every open to keep
+    // the drawer above its catcher.
+    let catcher = build_catcher(monitor, key.clone());
+
+    // Drawer and bar both live on `Layer::Top`; the drawer butts flush up
+    // against the bar's bottom (no overlap) so there's no z-order conflict
+    // at the seam to worry about. Bar stays on the default Top layer so
+    // fullscreen apps can still cover it.
     let window = layer_window(monitor)
-        .layer(Layer::Overlay)
+        .layer(Layer::Top)
         .anchor(Anchor::Top)
         .anchor(Anchor::Right)
         .margin(Margin {
-            top: 8,
-            right: 8,
+            top: 49,
+            right: 0,
             bottom: 0,
             left: 0,
         })
@@ -90,159 +90,136 @@ pub fn install(monitor: &Monitor) {
         .namespace(format!("hytte-modal-{key}"))
         .build();
     window.add_css_class("ts-modal");
-    // Wider than the content so the inner .ts-modal-root's shadow has room
-    // to breathe instead of being clipped by the layer-shell surface edge.
-    // 60 px margin on root × 2 sides + ~720×520 content ≈ 840×640.
-    window.set_size_request(840, 640);
+    // Ignore other layer-shell surfaces' exclusive zones so `margin.top` is
+    // measured from the true screen edge, not from below the bar's reserved
+    // zone. Without this, the bar's auto-exclusive-zone (≈59 px) stacks
+    // with our margin and pushes the drawer ~60 px lower than intended.
+    window.set_exclusive_zone(-1);
+    // Fixed surface envelope: 720 wide matches the widest page's natural
+    // width; 720 tall is enough headroom for Stats/Network, the unused
+    // space below the revealed drawer is transparent and click-through.
+    window.set_size_request(720, 720);
 
-    // ESC → close.
+    // ESC → animated retract.
     let key_ctrl = gtk::EventControllerKey::new();
     let key_for_esc = key.clone();
-    key_ctrl.connect_key_pressed(move |_, key, _, _| {
-        if key == gdk::Key::Escape {
-            close_by_key(&key_for_esc);
+    key_ctrl.connect_key_pressed(move |_, k, _, _| {
+        if k == gdk::Key::Escape {
+            retract_by_key(&key_for_esc);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });
     window.add_controller(key_ctrl);
 
-    // Root vertical box.
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    vbox.add_css_class("ts-modal-root");
+    // Revealer with SlideDown transition — the drawer "pulls out" of the
+    // bar's bottom. Height animates automatically when the revealed child
+    // (the stack) picks a different page with a different natural height.
+    // `valign = Start` pins the revealer to the top of the 720-tall surface
+    // so the card doesn't float in the middle of the transparent envelope.
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(180);
+    revealer.set_reveal_child(false);
+    revealer.set_valign(gtk::Align::Start);
+    revealer.set_vexpand(false);
 
-    // Header: title label + close button.
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    header.add_css_class("ts-modal-header");
+    // Card — dark surface with rounded bottom corners.
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("ts-drawer");
+    card.set_valign(gtk::Align::Start);
+    card.set_vexpand(false);
 
-    let title_label = gtk::Label::new(Some("\u{2014}"));
-    title_label.add_css_class("ts-modal-title");
-    title_label.set_xalign(0.0);
-    title_label.set_hexpand(true);
-    header.append(&title_label);
-
-    let close_btn = gtk::Button::from_icon_name("window-close-symbolic");
-    close_btn.add_css_class("ts-modal-close");
-    let key_for_close = key.clone();
-    close_btn.connect_clicked(move |_| close_by_key(&key_for_close));
-    header.append(&close_btn);
-
-    vbox.append(&header);
-
-    // Page stack.
     let stack = gtk::Stack::new();
-    stack.set_vexpand(true);
+    stack.set_vexpand(false);
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    stack.set_transition_duration(120);
+    stack.set_transition_duration(140);
+    stack.set_interpolate_size(true);
 
-    stack.add_titled(
-        &pages::page_media(),
-        Some(Page::Media.stack_name()),
-        Page::Media.title(),
-    );
-    stack.add_titled(
-        &pages::page_network(),
-        Some(Page::Network.stack_name()),
-        Page::Network.title(),
-    );
-    stack.add_titled(
-        &pages::page_bluetooth(),
-        Some(Page::Bluetooth.stack_name()),
-        Page::Bluetooth.title(),
-    );
-    stack.add_titled(
-        &pages::page_stats(),
-        Some(Page::Stats.stack_name()),
-        Page::Stats.title(),
-    );
-    stack.add_titled(
-        &pages::page_audio(),
-        Some(Page::Audio.stack_name()),
-        Page::Audio.title(),
-    );
-    stack.add_titled(
-        &pages::page_power(),
-        Some(Page::Power.stack_name()),
-        Page::Power.title(),
-    );
-    stack.add_titled(
+    stack.add_named(&pages::page_media(), Some(Page::Media.stack_name()));
+    stack.add_named(&pages::page_network(), Some(Page::Network.stack_name()));
+    stack.add_named(&pages::page_bluetooth(), Some(Page::Bluetooth.stack_name()));
+    stack.add_named(&pages::page_stats(), Some(Page::Stats.stack_name()));
+    stack.add_named(&pages::page_audio(), Some(Page::Audio.stack_name()));
+    stack.add_named(&pages::page_power(), Some(Page::Power.stack_name()));
+    stack.add_named(
         &pages::page_notifications(),
         Some(Page::Notifications.stack_name()),
-        Page::Notifications.title(),
     );
 
-    vbox.append(&stack);
-    window.set_child(Some(&vbox));
+    card.append(&stack);
+    revealer.set_child(Some(&card));
+    window.set_child(Some(&revealer));
 
-    // Initially hidden.
-    window.set_visible(false);
-
-    // When hidden (via any path), tear down the click-catcher and clear
-    // the current page so the next toggle re-opens.
-    let key_for_hide = key.clone();
-    window.connect_hide(move |_| {
-        PANELS.with(|panels| {
-            if let Some(panel) = panels.borrow().get(&key_for_hide) {
-                *panel.current.borrow_mut() = None;
-                if let Some(catcher) = panel.catcher.borrow_mut().take() {
-                    catcher.close();
+    // When the retract animation finishes (child-revealed goes false),
+    // hide both the drawer surface and the persistent catcher.
+    let key_for_revealed = key.clone();
+    revealer.connect_child_revealed_notify(move |r| {
+        if !r.is_child_revealed() {
+            PANELS.with(|panels| {
+                if let Some(panel) = panels.borrow().get(&key_for_revealed) {
+                    panel.window.set_visible(false);
+                    panel.catcher.set_visible(false);
+                    *panel.current.borrow_mut() = None;
+                    panel.open_state.set(false);
                 }
-            }
-        });
+            });
+        }
     });
+
+    window.set_visible(false);
 
     PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key.clone(),
             ModalPanel {
                 window,
+                revealer,
                 stack,
-                title_label,
                 current: RefCell::new(None),
                 monitor: monitor.clone(),
-                catcher: RefCell::new(None),
+                catcher,
+                open_state: Mutable::new(false),
             },
         );
     });
 }
 
-/// Close and remove the modal for a monitor that has been unplugged.
+/// Close and remove the drawer for a monitor that has been unplugged.
 #[allow(dead_code)]
 pub fn uninstall(monitor: &Monitor) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {
         if let Some(panel) = panels.borrow_mut().remove(&key) {
-            if let Some(catcher) = panel.catcher.borrow_mut().take() {
-                catcher.close();
-            }
+            panel.catcher.close();
             panel.window.close();
         }
     });
 }
 
-/// Close and remove all modals (called before rebuilding bars on hot-plug).
+/// Close and remove all drawers (called before rebuilding bars on hot-plug).
 pub fn close_all() {
     PANELS.with(|panels| {
         for (_, panel) in panels.borrow_mut().drain() {
-            if let Some(catcher) = panel.catcher.borrow_mut().take() {
-                catcher.close();
-            }
+            panel.catcher.close();
             panel.window.close();
         }
     });
 }
 
-fn close_by_key(key: &str) {
+/// Begin the retract animation. The notify-child-revealed handler finishes
+/// the teardown (hiding the surface + closing the catcher) when it ends.
+fn retract_by_key(key: &str) {
     PANELS.with(|panels| {
         if let Some(panel) = panels.borrow().get(key) {
-            panel.window.set_visible(false);
+            panel.revealer.set_reveal_child(false);
         }
     });
 }
 
 #[allow(dead_code)]
 pub fn close(monitor: &Monitor) {
-    close_by_key(&monitor_key(monitor));
+    retract_by_key(&monitor_key(monitor));
 }
 
 #[allow(dead_code)]
@@ -257,10 +234,10 @@ pub fn open(monitor: &Monitor, page: Page) {
     });
 }
 
-/// Toggle the modal on `monitor` to the given `page`:
-/// - Same page open → close.
-/// - Different page open → switch to target page.
-/// - Closed → open on target page.
+/// Toggle the drawer on `monitor` to the given `page`:
+/// - Same page open → start retract.
+/// - Different page open → swap stack child in place (crossfade + height).
+/// - Closed → present surface and reveal.
 pub fn toggle(monitor: &Monitor, page: Page) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {
@@ -271,40 +248,51 @@ pub fn toggle(monitor: &Monitor, page: Page) {
         let current = *panel.current.borrow();
         match current {
             Some(p) if p == page => {
-                // Same page — close.
-                panel.window.set_visible(false);
+                panel.revealer.set_reveal_child(false);
             }
             Some(_) => {
-                // Different page — switch.
                 panel.stack.set_visible_child_name(page.stack_name());
-                panel.title_label.set_text(page.title());
                 *panel.current.borrow_mut() = Some(page);
             }
             None => {
-                // Closed → open.
                 show_panel(panel, &key, page);
             }
         }
     });
 }
 
-/// Present the modal on `page` and install a fresh click-catcher.
-fn show_panel(panel: &ModalPanel, key: &str, page: Page) {
+/// Present the drawer on `page`. Show the catcher before the drawer so
+/// that within `Layer::Top` the drawer's surface commits most recently
+/// and stacks above the catcher.
+fn show_panel(panel: &ModalPanel, _key: &str, page: Page) {
     panel.stack.set_visible_child_name(page.stack_name());
-    panel.title_label.set_text(page.title());
     *panel.current.borrow_mut() = Some(page);
+    panel.open_state.set(true);
+
+    panel.catcher.set_visible(true);
+    panel.catcher.present();
+
     panel.window.set_visible(true);
     panel.window.present();
-
-    // Spawn a full-screen transparent catcher on Layer::Top (below the
-    // modal's Layer::Overlay) that closes the modal on click.
-    let catcher = build_catcher(&panel.monitor, key.to_string());
-    *panel.catcher.borrow_mut() = Some(catcher);
+    panel.revealer.set_reveal_child(true);
 }
 
-/// Build a full-screen transparent layer-shell window whose only job is to
-/// catch clicks outside the modal and close it. One-shot — destroyed when
-/// the modal hides.
+/// Signal that emits `true` while the drawer on `monitor` is open (the
+/// retract animation hasn't completed yet), and `false` when it's closed.
+/// Returns `None` if `install` hasn't been called for this monitor yet.
+pub fn drawer_open_signal(monitor: &Monitor) -> Option<impl Signal<Item = bool> + 'static> {
+    let key = monitor_key(monitor);
+    PANELS.with(|panels| {
+        panels
+            .borrow()
+            .get(&key)
+            .map(|panel| panel.open_state.signal())
+    })
+}
+
+/// Full-screen transparent layer-shell window that closes the drawer on any
+/// press. Built once at install time and kept alive for the panel's
+/// lifetime; visibility tracks the drawer.
 fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
     let win = layer_window(monitor)
         .layer(Layer::Top)
@@ -318,22 +306,20 @@ fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
         .build();
     win.add_css_class("ts-modal-catcher");
 
-    // Transparent empty box that fills the surface and accepts input.
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
     win.set_child(Some(&content));
 
-    // Any mouse press anywhere on the catcher closes the modal.
     let gesture = gtk::GestureClick::new();
-    gesture.set_button(0); // any button
+    gesture.set_button(0);
     let modal_key_for_press = modal_key;
     gesture.connect_pressed(move |_, _, _, _| {
-        close_by_key(&modal_key_for_press);
+        retract_by_key(&modal_key_for_press);
     });
     content.add_controller(gesture);
 
-    win.set_visible(true);
-    win.present();
+    // Start hidden; `show_panel` toggles visibility alongside the drawer.
+    win.set_visible(false);
     win
 }

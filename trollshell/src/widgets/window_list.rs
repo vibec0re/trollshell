@@ -11,7 +11,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     container.add_css_class("ts-windows");
 
     let connector = monitor.connector();
-    let signal = combined_windows_signal(connector);
+    let signal = active_workspace_windows(connector);
 
     let container_for_signal = container.clone();
     bind(signal, &container, move |_, windows| {
@@ -19,14 +19,20 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             container_for_signal.remove(&child);
         }
         for win in windows {
-            let label = win
+            let label_text = win
                 .title
                 .clone()
                 .or_else(|| win.app_id.clone())
                 .unwrap_or_else(|| format!("window {}", win.id));
-            let trimmed = truncate(&label, 40);
-            let btn = gtk::Button::with_label(&trimmed);
-            btn.set_tooltip_text(Some(&label));
+            // Bounded label — ellipsize at render, tooltip has full title.
+            // Prevents the left cluster from pushing the right cluster off
+            // the monitor when window titles or counts get large.
+            let label_widget = gtk::Label::new(Some(&label_text));
+            label_widget.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label_widget.set_max_width_chars(18);
+            let btn = gtk::Button::new();
+            btn.set_child(Some(&label_widget));
+            btn.set_tooltip_text(Some(&label_text));
             if win.is_focused {
                 btn.add_css_class("focused");
             }
@@ -41,7 +47,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
 /// Combine workspaces + windows into a per-monitor active-workspace
 /// window list. Re-evaluates whenever either upstream signal changes.
-fn combined_windows_signal(
+pub fn active_workspace_windows(
     connector: Option<String>,
 ) -> impl hytte::futures_signals::signal::Signal<Item = Vec<Window>> {
     let workspaces = niri::workspaces();
@@ -74,11 +80,3 @@ fn combined_windows_signal(
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max - 1).collect();
-        format!("{cut}…")
-    }
-}

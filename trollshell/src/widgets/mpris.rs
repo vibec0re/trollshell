@@ -11,9 +11,17 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, prelude::*};
 use hytte::prelude::*;
-use hytte::services::mpris::{self, PlaybackStatus};
+use hytte::services::mpris::{self, PlaybackStatus, Player};
+
+use crate::widgets::window_list;
+
+/// Hide MPRIS once the left cluster gets this busy, so the right cluster
+/// has room on narrow monitors. Tuned by eye — bump if it feels too
+/// aggressive.
+const HIDE_WHEN_WINDOWS_GTE: usize = 3;
 
 /// Build the MPRIS center-cluster widget.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
@@ -79,15 +87,28 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         }
     });
 
-    // Bind the active player signal.
+    // Bind the active player signal combined with the per-monitor window
+    // count. MPRIS hides when there's no active player OR when the left
+    // cluster is crowded enough that keeping it visible would risk pushing
+    // the right cluster off-screen.
+    let combined = map_ref! {
+        let player = mpris::active_player(),
+        let wins = window_list::active_workspace_windows(monitor.connector()) => {
+            (player.clone(), wins.len())
+        }
+    };
+
     bind(
-        mpris::active_player(),
+        combined,
         &container,
-        move |container, maybe_player| {
+        move |container, (maybe_player, win_count): (Option<Player>, usize)| {
             match maybe_player {
                 None => {
                     container.set_visible(false);
                     *current_bus.borrow_mut() = None;
+                }
+                Some(_) if win_count >= HIDE_WHEN_WINDOWS_GTE => {
+                    container.set_visible(false);
                 }
                 Some(player) => {
                     *current_bus.borrow_mut() = Some(player.bus_name.clone());

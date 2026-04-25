@@ -33,10 +33,15 @@
     min-height: 32px;
     border-radius: 12px;
     background: linear-gradient(90deg,
-        rgba(15, 15, 35, 0.95) 0%,
-        rgba(25, 15, 45, 0.95) 50%,
-        rgba(15, 15, 35, 0.95) 100%);
+        rgba(15, 15, 35, 1) 0%,
+        rgba(25, 15, 45, 1) 50%,
+        rgba(15, 15, 35, 1) 100%);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
+}
+/* Drawer open: square off the bar's bottom-right corner so the bar and
+ * drawer share a clean vertical edge on the right. */
+.hytte-bar.drawer-open .hytte-bar-content {
+    border-bottom-right-radius: 0;
 }
 .hytte-bar-group-left button,
 .hytte-bar-group-center button {
@@ -117,6 +122,14 @@
     margin: 0 2px;
     box-shadow: 0 0 14px rgba(131, 56, 236, 0.35);
 }
+/* Sub-groups inside the right rainbow pill — dark pills wrapping a set
+ * of related chips (connectivity, media, sensors, …). The rainbow shows
+ * through the gap between groups, giving the cluster a segmented look. */
+.ts-bar-group {
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 8px;
+    padding: 0px;
+}
 /* Chips sit inside the rainbow pill with minimal padding + no inter-chip
  * margin, so the gradient line between them is just a hair of rainbow. */
 .ts-indicator {
@@ -173,6 +186,28 @@
     min-width: 4px;
     border-radius: 2px;
     background: #ffffff;
+    border: none;
+}
+.ts-cores-row {
+    margin-top: 4px;
+    min-height: 56px;
+}
+.ts-core-bar {
+    min-width: 8px;
+    min-height: 56px;
+}
+.ts-core-bar > trough {
+    min-width: 8px;
+    min-height: 56px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.1);
+    border: none;
+    padding: 0;
+}
+.ts-core-bar > trough > progress {
+    min-width: 8px;
+    border-radius: 3px;
+    background: linear-gradient(180deg, #ff006e, #8338ec 60%, #3a86ff);
     border: none;
 }
 .ts-disk-mounts {
@@ -235,28 +270,25 @@
     background: transparent;
     box-shadow: none;
     border: none;
+    padding-right: 5px;
+    padding-left:  20px;
 }
-.ts-modal-root {
-    /* 60 px on all sides gives the box-shadow (48 px blur + 12 px y-offset)
-     * enough room to render inside the layer-shell surface. */
-    margin: 60px;
-    background: @window_bg_color;
+/* Drawer card — slides out of the bar's bottom edge. Top is flush with
+ * the bar so no top rounding; bottom corners rounded; drop shadow aims
+ * downward only. Colors inherit the Adwaita theme. */
+.ts-drawer {
+    background: @window_bg_color; 
+    background-image: linear-gradient(180deg,
+        rgba(15, 15, 35, 1) 0%,
+        @window_bg_color 100%);
+
     color: @window_fg_color;
-    border-radius: 12px;
-    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.45);
+    border-radius: 0 0 14px 14px;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
     border: 1px solid @borders;
-}
-.ts-modal-header {
-    padding: 12px 14px 8px;
-    border-bottom: 1px solid @borders;
-}
-.ts-modal-title {
-    font-weight: 600;
-    font-size: 15px;
-}
-.ts-modal-close {
-    padding: 2px 6px;
-    border-radius: 6px;
+    border-top: none;
+    padding-top: 10px;
+    margin-bottom: 20px;
 }
 .ts-modal-page {
     padding: 12px;

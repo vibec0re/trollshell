@@ -98,6 +98,10 @@ pub struct HistoryEntry {
     pub body: String,
     pub urgency: Urgency,
     pub image: Option<NotificationImage>,
+    /// Action buttons that were attached to the original notification, kept
+    /// in history so the drawer can render clickable buttons that re-invoke
+    /// them via `invoke_action`.
+    pub actions: Vec<Action>,
     /// Why the notification was closed: 1=expired, 2=dismissed, 3=closed-by-call, 4=undefined.
     pub reason: u32,
     /// When the notification was first shown (Unix seconds).
@@ -245,6 +249,7 @@ async fn do_dismiss(id: u32, reason: u32) -> Result<()> {
             body: n.body,
             urgency: n.urgency,
             image: n.image,
+            actions: n.actions,
             reason,
             created_at: n.created_at,
             dismissed_at,
@@ -267,8 +272,9 @@ async fn do_dismiss(id: u32, reason: u32) -> Result<()> {
 
 /// Invoke action `action_key` on notification `id`.
 ///
-/// Emits `ActionInvoked` on the session bus. Trollshell v0.4.0 doesn't
-/// render action buttons, but this API is here for v0.4.1's history popup.
+/// Emits `ActionInvoked` on the session bus as a broadcast — the originating
+/// app filters by `id` and reacts (e.g. opens its window, posts a reply form).
+/// Both the toast widget and the history page wire action buttons to this.
 pub fn invoke_action(id: u32, action_key: &str) {
     let action_key = action_key.to_string();
     runtime::handle().spawn(async move {
@@ -336,6 +342,7 @@ impl State {
                 body: n.body,
                 urgency: n.urgency,
                 image: n.image,
+                actions: n.actions,
                 reason,
                 created_at: n.created_at,
                 dismissed_at,

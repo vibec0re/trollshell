@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
@@ -23,6 +24,7 @@ use hytte::services::dnd;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
 use hytte::services::notifications;
+use hytte::services::notifications_mute;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
 use hytte::services::sensors::{self, CpuLoad};
@@ -1714,67 +1716,147 @@ pub fn page_notifications() -> gtk::Widget {
     scrolled.set_min_content_height(380);
     scrolled.add_css_class("ts-notif-history");
 
-    let list = boxed_list();
-    scrolled.set_child(Some(&list));
+    // Group entries by app_name into per-app AdwExpanderRows. Each app row's
+    // mute switch controls notifications_mute for future TOASTS only —
+    // history always records (`page_notifications` lives in the drawer
+    // history page, so the mute switch sits next to the entries it affects
+    // future emissions of).
+    let groups_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    scrolled.set_child(Some(&groups_box));
     column.append(&scrolled);
 
-    let list_for_signal = list.clone();
-    bind(notifications::history(), &list, move |_, entries| {
-        while let Some(child) = list_for_signal.first_child() {
-            list_for_signal.remove(&child);
+    let groups_for_signal = groups_box.clone();
+    let combined = map_ref! {
+        let entries = notifications::history(),
+        let muted = notifications_mute::muted_apps() => {
+            (entries.clone(), muted.clone())
+        }
+    };
+    bind(combined, &groups_box, move |_, (entries, muted)| {
+        while let Some(child) = groups_for_signal.first_child() {
+            groups_for_signal.remove(&child);
         }
         if entries.is_empty() {
-            let empty = gtk::Label::new(Some("No notifications"));
-            empty.add_css_class("ts-notif-empty");
-            empty.set_xalign(0.0);
-            empty.set_margin_start(12);
-            empty.set_margin_end(12);
-            empty.set_margin_top(8);
-            empty.set_margin_bottom(8);
-            list_for_signal.append(&empty);
+            let group = adw::PreferencesGroup::new();
+            let empty = adw::ActionRow::builder()
+                .title("No notifications")
+                .build();
+            group.add(&empty);
+            groups_for_signal.append(&group);
             return;
         }
+        // Group entries by app_name, preserving newest-first ordering by
+        // walking entries (already newest-first) and pushing into per-app
+        // Vec<&HistoryEntry> on first sighting. The order of apps in the UI
+        // becomes "app whose newest entry is most recent first".
+        let mut order: Vec<String> = Vec::new();
+        let mut buckets: std::collections::HashMap<String, Vec<&notifications::HistoryEntry>> =
+            std::collections::HashMap::new();
         for entry in &entries {
-            list_for_signal.append(&build_history_row(entry));
+            let key = entry.app_name.clone();
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(entry);
         }
+        let group = adw::PreferencesGroup::new();
+        for app in &order {
+            let bucket = buckets.get(app).expect("bucket present for tracked app");
+            group.add(&build_history_app_row(app, bucket, &muted));
+        }
+        groups_for_signal.append(&group);
     });
 
     finish_page(&column)
 }
 
-fn build_history_row(entry: &notifications::HistoryEntry) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    row.add_css_class("ts-notif-row");
+/// Build the `AdwExpanderRow` for a single app's history bucket.
+///
+/// - Title: app name.
+/// - Subtitle: most-recent summary plus an entry count.
+/// - Trailing action: `Switch` bound to `notifications_mute`'s set, tooltipped
+///   as "Mute toasts from this app".
+/// - Children: up to 20 `AdwActionRow`s (most-recent-first), each with a
+///   trailing per-action button row that re-fires the original action via
+///   `notifications::invoke_action`.
+fn build_history_app_row(
+    app: &str,
+    entries: &[&notifications::HistoryEntry],
+    muted: &HashSet<String>,
+) -> adw::ExpanderRow {
+    const MAX_PER_APP: usize = 20;
+
+    let row = adw::ExpanderRow::builder().title(app).build();
+    let count = entries.len();
+    if let Some(latest) = entries.first() {
+        let subtitle = if count == 1 {
+            latest.summary.clone()
+        } else {
+            format!("{} · {} entries", latest.summary, count)
+        };
+        row.set_subtitle(&subtitle);
+    }
+
+    // Per-app mute switch: feeds `notifications_mute::set_app_muted`.
+    let mute_switch = gtk::Switch::new();
+    mute_switch.set_valign(gtk::Align::Center);
+    mute_switch.set_tooltip_text(Some("Mute toasts from this app"));
+    mute_switch.set_active(muted.contains(app));
+    let app_owned = app.to_string();
+    mute_switch.connect_active_notify(move |sw| {
+        notifications_mute::set_app_muted(&app_owned, sw.is_active());
+    });
+    // Trailing widget on the header. `add_suffix` is gated on libadwaita
+    // 1.4+ feature flag; `add_action` predates it and works in all 1.x —
+    // both place the widget on the trailing edge before the expander toggle.
+    row.add_action(&mute_switch);
+
+    for entry in entries.iter().take(MAX_PER_APP) {
+        row.add_row(&build_history_action_row(entry));
+    }
+
+    row
+}
+
+/// Per-notification `AdwActionRow` showing summary + body + action buttons.
+/// Action buttons re-invoke `notifications::invoke_action` (the originating
+/// app filters by `id`). Capped at 3 visible buttons to match the toast
+/// widget — chatty notifications like calendar reminders can pack many.
+fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(&entry.summary)
+        .build();
+    if !entry.body.is_empty() {
+        row.set_subtitle(&entry.body);
+    }
     if entry.urgency == notifications::Urgency::Critical {
         row.add_css_class("critical");
     }
 
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let app_label = gtk::Label::new(Some(&entry.app_name));
-    app_label.add_css_class("ts-notif-row-app");
-    app_label.set_xalign(0.0);
-    app_label.set_hexpand(true);
-    header.append(&app_label);
+    // Time stamp on the left side as a prefix (small label).
     let time_label = gtk::Label::new(Some(&fmt_notif_time(entry.dismissed_at)));
-    time_label.add_css_class("ts-notif-row-time");
-    header.append(&time_label);
-    row.append(&header);
+    time_label.add_css_class("dim-label");
+    time_label.set_valign(gtk::Align::Center);
+    row.add_prefix(&time_label);
 
-    let summary = gtk::Label::new(Some(&entry.summary));
-    summary.add_css_class("ts-notif-row-summary");
-    summary.set_xalign(0.0);
-    summary.set_wrap(true);
-    row.append(&summary);
-
-    if !entry.body.is_empty() {
-        let body = gtk::Label::new(Some(&entry.body));
-        body.add_css_class("ts-notif-row-body");
-        body.set_xalign(0.0);
-        body.set_wrap(true);
-        row.append(&body);
+    // Action buttons (cap at 3 — same as toasts).
+    if !entry.actions.is_empty() {
+        let actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        actions_box.set_valign(gtk::Align::Center);
+        for action in entry.actions.iter().take(3) {
+            let btn = gtk::Button::with_label(&action.label);
+            btn.add_css_class("flat");
+            let id = entry.id;
+            let key = action.key.clone();
+            btn.connect_clicked(move |_| {
+                notifications::invoke_action(id, &key);
+            });
+            actions_box.append(&btn);
+        }
+        row.add_suffix(&actions_box);
     }
 
-    row.upcast()
+    row
 }
 
 fn fmt_notif_time(unix_secs: u64) -> String {

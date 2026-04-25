@@ -14,6 +14,14 @@
 //! via the underlying notifications service. Critical-urgency notifications
 //! (`urgency=2`) BYPASS DND per freedesktop spec.
 //!
+//! # Per-app mute
+//!
+//! When an `app_name` is in [`notifications_mute::muted_apps()`], non-critical
+//! toasts from that app are suppressed before they're shown (history still
+//! records them). Critical urgency bypasses the per-app mute too. Like DND,
+//! this is a "from-now-forward" gate — toggling an app's mute off does NOT
+//! revive previously suppressed toasts.
+//!
 //! # Queue cap
 //!
 //! TODO(notif-followup): when bursts produce 5+ active toasts, show only the
@@ -31,6 +39,7 @@ use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::dnd;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
+use hytte::services::notifications_mute;
 use hytte::ui::{layer_window, Anchor, Margin};
 
 // ── Thread-local window storage ───────────────────────────────────────────────
@@ -80,20 +89,22 @@ pub fn install(monitor: &Monitor) {
     let window_weak = window.downgrade();
     let vbox_weak = vbox.downgrade();
 
-    // Combine the live notifications with the DND flag. The visibility
-    // filter — "critical bypasses DND, non-critical arriving during DND
-    // gets parked in the suppressed set forever" — runs inside the
-    // `for_each` callback below, where the suppressed-set state lives.
+    // Combine the live notifications with the DND flag and the per-app mute
+    // set. The visibility filter — "critical bypasses DND + mute, anything
+    // suppressed once stays suppressed even after the gate flips off" —
+    // runs inside the `for_each` callback below, where the suppressed-set
+    // state lives.
     let toast_signal = map_ref! {
         let notifs = notifications::active(),
-        let dnd_on = dnd::enabled() => {
-            (notifs.clone(), *dnd_on)
+        let dnd_on = dnd::enabled(),
+        let muted = notifications_mute::muted_apps() => {
+            (notifs.clone(), *dnd_on, muted.clone())
         }
     };
 
     glib::MainContext::default().spawn_local(
         toast_signal
-            .for_each(move |(notifs, dnd_on): (Vec<Notification>, bool)| {
+            .for_each(move |(notifs, dnd_on, muted): (Vec<Notification>, bool, HashSet<String>)| {
                 let Some(window) = window_weak.upgrade() else {
                     return std::future::ready(());
                 };
@@ -104,11 +115,13 @@ pub fn install(monitor: &Monitor) {
                 let mut map = card_map.borrow_mut();
                 let mut suppressed = suppressed_during_dnd.borrow_mut();
 
-                // Apply DND gate. Critical urgency always shows and never
-                // touches the suppressed set. Non-critical notifications
-                // that arrive while DND is on are recorded in `suppressed`
-                // and stay hidden even after DND is toggled off — flipping
-                // DND off must NOT unleash the backlog.
+                // Apply DND + per-app-mute gates. Critical urgency always
+                // shows and never touches the suppressed set. Non-critical
+                // notifications that arrive while DND is on, or whose
+                // app_name is in the muted set, are recorded in
+                // `suppressed` and stay hidden even after DND is toggled
+                // off / the app is unmuted — flipping a gate off must NOT
+                // unleash the backlog.
                 let visible: Vec<&Notification> = notifs
                     .iter()
                     .filter(|n| {
@@ -118,7 +131,7 @@ pub fn install(monitor: &Monitor) {
                         if suppressed.contains(&n.id) {
                             return false;
                         }
-                        if dnd_on {
+                        if dnd_on || muted.contains(&n.app_name) {
                             suppressed.insert(n.id);
                             return false;
                         }
@@ -234,11 +247,14 @@ fn build_card(notif: &Notification) -> gtk::Widget {
         column.append(&body);
     }
 
-    // Action buttons (rendered only when actions are present).
+    // Action buttons (rendered only when actions are present). Cap at 3
+    // visible buttons so a chatty app (e.g. an "snooze 1m / 5m / 15m / 1h"
+    // calendar reminder) can't blow out the toast width — the rest stay
+    // accessible from the drawer history page.
     if !notif.actions.is_empty() {
         let actions_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions_row.add_css_class("ts-toast-actions");
-        for action in &notif.actions {
+        for action in notif.actions.iter().take(3) {
             let btn = gtk::Button::with_label(&action.label);
             btn.add_css_class("ts-toast-action");
             let id = notif.id;

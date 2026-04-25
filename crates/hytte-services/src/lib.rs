@@ -11,6 +11,7 @@ pub mod mpris;
 pub mod networkd;
 pub mod niri;
 pub mod notifications;
+pub mod notifications_mute;
 pub mod pipewire;
 pub mod polkit;
 pub mod resolved;

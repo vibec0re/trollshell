@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local};
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, gio, glib};
@@ -2507,14 +2507,30 @@ pub fn page_calendar() -> gtk::Widget {
     column.add_css_class("ts-popup-column");
 
     // ── Month view ─────────────────────────────────────────────────────────
-    // GtkCalendar scrolls itself to the current month on construction. We
-    // don't bind it to the events signal — v1 just shows the grid.
+    // GtkCalendar scrolls itself to the current month on construction.
+    // Days that have at least one event in the visible month get mark_day().
     let cal = gtk::Calendar::new();
     cal.set_show_heading(true);
     cal.set_show_day_names(true);
     cal.set_show_week_numbers(false);
     cal.add_css_class("ts-calendar");
     column.append(&cal);
+
+    // Latest events snapshot, shared between the events() subscription and
+    // the prev/next-month signal handlers.
+    let current_events: Rc<RefCell<Vec<CalendarEvent>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // Re-mark on month navigation. connect_next_month bumps year on December
+    // rollover internally, so connect_year_changed isn't needed.
+    // TODO: click on a marked day to scroll/highlight matching list rows.
+    {
+        let events_for_next = current_events.clone();
+        cal.connect_next_month(move |c| apply_event_marks(c, &events_for_next.borrow()));
+    }
+    {
+        let events_for_prev = current_events.clone();
+        cal.connect_prev_month(move |c| apply_event_marks(c, &events_for_prev.borrow()));
+    }
 
     // ── Upcoming list ──────────────────────────────────────────────────────
     let group = adw::PreferencesGroup::builder().title("Upcoming").build();
@@ -2529,6 +2545,8 @@ pub fn page_calendar() -> gtk::Widget {
     let group_for_bind = group.clone();
     let rows_for_bind = rows_track.clone();
     let placeholder_for_bind = placeholder_track.clone();
+    let cal_for_bind = cal.clone();
+    let events_for_bind = current_events.clone();
     bind(calendar::events(), &group, move |_, evs| {
         for row in rows_for_bind.borrow_mut().drain(..) {
             group_for_bind.remove(&row);
@@ -2536,6 +2554,11 @@ pub fn page_calendar() -> gtk::Widget {
         if let Some(p) = placeholder_for_bind.borrow_mut().take() {
             group_for_bind.remove(&p);
         }
+
+        // Stash the snapshot before re-marking so the month-change handlers
+        // see the latest events too.
+        events_for_bind.borrow_mut().clone_from(&evs);
+        apply_event_marks(&cal_for_bind, &evs);
 
         if evs.is_empty() {
             let placeholder = adw::ActionRow::builder()
@@ -2558,6 +2581,25 @@ pub fn page_calendar() -> gtk::Widget {
     });
 
     finish_page(&column)
+}
+
+/// Mark each day in the calendar's currently-visible month that has at
+/// least one event. `GtkCalendar`'s `month()` is 0-indexed; chrono's
+/// `NaiveDate::month()` is 1-indexed — adjust before comparing.
+fn apply_event_marks(cal: &gtk::Calendar, events: &[CalendarEvent]) {
+    cal.clear_marks();
+    let month = u32::try_from(cal.month() + 1).unwrap_or(0);
+    let year = cal.year();
+    let mut marked: HashSet<u32> = HashSet::new();
+    for ev in events {
+        let d = ev.start.date_naive();
+        if d.year() == year && d.month() == month {
+            marked.insert(d.day());
+        }
+    }
+    for day in marked {
+        cal.mark_day(day);
+    }
 }
 
 fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {

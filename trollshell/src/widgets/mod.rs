@@ -11,6 +11,7 @@ pub mod mpris;
 pub mod network;
 pub mod notif_indicator;
 pub mod notifications;
+pub mod osd;
 pub mod pages;
 pub mod polkit_dialog;
 pub mod prompt;

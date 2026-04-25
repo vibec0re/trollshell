@@ -57,6 +57,7 @@ fn main() -> hytte::ui::Result<()> {
             if let Some(primary) = app.monitors().first() {
                 widgets::prompt::install(primary);
                 widgets::polkit_dialog::install(primary);
+                widgets::osd::install(primary);
             }
         })
 }

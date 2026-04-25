@@ -629,18 +629,12 @@ fn build_bluetooth_header() -> gtk::Widget {
         &power_switch,
         gtk::prelude::WidgetExt::set_sensitive,
     );
-    bind(
+    bind_two_way(
         bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
         &power_switch,
-        |w, on| {
-            if w.is_active() != on {
-                w.set_active(on);
-            }
-        },
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| bluetooth::set_powered(sw.is_active())),
     );
-    power_switch.connect_active_notify(|sw| {
-        bluetooth::set_powered(sw.is_active());
-    });
 
     row.add_suffix(&power_switch);
     row.set_activatable_widget(Some(&power_switch));
@@ -674,18 +668,12 @@ fn build_bluetooth_controls() -> gtk::Widget {
     );
     let disc_switch = gtk::Switch::new();
     disc_switch.set_valign(gtk::Align::Center);
-    bind(
+    bind_two_way(
         bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.discoverable)),
         &disc_switch,
-        |w, on| {
-            if w.is_active() != on {
-                w.set_active(on);
-            }
-        },
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| bluetooth::set_discoverable(sw.is_active())),
     );
-    disc_switch.connect_active_notify(|sw| {
-        bluetooth::set_discoverable(sw.is_active());
-    });
     disc_row.add_suffix(&disc_switch);
     disc_row.set_activatable_widget(Some(&disc_switch));
     group.add(&disc_row);
@@ -698,18 +686,12 @@ fn build_bluetooth_controls() -> gtk::Widget {
         .build();
     let auto_switch = gtk::Switch::new();
     auto_switch.set_valign(gtk::Align::Center);
-    bind(
+    bind_two_way(
         bluetooth_audio::auto_switch_enabled(),
         &auto_switch,
-        |w, on| {
-            if w.is_active() != on {
-                w.set_active(on);
-            }
-        },
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| bluetooth_audio::set_auto_switch_enabled(sw.is_active())),
     );
-    auto_switch.connect_active_notify(|sw| {
-        bluetooth_audio::set_auto_switch_enabled(sw.is_active());
-    });
     auto_row.add_suffix(&auto_switch);
     auto_row.set_activatable_widget(Some(&auto_switch));
     group.add(&auto_row);
@@ -1683,14 +1665,12 @@ pub fn page_notifications() -> gtk::Widget {
         .build();
     let dnd_switch = gtk::Switch::new();
     dnd_switch.set_valign(gtk::Align::Center);
-    bind(dnd::enabled(), &dnd_switch, |w, on| {
-        if w.is_active() != on {
-            w.set_active(on);
-        }
-    });
-    dnd_switch.connect_active_notify(|sw| {
-        dnd::set_enabled(sw.is_active());
-    });
+    bind_two_way(
+        dnd::enabled(),
+        &dnd_switch,
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active())),
+    );
     dnd_row.add_suffix(&dnd_switch);
     dnd_row.set_activatable_widget(Some(&dnd_switch));
     dnd_group.add(&dnd_row);
@@ -1823,24 +1803,22 @@ fn build_history_app_row(
 
     // Per-app mute switch: feeds `notifications_mute::set_app_muted` and
     // subscribes to `muted_apps()` so toggles from another monitor's drawer
-    // sync into this row's switch. The `is_active() != on` guard breaks the
-    // bind→active-notify→set_app_muted→bind feedback loop.
+    // sync into this row's switch.
+    // bind_two_way blocks the user handler around the apply, so no feedback loop.
     let mute_switch = gtk::Switch::new();
     mute_switch.set_valign(gtk::Align::Center);
     mute_switch.set_tooltip_text(Some("Mute toasts from this app"));
     mute_switch.set_active(muted.contains(app));
-    let app_owned = app.to_string();
-    mute_switch.connect_active_notify(move |sw| {
-        notifications_mute::set_app_muted(&app_owned, sw.is_active());
-    });
     let app_for_bind = app.to_string();
-    bind(
+    let app_for_handler = app.to_string();
+    bind_two_way(
         notifications_mute::muted_apps().map(move |m| m.contains(&app_for_bind)),
         &mute_switch,
-        |w, on| {
-            if w.is_active() != on {
-                w.set_active(on);
-            }
+        gtk::Switch::set_active,
+        move |w| {
+            w.connect_active_notify(move |sw| {
+                notifications_mute::set_app_muted(&app_for_handler, sw.is_active());
+            })
         },
     );
     // Trailing widget on the header (before the expander toggle). Uses
@@ -2394,14 +2372,12 @@ pub fn page_settings() -> gtk::Widget {
         .build();
     let dnd_switch = gtk::Switch::new();
     dnd_switch.set_valign(gtk::Align::Center);
-    bind(dnd::enabled(), &dnd_switch, |w, on| {
-        if w.is_active() != on {
-            w.set_active(on);
-        }
-    });
-    dnd_switch.connect_active_notify(|sw| {
-        dnd::set_enabled(sw.is_active());
-    });
+    bind_two_way(
+        dnd::enabled(),
+        &dnd_switch,
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active())),
+    );
     dnd_row.add_suffix(&dnd_switch);
     dnd_row.set_activatable_widget(Some(&dnd_switch));
     notif.add(&dnd_row);

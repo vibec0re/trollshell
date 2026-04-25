@@ -1,7 +1,7 @@
 [Unit]
 Description=Idle manager for Wayland (swayidle)
 Documentation=man:swayidle(1) man:swayidle(5)
-PartOf=graphical-session.target
+PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
 
@@ -12,4 +12,4 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=niri-session.target

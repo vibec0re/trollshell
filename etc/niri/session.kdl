@@ -1,0 +1,26 @@
+// niri session-autostart snippet for trollshell — see ../systemd/user/README.md
+//
+// niri has no `include` directive, so the line below has to be merged into
+// your `~/.config/niri/config.kdl` by hand. It's a top-level node — DO NOT
+// nest it inside `binds { … }` (the binds snippet ships separately in
+// ./binds.kdl). Multiple `spawn-at-startup` lines are allowed; add this one
+// alongside any others you have.
+//
+// What it does:
+//
+//   1. `systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP`
+//      copies those two env vars from the niri process into the user
+//      systemd manager's environment, so D-Bus-activated services and any
+//      .desktop launchers see them. Without this, GTK clients started via
+//      a launcher fail to connect to the Wayland display.
+//
+//   2. `systemctl --user start niri-session.target` brings up the umbrella
+//      target, which in turn pulls in trollshell.service, swayidle.service,
+//      swaybg.service, and any other unit installed with
+//      `WantedBy=niri-session.target`.
+//
+// XDG_CURRENT_DESKTOP=niri:GNOME is set via environment.d (see #26's README);
+// it has to exist in the niri process env *before* this line runs, otherwise
+// import-environment has nothing to copy.
+
+spawn-at-startup "/bin/sh" "-c" "systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP && systemctl --user start niri-session.target"

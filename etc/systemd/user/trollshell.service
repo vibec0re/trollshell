@@ -1,0 +1,15 @@
+[Unit]
+Description=trollshell — bar, drawer, services
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=niri-session.target
+After=niri-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/trollshell
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

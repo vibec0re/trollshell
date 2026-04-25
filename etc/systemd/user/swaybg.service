@@ -1,7 +1,7 @@
 [Unit]
 Description=Wallpaper background via swaybg
 Documentation=man:swaybg(1)
-PartOf=graphical-session.target
+PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
 
@@ -12,4 +12,4 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=niri-session.target

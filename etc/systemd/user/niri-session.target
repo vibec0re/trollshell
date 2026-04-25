@@ -1,0 +1,6 @@
+[Unit]
+Description=niri+trollshell user session
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=graphical-session.target
+Requires=graphical-session.target
+After=graphical-session.target

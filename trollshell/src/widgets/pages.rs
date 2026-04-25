@@ -2673,9 +2673,9 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     let icon = gtk::Image::from_icon_name(icon_name);
     row.add_prefix(&icon);
 
-    if matches!(entry.kind, ClipKind::Image) {
-        row.set_subtitle("Image");
-    }
+    // No subtitle: text rows have none, and the image row's title is
+    // already the informative `Image (12.3 KiB png)` cliphist preview —
+    // a "Image" subtitle would be redundant.
 
     let id = entry.id;
     row.connect_activated(move |_| {

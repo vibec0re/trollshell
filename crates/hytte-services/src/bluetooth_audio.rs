@@ -608,10 +608,42 @@ mod tests {
         );
     }
 
-    // TODO(bt-audio-followup): add a test for the actual restore path where
-    // the current default differs from `last_non_bt_default` (i.e. exercise
-    // the `pipewire::set_default_sink(&target)` branch end-to-end). Needs a
-    // pipewire test seam first.
+    #[test]
+    fn react_disappear_arm_already_current_short_circuit() {
+        // BT-disappear edge where the saved restore target is *already* the
+        // current default (e.g. user manually switched away before BT
+        // disconnected). The disappear arm must still `take()` the BT
+        // observation so a reconnect re-arms BT-appears, and must not
+        // clobber the saved target.
+        let st = Mutex::new(ReactorState {
+            last_non_bt_default: Some("alsa_output.builtin".to_string()),
+            last_observed_bt_default: Some("bluez_output.AC_C5_8B_FF_FF_FF.1".to_string()),
+        });
+        let sinks = vec![sink("alsa_output.builtin", true)];
+        react(&st, &[], &sinks, true);
+        let state = st.lock().unwrap();
+        assert!(state.last_observed_bt_default.is_none());
+        assert_eq!(state.last_non_bt_default.as_deref(), Some("alsa_output.builtin"));
+    }
+
+    #[test]
+    fn react_disappear_arm_with_no_current_default() {
+        // BT-disappear edge with no current default sink at all: the
+        // top-of-react bookkeeping leaves `last_non_bt_default` intact, so
+        // the disappear arm sees a real restore-needed scenario (this is
+        // the path that would call `set_default_sink(saved_target)`). The
+        // pipewire call is fire-and-forget; we assert observable state
+        // instead — observation cleared, saved target survives.
+        let st = Mutex::new(ReactorState {
+            last_non_bt_default: Some("alsa_output.builtin".to_string()),
+            last_observed_bt_default: Some("bluez_output.AC_C5_8B_FF_FF_FF.1".to_string()),
+        });
+        let sinks = vec![sink("alsa_output.builtin", false)];
+        react(&st, &[], &sinks, true);
+        let state = st.lock().unwrap();
+        assert!(state.last_observed_bt_default.is_none());
+        assert_eq!(state.last_non_bt_default.as_deref(), Some("alsa_output.builtin"));
+    }
 
     #[test]
     fn react_no_action_when_disabled() {

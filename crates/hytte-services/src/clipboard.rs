@@ -191,16 +191,22 @@ fn parse_list(text: &str) -> Vec<ClipEntry> {
         } else {
             (ClipKind::Text, truncate(rest, PREVIEW_MAX))
         };
+        // Skip blank rows: cliphist occasionally emits an id with an empty
+        // preview, which would render as a blank clickable row in the UI.
+        if preview.is_empty() {
+            continue;
+        }
         out.push(ClipEntry { id, preview, kind });
     }
     out
 }
 
 /// cliphist marks binary entries with a `[[ binary data … ]]` preview.
-/// Be permissive: any line whose preview starts with `[[ binary` counts.
+/// Match the canonical double-bracket prefix only — `[binary…` (single
+/// bracket) is not something cliphist emits and would false-positive on
+/// legitimate text starting with that string.
 fn is_image_preview(preview: &str) -> bool {
-    let trimmed = preview.trim_start();
-    trimmed.starts_with("[[ binary") || trimmed.starts_with("[binary")
+    preview.trim_start().starts_with("[[ binary")
 }
 
 /// Compact image preview into `"Image (12.3 KiB png)"` when the size +
@@ -307,6 +313,28 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id, 3);
         assert_eq!(v[0].preview, "ok");
+    }
+
+    #[test]
+    fn parse_list_skips_empty_preview() {
+        // cliphist sometimes emits "5\t\n" (id with empty preview); the
+        // parser must drop such rows so the UI doesn't render blank clicks.
+        let raw = "5\t\n6\treal entry\n";
+        let v = parse_list(raw);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, 6);
+    }
+
+    #[test]
+    fn parse_list_text_starting_with_single_bracket_binary_is_text() {
+        // Regression: the old fallback `[binary` (single bracket) would
+        // false-positive a text clip whose contents happen to start that
+        // way. Real cliphist always uses `[[ binary data … ]]`.
+        let raw = "9\t[binary review note]\n";
+        let v = parse_list(raw);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ClipKind::Text);
+        assert_eq!(v[0].preview, "[binary review note]");
     }
 
     #[test]

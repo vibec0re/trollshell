@@ -1,0 +1,15 @@
+[Unit]
+Description=Dynamic output configuration via kanshi
+Documentation=man:kanshi(1) man:kanshi(5)
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kanshi
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

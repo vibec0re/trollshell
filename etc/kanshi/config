@@ -1,0 +1,23 @@
+# kanshi(5) config — display profile autoselection.
+#
+# kanshi watches the wlr-output-management protocol (which niri also speaks)
+# and applies the FIRST profile whose `output` lines all match the set of
+# currently-connected outputs. Add more profiles below for docking stations,
+# external monitors at desks, etc.
+#
+# IMPORTANT: the connector names, modes, positions and scales below are
+# example values. Replace them with values from `niri msg outputs` for your
+# actual hardware before enabling the unit. See ../README.md.
+
+# Profile 1: laptop alone, internal display only.
+profile laptop {
+    output eDP-1 enable mode 2880x1800@90 position 0,0 scale 2
+}
+
+# Profile 2: docked at a desk with one external HDMI monitor to the right
+# of the internal display. Adjust position to taste (the X offset must be
+# the laptop's logical width — width / scale = 2880 / 2 = 1440).
+profile docked {
+    output eDP-1 enable mode 2880x1800@90 position 0,0 scale 2
+    output HDMI-A-1 enable mode 1920x1080@60 position 1440,0 scale 1
+}

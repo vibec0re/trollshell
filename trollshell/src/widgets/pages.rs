@@ -17,6 +17,7 @@ use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
 use hytte::services::brightness;
+use hytte::services::displays::{self, Output};
 use hytte::services::dnd;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
@@ -2009,4 +2010,110 @@ fn open_wallpaper_picker(parent_widget: &gtk::Button) {
             }
         }
     });
+}
+
+// ── Displays page ─────────────────────────────────────────────────────────────
+
+/// Drawer page listing the connected outputs as reported by niri's IPC.
+/// Each row shows make/model + the active mode and scale, with a switch
+/// suffix that calls `displays::set_output_enabled`. Topology changes
+/// (plug/unplug) are picked up by the displays service's 2 s polling loop
+/// and trigger a full row-list rebuild here.
+///
+/// v1 is read-only beyond the on/off switch — there's no mode picker, no
+/// scale editor, no rotation UI, and no position editor. Persistent
+/// multi-monitor layouts live in `~/.config/kanshi/config` (see
+/// `etc/kanshi/`); this page reflects whatever the running compositor +
+/// kanshi have already decided.
+pub fn page_displays() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+
+    let group = adw::PreferencesGroup::builder().title("Displays").build();
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    column.append(&group);
+
+    let group_for_bind = group.clone();
+    let rows_track_for_bind = rows_track.clone();
+    bind(displays::outputs(), &group, move |_, list| {
+        // PreferencesGroup has no row-traversal API, so we track the rows
+        // we've added and remove them explicitly before each rebuild.
+        for row in rows_track_for_bind.borrow_mut().drain(..) {
+            group_for_bind.remove(&row);
+        }
+        if list.is_empty() {
+            // Show a single placeholder row when niri reports nothing yet
+            // — typically the first poll hasn't completed, or niri's IPC
+            // socket isn't reachable.
+            let placeholder = adw::ActionRow::builder()
+                .title("No displays detected")
+                .subtitle("Waiting for niri\u{2026}")
+                .activatable(false)
+                .build();
+            group_for_bind.add(&placeholder);
+            rows_track_for_bind.borrow_mut().push(placeholder);
+            return;
+        }
+        let mut new_rows = Vec::with_capacity(list.len());
+        for output in &list {
+            let row = build_display_row(output);
+            group_for_bind.add(&row);
+            new_rows.push(row);
+        }
+        *rows_track_for_bind.borrow_mut() = new_rows;
+    });
+
+    finish_page(&column)
+}
+
+fn build_display_row(o: &Output) -> adw::ActionRow {
+    // Title prefers make+model when EDID is informative; falls back to the
+    // bare connector name (e.g. virtual outputs, generic displays).
+    let trimmed = format!("{} {}", o.make.trim(), o.model.trim());
+    let title = if trimmed.trim().is_empty() {
+        o.name.clone()
+    } else {
+        trimmed.trim().to_string()
+    };
+
+    let subtitle = if !o.enabled {
+        "Disabled".to_string()
+    } else if let Some(mode) = o.mode {
+        let hz = f64::from(mode.refresh_mhz) / 1000.0;
+        format!(
+            "{}\u{00d7}{} @ {:.0} Hz, {:.1}\u{00d7}",
+            mode.width, mode.height, hz, o.scale,
+        )
+    } else {
+        // Enabled but no mode reported — odd but possible during
+        // mode-switch races. Show what we know.
+        format!("Enabled, scale {:.1}\u{00d7}", o.scale)
+    };
+
+    let row = adw::ActionRow::builder()
+        .title(&title)
+        .subtitle(&subtitle)
+        .build();
+    // Long-form titles or driver-injected EDIDs can blow the modal width;
+    // let title and subtitle wrap rather than push the surface.
+    row.set_subtitle_lines(0);
+
+    let prefix = gtk::Label::new(Some(&o.name));
+    prefix.add_css_class("ts-display-connector");
+    prefix.add_css_class("monospace");
+    prefix.set_valign(gtk::Align::Center);
+    row.add_prefix(&prefix);
+
+    let switch = gtk::Switch::new();
+    switch.set_valign(gtk::Align::Center);
+    switch.set_active(o.enabled);
+    let name_for_toggle = o.name.clone();
+    switch.connect_active_notify(move |sw| {
+        displays::set_output_enabled(&name_for_toggle, sw.is_active());
+    });
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+
+    row
 }

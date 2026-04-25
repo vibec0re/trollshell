@@ -5,7 +5,7 @@ pub mod bind;
 pub mod registry;
 pub mod runtime;
 
-pub use bind::{bind, bind_class, bind_text, bind_visible};
+pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_visible};
 pub use registry::{Registry, Service, ServiceErased};
 
 // Re-export so consumers don't need their own dep on futures-signals.

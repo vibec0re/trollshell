@@ -181,6 +181,7 @@ impl BarHandle {
 
     /// Access the underlying layer-shell window — useful for binding
     /// state-driven CSS classes from outside the Bar builder.
+    #[must_use]
     pub fn window(&self) -> &gtk::Window {
         &self.window
     }

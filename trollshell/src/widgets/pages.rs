@@ -159,7 +159,6 @@ pub fn page_media() -> gtk::Widget {
     let current_track_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let current_length: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let last_art_url: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-    let seek_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // Controls.
     {
@@ -187,36 +186,6 @@ pub fn page_media() -> gtk::Widget {
         });
     }
 
-    // Seek-bar → SetPosition on user drag (not on programmatic updates).
-    {
-        let bus = current_bus.clone();
-        let tid = current_track_id.clone();
-        let len = current_length.clone();
-        let suppress = seek_suppress.clone();
-        seek.connect_value_changed(move |s| {
-            if suppress.get() {
-                return;
-            }
-            let bus_opt = bus.borrow();
-            let tid_opt = tid.borrow();
-            let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else {
-                return;
-            };
-            let pos_fraction = s.value().clamp(0.0, 1.0);
-            let length = len.get();
-            if length == 0 {
-                return;
-            }
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
-            )]
-            let pos_us = (pos_fraction * length as f64) as i64;
-            mpris::set_position(b, t, pos_us);
-        });
-    }
-
     // Signal binding — handles ALL UI updates.
     let art_image_for_bind = art_image.clone();
     let title_label_for_bind = title_label.clone();
@@ -225,9 +194,14 @@ pub fn page_media() -> gtk::Widget {
     let prev_for_bind = prev_btn.clone();
     let pp_for_bind = play_pause_btn.clone();
     let next_for_bind = next_btn.clone();
-    let seek_for_bind = seek.clone();
     let pos_label_for_bind = pos_label.clone();
     let len_label_for_bind = len_label.clone();
+
+    // Pre-clone shared state for the seek bind_two_way below (the big bind
+    // takes ownership of the originals via `move`).
+    let bus_for_seek = current_bus.clone();
+    let tid_for_seek = current_track_id.clone();
+    let len_for_seek = current_length.clone();
 
     bind(mpris::active_player(), &title_label, move |_, maybe_player| {
         match maybe_player {
@@ -240,9 +214,6 @@ pub fn page_media() -> gtk::Widget {
                 album_label_for_bind.set_text("");
                 pos_label_for_bind.set_text("0:00");
                 len_label_for_bind.set_text("0:00");
-                seek_suppress.set(true);
-                seek_for_bind.set_value(0.0);
-                seek_suppress.set(false);
                 art_image_for_bind.set_paintable(None::<&gdk::Paintable>);
                 art_image_for_bind.set_icon_name(Some("audio-x-generic-symbolic"));
                 art_image_for_bind.set_pixel_size(200);
@@ -273,14 +244,6 @@ pub fn page_media() -> gtk::Widget {
                 pos_label_for_bind.set_text(&fmt_us(player.position_us));
                 len_label_for_bind.set_text(&fmt_us(player.length_us));
 
-                if player.length_us > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let frac = (player.position_us as f64) / (player.length_us as f64);
-                    seek_suppress.set(true);
-                    seek_for_bind.set_value(frac.clamp(0.0, 1.0));
-                    seek_suppress.set(false);
-                }
-
                 // Art: only re-fetch when URL changes.
                 if *last_art_url.borrow() != player.art_url {
                     (*last_art_url.borrow_mut()).clone_from(&player.art_url);
@@ -300,6 +263,34 @@ pub fn page_media() -> gtk::Widget {
             }
         }
     });
+
+    // Seek value mirror + user-driven SetPosition. Subscribes to active_player
+    // independently of the title/art bind above; futures-signals allows
+    // multiple subscribers and bind_two_way owns the user-handler block.
+    bind_two_way(
+        mpris::active_player().map(|maybe| {
+            let Some(p) = maybe else { return 0.0; };
+            if p.length_us == 0 { 0.0 } else {
+                #[allow(clippy::cast_precision_loss)]
+                ((p.position_us as f64) / (p.length_us as f64)).clamp(0.0, 1.0)
+            }
+        }),
+        &seek,
+        gtk::prelude::RangeExt::set_value,
+        move |s| s.connect_value_changed(move |s| {
+            let bus_opt = bus_for_seek.borrow();
+            let tid_opt = tid_for_seek.borrow();
+            let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else {
+                return;
+            };
+            let pos_fraction = s.value().clamp(0.0, 1.0);
+            let length = len_for_seek.get();
+            if length == 0 { return; }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            let pos_us = (pos_fraction * length as f64) as i64;
+            mpris::set_position(b, t, pos_us);
+        }),
+    );
 
     finish_page(&grid)
 }
@@ -1577,26 +1568,17 @@ fn build_brightness_row() -> gtk::ListBox {
     slider.set_draw_value(false);
     slider.set_hexpand(true);
 
-    // Avoid feedback: when bind() reflects external state into the slider,
-    // suppress the connect_value_changed → brightness::set() path. Without
-    // this the slider would echo every poll back into a brightness write.
-    let suppress = Rc::new(Cell::new(false));
-    let suppress_for_handler = suppress.clone();
-    slider.connect_value_changed(move |s| {
-        if suppress_for_handler.get() {
-            return;
-        }
-        brightness::set(s.value());
-    });
-    let suppress_for_bind = suppress.clone();
-    bind(brightness::current(), &slider, move |s, b| {
-        if let Some(b) = b {
-            suppress_for_bind.set(true);
-            s.set_value(b.level);
-            suppress_for_bind.set(false);
-        }
-        s.set_sensitive(b.is_some());
-    });
+    bind_two_way(
+        brightness::current(),
+        &slider,
+        |s, b| {
+            if let Some(b) = b {
+                s.set_value(b.level);
+            }
+            s.set_sensitive(b.is_some());
+        },
+        |s| s.connect_value_changed(|s| brightness::set(s.value())),
+    );
     inner.append(&slider);
 
     let pct_lbl = gtk::Label::new(None);

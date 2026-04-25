@@ -57,7 +57,14 @@ that lets you add Google / iCloud / CalDAV accounts.
   ascending. Multi-day events that started in the past but haven't ended
   yet are also surfaced.
 - Sync lag: up to ~60 s (one poll interval) plus whatever EDS itself
-  takes to refresh from the upstream provider.
+  takes to refresh from the upstream provider — in practice EDS's own
+  cycle dominates and can run to tens of minutes, depending on the
+  provider's hints.
+- Both `DTEND` and `DURATION` are honoured. The duration parser covers
+  the PT-form (e.g. `PT15M`, `PT1H30M`, `PT4H`) for timed events and the
+  P-form (e.g. `P1D`, `P3D`, `P1W`) for all-day events, plus combined
+  forms like `P1DT2H`. Google Calendar in particular emits `DURATION`
+  for many events, especially recurring instances.
 
 ## Verification
 

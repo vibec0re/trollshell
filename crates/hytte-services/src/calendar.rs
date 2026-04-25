@@ -29,6 +29,19 @@
 //!   fails we treat the inner naive datetime as local time. Floating
 //!   datetimes are interpreted as local time.
 //!
+// TODO(calendar-followup): tracked items that intentionally aren't fixed
+// in this iteration:
+//   * I2  — try a `*.ics` glob fallback when `calendar.ics` is missing
+//           (some EDS versions name it differently). Defer until we hit
+//           a real cache layout that needs it.
+//   * I5  — "this week" relative labels in `short_date` (cosmetic).
+//   * I6  — anonymous UID synthesis based on a hash of (calendar, dtstart,
+//           summary) so the row identity is stable across refreshes when
+//           the master VEVENT really has no UID.
+//   * I11 — README sync-lag wording: re-state as "tens of minutes" once we
+//           know EDS's actual cadence on real-world accounts.
+//   * I13 — TZ-roundtrip test coverage. Add when a real bug surfaces.
+//
 //! # Background refresh
 //!
 //! Pure 60-second polling — no inotify. The cache directory turn-over is
@@ -151,8 +164,11 @@ async fn poll_loop(writer: Mutable<Vec<CalendarEvent>>) {
         // Refresh inline on a blocking thread so we don't park a tokio
         // worker on filesystem I/O.
         let writer_for_blocking = writer.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await;
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await
+        {
+            tracing::error!(error = %e, "calendar refresh task panicked");
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
@@ -172,6 +188,14 @@ fn do_refresh(writer: &Mutable<Vec<CalendarEvent>>) {
 // ── Filesystem scanning ──────────────────────────────────────────────────────
 
 fn cache_root() -> Option<PathBuf> {
+    // EDS itself follows the XDG Base Directory spec, writing under
+    // `$XDG_DATA_HOME/evolution/calendar`. Honour the override before
+    // falling back to the spec's default of `$HOME/.local/share`.
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("evolution").join("calendar"));
+    }
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".local/share/evolution/calendar"))
 }
@@ -248,21 +272,27 @@ fn parse_ics_file(
         let Some((start_local, all_day)) = dpt_to_local(start_dpt) else {
             continue;
         };
-        let end_local = event.get_end().and_then(dpt_to_local).map_or_else(
-            || {
-                if all_day {
-                    // Per RFC 5545: if DTEND is missing on a DATE-typed
-                    // VEVENT, the event ends at the end of DTSTART's day.
-                    start_local + Duration::days(1)
-                } else {
-                    // Missing DTEND on a DATE-TIME means a zero-duration
-                    // event in iCal, but for UI purposes we'd rather see
-                    // a 1-hour bar than a coincident edge.
-                    start_local + Duration::hours(1)
-                }
-            },
-            |(dt, _)| dt,
-        );
+        // RFC 5545 §3.6.1: a VEVENT carries DTEND xor DURATION (never
+        // both). Google Calendar and many recurring-instance emitters
+        // prefer DURATION, so we have to honour both.
+        let end_local = if let Some((dt, _)) = event.get_end().and_then(dpt_to_local) {
+            dt
+        } else if let Some(dur) = event
+            .property_value("DURATION")
+            .and_then(parse_iso8601_duration)
+        {
+            start_local + dur
+        } else if all_day {
+            // Per RFC 5545: if neither DTEND nor DURATION is present on a
+            // DATE-typed VEVENT, the event ends at the end of DTSTART's
+            // day (i.e. start + 1 day).
+            start_local + Duration::days(1)
+        } else {
+            // Missing DTEND/DURATION on a DATE-TIME means a zero-duration
+            // event in iCal, but for UI purposes we'd rather see a 1-hour
+            // bar than a coincident edge.
+            start_local + Duration::hours(1)
+        };
 
         // Window filter: include if the event hasn't ended yet AND its
         // start lies inside the next-N-days window. The "hasn't ended"
@@ -318,7 +348,7 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
             CalendarDateTime::Floating(naive) => {
                 Some((Local.from_local_datetime(&naive).single()?, false))
             }
-            ref other @ CalendarDateTime::WithTimezone { ref date_time, .. } => {
+            ref other @ CalendarDateTime::WithTimezone { ref date_time, ref tzid } => {
                 // WithTimezone: chrono-tz-backed conversion when the TZID
                 // is one chrono-tz knows; otherwise interpret the wall-
                 // clock time as local. The fallback is wrong for events
@@ -327,11 +357,104 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
                 if let Some(utc) = other.try_into_utc() {
                     Some((utc.with_timezone(&Local), false))
                 } else {
+                    tracing::debug!(
+                        tzid = %tzid,
+                        "calendar: unknown TZID; falling back to local interpretation",
+                    );
                     Some((Local.from_local_datetime(date_time).single()?, false))
                 }
             }
         },
     }
+}
+
+/// Parse an ISO 8601 / RFC 5545 duration string into a `chrono::Duration`.
+///
+/// Coverage: `PT0S`, `PT15M`, `PT1H`, `PT1H30M`, `PT4H`, `P1D`, `P3D`,
+/// `P1W`, and combined forms like `P1DT2H`. A leading `-` flips sign.
+/// Anything that doesn't tokenise cleanly returns `None` rather than
+/// crashing; the caller falls back to the prior heuristic.
+fn parse_iso8601_duration(raw: &str) -> Option<Duration> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (negative, rest) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    // Must start with a literal `P`.
+    let rest = rest.strip_prefix('P')?;
+
+    // Split into the date-part (before any `T`) and the time-part (after).
+    let (date_part, time_part) = match rest.find('T') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+
+    // Both halves can be empty individually — `PT1H` has no date part,
+    // `P1D` has no time part — but the *combined* result must contain at
+    // least one segment. Reject `P` and `PT` outright.
+    if date_part.is_empty() && time_part.is_empty() {
+        return None;
+    }
+
+    let mut total = Duration::zero();
+
+    // Date-part legal designators: D, W. (Y/M omitted: variable length,
+    // not meaningful for a UI offset against an instant.)
+    let mut num = String::new();
+    for c in date_part.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        if num.is_empty() {
+            return None;
+        }
+        let n: i64 = num.parse().ok()?;
+        num.clear();
+        match c {
+            'D' => total += Duration::days(n),
+            'W' => total += Duration::weeks(n),
+            // Y and M would need a calendar anchor to be meaningful;
+            // we deliberately don't support them.
+            _ => return None,
+        }
+    }
+    if !num.is_empty() {
+        // Trailing digits with no designator — malformed.
+        return None;
+    }
+
+    // Time-part legal designators: H, M, S.
+    let mut num = String::new();
+    for c in time_part.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        if num.is_empty() {
+            return None;
+        }
+        let n: i64 = num.parse().ok()?;
+        num.clear();
+        match c {
+            'H' => total += Duration::hours(n),
+            'M' => total += Duration::minutes(n),
+            'S' => total += Duration::seconds(n),
+            _ => return None,
+        }
+    }
+    if !num.is_empty() {
+        return None;
+    }
+
+    if negative {
+        total = -total;
+    }
+    Some(total)
 }
 
 // ── Helpers used by the page (formatting) ────────────────────────────────────
@@ -344,19 +467,35 @@ pub fn format_when(event: &CalendarEvent) -> String {
     let now = Local::now();
     let today = now.date_naive();
     let start_date = event.start.date_naive();
+    let end_date = event.end.date_naive();
 
     if event.all_day {
+        // iCal DTEND for DATE-typed events is exclusive (the day *after*
+        // the last day). Subtract 1 day to recover the inclusive last-day
+        // for display.
+        let inclusive_end = end_date - chrono::Duration::days(1);
+        if inclusive_end > start_date {
+            return format!(
+                "All day, {} \u{2192} {}",
+                short_date(start_date, today),
+                short_date(inclusive_end, today),
+            );
+        }
         return format!("All day, {}", short_date(start_date, today));
     }
 
     let start_label = short_date(start_date, today);
     let start_hm = event.start.format("%H:%M");
-    if event.start.date_naive() == event.end.date_naive() {
+    if start_date == end_date {
         let end_hm = event.end.format("%H:%M");
-        format!("{start_label} {start_hm}\u{2013}{end_hm}")
-    } else {
-        format!("{start_label} {start_hm}")
+        return format!("{start_label} {start_hm}\u{2013}{end_hm}");
     }
+
+    // Multi-day timed event: show both endpoints so a Sat 09:00 → Mon
+    // 17:00 conference doesn't lose its Monday.
+    let end_label = short_date(end_date, today);
+    let end_hm = event.end.format("%H:%M");
+    format!("{start_label} {start_hm} \u{2192} {end_label} {end_hm}")
 }
 
 /// Render a date as one of "Today", "Tomorrow", or `"Mon 14 Apr"` relative
@@ -507,4 +646,120 @@ mod tests {
         assert_eq!(s, "All day, Tomorrow");
     }
 
+    #[test]
+    fn iso8601_duration_pt_forms() {
+        assert_eq!(parse_iso8601_duration("PT0S"), Some(Duration::zero()));
+        assert_eq!(parse_iso8601_duration("PT15M"), Some(Duration::minutes(15)));
+        assert_eq!(parse_iso8601_duration("PT1H"), Some(Duration::hours(1)));
+        assert_eq!(
+            parse_iso8601_duration("PT1H30M"),
+            Some(Duration::hours(1) + Duration::minutes(30)),
+        );
+        assert_eq!(parse_iso8601_duration("PT4H"), Some(Duration::hours(4)));
+    }
+
+    #[test]
+    fn iso8601_duration_p_forms() {
+        assert_eq!(parse_iso8601_duration("P1D"), Some(Duration::days(1)));
+        assert_eq!(parse_iso8601_duration("P3D"), Some(Duration::days(3)));
+        assert_eq!(parse_iso8601_duration("P1W"), Some(Duration::weeks(1)));
+        assert_eq!(
+            parse_iso8601_duration("P1DT2H"),
+            Some(Duration::days(1) + Duration::hours(2)),
+        );
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_garbage() {
+        assert_eq!(parse_iso8601_duration(""), None);
+        assert_eq!(parse_iso8601_duration("P"), None);
+        assert_eq!(parse_iso8601_duration("PT"), None);
+        assert_eq!(parse_iso8601_duration("1H"), None);
+        assert_eq!(parse_iso8601_duration("PT1X"), None);
+    }
+
+    #[test]
+    fn duration_pt4h_overrides_dtend_fabrication() {
+        // VEVENT with DURATION:PT4H and no DTEND must end 4h after start,
+        // not 1h (the previous default).
+        let now = Local::now();
+        let start = now + Duration::hours(2);
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
+             BEGIN:VEVENT\r\nUID:dur-pt4h\r\nSUMMARY:Workshop\r\n\
+             DTSTART:{}\r\nDURATION:PT4H\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
+            start.naive_utc().format("%Y%m%dT%H%M%SZ"),
+        );
+        let path = std::env::temp_dir().join("hytte-calendar-test-pt4h.ics");
+        std::fs::write(&path, body).unwrap();
+        let evs = parse_ics_file(
+            &path,
+            "test-cal",
+            now - Duration::hours(1),
+            now + Duration::days(NEXT_DAYS),
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].end - evs[0].start, Duration::hours(4));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duration_p3d_overrides_for_all_day() {
+        // All-day VEVENT (DTSTART;VALUE=DATE) with DURATION:P3D should
+        // span 3 days, not 1 (the all-day fallback).
+        let now = Local::now();
+        let date = (now + Duration::days(1)).format("%Y%m%d");
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
+             BEGIN:VEVENT\r\nUID:dur-p3d\r\nSUMMARY:Long weekend\r\n\
+             DTSTART;VALUE=DATE:{date}\r\nDURATION:P3D\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        let path = std::env::temp_dir().join("hytte-calendar-test-p3d.ics");
+        std::fs::write(&path, body).unwrap();
+        let evs = parse_ics_file(
+            &path,
+            "test-cal",
+            now - Duration::hours(1),
+            now + Duration::days(NEXT_DAYS),
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].all_day);
+        assert_eq!(evs[0].end - evs[0].start, Duration::days(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn format_when_multi_day_timed() {
+        // Sat 09:00 → Mon 17:00 must show both endpoints.
+        let now = Local::now();
+        let start = Local
+            .with_ymd_and_hms(now.year(), now.month(), now.day(), 9, 0, 0)
+            .single()
+            .unwrap()
+            + Duration::days(2);
+        let end = start + Duration::days(2) + Duration::hours(8);
+        let s = format_when(&ev_at(start, end, false));
+        assert!(s.contains("09:00"), "got {s}");
+        assert!(s.contains("17:00"), "got {s}");
+        assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+    }
+
+    #[test]
+    fn format_when_multi_day_all_day() {
+        let now = Local::now();
+        let start = Local
+            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
+            .single()
+            .unwrap()
+            + Duration::days(1);
+        // 3-day span: DTEND is exclusive ⇒ start + 3 days.
+        let end = start + Duration::days(3);
+        let s = format_when(&ev_at(start, end, true));
+        assert!(s.starts_with("All day, "), "got {s}");
+        assert!(s.contains('\u{2192}'), "expected arrow in {s}");
+    }
 }

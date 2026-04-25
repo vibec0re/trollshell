@@ -149,7 +149,13 @@ pub fn paste_entry(id: u64) {
 
 /// Delete a history entry by id. Re-runs `cliphist list` to obtain the
 /// exact line cliphist will recognize, then pipes that line into
-/// `cliphist delete`. Refreshes [`history()`] afterwards.
+/// `cliphist delete`. Triggers a [`refresh()`] so the [`history()`]
+/// signal updates.
+///
+/// The refresh is best-effort: it runs concurrently with the delete
+/// subprocess, so the first emit may still contain the doomed entry.
+/// The next refresh trigger reconciles it. Acceptable because deletion
+/// is rare and the drawer page also refreshes on next open.
 ///
 /// Fire-and-forget; failures are logged at warn.
 pub fn delete(id: u64) {

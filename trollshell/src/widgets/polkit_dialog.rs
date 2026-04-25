@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::polkit::{self, AuthPrompt};
+use hytte::services::polkit::{self, AuthPrompt, Zeroizing};
 use hytte::ui::{layer_window, Layer};
 
 // ── Thread-local window storage ───────────────────────────────────────────────
@@ -180,7 +180,7 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
         let entry = entry.clone();
         let selected_uid = selected_uid.clone();
         move || {
-            let text = entry.text().to_string();
+            let text = Zeroizing::new(entry.text().to_string());
             polkit::respond_to_auth(Some((text, selected_uid.get())));
             // Drop cleartext from the GtkEntry buffer immediately; the
             // dialog stays up until the helper round-trip resolves.

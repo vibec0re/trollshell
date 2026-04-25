@@ -21,9 +21,9 @@
 //! // Subscribe in widgets:
 //! polkit::auth_prompts() -> impl Signal<Item = Option<AuthPrompt>>
 //!
-//! // Resolve from the UI:
-//! polkit::respond_to_auth(Some(password)); // Confirm
-//! polkit::respond_to_auth(None);           // Cancel
+//! // Resolve from the UI (password is wrapped in `Zeroizing<String>`):
+//! polkit::respond_to_auth(Some((Zeroizing::new(pw), uid))); // Confirm
+//! polkit::respond_to_auth(None);                            // Cancel
 //! ```
 
 use anyhow::{Context, Result};
@@ -31,14 +31,16 @@ use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::{OwnedValue, Value};
 use zbus::Connection;
+pub use zeroize::Zeroizing;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -86,8 +88,12 @@ pub struct PolkitHandles {
 #[derive(Debug)]
 pub(crate) enum UserReply {
     /// Submitted password — consumed by `polkit-agent-helper-1` and dropped
-    /// immediately afterwards.
-    Submit { password: String, uid: u32 },
+    /// immediately afterwards.  Wrapped in [`Zeroizing`] so the heap buffer
+    /// is overwritten on drop rather than just released.
+    Submit {
+        password: Zeroizing<String>,
+        uid: u32,
+    },
     /// Cancel / dismiss.
     Cancel,
 }
@@ -160,10 +166,11 @@ pub fn auth_prompts() -> impl Signal<Item = Option<AuthPrompt>> {
 /// Resolve the pending prompt.
 ///
 /// * `Some((password, uid))` — submit `password` for `uid` to
-///   `polkit-agent-helper-1`.
+///   `polkit-agent-helper-1`.  The password is taken by [`Zeroizing`] so
+///   the underlying heap buffer is wiped when the wrapper is dropped.
 /// * `None` — cancel; the agent's `BeginAuthentication` returns an error
 ///   and polkit reports the action as not-authorized.
-pub fn respond_to_auth(response: Option<(String, u32)>) {
+pub fn respond_to_auth(response: Option<(Zeroizing<String>, u32)>) {
     let reply = match response {
         Some((password, uid)) => UserReply::Submit { password, uid },
         None => UserReply::Cancel,
@@ -263,8 +270,43 @@ fn uid_from_identity(kind: &str, details: &HashMap<String, OwnedValue>) -> Optio
 
 // ── polkit-agent-helper-1 invocation ──────────────────────────────────────────
 
-// TODO(polkit-followup): M9 — multi-distro helper-path lookup (Debian/Ubuntu put it under /usr/lib/policykit-1/, Alpine elsewhere).
-const HELPER_PATH: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
+/// Canonical install locations for `polkit-agent-helper-1` across distros,
+/// probed in priority order.  The first existing path wins; if none of them
+/// exist we fall back to entry 0 so the spawn fails predictably with
+/// `ENOENT` and the Authority sees a `Failed` reply.
+const HELPER_CANDIDATES: &[&str] = &[
+    // Arch, Alpine, most musl distros.
+    "/usr/lib/polkit-1/polkit-agent-helper-1",
+    // Fedora / RHEL / openSUSE.
+    "/usr/libexec/polkit-1/polkit-agent-helper-1",
+    // Debian / Ubuntu (legacy `policykit-1` directory name).
+    "/usr/lib/policykit-1/polkit-agent-helper-1",
+    // Source / custom builds.
+    "/usr/local/lib/polkit-1/polkit-agent-helper-1",
+];
+
+/// Resolve `polkit-agent-helper-1` once per process.
+///
+/// Returns the first [`HELPER_CANDIDATES`] entry that exists on disk.  If
+/// none do, logs a single error and returns the Arch path so the spawn
+/// surfaces an actionable `ENOENT` instead of crashing the agent.
+fn find_helper() -> &'static Path {
+    static CACHED: OnceLock<&'static Path> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        for candidate in HELPER_CANDIDATES {
+            if Path::new(candidate).exists() {
+                return Path::new(candidate);
+            }
+        }
+        tracing::error!(
+            candidates = ?HELPER_CANDIDATES,
+            "polkit-agent-helper-1 not found in any canonical location; \
+             falling back to {} — auth will fail until the helper is installed",
+            HELPER_CANDIDATES[0]
+        );
+        Path::new(HELPER_CANDIDATES[0])
+    })
+}
 
 /// Run the polkit setuid helper to verify the password.
 ///
@@ -276,18 +318,23 @@ const HELPER_PATH: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
 ///   * helper writes `PAM_TEXT_INFO <msg>` / `PAM_ERROR_MSG <msg>` — informational, ignore.
 ///   * helper writes `SUCCESS` and exits 0 on success, `FAILURE` on failure.
 ///
-/// The password is moved into this fn and dropped as soon as it has been
+/// The password is moved into this fn (wrapped in [`Zeroizing`] so its
+/// heap buffer is wiped on drop) and dropped as soon as it has been
 /// written into the helper's stdin pipe.
-// TODO(polkit-followup): I5 — wrap `password` in a `zeroize::Zeroizing<String>` so the heap buffer is wiped on drop.
-async fn run_helper(username: &str, cookie: &str, password: String) -> Result<bool> {
-    let mut child = tokio::process::Command::new(HELPER_PATH)
+async fn run_helper(
+    username: &str,
+    cookie: &str,
+    password: Zeroizing<String>,
+) -> Result<bool> {
+    let helper = find_helper();
+    let mut child = tokio::process::Command::new(helper)
         .arg(username)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn {HELPER_PATH}"))?;
+        .with_context(|| format!("spawn {}", helper.display()))?;
 
     let mut stdin = child.stdin.take().context("helper stdin")?;
     let stdout = child.stdout.take().context("helper stdout")?;
@@ -299,9 +346,10 @@ async fn run_helper(username: &str, cookie: &str, password: String) -> Result<bo
         .await
         .context("write cookie to helper")?;
 
-    // PAM conversation. Wrap the password in an Option<String> so we can
-    // explicitly drop it the moment it's written.
-    let mut password_slot: Option<String> = Some(password);
+    // PAM conversation. Wrap the password in an Option so we can take it
+    // out and drop it the moment it's written; dropping the Zeroizing
+    // wrapper overwrites the heap buffer.
+    let mut password_slot: Option<Zeroizing<String>> = Some(password);
     let mut authenticated = false;
 
     while let Some(line) = reader.next_line().await.context("read helper stdout")? {
@@ -319,10 +367,8 @@ async fn run_helper(username: &str, cookie: &str, password: String) -> Result<bo
                     .write_all(b"\n")
                     .await
                     .context("write password newline")?;
-                // Drop the secret immediately. tokio doesn't expose explicit
-                // zeroisation; assignment to a fresh empty String releases
-                // the heap allocation. (For a hardened build, swap to the
-                // `zeroize` crate.)
+                // Drop the secret immediately; Zeroizing's Drop wipes the
+                // backing allocation before releasing it.
                 drop(pw);
             }
             "PAM_PROMPT_ECHO_ON" => {

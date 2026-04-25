@@ -792,6 +792,7 @@ dependencies = [
  "tracing",
  "ureq",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

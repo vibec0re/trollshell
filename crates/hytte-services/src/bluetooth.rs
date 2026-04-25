@@ -35,6 +35,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OnceCell;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
@@ -507,12 +508,26 @@ pub fn remove_device(device_path: &str) {
     });
 }
 
+/// Shared command-channel connection. `BlueZ` owns sessions (e.g. for
+/// `StartDiscovery`) per bus client; using a fresh connection per call
+/// breaks Start/Stop pairing because `BlueZ` sees them as different
+/// clients. Lazily initialized on first command call.
+static CMD_CONN: OnceCell<Connection> = OnceCell::const_new();
+
+async fn cmd_conn() -> Result<&'static Connection> {
+    CMD_CONN
+        .get_or_try_init(|| async {
+            Connection::system()
+                .await
+                .context("open shared bluetooth command connection")
+        })
+        .await
+}
+
 // ── Command helpers ───────────────────────────────────────────────────────────
 
 async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for adapter property set")?;
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("org.bluez"),
         adapter_path,
@@ -530,9 +545,7 @@ async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result
 }
 
 async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for device property set")?;
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("org.bluez"),
         device_path,
@@ -550,9 +563,7 @@ async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<(
 }
 
 async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for adapter call")?;
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("org.bluez"),
         adapter_path,
@@ -566,9 +577,7 @@ async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<()> {
 }
 
 async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for device call")?;
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("org.bluez"),
         device_path,
@@ -582,9 +591,7 @@ async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
 }
 
 async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for RemoveDevice")?;
+    let conn = cmd_conn().await?;
     let dev_op = zbus::zvariant::ObjectPath::try_from(device_path)
         .map_err(|e| anyhow::anyhow!("invalid device object path: {e}"))?;
     conn.call_method(
@@ -1201,6 +1208,8 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
 }
 
 async fn run_agent() -> Result<()> {
+    // Distinct connection from CMD_CONN: the agent path is owned by this
+    // connection, and BlueZ delivers Agent1 callbacks to the same one.
     let conn = Connection::system()
         .await
         .context("open system bus for pairing agent")?;

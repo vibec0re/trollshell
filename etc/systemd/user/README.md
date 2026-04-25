@@ -179,9 +179,9 @@ journalctl --user -f -u niri-session.target \
 - **swayidle starts but the lock never fires.** gtklock (or your chosen
   locker) isn't installed. See `../../swayidle/README.md`.
 - **`niri-session.target` is `inactive`.** niri's spawn-at-startup didn't
-  fire, or `import-environment` failed. Log out of niri, run `niri-session
-  -- niri --session` from a TTY (or however you launch niri), and check
-  the journal for the spawn-at-startup line.
+  fire, or `import-environment` failed. Log into niri however you normally
+  do (greetd, TTY exec, etc.), then watch `journalctl --user -f` for the
+  target startup and the spawn-at-startup line.
 - **A unit refuses to start with `Failed condition`.** That's the
   `Requisite=` check — `niri-session.target` (or `graphical-session.target`)
   isn't active. Make sure you're inside a niri session; these units

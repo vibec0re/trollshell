@@ -2,8 +2,8 @@
 Description=trollshell — bar, drawer, services
 Documentation=file://%h/.config/systemd/user/README.md
 PartOf=niri-session.target
-Requisite=niri-session.target
-After=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple

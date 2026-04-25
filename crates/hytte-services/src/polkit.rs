@@ -227,12 +227,25 @@ async fn await_reply(prompt: AuthPrompt) -> UserReply {
 }
 
 /// Resolve a uid to a printable username via NSS.  Falls back to
-/// `"uid <n>"` so we never feed the helper or display an empty string.
+/// `"uid <n>"` so we never feed the UI an empty string.  This fallback is
+/// **only** safe for display: see [`username_for_uid`] for the helper path.
 fn pretty_name_for_uid(uid: u32) -> String {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
         .flatten()
         .map_or_else(|| format!("uid {uid}"), |u| u.name)
+}
+
+/// Strict variant: returns the actual passwd entry's `pw_name`, or `Err`
+/// when NSS can't resolve one.  Used for `polkit-agent-helper-1`'s
+/// argv[1], which calls `getpwnam()` and silently aborts if it returns
+/// NULL — feeding `"uid 1000"` there would deadlock the auth round-trip
+/// before PAM ever sees the cookie.
+fn username_for_uid(uid: u32) -> Result<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .context("nss lookup")?
+        .map(|u| u.name)
+        .with_context(|| format!("no passwd entry for uid {uid}"))
 }
 
 /// Extract the unix-user uid from a polkit identity tuple.  Polkit
@@ -250,6 +263,7 @@ fn uid_from_identity(kind: &str, details: &HashMap<String, OwnedValue>) -> Optio
 
 // ── polkit-agent-helper-1 invocation ──────────────────────────────────────────
 
+// TODO(polkit-followup): M9 — multi-distro helper-path lookup (Debian/Ubuntu put it under /usr/lib/policykit-1/, Alpine elsewhere).
 const HELPER_PATH: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
 
 /// Run the polkit setuid helper to verify the password.
@@ -264,6 +278,7 @@ const HELPER_PATH: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
 ///
 /// The password is moved into this fn and dropped as soon as it has been
 /// written into the helper's stdin pipe.
+// TODO(polkit-followup): I5 — wrap `password` in a `zeroize::Zeroizing<String>` so the heap buffer is wiped on drop.
 async fn run_helper(username: &str, cookie: &str, password: String) -> Result<bool> {
     let mut child = tokio::process::Command::new(HELPER_PATH)
         .arg(username)
@@ -294,6 +309,7 @@ async fn run_helper(username: &str, cookie: &str, password: String) -> Result<bo
         let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
         match tag {
             "PAM_PROMPT_ECHO_OFF" => {
+                // TODO(polkit-followup): I4 — handle a second PAM_PROMPT_ECHO_OFF (rare; e.g. confirm-new-password flows).
                 let pw = password_slot.take().unwrap_or_default();
                 stdin
                     .write_all(pw.as_bytes())
@@ -427,7 +443,10 @@ impl AuthAgent {
             return Err(AgentError::Cancelled("user cancelled".into()));
         };
 
-        let username = pretty_name_for_uid(uid);
+        // Helper's argv[1] must be a real passwd-resolvable username, not
+        // the UI's "uid N" fallback — see [`username_for_uid`] docs.
+        let username = username_for_uid(uid)
+            .map_err(|_| AgentError::Failed("user not found in passwd".into()))?;
 
         // ── Verify with helper ─────────────────────────────────────────────────
 
@@ -436,7 +455,9 @@ impl AuthAgent {
             .map_err(|e| AgentError::Failed(format!("helper: {e}")))?;
 
         if !ok {
-            return Err(AgentError::NotAuthorized("authentication failed".into()));
+            // Failed (not NotAuthorized) so polkitd lets the user retry —
+            // matches gnome-shell / polkit-kde-agent behaviour.
+            return Err(AgentError::Failed("authentication failed".into()));
         }
 
         // ── Report success back to the Authority ───────────────────────────────
@@ -461,7 +482,6 @@ impl AuthAgent {
             .await
             .map_err(|e| AgentError::Failed(format!("AuthenticationAgentResponse2: {e}")))?;
 
-        let _ = action_id; // reserved for future logging/metrics
         Ok(())
     }
 

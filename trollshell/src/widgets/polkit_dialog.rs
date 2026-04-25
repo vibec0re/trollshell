@@ -162,9 +162,12 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
     // ── ESC → cancel ──────────────────────────────────────────────────────────
 
     let key_ctrl = gtk::EventControllerKey::new();
+    let entry_for_esc = entry.clone();
     key_ctrl.connect_key_pressed(move |_, key, _, _| {
         if key == gdk::Key::Escape {
             polkit::respond_to_auth(None);
+            // Drop cleartext from the GtkEntry buffer before the dialog hides.
+            entry_for_esc.set_text("");
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -179,6 +182,9 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
         move || {
             let text = entry.text().to_string();
             polkit::respond_to_auth(Some((text, selected_uid.get())));
+            // Drop cleartext from the GtkEntry buffer immediately; the
+            // dialog stays up until the helper round-trip resolves.
+            entry.set_text("");
         }
     };
 
@@ -189,7 +195,11 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
 
     // ── Cancel ────────────────────────────────────────────────────────────────
 
-    cancel_btn.connect_clicked(|_| polkit::respond_to_auth(None));
+    let entry_for_cancel = entry.clone();
+    cancel_btn.connect_clicked(move |_| {
+        polkit::respond_to_auth(None);
+        entry_for_cancel.set_text("");
+    });
 
     // ── Show ──────────────────────────────────────────────────────────────────
 

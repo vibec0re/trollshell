@@ -8,6 +8,7 @@ pub mod networkd;
 pub mod niri;
 pub mod notifications;
 pub mod pipewire;
+pub mod polkit;
 pub mod resolved;
 pub mod sensors;
 pub mod tray;

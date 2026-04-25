@@ -8,8 +8,8 @@ use hytte::gtk;
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
-    bluetooth, brightness, clock, mpris, networkd, niri, notifications, pipewire, resolved,
-    sensors, tray, upower, wifi,
+    bluetooth, brightness, clock, mpris, networkd, niri, notifications, pipewire, polkit,
+    resolved, sensors, tray, upower, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -29,6 +29,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(brightness::service())
         .with(sensors::service())
         .with(wifi::service())
+        .with(polkit::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
         .run(|app| {
             // Spawn a task on the GTK main loop that owns the live set of
@@ -52,8 +53,10 @@ fn main() -> hytte::ui::Result<()> {
             // drawer page only (open on demand via the bell indicator).
 
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
+            // Polkit auth dialog — reacts to polkit::auth_prompts() signal.
             if let Some(primary) = app.monitors().first() {
                 widgets::prompt::install(primary);
+                widgets::polkit_dialog::install(primary);
             }
         })
 }

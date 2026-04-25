@@ -57,6 +57,7 @@ use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{registry, runtime, Service};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -156,7 +157,10 @@ pub fn service() -> BluetoothAudioService {
 pub fn auto_switch_enabled() -> impl Signal<Item = bool> {
     registry::with(|r| {
         r.get::<BluetoothAudioHandles>()
-            .expect("bluetooth_audio::service() not registered")
+            .expect(
+                "bluetooth_audio::init() must be called after \
+                 bluetooth::service() and pipewire::service()",
+            )
             .enabled
             .signal_cloned()
     })
@@ -211,11 +215,35 @@ fn sink_belongs_to_device(sink_name: &str, device: &Device) -> bool {
     // Belt-and-suspenders: substring + the conventional "bluez_output" prefix
     // is the realistic shape; we also allow bluez_input / bluez_sink variants
     // by leaving the prefix unchecked.
+    // TODO(bt-audio-followup): consider case-insensitive MAC match if BlueZ
+    // ever emits lowercase MACs. Today everything we've seen is upper-case.
     sink_name.contains(&token)
+}
+
+/// Structural classifier for pipewire bluez sinks: matches by canonical name
+/// prefix (`bluez_output.` / `bluez_source.`) regardless of whether a matching
+/// connected device is present.
+///
+/// This exists so steady-state bookkeeping in `react()` doesn't depend on the
+/// `BlueZ` device list and the pipewire sink list being in lock-step. During
+/// a disconnect, `BlueZ` emits `Connected=false` immediately, but pipewire
+/// takes a beat to drop the bluez sink. Without a structural check, the
+/// still-default bluez sink would be misclassified as non-BT and pollute
+/// `last_non_bt_default`.
+fn is_bluez_sink_name(name: &str) -> bool {
+    name.starts_with("bluez_output.") || name.starts_with("bluez_source.")
 }
 
 /// True when this sink is owned by *some* connected BT audio device in the
 /// current device list.
+///
+/// Currently unused at call sites — `react()`'s bookkeeping arm switched to
+/// the structural `is_bluez_sink_name` check (see C1/C2 race fix) and the
+/// edge-detection arms drive off `find_bt_target` instead. Kept around as
+/// the device-list-aware classifier in case future reactor logic needs to
+/// answer "is this specific sink owned by a connected BT audio device?"
+/// without reaching for `find_bt_target`.
+#[allow(dead_code)]
 fn sink_is_bt(sink_name: &str, devices: &[Device]) -> bool {
     devices
         .iter()
@@ -249,11 +277,27 @@ struct ReactorState {
     last_observed_bt_default: Option<String>,
 }
 
+/// One-shot guard so a future "reload services" feature or a confused test
+/// harness doesn't end up with two reactor tasks racing each other on the
+/// same `set_default_sink` calls.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Spawn the reactor on the GTK main loop. Call once from `main.rs` after
-/// the App services are registered. Idempotent in spirit — calling twice
-/// would just spawn two reactors that each issue the same switch commands,
-/// so don't.
+/// the App services are registered. Subsequent calls are no-ops (guarded by
+/// `INITIALIZED` — see comment above).
+///
+/// # Panics
+///
+/// `bluetooth_audio::init()` must be called after `bluetooth::service()` and
+/// `pipewire::service()` have been registered with `App::with`; otherwise
+/// `auto_switch_enabled()` and the upstream signal lookups will panic with a
+/// registration-order diagnostic.
 pub fn init() {
+    if INITIALIZED.swap(true, Ordering::Relaxed) {
+        tracing::debug!("bluetooth_audio::init called twice — ignoring");
+        return;
+    }
+
     let state = Arc::new(Mutex::new(ReactorState::default()));
 
     let combined = map_ref! {
@@ -277,9 +321,15 @@ fn react(state: &Mutex<ReactorState>, devices: &[Device], sinks: &[Sink], enable
 
     // Always track the current default's identity so we can restore on
     // disconnect even if auto-switch was toggled off and on again.
+    //
+    // We classify by sink-name prefix here (NOT by joining against the live
+    // device list) so a transient race between BlueZ's `Connected=false` event
+    // and pipewire's removal of the bluez sink can't make us misclassify the
+    // still-default bluez sink as non-BT and overwrite `last_non_bt_default`
+    // with its name.
     let current_default = sinks.iter().find(|s| s.is_default);
     if let Some(cur) = current_default {
-        if sink_is_bt(&cur.name, devices) {
+        if is_bluez_sink_name(&cur.name) {
             st.last_observed_bt_default = Some(cur.name.clone());
         } else {
             // Non-BT default: this is what we'd want to restore to.
@@ -335,7 +385,17 @@ fn react(state: &Mutex<ReactorState>, devices: &[Device], sinks: &[Sink], enable
                 // (e.g. user manually switched away from BT before it
                 // disconnected, so there's nothing to restore).
                 let already_current = cur_opt.is_some_and(|c| c.name == target);
-                if already_current {
+                // Belt-and-suspenders: even if `last_non_bt_default` somehow
+                // ended up containing a bluez_-prefixed name, never call
+                // set_default_sink on it. The structural check upstream
+                // should already prevent this, but the cost of the extra
+                // guard here is one strncmp.
+                if is_bluez_sink_name(&target) {
+                    tracing::warn!(
+                        target = %target,
+                        "bluetooth-audio: skip restore — saved target is itself a bluez sink"
+                    );
+                } else if already_current {
                     tracing::debug!(
                         target = %target,
                         "bluetooth-audio: skip restore — already current default"
@@ -495,6 +555,63 @@ mod tests {
         // last_observed_bt_default should be cleared by the take().
         assert!(state.last_observed_bt_default.is_none());
     }
+
+    #[test]
+    fn is_bluez_sink_name_recognizes_canonical_prefixes() {
+        assert!(is_bluez_sink_name("bluez_output.AC_C5_8B_11_22_33.1"));
+        assert!(is_bluez_sink_name("bluez_source.AC_C5_8B_11_22_33.a2dp"));
+        // Plain `bluez_*` without a dot doesn't count — the canonical
+        // pipewire shape always has the trailing dot.
+        assert!(!is_bluez_sink_name("bluez_output_no_dot"));
+        assert!(!is_bluez_sink_name("alsa_output.pci-0000_00_1f.3"));
+        assert!(!is_bluez_sink_name(""));
+    }
+
+    #[test]
+    fn react_handles_bt_disconnect_race_without_pollution() {
+        // Reproduces the C1/C2 race: BlueZ reports the device as no longer
+        // connected, but pipewire still has the bluez_output sink as
+        // is_default=true. The bookkeeping must NOT misclassify that sink as
+        // non-BT and clobber `last_non_bt_default` with its name.
+
+        // Initial: BT connected, BT sink is default. The reactor records
+        // `last_observed_bt_default` and we keep `last_non_bt_default` as the
+        // alsa builtin (e.g. captured during a previous emission).
+        let st = Mutex::new(ReactorState {
+            last_non_bt_default: Some("alsa_output.builtin".to_string()),
+            last_observed_bt_default: None,
+        });
+        let bt_dev = dev("AC:C5:8B:FF:FF:FF", "audio-headphones", true);
+        let bt_sink = sink("bluez_output.AC_C5_8B_FF_FF_FF.1", true);
+        let alsa = sink("alsa_output.builtin", false);
+        react(&st, &[bt_dev], &[alsa.clone(), bt_sink.clone()], true);
+        assert_eq!(
+            st.lock().unwrap().last_observed_bt_default.as_deref(),
+            Some("bluez_output.AC_C5_8B_FF_FF_FF.1")
+        );
+
+        // Race window: BlueZ emits Connected=false (devices empty) but
+        // pipewire hasn't dropped the bluez_output sink yet — it's still
+        // marked is_default=true.
+        let bt_sink_still_default = sink("bluez_output.AC_C5_8B_FF_FF_FF.1", true);
+        react(&st, &[], &[alsa, bt_sink_still_default], true);
+
+        // Critical: name-pattern classifier identifies the lingering bluez
+        // sink as BT-shaped, so `last_non_bt_default` stays as
+        // "alsa_output.builtin" rather than being polluted with the bluez
+        // sink name.
+        let state = st.lock().unwrap();
+        assert_eq!(
+            state.last_non_bt_default.as_deref(),
+            Some("alsa_output.builtin"),
+            "race: bookkeeping mis-classified the lingering bluez sink as non-BT"
+        );
+    }
+
+    // TODO(bt-audio-followup): add a test for the actual restore path where
+    // the current default differs from `last_non_bt_default` (i.e. exercise
+    // the `pipewire::set_default_sink(&target)` branch end-to-end). Needs a
+    // pipewire test seam first.
 
     #[test]
     fn react_no_action_when_disabled() {

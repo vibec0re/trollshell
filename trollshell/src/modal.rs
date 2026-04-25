@@ -152,6 +152,12 @@ pub fn install(monitor: &Monitor) {
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     stack.set_transition_duration(140);
     stack.set_interpolate_size(true);
+    // Disable homogeneous sizing (default true on both axes in GTK4) so the
+    // stack reports the *visible* child's natural size, not the max across
+    // all children. Without this, sparse pages (Calendar, PowerMenu) render
+    // at the size of the largest mounted page (Stats / Audio).
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
 
     stack.add_named(&pages::page_media(), Some(Page::Media.stack_name()));
     stack.add_named(&pages::page_network(), Some(Page::Network.stack_name()));

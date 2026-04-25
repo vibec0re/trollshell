@@ -22,10 +22,10 @@
 //!
 //! # Scope (v1)
 //!
-//! No delete API. cliphist's `cliphist delete` reads `<id>\t<preview>`
-//! lines from stdin (it doesn't take an id argument), which means a clean
-//! "delete by id" call would have to feed back the exact line we got from
-//! `cliphist list`. Skipped until there's UI demand. TODO.
+//! Delete by id is supported via [`delete`]. Implementation runs
+//! `cliphist list` to get the exact line cliphist recognises, then
+//! pipes that line into `cliphist delete`. Two subprocess calls per
+//! delete; acceptable since deletion is user-initiated.
 //!
 //! No clip pinning, no search/filter UI, no multi-select, no rich-format
 //! paste. The page is a plain history list with click-to-paste.
@@ -145,6 +145,20 @@ pub fn paste_entry(id: u64) {
             tracing::warn!(id, error = %e, "clipboard: paste_entry failed");
         }
     });
+}
+
+/// Delete a history entry by id. Re-runs `cliphist list` to obtain the
+/// exact line cliphist will recognize, then pipes that line into
+/// `cliphist delete`. Refreshes [`history()`] afterwards.
+///
+/// Fire-and-forget; failures are logged at warn.
+pub fn delete(id: u64) {
+    runtime::handle().spawn_blocking(move || {
+        if let Err(e) = run_delete_by_id(id) {
+            tracing::warn!(id, error = %e, "clipboard: delete failed");
+        }
+    });
+    refresh();
 }
 
 // ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -280,6 +294,68 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Find the `<id>\t<preview>` line in `cliphist list` output whose
+/// integer prefix equals `id`. Returns the line trimmed of the trailing
+/// newline (suitable for piping into `cliphist delete` with an explicit
+/// `\n` appended).
+fn select_delete_line(list_output: &str, id: u64) -> Option<String> {
+    for line in list_output.lines() {
+        let Some((id_part, _)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(parsed) = id_part.trim().parse::<u64>() else {
+            continue;
+        };
+        if parsed == id {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let list = std::process::Command::new("cliphist")
+        .arg("list")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn cliphist list (for delete): {e}"))?;
+    if !list.status.success() {
+        return Err(anyhow::anyhow!("cliphist list (for delete) exited {:?}", list.status));
+    }
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    let Some(line) = select_delete_line(&stdout, id) else {
+        // Entry already gone (concurrent delete, or id stale). Treat as
+        // success so the caller's refresh still runs.
+        return Ok(());
+    };
+
+    let mut delete = std::process::Command::new("cliphist")
+        .arg("delete")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn cliphist delete: {e}"))?;
+    {
+        let mut stdin = delete.stdin.take()
+            .ok_or_else(|| anyhow::anyhow!("cliphist delete: no stdin pipe"))?;
+        stdin.write_all(line.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write cliphist delete stdin: {e}"))?;
+        stdin.write_all(b"\n")
+            .map_err(|e| anyhow::anyhow!("write cliphist delete newline: {e}"))?;
+    }
+    let status = delete.wait()
+        .map_err(|e| anyhow::anyhow!("wait cliphist delete: {e}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("cliphist delete exited {status:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +435,23 @@ mod tests {
         let t = truncate(&long, 10);
         assert!(t.chars().count() == 11);
         assert!(t.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn select_delete_line_finds_matching_id() {
+        let raw = "1\thello\n42\ttarget\n3\tnope\n";
+        assert_eq!(select_delete_line(raw, 42), Some("42\ttarget".to_string()));
+    }
+
+    #[test]
+    fn select_delete_line_returns_none_when_id_missing() {
+        let raw = "1\thello\n3\tnope\n";
+        assert_eq!(select_delete_line(raw, 42), None);
+    }
+
+    #[test]
+    fn select_delete_line_skips_garbage_rows() {
+        let raw = "garbage-line\n42\ttarget\n";
+        assert_eq!(select_delete_line(raw, 42), Some("42\ttarget".to_string()));
     }
 }

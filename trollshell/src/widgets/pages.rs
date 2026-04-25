@@ -2618,8 +2618,6 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
         .title(&entry.preview)
         .activatable(true)
         .build();
-    // Single-line title; long previews ellipsize so the row stays compact
-    // and the drawer's natural width doesn't blow out.
     row.set_title_lines(1);
 
     let icon_name = match entry.kind {
@@ -2629,9 +2627,35 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     let icon = gtk::Image::from_icon_name(icon_name);
     row.add_prefix(&icon);
 
-    // No subtitle: text rows have none, and the image row's title is
-    // already the informative `Image (12.3 KiB png)` cliphist preview —
-    // a "Image" subtitle would be redundant.
+    // ⋮ menu button: destructive "Delete entry" lives here, not on the row's
+    // primary click target — destructive actions belong in a popover so they
+    // can't be misclicked while reaching for paste.
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("view-more-symbolic");
+    menu_btn.set_valign(gtk::Align::Center);
+    menu_btn.add_css_class("flat");
+    menu_btn.set_tooltip_text(Some("More actions"));
+
+    let popover = gtk::Popover::new();
+    let popover_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    popover_box.set_margin_top(4);
+    popover_box.set_margin_bottom(4);
+    popover_box.set_margin_start(4);
+    popover_box.set_margin_end(4);
+
+    let delete_btn = gtk::Button::with_label("Delete entry");
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
+    let id_for_delete = entry.id;
+    let popover_for_delete = popover.clone();
+    delete_btn.connect_clicked(move |_| {
+        clipboard::delete(id_for_delete);
+        popover_for_delete.popdown();
+    });
+    popover_box.append(&delete_btn);
+    popover.set_child(Some(&popover_box));
+    menu_btn.set_popover(Some(&popover));
+    row.add_suffix(&menu_btn);
 
     let id = entry.id;
     row.connect_activated(move |_| {

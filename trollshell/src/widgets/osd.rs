@@ -36,7 +36,7 @@ use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::brightness::{self, Brightness};
 use hytte::services::pipewire::{self, Source, Volume};
-use hytte::ui::{layer_window, Anchor, Margin};
+use hytte::ui::layer_window;
 
 /// How long the OSD stays visible after the latest event, in ms. Each
 /// new event resets the timer.
@@ -91,7 +91,7 @@ pub fn install(monitor: &Monitor) {
             top: TOP_MARGIN,
             ..Margin::default()
         })
-        .namespace("trollshell-osd")
+        .namespace("hytte-osd")
         .exclusive(false)
         .keyboard_mode(KeyboardMode::None)
         .build();
@@ -180,7 +180,9 @@ pub fn install(monitor: &Monitor) {
     {
         let view = view.clone();
         let first = Cell::new(true);
-        glib::MainContext::default().spawn_local(brightness::current().for_each(
+        // TODO(brightness-followup): brightness::poll_loop should use set_neq to avoid 1Hz re-emit storms; mirror pipewire's gated emit pattern.
+        let signal = brightness::current().dedupe_cloned();
+        glib::MainContext::default().spawn_local(signal.for_each(
             move |b: Option<Brightness>| {
                 if first.replace(false) {
                     return std::future::ready(());
@@ -219,7 +221,10 @@ fn render_volume(v: Volume) -> State {
     } else {
         "audio-volume-high-symbolic"
     };
-    let pct = pct(v.linear);
+    // Boosted volume can exceed 100%; show the true value in the label
+    // while still clamping the progress bar to [0.0, 1.0].
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (v.linear * 100.0).round() as u32;
     let text = if v.muted {
         "Volume muted".to_string()
     } else {

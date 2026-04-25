@@ -13,7 +13,7 @@ use std::time::Duration;
 use zbus::Connection;
 
 /// Active backlight state.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Brightness {
     /// Current backlight level, `0.0..=1.0`.
     pub level: f64,

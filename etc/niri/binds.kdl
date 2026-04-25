@@ -1,0 +1,35 @@
+// niri media-key bindings for trollshell — see ./README.md
+//
+// Drop this `binds { … }` block into ~/.config/niri/config.kdl, or merge the
+// individual binding lines into your existing `binds { }` block. niri has no
+// `include` directive, so a copy is required either way.
+//
+// External tools: wpctl (wireplumber), brightnessctl, playerctl. The
+// trollshell pipewire and brightness services pick up the resulting state
+// changes via their own listeners (pactl subscribe / inotify on sysfs), so
+// the OSD reacts automatically — no D-Bus call back into trollshell needed.
+
+binds {
+    // Volume — repeat while held so the user can ramp; -l 1.5 caps the boost
+    // at 150 % to keep the speaker driver out of distortion / damage range.
+    // Not allow-when-locked: surprise volume jumps through a locked screen
+    // are unfriendly.
+    XF86AudioRaiseVolume repeat=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%+" "-l" "1.5"; }
+    XF86AudioLowerVolume repeat=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
+
+    // Mute — single-fire, allowed from the lock screen so you can silence a
+    // surprise notification sound without unlocking.
+    XF86AudioMute     allow-when-locked=true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SINK@"   "toggle"; }
+    XF86AudioMicMute  allow-when-locked=true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SOURCE@" "toggle"; }
+
+    // Brightness — repeat while held. Not allow-when-locked: same reasoning
+    // as volume, plus a fully bright lock screen is a privacy footgun.
+    XF86MonBrightnessUp   repeat=true { spawn "brightnessctl" "set" "5%+"; }
+    XF86MonBrightnessDown repeat=true { spawn "brightnessctl" "set" "5%-"; }
+
+    // Media transport — single-fire, controllable from the lock screen so
+    // music can be paused / skipped without unlocking.
+    XF86AudioPlay  allow-when-locked=true { spawn "playerctl" "play-pause"; }
+    XF86AudioNext  allow-when-locked=true { spawn "playerctl" "next"; }
+    XF86AudioPrev  allow-when-locked=true { spawn "playerctl" "previous"; }
+}

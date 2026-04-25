@@ -10,9 +10,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
-use hytte::gtk::{self, gdk, glib, prelude::*};
+use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::map_ref;
+use hytte::gtk::{self, gdk, glib};
 use hytte::prelude::*;
-use hytte::services::bluetooth::{self, Device};
+use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::brightness;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
@@ -290,57 +292,86 @@ fn fmt_us(us: u64) -> String {
 pub fn page_network() -> gtk::Widget {
     let grid = page_grid();
 
-    // ── Connection panel (col 0, row 0) ──────────────────────────────────────
     let conn_panel = panel("Connection");
+    conn_panel.append(&build_connection_group());
+    grid.attach(&conn_panel, 0, 0, 1, 1);
 
-    let headline = gtk::Label::new(None);
-    headline.set_xalign(0.0);
-    bind_text(
+    let traffic_panel = panel("Traffic");
+    traffic_panel.append(&build_traffic_group());
+    grid.attach(&traffic_panel, 1, 0, 1, 1);
+
+    let wifi_panel = panel("Wi-Fi");
+    append_wifi_section(&wifi_panel);
+    grid.attach(&wifi_panel, 0, 1, 2, 1);
+
+    grid.upcast()
+}
+
+fn build_connection_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+
+    let primary_row = adw::ActionRow::builder().title("Primary").build();
+    bind(
         networkd::primary().map(|p| match p {
-            Some(link) => format!("{}: {}", link.name, describe_state(link.operational)),
+            Some(link) => link.name,
+            None => "(none)".to_string(),
+        }),
+        &primary_row,
+        |row, name| row.set_title(&name),
+    );
+    bind(
+        networkd::primary().map(|p| match p {
+            Some(link) => describe_state(link.operational).to_string(),
             None => "Disconnected".to_string(),
         }),
-        &headline,
+        &primary_row,
+        |row, text| row.set_subtitle(&text),
     );
-    conn_panel.append(&headline);
+    group.add(&primary_row);
 
-    let links_label = gtk::Label::new(None);
-    links_label.set_xalign(0.0);
-    bind_text(
+    let links_row = adw::ActionRow::builder().title("Links").build();
+    bind(
         networkd::links().map(|ls| {
             let lines: Vec<String> = ls
                 .iter()
                 .map(|l| format!("{} ({})", l.name, describe_state(l.operational)))
                 .collect();
-            lines.join("\n")
-        }),
-        &links_label,
-    );
-    conn_panel.append(&links_label);
-
-    let dns = gtk::Label::new(None);
-    dns.set_xalign(0.0);
-    bind_text(
-        resolved::dns().map(|state| {
-            if state.configured() {
-                format!("DNS: {} server(s)", state.servers.len())
+            if lines.is_empty() {
+                "(none)".to_string()
             } else {
-                "DNS: not configured".to_string()
+                lines.join(", ")
             }
         }),
-        &dns,
+        &links_row,
+        |row, text| row.set_subtitle(&text),
     );
-    conn_panel.append(&dns);
-    grid.attach(&conn_panel, 0, 0, 1, 1);
+    group.add(&links_row);
 
-    // ── Traffic panel (col 1, row 0) ─────────────────────────────────────────
-    let traffic = panel("Traffic");
+    let dns_row = adw::ActionRow::builder().title("DNS").build();
+    bind(
+        resolved::dns().map(|state| {
+            if state.configured() {
+                format!("{} server(s)", state.servers.len())
+            } else {
+                "Not configured".to_string()
+            }
+        }),
+        &dns_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    group.add(&dns_row);
 
-    let rate = gtk::Label::new(None);
-    rate.set_xalign(0.0);
-    bind_text(
+    group
+}
+
+fn build_traffic_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+
+    let rate_row = adw::ActionRow::builder().title("Live").build();
+    bind(
         sensors::network().map(|net| {
-            net.interfaces
+            let parts: Vec<String> = net
+                .interfaces
                 .iter()
                 .filter(|i| i.name != "lo")
                 .map(|i| {
@@ -351,16 +382,20 @@ pub fn page_network() -> gtk::Widget {
                         fmt_rate(i.tx_rate_bps),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect();
+            if parts.is_empty() {
+                "(no active interfaces)".to_string()
+            } else {
+                parts.join("   ")
+            }
         }),
-        &rate,
+        &rate_row,
+        |row, text| row.set_subtitle(&text),
     );
-    traffic.append(&rate);
+    group.add(&rate_row);
 
-    let totals = gtk::Label::new(None);
-    totals.set_xalign(0.0);
-    bind_text(
+    let totals_row = adw::ActionRow::builder().title("Total").build();
+    bind(
         sensors::network().map(|net| {
             let (rx, tx) = net
                 .interfaces
@@ -370,36 +405,31 @@ pub fn page_network() -> gtk::Widget {
                     (rx + i.rx_bytes_total, tx + i.tx_bytes_total)
                 });
             format!(
-                "Total: \u{2193} {} \u{2191} {}",
+                "\u{2193} {} \u{2191} {}",
                 fmt_bytes(rx),
                 fmt_bytes(tx),
             )
         }),
-        &totals,
+        &totals_row,
+        |row, text| row.set_subtitle(&text),
     );
-    traffic.append(&totals);
+    group.add(&totals_row);
 
-    let conns = gtk::Label::new(None);
-    conns.set_xalign(0.0);
-    bind_text(
+    let tcp_row = adw::ActionRow::builder().title("TCP").build();
+    bind(
         sensors::net_connections().map(|c| {
             format!(
-                "TCP: {} established, {} listening",
+                "{} established, {} listening",
                 c.established_total(),
                 c.tcp_listen + c.tcp6_listen,
             )
         }),
-        &conns,
+        &tcp_row,
+        |row, text| row.set_subtitle(&text),
     );
-    traffic.append(&conns);
-    grid.attach(&traffic, 1, 0, 1, 1);
+    group.add(&tcp_row);
 
-    // ── Wi-Fi panel spanning both columns (row 1) ────────────────────────────
-    let wifi_panel = panel("Wi-Fi");
-    append_wifi_section(&wifi_panel);
-    grid.attach(&wifi_panel, 0, 1, 2, 1);
-
-    grid.upcast()
+    group
 }
 
 fn append_wifi_section(column: &gtk::Box) {
@@ -443,57 +473,58 @@ fn append_wifi_section(column: &gtk::Box) {
     scrolled.set_max_content_height(240);
     scrolled.add_css_class("ts-wifi-list");
 
-    let networks_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    scrolled.set_child(Some(&networks_box));
+    let networks_group = adw::PreferencesGroup::new();
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    scrolled.set_child(Some(&networks_group));
     column.append(&scrolled);
 
-    let networks_box_for_signal = networks_box.clone();
-    bind(wifi::networks(), &networks_box, move |_, nets| {
-        while let Some(child) = networks_box_for_signal.first_child() {
-            networks_box_for_signal.remove(&child);
+    let group_for_bind = networks_group.clone();
+    let rows_track_for_bind = rows_track.clone();
+    bind(wifi::networks(), &networks_group, move |_, nets| {
+        // PreferencesGroup has no first_child traversal API for its rows;
+        // track and remove explicitly.
+        for row in rows_track_for_bind.borrow_mut().drain(..) {
+            group_for_bind.remove(&row);
         }
+        let mut new_rows = Vec::with_capacity(nets.len());
         for net in nets {
             let row = build_network_row(&net);
-            networks_box_for_signal.append(&row);
+            group_for_bind.add(&row);
+            new_rows.push(row);
         }
+        *rows_track_for_bind.borrow_mut() = new_rows;
     });
 }
 
-fn build_network_row(net: &wifi::WifiNetwork) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-wifi-row");
-    if net.connected {
-        btn.add_css_class("connected");
-    }
-
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
+    let suffix_text = if net.connected {
+        "Connected"
+    } else if net.known {
+        "Known"
+    } else if net.security == "open" {
+        "Open"
+    } else {
+        &net.security
+    };
+    let row = adw::ActionRow::builder()
+        .title(&net.ssid)
+        .subtitle(suffix_text)
+        .activatable(true)
+        .build();
 
     let icon = gtk::Image::from_icon_name(signal_icon(net.signal_dbm));
-    row.append(&icon);
+    row.add_prefix(&icon);
 
-    let label = gtk::Label::new(Some(&net.ssid));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    row.append(&label);
-
-    let suffix = if net.connected {
-        "connected".to_string()
-    } else if net.known {
-        "known".to_string()
-    } else if net.security == "open" {
-        "open".to_string()
-    } else {
-        net.security.clone()
-    };
-    let suffix_label = gtk::Label::new(Some(&suffix));
-    suffix_label.add_css_class("ts-wifi-suffix");
-    row.append(&suffix_label);
-
-    btn.set_child(Some(&row));
+    if net.security != "open" {
+        let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
+        lock.add_css_class("dim-label");
+        lock.set_tooltip_text(Some(&net.security));
+        row.add_suffix(&lock);
+    }
 
     let path = net.path.clone();
     let connected = net.connected;
-    btn.connect_clicked(move |_| {
+    row.connect_activated(move |_| {
         if connected {
             wifi::disconnect();
         } else {
@@ -501,7 +532,7 @@ fn build_network_row(net: &wifi::WifiNetwork) -> gtk::Widget {
         }
     });
 
-    btn.upcast()
+    row
 }
 
 fn signal_icon(dbm: i16) -> &'static str {
@@ -537,42 +568,123 @@ pub fn page_bluetooth() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
 
-    let headline = gtk::Label::new(None);
-    headline.set_xalign(0.0);
-    headline.add_css_class("ts-popup-headline");
-    bind_text(
-        bluetooth::adapter().map(|a| match a {
-            Some(adapter) => format!(
-                "{} — {}",
-                adapter.name,
-                if adapter.powered { "on" } else { "off" }
-            ),
-            None => "Bluetooth — no adapter".to_string(),
-        }),
-        &headline,
-    );
-    column.append(&headline);
+    column.append(&build_bluetooth_header());
+    column.append(&build_pair_prompt_banner());
+    column.append(&build_bluetooth_controls());
+    column.append(&build_bluetooth_device_groups());
 
-    let power_btn = gtk::ToggleButton::with_label("Power");
+    column.upcast()
+}
+
+/// Top header row: "Bluetooth" title with adapter name as subtitle and a
+/// proper `GtkSwitch` for Power. Wrapped in an `AdwPreferencesGroup` so it gets
+/// the boxed-list look every other row uses.
+fn build_bluetooth_header() -> gtk::Widget {
+    let group = adw::PreferencesGroup::new();
+
+    let row = adw::ActionRow::builder().title("Bluetooth").build();
+    bind(
+        bluetooth::adapter().map(|a| match a {
+            Some(ad) => ad.name,
+            None => "No Bluetooth adapter".to_string(),
+        }),
+        &row,
+        |w, name| w.set_subtitle(&name),
+    );
+
+    let power_switch = gtk::Switch::new();
+    power_switch.set_valign(gtk::Align::Center);
+    bind(
+        bluetooth::adapter().map(|a| a.is_some()),
+        &power_switch,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
     bind(
         bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
-        &power_btn,
-        |w, powered| {
-            w.set_active(powered);
+        &power_switch,
+        |w, on| {
+            if w.is_active() != on {
+                w.set_active(on);
+            }
         },
     );
-    power_btn.connect_toggled(|btn| {
-        bluetooth::set_powered(btn.is_active());
+    power_switch.connect_active_notify(|sw| {
+        bluetooth::set_powered(sw.is_active());
     });
-    column.append(&power_btn);
+
+    row.add_suffix(&power_switch);
+    row.set_activatable_widget(Some(&power_switch));
+    group.add(&row);
+
+    group.upcast()
+}
+
+/// Adapter sub-controls: Discoverable + Scan. Disabled when the adapter is
+/// off or absent, so toggling Power is the obvious entry point.
+fn build_bluetooth_controls() -> gtk::Widget {
+    let group = adw::PreferencesGroup::new();
+    bind(
+        bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
+        &group,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+
+    // Discoverable
+    let disc_row = adw::ActionRow::builder().title("Discoverable").build();
+    bind(
+        bluetooth::adapter().map(|a| match a {
+            Some(ad) if ad.discoverable && !ad.name.is_empty() => {
+                format!("Visible as \u{201c}{}\u{201d}", ad.name)
+            }
+            Some(ad) if ad.discoverable => "Visible to other devices".to_string(),
+            _ => "Hidden from other devices".to_string(),
+        }),
+        &disc_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    let disc_switch = gtk::Switch::new();
+    disc_switch.set_valign(gtk::Align::Center);
+    bind(
+        bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.discoverable)),
+        &disc_switch,
+        |w, on| {
+            if w.is_active() != on {
+                w.set_active(on);
+            }
+        },
+    );
+    disc_switch.connect_active_notify(|sw| {
+        bluetooth::set_discoverable(sw.is_active());
+    });
+    disc_row.add_suffix(&disc_switch);
+    disc_row.set_activatable_widget(Some(&disc_switch));
+    group.add(&disc_row);
+
+    // Scan with inline spinner showing live progress.
+    let scan_row = adw::ActionRow::builder().title("Scan for devices").build();
+
+    let spinner = gtk::Spinner::new();
+    spinner.set_valign(gtk::Align::Center);
+    bind(
+        bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.discovering)),
+        &spinner,
+        |w, on| {
+            w.set_spinning(on);
+            w.set_visible(on);
+        },
+    );
+    scan_row.add_suffix(&spinner);
 
     let scan_btn = gtk::ToggleButton::new();
+    scan_btn.set_valign(gtk::Align::Center);
     bind(
         bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.discovering)),
         &scan_btn,
         |w, discovering| {
-            w.set_active(discovering);
-            w.set_label(if discovering { "Stop scan" } else { "Scan\u{2026}" });
+            if w.is_active() != discovering {
+                w.set_active(discovering);
+            }
+            w.set_label(if discovering { "Stop" } else { "Scan" });
         },
     );
     scan_btn.connect_toggled(|btn| {
@@ -582,77 +694,308 @@ pub fn page_bluetooth() -> gtk::Widget {
             bluetooth::stop_discovery();
         }
     });
-    column.append(&scan_btn);
+    scan_row.add_suffix(&scan_btn);
+    scan_row.set_activatable_widget(Some(&scan_btn));
+    group.add(&scan_row);
 
-    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
-    column.append(&sep);
-
-    let device_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let device_list_for_bind = device_list.clone();
-
-    bind(bluetooth::devices(), &device_list, move |_, devs| {
-        while let Some(child) = device_list_for_bind.first_child() {
-            device_list_for_bind.remove(&child);
-        }
-        for dev in &devs {
-            let row = build_device_row(dev);
-            device_list_for_bind.append(&row);
-        }
-    });
-    column.append(&device_list);
-
-    column.upcast()
+    group.upcast()
 }
 
-fn build_device_row(dev: &Device) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-bluetooth-device");
-    if dev.connected {
-        btn.add_css_class("connected");
-    }
+/// Container holding three boxed-list groups (Connected / Paired /
+/// Available). Each group is rebuilt on every `devices()`/`device_actions()`
+/// emission. Empty groups are omitted entirely so the page doesn't show
+/// dangling section headers.
+fn build_bluetooth_device_groups() -> gtk::Widget {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let outer_for_bind = outer.clone();
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("ts-bluetooth-row");
-
-    let icon_name = if dev.icon.is_empty() {
-        "bluetooth-symbolic"
-    } else {
-        &dev.icon
+    let combined = map_ref! {
+        let devs = bluetooth::devices(),
+        let actions = bluetooth::device_actions() => {
+            (devs.clone(), actions.clone())
+        }
     };
-    let img = gtk::Image::from_icon_name(icon_name);
-    row.append(&img);
 
-    let alias_label = gtk::Label::new(Some(&dev.alias));
-    alias_label.set_hexpand(true);
-    alias_label.set_xalign(0.0);
-    row.append(&alias_label);
-
-    let state_text = if dev.connected {
-        "(connected)"
-    } else if dev.paired {
-        "(paired)"
-    } else {
-        ""
-    };
-    if !state_text.is_empty() {
-        let state_label = gtk::Label::new(Some(state_text));
-        state_label.add_css_class("dim-label");
-        row.append(&state_label);
-    }
-
-    btn.set_child(Some(&row));
-
-    let path = dev.path.clone();
-    let connected = dev.connected;
-    btn.connect_clicked(move |_| {
-        if connected {
-            bluetooth::disconnect_device(&path);
-        } else {
-            bluetooth::connect_device(&path);
+    bind(combined, &outer, move |_, (devs, actions)| {
+        while let Some(child) = outer_for_bind.first_child() {
+            outer_for_bind.remove(&child);
+        }
+        let mut connected = Vec::new();
+        let mut paired = Vec::new();
+        let mut available = Vec::new();
+        for dev in &devs {
+            if dev.connected {
+                connected.push(dev);
+            } else if dev.paired {
+                paired.push(dev);
+            } else {
+                available.push(dev);
+            }
+        }
+        for (title, group_devs) in [
+            ("Connected", connected),
+            ("Paired", paired),
+            ("Available", available),
+        ] {
+            if group_devs.is_empty() {
+                continue;
+            }
+            let group = adw::PreferencesGroup::builder().title(title).build();
+            for dev in &group_devs {
+                let is_busy = actions.contains(&dev.path);
+                let row = build_device_row(dev, is_busy);
+                group.add(&row);
+            }
+            outer_for_bind.append(&group);
         }
     });
 
-    btn.upcast()
+    outer.upcast()
+}
+
+/// Banner shown above the device list while `BlueZ`'s `Agent1` callback is
+/// waiting on the user to accept or reject a pairing. Hidden otherwise.
+fn build_pair_prompt_banner() -> gtk::Widget {
+    let prompt_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    prompt_box.add_css_class("ts-bluetooth-prompt");
+    prompt_box.set_visible(false);
+    let prompt_box_for_bind = prompt_box.clone();
+    bind(
+        bluetooth::pair_prompts(),
+        &prompt_box,
+        move |_, prompt: Option<PairPrompt>| {
+            while let Some(child) = prompt_box_for_bind.first_child() {
+                prompt_box_for_bind.remove(&child);
+            }
+            let Some(p) = prompt else {
+                prompt_box_for_bind.set_visible(false);
+                return;
+            };
+            prompt_box_for_bind.set_visible(true);
+            populate_pair_prompt(&prompt_box_for_bind, &p);
+        },
+    );
+    prompt_box.upcast()
+}
+
+fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
+    let title = gtk::Label::new(Some(&format!("Pair with {}?", p.alias)));
+    title.set_xalign(0.0);
+    title.add_css_class("ts-bluetooth-prompt-title");
+    container.append(&title);
+
+    let detail_text = match (p.kind, p.passkey) {
+        (PromptKind::ConfirmPasskey, Some(code)) => {
+            format!("Code: {code:06}\nMatch this on the other device, then Confirm.")
+        }
+        (PromptKind::ConfirmPasskey, None) => "Confirm pairing.".to_string(),
+        (PromptKind::Authorize, _) => "Allow this device to pair with you.".to_string(),
+        (PromptKind::EnterPinCode, _) => {
+            "Enter the PIN shown on the other device.".to_string()
+        }
+        (PromptKind::EnterPasskey, _) => {
+            "Enter the numeric passkey shown on the other device.".to_string()
+        }
+    };
+    let detail = gtk::Label::new(Some(&detail_text));
+    detail.set_xalign(0.0);
+    detail.set_wrap(true);
+    detail.add_css_class("ts-bluetooth-prompt-detail");
+    container.append(&detail);
+
+    match p.kind {
+        PromptKind::ConfirmPasskey | PromptKind::Authorize => {
+            container.append(&build_yes_no_row());
+        }
+        PromptKind::EnterPinCode => {
+            container.append(&build_text_entry_row(false));
+        }
+        PromptKind::EnterPasskey => {
+            container.append(&build_text_entry_row(true));
+        }
+    }
+}
+
+fn build_yes_no_row() -> gtk::Box {
+    let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let confirm_btn = gtk::Button::with_label("Confirm");
+    confirm_btn.add_css_class("suggested-action");
+    confirm_btn.connect_clicked(|_| bluetooth::respond_to_prompt(true));
+    let reject_btn = gtk::Button::with_label("Reject");
+    reject_btn.add_css_class("destructive-action");
+    reject_btn.connect_clicked(|_| bluetooth::respond_to_prompt(false));
+    btn_row.append(&confirm_btn);
+    btn_row.append(&reject_btn);
+    btn_row
+}
+
+/// Entry + Submit/Cancel row for legacy `RequestPinCode` / `RequestPasskey`.
+/// `numeric_only` switches input filtering so passkey entries can't contain
+/// non-digits — `BlueZ` would reject the malformed value anyway.
+fn build_text_entry_row(numeric_only: bool) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    if numeric_only {
+        entry.set_input_purpose(gtk::InputPurpose::Digits);
+        entry.set_max_length(6);
+        entry.set_placeholder_text(Some("0–999999"));
+    } else {
+        entry.set_max_length(16);
+        entry.set_placeholder_text(Some("PIN"));
+    }
+    entry.set_activates_default(false);
+    row.append(&entry);
+
+    let submit_btn = gtk::Button::with_label("Submit");
+    submit_btn.add_css_class("suggested-action");
+    let entry_for_submit = entry.clone();
+    submit_btn.connect_clicked(move |_| submit_entry(&entry_for_submit, numeric_only));
+    let entry_for_activate = entry.clone();
+    entry.connect_activate(move |_| submit_entry(&entry_for_activate, numeric_only));
+    row.append(&submit_btn);
+
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    cancel_btn.add_css_class("destructive-action");
+    cancel_btn.connect_clicked(|_| bluetooth::respond_to_prompt(false));
+    row.append(&cancel_btn);
+
+    row
+}
+
+fn submit_entry(entry: &gtk::Entry, numeric_only: bool) {
+    let text = entry.text().to_string();
+    if numeric_only {
+        match text.trim().parse::<u32>() {
+            Ok(n) => bluetooth::submit_passkey(n),
+            // Empty / non-numeric → reject so `BlueZ` doesn't see junk.
+            Err(_) => bluetooth::respond_to_prompt(false),
+        }
+    } else {
+        bluetooth::submit_pin(text);
+    }
+}
+
+fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
+    let subtitle = if dev.connected {
+        "Connected"
+    } else if dev.paired {
+        "Paired"
+    } else {
+        "Tap to pair"
+    };
+    let row = adw::ActionRow::builder()
+        .title(&dev.alias)
+        .subtitle(subtitle)
+        .activatable(true)
+        .build();
+    row.set_sensitive(!is_busy);
+    if !dev.address.is_empty() {
+        row.set_tooltip_text(Some(&dev.address));
+    }
+
+    // Prefix: device icon, or spinner while a D-Bus call is in flight.
+    if is_busy {
+        let spinner = gtk::Spinner::new();
+        spinner.set_spinning(true);
+        row.add_prefix(&spinner);
+    } else {
+        let icon_name = if dev.icon.is_empty() {
+            "bluetooth-symbolic"
+        } else {
+            &dev.icon
+        };
+        let img = gtk::Image::from_icon_name(icon_name);
+        row.add_prefix(&img);
+    }
+
+    // Battery suffix when reported.
+    if let Some(pct) = dev.battery {
+        let battery_lbl = gtk::Label::new(Some(&format!("{pct}%")));
+        battery_lbl.add_css_class("dim-label");
+        battery_lbl.set_tooltip_text(Some(&format!("Battery {pct}%")));
+        row.add_suffix(&battery_lbl);
+    }
+
+    // Trust indicator: read-only star at row level. Actual toggle lives in
+    // the ⋮ popover so it can't be hit by accident while reaching for
+    // connect/disconnect.
+    if dev.paired && dev.trusted {
+        let star = gtk::Image::from_icon_name("starred-symbolic");
+        star.set_tooltip_text(Some("Trusted — auto-reconnects"));
+        star.add_css_class("dim-label");
+        row.add_suffix(&star);
+    }
+
+    // ⋮ menu with Trust/Untrust + Forget. Only present on paired devices.
+    if dev.paired {
+        row.add_suffix(&build_device_menu(dev, is_busy));
+    }
+
+    // Row click → primary action (pair/connect/disconnect). Trust + Forget
+    // are deliberately *not* reachable from this gesture so a misclick
+    // can't untrust or unpair.
+    let path = dev.path.clone();
+    let connected = dev.connected;
+    let paired = dev.paired;
+    row.connect_activated(move |_| {
+        if connected {
+            bluetooth::disconnect_device(&path);
+        } else if paired {
+            bluetooth::connect_device(&path);
+        } else {
+            bluetooth::pair_device(&path);
+        }
+    });
+
+    row
+}
+
+/// Per-device "⋮" popover menu. Holds Trust/Untrust and Forget so the
+/// row's primary activation gesture can stay focused on connect/pair
+/// without surfacing destructive controls in the click target.
+fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("view-more-symbolic");
+    menu_btn.add_css_class("flat");
+    menu_btn.set_valign(gtk::Align::Center);
+    menu_btn.set_sensitive(!is_busy);
+    menu_btn.set_tooltip_text(Some("Device options"));
+
+    let popover = gtk::Popover::new();
+    let pop_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    pop_box.set_margin_start(6);
+    pop_box.set_margin_end(6);
+    pop_box.set_margin_top(6);
+    pop_box.set_margin_bottom(6);
+
+    let trust_lbl = if dev.trusted { "Untrust" } else { "Trust" };
+    let trust_btn = gtk::Button::with_label(trust_lbl);
+    trust_btn.add_css_class("flat");
+    let path_t = dev.path.clone();
+    let was_trusted = dev.trusted;
+    let popover_for_trust = popover.clone();
+    trust_btn.connect_clicked(move |_| {
+        bluetooth::set_trusted(&path_t, !was_trusted);
+        popover_for_trust.popdown();
+    });
+    pop_box.append(&trust_btn);
+
+    let forget_btn = gtk::Button::with_label("Forget");
+    forget_btn.add_css_class("flat");
+    forget_btn.add_css_class("destructive-action");
+    let path_f = dev.path.clone();
+    let popover_for_forget = popover.clone();
+    forget_btn.connect_clicked(move |_| {
+        bluetooth::remove_device(&path_f);
+        popover_for_forget.popdown();
+    });
+    pop_box.append(&forget_btn);
+
+    popover.set_child(Some(&pop_box));
+    menu_btn.set_popover(Some(&popover));
+    menu_btn
 }
 
 // ── Stats page ────────────────────────────────────────────────────────────────
@@ -672,20 +1015,40 @@ pub fn page_stats() -> gtk::Widget {
     );
     cpu.append(&cpu_headline);
 
-    let cores_label = gtk::Label::new(None);
-    cores_label.set_xalign(0.0);
-    bind_text(
-        sensors::cpu().map(|c: CpuLoad| {
-            c.per_core
-                .iter()
-                .enumerate()
-                .map(|(i, l)| format!("Core {i}: {:>3.0}%", l * 100.0))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }),
-        &cores_label,
-    );
-    cpu.append(&cores_label);
+    // Grid of vertical mini-bars — one per logical core. Rebuild when the
+    // core count changes (rare), otherwise just update fractions in place.
+    let cores_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    cores_row.add_css_class("ts-cores-row");
+    let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
+    let cores_row_for_bind = cores_row.clone();
+    let bars_for_bind = core_bars.clone();
+    bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
+        let mut bars = bars_for_bind.borrow_mut();
+        if bars.len() != c.per_core.len() {
+            while let Some(child) = cores_row_for_bind.first_child() {
+                cores_row_for_bind.remove(&child);
+            }
+            bars.clear();
+            for _ in 0..c.per_core.len() {
+                let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                col.set_hexpand(true);
+                col.set_halign(gtk::Align::Center);
+                let bar = gtk::ProgressBar::new();
+                bar.add_css_class("ts-core-bar");
+                bar.set_orientation(gtk::Orientation::Vertical);
+                bar.set_inverted(true);
+                bar.set_valign(gtk::Align::End);
+                col.append(&bar);
+                cores_row_for_bind.append(&col);
+                bars.push(bar);
+            }
+        }
+        for (bar, load) in bars.iter().zip(c.per_core.iter()) {
+            bar.set_fraction(load.clamp(0.0, 1.0));
+            bar.set_tooltip_text(Some(&format!("{:.0}%", load * 100.0)));
+        }
+    });
+    cpu.append(&cores_row);
 
     let cpu_temp = gtk::Label::new(None);
     cpu_temp.set_xalign(0.0);
@@ -825,74 +1188,91 @@ pub fn page_stats() -> gtk::Widget {
 pub fn page_audio() -> gtk::Widget {
     let column = page_box();
 
-    // ── Output section ────────────────────────────────────────────────────────
-    let output_panel = panel("Output");
-    let output_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    output_panel.append(&output_list);
+    column.append(&audio_section("Output", &build_sink_list()));
+    column.append(&audio_section("Input", &build_source_list()));
+    column.append(&audio_section("Playback", &build_playback_list()));
 
-    let output_list_for_bind = output_list.clone();
-    bind(pipewire::sinks(), &output_list, move |_, sinks: Vec<Sink>| {
-        while let Some(child) = output_list_for_bind.first_child() {
-            output_list_for_bind.remove(&child);
+    column.upcast()
+}
+
+/// Wrap a section title + `boxed-list`-styled `ListBox` in a vertical Box so
+/// every audio section has the same Adwaita-style framing.
+fn audio_section(title: &str, list: &gtk::ListBox) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let title_lbl = gtk::Label::new(Some(title));
+    title_lbl.add_css_class("heading");
+    title_lbl.set_xalign(0.0);
+    section.append(&title_lbl);
+    section.append(list);
+    section
+}
+
+fn boxed_list() -> gtk::ListBox {
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list
+}
+
+fn build_sink_list() -> gtk::ListBox {
+    let list = boxed_list();
+    let list_for_bind = list.clone();
+    bind(pipewire::sinks(), &list, move |_, sinks: Vec<Sink>| {
+        while let Some(child) = list_for_bind.first_child() {
+            list_for_bind.remove(&child);
         }
         for s in &sinks {
-            let row = sink_row(s);
-            output_list_for_bind.append(&row);
+            list_for_bind.append(&sink_row(s));
         }
     });
-    column.append(&output_panel);
+    list
+}
 
-    // ── Input section ─────────────────────────────────────────────────────────
-    let input_panel = panel("Input");
-    let input_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    input_panel.append(&input_list);
-
-    let input_list_for_bind = input_list.clone();
+fn build_source_list() -> gtk::ListBox {
+    let list = boxed_list();
+    let list_for_bind = list.clone();
     bind(
         pipewire::sources(),
-        &input_list,
+        &list,
         move |_, sources: Vec<Source>| {
-            while let Some(child) = input_list_for_bind.first_child() {
-                input_list_for_bind.remove(&child);
+            while let Some(child) = list_for_bind.first_child() {
+                list_for_bind.remove(&child);
             }
             for s in &sources {
-                let row = source_row(s);
-                input_list_for_bind.append(&row);
+                list_for_bind.append(&source_row(s));
             }
         },
     );
-    column.append(&input_panel);
+    list
+}
 
-    // ── Playback section ──────────────────────────────────────────────────────
-    let playback_panel = panel("Playback");
-    let playback_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    playback_panel.append(&playback_list);
-
-    let playback_list_for_bind = playback_list.clone();
+fn build_playback_list() -> gtk::ListBox {
+    let list = boxed_list();
+    let list_for_bind = list.clone();
     bind(
         pipewire::playback_streams(),
-        &playback_list,
+        &list,
         move |_, streams: Vec<PlaybackStream>| {
-            while let Some(child) = playback_list_for_bind.first_child() {
-                playback_list_for_bind.remove(&child);
+            while let Some(child) = list_for_bind.first_child() {
+                list_for_bind.remove(&child);
             }
             if streams.is_empty() {
-                let lbl = gtk::Label::new(Some("No active streams"));
-                lbl.set_xalign(0.0);
-                lbl.add_css_class("ts-audio-row-name");
-                lbl.add_css_class("dim");
-                playback_list_for_bind.append(&lbl);
+                let placeholder = gtk::Label::new(Some("No active streams"));
+                placeholder.set_xalign(0.0);
+                placeholder.add_css_class("dim-label");
+                placeholder.set_margin_start(12);
+                placeholder.set_margin_end(12);
+                placeholder.set_margin_top(8);
+                placeholder.set_margin_bottom(8);
+                list_for_bind.append(&placeholder);
             } else {
                 for s in &streams {
-                    let row = stream_row(s);
-                    playback_list_for_bind.append(&row);
+                    list_for_bind.append(&stream_row(s));
                 }
             }
         },
     );
-    column.append(&playback_panel);
-
-    column.upcast()
+    list
 }
 
 fn sink_row(s: &Sink) -> gtk::Widget {
@@ -941,9 +1321,9 @@ fn sink_row(s: &Sink) -> gtk::Widget {
     slider.set_size_request(160, -1);
     slider.set_value(s.volume);
 
-    let sink_id = s.id;
+    let sink_name_for_slider = s.name.clone();
     slider.connect_value_changed(move |sl| {
-        pipewire::set_sink_volume(sink_id, sl.value());
+        pipewire::set_sink_volume(&sink_name_for_slider, sl.value());
     });
     // No signal bind here — we rebuild the whole row on each poll emission.
     row.append(&slider);
@@ -955,10 +1335,11 @@ fn sink_row(s: &Sink) -> gtk::Widget {
         mute_btn.add_css_class("muted");
     }
     let muted_cell = Rc::new(Cell::new(s.muted));
+    let sink_name_for_mute = s.name.clone();
     mute_btn.connect_clicked(move |btn| {
         let new_mute = !muted_cell.get();
         muted_cell.set(new_mute);
-        pipewire::set_sink_mute(sink_id, new_mute);
+        pipewire::set_sink_mute(&sink_name_for_mute, new_mute);
         if new_mute {
             btn.add_css_class("muted");
         } else {
@@ -1016,9 +1397,9 @@ fn source_row(s: &Source) -> gtk::Widget {
     slider.set_size_request(160, -1);
     slider.set_value(s.volume);
 
-    let source_id = s.id;
+    let source_name_for_slider = s.name.clone();
     slider.connect_value_changed(move |sl| {
-        pipewire::set_source_volume(source_id, sl.value());
+        pipewire::set_source_volume(&source_name_for_slider, sl.value());
     });
     row.append(&slider);
 
@@ -1029,10 +1410,11 @@ fn source_row(s: &Source) -> gtk::Widget {
         mute_btn.add_css_class("muted");
     }
     let muted_cell = Rc::new(Cell::new(s.muted));
+    let source_name_for_mute = s.name.clone();
     mute_btn.connect_clicked(move |btn| {
         let new_mute = !muted_cell.get();
         muted_cell.set(new_mute);
-        pipewire::set_source_mute(source_id, new_mute);
+        pipewire::set_source_mute(&source_name_for_mute, new_mute);
         if new_mute {
             btn.add_css_class("muted");
         } else {
@@ -1111,65 +1493,92 @@ pub fn page_power() -> gtk::Widget {
     // ── Battery panel (col 0) ─────────────────────────────────────────────────
     let battery = panel("Battery");
 
-    let battery_headline = gtk::Label::new(None);
-    battery_headline.set_xalign(0.0);
+    let battery_group = adw::PreferencesGroup::new();
+    let battery_row = adw::ActionRow::builder().title("Charge").build();
+    bind(
+        upower::battery().map(|b: Battery| describe_battery(&b)),
+        &battery_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    let pct_lbl = gtk::Label::new(None);
+    pct_lbl.add_css_class("dim-label");
     bind_text(
         upower::battery().map(|b: Battery| format!("{:.0}%", b.percentage)),
-        &battery_headline,
+        &pct_lbl,
     );
-    battery.append(&battery_headline);
-
-    let state_label = gtk::Label::new(None);
-    state_label.set_xalign(0.0);
-    bind_text(upower::battery().map(|b: Battery| describe_battery(&b)), &state_label);
-    battery.append(&state_label);
+    battery_row.add_suffix(&pct_lbl);
+    battery_group.add(&battery_row);
+    battery.append(&battery_group);
     grid.attach(&battery, 0, 0, 1, 1);
 
-    // ── Brightness panel (col 1) ──────────────────────────────────────────────
     let bright = panel("Brightness");
+    bright.append(&build_brightness_row());
+    grid.attach(&bright, 1, 0, 1, 1);
 
-    let bright_headline = gtk::Label::new(None);
-    bright_headline.set_xalign(0.0);
-    bind_text(
-        brightness::current().map(|b| match b {
-            Some(b) => format!("{:.0}%", b.level * 100.0),
-            None => "no backlight".to_string(),
-        }),
-        &bright_headline,
-    );
-    bright.append(&bright_headline);
+    grid.upcast()
+}
 
-    let bright_slider =
-        gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.05, 1.0, 0.05);
-    bright_slider.set_draw_value(false);
-    bright_slider.set_hexpand(true);
+/// Adwaita-flavoured brightness control: icon + slider + live percentage,
+/// inside a single boxed-list row so it visually matches the battery panel.
+fn build_brightness_row() -> gtk::ListBox {
+    let list = boxed_list();
 
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+
+    let inner = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    inner.set_margin_start(12);
+    inner.set_margin_end(12);
+    inner.set_margin_top(8);
+    inner.set_margin_bottom(8);
+
+    let icon = gtk::Image::from_icon_name("display-brightness-symbolic");
+    icon.add_css_class("dim-label");
+    inner.append(&icon);
+
+    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.05, 1.0, 0.05);
+    slider.set_draw_value(false);
+    slider.set_hexpand(true);
+
+    // Avoid feedback: when bind() reflects external state into the slider,
+    // suppress the connect_value_changed → brightness::set() path. Without
+    // this the slider would echo every poll back into a brightness write.
     let suppress = Rc::new(Cell::new(false));
-
     let suppress_for_handler = suppress.clone();
-    bright_slider.connect_value_changed(move |s| {
+    slider.connect_value_changed(move |s| {
         if suppress_for_handler.get() {
             return;
         }
         brightness::set(s.value());
     });
-
     let suppress_for_bind = suppress.clone();
-    bind(brightness::current(), &bright_slider, move |s, b| {
+    bind(brightness::current(), &slider, move |s, b| {
         if let Some(b) = b {
             suppress_for_bind.set(true);
             s.set_value(b.level);
             suppress_for_bind.set(false);
         }
+        s.set_sensitive(b.is_some());
     });
-    bright.append(&bright_slider);
+    inner.append(&slider);
 
-    let device_label = gtk::Label::new(Some("Backlight"));
-    device_label.set_xalign(0.0);
-    bright.append(&device_label);
-    grid.attach(&bright, 1, 0, 1, 1);
+    let pct_lbl = gtk::Label::new(None);
+    pct_lbl.add_css_class("dim-label");
+    pct_lbl.set_width_chars(4);
+    pct_lbl.set_xalign(1.0);
+    bind_text(
+        brightness::current().map(|b| match b {
+            Some(b) => format!("{:.0}%", b.level * 100.0),
+            None => "—".to_string(),
+        }),
+        &pct_lbl,
+    );
+    inner.append(&pct_lbl);
 
-    grid.upcast()
+    row.set_child(Some(&inner));
+    list.append(&row);
+    list
 }
 
 // ── Battery helpers ───────────────────────────────────────────────────────────
@@ -1231,7 +1640,7 @@ pub fn page_notifications() -> gtk::Widget {
     scrolled.set_min_content_height(380);
     scrolled.add_css_class("ts-notif-history");
 
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let list = boxed_list();
     scrolled.set_child(Some(&list));
     column.append(&scrolled);
 
@@ -1244,6 +1653,10 @@ pub fn page_notifications() -> gtk::Widget {
             let empty = gtk::Label::new(Some("No notifications"));
             empty.add_css_class("ts-notif-empty");
             empty.set_xalign(0.0);
+            empty.set_margin_start(12);
+            empty.set_margin_end(12);
+            empty.set_margin_top(8);
+            empty.set_margin_bottom(8);
             list_for_signal.append(&empty);
             return;
         }

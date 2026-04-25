@@ -32,4 +32,12 @@ binds {
     XF86AudioPlay  allow-when-locked=true { spawn "playerctl" "play-pause"; }
     XF86AudioNext  allow-when-locked=true { spawn "playerctl" "next"; }
     XF86AudioPrev  allow-when-locked=true { spawn "playerctl" "previous"; }
+
+    // App launcher (#32) — fuzzel reads .desktop files from XDG_DATA_DIRS,
+    // so flatpak / system / user-installed apps surface automatically.
+    // Mod+D mirrors the dmenu convention and matches niri's own default
+    // config. If you prefer Mod+Space, swap the chord here — note that
+    // niri's default config comments Mod+Space out, but some users bind
+    // it to switch-layout, so a conflict is on you to resolve.
+    Mod+D hotkey-overlay-title="Run an Application: fuzzel" { spawn "fuzzel"; }
 }

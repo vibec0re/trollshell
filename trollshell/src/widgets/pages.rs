@@ -1756,3 +1756,132 @@ fn fmt_notif_time(unix_secs: u64) -> String {
     );
     dt.format("%H:%M").to_string()
 }
+
+// ── Power-menu page (lock / logout / suspend / reboot / shutdown) ─────────────
+
+/// Drawer page with system-power actions. Distinct from [`page_power`] (the
+/// battery + brightness page); this one is the lock / logout / suspend /
+/// reboot / shutdown menu, ordered most-common at top, most-destructive at
+/// bottom. Each row is an `AdwActionRow` whose activation fires the action
+/// and dismisses the drawer.
+pub fn page_power_menu() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+
+    let group = adw::PreferencesGroup::new();
+
+    group.add(&power_action_row(
+        "Lock",
+        "Lock the screen",
+        "system-lock-screen-symbolic",
+        None,
+        || {
+            hytte::services::screensaver::lock();
+        },
+    ));
+
+    group.add(&power_action_row(
+        "Logout",
+        "End the niri session",
+        "system-log-out-symbolic",
+        None,
+        || {
+            // niri's `quit` shows its own confirmation overlay, which is the
+            // right UX for a destructive session-end action. Pass
+            // `--skip-confirmation` to suppress it if you want this row to
+            // be the single point of confirmation.
+            spawn_detached("niri", &["msg", "action", "quit"]);
+        },
+    ));
+
+    group.add(&power_action_row(
+        "Suspend",
+        "Sleep until next interaction",
+        "system-suspend-symbolic",
+        None,
+        || {
+            spawn_detached("systemctl", &["suspend"]);
+        },
+    ));
+
+    group.add(&power_action_row(
+        "Reboot",
+        "Restart the system",
+        "system-reboot-symbolic",
+        None,
+        || {
+            spawn_detached("systemctl", &["reboot"]);
+        },
+    ));
+
+    group.add(&power_action_row(
+        "Shutdown",
+        "Power off",
+        "system-shutdown-symbolic",
+        Some("destructive-action"),
+        || {
+            spawn_detached("systemctl", &["poweroff"]);
+        },
+    ));
+
+    column.append(&group);
+
+    // Cancel row: just retract the drawer. ESC also closes (modal.rs handles
+    // it) but a visible affordance helps when the page was opened by chip.
+    let close_group = adw::PreferencesGroup::new();
+    let close_row = adw::ActionRow::builder()
+        .title("Close")
+        .activatable(true)
+        .build();
+    let close_icon = gtk::Image::from_icon_name("window-close-symbolic");
+    close_row.add_prefix(&close_icon);
+    close_row.connect_activated(|_| {
+        crate::modal::dismiss_all();
+    });
+    close_group.add(&close_row);
+    column.append(&close_group);
+
+    finish_page(&column)
+}
+
+/// Build one power-menu action row. `css_class` is for variants like
+/// `destructive-action` on Shutdown. The callback runs on activation; the
+/// drawer is dismissed afterwards so the user sees their action take effect.
+fn power_action_row(
+    title: &str,
+    subtitle: &str,
+    icon_name: &str,
+    css_class: Option<&str>,
+    on_activate: impl Fn() + 'static,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .activatable(true)
+        .build();
+    let icon = gtk::Image::from_icon_name(icon_name);
+    row.add_prefix(&icon);
+    if let Some(class) = css_class {
+        row.add_css_class(class);
+    }
+    row.connect_activated(move |_| {
+        on_activate();
+        crate::modal::dismiss_all();
+    });
+    row
+}
+
+/// Fire-and-forget process spawn for power-menu actions. systemctl calls
+/// hit polkit (wired up in task #27); auth flows through the trollshell
+/// polkit dialog. Errors are logged at warn level — the user already sees
+/// the drawer close, so a silent failure would be confusing.
+fn spawn_detached(program: &str, args: &[&str]) {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    if let Err(e) = cmd.spawn() {
+        tracing::warn!(program, ?args, error = %e, "power-menu: spawn failed");
+    }
+}

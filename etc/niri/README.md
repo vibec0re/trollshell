@@ -120,6 +120,13 @@ outright, drop them from the affected lines and re-load.
   (brightness service); those are the existing event paths and the OSD
   hooks off them. A custom IPC channel was considered and rejected
   — `wpctl` and `brightnessctl` already do the right thing.
+- It does NOT bind a power-menu shortcut (lock / logout / suspend / reboot /
+  shutdown). Those actions live on a drawer page (`page_power_menu` in
+  `trollshell/src/widgets/pages.rs`); reaching it from a keybind would need
+  a tiny trollshell IPC channel that doesn't exist yet. For v1 the page is
+  reachable through the existing modal infrastructure only — a follow-up
+  task will add a chip and/or a `Mod+Escape` binding once the IPC lands.
+
 - It does NOT bind the keyboard-backlight keys (`XF86KbdBrightnessUp/Down`).
   Those typically don't have a sysfs uniformity story; add them by hand if
   your hardware exposes them and you want them.

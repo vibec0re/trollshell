@@ -16,6 +16,7 @@ pub enum Page {
     Stats,
     Audio,
     Power,
+    PowerMenu,
     Notifications,
 }
 
@@ -28,6 +29,7 @@ impl Page {
             Self::Stats => "stats",
             Self::Audio => "audio",
             Self::Power => "power",
+            Self::PowerMenu => "power-menu",
             Self::Notifications => "notifications",
         }
     }
@@ -143,6 +145,10 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(&pages::page_audio(), Some(Page::Audio.stack_name()));
     stack.add_named(&pages::page_power(), Some(Page::Power.stack_name()));
     stack.add_named(
+        &pages::page_power_menu(),
+        Some(Page::PowerMenu.stack_name()),
+    );
+    stack.add_named(
         &pages::page_notifications(),
         Some(Page::Notifications.stack_name()),
     );
@@ -203,6 +209,17 @@ pub fn close_all() {
         for (_, panel) in panels.borrow_mut().drain() {
             panel.catcher.close();
             panel.window.close();
+        }
+    });
+}
+
+/// Begin the retract animation on every open drawer. Used by drawer-content
+/// callbacks (e.g. the power-menu action rows) that don't carry a monitor
+/// handle but want the drawer to close after their action fires.
+pub fn dismiss_all() {
+    PANELS.with(|panels| {
+        for panel in panels.borrow().values() {
+            panel.revealer.set_reveal_child(false);
         }
     });
 }

@@ -2284,6 +2284,133 @@ pub fn page_clipboard() -> gtk::Widget {
     finish_page(&column)
 }
 
+// ── Settings page ─────────────────────────────────────────────────────────────
+
+/// Drawer page exposing trollshell-wide preferences. v1 (minimal) covers two
+/// knobs:
+///
+/// - Theme (Light / Dark / Follow system) — mediated by `gsettings` on
+///   `org.gnome.desktop.interface color-scheme`. The dropdown reads the
+///   current value once at page mount and writes back on selection change.
+///   We do NOT live-track external `gsettings` changes; for v1 the dropdown
+///   is the source of truth while the page is open.
+/// - Do Not Disturb — duplicates the toggle at the top of `page_notifications`.
+///   Both bindings drive the same `dnd::set_enabled` setter and observe the
+///   same `dnd::enabled` signal, so they stay in sync.
+///
+/// Future v1.x: bar/drawer layout, idle timeouts (#28's swayidle is currently
+/// hand-edited), accent color, notification policy. See task description.
+///
+/// Requires the `gsettings-desktop-schemas` package on Arch for the
+/// `org.gnome.desktop.interface` schema; missing schema falls back to
+/// "Follow system" with a logged warning.
+pub fn page_settings() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+
+    // ── Appearance ────────────────────────────────────────────────────────
+    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+
+    let theme_row = adw::ActionRow::builder()
+        .title("Theme")
+        .subtitle("Light, dark, or follow system.")
+        .build();
+
+    // Order matches THEME_KEYS below — the DropDown's selected index maps
+    // 1:1 to the gsettings color-scheme value.
+    let theme_dropdown = gtk::DropDown::from_strings(&["Light", "Dark", "Follow system"]);
+    theme_dropdown.set_valign(gtk::Align::Center);
+    theme_dropdown.set_selected(read_color_scheme_index());
+    theme_dropdown.connect_selected_notify(|dd| {
+        let key = THEME_KEYS
+            .get(dd.selected() as usize)
+            .copied()
+            .unwrap_or("default");
+        write_color_scheme(key);
+    });
+    theme_row.add_suffix(&theme_dropdown);
+    theme_row.set_activatable_widget(Some(&theme_dropdown));
+    appearance.add(&theme_row);
+
+    column.append(&appearance);
+
+    // ── Notifications ─────────────────────────────────────────────────────
+    let notif = adw::PreferencesGroup::builder().title("Notifications").build();
+
+    let dnd_row = adw::ActionRow::builder()
+        .title("Do Not Disturb")
+        .subtitle("Suppress non-critical toasts; history still records.")
+        .build();
+    let dnd_switch = gtk::Switch::new();
+    dnd_switch.set_valign(gtk::Align::Center);
+    bind(dnd::enabled(), &dnd_switch, |w, on| {
+        if w.is_active() != on {
+            w.set_active(on);
+        }
+    });
+    dnd_switch.connect_active_notify(|sw| {
+        dnd::set_enabled(sw.is_active());
+    });
+    dnd_row.add_suffix(&dnd_switch);
+    dnd_row.set_activatable_widget(Some(&dnd_switch));
+    notif.add(&dnd_row);
+
+    column.append(&notif);
+
+    finish_page(&column)
+}
+
+/// Index ↔ gsettings value mapping for the theme dropdown. Order must match
+/// the strings passed to `gtk::DropDown::from_strings` in `page_settings`.
+const THEME_KEYS: [&str; 3] = ["prefer-light", "prefer-dark", "default"];
+
+/// Read the current `org.gnome.desktop.interface color-scheme` value via a
+/// one-shot synchronous `gsettings get` and map it to a dropdown index.
+/// Returns the "Follow system" index (2) on any error so the UI is never
+/// blank — including when `gsettings-desktop-schemas` is missing.
+fn read_color_scheme_index() -> u32 {
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            // gsettings get prints quoted strings, e.g. `'prefer-dark'\n`.
+            let raw = String::from_utf8_lossy(&out.stdout);
+            let trimmed = raw.trim().trim_matches('\'').trim_matches('"');
+            THEME_KEYS
+                .iter()
+                .position(|k| *k == trimmed)
+                .and_then(|i| u32::try_from(i).ok())
+                .unwrap_or(2)
+        }
+        Ok(out) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "settings: gsettings get color-scheme failed",
+            );
+            2
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "settings: gsettings unavailable");
+            2
+        }
+    }
+}
+
+/// Set `org.gnome.desktop.interface color-scheme` to `value`. Spawned
+/// detached — we don't care to wait on the exit; failures are logged when
+/// the spawn itself fails, but a non-zero exit (e.g. unknown schema) is
+/// silently dropped by the OS reaping the child. That's fine for v1: the
+/// next page mount will re-read and surface the actual current value.
+fn write_color_scheme(value: &str) {
+    let result = std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "color-scheme", value])
+        .spawn();
+    if let Err(e) = result {
+        tracing::warn!(error = %e, value, "settings: gsettings set color-scheme failed");
+    }
+}
+
 fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(&entry.preview)

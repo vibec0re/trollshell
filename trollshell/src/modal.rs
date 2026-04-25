@@ -22,6 +22,7 @@ pub enum Page {
     Appearance,
     Displays,
     Clipboard,
+    Settings,
 }
 
 impl Page {
@@ -38,6 +39,7 @@ impl Page {
             Self::Appearance => "appearance",
             Self::Displays => "displays",
             Self::Clipboard => "clipboard",
+            Self::Settings => "settings",
         }
     }
 }
@@ -170,6 +172,10 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(
         &pages::page_clipboard(),
         Some(Page::Clipboard.stack_name()),
+    );
+    stack.add_named(
+        &pages::page_settings(),
+        Some(Page::Settings.stack_name()),
     );
 
     card.append(&stack);

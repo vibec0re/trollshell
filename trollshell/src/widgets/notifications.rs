@@ -24,7 +24,7 @@
 //! the live set, so any cap is consumer-side.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
@@ -69,33 +69,31 @@ pub fn install(monitor: &Monitor) {
     // Map of mounted card widgets keyed by notification id.
     let card_map: RefCell<HashMap<u32, gtk::Widget>> = RefCell::new(HashMap::new());
 
+    // `suppressed_during_dnd` records notification ids that arrived while
+    // DND was on. Toggling DND off does NOT revive them — DND is a
+    // "from-now-forward" gate. Entries are dropped when the upstream
+    // notification leaves the active list (dismissed or expired).
+    let suppressed_during_dnd: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+
     // Weak refs so the signal closure doesn't hold the window alive (the
     // thread-local owns it).
     let window_weak = window.downgrade();
     let vbox_weak = vbox.downgrade();
 
-    // Combine the live notifications with the DND flag. When DND is on,
-    // filter the visible set down to critical-urgency only — non-critical
-    // notifications are still recorded by the notifications service (the
-    // drawer's history page reflects them) but do not pop a toast.
+    // Combine the live notifications with the DND flag. The visibility
+    // filter — "critical bypasses DND, non-critical arriving during DND
+    // gets parked in the suppressed set forever" — runs inside the
+    // `for_each` callback below, where the suppressed-set state lives.
     let toast_signal = map_ref! {
         let notifs = notifications::active(),
         let dnd_on = dnd::enabled() => {
-            if *dnd_on {
-                notifs
-                    .iter()
-                    .filter(|n| n.urgency == Urgency::Critical)
-                    .cloned()
-                    .collect::<Vec<Notification>>()
-            } else {
-                notifs.clone()
-            }
+            (notifs.clone(), *dnd_on)
         }
     };
 
     glib::MainContext::default().spawn_local(
         toast_signal
-            .for_each(move |notifs: Vec<Notification>| {
+            .for_each(move |(notifs, dnd_on): (Vec<Notification>, bool)| {
                 let Some(window) = window_weak.upgrade() else {
                     return std::future::ready(());
                 };
@@ -104,10 +102,40 @@ pub fn install(monitor: &Monitor) {
                 };
 
                 let mut map = card_map.borrow_mut();
+                let mut suppressed = suppressed_during_dnd.borrow_mut();
+
+                // Apply DND gate. Critical urgency always shows and never
+                // touches the suppressed set. Non-critical notifications
+                // that arrive while DND is on are recorded in `suppressed`
+                // and stay hidden even after DND is toggled off — flipping
+                // DND off must NOT unleash the backlog.
+                let visible: Vec<&Notification> = notifs
+                    .iter()
+                    .filter(|n| {
+                        if n.urgency == Urgency::Critical {
+                            return true;
+                        }
+                        if suppressed.contains(&n.id) {
+                            return false;
+                        }
+                        if dnd_on {
+                            suppressed.insert(n.id);
+                            return false;
+                        }
+                        true
+                    })
+                    .collect();
+
+                // GC the suppressed set: drop any ids whose notifications
+                // are no longer in the upstream active list (dismissed or
+                // expired). Once gone upstream, we'll never need to suppress
+                // them again. O(N) per emit.
+                let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
+                suppressed.retain(|id| active_ids.contains(id));
 
                 // Build id sets.
                 let new_ids: HashMap<u32, &Notification> =
-                    notifs.iter().map(|n| (n.id, n)).collect();
+                    visible.iter().map(|n| (n.id, *n)).collect();
                 let old_ids: Vec<u32> = map.keys().copied().collect();
 
                 // Remove cards whose notifications have gone.

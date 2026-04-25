@@ -109,10 +109,13 @@ pub fn install(monitor: &Monitor) {
     // zone. Without this, the bar's auto-exclusive-zone (≈59 px) stacks
     // with our margin and pushes the drawer ~60 px lower than intended.
     window.set_exclusive_zone(-1);
-    // Fixed surface envelope: 720 wide matches the widest page's natural
-    // width; 720 tall is enough headroom for Stats/Network, the unused
-    // space below the revealed drawer is transparent and click-through.
-    window.set_size_request(720, 720);
+    // Content-driven sizing: the layer-shell surface auto-negotiates its
+    // size from the visible page's natural request. AdwClamp inside each
+    // page caps width at 680 (see `pages::finish_page`); height is the
+    // page's natural height. The min-width floor (360) keeps very sparse
+    // pages from collapsing to a sliver. niri honors the surface-size
+    // commit when switching pages, so the modal grows/shrinks live.
+    window.set_size_request(360, -1);
 
     // ESC → animated retract.
     let key_ctrl = gtk::EventControllerKey::new();

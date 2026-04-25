@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
@@ -1672,13 +1672,6 @@ fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
 // ── Notifications history page ────────────────────────────────────────────────
 
 pub fn page_notifications() -> gtk::Widget {
-    // TODO(notif-followup):
-    //   M3: ExpanderRow expand-state is lost on every history/muted-apps
-    //       signal — rebuild collapses any open app row. Diff-update the
-    //       existing groups instead of clear+rebuild to preserve state.
-    //   M4: per-app mute Switch is set once from the bound `muted` snapshot;
-    //       it doesn't subscribe to `notifications_mute::muted_apps()` for
-    //       cross-instance sync (e.g. another trollshell window toggling).
     let column = page_box();
 
     // Do-Not-Disturb toggle. When on, non-critical toasts are suppressed;
@@ -1734,6 +1727,11 @@ pub fn page_notifications() -> gtk::Widget {
     column.append(&scrolled);
 
     let groups_for_signal = groups_box.clone();
+    // Track the per-app ExpanderRows from the previous bind emission so we can
+    // restore each row's `is_expanded()` state across the clear+rebuild —
+    // otherwise an arriving notification collapses every open app row.
+    let current_rows: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let combined = map_ref! {
         let entries = notifications::history(),
         let muted = notifications_mute::muted_apps() => {
@@ -1741,6 +1739,13 @@ pub fn page_notifications() -> gtk::Widget {
         }
     };
     bind(combined, &groups_box, move |_, (entries, muted)| {
+        // Stash prior expand-state keyed by app_name before teardown.
+        let prior_expanded: HashMap<String, bool> = current_rows
+            .borrow()
+            .iter()
+            .map(|(name, row)| (name.clone(), row.is_expanded()))
+            .collect();
+        current_rows.borrow_mut().clear();
         while let Some(child) = groups_for_signal.first_child() {
             groups_for_signal.remove(&child);
         }
@@ -1758,8 +1763,7 @@ pub fn page_notifications() -> gtk::Widget {
         // Vec<&HistoryEntry> on first sighting. The order of apps in the UI
         // becomes "app whose newest entry is most recent first".
         let mut order: Vec<String> = Vec::new();
-        let mut buckets: std::collections::HashMap<String, Vec<&notifications::HistoryEntry>> =
-            std::collections::HashMap::new();
+        let mut buckets: HashMap<String, Vec<&notifications::HistoryEntry>> = HashMap::new();
         for entry in &entries {
             // freedesktop spec allows empty `app_name`; substitute "Unknown"
             // so we don't render a blank ExpanderRow or persist "" to the
@@ -1777,7 +1781,12 @@ pub fn page_notifications() -> gtk::Widget {
         let group = adw::PreferencesGroup::new();
         for app in &order {
             let bucket = buckets.get(app).expect("bucket present for tracked app");
-            group.add(&build_history_app_row(app, bucket, &muted));
+            let row = build_history_app_row(app, bucket, &muted);
+            if prior_expanded.get(app).copied().unwrap_or(false) {
+                row.set_expanded(true);
+            }
+            group.add(&row);
+            current_rows.borrow_mut().insert(app.clone(), row);
         }
         groups_for_signal.append(&group);
     });
@@ -1812,7 +1821,10 @@ fn build_history_app_row(
         row.set_subtitle(&subtitle);
     }
 
-    // Per-app mute switch: feeds `notifications_mute::set_app_muted`.
+    // Per-app mute switch: feeds `notifications_mute::set_app_muted` and
+    // subscribes to `muted_apps()` so toggles from another monitor's drawer
+    // sync into this row's switch. The `is_active() != on` guard breaks the
+    // bind→active-notify→set_app_muted→bind feedback loop.
     let mute_switch = gtk::Switch::new();
     mute_switch.set_valign(gtk::Align::Center);
     mute_switch.set_tooltip_text(Some("Mute toasts from this app"));
@@ -1821,6 +1833,16 @@ fn build_history_app_row(
     mute_switch.connect_active_notify(move |sw| {
         notifications_mute::set_app_muted(&app_owned, sw.is_active());
     });
+    let app_for_bind = app.to_string();
+    bind(
+        notifications_mute::muted_apps().map(move |m| m.contains(&app_for_bind)),
+        &mute_switch,
+        |w, on| {
+            if w.is_active() != on {
+                w.set_active(on);
+            }
+        },
+    );
     // Trailing widget on the header (before the expander toggle). Uses
     // `add_suffix`; `add_action` was deprecated in libadwaita 1.4.
     row.add_suffix(&mute_switch);

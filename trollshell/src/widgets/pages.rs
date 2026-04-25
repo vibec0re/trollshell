@@ -2358,7 +2358,59 @@ pub fn page_settings() -> gtk::Widget {
 
     column.append(&notif);
 
+    // ── More ──────────────────────────────────────────────────────────────
+    // Deep-link rows to drawer pages that don't have a dedicated bar chip.
+    // Each row swaps the currently-open drawer to the target page via
+    // `modal::switch_active` (see modal.rs) so the user stays on the same
+    // monitor's drawer surface; no `&Monitor` is plumbed through here.
+    let more = adw::PreferencesGroup::builder().title("More").build();
+
+    more.add(&deep_link_row(
+        "Wallpaper",
+        Some("Pick a desktop background"),
+        "preferences-desktop-wallpaper-symbolic",
+        crate::modal::Page::Appearance,
+    ));
+    more.add(&deep_link_row(
+        "Displays",
+        Some("Output layout and resolution"),
+        "video-display-symbolic",
+        crate::modal::Page::Displays,
+    ));
+    more.add(&deep_link_row(
+        "Clipboard history",
+        Some("Recent copies from cliphist"),
+        "edit-paste-symbolic",
+        crate::modal::Page::Clipboard,
+    ));
+
+    column.append(&more);
+
     finish_page(&column)
+}
+
+/// Build an `AdwActionRow` that, on activation, swaps every open drawer to
+/// `target` via `modal::switch_active`. Used by the Settings page "More"
+/// group to surface drawer pages that don't have a dedicated bar chip.
+fn deep_link_row(
+    title: &str,
+    subtitle: Option<&str>,
+    icon_name: &str,
+    target: crate::modal::Page,
+) -> adw::ActionRow {
+    let mut builder = adw::ActionRow::builder().title(title).activatable(true);
+    if let Some(s) = subtitle {
+        builder = builder.subtitle(s);
+    }
+    let row = builder.build();
+    let icon = gtk::Image::from_icon_name(icon_name);
+    row.add_prefix(&icon);
+    let go_next = gtk::Image::from_icon_name("go-next-symbolic");
+    row.add_suffix(&go_next);
+    row.connect_activated(move |_| {
+        crate::modal::switch_active(target);
+    });
+    row
 }
 
 /// Index ↔ gsettings value mapping for the theme dropdown. Order must match

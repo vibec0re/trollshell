@@ -245,6 +245,29 @@ pub fn close_all() {
     });
 }
 
+/// Swap every currently-open panel's visible page to `target`. Drawer pages
+/// are built once, monitor-agnostically, so an in-page deep-link callback
+/// (e.g. a Settings row → Wallpaper) doesn't have a handy `&Monitor`. This
+/// helper walks the per-monitor panel set and:
+/// - For each panel currently showing a page (`current.is_some()`), swaps
+///   the stack child to `target` (crossfade + height) without retracting.
+/// - For closed panels, does nothing — we only switch what's actually open.
+///
+/// If the user has no drawer open when this fires, the call is a no-op.
+/// Future work could open `target` on the primary monitor in that case;
+/// for v1 we treat the deep-link as "in this drawer, jump there".
+pub fn switch_active(target: Page) {
+    PANELS.with(|panels| {
+        for panel in panels.borrow().values() {
+            if panel.current.borrow().is_some() {
+                panel.stack.set_visible_child_name(target.stack_name());
+                *panel.current.borrow_mut() = Some(target);
+                on_page_show(target);
+            }
+        }
+    });
+}
+
 /// Begin the retract animation on every open drawer. Used by drawer-content
 /// callbacks (e.g. the power-menu action rows) that don't carry a monitor
 /// handle but want the drawer to close after their action fires.

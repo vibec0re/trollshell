@@ -108,7 +108,11 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
                 widgets::gpu::widget(monitor),
                 widgets::disk::widget(monitor),
             ]),
-            group([widgets::clock::widget()]),
+            group([
+                widgets::settings_chip::widget(monitor),
+                widgets::power_chip::widget(monitor),
+            ]),
+            group([widgets::clock::widget(monitor)]),
             group([widgets::notif_indicator::widget(monitor)]),
         ])
         .show();

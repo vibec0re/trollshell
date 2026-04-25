@@ -1,0 +1,20 @@
+use hytte::gtk::{self, prelude::*};
+use hytte::prelude::*;
+
+/// Bar chip → opens the power-menu drawer page (Lock / Logout / Suspend /
+/// Reboot / Shutdown).
+pub fn widget(monitor: &Monitor) -> gtk::Widget {
+    let btn = gtk::Button::new();
+    btn.add_css_class("ts-indicator");
+    btn.add_css_class("ts-power");
+
+    let icon = gtk::Image::from_icon_name("system-shutdown-symbolic");
+    btn.set_child(Some(&icon));
+
+    let monitor_for_click = monitor.clone();
+    btn.connect_clicked(move |_| {
+        crate::modal::toggle(&monitor_for_click, crate::modal::Page::PowerMenu);
+    });
+
+    btn.upcast()
+}

@@ -17,6 +17,7 @@ use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
 use hytte::services::brightness;
+use hytte::services::dnd;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
 use hytte::services::notifications;
@@ -1668,7 +1669,30 @@ fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
 pub fn page_notifications() -> gtk::Widget {
     let column = page_box();
 
+    // Do-Not-Disturb toggle. When on, non-critical toasts are suppressed;
+    // history below still records every notification.
+    let dnd_group = adw::PreferencesGroup::new();
+    let dnd_row = adw::ActionRow::builder()
+        .title("Do Not Disturb")
+        .subtitle("Suppress toast popups; history still records.")
+        .build();
+    let dnd_switch = gtk::Switch::new();
+    dnd_switch.set_valign(gtk::Align::Center);
+    bind(dnd::enabled(), &dnd_switch, |w, on| {
+        if w.is_active() != on {
+            w.set_active(on);
+        }
+    });
+    dnd_switch.connect_active_notify(|sw| {
+        dnd::set_enabled(sw.is_active());
+    });
+    dnd_row.add_suffix(&dnd_switch);
+    dnd_row.set_activatable_widget(Some(&dnd_switch));
+    dnd_group.add(&dnd_row);
+    column.append(&dnd_group);
+
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header.set_margin_top(6);
     header.set_margin_bottom(6);
     let title = gtk::Label::new(Some("History"));
     title.add_css_class("ts-popup-headline");

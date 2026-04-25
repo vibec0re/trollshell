@@ -4,6 +4,7 @@ pub mod bluetooth;
 pub mod bluetooth_audio;
 pub mod brightness;
 pub mod clock;
+pub mod dnd;
 pub mod mpris;
 pub mod networkd;
 pub mod niri;

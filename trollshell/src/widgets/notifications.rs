@@ -1,23 +1,35 @@
 //! Layer-shell toast window for `org.freedesktop.Notifications`.
 //!
-//! Currently not installed — the user opted out of toast popups in favour
-//! of on-demand viewing via the Notifications drawer page. Kept around so
-//! re-enabling is one call-site change in `main.rs`.
-#![allow(dead_code)]
-
-//!
 //! Call [`install`] once after GTK initialises (before the main loop runs).
 //! It builds a single `gtk::Window` pinned to the top-right corner of the
 //! given monitor and subscribes to [`hytte::services::notifications::active`].
 //!
 //! The window is stored in a thread-local so it is never dropped.  Callers
 //! do not hold a handle; the window stays alive for the process lifetime.
+//!
+//! # Do-Not-Disturb gating
+//!
+//! When [`hytte::services::dnd::enabled()`] is true, non-critical toasts are
+//! suppressed at the bind site — the drawer history page still records them
+//! via the underlying notifications service. Critical-urgency notifications
+//! (`urgency=2`) BYPASS DND per freedesktop spec.
+//!
+//! # Queue cap
+//!
+//! TODO(notif-followup): when bursts produce 5+ active toasts, show only the
+//! latest 3 plus a synthetic "+N more" card that opens the drawer's
+//! Notifications page on click. The current implementation renders one card
+//! per active notification — fine for steady-state but visually noisy under
+//! a fast burst. The notifications service itself does not queue; it tracks
+//! the live set, so any cap is consumer-side.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::services::dnd;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::ui::{layer_window, Anchor, Margin};
 
@@ -62,8 +74,27 @@ pub fn install(monitor: &Monitor) {
     let window_weak = window.downgrade();
     let vbox_weak = vbox.downgrade();
 
+    // Combine the live notifications with the DND flag. When DND is on,
+    // filter the visible set down to critical-urgency only — non-critical
+    // notifications are still recorded by the notifications service (the
+    // drawer's history page reflects them) but do not pop a toast.
+    let toast_signal = map_ref! {
+        let notifs = notifications::active(),
+        let dnd_on = dnd::enabled() => {
+            if *dnd_on {
+                notifs
+                    .iter()
+                    .filter(|n| n.urgency == Urgency::Critical)
+                    .cloned()
+                    .collect::<Vec<Notification>>()
+            } else {
+                notifs.clone()
+            }
+        }
+    };
+
     glib::MainContext::default().spawn_local(
-        notifications::active()
+        toast_signal
             .for_each(move |notifs: Vec<Notification>| {
                 let Some(window) = window_weak.upgrade() else {
                     return std::future::ready(());

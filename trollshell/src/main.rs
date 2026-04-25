@@ -8,8 +8,8 @@ use hytte::gtk;
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
-    bluetooth, bluetooth_audio, brightness, clock, mpris, networkd, niri, notifications, pipewire,
-    polkit, resolved, screensaver, sensors, tray, upower, wallpaper, wifi,
+    bluetooth, bluetooth_audio, brightness, clock, dnd, mpris, networkd, niri, notifications,
+    pipewire, polkit, resolved, screensaver, sensors, tray, upower, wallpaper, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -24,6 +24,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(resolved::service())
         .with(tray::service())
         .with(notifications::service())
+        .with(dnd::service())
         .with(mpris::service())
         .with(bluetooth::service())
         .with(bluetooth_audio::service())
@@ -57,12 +58,15 @@ fn main() -> hytte::ui::Result<()> {
             // bluetooth + pipewire signals out of the registry.
             bluetooth_audio::init();
 
-            // Toast popups disabled — notifications live in the Notifications
-            // drawer page only (open on demand via the bell indicator).
-
+            // Notification toasts: transient layer-shell window pinned
+            // top-right on the primary monitor. Suppressed when DND is on
+            // (drawer history still records). Critical notifications bypass
+            // DND per freedesktop spec.
+            //
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             // Polkit auth dialog — reacts to polkit::auth_prompts() signal.
             if let Some(primary) = app.monitors().first() {
+                widgets::notifications::install(primary);
                 widgets::prompt::install(primary);
                 widgets::polkit_dialog::install(primary);
                 widgets::osd::install(primary);

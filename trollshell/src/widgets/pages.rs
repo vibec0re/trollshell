@@ -1671,6 +1671,13 @@ fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
 // ── Notifications history page ────────────────────────────────────────────────
 
 pub fn page_notifications() -> gtk::Widget {
+    // TODO(notif-followup):
+    //   M3: ExpanderRow expand-state is lost on every history/muted-apps
+    //       signal — rebuild collapses any open app row. Diff-update the
+    //       existing groups instead of clear+rebuild to preserve state.
+    //   M4: per-app mute Switch is set once from the bound `muted` snapshot;
+    //       it doesn't subscribe to `notifications_mute::muted_apps()` for
+    //       cross-instance sync (e.g. another trollshell window toggling).
     let column = page_box();
 
     // Do-Not-Disturb toggle. When on, non-critical toasts are suppressed;
@@ -1753,7 +1760,14 @@ pub fn page_notifications() -> gtk::Widget {
         let mut buckets: std::collections::HashMap<String, Vec<&notifications::HistoryEntry>> =
             std::collections::HashMap::new();
         for entry in &entries {
-            let key = entry.app_name.clone();
+            // freedesktop spec allows empty `app_name`; substitute "Unknown"
+            // so we don't render a blank ExpanderRow or persist "" to the
+            // muted-apps file when the user toggles its switch.
+            let key = if entry.app_name.trim().is_empty() {
+                "Unknown".to_string()
+            } else {
+                entry.app_name.clone()
+            };
             if !buckets.contains_key(&key) {
                 order.push(key.clone());
             }
@@ -1806,10 +1820,9 @@ fn build_history_app_row(
     mute_switch.connect_active_notify(move |sw| {
         notifications_mute::set_app_muted(&app_owned, sw.is_active());
     });
-    // Trailing widget on the header. `add_suffix` is gated on libadwaita
-    // 1.4+ feature flag; `add_action` predates it and works in all 1.x —
-    // both place the widget on the trailing edge before the expander toggle.
-    row.add_action(&mute_switch);
+    // Trailing widget on the header (before the expander toggle). Uses
+    // `add_suffix`; `add_action` was deprecated in libadwaita 1.4.
+    row.add_suffix(&mute_switch);
 
     for entry in entries.iter().take(MAX_PER_APP) {
         row.add_row(&build_history_action_row(entry));

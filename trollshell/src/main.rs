@@ -9,7 +9,7 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     bluetooth, bluetooth_audio, brightness, clock, mpris, networkd, niri, notifications, pipewire,
-    polkit, resolved, sensors, tray, upower, wifi,
+    polkit, resolved, screensaver, sensors, tray, upower, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -31,6 +31,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(sensors::service())
         .with(wifi::service())
         .with(polkit::service())
+        .with(screensaver::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
         .run(|app| {
             // Spawn a task on the GTK main loop that owns the live set of

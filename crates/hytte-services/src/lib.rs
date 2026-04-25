@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod pipewire;
 pub mod polkit;
 pub mod resolved;
+pub mod screensaver;
 pub mod sensors;
 pub mod tray;
 pub mod upower;

@@ -15,6 +15,7 @@ use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
+use hytte::services::bluetooth_audio;
 use hytte::services::brightness;
 use hytte::services::mpris::{self, PlaybackStatus};
 use hytte::services::networkd::{self, OperationalState};
@@ -681,6 +682,30 @@ fn build_bluetooth_controls() -> gtk::Widget {
     disc_row.add_suffix(&disc_switch);
     disc_row.set_activatable_widget(Some(&disc_switch));
     group.add(&disc_row);
+
+    // Auto-switch audio: when a BT audio device connects, make it the
+    // default pipewire sink (and restore the previous one on disconnect).
+    let auto_row = adw::ActionRow::builder()
+        .title("Auto-switch audio")
+        .subtitle("Use Bluetooth audio devices when they connect")
+        .build();
+    let auto_switch = gtk::Switch::new();
+    auto_switch.set_valign(gtk::Align::Center);
+    bind(
+        bluetooth_audio::auto_switch_enabled(),
+        &auto_switch,
+        |w, on| {
+            if w.is_active() != on {
+                w.set_active(on);
+            }
+        },
+    );
+    auto_switch.connect_active_notify(|sw| {
+        bluetooth_audio::set_auto_switch_enabled(sw.is_active());
+    });
+    auto_row.add_suffix(&auto_switch);
+    auto_row.set_activatable_widget(Some(&auto_switch));
+    group.add(&auto_row);
 
     // Scan with inline spinner showing live progress.
     let scan_row = adw::ActionRow::builder().title("Scan for devices").build();

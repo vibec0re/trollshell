@@ -8,8 +8,8 @@ use hytte::gtk;
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
-    bluetooth, brightness, clock, mpris, networkd, niri, notifications, pipewire, polkit,
-    resolved, sensors, tray, upower, wifi,
+    bluetooth, bluetooth_audio, brightness, clock, mpris, networkd, niri, notifications, pipewire,
+    polkit, resolved, sensors, tray, upower, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -26,6 +26,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(notifications::service())
         .with(mpris::service())
         .with(bluetooth::service())
+        .with(bluetooth_audio::service())
         .with(brightness::service())
         .with(sensors::service())
         .with(wifi::service())
@@ -48,6 +49,11 @@ fn main() -> hytte::ui::Result<()> {
                     })
                     .await;
             });
+
+            // Spawn the bluetooth-audio auto-switch reactor on the GTK main
+            // loop. Must run after services are registered so it can pull
+            // bluetooth + pipewire signals out of the registry.
+            bluetooth_audio::init();
 
             // Toast popups disabled — notifications live in the Notifications
             // drawer page only (open on demand via the bell indicator).

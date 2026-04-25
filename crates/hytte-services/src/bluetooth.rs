@@ -16,21 +16,26 @@
 //!
 //! // Fire-and-forget commands:
 //! bluetooth::set_powered(true);
+//! bluetooth::set_discoverable(true);
 //! bluetooth::start_discovery();
 //! bluetooth::stop_discovery();
+//! bluetooth::pair_device(path);     // Pair, then auto-trust + auto-connect on success
 //! bluetooth::connect_device(path);
 //! bluetooth::disconnect_device(path);
+//! bluetooth::set_trusted(path, true);
+//! bluetooth::remove_device(path);   // unpair / forget
 //! ```
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_reactive::{registry, runtime, Service};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -47,6 +52,37 @@ pub struct Adapter {
     pub discovering: bool,
 }
 
+/// What sort of pairing prompt the `BlueZ` agent is asking us to handle.
+/// The UI uses this to choose copy/buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    /// "Confirm pairing with X — code 123456" style. The user matches the
+    /// number against the one shown on the remote device. Most modern path.
+    ConfirmPasskey,
+    /// Bare "allow this device to pair?" without a code. Older or
+    /// no-input devices.
+    Authorize,
+    /// Legacy: the device wants the user to type a free-form PIN string
+    /// (length up to 16 chars, ASCII). Used by older pre-SSP devices.
+    EnterPinCode,
+    /// Legacy: the device wants the user to type a 0..=999999 numeric
+    /// passkey. Pre-SSP path; rare on modern hardware.
+    EnterPasskey,
+}
+
+/// A pending Bluetooth pairing prompt the user must accept or reject.
+/// The agent suspends pairing on the `BlueZ` side until
+/// `respond_to_prompt(...)` is called.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairPrompt {
+    pub device_path: String,
+    /// Resolved alias from the `devices()` snapshot at prompt time.
+    /// Falls back to the bare path if the device isn't yet in our cache.
+    pub alias: String,
+    pub passkey: Option<u32>,
+    pub kind: PromptKind,
+}
+
 /// Snapshot of a single paired/nearby Bluetooth device.
 #[derive(Clone, Debug, Default)]
 pub struct Device {
@@ -61,6 +97,11 @@ pub struct Device {
     pub paired: bool,
     pub connected: bool,
     pub trusted: bool,
+    /// Battery percentage 0..=100, when the device exposes the
+    /// `org.bluez.Battery1` interface (mostly headphones, mice, keyboards).
+    /// `None` when `BlueZ` doesn't report one — either the device doesn't
+    /// support it or it's currently disconnected.
+    pub battery: Option<u8>,
 }
 
 // ── Adapter path storage ──────────────────────────────────────────────────────
@@ -92,6 +133,34 @@ async fn set_adapter_path(path: &str) {
 pub struct BluetoothHandles {
     pub(crate) adapter: Mutable<Option<Adapter>>,
     pub(crate) devices: Mutable<Vec<Device>>,
+    /// Set of device paths with an in-flight action (`Connect` / `Disconnect`
+    /// / `Pair` / `RemoveDevice` / `Set Trusted`). The UI binds to this so it
+    /// can show a spinner and disable the row while the D-Bus call is pending.
+    pub(crate) device_actions: Mutable<HashSet<String>>,
+    /// Currently-active pairing prompt from the `BlueZ` `Agent1` implementation,
+    /// or `None` when no prompt is pending. The UI renders a banner when
+    /// `Some` and calls `respond_to_prompt(accept)` to resolve it.
+    pub(crate) pair_prompt: Mutable<Option<PairPrompt>>,
+    /// Sender half of the oneshot the agent method is awaiting. Held under
+    /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
+    /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
+    pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+}
+
+/// Internal reply variants from the UI back to the agent's awaiting
+/// method handler. Each variant maps to a specific Agent1 method's
+/// expected return shape.
+#[derive(Debug)]
+pub(crate) enum AgentReply {
+    /// User clicked Confirm on a yes/no prompt (`RequestConfirmation`,
+    /// `RequestAuthorization`).
+    Confirm,
+    /// User explicitly rejected — agent throws `org.bluez.Error.Rejected`.
+    Reject,
+    /// User submitted a PIN code for `RequestPinCode`.
+    Pin(String),
+    /// User submitted a numeric passkey for `RequestPasskey`.
+    Passkey(u32),
 }
 
 impl Default for BluetoothHandles {
@@ -99,6 +168,9 @@ impl Default for BluetoothHandles {
         Self {
             adapter: Mutable::new(None),
             devices: Mutable::new(Vec::new()),
+            device_actions: Mutable::new(HashSet::new()),
+            pair_prompt: Mutable::new(None),
+            pending_response: Arc::new(AsyncMutex::new(None)),
         }
     }
 }
@@ -126,10 +198,39 @@ impl Service for BluetoothService {
                         tracing::warn!(error = %e, "bluetooth watcher error, reconnecting in 2s");
                     }
                 }
-                // Clear state when adapter disappears.
+                // Clear state when the adapter disappears: the device list,
+                // any in-flight action markers, the active pair prompt, and
+                // the pending agent reply (so the agent method handler that's
+                // awaiting it returns Reject instead of hanging forever).
                 adapter_mutable.set(None);
                 devices_mutable.set(Vec::new());
+                let pending_response = registry::with(|r| {
+                    r.get::<BluetoothHandles>().map(|h| {
+                        h.device_actions.lock_mut().clear();
+                        if h.pair_prompt.lock_ref().is_some() {
+                            h.pair_prompt.set(None);
+                        }
+                        h.pending_response.clone()
+                    })
+                });
+                if let Some(pending) = pending_response
+                    && let Some(tx) = pending.lock().await.take()
+                {
+                    let _ = tx.send(AgentReply::Reject);
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        // Pairing-agent loop, independent of the watcher: stays registered
+        // for the process lifetime, retrying on errors (e.g. bluetoothd
+        // restart).
+        rt.spawn(async move {
+            loop {
+                if let Err(e) = run_agent().await {
+                    tracing::warn!(error = %e, "bluetooth agent failed, retrying in 5s");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
 
@@ -166,6 +267,108 @@ pub fn devices() -> impl Signal<Item = Vec<Device>> {
     })
 }
 
+/// Signal emitting the set of device paths that currently have an in-flight
+/// action (connect, disconnect, pair, remove, set-trusted). The UI uses this
+/// to render a spinner / disable controls until the D-Bus call returns.
+pub fn device_actions() -> impl Signal<Item = HashSet<String>> {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered")
+            .device_actions
+            .signal_cloned()
+    })
+}
+
+/// Signal emitting the active pairing prompt from `BlueZ`'s `Agent1` callbacks,
+/// or `None` when no prompt is pending. The UI shows a confirmation banner
+/// while this is `Some` and calls `respond_to_prompt(...)` on user action.
+pub fn pair_prompts() -> impl Signal<Item = Option<PairPrompt>> {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered")
+            .pair_prompt
+            .signal_cloned()
+    })
+}
+
+/// Resolve the active yes/no pairing prompt. `accept = true` returns `Ok`
+/// to `BlueZ`, completing the pair; `false` returns `org.bluez.Error.Rejected`
+/// and aborts. No-op when no prompt is in flight or the prompt is a
+/// text-entry kind (use `submit_pin` / `submit_passkey` for those).
+pub fn respond_to_prompt(accept: bool) {
+    send_reply(if accept {
+        AgentReply::Confirm
+    } else {
+        AgentReply::Reject
+    });
+}
+
+/// Resolve a `RequestPinCode` prompt by submitting the user's PIN.
+/// Empty string is treated as a reject so the user can dismiss the
+/// banner without triggering a malformed pair.
+pub fn submit_pin(pin: String) {
+    if pin.is_empty() {
+        send_reply(AgentReply::Reject);
+    } else {
+        send_reply(AgentReply::Pin(pin));
+    }
+}
+
+/// Resolve a `RequestPasskey` prompt by submitting the user's numeric
+/// passkey. Out-of-range values reject so we never hand `BlueZ` something
+/// it'll trip on.
+pub fn submit_passkey(passkey: u32) {
+    if passkey > 999_999 {
+        send_reply(AgentReply::Reject);
+    } else {
+        send_reply(AgentReply::Passkey(passkey));
+    }
+}
+
+fn send_reply(reply: AgentReply) {
+    runtime::handle().spawn(async move {
+        let pending = registry::with(|r| {
+            r.get::<BluetoothHandles>()
+                .map(|h| h.pending_response.clone())
+        });
+        let Some(pending) = pending else { return };
+        let mut guard = pending.lock().await;
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(reply);
+        }
+    });
+}
+
+fn mark_busy(path: &str) {
+    registry::with(|r| {
+        let handles = r
+            .get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered");
+        // Peek with a read lock first — `lock_mut()` always fires the
+        // signal on drop, even if the contents didn't change, so we only
+        // take a write lock when the value will actually flip.
+        if handles.device_actions.lock_ref().contains(path) {
+            return;
+        }
+        handles
+            .device_actions
+            .lock_mut()
+            .insert(path.to_string());
+    });
+}
+
+fn mark_idle(path: &str) {
+    registry::with(|r| {
+        let handles = r
+            .get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered");
+        if !handles.device_actions.lock_ref().contains(path) {
+            return;
+        }
+        handles.device_actions.lock_mut().remove(path);
+    });
+}
+
 /// Fire-and-forget: set the `Powered` property on the adapter.
 pub fn set_powered(on: bool) {
     runtime::handle().spawn(async move {
@@ -174,8 +377,24 @@ pub fn set_powered(on: bool) {
             tracing::warn!("set_powered: no adapter path known");
             return;
         }
-        if let Err(e) = do_set_powered(&path, on).await {
+        if let Err(e) = do_set_adapter_bool(&path, "Powered", on).await {
             tracing::warn!(error = %e, on, "bluetooth set_powered failed");
+        }
+    });
+}
+
+/// Fire-and-forget: set the `Discoverable` property on the adapter. While
+/// discoverable, this device shows up in other phones'/laptops' scan
+/// results so you can pair *to* it.
+pub fn set_discoverable(on: bool) {
+    runtime::handle().spawn(async move {
+        let path = get_adapter_path().await;
+        if path.is_empty() {
+            tracing::warn!("set_discoverable: no adapter path known");
+            return;
+        }
+        if let Err(e) = do_set_adapter_bool(&path, "Discoverable", on).await {
+            tracing::warn!(error = %e, on, "bluetooth set_discoverable failed");
         }
     });
 }
@@ -209,29 +428,91 @@ pub fn stop_discovery() {
 /// Fire-and-forget: call `Connect` on the given device path.
 pub fn connect_device(device_path: &str) {
     let path = device_path.to_string();
+    mark_busy(&path);
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Connect").await {
             tracing::warn!(error = %e, path, "bluetooth connect_device failed");
         }
+        mark_idle(&path);
     });
 }
 
 /// Fire-and-forget: call `Disconnect` on the given device path.
 pub fn disconnect_device(device_path: &str) {
     let path = device_path.to_string();
+    mark_busy(&path);
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, path, "bluetooth disconnect_device failed");
         }
+        mark_idle(&path);
+    });
+}
+
+/// Fire-and-forget: call `Pair` on the given device. On success, also marks
+/// the device trusted (so it auto-reconnects on next session) and starts a
+/// connection. The pair-then-trust-then-connect chain is what most users
+/// expect from a "tap to pair my headphones" interaction. For devices that
+/// require a PIN/passkey `BlueZ` delegates to a registered `Agent1`; without
+/// one such pairings will silently fail.
+pub fn pair_device(device_path: &str) {
+    let path = device_path.to_string();
+    mark_busy(&path);
+    runtime::handle().spawn(async move {
+        match do_device_call(&path, "Pair").await {
+            Ok(()) => {
+                if let Err(e) = do_set_device_bool(&path, "Trusted", true).await {
+                    tracing::warn!(error = %e, path, "auto-trust after pair failed");
+                }
+                if let Err(e) = do_device_call(&path, "Connect").await {
+                    tracing::warn!(error = %e, path, "auto-connect after pair failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path, "bluetooth pair_device failed");
+            }
+        }
+        mark_idle(&path);
+    });
+}
+
+/// Fire-and-forget: set the `Trusted` property on a device.
+pub fn set_trusted(device_path: &str, on: bool) {
+    let path = device_path.to_string();
+    mark_busy(&path);
+    runtime::handle().spawn(async move {
+        if let Err(e) = do_set_device_bool(&path, "Trusted", on).await {
+            tracing::warn!(error = %e, on, path, "bluetooth set_trusted failed");
+        }
+        mark_idle(&path);
+    });
+}
+
+/// Fire-and-forget: ask the adapter to forget the device entirely
+/// (unpair). Equivalent to `bluetoothctl remove <addr>`.
+pub fn remove_device(device_path: &str) {
+    let path = device_path.to_string();
+    mark_busy(&path);
+    runtime::handle().spawn(async move {
+        let adapter = get_adapter_path().await;
+        if adapter.is_empty() {
+            tracing::warn!("remove_device: no adapter path known");
+            mark_idle(&path);
+            return;
+        }
+        if let Err(e) = do_remove_device(&adapter, &path).await {
+            tracing::warn!(error = %e, path, "bluetooth remove_device failed");
+        }
+        mark_idle(&path);
     });
 }
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-async fn do_set_powered(adapter_path: &str, on: bool) -> Result<()> {
+async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
     let conn = Connection::system()
         .await
-        .context("open system bus for set_powered")?;
+        .context("open system bus for adapter property set")?;
     conn.call_method(
         Some("org.bluez"),
         adapter_path,
@@ -239,12 +520,32 @@ async fn do_set_powered(adapter_path: &str, on: bool) -> Result<()> {
         "Set",
         &(
             "org.bluez.Adapter1",
-            "Powered",
+            prop,
             zbus::zvariant::Value::from(on),
         ),
     )
     .await
-    .context("call Properties.Set Powered")?;
+    .with_context(|| format!("call Properties.Set Adapter1.{prop}"))?;
+    Ok(())
+}
+
+async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<()> {
+    let conn = Connection::system()
+        .await
+        .context("open system bus for device property set")?;
+    conn.call_method(
+        Some("org.bluez"),
+        device_path,
+        Some("org.freedesktop.DBus.Properties"),
+        "Set",
+        &(
+            "org.bluez.Device1",
+            prop,
+            zbus::zvariant::Value::from(on),
+        ),
+    )
+    .await
+    .with_context(|| format!("call Properties.Set Device1.{prop}"))?;
     Ok(())
 }
 
@@ -277,6 +578,24 @@ async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
     )
     .await
     .with_context(|| format!("call Device1.{method}"))?;
+    Ok(())
+}
+
+async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<()> {
+    let conn = Connection::system()
+        .await
+        .context("open system bus for RemoveDevice")?;
+    let dev_op = zbus::zvariant::ObjectPath::try_from(device_path)
+        .map_err(|e| anyhow::anyhow!("invalid device object path: {e}"))?;
+    conn.call_method(
+        Some("org.bluez"),
+        adapter_path,
+        Some("org.bluez.Adapter1"),
+        "RemoveDevice",
+        &(dev_op,),
+    )
+    .await
+    .context("call Adapter1.RemoveDevice")?;
     Ok(())
 }
 
@@ -329,6 +648,7 @@ fn parse_device_props(path: &str, props: &HashMap<String, OwnedValue>) -> Device
         paired: prop_bool(props, "Paired"),
         connected: prop_bool(props, "Connected"),
         trusted: prop_bool(props, "Trusted"),
+        battery: None,
     }
 }
 
@@ -473,7 +793,10 @@ async fn listen(
             if p.starts_with(adapter_path.as_str())
                 && let Some(dev_props) = ifaces.get("org.bluez.Device1")
             {
-                let dev = parse_device_props(p, dev_props);
+                let mut dev = parse_device_props(p, dev_props);
+                if let Some(bat_props) = ifaces.get("org.bluez.Battery1") {
+                    dev.battery = property::<u8>(bat_props, "Percentage");
+                }
                 map.insert(p.to_string(), dev);
             }
         }
@@ -574,9 +897,26 @@ async fn handle_ifaces_added(
     if p.starts_with(adapter_path)
         && let Some(dev_props) = ifaces.get("org.bluez.Device1")
     {
-        let dev = parse_device_props(p, dev_props);
+        let mut dev = parse_device_props(p, dev_props);
+        if let Some(bat_props) = ifaces.get("org.bluez.Battery1") {
+            dev.battery = property::<u8>(bat_props, "Percentage");
+        }
         tracing::debug!(path = p, alias = dev.alias, "device added");
         state.devices_map.lock().await.insert(p.to_string(), dev);
+        state.publish_devices().await;
+    }
+
+    // Battery1 may appear *after* Device1 (added when device connects) on
+    // its existing path. Update the stored device with the percentage.
+    if p.starts_with(adapter_path)
+        && let Some(bat_props) = ifaces.get("org.bluez.Battery1")
+    {
+        let pct = property::<u8>(bat_props, "Percentage");
+        let mut map = state.devices_map.lock().await;
+        if let Some(dev) = map.get_mut(p) {
+            dev.battery = pct;
+        }
+        drop(map);
         state.publish_devices().await;
     }
 }
@@ -608,6 +948,15 @@ async fn handle_ifaces_removed(
         tracing::debug!(path = p, "device removed");
         state.devices_map.lock().await.remove(p);
         state.publish_devices().await;
+    } else if removed_ifaces.iter().any(|i| i == "org.bluez.Battery1") {
+        // Device still exists, but Battery1 went away (typically on
+        // disconnect). Clear the percentage on the stored device.
+        let mut map = state.devices_map.lock().await;
+        if let Some(dev) = map.get_mut(p) {
+            dev.battery = None;
+        }
+        drop(map);
+        state.publish_devices().await;
     }
 
     false
@@ -637,5 +986,286 @@ async fn handle_props_changed(
     } else if iface_name == "org.bluez.Device1" {
         state.apply_device_props(&obj_path, &changed).await;
         state.publish_devices().await;
+    } else if iface_name == "org.bluez.Battery1" {
+        let mut map = state.devices_map.lock().await;
+        if let Some(dev) = map.get_mut(&obj_path)
+            && changed.contains_key("Percentage")
+        {
+            dev.battery = property::<u8>(&changed, "Percentage");
+        }
+        drop(map);
+        state.publish_devices().await;
     }
+}
+
+// ── Pairing agent ─────────────────────────────────────────────────────────────
+//
+// Implements `org.bluez.Agent1` so BlueZ can ask us to confirm pairings.
+// Without a registered agent BlueZ rejects most pair attempts that need any
+// user interaction (e.g. SSP numeric comparison). MVP scope:
+//   * RequestConfirmation: user confirms the displayed code matches.
+//   * RequestAuthorization: bare yes/no.
+//   * AuthorizeService: auto-accept (typical for trusted devices reconnecting).
+//   * PIN / Passkey entry methods: return Rejected (no text-input UI yet).
+//   * Cancel: aborts the pending prompt.
+
+const AGENT_PATH: &str = "/com/trollshell/BluetoothAgent";
+
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.bluez.Error")]
+#[allow(dead_code)]
+enum AgentError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    Rejected(String),
+    Canceled(String),
+}
+
+struct PairAgent;
+
+#[zbus::interface(name = "org.bluez.Agent1")]
+impl PairAgent {
+    #[allow(clippy::unused_async)]
+    async fn release(&self) {
+        tracing::debug!("agent released");
+    }
+
+    async fn request_pin_code(&self, device: OwnedObjectPath) -> Result<String, AgentError> {
+        let path = device.as_str().to_string();
+        let alias = lookup_alias(&path);
+        let reply = await_reply(PairPrompt {
+            device_path: path,
+            alias,
+            passkey: None,
+            kind: PromptKind::EnterPinCode,
+        })
+        .await;
+        match reply {
+            AgentReply::Pin(s) => Ok(s),
+            _ => Err(AgentError::Rejected("user did not provide PIN".into())),
+        }
+    }
+
+    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
+    async fn display_pin_code(&self, device: OwnedObjectPath, pincode: String) {
+        // Display-only acknowledgement — there is no return value to gate.
+        // The user enters the PIN on the remote device. Nothing to do.
+        let _ = (device, pincode);
+    }
+
+    async fn request_passkey(&self, device: OwnedObjectPath) -> Result<u32, AgentError> {
+        let path = device.as_str().to_string();
+        let alias = lookup_alias(&path);
+        let reply = await_reply(PairPrompt {
+            device_path: path,
+            alias,
+            passkey: None,
+            kind: PromptKind::EnterPasskey,
+        })
+        .await;
+        match reply {
+            AgentReply::Passkey(p) => Ok(p),
+            _ => Err(AgentError::Rejected("user did not provide passkey".into())),
+        }
+    }
+
+    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
+    async fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, entered: u16) {
+        // Same as DisplayPinCode — no input from us.
+        let _ = (device, passkey, entered);
+    }
+
+    async fn request_confirmation(
+        &self,
+        device: OwnedObjectPath,
+        passkey: u32,
+    ) -> Result<(), AgentError> {
+        let path = device.as_str().to_string();
+        let alias = lookup_alias(&path);
+        let reply = await_reply(PairPrompt {
+            device_path: path,
+            alias,
+            passkey: Some(passkey),
+            kind: PromptKind::ConfirmPasskey,
+        })
+        .await;
+        match reply {
+            AgentReply::Confirm => Ok(()),
+            _ => Err(AgentError::Rejected("user rejected pairing".into())),
+        }
+    }
+
+    async fn request_authorization(&self, device: OwnedObjectPath) -> Result<(), AgentError> {
+        let path = device.as_str().to_string();
+        let alias = lookup_alias(&path);
+        let reply = await_reply(PairPrompt {
+            device_path: path,
+            alias,
+            passkey: None,
+            kind: PromptKind::Authorize,
+        })
+        .await;
+        match reply {
+            AgentReply::Confirm => Ok(()),
+            _ => Err(AgentError::Rejected("user rejected pairing".into())),
+        }
+    }
+
+    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
+    async fn authorize_service(&self, device: OwnedObjectPath, uuid: String) {
+        // Auto-accept service authorization. BlueZ asks per-service for
+        // unknown protocols; for trusted/already-paired devices this is
+        // generally fine and matches blueman-applet's default policy.
+        let _ = (device, uuid);
+    }
+
+    async fn cancel(&self) {
+        tracing::debug!("agent cancel — aborting pending prompt");
+        if let Some(tx) = take_pending().await {
+            let _ = tx.send(AgentReply::Reject);
+        }
+        clear_prompt();
+    }
+}
+
+/// Resolve a device path to a user-facing label. Prefers the `BlueZ` Alias,
+/// falls through to the MAC address, and ultimately "Unknown device" so a
+/// raw D-Bus object path never bleeds into UI copy.
+fn lookup_alias(path: &str) -> String {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .and_then(|h| {
+                let devs = h.devices.lock_ref();
+                devs.iter().find(|d| d.path == path).map(|d| {
+                    if !d.alias.is_empty() {
+                        d.alias.clone()
+                    } else if !d.address.is_empty() {
+                        d.address.clone()
+                    } else {
+                        "Unknown device".to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "Unknown device".to_string())
+    })
+}
+
+fn pending_response_arc() -> Option<Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>> {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .map(|h| h.pending_response.clone())
+    })
+}
+
+async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
+    let arc = pending_response_arc()?;
+    arc.lock().await.take()
+}
+
+fn set_prompt(p: Option<PairPrompt>) {
+    registry::with(|r| {
+        if let Some(h) = r.get::<BluetoothHandles>() {
+            h.pair_prompt.set(p);
+        }
+    });
+}
+
+fn clear_prompt() {
+    set_prompt(None);
+}
+
+/// Suspend the calling Agent1 method until the user responds via the UI.
+/// Returns `AgentReply::Reject` if no prompt slot is available, the
+/// channel is dropped, or another pair is already in flight — callers
+/// pattern-match on the returned variant to shape their D-Bus return.
+async fn await_reply(prompt: PairPrompt) -> AgentReply {
+    let Some(pending) = pending_response_arc() else {
+        return AgentReply::Reject;
+    };
+
+    let (tx, rx) = oneshot::channel::<AgentReply>();
+    {
+        let mut guard = pending.lock().await;
+        if guard.is_some() {
+            // Another pairing already pending — refuse cleanly so BlueZ
+            // doesn't pile up coincident prompts.
+            return AgentReply::Reject;
+        }
+        *guard = Some(tx);
+    }
+
+    set_prompt(Some(prompt));
+    let reply = rx.await.unwrap_or(AgentReply::Reject);
+    clear_prompt();
+    reply
+}
+
+async fn run_agent() -> Result<()> {
+    let conn = Connection::system()
+        .await
+        .context("open system bus for pairing agent")?;
+
+    conn.object_server()
+        .at(AGENT_PATH, PairAgent)
+        .await
+        .context("register Agent1 at our path")?;
+
+    let agent_op = zbus::zvariant::ObjectPath::try_from(AGENT_PATH)
+        .map_err(|e| anyhow::anyhow!("bad agent path: {e}"))?;
+
+    // Subscribe to NameOwnerChanged BEFORE the RegisterAgent call so we
+    // can't miss a death event between successful registration and the
+    // start of our listen loop.
+    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn)
+        .await
+        .context("create DBusProxy for NameOwnerChanged")?;
+    let mut owner_changed = dbus_proxy
+        .receive_name_owner_changed()
+        .await
+        .context("subscribe NameOwnerChanged")?;
+
+    // RegisterAgent — capability "DisplayYesNo": we can show a code and
+    // accept yes/no, which is what RequestConfirmation needs.
+    conn.call_method(
+        Some("org.bluez"),
+        "/org/bluez",
+        Some("org.bluez.AgentManager1"),
+        "RegisterAgent",
+        &(&agent_op, "DisplayYesNo"),
+    )
+    .await
+    .context("AgentManager1.RegisterAgent")?;
+
+    // RequestDefaultAgent — make us the system-wide default. Without this
+    // BlueZ may use whichever Agent it sees first, including stale ones
+    // from a previous trollshell run if any.
+    conn.call_method(
+        Some("org.bluez"),
+        "/org/bluez",
+        Some("org.bluez.AgentManager1"),
+        "RequestDefaultAgent",
+        &(&agent_op,),
+    )
+    .await
+    .context("AgentManager1.RequestDefaultAgent")?;
+
+    tracing::info!("bluetooth pairing agent registered");
+
+    // Watch for bluetoothd death (e.g. service restart). When org.bluez
+    // loses its owner our registration is gone, so we return Err and the
+    // outer loop reconnects + re-registers. ObjectServer keeps dispatching
+    // method calls in the background while we sit on this stream.
+    while let Some(signal) = owner_changed.next().await {
+        let Ok(args) = signal.args() else { continue };
+        if args.name().as_str() != "org.bluez" {
+            continue;
+        }
+        if args.new_owner().is_none() {
+            return Err(anyhow::anyhow!(
+                "org.bluez owner lost — re-registering agent"
+            ));
+        }
+    }
+
+    Err(anyhow::anyhow!("NameOwnerChanged stream ended"))
 }

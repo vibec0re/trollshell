@@ -1,0 +1,15 @@
+[Unit]
+Description=Wallpaper background via swaybg
+Documentation=man:swaybg(1)
+PartOf=graphical-session.target
+Requisite=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'exec /usr/bin/swaybg -i "$(cat %h/.config/trollshell/wallpaper.path)" -m fill'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

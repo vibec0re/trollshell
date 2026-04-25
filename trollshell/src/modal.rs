@@ -18,6 +18,7 @@ pub enum Page {
     Power,
     PowerMenu,
     Notifications,
+    Appearance,
 }
 
 impl Page {
@@ -31,6 +32,7 @@ impl Page {
             Self::Power => "power",
             Self::PowerMenu => "power-menu",
             Self::Notifications => "notifications",
+            Self::Appearance => "appearance",
         }
     }
 }
@@ -151,6 +153,10 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(
         &pages::page_notifications(),
         Some(Page::Notifications.stack_name()),
+    );
+    stack.add_named(
+        &pages::page_appearance(),
+        Some(Page::Appearance.stack_name()),
     );
 
     card.append(&stack);

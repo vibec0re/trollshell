@@ -2,9 +2,8 @@
 //!
 //! GNOME's evolution-data-server (EDS), provisioned by GNOME Online Accounts
 //! (GOA) via `gnome-control-center → Online Accounts`, keeps a synced copy
-//! of every calendar source in iCalendar form at:
-//!
-//!     ~/.local/share/evolution/calendar/<source-uid>/calendar.ics
+//! of every calendar source in iCalendar form at
+//! `~/.local/share/evolution/calendar/<source-uid>/calendar.ics`.
 //!
 //! v1 reads those files directly and parses them with the `icalendar`
 //! crate — no D-Bus, no `ECalClient` bindings. The trade-off is up to one

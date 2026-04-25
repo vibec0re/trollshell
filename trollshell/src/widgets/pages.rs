@@ -704,23 +704,21 @@ fn build_bluetooth_controls() -> gtk::Widget {
 
     let scan_btn = gtk::ToggleButton::new();
     scan_btn.set_valign(gtk::Align::Center);
-    bind(
+    bind_two_way(
         bluetooth::adapter().map(|a| a.is_some_and(|ad| ad.discovering)),
         &scan_btn,
         |w, discovering| {
-            if w.is_active() != discovering {
-                w.set_active(discovering);
-            }
+            w.set_active(discovering);
             w.set_label(if discovering { "Stop" } else { "Scan" });
         },
+        |w| w.connect_toggled(|btn| {
+            if btn.is_active() {
+                bluetooth::start_discovery();
+            } else {
+                bluetooth::stop_discovery();
+            }
+        }),
     );
-    scan_btn.connect_toggled(|btn| {
-        if btn.is_active() {
-            bluetooth::start_discovery();
-        } else {
-            bluetooth::stop_discovery();
-        }
-    });
     scan_row.add_suffix(&scan_btn);
     scan_row.set_activatable_widget(Some(&scan_btn));
     group.add(&scan_row);

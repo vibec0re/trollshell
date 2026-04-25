@@ -24,12 +24,12 @@
 //!
 //! # Queue cap
 //!
-//! TODO(notif-followup): when bursts produce 5+ active toasts, show only the
-//! latest 3 plus a synthetic "+N more" card that opens the drawer's
-//! Notifications page on click. The current implementation renders one card
-//! per active notification — fine for steady-state but visually noisy under
-//! a fast burst. The notifications service itself does not queue; it tracks
-//! the live set, so any cap is consumer-side.
+//! Up to [`MAX_VISIBLE_NONCRITICAL`] non-critical toasts render
+//! individually. Additional non-critical toasts collapse into a
+//! synthetic "+N more" card that opens the Notifications drawer on
+//! click. Critical-urgency toasts always render individually and don't
+//! count toward the cap. The notifications service itself does not
+//! queue; it tracks the live set, so the cap is consumer-side only.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -41,6 +41,14 @@ use hytte::services::dnd;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::services::notifications_mute;
 use hytte::ui::{layer_window, Anchor, Margin};
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Maximum number of non-critical toasts rendered as individual cards.
+/// Additional non-critical notifications collapse into a synthetic
+/// "+N more" overflow card. Critical-urgency toasts always render
+/// individually and do not count toward this cap.
+const MAX_VISIBLE_NONCRITICAL: usize = 4;
 
 // ── Thread-local window storage ───────────────────────────────────────────────
 
@@ -54,6 +62,7 @@ thread_local! {
 /// notifications active signal.  Idempotent: a second call on the same thread
 /// replaces the stored window reference (harmless in practice — `install` is
 /// called once).
+#[allow(clippy::too_many_lines)]
 pub fn install(monitor: &Monitor) {
     let window = layer_window(monitor)
         .layer(Layer::Top)
@@ -78,6 +87,12 @@ pub fn install(monitor: &Monitor) {
     // Map of mounted card widgets keyed by notification id.
     let card_map: RefCell<HashMap<u32, gtk::Widget>> = RefCell::new(HashMap::new());
 
+    // Singleton "+N more" overflow card. Lives outside `card_map` because
+    // it isn't keyed to any notification id — it's purely a synthetic
+    // collapse for the non-critical tail. Removed when the tail is empty;
+    // rebuilt each time the count changes so the label stays accurate.
+    let overflow_card: RefCell<Option<gtk::Widget>> = RefCell::new(None);
+
     // `suppressed_during_dnd` records notification ids that arrived while
     // DND was on. Toggling DND off does NOT revive them — DND is a
     // "from-now-forward" gate. Entries are dropped when the upstream
@@ -88,6 +103,10 @@ pub fn install(monitor: &Monitor) {
     // thread-local owns it).
     let window_weak = window.downgrade();
     let vbox_weak = vbox.downgrade();
+
+    // Captured into the `for_each` closure so the overflow card click
+    // handler can open the Notifications drawer page.
+    let monitor_for_overflow = monitor.clone();
 
     // Combine the live notifications with the DND flag and the per-app mute
     // set. The visibility filter — "critical bypasses DND + mute, anything
@@ -146,9 +165,30 @@ pub fn install(monitor: &Monitor) {
                 let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
                 suppressed.retain(|id| active_ids.contains(id));
 
+                // Partition non-critical visible into head (rendered as
+                // cards) and tail (collapsed into a +N overflow card).
+                // Critical urgency always renders individually and never
+                // counts toward the cap.
+                let (critical_visible, noncritical_visible): (
+                    Vec<&Notification>,
+                    Vec<&Notification>,
+                ) = visible
+                    .iter()
+                    .copied()
+                    .partition(|n| n.urgency == Urgency::Critical);
+                let nc_head_start = noncritical_visible
+                    .len()
+                    .saturating_sub(MAX_VISIBLE_NONCRITICAL);
+                let head_noncritical = &noncritical_visible[nc_head_start..];
+                let tail_noncritical_count = nc_head_start;
+
                 // Build id sets.
-                let new_ids: HashMap<u32, &Notification> =
-                    visible.iter().map(|n| (n.id, *n)).collect();
+                let new_ids: HashMap<u32, &Notification> = critical_visible
+                    .iter()
+                    .copied()
+                    .chain(head_noncritical.iter().copied())
+                    .map(|n| (n.id, n))
+                    .collect();
                 let old_ids: Vec<u32> = map.keys().copied().collect();
 
                 // Remove cards whose notifications have gone.
@@ -170,8 +210,30 @@ pub fn install(monitor: &Monitor) {
                     map.insert(*id, card);
                 }
 
-                // Show/hide window based on whether any notifications are active.
-                window.set_visible(!map.is_empty());
+                // Manage the overflow "+N more" card. Singleton, lives in
+                // `overflow_card`. Removed when tail is empty; rebuilt when
+                // tail count changes (so the label updates).
+                {
+                    let mut slot = overflow_card.borrow_mut();
+                    if tail_noncritical_count == 0 {
+                        if let Some(card) = slot.take() {
+                            vbox.remove(&card);
+                        }
+                    } else {
+                        if let Some(card) = slot.take() {
+                            vbox.remove(&card);
+                        }
+                        let card = build_overflow_card(
+                            &monitor_for_overflow,
+                            tail_noncritical_count,
+                        );
+                        vbox.append(&card);
+                        *slot = Some(card);
+                    }
+                }
+
+                // Show/hide window based on whether any cards are mounted.
+                window.set_visible(!map.is_empty() || overflow_card.borrow().is_some());
 
                 std::future::ready(())
             }),
@@ -277,6 +339,49 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     gesture.connect_pressed(move |gesture, _, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
         notifications::dismiss(id, 2);
+    });
+    card.add_controller(gesture);
+
+    card.upcast()
+}
+
+// ── Overflow card builder ─────────────────────────────────────────────────────
+
+/// Synthetic "+N more notifications" card shown when more than
+/// [`MAX_VISIBLE_NONCRITICAL`] non-critical toasts are active. Clicking
+/// the card opens the Notifications drawer page on `monitor`.
+fn build_overflow_card(monitor: &Monitor, count: usize) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    card.add_css_class("ts-toast");
+    card.add_css_class("ts-toast-overflow");
+
+    let icon = gtk::Image::from_icon_name("preferences-system-notifications-symbolic");
+    icon.set_pixel_size(24);
+    icon.add_css_class("ts-toast-image");
+    card.append(&icon);
+
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    column.set_hexpand(true);
+
+    let summary = gtk::Label::new(Some(&format!("+{count} more notifications")));
+    summary.add_css_class("ts-toast-summary");
+    summary.set_xalign(0.0);
+    column.append(&summary);
+
+    let body = gtk::Label::new(Some("Click to open Notifications"));
+    body.add_css_class("ts-toast-body");
+    body.set_xalign(0.0);
+    column.append(&body);
+
+    card.append(&column);
+
+    // Open (not toggle) the drawer — clicking the overflow card while the
+    // drawer is already open should NOT close it.
+    let monitor_for_click = monitor.clone();
+    let gesture = gtk::GestureClick::new();
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        crate::modal::open(&monitor_for_click, crate::modal::Page::Notifications);
     });
     card.add_controller(gesture);
 

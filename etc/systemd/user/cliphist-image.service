@@ -1,0 +1,15 @@
+[Unit]
+Description=Clipboard history (image) via cliphist
+Documentation=https://github.com/sentriz/cliphist
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'exec wl-paste --type image --watch cliphist store'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

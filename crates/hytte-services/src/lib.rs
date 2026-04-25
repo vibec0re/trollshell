@@ -3,6 +3,7 @@
 pub mod bluetooth;
 pub mod bluetooth_audio;
 pub mod brightness;
+pub mod clipboard;
 pub mod clock;
 pub mod displays;
 pub mod dnd;

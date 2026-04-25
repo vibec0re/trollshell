@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::services::clipboard;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
 
 use crate::widgets::pages;
@@ -20,6 +21,7 @@ pub enum Page {
     Notifications,
     Appearance,
     Displays,
+    Clipboard,
 }
 
 impl Page {
@@ -35,6 +37,7 @@ impl Page {
             Self::Notifications => "notifications",
             Self::Appearance => "appearance",
             Self::Displays => "displays",
+            Self::Clipboard => "clipboard",
         }
     }
 }
@@ -164,6 +167,10 @@ pub fn install(monitor: &Monitor) {
         &pages::page_displays(),
         Some(Page::Displays.stack_name()),
     );
+    stack.add_named(
+        &pages::page_clipboard(),
+        Some(Page::Clipboard.stack_name()),
+    );
 
     card.append(&stack);
     revealer.set_child(Some(&card));
@@ -282,6 +289,7 @@ pub fn toggle(monitor: &Monitor, page: Page) {
             Some(_) => {
                 panel.stack.set_visible_child_name(page.stack_name());
                 *panel.current.borrow_mut() = Some(page);
+                on_page_show(page);
             }
             None => {
                 show_panel(panel, &key, page);
@@ -297,6 +305,7 @@ fn show_panel(panel: &ModalPanel, _key: &str, page: Page) {
     panel.stack.set_visible_child_name(page.stack_name());
     *panel.current.borrow_mut() = Some(page);
     panel.open_state.set(true);
+    on_page_show(page);
 
     panel.catcher.set_visible(true);
     panel.catcher.present();
@@ -351,4 +360,13 @@ fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
     // Start hidden; `show_panel` toggles visibility alongside the drawer.
     win.set_visible(false);
     win
+}
+
+/// Per-page side-effects that should run whenever a page becomes visible
+/// (initial open OR cross-fade swap from another page). Add a match arm
+/// here when a new page needs an on-show fetch.
+fn on_page_show(page: Page) {
+    if page == Page::Clipboard {
+        clipboard::refresh();
+    }
 }

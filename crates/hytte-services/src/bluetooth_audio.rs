@@ -211,13 +211,11 @@ fn sink_belongs_to_device(sink_name: &str, device: &Device) -> bool {
     if device.address.is_empty() {
         return false;
     }
-    let token = mac_to_pw_token(&device.address);
-    // Belt-and-suspenders: substring + the conventional "bluez_output" prefix
-    // is the realistic shape; we also allow bluez_input / bluez_sink variants
-    // by leaving the prefix unchecked.
-    // TODO(bt-audio-followup): consider case-insensitive MAC match if BlueZ
-    // ever emits lowercase MACs. Today everything we've seen is upper-case.
-    sink_name.contains(&token)
+    // Pipewire sometimes lowercases MAC tokens in node names
+    // (`bluez_input.ac_c5_…`) while BlueZ paths use uppercase. Match
+    // case-insensitively to cover both shapes.
+    let token = mac_to_pw_token(&device.address).to_ascii_uppercase();
+    sink_name.to_ascii_uppercase().contains(&token)
 }
 
 /// Structural classifier for pipewire bluez sinks: matches by canonical name
@@ -660,5 +658,44 @@ mod tests {
             Some("alsa_output.builtin")
         );
         assert!(st.lock().unwrap().last_observed_bt_default.is_none());
+    }
+
+    #[test]
+    fn sink_belongs_to_device_matches_lowercase_pw_name() {
+        let dev = Device {
+            path: "/org/bluez/hci0/dev_AC_C5_8B_11_22_33".to_string(),
+            address: "AC:C5:8B:11:22:33".to_string(),
+            ..Device::default()
+        };
+        assert!(sink_belongs_to_device(
+            "bluez_input.ac_c5_8b_11_22_33.headset-head-unit",
+            &dev,
+        ));
+    }
+
+    #[test]
+    fn sink_belongs_to_device_still_matches_uppercase() {
+        let dev = Device {
+            path: "/org/bluez/hci0/dev_AC_C5_8B_11_22_33".to_string(),
+            address: "AC:C5:8B:11:22:33".to_string(),
+            ..Device::default()
+        };
+        assert!(sink_belongs_to_device(
+            "bluez_output.AC_C5_8B_11_22_33.1",
+            &dev,
+        ));
+    }
+
+    #[test]
+    fn sink_belongs_to_device_rejects_other_mac() {
+        let dev = Device {
+            path: "/org/bluez/hci0/dev_AC_C5_8B_11_22_33".to_string(),
+            address: "AC:C5:8B:11:22:33".to_string(),
+            ..Device::default()
+        };
+        assert!(!sink_belongs_to_device(
+            "bluez_output.DE_AD_BE_EF_00_00.1",
+            &dev,
+        ));
     }
 }

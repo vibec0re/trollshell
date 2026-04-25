@@ -35,6 +35,22 @@ fn page_box() -> gtk::Box {
     b
 }
 
+/// Wrap a finished page widget (Box or Grid) in an `AdwClamp` so a child
+/// reporting a pathological natural width (e.g. an `AdwActionRow` subtitle
+/// that ends up holding a long single-line list) can't push the
+/// layer-shell modal surface to full-screen width. Belt-and-suspenders
+/// against the same class of bug — individual rows should still constrain
+/// themselves (multi-line subtitles, `subtitle_lines(0)`, etc.) but this
+/// catches the ones that don't.
+fn finish_page(content: &impl IsA<gtk::Widget>) -> gtk::Widget {
+    let clamp = adw::Clamp::builder()
+        .maximum_size(680)
+        .tightening_threshold(560)
+        .child(content)
+        .build();
+    clamp.upcast()
+}
+
 /// Two-column (or more) grid for rich modal pages. Panels attach via
 /// `grid.attach(&panel, col, row, 1, 1)`.
 fn page_grid() -> gtk::Grid {
@@ -277,7 +293,7 @@ pub fn page_media() -> gtk::Widget {
         }
     });
 
-    grid.upcast()
+    finish_page(&grid)
 }
 
 fn fmt_us(us: u64) -> String {
@@ -304,7 +320,7 @@ pub fn page_network() -> gtk::Widget {
     append_wifi_section(&wifi_panel);
     grid.attach(&wifi_panel, 0, 1, 2, 1);
 
-    grid.upcast()
+    finish_page(&grid)
 }
 
 fn build_connection_group() -> adw::PreferencesGroup {
@@ -330,6 +346,11 @@ fn build_connection_group() -> adw::PreferencesGroup {
     group.add(&primary_row);
 
     let links_row = adw::ActionRow::builder().title("Links").build();
+    // Multi-line subtitle: one link per line. Comma-joined produced a
+    // single very wide subtitle (AdwActionRow subtitles don't ellipsize)
+    // which pushed the whole modal to full-screen width on systems with
+    // many interfaces (wlp/eth/virbr/docker/veth/...).
+    links_row.set_subtitle_lines(0);
     bind(
         networkd::links().map(|ls| {
             let lines: Vec<String> = ls
@@ -339,7 +360,7 @@ fn build_connection_group() -> adw::PreferencesGroup {
             if lines.is_empty() {
                 "(none)".to_string()
             } else {
-                lines.join(", ")
+                lines.join("\n")
             }
         }),
         &links_row,
@@ -368,6 +389,7 @@ fn build_traffic_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
 
     let rate_row = adw::ActionRow::builder().title("Live").build();
+    rate_row.set_subtitle_lines(0);
     bind(
         sensors::network().map(|net| {
             let parts: Vec<String> = net
@@ -386,7 +408,7 @@ fn build_traffic_group() -> adw::PreferencesGroup {
             if parts.is_empty() {
                 "(no active interfaces)".to_string()
             } else {
-                parts.join("   ")
+                parts.join("\n")
             }
         }),
         &rate_row,
@@ -573,7 +595,7 @@ pub fn page_bluetooth() -> gtk::Widget {
     column.append(&build_bluetooth_controls());
     column.append(&build_bluetooth_device_groups());
 
-    column.upcast()
+    finish_page(&column)
 }
 
 /// Top header row: "Bluetooth" title with adapter name as subtitle and a
@@ -1180,7 +1202,7 @@ pub fn page_stats() -> gtk::Widget {
     disk.append(&mounts_label);
     grid.attach(&disk, 1, 1, 1, 1);
 
-    grid.upcast()
+    finish_page(&grid)
 }
 
 // ── Audio page ────────────────────────────────────────────────────────────────
@@ -1192,7 +1214,7 @@ pub fn page_audio() -> gtk::Widget {
     column.append(&audio_section("Input", &build_source_list()));
     column.append(&audio_section("Playback", &build_playback_list()));
 
-    column.upcast()
+    finish_page(&column)
 }
 
 /// Wrap a section title + `boxed-list`-styled `ListBox` in a vertical Box so
@@ -1515,7 +1537,7 @@ pub fn page_power() -> gtk::Widget {
     bright.append(&build_brightness_row());
     grid.attach(&bright, 1, 0, 1, 1);
 
-    grid.upcast()
+    finish_page(&grid)
 }
 
 /// Adwaita-flavoured brightness control: icon + slider + live percentage,
@@ -1665,7 +1687,7 @@ pub fn page_notifications() -> gtk::Widget {
         }
     });
 
-    column.upcast()
+    finish_page(&column)
 }
 
 fn build_history_row(entry: &notifications::HistoryEntry) -> gtk::Widget {

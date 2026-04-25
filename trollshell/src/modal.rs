@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::services::calendar;
 use hytte::services::clipboard;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
 
@@ -22,6 +23,7 @@ pub enum Page {
     Appearance,
     Displays,
     Clipboard,
+    Calendar,
     Settings,
 }
 
@@ -39,6 +41,7 @@ impl Page {
             Self::Appearance => "appearance",
             Self::Displays => "displays",
             Self::Clipboard => "clipboard",
+            Self::Calendar => "calendar",
             Self::Settings => "settings",
         }
     }
@@ -172,6 +175,10 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(
         &pages::page_clipboard(),
         Some(Page::Clipboard.stack_name()),
+    );
+    stack.add_named(
+        &pages::page_calendar(),
+        Some(Page::Calendar.stack_name()),
     );
     stack.add_named(
         &pages::page_settings(),
@@ -372,7 +379,9 @@ fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
 /// (initial open OR cross-fade swap from another page). Add a match arm
 /// here when a new page needs an on-show fetch.
 fn on_page_show(page: Page) {
-    if page == Page::Clipboard {
-        clipboard::refresh();
+    match page {
+        Page::Clipboard => clipboard::refresh(),
+        Page::Calendar => calendar::refresh(),
+        _ => {}
     }
 }

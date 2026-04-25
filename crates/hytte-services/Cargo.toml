@@ -19,8 +19,9 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 gtk = { version = "0.11.2", package = "gtk4" }
 hytte-reactive = { path = "../hytte-reactive" }
 niri-ipc = "25.11.0"
-tokio = { version = "1.52.1", features = ["rt", "io-util", "process"] }
+tokio = { version = "1.52.1", features = ["rt", "io-util", "process", "time"] }
 tracing = "0.1.44"
+icalendar = { version = "0.17", default-features = false, features = ["parser", "chrono-tz"] }
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 

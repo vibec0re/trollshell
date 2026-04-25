@@ -18,6 +18,7 @@ use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
 use hytte::services::brightness;
+use hytte::services::calendar::{self, CalendarEvent};
 use hytte::services::clipboard::{self, ClipEntry, ClipKind};
 use hytte::services::displays::{self, Output};
 use hytte::services::dnd;
@@ -2410,6 +2411,107 @@ fn write_color_scheme(value: &str) {
         tracing::warn!(error = %e, value, "settings: gsettings set color-scheme failed");
     }
 }
+
+// ── Calendar page ─────────────────────────────────────────────────────────────
+
+/// Drawer page for upcoming calendar events. Backed by
+/// `hytte::services::calendar`, which reads evolution-data-server's on-disk
+/// `.ics` cache (populated by GNOME Online Accounts via gnome-control-center).
+///
+/// Top: a `gtk::Calendar` scrolled to the current month. v1 shows the
+/// month grid only — no per-day event marking; that's a v2 task once the
+/// signal carries enough data to compute marked-day sets.
+///
+/// Below: an `adw::PreferencesGroup` titled "Upcoming" listing every event
+/// in the next 7 days, sorted ascending by start. Empty list ⇒ a single
+/// non-activatable "No upcoming events" placeholder row.
+///
+/// Click is a no-op for v1; future "open in calendar app" would pipe the
+/// event UID at a CLI helper.
+pub fn page_calendar() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+
+    // ── Month view ─────────────────────────────────────────────────────────
+    // GtkCalendar scrolls itself to the current month on construction. We
+    // don't bind it to the events signal — v1 just shows the grid.
+    let cal = gtk::Calendar::new();
+    cal.set_show_heading(true);
+    cal.set_show_day_names(true);
+    cal.set_show_week_numbers(false);
+    cal.add_css_class("ts-calendar");
+    column.append(&cal);
+
+    // ── Upcoming list ──────────────────────────────────────────────────────
+    let group = adw::PreferencesGroup::builder().title("Upcoming").build();
+
+    // Track rows + the empty-state placeholder so we can swap them on each
+    // signal emission. Same shape as page_clipboard.
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
+
+    column.append(&group);
+
+    let group_for_bind = group.clone();
+    let rows_for_bind = rows_track.clone();
+    let placeholder_for_bind = placeholder_track.clone();
+    bind(calendar::events(), &group, move |_, evs| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            group_for_bind.remove(&row);
+        }
+        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
+            group_for_bind.remove(&p);
+        }
+
+        if evs.is_empty() {
+            let placeholder = adw::ActionRow::builder()
+                .title("No upcoming events")
+                .subtitle("Add a calendar via Settings \u{2192} Online Accounts.")
+                .activatable(false)
+                .build();
+            group_for_bind.add(&placeholder);
+            *placeholder_for_bind.borrow_mut() = Some(placeholder);
+            return;
+        }
+
+        let mut new_rows = Vec::with_capacity(evs.len());
+        for ev in &evs {
+            let row = build_calendar_row(ev);
+            group_for_bind.add(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    finish_page(&column)
+}
+
+fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
+    // Compose the subtitle from when-string + optional location. Using two
+    // lines keeps long venue names from blowing the modal width.
+    let when = calendar::format_when(ev);
+    let subtitle = match &ev.location {
+        Some(loc) => format!("{when}\n{loc}"),
+        None => when,
+    };
+
+    let row = adw::ActionRow::builder()
+        .title(&ev.summary)
+        .subtitle(&subtitle)
+        .activatable(false)
+        .build();
+    // Allow the subtitle to wrap when it carries a multi-line location.
+    row.set_subtitle_lines(0);
+    row.set_title_lines(1);
+
+    let icon = gtk::Image::from_icon_name("x-office-calendar-symbolic");
+    icon.set_valign(gtk::Align::Center);
+    row.add_prefix(&icon);
+
+    row
+}
+
+// ── Clipboard helpers ─────────────────────────────────────────────────────────
 
 fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     let row = adw::ActionRow::builder()

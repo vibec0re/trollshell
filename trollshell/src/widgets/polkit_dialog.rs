@@ -32,6 +32,7 @@ pub fn install(monitor: &Monitor) {
     glib::MainContext::default().spawn_local(
         polkit::auth_prompts().for_each(move |prompt| {
             match prompt {
+                Some(req) if req.follow_up => update_dialog_for_followup(&req),
                 Some(req) => show_dialog(&monitor, req),
                 None => close_dialog(),
             }
@@ -48,6 +49,71 @@ fn close_dialog() {
             w.close();
         }
     });
+}
+
+/// Update the existing dialog in-place for a follow-up PAM prompt
+/// (e.g. "Retype new password"). The window stays mounted and
+/// keyboard-grabbed; only the prompt label and entry contents change.
+/// If no dialog is currently mounted (shouldn't happen — follow-ups
+/// only emit while the first dialog is up), log a warning so the
+/// missing window is visible in the journal.
+fn update_dialog_for_followup(prompt: &AuthPrompt) {
+    let updated = DIALOG_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
+        let slot = slot.borrow();
+        let Some(window) = slot.as_ref() else {
+            return false;
+        };
+        // Walk the child tree to find the prompt label and the
+        // PasswordEntry. The dialog is a fixed shape; the labels are
+        // appended in show_dialog in a known order. Use widget names
+        // to stay robust to layout tweaks: tag the relevant widgets in
+        // show_dialog with set_widget_name(...).
+        let Some(root) = window.child() else {
+            return false;
+        };
+        let mut walker = WidgetWalker::new(root);
+        if let Some(label) = walker.find_named("ts-prompt-followup-label")
+            && let Ok(label) = label.downcast::<gtk::Label>()
+        {
+            label.set_text(&prompt.message);
+            label.set_visible(!prompt.message.is_empty());
+        }
+        if let Some(entry_w) = walker.find_named("ts-prompt-password-entry")
+            && let Ok(entry) = entry_w.downcast::<gtk::PasswordEntry>()
+        {
+            entry.set_text("");
+            entry.grab_focus();
+        }
+        true
+    });
+    if !updated {
+        tracing::warn!("polkit follow-up prompt arrived without an existing dialog");
+    }
+}
+
+/// Iterator over a widget's descendants for `find_named`.
+struct WidgetWalker {
+    queue: std::collections::VecDeque<gtk::Widget>,
+}
+impl WidgetWalker {
+    fn new(root: gtk::Widget) -> Self {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root);
+        Self { queue }
+    }
+    fn find_named(&mut self, name: &str) -> Option<gtk::Widget> {
+        while let Some(w) = self.queue.pop_front() {
+            if w.widget_name() == name {
+                return Some(w);
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                self.queue.push_back(c.clone());
+                child = c.next_sibling();
+            }
+        }
+        None
+    }
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -143,7 +209,18 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
     let entry = gtk::PasswordEntry::new();
     entry.set_show_peek_icon(true);
     entry.set_margin_top(8);
+    entry.set_widget_name("ts-prompt-password-entry");
     vbox.append(&entry);
+
+    // Hidden by default; populated and shown when a follow-up PAM prompt
+    // arrives (e.g. "Retype new password" in a password-change flow).
+    let followup_label = gtk::Label::new(None);
+    followup_label.set_widget_name("ts-prompt-followup-label");
+    followup_label.set_xalign(0.0);
+    followup_label.set_wrap(true);
+    followup_label.add_css_class("ts-prompt-followup");
+    followup_label.set_visible(false);
+    vbox.append(&followup_label);
 
     // ── Buttons ───────────────────────────────────────────────────────────────
 

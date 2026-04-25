@@ -71,6 +71,10 @@ pub struct AuthPrompt {
     /// the user pick if there's more than one; defaulting to the entry
     /// matching the current uid is the right call.
     pub identities: Vec<AuthIdentity>,
+    /// True when this prompt arrives mid-flight (e.g. confirm-new-
+    /// password follow-up). The dialog updates an existing window
+    /// in-place rather than rebuilding.
+    pub follow_up: bool,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -233,6 +237,19 @@ async fn await_reply(prompt: AuthPrompt) -> UserReply {
     reply
 }
 
+/// Service-internal: emit a follow-up `AuthPrompt` and wait for the
+/// dialog's reply. `Some(pw)` on submit, `None` on user cancel.
+///
+/// `await_reply` already handles the `set_prompt(Some(..))` /
+/// `clear_prompt()` lifecycle, so this is a thin wrapper that just
+/// projects the password out of the `UserReply`.
+async fn await_followup_password(prompt: AuthPrompt) -> Option<Zeroizing<String>> {
+    match await_reply(prompt).await {
+        UserReply::Submit { password, .. } => Some(password),
+        UserReply::Cancel => None,
+    }
+}
+
 /// Resolve a uid to a printable username via NSS.  Falls back to
 /// `"uid <n>"` so we never feed the UI an empty string.  This fallback is
 /// **only** safe for display: see [`username_for_uid`] for the helper path.
@@ -325,6 +342,9 @@ async fn run_helper(
     username: &str,
     cookie: &str,
     password: Zeroizing<String>,
+    action_id: &str,
+    icon: &str,
+    identities: &[AuthIdentity],
 ) -> Result<bool> {
     let helper = find_helper();
     let mut child = tokio::process::Command::new(helper)
@@ -357,8 +377,30 @@ async fn run_helper(
         let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
         match tag {
             "PAM_PROMPT_ECHO_OFF" => {
-                // TODO(polkit-followup): I4 — handle a second PAM_PROMPT_ECHO_OFF (rare; e.g. confirm-new-password flows).
-                let pw = password_slot.take().unwrap_or_default();
+                // First prompt: serve from password_slot (the password the
+                // user already typed in the initial dialog). Subsequent
+                // prompts come from a follow-up dialog round-trip — common
+                // in password-change flows like passwd's "Retype new
+                // password".
+                let pw = if let Some(pw) = password_slot.take() {
+                    pw
+                } else {
+                    let prompt = AuthPrompt {
+                        action_id: action_id.to_string(),
+                        message: rest.to_string(),
+                        icon: icon.to_string(),
+                        identities: identities.to_vec(),
+                        follow_up: true,
+                    };
+                    if let Some(pw) = await_followup_password(prompt).await {
+                        pw
+                    } else {
+                        // User cancelled the follow-up; tear the helper
+                        // down.
+                        authenticated = false;
+                        break;
+                    }
+                };
                 stdin
                     .write_all(pw.as_bytes())
                     .await
@@ -478,8 +520,9 @@ impl AuthAgent {
         let prompt = AuthPrompt {
             action_id: action_id.clone(),
             message,
-            icon: icon_name,
-            identities: auth_identities,
+            icon: icon_name.clone(),
+            identities: auth_identities.clone(),
+            follow_up: false,
         };
 
         // ── Wait for UI ────────────────────────────────────────────────────────
@@ -496,9 +539,16 @@ impl AuthAgent {
 
         // ── Verify with helper ─────────────────────────────────────────────────
 
-        let ok = run_helper(&username, &cookie, password)
-            .await
-            .map_err(|e| AgentError::Failed(format!("helper: {e}")))?;
+        let ok = run_helper(
+            &username,
+            &cookie,
+            password,
+            &action_id,
+            &icon_name,
+            &auth_identities,
+        )
+        .await
+        .map_err(|e| AgentError::Failed(format!("helper: {e}")))?;
 
         if !ok {
             // Failed (not NotAuthorized) so polkitd lets the user retry —

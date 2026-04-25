@@ -1,21 +1,25 @@
-//! Default audio sink volume + mute state, polled via `wpctl`.
+//! Audio device + stream state from `pactl`.
 //!
-//! v0.2.0 uses a 250 ms shell-out poll for simplicity. v0.3+ should
-//! switch to a proper `pipewire-rs` registry subscription so updates
-//! arrive event-driven.
+//! State is fetched once at startup and then refetched on every relevant
+//! event from `pactl subscribe` (sink, source, sink-input, source-output,
+//! server). Emissions are deduped against the previously-emitted snapshot
+//! so consumers don't tear down and rebuild on no-op updates. The default
+//! sink's `Volume` is derived from the same fetched state, so there's no
+//! separate poll path for the bar chip.
 //!
-//! v0.7.1 extends this to full sink/source/sink-input tracking via
-//! pactl, polled at 1 Hz.
+//! v0.8+ should consider a real `pipewire-rs` registry subscription if we
+//! ever want to drop the pactl shell-out entirely.
 
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{registry, Service};
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub struct PipewireService;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Volume {
     /// Linear volume, `0.0..=1.0` (may exceed 1.0 if user boosts above
     /// 100%). Untouched on parse failure.
@@ -23,7 +27,7 @@ pub struct Volume {
     pub muted: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sink {
     pub id: u32,
     pub name: String,
@@ -33,7 +37,7 @@ pub struct Sink {
     pub is_default: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Source {
     pub id: u32,
     pub name: String,
@@ -43,7 +47,7 @@ pub struct Source {
     pub is_default: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackStream {
     pub id: u32,
     pub app_name: String,
@@ -52,7 +56,7 @@ pub struct PlaybackStream {
     pub muted: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordStream {
     pub id: u32,
     pub app_name: String,
@@ -88,41 +92,114 @@ impl Service for PipewireService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = PipewireHandles::default();
 
-        // 250 ms default-sink poll (bar widget depends on this).
-        let writer = handles.sink.clone();
-        rt.spawn(async move {
-            let mut last = Volume::default();
-            loop {
-                if let Some(v) = poll() {
-                    #[allow(clippy::float_cmp)]
-                    if v.linear != last.linear || v.muted != last.muted {
-                        writer.set(v);
-                        last = v;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        });
-
-        // 1 Hz full state poll for sinks/sources/streams.
+        // Single event-driven task: do an initial full-state read to seed the
+        // signals, then attach to `pactl subscribe` and refetch on each event.
+        // Replaces the old 250 ms wpctl poll + 1 Hz pactl poll. The bar
+        // widget's `default_sink()` Volume is derived from the default sink
+        // in the same fetched state — no separate polling path.
+        //
+        // Run blocking because: (a) tokio is built with `rt` only here, no
+        // process/io-util features; (b) `pactl list ...` shells out anyway
+        // and shouldn't share a tokio runtime worker.
+        let sink_writer = handles.sink.clone();
         let sinks_writer = handles.sinks.clone();
         let sources_writer = handles.sources.clone();
         let streams_writer = handles.streams.clone();
         let record_writer = handles.record_streams.clone();
-        rt.spawn(async move {
-            loop {
-                if let Some(state) = read_full_state() {
+        rt.spawn_blocking(move || {
+            let mut last_default = Volume::default();
+            let mut last_sinks: Vec<Sink> = Vec::new();
+            let mut last_sources: Vec<Source> = Vec::new();
+            let mut last_streams: Vec<PlaybackStream> = Vec::new();
+            let mut last_records: Vec<RecordStream> = Vec::new();
+
+            let mut emit = |state: FullState| {
+                let default_v = state
+                    .sinks
+                    .iter()
+                    .find(|s| s.is_default)
+                    .map_or(Volume::default(), |s| Volume {
+                        linear: s.volume,
+                        muted: s.muted,
+                    });
+                if default_v != last_default {
+                    last_default = default_v;
+                    sink_writer.set(default_v);
+                }
+                if state.sinks != last_sinks {
+                    last_sinks.clone_from(&state.sinks);
                     sinks_writer.set(state.sinks);
+                }
+                if state.sources != last_sources {
+                    last_sources.clone_from(&state.sources);
                     sources_writer.set(state.sources);
+                }
+                if state.streams != last_streams {
+                    last_streams.clone_from(&state.streams);
                     streams_writer.set(state.streams);
+                }
+                if state.record_streams != last_records {
+                    last_records.clone_from(&state.record_streams);
                     record_writer.set(state.record_streams);
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+
+            // Initial seed.
+            if let Some(state) = read_full_state() {
+                emit(state);
+            }
+
+            // Subscribe loop with restart-on-death backoff.
+            loop {
+                let Ok(mut child) = Command::new("pactl")
+                    .arg("subscribe")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                else {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+                let Some(stdout) = child.stdout.take() else {
+                    let _ = child.kill();
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if !is_relevant_event(&line) {
+                        continue;
+                    }
+                    if let Some(state) = read_full_state() {
+                        emit(state);
+                    }
+                }
+
+                // pactl subscribe died — clean up and retry shortly.
+                let _ = child.kill();
+                let _ = child.wait();
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
 
         handles
     }
+}
+
+/// True for `pactl subscribe` event lines that affect sinks, sources,
+/// playback streams, record streams, or default-device assignment. Skips
+/// noisy categories like `client`, `card`, `module`.
+fn is_relevant_event(line: &str) -> bool {
+    let Some(rest) = line.split(" on ").nth(1) else {
+        return false;
+    };
+    let cat = rest.split('#').next().unwrap_or("").trim();
+    matches!(
+        cat,
+        "sink" | "source" | "sink-input" | "source-output" | "server"
+    )
 }
 
 // ── pactl parsing ─────────────────────────────────────────────────────────────
@@ -209,7 +286,7 @@ fn read_full_state() -> Option<FullState> {
     // ── Sinks ────────────────────────────────────────────────────────────────
     let sinks_short = run_cmd(&["pactl", "list", "sinks", "short"])?;
     let sinks_long_out = run_cmd(&["pactl", "list", "sinks"]).unwrap_or_default();
-    let sink_descriptions = parse_descriptions_from_long(&sinks_long_out, "Sink #");
+    let sink_info = parse_device_info_from_long(&sinks_long_out, "Sink #");
 
     let mut sinks = Vec::new();
     for line in sinks_short.lines() {
@@ -219,12 +296,11 @@ fn read_full_state() -> Option<FullState> {
         }
         let id: u32 = parts[0].trim().parse().ok()?;
         let name = parts[1].trim().to_string();
-        let description = sink_descriptions
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| name.clone());
+        let info = sink_info.get(&name);
+        let description = info.map_or_else(|| name.clone(), |i| i.description.clone());
+        let volume = info.map_or(0.0, |i| i.volume);
+        let muted = info.is_some_and(|i| i.muted);
         let is_default = default_sink_name.as_deref() == Some(name.as_str());
-        let (volume, muted) = get_volume_mute(id);
         sinks.push(Sink {
             id,
             name,
@@ -238,7 +314,7 @@ fn read_full_state() -> Option<FullState> {
     // ── Sources (filter .monitor) ─────────────────────────────────────────────
     let sources_short = run_cmd(&["pactl", "list", "sources", "short"])?;
     let sources_long_out = run_cmd(&["pactl", "list", "sources"]).unwrap_or_default();
-    let source_descriptions = parse_descriptions_from_long(&sources_long_out, "Source #");
+    let source_info = parse_device_info_from_long(&sources_long_out, "Source #");
 
     let mut sources = Vec::new();
     for line in sources_short.lines() {
@@ -252,12 +328,11 @@ fn read_full_state() -> Option<FullState> {
             continue;
         }
         let id: u32 = parts[0].trim().parse().ok()?;
-        let description = source_descriptions
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| name.clone());
+        let info = source_info.get(&name);
+        let description = info.map_or_else(|| name.clone(), |i| i.description.clone());
+        let volume = info.map_or(0.0, |i| i.volume);
+        let muted = info.is_some_and(|i| i.muted);
         let is_default = default_source_name.as_deref() == Some(name.as_str());
-        let (volume, muted) = get_volume_mute(id);
         sources.push(Source {
             id,
             name,
@@ -293,13 +368,39 @@ fn parse_pactl_info_field(output: &str, field: &str) -> Option<String> {
     None
 }
 
-/// Build a map of `name → description` from long-form pactl sink/source output.
-fn parse_descriptions_from_long(output: &str, block_prefix: &str) -> HashMap<String, String> {
+struct DeviceInfo {
+    description: String,
+    volume: f64,
+    muted: bool,
+}
+
+/// Build a map of `name → DeviceInfo` from long-form pactl sink/source output.
+/// Reads `Description`, `Volume`, and `Mute` directly so we don't need a
+/// per-device wpctl shell-out and don't depend on pactl/wpctl id namespaces
+/// agreeing.
+fn parse_device_info_from_long(output: &str, block_prefix: &str) -> HashMap<String, DeviceInfo> {
     let mut map = HashMap::new();
     for block in parse_pactl_blocks(output, block_prefix) {
-        if let (Some(name), Some(desc)) = (block.get("Name"), block.get("Description")) {
-            map.insert(name.clone(), desc.clone());
-        }
+        let Some(name) = block.get("Name") else {
+            continue;
+        };
+        let description = block
+            .get("Description")
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        let volume = block
+            .get("Volume")
+            .and_then(|s| parse_pactl_volume(s))
+            .unwrap_or(0.0);
+        let muted = block.get("Mute").is_some_and(|s| parse_pactl_mute(s));
+        map.insert(
+            name.clone(),
+            DeviceInfo {
+                description,
+                volume,
+                muted,
+            },
+        );
     }
     map
 }
@@ -383,12 +484,12 @@ fn build_record_stream(id: u32, map: &HashMap<String, String>) -> Option<RecordS
     if map.get("media.role").map(String::as_str) == Some("peek") {
         return None;
     }
-    let app_name = map
-        .get("application.name")
-        .cloned()
-        .or_else(|| map.get("application.process.binary").cloned())
-        .unwrap_or_else(|| format!("Stream {id}"));
-    let (volume, muted) = get_volume_mute(id);
+    let app_name = pick_app_name(map, id);
+    let volume = map
+        .get("Volume")
+        .and_then(|s| parse_pactl_volume(s))
+        .unwrap_or(0.0);
+    let muted = map.get("Mute").is_some_and(|s| parse_pactl_mute(s));
     Some(RecordStream {
         id,
         app_name,
@@ -460,12 +561,12 @@ fn parse_sink_input_blocks_with_ids(output: &str) -> Vec<PlaybackStream> {
 
 fn build_playback_stream(id: u32, map: &HashMap<String, String>) -> Option<PlaybackStream> {
     let sink_id: u32 = map.get("Sink")?.trim().parse().ok()?;
-    let app_name = map
-        .get("application.name")
-        .cloned()
-        .or_else(|| map.get("application.process.binary").cloned())
-        .unwrap_or_else(|| format!("Stream {id}"));
-    let (volume, muted) = get_volume_mute(id);
+    let app_name = pick_app_name(map, id);
+    let volume = map
+        .get("Volume")
+        .and_then(|s| parse_pactl_volume(s))
+        .unwrap_or(0.0);
+    let muted = map.get("Mute").is_some_and(|s| parse_pactl_mute(s));
     Some(PlaybackStream {
         id,
         app_name,
@@ -475,46 +576,63 @@ fn build_playback_stream(id: u32, map: &HashMap<String, String>) -> Option<Playb
     })
 }
 
-fn get_volume_mute(id: u32) -> (f64, bool) {
-    let id_str = id.to_string();
-    let out = Command::new("wpctl")
-        .args(["get-volume", &id_str])
-        .output()
-        .ok();
-    match out {
-        Some(o) if o.status.success() => {
-            let s = std::str::from_utf8(&o.stdout).unwrap_or("");
-            parse(s).map_or((0.0, false), |v| (v.linear, v.muted))
+/// Pick a user-facing app name for a stream from its parsed pactl property
+/// map. Some apps (notably Spotify) publish only `node.name` / `media.name`
+/// over the pipewire-pulse compat layer, so the chain falls back through
+/// several candidates before resorting to `Stream {id}`.
+///
+/// Empty values are skipped, and so are known-generic placeholders like
+/// `audio-src` or `Loopback` that pipewire assigns to anonymous link-nodes
+/// — those would otherwise shadow a useful `media.name` further down.
+fn pick_app_name(map: &HashMap<String, String>, id: u32) -> String {
+    const KEYS: &[&str] = &[
+        "application.name",
+        "node.description",
+        "node.nick",
+        "node.name",
+        "application.process.binary",
+        "media.name",
+    ];
+    const GENERIC: &[&str] = &[
+        "audio-src",
+        "audio-sink",
+        "input-port",
+        "output-port",
+        "alsa-sink",
+        "alsa-source",
+        "Stream",
+        "Loopback",
+    ];
+    for key in KEYS {
+        if let Some(v) = map.get(*key) {
+            let t = v.trim();
+            if !t.is_empty() && !GENERIC.iter().any(|g| g.eq_ignore_ascii_case(t)) {
+                return t.to_string();
+            }
         }
-        _ => (0.0, false),
     }
+    format!("Stream {id}")
 }
 
-fn poll() -> Option<Volume> {
-    let out = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = std::str::from_utf8(&out.stdout).ok()?;
-    parse(s)
+/// Parse a pactl `Volume:` field value, e.g.
+/// `front-left: 32768 /  50% / -6.02 dB,   front-right: 32768 /  50% / -6.02 dB`
+/// → 0.50 (first channel's percentage, as linear 0.0..=1.0+).
+fn parse_pactl_volume(s: &str) -> Option<f64> {
+    let pct_str = s.split('%').next()?.rsplit_once(' ').map(|(_, n)| n)?;
+    let pct: f64 = pct_str.trim().parse().ok()?;
+    Some(pct / 100.0)
 }
 
-fn parse(s: &str) -> Option<Volume> {
-    // Expected: "Volume: 0.65 [MUTED]\n" or "Volume: 0.65\n"
-    let trimmed = s.trim();
-    let rest = trimmed.strip_prefix("Volume:")?.trim();
-    let mut parts = rest.split_whitespace();
-    let linear: f64 = parts.next()?.parse().ok()?;
-    let muted = rest.contains("[MUTED]");
-    Some(Volume { linear, muted })
+fn parse_pactl_mute(s: &str) -> bool {
+    s.trim().eq_ignore_ascii_case("yes")
 }
 
 // ── Commands (fire-and-forget) ─────────────────────────────────────────────────
 
 fn spawn_cmd(mut cmd: Command) {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     hytte_reactive::runtime::handle().spawn_blocking(move || {
         let _ = cmd.status();
     });
@@ -538,52 +656,65 @@ pub fn set_default_source(name: &str) {
     });
 }
 
-pub fn set_sink_volume(id: u32, linear: f64) {
-    let v = format!("{linear:.4}");
-    let id_str = id.to_string();
+/// Format a linear (0.0..=1.0+) volume as a pactl percentage argument,
+/// clamped to 0..=200% to stay inside u32 range and avoid sending nonsense
+/// values if a slider misbehaves.
+fn linear_to_pct(linear: f64) -> String {
+    let pct = (linear * 100.0).round().clamp(0.0, 200.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = pct as u32;
+    format!("{pct}%")
+}
+
+pub fn set_sink_volume(name: &str, linear: f64) {
+    let pct = linear_to_pct(linear);
+    let name = name.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-volume", &id_str, &v]);
+        let mut c = Command::new("pactl");
+        c.args(["set-sink-volume", &name, &pct]);
         c
     });
 }
 
-pub fn set_source_volume(id: u32, linear: f64) {
-    let v = format!("{linear:.4}");
-    let id_str = id.to_string();
+pub fn set_source_volume(name: &str, linear: f64) {
+    let pct = linear_to_pct(linear);
+    let name = name.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-volume", &id_str, &v]);
+        let mut c = Command::new("pactl");
+        c.args(["set-source-volume", &name, &pct]);
         c
     });
 }
 
 pub fn set_stream_volume(id: u32, linear: f64) {
-    let v = format!("{linear:.4}");
+    // pactl indexes sink-inputs with its own pulse-compat numbering, which is
+    // not always the same as a pipewire object id — so wpctl can fail to find
+    // these. Use pactl end-to-end here.
+    let pct = linear_to_pct(linear);
     let id_str = id.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-volume", &id_str, &v]);
+        let mut c = Command::new("pactl");
+        c.args(["set-sink-input-volume", &id_str, &pct]);
         c
     });
 }
 
-pub fn set_sink_mute(id: u32, mute: bool) {
+pub fn set_sink_mute(name: &str, mute: bool) {
     let m = if mute { "1" } else { "0" };
-    let id_str = id.to_string();
+    let name = name.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-mute", &id_str, m]);
+        let mut c = Command::new("pactl");
+        c.args(["set-sink-mute", &name, m]);
         c
     });
 }
 
-pub fn set_source_mute(id: u32, mute: bool) {
+pub fn set_source_mute(name: &str, mute: bool) {
     let m = if mute { "1" } else { "0" };
-    let id_str = id.to_string();
+    let name = name.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-mute", &id_str, m]);
+        let mut c = Command::new("pactl");
+        c.args(["set-source-mute", &name, m]);
         c
     });
 }
@@ -592,8 +723,8 @@ pub fn set_stream_mute(id: u32, mute: bool) {
     let m = if mute { "1" } else { "0" };
     let id_str = id.to_string();
     spawn_cmd({
-        let mut c = Command::new("wpctl");
-        c.args(["set-mute", &id_str, m]);
+        let mut c = Command::new("pactl");
+        c.args(["set-sink-input-mute", &id_str, m]);
         c
     });
 }
@@ -658,6 +789,9 @@ pub fn set_volume(linear: f64) {
         let arg = format!("{linear:.4}");
         let _ = Command::new("wpctl")
             .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &arg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     });
 }
@@ -667,34 +801,15 @@ pub fn toggle_mute() {
     hytte_reactive::runtime::handle().spawn_blocking(|| {
         let _ = Command::new("wpctl")
             .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
-
-    #[test]
-    fn parse_unmuted() {
-        let v = parse("Volume: 0.65\n").unwrap();
-        assert!((v.linear - 0.65).abs() < 1e-9);
-        assert!(!v.muted);
-    }
-
-    #[test]
-    fn parse_muted() {
-        let v = parse("Volume: 0.20 [MUTED]\n").unwrap();
-        assert!((v.linear - 0.20).abs() < 1e-9);
-        assert!(v.muted);
-    }
-
-    #[test]
-    fn parse_garbage_returns_none() {
-        assert!(parse("not wpctl output").is_none());
-        assert!(parse("Volume: foo").is_none());
-    }
-
     #[test]
     fn parse_pactl_info_field() {
         let info = "Server String: /run/user/1000/pulse/native\nDefault Sink: alsa_output.pci\nDefault Source: alsa_input.pci\n";
@@ -710,32 +825,92 @@ mod tests {
 
     #[test]
     fn parse_sink_input_blocks() {
-        let input = r#"Sink Input #51
-	Driver: PipeWire
-	Client: 194
-	Sink: 0
-	Properties:
-		application.name = "Firefox"
-		application.process.binary = "firefox"
-		media.name = "Playback"
-
-Sink Input #52
-	Driver: PipeWire
-	Client: 200
-	Sink: 1
-	Properties:
-		application.process.binary = "spotify"
-		media.name = "Music"
-"#;
+        // Block 0: classic case with application.name set.
+        // Block 1: Spotify-shaped — no application.name, only node.name + media.name.
+        // Block 2: nothing useful at all → fall back to "Stream {id}".
+        let input = "Sink Input #51\n\
+\tDriver: PipeWire\n\
+\tClient: 194\n\
+\tSink: 0\n\
+\tVolume: front-left: 32768 / 50% / -6.02 dB,   front-right: 32768 / 50% / -6.02 dB\n\
+\tMute: no\n\
+\tProperties:\n\
+\t\tapplication.name = \"Firefox\"\n\
+\t\tapplication.process.binary = \"firefox\"\n\
+\t\tmedia.name = \"Playback\"\n\
+\n\
+Sink Input #9220\n\
+\tDriver: PipeWire\n\
+\tClient: 200\n\
+\tSink: 1\n\
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB\n\
+\tMute: yes\n\
+\tProperties:\n\
+\t\tnode.name = \"audio-src\"\n\
+\t\tmedia.name = \"Sweet Caroline — Neil Diamond\"\n\
+\n\
+Sink Input #77\n\
+\tDriver: PipeWire\n\
+\tClient: 300\n\
+\tSink: 0\n\
+\tProperties:\n\
+\t\tobject.serial = \"99\"\n";
         let streams = super::parse_sink_input_blocks_with_ids(input);
-        // No wpctl available in test, so volume/muted will be defaults.
-        assert_eq!(streams.len(), 2);
+        assert_eq!(streams.len(), 3);
+
         assert_eq!(streams[0].id, 51);
         assert_eq!(streams[0].app_name, "Firefox");
         assert_eq!(streams[0].sink_id, 0);
-        assert_eq!(streams[1].id, 52);
-        assert_eq!(streams[1].app_name, "spotify");
+        assert!((streams[0].volume - 0.5).abs() < 1e-9);
+        assert!(!streams[0].muted);
+
+        assert_eq!(streams[1].id, 9220);
+        // node.name="audio-src" is generic and skipped; media.name wins.
+        assert_eq!(streams[1].app_name, "Sweet Caroline — Neil Diamond");
         assert_eq!(streams[1].sink_id, 1);
+        assert!((streams[1].volume - 1.0).abs() < 1e-9);
+        assert!(streams[1].muted);
+
+        assert_eq!(streams[2].app_name, "Stream 77");
+    }
+
+    #[test]
+    fn parse_pactl_volume_stereo() {
+        let line = "front-left: 32768 /  50% / -6.02 dB,   front-right: 32768 /  50% / -6.02 dB";
+        let v = super::parse_pactl_volume(line).unwrap();
+        assert!((v - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_pactl_volume_mono_full() {
+        let line = "mono: 65536 / 100% / 0.00 dB";
+        let v = super::parse_pactl_volume(line).unwrap();
+        assert!((v - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_pactl_volume_garbage() {
+        assert!(super::parse_pactl_volume("not a volume line").is_none());
+    }
+
+    #[test]
+    fn parse_pactl_mute_yes_no() {
+        assert!(super::parse_pactl_mute("yes"));
+        assert!(super::parse_pactl_mute("  yes  "));
+        assert!(!super::parse_pactl_mute("no"));
+    }
+
+    #[test]
+    fn is_relevant_event_filters_categories() {
+        assert!(super::is_relevant_event("Event 'change' on sink #0"));
+        assert!(super::is_relevant_event("Event 'new' on sink-input #9220"));
+        assert!(super::is_relevant_event("Event 'remove' on source-output #5"));
+        assert!(super::is_relevant_event("Event 'change' on source #1"));
+        assert!(super::is_relevant_event("Event 'change' on server"));
+        assert!(!super::is_relevant_event("Event 'change' on client #200"));
+        assert!(!super::is_relevant_event("Event 'change' on card #42"));
+        assert!(!super::is_relevant_event("Event 'change' on module #50"));
+        assert!(!super::is_relevant_event("garbage line"));
     }
 
     #[test]

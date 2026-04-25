@@ -68,12 +68,13 @@ and per-profile `exec '<shell>'` hook lines are documented in `kanshi(5)`.
 Before enabling the unit, dry-run the config to catch typos:
 
 ```sh
-kanshi -c ~/.config/kanshi/config -V
+kanshi -c ~/.config/kanshi/config -v
 ```
 
-`-V` is verbose mode — kanshi parses, prints the profiles it found, and
-exits if you also pass `--check` (older kanshi releases) or just runs in
-the foreground if not. Either way, syntax errors show up immediately.
+`-v` runs kanshi in verbose mode — it parses the config, prints the
+profiles it found, and then keeps running in the foreground waiting for
+output changes. `Ctrl+C` once the parse log lines confirm the config is
+valid; any syntax errors show up immediately and exit non-zero.
 
 ## Enable the systemd unit
 

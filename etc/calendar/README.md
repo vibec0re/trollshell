@@ -56,10 +56,10 @@ that lets you add Google / iCloud / CalDAV accounts.
 - The signal exposes events whose start lies in the next 7 days, sorted
   ascending. Multi-day events that started in the past but haven't ended
   yet are also surfaced.
-- Sync lag: up to ~60 s (one poll interval) plus whatever EDS itself
-  takes to refresh from the upstream provider — in practice EDS's own
-  cycle dominates and can run to tens of minutes, depending on the
-  provider's hints.
+- Sync lag: trollshell re-reads the `.ics` cache once a minute, but EDS
+  itself typically pulls upstream every 5–30 minutes (configurable per
+  source via Settings → Online Accounts). New events can take tens of
+  minutes to appear after they're created on Google / iCloud / CalDAV.
 - Both `DTEND` and `DURATION` are honoured. The duration parser covers
   the PT-form (e.g. `PT15M`, `PT1H30M`, `PT4H`) for timed events and the
   P-form (e.g. `P1D`, `P3D`, `P1W`) for all-day events, plus combined

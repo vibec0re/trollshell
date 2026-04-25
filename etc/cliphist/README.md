@@ -92,6 +92,15 @@ cliphist wipe
 The trollshell drawer caps the *visible* list at 50 entries regardless of
 how many cliphist holds — that's purely a UI cap, not a storage cap.
 
+## Opening the clipboard page
+
+There is no shipped niri keybind for the clipboard drawer. trollshell
+doesn't expose an IPC channel for "open drawer at page X" yet, so the
+only way in is the bar's drawer chip — open the drawer normally and
+switch to the **Clipboard** page. A `Mod+V`-style binding awaits a
+trollshell IPC follow-up; once that lands, niri can spawn a small
+helper to toggle the page directly.
+
 ## How it composes
 
 - `wl-paste --watch cliphist store` is one long-running process. Every

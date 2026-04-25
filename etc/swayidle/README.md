@@ -69,10 +69,11 @@ see task #34 (session autostart units) if it doesn't.
 2. Check the login session reports an idle hint as time passes:
 
    ```sh
-   loginctl show-session "$(loginctl | awk '/seat/ {print $1; exit}')" \
-     -p IdleHint -p IdleSinceHint
+   loginctl show-session "$XDG_SESSION_ID" -p IdleHint -p IdleSinceHint
    ```
 
+   The systemd user manager exports `XDG_SESSION_ID` for the current
+   session, so this works from any shell inside the session.
    `IdleHint=yes` after the first activity-free minute confirms the session
    bus is wired up to swayidle's notifications.
 

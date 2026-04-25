@@ -532,3 +532,10 @@
 .ts-tray-menu separator {
     margin: 2px 0;
 }
+
+/* ─── Calendar — transient highlight when click-day matches a row ─ */
+
+.ts-cal-day-hit {
+    background: alpha(@accent_color, 0.2);
+    transition: background 600ms ease-out;
+}

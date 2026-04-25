@@ -2506,7 +2506,6 @@ pub fn page_calendar() -> gtk::Widget {
 
     // Re-mark on month navigation. connect_next_month bumps year on December
     // rollover internally, so connect_year_changed isn't needed.
-    // TODO: click on a marked day to scroll/highlight matching list rows.
     {
         let events_for_next = current_events.clone();
         cal.connect_next_month(move |c| apply_event_marks(c, &events_for_next.borrow()));
@@ -2519,12 +2518,45 @@ pub fn page_calendar() -> gtk::Widget {
     // ── Upcoming list ──────────────────────────────────────────────────────
     let group = adw::PreferencesGroup::builder().title("Upcoming").build();
 
-    // Track rows + the empty-state placeholder so we can swap them on each
-    // signal emission. Same shape as page_clipboard.
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // Track rows by date so click-day in the calendar can scroll the list to
+    // the matching event. Plus the empty-state placeholder so we can swap
+    // them on each signal emission. Same shape as page_clipboard.
+    let rows_track: Rc<RefCell<Vec<(chrono::NaiveDate, adw::ActionRow)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
 
-    column.append(&group);
+    // Bounded ScrolledWindow so click-day can drive scrolling directly.
+    // finish_page only wraps in adw::Clamp, which doesn't scroll.
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_min_content_height(220);
+    scrolled.set_max_content_height(360);
+    scrolled.add_css_class("ts-calendar-list");
+    scrolled.set_child(Some(&group));
+    column.append(&scrolled);
+
+    // Click a marked day → scroll the events list to the first matching
+    // event and briefly highlight it. We compare on NaiveDate so we don't
+    // care about start-time; multiple events on the same day all match the
+    // first one we pushed (events are already sorted ascending).
+    {
+        let rows_for_select = rows_track.clone();
+        let scrolled_for_select = scrolled.clone();
+        cal.connect_day_selected(move |c| {
+            let gdt = c.date();
+            let y = gdt.year();
+            let Ok(m) = u32::try_from(gdt.month()) else { return; };
+            let Ok(day) = u32::try_from(gdt.day_of_month()) else { return; };
+            let Some(d) = chrono::NaiveDate::from_ymd_opt(y, m, day) else { return; };
+            let rows = rows_for_select.borrow();
+            let Some((_d, row)) = rows.iter().find(|(date, _)| *date == d) else {
+                return;
+            };
+            scroll_row_into_view(&scrolled_for_select, row);
+            flash_row_highlight(row);
+        });
+    }
 
     let group_for_bind = group.clone();
     let rows_for_bind = rows_track.clone();
@@ -2532,7 +2564,7 @@ pub fn page_calendar() -> gtk::Widget {
     let cal_for_bind = cal.clone();
     let events_for_bind = current_events.clone();
     bind(calendar::events(), &group, move |_, evs| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
+        for (_date, row) in rows_for_bind.borrow_mut().drain(..) {
             group_for_bind.remove(&row);
         }
         if let Some(p) = placeholder_for_bind.borrow_mut().take() {
@@ -2555,16 +2587,42 @@ pub fn page_calendar() -> gtk::Widget {
             return;
         }
 
-        let mut new_rows = Vec::with_capacity(evs.len());
+        let mut new_rows: Vec<(chrono::NaiveDate, adw::ActionRow)> =
+            Vec::with_capacity(evs.len());
         for ev in &evs {
             let row = build_calendar_row(ev);
             group_for_bind.add(&row);
-            new_rows.push(row);
+            new_rows.push((ev.start.date_naive(), row));
         }
         *rows_for_bind.borrow_mut() = new_rows;
     });
 
     finish_page(&column)
+}
+
+/// Scroll `scrolled` so that `row` is visible. Uses `compute_point` to
+/// translate the row's origin into the scrolled-window child's coordinate
+/// space; an 8px lead-in keeps the row from butting against the top edge.
+fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &adw::ActionRow) {
+    use gtk::prelude::WidgetExt;
+    let Some(child) = scrolled.child() else { return; };
+    let origin = gtk::graphene::Point::new(0.0, 0.0);
+    let Some(point) = row.compute_point(&child, &origin) else { return; };
+    let y = f64::from(point.y());
+    let adj = scrolled.vadjustment();
+    let target = (y - 8.0).max(adj.lower());
+    let max = (adj.upper() - adj.page_size()).max(adj.lower());
+    adj.set_value(target.min(max));
+}
+
+/// Add `.ts-cal-day-hit` to `row` for ~1.5s, then remove it. The CSS rule
+/// uses a 600ms transition so the highlight fades rather than flashes.
+fn flash_row_highlight(row: &adw::ActionRow) {
+    row.add_css_class("ts-cal-day-hit");
+    let row_for_clear = row.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+        row_for_clear.remove_css_class("ts-cal-day-hit");
+    });
 }
 
 /// Mark each day in the calendar's currently-visible month that has at

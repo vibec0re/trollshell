@@ -2150,11 +2150,19 @@ pub fn page_displays() -> gtk::Widget {
 
     let group = adw::PreferencesGroup::builder().title("Displays").build();
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // In-flight set_output_enabled calls. The displays service polls niri
+    // every 2 s; if niri's ack lags the next poll, the rebuilt row would
+    // briefly flip the Switch back to the stale state. While a name is in
+    // this map, the row build uses the stored intent instead of the
+    // service snapshot, so the user's last toggle stands until niri
+    // catches up.
+    let pending: Rc<RefCell<HashMap<String, bool>>> = Rc::new(RefCell::new(HashMap::new()));
 
     column.append(&group);
 
     let group_for_bind = group.clone();
     let rows_track_for_bind = rows_track.clone();
+    let pending_for_bind = pending.clone();
     bind(displays::outputs(), &group, move |_, list| {
         // PreferencesGroup has no row-traversal API, so we track the rows
         // we've added and remove them explicitly before each rebuild.
@@ -2176,7 +2184,7 @@ pub fn page_displays() -> gtk::Widget {
         }
         let mut new_rows = Vec::with_capacity(list.len());
         for output in &list {
-            let row = build_display_row(output);
+            let row = build_display_row(output, &pending_for_bind);
             group_for_bind.add(&row);
             new_rows.push(row);
         }
@@ -2186,7 +2194,7 @@ pub fn page_displays() -> gtk::Widget {
     finish_page(&column)
 }
 
-fn build_display_row(o: &Output) -> adw::ActionRow {
+fn build_display_row(o: &Output, pending: &Rc<RefCell<HashMap<String, bool>>>) -> adw::ActionRow {
     // Title prefers make+model when EDID is informative; falls back to the
     // bare connector name (e.g. virtual outputs, generic displays).
     let trimmed = format!("{} {}", o.make.trim(), o.model.trim());
@@ -2226,10 +2234,30 @@ fn build_display_row(o: &Output) -> adw::ActionRow {
 
     let switch = gtk::Switch::new();
     switch.set_valign(gtk::Align::Center);
-    switch.set_active(o.enabled);
+    // Skip the active-state restore while a toggle for this output is
+    // in-flight: the next poll's row rebuild may carry the pre-toggle
+    // state if niri's ack hasn't landed yet, which would visually flip
+    // the switch back until the t+2 s poll catches up. When pending,
+    // honor the user's last intent instead of the (possibly stale)
+    // service snapshot.
+    let pending_state = pending.borrow().get(&o.name).copied();
+    switch.set_active(pending_state.unwrap_or(o.enabled));
     let name_for_toggle = o.name.clone();
+    let pending_for_toggle = pending.clone();
     switch.connect_active_notify(move |sw| {
-        displays::set_output_enabled(&name_for_toggle, sw.is_active());
+        let on = sw.is_active();
+        pending_for_toggle
+            .borrow_mut()
+            .insert(name_for_toggle.clone(), on);
+        displays::set_output_enabled(&name_for_toggle, on);
+        // Disarm after 3 s — long enough for niri to ack and one or two
+        // polls to land carrying the new state. After the timeout the
+        // service's snapshot is treated as truth again.
+        let pending_for_clear = pending_for_toggle.clone();
+        let name_for_clear = name_for_toggle.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+            pending_for_clear.borrow_mut().remove(&name_for_clear);
+        });
     });
     row.add_suffix(&switch);
     row.set_activatable_widget(Some(&switch));

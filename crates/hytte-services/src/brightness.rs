@@ -105,10 +105,15 @@ async fn do_set(level: f64) -> Result<()> {
 }
 
 async fn poll_loop(writer: Mutable<Option<Brightness>>) {
+    // Last-snapshot dedupe so identical readings don't re-emit at 1 Hz to
+    // every consumer (OSD, power-page slider, brightness chip). Mirrors the
+    // pipewire service's gated-emit pattern.
+    let mut last: Option<Brightness> = None;
     loop {
-        match read_state() {
-            Some(b) => writer.set(Some(b)),
-            None => writer.set(None),
+        let cur = read_state();
+        if cur != last {
+            writer.set(cur);
+            last = cur;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

@@ -180,8 +180,7 @@ pub fn install(monitor: &Monitor) {
     {
         let view = view.clone();
         let first = Cell::new(true);
-        // TODO(brightness-followup): brightness::poll_loop should use set_neq to avoid 1Hz re-emit storms; mirror pipewire's gated emit pattern.
-        let signal = brightness::current().dedupe_cloned();
+        let signal = brightness::current();
         glib::MainContext::default().spawn_local(signal.for_each(
             move |b: Option<Brightness>| {
                 if first.replace(false) {

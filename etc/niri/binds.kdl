@@ -14,8 +14,8 @@ binds {
     // at 150 % to keep the speaker driver out of distortion / damage range.
     // Not allow-when-locked: surprise volume jumps through a locked screen
     // are unfriendly.
-    XF86AudioRaiseVolume repeat=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%+" "-l" "1.5"; }
-    XF86AudioLowerVolume repeat=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
+    XF86AudioRaiseVolume { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%+" "-l" "1.5"; }
+    XF86AudioLowerVolume { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
 
     // Mute — single-fire, allowed from the lock screen so you can silence a
     // surprise notification sound without unlocking.
@@ -24,8 +24,8 @@ binds {
 
     // Brightness — repeat while held. Not allow-when-locked: same reasoning
     // as volume, plus a fully bright lock screen is a privacy footgun.
-    XF86MonBrightnessUp   repeat=true { spawn "brightnessctl" "set" "5%+"; }
-    XF86MonBrightnessDown repeat=true { spawn "brightnessctl" "set" "5%-"; }
+    XF86MonBrightnessUp   { spawn "brightnessctl" "set" "5%+"; }
+    XF86MonBrightnessDown { spawn "brightnessctl" "set" "5%-"; }
 
     // Media transport — single-fire, controllable from the lock screen so
     // music can be paused / skipped without unlocking.

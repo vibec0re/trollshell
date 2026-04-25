@@ -59,8 +59,8 @@ Then paste the inner lines.
 ## Verification
 
 1. Press `XF86AudioRaiseVolume` (often `Fn+F3` on a laptop). The trollshell
-   OSD should pop up showing the new volume level. Repeat to confirm the
-   `repeat=true` keyword fires while the key is held.
+   OSD should pop up showing the new volume level. Hold the key to confirm
+   it ramps — niri auto-repeats spawn binds by default.
 
 2. Confirm the actual sink moved:
 
@@ -89,9 +89,10 @@ issue is in the OSD widget, not these bindings — check task #30's wiring.
 
 ## Niri version notes
 
-- `repeat=true` on a binding requires niri ≥ 0.1.6 (when held-key auto-repeat
-  for `spawn` actions landed). Older niri silently ignores the keyword and
-  falls back to single-fire.
+- Niri auto-repeats spawn binds by default — no explicit `repeat=true` is
+  needed (and no such keyword exists). To DISABLE auto-repeat on a specific
+  bind (rare; not used here), use `repeat=false` — that keyword landed in
+  niri ≥ 0.1.8.
 - `allow-when-locked=true` requires niri ≥ 0.1.5. On older niri the binding
   is parsed but the keyword is treated as a single-fire binding that simply
   does not fire while the screen-lock client holds focus — i.e. the keys

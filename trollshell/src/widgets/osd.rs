@@ -15,8 +15,11 @@
 //! three OSDs in a row. We track one `Cell<bool>` per signal and silently
 //! consume the FIRST emission; subsequent emissions show the OSD.
 //!
-//! Mounted on the primary monitor only for v1 — multi-monitor follow-up
-//! is a tiny loop in main.rs (see #30 follow-ups).
+//! Multi-monitor: `install` mounts one layer-shell window per monitor,
+//! keyed by `Monitor.connector()`. Module-level signal subscriptions
+//! run exactly once across all mounts; `route_show` picks the OSD on
+//! niri's focused output, falling back to the first mounted OSD when
+//! the focused output is unknown or missing from the map.
 //!
 //! CSS hooks (intentionally bar-prefixed `ts-`):
 //! - window root: `.ts-osd`
@@ -31,6 +34,7 @@
 //! - shown modifier: `.shown` (toggled by Rust to drive CSS transitions)
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -38,6 +42,7 @@ use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::brightness::{self, Brightness};
+use hytte::services::niri;
 use hytte::services::pipewire::{self, Source, Volume};
 use hytte::ui::layer_window;
 
@@ -88,11 +93,35 @@ struct OsdView {
     current_muted: Cell<bool>,
 }
 
-/// Build the OSD layer-shell window for `monitor`, subscribe it to the
-/// three signals, and store it in a thread-local so it lives for the
-/// process lifetime.
-#[allow(clippy::too_many_lines)]
+/// Mount one OSD on `monitor` and lazily wire the module-level signal
+/// subscriptions (volume / mic / brightness / focused-output) on the
+/// first call. Subsequent calls only insert into the per-monitor map;
+/// subscriptions stay singletons.
 pub fn install(monitor: &Monitor) {
+    let connector = match monitor.connector() {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            tracing::debug!("osd::install: monitor has no connector name; skipping");
+            return;
+        }
+    };
+
+    let view = build_osd_view(monitor);
+    OSDS.with(|map| {
+        map.borrow_mut().insert(connector, view);
+    });
+
+    if !SUBS_INSTALLED.with(Cell::get) {
+        SUBS_INSTALLED.with(|c| c.set(true));
+        install_subscriptions();
+    }
+}
+
+/// Construct one `OsdView` for `monitor`. Pure widget construction —
+/// signal wiring lives in [`install_subscriptions`] and runs once
+/// regardless of monitor count.
+#[allow(clippy::too_many_lines)]
+fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
         .anchor(Anchor::Top)
@@ -138,7 +167,7 @@ pub fn install(monitor: &Monitor) {
 
     window.set_child(Some(&card));
 
-    let view = Rc::new(OsdView {
+    Rc::new(OsdView {
         window,
         card,
         icon,
@@ -149,22 +178,26 @@ pub fn install(monitor: &Monitor) {
         fade_out_timeout: Cell::new(None),
         current_kind: Cell::new(None),
         current_muted: Cell::new(false),
-    });
+    })
+}
 
-    // Bootstrap suppression: each signal's first emission carries the
-    // snapshot at install time. We don't want the OSD flashing on
-    // startup, so silently consume that first event per signal.
-
+/// Wire the four module-level signal subscriptions exactly once on the
+/// first [`install`] call, regardless of monitor count.
+///
+/// Bootstrap suppression: each signal's first emission carries the
+/// snapshot at install time. We don't want the OSD flashing on
+/// startup, so silently consume that first event per signal.
+fn install_subscriptions() {
     // ── Volume ────────────────────────────────────────────────────────
     {
-        let view = view.clone();
         let first = Cell::new(true);
         glib::MainContext::default().spawn_local(
             pipewire::default_sink().for_each(move |v: Volume| {
                 if first.replace(false) {
                     return std::future::ready(());
                 }
-                show(&view, &render_volume(v));
+                let state = render_volume(v);
+                route_show(&state);
                 std::future::ready(())
             }),
         );
@@ -178,7 +211,6 @@ pub fn install(monitor: &Monitor) {
     // unrelated source list changes (e.g. a USB mic plug event when
     // the system mic is still the default).
     {
-        let view = view.clone();
         let first = Cell::new(true);
         let combined = map_ref! {
             let sources = pipewire::sources() => {
@@ -193,7 +225,7 @@ pub fn install(monitor: &Monitor) {
                     return std::future::ready(());
                 }
                 if let Some(state) = render_mic(source.as_ref()) {
-                    show(&view, &state);
+                    route_show(&state);
                 }
                 std::future::ready(())
             },
@@ -202,31 +234,68 @@ pub fn install(monitor: &Monitor) {
 
     // ── Brightness ────────────────────────────────────────────────────
     {
-        let view = view.clone();
         let first = Cell::new(true);
-        let signal = brightness::current();
-        glib::MainContext::default().spawn_local(signal.for_each(
+        glib::MainContext::default().spawn_local(brightness::current().for_each(
             move |b: Option<Brightness>| {
                 if first.replace(false) {
                     return std::future::ready(());
                 }
                 if let Some(b) = b {
-                    show(&view, &render_brightness(b));
+                    let state = render_brightness(b);
+                    route_show(&state);
                 }
                 std::future::ready(())
             },
         ));
     }
 
-    OSD_VIEW.with(|cell| {
-        *cell.borrow_mut() = Some(view);
+    // ── Focused output ────────────────────────────────────────────────
+    //
+    // Updates `FOCUSED_OUTPUT` used by `route_show`. No bootstrap
+    // suppression: we want the latest known focused output even before
+    // any media/brightness event lands.
+    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
+        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
+        std::future::ready(())
+    }));
+}
+
+/// Route `state` to the OSD on the focused monitor. Falls back to the
+/// first mounted OSD when the focused output is unknown or not in the
+/// map (e.g. niri startup, monitor disconnect).
+fn route_show(state: &State) {
+    let target_name: Option<String> = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+    OSDS.with(|map| {
+        let map = map.borrow();
+        if map.is_empty() {
+            return;
+        }
+        let view = target_name
+            .as_ref()
+            .and_then(|name| map.get(name))
+            .or_else(|| map.values().next());
+        if let Some(view) = view {
+            show(view, state);
+        }
     });
 }
 
 thread_local! {
-    /// Holds the OSD `Rc` for the process lifetime so the layer-shell
-    /// window and its signal futures aren't dropped.
-    static OSD_VIEW: RefCell<Option<Rc<OsdView>>> = const { RefCell::new(None) };
+    /// Mounted OSD instances keyed by `gtk::Monitor.connector()`.
+    /// `connector()` matches niri's `Workspace.output` (KMS connector
+    /// names like `"DP-1"`, `"eDP-1"`).
+    static OSDS: RefCell<HashMap<String, Rc<OsdView>>> =
+        RefCell::new(HashMap::new());
+
+    /// Most recent focused-output name from
+    /// [`hytte::services::niri::focused_output`]. Updated by the
+    /// module-level subscription.
+    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Set after the first `install()` call to ensure module-level
+    /// signal subscriptions are wired exactly once across all
+    /// per-monitor mounts.
+    static SUBS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Rendered OSD state — what to display once a signal fires.

@@ -95,8 +95,8 @@ pub struct ScreenSaverHandles {
     /// will hit the `HashMap` memory limit long before.
     pub(crate) next_cookie: Arc<AtomicU32>,
     /// `true` while the native lock UI is mounted on all monitors, `false`
-    /// otherwise. Driven by [`handle_unlock_success`] and by the Task 3
-    /// `lock()` rewrite. Subscribers: `widgets::lock_screen`.
+    /// otherwise. Set by [`lock`] and cleared by [`handle_unlock_success`].
+    /// Subscribers: `widgets::lock_screen`.
     pub(crate) is_locked: Mutable<bool>,
 }
 
@@ -386,8 +386,8 @@ struct ScreenSaverIface {
 
 #[zbus::interface(name = "org.freedesktop.ScreenSaver")]
 impl ScreenSaverIface {
-    /// Lock the screen now. Flips `is_locked` to `true`; returns
-    /// immediately. Apps and `gnome-screensaver-command --lock` use this.
+    /// Lock the screen now. Flips `is_locked` to `true`. Apps and
+    /// `gnome-screensaver-command --lock` use this.
     #[allow(clippy::unused_async, clippy::unused_self)]
     async fn lock(&self) {
         lock();

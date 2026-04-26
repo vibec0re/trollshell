@@ -87,6 +87,10 @@ pub struct WifiNetwork {
     pub connected: bool,
     /// Signal strength in dBm (iwd reports dBm × 100; we divide before storing).
     pub signal_dbm: i16,
+    /// iwd `KnownNetwork` object path when stored credentials exist;
+    /// `None` otherwise. Used by `forget()` to call
+    /// `net.connman.iwd.KnownNetwork.Forget()`.
+    pub known_network_path: Option<String>,
 }
 
 // ── Prompt request ────────────────────────────────────────────────────────────
@@ -354,6 +358,17 @@ pub fn set_powered(on: bool) {
     });
 }
 
+/// Fire-and-forget: call `Forget` on the given iwd `KnownNetwork` object.
+/// iwd handles cascading disconnect when forgetting the active network.
+pub fn forget(known_network_path: &str) {
+    let path = known_network_path.to_string();
+    runtime::handle().spawn(async move {
+        if let Err(e) = do_known_network_call(&path, "Forget").await {
+            tracing::warn!(error = %e, path, "wifi forget failed");
+        }
+    });
+}
+
 /// Signal emitting `Some(PromptRequest)` when iwd needs a passphrase, `None`
 /// otherwise.  Only one prompt can be active at a time — v0.6.1 serialises.
 pub fn active_prompt() -> impl Signal<Item = Option<PromptRequest>> {
@@ -451,6 +466,20 @@ async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result
     )
     .await
     .with_context(|| format!("call Properties.Set Adapter1.{prop}"))?;
+    Ok(())
+}
+
+async fn do_known_network_call(known_network_path: &str, method: &str) -> Result<()> {
+    let conn = cmd_conn().await?;
+    conn.call_method(
+        Some("net.connman.iwd"),
+        known_network_path,
+        Some("net.connman.iwd.KnownNetwork"),
+        method,
+        &(),
+    )
+    .await
+    .with_context(|| format!("call KnownNetwork.{method}"))?;
     Ok(())
 }
 
@@ -568,13 +597,20 @@ async fn read_networks(
         let security = prop_str(&props, "Type");
 
         // KnownNetwork is an object path; "/" means no stored credentials.
-        let known_network_path = props
+        let known_network_path_raw = props
             .get("KnownNetwork")
             .and_then(|v| v.try_clone().ok())
             .and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v).ok())
             .map(|p| p.as_str().to_string())
             .unwrap_or_default();
-        let known = !known_network_path.is_empty() && known_network_path != "/";
+        let known_network_path: Option<String> = if known_network_path_raw.is_empty()
+            || known_network_path_raw == "/"
+        {
+            None
+        } else {
+            Some(known_network_path_raw)
+        };
+        let known = known_network_path.is_some();
 
         let connected = connected_network_path.is_some_and(|cp| cp == net_path_str);
 
@@ -588,6 +624,7 @@ async fn read_networks(
             known,
             connected,
             signal_dbm,
+            known_network_path,
         });
     }
 
@@ -1074,5 +1111,28 @@ async fn handle_props_changed(state: &State, msg: zbus::Message) {
                 adapter.name = prop_str(&changed, "Name");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn known_network_path_round_trips() {
+        // Smoke-test the Option<String> derivation logic as a pure function.
+        // The real extraction lives in read_networks; replicate the
+        // canonicalization here so we lock in the "/ → None" rule.
+        fn derive(raw: &str) -> Option<String> {
+            if raw.is_empty() || raw == "/" {
+                None
+            } else {
+                Some(raw.to_string())
+            }
+        }
+        assert_eq!(derive(""), None);
+        assert_eq!(derive("/"), None);
+        assert_eq!(
+            derive("/net/connman/iwd/0/3/6/known"),
+            Some("/net/connman/iwd/0/3/6/known".to_string())
+        );
     }
 }

@@ -9,8 +9,8 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, displays, dnd, mpris,
-    networkd, niri, notifications, notifications_mute, pipewire, polkit, resolved, screensaver,
-    sensors, systemd, tray, upower, wallpaper, wifi,
+    networkd, niri, notifications, notifications_mute, pipewire, polkit, power_profiles, resolved,
+    screensaver, sensors, systemd, tray, upower, wallpaper, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -34,6 +34,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(sensors::service())
         .with(wifi::service())
         .with(polkit::service())
+        .with(power_profiles::service())
         .with(screensaver::service())
         .with(systemd::service())
         .with(wallpaper::service())

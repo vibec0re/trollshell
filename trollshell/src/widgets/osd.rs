@@ -123,7 +123,7 @@ pub fn install(monitor: &Monitor) {
 #[allow(clippy::too_many_lines)]
 fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
     let window = layer_window(monitor)
-        .layer(Layer::Overlay)
+        .layer(Layer::Top)
         .anchor(Anchor::Top)
         .margin(Margin {
             top: TOP_MARGIN,

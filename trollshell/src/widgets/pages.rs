@@ -337,8 +337,10 @@ fn build_connection_group_v2() -> adw::PreferencesGroup {
         |g, text| g.set_description(Some(&text)),
     );
 
-    // Three expanders in vertical order.
+    // Three expanders in vertical order; placeholder row replaces
+    // Primary when no connection is active.
     group.add(&build_primary_expander());
+    group.add(&build_no_connection_placeholder_row());
     group.add(&build_all_links_expander());
     group.add(&build_dns_expander());
 
@@ -350,10 +352,7 @@ fn build_primary_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("Primary").build();
 
     bind(
-        networkd::primary().map(|p| match p {
-            Some(link) => link.name,
-            None => "No connection".to_string(),
-        }),
+        networkd::primary().map(|p| p.map_or(String::new(), |link| link.name)),
         &expander,
         |w, name| w.set_title(&name),
     );
@@ -364,6 +363,11 @@ fn build_primary_expander() -> adw::ExpanderRow {
         }),
         &expander,
         |w, sub| w.set_subtitle(&sub),
+    );
+    bind(
+        networkd::primary().map(|p| p.is_some()),
+        &expander,
+        gtk::prelude::WidgetExt::set_visible,
     );
 
     let v4_addr_row = adw::ActionRow::builder().title("IPv4 address").build();
@@ -461,6 +465,21 @@ fn build_primary_expander() -> adw::ExpanderRow {
     expander.add_row(&v6_gw_row);
 
     expander
+}
+
+fn build_no_connection_placeholder_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("No connection")
+        .activatable(false)
+        .selectable(false)
+        .build();
+    row.set_subtitle("No primary network link");
+    bind(
+        networkd::primary().map(|p| p.is_none()),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+    row
 }
 
 fn build_all_links_expander() -> adw::ExpanderRow {

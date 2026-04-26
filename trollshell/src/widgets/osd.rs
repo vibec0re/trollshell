@@ -312,11 +312,29 @@ struct State {
 }
 
 fn volume_icon(v: &Volume) -> &'static str {
-    if v.muted { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" }
+    if v.muted {
+        return "audio-volume-muted-symbolic";
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (clamp01(v.linear) * 100.0).round() as u32;
+    match pct {
+        0..=33 => "audio-volume-low-symbolic",
+        34..=66 => "audio-volume-medium-symbolic",
+        _ => "audio-volume-high-symbolic",
+    }
 }
 
 fn mic_icon(s: &Source) -> &'static str {
-    if s.muted { "microphone-sensitivity-muted-symbolic" } else { "audio-input-microphone-symbolic" }
+    if s.muted {
+        return "microphone-sensitivity-muted-symbolic";
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (clamp01(s.volume) * 100.0).round() as u32;
+    if pct >= 50 {
+        "microphone-sensitivity-high-symbolic"
+    } else {
+        "microphone-sensitivity-medium-symbolic"
+    }
 }
 
 fn render_volume(v: Volume) -> State {
@@ -451,4 +469,65 @@ fn pct(linear: f64) -> u32 {
 
 fn clamp01(v: f64) -> f64 {
     v.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hytte::services::pipewire::{Source, Volume};
+
+    fn vol(linear: f64, muted: bool) -> Volume {
+        Volume { linear, muted }
+    }
+
+    fn src(volume: f64, muted: bool) -> Source {
+        Source {
+            id: 0,
+            name: String::new(),
+            description: String::new(),
+            volume,
+            muted,
+            is_default: false,
+        }
+    }
+
+    #[test]
+    fn volume_icon_muted() {
+        assert_eq!(volume_icon(&vol(0.5, true)), "audio-volume-muted-symbolic");
+    }
+
+    #[test]
+    fn volume_icon_low_band() {
+        assert_eq!(volume_icon(&vol(0.0, false)), "audio-volume-low-symbolic");
+        assert_eq!(volume_icon(&vol(0.33, false)), "audio-volume-low-symbolic");
+    }
+
+    #[test]
+    fn volume_icon_medium_band() {
+        assert_eq!(volume_icon(&vol(0.5, false)), "audio-volume-medium-symbolic");
+        assert_eq!(volume_icon(&vol(0.66, false)), "audio-volume-medium-symbolic");
+    }
+
+    #[test]
+    fn volume_icon_high_band() {
+        assert_eq!(volume_icon(&vol(0.67, false)), "audio-volume-high-symbolic");
+        assert_eq!(volume_icon(&vol(1.0, false)), "audio-volume-high-symbolic");
+    }
+
+    #[test]
+    fn mic_icon_muted() {
+        assert_eq!(mic_icon(&src(0.5, true)), "microphone-sensitivity-muted-symbolic");
+    }
+
+    #[test]
+    fn mic_icon_high_band() {
+        assert_eq!(mic_icon(&src(0.5, false)), "microphone-sensitivity-high-symbolic");
+        assert_eq!(mic_icon(&src(1.0, false)), "microphone-sensitivity-high-symbolic");
+    }
+
+    #[test]
+    fn mic_icon_medium_band() {
+        assert_eq!(mic_icon(&src(0.0, false)), "microphone-sensitivity-medium-symbolic");
+        assert_eq!(mic_icon(&src(0.49, false)), "microphone-sensitivity-medium-symbolic");
+    }
 }

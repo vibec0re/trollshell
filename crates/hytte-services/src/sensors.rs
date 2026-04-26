@@ -43,6 +43,8 @@ pub struct Memory {
     pub available: u64,
     /// Convenience: `total - available`.
     pub used: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
 }
 
 /// Network I/O snapshot — all interfaces.
@@ -493,9 +495,15 @@ fn compute_cpu_load(prev: &[(u64, u64)], now: &[(u64, u64)]) -> CpuLoad {
 
 fn read_proc_meminfo() -> Result<Memory, std::io::Error> {
     let text = std::fs::read_to_string("/proc/meminfo")?;
+    Ok(parse_meminfo(&text))
+}
+
+fn parse_meminfo(text: &str) -> Memory {
     let mut total_kb: u64 = 0;
     let mut free_kb: u64 = 0;
     let mut available_kb: u64 = 0;
+    let mut swap_total_kb: u64 = 0;
+    let mut swap_free_kb: u64 = 0;
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -504,6 +512,10 @@ fn read_proc_meminfo() -> Result<Memory, std::io::Error> {
             free_kb = parse_kb(rest);
         } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
             available_kb = parse_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            swap_total_kb = parse_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            swap_free_kb = parse_kb(rest);
         }
     }
 
@@ -511,8 +523,18 @@ fn read_proc_meminfo() -> Result<Memory, std::io::Error> {
     let free = free_kb * 1024;
     let available = available_kb * 1024;
     let used = total.saturating_sub(available);
+    let swap_total = swap_total_kb * 1024;
+    let swap_free = swap_free_kb * 1024;
+    let swap_used = swap_total.saturating_sub(swap_free);
 
-    Ok(Memory { total, free, available, used })
+    Memory {
+        total,
+        free,
+        available,
+        used,
+        swap_used,
+        swap_total,
+    }
 }
 
 /// Parse a `/proc/meminfo` value field like `"  16331836 kB"` → `16331836`.
@@ -734,4 +756,36 @@ fn read_disk(paths: &[&str]) -> DiskUsage {
         });
     }
     DiskUsage { mounts }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_meminfo_extracts_swap_fields() {
+        let text = "\
+MemTotal:       16331836 kB
+MemFree:         1234567 kB
+MemAvailable:    8000000 kB
+SwapTotal:       8388604 kB
+SwapFree:        4194302 kB
+";
+        let m = parse_meminfo(text);
+        assert_eq!(m.total, 16_331_836 * 1024);
+        assert_eq!(m.swap_total, 8_388_604 * 1024);
+        assert_eq!(m.swap_used, 4_194_302 * 1024);
+    }
+
+    #[test]
+    fn parse_meminfo_zero_swap_when_missing() {
+        let text = "\
+MemTotal:       16331836 kB
+MemFree:         1234567 kB
+MemAvailable:    8000000 kB
+";
+        let m = parse_meminfo(text);
+        assert_eq!(m.swap_total, 0);
+        assert_eq!(m.swap_used, 0);
+    }
 }

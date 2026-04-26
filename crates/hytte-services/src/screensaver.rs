@@ -136,6 +136,17 @@ impl Service for ScreenSaverService {
             }
         });
 
+        let locked_writer = handles.is_locked.clone();
+        rt.spawn(async move {
+            loop {
+                match listen_login1(&locked_writer).await {
+                    Ok(()) => tracing::warn!("login1 stream ended, retrying in 5s"),
+                    Err(e) => tracing::warn!(error = %e, "login1 error, retrying in 5s"),
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
         handles
     }
 }
@@ -217,6 +228,54 @@ async fn call_login1_unlock() -> anyhow::Result<()> {
         .call::<_, _, ()>("SetLockedHint", &(false,))
         .await
         .context("Session.SetLockedHint(false)")?;
+    Ok(())
+}
+
+async fn listen_login1(handles: &Mutable<bool>) -> anyhow::Result<()> {
+    let conn = Connection::system()
+        .await
+        .context("connect system bus for login1")?;
+
+    let manager = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .context("login1 Manager proxy")?;
+
+    let pid: u32 = std::process::id();
+    let session_path: zbus::zvariant::OwnedObjectPath = manager
+        .call("GetSessionByPID", &(pid,))
+        .await
+        .context("GetSessionByPID")?;
+
+    let session = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        session_path.as_str(),
+        "org.freedesktop.login1.Session",
+    )
+    .await
+    .context("login1 Session proxy")?;
+
+    let mut lock_signals = session
+        .receive_signal("Lock")
+        .await
+        .context("subscribe Session.Lock")?;
+    let mut unlock_signals = session
+        .receive_signal("Unlock")
+        .await
+        .context("subscribe Session.Unlock")?;
+
+    loop {
+        tokio::select! {
+            Some(_) = lock_signals.next() => handles.set(true),
+            Some(_) = unlock_signals.next() => handles.set(false),
+            else => break,
+        }
+    }
     Ok(())
 }
 

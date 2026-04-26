@@ -200,14 +200,15 @@
     min-width: 8px;
     min-height: 56px;
     border-radius: 3px;
-    background: rgba(255, 255, 255, 0.1);
+    background: alpha(@accent_color, 0.10);
     border: none;
     padding: 0;
 }
+
 .ts-core-bar > trough > progress {
     min-width: 8px;
     border-radius: 3px;
-    background: linear-gradient(180deg, #ff006e, #8338ec 60%, #3a86ff);
+    background: @accent_color;
     border: none;
 }
 .ts-disk-mounts {
@@ -617,4 +618,53 @@
 .ts-osd-card.muted .ts-osd-progress progress,
 .ts-osd-card.muted .ts-osd-progress trough {
     opacity: 0.3;
+}
+
+/* ── Stats: live progress (memory + swap suffix bars) ──────────────────── */
+
+.ts-stat-progress {
+    min-height: 6px;
+    min-width: 100px;
+}
+
+.ts-stat-progress > trough {
+    min-height: 6px;
+    background: alpha(@accent_color, 0.15);
+    border-radius: 9999px;
+}
+
+.ts-stat-progress > trough > progress {
+    background: @accent_color;
+    border-radius: 9999px;
+}
+
+/* ── Stats: history sparkline rows ─────────────────────────────────────── */
+
+.ts-history-row {
+    padding: 8px 12px;
+}
+
+.ts-stat-name {
+    font-weight: 600;
+}
+
+.ts-stat-value {
+    opacity: 0.7;
+    font-variant-numeric: tabular-nums;
+}
+
+.ts-sparkline {
+    color: @accent_color;
+    min-height: 24px;
+}
+
+/* ── Stats: failed-unit pill ───────────────────────────────────────────── */
+
+.ts-pill-error {
+    padding: 2px 10px;
+    border-radius: 9999px;
+    font-size: 0.8em;
+    font-weight: 600;
+    background: alpha(@error_color, 0.20);
+    color: @error_color;
 }

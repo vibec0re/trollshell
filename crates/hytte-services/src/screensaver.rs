@@ -174,12 +174,13 @@ pub fn is_locked() -> impl Signal<Item = bool> {
 /// tells logind to release its session-level lock state via
 /// `Session.SetLockedHint(false)`.
 pub fn handle_unlock_success() {
-    let handles = registry::with(|r| {
+    let Some(locked) = registry::with(|r| {
         r.get::<ScreenSaverHandles>().map(|h| h.is_locked.clone())
-    });
-    if let Some(locked) = handles {
-        locked.set(false);
-    }
+    }) else {
+        tracing::warn!("handle_unlock_success called before service registered");
+        return;
+    };
+    locked.set(false);
     runtime::handle().spawn(async move {
         if let Err(e) = call_login1_unlock().await {
             tracing::warn!(error = %e, "login1 SetLockedHint(false) failed");
@@ -188,7 +189,6 @@ pub fn handle_unlock_success() {
 }
 
 async fn call_login1_unlock() -> anyhow::Result<()> {
-    use anyhow::Context;
     let conn = Connection::system().await.context("connect system bus")?;
     let manager = zbus::Proxy::new(
         &conn,

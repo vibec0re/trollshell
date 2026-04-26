@@ -1407,10 +1407,10 @@ pub fn page_stats() -> gtk::Widget {
 }
 
 fn build_stats_live_group_v2() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Live").build();
+    let group = adw::PreferencesGroup::new();
 
     group.add(&build_live_cpu_row());
-    group.add(&build_live_per_core_expander());
+    group.add(&build_live_per_core_row());
     group.add(&build_live_memory_row());
     group.add(&build_live_swap_row());
     group.add(&build_live_processes_row());
@@ -1444,25 +1444,22 @@ fn build_live_cpu_row() -> adw::ActionRow {
     row
 }
 
-fn build_live_per_core_expander() -> adw::ExpanderRow {
-    let expander = adw::ExpanderRow::builder().title("Per-core").build();
+fn build_live_per_core_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Per-core").build();
+    row.set_activatable(false);
+    row.set_selectable(false);
     bind(
         sensors::cpu().map(|c| format!("{} cores", c.per_core.len())),
-        &expander,
+        &row,
         |r, t| r.set_subtitle(&t),
     );
 
-    // Single nested row containing the horizontal bars Box, mirroring
-    // the legacy build but inside an expander.
-    let nested = adw::ActionRow::new();
-    nested.set_activatable(false);
-    nested.set_selectable(false);
     let cores_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     cores_row.add_css_class("ts-cores-row");
     cores_row.set_margin_top(4);
     cores_row.set_margin_bottom(4);
     cores_row.set_hexpand(true);
-    nested.set_child(Some(&cores_row));
+    cores_row.set_valign(gtk::Align::Center);
 
     let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
     let cores_row_for_bind = cores_row.clone();
@@ -1494,8 +1491,8 @@ fn build_live_per_core_expander() -> adw::ExpanderRow {
         }
     });
 
-    expander.add_row(&nested);
-    expander
+    row.add_suffix(&cores_row);
+    row
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -1714,7 +1711,7 @@ fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label) {
     let value_label = gtk::Label::new(None);
     value_label.add_css_class("ts-stat-value");
     value_label.set_xalign(1.0);
-    value_label.set_size_request(80, -1);
+    value_label.set_size_request(140, -1);
     row.append(&value_label);
 
     (row, spark, value_label)

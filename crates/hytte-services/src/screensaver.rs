@@ -92,6 +92,10 @@ pub struct ScreenSaverHandles {
     /// second we'd take ~136 years to wrap, and apps that leak cookies
     /// will hit the `HashMap` memory limit long before.
     pub(crate) next_cookie: Arc<AtomicU32>,
+    /// `true` while the native lock UI is mounted on all monitors, `false`
+    /// otherwise. Driven by [`handle_unlock_success`] and by the Task 3
+    /// `lock()` rewrite. Subscribers: `widgets::lock_screen`.
+    pub(crate) is_locked: Mutable<bool>,
 }
 
 impl Default for ScreenSaverHandles {
@@ -101,6 +105,7 @@ impl Default for ScreenSaverHandles {
             inhibitors: Mutable::new(Vec::new()),
             // Start at 1 so a leaked default-zero cookie never matches.
             next_cookie: Arc::new(AtomicU32::new(1)),
+            is_locked: Mutable::new(false),
         }
     }
 }
@@ -150,6 +155,67 @@ pub fn inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
             .inhibitors
             .signal_cloned()
     })
+}
+
+/// Signal emitting `true` while the lock UI is mounted, `false`
+/// otherwise. Subscribed by `widgets::lock_screen` to drive the
+/// per-monitor surfaces.
+pub fn is_locked() -> impl Signal<Item = bool> {
+    registry::with(|r| {
+        r.get::<ScreenSaverHandles>()
+            .expect("screensaver::service() not registered")
+            .is_locked
+            .signal_cloned()
+    })
+}
+
+/// Called by the lock UI after a successful PAM authentication.
+/// Flips `is_locked` to false (which clears the lock surfaces) and
+/// tells logind to release its session-level lock state via
+/// `Session.SetLockedHint(false)`.
+pub fn handle_unlock_success() {
+    let handles = registry::with(|r| {
+        r.get::<ScreenSaverHandles>().map(|h| h.is_locked.clone())
+    });
+    if let Some(locked) = handles {
+        locked.set(false);
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = call_login1_unlock().await {
+            tracing::warn!(error = %e, "login1 SetLockedHint(false) failed");
+        }
+    });
+}
+
+async fn call_login1_unlock() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let conn = Connection::system().await.context("connect system bus")?;
+    let manager = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .context("login1 Manager proxy")?;
+    let pid: u32 = std::process::id();
+    let session_path: zbus::zvariant::OwnedObjectPath = manager
+        .call("GetSessionByPID", &(pid,))
+        .await
+        .context("GetSessionByPID")?;
+    let session = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        session_path.as_str(),
+        "org.freedesktop.login1.Session",
+    )
+    .await
+    .context("login1 Session proxy")?;
+    session
+        .call::<_, _, ()>("SetLockedHint", &(false,))
+        .await
+        .context("Session.SetLockedHint(false)")?;
+    Ok(())
 }
 
 /// Spawn the lock binary (`$TROLL_LOCK_CMD` or `gtklock`). Idempotent: if

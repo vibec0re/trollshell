@@ -1711,7 +1711,7 @@ fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label) {
     let value_label = gtk::Label::new(None);
     value_label.add_css_class("ts-stat-value");
     value_label.set_xalign(1.0);
-    value_label.set_size_request(140, -1);
+    value_label.set_size_request(80, -1);
     row.append(&value_label);
 
     (row, spark, value_label)
@@ -1753,12 +1753,26 @@ fn build_history_memory_row() -> gtk::Box {
 }
 
 fn build_history_network_row() -> gtk::Box {
-    let (row, spark, value) = build_history_row("Network");
-    spark.set_domain_max(None); // auto-scale
+    // Vertical container: [main row | detail line]
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+
+    let (top_row, spark, value) = build_history_row("Network");
+    spark.set_domain_max(None);
+    outer.append(&top_row);
+
+    // Detail line: indented to align under the sparkline column.
+    // 80px (name col) + 8px (Box spacing) = 88px left margin.
+    let detail = gtk::Label::new(None);
+    detail.add_css_class("ts-stat-value");
+    detail.set_xalign(0.0);
+    detail.set_margin_start(88);
+    detail.set_margin_bottom(4);
+    outer.append(&detail);
 
     let spark_clone = spark.clone();
     let value_clone = value.clone();
-    bind(sensors::network(), &row, move |_, net| {
+    let detail_clone = detail.clone();
+    bind(sensors::network(), &outer, move |_, net| {
         let (rx_total, tx_total) = net
             .interfaces
             .iter()
@@ -1768,14 +1782,15 @@ fn build_history_network_row() -> gtk::Box {
             });
         let combined = rx_total + tx_total;
         spark_clone.push(combined);
-        value_clone.set_text(&format!(
+        value_clone.set_text(&fmt_rate(combined));
+        detail_clone.set_text(&format!(
             "\u{2193} {} \u{2191} {}",
             fmt_rate(rx_total),
             fmt_rate(tx_total)
         ));
     });
 
-    row
+    outer
 }
 
 fn build_history_gpu_temp_row() -> gtk::Box {

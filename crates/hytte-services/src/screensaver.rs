@@ -9,10 +9,12 @@
 //!   * `Lock()` programmatically (e.g. `gnome-screensaver-command --lock`).
 //!   * Query active state (stubbed in v1 — see method docs).
 //!
-//! The lock binary is `gtklock` by default, overridable via the
-//! `TROLL_LOCK_CMD` env var (set it to a single shell-style command, parsed
-//! with naive whitespace splitting; quoting is not supported — use a wrapper
-//! script if you need it).
+//! `screensaver::lock()` flips an `is_locked: Mutable<bool>` signal;
+//! `widgets::lock_screen` subscribes and mounts per-monitor layer-shell
+//! lock surfaces with PAM-backed unlock. External triggers
+//! (`loginctl lock-session`, `systemd-logind` Lock signal, swayidle
+//! before-sleep) flow through the same signal via the login1 listen
+//! loop in this module.
 //!
 //! While at least one inhibitor is active, swayidle is paused via
 //! `SIGSTOP`; when the last inhibitor releases, we send `SIGCONT`. swayidle
@@ -218,14 +220,17 @@ async fn call_login1_unlock() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn the lock binary (`$TROLL_LOCK_CMD` or `gtklock`). Idempotent: if
-/// the locker is already running, the second instance typically detects
-/// the existing one and exits cleanly (gtklock does this; waylock does
-/// too). Best-effort — failures are logged, not surfaced.
+/// Trigger the lock surface. Flips `is_locked` to `true`; the
+/// `widgets::lock_screen` subscription mounts the per-monitor lock
+/// surfaces in response.
 pub fn lock() {
-    if let Err(e) = spawn_locker() {
-        tracing::warn!(error = %e, "screensaver::lock failed to spawn lock binary");
-    }
+    let Some(locked) = registry::with(|r| {
+        r.get::<ScreenSaverHandles>().map(|h| h.is_locked.clone())
+    }) else {
+        tracing::warn!("screensaver::lock called before service registered");
+        return;
+    };
+    locked.set(true);
 }
 
 /// Programmatically register an inhibitor. Returns the cookie; the caller
@@ -312,39 +317,6 @@ fn publish_inhibitors(state: &Mutex<HashMap<u32, Inhibitor>>, view: &Mutable<Vec
     view.set(snapshot);
 }
 
-// ── Internal: lock-binary dispatch ────────────────────────────────────────────
-
-/// Resolve the lock command from `$TROLL_LOCK_CMD`, falling back to
-/// `gtklock`. Splits on ASCII whitespace; no shell quoting. Empty or
-/// whitespace-only env values fall back to the default.
-fn resolve_lock_cmd() -> Vec<String> {
-    if let Ok(raw) = std::env::var("TROLL_LOCK_CMD") {
-        let parts: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
-        if !parts.is_empty() {
-            return parts;
-        }
-    }
-    vec!["gtklock".to_string()]
-}
-
-fn spawn_locker() -> Result<()> {
-    let cmd = resolve_lock_cmd();
-    let (program, args) = cmd.split_first().context("empty lock command")?;
-    tracing::info!(program = %program, args = ?args, "spawning lock binary");
-    // Detach: synchronous std spawn, no wait. The OS reaps when the locker
-    // exits via SIGCHLD into trollshell's default handler (zombies are
-    // cheap and rare here — at most one outstanding per lock cycle).
-    let mut command = std::process::Command::new(program);
-    command.args(args);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
-    command
-        .spawn()
-        .with_context(|| format!("spawn {program}"))?;
-    Ok(())
-}
-
 // ── Internal: swayidle pause / resume ─────────────────────────────────────────
 
 /// Resolve the swayidle PID by asking systemd-user for the unit's `MainPID`.
@@ -414,13 +386,11 @@ struct ScreenSaverIface {
 
 #[zbus::interface(name = "org.freedesktop.ScreenSaver")]
 impl ScreenSaverIface {
-    /// Lock the screen now. Spawns the configured lock binary; returns
+    /// Lock the screen now. Flips `is_locked` to `true`; returns
     /// immediately. Apps and `gnome-screensaver-command --lock` use this.
     #[allow(clippy::unused_async, clippy::unused_self)]
     async fn lock(&self) {
-        if let Err(e) = spawn_locker() {
-            tracing::warn!(error = %e, "Lock(): spawn_locker failed");
-        }
+        lock();
     }
 
     /// Register an inhibitor. Returns a cookie the app must keep + pass

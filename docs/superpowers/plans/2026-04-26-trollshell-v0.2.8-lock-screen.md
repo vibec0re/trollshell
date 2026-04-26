@@ -727,9 +727,7 @@ fn submit_password(
             authenticate("trollshell", &username, password)
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(PamError::Service("blocking task panicked".into()))
-        });
+        .unwrap_or_else(|_| Err(PamError::Service("blocking task panicked".into())));
 
         spinner_for_done.set_spinning(false);
         spinner_for_done.set_visible(false);
@@ -746,10 +744,6 @@ fn submit_password(
             Err(PamError::Service(msg)) => {
                 tracing::warn!(error = %msg, "PAM service error");
                 show_auth_error(&error_for_done, "Authentication unavailable");
-            }
-            Err(PamError::Session(msg)) => {
-                tracing::warn!(error = %msg, "PAM session error");
-                show_auth_error(&error_for_done, "Account unavailable");
             }
         }
     });

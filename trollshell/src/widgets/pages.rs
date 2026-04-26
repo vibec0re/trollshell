@@ -29,6 +29,7 @@ use hytte::services::notifications_mute;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
 use hytte::services::sensors::{self, CpuLoad};
+use hytte::services::systemd;
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::services::wallpaper;
 use hytte::services::wifi;
@@ -1806,7 +1807,85 @@ fn build_history_gpu_temp_row() -> gtk::Box {
 }
 
 fn build_stats_services_group() -> adw::PreferencesGroup {
-    adw::PreferencesGroup::builder().title("Services").build()
+    let group = adw::PreferencesGroup::builder().title("Services").build();
+
+    bind(
+        systemd::failed_units().map(|units| {
+            if units.is_empty() {
+                "All services running".to_string()
+            } else {
+                format!("{} failed unit(s)", units.len())
+            }
+        }),
+        &group,
+        |g, txt| g.set_description(Some(&txt)),
+    );
+
+    group.add(&build_failed_units_expander());
+    group
+}
+
+fn build_failed_units_expander() -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder().title("Failed units").build();
+    bind(
+        systemd::failed_units().map(|u| {
+            if u.is_empty() {
+                "None".to_string()
+            } else {
+                format!("{} unit(s)", u.len())
+            }
+        }),
+        &expander,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
+    let expander_for_bind = expander.clone();
+    let rows_for_bind = rows_track.clone();
+    let placeholder_for_bind = placeholder_track.clone();
+    bind(systemd::failed_units(), &expander, move |_, units| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            expander_for_bind.remove(&row);
+        }
+        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
+            expander_for_bind.remove(&p);
+        }
+        if units.is_empty() {
+            let placeholder = adw::ActionRow::builder()
+                .title("All units running")
+                .activatable(false)
+                .selectable(false)
+                .build();
+            expander_for_bind.add_row(&placeholder);
+            *placeholder_for_bind.borrow_mut() = Some(placeholder);
+            return;
+        }
+        let mut new_rows = Vec::with_capacity(units.len());
+        for unit in &units {
+            let row = adw::ActionRow::builder()
+                .title(&unit.name)
+                .activatable(false)
+                .build();
+            let subtitle = if unit.description.is_empty() {
+                unit.sub_state.clone()
+            } else {
+                unit.description.clone()
+            };
+            row.set_subtitle(&subtitle);
+
+            let pill = gtk::Label::new(Some("failed"));
+            pill.set_valign(gtk::Align::Center);
+            pill.add_css_class("ts-pill-error");
+            row.add_suffix(&pill);
+
+            expander_for_bind.add_row(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    expander
 }
 
 // ── Audio page ────────────────────────────────────────────────────────────────

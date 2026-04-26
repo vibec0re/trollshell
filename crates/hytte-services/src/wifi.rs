@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OnceCell;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
 
@@ -287,10 +288,24 @@ pub fn cancel_prompt(id: u64) {
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
-    let conn = Connection::system()
+/// Shared command-channel connection. Avoids opening a fresh system bus
+/// connection on every iwd call. The listen loop keeps its own
+/// connection because its long-lived signal subscriptions are
+/// independent of command identity.
+static CMD_CONN: OnceCell<Connection> = OnceCell::const_new();
+
+async fn cmd_conn() -> Result<&'static Connection> {
+    CMD_CONN
+        .get_or_try_init(|| async {
+            Connection::system()
+                .await
+                .context("open shared wifi command connection")
+        })
         .await
-        .context("open system bus for station call")?;
+}
+
+async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("net.connman.iwd"),
         station_path,
@@ -304,9 +319,7 @@ async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
 }
 
 async fn do_network_call(network_path: &str, method: &str) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("open system bus for network call")?;
+    let conn = cmd_conn().await?;
     conn.call_method(
         Some("net.connman.iwd"),
         network_path,

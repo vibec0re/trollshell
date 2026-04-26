@@ -44,6 +44,8 @@ use hytte::prelude::*;
 use hytte::services::brightness::{self, Brightness};
 use hytte::services::niri;
 use hytte::services::pipewire::{self, Source, Volume};
+#[allow(unused_imports)] // `upower` (module) wired in Task 4
+use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::ui::layer_window;
 
 /// How long the OSD stays visible after the latest event, in ms. Each
@@ -59,6 +61,8 @@ enum Kind {
     Volume,
     Mic,
     Brightness,
+    #[allow(dead_code)] // wired in Task 4
+    Battery,
 }
 
 impl Kind {
@@ -67,6 +71,7 @@ impl Kind {
             Self::Volume => "volume",
             Self::Mic => "mic",
             Self::Brightness => "brightness",
+            Self::Battery => "battery",
         }
     }
 }
@@ -359,6 +364,49 @@ fn mic_icon(s: &Source) -> &'static str {
     }
 }
 
+const LOW_THRESHOLD: f64 = 20.0;
+const CRITICAL_THRESHOLD: f64 = 10.0;
+const IMMINENT_THRESHOLD: f64 = 5.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatteryEvent {
+    PluggedIn,
+    Unplugged,
+    LowBattery,
+    CriticalBattery,
+    ImminentShutdown,
+}
+
+#[allow(dead_code)] // wired in Task 4
+fn detect_battery_event(prev: Option<&Battery>, curr: &Battery) -> Option<BatteryEvent> {
+    let prev = prev?;
+
+    if curr.state == BatteryState::Unknown || prev.state == BatteryState::Unknown {
+        return None;
+    }
+
+    if prev.state == BatteryState::Discharging && curr.state == BatteryState::Charging {
+        return Some(BatteryEvent::PluggedIn);
+    }
+    if prev.state == BatteryState::Charging && curr.state == BatteryState::Discharging {
+        return Some(BatteryEvent::Unplugged);
+    }
+
+    if curr.state == BatteryState::Discharging && prev.state == BatteryState::Discharging {
+        if prev.percentage > IMMINENT_THRESHOLD && curr.percentage <= IMMINENT_THRESHOLD {
+            return Some(BatteryEvent::ImminentShutdown);
+        }
+        if prev.percentage > CRITICAL_THRESHOLD && curr.percentage <= CRITICAL_THRESHOLD {
+            return Some(BatteryEvent::CriticalBattery);
+        }
+        if prev.percentage > LOW_THRESHOLD && curr.percentage <= LOW_THRESHOLD {
+            return Some(BatteryEvent::LowBattery);
+        }
+    }
+
+    None
+}
+
 fn render_volume(v: Volume) -> State {
     let icon = volume_icon(&v);
     // Boosted volume can exceed 100%; show the true value in the label
@@ -551,5 +599,77 @@ mod tests {
     fn mic_icon_medium_band() {
         assert_eq!(mic_icon(&src(0.0, false)), "microphone-sensitivity-medium-symbolic");
         assert_eq!(mic_icon(&src(0.49, false)), "microphone-sensitivity-medium-symbolic");
+    }
+
+    fn batt(percentage: f64, state: BatteryState) -> Battery {
+        Battery {
+            percentage,
+            state,
+            ..Battery::default()
+        }
+    }
+
+    #[test]
+    fn detect_plug_in() {
+        let prev = batt(50.0, BatteryState::Discharging);
+        let curr = batt(50.0, BatteryState::Charging);
+        assert!(matches!(
+            detect_battery_event(Some(&prev), &curr),
+            Some(BatteryEvent::PluggedIn)
+        ));
+    }
+
+    #[test]
+    fn detect_unplug() {
+        let prev = batt(80.0, BatteryState::Charging);
+        let curr = batt(80.0, BatteryState::Discharging);
+        assert!(matches!(
+            detect_battery_event(Some(&prev), &curr),
+            Some(BatteryEvent::Unplugged)
+        ));
+    }
+
+    #[test]
+    fn detect_low_threshold_cross() {
+        let prev = batt(22.0, BatteryState::Discharging);
+        let curr = batt(19.0, BatteryState::Discharging);
+        assert!(matches!(
+            detect_battery_event(Some(&prev), &curr),
+            Some(BatteryEvent::LowBattery)
+        ));
+    }
+
+    #[test]
+    fn detect_critical_threshold_cross() {
+        let prev = batt(11.0, BatteryState::Discharging);
+        let curr = batt(9.0, BatteryState::Discharging);
+        assert!(matches!(
+            detect_battery_event(Some(&prev), &curr),
+            Some(BatteryEvent::CriticalBattery)
+        ));
+    }
+
+    #[test]
+    fn detect_imminent_shutdown_threshold_cross() {
+        let prev = batt(6.0, BatteryState::Discharging);
+        let curr = batt(4.0, BatteryState::Discharging);
+        assert!(matches!(
+            detect_battery_event(Some(&prev), &curr),
+            Some(BatteryEvent::ImminentShutdown)
+        ));
+    }
+
+    #[test]
+    fn no_event_on_steady_discharge() {
+        let prev = batt(50.0, BatteryState::Discharging);
+        let curr = batt(49.0, BatteryState::Discharging);
+        assert!(detect_battery_event(Some(&prev), &curr).is_none());
+    }
+
+    #[test]
+    fn no_event_on_unknown_state() {
+        let prev = batt(50.0, BatteryState::Unknown);
+        let curr = batt(50.0, BatteryState::Charging);
+        assert!(detect_battery_event(Some(&prev), &curr).is_none());
     }
 }

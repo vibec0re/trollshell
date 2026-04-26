@@ -64,21 +64,16 @@ fn main() -> hytte::ui::Result<()> {
             // bluetooth + pipewire signals out of the registry.
             bluetooth_audio::init();
 
-            // Notification toasts: transient layer-shell window pinned
-            // top-right on the primary monitor. Suppressed when DND is on
-            // (drawer history still records). Critical notifications bypass
-            // DND per freedesktop spec.
-            //
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             // Polkit auth dialog — reacts to polkit::auth_prompts() signal.
             if let Some(primary) = app.monitors().first() {
-                widgets::notifications::install(primary);
                 widgets::prompt::install(primary);
                 widgets::polkit_dialog::install(primary);
             }
 
-            // OSD mounts on every monitor; routing picks the focused one.
+            // Notifications + OSD mount on every monitor; routing picks the focused one.
             for monitor in &app.monitors() {
+                widgets::notifications::install(monitor);
                 widgets::osd::install(monitor);
             }
         })

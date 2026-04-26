@@ -10,7 +10,7 @@ use hytte::prelude::*;
 use hytte::services::{
     bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, displays, dnd, mpris,
     networkd, niri, notifications, notifications_mute, pipewire, polkit, resolved, screensaver,
-    sensors, tray, upower, wallpaper, wifi,
+    sensors, systemd, tray, upower, wallpaper, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -35,6 +35,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(wifi::service())
         .with(polkit::service())
         .with(screensaver::service())
+        .with(systemd::service())
         .with(wallpaper::service())
         .with(displays::service())
         .with(clipboard::service())

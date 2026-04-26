@@ -18,6 +18,7 @@ pub mod polkit;
 pub mod resolved;
 pub mod screensaver;
 pub mod sensors;
+pub mod systemd;
 pub mod tray;
 pub mod upower;
 pub mod wallpaper;

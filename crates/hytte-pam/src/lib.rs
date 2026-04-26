@@ -23,10 +23,11 @@ pub enum PamError {
 ///
 /// Blocks the calling thread. Always call from
 /// `tokio::task::spawn_blocking` or a dedicated worker thread.
+#[allow(clippy::needless_pass_by_value)] // reason: owned Zeroizing<String> zeroizes at fn exit
 pub fn authenticate(
     service: &str,
     username: &str,
-    password: &Zeroizing<String>,
+    password: Zeroizing<String>,
 ) -> Result<(), PamError> {
     let mut client = pam::Client::with_password(service)
         .map_err(|e| PamError::Service(e.to_string()))?;
@@ -46,6 +47,6 @@ mod tests {
 
     #[test]
     fn api_surface_compiles() {
-        let _: fn(&str, &str, &Zeroizing<String>) -> Result<(), PamError> = authenticate;
+        let _: fn(&str, &str, Zeroizing<String>) -> Result<(), PamError> = authenticate;
     }
 }

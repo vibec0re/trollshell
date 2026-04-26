@@ -50,6 +50,18 @@ use hytte::ui::{layer_window, Anchor, Margin};
 /// individually and do not count toward this cap.
 const MAX_VISIBLE_NONCRITICAL: usize = 4;
 
+// ── Per-monitor toast view ────────────────────────────────────────────────────
+
+#[allow(dead_code)] // wired in Task 2
+struct ToastView {
+    window: gtk::Window,
+    vbox: gtk::Box,
+    monitor: Monitor,
+    card_map: RefCell<HashMap<u32, gtk::Widget>>,
+    overflow_card: RefCell<Option<gtk::Widget>>,
+    suppressed_during_dnd: RefCell<HashSet<u32>>,
+}
+
 // ── Thread-local window storage ───────────────────────────────────────────────
 
 thread_local! {
@@ -242,6 +254,39 @@ pub fn install(monitor: &Monitor) {
     TOAST_WINDOW.with(|cell| {
         *cell.borrow_mut() = Some(window);
     });
+}
+
+// ── Toast view constructor ────────────────────────────────────────────────────
+
+#[allow(dead_code)] // wired in Task 2
+fn build_toast_view(monitor: &Monitor) -> ToastView {
+    let window = layer_window(monitor)
+        .layer(Layer::Top)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Right)
+        .margin(Margin {
+            top: 8,
+            right: 8,
+            bottom: 0,
+            left: 0,
+        })
+        .namespace("hytte-toasts")
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::None)
+        .build();
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    vbox.add_css_class("ts-toasts");
+    window.set_child(Some(&vbox));
+
+    ToastView {
+        window,
+        vbox,
+        monitor: monitor.clone(),
+        card_map: RefCell::new(HashMap::new()),
+        overflow_card: RefCell::new(None),
+        suppressed_during_dnd: RefCell::new(HashSet::new()),
+    }
 }
 
 // ── Card builder ──────────────────────────────────────────────────────────────

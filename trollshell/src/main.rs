@@ -74,7 +74,11 @@ fn main() -> hytte::ui::Result<()> {
                 widgets::notifications::install(primary);
                 widgets::prompt::install(primary);
                 widgets::polkit_dialog::install(primary);
-                widgets::osd::install(primary);
+            }
+
+            // OSD mounts on every monitor; routing picks the focused one.
+            for monitor in &app.monitors() {
+                widgets::osd::install(monitor);
             }
         })
 }

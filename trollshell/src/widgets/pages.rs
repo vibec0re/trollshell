@@ -800,48 +800,127 @@ fn dbm_label(dbm: i16) -> &'static str {
     }
 }
 
-// Temporary alias: Task 8 replaces the body with the new pill+popover form.
 fn build_network_row_v2(net: &wifi::WifiNetwork) -> adw::ActionRow {
-    build_network_row(net)
-}
-
-fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
-    let suffix_text = if net.connected {
-        "Connected"
-    } else if net.known {
-        "Known"
-    } else if net.security == "open" {
-        "Open"
-    } else {
-        &net.security
-    };
     let row = adw::ActionRow::builder()
         .title(&net.ssid)
-        .subtitle(suffix_text)
+        .subtitle(format!(
+            "{} dBm \u{00b7} {}",
+            net.signal_dbm,
+            security_label(&net.security)
+        ))
         .activatable(true)
         .build();
 
     let icon = gtk::Image::from_icon_name(signal_icon(net.signal_dbm));
     row.add_prefix(&icon);
 
-    if net.security != "open" {
-        let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
-        lock.add_css_class("dim-label");
-        lock.set_tooltip_text(Some(&net.security));
-        row.add_suffix(&lock);
+    // Pill suffix (only for connected / known states).
+    if net.connected {
+        row.add_suffix(&pill_label("Connected", "ts-pill-connected"));
+    } else if net.known {
+        row.add_suffix(&pill_label("Known", "ts-pill-known"));
     }
 
-    let path = net.path.clone();
+    // ⋮ popover.
+    let menu_btn = build_network_row_menu(net);
+    row.add_suffix(&menu_btn);
+
+    // Row activation: connect only when not currently connected.
     let connected = net.connected;
+    let act_path = net.path.clone();
     row.connect_activated(move |_| {
-        if connected {
-            wifi::disconnect();
-        } else {
-            wifi::connect_network(&path);
+        if !connected {
+            wifi::connect_network(&act_path);
         }
     });
 
     row
+}
+
+fn build_network_row_menu(net: &wifi::WifiNetwork) -> gtk::MenuButton {
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("view-more-symbolic");
+    menu_btn.set_valign(gtk::Align::Center);
+    menu_btn.add_css_class("flat");
+    menu_btn.set_tooltip_text(Some("More actions"));
+
+    let popover = gtk::Popover::new();
+    let popover_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    popover_box.set_margin_top(4);
+    popover_box.set_margin_bottom(4);
+    popover_box.set_margin_start(4);
+    popover_box.set_margin_end(4);
+
+    let net_path = net.path.clone();
+    let known_path_opt = net.known_network_path.clone();
+
+    if net.connected {
+        let pop_for_disc = popover.clone();
+        let disconnect_btn = gtk::Button::with_label("Disconnect");
+        disconnect_btn.add_css_class("flat");
+        disconnect_btn.add_css_class("destructive-action");
+        disconnect_btn.connect_clicked(move |_| {
+            wifi::disconnect();
+            pop_for_disc.popdown();
+        });
+        popover_box.append(&disconnect_btn);
+
+        if let Some(known_path) = known_path_opt {
+            let pop_for_forget = popover.clone();
+            let forget_btn = gtk::Button::with_label("Forget");
+            forget_btn.add_css_class("flat");
+            forget_btn.add_css_class("destructive-action");
+            forget_btn.connect_clicked(move |_| {
+                wifi::forget(&known_path);
+                pop_for_forget.popdown();
+            });
+            popover_box.append(&forget_btn);
+        }
+    } else {
+        let pop_for_conn = popover.clone();
+        let connect_path = net_path;
+        let connect_btn = gtk::Button::with_label("Connect");
+        connect_btn.add_css_class("flat");
+        connect_btn.connect_clicked(move |_| {
+            wifi::connect_network(&connect_path);
+            pop_for_conn.popdown();
+        });
+        popover_box.append(&connect_btn);
+
+        if let Some(known_path) = known_path_opt {
+            let pop_for_forget = popover.clone();
+            let forget_btn = gtk::Button::with_label("Forget");
+            forget_btn.add_css_class("flat");
+            forget_btn.add_css_class("destructive-action");
+            forget_btn.connect_clicked(move |_| {
+                wifi::forget(&known_path);
+                pop_for_forget.popdown();
+            });
+            popover_box.append(&forget_btn);
+        }
+    }
+
+    popover.set_child(Some(&popover_box));
+    menu_btn.set_popover(Some(&popover));
+    menu_btn
+}
+
+fn pill_label(text: &str, variant_class: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_valign(gtk::Align::Center);
+    label.add_css_class("ts-net-pill");
+    label.add_css_class(variant_class);
+    label
+}
+
+fn security_label(security: &str) -> &'static str {
+    match security {
+        "open" => "Open",
+        "psk" => "WPA2",
+        "8021x" => "802.1x",
+        "wep" => "WEP",
+        _ => "Secured",
+    }
 }
 
 fn signal_icon(dbm: i16) -> &'static str {

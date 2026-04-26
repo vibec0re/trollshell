@@ -143,6 +143,7 @@ pub struct SensorsHandles {
     pub(crate) gpu: Mutable<Option<GpuState>>,
     pub(crate) disk: Mutable<DiskUsage>,
     pub(crate) net_connections: Mutable<NetConnections>,
+    pub(crate) process_count: Mutable<u32>,
 }
 
 impl Default for SensorsHandles {
@@ -155,6 +156,7 @@ impl Default for SensorsHandles {
             gpu: Mutable::new(None),
             disk: Mutable::new(DiskUsage::default()),
             net_connections: Mutable::new(NetConnections::default()),
+            process_count: Mutable::new(0),
         }
     }
 }
@@ -176,6 +178,7 @@ impl Service for SensorsService {
         let gpu_writer = handles.gpu.clone();
         let disk_writer = handles.disk.clone();
         let net_conn_writer = handles.net_connections.clone();
+        let proc_count_writer = handles.process_count.clone();
 
         rt.spawn(async move {
             poll_loop(
@@ -186,6 +189,7 @@ impl Service for SensorsService {
                 gpu_writer,
                 disk_writer,
                 net_conn_writer,
+                proc_count_writer,
             )
             .await;
         });
@@ -272,6 +276,16 @@ pub fn disk() -> impl Signal<Item = DiskUsage> {
     })
 }
 
+/// Signal that emits the current number of running processes.
+pub fn process_count() -> impl Signal<Item = u32> {
+    registry::with(|r| {
+        r.get::<SensorsHandles>()
+            .expect("sensors::service() not registered")
+            .process_count
+            .signal_cloned()
+    })
+}
+
 // ── Polling loop ──────────────────────────────────────────────────────────────
 
 struct PollState {
@@ -302,6 +316,7 @@ async fn poll_loop(
     gpu_writer: Mutable<Option<GpuState>>,
     disk_writer: Mutable<DiskUsage>,
     net_conn_writer: Mutable<NetConnections>,
+    proc_count_writer: Mutable<u32>,
 ) {
     let mut state = PollState::new();
 
@@ -386,6 +401,9 @@ async fn poll_loop(
         if state.tick.is_multiple_of(2) {
             net_conn_writer.set(read_net_connections());
         }
+
+        // ── Process count (every tick) ────────────────────────────────────
+        proc_count_writer.set(read_process_count());
 
         state.tick = state.tick.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -756,6 +774,25 @@ fn read_disk(paths: &[&str]) -> DiskUsage {
         });
     }
     DiskUsage { mounts }
+}
+
+// ── Process count ─────────────────────────────────────────────────────────────
+
+fn read_process_count() -> u32 {
+    std::fs::read_dir("/proc")
+        .map(|iter| {
+            #[allow(clippy::cast_possible_truncation)]
+            let count = iter
+                .filter_map(std::result::Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.parse::<u32>().is_ok())
+                })
+                .count();
+            count.try_into().unwrap_or(u32::MAX)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

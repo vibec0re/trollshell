@@ -5,6 +5,7 @@ members = [
     "crates/hytte-ui",
     "crates/hytte-services",
     "crates/hytte",
+    "crates/hytte-pam",
     "trollshell",
 ]
 

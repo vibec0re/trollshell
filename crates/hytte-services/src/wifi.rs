@@ -159,6 +159,7 @@ async fn capture_initial_adapter(
 ) {
     let adapter_path = adapter_path_from_station(station_path);
     if adapter_path.is_empty() {
+        set_current_adapter_path("").await;
         adapter_mutable.set(None);
         return;
     }

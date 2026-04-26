@@ -668,3 +668,7 @@
     background: alpha(@error_color, 0.20);
     color: @error_color;
 }
+
+.ts-osd-card.battery .ts-osd-icon {
+    color: @accent_color;
+}

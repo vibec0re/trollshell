@@ -81,7 +81,6 @@ struct OsdView {
     timeout: Cell<Option<glib::SourceId>>,
     /// Pending fade-out → `set_visible(false)` timeout. Cancelled if a
     /// new event arrives mid-fade-out.
-    #[expect(dead_code, reason = "wired in Task 3 animation work")]
     fade_out_timeout: Cell<Option<glib::SourceId>>,
     /// CSS modifier classes currently set on the card so we can clean
     /// them up on each update without growing a leaky class list.
@@ -329,17 +328,50 @@ fn show(view: &Rc<OsdView>, state: &State) {
         view.card.remove_css_class("muted");
     }
 
+    // Make the window visible, then defer the .shown class flip by one
+    // frame so GTK4's CSS engine sees the transition's "from" state
+    // (opacity 0, margin-top 0) before the "to" state. Without the
+    // idle defer, the same-frame visibility-and-class flip skips the
+    // transition entirely.
+    //
+    // Cancel any in-flight fade-out: a new event landed before the
+    // previous fade-out timer fired, so we keep the window visible
+    // and re-arm.
+    if let Some(prev) = view.fade_out_timeout.take() {
+        prev.remove();
+    }
     view.window.set_visible(true);
+    let card_for_idle = view.card.clone();
+    glib::idle_add_local_once(move || {
+        card_for_idle.add_css_class("shown");
+    });
 
-    // Reset auto-hide.
+    // Reset auto-hide. When the timer fires we DON'T set_visible(false)
+    // directly; instead remove the .shown class to start the CSS fade,
+    // then schedule a second timer to flip visibility once the
+    // transition has finished.
     if let Some(prev) = view.timeout.take() {
         prev.remove();
     }
     let view_for_timeout = view.clone();
-    let id = glib::timeout_add_local_once(Duration::from_millis(u64::from(HIDE_AFTER_MS)), move || {
-        view_for_timeout.timeout.set(None);
-        view_for_timeout.window.set_visible(false);
-    });
+    let id = glib::timeout_add_local_once(
+        Duration::from_millis(u64::from(HIDE_AFTER_MS)),
+        move || {
+            view_for_timeout.timeout.set(None);
+            view_for_timeout.card.remove_css_class("shown");
+            // Wait for the 200ms CSS transition + 20ms safety buffer
+            // before actually hiding the layer-shell window.
+            let view_for_fade = view_for_timeout.clone();
+            let fade_id = glib::timeout_add_local_once(
+                Duration::from_millis(220),
+                move || {
+                    view_for_fade.fade_out_timeout.set(None);
+                    view_for_fade.window.set_visible(false);
+                },
+            );
+            view_for_timeout.fade_out_timeout.set(Some(fade_id));
+        },
+    );
     view.timeout.set(Some(id));
 }
 

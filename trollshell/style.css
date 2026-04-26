@@ -539,3 +539,24 @@
     background: alpha(@accent_color, 0.2);
     transition: background 600ms ease-out;
 }
+
+.ts-net-pill {
+    padding: 2px 10px;
+    border-radius: 9999px;
+    font-size: 0.8em;
+    font-weight: 600;
+}
+
+.ts-pill-connected {
+    background: alpha(@accent_color, 0.20);
+    color: @accent_color;
+}
+
+.ts-pill-known {
+    background: alpha(@accent_color, 0.08);
+    color: alpha(@accent_color, 0.70);
+}
+
+.ts-mono {
+    font-family: monospace;
+}

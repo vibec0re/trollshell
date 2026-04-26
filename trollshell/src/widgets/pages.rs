@@ -311,78 +311,9 @@ pub fn page_network() -> gtk::Widget {
 
     column.append(build_connection_group_v2().upcast_ref::<gtk::Widget>());
     column.append(build_traffic_group_v2().upcast_ref::<gtk::Widget>());
-
-    let wifi_panel = panel("Wi-Fi");
-    append_wifi_section(&wifi_panel);
-    column.append(&wifi_panel);
+    column.append(build_wifi_group_v2().upcast_ref::<gtk::Widget>());
 
     finish_page(&column)
-}
-
-// Legacy: superseded by `build_connection_group_v2`. Retained for now to
-// keep the file compiling through the staged Task 5/6/7 migration; will
-// be removed in Task 7 when the last legacy caller goes away.
-#[allow(dead_code)]
-fn build_connection_group() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-
-    let primary_row = adw::ActionRow::builder().title("Primary").build();
-    bind(
-        networkd::primary().map(|p| match p {
-            Some(link) => link.name,
-            None => "(none)".to_string(),
-        }),
-        &primary_row,
-        |row, name| row.set_title(&name),
-    );
-    bind(
-        networkd::primary().map(|p| match p {
-            Some(link) => describe_state(link.operational).to_string(),
-            None => "Disconnected".to_string(),
-        }),
-        &primary_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    group.add(&primary_row);
-
-    let links_row = adw::ActionRow::builder().title("Links").build();
-    // Multi-line subtitle: one link per line. Comma-joined produced a
-    // single very wide subtitle (AdwActionRow subtitles don't ellipsize)
-    // which pushed the whole modal to full-screen width on systems with
-    // many interfaces (wlp/eth/virbr/docker/veth/...).
-    links_row.set_subtitle_lines(0);
-    bind(
-        networkd::links().map(|ls| {
-            let lines: Vec<String> = ls
-                .iter()
-                .map(|l| format!("{} ({})", l.name, describe_state(l.operational)))
-                .collect();
-            if lines.is_empty() {
-                "(none)".to_string()
-            } else {
-                lines.join("\n")
-            }
-        }),
-        &links_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    group.add(&links_row);
-
-    let dns_row = adw::ActionRow::builder().title("DNS").build();
-    bind(
-        resolved::dns().map(|state| {
-            if state.configured() {
-                format!("{} server(s)", state.servers.len())
-            } else {
-                "Not configured".to_string()
-            }
-        }),
-        &dns_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    group.add(&dns_row);
-
-    group
 }
 
 fn build_connection_group_v2() -> adw::PreferencesGroup {
@@ -699,68 +630,179 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
     group
 }
 
-fn append_wifi_section(column: &gtk::Box) {
-    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-    separator.set_margin_top(4);
-    separator.set_margin_bottom(4);
-    column.append(&separator);
+fn build_wifi_group_v2() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Wi-Fi").build();
 
-    let wifi_headline = gtk::Label::new(None);
-    wifi_headline.set_xalign(0.0);
-    wifi_headline.add_css_class("ts-wifi-headline");
-    bind_text(
-        wifi::station().map(|s| match s {
-            Some(st) => match st.connected_ssid {
-                Some(ssid) => format!("Wi-Fi: {ssid}"),
-                None => match st.state {
-                    wifi::StationState::Connecting => "Wi-Fi: connecting\u{2026}".to_string(),
-                    wifi::StationState::Roaming => "Wi-Fi: roaming".to_string(),
-                    _ => "Wi-Fi: disconnected".to_string(),
-                },
-            },
-            None => "Wi-Fi: no adapter".to_string(),
-        }),
-        &wifi_headline,
-    );
-    column.append(&wifi_headline);
+    // Live description bound to (adapter, station, networks).
+    let combined = map_ref! {
+        let adapter = wifi::adapter(),
+        let station = wifi::station(),
+        let networks = wifi::networks() => {
+            (adapter.clone(), station.clone(), networks.clone())
+        }
+    };
+    bind(combined, &group, |g, (adapter, station, networks)| {
+        let text = wifi_description_text(adapter.as_ref(), station.as_ref(), &networks);
+        g.set_description(Some(&text));
+    });
 
-    let scan_btn = gtk::Button::with_label("Scan");
-    scan_btn.connect_clicked(|_| wifi::scan());
-    bind(
-        wifi::station().map(|s| !s.is_some_and(|st| st.scanning)),
-        &scan_btn,
-        gtk::prelude::WidgetExt::set_sensitive,
-    );
-    column.append(&scan_btn);
+    let header = build_wifi_header_suffix();
+    group.set_header_suffix(Some(&header));
 
+    // Network list inside a bounded ScrolledWindow.
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_min_content_height(160);
     scrolled.set_max_content_height(240);
     scrolled.add_css_class("ts-wifi-list");
-
     let networks_group = adw::PreferencesGroup::new();
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     scrolled.set_child(Some(&networks_group));
-    column.append(&scrolled);
+    group.add(&scrolled);
+
+    // Power-off greying for the network list (Switch stays sensitive).
+    bind(
+        wifi::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
+        &scrolled,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
 
     let group_for_bind = networks_group.clone();
-    let rows_track_for_bind = rows_track.clone();
+    let rows_for_bind = rows_track.clone();
+    let placeholder_for_bind = placeholder_track.clone();
     bind(wifi::networks(), &networks_group, move |_, nets| {
-        // PreferencesGroup has no first_child traversal API for its rows;
-        // track and remove explicitly.
-        for row in rows_track_for_bind.borrow_mut().drain(..) {
+        for row in rows_for_bind.borrow_mut().drain(..) {
             group_for_bind.remove(&row);
         }
-        let mut new_rows = Vec::with_capacity(nets.len());
-        for net in nets {
-            let row = build_network_row(&net);
-            group_for_bind.add(&row);
-            new_rows.push(row);
+        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
+            group_for_bind.remove(&p);
         }
-        *rows_track_for_bind.borrow_mut() = new_rows;
+        if nets.is_empty() {
+            let placeholder = adw::ActionRow::builder()
+                .title("No networks found")
+                .subtitle("Tap Scan to refresh")
+                .activatable(false)
+                .build();
+            group_for_bind.add(&placeholder);
+            *placeholder_for_bind.borrow_mut() = Some(placeholder);
+        } else {
+            let mut new_rows = Vec::with_capacity(nets.len());
+            for net in &nets {
+                let row = build_network_row_v2(net);
+                group_for_bind.add(&row);
+                new_rows.push(row);
+            }
+            *rows_for_bind.borrow_mut() = new_rows;
+        }
     });
+
+    group
+}
+
+fn build_wifi_header_suffix() -> gtk::Box {
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.set_valign(gtk::Align::Center);
+
+    let power_switch = gtk::Switch::new();
+    power_switch.set_valign(gtk::Align::Center);
+    bind(
+        wifi::adapter().map(|a| a.is_some()),
+        &power_switch,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+    bind_two_way(
+        wifi::adapter().map(|a| a.is_some_and(|ad| ad.powered)),
+        &power_switch,
+        gtk::Switch::set_active,
+        |w| w.connect_active_notify(|sw| wifi::set_powered(sw.is_active())),
+    );
+    header.append(&power_switch);
+
+    let scan_btn = gtk::Button::with_label("Scan");
+    scan_btn.connect_clicked(|_| wifi::scan());
+    let scan_sensitive_signal = map_ref! {
+        let adapter = wifi::adapter(),
+        let station = wifi::station() => {
+            let powered = adapter.as_ref().is_some_and(|a| a.powered);
+            let scanning = station.as_ref().is_some_and(|s| s.scanning);
+            powered && !scanning
+        }
+    };
+    bind(
+        scan_sensitive_signal,
+        &scan_btn,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+    header.append(&scan_btn);
+
+    let spinner = gtk::Spinner::new();
+    spinner.set_valign(gtk::Align::Center);
+    bind(
+        wifi::station().map(|s| s.is_some_and(|st| st.scanning)),
+        &spinner,
+        |w, scanning| {
+            w.set_spinning(scanning);
+            w.set_visible(scanning);
+        },
+    );
+    header.append(&spinner);
+
+    header
+}
+
+fn wifi_description_text(
+    adapter: Option<&wifi::Adapter>,
+    station: Option<&wifi::Station>,
+    networks: &[wifi::WifiNetwork],
+) -> String {
+    let Some(a) = adapter else {
+        return "No adapter".to_string();
+    };
+    if !a.powered {
+        return "Disabled".to_string();
+    }
+    let Some(st) = station else {
+        return "Disconnected".to_string();
+    };
+    match st.state {
+        wifi::StationState::Connecting => "Connecting\u{2026}".to_string(),
+        wifi::StationState::Roaming => "Roaming".to_string(),
+        wifi::StationState::Connected => {
+            if let Some(ssid) = &st.connected_ssid {
+                if let Some(n) = networks.iter().find(|n| n.connected) {
+                    format!(
+                        "{ssid} \u{00b7} {} dBm ({})",
+                        n.signal_dbm,
+                        dbm_label(n.signal_dbm)
+                    )
+                } else {
+                    ssid.clone()
+                }
+            } else {
+                "Connected".to_string()
+            }
+        }
+        _ => "Disconnected".to_string(),
+    }
+}
+
+fn dbm_label(dbm: i16) -> &'static str {
+    if dbm >= -50 {
+        "excellent"
+    } else if dbm >= -60 {
+        "good"
+    } else if dbm >= -75 {
+        "ok"
+    } else {
+        "weak"
+    }
+}
+
+// Temporary alias: Task 8 replaces the body with the new pill+popover form.
+fn build_network_row_v2(net: &wifi::WifiNetwork) -> adw::ActionRow {
+    build_network_row(net)
 }
 
 fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {

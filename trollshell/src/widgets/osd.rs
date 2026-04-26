@@ -44,7 +44,6 @@ use hytte::prelude::*;
 use hytte::services::brightness::{self, Brightness};
 use hytte::services::niri;
 use hytte::services::pipewire::{self, Source, Volume};
-#[allow(unused_imports)] // `upower` (module) wired in Task 4
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::ui::layer_window;
 
@@ -61,7 +60,6 @@ enum Kind {
     Volume,
     Mic,
     Brightness,
-    #[allow(dead_code)] // wired in Task 4
     Battery,
 }
 
@@ -273,6 +271,31 @@ fn install_subscriptions() {
         ));
     }
 
+    // ── Battery ───────────────────────────────────────────────────────
+    //
+    // Edge + threshold detection. The first emission seeds a baseline
+    // silently; subsequent emissions diff against it via
+    // detect_battery_event.
+    {
+        let first = Cell::new(true);
+        let last_battery: RefCell<Option<Battery>> = RefCell::new(None);
+        glib::MainContext::default().spawn_local(upower::battery().for_each(
+            move |batt: Battery| {
+                if first.replace(false) {
+                    *last_battery.borrow_mut() = Some(batt);
+                    return std::future::ready(());
+                }
+                let prev_snapshot = last_battery.borrow().clone();
+                if let Some(event) = detect_battery_event(prev_snapshot.as_ref(), &batt) {
+                    let state = render_battery(event, &batt);
+                    route_show(&state);
+                }
+                *last_battery.borrow_mut() = Some(batt);
+                std::future::ready(())
+            },
+        ));
+    }
+
     // ── Focused output ────────────────────────────────────────────────
     //
     // Updates `FOCUSED_OUTPUT` used by `route_show`. No bootstrap
@@ -377,7 +400,6 @@ enum BatteryEvent {
     ImminentShutdown,
 }
 
-#[allow(dead_code)] // wired in Task 4
 fn detect_battery_event(prev: Option<&Battery>, curr: &Battery) -> Option<BatteryEvent> {
     let prev = prev?;
 
@@ -455,6 +477,44 @@ fn render_brightness(b: Brightness) -> State {
         fraction: clamp01(b.level),
         label: "Brightness",
         value: format!("{pct}%"),
+        muted: false,
+    }
+}
+
+fn render_battery(event: BatteryEvent, batt: &Battery) -> State {
+    let (icon, label, value) = match event {
+        BatteryEvent::PluggedIn => (
+            "battery-charging-symbolic",
+            "Charging",
+            format!("{:.0}%", batt.percentage),
+        ),
+        BatteryEvent::Unplugged => (
+            "battery-symbolic",
+            "On battery",
+            format!("{:.0}%", batt.percentage),
+        ),
+        BatteryEvent::LowBattery => (
+            "battery-low-symbolic",
+            "Low battery",
+            format!("{:.0}%", batt.percentage),
+        ),
+        BatteryEvent::CriticalBattery => (
+            "battery-caution-symbolic",
+            "Critical battery",
+            format!("{:.0}%", batt.percentage),
+        ),
+        BatteryEvent::ImminentShutdown => (
+            "battery-caution-symbolic",
+            "Battery very low",
+            format!("{:.0}%", batt.percentage),
+        ),
+    };
+    State {
+        kind: Kind::Battery,
+        icon,
+        fraction: (batt.percentage / 100.0).clamp(0.0, 1.0),
+        label,
+        value,
         muted: false,
     }
 }

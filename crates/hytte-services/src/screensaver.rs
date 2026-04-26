@@ -136,6 +136,10 @@ impl Service for ScreenSaverService {
             }
         });
 
+        // If this process has no logind session (TTY login, headless container),
+        // GetSessionByPID will fail on every iteration. That is expected — external
+        // lock signals just won't work in those environments; the bar's Lock button
+        // and the ScreenSaver D-Bus interface still flip is_locked directly.
         let locked_writer = handles.is_locked.clone();
         rt.spawn(async move {
             loop {
@@ -231,7 +235,11 @@ async fn call_login1_unlock() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn listen_login1(handles: &Mutable<bool>) -> anyhow::Result<()> {
+/// Subscribe to logind `Session.Lock`/`Unlock` and mirror them into
+/// `is_locked`. Returns `Ok(())` when both signal streams end (which
+/// the outer retry loop treats as a reconnect trigger), or `Err` if
+/// any setup step fails.
+async fn listen_login1(is_locked: &Mutable<bool>) -> anyhow::Result<()> {
     let conn = Connection::system()
         .await
         .context("connect system bus for login1")?;
@@ -269,10 +277,12 @@ async fn listen_login1(handles: &Mutable<bool>) -> anyhow::Result<()> {
         .await
         .context("subscribe Session.Unlock")?;
 
+    tracing::debug!(?session_path, "subscribed to login1 Session.Lock/Unlock");
+
     loop {
         tokio::select! {
-            Some(_) = lock_signals.next() => handles.set(true),
-            Some(_) = unlock_signals.next() => handles.set(false),
+            Some(_) = lock_signals.next() => is_locked.set(true),
+            Some(_) = unlock_signals.next() => is_locked.set(false),
             else => break,
         }
     }

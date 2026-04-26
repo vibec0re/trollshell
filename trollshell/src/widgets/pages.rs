@@ -682,6 +682,20 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
     );
     group.add(&totals_row);
 
+    let tcp_row = adw::ActionRow::builder().title("TCP").build();
+    bind(
+        sensors::net_connections().map(|c| {
+            format!(
+                "{} established, {} listening",
+                c.established_total(),
+                c.tcp_listen + c.tcp6_listen,
+            )
+        }),
+        &tcp_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    group.add(&tcp_row);
+
     group
 }
 

@@ -14,8 +14,6 @@ pub enum PamError {
     AuthFailed,
     #[error("PAM service error: {0}")]
     Service(String),
-    #[error("PAM session error: {0}")]
-    Session(String),
 }
 
 /// Verify `password` against the PAM stack configured for `service`
@@ -35,9 +33,6 @@ pub fn authenticate(
         .conversation_mut()
         .set_credentials(username, password.as_str());
     client.authenticate().map_err(|_| PamError::AuthFailed)?;
-    client
-        .open_session()
-        .map_err(|e| PamError::Session(e.to_string()))?;
     Ok(())
 }
 

@@ -1840,6 +1840,11 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
 fn build_failed_units_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("Failed units").build();
     bind(
+        systemd::failed_units().map(|u| !u.is_empty()),
+        &expander,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+    bind(
         systemd::failed_units().map(|u| {
             if u.is_empty() {
                 "None".to_string()
@@ -1852,26 +1857,11 @@ fn build_failed_units_expander() -> adw::ExpanderRow {
     );
 
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
-    let placeholder_for_bind = placeholder_track.clone();
     bind(systemd::failed_units(), &expander, move |_, units| {
         for row in rows_for_bind.borrow_mut().drain(..) {
             expander_for_bind.remove(&row);
-        }
-        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
-            expander_for_bind.remove(&p);
-        }
-        if units.is_empty() {
-            let placeholder = adw::ActionRow::builder()
-                .title("All units running")
-                .activatable(false)
-                .selectable(false)
-                .build();
-            expander_for_bind.add_row(&placeholder);
-            *placeholder_for_bind.borrow_mut() = Some(placeholder);
-            return;
         }
         let mut new_rows = Vec::with_capacity(units.len());
         for unit in &units {

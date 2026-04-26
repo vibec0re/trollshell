@@ -64,6 +64,15 @@ pub struct Station {
     pub connected_ssid: Option<String>,
 }
 
+/// Snapshot of the iwd Adapter (`net.connman.iwd.Adapter1`).
+#[derive(Clone, Debug, Default)]
+pub struct Adapter {
+    /// D-Bus object path, e.g. `"/net/connman/iwd/0"`.
+    pub path: String,
+    pub powered: bool,
+    pub name: String,
+}
+
 /// Snapshot of one visible Wi-Fi network.
 #[derive(Clone, Debug)]
 pub struct WifiNetwork {
@@ -113,6 +122,64 @@ async fn set_station_path(path: &str) {
     *station_path_store().write().await = path.to_string();
 }
 
+/// Filled by the listen loop on adapter discovery; read by command helpers.
+static ADAPTER_PATH: OnceLock<Arc<tokio::sync::RwLock<String>>> = OnceLock::new();
+
+fn adapter_path_store() -> &'static Arc<tokio::sync::RwLock<String>> {
+    ADAPTER_PATH.get_or_init(|| Arc::new(tokio::sync::RwLock::new(String::new())))
+}
+
+async fn current_adapter_path() -> String {
+    adapter_path_store().read().await.clone()
+}
+
+async fn set_current_adapter_path(path: &str) {
+    *adapter_path_store().write().await = path.to_string();
+}
+
+/// Given a station path like `"/net/connman/iwd/0/3/6"`, return the adapter
+/// path `"/net/connman/iwd/0"`. Returns an empty string if the input does
+/// not match the expected layout.
+fn adapter_path_from_station(station_path: &str) -> String {
+    // Expected layout: /net/connman/iwd/<adapter_idx>/<phy>/<station_idx>
+    // → parts = ["", "net", "connman", "iwd", "<adapter>", "<phy>", "<station>"]
+    let parts: Vec<&str> = station_path.split('/').collect();
+    if parts.len() < 5 || parts[1] != "net" || parts[2] != "connman" || parts[3] != "iwd" {
+        return String::new();
+    }
+    format!("/net/connman/iwd/{}", parts[4])
+}
+
+/// Derive the adapter path from the station path, store it in the cache,
+/// and publish an initial Adapter snapshot from the `GetManagedObjects` map.
+async fn capture_initial_adapter(
+    managed: &ManagedObjects,
+    station_path: &str,
+    adapter_mutable: &Mutable<Option<Adapter>>,
+) {
+    let adapter_path = adapter_path_from_station(station_path);
+    if adapter_path.is_empty() {
+        adapter_mutable.set(None);
+        return;
+    }
+    set_current_adapter_path(&adapter_path).await;
+
+    let adapter_props = managed
+        .iter()
+        .find(|(p, _)| p.as_str() == adapter_path)
+        .and_then(|(_, ifaces)| ifaces.get("net.connman.iwd.Adapter1"));
+
+    if let Some(props) = adapter_props {
+        adapter_mutable.set(Some(Adapter {
+            path: adapter_path,
+            powered: prop_bool(props, "Powered"),
+            name: prop_str(props, "Name"),
+        }));
+    } else {
+        adapter_mutable.set(None);
+    }
+}
+
 // ── Agent waiter map (module-level OnceLock for public API access) ────────────
 
 type WaitersMap = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>;
@@ -131,6 +198,7 @@ pub struct WifiHandles {
     pub(crate) station: Mutable<Option<Station>>,
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
     pub(crate) prompts: Mutable<Option<PromptRequest>>,
+    pub(crate) adapter: Mutable<Option<Adapter>>,
 }
 
 impl Default for WifiHandles {
@@ -139,6 +207,7 @@ impl Default for WifiHandles {
             station: Mutable::new(None),
             networks: Mutable::new(Vec::new()),
             prompts: Mutable::new(None),
+            adapter: Mutable::new(None),
         }
     }
 }
@@ -156,10 +225,18 @@ impl Service for WifiService {
         let station_mutable = handles.station.clone();
         let networks_mutable = handles.networks.clone();
         let prompts_mutable = handles.prompts.clone();
+        let adapter_mutable = handles.adapter.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&station_mutable, &networks_mutable, &prompts_mutable).await {
+                match listen(
+                    &station_mutable,
+                    &networks_mutable,
+                    &prompts_mutable,
+                    &adapter_mutable,
+                )
+                .await
+                {
                     Ok(()) => {
                         tracing::warn!("wifi watcher closed, reconnecting in 2s");
                     }
@@ -170,6 +247,7 @@ impl Service for WifiService {
                 station_mutable.set(None);
                 networks_mutable.set(Vec::new());
                 prompts_mutable.set(None);
+                adapter_mutable.set(None);
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
@@ -193,6 +271,17 @@ pub fn station() -> impl Signal<Item = Option<Station>> {
         r.get::<WifiHandles>()
             .expect("wifi::service() not registered")
             .station
+            .signal_cloned()
+    })
+}
+
+/// Signal emitting the current Adapter snapshot, or `None` when no adapter
+/// is present.
+pub fn adapter() -> impl Signal<Item = Option<Adapter>> {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .adapter
             .signal_cloned()
     })
 }
@@ -246,6 +335,20 @@ pub fn disconnect() {
         }
         if let Err(e) = do_station_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, "wifi disconnect failed");
+        }
+    });
+}
+
+/// Fire-and-forget: set `Powered` on the iwd Adapter1.
+pub fn set_powered(on: bool) {
+    runtime::handle().spawn(async move {
+        let path = current_adapter_path().await;
+        if path.is_empty() {
+            tracing::warn!("wifi::set_powered: no adapter path known");
+            return;
+        }
+        if let Err(e) = do_set_adapter_bool(&path, "Powered", on).await {
+            tracing::warn!(error = %e, on, "wifi set_powered failed");
         }
     });
 }
@@ -329,6 +432,24 @@ async fn do_network_call(network_path: &str, method: &str) -> Result<()> {
     )
     .await
     .with_context(|| format!("call Network.{method}"))?;
+    Ok(())
+}
+
+async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
+    let conn = cmd_conn().await?;
+    conn.call_method(
+        Some("net.connman.iwd"),
+        adapter_path,
+        Some("org.freedesktop.DBus.Properties"),
+        "Set",
+        &(
+            "net.connman.iwd.Adapter1",
+            prop,
+            zbus::zvariant::Value::from(on),
+        ),
+    )
+    .await
+    .with_context(|| format!("call Properties.Set Adapter1.{prop}"))?;
     Ok(())
 }
 
@@ -479,6 +600,7 @@ struct State {
     station: Mutable<Option<Station>>,
     networks: Mutable<Vec<WifiNetwork>>,
     prompts: Mutable<Option<PromptRequest>>,
+    adapter: Mutable<Option<Adapter>>,
     waiters: WaitersMap,
     next_id: Arc<AtomicU64>,
     conn: Arc<Connection>,
@@ -486,10 +608,12 @@ struct State {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         station: Mutable<Option<Station>>,
         networks: Mutable<Vec<WifiNetwork>>,
         prompts: Mutable<Option<PromptRequest>>,
+        adapter: Mutable<Option<Adapter>>,
         waiters: WaitersMap,
         next_id: Arc<AtomicU64>,
         conn: Arc<Connection>,
@@ -499,6 +623,7 @@ impl State {
             station,
             networks,
             prompts,
+            adapter,
             waiters,
             next_id,
             conn,
@@ -686,6 +811,7 @@ async fn listen(
     station_mutable: &Mutable<Option<Station>>,
     networks_mutable: &Mutable<Vec<WifiNetwork>>,
     prompts_mutable: &Mutable<Option<PromptRequest>>,
+    adapter_mutable: &Mutable<Option<Adapter>>,
 ) -> Result<()> {
     let conn = Connection::system()
         .await
@@ -706,6 +832,10 @@ async fn listen(
     set_station_path(&station_path).await;
 
     tracing::info!(path = station_path, "wifi station found");
+
+    // ── Find the parent Adapter ───────────────────────────────────────────────
+
+    capture_initial_adapter(&managed, &station_path, adapter_mutable).await;
 
     // ── Parse initial Station state ───────────────────────────────────────────
 
@@ -743,6 +873,7 @@ async fn listen(
         station_mutable.clone(),
         networks_mutable.clone(),
         prompts_mutable.clone(),
+        adapter_mutable.clone(),
         waiters_arc,
         next_id,
         conn.clone(),
@@ -932,5 +1063,15 @@ async fn handle_props_changed(state: &State, msg: zbus::Message) {
     } else if iface_name == "net.connman.iwd.Network" {
         // A network's properties changed — refresh the list.
         state.refresh_networks().await;
+    } else if iface_name == "net.connman.iwd.Adapter1" {
+        let mut guard = state.adapter.lock_mut();
+        if let Some(adapter) = guard.as_mut() {
+            if changed.contains_key("Powered") {
+                adapter.powered = prop_bool(&changed, "Powered");
+            }
+            if changed.contains_key("Name") {
+                adapter.name = prop_str(&changed, "Name");
+            }
+        }
     }
 }

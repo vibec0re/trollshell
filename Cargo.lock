@@ -788,6 +788,8 @@ dependencies = [
  "icalendar",
  "niri-ipc",
  "nix",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "ureq",

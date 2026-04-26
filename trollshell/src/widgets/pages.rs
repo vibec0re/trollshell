@@ -1758,6 +1758,7 @@ fn build_history_network_row() -> gtk::Box {
 
     let (top_row, spark, value) = build_history_row("Network");
     spark.set_domain_max(None);
+    value.set_text("B/s");
     outer.append(&top_row);
 
     // Detail line: indented to align under the sparkline column.
@@ -1770,7 +1771,6 @@ fn build_history_network_row() -> gtk::Box {
     outer.append(&detail);
 
     let spark_clone = spark.clone();
-    let value_clone = value.clone();
     let detail_clone = detail.clone();
     bind(sensors::network(), &outer, move |_, net| {
         let (rx_total, tx_total) = net
@@ -1782,7 +1782,6 @@ fn build_history_network_row() -> gtk::Box {
             });
         let combined = rx_total + tx_total;
         spark_clone.push(combined);
-        value_clone.set_text(&fmt_rate(combined));
         detail_clone.set_text(&format!(
             "\u{2193} {} \u{2191} {}",
             fmt_rate(rx_total),

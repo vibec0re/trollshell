@@ -27,6 +27,7 @@ use hytte::services::networkd::{self, OperationalState};
 use hytte::services::notifications;
 use hytte::services::notifications_mute;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
+use hytte::services::power_profiles::{self, humanize_profile};
 use hytte::services::resolved;
 use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
@@ -2233,6 +2234,7 @@ pub fn page_power() -> gtk::Widget {
     );
     battery_row.add_suffix(&pct_lbl);
     battery_group.add(&battery_row);
+    battery_group.add(&build_power_profile_expander());
     battery.append(&battery_group);
     grid.attach(&battery, 0, 0, 1, 1);
 
@@ -2298,6 +2300,72 @@ fn build_brightness_row() -> gtk::ListBox {
 }
 
 // ── Battery helpers ───────────────────────────────────────────────────────────
+
+fn build_power_profile_expander() -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder()
+        .title("Power profile")
+        .build();
+
+    bind(
+        power_profiles::state().map(|s| !s.available.is_empty()),
+        &expander,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    bind(
+        power_profiles::state().map(|s| humanize_profile(&s.active)),
+        &expander,
+        |row, t| row.set_subtitle(&t),
+    );
+
+    let icon = gtk::Image::new();
+    icon.set_valign(gtk::Align::Center);
+    bind(
+        power_profiles::state().map(|s| profile_icon_name(&s.active)),
+        &icon,
+        |w, name| w.set_icon_name(Some(name)),
+    );
+    expander.add_prefix(&icon);
+
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let expander_for_bind = expander.clone();
+    let rows_for_bind = rows_track.clone();
+    bind(power_profiles::state(), &expander, move |_, state| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            expander_for_bind.remove(&row);
+        }
+        let mut new_rows = Vec::with_capacity(state.available.len());
+        for profile in &state.available {
+            let row = adw::ActionRow::builder()
+                .title(humanize_profile(profile))
+                .activatable(true)
+                .build();
+            if profile == &state.active {
+                let check = gtk::Image::from_icon_name("object-select-symbolic");
+                check.set_valign(gtk::Align::Center);
+                row.add_suffix(&check);
+            }
+            let profile_owned = profile.clone();
+            row.connect_activated(move |_| {
+                power_profiles::set_active(&profile_owned);
+            });
+            expander_for_bind.add_row(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    expander
+}
+
+fn profile_icon_name(active: &str) -> &'static str {
+    match active {
+        "performance" => "power-profile-performance-symbolic",
+        "balanced" => "power-profile-balanced-symbolic",
+        "power-saver" => "power-profile-power-saver-symbolic",
+        _ => "system-run-symbolic",
+    }
+}
 
 fn describe_battery(b: &Battery) -> String {
     let state = match b.state {

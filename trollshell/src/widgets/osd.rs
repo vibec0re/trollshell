@@ -21,11 +21,14 @@
 //! CSS hooks (intentionally bar-prefixed `ts-`):
 //! - window root: `.ts-osd`
 //! - inner card: `.ts-osd-card`
+//! - header (icon + label/value column): `.ts-osd-header`
 //! - icon: `.ts-osd-icon`
+//! - kind label: `.ts-osd-label`
+//! - value readout: `.ts-osd-value`
 //! - progress bar: `.ts-osd-progress`
-//! - text label: `.ts-osd-text`
 //! - kind modifier: `.volume`, `.mic`, `.brightness`
 //! - state modifier: `.muted` (when applicable)
+//! - shown modifier: `.shown` (toggled by Rust to drive CSS transitions)
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -64,16 +67,22 @@ impl Kind {
 }
 
 /// Mutable widgets owned by the OSD; rebuilt content swaps icon name,
-/// progress fraction, label text, and kind/muted CSS classes in place.
+/// progress fraction, label/value text, and kind/muted CSS classes
+/// in place.
 struct OsdView {
     window: gtk::Window,
     card: gtk::Box,
     icon: gtk::Image,
+    label: gtk::Label,        // kind name: "Volume" / "Microphone" / "Brightness"
+    value: gtk::Label,        // percent / "Muted"
     progress: gtk::ProgressBar,
-    text: gtk::Label,
     /// Pending hide timeout. Held so each new event can cancel and
     /// re-arm it (latest-wins debounce).
     timeout: Cell<Option<glib::SourceId>>,
+    /// Pending fade-out → `set_visible(false)` timeout. Cancelled if a
+    /// new event arrives mid-fade-out.
+    #[expect(dead_code, reason = "wired in Task 3 animation work")]
+    fade_out_timeout: Cell<Option<glib::SourceId>>,
     /// CSS modifier classes currently set on the card so we can clean
     /// them up on each update without growing a leaky class list.
     current_kind: Cell<Option<&'static str>>,
@@ -83,6 +92,7 @@ struct OsdView {
 /// Build the OSD layer-shell window for `monitor`, subscribe it to the
 /// three signals, and store it in a thread-local so it lives for the
 /// process lifetime.
+#[allow(clippy::too_many_lines)]
 pub fn install(monitor: &Monitor) {
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
@@ -98,31 +108,46 @@ pub fn install(monitor: &Monitor) {
     window.add_css_class("ts-osd");
     window.set_visible(false);
 
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
     card.add_css_class("ts-osd-card");
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    header.add_css_class("ts-osd-header");
 
     let icon = gtk::Image::new();
     icon.add_css_class("ts-osd-icon");
-    icon.set_pixel_size(48);
+    icon.set_pixel_size(32);
+    header.append(&icon);
+
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    column.set_hexpand(true);
+    let label = gtk::Label::new(None);
+    label.add_css_class("ts-osd-label");
+    label.set_xalign(0.0);
+    column.append(&label);
+    let value = gtk::Label::new(None);
+    value.add_css_class("ts-osd-value");
+    value.set_xalign(0.0);
+    column.append(&value);
+    header.append(&column);
+
+    card.append(&header);
 
     let progress = gtk::ProgressBar::new();
     progress.add_css_class("ts-osd-progress");
-
-    let text = gtk::Label::new(None);
-    text.add_css_class("ts-osd-text");
-
-    card.append(&icon);
     card.append(&progress);
-    card.append(&text);
+
     window.set_child(Some(&card));
 
     let view = Rc::new(OsdView {
         window,
         card,
         icon,
+        label,
+        value,
         progress,
-        text,
         timeout: Cell::new(None),
+        fade_out_timeout: Cell::new(None),
         current_kind: Cell::new(None),
         current_muted: Cell::new(false),
     });
@@ -210,48 +235,58 @@ struct State {
     kind: Kind,
     icon: &'static str,
     fraction: f64,
-    text: String,
+    /// Kind name shown in `.ts-osd-label` ("Volume" / "Microphone" /
+    /// "Brightness").
+    label: &'static str,
+    /// Percent / "Muted" text shown in `.ts-osd-value`.
+    value: String,
     muted: bool,
 }
 
+fn volume_icon(v: &Volume) -> &'static str {
+    if v.muted { "audio-volume-muted-symbolic" } else { "audio-volume-high-symbolic" }
+}
+
+fn mic_icon(s: &Source) -> &'static str {
+    if s.muted { "microphone-sensitivity-muted-symbolic" } else { "audio-input-microphone-symbolic" }
+}
+
 fn render_volume(v: Volume) -> State {
-    let icon = if v.muted {
-        "audio-volume-muted-symbolic"
-    } else {
-        "audio-volume-high-symbolic"
-    };
+    let icon = volume_icon(&v);
     // Boosted volume can exceed 100%; show the true value in the label
     // while still clamping the progress bar to [0.0, 1.0].
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let pct = (v.linear * 100.0).round() as u32;
-    let text = if v.muted {
-        "Volume muted".to_string()
+    let value = if v.muted {
+        "Muted".to_string()
     } else {
-        format!("Volume {pct}%")
+        format!("{pct}%")
     };
     State {
         kind: Kind::Volume,
         icon,
         fraction: clamp01(v.linear),
-        text,
+        label: "Volume",
+        value,
         muted: v.muted,
     }
 }
 
 fn render_mic(source: Option<&Source>) -> Option<State> {
     let s = source?;
-    let icon = "audio-input-microphone-symbolic";
+    let icon = mic_icon(s);
     let pct = pct(s.volume);
-    let text = if s.muted {
-        "Microphone muted".to_string()
+    let value = if s.muted {
+        "Muted".to_string()
     } else {
-        format!("Microphone {pct}%")
+        format!("{pct}%")
     };
     Some(State {
         kind: Kind::Mic,
         icon,
         fraction: clamp01(s.volume),
-        text,
+        label: "Microphone",
+        value,
         muted: s.muted,
     })
 }
@@ -262,7 +297,8 @@ fn render_brightness(b: Brightness) -> State {
         kind: Kind::Brightness,
         icon: "display-brightness-symbolic",
         fraction: clamp01(b.level),
-        text: format!("Brightness {pct}%"),
+        label: "Brightness",
+        value: format!("{pct}%"),
         muted: false,
     }
 }
@@ -273,7 +309,8 @@ fn render_brightness(b: Brightness) -> State {
 fn show(view: &Rc<OsdView>, state: &State) {
     view.icon.set_icon_name(Some(state.icon));
     view.progress.set_fraction(state.fraction);
-    view.text.set_text(&state.text);
+    view.label.set_text(state.label);
+    view.value.set_text(&state.value);
 
     // Swap kind modifier class.
     let new_kind = state.kind.css_class();

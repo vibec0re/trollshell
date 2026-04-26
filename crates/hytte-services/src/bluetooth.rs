@@ -35,7 +35,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::OnceCell;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
@@ -511,24 +510,45 @@ pub fn remove_device(device_path: &str) {
 /// Shared command-channel connection. `BlueZ` owns sessions (e.g. for
 /// `StartDiscovery`) per bus client; using a fresh connection per call
 /// breaks Start/Stop pairing because `BlueZ` sees them as different
-/// clients. Lazily initialized on first command call.
-static CMD_CONN: OnceCell<Connection> = OnceCell::const_new();
+/// clients. Lazily opened on first call; evicted on I/O error so the
+/// next call reopens — trollshell survives `systemctl restart bluetooth`
+/// without itself restarting.
+static CMD_CONN: AsyncMutex<Option<Connection>> = AsyncMutex::const_new(None);
 
-async fn cmd_conn() -> Result<&'static Connection> {
-    CMD_CONN
-        .get_or_try_init(|| async {
-            Connection::system()
-                .await
-                .context("open shared bluetooth command connection")
-        })
-        .await
+async fn cmd_conn() -> Result<Connection> {
+    let mut guard = CMD_CONN.lock().await;
+    if guard.is_none() {
+        let fresh = Connection::system()
+            .await
+            .context("open shared bluetooth command connection")?;
+        *guard = Some(fresh);
+    }
+    Ok(guard
+        .as_ref()
+        .expect("just stored Some")
+        .clone())
+}
+
+/// Clears the cached command connection. Called after an I/O-level failure
+/// so the next [`cmd_conn`] call opens a fresh system-bus connection.
+async fn evict_cmd_conn() {
+    *CMD_CONN.lock().await = None;
 }
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
+/// Returns `true` when `e` wraps a [`zbus::Error::InputOutput`] — the signal
+/// that the socket to the D-Bus daemon is gone (e.g. after
+/// `systemctl restart bluetooth`). Used to decide whether to evict the cached
+/// command connection.
+fn is_io_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<zbus::Error>().is_some_and(|ze| matches!(ze, zbus::Error::InputOutput(_))))
+}
+
 async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("org.bluez"),
         adapter_path,
         Some("org.freedesktop.DBus.Properties"),
@@ -540,13 +560,14 @@ async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result
         ),
     )
     .await
-    .with_context(|| format!("call Properties.Set Adapter1.{prop}"))?;
-    Ok(())
+    .with_context(|| format!("call Properties.Set Adapter1.{prop}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r.map(|_| ())
 }
 
 async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("org.bluez"),
         device_path,
         Some("org.freedesktop.DBus.Properties"),
@@ -558,13 +579,14 @@ async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<(
         ),
     )
     .await
-    .with_context(|| format!("call Properties.Set Device1.{prop}"))?;
-    Ok(())
+    .with_context(|| format!("call Properties.Set Device1.{prop}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r.map(|_| ())
 }
 
 async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("org.bluez"),
         adapter_path,
         Some("org.bluez.Adapter1"),
@@ -572,13 +594,14 @@ async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<()> {
         &(),
     )
     .await
-    .with_context(|| format!("call Adapter1.{method}"))?;
-    Ok(())
+    .with_context(|| format!("call Adapter1.{method}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r.map(|_| ())
 }
 
 async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("org.bluez"),
         device_path,
         Some("org.bluez.Device1"),
@@ -586,15 +609,16 @@ async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
         &(),
     )
     .await
-    .with_context(|| format!("call Device1.{method}"))?;
-    Ok(())
+    .with_context(|| format!("call Device1.{method}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r.map(|_| ())
 }
 
 async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<()> {
     let conn = cmd_conn().await?;
     let dev_op = zbus::zvariant::ObjectPath::try_from(device_path)
         .map_err(|e| anyhow::anyhow!("invalid device object path: {e}"))?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("org.bluez"),
         adapter_path,
         Some("org.bluez.Adapter1"),
@@ -602,8 +626,9 @@ async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<()> {
         &(dev_op,),
     )
     .await
-    .context("call Adapter1.RemoveDevice")?;
-    Ok(())
+    .context("call Adapter1.RemoveDevice");
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r.map(|_| ())
 }
 
 // ── Property parsing helpers ──────────────────────────────────────────────────

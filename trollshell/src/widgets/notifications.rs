@@ -31,13 +31,14 @@
 //! count toward the cap. The notifications service itself does not
 //! queue; it tracks the live set, so the cap is consumer-side only.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::dnd;
+use hytte::services::niri;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::services::notifications_mute;
 use hytte::ui::{layer_window, Anchor, Margin};
@@ -52,7 +53,6 @@ const MAX_VISIBLE_NONCRITICAL: usize = 4;
 
 // ── Per-monitor toast view ────────────────────────────────────────────────────
 
-#[allow(dead_code)] // wired in Task 2
 struct ToastView {
     window: gtk::Window,
     vbox: gtk::Box,
@@ -65,66 +65,59 @@ struct ToastView {
 // ── Thread-local window storage ───────────────────────────────────────────────
 
 thread_local! {
-    static TOAST_WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
+    /// Mounted toast surfaces keyed by `Monitor.connector()`. Each
+    /// entry owns its layer-shell window and the per-window state.
+    static TOAST_WINDOWS: RefCell<HashMap<String, ToastView>> =
+        RefCell::new(HashMap::new());
+
+    /// Most recent focused-output name from
+    /// [`hytte::services::niri::focused_output`]. Routes incoming
+    /// notification batches to the matching window.
+    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Set after the first `install()` call so module-level
+    /// subscriptions wire exactly once across all per-monitor mounts.
+    static SUBS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
-/// Build the toast layer-shell window for `monitor` and subscribe it to the
-/// notifications active signal.  Idempotent: a second call on the same thread
-/// replaces the stored window reference (harmless in practice — `install` is
-/// called once).
-#[allow(clippy::too_many_lines)]
+/// Build the toast layer-shell window for `monitor`, register it in
+/// [`TOAST_WINDOWS`] keyed by the monitor's connector name, and lazily
+/// install module-level subscriptions on the first call. Subsequent
+/// calls register additional per-monitor surfaces; subscriptions wire
+/// exactly once.
 pub fn install(monitor: &Monitor) {
-    let window = layer_window(monitor)
-        .layer(Layer::Top)
-        .anchor(Anchor::Top)
-        .anchor(Anchor::Right)
-        .margin(Margin {
-            top: 8,
-            right: 8,
-            bottom: 0,
-            left: 0,
-        })
-        .namespace("hytte-toasts")
-        .exclusive(false)
-        .keyboard_mode(KeyboardMode::None)
-        .build();
+    let connector = match monitor.connector() {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            tracing::debug!("notifications::install: monitor has no connector; skipping");
+            return;
+        }
+    };
 
-    // Container: vertically stacked cards.
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    vbox.add_css_class("ts-toasts");
-    window.set_child(Some(&vbox));
+    let view = build_toast_view(monitor);
+    TOAST_WINDOWS.with(|map| map.borrow_mut().insert(connector, view));
 
-    // Map of mounted card widgets keyed by notification id.
-    let card_map: RefCell<HashMap<u32, gtk::Widget>> = RefCell::new(HashMap::new());
+    if !SUBS_INSTALLED.with(Cell::get) {
+        SUBS_INSTALLED.with(|c| c.set(true));
+        install_subscriptions();
+    }
+}
 
-    // Singleton "+N more" overflow card. Lives outside `card_map` because
-    // it isn't keyed to any notification id — it's purely a synthetic
-    // collapse for the non-critical tail. Removed when the tail is empty;
-    // rebuilt each time the count changes so the label stays accurate.
-    let overflow_card: RefCell<Option<gtk::Widget>> = RefCell::new(None);
+// ── Subscriptions + routing ───────────────────────────────────────────────────
 
-    // `suppressed_during_dnd` records notification ids that arrived while
-    // DND was on. Toggling DND off does NOT revive them — DND is a
-    // "from-now-forward" gate. Entries are dropped when the upstream
-    // notification leaves the active list (dismissed or expired).
-    let suppressed_during_dnd: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+/// Wires the focused-output cell and the combined notification signal.
+/// Runs exactly once across all per-monitor [`install`] calls (gated by
+/// [`SUBS_INSTALLED`]).
+fn install_subscriptions() {
+    // niri::focused_output() → FOCUSED_OUTPUT
+    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
+        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
+        std::future::ready(())
+    }));
 
-    // Weak refs so the signal closure doesn't hold the window alive (the
-    // thread-local owns it).
-    let window_weak = window.downgrade();
-    let vbox_weak = vbox.downgrade();
-
-    // Captured into the `for_each` closure so the overflow card click
-    // handler can open the Notifications drawer page.
-    let monitor_for_overflow = monitor.clone();
-
-    // Combine the live notifications with the DND flag and the per-app mute
-    // set. The visibility filter — "critical bypasses DND + mute, anything
-    // suppressed once stays suppressed even after the gate flips off" —
-    // runs inside the `for_each` callback below, where the suppressed-set
-    // state lives.
+    // Combined (notifications, dnd, muted) signal → route_emission.
     let toast_signal = map_ref! {
         let notifs = notifications::active(),
         let dnd_on = dnd::enabled(),
@@ -132,133 +125,148 @@ pub fn install(monitor: &Monitor) {
             (notifs.clone(), *dnd_on, muted.clone())
         }
     };
+    glib::MainContext::default().spawn_local(toast_signal.for_each(
+        |(notifs, dnd_on, muted): (Vec<Notification>, bool, HashSet<String>)| {
+            route_emission(&notifs, dnd_on, &muted);
+            std::future::ready(())
+        },
+    ));
+}
 
-    glib::MainContext::default().spawn_local(
-        toast_signal
-            .for_each(move |(notifs, dnd_on, muted): (Vec<Notification>, bool, HashSet<String>)| {
-                let Some(window) = window_weak.upgrade() else {
-                    return std::future::ready(());
-                };
-                let Some(vbox) = vbox_weak.upgrade() else {
-                    return std::future::ready(());
-                };
-
-                let mut map = card_map.borrow_mut();
-                let mut suppressed = suppressed_during_dnd.borrow_mut();
-
-                // Apply DND + per-app-mute gates. Critical urgency always
-                // shows and never touches the suppressed set. Non-critical
-                // notifications that arrive while DND is on, or whose
-                // app_name is in the muted set, are recorded in
-                // `suppressed` and stay hidden even after DND is toggled
-                // off / the app is unmuted — flipping a gate off must NOT
-                // unleash the backlog.
-                let visible: Vec<&Notification> = notifs
-                    .iter()
-                    .filter(|n| {
-                        if n.urgency == Urgency::Critical {
-                            return true;
-                        }
-                        if suppressed.contains(&n.id) {
-                            return false;
-                        }
-                        if dnd_on || muted.contains(&n.app_name) {
-                            suppressed.insert(n.id);
-                            return false;
-                        }
-                        true
-                    })
-                    .collect();
-
-                // GC the suppressed set: drop any ids whose notifications
-                // are no longer in the upstream active list (dismissed or
-                // expired). Once gone upstream, we'll never need to suppress
-                // them again. O(N) per emit.
-                let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
-                suppressed.retain(|id| active_ids.contains(id));
-
-                // Partition non-critical visible into head (rendered as
-                // cards) and tail (collapsed into a +N overflow card).
-                // Critical urgency always renders individually and never
-                // counts toward the cap.
-                let (critical_visible, noncritical_visible): (
-                    Vec<&Notification>,
-                    Vec<&Notification>,
-                ) = visible
-                    .iter()
-                    .copied()
-                    .partition(|n| n.urgency == Urgency::Critical);
-                let nc_head_start = noncritical_visible
-                    .len()
-                    .saturating_sub(MAX_VISIBLE_NONCRITICAL);
-                let head_noncritical = &noncritical_visible[nc_head_start..];
-                let tail_noncritical_count = nc_head_start;
-
-                // Build id sets.
-                let new_ids: HashMap<u32, &Notification> = critical_visible
-                    .iter()
-                    .copied()
-                    .chain(head_noncritical.iter().copied())
-                    .map(|n| (n.id, n))
-                    .collect();
-                let old_ids: Vec<u32> = map.keys().copied().collect();
-
-                // Remove cards whose notifications have gone.
-                for id in &old_ids {
-                    if !new_ids.contains_key(id) && let Some(card) = map.remove(id) {
-                        vbox.remove(&card);
-                    }
-                }
-
-                // Add or rebuild cards for each notification.
-                for (id, notif) in &new_ids {
-                    // For v0.4.0 we rebuild on replaces_id updates (same id,
-                    // new content) — drop the old card and build fresh.
-                    if let Some(old_card) = map.remove(id) {
-                        vbox.remove(&old_card);
-                    }
-                    let card = build_card(notif);
-                    vbox.append(&card);
-                    map.insert(*id, card);
-                }
-
-                // Manage the overflow "+N more" card. Singleton, lives in
-                // `overflow_card`. Removed when tail is empty; rebuilt when
-                // tail count changes (so the label updates).
-                {
-                    let mut slot = overflow_card.borrow_mut();
-                    if tail_noncritical_count == 0 {
-                        if let Some(card) = slot.take() {
-                            vbox.remove(&card);
-                        }
-                    } else {
-                        if let Some(card) = slot.take() {
-                            vbox.remove(&card);
-                        }
-                        let card = build_overflow_card(
-                            &monitor_for_overflow,
-                            tail_noncritical_count,
-                        );
-                        vbox.append(&card);
-                        *slot = Some(card);
-                    }
-                }
-
-                // Show/hide window based on whether any cards are mounted.
-                window.set_visible(!map.is_empty() || overflow_card.borrow().is_some());
-
-                std::future::ready(())
-            }),
-    );
-
-    TOAST_WINDOW.with(|cell| {
-        *cell.borrow_mut() = Some(window);
+/// Picks the [`ToastView`] on the focused output and forwards the
+/// emission to [`apply_emission`]. Falls back to the first mounted view
+/// when the focused output is unknown or absent from the map (covers
+/// startup before the first niri focus event lands, and outputs that
+/// trollshell hasn't mounted on).
+fn route_emission(notifs: &[Notification], dnd_on: bool, muted: &HashSet<String>) {
+    let target_name = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+    TOAST_WINDOWS.with(|map| {
+        let map = map.borrow();
+        if map.is_empty() {
+            return;
+        }
+        let view = target_name
+            .as_ref()
+            .and_then(|n| map.get(n))
+            .or_else(|| map.values().next());
+        if let Some(view) = view {
+            apply_emission(view, notifs, dnd_on, muted);
+        }
     });
+}
+
+/// Toast-management logic running against a single per-monitor view.
+/// Applies DND + per-app-mute gates, GCs the suppressed set, partitions
+/// critical vs non-critical, collapses the non-critical tail into an
+/// overflow card, and toggles window visibility.
+#[allow(clippy::too_many_lines)]
+fn apply_emission(
+    view: &ToastView,
+    notifs: &[Notification],
+    dnd_on: bool,
+    muted: &HashSet<String>,
+) {
+    let mut map = view.card_map.borrow_mut();
+    let mut suppressed = view.suppressed_during_dnd.borrow_mut();
+
+    // Apply DND + per-app-mute gates. Critical urgency always shows and
+    // never touches the suppressed set. Non-critical notifications that
+    // arrive while DND is on, or whose app_name is in the muted set,
+    // are recorded in `suppressed` and stay hidden even after DND is
+    // toggled off / the app is unmuted — flipping a gate off must NOT
+    // unleash the backlog.
+    let visible: Vec<&Notification> = notifs
+        .iter()
+        .filter(|n| {
+            if n.urgency == Urgency::Critical {
+                return true;
+            }
+            if suppressed.contains(&n.id) {
+                return false;
+            }
+            if dnd_on || muted.contains(&n.app_name) {
+                suppressed.insert(n.id);
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // GC the suppressed set: drop any ids whose notifications are no
+    // longer in the upstream active list (dismissed or expired). Once
+    // gone upstream, we'll never need to suppress them again. O(N) per
+    // emit.
+    let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
+    suppressed.retain(|id| active_ids.contains(id));
+
+    // Partition non-critical visible into head (rendered as cards) and
+    // tail (collapsed into a +N overflow card). Critical urgency always
+    // renders individually and never counts toward the cap.
+    let (critical_visible, noncritical_visible): (Vec<&Notification>, Vec<&Notification>) =
+        visible
+            .iter()
+            .copied()
+            .partition(|n| n.urgency == Urgency::Critical);
+    let nc_head_start = noncritical_visible
+        .len()
+        .saturating_sub(MAX_VISIBLE_NONCRITICAL);
+    let head_noncritical = &noncritical_visible[nc_head_start..];
+    let tail_noncritical_count = nc_head_start;
+
+    // Build id sets.
+    let new_ids: HashMap<u32, &Notification> = critical_visible
+        .iter()
+        .copied()
+        .chain(head_noncritical.iter().copied())
+        .map(|n| (n.id, n))
+        .collect();
+    let old_ids: Vec<u32> = map.keys().copied().collect();
+
+    // Remove cards whose notifications have gone.
+    for id in &old_ids {
+        if !new_ids.contains_key(id) && let Some(card) = map.remove(id) {
+            view.vbox.remove(&card);
+        }
+    }
+
+    // Add or rebuild cards for each notification.
+    for (id, notif) in &new_ids {
+        // For v0.4.0 we rebuild on replaces_id updates (same id, new
+        // content) — drop the old card and build fresh.
+        if let Some(old_card) = map.remove(id) {
+            view.vbox.remove(&old_card);
+        }
+        let card = build_card(notif);
+        view.vbox.append(&card);
+        map.insert(*id, card);
+    }
+
+    // Manage the overflow "+N more" card. Singleton, lives in
+    // `view.overflow_card`. Removed when tail is empty; rebuilt when
+    // tail count changes (so the label updates).
+    {
+        let mut slot = view.overflow_card.borrow_mut();
+        if tail_noncritical_count == 0 {
+            if let Some(card) = slot.take() {
+                view.vbox.remove(&card);
+            }
+        } else {
+            if let Some(card) = slot.take() {
+                view.vbox.remove(&card);
+            }
+            let card = build_overflow_card(&view.monitor, tail_noncritical_count);
+            view.vbox.append(&card);
+            *slot = Some(card);
+        }
+    }
+
+    // Show/hide window based on whether any cards are mounted.
+    view.window
+        .set_visible(!map.is_empty() || view.overflow_card.borrow().is_some());
 }
 
 // ── Toast view constructor ────────────────────────────────────────────────────
 
-#[allow(dead_code)] // wired in Task 2
 fn build_toast_view(monitor: &Monitor) -> ToastView {
     let window = layer_window(monitor)
         .layer(Layer::Top)

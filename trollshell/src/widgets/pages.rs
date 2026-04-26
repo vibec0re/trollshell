@@ -310,7 +310,7 @@ pub fn page_network() -> gtk::Widget {
     column.set_spacing(16);
 
     column.append(build_connection_group_v2().upcast_ref::<gtk::Widget>());
-    column.append(build_traffic_group().upcast_ref::<gtk::Widget>());
+    column.append(build_traffic_group_v2().upcast_ref::<gtk::Widget>());
 
     let wifi_panel = panel("Wi-Fi");
     append_wifi_section(&wifi_panel);
@@ -630,8 +630,8 @@ fn build_dns_expander() -> adw::ExpanderRow {
     expander
 }
 
-fn build_traffic_group() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
+fn build_traffic_group_v2() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Traffic").build();
 
     let rate_row = adw::ActionRow::builder().title("Live").build();
     rate_row.set_subtitle_lines(0);
@@ -681,20 +681,6 @@ fn build_traffic_group() -> adw::PreferencesGroup {
         |row, text| row.set_subtitle(&text),
     );
     group.add(&totals_row);
-
-    let tcp_row = adw::ActionRow::builder().title("TCP").build();
-    bind(
-        sensors::net_connections().map(|c| {
-            format!(
-                "{} established, {} listening",
-                c.established_total(),
-                c.tcp_listen + c.tcp6_listen,
-            )
-        }),
-        &tcp_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    group.add(&tcp_row);
 
     group
 }

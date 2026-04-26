@@ -375,8 +375,8 @@ fn build_primary_expander() -> adw::ExpanderRow {
             Some(link) => link
                 .addresses
                 .iter()
-                .filter_map(|ip| match ip {
-                    std::net::IpAddr::V4(v) => Some(v.to_string()),
+                .filter_map(|a| match a.addr {
+                    std::net::IpAddr::V4(v) => Some(format!("{v}/{}", a.prefix_len)),
                     std::net::IpAddr::V6(_) => None,
                 })
                 .collect::<Vec<_>>()
@@ -418,9 +418,9 @@ fn build_primary_expander() -> adw::ExpanderRow {
                 let v6: Vec<String> = link
                     .addresses
                     .iter()
-                    .filter_map(|ip| match ip {
+                    .filter_map(|a| match a.addr {
                         std::net::IpAddr::V6(v) if !v.is_unicast_link_local() => {
-                            Some(v.to_string())
+                            Some(format!("{v}/{}", a.prefix_len))
                         }
                         _ => None,
                     })

@@ -91,6 +91,10 @@ struct OsdView {
     /// them up on each update without growing a leaky class list.
     current_kind: Cell<Option<&'static str>>,
     current_muted: Cell<bool>,
+    /// Set to `true` while the modal drawer on this monitor is open.
+    /// When true, `route_show` skips the OSD to avoid redundant noise
+    /// while the user is interacting with the live slider.
+    drawer_open: Cell<bool>,
 }
 
 /// Mount one OSD on `monitor` and lazily wire the module-level signal
@@ -108,8 +112,22 @@ pub fn install(monitor: &Monitor) {
 
     let view = build_osd_view(monitor);
     OSDS.with(|map| {
-        map.borrow_mut().insert(connector, view);
+        map.borrow_mut().insert(connector.clone(), view);
     });
+
+    // Subscribe to the drawer-open state for this monitor so route_show
+    // can suppress the OSD while the user is looking at the live slider.
+    if let Some(signal) = crate::modal::drawer_open_signal(monitor) {
+        let connector_for_sub = connector.clone();
+        glib::MainContext::default().spawn_local(signal.for_each(move |open| {
+            OSDS.with(|map| {
+                if let Some(view) = map.borrow().get(&connector_for_sub) {
+                    view.drawer_open.set(open);
+                }
+            });
+            std::future::ready(())
+        }));
+    }
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));
@@ -178,6 +196,7 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
         fade_out_timeout: Cell::new(None),
         current_kind: Cell::new(None),
         current_muted: Cell::new(false),
+        drawer_open: Cell::new(false),
     })
 }
 
@@ -275,6 +294,9 @@ fn route_show(state: &State) {
             .and_then(|name| map.get(name))
             .or_else(|| map.values().next());
         if let Some(view) = view {
+            if view.drawer_open.get() {
+                return; // drawer is showing the same control; OSD is redundant
+            }
             show(view, state);
         }
     });

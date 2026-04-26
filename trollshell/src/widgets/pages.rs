@@ -32,6 +32,7 @@ use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::services::wallpaper;
 use hytte::services::wifi;
+use hytte::ui::Sparkline;
 
 use super::util::{fmt_bytes, fmt_rate};
 
@@ -1682,7 +1683,126 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
 }
 
 fn build_stats_history_group() -> adw::PreferencesGroup {
-    adw::PreferencesGroup::builder().title("History").build()
+    let group = adw::PreferencesGroup::builder().title("History").build();
+
+    group.add(&build_history_cpu_row());
+    group.add(&build_history_memory_row());
+    group.add(&build_history_network_row());
+    group.add(&build_history_gpu_temp_row());
+
+    group
+}
+
+/// Build a `[name | Sparkline | value]` row styled `.ts-history-row`.
+/// Returns the box, the Sparkline (caller pushes samples), and the
+/// value label (caller binds text on it).
+fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("ts-history-row");
+
+    let name_label = gtk::Label::new(Some(name));
+    name_label.add_css_class("ts-stat-name");
+    name_label.set_xalign(0.0);
+    name_label.set_size_request(80, -1);
+    row.append(&name_label);
+
+    let spark = Sparkline::new(60);
+    spark.widget().set_hexpand(true);
+    row.append(spark.widget());
+
+    let value_label = gtk::Label::new(None);
+    value_label.add_css_class("ts-stat-value");
+    value_label.set_xalign(1.0);
+    value_label.set_size_request(80, -1);
+    row.append(&value_label);
+
+    (row, spark, value_label)
+}
+
+fn build_history_cpu_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("CPU");
+    spark.set_domain_max(Some(1.0));
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::cpu(), &row, move |_, c: CpuLoad| {
+        spark_clone.push(c.overall);
+        value_clone.set_text(&format!("{:.0}%", c.overall * 100.0));
+    });
+
+    row
+}
+
+fn build_history_memory_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("Memory");
+    spark.set_domain_max(Some(1.0));
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::memory(), &row, move |_, m| {
+        if m.total == 0 {
+            spark_clone.push(0.0);
+            value_clone.set_text("\u{2014}");
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let frac = (m.used as f64 / m.total as f64).clamp(0.0, 1.0);
+            spark_clone.push(frac);
+            value_clone.set_text(&format!("{:.0}%", frac * 100.0));
+        }
+    });
+
+    row
+}
+
+fn build_history_network_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("Network");
+    spark.set_domain_max(None); // auto-scale
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::network(), &row, move |_, net| {
+        let (rx_total, tx_total) = net
+            .interfaces
+            .iter()
+            .filter(|i| i.name != "lo")
+            .fold((0.0_f64, 0.0_f64), |(rx, tx), i| {
+                (rx + i.rx_rate_bps, tx + i.tx_rate_bps)
+            });
+        let combined = rx_total + tx_total;
+        spark_clone.push(combined);
+        value_clone.set_text(&format!(
+            "\u{2193} {} \u{2191} {}",
+            fmt_rate(rx_total),
+            fmt_rate(tx_total)
+        ));
+    });
+
+    row
+}
+
+fn build_history_gpu_temp_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("GPU temp");
+    spark.set_domain_max(None);
+
+    // Hide unless GPU is present with a temperature reading.
+    bind(
+        sensors::gpu().map(|g| g.and_then(|s| s.temperature_celsius).is_some()),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::gpu(), &row, move |_, g| {
+        if let Some(state) = g
+            && let Some(t) = state.temperature_celsius
+        {
+            spark_clone.push(t);
+            value_clone.set_text(&format!("{t:.0} \u{00b0}C"));
+        }
+    });
+
+    row
 }
 
 fn build_stats_services_group() -> adw::PreferencesGroup {

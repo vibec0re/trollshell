@@ -58,12 +58,18 @@ impl OperationalState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct LinkAddress {
+    pub addr: IpAddr,
+    pub prefix_len: u8,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Link {
     pub idx: i32,
     pub name: String,
     pub operational: OperationalState,
-    pub addresses: Vec<IpAddr>,
+    pub addresses: Vec<LinkAddress>,
     pub gateway_v4: Option<Ipv4Addr>,
     pub gateway_v6: Option<Ipv6Addr>,
     pub routes: Vec<RouteSummary>,
@@ -235,7 +241,7 @@ struct DescribeRoute {
 
 #[derive(Debug, Default)]
 pub(crate) struct ParsedDescribe {
-    pub addresses: Vec<IpAddr>,
+    pub addresses: Vec<LinkAddress>,
     pub gateway_v4: Option<Ipv4Addr>,
     pub gateway_v6: Option<Ipv6Addr>,
     pub routes: Vec<RouteSummary>,
@@ -246,8 +252,11 @@ pub(crate) fn parse_describe(json: &str) -> anyhow::Result<ParsedDescribe> {
     let mut out = ParsedDescribe::default();
 
     for a in raw.addresses {
-        if let Some(ip) = bytes_to_ip(a.family, &a.address) {
-            out.addresses.push(ip);
+        if let Some(addr) = bytes_to_ip(a.family, &a.address) {
+            out.addresses.push(LinkAddress {
+                addr,
+                prefix_len: a.prefix_length,
+            });
         }
     }
 
@@ -318,7 +327,9 @@ mod tests {
     #[test]
     fn parses_describe_json_minimal() {
         let parsed = parse_describe(SAMPLE_DESCRIBE).expect("parse");
-        assert_eq!(parsed.addresses, vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42))]);
+        assert_eq!(parsed.addresses.len(), 1);
+        assert_eq!(parsed.addresses[0].addr, IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42)));
+        assert_eq!(parsed.addresses[0].prefix_len, 24);
         assert_eq!(parsed.gateway_v4, Some(std::net::Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(parsed.gateway_v6, None);
         assert_eq!(parsed.routes.len(), 2);

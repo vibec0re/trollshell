@@ -28,7 +28,7 @@ use hytte::services::notifications;
 use hytte::services::notifications_mute;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
-use hytte::services::sensors;
+use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::services::wallpaper;
 use hytte::services::wifi;
@@ -1405,7 +1405,280 @@ pub fn page_stats() -> gtk::Widget {
 }
 
 fn build_stats_live_group_v2() -> adw::PreferencesGroup {
-    adw::PreferencesGroup::builder().title("Live").build()
+    let group = adw::PreferencesGroup::builder().title("Live").build();
+
+    group.add(&build_live_cpu_row());
+    group.add(&build_live_per_core_expander());
+    group.add(&build_live_memory_row());
+    group.add(&build_live_swap_row());
+    group.add(&build_live_processes_row());
+    group.add(&build_live_gpu_row());
+    group.add(&build_live_disk_expander());
+
+    group
+}
+
+fn build_live_cpu_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("CPU").build();
+    bind(
+        sensors::cpu().map(|c| format!("{:.0}%", c.overall * 100.0)),
+        &row,
+        |r, t| r.set_subtitle(&t),
+    );
+    let temp_label = gtk::Label::new(None);
+    temp_label.set_valign(gtk::Align::Center);
+    bind(
+        sensors::cpu_temp().map(|t| match t.package_celsius {
+            Some(c) => format!("{c:.0} \u{00b0}C"),
+            None => String::new(),
+        }),
+        &temp_label,
+        move |label, txt| {
+            label.set_text(&txt);
+            label.set_visible(!txt.is_empty());
+        },
+    );
+    row.add_suffix(&temp_label);
+    row
+}
+
+fn build_live_per_core_expander() -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder().title("Per-core").build();
+    bind(
+        sensors::cpu().map(|c| format!("{} cores", c.per_core.len())),
+        &expander,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    // Single nested row containing the horizontal bars Box, mirroring
+    // the legacy build but inside an expander.
+    let nested = adw::ActionRow::new();
+    nested.set_activatable(false);
+    nested.set_selectable(false);
+    let cores_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    cores_row.add_css_class("ts-cores-row");
+    cores_row.set_margin_top(4);
+    cores_row.set_margin_bottom(4);
+    cores_row.set_hexpand(true);
+    nested.set_child(Some(&cores_row));
+
+    let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
+    let cores_row_for_bind = cores_row.clone();
+    let bars_for_bind = core_bars.clone();
+    bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
+        let mut bars = bars_for_bind.borrow_mut();
+        if bars.len() != c.per_core.len() {
+            while let Some(child) = cores_row_for_bind.first_child() {
+                cores_row_for_bind.remove(&child);
+            }
+            bars.clear();
+            for _ in 0..c.per_core.len() {
+                let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                col.set_hexpand(true);
+                col.set_halign(gtk::Align::Center);
+                let bar = gtk::ProgressBar::new();
+                bar.add_css_class("ts-core-bar");
+                bar.set_orientation(gtk::Orientation::Vertical);
+                bar.set_inverted(true);
+                bar.set_valign(gtk::Align::End);
+                col.append(&bar);
+                cores_row_for_bind.append(&col);
+                bars.push(bar);
+            }
+        }
+        for (bar, load) in bars.iter().zip(c.per_core.iter()) {
+            bar.set_fraction(load.clamp(0.0, 1.0));
+            bar.set_tooltip_text(Some(&format!("{:.0}%", load * 100.0)));
+        }
+    });
+
+    expander.add_row(&nested);
+    expander
+}
+
+fn build_live_memory_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Memory").build();
+    bind(
+        sensors::memory().map(|m| {
+            if m.total == 0 {
+                "—".to_string()
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (m.used as f64 / m.total as f64) * 100.0;
+                format!("{} / {} ({pct:.0}%)", fmt_bytes(m.used), fmt_bytes(m.total))
+            }
+        }),
+        &row,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("ts-stat-progress");
+    bar.set_valign(gtk::Align::Center);
+    bind(
+        sensors::memory().map(|m| {
+            if m.total == 0 {
+                0.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let frac = m.used as f64 / m.total as f64;
+                frac.clamp(0.0, 1.0)
+            }
+        }),
+        &bar,
+        gtk::ProgressBar::set_fraction,
+    );
+    row.add_suffix(&bar);
+
+    row
+}
+
+fn build_live_swap_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Swap").build();
+
+    // Hide entirely when no swap is configured.
+    bind(
+        sensors::memory().map(|m| m.swap_total > 0),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    bind(
+        sensors::memory().map(|m| {
+            if m.swap_total == 0 {
+                String::new()
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let pct = (m.swap_used as f64 / m.swap_total as f64) * 100.0;
+                format!(
+                    "{} / {} ({pct:.0}%)",
+                    fmt_bytes(m.swap_used),
+                    fmt_bytes(m.swap_total)
+                )
+            }
+        }),
+        &row,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    let bar = gtk::ProgressBar::new();
+    bar.add_css_class("ts-stat-progress");
+    bar.set_valign(gtk::Align::Center);
+    bind(
+        sensors::memory().map(|m| {
+            if m.swap_total == 0 {
+                0.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let frac = m.swap_used as f64 / m.swap_total as f64;
+                frac.clamp(0.0, 1.0)
+            }
+        }),
+        &bar,
+        gtk::ProgressBar::set_fraction,
+    );
+    row.add_suffix(&bar);
+
+    row
+}
+
+fn build_live_processes_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("Processes").build();
+    let count_label = gtk::Label::new(None);
+    count_label.set_valign(gtk::Align::Center);
+    bind(
+        sensors::process_count().map(|n| format!("{n}")),
+        &count_label,
+        |label, txt| label.set_text(&txt),
+    );
+    row.add_suffix(&count_label);
+    row
+}
+
+fn build_live_gpu_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title("GPU").build();
+
+    // Hide when no GPU detected.
+    bind(
+        sensors::gpu().map(|g| g.is_some()),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    bind(
+        sensors::gpu().map(|g| match g {
+            Some(state) => state.name.clone(),
+            None => String::new(),
+        }),
+        &row,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    let suffix = gtk::Label::new(None);
+    suffix.set_valign(gtk::Align::Center);
+    bind(
+        sensors::gpu().map(|g| match g {
+            Some(state) => match state.temperature_celsius {
+                Some(t) => format!("{t:.0} \u{00b0}C"),
+                None => match state.load {
+                    Some(l) => format!("{:.0}%", l * 100.0),
+                    None => String::new(),
+                },
+            },
+            None => String::new(),
+        }),
+        &suffix,
+        |label, txt| {
+            label.set_text(&txt);
+            label.set_visible(!txt.is_empty());
+        },
+    );
+    row.add_suffix(&suffix);
+
+    row
+}
+
+fn build_live_disk_expander() -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder().title("Disk").build();
+    bind(
+        sensors::disk().map(|d| format!("{} mount(s)", d.mounts.len())),
+        &expander,
+        |r, t| r.set_subtitle(&t),
+    );
+
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let expander_for_bind = expander.clone();
+    let rows_for_bind = rows_track.clone();
+    bind(sensors::disk(), &expander, move |_, d| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            expander_for_bind.remove(&row);
+        }
+        let mut new_rows = Vec::with_capacity(d.mounts.len());
+        for m in &d.mounts {
+            let row = adw::ActionRow::builder()
+                .title(&m.path)
+                .activatable(false)
+                .build();
+            #[allow(clippy::cast_precision_loss)]
+            let pct = if m.total_bytes > 0 {
+                (m.used_bytes as f64 / m.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+            let label = gtk::Label::new(Some(&format!(
+                "{} / {} ({pct:.0}%)",
+                fmt_bytes(m.used_bytes),
+                fmt_bytes(m.total_bytes),
+            )));
+            label.set_valign(gtk::Align::Center);
+            row.add_suffix(&label);
+            expander_for_bind.add_row(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    expander
 }
 
 fn build_stats_history_group() -> adw::PreferencesGroup {

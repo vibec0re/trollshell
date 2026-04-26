@@ -9,6 +9,8 @@ use hytte::services::niri::{self, Window};
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-windows");
+    container.set_hexpand(true);
+    container.set_homogeneous(true);
 
     let connector = monitor.connector();
     let signal = active_workspace_windows(connector);
@@ -24,12 +26,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 .clone()
                 .or_else(|| win.app_id.clone())
                 .unwrap_or_else(|| format!("window {}", win.id));
-            // Bounded label — ellipsize at render, tooltip has full title.
-            // Prevents the left cluster from pushing the right cluster off
-            // the monitor when window titles or counts get large.
+            // Ellipsize at render; tooltip has the full title. The container's
+            // hexpand + homogeneous claims available width in the left cluster
+            // and distributes it evenly across buttons.
             let label_widget = gtk::Label::new(Some(&label_text));
             label_widget.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label_widget.set_max_width_chars(18);
             let btn = gtk::Button::new();
             btn.set_child(Some(&label_widget));
             btn.set_tooltip_text(Some(&label_text));

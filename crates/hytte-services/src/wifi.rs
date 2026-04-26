@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::OnceCell;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
 
@@ -407,25 +406,48 @@ pub fn cancel_prompt(id: u64) {
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-/// Shared command-channel connection. Avoids opening a fresh system bus
-/// connection on every iwd call. The listen loop keeps its own
-/// connection because its long-lived signal subscriptions are
-/// independent of command identity.
-static CMD_CONN: OnceCell<Connection> = OnceCell::const_new();
+/// Shared command-channel connection. Avoids opening a fresh system
+/// bus connection on every iwd call. Lazily opened on first call;
+/// evicted on I/O error so the next call reopens — trollshell
+/// survives `systemctl restart iwd` without itself restarting.
+static CMD_CONN: AsyncMutex<Option<Connection>> = AsyncMutex::const_new(None);
 
-async fn cmd_conn() -> Result<&'static Connection> {
-    CMD_CONN
-        .get_or_try_init(|| async {
-            Connection::system()
-                .await
-                .context("open shared wifi command connection")
+async fn cmd_conn() -> Result<Connection> {
+    let mut guard = CMD_CONN.lock().await;
+    if guard.is_none() {
+        let fresh = Connection::system()
+            .await
+            .context("open shared wifi command connection")?;
+        *guard = Some(fresh);
+    }
+    Ok(guard
+        .as_ref()
+        .expect("just stored Some")
+        .clone())
+}
+
+/// Clears the cached command connection. Called after an I/O-level
+/// failure so the next [`cmd_conn`] call opens a fresh system-bus
+/// connection.
+async fn evict_cmd_conn() {
+    *CMD_CONN.lock().await = None;
+}
+
+/// Returns `true` when `e` wraps a [`zbus::Error::InputOutput`] — the
+/// signal that the socket to the D-Bus daemon is gone (e.g. after
+/// `systemctl restart iwd`). Used to decide whether to evict the
+/// cached command connection.
+fn is_io_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| {
+            cause.downcast_ref::<zbus::Error>()
+                .is_some_and(|ze| matches!(ze, zbus::Error::InputOutput(_)))
         })
-        .await
 }
 
 async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("net.connman.iwd"),
         station_path,
         Some("net.connman.iwd.Station"),
@@ -433,13 +455,15 @@ async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
         &(),
     )
     .await
-    .with_context(|| format!("call Station.{method}"))?;
+    .with_context(|| format!("call Station.{method}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r?;
     Ok(())
 }
 
 async fn do_network_call(network_path: &str, method: &str) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("net.connman.iwd"),
         network_path,
         Some("net.connman.iwd.Network"),
@@ -447,13 +471,15 @@ async fn do_network_call(network_path: &str, method: &str) -> Result<()> {
         &(),
     )
     .await
-    .with_context(|| format!("call Network.{method}"))?;
+    .with_context(|| format!("call Network.{method}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r?;
     Ok(())
 }
 
 async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("net.connman.iwd"),
         adapter_path,
         Some("org.freedesktop.DBus.Properties"),
@@ -465,13 +491,15 @@ async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result
         ),
     )
     .await
-    .with_context(|| format!("call Properties.Set Adapter1.{prop}"))?;
+    .with_context(|| format!("call Properties.Set Adapter1.{prop}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r?;
     Ok(())
 }
 
 async fn do_known_network_call(known_network_path: &str, method: &str) -> Result<()> {
     let conn = cmd_conn().await?;
-    conn.call_method(
+    let r = conn.call_method(
         Some("net.connman.iwd"),
         known_network_path,
         Some("net.connman.iwd.KnownNetwork"),
@@ -479,7 +507,9 @@ async fn do_known_network_call(known_network_path: &str, method: &str) -> Result
         &(),
     )
     .await
-    .with_context(|| format!("call KnownNetwork.{method}"))?;
+    .with_context(|| format!("call KnownNetwork.{method}"));
+    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
+    r?;
     Ok(())
 }
 

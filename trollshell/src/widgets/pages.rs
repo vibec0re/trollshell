@@ -28,7 +28,7 @@ use hytte::services::notifications;
 use hytte::services::notifications_mute;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 use hytte::services::resolved;
-use hytte::services::sensors::{self, CpuLoad};
+use hytte::services::sensors;
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::services::wallpaper;
 use hytte::services::wifi;
@@ -1392,187 +1392,28 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
 
 // ── Stats page ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
 pub fn page_stats() -> gtk::Widget {
-    let grid = page_grid();
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+    column.set_spacing(16);
 
-    // ── CPU panel (col 0, row 0) ──────────────────────────────────────────────
-    let cpu = panel("CPU");
+    column.append(build_stats_live_group_v2().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_history_group().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_services_group().upcast_ref::<gtk::Widget>());
 
-    let cpu_headline = gtk::Label::new(None);
-    cpu_headline.set_xalign(0.0);
-    bind_text(
-        sensors::cpu().map(|c| format!("{:.0}%", c.overall * 100.0)),
-        &cpu_headline,
-    );
-    cpu.append(&cpu_headline);
+    finish_page(&column)
+}
 
-    // Grid of vertical mini-bars — one per logical core. Rebuild when the
-    // core count changes (rare), otherwise just update fractions in place.
-    let cores_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    cores_row.add_css_class("ts-cores-row");
-    let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
-    let cores_row_for_bind = cores_row.clone();
-    let bars_for_bind = core_bars.clone();
-    bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
-        let mut bars = bars_for_bind.borrow_mut();
-        if bars.len() != c.per_core.len() {
-            while let Some(child) = cores_row_for_bind.first_child() {
-                cores_row_for_bind.remove(&child);
-            }
-            bars.clear();
-            for _ in 0..c.per_core.len() {
-                let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                col.set_hexpand(true);
-                col.set_halign(gtk::Align::Center);
-                let bar = gtk::ProgressBar::new();
-                bar.add_css_class("ts-core-bar");
-                bar.set_orientation(gtk::Orientation::Vertical);
-                bar.set_inverted(true);
-                bar.set_valign(gtk::Align::End);
-                col.append(&bar);
-                cores_row_for_bind.append(&col);
-                bars.push(bar);
-            }
-        }
-        for (bar, load) in bars.iter().zip(c.per_core.iter()) {
-            bar.set_fraction(load.clamp(0.0, 1.0));
-            bar.set_tooltip_text(Some(&format!("{:.0}%", load * 100.0)));
-        }
-    });
-    cpu.append(&cores_row);
+fn build_stats_live_group_v2() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder().title("Live").build()
+}
 
-    let cpu_temp = gtk::Label::new(None);
-    cpu_temp.set_xalign(0.0);
-    bind_text(
-        sensors::cpu_temp().map(|t| match t.package_celsius {
-            Some(c) => format!("Temp: {c:.0}\u{00b0}C"),
-            None => "Temp: \u{2014}".to_string(),
-        }),
-        &cpu_temp,
-    );
-    cpu.append(&cpu_temp);
-    grid.attach(&cpu, 0, 0, 1, 1);
+fn build_stats_history_group() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder().title("History").build()
+}
 
-    // ── Memory panel (col 1, row 0) ───────────────────────────────────────────
-    let mem = panel("Memory");
-
-    let mem_headline = gtk::Label::new(None);
-    mem_headline.set_xalign(0.0);
-    bind_text(
-        sensors::memory().map(|m| {
-            if m.total == 0 {
-                "--%".to_string()
-            } else {
-                #[allow(clippy::cast_precision_loss)]
-                let pct = (m.used as f64 / m.total as f64) * 100.0;
-                format!("{pct:.0}%")
-            }
-        }),
-        &mem_headline,
-    );
-    mem.append(&mem_headline);
-
-    let mem_used = gtk::Label::new(None);
-    mem_used.set_xalign(0.0);
-    bind_text(
-        sensors::memory()
-            .map(|m| format!("{} / {}", fmt_bytes(m.used), fmt_bytes(m.total))),
-        &mem_used,
-    );
-    mem.append(&mem_used);
-
-    let mem_avail = gtk::Label::new(None);
-    mem_avail.set_xalign(0.0);
-    bind_text(
-        sensors::memory().map(|m| format!("available: {}", fmt_bytes(m.available))),
-        &mem_avail,
-    );
-    mem.append(&mem_avail);
-    grid.attach(&mem, 1, 0, 1, 1);
-
-    // ── GPU panel (col 0, row 1) ──────────────────────────────────────────────
-    let gpu = panel("GPU");
-
-    let gpu_name = gtk::Label::new(None);
-    gpu_name.set_xalign(0.0);
-    bind_text(
-        sensors::gpu().map(|g| match g {
-            Some(state) => state.name.clone(),
-            None => "no GPU detected".to_string(),
-        }),
-        &gpu_name,
-    );
-    gpu.append(&gpu_name);
-
-    let gpu_temp = gtk::Label::new(None);
-    gpu_temp.set_xalign(0.0);
-    bind_text(
-        sensors::gpu().map(|g| match g.as_ref().and_then(|s| s.temperature_celsius) {
-            Some(t) => format!("Temp: {t:.0}\u{00b0}C"),
-            None => "Temp: \u{2014}".to_string(),
-        }),
-        &gpu_temp,
-    );
-    gpu.append(&gpu_temp);
-
-    let gpu_load = gtk::Label::new(None);
-    gpu_load.set_xalign(0.0);
-    bind_text(
-        sensors::gpu().map(|g| match g.as_ref().and_then(|s| s.load) {
-            Some(l) => format!("Load: {:.0}%", l * 100.0),
-            None => "Load: \u{2014}".to_string(),
-        }),
-        &gpu_load,
-    );
-    gpu.append(&gpu_load);
-
-    let gpu_mem = gtk::Label::new(None);
-    gpu_mem.set_xalign(0.0);
-    bind_text(
-        sensors::gpu().map(|g| {
-            let used = g.as_ref().and_then(|s| s.memory_used_bytes);
-            let total = g.as_ref().and_then(|s| s.memory_total_bytes);
-            match (used, total) {
-                (Some(u), Some(t)) => format!("VRAM: {} / {}", fmt_bytes(u), fmt_bytes(t)),
-                _ => "VRAM: \u{2014}".to_string(),
-            }
-        }),
-        &gpu_mem,
-    );
-    gpu.append(&gpu_mem);
-    grid.attach(&gpu, 0, 1, 1, 1);
-
-    // ── Disk panel (col 1, row 1) ─────────────────────────────────────────────
-    let disk = panel("Disk");
-
-    let mounts_label = gtk::Label::new(None);
-    mounts_label.set_xalign(0.0);
-    bind_text(
-        sensors::disk().map(|d| {
-            if d.mounts.is_empty() {
-                return "No mounts".to_string();
-            }
-            d.mounts
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{}: {:.0}% ({} / {})",
-                        m.path,
-                        m.usage * 100.0,
-                        fmt_bytes(m.used_bytes),
-                        fmt_bytes(m.total_bytes),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }),
-        &mounts_label,
-    );
-    disk.append(&mounts_label);
-    grid.attach(&disk, 1, 1, 1, 1);
-
-    finish_page(&grid)
+fn build_stats_services_group() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder().title("Services").build()
 }
 
 // ── Audio page ────────────────────────────────────────────────────────────────

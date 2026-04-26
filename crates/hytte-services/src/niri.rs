@@ -195,6 +195,20 @@ pub fn workspaces() -> impl Signal<Item = Vec<Workspace>> {
     })
 }
 
+/// Connector name of the currently focused monitor (e.g. `"DP-1"`).
+/// Derived from [`workspaces()`] by finding the workspace whose
+/// `is_focused == true` and reading its `output`. `None` when no
+/// workspace is focused or the focused workspace has no output (rare
+/// during reconnect / niri startup).
+pub fn focused_output() -> impl Signal<Item = Option<String>> {
+    use futures_signals::signal::SignalExt;
+    workspaces().map(|ws| {
+        ws.iter()
+            .find(|w| w.is_focused)
+            .and_then(|w| w.output.clone())
+    })
+}
+
 /// Signal of the current niri windows.
 pub fn windows() -> impl Signal<Item = Vec<Window>> {
     registry::with(|r| {

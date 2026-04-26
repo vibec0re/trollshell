@@ -560,3 +560,61 @@
 .ts-mono {
     font-family: monospace;
 }
+
+/* ── OSD ────────────────────────────────────────────────────────────────── */
+
+.ts-osd {
+    background: transparent;
+}
+
+.ts-osd-card {
+    min-width: 280px;
+    max-width: 320px;
+    padding: 16px;
+    border-radius: 14px;
+    background: alpha(@window_bg_color, 0.92);
+    box-shadow: 0 4px 16px alpha(black, 0.25);
+
+    opacity: 0;
+    margin-top: 0px;
+    transition: opacity 200ms ease-out,
+                margin-top 200ms ease-out;
+}
+
+.ts-osd-card.shown {
+    opacity: 1;
+    margin-top: 8px;
+}
+
+.ts-osd-icon {
+    color: @accent_color;
+}
+
+.ts-osd-label {
+    font-weight: 600;
+}
+
+.ts-osd-value {
+    font-size: 0.85em;
+    opacity: 0.7;
+}
+
+.ts-osd-progress trough {
+    min-height: 6px;
+    background: alpha(@accent_color, 0.15);
+    border-radius: 9999px;
+}
+
+.ts-osd-progress progress {
+    background: @accent_color;
+    border-radius: 9999px;
+}
+
+.ts-osd-card.muted .ts-osd-icon {
+    color: alpha(@accent_color, 0.5);
+}
+
+.ts-osd-card.muted .ts-osd-progress progress,
+.ts-osd-card.muted .ts-osd-progress trough {
+    opacity: 0.3;
+}

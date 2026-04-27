@@ -5,6 +5,8 @@
 
 #![doc(html_no_source)]
 
+mod connection;
 mod error;
 
+pub use connection::BusKind;
 pub use error::BusError;

@@ -6,9 +6,21 @@ use crate::connection::SharedConnection;
 use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use zbus::fdo;
+use zbus::object_server::Interface;
 use zbus::{MatchRule, MessageStream};
+
+/// Type-erased async closure: given a `&zbus::Connection`, mount an interface
+/// and return a `zbus::Result<()>`.
+type MountFn = Arc<
+    dyn Fn(zbus::Connection) -> Pin<Box<dyn Future<Output = zbus::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Lifecycle of an owned name as observed from outside.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +72,12 @@ pub struct OwnNameBuilder<'a> {
     /// How long to wait after entering `PermanentlyTaken` before retrying.
     /// Defaults to 5 minutes; tests may override to a short duration.
     cooldown: Duration,
+    /// Interface mounts to apply on each new connection. Each entry is a
+    /// `(path, mount_fn)` pair; `mount_fn` is called with the connection
+    /// after `RequestName` succeeds and must register the interface on the
+    /// connection's object server. On reconnect, it is called again on the
+    /// fresh connection.
+    mounts: Vec<(String, MountFn)>,
 }
 
 impl OwnNameBuilder<'_> {
@@ -78,7 +96,34 @@ impl OwnNameBuilder<'_> {
             name: self.name,
             permanent_after: self.permanent_after,
             cooldown: self.cooldown,
+            mounts: self.mounts,
         }
+    }
+
+    /// Register a D-Bus interface at `path` on every connection this builder
+    /// acquires. The interface is mounted BEFORE `RequestName` so that callers
+    /// racing the `NameAcquired` signal always find the object already present.
+    ///
+    /// `iface` must be `Clone` because the object server takes ownership on
+    /// each mount; the clone is used when the connection is re-established
+    /// after a loss.
+    #[must_use]
+    pub fn at_path<I>(mut self, path: impl Into<String>, iface: I) -> Self
+    where
+        I: Interface + Clone + Send + Sync + 'static,
+    {
+        let path_str: String = path.into();
+        let path_for_vec = path_str.clone();
+        let mount: MountFn = Arc::new(move |conn: zbus::Connection| {
+            let iface_clone = iface.clone();
+            let p = path_str.clone();
+            Box::pin(async move {
+                conn.object_server().at(p.as_str(), iface_clone).await?;
+                Ok(())
+            })
+        });
+        self.mounts.push((path_for_vec, mount));
+        self
     }
 
     /// Override the consecutive-losses threshold (default 3).
@@ -114,8 +159,9 @@ impl OwnNameBuilder<'_> {
         let name = self.name;
         let threshold = self.permanent_after;
         let cooldown = self.cooldown;
+        let mounts = self.mounts;
         hytte_reactive::runtime::handle().spawn(async move {
-            run_ownership(shared, name, threshold, cooldown, writer).await;
+            run_ownership(shared, name, threshold, cooldown, writer, mounts).await;
         });
         OwnNameSignal { inner: state }
     }
@@ -134,6 +180,7 @@ pub fn own_name_with(
         name: name.into(),
         permanent_after: 3,
         cooldown: Duration::from_secs(5 * 60),
+        mounts: Vec::new(),
     }
 }
 
@@ -143,6 +190,7 @@ async fn run_ownership(
     permanent_after: u32,
     cooldown: Duration,
     writer: Mutable<OwnState>,
+    mounts: Vec<(String, MountFn)>,
 ) {
     // Track consecutive losses to the same owner: (unique_name, count).
     // Reset to None each time we successfully (re-)acquire the name.
@@ -155,10 +203,19 @@ async fn run_ownership(
         // avoids a race between an old `RemoveMatch` (queued async on drop) and
         // a new `AddMatch` for the next retry: the D-Bus daemon would decrement
         // the reference count and silently stop delivering signals.
+        //
+        // Interface mounts are also applied here, on the fresh connection,
+        // before RequestName so callers racing NameAcquired find the objects
+        // already present.
         let connect_result = shared
             .with_conn(|conn| {
                 let name = name.clone();
+                let mounts = mounts.clone();
                 async move {
+                    // Mount registered interfaces before subscribing.
+                    for (_path, mount_fn) in &mounts {
+                        mount_fn(conn.clone()).await?;
+                    }
                     let match_rule = build_name_owner_changed_rule(&name)?;
                     let stream = MessageStream::for_match_rule(match_rule, &conn, None).await?;
                     Ok((conn, stream))

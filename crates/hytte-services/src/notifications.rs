@@ -6,10 +6,11 @@
 //! Only one process on the session bus may own `org.freedesktop.Notifications`
 //! at a time. Disable mako, dunst, or any other notification daemon before
 //! starting trollshell, otherwise the name acquisition will fail and the
-//! service will keep retrying every 2s.
+//! service will keep retrying.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
+use hytte_bus::OwnNameSignal;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,7 +18,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
-use zbus::{Connection, fdo};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -116,18 +116,15 @@ pub struct HistoryEntry {
 #[doc(hidden)]
 pub struct NotificationsHandles {
     pub(crate) active: Mutable<Vec<Notification>>,
+    /// Shared counter for allocating notification IDs. Stored here so that
+    /// `NotificationsIface` clones across reconnects share the same sequence.
+    #[allow(dead_code)]
     pub(crate) next_id: Arc<AtomicU32>,
     pub(crate) history: Mutable<Vec<HistoryEntry>>,
-}
-
-impl Default for NotificationsHandles {
-    fn default() -> Self {
-        Self {
-            active: Mutable::new(Vec::new()),
-            next_id: Arc::new(AtomicU32::new(1)),
-            history: Mutable::new(Vec::new()),
-        }
-    }
+    /// Kept alive so the `own_name` task continues owning
+    /// `org.freedesktop.Notifications` for the process lifetime.
+    #[allow(dead_code)]
+    ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -138,32 +135,34 @@ pub struct NotificationsService;
 impl Service for NotificationsService {
     type Handles = NotificationsHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = NotificationsHandles::default();
-        let active_writer = handles.active.clone();
-        let next_id = handles.next_id.clone();
-        let history_writer = handles.history.clone();
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+        let active = Mutable::new(Vec::new());
+        let next_id = Arc::new(AtomicU32::new(1));
+        let history = Mutable::new(Vec::new());
 
-        rt.spawn(async move {
-            loop {
-                match listen(&active_writer, &next_id, &history_writer).await {
-                    Ok(()) => {
-                        tracing::warn!(
-                            "notifications daemon stream closed, reconnecting in 2s"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "notifications daemon error, reconnecting in 2s"
-                        );
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
+        let iface = NotificationsIface {
+            active: active.clone(),
+            next_id: next_id.clone(),
+            history: history.clone(),
+        };
 
-        handles
+        // Own the well-known name + mount the interface. The bus layer handles
+        // connection lifecycle, RequestName retries, and per-owner back-off if
+        // mako/dunst is camping the name.
+        //
+        // The OwnNameSignal is stored in NotificationsHandles (which lives in
+        // the registry for the process lifetime) to keep the watcher task
+        // alive.
+        let ownership = hytte_bus::own_name("org.freedesktop.Notifications")
+            .at_path("/org/freedesktop/Notifications", iface)
+            .start();
+
+        NotificationsHandles {
+            active,
+            next_id,
+            history,
+            ownership,
+        }
     }
 }
 
@@ -258,15 +257,15 @@ async fn do_dismiss(id: u32, reason: u32) -> Result<()> {
         hist.insert(0, entry);
         hist.truncate(100);
     }
-    // Emit the D-Bus signal.
-    let conn = Connection::session()
+    // Emit the D-Bus signal via our own interface's _EmitClosed method.
+    hytte_bus::call("org.freedesktop.Notifications")
+        .at_path("/org/freedesktop/Notifications")
+        .iface("org.freedesktop.Notifications")
+        .method("_EmitClosed")
+        .args((id, reason))
+        .send::<()>()
         .await
-        .context("open session bus for dismiss")?;
-    let emitter = SignalEmitter::new(&conn, "/org/freedesktop/Notifications")
-        .context("create signal emitter")?;
-    NotificationsIface::notification_closed(&emitter, id, reason)
-        .await
-        .context("emit NotificationClosed")?;
+        .context("emit NotificationClosed via _EmitClosed")?;
     Ok(())
 }
 
@@ -285,92 +284,57 @@ pub fn invoke_action(id: u32, action_key: &str) {
 }
 
 async fn do_invoke_action(id: u32, action_key: &str) -> Result<()> {
-    let conn = Connection::session()
+    hytte_bus::call("org.freedesktop.Notifications")
+        .at_path("/org/freedesktop/Notifications")
+        .iface("org.freedesktop.Notifications")
+        .method("_EmitInvoked")
+        .args((id, action_key.to_string()))
+        .send::<()>()
         .await
-        .context("open session bus for invoke_action")?;
-    let emitter = SignalEmitter::new(&conn, "/org/freedesktop/Notifications")
-        .context("create signal emitter")?;
-    NotificationsIface::action_invoked(&emitter, id, action_key)
-        .await
-        .context("emit ActionInvoked")?;
+        .context("emit ActionInvoked via _EmitInvoked")?;
     Ok(())
-}
-
-// ── Daemon shared state ───────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct State {
-    active: Mutable<Vec<Notification>>,
-    history: Mutable<Vec<HistoryEntry>>,
-    next_id: Arc<AtomicU32>,
-    conn: Connection,
-}
-
-impl State {
-    fn new(
-        active: Mutable<Vec<Notification>>,
-        history: Mutable<Vec<HistoryEntry>>,
-        next_id: Arc<AtomicU32>,
-        conn: Connection,
-    ) -> Self {
-        Self {
-            active,
-            history,
-            next_id,
-            conn,
-        }
-    }
-
-    async fn dismiss(&self, id: u32, reason: u32) {
-        // Remove from active list, capturing the notification for history.
-        let removed = {
-            let mut list = self.active.lock_mut();
-            let pos = list.iter().position(|n| n.id == id);
-            pos.map(|i| list.remove(i))
-        };
-        // Push to history if we found and removed the notification.
-        if let Some(n) = removed {
-            let dismissed_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let entry = HistoryEntry {
-                id: n.id,
-                app_name: n.app_name,
-                app_icon: n.app_icon,
-                summary: n.summary,
-                body: n.body,
-                urgency: n.urgency,
-                image: n.image,
-                actions: n.actions,
-                reason,
-                created_at: n.created_at,
-                dismissed_at,
-            };
-            let mut hist = self.history.lock_mut();
-            hist.insert(0, entry);
-            hist.truncate(100);
-        }
-        // Emit the D-Bus signal.
-        match SignalEmitter::new(&self.conn, "/org/freedesktop/Notifications") {
-            Ok(emitter) => {
-                if let Err(e) =
-                    NotificationsIface::notification_closed(&emitter, id, reason).await
-                {
-                    tracing::warn!(error = %e, id, reason, "emit NotificationClosed failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "create emitter for dismiss failed");
-            }
-        }
-    }
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct NotificationsIface {
-    state: State,
+    active: Mutable<Vec<Notification>>,
+    next_id: Arc<AtomicU32>,
+    history: Mutable<Vec<HistoryEntry>>,
+}
+
+impl NotificationsIface {
+    /// Remove `id` from the active list and push it to history.
+    /// Returns the removed notification if found.
+    fn remove_from_active(&self, id: u32) -> Option<Notification> {
+        let mut list = self.active.lock_mut();
+        let pos = list.iter().position(|n| n.id == id)?;
+        Some(list.remove(pos))
+    }
+
+    fn push_to_history(&self, n: Notification, reason: u32) {
+        let dismissed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = HistoryEntry {
+            id: n.id,
+            app_name: n.app_name,
+            app_icon: n.app_icon,
+            summary: n.summary,
+            body: n.body,
+            urgency: n.urgency,
+            image: n.image,
+            actions: n.actions,
+            reason,
+            created_at: n.created_at,
+            dismissed_at,
+        };
+        let mut hist = self.history.lock_mut();
+        hist.insert(0, entry);
+        hist.truncate(100);
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
@@ -398,7 +362,7 @@ impl NotificationsIface {
         let id = if replaces_id != 0 {
             replaces_id
         } else {
-            self.state.next_id.fetch_add(1, Ordering::Relaxed)
+            self.next_id.fetch_add(1, Ordering::Relaxed)
         };
 
         // Parse urgency from hints (key "urgency", type u8).
@@ -454,7 +418,7 @@ impl NotificationsIface {
 
         // Update active list: replace in-place if same id, else push.
         {
-            let mut list = self.state.active.lock_mut();
+            let mut list = self.active.lock_mut();
             if let Some(existing) = list.iter_mut().find(|n| n.id == id) {
                 *existing = notification.clone();
             } else {
@@ -465,11 +429,12 @@ impl NotificationsIface {
         tracing::debug!(id, app_name, summary, "notification added");
 
         // Schedule auto-dismiss if this notification has a finite timeout.
-        if let Some(dur) = timeout {
-            let state = self.state.clone();
+        if timeout.is_some() {
             tokio::spawn(async move {
-                tokio::time::sleep(dur).await;
-                state.dismiss(id, 1).await; // 1 = expired
+                tokio::time::sleep(timeout.unwrap()).await;
+                // Route through the public dismiss() so signal emission goes
+                // through _EmitClosed on the bus-layer connection.
+                crate::notifications::dismiss(id, 1); // 1 = expired
             });
         }
 
@@ -477,8 +442,14 @@ impl NotificationsIface {
     }
 
     /// Close a notification by id (reason 3 = closed by call).
+    #[allow(clippy::unused_async)]
     async fn close_notification(&self, id: u32) {
-        self.state.dismiss(id, 3).await;
+        // Remove from local state and emit the signal via the public API,
+        // which routes through _EmitClosed on the bus-layer connection.
+        if let Some(n) = self.remove_from_active(id) {
+            self.push_to_history(n, 3);
+        }
+        crate::notifications::dismiss(id, 3);
     }
 
     /// Return the capabilities this server implements.
@@ -515,55 +486,41 @@ impl NotificationsIface {
         id: u32,
         action_key: &str,
     ) -> zbus::Result<()>;
-}
 
-// ── Main listen loop ──────────────────────────────────────────────────────────
-
-async fn listen(
-    active: &Mutable<Vec<Notification>>,
-    next_id: &Arc<AtomicU32>,
-    history: &Mutable<Vec<HistoryEntry>>,
-) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("connect session bus")?;
-
-    let state = State::new(active.clone(), history.clone(), next_id.clone(), conn.clone());
-    let iface = NotificationsIface {
-        state: state.clone(),
-    };
-
-    conn.object_server()
-        .at("/org/freedesktop/Notifications", iface)
-        .await
-        .context("register /org/freedesktop/Notifications")?;
-
-    let dbus = fdo::DBusProxy::new(&conn)
-        .await
-        .context("create DBusProxy")?;
-
-    let flags = fdo::RequestNameFlags::ReplaceExisting | fdo::RequestNameFlags::DoNotQueue;
-    let reply = dbus
-        .request_name(
-            "org.freedesktop.Notifications".try_into().unwrap(),
-            flags,
-        )
-        .await
-        .context("request_name org.freedesktop.Notifications")?;
-
-    if reply != fdo::RequestNameReply::PrimaryOwner && reply != fdo::RequestNameReply::AlreadyOwner
-    {
-        return Err(anyhow!(
-            "could not acquire org.freedesktop.Notifications: {reply:?}. \
-             Disable mako/dunst or any other notification daemon first."
-        ));
+    /// Emit `NotificationClosed` programmatically.
+    ///
+    /// Called via `bus::call` from `do_dismiss` so that the signal is emitted
+    /// on the connection that owns the interface (the shared session bus
+    /// connection managed by the bus layer).
+    #[allow(non_snake_case)]
+    async fn _EmitClosed(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        reason: u32,
+    ) -> zbus::fdo::Result<()> {
+        Self::notification_closed(&emitter, id, reason)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
     }
 
-    tracing::info!("org.freedesktop.Notifications acquired");
-
-    // Park indefinitely; all work is driven by incoming D-Bus method calls.
-    std::future::pending::<()>().await;
-    Ok(())
+    /// Emit `ActionInvoked` programmatically.
+    ///
+    /// Called via `bus::call` from `do_invoke_action` so that the signal is
+    /// emitted on the connection that owns the interface.
+    #[allow(non_snake_case)]
+    async fn _EmitInvoked(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        action_key: String,
+    ) -> zbus::fdo::Result<()> {
+        Self::action_invoked(&emitter, id, &action_key)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
 }
 
 // ── Helper: parse actions ─────────────────────────────────────────────────────

@@ -139,6 +139,86 @@ async fn properties_changed_emits_loaded_with_new_value() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reconnect_emits_stale_then_loaded() {
+    let (conn, guard) = ephemeral_bus().await;
+    let address = guard.address.clone();
+
+    // Stand up a server exposing the Counter interface (value = 42).
+    let _server = zbus::connection::Builder::address(address.as_str())
+        .unwrap()
+        .name("cc.hannig.test.Counter")
+        .unwrap()
+        .serve_at("/cc/hannig/test/Counter", Counter { value: 42 })
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
+        .at_path("/cc/hannig/test/Counter")
+        .iface("cc.hannig.test.Counter")
+        .name("Value")
+        .start();
+
+    let mut stream = prop.signal().to_stream();
+
+    // ── Step 1: drain until Loaded(42) ───────────────────────────────────────
+    let mut saw_loaded_initial = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !saw_loaded_initial {
+        if let Ok(Some(PropState::Loaded(42))) =
+            tokio::time::timeout(Duration::from_millis(50), stream.next()).await
+        {
+            saw_loaded_initial = true;
+        }
+    }
+    assert!(saw_loaded_initial, "did not observe Loaded(42) before simulated disconnect");
+
+    // Give the tracking task time to enter the PropertiesChanged listen loop
+    // before we trigger the disconnect (mirrors the sleep in
+    // properties_changed_emits_loaded_with_new_value).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ── Step 2: open a replacement connection and simulate a disconnect ───────
+    let replacement = zbus::connection::Builder::address(address.as_str())
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("open replacement connection to ephemeral bus");
+
+    shared.simulate_disconnect_for_test(replacement).await;
+
+    // ── Step 3: assert Stale(42) then Loaded(_) are both observed ────────────
+    let mut saw_stale = false;
+    let mut saw_loaded_after = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline
+        && !(saw_stale && saw_loaded_after)
+    {
+        let next = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        if let Ok(Some(state)) = next {
+            match state {
+                PropState::Stale(42) => saw_stale = true,
+                PropState::Loaded(_) if saw_stale => saw_loaded_after = true,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        saw_stale,
+        "property task did not emit Stale(42) after simulated disconnect"
+    );
+    assert!(
+        saw_loaded_after,
+        "property task did not emit Loaded(_) after Stale(42)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn task_exits_when_property_signal_dropped() {
     let (conn, _guard) = ephemeral_bus().await;
     let shared = SharedConnection::for_test_session(conn);

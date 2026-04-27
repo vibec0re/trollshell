@@ -76,14 +76,36 @@ pub struct AuthPrompt {
     pub follow_up: bool,
 }
 
+// ── Cross-thread shared handle ────────────────────────────────────────────────
+//
+// `hytte_reactive::registry` is a thread-local — initialised on the GTK main
+// thread, empty on hytte-tokio worker threads. The following call paths run on
+// hytte-tokio and must NOT use `registry::with`:
+//   - `respond_to_auth`: spawns a tokio task that locks `pending_response`.
+//   - `AuthAgent::begin_authentication` / `cancel_authentication`: D-Bus iface
+//     methods dispatched on the bus connection's tokio worker.
+//   - Internal helpers `pending_response_arc`, `set_prompt`, `clear_prompt`
+//     called from the above.
+//
+// Using `registry::with` from these paths silently no-ops, causing polkit auth
+// dialogs to hang forever (the reply channel is never signalled). A static
+// `OnceLock` populated by `Service::start` is the cross-thread-safe
+// alternative — `Mutable<T>` and `Arc<AsyncMutex<…>>` are `Send + Sync`.
+struct PolkitShared {
+    prompt: Mutable<Option<AuthPrompt>>,
+    pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
+}
+
+static SHARED: OnceLock<PolkitShared> = OnceLock::new();
+
 // ── Service handle ────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub struct PolkitHandles {
     pub(crate) prompt: Mutable<Option<AuthPrompt>>,
-    /// Sender half of the oneshot the agent method is awaiting.  Held under
-    /// an async mutex so [`respond_to_auth`] can race-lessly take it.
-    /// `None` when no prompt is in flight.
+    /// Sender half of the oneshot the agent method is awaiting.  Mutators
+    /// now go through SHARED; kept here so the Arc is not dropped prematurely.
+    #[allow(dead_code)]
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
     /// Keeps the `own_name` watcher task alive for the process lifetime so
     /// the system bus holds `ANCHOR_NAME` and the `AuthAgent` interface
@@ -142,6 +164,11 @@ impl Service for PolkitService {
             }
         });
 
+        let _ = SHARED.set(PolkitShared {
+            prompt: prompt.clone(),
+            pending_response: pending_response.clone(),
+        });
+
         PolkitHandles {
             prompt,
             pending_response,
@@ -182,11 +209,10 @@ pub fn respond_to_auth(response: Option<(Zeroizing<String>, u32)>) {
         Some((password, uid)) => UserReply::Submit { password, uid },
         None => UserReply::Cancel,
     };
+    let Some(pending) = SHARED.get().map(|s| s.pending_response.clone()) else {
+        return;
+    };
     runtime::handle().spawn(async move {
-        let pending = registry::with(|r| {
-            r.get::<PolkitHandles>().map(|h| h.pending_response.clone())
-        });
-        let Some(pending) = pending else { return };
         let mut guard = pending.lock().await;
         if let Some(tx) = guard.take() {
             let _ = tx.send(reply);
@@ -197,18 +223,13 @@ pub fn respond_to_auth(response: Option<(Zeroizing<String>, u32)>) {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn pending_response_arc() -> Option<Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>> {
-    registry::with(|r| {
-        r.get::<PolkitHandles>()
-            .map(|h| h.pending_response.clone())
-    })
+    SHARED.get().map(|s| s.pending_response.clone())
 }
 
 fn set_prompt(p: Option<AuthPrompt>) {
-    registry::with(|r| {
-        if let Some(h) = r.get::<PolkitHandles>() {
-            h.prompt.set(p);
-        }
-    });
+    if let Some(s) = SHARED.get() {
+        s.prompt.set(p);
+    }
 }
 
 fn clear_prompt() {

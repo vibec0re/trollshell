@@ -43,8 +43,6 @@ struct PrimaryUi {
     error_label: gtk::Label,
     spinner: gtk::Spinner,
     submit_btn: gtk::Button,
-    #[allow(dead_code)] // reserved for future shake-on-lock-state-change
-    card: gtk::Box,
 }
 
 pub fn install(monitors: &[Monitor]) {
@@ -165,7 +163,6 @@ fn build_lock_surface(monitor: &Monitor, primary: bool) -> LockSurface {
             error_label,
             spinner,
             submit_btn,
-            card: card.clone(),
         })
     } else {
         None

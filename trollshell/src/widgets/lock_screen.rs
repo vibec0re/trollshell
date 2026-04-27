@@ -201,11 +201,13 @@ fn submit_password(
     let submit_for_done = submit_btn.clone();
 
     glib::MainContext::default().spawn_local(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            authenticate("trollshell", &username, password)
-        })
-        .await
-        .unwrap_or_else(|_| Err(PamError::Service("blocking task panicked".into())));
+        // Route through the shared hytte runtime — the GTK main thread
+        // has no tokio Handle::current(), so bare spawn_blocking would
+        // panic on first submit.
+        let result = hytte::reactive::runtime::handle()
+            .spawn_blocking(move || authenticate("trollshell", &username, password))
+            .await
+            .unwrap_or_else(|_| Err(PamError::Service("blocking task panicked".into())));
 
         spinner_for_done.set_spinning(false);
         spinner_for_done.set_visible(false);

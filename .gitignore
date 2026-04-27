@@ -3,3 +3,7 @@
 Cargo.lock.bak
 .direnv
 .envrc
+
+# Local debug captures (journalctl dumps, trollshell stdout/stderr,
+# stack-overflow logs etc.). Never check these in.
+*.log

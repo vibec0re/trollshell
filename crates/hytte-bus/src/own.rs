@@ -3,6 +3,7 @@
 //! See spec section 3.1.
 
 use crate::connection::SharedConnection;
+use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
 use std::time::Duration;
@@ -209,14 +210,15 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
             .await
         {
             Ok(r) => r,
-            Err(fdo::Error::Disconnected(_)) => {
-                writer.set(OwnState::Acquiring);
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                return;
-            }
             Err(e) => {
-                tracing::warn!(error = %e, %name, "RequestName failed");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let as_zbus = zbus::Error::FDO(Box::new(e));
+                if is_transient_zbus_error(&as_zbus) {
+                    writer.set(OwnState::Acquiring);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                } else {
+                    tracing::warn!(error = %as_zbus, %name, "RequestName failed");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
                 return;
             }
         };

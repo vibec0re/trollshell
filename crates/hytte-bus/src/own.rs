@@ -4,6 +4,7 @@
 
 use crate::connection::SharedConnection;
 use crate::error::is_transient_zbus_error;
+use crate::BusError;
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
 use std::future::Future;
@@ -11,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use zbus::fdo;
-use zbus::object_server::Interface;
+use zbus::object_server::{Interface, SignalEmitter};
 use zbus::{MatchRule, MessageStream};
 
 /// Type-erased async closure: given a `&zbus::Connection`, mount an interface
@@ -54,6 +55,7 @@ pub enum OwnState {
 #[derive(Clone)]
 pub struct OwnNameSignal {
     inner: Mutable<OwnState>,
+    shared: SharedConnection,
 }
 
 impl OwnNameSignal {
@@ -61,6 +63,34 @@ impl OwnNameSignal {
     /// delivers the current state immediately and then on every change.
     pub fn signal_cloned(&self) -> impl futures_signals::signal::Signal<Item = OwnState> {
         self.inner.signal_cloned()
+    }
+
+    /// Emit a D-Bus signal on the connection that owns this name, at the given
+    /// object path.
+    ///
+    /// The closure receives a [`SignalEmitter<'static>`] bound to the owned
+    /// connection and the supplied path. Call the macro-generated signal helper
+    /// (e.g. `MyIface::my_signal(&emitter, args...).await`) from inside the
+    /// closure.
+    ///
+    /// Reconnect-aware: routes through the same [`SharedConnection`] that the
+    /// ownership task uses, so the emitter always targets the currently-live
+    /// connection. Returns `Err(`[`BusError::Transient`]`)` when the
+    /// connection is mid-reconnect and no live connection is cached.
+    pub async fn emit<F, Fut>(&self, path: &str, f: F) -> Result<(), BusError>
+    where
+        F: FnOnce(SignalEmitter<'static>) -> Fut + Send,
+        Fut: Future<Output = zbus::Result<()>> + Send,
+    {
+        let path_owned = path.to_string();
+        self.shared
+            .with_conn(|conn| async move {
+                let emitter = SignalEmitter::new(&conn, path_owned.as_str())
+                    .map_err(|e| zbus::Error::Failure(e.to_string()))?
+                    .into_owned();
+                f(emitter).await
+            })
+            .await
     }
 }
 
@@ -164,10 +194,14 @@ impl OwnNameBuilder {
         let threshold = self.permanent_after;
         let cooldown = self.cooldown;
         let mounts = self.mounts;
+        let shared_clone = shared.clone();
         hytte_reactive::runtime::handle().spawn(async move {
             run_ownership(shared, name, threshold, cooldown, writer, mounts).await;
         });
-        OwnNameSignal { inner: state }
+        OwnNameSignal {
+            inner: state,
+            shared: shared_clone,
+        }
     }
 }
 

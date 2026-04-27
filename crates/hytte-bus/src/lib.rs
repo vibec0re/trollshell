@@ -10,3 +10,6 @@ mod error;
 
 pub use connection::BusKind;
 pub use error::BusError;
+
+#[doc(hidden)]
+pub use connection::test_support;

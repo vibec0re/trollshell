@@ -19,6 +19,10 @@ use zbus::Connection;
 pub struct BusGuard {
     child: Option<Child>,
     _tmp: TempDir,
+    // Used by connection_reconnect.rs to open a replacement connection against
+    // the same ephemeral bus; not all test binaries need it.
+    #[allow(dead_code)]
+    pub address: String,
 }
 
 impl Drop for BusGuard {
@@ -102,6 +106,7 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
         BusGuard {
             child: Some(child),
             _tmp: tmp,
+            address,
         },
     )
 }

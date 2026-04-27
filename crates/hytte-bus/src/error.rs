@@ -44,18 +44,14 @@ impl BusError {
     /// equivalent is `zbus::Error::FDO(Box<fdo::Error::Disconnected>)`.
     #[must_use]
     pub fn from_zbus(err: zbus::Error) -> Self {
+        if is_transient_zbus_error(&err) {
+            return Self::Transient { source: err };
+        }
         match &err {
-            zbus::Error::InputOutput(_) => Self::Transient { source: err },
-            zbus::Error::FDO(fdo_err) => {
-                if matches!(**fdo_err, zbus::fdo::Error::Disconnected(_)) {
-                    Self::Transient { source: err }
-                } else {
-                    Self::Permanent {
-                        reason: fdo_err.to_string(),
-                        dbus_name: None,
-                    }
-                }
-            }
+            zbus::Error::FDO(fdo_err) => Self::Permanent {
+                reason: fdo_err.to_string(),
+                dbus_name: None,
+            },
             zbus::Error::MethodError(name, msg, _) => Self::Permanent {
                 reason: msg.clone().unwrap_or_else(|| name.to_string()),
                 dbus_name: Some(name.to_string()),
@@ -72,6 +68,21 @@ impl BusError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Transient { .. })
+    }
+}
+
+/// Returns `true` for `zbus::Error` variants that indicate a lost or
+/// unavailable connection (transient; the supervisor should reconnect and
+/// callers should retry). Single classification point — consumed by both
+/// `BusError::from_zbus` and `SharedConnection::with_conn`.
+///
+/// In zbus 5.x the top-level `Disconnected` variant was removed; the
+/// equivalent is `zbus::Error::FDO(Box<fdo::Error::Disconnected>)`.
+pub(crate) fn is_transient_zbus_error(err: &zbus::Error) -> bool {
+    match err {
+        zbus::Error::InputOutput(_) => true,
+        zbus::Error::FDO(fdo_err) => matches!(**fdo_err, zbus::fdo::Error::Disconnected(_)),
+        _ => false,
     }
 }
 

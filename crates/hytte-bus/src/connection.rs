@@ -5,14 +5,17 @@
 //! other code in the workspace should call `zbus::Connection::session()`
 //! or `system()`.
 
-// These accessors are all used by Task 6 supervisor and production callers;
-// they are intentionally forward-declared here before any caller exists.
+// Production-only accessors (session/system/start) are forward-declared for
+// Task 6; they are wired up in Task 12.
 #![allow(dead_code)]
 
+use crate::error::is_transient_zbus_error;
 use crate::BusError;
 use futures_signals::signal::Mutable;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
@@ -30,7 +33,7 @@ pub enum BusKind {
 /// The internal mutable state of a `SharedConnection`.
 ///
 /// `conn = None` means "currently reconnecting" — `with_conn` will return
-/// a transient error until the supervisor (Task 6) re-establishes it.
+/// a transient error until the supervisor re-establishes it.
 struct Inner {
     conn: Option<Connection>,
 }
@@ -48,18 +51,97 @@ pub struct SharedConnection {
     epoch_signal: Mutable<u64>,
 }
 
-/// Returns true for zbus errors that indicate a lost or unavailable
-/// connection (transient; the supervisor should reconnect and callers retry).
-///
-/// In zbus 5.x the top-level `Disconnected` variant was removed; the
-/// equivalent is `zbus::Error::FDO(Box<fdo::Error::Disconnected>)`.
-fn is_transient_zbus_error(err: &zbus::Error) -> bool {
-    match err {
-        zbus::Error::InputOutput(_) => true,
-        zbus::Error::FDO(fdo_err) => matches!(**fdo_err, zbus::fdo::Error::Disconnected(_)),
-        _ => false,
+// ── Exponential backoff ───────────────────────────────────────────────────────
+
+/// Exponential backoff with cap. State is the next sleep duration to use.
+#[derive(Clone, Copy)]
+struct Backoff {
+    next_ms: u64,
+}
+
+impl Backoff {
+    const fn new() -> Self {
+        Self { next_ms: 250 }
+    }
+
+    fn reset(&mut self) {
+        self.next_ms = 250;
+    }
+
+    fn next(&mut self) -> Duration {
+        let d = Duration::from_millis(self.next_ms);
+        self.next_ms = (self.next_ms * 2).min(30_000);
+        d
     }
 }
+
+// ── Supervisor notify side-table ──────────────────────────────────────────────
+
+/// Side-table mapping `SharedConnection` instances (keyed by Arc pointer
+/// identity) to their supervisor's `Notify` channel. Used by
+/// `simulate_disconnect_for_test` and by `with_conn`'s transient-error path
+/// to wake the supervisor without storing the notifier inside `Inner`.
+struct SupervisorNotifyTable {
+    inner: StdMutex<HashMap<usize, Arc<tokio::sync::Notify>>>,
+}
+
+impl SupervisorNotifyTable {
+    fn register(&self, owner: &SharedConnection, notify: Arc<tokio::sync::Notify>) {
+        let key = Arc::as_ptr(&owner.inner) as usize;
+        self.inner.lock().unwrap().insert(key, notify);
+    }
+
+    fn lookup(&self, owner: &SharedConnection) -> Option<Arc<tokio::sync::Notify>> {
+        let key = Arc::as_ptr(&owner.inner) as usize;
+        self.inner.lock().unwrap().get(&key).cloned()
+    }
+}
+
+static SUPERVISOR_NOTIFY: LazyLock<SupervisorNotifyTable> =
+    LazyLock::new(|| SupervisorNotifyTable {
+        inner: StdMutex::new(HashMap::new()),
+    });
+
+/// Test-only side-table: pre-injected connections the supervisor should use
+/// instead of calling `Connection::session/system`. Keyed by the same Arc
+/// pointer identity as `SUPERVISOR_NOTIFY`. The value is consumed on first use.
+struct InjectedConnTable {
+    inner: StdMutex<HashMap<usize, Connection>>,
+}
+
+impl InjectedConnTable {
+    fn inject(&self, owner: &SharedConnection, conn: Connection) {
+        let key = Arc::as_ptr(&owner.inner) as usize;
+        self.inner.lock().unwrap().insert(key, conn);
+    }
+
+    fn take(&self, owner_key: usize) -> Option<Connection> {
+        self.inner.lock().unwrap().remove(&owner_key)
+    }
+}
+
+static INJECTED_CONN: LazyLock<InjectedConnTable> = LazyLock::new(|| InjectedConnTable {
+    inner: StdMutex::new(HashMap::new()),
+});
+
+// ── Process-wide singletons ───────────────────────────────────────────────────
+
+static SESSION: OnceLock<SharedConnection> = OnceLock::new();
+static SYSTEM: OnceLock<SharedConnection> = OnceLock::new();
+
+/// Lazy global accessor for the session-bus shared connection. First call
+/// constructs the singleton, opens the connection, and spawns the supervisor
+/// on the hytte tokio runtime.
+pub(crate) fn session() -> &'static SharedConnection {
+    SESSION.get_or_init(|| SharedConnection::start(BusKind::Session))
+}
+
+/// Lazy global accessor for the system-bus shared connection.
+pub(crate) fn system() -> &'static SharedConnection {
+    SYSTEM.get_or_init(|| SharedConnection::start(BusKind::System))
+}
+
+// ── SharedConnection public API ───────────────────────────────────────────────
 
 impl SharedConnection {
     /// The kind of bus this connection talks to.
@@ -82,12 +164,11 @@ impl SharedConnection {
         self.epoch_signal.clone()
     }
 
-    /// Run `f` against the current connection. On `zbus::Error::InputOutput`
-    /// or FDO `Disconnected` (transient variants), maps to
-    /// `BusError::Transient` and clears the cached connection so the next
-    /// caller waits for the supervisor to reconnect (supervisor wiring in
-    /// Task 6). Returns `BusError::Transient` immediately when no cached
-    /// connection is available (mid-reconnect).
+    /// Run `f` against the current connection. On transient zbus errors
+    /// (`InputOutput`, FDO `Disconnected`), maps to `BusError::Transient`,
+    /// clears the cached connection, and notifies the supervisor to reconnect.
+    /// Returns `BusError::Transient` immediately when no cached connection is
+    /// available (mid-reconnect).
     pub async fn with_conn<F, R, Fut>(&self, f: F) -> Result<R, BusError>
     where
         F: FnOnce(Connection) -> Fut,
@@ -98,8 +179,7 @@ impl SharedConnection {
             if let Some(c) = guard.conn.as_ref() {
                 c.clone()
             } else {
-                // No cached connection — mid-reconnect. Signal transient
-                // failure; Task 6 supervisor will fill the slot again.
+                // No cached connection — mid-reconnect.
                 let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
                     "no cached connection (mid-reconnect)".into(),
                 )));
@@ -109,10 +189,11 @@ impl SharedConnection {
 
         f(conn).await.map_err(|e| {
             if is_transient_zbus_error(&e) {
-                // Mark the cached conn as broken so the next call returns
-                // Transient immediately while the supervisor (Task 6) reconnects.
                 if let Ok(mut guard) = self.inner.try_lock() {
                     guard.conn = None;
+                }
+                if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                    notify.notify_one();
                 }
             }
             BusError::from_zbus(e)
@@ -120,11 +201,47 @@ impl SharedConnection {
     }
 }
 
+// ── Production constructor ────────────────────────────────────────────────────
+
+impl SharedConnection {
+    /// Production constructor: creates the `SharedConnection` with `conn = None`
+    /// and spawns the supervisor on the hytte tokio runtime. The supervisor's
+    /// first iteration opens the real connection asynchronously.
+    fn start(kind: BusKind) -> Self {
+        let inner = Arc::new(Mutex::new(Inner { conn: None }));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let epoch_signal = Mutable::new(0u64);
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let me = Self {
+            kind,
+            inner: inner.clone(),
+            epoch: epoch.clone(),
+            epoch_signal: epoch_signal.clone(),
+        };
+
+        SUPERVISOR_NOTIFY.register(&me, notify.clone());
+
+        let inner_key = Arc::as_ptr(&me.inner) as usize;
+        let task_notify = notify;
+        hytte_reactive::runtime::handle().spawn(async move {
+            supervisor_loop(kind, inner_key, inner, epoch, epoch_signal, task_notify).await;
+        });
+
+        me
+    }
+}
+
+// ── Test-only constructors and accessors ──────────────────────────────────────
+
 /// Test-only constructors and accessors. Production code uses
 /// `connection::session()` / `connection::system()` (Task 6).
 #[doc(hidden)]
 pub mod test_support {
-    use super::{Arc, AtomicU64, BusKind, Connection, Inner, Mutable, Mutex};
+    use super::{
+        Arc, AtomicU64, BusKind, Connection, INJECTED_CONN, Inner, Mutable, Mutex,
+        SUPERVISOR_NOTIFY,
+    };
 
     pub use super::SharedConnection;
 
@@ -151,5 +268,114 @@ pub mod test_support {
                 epoch_signal: Mutable::new(1),
             }
         }
+
+        /// Test-only: spawn a supervisor loop for a `for_test_*`
+        /// `SharedConnection`. Production code never calls this — it is
+        /// invoked from `start()` and from integration tests that need to
+        /// exercise the reconnect path.
+        #[doc(hidden)]
+        pub fn spawn_supervisor_for_test(&self) {
+            let inner = self.inner.clone();
+            let inner_key = Arc::as_ptr(&self.inner) as usize;
+            let epoch = self.epoch.clone();
+            let signal = self.epoch_signal.clone();
+            let notify = Arc::new(tokio::sync::Notify::new());
+            SUPERVISOR_NOTIFY.register(self, notify.clone());
+            let kind = self.kind;
+            tokio::spawn(async move {
+                super::supervisor_loop(kind, inner_key, inner, epoch, signal, notify).await;
+            });
+        }
+
+        /// Test-only: pre-inject the connection the supervisor should use on
+        /// its next reconnect, then drop the cached connection and wake the
+        /// supervisor. This lets tests exercise the full supervisor reconnect
+        /// path without needing to mutate `DBUS_SESSION_BUS_ADDRESS` (which
+        /// is not allowed under `unsafe_code = "forbid"`).
+        #[doc(hidden)]
+        pub async fn simulate_disconnect_for_test(&self, replacement: Connection) {
+            let key = Arc::as_ptr(&self.inner) as usize;
+            INJECTED_CONN.inject(self, replacement);
+            {
+                let mut guard = self.inner.lock().await;
+                guard.conn = None;
+                // Release the lock before notifying so the supervisor can
+                // immediately acquire it.
+                drop(guard);
+            }
+            if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                notify.notify_one();
+            }
+            // Drop `key` via the explicit variable to avoid a clippy lint about
+            // the key not being needed after the inject call; the inject already
+            // stored it by Arc pointer, which is derived the same way in the
+            // supervisor loop.
+            let _ = key;
+        }
+    }
+}
+
+// ── Supervisor loop ───────────────────────────────────────────────────────────
+
+// `inner_key` is the stable pointer identity of `inner` (Arc::as_ptr cast to
+// usize). It is pre-computed by the caller so the supervisor can look up the
+// injection table without borrowing the Arc.
+async fn supervisor_loop(
+    kind: BusKind,
+    inner_key: usize,
+    inner: Arc<Mutex<Inner>>,
+    epoch: Arc<AtomicU64>,
+    signal: Mutable<u64>,
+    notify: Arc<tokio::sync::Notify>,
+) {
+    let mut backoff = Backoff::new();
+    loop {
+        // 1. If inner.conn is None, open a fresh connection.
+        let needs_connect = {
+            let g = inner.lock().await;
+            g.conn.is_none()
+        };
+
+        if needs_connect {
+            // Check for a test-injected replacement before hitting the real bus.
+            let result = if let Some(conn) = INJECTED_CONN.take(inner_key) {
+                Ok(conn)
+            } else {
+                open_connection(kind).await
+            };
+
+            match result {
+                Ok(conn) => {
+                    let mut g = inner.lock().await;
+                    g.conn = Some(conn);
+                    drop(g);
+                    let new_epoch = epoch.fetch_add(1, Ordering::AcqRel) + 1;
+                    signal.set(new_epoch);
+                    backoff.reset();
+                    tracing::info!(?kind, epoch = new_epoch, "bus connected");
+                }
+                Err(e) => {
+                    let d = backoff.next();
+                    tracing::warn!(
+                        ?kind,
+                        error = %e,
+                        retry_in_ms = d.as_millis(),
+                        "bus connect failed"
+                    );
+                    tokio::time::sleep(d).await;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Wait for someone to notify us that the conn is broken.
+        notify.notified().await;
+    }
+}
+
+async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
+    match kind {
+        BusKind::Session => Connection::session().await,
+        BusKind::System => Connection::system().await,
     }
 }

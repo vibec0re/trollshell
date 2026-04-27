@@ -1,14 +1,14 @@
 //! DNS state from systemd-resolved (`org.freedesktop.resolve1`).
 //!
 //! Reads the Manager's `DNS` property — a list of `(ifindex, family,
-//! address)` tuples — every 2 seconds. Emits a `DnsState` summary.
+//! address)` tuples — and emits a `DnsState` summary. The underlying
+//! property subscription lives in `hytte_bus::property`, so reconnects
+//! and `PropertiesChanged` tracking are handled by the bus layer.
 
-use anyhow::{Context, Result};
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_bus::{property, BusKind, PropState};
 use hytte_reactive::{registry, Service};
 use std::net::IpAddr;
-use std::time::Duration;
-use zbus::Connection;
 
 pub struct ResolvedService;
 
@@ -44,46 +44,37 @@ impl Service for ResolvedService {
         let handles = ResolvedHandles::default();
         let writer = handles.dns.clone();
 
+        // DNS = a(iiay) — array of (ifindex i32, family i32, address bytes).
+        let dns_property = property::<Vec<(i32, i32, Vec<u8>)>>("org.freedesktop.resolve1")
+            .bus(BusKind::System)
+            .at_path("/org/freedesktop/resolve1")
+            .iface("org.freedesktop.resolve1.Manager")
+            .name("DNS")
+            .start();
+
         rt.spawn(async move {
-            loop {
-                match listen(&writer).await {
-                    Ok(()) => tracing::warn!("resolved poll ended, retrying in 2s"),
-                    Err(e) => tracing::warn!(error = %e, "resolved error, retrying in 2s"),
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            dns_property
+                .signal()
+                .for_each(move |state| {
+                    let raw = match state {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => Vec::new(),
+                    };
+                    let mut servers: Vec<IpAddr> = Vec::with_capacity(raw.len());
+                    for (_idx, family, bytes) in raw {
+                        if let Some(ip) = parse_addr(family, &bytes) {
+                            servers.push(ip);
+                        }
+                    }
+                    servers.sort();
+                    servers.dedup();
+                    writer.set(DnsState { servers });
+                    std::future::ready(())
+                })
+                .await;
         });
 
         handles
-    }
-}
-
-async fn listen(out: &Mutable<DnsState>) -> Result<()> {
-    let conn = Connection::system().await.context("connect system bus")?;
-
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.resolve1",
-        "/org/freedesktop/resolve1",
-        "org.freedesktop.resolve1.Manager",
-    )
-    .await
-    .context("create resolved Manager proxy")?;
-
-    loop {
-        // DNS = a(iiay) — array of (ifindex i32, family i32, address bytes).
-        let raw: Vec<(i32, i32, Vec<u8>)> = proxy.get_property("DNS").await.unwrap_or_default();
-        let mut servers: Vec<IpAddr> = Vec::with_capacity(raw.len());
-        for (_idx, family, bytes) in raw {
-            if let Some(ip) = parse_addr(family, &bytes) {
-                servers.push(ip);
-            }
-        }
-        servers.sort();
-        servers.dedup();
-        out.set(DnsState { servers });
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

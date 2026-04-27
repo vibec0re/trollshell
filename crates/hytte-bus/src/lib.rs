@@ -5,11 +5,13 @@
 
 #![doc(html_no_source)]
 
+mod call;
 mod connection;
 mod error;
 mod own;
 mod signals;
 
+pub use call::{call_with, CallBuilder, RetryPolicy};
 pub use connection::BusKind;
 pub use error::BusError;
 pub use own::{own_name_with, OwnNameSignal, OwnState};

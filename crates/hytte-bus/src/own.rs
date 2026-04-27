@@ -33,6 +33,25 @@ pub enum OwnState {
     },
 }
 
+/// A cloneable handle to the live ownership-state signal returned by
+/// [`OwnNameBuilder::start`].
+///
+/// Call [`signal_cloned`](OwnNameSignal::signal_cloned) to obtain a
+/// [`futures_signals::signal::Signal`] that tracks the current [`OwnState`].
+/// Multiple independent subscriptions are supported.
+#[derive(Clone)]
+pub struct OwnNameSignal {
+    inner: Mutable<OwnState>,
+}
+
+impl OwnNameSignal {
+    /// Returns a fresh [`Signal`](futures_signals::signal::Signal) that
+    /// delivers the current state immediately and then on every change.
+    pub fn signal_cloned(&self) -> impl futures_signals::signal::Signal<Item = OwnState> {
+        self.inner.signal_cloned()
+    }
+}
+
 /// Builder for `own_name`. See the spec (section 3.1) for full semantics.
 pub struct OwnNameBuilder<'a> {
     shared: &'a SharedConnection,
@@ -51,19 +70,25 @@ impl OwnNameBuilder<'_> {
         self
     }
 
-    /// Override the cooldown after `PermanentlyTaken` before the next retry
-    /// attempt. Defaults to 5 minutes. Tests may pass a short duration.
+    /// Override the cooldown after a `PermanentlyTaken` transition before
+    /// re-attempting acquisition. Default: 5 minutes.
+    ///
+    /// Test-only — consumers should not shorten this in production. The 5-minute
+    /// cooldown is what prevents PermanentlyTaken from degrading into a tight
+    /// retry loop that would re-introduce the FD-storm pattern this primitive
+    /// is designed to prevent.
+    #[doc(hidden)]
     #[must_use]
     pub fn cooldown_after_permanent(mut self, d: Duration) -> Self {
         self.cooldown = d;
         self
     }
 
-    /// Spawn the ownership task. The returned `Mutable` holds the current
-    /// state; call `.signal_cloned()` on it to subscribe. Multiple
-    /// subscribers are supported — each gets an independent signal derived
-    /// from the same underlying `Mutable`.
-    pub fn start(self) -> Mutable<OwnState> {
+    /// Spawn the ownership task. Returns an [`OwnNameSignal`] handle; call
+    /// `.signal_cloned()` on it to subscribe. Multiple independent subscriptions
+    /// are supported — each call to `.signal_cloned()` returns a fresh signal
+    /// derived from the same underlying state.
+    pub fn start(self) -> OwnNameSignal {
         let state = Mutable::new(OwnState::Acquiring);
         let writer = state.clone();
         let shared = self.shared.clone();
@@ -73,7 +98,7 @@ impl OwnNameBuilder<'_> {
         hytte_reactive::runtime::handle().spawn(async move {
             run_ownership(shared, name, threshold, cooldown, writer).await;
         });
-        state
+        OwnNameSignal { inner: state }
     }
 }
 

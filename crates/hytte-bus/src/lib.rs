@@ -11,7 +11,7 @@ mod own;
 
 pub use connection::BusKind;
 pub use error::BusError;
-pub use own::{own_name_with, OwnState};
+pub use own::{own_name_with, OwnNameSignal, OwnState};
 
 #[doc(hidden)]
 pub use connection::test_support;

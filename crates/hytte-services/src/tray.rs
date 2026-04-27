@@ -18,6 +18,8 @@
 use anyhow::{anyhow, Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use futures_signals::signal::SignalExt;
+use hytte_bus::{BusKind, OwnNameSignal, ProxyState, call, proxy, signals};
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +28,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Structure, Value};
-use zbus::{Connection, fdo};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -124,14 +125,10 @@ pub struct MenuItem {
 #[doc(hidden)]
 pub struct TrayHandles {
     pub(crate) items: Mutable<Vec<TrayItem>>,
-}
-
-impl Default for TrayHandles {
-    fn default() -> Self {
-        Self {
-            items: Mutable::new(Vec::new()),
-        }
-    }
+    /// Kept alive so the `own_name` task continues owning
+    /// `org.kde.StatusNotifierWatcher` for the process lifetime.
+    #[allow(dead_code)]
+    ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -142,25 +139,44 @@ pub struct TrayService;
 impl Service for TrayService {
     type Handles = TrayHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = TrayHandles::default();
-        let items_writer = handles.items.clone();
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+        let items = Mutable::new(Vec::new());
 
-        rt.spawn(async move {
+        let state = State {
+            items: items.clone(),
+            registered: Arc::new(AsyncMutex::new(HashMap::new())),
+        };
+
+        let watcher = Watcher {
+            state: state.clone(),
+        };
+
+        // Own `org.kde.StatusNotifierWatcher` + mount the watcher interface.
+        // The OwnNameSignal is stored in TrayHandles (process lifetime) to keep
+        // the task alive.
+        let ownership = hytte_bus::own_name("org.kde.StatusNotifierWatcher")
+            .bus(BusKind::Session)
+            .at_path(WATCHER_PATH, watcher)
+            .start();
+
+        // Spawn the NameOwnerChanged watcher to prune items when their bus
+        // name disappears.
+        let state2 = state;
+        runtime::handle().spawn(async move {
             loop {
-                match listen(&items_writer).await {
+                match watch_name_owner_changes(&state2).await {
                     Ok(()) => {
-                        tracing::warn!("tray watcher stream closed, reconnecting in 2s");
+                        tracing::warn!("tray NOC stream closed, reconnecting in 2s");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "tray watcher error, reconnecting in 2s");
+                        tracing::warn!(error = %e, "tray NOC watcher error, reconnecting in 2s");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
-        handles
+        TrayHandles { items, ownership }
     }
 }
 
@@ -184,29 +200,13 @@ pub fn items() -> impl Signal<Item = Vec<TrayItem>> {
 
 /// Fire-and-forget: send `Activate(0, 0)` to the given `StatusNotifierItem`.
 pub fn activate(bus_name: &str, object_path: &str) {
-    let bus_name = bus_name.to_string();
-    let object_path = object_path.to_string();
-    runtime::handle().spawn(async move {
-        if let Err(e) = do_activate(&bus_name, &object_path).await {
-            tracing::warn!(error = %e, bus_name, object_path, "tray activate failed");
-        }
-    });
-}
-
-async fn do_activate(bus_name: &str, object_path: &str) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("open session bus for activate")?;
-    conn.call_method(
-        Some(bus_name),
-        object_path,
-        Some("org.kde.StatusNotifierItem"),
-        "Activate",
-        &(0i32, 0i32),
-    )
-    .await
-    .context("call Activate")?;
-    Ok(())
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(object_path)
+        .iface(SNI_IFACE)
+        .method("Activate")
+        .args((0i32, 0i32))
+        .fire_and_forget();
 }
 
 /// Fetch the `com.canonical.dbusmenu` layout tree for the given bus + path.
@@ -236,19 +236,14 @@ pub async fn fetch_menu(bus_name: &str, menu_path: &str) -> Option<Menu> {
 }
 
 async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
-    let conn = Connection::session()
-        .await
-        .context("open session bus for dbusmenu")?;
-
     // Call AboutToShow(0) — ignore errors (not all apps implement it).
-    let _ = conn
-        .call_method(
-            Some(bus_name),
-            menu_path,
-            Some("com.canonical.dbusmenu"),
-            "AboutToShow",
-            &(0i32,),
-        )
+    let _ = call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(menu_path)
+        .iface(DBUSMENU_IFACE)
+        .method("AboutToShow")
+        .args((0i32,))
+        .send::<bool>()
         .await;
 
     let property_names: Vec<&str> = vec![
@@ -262,20 +257,15 @@ async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
         "children-display",
     ];
 
-    let reply = conn
-        .call_method(
-            Some(bus_name),
-            menu_path,
-            Some("com.canonical.dbusmenu"),
-            "GetLayout",
-            &(0i32, -1i32, property_names),
-        )
+    let (_, layout): (u32, OwnedValue) = call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(menu_path)
+        .iface(DBUSMENU_IFACE)
+        .method("GetLayout")
+        .args((0i32, -1i32, property_names))
+        .send()
         .await
         .context("call GetLayout")?;
-
-    // Reply body: (u, (i, a{sv}, av))
-    let body = reply.body();
-    let (_, layout): (u32, OwnedValue) = body.deserialize().context("deserialise GetLayout reply")?;
 
     let root = parse_layout_node(layout)?;
     Ok(root)
@@ -423,10 +413,6 @@ pub fn menu_event(bus_name: &str, menu_path: &str, item_id: i32) {
 }
 
 async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("open session bus for menu event")?;
-
     #[allow(clippy::cast_possible_truncation)]
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -436,15 +422,15 @@ async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<
     // data: variant — pass an i32(0) variant as a no-op payload.
     let data = OwnedValue::try_from(Value::I32(0)).unwrap();
 
-    conn.call_method(
-        Some(bus_name),
-        menu_path,
-        Some("com.canonical.dbusmenu"),
-        "Event",
-        &(item_id, "clicked", data, timestamp),
-    )
-    .await
-    .context("call Event")?;
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(menu_path)
+        .iface(DBUSMENU_IFACE)
+        .method("Event")
+        .args((item_id, "clicked", data, timestamp))
+        .send::<()>()
+        .await
+        .context("call Event")?;
 
     Ok(())
 }
@@ -452,26 +438,20 @@ async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<
 // ── Watcher state ─────────────────────────────────────────────────────────────
 
 /// Shared mutable state threaded through the watcher and per-item tasks.
+///
+/// No longer holds a `Connection`; all D-Bus I/O goes through `hytte_bus::call`
+/// and `hytte_bus::proxy`.
 #[derive(Clone)]
 struct State {
     items: Mutable<Vec<TrayItem>>,
     registered: Arc<AsyncMutex<HashMap<String, TrayItem>>>,
-    conn: Connection,
 }
 
 impl State {
-    fn new(items: Mutable<Vec<TrayItem>>, conn: Connection) -> Self {
-        Self {
-            items,
-            registered: Arc::new(AsyncMutex::new(HashMap::new())),
-            conn,
-        }
-    }
-
     /// Re-read one item's properties and update the map.  Returns `false`
     /// when the item should be removed (proxy read failed).
     async fn refresh_item(&self, bus_name: &str, object_path: &str) -> bool {
-        match read_item_props(&self.conn, bus_name, object_path).await {
+        match read_item_props(bus_name, object_path).await {
             Ok(item) => {
                 let mut map = self.registered.lock().await;
                 map.insert(item.key.clone(), item);
@@ -509,7 +489,14 @@ impl State {
 
 // ── `StatusNotifierWatcher` D-Bus interface ───────────────────────────────────
 
+const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+const SNI_IFACE: &str = "org.kde.StatusNotifierItem";
+const DBUSMENU_IFACE: &str = "com.canonical.dbusmenu";
+
 /// Service-side implementation of `org.kde.StatusNotifierWatcher`.
+///
+/// Derives `Clone` as required by `own_name().at_path()`.
+#[derive(Clone)]
 struct Watcher {
     state: State,
 }
@@ -534,7 +521,7 @@ impl Watcher {
         tracing::debug!(bus_name, object_path, "RegisterStatusNotifierItem");
 
         // Initial property read.
-        match read_item_props(&self.state.conn, &bus_name, &object_path).await {
+        match read_item_props(&bus_name, &object_path).await {
             Ok(item) => {
                 let key = item.key.clone();
                 self.state.registered.lock().await.insert(key.clone(), item);
@@ -546,11 +533,11 @@ impl Watcher {
                 )
                 .await;
 
-                // Spawn a per-item watcher.
+                // Spawn a per-item watcher using bus::proxy for PeerGone detection
+                // and bus::signals for property-update signals.
                 let state = self.state.clone();
-                let emitter_owned = emitter.to_owned();
                 tokio::spawn(async move {
-                    watch_item(state, bus_name, object_path, emitter_owned).await;
+                    watch_item(state, bus_name, object_path).await;
                 });
             }
             Err(e) => {
@@ -604,56 +591,98 @@ impl Watcher {
         emitter: &SignalEmitter<'_>,
         service: String,
     ) -> zbus::Result<()>;
+
+    /// Emit `StatusNotifierItemUnregistered` programmatically.
+    ///
+    /// Called via `bus::call` from `watch_item` tasks so that the signal is
+    /// emitted on the connection that owns the watcher interface.
+    #[allow(non_snake_case)]
+    async fn _EmitUnregistered(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        service: String,
+    ) -> zbus::fdo::Result<()> {
+        Self::status_notifier_item_unregistered(&emitter, service)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
 }
 
 // ── Per-item watcher task ─────────────────────────────────────────────────────
 
-async fn watch_item(
-    state: State,
-    bus_name: String,
-    object_path: String,
-    emitter: SignalEmitter<'static>,
-) {
-    // Build with owned strings so the proxy is `'static`-compatible.
-    let proxy = match zbus::Proxy::new_owned(
-        state.conn.clone(),
-        bus_name.clone(),
-        object_path.clone(),
-        "org.kde.StatusNotifierItem".to_string(),
-    )
-    .await
+async fn watch_item(state: State, bus_name: String, object_path: String) {
+    // Build a long-lived proxy for this item. The proxy monitors
+    // NameOwnerChanged for this exact bus name, giving us PeerGone when the
+    // item app exits.
+    let item_proxy = match proxy(bus_name.as_str())
+        .bus(BusKind::Session)
+        .at_path(object_path.clone())
+        .iface(SNI_IFACE)
+        .build()
+        .await
     {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, bus_name, object_path, "failed to create item proxy");
+            tracing::warn!(error = %e, bus_name, object_path, "failed to build item proxy");
             return;
         }
     };
 
-    // Subscribe to the four update signals.  Spawn a sub-task per signal to
-    // avoid lifetime issues with merging streams.
+    // Subscribe to the four update signals via bus::signals.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(4);
 
     for sig_name in ["NewIcon", "NewTitle", "NewStatus", "NewToolTip"] {
         let tx2 = tx.clone();
-        let proxy2 = proxy.clone();
+        let bus2 = bus_name.clone();
+        let path2 = object_path.clone();
         let sig = sig_name.to_string();
+        let sub = signals(bus2.as_str())
+            .bus(BusKind::Session)
+            .at_path(path2)
+            .iface(SNI_IFACE)
+            .signal(sig.clone())
+            .start();
         tokio::spawn(async move {
-            match proxy2.receive_signal(sig.clone()).await {
-                Ok(mut stream) => {
-                    while stream.next().await.is_some() {
-                        if tx2.send(()).await.is_err() {
-                            break;
-                        }
-                    }
+            let mut events = sub.events();
+            while events.next().await.is_some() {
+                if tx2.send(()).await.is_err() {
+                    break;
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, signal = sig, "subscribe signal failed");
+            }
+            tracing::debug!(signal = sig, bus_name = bus2, "signal stream ended");
+        });
+    }
+    drop(tx); // close sender side so channel closes when all sub-tasks end
+
+    // Spawn liveness watcher for PeerGone.
+    {
+        let state2 = state.clone();
+        let bus2 = bus_name.clone();
+        let path2 = object_path.clone();
+        let proxy2 = item_proxy.clone();
+        tokio::spawn(async move {
+            let mut liveness = proxy2.liveness().to_stream();
+            while let Some(s) = liveness.next().await {
+                if s == ProxyState::PeerGone {
+                    tracing::debug!(bus_name = bus2, object_path = path2, "item proxy: PeerGone");
+                    let key = format!("{bus2}{path2}");
+                    state2.registered.lock().await.remove(&key);
+                    state2.rebuild_published_list().await;
+                    // Emit unregistered signal via the owned watcher interface.
+                    let _ = call("org.kde.StatusNotifierWatcher")
+                        .bus(BusKind::Session)
+                        .at_path(WATCHER_PATH)
+                        .iface("org.kde.StatusNotifierWatcher")
+                        .method("_EmitUnregistered")
+                        .args((key,))
+                        .send::<()>()
+                        .await;
+                    return;
                 }
             }
         });
     }
-    drop(tx); // close sender side so channel closes when all sub-tasks end
 
     // Process update notifications.
     while rx.recv().await.is_some() {
@@ -662,7 +691,14 @@ async fn watch_item(
         if !still_alive {
             let key = format!("{bus_name}{object_path}");
             tracing::debug!(key, "item disappeared, unregistering");
-            let _ = Watcher::status_notifier_item_unregistered(&emitter, key).await;
+            let _ = call("org.kde.StatusNotifierWatcher")
+                .bus(BusKind::Session)
+                .at_path(WATCHER_PATH)
+                .iface("org.kde.StatusNotifierWatcher")
+                .method("_EmitUnregistered")
+                .args((key,))
+                .send::<()>()
+                .await;
             return;
         }
     }
@@ -671,96 +707,88 @@ async fn watch_item(
     let key = format!("{bus_name}{object_path}");
     state.registered.lock().await.remove(&key);
     state.rebuild_published_list().await;
-    let _ = Watcher::status_notifier_item_unregistered(&emitter, key).await;
+    let _ = call("org.kde.StatusNotifierWatcher")
+        .bus(BusKind::Session)
+        .at_path(WATCHER_PATH)
+        .iface("org.kde.StatusNotifierWatcher")
+        .method("_EmitUnregistered")
+        .args((key,))
+        .send::<()>()
+        .await;
 }
 
-// ── Main listen loop ──────────────────────────────────────────────────────────
+// ── NameOwnerChanged watcher ──────────────────────────────────────────────────
 
-async fn listen(items: &Mutable<Vec<TrayItem>>) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("connect session bus")?;
+/// Subscribe to `NameOwnerChanged` on the session bus and prune items when
+/// their bus name is released.
+async fn watch_name_owner_changes(state: &State) -> Result<()> {
+    let owner_changes = signals("org.freedesktop.DBus")
+        .bus(BusKind::Session)
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
 
-    let state = State::new(items.clone(), conn.clone());
-    let watcher = Watcher {
-        state: state.clone(),
-    };
-
-    // Register the watcher object.
-    conn.object_server()
-        .at("/StatusNotifierWatcher", watcher)
-        .await
-        .context("register /StatusNotifierWatcher")?;
-
-    // Acquire the well-known name, replacing any existing holder.
-    let dbus = fdo::DBusProxy::new(&conn)
-        .await
-        .context("create DBusProxy")?;
-
-    let flags = fdo::RequestNameFlags::ReplaceExisting | fdo::RequestNameFlags::DoNotQueue;
-    let reply = dbus
-        .request_name("org.kde.StatusNotifierWatcher".try_into().unwrap(), flags)
-        .await
-        .context("request_name")?;
-
-    if reply != fdo::RequestNameReply::PrimaryOwner && reply != fdo::RequestNameReply::AlreadyOwner
-    {
-        return Err(anyhow!(
-            "could not acquire org.kde.StatusNotifierWatcher: {reply:?}"
-        ));
-    }
-
-    tracing::info!("org.kde.StatusNotifierWatcher acquired");
-
-    // Watch for bus names disappearing so we can clean up their items.
-    let mut noc_stream = dbus
-        .receive_name_owner_changed()
-        .await
-        .context("subscribe NameOwnerChanged")?;
-
-    while let Some(signal) = noc_stream.next().await {
-        let args = match signal.args() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(error = %e, "NameOwnerChanged parse error");
-                continue;
-            }
+    let mut events = owner_changes.events();
+    while let Some(event) = events.next().await {
+        let Ok((name, _old_owner, new_owner)) =
+            event.body.body().deserialize::<(String, String, String)>()
+        else {
+            tracing::debug!("NameOwnerChanged parse error");
+            continue;
         };
 
         // `new_owner` is empty → the bus name was released.
-        if args.new_owner().is_none() {
-            let gone = args.name().to_string();
-            tracing::debug!(name = gone, "bus name released, pruning tray items");
-            state.unregister_by_bus_name(&gone).await;
+        if new_owner.is_empty() {
+            tracing::debug!(name, "bus name released, pruning tray items");
+            state.unregister_by_bus_name(&name).await;
         }
     }
 
     Ok(())
 }
 
-// ── Helper: read item properties ──────────────────────────────────────────────
+// ── Helper: read item properties via bus::call ────────────────────────────────
 
-async fn read_item_props(conn: &Connection, bus_name: &str, object_path: &str) -> Result<TrayItem> {
-    let proxy = zbus::Proxy::new(conn, bus_name, object_path, "org.kde.StatusNotifierItem")
+/// Read a single D-Bus property from a `StatusNotifierItem`.
+async fn get_sni_property<T>(bus_name: &str, object_path: &str, prop: &'static str) -> Option<T>
+where
+    T: serde::de::DeserializeOwned + zbus::zvariant::Type + 'static,
+{
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(object_path)
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Get")
+        .args((SNI_IFACE, prop))
+        .send::<T>()
         .await
-        .context("create item proxy")?;
+        .ok()
+}
 
-    let title: String = proxy.get_property("Title").await.unwrap_or_default();
-    let icon_name: String = proxy.get_property("IconName").await.unwrap_or_default();
-    let status_str: String = proxy.get_property("Status").await.unwrap_or_default();
+async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> {
+    let title: String = get_sni_property(bus_name, object_path, "Title")
+        .await
+        .unwrap_or_default();
+    let icon_name: String = get_sni_property(bus_name, object_path, "IconName")
+        .await
+        .unwrap_or_default();
+    let status_str: String = get_sni_property(bus_name, object_path, "Status")
+        .await
+        .unwrap_or_default();
 
     // IconPixmap: a(iiay) — pick the largest entry (by area).
     let icon_pixmap = if icon_name.is_empty() {
-        read_icon_pixmap(&proxy).await
+        read_icon_pixmap(bus_name, object_path).await
     } else {
         None
     };
 
     // Tooltip: (s, a(iiay), s, s) — (icon_name, icon_pixmap, title, description).
-    let (tooltip_title, tooltip_description) = read_tooltip(&proxy).await;
+    let (tooltip_title, tooltip_description) = read_tooltip(bus_name, object_path).await;
 
     // Menu object path.
-    let menu_path: Option<String> = read_menu_path(&proxy).await;
+    let menu_path = read_menu_path(bus_name, object_path).await;
 
     Ok(TrayItem {
         key: format!("{bus_name}{object_path}"),
@@ -777,9 +805,9 @@ async fn read_item_props(conn: &Connection, bus_name: &str, object_path: &str) -
 }
 
 /// Read `IconPixmap` and return the largest entry as `(w, h, bytes)`.
-async fn read_icon_pixmap(proxy: &zbus::Proxy<'_>) -> Option<(i32, i32, Vec<u8>)> {
+async fn read_icon_pixmap(bus_name: &str, object_path: &str) -> Option<(i32, i32, Vec<u8>)> {
     // Type: a(iiay)
-    let raw: OwnedValue = proxy.get_property("IconPixmap").await.ok()?;
+    let raw: OwnedValue = get_sni_property(bus_name, object_path, "IconPixmap").await?;
     let arr = zbus::zvariant::Array::try_from(raw).ok()?;
 
     let mut best: Option<(i32, i32, Vec<u8>)> = None;
@@ -821,11 +849,11 @@ async fn read_icon_pixmap(proxy: &zbus::Proxy<'_>) -> Option<(i32, i32, Vec<u8>)
 }
 
 /// Read `Tooltip` property and extract `(title, description)`.
-async fn read_tooltip(proxy: &zbus::Proxy<'_>) -> (String, String) {
+async fn read_tooltip(bus_name: &str, object_path: &str) -> (String, String) {
     // Type: (s, a(iiay), s, s)
-    let raw: OwnedValue = match proxy.get_property("ToolTip").await {
-        Ok(v) => v,
-        Err(_) => return (String::new(), String::new()),
+    let raw: OwnedValue = match get_sni_property(bus_name, object_path, "ToolTip").await {
+        Some(v) => v,
+        None => return (String::new(), String::new()),
     };
 
     let Ok(s) = Structure::try_from(raw) else {
@@ -850,8 +878,8 @@ async fn read_tooltip(proxy: &zbus::Proxy<'_>) -> (String, String) {
 }
 
 /// Read `Menu` property and return the object path as a `String`, or `None`.
-async fn read_menu_path(proxy: &zbus::Proxy<'_>) -> Option<String> {
-    let raw: OwnedValue = proxy.get_property("Menu").await.ok()?;
+async fn read_menu_path(bus_name: &str, object_path: &str) -> Option<String> {
+    let raw: OwnedValue = get_sni_property(bus_name, object_path, "Menu").await?;
     // The Menu property is an object path (o).
     let path = zbus::zvariant::OwnedObjectPath::try_from(raw).ok()?;
     let s = path.as_str().to_string();

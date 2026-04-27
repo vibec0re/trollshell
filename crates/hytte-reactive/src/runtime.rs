@@ -17,6 +17,7 @@ pub fn handle() -> &'static Handle {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("hytte-tokio")
+                .thread_stack_size(8 * 1024 * 1024) // 8 MB; default 2 MB is tight in debug
                 .build()
                 .expect("failed to build hytte tokio runtime")
         })

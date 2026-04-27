@@ -314,7 +314,17 @@ pub fn page_network() -> gtk::Widget {
 
     column.append(build_connection_group_v2().upcast_ref::<gtk::Widget>());
     column.append(build_traffic_group_v2().upcast_ref::<gtk::Widget>());
-    column.append(build_wifi_group_v2().upcast_ref::<gtk::Widget>());
+
+    let wifi_group = build_wifi_group_v2();
+    // Hide the Wi-Fi section entirely when no adapter is present (e.g. a
+    // desktop machine with no wireless hardware) so the popup doesn't show
+    // dead pixels / an empty group.
+    bind(
+        wifi::adapter().map(|a| a.is_some()),
+        &wifi_group,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+    column.append(wifi_group.upcast_ref::<gtk::Widget>());
 
     finish_page(&column)
 }

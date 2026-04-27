@@ -507,6 +507,97 @@ Existing `crates/hytte-services/tests/clock.rs` is the precedent — it tests be
 
 The bug being fixed manifests over hours. Unit tests cannot prove the fix. End-to-end verification: 24h soak with `lsof -p $(pidof trollshell) | wc -l` monitored for stability and `dbus-broker` uptime monitored for restarts. Documented as a release gate in this design, not as a CI check.
 
+## Implementation lessons
+
+Four non-obvious lessons emerged during the hytte-bus implementation (Phases 4–6 and the foundation review). Each section describes the rule, why it matters, and how to recognise when it applies.
+
+### Lesson 1: Anchor-name pattern for D-Bus agents
+
+When mounting an agent interface — one that a daemon calls back into, such as polkit's `AuthAgent`, iwd's `Agent`, or bluez's `PairAgent` — the well-known name we own is irrelevant to the daemon. Daemons look up our connection's **unique name** (`:1.42`-style) at registration time and call back via that. `bus::own_name("cc.hannig.trollshell.<service>-agent")` is used purely as an **anchor** that:
+
+- Keeps the bus layer's connection alive (a connection with no registered names can be collected by the broker).
+- Provides a logical path for `at_path` to mount the interface on.
+- Gives the supervisor task something concrete to remount on reconnect — it re-`RequestName`s and re-mounts the interface, which re-exports the object at the same path on the new connection before re-registering with the daemon.
+
+Three services use this pattern: `polkit`, `wifi`, and `bluetooth`. The naming convention is `cc.hannig.trollshell.<short-service-name>-agent`. Recognise the situation: any service that registers a callback object with a daemon (rather than owning a public service name) is using this pattern, even if it never intends for other processes to discover the name.
+
+### Lesson 2: Cross-bus rule
+
+When a service registers an agent with a daemon, the agent interface **must** be mounted on the **same bus** that the registration call is made from.
+
+Polkit's `Authority` is on the system bus, so the polkit agent must be mounted on the system bus. The same applies to iwd and bluez — both are system bus daemons. If you mount the agent interface on the session bus and register from the system bus, the daemon records your system-bus unique name and tries to call back at `<system-unique-name>:AGENT_PATH` — finding nothing, because the interface lives on a different connection.
+
+Recognise the situation: any time `bus::own_name(...)` mounts an agent **and** `bus::call(...)` registers it with a daemon, both must use the same `BusKind`. Pre-Phase-4 polkit had this bug silently for the original code's lifetime; it was discovered during migration code review.
+
+### Lesson 3: Registry is thread-local; cross-thread mutators need a static `OnceLock`
+
+`hytte_reactive::registry` is a `thread_local!` by design — populated only on the GTK main thread, where `App::run` calls `Service::start`. It is **empty** on hytte-tokio worker threads.
+
+Public service functions that can be called from **either** thread — widget callbacks arriving on GTK, and D-Bus interface methods, spawned tasks, and timers arriving on hytte-tokio — must **not** use `registry::with(...)` to look up shared state. The lookup silently no-ops on hytte-tokio threads.
+
+```rust
+// BUG: this works only when called from the GTK thread.
+pub fn dismiss(id: u32) {
+    runtime::handle().spawn(async move {
+        let h = registry::with(|r| r.get::<Handles>().map(|h| h.field.clone()));
+        // h is always None on the spawned task → silent no-op
+    });
+}
+```
+
+Fix: initialise shared state into a `static OnceLock` inside `Service::start`, and read from it directly in public functions.
+
+```rust
+struct ServiceShared {
+    field: Mutable<...>,  // must be Send + Sync
+    // ...
+}
+static SHARED: OnceLock<ServiceShared> = OnceLock::new();
+
+impl Service for X {
+    fn start(self, _rt: &Handle) -> Self::Handles {
+        let field = Mutable::new(...);
+        let _ = SHARED.set(ServiceShared { field: field.clone(), ... });
+        // ...
+    }
+}
+
+pub fn dismiss(id: u32) {
+    let Some(shared) = SHARED.get() else { return };
+    // synchronous local mutation — Mutable is thread-safe
+    shared.field.lock_mut().do_thing(id);
+    // async work (e.g. signal emit, bus call) on the runtime
+    runtime::handle().spawn(async move { /* bus::call */ });
+}
+```
+
+This bug class hit five services before it was fixed: `notifications`, `screensaver`, `polkit`, `bluetooth`, and `wifi`. Fixed in commits `11bb204`, `7421a11`, `9ba1977`, and `751c4dd`. Future rule: if a public function might ever be called from a D-Bus interface method or a spawned task, use the static-`OnceLock` pattern from the start.
+
+### Lesson 4: Subscriptions must `select!` on the supervisor's `epoch_signal` to react to reconnect
+
+`bus::signals`, `bus::property`, and `bus::proxy` each run an inner loop that consumes events from a long-lived stream — a `PropertiesChanged` subscription, a signal subscription, or a `NameOwnerChanged` watcher. A supervisor reconnect does **not** terminate those streams. The inner task holds a cloned `Connection` from the prior `with_conn` call, and zbus's Arc-backed socket keeps the old connection alive.
+
+Result: the supervisor reconnects, bumps the epoch, and the new `SharedConnection` is healthy — but the inner task remains stuck on the dead connection's stream, producing nothing, indefinitely.
+
+The fix (used in all three primitives): `tokio::select!` between the data stream and `shared.epoch_signal().to_stream()`. When the epoch advances past the value captured **right after** the original `with_conn` returns (not before — capturing before `with_conn` introduces a cold-start race caught during the foundation review), break out of the inner loop. The outer loop re-`with_conn`s on the fresh connection.
+
+```rust
+let current_epoch = shared.epoch();   // capture AFTER with_conn returns
+let mut epoch_stream = shared.epoch_signal().to_stream();
+loop {
+    tokio::select! {
+        Some(event) = stream.next() => { /* handle */ }
+        Some(new_epoch) = epoch_stream.next() => {
+            if new_epoch > current_epoch {
+                break;  // outer loop re-establishes on fresh connection
+            }
+        }
+    }
+}
+```
+
+`property.rs` originally lacked the `select`-on-epoch arm; the gap was caught by adding `tests/property.rs::reconnect_emits_stale_then_loaded` and fixed in commit `b25dcc5`. `signals.rs` and `proxy.rs` already had the pattern from their original implementation. Future rule: every primitive that holds a long-lived stream must select on the epoch signal, and must capture the epoch **after** `with_conn`, not before.
+
 ## Appendix — illustrative migration: `notifications`
 
 Today, the loop in `crates/hytte-services/src/notifications.rs:147-164`:

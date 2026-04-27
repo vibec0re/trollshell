@@ -1,4 +1,4 @@
 timeout 240 'brightnessctl -s set 10%' resume 'brightnessctl -r'
-timeout 300 'gtklock'
+timeout 300 'loginctl lock-session'
 timeout 600 'systemctl suspend'
-before-sleep 'gtklock'
+before-sleep 'loginctl lock-session'

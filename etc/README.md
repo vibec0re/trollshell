@@ -17,3 +17,19 @@ into your user config directory per the per-feature README.
 
 For the entire stack: see [systemd/user/README.md](systemd/user/README.md) for the
 full install sequence.
+
+## PAM lock screen
+
+Install the screen-unlock PAM service file:
+
+```sh
+sudo install -m 644 etc/pam.d/trollshell /etc/pam.d/trollshell
+```
+
+Without this file the lock UI mounts but authentication fails with
+"Authentication unavailable" — there's no PAM service named
+`trollshell` for libpam to consult.
+
+Build-time deps: `libpam` headers (Arch `pam` package, Nix
+`pkgs.pam`). Runtime deps: standard `pam_unix` stack (default on
+every distro that has working login).

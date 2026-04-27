@@ -57,7 +57,33 @@ use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ── Cross-thread shared handle ────────────────────────────────────────────────
+//
+// `hytte_reactive::registry` is a thread-local — initialised on the GTK main
+// thread, empty on hytte-tokio worker threads. Public mutators below
+// (`lock`, `inhibit`, `uninhibit`, `handle_unlock_success`) are called from
+// BOTH threads:
+//   - GTK: widget button handlers, keybinds, power-menu.
+//   - hytte-tokio: `ScreenSaverIface::lock`, `ScreenSaverIface::inhibit`,
+//     `ScreenSaverIface::un_inhibit` D-Bus methods, which run on the bus
+//     connection's tokio worker.
+//
+// Using `registry::with` from a hytte-tokio thread silently no-ops (no
+// handles → early return), causing `Lock()` D-Bus calls and inhibit/uninhibit
+// from external apps (Firefox, Chromium, mpv) to be silently dropped. A
+// static `OnceLock` populated by `Service::start` is the cross-thread-safe
+// alternative — `Mutable<T>`, `Arc<Mutex<…>>`, and `Arc<AtomicU32>` are all
+// `Send + Sync`, so storing them in a static is safe.
+struct ScreenSaverShared {
+    is_locked: Mutable<bool>,
+    state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
+    inhibitors: Mutable<Vec<Inhibitor>>,
+    next_cookie: Arc<AtomicU32>,
+}
+
+static SHARED: OnceLock<ScreenSaverShared> = OnceLock::new();
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -79,17 +105,16 @@ pub struct Inhibitor {
 
 #[doc(hidden)]
 pub struct ScreenSaverHandles {
-    /// Live inhibitor list, keyed by cookie. Wrapped in a sync Mutex so
-    /// both the public `inhibit/uninhibit` helpers and the D-Bus interface
-    /// methods (which run on the tokio scheduler) can mutate without
-    /// `.await`-ing across an async barrier.
+    /// Live inhibitor list, keyed by cookie. Mutators now go through SHARED;
+    /// kept here so the Arc isn't dropped (its backing Mutex is shared).
+    #[allow(dead_code)]
     pub(crate) state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
     /// Reactive view of `state` for UI subscribers. Kept in sync after
     /// every mutation by [`publish_inhibitors`].
     pub(crate) inhibitors: Mutable<Vec<Inhibitor>>,
-    /// Monotonic cookie counter. u32 is plenty: even at one inhibit per
-    /// second we'd take ~136 years to wrap, and apps that leak cookies
-    /// will hit the `HashMap` memory limit long before.
+    /// Monotonic cookie counter. Mutators now go through SHARED; kept here
+    /// so the Arc is not dropped prematurely.
+    #[allow(dead_code)]
     pub(crate) next_cookie: Arc<AtomicU32>,
     /// `true` while the native lock UI is mounted on all monitors, `false`
     /// otherwise. Set by [`lock`] and cleared by [`handle_unlock_success`].
@@ -129,6 +154,13 @@ impl Service for ScreenSaverService {
         // Start the login1 Session.Lock/Unlock listener.
         let locked_writer = is_locked.clone();
         rt.spawn(spawn_login1_listener(locked_writer));
+
+        let _ = SHARED.set(ScreenSaverShared {
+            is_locked: is_locked.clone(),
+            state: state.clone(),
+            inhibitors: inhibitors.clone(),
+            next_cookie: next_cookie.clone(),
+        });
 
         ScreenSaverHandles {
             state,
@@ -176,13 +208,11 @@ pub fn is_locked() -> impl Signal<Item = bool> {
 /// tells logind to release its session-level lock state via
 /// `Session.SetLockedHint(false)`.
 pub fn handle_unlock_success() {
-    let Some(locked) = registry::with(|r| {
-        r.get::<ScreenSaverHandles>().map(|h| h.is_locked.clone())
-    }) else {
+    let Some(shared) = SHARED.get() else {
         tracing::warn!("handle_unlock_success called before service registered");
         return;
     };
-    locked.set(false);
+    shared.is_locked.set(false);
     runtime::handle().spawn(async move {
         if let Err(e) = call_login1_unlock().await {
             tracing::warn!(error = %e, "login1 SetLockedHint(false) failed");
@@ -333,13 +363,11 @@ async fn get_locked_hint(session_path: &str) -> Result<bool, hytte_bus::BusError
 /// `widgets::lock_screen` subscription mounts the per-monitor lock
 /// surfaces in response.
 pub fn lock() {
-    let Some(locked) = registry::with(|r| {
-        r.get::<ScreenSaverHandles>().map(|h| h.is_locked.clone())
-    }) else {
+    let Some(shared) = SHARED.get() else {
         tracing::warn!("screensaver::lock called before service registered");
         return;
     };
-    locked.set(true);
+    shared.is_locked.set(true);
 }
 
 /// Programmatically register an inhibitor. Returns the cookie; the caller
@@ -350,25 +378,21 @@ pub fn lock() {
 /// through D-Bus.
 #[must_use]
 pub fn inhibit(application: &str, reason: &str) -> u32 {
-    let Some(handles) = registry::with(|r| {
-        r.get::<ScreenSaverHandles>()
-            .map(|h| (h.state.clone(), h.inhibitors.clone(), h.next_cookie.clone()))
-    }) else {
+    let Some(shared) = SHARED.get() else {
         // Service not registered (test harness?): return a sentinel so the
         // caller can still "release" without panicking.
         return 0;
     };
-    let (state, view, counter) = handles;
-    let cookie = counter.fetch_add(1, Ordering::Relaxed);
+    let cookie = shared.next_cookie.fetch_add(1, Ordering::Relaxed);
     let was_empty = insert_inhibitor(
-        &state,
+        &shared.state,
         Inhibitor {
             cookie,
             application: application.to_string(),
             reason: reason.to_string(),
         },
     );
-    publish_inhibitors(&state, &view);
+    publish_inhibitors(&shared.state, &shared.inhibitors);
     if was_empty {
         spawn_pause_swayidle();
     }
@@ -378,15 +402,11 @@ pub fn inhibit(application: &str, reason: &str) -> u32 {
 /// Release a cookie returned from [`inhibit`]. Unknown cookies are
 /// silently ignored — apps regularly double-call `UnInhibit` on shutdown.
 pub fn uninhibit(cookie: u32) {
-    let Some(handles) = registry::with(|r| {
-        r.get::<ScreenSaverHandles>()
-            .map(|h| (h.state.clone(), h.inhibitors.clone()))
-    }) else {
+    let Some(shared) = SHARED.get() else {
         return;
     };
-    let (state, view) = handles;
-    let became_empty = remove_inhibitor(&state, cookie);
-    publish_inhibitors(&state, &view);
+    let became_empty = remove_inhibitor(&shared.state, cookie);
+    publish_inhibitors(&shared.state, &shared.inhibitors);
     if became_empty {
         spawn_resume_swayidle();
     }

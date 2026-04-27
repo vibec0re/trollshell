@@ -117,6 +117,7 @@ fn build_lock_surface(monitor: &Monitor, primary: bool) -> LockSurface {
         card.append(&user_label);
 
         let entry = gtk::PasswordEntry::new();
+        // No peek icon: prevents shoulder-surf reveal on a lock screen.
         entry.set_show_peek_icon(false);
         entry.add_css_class("ts-lock-entry");
         entry.set_width_chars(28);
@@ -271,6 +272,10 @@ fn install_lock_subscription() {
                         if let Some(p) = surface.primary.as_ref() {
                             p.entry.set_text("");
                             p.error_label.set_visible(false);
+                            p.spinner.set_spinning(false);
+                            p.spinner.set_visible(false);
+                            p.submit_btn.set_sensitive(true);
+                            p.entry.set_sensitive(true);
                         }
                         surface.window.set_visible(false);
                     }

@@ -122,12 +122,14 @@ impl Service for PolkitService {
 
         let agent = AuthAgent {};
 
-        // Mount the AuthAgent interface on the session bus under a private
-        // anchor name.  The well-known name is irrelevant to polkit — it
-        // calls back via our unique name (:1.xx) — but owning it keeps the
-        // bus layer's connection alive and re-mounts the interface on
-        // reconnect.
+        // Mount the AuthAgent on the SYSTEM bus (same as the polkit Authority).
+        // polkit records our system-bus unique name (:1.xx) when we call
+        // RegisterAuthenticationAgent, then issues BeginAuthentication
+        // callbacks at <our-system-unique-name>:AGENT_PATH — also on the
+        // system bus.  The well-known anchor name keeps the connection alive
+        // and re-mounts the interface on reconnect.
         let ownership = hytte_bus::own_name(ANCHOR_NAME)
+            .bus(hytte_bus::BusKind::System)
             .at_path(AGENT_PATH, agent)
             .start();
 
@@ -627,6 +629,11 @@ async fn run_agent_lifecycle() -> Result<()> {
         .start();
 
     let mut events = polkitd_changes.events();
+    // Track whether polkitd has ever disappeared since we started.  Only
+    // re-register on a genuine "absent → present" transition; the initial
+    // NameOwnerChanged snapshot delivered at subscription time must not
+    // trigger a redundant RegisterAuthenticationAgent call.
+    let mut polkitd_was_absent = false;
     while let Some(event) = events.next().await {
         let Ok(args) = event.body.body().deserialize::<(String, String, String)>() else {
             continue;
@@ -636,10 +643,16 @@ async fn run_agent_lifecycle() -> Result<()> {
             continue;
         }
         if new_owner.is_empty() {
-            tracing::warn!("polkitd disappeared — will re-register on restart");
+            tracing::warn!("polkitd disappeared — will re-register when it returns");
+            polkitd_was_absent = true;
             continue;
         }
-        // polkitd came back: re-register our agent.
+        // polkitd present.  Only re-register if we previously saw it absent;
+        // skip the initial snapshot event delivered at subscription time.
+        if !polkitd_was_absent {
+            continue;
+        }
+        polkitd_was_absent = false;
         if let Err(e) = register_with_authority(subject.clone()).await {
             tracing::warn!(error = %e, "re-RegisterAuthenticationAgent failed");
         } else {
@@ -658,6 +671,7 @@ async fn register_with_authority(
         .iface("org.freedesktop.PolicyKit1.Authority")
         .method("RegisterAuthenticationAgent")
         .args((subject, "en_US.UTF-8".to_string(), AGENT_PATH.to_string()))
+        .retry(hytte_bus::RetryPolicy::Backoff { max_attempts: 5 })
         .send::<()>()
         .await
 }

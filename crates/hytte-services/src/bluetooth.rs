@@ -103,6 +103,33 @@ pub struct Device {
     pub battery: Option<u8>,
 }
 
+// ── Cross-thread shared handle ────────────────────────────────────────────────
+//
+// `hytte_reactive::registry` is a thread-local — initialised on the GTK main
+// thread, empty on hytte-tokio worker threads. The following call paths run on
+// hytte-tokio and must NOT use `registry::with`:
+//   - The reconnect-cleanup loop in `Service::start`'s spawned task clears
+//     `device_actions` / `pair_prompt` / `pending_response` on bluetoothd
+//     restart; without a handle it silently skips the cleanup.
+//   - `send_reply` (called by `respond_to_prompt`, `submit_pin`,
+//     `submit_passkey`) spawns a task that signals `pending_response`; the
+//     pairing dialog hangs forever on a no-op.
+//   - `PairAgent` iface methods (`request_pin_code`, `request_passkey`,
+//     `request_confirmation`, `request_authorization`, `cancel`) call
+//     `lookup_alias`, `pending_response_arc`, `set_prompt`, `clear_prompt`
+//     — all of which used `registry::with`.
+//
+// A static `OnceLock` populated by `Service::start` is the cross-thread-safe
+// alternative — `Mutable<T>` and `Arc<AsyncMutex<…>>` are `Send + Sync`.
+struct BluetoothShared {
+    devices: Mutable<Vec<Device>>,
+    device_actions: Mutable<HashSet<String>>,
+    pair_prompt: Mutable<Option<PairPrompt>>,
+    pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+}
+
+static SHARED: OnceLock<BluetoothShared> = OnceLock::new();
+
 // ── Adapter path storage ──────────────────────────────────────────────────────
 
 /// Filled by the listen loop on adapter discovery; read by command fns.
@@ -195,6 +222,13 @@ impl Service for BluetoothService {
             pending_response: Arc::new(AsyncMutex::new(None)),
             ownership: ownership.clone(),
         };
+        let _ = SHARED.set(BluetoothShared {
+            devices: handles.devices.clone(),
+            device_actions: handles.device_actions.clone(),
+            pair_prompt: handles.pair_prompt.clone(),
+            pending_response: handles.pending_response.clone(),
+        });
+
         let adapter_mutable = handles.adapter.clone();
         let devices_mutable = handles.devices.clone();
 
@@ -214,14 +248,12 @@ impl Service for BluetoothService {
                 // awaiting it returns Reject instead of hanging forever).
                 adapter_mutable.set(None);
                 devices_mutable.set(Vec::new());
-                let pending_response = registry::with(|r| {
-                    r.get::<BluetoothHandles>().map(|h| {
-                        h.device_actions.lock_mut().clear();
-                        if h.pair_prompt.lock_ref().is_some() {
-                            h.pair_prompt.set(None);
-                        }
-                        h.pending_response.clone()
-                    })
+                let pending_response = SHARED.get().map(|s| {
+                    s.device_actions.lock_mut().clear();
+                    if s.pair_prompt.lock_ref().is_some() {
+                        s.pair_prompt.set(None);
+                    }
+                    s.pending_response.clone()
                 });
                 if let Some(pending) = pending_response
                     && let Some(tx) = pending.lock().await.take()
@@ -332,12 +364,10 @@ pub fn submit_passkey(passkey: u32) {
 }
 
 fn send_reply(reply: AgentReply) {
+    let Some(pending) = SHARED.get().map(|s| s.pending_response.clone()) else {
+        return;
+    };
     runtime::handle().spawn(async move {
-        let pending = registry::with(|r| {
-            r.get::<BluetoothHandles>()
-                .map(|h| h.pending_response.clone())
-        });
-        let Some(pending) = pending else { return };
         let mut guard = pending.lock().await;
         if let Some(tx) = guard.take() {
             let _ = tx.send(reply);
@@ -346,33 +376,26 @@ fn send_reply(reply: AgentReply) {
 }
 
 fn mark_busy(path: &str) {
-    registry::with(|r| {
-        let handles = r
-            .get::<BluetoothHandles>()
-            .expect("bluetooth::service() not registered");
-        // Peek with a read lock first — `lock_mut()` always fires the
-        // signal on drop, even if the contents didn't change, so we only
-        // take a write lock when the value will actually flip.
-        if handles.device_actions.lock_ref().contains(path) {
-            return;
-        }
-        handles
-            .device_actions
-            .lock_mut()
-            .insert(path.to_string());
-    });
+    let Some(shared) = SHARED.get() else {
+        return;
+    };
+    // Peek with a read lock first — `lock_mut()` always fires the
+    // signal on drop, even if the contents didn't change, so we only
+    // take a write lock when the value will actually flip.
+    if shared.device_actions.lock_ref().contains(path) {
+        return;
+    }
+    shared.device_actions.lock_mut().insert(path.to_string());
 }
 
 fn mark_idle(path: &str) {
-    registry::with(|r| {
-        let handles = r
-            .get::<BluetoothHandles>()
-            .expect("bluetooth::service() not registered");
-        if !handles.device_actions.lock_ref().contains(path) {
-            return;
-        }
-        handles.device_actions.lock_mut().remove(path);
-    });
+    let Some(shared) = SHARED.get() else {
+        return;
+    };
+    if !shared.device_actions.lock_ref().contains(path) {
+        return;
+    }
+    shared.device_actions.lock_mut().remove(path);
 }
 
 /// Fire-and-forget: set the `Powered` property on the adapter.
@@ -1201,29 +1224,25 @@ impl PairAgent {
 /// falls through to the MAC address, and ultimately "Unknown device" so a
 /// raw D-Bus object path never bleeds into UI copy.
 fn lookup_alias(path: &str) -> String {
-    registry::with(|r| {
-        r.get::<BluetoothHandles>()
-            .and_then(|h| {
-                let devs = h.devices.lock_ref();
-                devs.iter().find(|d| d.path == path).map(|d| {
-                    if !d.alias.is_empty() {
-                        d.alias.clone()
-                    } else if !d.address.is_empty() {
-                        d.address.clone()
-                    } else {
-                        "Unknown device".to_string()
-                    }
-                })
+    SHARED
+        .get()
+        .and_then(|s| {
+            let devs = s.devices.lock_ref();
+            devs.iter().find(|d| d.path == path).map(|d| {
+                if !d.alias.is_empty() {
+                    d.alias.clone()
+                } else if !d.address.is_empty() {
+                    d.address.clone()
+                } else {
+                    "Unknown device".to_string()
+                }
             })
-            .unwrap_or_else(|| "Unknown device".to_string())
-    })
+        })
+        .unwrap_or_else(|| "Unknown device".to_string())
 }
 
 fn pending_response_arc() -> Option<Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>> {
-    registry::with(|r| {
-        r.get::<BluetoothHandles>()
-            .map(|h| h.pending_response.clone())
-    })
+    SHARED.get().map(|s| s.pending_response.clone())
 }
 
 async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
@@ -1232,11 +1251,9 @@ async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
 }
 
 fn set_prompt(p: Option<PairPrompt>) {
-    registry::with(|r| {
-        if let Some(h) = r.get::<BluetoothHandles>() {
-            h.pair_prompt.set(p);
-        }
-    });
+    if let Some(s) = SHARED.get() {
+        s.pair_prompt.set(p);
+    }
 }
 
 fn clear_prompt() {

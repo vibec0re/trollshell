@@ -1,16 +1,23 @@
 //! Battery state via `UPower`.
 //!
-//! Subscribes to `org.freedesktop.UPower.Device.PropertiesChanged` on the
-//! `/org/freedesktop/UPower/devices/DisplayDevice` path of the `UPower`
-//! daemon (the aggregated battery — one entry covering all batteries on
-//! the system).
+//! Subscribes to `org.freedesktop.UPower.Device` properties on
+//! `/org/freedesktop/UPower/devices/DisplayDevice` (the aggregated battery —
+//! one entry covering all batteries on the system).
+//!
+//! Each tracked field (`Percentage`, `State`, `IconName`, `TimeToEmpty`,
+//! `TimeToFull`) gets its own [`hytte_bus::property`] subscription.  Changes
+//! are coalesced into the shared [`Battery`] via parallel `for_each` tasks
+//! that each update only their slice of the state (same pattern as
+//! `power_profiles`).
 
-use anyhow::{anyhow, Context, Result};
-use futures_signals::signal::{Mutable, Signal};
-use futures_util::StreamExt;
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_bus::{property, BusKind, PropState};
 use hytte_reactive::{registry, Service};
 use std::time::Duration;
-use zbus::Connection;
+
+const UPOWER_NAME: &str = "org.freedesktop.UPower";
+const DISPLAY_DEVICE_PATH: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
+const DEVICE_IFACE: &str = "org.freedesktop.UPower.Device";
 
 pub struct UpowerService;
 
@@ -81,71 +88,132 @@ impl Default for UpowerHandles {
 impl Service for UpowerService {
     type Handles = UpowerHandles;
 
+    #[allow(clippy::too_many_lines)]
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = UpowerHandles::default();
         let writer = handles.battery.clone();
 
+        // ── Percentage ────────────────────────────────────────────────────────
+        let percentage_signal = property::<f64>(UPOWER_NAME)
+            .bus(BusKind::System)
+            .at_path(DISPLAY_DEVICE_PATH)
+            .iface(DEVICE_IFACE)
+            .name("Percentage")
+            .start();
+
+        // ── State ─────────────────────────────────────────────────────────────
+        let state_signal = property::<u32>(UPOWER_NAME)
+            .bus(BusKind::System)
+            .at_path(DISPLAY_DEVICE_PATH)
+            .iface(DEVICE_IFACE)
+            .name("State")
+            .start();
+
+        // ── TimeToEmpty ───────────────────────────────────────────────────────
+        let time_to_empty_signal = property::<i64>(UPOWER_NAME)
+            .bus(BusKind::System)
+            .at_path(DISPLAY_DEVICE_PATH)
+            .iface(DEVICE_IFACE)
+            .name("TimeToEmpty")
+            .start();
+
+        // ── TimeToFull ────────────────────────────────────────────────────────
+        let time_to_full_signal = property::<i64>(UPOWER_NAME)
+            .bus(BusKind::System)
+            .at_path(DISPLAY_DEVICE_PATH)
+            .iface(DEVICE_IFACE)
+            .name("TimeToFull")
+            .start();
+
+        // ── IconName ──────────────────────────────────────────────────────────
+        let icon_name_signal = property::<String>(UPOWER_NAME)
+            .bus(BusKind::System)
+            .at_path(DISPLAY_DEVICE_PATH)
+            .iface(DEVICE_IFACE)
+            .name("IconName")
+            .start();
+
+        // ── Coalesce into Battery ─────────────────────────────────────────────
+
+        let percentage_writer = writer.clone();
         rt.spawn(async move {
-            loop {
-                match listen(&writer).await {
-                    Ok(()) => tracing::warn!("upower stream closed, reconnecting in 1s"),
-                    Err(e) => tracing::warn!(error = %e, "upower error, reconnecting in 1s"),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            percentage_signal
+                .signal()
+                .for_each(move |s| {
+                    let pct = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => 0.0,
+                    };
+                    percentage_writer.lock_mut().percentage = pct;
+                    std::future::ready(())
+                })
+                .await;
+        });
+
+        let state_writer = writer.clone();
+        rt.spawn(async move {
+            state_signal
+                .signal()
+                .for_each(move |s| {
+                    let raw = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => 0,
+                    };
+                    state_writer.lock_mut().state = BatteryState::from_u32(raw);
+                    std::future::ready(())
+                })
+                .await;
+        });
+
+        let tte_writer = writer.clone();
+        rt.spawn(async move {
+            time_to_empty_signal
+                .signal()
+                .for_each(move |s| {
+                    let secs = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => 0,
+                    };
+                    tte_writer.lock_mut().time_to_empty =
+                        u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs);
+                    std::future::ready(())
+                })
+                .await;
+        });
+
+        let ttf_writer = writer.clone();
+        rt.spawn(async move {
+            time_to_full_signal
+                .signal()
+                .for_each(move |s| {
+                    let secs = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => 0,
+                    };
+                    ttf_writer.lock_mut().time_to_full =
+                        u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs);
+                    std::future::ready(())
+                })
+                .await;
+        });
+
+        let icon_writer = writer.clone();
+        rt.spawn(async move {
+            icon_name_signal
+                .signal()
+                .for_each(move |s| {
+                    let name = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => String::new(),
+                    };
+                    icon_writer.lock_mut().icon_name = name;
+                    std::future::ready(())
+                })
+                .await;
         });
 
         handles
     }
-}
-
-async fn listen(battery: &Mutable<Battery>) -> Result<()> {
-    let conn = Connection::system().await.context("connect system bus")?;
-
-    // Read all properties of the DisplayDevice.
-    let read = || async {
-        let proxy = zbus::Proxy::new(
-            &conn,
-            "org.freedesktop.UPower",
-            "/org/freedesktop/UPower/devices/DisplayDevice",
-            "org.freedesktop.UPower.Device",
-        )
-        .await
-        .context("create DisplayDevice proxy")?;
-
-        let percentage: f64 = proxy.get_property("Percentage").await.unwrap_or(0.0);
-        let state: u32 = proxy.get_property("State").await.unwrap_or(0);
-        let time_to_empty: i64 = proxy.get_property("TimeToEmpty").await.unwrap_or(0);
-        let time_to_full: i64 = proxy.get_property("TimeToFull").await.unwrap_or(0);
-        let icon_name: String = proxy.get_property("IconName").await.unwrap_or_default();
-
-        Ok::<Battery, anyhow::Error>(Battery {
-            percentage,
-            state: BatteryState::from_u32(state),
-            time_to_empty: u64::try_from(time_to_empty).ok().map(Duration::from_secs),
-            time_to_full: u64::try_from(time_to_full).ok().map(Duration::from_secs),
-            icon_name,
-        })
-    };
-
-    // Initial state.
-    battery.set(read().await?);
-
-    // Subscribe to PropertiesChanged.
-    let proxy = zbus::fdo::PropertiesProxy::builder(&conn)
-        .destination("org.freedesktop.UPower")
-        .map_err(|e| anyhow!("set destination: {e}"))?
-        .path("/org/freedesktop/UPower/devices/DisplayDevice")
-        .map_err(|e| anyhow!("set path: {e}"))?
-        .build()
-        .await
-        .context("build properties proxy")?;
-
-    let mut changes = proxy.receive_properties_changed().await?;
-    while changes.next().await.is_some() {
-        battery.set(read().await?);
-    }
-    Ok(())
 }
 
 #[must_use]

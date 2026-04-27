@@ -24,18 +24,16 @@
 //! wifi::cancel_prompt(id);
 //! ```
 
-use anyhow::{Context, Result, anyhow};
 use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use hytte_bus::BusKind;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::OwnedValue;
-use zbus::Connection;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -109,7 +107,7 @@ pub struct PromptRequest {
 
 // ── Station path cache ────────────────────────────────────────────────────────
 
-/// Filled by the listen loop on station discovery; read by command helpers.
+/// Filled by the watcher on station discovery; read by command helpers.
 /// Uses an `RwLock` so a new station path (USB dongle swap) can be written.
 static STATION_PATH: OnceLock<Arc<tokio::sync::RwLock<String>>> = OnceLock::new();
 
@@ -125,7 +123,7 @@ async fn set_station_path(path: &str) {
     *station_path_store().write().await = path.to_string();
 }
 
-/// Filled by the listen loop on adapter discovery; read by command helpers.
+/// Filled by the watcher on adapter discovery; read by command helpers.
 static ADAPTER_PATH: OnceLock<Arc<tokio::sync::RwLock<String>>> = OnceLock::new();
 
 fn adapter_path_store() -> &'static Arc<tokio::sync::RwLock<String>> {
@@ -153,37 +151,6 @@ fn adapter_path_from_station(station_path: &str) -> String {
     format!("/net/connman/iwd/{}", parts[4])
 }
 
-/// Derive the adapter path from the station path, store it in the cache,
-/// and publish an initial Adapter snapshot from the `GetManagedObjects` map.
-async fn capture_initial_adapter(
-    managed: &ManagedObjects,
-    station_path: &str,
-    adapter_mutable: &Mutable<Option<Adapter>>,
-) {
-    let adapter_path = adapter_path_from_station(station_path);
-    if adapter_path.is_empty() {
-        set_current_adapter_path("").await;
-        adapter_mutable.set(None);
-        return;
-    }
-    set_current_adapter_path(&adapter_path).await;
-
-    let adapter_props = managed
-        .iter()
-        .find(|(p, _)| p.as_str() == adapter_path)
-        .and_then(|(_, ifaces)| ifaces.get("net.connman.iwd.Adapter1"));
-
-    if let Some(props) = adapter_props {
-        adapter_mutable.set(Some(Adapter {
-            path: adapter_path,
-            powered: prop_bool(props, "Powered"),
-            name: prop_str(props, "Name"),
-        }));
-    } else {
-        adapter_mutable.set(None);
-    }
-}
-
 // ── Agent waiter map (module-level OnceLock for public API access) ────────────
 
 type WaitersMap = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>;
@@ -194,6 +161,8 @@ fn waiters() -> Option<&'static WaitersMap> {
     WAITERS.get()
 }
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 // ── Service handle ────────────────────────────────────────────────────────────
 
 /// Shared mutable state held in the service registry.
@@ -203,16 +172,16 @@ pub struct WifiHandles {
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
     pub(crate) prompts: Mutable<Option<PromptRequest>>,
     pub(crate) adapter: Mutable<Option<Adapter>>,
+    #[allow(dead_code)]
+    ownership: hytte_bus::OwnNameSignal,
 }
 
 impl Default for WifiHandles {
     fn default() -> Self {
-        Self {
-            station: Mutable::new(None),
-            networks: Mutable::new(Vec::new()),
-            prompts: Mutable::new(None),
-            adapter: Mutable::new(None),
-        }
+        // We can't call own_name here without the runtime; ownership is set
+        // in Service::start. Use a placeholder that gets replaced immediately.
+        // This is never called in practice — start() constructs WifiHandles directly.
+        unreachable!("WifiHandles must be constructed via Service::start")
     }
 }
 
@@ -221,42 +190,48 @@ impl Default for WifiHandles {
 /// The Wi-Fi service marker type — pass to `App::with`.
 pub struct WifiService;
 
+const AGENT_PATH: &str = "/cc/hannig/trollshell/iwd_agent";
+const ANCHOR_NAME: &str = "cc.hannig.trollshell.iwd-agent";
+
 impl Service for WifiService {
     type Handles = WifiHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = WifiHandles::default();
-        let station_mutable = handles.station.clone();
-        let networks_mutable = handles.networks.clone();
-        let prompts_mutable = handles.prompts.clone();
-        let adapter_mutable = handles.adapter.clone();
+        // Initialise the WAITERS map once so public API functions can reach it.
+        let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        let _ = WAITERS.set(waiters_arc.clone());
 
-        rt.spawn(async move {
-            loop {
-                match listen(
-                    &station_mutable,
-                    &networks_mutable,
-                    &prompts_mutable,
-                    &adapter_mutable,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        tracing::warn!("wifi watcher closed, reconnecting in 2s");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "wifi watcher error, reconnecting in 2s");
-                    }
-                }
-                station_mutable.set(None);
-                networks_mutable.set(Vec::new());
-                prompts_mutable.set(None);
-                adapter_mutable.set(None);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
+        let station_mutable = Mutable::new(None);
+        let networks_mutable = Mutable::new(Vec::new());
+        let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
+        let adapter_mutable = Mutable::new(None);
 
-        handles
+        // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
+        // iwd records our system-bus unique name when we call RegisterAgent,
+        // then issues RequestPassphrase callbacks on the system bus.
+        let agent = IwdAgent {
+            prompts: prompts_mutable.clone(),
+            waiters: waiters_arc,
+        };
+        let ownership = hytte_bus::own_name(ANCHOR_NAME)
+            .bus(BusKind::System)
+            .at_path(AGENT_PATH, agent)
+            .start();
+
+        let station_m = station_mutable.clone();
+        let networks_m = networks_mutable.clone();
+        let prompts_m = prompts_mutable.clone();
+        let adapter_m = adapter_mutable.clone();
+
+        rt.spawn(run_wifi_watcher(station_m, networks_m, prompts_m, adapter_m));
+
+        WifiHandles {
+            station: station_mutable,
+            networks: networks_mutable,
+            prompts: prompts_mutable,
+            adapter: adapter_mutable,
+            ownership,
+        }
     }
 }
 
@@ -316,10 +291,6 @@ pub fn scan() {
 }
 
 /// Fire-and-forget: connect to the network at `network_path`.
-///
-/// For known networks this succeeds immediately. For unknown protected
-/// networks iwd will return an error (no agent registered); that error is
-/// silently logged — agent support is deferred to v0.6.1.
 pub fn connect_network(network_path: &str) {
     let path = network_path.to_string();
     runtime::handle().spawn(async move {
@@ -351,7 +322,7 @@ pub fn set_powered(on: bool) {
             tracing::warn!("wifi::set_powered: no adapter path known");
             return;
         }
-        if let Err(e) = do_set_adapter_bool(&path, "Powered", on).await {
+        if let Err(e) = do_set_powered(&path, on).await {
             tracing::warn!(error = %e, on, "wifi set_powered failed");
         }
     });
@@ -406,111 +377,54 @@ pub fn cancel_prompt(id: u64) {
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-/// Shared command-channel connection. Avoids opening a fresh system
-/// bus connection on every iwd call. Lazily opened on first call;
-/// evicted on I/O error so the next call reopens — trollshell
-/// survives `systemctl restart iwd` without itself restarting.
-static CMD_CONN: AsyncMutex<Option<Connection>> = AsyncMutex::const_new(None);
-
-async fn cmd_conn() -> Result<Connection> {
-    let mut guard = CMD_CONN.lock().await;
-    if guard.is_none() {
-        let fresh = Connection::system()
-            .await
-            .context("open shared wifi command connection")?;
-        *guard = Some(fresh);
-    }
-    Ok(guard
-        .as_ref()
-        .expect("just stored Some")
-        .clone())
+async fn do_station_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(path.to_string())
+        .iface("net.connman.iwd.Station")
+        .method(method)
+        .args(())
+        .send::<()>()
+        .await
 }
 
-/// Clears the cached command connection. Called after an I/O-level
-/// failure so the next [`cmd_conn`] call opens a fresh system-bus
-/// connection.
-async fn evict_cmd_conn() {
-    *CMD_CONN.lock().await = None;
+async fn do_network_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(path.to_string())
+        .iface("net.connman.iwd.Network")
+        .method(method)
+        .args(())
+        .send::<()>()
+        .await
 }
 
-/// Returns `true` when `e` wraps a [`zbus::Error::InputOutput`] — the
-/// signal that the socket to the D-Bus daemon is gone (e.g. after
-/// `systemctl restart iwd`). Used to decide whether to evict the
-/// cached command connection.
-fn is_io_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|cause| {
-            cause.downcast_ref::<zbus::Error>()
-                .is_some_and(|ze| matches!(ze, zbus::Error::InputOutput(_)))
-        })
+async fn do_set_powered(adapter_path: &str, on: bool) -> Result<(), hytte_bus::BusError> {
+    let value = zbus::zvariant::Value::from(on)
+        .try_to_owned()
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: e.to_string(),
+            dbus_name: None,
+        })?;
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(adapter_path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Set")
+        .args(("net.connman.iwd.Adapter1", "Powered", value))
+        .send::<()>()
+        .await
 }
 
-async fn do_station_call(station_path: &str, method: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("net.connman.iwd"),
-        station_path,
-        Some("net.connman.iwd.Station"),
-        method,
-        &(),
-    )
-    .await
-    .with_context(|| format!("call Station.{method}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r?;
-    Ok(())
-}
-
-async fn do_network_call(network_path: &str, method: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("net.connman.iwd"),
-        network_path,
-        Some("net.connman.iwd.Network"),
-        method,
-        &(),
-    )
-    .await
-    .with_context(|| format!("call Network.{method}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r?;
-    Ok(())
-}
-
-async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("net.connman.iwd"),
-        adapter_path,
-        Some("org.freedesktop.DBus.Properties"),
-        "Set",
-        &(
-            "net.connman.iwd.Adapter1",
-            prop,
-            zbus::zvariant::Value::from(on),
-        ),
-    )
-    .await
-    .with_context(|| format!("call Properties.Set Adapter1.{prop}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r?;
-    Ok(())
-}
-
-async fn do_known_network_call(known_network_path: &str, method: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("net.connman.iwd"),
-        known_network_path,
-        Some("net.connman.iwd.KnownNetwork"),
-        method,
-        &(),
-    )
-    .await
-    .with_context(|| format!("call KnownNetwork.{method}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r?;
-    Ok(())
+async fn do_known_network_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(path.to_string())
+        .iface("net.connman.iwd.KnownNetwork")
+        .method(method)
+        .args(())
+        .send::<()>()
+        .await
 }
 
 // ── Property parsing helpers ──────────────────────────────────────────────────
@@ -558,46 +472,42 @@ type ManagedObjects = HashMap<
     HashMap<String, HashMap<String, OwnedValue>>,
 >;
 
-async fn get_managed_objects(conn: &Connection) -> Result<ManagedObjects> {
-    let reply = conn
-        .call_method(
-            Some("net.connman.iwd"),
-            "/",
-            Some("org.freedesktop.DBus.ObjectManager"),
-            "GetManagedObjects",
-            &(),
-        )
+async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .method("GetManagedObjects")
+        .args(())
+        .send::<ManagedObjects>()
         .await
-        .context("GetManagedObjects on net.connman.iwd")?;
-    let body = reply.body();
-    body.deserialize()
-        .context("deserialise GetManagedObjects reply")
 }
 
 // ── Network list reader ───────────────────────────────────────────────────────
 
 /// Call `Station.GetOrderedNetworks()` and read per-network properties.
 async fn read_networks(
-    conn: &Connection,
     station_path: &str,
     connected_network_path: Option<&str>,
-) -> Result<Vec<WifiNetwork>> {
+) -> Vec<WifiNetwork> {
     // GetOrderedNetworks returns Vec<(ObjectPath, i16)>
-    let reply = conn
-        .call_method(
-            Some("net.connman.iwd"),
-            station_path,
-            Some("net.connman.iwd.Station"),
-            "GetOrderedNetworks",
-            &(),
-        )
-        .await
-        .context("Station.GetOrderedNetworks")?;
-
-    let ordered: Vec<(zbus::zvariant::OwnedObjectPath, i16)> = reply
-        .body()
-        .deserialize()
-        .context("deserialise GetOrderedNetworks")?;
+    let ordered: Vec<(zbus::zvariant::OwnedObjectPath, i16)> = match hytte_bus::call(
+        "net.connman.iwd",
+    )
+    .bus(BusKind::System)
+    .at_path(station_path.to_string())
+    .iface("net.connman.iwd.Station")
+    .method("GetOrderedNetworks")
+    .args(())
+    .send::<Vec<(zbus::zvariant::OwnedObjectPath, i16)>>()
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Station.GetOrderedNetworks failed");
+            return Vec::new();
+        }
+    };
 
     let mut networks = Vec::with_capacity(ordered.len());
 
@@ -605,18 +515,16 @@ async fn read_networks(
         let net_path_str = net_path.as_str();
 
         // Read per-network properties via Properties.GetAll
-        let props_reply = conn
-            .call_method(
-                Some("net.connman.iwd"),
-                net_path_str,
-                Some("org.freedesktop.DBus.Properties"),
-                "GetAll",
-                &("net.connman.iwd.Network",),
-            )
-            .await;
-
-        let props: HashMap<String, OwnedValue> = match props_reply {
-            Ok(r) => r.body().deserialize().unwrap_or_default(),
+        let props: HashMap<String, OwnedValue> = match hytte_bus::call("net.connman.iwd")
+            .bus(BusKind::System)
+            .at_path(net_path_str.to_string())
+            .iface("org.freedesktop.DBus.Properties")
+            .method("GetAll")
+            .args(("net.connman.iwd.Network",))
+            .send::<HashMap<String, OwnedValue>>()
+            .await
+        {
+            Ok(p) => p,
             Err(e) => {
                 tracing::debug!(path = net_path_str, error = %e, "failed to read network props");
                 continue;
@@ -658,105 +566,15 @@ async fn read_networks(
         });
     }
 
-    Ok(networks)
-}
-
-// ── Internal watcher state ────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct State {
-    station: Mutable<Option<Station>>,
-    networks: Mutable<Vec<WifiNetwork>>,
-    prompts: Mutable<Option<PromptRequest>>,
-    adapter: Mutable<Option<Adapter>>,
-    waiters: WaitersMap,
-    next_id: Arc<AtomicU64>,
-    conn: Arc<Connection>,
-    station_path: String,
-}
-
-impl State {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        station: Mutable<Option<Station>>,
-        networks: Mutable<Vec<WifiNetwork>>,
-        prompts: Mutable<Option<PromptRequest>>,
-        adapter: Mutable<Option<Adapter>>,
-        waiters: WaitersMap,
-        next_id: Arc<AtomicU64>,
-        conn: Arc<Connection>,
-        station_path: String,
-    ) -> Self {
-        Self {
-            station,
-            networks,
-            prompts,
-            adapter,
-            waiters,
-            next_id,
-            conn,
-            station_path,
-        }
-    }
-
-    /// Re-read the full networks list and publish it.
-    async fn refresh_networks(&self) {
-        let connected = self
-            .station
-            .lock_ref()
-            .as_ref()
-            .and_then(|s| s.connected_network.clone());
-
-        match read_networks(&self.conn, &self.station_path, connected.as_deref()).await {
-            Ok(nets) => self.networks.set(nets),
-            Err(e) => {
-                tracing::warn!(error = %e, "wifi: failed to refresh networks");
-            }
-        }
-    }
-
-    /// Apply a `PropertiesChanged` update for the Station interface.
-    fn apply_station_props(&self, changed: &HashMap<String, OwnedValue>) {
-        let mut guard = self.station.lock_mut();
-        let Some(st) = guard.as_mut() else { return };
-
-        for (key, value) in changed {
-            match key.as_str() {
-                "State" => {
-                    if let Ok(s) = String::try_from(value.try_clone().unwrap_or_else(|_| {
-                        OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
-                    })) {
-                        st.state = parse_state(&s);
-                    } else if let Ok(s) = zbus::zvariant::Str::try_from(
-                        value.try_clone().unwrap_or_else(|_| {
-                            OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
-                        }),
-                    ) {
-                        st.state = parse_state(s.as_str());
-                    }
-                }
-                "Scanning" => {
-                    st.scanning = property::<bool>(changed, "Scanning").unwrap_or(false);
-                }
-                "ConnectedNetwork" => {
-                    let path = value
-                        .try_clone()
-                        .ok()
-                        .and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v).ok())
-                        .map(|p| p.as_str().to_string());
-                    // "/" means no network
-                    st.connected_network = path.filter(|p| !p.is_empty() && p != "/");
-                }
-                _ => {}
-            }
-        }
-    }
+    networks
 }
 
 // ── iwd Agent object ──────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct IwdAgent {
-    state: State,
+    prompts: Mutable<Option<PromptRequest>>,
+    waiters: WaitersMap,
 }
 
 #[zbus::interface(name = "net.connman.iwd.Agent")]
@@ -771,15 +589,15 @@ impl IwdAgent {
         network: zbus::zvariant::OwnedObjectPath,
     ) -> zbus::fdo::Result<String> {
         let path = network.as_str().to_string();
-        let (ssid, security) = read_network_metadata(&self.state.conn, &path).await;
+        let (ssid, security) = read_network_metadata(&path).await;
 
-        let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<Result<String, String>>();
         {
-            let mut waiters = self.state.waiters.lock().await;
+            let mut waiters = self.waiters.lock().await;
             waiters.insert(id, tx);
         }
-        self.state.prompts.set(Some(PromptRequest {
+        self.prompts.set(Some(PromptRequest {
             id,
             network_path: path,
             ssid,
@@ -787,10 +605,10 @@ impl IwdAgent {
         }));
 
         if let Ok(Ok(pass)) = rx.await {
-            self.state.prompts.set(None);
+            self.prompts.set(None);
             Ok(pass)
         } else {
-            self.state.prompts.set(None);
+            self.prompts.set(None);
             Err(zbus::fdo::Error::Failed("agent cancelled".into()))
         }
     }
@@ -831,31 +649,27 @@ impl IwdAgent {
 
     async fn cancel(&self, reason: String) {
         tracing::info!(%reason, "iwd Agent::Cancel");
-        let mut waiters = self.state.waiters.lock().await;
+        let mut waiters = self.waiters.lock().await;
         for (_, tx) in waiters.drain() {
             let _ = tx.send(Err("cancelled".into()));
         }
-        self.state.prompts.set(None);
+        self.prompts.set(None);
     }
 }
 
 /// Read the Name and Type properties from a net.connman.iwd.Network object.
 /// Falls back to the last path segment for the SSID on any error.
-async fn read_network_metadata(conn: &Connection, path: &str) -> (String, String) {
-    let result = conn
-        .call_method(
-            Some("net.connman.iwd"),
-            path,
-            Some("org.freedesktop.DBus.Properties"),
-            "GetAll",
-            &("net.connman.iwd.Network",),
-        )
-        .await;
-
-    match result {
-        Ok(reply) => {
-            let props: HashMap<String, OwnedValue> =
-                reply.body().deserialize().unwrap_or_default();
+async fn read_network_metadata(path: &str) -> (String, String) {
+    match hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("GetAll")
+        .args(("net.connman.iwd.Network",))
+        .send::<HashMap<String, OwnedValue>>()
+        .await
+    {
+        Ok(props) => {
             let ssid = prop_str(&props, "Name");
             let security = prop_str(&props, "Type");
             let ssid = if ssid.is_empty() {
@@ -873,43 +687,51 @@ async fn read_network_metadata(conn: &Connection, path: &str) -> (String, String
     }
 }
 
-// ── Main listen loop ──────────────────────────────────────────────────────────
+// ── Refresh helpers ───────────────────────────────────────────────────────────
 
-async fn listen(
-    station_mutable: &Mutable<Option<Station>>,
-    networks_mutable: &Mutable<Vec<WifiNetwork>>,
-    prompts_mutable: &Mutable<Option<PromptRequest>>,
+/// Refresh Adapter from the managed-objects map (called once on discovery).
+fn refresh_adapter_from_managed(
+    managed: &ManagedObjects,
+    station_path: &str,
     adapter_mutable: &Mutable<Option<Adapter>>,
-) -> Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("connect system bus for wifi")?;
+) {
+    let adapter_path = adapter_path_from_station(station_path);
+    if adapter_path.is_empty() {
+        adapter_mutable.set(None);
+        return;
+    }
 
-    let managed = get_managed_objects(&conn).await?;
-
-    // ── Find the first Station ────────────────────────────────────────────────
-
-    let Some((station_obj_path, station_ifaces)) = managed
+    let adapter_props = managed
         .iter()
-        .find(|(_, ifaces)| ifaces.contains_key("net.connman.iwd.Station"))
-    else {
-        return Err(anyhow::anyhow!("no net.connman.iwd.Station found"));
+        .find(|(p, _)| p.as_str() == adapter_path)
+        .and_then(|(_, ifaces)| ifaces.get("net.connman.iwd.Adapter1"));
+
+    if let Some(props) = adapter_props {
+        adapter_mutable.set(Some(Adapter {
+            path: adapter_path,
+            powered: prop_bool(props, "Powered"),
+            name: prop_str(props, "Name"),
+        }));
+    } else {
+        adapter_mutable.set(None);
+    }
+}
+
+/// Refresh the Station mutable from the managed-objects map (called once on discovery).
+fn refresh_station_from_managed(
+    managed: &ManagedObjects,
+    station_path: &zbus::zvariant::OwnedObjectPath,
+    station_mutable: &Mutable<Option<Station>>,
+) {
+    let path_str = station_path.as_str();
+    let Some(ifaces) = managed.get(station_path) else {
+        station_mutable.set(None);
+        return;
     };
-
-    let station_path = station_obj_path.as_str().to_string();
-    set_station_path(&station_path).await;
-
-    tracing::info!(path = station_path, "wifi station found");
-
-    // ── Find the parent Adapter ───────────────────────────────────────────────
-
-    capture_initial_adapter(&managed, &station_path, adapter_mutable).await;
-
-    // ── Parse initial Station state ───────────────────────────────────────────
-
-    let station_props = station_ifaces
-        .get("net.connman.iwd.Station")
-        .expect("Station iface present — just checked");
+    let Some(station_props) = ifaces.get("net.connman.iwd.Station") else {
+        station_mutable.set(None);
+        return;
+    };
 
     let state_str = prop_str(station_props, "State");
     let scanning = prop_bool(station_props, "Scanning");
@@ -920,154 +742,314 @@ async fn listen(
         .map(|p| p.as_str().to_string())
         .filter(|p| !p.is_empty() && p != "/");
 
-    let initial_station = Station {
-        path: station_path.clone(),
+    station_mutable.set(Some(Station {
+        path: path_str.to_string(),
         state: parse_state(&state_str),
         scanning,
-        connected_network: connected_network.clone(),
-        connected_ssid: None, // filled after network list read
-    };
-    station_mutable.set(Some(initial_station));
-
-    // ── Set up shared agent state ─────────────────────────────────────────────
-
-    let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
-    let next_id = Arc::new(AtomicU64::new(1));
-    // Publish into module-level OnceLock so public API fns can reach the map.
-    let _ = WAITERS.set(waiters_arc.clone());
-
-    let conn = Arc::new(conn);
-    let state = State::new(
-        station_mutable.clone(),
-        networks_mutable.clone(),
-        prompts_mutable.clone(),
-        adapter_mutable.clone(),
-        waiters_arc,
-        next_id,
-        conn.clone(),
-        station_path.clone(),
-    );
-
-    // ── Initial network list ──────────────────────────────────────────────────
-
-    state.refresh_networks().await;
-
-    // Populate connected_ssid from the just-loaded network list.
-    if let Some(cn_path) = connected_network {
-        let ssid = networks_mutable
-            .lock_ref()
-            .iter()
-            .find(|n| n.path == cn_path)
-            .map(|n| n.ssid.clone());
-        let mut guard = station_mutable.lock_mut();
-        if let Some(st) = guard.as_mut() {
-            st.connected_ssid = ssid;
-        }
-    }
-
-    // ── Register iwd Agent ────────────────────────────────────────────────────
-
-    let agent = IwdAgent {
-        state: state.clone(),
-    };
-    conn.object_server()
-        .at("/cc/hannig/trollshell/iwd_agent", agent)
-        .await
-        .context("register iwd agent object")?;
-
-    let agent_path =
-        zbus::zvariant::OwnedObjectPath::try_from("/cc/hannig/trollshell/iwd_agent")
-            .map_err(|e| anyhow!("build agent path: {e}"))?;
-
-    let agent_mgr = zbus::Proxy::new(
-        conn.as_ref(),
-        "net.connman.iwd",
-        "/net/connman/iwd",
-        "net.connman.iwd.AgentManager",
-    )
-    .await
-    .context("build AgentManager proxy")?;
-
-    agent_mgr
-        .call::<_, _, ()>("RegisterAgent", &(agent_path,))
-        .await
-        .context("RegisterAgent")?;
-
-    tracing::info!("hytte iwd agent registered");
-
-    // ── Event loop ────────────────────────────────────────────────────────────
-
-    event_loop(&conn, &state).await
+        connected_network,
+        connected_ssid: None, // filled after network list is read
+    }));
 }
 
-async fn event_loop(conn: &Connection, state: &State) -> Result<()> {
-    // ObjectManager proxy for InterfacesAdded / InterfacesRemoved.
-    let obj_mgr_proxy = zbus::Proxy::new(
-        conn,
-        "net.connman.iwd",
-        "/",
-        "org.freedesktop.DBus.ObjectManager",
-    )
-    .await
-    .context("create iwd ObjectManager proxy")?;
-
-    let mut ifaces_added = obj_mgr_proxy
-        .receive_signal("InterfacesAdded")
+/// Re-read Station properties via Properties.GetAll and update the mutable.
+async fn refresh_station(station_path: &str, station_mutable: &Mutable<Option<Station>>) {
+    let props: HashMap<String, OwnedValue> = match hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(station_path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("GetAll")
+        .args(("net.connman.iwd.Station",))
+        .send::<HashMap<String, OwnedValue>>()
         .await
-        .context("subscribe iwd InterfacesAdded")?;
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi: refresh_station GetAll failed");
+            return;
+        }
+    };
 
-    let mut ifaces_removed = obj_mgr_proxy
-        .receive_signal("InterfacesRemoved")
+    let state_str = prop_str(&props, "State");
+    let scanning = prop_bool(&props, "Scanning");
+    let connected_network = props
+        .get("ConnectedNetwork")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v).ok())
+        .map(|p| p.as_str().to_string())
+        .filter(|p| !p.is_empty() && p != "/");
+
+    let new_state = parse_state(&state_str);
+
+    let mut guard = station_mutable.lock_mut();
+    if let Some(st) = guard.as_mut() {
+        st.state = new_state;
+        st.scanning = scanning;
+        st.connected_network = connected_network;
+    } else {
+        *guard = Some(Station {
+            path: station_path.to_string(),
+            state: new_state,
+            scanning,
+            connected_network,
+            connected_ssid: None,
+        });
+    }
+}
+
+/// Re-read the network list and update the mutable.
+async fn refresh_networks(
+    station_path: &str,
+    station_mutable: &Mutable<Option<Station>>,
+    networks_mutable: &Mutable<Vec<WifiNetwork>>,
+) {
+    let connected = station_mutable
+        .lock_ref()
+        .as_ref()
+        .and_then(|s| s.connected_network.clone());
+
+    let nets = read_networks(station_path, connected.as_deref()).await;
+
+    // Update connected_ssid from the refreshed network list.
+    let connected_ssid = connected.as_deref().and_then(|cp| {
+        nets.iter().find(|n| n.path == cp).map(|n| n.ssid.clone())
+    });
+
+    networks_mutable.set(nets);
+
+    let mut guard = station_mutable.lock_mut();
+    if let Some(st) = guard.as_mut() {
+        st.connected_ssid = connected_ssid;
+    }
+}
+
+/// Register our agent object with iwd's `AgentManager`.
+async fn register_iwd_agent() -> Result<(), hytte_bus::BusError> {
+    let agent_path = zbus::zvariant::ObjectPath::try_from(AGENT_PATH)
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("invalid agent path: {e}"),
+            dbus_name: None,
+        })?
+        .to_owned();
+
+    hytte_bus::call("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/net/connman/iwd")
+        .iface("net.connman.iwd.AgentManager")
+        .method("RegisterAgent")
+        .args((agent_path,))
+        .send::<()>()
         .await
-        .context("subscribe iwd InterfacesRemoved")?;
+}
 
-    // PropertiesChanged covering all iwd objects under /net/connman/iwd.
-    let props_rule = zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender("net.connman.iwd")
-        .map_err(|e| anyhow::anyhow!("match rule sender: {e}"))?
-        .interface("org.freedesktop.DBus.Properties")
-        .map_err(|e| anyhow::anyhow!("match rule interface: {e}"))?
-        .member("PropertiesChanged")
-        .map_err(|e| anyhow::anyhow!("match rule member: {e}"))?
-        .path_namespace("/net/connman/iwd")
-        .map_err(|e| anyhow::anyhow!("match rule path: {e}"))?
-        .build();
+// ── Main watcher task ─────────────────────────────────────────────────────────
 
-    let mut props_changed = zbus::MessageStream::for_match_rule(props_rule, conn, None)
-        .await
-        .context("subscribe iwd PropertiesChanged")?;
+#[allow(clippy::too_many_lines)]
+async fn run_wifi_watcher(
+    station_mutable: Mutable<Option<Station>>,
+    networks_mutable: Mutable<Vec<WifiNetwork>>,
+    prompts_mutable: Mutable<Option<PromptRequest>>,
+    adapter_mutable: Mutable<Option<Adapter>>,
+) {
+    // 1. Discover paths via GetManagedObjects.
+    let managed = match get_managed_objects().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            return Box::pin(run_wifi_watcher(
+                station_mutable,
+                networks_mutable,
+                prompts_mutable,
+                adapter_mutable,
+            ))
+            .await;
+        }
+    };
+
+    // 2. Find the first Station path.
+    let station_path = managed.iter().find_map(|(path, ifaces)| {
+        ifaces
+            .contains_key("net.connman.iwd.Station")
+            .then(|| path.clone())
+    });
+
+    let Some(station_path) = station_path else {
+        tracing::debug!("iwd has no Station object yet");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        return Box::pin(run_wifi_watcher(
+            station_mutable,
+            networks_mutable,
+            prompts_mutable,
+            adapter_mutable,
+        ))
+        .await;
+    };
+
+    // 3. Update STATION_PATH + ADAPTER_PATH statics.
+    set_station_path(station_path.as_str()).await;
+    let adapter_path = adapter_path_from_station(station_path.as_str());
+    if !adapter_path.is_empty() {
+        set_current_adapter_path(&adapter_path).await;
+    }
+
+    tracing::info!(path = station_path.as_str(), "wifi station found");
+
+    // 4. Populate initial state from managed objects.
+    refresh_adapter_from_managed(&managed, station_path.as_str(), &adapter_mutable);
+    refresh_station_from_managed(&managed, &station_path, &station_mutable);
+
+    // Initial network list.
+    refresh_networks(station_path.as_str(), &station_mutable, &networks_mutable).await;
+
+    // 5. Subscribe to Station PropertiesChanged.
+    let station_props_sub = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(station_path.as_str().to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .signal("PropertiesChanged")
+        .start();
+
+    // 6. Subscribe to ObjectManager InterfacesAdded/Removed.
+    let added_sub = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesAdded")
+        .start();
+    let removed_sub = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesRemoved")
+        .start();
+
+    // 7. Register with iwd AgentManager.
+    match register_iwd_agent().await {
+        Ok(()) => tracing::info!("hytte iwd agent registered"),
+        Err(e) => tracing::warn!(error = %e, "iwd RegisterAgent failed"),
+    }
+
+    // 8. Pump events.
+    let mut station_events = station_props_sub.events();
+    let mut added_events = added_sub.events();
+    let mut removed_events = removed_sub.events();
+
+    let station_path_str = station_path.as_str().to_string();
 
     loop {
         tokio::select! {
-            msg = ifaces_added.next() => {
-                let Some(_msg) = msg else { break; };
-                // A new network object appeared — refresh the list.
-                state.refresh_networks().await;
-            }
-
-            msg = ifaces_removed.next() => {
-                let Some(msg) = msg else { break; };
-                // Check if the station itself was removed.
-                if handle_ifaces_removed(state, &msg) {
-                    return Err(anyhow::anyhow!("iwd station removed"));
+            Some(evt) = station_events.next() => {
+                // Decode the PropertiesChanged body: (interface_name, changed, invalidated)
+                // Only handle changes for the Station interface.
+                let should_refresh = if let Ok((iface, changed, _)) = evt.body.body()
+                    .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                {
+                    if iface == "net.connman.iwd.Station" {
+                        // Apply the delta directly to avoid a full GetAll round-trip
+                        // for simple Scanning/State flips, then refresh networks for
+                        // ConnectedNetwork changes.
+                        apply_station_props_delta(&changed, &station_mutable);
+                        true
+                    } else if iface == "net.connman.iwd.Adapter1" {
+                        apply_adapter_props_delta(&changed, &adapter_mutable);
+                        false
+                    } else {
+                        // Network property changed — refresh network list.
+                        true
+                    }
+                } else {
+                    // Can't decode — do a full refresh to be safe.
+                    refresh_station(&station_path_str, &station_mutable).await;
+                    true
+                };
+                if should_refresh {
+                    refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
                 }
-                state.refresh_networks().await;
             }
-
-            msg = props_changed.next() => {
-                let Some(msg) = msg else { break; };
-                let Ok(msg) = msg else { continue; };
-                handle_props_changed(state, msg).await;
+            Some(_) = added_events.next() => {
+                refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
+            }
+            Some(evt) = removed_events.next() => {
+                // Check if the station itself was removed.
+                if station_removed_from_event(&evt.body, &station_path_str) {
+                    tracing::warn!(path = station_path_str, "iwd station removed — rewatching");
+                    // Clear state and restart discovery.
+                    station_mutable.set(None);
+                    networks_mutable.set(Vec::new());
+                    prompts_mutable.set(None);
+                    adapter_mutable.set(None);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    return Box::pin(run_wifi_watcher(
+                        station_mutable,
+                        networks_mutable,
+                        prompts_mutable,
+                        adapter_mutable,
+                    ))
+                    .await;
+                }
+                refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
             }
         }
     }
-
-    Ok(())
 }
 
-/// Returns `true` when the station was removed (caller should reconnect).
-fn handle_ifaces_removed(state: &State, msg: &zbus::Message) -> bool {
+/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Station`.
+fn apply_station_props_delta(
+    changed: &HashMap<String, OwnedValue>,
+    station_mutable: &Mutable<Option<Station>>,
+) {
+    let mut guard = station_mutable.lock_mut();
+    let Some(st) = guard.as_mut() else { return };
+
+    for (key, value) in changed {
+        match key.as_str() {
+            "State" => {
+                if let Ok(s) = String::try_from(value.try_clone().unwrap_or_else(|_| {
+                    OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
+                })) {
+                    st.state = parse_state(&s);
+                } else if let Ok(s) = zbus::zvariant::Str::try_from(
+                    value.try_clone().unwrap_or_else(|_| {
+                        OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
+                    }),
+                ) {
+                    st.state = parse_state(s.as_str());
+                }
+            }
+            "Scanning" => {
+                st.scanning = property::<bool>(changed, "Scanning").unwrap_or(false);
+            }
+            "ConnectedNetwork" => {
+                let path = value
+                    .try_clone()
+                    .ok()
+                    .and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v).ok())
+                    .map(|p| p.as_str().to_string());
+                st.connected_network = path.filter(|p| !p.is_empty() && p != "/");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply a `PropertiesChanged` delta for `net.connman.iwd.Adapter1`.
+fn apply_adapter_props_delta(
+    changed: &HashMap<String, OwnedValue>,
+    adapter_mutable: &Mutable<Option<Adapter>>,
+) {
+    let mut guard = adapter_mutable.lock_mut();
+    if let Some(adapter) = guard.as_mut() {
+        if changed.contains_key("Powered") {
+            adapter.powered = prop_bool(changed, "Powered");
+        }
+        if changed.contains_key("Name") {
+            adapter.name = prop_str(changed, "Name");
+        }
+    }
+}
+
+/// Returns `true` when the `InterfacesRemoved` signal indicates the station was removed.
+fn station_removed_from_event(msg: &zbus::Message, station_path: &str) -> bool {
     let Ok((path, removed_ifaces)) =
         msg.body()
             .deserialize::<(zbus::zvariant::OwnedObjectPath, Vec<String>)>()
@@ -1075,73 +1057,10 @@ fn handle_ifaces_removed(state: &State, msg: &zbus::Message) -> bool {
         return false;
     };
 
-    let p = path.as_str();
-    if removed_ifaces
-        .iter()
-        .any(|i| i == "net.connman.iwd.Station")
-        && p == state.station_path
-    {
-        tracing::warn!(path = p, "iwd station removed — reconnecting");
-        return true;
-    }
-
-    false
-}
-
-async fn handle_props_changed(state: &State, msg: zbus::Message) {
-    let Ok((iface_name, changed, _)) = msg.body().deserialize::<(
-        String,
-        HashMap<String, OwnedValue>,
-        Vec<String>,
-    )>() else {
-        return;
-    };
-
-    let obj_path = msg
-        .header()
-        .path()
-        .map_or("", |p: &zbus::zvariant::ObjectPath<'_>| p.as_str())
-        .to_string();
-
-    if iface_name == "net.connman.iwd.Station" && obj_path == state.station_path {
-        state.apply_station_props(&changed);
-        // Re-read networks so connected flags and connected_ssid stay current.
-        state.refresh_networks().await;
-
-        // Update connected_ssid from the refreshed network list.
-        let connected_path = state
-            .station
-            .lock_ref()
-            .as_ref()
-            .and_then(|s| s.connected_network.clone());
-
-        let ssid = connected_path.as_deref().and_then(|cp| {
-            state
-                .networks
-                .lock_ref()
-                .iter()
-                .find(|n| n.path == cp)
-                .map(|n| n.ssid.clone())
-        });
-
-        let mut guard = state.station.lock_mut();
-        if let Some(st) = guard.as_mut() {
-            st.connected_ssid = ssid;
-        }
-    } else if iface_name == "net.connman.iwd.Network" {
-        // A network's properties changed — refresh the list.
-        state.refresh_networks().await;
-    } else if iface_name == "net.connman.iwd.Adapter1" {
-        let mut guard = state.adapter.lock_mut();
-        if let Some(adapter) = guard.as_mut() {
-            if changed.contains_key("Powered") {
-                adapter.powered = prop_bool(&changed, "Powered");
-            }
-            if changed.contains_key("Name") {
-                adapter.name = prop_str(&changed, "Name");
-            }
-        }
-    }
+    path.as_str() == station_path
+        && removed_ifaces
+            .iter()
+            .any(|i| i == "net.connman.iwd.Station")
 }
 
 #[cfg(test)]

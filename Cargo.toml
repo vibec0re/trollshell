@@ -6,6 +6,7 @@ members = [
     "crates/hytte-services",
     "crates/hytte",
     "crates/hytte-pam",
+    "crates/hytte-bus",
     "trollshell",
 ]
 

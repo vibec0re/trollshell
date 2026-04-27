@@ -23,6 +23,11 @@ niri-ipc = "25.11.0"
 tokio = { version = "1.52.1", features = ["rt", "io-util", "process", "sync", "time"] }
 tracing = "0.1.44"
 icalendar = { version = "0.17", default-features = false, features = ["parser", "chrono-tz"] }
+# Direct zbus dep retained for zvariant::{OwnedValue, Value, ObjectPath} types
+# used as data shapes (D-Bus Variants in property/signal payloads), for the
+# #[zbus::interface] / #[zbus::DBusError] macros, and for zbus::fdo::Error /
+# zbus::Message in interface impls. Connection and Proxy construction is
+# forbidden by the workspace clippy::disallowed_methods rule.
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

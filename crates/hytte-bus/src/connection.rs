@@ -374,6 +374,9 @@ async fn supervisor_loop(
     }
 }
 
+// Production-allowed: this IS the single centralized site that opens D-Bus
+// connections. All other crates must use hytte::bus::* primitives instead.
+#[allow(clippy::disallowed_methods)]
 async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
     match kind {
         BusKind::Session => Connection::session().await,

@@ -43,13 +43,13 @@ async fn cold_start_emits_loading_then_loaded() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let signal = property_with::<u32>(&shared, "cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
         .at_path("/cc/hannig/test/Counter")
         .iface("cc.hannig.test.Counter")
         .name("Value")
         .start();
 
-    let mut stream = signal.to_stream();
+    let mut stream = prop.signal().to_stream();
     let mut saw_loading = false;
     let mut saw_loaded = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -86,12 +86,12 @@ async fn properties_changed_emits_loaded_with_new_value() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let signal = property_with::<u32>(&shared, "cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
         .at_path("/cc/hannig/test/Counter")
         .iface("cc.hannig.test.Counter")
         .name("Value")
         .start();
-    let mut stream = signal.to_stream();
+    let mut stream = prop.signal().to_stream();
 
     // Drain initial Loading + Loaded(1).
     let mut current = None;
@@ -136,4 +136,37 @@ async fn properties_changed_emits_loaded_with_new_value() {
         }
     }
     assert_eq!(updated, Some(99));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn task_exits_when_property_signal_dropped() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+
+    // Start a property tracker. No server is needed — the task will park
+    // in its retry loop, but that's fine: we only care that it exits when
+    // the handle is dropped.
+    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
+        .at_path("/cc/hannig/test/Counter")
+        .iface("cc.hannig.test.Counter")
+        .name("Value")
+        .start();
+
+    // Grab the task-done receiver while we still hold the handle.
+    let done_rx = prop
+        .task_done_receiver()
+        .await
+        .expect("task_done_receiver should be Some on first call");
+
+    // Give the task a moment to start and reach its first wait point.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Drop the handle — the task must detect this and exit.
+    drop(prop);
+
+    // The task must exit within 1 second.
+    tokio::time::timeout(Duration::from_secs(1), done_rx)
+        .await
+        .expect("timeout: property task did not exit within 1s after handle dropped")
+        .expect("task_done_tx was dropped without sending — task panicked?");
 }

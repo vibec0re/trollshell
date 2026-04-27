@@ -5,6 +5,7 @@
 use crate::connection::SharedConnection;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use std::sync::Arc;
 use zbus::zvariant::{OwnedValue, Value};
 
 /// Three states of a tracked property.
@@ -20,6 +21,43 @@ pub enum PropState<T> {
     Stale(T),
 }
 
+// ── Inner state shared between the handle and the task ───────────────────────
+
+struct PropertyInner<T> {
+    state: Mutable<PropState<T>>,
+    /// Fired when the internal task exits. Wrapped in a Mutex so it can be
+    /// taken exactly once (for tests).
+    task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+// ── Public handle ─────────────────────────────────────────────────────────────
+
+/// Handle on a live property-tracking task. Cloning is cheap (Arc) and does
+/// not cancel; dropping the last clone tears down the background task.
+#[derive(Clone)]
+pub struct PropertySignal<T> {
+    inner: Arc<PropertyInner<T>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> PropertySignal<T> {
+    /// Returns a signal that emits [`PropState`] transitions as the tracked
+    /// D-Bus property changes.
+    pub fn signal(&self) -> impl Signal<Item = PropState<T>> {
+        self.inner.state.signal_cloned()
+    }
+
+    /// Take the oneshot receiver that fires when the internal tracking task
+    /// exits. May only be called once per handle; returns `None` on subsequent
+    /// calls. Intended for integration tests that need to verify the task
+    /// actually shuts down when the handle is dropped.
+    #[doc(hidden)]
+    pub async fn task_done_receiver(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.inner.task_done_rx.lock().await.take()
+    }
+}
+
+// ── Builder ───────────────────────────────────────────────────────────────────
+
 /// Builder for a tracked D-Bus property.
 pub struct PropertyBuilder<'a, T> {
     shared: &'a SharedConnection,
@@ -32,16 +70,19 @@ pub struct PropertyBuilder<'a, T> {
 
 /// Create a property-tracking builder for a remote D-Bus property.
 ///
-/// Returns a [`futures_signals::signal::Signal`] that emits [`PropState`]
-/// transitions as the property value changes.
+/// Returns a [`PropertySignal`] handle. Call `.signal()` on the handle to
+/// obtain a [`futures_signals::signal::Signal`] that emits [`PropState`]
+/// transitions as the property value changes. Dropping the last clone of the
+/// handle tears down the background task.
 ///
 /// # Example
 /// ```ignore
-/// let sig = property_with::<u32>(&shared, "org.example.Counter")
+/// let prop = property_with::<u32>(&shared, "org.example.Counter")
 ///     .at_path("/org/example/Counter")
 ///     .iface("org.example.Counter")
 ///     .name("Value")
 ///     .start();
+/// let mut stream = prop.signal().to_stream();
 /// ```
 #[doc(hidden)]
 #[must_use]
@@ -96,36 +137,48 @@ where
         self
     }
 
-    /// Spawn the tracking task. Returns a signal whose value transitions
-    /// through [`PropState::Loading`] → [`PropState::Loaded`] and
-    /// [`PropState::Stale`] on reconnects.
-    pub fn start(self) -> impl Signal<Item = PropState<T>> {
-        let state: Mutable<PropState<T>> = Mutable::new(PropState::Loading);
-        let writer = state.clone();
+    /// Spawn the tracking task. Returns a [`PropertySignal`] handle whose
+    /// value transitions through [`PropState::Loading`] → [`PropState::Loaded`]
+    /// and [`PropState::Stale`] on reconnects. Dropping the last clone of the
+    /// handle tears down the background task.
+    pub fn start(self) -> PropertySignal<T> {
+        let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let inner = Arc::new(PropertyInner {
+            state: Mutable::new(PropState::Loading),
+            task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
+        });
+        let weak = Arc::downgrade(&inner);
+        let writer = inner.state.clone();
+
         let shared = self.shared.clone();
         let dest = self.destination;
         let path = self.path;
         let iface = self.iface;
         let name = self.name;
+
         hytte_reactive::runtime::handle().spawn(async move {
-            run_property::<T>(shared, dest, path, iface, name, writer).await;
+            run_property::<T>(shared, dest, path, iface, name, writer, weak, task_done_tx).await;
         });
-        state.signal_cloned()
+
+        PropertySignal { inner }
     }
 }
 
 // ── Context struct ────────────────────────────────────────────────────────────
 
-struct PropCtx {
+struct PropCtx<T> {
     shared: SharedConnection,
     dest: String,
     path: String,
     iface: String,
     name: String,
+    weak: std::sync::Weak<PropertyInner<T>>,
 }
 
 // ── Core property-tracking loop ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 async fn run_property<T>(
     shared: SharedConnection,
@@ -134,6 +187,8 @@ async fn run_property<T>(
     iface: String,
     name: String,
     writer: Mutable<PropState<T>>,
+    weak: std::sync::Weak<PropertyInner<T>>,
+    task_done_tx: tokio::sync::oneshot::Sender<()>,
 ) where
     T: Clone
         + Send
@@ -142,10 +197,19 @@ async fn run_property<T>(
         + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
-    let ctx = PropCtx { shared, dest, path, iface, name };
+    let ctx = PropCtx { shared, dest, path, iface, name, weak };
     let mut last: Option<T> = None;
 
     loop {
+        // Exit cleanly if all handles have been dropped (checked at each
+        // reconnect boundary — mirrors the signals primitive pattern).
+        if ctx.weak.upgrade().is_none() {
+            tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
+                name = ctx.name, "all property handles dropped; exiting task");
+            let _ = task_done_tx.send(());
+            return;
+        }
+
         // Mark state: Stale if we have a prior value, Loading otherwise.
         match &last {
             Some(v) => writer.set(PropState::Stale(v.clone())),
@@ -245,38 +309,65 @@ async fn run_property<T>(
             }
         };
 
-        // Drain the stream until it ends or an invalidation triggers a re-Get.
-        while let Some(sig) = changes.next().await {
-            let Ok(args) = sig.args() else { continue };
+        // Drain the PropertiesChanged stream until it ends, an invalidation
+        // triggers a re-Get, or all handles are dropped.
+        //
+        // A periodic liveness tick wakes the loop even when no D-Bus events
+        // arrive so that we detect handle-drops promptly (same pattern as the
+        // signals primitive).
+        let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
+        liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            if args.interface_name != ctx.iface.as_str() {
-                continue;
+        'changes: loop {
+            // Check liveness before parking in select! — covers the case where
+            // all handles were dropped while we were processing a prior event.
+            if ctx.weak.upgrade().is_none() {
+                tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
+                    name = ctx.name,
+                    "all property handles dropped (inner loop); exiting task");
+                let _ = task_done_tx.send(());
+                return;
             }
 
-            // Check for an inline value in `changed_properties`.
-            if let Some(raw) = args.changed_properties.get(ctx.name.as_str()) {
-                let decode: Result<T, _> = T::try_from(raw.clone());
-                match decode {
-                    Ok(typed) => {
-                        last = Some(typed.clone());
-                        writer.set(PropState::Loaded(typed));
+            tokio::select! {
+                maybe_sig = changes.next() => {
+                    let Some(sig) = maybe_sig else {
+                        // Stream ended — reconnect.
+                        break 'changes;
+                    };
+                    let Ok(args) = sig.args() else { continue };
+
+                    if args.interface_name != ctx.iface.as_str() {
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            name = ctx.name,
-                            "PropertiesChanged: failed to decode value"
-                        );
+
+                    // Check for an inline value in `changed_properties`.
+                    if let Some(raw) = args.changed_properties.get(ctx.name.as_str()) {
+                        let decode: Result<T, _> = T::try_from(raw.clone());
+                        match decode {
+                            Ok(typed) => {
+                                last = Some(typed.clone());
+                                writer.set(PropState::Loaded(typed));
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    error = %e,
+                                    name = ctx.name,
+                                    "PropertiesChanged: failed to decode value"
+                                );
+                            }
+                        }
+                    }
+
+                    // Invalidation: break to trigger a re-Get on the next loop iteration.
+                    if args.invalidated_properties.contains(&ctx.name.as_str()) {
+                        break 'changes;
                     }
                 }
-            }
-
-            // Invalidation: break to trigger a re-Get on the next loop iteration.
-            if args
-                .invalidated_properties
-                .contains(&ctx.name.as_str())
-            {
-                break;
+                _ = liveness.tick() => {
+                    // Woke to check liveness — loop back to the upgrade check
+                    // at the top of 'changes.
+                }
             }
         }
 

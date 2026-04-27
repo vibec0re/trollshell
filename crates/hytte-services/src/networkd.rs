@@ -1,16 +1,24 @@
 //! Link state from systemd-networkd (`org.freedesktop.network1`).
 //!
-//! Polls the Manager's `ListLinks` once at startup, then queries each
-//! link's properties. Subscribes to `Manager.PropertiesChanged` for
-//! refresh signals. (networkd does not emit per-link `PropertiesChanged`
-//! universally; a periodic re-poll is the robust path.)
+//! Polls the Manager's `ListLinks` once at startup and then whenever
+//! `StateChanged` fires on the Manager, falling back to a 5-second timer so
+//! newly-appeared links (hot-plug) never stall longer than 5 s.
+//!
+//! All D-Bus I/O goes through [`hytte_bus::call`] and [`hytte_bus::signals`]
+//! so the shared connection supervisor handles reconnects automatically.
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
+use futures_util::StreamExt;
+use hytte_bus::{call, signals, BusKind};
 use hytte_reactive::{registry, Service};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
-use zbus::Connection;
+
+const NETWORKD_NAME: &str = "org.freedesktop.network1";
+const MANAGER_PATH: &str = "/org/freedesktop/network1";
+const MANAGER_IFACE: &str = "org.freedesktop.network1.Manager";
+const LINK_IFACE: &str = "org.freedesktop.network1.Link";
 
 pub struct NetworkdService;
 
@@ -124,65 +132,109 @@ async fn listen(
     links_out: &Mutable<Vec<Link>>,
     primary_out: &Mutable<Option<Link>>,
 ) -> Result<()> {
-    let conn = Connection::system().await.context("connect system bus")?;
+    // Subscribe to StateChanged on the Manager so we react quickly to
+    // link state transitions.  Missed-emissions on reconnect trigger a
+    // re-poll too, so we never miss a change across a D-Bus restart.
+    let state_changed = signals(NETWORKD_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .signal("StateChanged")
+        .start();
+
+    let mut events = state_changed.events();
+
+    // Initial poll.
+    refresh(links_out, primary_out).await?;
+
+    // 5-second fallback timer — catches hot-plug when StateChanged is
+    // not emitted (e.g. older networkd, or newly added links).
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Discard the immediate first tick (we already polled above).
+    interval.tick().await;
 
     loop {
-        let links = read_links(&conn).await?;
-        let primary = links
-            .iter()
-            .max_by_key(|l| l.operational.priority())
-            .filter(|l| l.operational.priority() > 0)
-            .cloned();
-
-        links_out.set(links);
-        primary_out.set(primary);
-
-        // Re-poll every 2 seconds. Cheap; networkd has no global property
-        // change signal we can listen for portably.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = events.next() => {
+                tracing::debug!("networkd StateChanged; refreshing links");
+                if let Err(e) = refresh(links_out, primary_out).await {
+                    tracing::warn!(error = %e, "networkd refresh after StateChanged failed");
+                }
+            }
+            _ = interval.tick() => {
+                if let Err(e) = refresh(links_out, primary_out).await {
+                    tracing::warn!(error = %e, "networkd periodic refresh failed");
+                }
+            }
+        }
     }
 }
 
-async fn read_links(conn: &Connection) -> Result<Vec<Link>> {
-    let manager = zbus::Proxy::new(
-        conn,
-        "org.freedesktop.network1",
-        "/org/freedesktop/network1",
-        "org.freedesktop.network1.Manager",
-    )
-    .await
-    .context("create networkd Manager proxy")?;
+async fn refresh(
+    links_out: &Mutable<Vec<Link>>,
+    primary_out: &Mutable<Option<Link>>,
+) -> Result<()> {
+    let links = read_links().await?;
+    let primary = links
+        .iter()
+        .max_by_key(|l| l.operational.priority())
+        .filter(|l| l.operational.priority() > 0)
+        .cloned();
 
+    links_out.set(links);
+    primary_out.set(primary);
+    Ok(())
+}
+
+async fn read_links() -> Result<Vec<Link>> {
     // ListLinks returns array of (idx: i32, name: String, path: ObjectPath).
     let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> =
-        manager.call("ListLinks", &()).await.context("ListLinks")?;
+        call(NETWORKD_NAME)
+            .bus(BusKind::System)
+            .at_path(MANAGER_PATH)
+            .iface(MANAGER_IFACE)
+            .method("ListLinks")
+            .args(())
+            .send()
+            .await
+            .context("ListLinks")?;
 
     let mut out = Vec::with_capacity(list.len());
     for (idx, name, path) in list {
-        let link_proxy = zbus::Proxy::new(
-            conn,
-            "org.freedesktop.network1",
-            path.as_str(),
-            "org.freedesktop.network1.Link",
-        )
-        .await
-        .context("create Link proxy")?;
+        let path_str = path.as_str().to_string();
 
-        let op_state: String = link_proxy
-            .get_property("OperationalState")
+        let describe_json: String = call(NETWORKD_NAME)
+            .bus(BusKind::System)
+            .at_path(path_str.clone())
+            .iface(LINK_IFACE)
+            .method("Describe")
+            .args(())
+            .send()
             .await
             .unwrap_or_default();
 
-        let describe_json: String = link_proxy
-            .call("Describe", &())
+        // OperationalState is also in the Describe JSON, but older networkd
+        // only exposes it as a property.  Read it directly so we always have it.
+        let op_prop: String = call(NETWORKD_NAME)
+            .bus(BusKind::System)
+            .at_path(path_str.clone())
+            .iface("org.freedesktop.DBus.Properties")
+            .method("Get")
+            .args((LINK_IFACE, "OperationalState"))
+            .send::<zbus::zvariant::OwnedValue>()
             .await
+            .ok()
+            .and_then(|v| String::try_from(v).ok())
             .unwrap_or_default();
+
+        // The `Describe` method returns a JSON blob; parse addresses & routes.
         let parsed = parse_describe(&describe_json).unwrap_or_default();
 
         out.push(Link {
             idx,
             name,
-            operational: OperationalState::parse(&op_state),
+            operational: OperationalState::parse(&op_prop),
             addresses: parsed.addresses,
             gateway_v4: parsed.gateway_v4,
             gateway_v6: parsed.gateway_v6,

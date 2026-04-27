@@ -158,10 +158,12 @@ impl SharedConnection {
         self.epoch.load(Ordering::Acquire)
     }
 
-    /// Reactive view of the epoch.
+    /// Reactive view of the epoch. Returns an `impl Signal` (not `Mutable`)
+    /// so consumers cannot call `.set()` on it — only the supervisor does that
+    /// through the struct field directly.
     #[must_use]
-    pub fn epoch_signal(&self) -> Mutable<u64> {
-        self.epoch_signal.clone()
+    pub fn epoch_signal(&self) -> impl futures_signals::signal::Signal<Item = u64> + use<> {
+        self.epoch_signal.signal_cloned()
     }
 
     /// Run `f` against the current connection. On transient zbus errors

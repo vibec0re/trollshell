@@ -32,7 +32,7 @@ async fn epoch_bumps_after_supervised_reconnect() {
     // and use it instead of calling Connection::session().
     shared.simulate_disconnect_for_test(replacement).await;
 
-    let mut epoch_stream = shared.epoch_signal().signal_cloned().to_stream();
+    let mut epoch_stream = shared.epoch_signal().to_stream();
     let mut saw_higher = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {

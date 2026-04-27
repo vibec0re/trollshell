@@ -322,7 +322,7 @@ async fn run_proxy_watcher(
         // Record the epoch at the time we subscribed so we can detect a
         // bus reconnect that bumps the epoch.
         let current_epoch = inner.shared.epoch();
-        let mut epoch_stream = inner.shared.epoch_signal().signal_cloned().to_stream();
+        let mut epoch_stream = inner.shared.epoch_signal().to_stream();
 
         // Now that we're subscribed and have a working proxy, emit Live.
         inner.liveness.set(ProxyState::Live);

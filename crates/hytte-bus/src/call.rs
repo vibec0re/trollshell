@@ -279,7 +279,7 @@ where
 /// `RetryPolicy::Once` path to avoid an immediate retry that would also fail.
 async fn wait_for_reconnect(shared: &SharedConnection, timeout: Duration) {
     let current_epoch = shared.epoch();
-    let mut epoch_stream = shared.epoch_signal().signal_cloned().to_stream();
+    let mut epoch_stream = shared.epoch_signal().to_stream();
     // Give the supervisor a reasonable time to reconnect, bounded by the
     // caller's overall timeout (so fire_and_forget paths don't wait forever).
     let deadline = timeout.min(Duration::from_secs(5));

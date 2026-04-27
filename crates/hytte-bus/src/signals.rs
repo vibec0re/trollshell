@@ -233,7 +233,7 @@ async fn drain_signal_stream(
     dc: DrainCtx<'_>,
 ) -> DrainOutcome {
     use futures_signals::signal::SignalExt;
-    let mut epoch_stream = dc.shared.epoch_signal().signal_cloned().to_stream();
+    let mut epoch_stream = dc.shared.epoch_signal().to_stream();
     // Periodic wakeup so we notice when all subscription handles have been
     // dropped while the task is parked waiting for a signal that never arrives.
     let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));

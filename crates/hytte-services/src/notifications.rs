@@ -14,10 +14,34 @@ use hytte_bus::OwnNameSignal;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
+
+// ── Cross-thread shared handle ────────────────────────────────────────────────
+//
+// `hytte_reactive::registry` is a thread-local — initialised on the GTK main
+// thread, empty on hytte-tokio worker threads. Public mutators below
+// (`dismiss`, `clear_history`) are called from BOTH threads:
+//   - GTK: widget click handlers (toast click, action button, "Clear all").
+//   - hytte-tokio: the auto-expire timer in `notify()` and the iface's
+//     `close_notification` method, both of which run on the bus connection's
+//     worker.
+//
+// Using `registry::with` from a hytte-tokio thread silently no-ops (no
+// handles → early return), which is the root cause of the "history is empty
+// / clear-all does nothing" bug: the auto-expire path never reaches the
+// `history.insert(...)` line. A static `OnceLock` populated by
+// `Service::start` is the cross-thread-safe alternative — `Mutable<T>` and
+// `Arc<AtomicU32>` are both `Send + Sync`, so storing them in a static is
+// safe.
+struct NotificationsShared {
+    active: Mutable<Vec<Notification>>,
+    history: Mutable<Vec<HistoryEntry>>,
+}
+
+static SHARED: OnceLock<NotificationsShared> = OnceLock::new();
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -140,6 +164,15 @@ impl Service for NotificationsService {
         let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
 
+        // Populate the cross-thread shared handle so `dismiss` / `clear_history`
+        // can find these Mutables when called from a hytte-tokio worker (the
+        // thread-local registry is GTK-only). Calling Service::start a second
+        // time would `set` fail silently — services are registered once.
+        let _ = SHARED.set(NotificationsShared {
+            active: active.clone(),
+            history: history.clone(),
+        });
+
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
@@ -210,63 +243,58 @@ pub fn clear_history() {
 /// Reason codes: 1 = expired, 2 = dismissed-by-user, 3 = closed-by-call,
 /// 4 = undefined.
 ///
-/// Removes the notification from the active list and emits `NotificationClosed`
-/// on the session bus.
+/// Removes the notification from the active list, pushes it to history, and
+/// emits `NotificationClosed` on the session bus.
+///
+/// Safe to call from any thread (GTK widget handlers, hytte-tokio workers,
+/// the auto-expire timer in `notify()`). The local mutation runs
+/// synchronously on the calling thread; the bus signal emit is spawned onto
+/// the runtime.
 pub fn dismiss(id: u32, reason: u32) {
+    // Local state mutation. Synchronous — Mutable is thread-safe.
+    if let Some(shared) = SHARED.get() {
+        let removed = {
+            let mut list = shared.active.lock_mut();
+            let pos = list.iter().position(|n| n.id == id);
+            pos.map(|i| list.remove(i))
+        };
+        if let Some(n) = removed {
+            let dismissed_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let entry = HistoryEntry {
+                id: n.id,
+                app_name: n.app_name,
+                app_icon: n.app_icon,
+                summary: n.summary,
+                body: n.body,
+                urgency: n.urgency,
+                image: n.image,
+                actions: n.actions,
+                reason,
+                created_at: n.created_at,
+                dismissed_at,
+            };
+            let mut hist = shared.history.lock_mut();
+            hist.insert(0, entry);
+            hist.truncate(100);
+        }
+    }
+
+    // Emit the D-Bus signal via our own interface's _EmitClosed method.
     runtime::handle().spawn(async move {
-        if let Err(e) = do_dismiss(id, reason).await {
-            tracing::warn!(error = %e, id, reason, "notifications::dismiss failed");
+        let result = hytte_bus::call("org.freedesktop.Notifications")
+            .at_path("/org/freedesktop/Notifications")
+            .iface("org.freedesktop.Notifications")
+            .method("_EmitClosed")
+            .args((id, reason))
+            .send::<()>()
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, id, reason, "_EmitClosed failed");
         }
     });
-}
-
-async fn do_dismiss(id: u32, reason: u32) -> Result<()> {
-    let handles = registry::with(|r| {
-        r.get::<NotificationsHandles>()
-            .map(|h| (h.active.clone(), h.history.clone()))
-    });
-    let Some((active, history)) = handles else {
-        return Ok(());
-    };
-    // Remove from active list, capturing the notification for history.
-    let removed = {
-        let mut list = active.lock_mut();
-        let pos = list.iter().position(|n| n.id == id);
-        pos.map(|i| list.remove(i))
-    };
-    // Push to history if we found and removed the notification.
-    if let Some(n) = removed {
-        let dismissed_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let entry = HistoryEntry {
-            id: n.id,
-            app_name: n.app_name,
-            app_icon: n.app_icon,
-            summary: n.summary,
-            body: n.body,
-            urgency: n.urgency,
-            image: n.image,
-            actions: n.actions,
-            reason,
-            created_at: n.created_at,
-            dismissed_at,
-        };
-        let mut hist = history.lock_mut();
-        hist.insert(0, entry);
-        hist.truncate(100);
-    }
-    // Emit the D-Bus signal via our own interface's _EmitClosed method.
-    hytte_bus::call("org.freedesktop.Notifications")
-        .at_path("/org/freedesktop/Notifications")
-        .iface("org.freedesktop.Notifications")
-        .method("_EmitClosed")
-        .args((id, reason))
-        .send::<()>()
-        .await
-        .context("emit NotificationClosed via _EmitClosed")?;
-    Ok(())
 }
 
 /// Invoke action `action_key` on notification `id`.

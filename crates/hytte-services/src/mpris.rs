@@ -2,9 +2,11 @@
 //!
 //! Discovers all `org.mpris.MediaPlayer2.*` names on the session bus at
 //! startup and follows `NameOwnerChanged` to track live add/remove of
-//! players. Per-player tokio tasks subscribe to `PropertiesChanged` on the
-//! `org.mpris.MediaPlayer2.Player` interface and re-read metadata + Can*
-//! flags + playback status on each change.
+//! players. Per-player [`BusProxy`] handles survive bus reconnects and detect
+//! peer departure via [`ProxyState::PeerGone`]. Per-player tokio tasks
+//! subscribe to `PropertiesChanged` on the `org.mpris.MediaPlayer2.Player`
+//! interface and re-read metadata + Can* flags + playback status on each
+//! change.
 //!
 //! # Public API
 //!
@@ -27,8 +29,9 @@
 //! ```
 
 use anyhow::{Context, Result};
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
+use hytte_bus::{call, proxy, signals, BusKind, BusProxy, ProxyState};
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -36,7 +39,6 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use zbus::zvariant::OwnedValue;
-use zbus::Connection;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -175,71 +177,35 @@ pub fn active_player() -> impl Signal<Item = Option<Player>> {
 
 /// Fire-and-forget: send `PlayPause` to the given bus name.
 pub fn play_pause(bus_name: &str) {
-    let bus = bus_name.to_string();
-    runtime::handle().spawn(async move {
-        let conn = match Connection::session().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mpris play_pause: failed to open session bus");
-                return;
-            }
-        };
-        let _ = conn
-            .call_method(
-                Some(bus.as_str()),
-                "/org/mpris/MediaPlayer2",
-                Some("org.mpris.MediaPlayer2.Player"),
-                "PlayPause",
-                &(),
-            )
-            .await;
-    });
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface(PLAYER_IFACE)
+        .method("PlayPause")
+        .args(())
+        .fire_and_forget();
 }
 
 /// Fire-and-forget: send `Next` to the given bus name.
 pub fn next(bus_name: &str) {
-    let bus = bus_name.to_string();
-    runtime::handle().spawn(async move {
-        let conn = match Connection::session().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mpris next: failed to open session bus");
-                return;
-            }
-        };
-        let _ = conn
-            .call_method(
-                Some(bus.as_str()),
-                "/org/mpris/MediaPlayer2",
-                Some("org.mpris.MediaPlayer2.Player"),
-                "Next",
-                &(),
-            )
-            .await;
-    });
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface(PLAYER_IFACE)
+        .method("Next")
+        .args(())
+        .fire_and_forget();
 }
 
 /// Fire-and-forget: send `Previous` to the given bus name.
 pub fn previous(bus_name: &str) {
-    let bus = bus_name.to_string();
-    runtime::handle().spawn(async move {
-        let conn = match Connection::session().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mpris previous: failed to open session bus");
-                return;
-            }
-        };
-        let _ = conn
-            .call_method(
-                Some(bus.as_str()),
-                "/org/mpris/MediaPlayer2",
-                Some("org.mpris.MediaPlayer2.Player"),
-                "Previous",
-                &(),
-            )
-            .await;
-    });
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface(PLAYER_IFACE)
+        .method("Previous")
+        .args(())
+        .fire_and_forget();
 }
 
 /// Fire-and-forget: send `SetPosition` to the given bus name.
@@ -251,26 +217,17 @@ pub fn set_position(bus_name: &str, track_id: &str, position_us: i64) {
     let bus = bus_name.to_string();
     let track_id = track_id.to_string();
     runtime::handle().spawn(async move {
-        let conn = match Connection::session().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mpris set_position: failed to open session bus");
-                return;
-            }
-        };
         let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(track_id.as_str()) else {
             tracing::warn!(track = %track_id, "mpris::set_position: invalid track id");
             return;
         };
-        let _ = conn
-            .call_method(
-                Some(bus.as_str()),
-                "/org/mpris/MediaPlayer2",
-                Some("org.mpris.MediaPlayer2.Player"),
-                "SetPosition",
-                &(path, position_us),
-            )
-            .await;
+        call(bus.as_str())
+            .bus(BusKind::Session)
+            .at_path(MPRIS_PATH)
+            .iface(PLAYER_IFACE)
+            .method("SetPosition")
+            .args((path, position_us))
+            .fire_and_forget();
     });
 }
 
@@ -365,36 +322,30 @@ fn pick_active(players: &[Player]) -> Option<Player> {
 /// State shared between the main listener loop and per-player watcher tasks.
 #[derive(Clone)]
 struct State {
-    /// Ordered list of tracked players (order = discovery order).
+    /// Player data keyed by bus name.
     map: Arc<AsyncMutex<HashMap<String, Player>>>,
-    /// Order list for stable iteration (bus names in discovery order).
+    /// Stable discovery order (bus names in registration order).
     order: Arc<AsyncMutex<Vec<String>>>,
     /// Published signal for the full player list.
     players: Mutable<Vec<Player>>,
     /// Published signal for the active player.
     active: Mutable<Option<Player>>,
-    conn: Connection,
 }
 
 impl State {
-    fn new(
-        players: Mutable<Vec<Player>>,
-        active: Mutable<Option<Player>>,
-        conn: Connection,
-    ) -> Self {
+    fn new(players: Mutable<Vec<Player>>, active: Mutable<Option<Player>>) -> Self {
         Self {
             map: Arc::new(AsyncMutex::new(HashMap::new())),
             order: Arc::new(AsyncMutex::new(Vec::new())),
             players,
             active,
-            conn,
         }
     }
 
-    /// Re-read one player's properties and update the map.  Returns `false`
-    /// when the player should be dropped (proxy read failed).
+    /// Re-read one player's properties and update the map. Returns `false`
+    /// when the player should be dropped (property read failed).
     async fn refresh_player(&self, bus_name: &str) -> bool {
-        match read_player_props(&self.conn, bus_name).await {
+        match read_player_props(bus_name).await {
             Ok(player) => {
                 self.map.lock().await.insert(bus_name.to_string(), player);
                 true
@@ -443,38 +394,101 @@ impl State {
 
 // ── Per-player watcher task ───────────────────────────────────────────────────
 
-async fn watch_player(state: State, bus_name: String) {
-    // Build PropertiesProxy for the Player interface.
-    let props_proxy = match zbus::fdo::PropertiesProxy::builder(&state.conn)
-        .destination(bus_name.clone())
-        .and_then(|b| b.path("/org/mpris/MediaPlayer2"))
-        .map_err(|e| anyhow::anyhow!("proxy builder: {e}"))
+/// Spawn per-player tasks: one watches `PropertiesChanged`, another polls
+/// `Position`, and a third watches the [`BusProxy`] liveness signal for
+/// `PeerGone`.
+async fn spawn_player_tasks(state: State, bus_name: String) {
+    // Register in discovery order first.
+    state.register(&bus_name).await;
+
+    // Initial property read.
+    if !state.refresh_player(&bus_name).await {
+        state.unregister(&bus_name).await;
+        return;
+    }
+    state.publish().await;
+
+    // Build a long-lived proxy for this player. The proxy monitors
+    // NameOwnerChanged for this exact bus name, giving us PeerGone when the
+    // player exits.
+    let player_proxy = match proxy(bus_name.as_str())
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface(PLAYER_IFACE)
+        .build()
+        .await
     {
-        Ok(b) => match b.build().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, bus_name, "failed to build PropertiesProxy");
-                return;
-            }
-        },
+        Ok(p) => p,
         Err(e) => {
-            tracing::debug!(error = %e, bus_name, "failed to configure PropertiesProxy");
+            tracing::debug!(error = %e, bus_name, "failed to build BusProxy for player");
+            state.unregister(&bus_name).await;
             return;
         }
     };
 
-    let mut changes = match props_proxy.receive_properties_changed().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(error = %e, bus_name, "subscribe PropertiesChanged failed");
+    // Subscribe to PropertiesChanged for this player.
+    let props_changed = signals(bus_name.as_str())
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface("org.freedesktop.DBus.Properties")
+        .signal("PropertiesChanged")
+        .start();
+
+    // Spawn liveness watcher.
+    {
+        let state2 = state.clone();
+        let bus2 = bus_name.clone();
+        let proxy2 = player_proxy.clone();
+        runtime::handle().spawn(async move {
+            watch_liveness(state2, bus2, proxy2).await;
+        });
+    }
+
+    // Spawn position poller.
+    {
+        let state2 = state.clone();
+        let bus2 = bus_name.clone();
+        runtime::handle().spawn(async move {
+            poll_position(state2, bus2).await;
+        });
+    }
+
+    // Run PropertiesChanged watcher in this task.
+    watch_properties(state, bus_name, props_changed).await;
+}
+
+/// Watch the `BusProxy` liveness signal. When `PeerGone` fires, unregister
+/// the player. The watcher exits after `PeerGone` — the NOC subscription in
+/// the main loop will handle re-discovery if the player comes back.
+async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) {
+    let mut liveness_stream = player_proxy.liveness().to_stream();
+    while let Some(state_val) = liveness_stream.next().await {
+        if state_val == ProxyState::PeerGone {
+            tracing::debug!(bus_name, "mpris player proxy: PeerGone");
+            state.unregister(&bus_name).await;
             return;
         }
-    };
+    }
+}
 
-    while let Some(signal) = changes.next().await {
+/// Watch `PropertiesChanged` for a player. Re-reads all properties on each
+/// emission for the `org.mpris.MediaPlayer2.Player` interface.
+async fn watch_properties(
+    state: State,
+    bus_name: String,
+    sub: hytte_bus::SignalSubscription,
+) {
+    let mut events = sub.events();
+    while let Some(event) = events.next().await {
+        // Decode body: (interface_name, changed_properties, invalidated_properties)
+        let Ok((iface, _changed, _invalidated)) =
+            event.body.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+        else {
+            continue;
+        };
+
         // Only react to changes on the Player interface.
-        let Ok(args) = signal.args() else { continue };
-        if args.interface_name.as_str() != "org.mpris.MediaPlayer2.Player" {
+        if iface != PLAYER_IFACE {
             continue;
         }
 
@@ -486,7 +500,6 @@ async fn watch_player(state: State, bus_name: String) {
         }
     }
 
-    // Stream ended → player likely disconnected.
     tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
 }
 
@@ -515,23 +528,23 @@ async fn poll_position(state: State, bus_name: String) {
             continue;
         }
 
-        // Read the Position property via a fresh connection (non-signalling).
-        let Ok(conn) = Connection::session().await else {
-            continue;
-        };
-        let Ok(proxy) = zbus::Proxy::new(
-            &conn,
-            bus_name.as_str(),
-            "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player",
-        )
-        .await
-        else {
-            continue;
-        };
+        // Read the Position property via a one-shot call.
+        let pos_result = call(bus_name.as_str())
+            .bus(BusKind::Session)
+            .at_path(MPRIS_PATH)
+            .iface("org.freedesktop.DBus.Properties")
+            .method("Get")
+            .args((PLAYER_IFACE, "Position"))
+            .send::<OwnedValue>()
+            .await;
 
-        let pos: i64 = proxy.get_property("Position").await.unwrap_or(0);
-        let pos_us = u64::try_from(pos).unwrap_or(0);
+        let pos_us = match pos_result {
+            Ok(v) => {
+                let pos_i64 = i64::try_from(v).unwrap_or(0);
+                u64::try_from(pos_i64).unwrap_or(0)
+            }
+            Err(_) => continue,
+        };
 
         // Update position in state and re-publish.
         {
@@ -552,32 +565,27 @@ async fn listen(
     players: &Mutable<Vec<Player>>,
     active: &Mutable<Option<Player>>,
 ) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("connect session bus")?;
+    let state = State::new(players.clone(), active.clone());
 
-    let state = State::new(players.clone(), active.clone(), conn.clone());
+    // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
+    // names, so we don't miss any registrations during the startup window.
+    let owner_changes = signals("org.freedesktop.DBus")
+        .bus(BusKind::Session)
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
 
-    // Get the DBus proxy.
-    let dbus = zbus::fdo::DBusProxy::new(&conn)
+    // List all current names and register existing MPRIS players.
+    let names: Vec<String> = call("org.freedesktop.DBus")
+        .bus(BusKind::Session)
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("ListNames")
+        .args(())
+        .send()
         .await
-        .context("create DBusProxy")?;
-
-    // Subscribe to NameOwnerChanged before listing names so we don't miss
-    // any registrations that happen during the startup window.
-    let mut noc_stream = dbus
-        .receive_name_owner_changed()
-        .await
-        .context("subscribe NameOwnerChanged")?;
-
-    // List all current names and register MPRIS ones.
-    let names: Vec<String> = dbus
-        .list_names()
-        .await
-        .context("list_names")?
-        .into_iter()
-        .map(|n| n.to_string())
-        .collect();
+        .context("ListNames")?;
 
     for name in names {
         if name.starts_with("org.mpris.MediaPlayer2.") {
@@ -585,57 +593,40 @@ async fn listen(
             let state2 = state.clone();
             let bus_name = name.clone();
             tokio::spawn(async move {
-                state2.register(&bus_name).await;
-                if state2.refresh_player(&bus_name).await {
-                    state2.publish().await;
-                    // Spawn position poller alongside the PropertiesChanged watcher.
-                    let state3 = state2.clone();
-                    let bus3 = bus_name.clone();
-                    tokio::spawn(async move { poll_position(state3, bus3).await });
-                    watch_player(state2, bus_name).await;
-                } else {
-                    state2.unregister(&bus_name).await;
-                }
+                spawn_player_tasks(state2, bus_name).await;
             });
         }
     }
 
     // Process NameOwnerChanged events.
-    while let Some(signal) = noc_stream.next().await {
-        let args = match signal.args() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(error = %e, "NameOwnerChanged parse error");
-                continue;
-            }
+    let mut events = owner_changes.events();
+    while let Some(event) = events.next().await {
+        let Ok((name, _old_owner, new_owner)) =
+            event.body.body().deserialize::<(String, String, String)>()
+        else {
+            tracing::debug!("NameOwnerChanged parse error");
+            continue;
         };
 
-        let name = args.name().to_string();
         if !name.starts_with("org.mpris.MediaPlayer2.") {
             continue;
         }
 
-        if args.new_owner().is_some() {
+        if new_owner.is_empty() {
+            // Player released its name (NameOwnerChanged with empty new_owner).
+            // The BusProxy liveness watcher handles this for registered players,
+            // but we also handle it here for the edge case where the proxy was
+            // never successfully built.
+            tracing::debug!(name, "mpris player disappeared (NOC)");
+            state.unregister(&name).await;
+        } else {
             // New player appeared.
             tracing::debug!(name, "mpris player appeared");
             let state2 = state.clone();
             let bus_name = name.clone();
             tokio::spawn(async move {
-                state2.register(&bus_name).await;
-                if state2.refresh_player(&bus_name).await {
-                    state2.publish().await;
-                    let state3 = state2.clone();
-                    let bus3 = bus_name.clone();
-                    tokio::spawn(async move { poll_position(state3, bus3).await });
-                    watch_player(state2, bus_name).await;
-                } else {
-                    state2.unregister(&bus_name).await;
-                }
+                spawn_player_tasks(state2, bus_name).await;
             });
-        } else {
-            // Player released its name.
-            tracing::debug!(name, "mpris player disappeared");
-            state.unregister(&name).await;
         }
     }
 
@@ -648,42 +639,47 @@ const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 const MPRIS_IFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 
-async fn read_player_props(conn: &Connection, bus_name: &str) -> Result<Player> {
-    // Two proxies — one for each interface.
-    let base_proxy = zbus::Proxy::new(conn, bus_name, MPRIS_PATH, MPRIS_IFACE)
+/// Helper: read a single D-Bus property via `org.freedesktop.DBus.Properties.Get`.
+async fn get_property<T>(
+    bus_name: &str,
+    iface: &'static str,
+    prop: &'static str,
+) -> Result<T, hytte_bus::BusError>
+where
+    T: serde::de::DeserializeOwned + zbus::zvariant::Type + 'static,
+{
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(MPRIS_PATH)
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Get")
+        .args((iface, prop))
+        .send::<T>()
         .await
-        .context("create base MediaPlayer2 proxy")?;
+}
 
-    let player_proxy = zbus::Proxy::new(conn, bus_name, MPRIS_PATH, PLAYER_IFACE)
-        .await
-        .context("create Player proxy")?;
-
-    let identity: String = base_proxy
-        .get_property("Identity")
+async fn read_player_props(bus_name: &str) -> Result<Player> {
+    let identity: String = get_property(bus_name, MPRIS_IFACE, "Identity")
         .await
         .unwrap_or_default();
 
-    let status_str: String = player_proxy
-        .get_property("PlaybackStatus")
+    let status_str: String = get_property(bus_name, PLAYER_IFACE, "PlaybackStatus")
         .await
         .unwrap_or_default();
     let status = PlaybackStatus::from_str(&status_str);
 
-    let can_play_pause: bool = player_proxy
-        .get_property("CanPlay")
+    let can_play_pause: bool = get_property(bus_name, PLAYER_IFACE, "CanPlay")
         .await
         .unwrap_or(false);
-    let can_go_next: bool = player_proxy
-        .get_property("CanGoNext")
+    let can_go_next: bool = get_property(bus_name, PLAYER_IFACE, "CanGoNext")
         .await
         .unwrap_or(false);
-    let can_go_previous: bool = player_proxy
-        .get_property("CanGoPrevious")
+    let can_go_previous: bool = get_property(bus_name, PLAYER_IFACE, "CanGoPrevious")
         .await
         .unwrap_or(false);
 
     let (title, artists, album, art_url, length_us, track_id) =
-        read_metadata(&player_proxy).await;
+        read_metadata(bus_name).await;
 
     Ok(Player {
         bus_name: bus_name.to_string(),
@@ -705,10 +701,8 @@ async fn read_player_props(conn: &Connection, bus_name: &str) -> Result<Player> 
 /// Extract track metadata from the `Metadata` property. Returns
 /// `(title, artists, album, art_url, length_us, track_id)` — all default
 /// to empty / zero / None on missing/malformed values.
-async fn read_metadata(
-    player_proxy: &zbus::Proxy<'_>,
-) -> (String, String, String, String, u64, Option<String>) {
-    let raw: OwnedValue = match player_proxy.get_property("Metadata").await {
+async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, Option<String>) {
+    let raw: OwnedValue = match get_property(bus_name, PLAYER_IFACE, "Metadata").await {
         Ok(v) => v,
         Err(_) => {
             return (

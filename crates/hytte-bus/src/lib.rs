@@ -10,6 +10,7 @@ mod connection;
 mod error;
 mod own;
 mod property;
+mod proxy;
 mod signals;
 
 pub use call::{call_with, CallBuilder, RetryPolicy};
@@ -17,6 +18,7 @@ pub use connection::BusKind;
 pub use error::BusError;
 pub use own::{own_name_with, OwnNameSignal, OwnState};
 pub use property::{property_with, PropState, PropertySignal};
+pub use proxy::{proxy_with, BusProxy, ProxyBuilder, ProxyState};
 pub use signals::{signals_with, SignalEvent, SignalSubscription};
 
 #[doc(hidden)]

@@ -22,7 +22,7 @@ use futures_signals::signal::SignalExt;
 use hytte_bus::{BusKind, OwnNameSignal, ProxyState, call, proxy, signals};
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::message::Header;
@@ -141,10 +141,12 @@ impl Service for TrayService {
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let items = Mutable::new(Vec::new());
+        let ownership_slot: Arc<OnceLock<OwnNameSignal>> = Arc::new(OnceLock::new());
 
         let state = State {
             items: items.clone(),
             registered: Arc::new(AsyncMutex::new(HashMap::new())),
+            ownership: ownership_slot.clone(),
         };
 
         let watcher = Watcher {
@@ -152,12 +154,18 @@ impl Service for TrayService {
         };
 
         // Own `org.kde.StatusNotifierWatcher` + mount the watcher interface.
-        // The OwnNameSignal is stored in TrayHandles (process lifetime) to keep
-        // the task alive.
+        // The OwnNameSignal is stored in TrayHandles (process lifetime) and in
+        // `state.ownership` so that watch_item tasks can emit signals directly
+        // without a round-trip D-Bus call.
         let ownership = hytte_bus::own_name("org.kde.StatusNotifierWatcher")
             .bus(BusKind::Session)
             .at_path(WATCHER_PATH, watcher)
             .start();
+
+        // Populate the OnceLock so watch_item tasks can call emit_unregistered.
+        // Items only start registering after the watcher interface is mounted,
+        // so this is always set before any watch_item task runs.
+        let _ = ownership_slot.set(ownership.clone());
 
         // Spawn the NameOwnerChanged watcher to prune items when their bus
         // name disappears.
@@ -441,10 +449,16 @@ async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<
 ///
 /// No longer holds a `Connection`; all D-Bus I/O goes through `hytte_bus::call`
 /// and `hytte_bus::proxy`.
+///
+/// `ownership` is set once after `own_name(...).start()` returns. The
+/// `OnceLock` is always populated before any `watch_item` task can call
+/// `emit_unregistered`, because item registrations only arrive after the
+/// watcher interface is fully mounted on the bus.
 #[derive(Clone)]
 struct State {
     items: Mutable<Vec<TrayItem>>,
     registered: Arc<AsyncMutex<HashMap<String, TrayItem>>>,
+    ownership: Arc<OnceLock<OwnNameSignal>>,
 }
 
 impl State {
@@ -484,6 +498,23 @@ impl State {
         drop(map);
         list.sort_by(|a, b| a.key.cmp(&b.key));
         self.items.set(list);
+    }
+
+    /// Emit `StatusNotifierItemUnregistered` directly on the owned watcher
+    /// connection, bypassing the `_EmitUnregistered` round-trip.
+    async fn emit_unregistered(&self, key: String) {
+        let Some(ownership) = self.ownership.get() else {
+            tracing::warn!(key, "emit_unregistered: ownership not yet set");
+            return;
+        };
+        let result = ownership
+            .emit(WATCHER_PATH, |emitter| async move {
+                Watcher::status_notifier_item_unregistered(&emitter, key).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "StatusNotifierItemUnregistered emit failed");
+        }
     }
 }
 
@@ -591,22 +622,6 @@ impl Watcher {
         emitter: &SignalEmitter<'_>,
         service: String,
     ) -> zbus::Result<()>;
-
-    /// Emit `StatusNotifierItemUnregistered` programmatically.
-    ///
-    /// Called via `bus::call` from `watch_item` tasks so that the signal is
-    /// emitted on the connection that owns the watcher interface.
-    #[allow(non_snake_case)]
-    async fn _EmitUnregistered(
-        &self,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-        service: String,
-    ) -> zbus::fdo::Result<()> {
-        Self::status_notifier_item_unregistered(&emitter, service)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(())
-    }
 }
 
 // ── Per-item watcher task ─────────────────────────────────────────────────────
@@ -669,15 +684,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
                     let key = format!("{bus2}{path2}");
                     state2.registered.lock().await.remove(&key);
                     state2.rebuild_published_list().await;
-                    // Emit unregistered signal via the owned watcher interface.
-                    let _ = call("org.kde.StatusNotifierWatcher")
-                        .bus(BusKind::Session)
-                        .at_path(WATCHER_PATH)
-                        .iface("org.kde.StatusNotifierWatcher")
-                        .method("_EmitUnregistered")
-                        .args((key,))
-                        .send::<()>()
-                        .await;
+                    state2.emit_unregistered(key).await;
                     return;
                 }
             }
@@ -691,14 +698,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
         if !still_alive {
             let key = format!("{bus_name}{object_path}");
             tracing::debug!(key, "item disappeared, unregistering");
-            let _ = call("org.kde.StatusNotifierWatcher")
-                .bus(BusKind::Session)
-                .at_path(WATCHER_PATH)
-                .iface("org.kde.StatusNotifierWatcher")
-                .method("_EmitUnregistered")
-                .args((key,))
-                .send::<()>()
-                .await;
+            state.emit_unregistered(key).await;
             return;
         }
     }
@@ -707,14 +707,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     let key = format!("{bus_name}{object_path}");
     state.registered.lock().await.remove(&key);
     state.rebuild_published_list().await;
-    let _ = call("org.kde.StatusNotifierWatcher")
-        .bus(BusKind::Session)
-        .at_path(WATCHER_PATH)
-        .iface("org.kde.StatusNotifierWatcher")
-        .method("_EmitUnregistered")
-        .args((key,))
-        .send::<()>()
-        .await;
+    state.emit_unregistered(key).await;
 }
 
 // ── NameOwnerChanged watcher ──────────────────────────────────────────────────

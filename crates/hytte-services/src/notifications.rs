@@ -8,7 +8,6 @@
 //! starting trollshell, otherwise the name acquisition will fail and the
 //! service will keep retrying.
 
-use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::OwnNameSignal;
 use hytte_reactive::{registry, runtime, Service};
@@ -39,6 +38,9 @@ use zbus::zvariant::OwnedValue;
 struct NotificationsShared {
     active: Mutable<Vec<Notification>>,
     history: Mutable<Vec<HistoryEntry>>,
+    /// Ownership handle used to emit D-Bus signals directly on the owned
+    /// connection without a round-trip method call.
+    ownership: OwnNameSignal,
 }
 
 static SHARED: OnceLock<NotificationsShared> = OnceLock::new();
@@ -164,15 +166,6 @@ impl Service for NotificationsService {
         let next_id = Arc::new(AtomicU32::new(1));
         let history = Mutable::new(Vec::new());
 
-        // Populate the cross-thread shared handle so `dismiss` / `clear_history`
-        // can find these Mutables when called from a hytte-tokio worker (the
-        // thread-local registry is GTK-only). Calling Service::start a second
-        // time would `set` fail silently — services are registered once.
-        let _ = SHARED.set(NotificationsShared {
-            active: active.clone(),
-            history: history.clone(),
-        });
-
         let iface = NotificationsIface {
             active: active.clone(),
             next_id: next_id.clone(),
@@ -183,12 +176,22 @@ impl Service for NotificationsService {
         // connection lifecycle, RequestName retries, and per-owner back-off if
         // mako/dunst is camping the name.
         //
-        // The OwnNameSignal is stored in NotificationsHandles (which lives in
-        // the registry for the process lifetime) to keep the watcher task
-        // alive.
+        // The OwnNameSignal is stored both in NotificationsHandles (process
+        // lifetime keep-alive) and in SHARED (so dismiss/invoke_action can
+        // emit signals directly without a round-trip D-Bus call).
         let ownership = hytte_bus::own_name("org.freedesktop.Notifications")
             .at_path("/org/freedesktop/Notifications", iface)
             .start();
+
+        // Populate the cross-thread shared handle so `dismiss` / `clear_history`
+        // can find these Mutables when called from a hytte-tokio worker (the
+        // thread-local registry is GTK-only). Calling Service::start a second
+        // time would `set` fail silently — services are registered once.
+        let _ = SHARED.set(NotificationsShared {
+            active: active.clone(),
+            history: history.clone(),
+            ownership: ownership.clone(),
+        });
 
         NotificationsHandles {
             active,
@@ -282,19 +285,20 @@ pub fn dismiss(id: u32, reason: u32) {
         }
     }
 
-    // Emit the D-Bus signal via our own interface's _EmitClosed method.
-    runtime::handle().spawn(async move {
-        let result = hytte_bus::call("org.freedesktop.Notifications")
-            .at_path("/org/freedesktop/Notifications")
-            .iface("org.freedesktop.Notifications")
-            .method("_EmitClosed")
-            .args((id, reason))
-            .send::<()>()
-            .await;
-        if let Err(e) = result {
-            tracing::warn!(error = %e, id, reason, "_EmitClosed failed");
-        }
-    });
+    // Emit the NotificationClosed signal directly on the owned connection.
+    if let Some(shared) = SHARED.get() {
+        let ownership = shared.ownership.clone();
+        runtime::handle().spawn(async move {
+            let result = ownership
+                .emit("/org/freedesktop/Notifications", |emitter| async move {
+                    NotificationsIface::notification_closed(&emitter, id, reason).await
+                })
+                .await;
+            if let Err(e) = result {
+                tracing::warn!(error = %e, id, reason, "NotificationClosed emit failed");
+            }
+        });
+    }
 }
 
 /// Dismiss every currently-active notification (reason 2 = dismissed-by-user)
@@ -325,23 +329,20 @@ pub fn dismiss_all() {
 /// Both the toast widget and the history page wire action buttons to this.
 pub fn invoke_action(id: u32, action_key: &str) {
     let action_key = action_key.to_string();
-    runtime::handle().spawn(async move {
-        if let Err(e) = do_invoke_action(id, &action_key).await {
-            tracing::warn!(error = %e, id, action_key, "notifications::invoke_action failed");
-        }
-    });
-}
-
-async fn do_invoke_action(id: u32, action_key: &str) -> Result<()> {
-    hytte_bus::call("org.freedesktop.Notifications")
-        .at_path("/org/freedesktop/Notifications")
-        .iface("org.freedesktop.Notifications")
-        .method("_EmitInvoked")
-        .args((id, action_key.to_string()))
-        .send::<()>()
-        .await
-        .context("emit ActionInvoked via _EmitInvoked")?;
-    Ok(())
+    if let Some(shared) = SHARED.get() {
+        let ownership = shared.ownership.clone();
+        runtime::handle().spawn(async move {
+            let key_for_log = action_key.clone();
+            let result = ownership
+                .emit("/org/freedesktop/Notifications", |emitter| async move {
+                    NotificationsIface::action_invoked(&emitter, id, &action_key).await
+                })
+                .await;
+            if let Err(e) = result {
+                tracing::warn!(error = %e, id, action_key = key_for_log, "ActionInvoked emit failed");
+            }
+        });
+    }
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -481,8 +482,6 @@ impl NotificationsIface {
         if let Some(dur) = timeout {
             tokio::spawn(async move {
                 tokio::time::sleep(dur).await;
-                // Route through the public dismiss() so signal emission goes
-                // through _EmitClosed on the bus-layer connection.
                 crate::notifications::dismiss(id, 1); // 1 = expired
             });
         }
@@ -493,8 +492,6 @@ impl NotificationsIface {
     /// Close a notification by id (reason 3 = closed by call).
     #[allow(clippy::unused_async)]
     async fn close_notification(&self, id: u32) {
-        // Remove from local state and emit the signal via the public API,
-        // which routes through _EmitClosed on the bus-layer connection.
         if let Some(n) = self.remove_from_active(id) {
             self.push_to_history(n, 3);
         }
@@ -535,41 +532,6 @@ impl NotificationsIface {
         id: u32,
         action_key: &str,
     ) -> zbus::Result<()>;
-
-    /// Emit `NotificationClosed` programmatically.
-    ///
-    /// Called via `bus::call` from `do_dismiss` so that the signal is emitted
-    /// on the connection that owns the interface (the shared session bus
-    /// connection managed by the bus layer).
-    #[allow(non_snake_case)]
-    async fn _EmitClosed(
-        &self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        id: u32,
-        reason: u32,
-    ) -> zbus::fdo::Result<()> {
-        Self::notification_closed(&emitter, id, reason)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Emit `ActionInvoked` programmatically.
-    ///
-    /// Called via `bus::call` from `do_invoke_action` so that the signal is
-    /// emitted on the connection that owns the interface.
-    #[allow(non_snake_case)]
-    async fn _EmitInvoked(
-        &self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        id: u32,
-        action_key: String,
-    ) -> zbus::fdo::Result<()> {
-        Self::action_invoked(&emitter, id, &action_key)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-        Ok(())
-    }
 }
 
 // ── Helper: parse actions ─────────────────────────────────────────────────────

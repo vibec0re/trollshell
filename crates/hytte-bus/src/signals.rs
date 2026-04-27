@@ -32,6 +32,9 @@ struct SubInner {
     sender: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
     missed: Mutable<u64>,
     missed_counter: Arc<AtomicU64>,
+    /// A oneshot receiver that resolves when the internal task exits.
+    /// Exposed via `task_done_receiver()` for integration tests.
+    task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl SignalSubscription {
@@ -61,6 +64,15 @@ impl SignalSubscription {
     pub fn missed_count(&self) -> u64 {
         self.inner.missed_counter.load(Ordering::Acquire)
     }
+
+    /// Take the oneshot receiver that fires when the internal subscription
+    /// task exits. May only be called once per subscription; returns `None`
+    /// on subsequent calls. Intended for integration tests that need to verify
+    /// the task actually shuts down when the subscription is dropped.
+    #[doc(hidden)]
+    pub async fn task_done_receiver(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.inner.task_done_rx.lock().await.take()
+    }
 }
 
 /// Context passed to `run_subscription` to avoid too-many-arguments lint.
@@ -71,8 +83,15 @@ struct RunCtx {
     iface: String,
     signal_name: String,
     tx: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
+    /// Weak reference to the subscription's inner state. When all
+    /// `SignalSubscription` clones have been dropped, `upgrade()` returns
+    /// `None`, which is the definitive signal that no consumer will ever call
+    /// `events()` again and the task can exit.
+    weak: std::sync::Weak<SubInner>,
     missed: Mutable<u64>,
     missed_counter: Arc<AtomicU64>,
+    /// Fired when the task exits so integration tests can verify teardown.
+    task_done_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Builder.
@@ -112,13 +131,16 @@ impl SignalsBuilder<'_> {
         let (tx, _) = tokio::sync::broadcast::channel(64);
         let missed = Mutable::new(0u64);
         let missed_counter = Arc::new(AtomicU64::new(0));
-        let sub = SignalSubscription {
-            inner: Arc::new(SubInner {
-                sender: tx.clone(),
-                missed: missed.clone(),
-                missed_counter: missed_counter.clone(),
-            }),
-        };
+        let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let inner = Arc::new(SubInner {
+            sender: tx.clone(),
+            missed: missed.clone(),
+            missed_counter: missed_counter.clone(),
+            task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
+        });
+        let weak = Arc::downgrade(&inner);
+        let sub = SignalSubscription { inner };
         let ctx = RunCtx {
             shared: self.shared.clone(),
             dest: self.destination,
@@ -126,8 +148,10 @@ impl SignalsBuilder<'_> {
             iface: self.iface,
             signal_name: self.signal,
             tx,
+            weak,
             missed,
             missed_counter,
+            task_done_tx,
         };
         hytte_reactive::runtime::handle().spawn(async move {
             run_subscription(ctx).await;
@@ -161,115 +185,136 @@ pub fn signals_with(
     }
 }
 
-async fn run_subscription(ctx: RunCtx) {
-    use futures_signals::signal::SignalExt;
+/// Why `drain_signal_stream` returned.
+enum DrainOutcome {
+    /// All `SignalSubscription` handles dropped — task must exit.
+    NoSubscribers,
+    /// Stream ended or epoch advanced — outer loop should reconnect.
+    Reconnect,
+}
 
-    let RunCtx {
-        shared,
-        dest,
-        path,
-        iface,
-        signal_name,
-        tx,
-        missed,
-        missed_counter,
-    } = ctx;
+/// Drain context passed to `drain_signal_stream` to stay under the argument limit.
+struct DrainCtx<'a> {
+    shared: &'a SharedConnection,
+    current_epoch: u64,
+    tx: &'a tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
+    /// Weak handle — `None` strong count means all subscription handles dropped.
+    weak: &'a std::sync::Weak<SubInner>,
+    dest: &'a str,
+    path: &'a str,
+    iface: &'a str,
+    signal_name: &'a str,
+}
+
+/// Consume one connected signal stream until it ends, the epoch advances,
+/// or all subscription handles are dropped.
+async fn drain_signal_stream(
+    mut stream: zbus::proxy::SignalStream<'_>,
+    dc: DrainCtx<'_>,
+) -> DrainOutcome {
+    use futures_signals::signal::SignalExt;
+    let mut epoch_stream = dc.shared.epoch_signal().signal_cloned().to_stream();
+    // Periodic wakeup so we notice when all subscription handles have been
+    // dropped while the task is parked waiting for a signal that never arrives.
+    let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                if let Some(msg) = msg {
+                    let event = SignalEvent {
+                        body: msg.clone(),
+                        sender: msg.header().sender().map(ToString::to_string),
+                        timestamp: SystemTime::now(),
+                    };
+                    let _ = dc.tx.send(Arc::new(event));
+                } else {
+                    tracing::debug!(dest = dc.dest, path = dc.path, iface = dc.iface,
+                        signal_name = dc.signal_name, "signal stream ended; will re-subscribe");
+                    return DrainOutcome::Reconnect;
+                }
+            }
+            epoch_update = epoch_stream.next() => {
+                if let Some(new_epoch) = epoch_update && new_epoch > dc.current_epoch {
+                    tracing::debug!(dest = dc.dest, path = dc.path, iface = dc.iface,
+                        signal_name = dc.signal_name, new_epoch, "epoch advanced; re-subscribing");
+                    return DrainOutcome::Reconnect;
+                }
+            }
+            _ = liveness.tick() => {}
+        }
+        // After each select arm: exit if all subscription handles are gone.
+        if dc.weak.upgrade().is_none() {
+            tracing::debug!(dest = dc.dest, path = dc.path, iface = dc.iface,
+                signal_name = dc.signal_name,
+                "all subscribers dropped; exiting subscription task");
+            return DrainOutcome::NoSubscribers;
+        }
+    }
+}
+
+async fn run_subscription(ctx: RunCtx) {
+    let RunCtx { shared, dest, path, iface, signal_name, tx, weak, missed, missed_counter, task_done_tx } = ctx;
 
     let mut first_iteration = true;
     loop {
+        // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
+        if weak.upgrade().is_none() {
+            tracing::debug!(dest, path, iface, signal_name,
+                "all subscribers dropped; exiting subscription task");
+            let _ = task_done_tx.send(());
+            return;
+        }
+
         if !first_iteration {
             let n = missed_counter.fetch_add(1, Ordering::AcqRel) + 1;
             missed.set(n);
         }
         first_iteration = false;
 
-        // Snapshot the current epoch and grab the connection. We use `with_conn`
-        // only to obtain the connection handle — the actual stream runs outside
-        // of the closure so that epoch changes (reconnects) can abort it.
         let current_epoch = shared.epoch();
-        let conn_result = shared
-            .with_conn(|conn| async move { Ok(conn) })
-            .await;
-
+        let conn_result = shared.with_conn(|conn| async move { Ok(conn) }).await;
         let conn = match conn_result {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "signal subscription: no connection, will retry"
-                );
+                tracing::debug!(error = %e, "signal subscription: no connection, will retry");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 continue;
             }
         };
 
-        // Build the proxy and subscribe to the signal.
         let stream_result = async {
             let proxy = zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str()).await?;
             proxy.receive_signal(signal_name.as_str()).await
-        }
-        .await;
+        }.await;
 
-        let mut stream = match stream_result {
+        let stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    dest,
-                    path,
-                    iface,
-                    signal_name,
-                    "signal subscription: receive_signal failed, will retry"
-                );
+                tracing::debug!(error = %e, dest, path, iface, signal_name,
+                    "signal subscription: receive_signal failed, will retry");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 continue;
             }
         };
 
-        // Watch for epoch changes so we can abort when the bus reconnects.
-        let mut epoch_stream = shared.epoch_signal().signal_cloned().to_stream();
+        let outcome = drain_signal_stream(stream, DrainCtx {
+            shared: &shared,
+            current_epoch,
+            tx: &tx,
+            weak: &weak,
+            dest: &dest,
+            path: &path,
+            iface: &iface,
+            signal_name: &signal_name,
+        }).await;
 
-        // Consume signal emissions until either the stream ends or the epoch advances.
-        loop {
-            tokio::select! {
-                msg = stream.next() => {
-                    if let Some(msg) = msg {
-                        let event = SignalEvent {
-                            body: msg.clone(),
-                            sender: msg.header().sender().map(ToString::to_string),
-                            timestamp: SystemTime::now(),
-                        };
-                        let _ = tx.send(Arc::new(event));
-                    } else {
-                        // Stream ended (connection dropped or signal interface disappeared).
-                        tracing::debug!(
-                            dest,
-                            path,
-                            iface,
-                            signal_name,
-                            "signal stream ended; will re-subscribe"
-                        );
-                        break;
-                    }
-                }
-                epoch_update = epoch_stream.next() => {
-                    if let Some(new_epoch) = epoch_update
-                        && new_epoch > current_epoch
-                    {
-                        // The bus reconnected — re-subscribe on the new connection.
-                        tracing::debug!(
-                            dest,
-                            path,
-                            iface,
-                            signal_name,
-                            new_epoch,
-                            "epoch advanced; re-subscribing"
-                        );
-                        break;
-                    }
-                }
-            }
+        if matches!(outcome, DrainOutcome::NoSubscribers) {
+            let _ = task_done_tx.send(());
+            return;
         }
+
         // Brief pause before re-subscribing to avoid a tight loop when the bus
         // is cycling rapidly.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

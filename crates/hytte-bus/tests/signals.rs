@@ -8,6 +8,42 @@ use std::time::Duration;
 use zbus::connection::Builder;
 use zbus::object_server::SignalEmitter;
 
+// ── Task-exit-on-drop test ────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn task_exits_when_subscription_dropped() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+
+    // Start a subscription and grab the exit probe *before* dropping.
+    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
+        .at_path("/cc/hannig/test/Pinger")
+        .iface("cc.hannig.test.Pinger")
+        .signal("Pinged")
+        .start();
+
+    // Grab the task-done receiver while we still hold the subscription.
+    let done_rx = sub
+        .task_done_receiver()
+        .await
+        .expect("task_done_receiver should be Some on first call");
+
+    // Give the task a moment to start up and reach its first select! wait.
+    // The task parks in the inner loop on `stream.next()` / epoch_stream.
+    // After drop, `receiver_count()` becomes 0 and the check fires on the
+    // next select! iteration.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Drop all handles — this is the moment the task should detect the leak.
+    drop(sub);
+
+    // The task must exit within 1 second.
+    tokio::time::timeout(Duration::from_secs(1), done_rx)
+        .await
+        .expect("timeout: subscription task did not exit within 1s after drop")
+        .expect("task_done_tx was dropped without sending — task panicked?");
+}
+
 struct Pinger;
 
 #[zbus::interface(name = "cc.hannig.test.Pinger")]

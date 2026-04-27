@@ -24,8 +24,15 @@ pub struct BusGuard {
 impl Drop for BusGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Best-effort SIGKILL; this is test cleanup.
+            // Send SIGKILL then block until the daemon is fully reaped, so the
+            // TempDir (socket directory) is not removed before the process exits.
+            // block_in_place suspends async scheduling on this thread, allowing
+            // a nested block_on without the "cannot block inside async" panic.
             let _ = child.start_kill();
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                let _ = handle.block_on(child.wait());
+            });
         }
     }
 }
@@ -66,6 +73,7 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
         .arg("--nofork")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn dbus-daemon — install package `dbus` if missing");
 

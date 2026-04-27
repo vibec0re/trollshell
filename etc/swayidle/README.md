@@ -10,20 +10,14 @@ A native `ext-idle-notify-v1` implementation in `hytte-services` is deferred
 
 - `swayidle` — the idle daemon itself (reads `ext-idle-notify-v1` from the
   Wayland compositor; niri implements it).
-- `gtklock` — GTK-based screen locker. `waylock` is an acceptable substitute
-  if you prefer a smaller TUI-style locker; edit the `config` accordingly.
 - `brightnessctl` — used by the `timeout 240` action to save and restore
   backlight level.
 
 Install on Arch:
 
 ```sh
-sudo pacman -S swayidle gtklock brightnessctl
+sudo pacman -S swayidle brightnessctl
 ```
-
-If `gtklock` is missing, swayidle will still fire the timeout but the lock
-command silently fails — the screen dims and suspends but is never locked.
-Install it before enabling the unit.
 
 ## Install the config
 
@@ -80,9 +74,9 @@ see task #34 (session autostart units) if it doesn't.
 3. Manual smoke test:
    - Leave the laptop alone for ~4 min. Backlight should dim to 10%.
    - Move the mouse / press a key. Backlight restores to its prior level.
-   - Walk away again, wait ~5 min total. gtklock should appear.
+   - Walk away again, wait ~5 min total. The trollshell lock surface should appear.
    - Wait the rest of the way to ~10 min. The system should suspend; on
-     wake, gtklock is already in front (from `before-sleep`) and you must
+     wake, the trollshell lock surface is already in front (from `before-sleep`) and you must
      auth to get back in.
 
 ## Tuning
@@ -92,12 +86,14 @@ The four directives in `etc/swayidle/config` are:
 | Directive                              | When        | Action                            |
 | -------------------------------------- | ----------- | --------------------------------- |
 | `timeout 240 ... resume ...`           | 4 min idle  | Save brightness, dim to 10%; restore on resume. |
-| `timeout 300 'gtklock'`                | 5 min idle  | Lock the screen.                  |
+| `timeout 300 'loginctl lock-session'`  | 5 min idle  | Lock the screen.                  |
 | `timeout 600 'systemctl suspend'`      | 10 min idle | Suspend the system.               |
-| `before-sleep 'gtklock'`               | pre-suspend | Lock right before any suspend.    |
+| `before-sleep 'loginctl lock-session'` | pre-suspend | Lock right before any suspend.    |
 
-To change the timeouts or swap `gtklock` for `waylock` / `hyprlock`, edit
-`etc/swayidle/config`, then reload:
+`loginctl lock-session` fires logind's `Session.Lock` signal, which trollshell's
+screensaver listen loop translates into the native lock surface.
+
+To change the timeouts, edit `etc/swayidle/config`, then reload:
 
 ```sh
 systemctl --user restart swayidle.service

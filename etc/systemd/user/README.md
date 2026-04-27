@@ -61,7 +61,7 @@ Just niri itself — the components have their own package lists:
   up and running.
 
 Each child unit's README documents its own dependencies (swayidle pulls in
-gtklock + brightnessctl; swaybg pulls in swaybg the binary; trollshell is
+brightnessctl; swaybg pulls in swaybg the binary; trollshell is
 this repo's `cargo build --release` output).
 
 Install niri on Arch:
@@ -176,8 +176,9 @@ journalctl --user -f -u niri-session.target \
   goes into `failed` state after systemd's default start-limit kicks in.
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
-- **swayidle starts but the lock never fires.** gtklock (or your chosen
-  locker) isn't installed. See `../../swayidle/README.md`.
+- **swayidle starts but the lock never fires.** The PAM service file is
+  probably missing — trollshell's lock screen requires `/etc/pam.d/trollshell`.
+  See `etc/pam.d/` and the install step in `etc/README.md`.
 - **`niri-session.target` is `inactive`.** niri's spawn-at-startup didn't
   fire, or `import-environment` failed. Log into niri however you normally
   do (greetd, TTY exec, etc.), then watch `journalctl --user -f` for the

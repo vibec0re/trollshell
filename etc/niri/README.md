@@ -80,8 +80,8 @@ Then paste the inner lines.
    pause; `XF86AudioNext` / `Prev` move tracks. The MPRIS bar widget
    updates in lockstep.
 
-6. Lock the screen (`gtklock` or whatever you use from task #28). The
-   media-transport keys and mute keys should still work; volume and
+6. Lock the screen (`loginctl lock-session` or the trollshell bar Power button).
+   The media-transport keys and mute keys should still work; volume and
    brightness keys should not — that's the `allow-when-locked=true` split.
 
 If the OSD doesn't appear but `wpctl get-volume` reports a change, the

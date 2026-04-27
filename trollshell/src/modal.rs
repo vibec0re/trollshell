@@ -6,6 +6,7 @@ use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::calendar;
 use hytte::services::clipboard;
+use hytte::services::notifications;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
 
 use crate::widgets::pages;
@@ -414,6 +415,10 @@ fn on_page_show(page: Page) {
     match page {
         Page::Clipboard => clipboard::refresh(),
         Page::Calendar => calendar::refresh(),
+        // Opening the Notifications drawer = the user has seen them.
+        // Dismiss all active toasts (move to history); the bell counter
+        // bound to active.len() drops to zero.
+        Page::Notifications => notifications::dismiss_all(),
         _ => {}
     }
 }

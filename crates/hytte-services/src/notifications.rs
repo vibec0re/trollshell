@@ -297,6 +297,27 @@ pub fn dismiss(id: u32, reason: u32) {
     });
 }
 
+/// Dismiss every currently-active notification (reason 2 = dismissed-by-user)
+/// and move them all into history.
+///
+/// Used by the notifications drawer page on open so the bell counter goes to
+/// zero when the user views them. Critical-urgency entries are dismissed too
+/// — their actions remain accessible from the history page.
+///
+/// Safe to call from any thread; each id is forwarded to [`dismiss`], which
+/// is itself thread-safe.
+pub fn dismiss_all() {
+    let Some(shared) = SHARED.get() else {
+        return;
+    };
+    // Snapshot ids first so we don't hold the read guard across a write
+    // (`dismiss` takes its own `lock_mut`).
+    let ids: Vec<u32> = shared.active.lock_ref().iter().map(|n| n.id).collect();
+    for id in ids {
+        dismiss(id, 2);
+    }
+}
+
 /// Invoke action `action_key` on notification `id`.
 ///
 /// Emits `ActionInvoked` on the session bus as a broadcast — the originating

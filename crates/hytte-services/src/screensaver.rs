@@ -54,13 +54,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures_signals::signal::{Mutable, Signal};
-use futures_util::StreamExt;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use zbus::{fdo, Connection};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -98,18 +95,9 @@ pub struct ScreenSaverHandles {
     /// otherwise. Set by [`lock`] and cleared by [`handle_unlock_success`].
     /// Subscribers: `widgets::lock_screen`.
     pub(crate) is_locked: Mutable<bool>,
-}
-
-impl Default for ScreenSaverHandles {
-    fn default() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(HashMap::new())),
-            inhibitors: Mutable::new(Vec::new()),
-            // Start at 1 so a leaked default-zero cookie never matches.
-            next_cookie: Arc::new(AtomicU32::new(1)),
-            is_locked: Mutable::new(false),
-        }
-    }
+    /// Keeps the name-ownership task alive for the process lifetime.
+    #[allow(dead_code)]
+    ownership: hytte_bus::OwnNameSignal,
 }
 
 // ── Service marker ────────────────────────────────────────────────────────────
@@ -120,38 +108,35 @@ impl Service for ScreenSaverService {
     type Handles = ScreenSaverHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = ScreenSaverHandles::default();
-        let state = handles.state.clone();
-        let inhibitors_view = handles.inhibitors.clone();
-        let next_cookie = handles.next_cookie.clone();
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        let inhibitors = Mutable::new(Vec::new());
+        // Start at 1 so a leaked default-zero cookie never matches.
+        let next_cookie = Arc::new(AtomicU32::new(1));
+        let is_locked = Mutable::new(false);
 
-        rt.spawn(async move {
-            loop {
-                if let Err(e) =
-                    run_server(state.clone(), inhibitors_view.clone(), next_cookie.clone()).await
-                {
-                    tracing::warn!(error = %e, "ScreenSaver server failed, retrying in 5s");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+        let iface = ScreenSaverIface {
+            state: state.clone(),
+            inhibitors: inhibitors.clone(),
+            next_cookie: next_cookie.clone(),
+        };
 
-        // If this process has no logind session (TTY login, headless container),
-        // GetSessionByPID will fail on every iteration. That is expected — external
-        // lock signals just won't work in those environments; the bar's Lock button
-        // and the ScreenSaver D-Bus interface still flip is_locked directly.
-        let locked_writer = handles.is_locked.clone();
-        rt.spawn(async move {
-            loop {
-                match listen_login1(&locked_writer).await {
-                    Ok(()) => tracing::warn!("login1 stream ended, retrying in 5s"),
-                    Err(e) => tracing::warn!(error = %e, "login1 error, retrying in 5s"),
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+        // Own the well-known name on session bus, mount at both paths.
+        let ownership = hytte_bus::own_name("org.freedesktop.ScreenSaver")
+            .at_path(PATH_CANONICAL, iface.clone())
+            .at_path(PATH_LEGACY, iface)
+            .start();
 
-        handles
+        // Start the login1 Session.Lock/Unlock listener.
+        let locked_writer = is_locked.clone();
+        rt.spawn(spawn_login1_listener(locked_writer));
+
+        ScreenSaverHandles {
+            state,
+            inhibitors,
+            next_cookie,
+            is_locked,
+            ownership,
+        }
     }
 }
 
@@ -206,87 +191,142 @@ pub fn handle_unlock_success() {
 }
 
 async fn call_login1_unlock() -> anyhow::Result<()> {
-    let conn = Connection::system().await.context("connect system bus")?;
-    let manager = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-    )
-    .await
-    .context("login1 Manager proxy")?;
-    let pid: u32 = std::process::id();
-    let session_path: zbus::zvariant::OwnedObjectPath = manager
-        .call("GetSessionByPID", &(pid,))
+    let session_path = resolve_session_path()
         .await
-        .context("GetSessionByPID")?;
-    let session = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.login1",
-        session_path.as_str(),
-        "org.freedesktop.login1.Session",
-    )
-    .await
-    .context("login1 Session proxy")?;
-    session
-        .call::<_, _, ()>("SetLockedHint", &(false,))
+        .context("resolve login1 session path")?;
+    hytte_bus::call("org.freedesktop.login1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path(session_path)
+        .iface("org.freedesktop.login1.Session")
+        .method("SetLockedHint")
+        .args((false,))
+        .send::<()>()
         .await
         .context("Session.SetLockedHint(false)")?;
     Ok(())
 }
 
-/// Subscribe to logind `Session.Lock`/`Unlock` and mirror them into
-/// `is_locked`. Returns `Ok(())` when both signal streams end (which
-/// the outer retry loop treats as a reconnect trigger), or `Err` if
-/// any setup step fails.
-async fn listen_login1(is_locked: &Mutable<bool>) -> anyhow::Result<()> {
-    let conn = Connection::system()
-        .await
-        .context("connect system bus for login1")?;
+async fn spawn_login1_listener(is_locked: Mutable<bool>) {
+    use futures_signals::signal::SignalExt;
+    use futures_util::StreamExt;
 
-    let manager = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-    )
-    .await
-    .context("login1 Manager proxy")?;
-
-    let pid: u32 = std::process::id();
-    let session_path: zbus::zvariant::OwnedObjectPath = manager
-        .call("GetSessionByPID", &(pid,))
-        .await
-        .context("GetSessionByPID")?;
-
-    let session = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.login1",
-        session_path.as_str(),
-        "org.freedesktop.login1.Session",
-    )
-    .await
-    .context("login1 Session proxy")?;
-
-    let mut lock_signals = session
-        .receive_signal("Lock")
-        .await
-        .context("subscribe Session.Lock")?;
-    let mut unlock_signals = session
-        .receive_signal("Unlock")
-        .await
-        .context("subscribe Session.Unlock")?;
-
-    tracing::debug!(?session_path, "subscribed to login1 Session.Lock/Unlock");
-
-    loop {
-        tokio::select! {
-            Some(_) = lock_signals.next() => is_locked.set(true),
-            Some(_) = unlock_signals.next() => is_locked.set(false),
-            else => break,
+    // Cache the session path; resolve once.
+    let session_path = match resolve_session_path().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::info!(error = %e,
+                "no logind session for this process — login1 lock signals disabled");
+            return;
         }
-    }
-    Ok(())
+    };
+
+    let lock_sub = hytte_bus::signals("org.freedesktop.login1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path(session_path.clone())
+        .iface("org.freedesktop.login1.Session")
+        .signal("Lock")
+        .start();
+    let unlock_sub = hytte_bus::signals("org.freedesktop.login1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path(session_path.clone())
+        .iface("org.freedesktop.login1.Session")
+        .signal("Unlock")
+        .start();
+
+    let lock_writer = is_locked.clone();
+    let unlock_writer = is_locked.clone();
+    let lock_writer_for_missed = is_locked.clone();
+    let unlock_writer_for_missed = is_locked.clone();
+
+    // Lock events: set is_locked=true.
+    // Clone the subscription so the stream is owned and 'static.
+    let lock_sub_for_events = lock_sub.clone();
+    tokio::spawn(async move {
+        let mut stream = lock_sub_for_events.events();
+        while stream.next().await.is_some() {
+            lock_writer.set(true);
+        }
+    });
+
+    // Unlock events: set is_locked=false.
+    let unlock_sub_for_events = unlock_sub.clone();
+    tokio::spawn(async move {
+        let mut stream = unlock_sub_for_events.events();
+        while stream.next().await.is_some() {
+            unlock_writer.set(false);
+        }
+    });
+
+    // On missed emissions (reconnect), re-fetch authoritative state via GetLockedHint.
+    // Clone so the signal is owned and 'static in the spawned task.
+    let lock_path_for_missed = session_path.clone();
+    let lock_sub_for_missed = lock_sub.clone();
+    tokio::spawn(async move {
+        lock_sub_for_missed
+            .missed_emissions()
+            .for_each(move |_| {
+                let path = lock_path_for_missed.clone();
+                let writer = lock_writer_for_missed.clone();
+                async move {
+                    match get_locked_hint(&path).await {
+                        Ok(locked) => writer.set(locked),
+                        Err(e) => tracing::debug!(error = %e, "GetLockedHint after reconnect"),
+                    }
+                }
+            })
+            .await;
+    });
+
+    // Same for unlock.
+    let unlock_path_for_missed = session_path.clone();
+    let unlock_sub_for_missed = unlock_sub.clone();
+    tokio::spawn(async move {
+        unlock_sub_for_missed
+            .missed_emissions()
+            .for_each(move |_| {
+                let path = unlock_path_for_missed.clone();
+                let writer = unlock_writer_for_missed.clone();
+                async move {
+                    match get_locked_hint(&path).await {
+                        Ok(locked) => writer.set(locked),
+                        Err(e) => tracing::debug!(error = %e, "GetLockedHint after reconnect"),
+                    }
+                }
+            })
+            .await;
+    });
+}
+
+static SESSION_PATH: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+async fn resolve_session_path() -> Result<String, hytte_bus::BusError> {
+    SESSION_PATH
+        .get_or_try_init(|| async {
+            let pid: u32 = std::process::id();
+            let path: zbus::zvariant::OwnedObjectPath =
+                hytte_bus::call("org.freedesktop.login1")
+                    .bus(hytte_bus::BusKind::System)
+                    .at_path("/org/freedesktop/login1")
+                    .iface("org.freedesktop.login1.Manager")
+                    .method("GetSessionByPID")
+                    .args((pid,))
+                    .send()
+                    .await?;
+            Ok(path.as_str().to_string())
+        })
+        .await
+        .cloned()
+}
+
+async fn get_locked_hint(session_path: &str) -> Result<bool, hytte_bus::BusError> {
+    hytte_bus::call("org.freedesktop.login1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path(session_path.to_string())
+        .iface("org.freedesktop.login1.Session")
+        .method("GetLockedHint")
+        .args(())
+        .send::<bool>()
+        .await
 }
 
 /// Trigger the lock surface. Flips `is_locked` to `true`; the
@@ -526,92 +566,3 @@ impl ScreenSaverIface {
     }
 }
 
-// ── Server bootstrap + restart loop ───────────────────────────────────────────
-
-async fn run_server(
-    state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
-    inhibitors_view: Mutable<Vec<Inhibitor>>,
-    next_cookie: Arc<AtomicU32>,
-) -> Result<()> {
-    let conn = Connection::session()
-        .await
-        .context("connect session bus")?;
-
-    let iface = ScreenSaverIface {
-        state,
-        inhibitors: inhibitors_view,
-        next_cookie,
-    };
-
-    // Mount at both paths *before* claiming the well-known name so apps
-    // that race the NameAcquired signal find both objects already present.
-    conn.object_server()
-        .at(PATH_CANONICAL, iface.clone())
-        .await
-        .context("register /org/freedesktop/ScreenSaver")?;
-    conn.object_server()
-        .at(PATH_LEGACY, iface)
-        .await
-        .context("register /ScreenSaver")?;
-
-    let dbus = fdo::DBusProxy::new(&conn)
-        .await
-        .context("create DBusProxy")?;
-
-    // Replace any other holder (gnome-screensaver, xfce4-screensaver,
-    // mate-screensaver). They can re-grab us back if they outlive us; in
-    // practice on a niri+trollshell session they aren't running. Document
-    // this collision in the user-facing notes.
-    let flags = fdo::RequestNameFlags::ReplaceExisting | fdo::RequestNameFlags::DoNotQueue;
-    let reply = dbus
-        .request_name("org.freedesktop.ScreenSaver".try_into().unwrap(), flags)
-        .await
-        .context("request_name org.freedesktop.ScreenSaver")?;
-
-    if reply != fdo::RequestNameReply::PrimaryOwner && reply != fdo::RequestNameReply::AlreadyOwner
-    {
-        return Err(anyhow!(
-            "could not acquire org.freedesktop.ScreenSaver: {reply:?}. \
-             Disable gnome-screensaver / xfce4-screensaver / mate-screensaver first."
-        ));
-    }
-
-    tracing::info!("org.freedesktop.ScreenSaver acquired");
-
-    // Watch for someone else replacing us (or the bus dropping our name).
-    // When that happens we tear down + retry from the outer loop, mirroring
-    // the bluetooth / polkit Agent re-registration pattern.
-    let mut owner_changed = dbus
-        .receive_name_owner_changed()
-        .await
-        .context("subscribe NameOwnerChanged")?;
-
-    while let Some(signal) = owner_changed.next().await {
-        let Ok(args) = signal.args() else { continue };
-        if args.name().as_str() != "org.freedesktop.ScreenSaver" {
-            continue;
-        }
-        // Lost our slot. Bounce + try to reclaim with ReplaceExisting.
-        let unique = conn.unique_name().map(|n| n.as_str().to_string());
-        let new_owner = args
-            .new_owner()
-            .as_ref()
-            .map(|n| n.as_str().to_string());
-        if new_owner != unique {
-            // Best-effort cleanup so the next iteration can re-`at()` fresh.
-            let _ = conn
-                .object_server()
-                .remove::<ScreenSaverIface, _>(PATH_CANONICAL)
-                .await;
-            let _ = conn
-                .object_server()
-                .remove::<ScreenSaverIface, _>(PATH_LEGACY)
-                .await;
-            return Err(anyhow!(
-                "org.freedesktop.ScreenSaver owner changed away — re-registering"
-            ));
-        }
-    }
-
-    Err(anyhow!("NameOwnerChanged stream ended"))
-}

@@ -273,6 +273,13 @@ pub mod test_support {
         /// `SharedConnection`. Production code never calls this — it is
         /// invoked from `start()` and from integration tests that need to
         /// exercise the reconnect path.
+        ///
+        /// Call this once per test, not once per reconnect cycle. Each call
+        /// registers one `SUPERVISOR_NOTIFY` entry and spawns one orphaned
+        /// tokio task that is never removed; this is harmless because each
+        /// integration test binary runs in its own process and the runtime is
+        /// torn down at process exit. Production code uses `start()` instead,
+        /// which lives in an `OnceLock` for the lifetime of the process.
         #[doc(hidden)]
         pub fn spawn_supervisor_for_test(&self) {
             let inner = self.inner.clone();
@@ -294,7 +301,6 @@ pub mod test_support {
         /// is not allowed under `unsafe_code = "forbid"`).
         #[doc(hidden)]
         pub async fn simulate_disconnect_for_test(&self, replacement: Connection) {
-            let key = Arc::as_ptr(&self.inner) as usize;
             INJECTED_CONN.inject(self, replacement);
             {
                 let mut guard = self.inner.lock().await;
@@ -306,11 +312,6 @@ pub mod test_support {
             if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
                 notify.notify_one();
             }
-            // Drop `key` via the explicit variable to avoid a clippy lint about
-            // the key not being needed after the inject call; the inject already
-            // stored it by Arc pointer, which is derived the same way in the
-            // supervisor loop.
-            let _ = key;
         }
     }
 }

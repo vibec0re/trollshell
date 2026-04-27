@@ -161,7 +161,6 @@ impl SharedConnection {
     /// Reactive view of the epoch. Returns an `impl Signal` (not `Mutable`)
     /// so consumers cannot call `.set()` on it — only the supervisor does that
     /// through the struct field directly.
-    #[must_use]
     pub fn epoch_signal(&self) -> impl futures_signals::signal::Signal<Item = u64> + use<> {
         self.epoch_signal.signal_cloned()
     }
@@ -190,17 +189,17 @@ impl SharedConnection {
         };
 
         let result = f(conn).await;
-        if let Err(ref e) = result {
-            if is_transient_zbus_error(e) {
-                // Was try_lock; replaced with lock().await so a concurrent with_conn doesn't
-                // race us into leaving a known-broken connection cached. The lock is held briefly
-                // — only long enough to write None — so the contention window is small.
-                let mut guard = self.inner.lock().await;
-                guard.conn = None;
-                drop(guard);
-                if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
-                    notify.notify_one();
-                }
+        if let Err(ref e) = result
+            && is_transient_zbus_error(e)
+        {
+            // Was try_lock; replaced with lock().await so a concurrent with_conn doesn't
+            // race us into leaving a known-broken connection cached. The lock is held briefly
+            // — only long enough to write None — so the contention window is small.
+            let mut guard = self.inner.lock().await;
+            guard.conn = None;
+            drop(guard);
+            if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                notify.notify_one();
             }
         }
         result.map_err(BusError::from_zbus)

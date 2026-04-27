@@ -672,3 +672,57 @@
 .ts-osd-card.battery .ts-osd-icon {
     color: @accent_color;
 }
+
+/* ── Lock screen ────────────────────────────────────────────────────────── */
+
+.ts-lock-root {
+    background: alpha(@window_bg_color, 0.95);
+}
+
+.ts-lock-card {
+    padding: 32px 48px;
+    border-radius: 18px;
+    background: alpha(@card_bg_color, 0.92);
+    box-shadow: 0 8px 32px alpha(black, 0.40);
+}
+
+.ts-lock-clock {
+    font-size: 4em;
+    font-weight: 300;
+    font-variant-numeric: tabular-nums;
+    margin-bottom: -8px;
+}
+
+.ts-lock-date {
+    font-size: 1.1em;
+    opacity: 0.7;
+    margin-bottom: 8px;
+}
+
+.ts-lock-user {
+    font-size: 0.95em;
+    opacity: 0.8;
+    margin-top: 16px;
+}
+
+.ts-lock-entry {
+    margin-top: 8px;
+}
+
+.ts-lock-error {
+    color: @error_color;
+    font-size: 0.9em;
+    margin-top: 4px;
+}
+
+@keyframes ts-lock-shake-keyframes {
+    0%, 100% { margin-left: 0; }
+    20%      { margin-left: -8px; }
+    40%      { margin-left:  8px; }
+    60%      { margin-left: -6px; }
+    80%      { margin-left:  4px; }
+}
+
+.ts-lock-shake {
+    animation: ts-lock-shake-keyframes 400ms ease-in-out;
+}

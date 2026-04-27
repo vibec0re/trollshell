@@ -144,6 +144,13 @@ pub struct BluetoothHandles {
     /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
     /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Keeps the `own_name` watcher task alive for the process lifetime so the
+    /// system bus holds `AGENT_ANCHOR_NAME` and the `PairAgent` interface
+    /// remains reachable at `AGENT_PATH`. Stored here for parity with other
+    /// services (polkit, notifications, etc.) that keep their ownership handle
+    /// in Handles.
+    #[allow(dead_code)]
+    pub(crate) ownership: hytte_bus::OwnNameSignal,
 }
 
 /// Internal reply variants from the UI back to the agent's awaiting
@@ -162,17 +169,6 @@ pub(crate) enum AgentReply {
     Passkey(u32),
 }
 
-impl Default for BluetoothHandles {
-    fn default() -> Self {
-        Self {
-            adapter: Mutable::new(None),
-            devices: Mutable::new(Vec::new()),
-            device_actions: Mutable::new(HashSet::new()),
-            pair_prompt: Mutable::new(None),
-            pending_response: Arc::new(AsyncMutex::new(None)),
-        }
-    }
-}
 
 // ── Service marker ────────────────────────────────────────────────────────────
 
@@ -183,7 +179,22 @@ impl Service for BluetoothService {
     type Handles = BluetoothHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = BluetoothHandles::default();
+        // Build the own_name handle first so it can be stored in Handles for
+        // parity with other services (polkit, screensaver, etc.) and passed
+        // into run_agent to keep the interface alive for its lifetime.
+        let ownership = hytte_bus::own_name(AGENT_ANCHOR_NAME)
+            .bus(BusKind::System)
+            .at_path(AGENT_PATH, PairAgent)
+            .start();
+
+        let handles = BluetoothHandles {
+            adapter: Mutable::new(None),
+            devices: Mutable::new(Vec::new()),
+            device_actions: Mutable::new(HashSet::new()),
+            pair_prompt: Mutable::new(None),
+            pending_response: Arc::new(AsyncMutex::new(None)),
+            ownership: ownership.clone(),
+        };
         let adapter_mutable = handles.adapter.clone();
         let devices_mutable = handles.devices.clone();
 
@@ -226,7 +237,7 @@ impl Service for BluetoothService {
         // restart). The agent connection is managed by bus::own_name which
         // handles reconnects automatically.
         rt.spawn(async move {
-            run_agent().await;
+            run_agent(ownership).await;
         });
 
         handles
@@ -1267,15 +1278,11 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
 /// After the name is owned, we call `RegisterAgent` and
 /// `RequestDefaultAgent` once via `bus::call`. On bluetoothd restart the
 /// `NameOwnerChanged` stream for `org.bluez` wakes us to re-register.
-async fn run_agent() {
-    // Own the anchor name on the system bus. The PairAgent interface is
-    // mounted at AGENT_PATH on each connection established by own_name.
-    // bus::own_name handles reconnects: if bluetoothd restarts and the name
-    // is temporarily lost, own_name re-acquires and re-mounts the interface.
-    let _ownership = hytte_bus::own_name(AGENT_ANCHOR_NAME)
-        .bus(BusKind::System)
-        .at_path(AGENT_PATH, PairAgent)
-        .start();
+///
+/// The `ownership` handle is passed in (created in `Service::start` and also
+/// stored in `BluetoothHandles`) to keep the interface alive for the duration
+/// of this task.
+async fn run_agent(_ownership: hytte_bus::OwnNameSignal) {
 
     // Watch for org.bluez owner changes. When bluetoothd restarts (loses
     // its name), our registration is gone and we must re-register.

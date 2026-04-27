@@ -24,11 +24,11 @@ async fn live_when_peer_present() {
     let mut saw_live = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(s)) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
-            if matches!(s, ProxyState::Live) {
-                saw_live = true;
-                break;
-            }
+        if let Ok(Some(s)) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await
+            && matches!(s, ProxyState::Live)
+        {
+            saw_live = true;
+            break;
         }
     }
     assert!(saw_live, "proxy never reached Live state");
@@ -79,11 +79,10 @@ async fn peer_gone_then_back() {
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(s)) =
             tokio::time::timeout(Duration::from_millis(50), liveness.next()).await
+            && matches!(s, ProxyState::PeerGone)
         {
-            if matches!(s, ProxyState::PeerGone) {
-                saw_peer_gone = true;
-                break;
-            }
+            saw_peer_gone = true;
+            break;
         }
     }
     assert!(saw_peer_gone, "expected PeerGone after peer dropped");

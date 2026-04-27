@@ -29,17 +29,16 @@
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use hytte_bus::OwnNameSignal;
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::{OwnedValue, Value};
-use zbus::Connection;
 pub use zeroize::Zeroizing;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -86,6 +85,11 @@ pub struct PolkitHandles {
     /// an async mutex so [`respond_to_auth`] can race-lessly take it.
     /// `None` when no prompt is in flight.
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
+    /// Keeps the `own_name` watcher task alive for the process lifetime so
+    /// the session bus holds `ANCHOR_NAME` and the `AuthAgent` interface
+    /// remains reachable at `AGENT_PATH`.
+    #[allow(dead_code)]
+    ownership: OwnNameSignal,
 }
 
 /// User's resolution of a pending prompt.
@@ -102,48 +106,42 @@ pub(crate) enum UserReply {
     Cancel,
 }
 
-impl Default for PolkitHandles {
-    fn default() -> Self {
-        Self {
-            prompt: Mutable::new(None),
-            pending_response: Arc::new(AsyncMutex::new(None)),
-        }
-    }
-}
 
 // ── Service marker ────────────────────────────────────────────────────────────
 
 pub struct PolkitService;
 
+const ANCHOR_NAME: &str = "cc.hannig.trollshell.polkit-agent";
+
 impl Service for PolkitService {
     type Handles = PolkitHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let handles = PolkitHandles::default();
+        let prompt = Mutable::new(None);
+        let pending_response = Arc::new(AsyncMutex::new(None));
+
+        let agent = AuthAgent {};
+
+        // Mount the AuthAgent interface on the session bus under a private
+        // anchor name.  The well-known name is irrelevant to polkit — it
+        // calls back via our unique name (:1.xx) — but owning it keeps the
+        // bus layer's connection alive and re-mounts the interface on
+        // reconnect.
+        let ownership = hytte_bus::own_name(ANCHOR_NAME)
+            .at_path(AGENT_PATH, agent)
+            .start();
+
         rt.spawn(async move {
-            loop {
-                if let Err(e) = run_agent().await {
-                    tracing::warn!(error = %e, "polkit agent failed, retrying in 5s");
-                }
-                // On exit, drop any in-flight prompt + pending response so the
-                // UI doesn't hang on a stale modal after a polkitd restart.
-                let pending = registry::with(|r| {
-                    r.get::<PolkitHandles>().map(|h| {
-                        if h.prompt.lock_ref().is_some() {
-                            h.prompt.set(None);
-                        }
-                        h.pending_response.clone()
-                    })
-                });
-                if let Some(p) = pending
-                    && let Some(tx) = p.lock().await.take()
-                {
-                    let _ = tx.send(UserReply::Cancel);
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            if let Err(e) = run_agent_lifecycle().await {
+                tracing::error!(error = %e, "polkit agent setup failed");
             }
         });
-        handles
+
+        PolkitHandles {
+            prompt,
+            pending_response,
+            ownership,
+        }
     }
 }
 
@@ -469,11 +467,8 @@ type IdentityTuple = (String, HashMap<String, OwnedValue>);
 
 const AGENT_PATH: &str = "/com/trollshell/PolkitAgent";
 
-struct AuthAgent {
-    /// System-bus connection used to call `AuthenticationAgentResponse2`
-    /// back to the polkit Authority.  Cloned per-call.
-    system_conn: Arc<Connection>,
-}
+#[derive(Clone)]
+struct AuthAgent {}
 
 #[zbus::interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl AuthAgent {
@@ -567,14 +562,13 @@ impl AuthAgent {
         details.insert("uid".into(), uid_v);
         let identity: IdentityTuple = ("unix-user".into(), details);
 
-        self.system_conn
-            .call_method(
-                Some("org.freedesktop.PolicyKit1"),
-                "/org/freedesktop/PolicyKit1/Authority",
-                Some("org.freedesktop.PolicyKit1.Authority"),
-                "AuthenticationAgentResponse2",
-                &(uid, cookie.as_str(), identity),
-            )
+        hytte_bus::call("org.freedesktop.PolicyKit1")
+            .bus(hytte_bus::BusKind::System)
+            .at_path("/org/freedesktop/PolicyKit1/Authority")
+            .iface("org.freedesktop.PolicyKit1.Authority")
+            .method("AuthenticationAgentResponse2")
+            .args((uid, cookie.clone(), identity))
+            .send::<()>()
             .await
             .map_err(|e| AgentError::Failed(format!("AuthenticationAgentResponse2: {e}")))?;
 
@@ -612,94 +606,58 @@ fn build_subject(session_id: &str) -> Result<(String, HashMap<String, OwnedValue
     Ok(("unix-session".into(), details))
 }
 
-async fn run_agent() -> Result<()> {
-    // ── Two connections ───────────────────────────────────────────────────────
-    //
-    // Polkit's authority lives on the system bus, but agents register
-    // themselves with their own bus + path so polkitd can call back. Per
-    // upstream practice (and the polkit gobject reference impl), the agent
-    // server lives on the session bus while registration calls go to the
-    // system-bus authority.
-    let session_conn = Connection::session()
-        .await
-        .context("open session bus for polkit agent")?;
-    let system_conn = Arc::new(
-        Connection::system()
-            .await
-            .context("open system bus for polkit authority")?,
-    );
+async fn run_agent_lifecycle() -> Result<()> {
+    let session_id = current_session_id().context("XDG_SESSION_ID unset")?;
+    let subject = build_subject(&session_id).context("build polkit subject")?;
 
-    // ── Mount the agent on the session bus ────────────────────────────────────
-    //
-    // On a re-registration loop our path may still be live from the previous
-    // iteration (we open a fresh Connection each time, so this only matters
-    // if a future refactor reuses the connection — defensive removal is
-    // cheap and keeps the loop idempotent).
-    let _ = session_conn
-        .object_server()
-        .remove::<AuthAgent, _>(AGENT_PATH)
-        .await;
-
-    let agent = AuthAgent {
-        system_conn: system_conn.clone(),
-    };
-    session_conn
-        .object_server()
-        .at(AGENT_PATH, agent)
-        .await
-        .context("register AuthenticationAgent at our path")?;
-
-    // ── Subscribe to NameOwnerChanged BEFORE registering ──────────────────────
-    //
-    // Watching the system-bus org.freedesktop.PolicyKit1 owner: when polkitd
-    // restarts our registration vanishes, so we want to detect that and
-    // restart the loop.
-    let dbus_proxy = zbus::fdo::DBusProxy::new(&system_conn)
-        .await
-        .context("DBusProxy on system bus")?;
-    let mut owner_changed = dbus_proxy
-        .receive_name_owner_changed()
-        .await
-        .context("subscribe NameOwnerChanged")?;
-
-    // ── Register with the Authority ───────────────────────────────────────────
-
-    let session_id = current_session_id()?;
-    let subject = build_subject(&session_id)?;
-
-    system_conn
-        .call_method(
-            Some("org.freedesktop.PolicyKit1"),
-            "/org/freedesktop/PolicyKit1/Authority",
-            Some("org.freedesktop.PolicyKit1.Authority"),
-            "RegisterAuthenticationAgent",
-            // (subject, locale, object_path) — note object_path is `s`, not `o`,
-            // per the polkit Authority introspection XML.
-            &(subject, "en_US.UTF-8", AGENT_PATH),
-        )
+    // Register with polkit Authority on system bus.
+    register_with_authority(subject.clone())
         .await
         .context("Authority.RegisterAuthenticationAgent")?;
-
     tracing::info!(session = %session_id, "polkit authentication agent registered");
 
-    // ── Wait for polkitd to disappear ─────────────────────────────────────────
+    // Watch polkitd's well-known name on the system bus; on re-appearance,
+    // re-register our agent (our registration is lost whenever polkitd
+    // restarts).
+    let polkitd_changes = hytte_bus::signals("org.freedesktop.DBus")
+        .bus(hytte_bus::BusKind::System)
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
 
-    while let Some(signal) = owner_changed.next().await {
-        let Ok(args) = signal.args() else { continue };
-        if args.name().as_str() != "org.freedesktop.PolicyKit1" {
+    let mut events = polkitd_changes.events();
+    while let Some(event) = events.next().await {
+        let Ok(args) = event.body.body().deserialize::<(String, String, String)>() else {
+            continue;
+        };
+        let (name, _old, new_owner) = args;
+        if name != "org.freedesktop.PolicyKit1" {
             continue;
         }
-        if args.new_owner().is_none() {
-            // Best-effort cleanup before bouncing.
-            let _ = session_conn
-                .object_server()
-                .remove::<AuthAgent, _>(AGENT_PATH)
-                .await;
-            return Err(anyhow::anyhow!(
-                "org.freedesktop.PolicyKit1 owner lost — re-registering agent"
-            ));
+        if new_owner.is_empty() {
+            tracing::warn!("polkitd disappeared — will re-register on restart");
+            continue;
+        }
+        // polkitd came back: re-register our agent.
+        if let Err(e) = register_with_authority(subject.clone()).await {
+            tracing::warn!(error = %e, "re-RegisterAuthenticationAgent failed");
+        } else {
+            tracing::info!("polkit agent re-registered after polkitd restart");
         }
     }
+    Ok(())
+}
 
-    Err(anyhow::anyhow!("NameOwnerChanged stream ended"))
+async fn register_with_authority(
+    subject: (String, HashMap<String, OwnedValue>),
+) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("org.freedesktop.PolicyKit1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path("/org/freedesktop/PolicyKit1/Authority")
+        .iface("org.freedesktop.PolicyKit1.Authority")
+        .method("RegisterAuthenticationAgent")
+        .args((subject, "en_US.UTF-8".to_string(), AGENT_PATH.to_string()))
+        .send::<()>()
+        .await
 }

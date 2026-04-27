@@ -3,7 +3,7 @@
 //! See spec section 3.4.
 
 use crate::connection::SharedConnection;
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use zbus::zvariant::{OwnedValue, Value};
@@ -289,6 +289,11 @@ async fn run_property<T>(
             .with_conn(|conn| async move { Ok(conn) })
             .await;
 
+        // Capture epoch AFTER with_conn returns so that current_epoch reflects
+        // the epoch under which the subscription was actually built — same
+        // lesson as signals.rs's cold-start fix.
+        let current_epoch = ctx.shared.epoch();
+
         let conn = match conn_result {
             Ok(c) => c,
             Err(e) => {
@@ -332,6 +337,10 @@ async fn run_property<T>(
         // A periodic liveness tick wakes the loop even when no D-Bus events
         // arrive so that we detect handle-drops promptly (same pattern as the
         // signals primitive).
+        //
+        // The epoch_stream arm detects supervisor reconnects so that the
+        // property task does not remain stuck on the old connection's stream.
+        let mut epoch_stream = ctx.shared.epoch_signal().to_stream();
         let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
         liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -378,6 +387,16 @@ async fn run_property<T>(
 
                     // Invalidation: break to trigger a re-Get on the next loop iteration.
                     if args.invalidated_properties.contains(&ctx.name.as_str()) {
+                        break 'changes;
+                    }
+                }
+                epoch_update = epoch_stream.next() => {
+                    if let Some(new_epoch) = epoch_update && new_epoch > current_epoch {
+                        tracing::debug!(
+                            dest = ctx.dest, path = ctx.path, iface = ctx.iface,
+                            name = ctx.name, new_epoch,
+                            "epoch advanced; breaking to re-Get on fresh connection"
+                        );
                         break 'changes;
                     }
                 }

@@ -86,7 +86,7 @@ pub struct PolkitHandles {
     /// `None` when no prompt is in flight.
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
     /// Keeps the `own_name` watcher task alive for the process lifetime so
-    /// the session bus holds `ANCHOR_NAME` and the `AuthAgent` interface
+    /// the system bus holds `ANCHOR_NAME` and the `AuthAgent` interface
     /// remains reachable at `AGENT_PATH`.
     #[allow(dead_code)]
     ownership: OwnNameSignal,

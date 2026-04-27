@@ -8,10 +8,12 @@
 mod connection;
 mod error;
 mod own;
+mod signals;
 
 pub use connection::BusKind;
 pub use error::BusError;
 pub use own::{own_name_with, OwnNameSignal, OwnState};
+pub use signals::{signals_with, SignalEvent, SignalSubscription};
 
 #[doc(hidden)]
 pub use connection::test_support;

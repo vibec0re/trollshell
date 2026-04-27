@@ -429,9 +429,9 @@ impl NotificationsIface {
         tracing::debug!(id, app_name, summary, "notification added");
 
         // Schedule auto-dismiss if this notification has a finite timeout.
-        if timeout.is_some() {
+        if let Some(dur) = timeout {
             tokio::spawn(async move {
-                tokio::time::sleep(timeout.unwrap()).await;
+                tokio::time::sleep(dur).await;
                 // Route through the public dismiss() so signal emission goes
                 // through _EmitClosed on the bus-layer connection.
                 crate::notifications::dismiss(id, 1); // 1 = expired

@@ -183,6 +183,58 @@ async fn permanently_taken_after_three_losses() {
     );
 }
 
+// Trivial D-Bus interface used by `at_path_mounts_iface_callable`.
+#[derive(Clone)]
+struct Greeter;
+
+#[zbus::interface(name = "cc.hannig.test.Greeter")]
+impl Greeter {
+    #[allow(clippy::unused_self)]
+    fn hello(&self) -> String {
+        "world".to_string()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn at_path_mounts_iface_callable() {
+    let (conn, guard) = ephemeral_bus().await;
+    let address = guard.address.clone();
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let state = own_name_with(&shared, "cc.hannig.test.greeter")
+        .at_path("/cc/hannig/test/Greeter", Greeter)
+        .start();
+
+    // Wait for Owned.
+    let final_state = wait_for_state(state.signal_cloned(), Duration::from_secs(2), |s| {
+        matches!(s, OwnState::Owned)
+    })
+    .await;
+    assert!(
+        matches!(final_state, OwnState::Owned),
+        "expected Owned, got {final_state:?}"
+    );
+
+    // Call the mounted method from a separate connection.
+    let client = Builder::address(address.as_str())
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("connect to ephemeral bus for client");
+    let proxy = zbus::Proxy::new(
+        &client,
+        "cc.hannig.test.greeter",
+        "/cc/hannig/test/Greeter",
+        "cc.hannig.test.Greeter",
+    )
+    .await
+    .expect("create proxy");
+    // zbus maps snake_case fn names to PascalCase D-Bus member names.
+    let result: String = proxy.call("Hello", &()).await.expect("Hello call");
+    assert_eq!(result, "world");
+}
+
 async fn wait_for_state<S>(
     signal: S,
     deadline: Duration,

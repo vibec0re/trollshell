@@ -118,7 +118,11 @@ impl OwnNameBuilder<'_> {
             let iface_clone = iface.clone();
             let p = path_str.clone();
             Box::pin(async move {
-                conn.object_server().at(p.as_str(), iface_clone).await?;
+                // `at()` returns `Ok(true)` on first mount, `Ok(false)` if an
+                // interface was already registered at this path. We treat both
+                // as success: a re-iteration that finds the iface still mounted
+                // from a prior loop is a no-op, not an error.
+                let _ = conn.object_server().at(p.as_str(), iface_clone).await?;
                 Ok(())
             })
         });

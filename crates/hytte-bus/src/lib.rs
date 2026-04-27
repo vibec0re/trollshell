@@ -4,3 +4,7 @@
 //! for the design.
 
 #![doc(html_no_source)]
+
+mod error;
+
+pub use error::BusError;

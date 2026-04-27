@@ -10,7 +10,6 @@ use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{registry, runtime, Service};
 use std::sync::OnceLock;
 use std::time::Duration;
-use zbus::Connection;
 
 /// Active backlight state.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -91,16 +90,15 @@ async fn do_set(level: f64) -> Result<()> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let value = (level * f64::from(device.max)).round() as u32;
 
-    let conn = Connection::system().await.context("open system bus")?;
-    conn.call_method(
-        Some("org.freedesktop.login1"),
-        "/org/freedesktop/login1/session/auto",
-        Some("org.freedesktop.login1.Session"),
-        "SetBrightness",
-        &("backlight", device.name.as_str(), value),
-    )
-    .await
-    .context("logind SetBrightness")?;
+    hytte_bus::call("org.freedesktop.login1")
+        .bus(hytte_bus::BusKind::System)
+        .at_path("/org/freedesktop/login1/session/auto")
+        .iface("org.freedesktop.login1.Session")
+        .method("SetBrightness")
+        .args(("backlight", device.name, value))
+        .send::<()>()
+        .await
+        .context("logind SetBrightness")?;
     Ok(())
 }
 

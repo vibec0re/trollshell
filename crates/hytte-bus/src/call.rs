@@ -149,6 +149,28 @@ pub fn call_with(
 }
 
 impl<'a, A> CallBuilder<'a, A> {
+    /// Override which bus this builder targets. The default is determined by
+    /// the constructor: [`call`](crate::call) uses the session bus.
+    ///
+    /// Overriding here replaces the `SharedConnection` with the corresponding
+    /// global singleton.
+    #[must_use]
+    pub fn bus(self, kind: crate::BusKind) -> CallBuilder<'static, A> {
+        CallBuilder {
+            shared: match kind {
+                crate::BusKind::Session => crate::connection::session(),
+                crate::BusKind::System => crate::connection::system(),
+            },
+            destination: self.destination,
+            path: self.path,
+            iface: self.iface,
+            method: self.method,
+            args: self.args,
+            timeout: self.timeout,
+            retry: self.retry,
+        }
+    }
+
     /// Set the object path.
     #[must_use]
     pub fn at_path(mut self, p: impl Into<String>) -> Self {

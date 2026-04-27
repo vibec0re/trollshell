@@ -104,6 +104,25 @@ pub struct SignalsBuilder<'a> {
 }
 
 impl SignalsBuilder<'_> {
+    /// Override which bus this builder targets. The default is determined by
+    /// the constructor: [`signals`](crate::signals) uses the system bus.
+    ///
+    /// Overriding here replaces the `SharedConnection` with the corresponding
+    /// global singleton.
+    #[must_use]
+    pub fn bus(self, kind: crate::BusKind) -> SignalsBuilder<'static> {
+        SignalsBuilder {
+            shared: match kind {
+                crate::BusKind::Session => crate::connection::session(),
+                crate::BusKind::System => crate::connection::system(),
+            },
+            destination: self.destination,
+            path: self.path,
+            iface: self.iface,
+            signal: self.signal,
+        }
+    }
+
     /// Set the object path to listen on.
     #[must_use]
     pub fn at_path(mut self, path: impl Into<String>) -> Self {
@@ -127,6 +146,7 @@ impl SignalsBuilder<'_> {
 
     /// Spawn the subscription task. Returns a [`SignalSubscription`] handle
     /// from which independent event streams can be obtained.
+    #[must_use]
     pub fn start(self) -> SignalSubscription {
         let (tx, _) = tokio::sync::broadcast::channel(64);
         let missed = Mutable::new(0u64);

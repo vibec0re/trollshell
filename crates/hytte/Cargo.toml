@@ -10,6 +10,7 @@ description = "Library-first toolkit for composing GTK4 + Wayland desktop shells
 workspace = true
 
 [dependencies]
+hytte-bus      = { path = "../hytte-bus" }
 hytte-reactive = { path = "../hytte-reactive" }
 hytte-ui       = { path = "../hytte-ui" }
 hytte-services = { path = "../hytte-services" }

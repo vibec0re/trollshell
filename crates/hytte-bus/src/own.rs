@@ -63,6 +63,24 @@ pub struct OwnNameBuilder<'a> {
 }
 
 impl OwnNameBuilder<'_> {
+    /// Override which bus this builder targets. The default is determined by
+    /// the constructor: [`own_name`](crate::own_name) uses the session bus.
+    ///
+    /// Overriding here replaces the `SharedConnection` with the corresponding
+    /// global singleton.
+    #[must_use]
+    pub fn bus(self, kind: crate::BusKind) -> OwnNameBuilder<'static> {
+        OwnNameBuilder {
+            shared: match kind {
+                crate::BusKind::Session => crate::connection::session(),
+                crate::BusKind::System => crate::connection::system(),
+            },
+            name: self.name,
+            permanent_after: self.permanent_after,
+            cooldown: self.cooldown,
+        }
+    }
+
     /// Override the consecutive-losses threshold (default 3).
     #[must_use]
     pub fn permanent_after(mut self, n: u32) -> Self {
@@ -88,6 +106,7 @@ impl OwnNameBuilder<'_> {
     /// `.signal_cloned()` on it to subscribe. Multiple independent subscriptions
     /// are supported — each call to `.signal_cloned()` returns a fresh signal
     /// derived from the same underlying state.
+    #[must_use]
     pub fn start(self) -> OwnNameSignal {
         let state = Mutable::new(OwnState::Acquiring);
         let writer = state.clone();

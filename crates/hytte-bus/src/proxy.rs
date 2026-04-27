@@ -128,6 +128,23 @@ pub fn proxy_with(
 }
 
 impl ProxyBuilder<'_> {
+    /// Override which bus this builder targets. The default is determined by
+    /// the constructor: [`proxy`](crate::proxy) uses the system bus.
+    ///
+    /// Overriding here replaces the `SharedConnection` with the corresponding
+    /// global singleton.
+    pub fn bus(self, kind: crate::BusKind) -> ProxyBuilder<'static> {
+        ProxyBuilder {
+            shared: match kind {
+                crate::BusKind::Session => crate::connection::session(),
+                crate::BusKind::System => crate::connection::system(),
+            },
+            destination: self.destination,
+            path: self.path,
+            iface: self.iface,
+        }
+    }
+
     /// Set the object path.
     pub fn at_path(mut self, p: impl Into<String>) -> Self {
         self.path = p.into();

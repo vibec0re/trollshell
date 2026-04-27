@@ -4,6 +4,9 @@
 //! each emission.
 //!
 //! Notes on systemd dbus:
+//! - Uses the **system bus** (`org.freedesktop.systemd1` on the system bus
+//!   is the system manager; `systemd --user` exposes the same name on the
+//!   session bus but this service monitors the system manager).
 //! - `Manager.Subscribe()` MUST be called for the daemon to start
 //!   emitting signals to this client. Without it `JobRemoved` never
 //!   fires.
@@ -11,6 +14,9 @@
 //!   complete) regardless of result, so it's a reasonable proxy for
 //!   "the failed-unit set may have changed". Cheaper than per-unit
 //!   `PropertiesChanged` subscriptions for the v0.2.5 fidelity.
+//!
+//! All D-Bus I/O goes through [`hytte_bus::call`] and [`hytte_bus::signals`]
+//! so the shared connection supervisor handles reconnects automatically.
 //!
 //! # Public API
 //!
@@ -23,9 +29,13 @@
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use hytte_bus::{call, signals, BusKind};
 use hytte_reactive::{registry, Service};
 use std::time::Duration;
-use zbus::Connection;
+
+const SYSTEMD_NAME: &str = "org.freedesktop.systemd1";
+const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
+const MANAGER_IFACE: &str = "org.freedesktop.systemd1.Manager";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedUnit {
@@ -103,44 +113,48 @@ type UnitTuple = (
 );
 
 async fn listen(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
-    let conn = Connection::system().await.context("connect system bus")?;
-    let manager = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-    )
-    .await
-    .context("create systemd Manager proxy")?;
-
     // REQUIRED: systemd only emits signals to clients that have called
     // Subscribe(). Without this, JobRemoved never fires.
-    manager
-        .call::<_, _, ()>("Subscribe", &())
+    call(SYSTEMD_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("Subscribe")
+        .args(())
+        .send::<()>()
         .await
         .context("Manager.Subscribe")?;
 
-    refresh_failed(&manager, writer).await?;
+    // Initial fetch of failed units.
+    refresh_failed(writer).await?;
 
-    let mut signals = manager
-        .receive_signal("JobRemoved")
-        .await
-        .context("subscribe JobRemoved")?;
+    // Subscribe to JobRemoved so we re-fetch whenever a job completes
+    // (which may change the failed-unit set).
+    let job_removed = signals(SYSTEMD_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .signal("JobRemoved")
+        .start();
 
-    while signals.next().await.is_some() {
-        if let Err(e) = refresh_failed(&manager, writer).await {
+    let mut events = job_removed.events();
+
+    while events.next().await.is_some() {
+        if let Err(e) = refresh_failed(writer).await {
             tracing::warn!(error = %e, "systemd refresh after JobRemoved failed");
         }
     }
     Ok(())
 }
 
-async fn refresh_failed(
-    manager: &zbus::Proxy<'_>,
-    writer: &Mutable<Vec<FailedUnit>>,
-) -> Result<()> {
-    let units: Vec<UnitTuple> = manager
-        .call("ListUnitsFiltered", &(vec!["failed".to_string()],))
+async fn refresh_failed(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
+    let units: Vec<UnitTuple> = call(SYSTEMD_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("ListUnitsFiltered")
+        .args((vec!["failed".to_string()],))
+        .send()
         .await
         .context("ListUnitsFiltered")?;
 

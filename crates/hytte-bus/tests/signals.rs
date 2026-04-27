@@ -137,3 +137,40 @@ async fn missed_emissions_bumps_on_reconnect() {
     }
     assert!(bumped, "missed_emissions did not bump after disconnect");
 }
+
+// ── Cold-start epoch race regression test ────────────────────────────────────
+//
+// Before the fix, `run_subscription` captured `current_epoch` BEFORE calling
+// `with_conn`. On production cold start the supervisor bumps epoch 0→1 during
+// that call; `drain_signal_stream` then immediately saw new_epoch (1) >
+// current_epoch (0) and returned Reconnect, which caused the outer loop to
+// bump `missed_emissions` even though no genuine reconnect had occurred.
+//
+// The test infrastructure (`for_test_session`) pre-initialises the epoch to 1
+// so the race is not directly reproducible here, but the test documents the
+// INVARIANT: a freshly started subscription must not bump missed_emissions
+// before any genuine reconnect.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_start_does_not_bump_missed_emissions() {
+    let (conn, _guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let sub = signals_with(&shared, "cc.hannig.test.NoSignal")
+        .at_path("/cc/hannig/test/NoSignal")
+        .iface("cc.hannig.test.NoSignal")
+        .signal("Pinged")
+        .start();
+
+    // Give the subscription task time to attempt subscribe, observe epoch_signal,
+    // and (under the bug) spuriously bump missed_emissions because it captured
+    // the epoch BEFORE with_conn ran.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        sub.missed_count(),
+        0,
+        "cold-start subscription must not bump missed_emissions before any disconnect"
+    );
+}

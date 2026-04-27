@@ -293,8 +293,14 @@ async fn run_subscription(ctx: RunCtx) {
         }
         first_iteration = false;
 
-        let current_epoch = shared.epoch();
         let conn_result = shared.with_conn(|conn| async move { Ok(conn) }).await;
+        // Capture epoch AFTER with_conn returns so that current_epoch reflects
+        // the epoch under which the subscription was actually built. Capturing
+        // it before with_conn would race against the supervisor's first connect
+        // (which bumps epoch 0 → 1), causing drain_signal_stream to see an
+        // immediate epoch advance and spuriously fire missed_emissions on cold
+        // start before any genuine reconnect has occurred.
+        let current_epoch = shared.epoch();
         let conn = match conn_result {
             Ok(c) => c,
             Err(e) => {

@@ -26,9 +26,9 @@
 //! bluetooth::remove_device(path);   // unpair / forget
 //! ```
 
-use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
+use hytte_bus::{BusKind, SignalSubscription};
 use hytte_reactive::{registry, runtime, Service};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -36,7 +36,6 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
-use zbus::Connection;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -224,14 +223,10 @@ impl Service for BluetoothService {
 
         // Pairing-agent loop, independent of the watcher: stays registered
         // for the process lifetime, retrying on errors (e.g. bluetoothd
-        // restart).
+        // restart). The agent connection is managed by bus::own_name which
+        // handles reconnects automatically.
         rt.spawn(async move {
-            loop {
-                if let Err(e) = run_agent().await {
-                    tracing::warn!(error = %e, "bluetooth agent failed, retrying in 5s");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
+            run_agent().await;
         });
 
         handles
@@ -507,128 +502,81 @@ pub fn remove_device(device_path: &str) {
     });
 }
 
-/// Shared command-channel connection. `BlueZ` owns sessions (e.g. for
-/// `StartDiscovery`) per bus client; using a fresh connection per call
-/// breaks Start/Stop pairing because `BlueZ` sees them as different
-/// clients. Lazily opened on first call; evicted on I/O error so the
-/// next call reopens — trollshell survives `systemctl restart bluetooth`
-/// without itself restarting.
-static CMD_CONN: AsyncMutex<Option<Connection>> = AsyncMutex::const_new(None);
-
-async fn cmd_conn() -> Result<Connection> {
-    let mut guard = CMD_CONN.lock().await;
-    if guard.is_none() {
-        let fresh = Connection::system()
-            .await
-            .context("open shared bluetooth command connection")?;
-        *guard = Some(fresh);
-    }
-    Ok(guard
-        .as_ref()
-        .expect("just stored Some")
-        .clone())
-}
-
-/// Clears the cached command connection. Called after an I/O-level failure
-/// so the next [`cmd_conn`] call opens a fresh system-bus connection.
-async fn evict_cmd_conn() {
-    *CMD_CONN.lock().await = None;
-}
-
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-/// Returns `true` when `e` wraps a [`zbus::Error::InputOutput`] — the signal
-/// that the socket to the D-Bus daemon is gone (e.g. after
-/// `systemctl restart bluetooth`). Used to decide whether to evict the cached
-/// command connection.
-fn is_io_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|cause| cause.downcast_ref::<zbus::Error>().is_some_and(|ze| matches!(ze, zbus::Error::InputOutput(_))))
+async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<(), hytte_bus::BusError> {
+    let value = zbus::zvariant::Value::from(on)
+        .try_to_owned()
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("failed to box bool: {e}"),
+            dbus_name: None,
+        })?;
+    let prop = prop.to_string();
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path(adapter_path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Set")
+        .args(("org.bluez.Adapter1".to_string(), prop, value))
+        .send::<()>()
+        .await
 }
 
-async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("org.bluez"),
-        adapter_path,
-        Some("org.freedesktop.DBus.Properties"),
-        "Set",
-        &(
-            "org.bluez.Adapter1",
-            prop,
-            zbus::zvariant::Value::from(on),
-        ),
-    )
-    .await
-    .with_context(|| format!("call Properties.Set Adapter1.{prop}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r.map(|_| ())
+async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<(), hytte_bus::BusError> {
+    let value = zbus::zvariant::Value::from(on)
+        .try_to_owned()
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("failed to box bool: {e}"),
+            dbus_name: None,
+        })?;
+    let prop = prop.to_string();
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path(device_path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Set")
+        .args(("org.bluez.Device1".to_string(), prop, value))
+        .send::<()>()
+        .await
 }
 
-async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("org.bluez"),
-        device_path,
-        Some("org.freedesktop.DBus.Properties"),
-        "Set",
-        &(
-            "org.bluez.Device1",
-            prop,
-            zbus::zvariant::Value::from(on),
-        ),
-    )
-    .await
-    .with_context(|| format!("call Properties.Set Device1.{prop}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r.map(|_| ())
+async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path(adapter_path.to_string())
+        .iface("org.bluez.Adapter1")
+        .method(method)
+        .args(())
+        .send::<()>()
+        .await
 }
 
-async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("org.bluez"),
-        adapter_path,
-        Some("org.bluez.Adapter1"),
-        method,
-        &(),
-    )
-    .await
-    .with_context(|| format!("call Adapter1.{method}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r.map(|_| ())
+async fn do_device_call(device_path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path(device_path.to_string())
+        .iface("org.bluez.Device1")
+        .method(method)
+        .args(())
+        .send::<()>()
+        .await
 }
 
-async fn do_device_call(device_path: &str, method: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
-    let r = conn.call_method(
-        Some("org.bluez"),
-        device_path,
-        Some("org.bluez.Device1"),
-        method,
-        &(),
-    )
-    .await
-    .with_context(|| format!("call Device1.{method}"));
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r.map(|_| ())
-}
-
-async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<()> {
-    let conn = cmd_conn().await?;
+async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<(), hytte_bus::BusError> {
     let dev_op = zbus::zvariant::ObjectPath::try_from(device_path)
-        .map_err(|e| anyhow::anyhow!("invalid device object path: {e}"))?;
-    let r = conn.call_method(
-        Some("org.bluez"),
-        adapter_path,
-        Some("org.bluez.Adapter1"),
-        "RemoveDevice",
-        &(dev_op,),
-    )
-    .await
-    .context("call Adapter1.RemoveDevice");
-    if let Err(ref e) = r && is_io_error(e) { evict_cmd_conn().await; }
-    r.map(|_| ())
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("invalid device object path: {e}"),
+            dbus_name: None,
+        })?
+        .to_owned();
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path(adapter_path.to_string())
+        .iface("org.bluez.Adapter1")
+        .method("RemoveDevice")
+        .args((dev_op,))
+        .send::<()>()
+        .await
 }
 
 // ── Property parsing helpers ──────────────────────────────────────────────────
@@ -769,30 +717,24 @@ type ManagedObjects = HashMap<
     HashMap<String, HashMap<String, OwnedValue>>,
 >;
 
-async fn get_managed_objects(conn: &Connection) -> Result<ManagedObjects> {
-    let reply = conn
-        .call_method(
-            Some("org.bluez"),
-            "/",
-            Some("org.freedesktop.DBus.ObjectManager"),
-            "GetManagedObjects",
-            &(),
-        )
+async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
+    hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .method("GetManagedObjects")
+        .args(())
+        .send::<ManagedObjects>()
         .await
-        .context("GetManagedObjects")?;
-    let body = reply.body();
-    body.deserialize().context("deserialise GetManagedObjects reply")
 }
 
 async fn listen(
     adapter_mutable: &Mutable<Option<Adapter>>,
     devices_mutable: &Mutable<Vec<Device>>,
-) -> Result<()> {
-    let conn = Connection::system()
+) -> Result<(), anyhow::Error> {
+    let managed = get_managed_objects()
         .await
-        .context("connect system bus for bluetooth")?;
-
-    let managed = get_managed_objects(&conn).await?;
+        .map_err(|e| anyhow::anyhow!("GetManagedObjects: {e}"))?;
 
     // ── Find the first adapter ────────────────────────────────────────────────
 
@@ -837,66 +779,89 @@ async fn listen(
 
     // ── Signal subscriptions ──────────────────────────────────────────────────
 
-    event_loop(&conn, &state, &adapter_path).await
+    event_loop(&state, &adapter_path).await
 }
 
-async fn event_loop(conn: &Connection, state: &State, adapter_path: &str) -> Result<()> {
-    // Build a proxy on the ObjectManager root object.
-    let obj_mgr_proxy = zbus::Proxy::new(
-        conn,
-        "org.bluez",
-        "/",
-        "org.freedesktop.DBus.ObjectManager",
-    )
-    .await
-    .context("create ObjectManager proxy")?;
+/// A `PropertiesChanged` event forwarded from a per-device or adapter subscription.
+struct PropChangedEvent {
+    /// The object path the signal came from.
+    path: String,
+    /// The body of the `PropertiesChanged` signal: (iface, changed, invalidated).
+    body: zbus::Message,
+}
 
-    let mut ifaces_added = obj_mgr_proxy
-        .receive_signal("InterfacesAdded")
-        .await
-        .context("subscribe InterfacesAdded")?;
+async fn event_loop(state: &State, adapter_path: &str) -> Result<(), anyhow::Error> {
+    // Subscribe to ObjectManager signals on the root path.
+    let ifaces_added_sub = hytte_bus::signals("org.bluez")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesAdded")
+        .start();
 
-    let mut ifaces_removed = obj_mgr_proxy
-        .receive_signal("InterfacesRemoved")
-        .await
-        .context("subscribe InterfacesRemoved")?;
+    let ifaces_removed_sub = hytte_bus::signals("org.bluez")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesRemoved")
+        .start();
 
-    // `PropertiesChanged` is sent per-object — use a match rule covering all
-    // paths under /org/bluez from sender org.bluez.
-    let props_rule = zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender("org.bluez")
-        .map_err(|e| anyhow::anyhow!("match rule sender: {e}"))?
-        .interface("org.freedesktop.DBus.Properties")
-        .map_err(|e| anyhow::anyhow!("match rule interface: {e}"))?
-        .member("PropertiesChanged")
-        .map_err(|e| anyhow::anyhow!("match rule member: {e}"))?
-        .path_namespace("/org/bluez")
-        .map_err(|e| anyhow::anyhow!("match rule path: {e}"))?
-        .build();
+    // Subscribe to PropertiesChanged on the adapter path.
+    let adapter_props_sub = hytte_bus::signals("org.bluez")
+        .bus(BusKind::System)
+        .at_path(adapter_path.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .signal("PropertiesChanged")
+        .start();
 
-    let mut props_changed = zbus::MessageStream::for_match_rule(props_rule, conn, None)
-        .await
-        .context("subscribe PropertiesChanged")?;
+    // Channel for device-level PropertiesChanged events forwarded from
+    // per-device subscriptions (added/removed as devices appear/disappear).
+    let (props_tx, mut props_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PropChangedEvent>();
+
+    // Subscribe PropertiesChanged for all devices already in the map.
+    let mut device_subs: HashMap<String, SignalSubscription> = {
+        let map = state.devices_map.lock().await;
+        map.keys()
+            .map(|p| {
+                let sub = subscribe_device_props(p, props_tx.clone());
+                (p.clone(), sub)
+            })
+            .collect()
+    };
+
+    let mut ifaces_added_events = ifaces_added_sub.events();
+    let mut ifaces_removed_events = ifaces_removed_sub.events();
+    let mut adapter_props_events = adapter_props_sub.events();
 
     loop {
         tokio::select! {
-            msg = ifaces_added.next() => {
-                let Some(msg) = msg else { break; };
-                handle_ifaces_added(state, adapter_path, msg).await;
+            evt = ifaces_added_events.next() => {
+                let Some(evt) = evt else { break; };
+                let added = handle_ifaces_added(
+                    state,
+                    adapter_path,
+                    evt.body,
+                    props_tx.clone(),
+                    &mut device_subs,
+                ).await;
+                let _ = added; // result used inside handler
             }
 
-            msg = ifaces_removed.next() => {
-                let Some(msg) = msg else { break; };
-                if handle_ifaces_removed(state, adapter_path, msg).await {
+            evt = ifaces_removed_events.next() => {
+                let Some(evt) = evt else { break; };
+                if handle_ifaces_removed(state, adapter_path, evt.body, &mut device_subs).await {
                     return Err(anyhow::anyhow!("adapter removed"));
                 }
             }
 
-            msg = props_changed.next() => {
-                let Some(msg) = msg else { break; };
-                let Ok(msg) = msg else { continue; };
-                handle_props_changed(state, adapter_path, msg).await;
+            evt = adapter_props_events.next() => {
+                let Some(evt) = evt else { break; };
+                handle_adapter_props_changed(state, adapter_path, &evt.body);
+            }
+
+            Some(dev_evt) = props_rx.recv() => {
+                handle_device_props_changed(state, dev_evt).await;
             }
         }
     }
@@ -904,16 +869,49 @@ async fn event_loop(conn: &Connection, state: &State, adapter_path: &str) -> Res
     Ok(())
 }
 
+/// Subscribe to `PropertiesChanged` on a single device path, forwarding
+/// events to `tx`. Returns the `SignalSubscription` handle; dropping it
+/// cancels the subscription.
+fn subscribe_device_props(
+    device_path: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<PropChangedEvent>,
+) -> SignalSubscription {
+    let path_str = device_path.to_string();
+    let sub = hytte_bus::signals("org.bluez")
+        .bus(BusKind::System)
+        .at_path(path_str.clone())
+        .iface("org.freedesktop.DBus.Properties")
+        .signal("PropertiesChanged")
+        .start();
+
+    // Spawn a forwarder task. It exits when the subscription is dropped
+    // (event stream ends) or the channel is closed.
+    let sub_clone = sub.clone();
+    runtime::handle().spawn(async move {
+        let mut stream = sub_clone.events();
+        while let Some(evt) = stream.next().await {
+            let _ = tx.send(PropChangedEvent {
+                path: path_str.clone(),
+                body: evt.body,
+            });
+        }
+    });
+
+    sub
+}
+
 async fn handle_ifaces_added(
     state: &State,
     adapter_path: &str,
     msg: zbus::Message,
-) {
+    props_tx: tokio::sync::mpsc::UnboundedSender<PropChangedEvent>,
+    device_subs: &mut HashMap<String, SignalSubscription>,
+) -> bool {
     let Ok((path, ifaces)) = msg.body().deserialize::<(
         zbus::zvariant::OwnedObjectPath,
         HashMap<String, HashMap<String, OwnedValue>>,
     )>() else {
-        return;
+        return false;
     };
 
     let p = path.as_str();
@@ -936,6 +934,14 @@ async fn handle_ifaces_added(
         tracing::debug!(path = p, alias = dev.alias, "device added");
         state.devices_map.lock().await.insert(p.to_string(), dev);
         state.publish_devices().await;
+
+        // Register a PropertiesChanged subscription for this new device.
+        if !device_subs.contains_key(p) {
+            let sub = subscribe_device_props(p, props_tx);
+            device_subs.insert(p.to_string(), sub);
+        }
+
+        return true;
     }
 
     // Battery1 may appear *after* Device1 (added when device connects) on
@@ -951,6 +957,8 @@ async fn handle_ifaces_added(
         drop(map);
         state.publish_devices().await;
     }
+
+    false
 }
 
 /// Returns `true` when the adapter was removed (caller should reconnect).
@@ -958,6 +966,7 @@ async fn handle_ifaces_removed(
     state: &State,
     adapter_path: &str,
     msg: zbus::Message,
+    device_subs: &mut HashMap<String, SignalSubscription>,
 ) -> bool {
     let Ok((path, removed_ifaces)) = msg.body().deserialize::<(
         zbus::zvariant::OwnedObjectPath,
@@ -973,12 +982,15 @@ async fn handle_ifaces_removed(
         state.adapter.set(None);
         state.devices_map.lock().await.clear();
         state.devices.set(Vec::new());
+        device_subs.clear();
         return true;
     }
 
     if removed_ifaces.iter().any(|i| i == "org.bluez.Device1") {
         tracing::debug!(path = p, "device removed");
         state.devices_map.lock().await.remove(p);
+        // Drop the PropertiesChanged subscription for this device.
+        device_subs.remove(p);
         state.publish_devices().await;
     } else if removed_ifaces.iter().any(|i| i == "org.bluez.Battery1") {
         // Device still exists, but Battery1 went away (typically on
@@ -994,10 +1006,10 @@ async fn handle_ifaces_removed(
     false
 }
 
-async fn handle_props_changed(
+fn handle_adapter_props_changed(
     state: &State,
     adapter_path: &str,
-    msg: zbus::Message,
+    msg: &zbus::Message,
 ) {
     let Ok((iface_name, changed, _)) = msg.body().deserialize::<(
         String,
@@ -1007,20 +1019,27 @@ async fn handle_props_changed(
         return;
     };
 
-    let obj_path = msg
-        .header()
-        .path()
-        .map_or("", |p: &zbus::zvariant::ObjectPath<'_>| p.as_str())
-        .to_string();
-
-    if iface_name == "org.bluez.Adapter1" && obj_path == adapter_path {
+    if iface_name == "org.bluez.Adapter1" {
+        let _ = adapter_path; // already filtered by subscription path
         state.apply_adapter_props(&changed);
-    } else if iface_name == "org.bluez.Device1" {
-        state.apply_device_props(&obj_path, &changed).await;
+    }
+}
+
+async fn handle_device_props_changed(state: &State, evt: PropChangedEvent) {
+    let Ok((iface_name, changed, _)) = evt.body.body().deserialize::<(
+        String,
+        HashMap<String, OwnedValue>,
+        Vec<String>,
+    )>() else {
+        return;
+    };
+
+    if iface_name == "org.bluez.Device1" {
+        state.apply_device_props(&evt.path, &changed).await;
         state.publish_devices().await;
     } else if iface_name == "org.bluez.Battery1" {
         let mut map = state.devices_map.lock().await;
-        if let Some(dev) = map.get_mut(&obj_path)
+        if let Some(dev) = map.get_mut(&evt.path)
             && changed.contains_key("Percentage")
         {
             dev.battery = property::<u8>(&changed, "Percentage");
@@ -1040,8 +1059,14 @@ async fn handle_props_changed(
 //   * AuthorizeService: auto-accept (typical for trusted devices reconnecting).
 //   * PIN / Passkey entry methods: return Rejected (no text-input UI yet).
 //   * Cancel: aborts the pending prompt.
+//
+// The agent is registered under bus::own_name on the SYSTEM bus. BlueZ
+// records the system-bus unique name when we call RegisterAgent, then issues
+// Agent1 callbacks on that same connection. This mirrors the polkit pattern:
+// agent + anchor name both on the system bus.
 
 const AGENT_PATH: &str = "/com/trollshell/BluetoothAgent";
+const AGENT_ANCHOR_NAME: &str = "cc.hannig.trollshell.bluez-agent";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]
@@ -1053,6 +1078,7 @@ enum AgentError {
     Canceled(String),
 }
 
+#[derive(Clone)]
 struct PairAgent;
 
 #[zbus::interface(name = "org.bluez.Agent1")]
@@ -1232,74 +1258,104 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
     reply
 }
 
-async fn run_agent() -> Result<()> {
-    // Distinct connection from CMD_CONN: the agent path is owned by this
-    // connection, and BlueZ delivers Agent1 callbacks to the same one.
-    let conn = Connection::system()
-        .await
-        .context("open system bus for pairing agent")?;
+/// Start the pairing-agent registration loop. Uses `bus::own_name` on the
+/// SYSTEM bus (`BlueZ` is on system bus; it records the unique name of the
+/// connection that called `RegisterAgent`). Mounting `PairAgent` at
+/// `AGENT_PATH` via `.at_path()` ensures the object is visible before
+/// `RequestName` succeeds, so `BlueZ` never races a missing object.
+///
+/// After the name is owned, we call `RegisterAgent` and
+/// `RequestDefaultAgent` once via `bus::call`. On bluetoothd restart the
+/// `NameOwnerChanged` stream for `org.bluez` wakes us to re-register.
+async fn run_agent() {
+    // Own the anchor name on the system bus. The PairAgent interface is
+    // mounted at AGENT_PATH on each connection established by own_name.
+    // bus::own_name handles reconnects: if bluetoothd restarts and the name
+    // is temporarily lost, own_name re-acquires and re-mounts the interface.
+    let _ownership = hytte_bus::own_name(AGENT_ANCHOR_NAME)
+        .bus(BusKind::System)
+        .at_path(AGENT_PATH, PairAgent)
+        .start();
 
-    conn.object_server()
-        .at(AGENT_PATH, PairAgent)
-        .await
-        .context("register Agent1 at our path")?;
+    // Watch for org.bluez owner changes. When bluetoothd restarts (loses
+    // its name), our registration is gone and we must re-register.
+    // We re-register once the owner comes back.
+    let bluez_gone_sub = hytte_bus::signals("org.freedesktop.DBus")
+        .bus(BusKind::System)
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
 
-    let agent_op = zbus::zvariant::ObjectPath::try_from(AGENT_PATH)
-        .map_err(|e| anyhow::anyhow!("bad agent path: {e}"))?;
+    // Initial registration attempt.
+    try_register_agent().await;
 
-    // Subscribe to NameOwnerChanged BEFORE the RegisterAgent call so we
-    // can't miss a death event between successful registration and the
-    // start of our listen loop.
-    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn)
-        .await
-        .context("create DBusProxy for NameOwnerChanged")?;
-    let mut owner_changed = dbus_proxy
-        .receive_name_owner_changed()
-        .await
-        .context("subscribe NameOwnerChanged")?;
+    // Re-register whenever BlueZ (org.bluez) gains a new owner, which
+    // indicates bluetoothd has restarted.
+    let mut noc_events = bluez_gone_sub.events();
+    while let Some(evt) = noc_events.next().await {
+        let Ok((name, _old_owner, new_owner)) =
+            evt.body.body().deserialize::<(String, String, String)>()
+        else {
+            continue;
+        };
+        if name != "org.bluez" {
+            continue;
+        }
+        if new_owner.is_empty() {
+            // bluetoothd died — our registration is gone. Wait for it to
+            // come back (the next NameOwnerChanged with a non-empty
+            // new_owner will trigger re-registration).
+            tracing::warn!("org.bluez lost — will re-register agent on restart");
+            continue;
+        }
+        // bluetoothd restarted: re-register.
+        tracing::info!("org.bluez new owner — re-registering pairing agent");
+        try_register_agent().await;
+    }
+}
+
+/// Attempt to register the pairing agent with `BlueZ` once. Logs any failure
+/// and returns (caller decides whether to retry or wait for `NameOwnerChanged`).
+async fn try_register_agent() {
+    let agent_op = match zbus::zvariant::ObjectPath::try_from(AGENT_PATH) {
+        Ok(p) => p.to_owned(),
+        Err(e) => {
+            tracing::error!(error = %e, "bluetooth agent: bad agent path");
+            return;
+        }
+    };
 
     // RegisterAgent — capability "DisplayYesNo": we can show a code and
     // accept yes/no, which is what RequestConfirmation needs.
-    conn.call_method(
-        Some("org.bluez"),
-        "/org/bluez",
-        Some("org.bluez.AgentManager1"),
-        "RegisterAgent",
-        &(&agent_op, "DisplayYesNo"),
-    )
-    .await
-    .context("AgentManager1.RegisterAgent")?;
+    if let Err(e) = hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path("/org/bluez")
+        .iface("org.bluez.AgentManager1")
+        .method("RegisterAgent")
+        .args((agent_op.clone(), "DisplayYesNo".to_string()))
+        .send::<()>()
+        .await
+    {
+        tracing::warn!(error = %e, "bluetooth agent: RegisterAgent failed");
+        return;
+    }
 
     // RequestDefaultAgent — make us the system-wide default. Without this
     // BlueZ may use whichever Agent it sees first, including stale ones
     // from a previous trollshell run if any.
-    conn.call_method(
-        Some("org.bluez"),
-        "/org/bluez",
-        Some("org.bluez.AgentManager1"),
-        "RequestDefaultAgent",
-        &(&agent_op,),
-    )
-    .await
-    .context("AgentManager1.RequestDefaultAgent")?;
-
-    tracing::info!("bluetooth pairing agent registered");
-
-    // Watch for bluetoothd death (e.g. service restart). When org.bluez
-    // loses its owner our registration is gone, so we return Err and the
-    // outer loop reconnects + re-registers. ObjectServer keeps dispatching
-    // method calls in the background while we sit on this stream.
-    while let Some(signal) = owner_changed.next().await {
-        let Ok(args) = signal.args() else { continue };
-        if args.name().as_str() != "org.bluez" {
-            continue;
-        }
-        if args.new_owner().is_none() {
-            return Err(anyhow::anyhow!(
-                "org.bluez owner lost — re-registering agent"
-            ));
-        }
+    if let Err(e) = hytte_bus::call("org.bluez")
+        .bus(BusKind::System)
+        .at_path("/org/bluez")
+        .iface("org.bluez.AgentManager1")
+        .method("RequestDefaultAgent")
+        .args((agent_op,))
+        .send::<()>()
+        .await
+    {
+        tracing::warn!(error = %e, "bluetooth agent: RequestDefaultAgent failed");
+        return;
     }
 
-    Err(anyhow::anyhow!("NameOwnerChanged stream ended"))
+    tracing::info!("bluetooth pairing agent registered");
 }

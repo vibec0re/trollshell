@@ -135,7 +135,10 @@ impl Service for PolkitService {
 
         rt.spawn(async move {
             if let Err(e) = run_agent_lifecycle().await {
-                tracing::error!(error = %e, "polkit agent setup failed");
+                // ?e walks the anyhow chain so the underlying BusError reason
+                // (e.g. AlreadyExists, NameHasNoOwner) is visible — %e would
+                // only show the topmost .context() and swallow the real cause.
+                tracing::error!(error = ?e, "polkit agent setup failed");
             }
         });
 
@@ -654,7 +657,7 @@ async fn run_agent_lifecycle() -> Result<()> {
         }
         polkitd_was_absent = false;
         if let Err(e) = register_with_authority(subject.clone()).await {
-            tracing::warn!(error = %e, "re-RegisterAuthenticationAgent failed");
+            tracing::warn!(error = ?e, "re-RegisterAuthenticationAgent failed");
         } else {
             tracing::info!("polkit agent re-registered after polkitd restart");
         }

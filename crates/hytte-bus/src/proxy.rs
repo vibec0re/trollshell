@@ -33,7 +33,11 @@ struct ProxyInner {
     destination: String,
     path: String,
     iface: String,
-    /// Cached `'static` proxy. `None` when mid-reconnect.
+    /// Cached `'static` proxy. `None` before `build()` completes and whenever
+    /// the proxy is mid-reconnect (`Reconnecting`) or the peer has gone
+    /// (`PeerGone`). Cleared explicitly on those transitions so that `call()`
+    /// fast-fails with `BusError::Transient` instead of attempting I/O on a
+    /// dead connection.
     cached: RwLock<Option<zbus::Proxy<'static>>>,
     liveness: Mutable<ProxyState>,
     /// Fired when the watcher task exits. Wrapped in a Mutex so it can be
@@ -283,8 +287,6 @@ async fn run_proxy_watcher(
                     "proxy watcher: subscribe failed; will retry");
                 inner.liveness.set(ProxyState::Reconnecting);
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                // On subsequent iterations, also rebuild the proxy cache.
-                let _ = do_rebuild_proxy_cache(&inner).await;
                 continue;
             }
         };
@@ -328,6 +330,10 @@ async fn run_proxy_watcher(
                             // Stream ended — bus disconnected or match rule removed.
                             tracing::debug!(%dest,
                                 "proxy watcher: NOC stream ended; reconnecting");
+                            {
+                                let mut cached = inner.cached.write().await;
+                                *cached = None;
+                            }
                             inner.liveness.set(ProxyState::Reconnecting);
                             break 'drain;
                         }
@@ -340,6 +346,10 @@ async fn run_proxy_watcher(
                                     if new_owner.is_empty() {
                                         tracing::debug!(%dest,
                                             "proxy watcher: peer gone");
+                                        {
+                                            let mut cached = inner.cached.write().await;
+                                            *cached = None;
+                                        }
                                         inner.liveness.set(ProxyState::PeerGone);
                                     } else {
                                         tracing::debug!(%dest, %new_owner,
@@ -354,6 +364,10 @@ async fn run_proxy_watcher(
                         Some(Err(e)) => {
                             tracing::debug!(error = %e, %dest,
                                 "proxy watcher: message error; reconnecting");
+                            {
+                                let mut cached = inner.cached.write().await;
+                                *cached = None;
+                            }
                             inner.liveness.set(ProxyState::Reconnecting);
                             break 'drain;
                         }
@@ -365,6 +379,10 @@ async fn run_proxy_watcher(
                     {
                         tracing::debug!(%dest, new_epoch,
                             "proxy watcher: epoch advanced; rebuilding");
+                        {
+                            let mut cached = inner.cached.write().await;
+                            *cached = None;
+                        }
                         inner.liveness.set(ProxyState::Reconnecting);
                         break 'drain;
                     }

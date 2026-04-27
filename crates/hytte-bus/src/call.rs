@@ -24,8 +24,8 @@ pub enum RetryPolicy {
 }
 
 /// Builder for a one-shot D-Bus method call.
-pub struct CallBuilder<'a, A> {
-    shared: &'a SharedConnection,
+pub struct CallBuilder<A> {
+    shared: SharedConnection,
     destination: String,
     path: String,
     iface: String,
@@ -132,12 +132,9 @@ where
 /// ```
 #[doc(hidden)]
 #[must_use]
-pub fn call_with(
-    shared: &SharedConnection,
-    destination: impl Into<String>,
-) -> CallBuilder<'_, ()> {
+pub fn call_with(shared: &SharedConnection, destination: impl Into<String>) -> CallBuilder<()> {
     CallBuilder {
-        shared,
+        shared: shared.clone(),
         destination: destination.into(),
         path: String::new(),
         iface: String::new(),
@@ -148,18 +145,18 @@ pub fn call_with(
     }
 }
 
-impl<'a, A> CallBuilder<'a, A> {
+impl<A> CallBuilder<A> {
     /// Override which bus this builder targets. The default is determined by
     /// the constructor: [`call`](crate::call) uses the session bus.
     ///
     /// Overriding here replaces the `SharedConnection` with the corresponding
     /// global singleton.
     #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> CallBuilder<'static, A> {
+    pub fn bus(self, kind: crate::BusKind) -> CallBuilder<A> {
         CallBuilder {
             shared: match kind {
-                crate::BusKind::Session => crate::connection::session(),
-                crate::BusKind::System => crate::connection::system(),
+                crate::BusKind::Session => crate::connection::session().clone(),
+                crate::BusKind::System => crate::connection::system().clone(),
             },
             destination: self.destination,
             path: self.path,
@@ -208,7 +205,7 @@ impl<'a, A> CallBuilder<'a, A> {
 
     /// Set the call arguments, changing the type parameter.
     #[must_use]
-    pub fn args<NewA>(self, args: NewA) -> CallBuilder<'a, NewA>
+    pub fn args<NewA>(self, args: NewA) -> CallBuilder<NewA>
     where
         NewA: Serialize + Type,
     {
@@ -224,10 +221,10 @@ impl<'a, A> CallBuilder<'a, A> {
         }
     }
 
-    /// Convert this builder into an owned call (cloning `SharedConnection`).
+    /// Convert this builder into an owned call.
     fn into_owned(self) -> OwnedCall<A> {
         OwnedCall {
-            shared: self.shared.clone(),
+            shared: self.shared,
             destination: self.destination,
             path: self.path,
             iface: self.iface,
@@ -239,7 +236,7 @@ impl<'a, A> CallBuilder<'a, A> {
     }
 }
 
-impl<A> CallBuilder<'_, A>
+impl<A> CallBuilder<A>
 where
     A: Serialize + Type + Send + Sync + Clone + 'static,
 {

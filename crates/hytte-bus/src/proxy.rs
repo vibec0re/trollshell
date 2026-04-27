@@ -98,8 +98,8 @@ impl BusProxy {
 
 /// Builder for a long-lived [`BusProxy`].
 #[must_use]
-pub struct ProxyBuilder<'a> {
-    shared: &'a SharedConnection,
+pub struct ProxyBuilder {
+    shared: SharedConnection,
     destination: String,
     path: String,
     iface: String,
@@ -115,29 +115,26 @@ pub struct ProxyBuilder<'a> {
 ///     .build().await?;
 /// ```
 #[doc(hidden)]
-pub fn proxy_with(
-    shared: &SharedConnection,
-    destination: impl Into<String>,
-) -> ProxyBuilder<'_> {
+pub fn proxy_with(shared: &SharedConnection, destination: impl Into<String>) -> ProxyBuilder {
     ProxyBuilder {
-        shared,
+        shared: shared.clone(),
         destination: destination.into(),
         path: String::new(),
         iface: String::new(),
     }
 }
 
-impl ProxyBuilder<'_> {
+impl ProxyBuilder {
     /// Override which bus this builder targets. The default is determined by
     /// the constructor: [`proxy`](crate::proxy) uses the system bus.
     ///
     /// Overriding here replaces the `SharedConnection` with the corresponding
     /// global singleton.
-    pub fn bus(self, kind: crate::BusKind) -> ProxyBuilder<'static> {
+    pub fn bus(self, kind: crate::BusKind) -> ProxyBuilder {
         ProxyBuilder {
             shared: match kind {
-                crate::BusKind::Session => crate::connection::session(),
-                crate::BusKind::System => crate::connection::system(),
+                crate::BusKind::Session => crate::connection::session().clone(),
+                crate::BusKind::System => crate::connection::system().clone(),
             },
             destination: self.destination,
             path: self.path,
@@ -168,7 +165,7 @@ impl ProxyBuilder<'_> {
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let inner = Arc::new(ProxyInner {
-            shared: self.shared.clone(),
+            shared: self.shared,
             destination: self.destination,
             path: self.path,
             iface: self.iface,

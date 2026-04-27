@@ -59,8 +59,8 @@ impl<T: Clone + Send + Sync + 'static> PropertySignal<T> {
 // ── Builder ───────────────────────────────────────────────────────────────────
 
 /// Builder for a tracked D-Bus property.
-pub struct PropertyBuilder<'a, T> {
-    shared: &'a SharedConnection,
+pub struct PropertyBuilder<T> {
+    shared: SharedConnection,
     destination: String,
     path: String,
     iface: String,
@@ -86,10 +86,7 @@ pub struct PropertyBuilder<'a, T> {
 /// ```
 #[doc(hidden)]
 #[must_use]
-pub fn property_with<'a, T>(
-    shared: &'a SharedConnection,
-    destination: impl Into<String>,
-) -> PropertyBuilder<'a, T>
+pub fn property_with<T>(shared: &SharedConnection, destination: impl Into<String>) -> PropertyBuilder<T>
 where
     T: Clone
         + Send
@@ -98,7 +95,7 @@ where
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
     PropertyBuilder {
-        shared,
+        shared: shared.clone(),
         destination: destination.into(),
         path: String::new(),
         iface: String::new(),
@@ -107,7 +104,7 @@ where
     }
 }
 
-impl<T> PropertyBuilder<'_, T>
+impl<T> PropertyBuilder<T>
 where
     T: Clone
         + Send
@@ -122,11 +119,11 @@ where
     /// Overriding here replaces the `SharedConnection` with the corresponding
     /// global singleton.
     #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> PropertyBuilder<'static, T> {
+    pub fn bus(self, kind: crate::BusKind) -> PropertyBuilder<T> {
         PropertyBuilder {
             shared: match kind {
-                crate::BusKind::Session => crate::connection::session(),
-                crate::BusKind::System => crate::connection::system(),
+                crate::BusKind::Session => crate::connection::session().clone(),
+                crate::BusKind::System => crate::connection::system().clone(),
             },
             destination: self.destination,
             path: self.path,
@@ -171,7 +168,7 @@ where
         let weak = Arc::downgrade(&inner);
         let writer = inner.state.clone();
 
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let dest = self.destination;
         let path = self.path;
         let iface = self.iface;

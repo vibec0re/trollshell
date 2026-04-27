@@ -65,8 +65,8 @@ impl OwnNameSignal {
 }
 
 /// Builder for `own_name`. See the spec (section 3.1) for full semantics.
-pub struct OwnNameBuilder<'a> {
-    shared: &'a SharedConnection,
+pub struct OwnNameBuilder {
+    shared: SharedConnection,
     name: String,
     permanent_after: u32,
     /// How long to wait after entering `PermanentlyTaken` before retrying.
@@ -80,18 +80,18 @@ pub struct OwnNameBuilder<'a> {
     mounts: Vec<(String, MountFn)>,
 }
 
-impl OwnNameBuilder<'_> {
+impl OwnNameBuilder {
     /// Override which bus this builder targets. The default is determined by
     /// the constructor: [`own_name`](crate::own_name) uses the session bus.
     ///
     /// Overriding here replaces the `SharedConnection` with the corresponding
     /// global singleton.
     #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> OwnNameBuilder<'static> {
+    pub fn bus(self, kind: crate::BusKind) -> OwnNameBuilder {
         OwnNameBuilder {
             shared: match kind {
-                crate::BusKind::Session => crate::connection::session(),
-                crate::BusKind::System => crate::connection::system(),
+                crate::BusKind::Session => crate::connection::session().clone(),
+                crate::BusKind::System => crate::connection::system().clone(),
             },
             name: self.name,
             permanent_after: self.permanent_after,
@@ -159,7 +159,7 @@ impl OwnNameBuilder<'_> {
     pub fn start(self) -> OwnNameSignal {
         let state = Mutable::new(OwnState::Acquiring);
         let writer = state.clone();
-        let shared = self.shared.clone();
+        let shared = self.shared;
         let name = self.name;
         let threshold = self.permanent_after;
         let cooldown = self.cooldown;
@@ -175,12 +175,9 @@ impl OwnNameBuilder<'_> {
 /// callers use `own_name(...)` (Task 12 wires the global session/system).
 #[doc(hidden)]
 #[must_use]
-pub fn own_name_with(
-    shared: &SharedConnection,
-    name: impl Into<String>,
-) -> OwnNameBuilder<'_> {
+pub fn own_name_with(shared: &SharedConnection, name: impl Into<String>) -> OwnNameBuilder {
     OwnNameBuilder {
-        shared,
+        shared: shared.clone(),
         name: name.into(),
         permanent_after: 3,
         cooldown: Duration::from_secs(5 * 60),

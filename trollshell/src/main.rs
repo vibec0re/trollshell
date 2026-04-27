@@ -72,6 +72,10 @@ fn main() -> hytte::ui::Result<()> {
                 widgets::polkit_dialog::install(primary);
             }
 
+            // Lock screen surfaces mount on all monitors; the subscription
+            // reacts to screensaver::is_locked() and shows/hides them.
+            widgets::lock_screen::install(&app.monitors());
+
             // Notifications + OSD mount on every monitor; routing picks the focused one.
             for monitor in &app.monitors() {
                 widgets::notifications::install(monitor);

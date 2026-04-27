@@ -12,5 +12,8 @@ workspace = true
 [dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 hytte = { path = "../crates/hytte" }
+hytte-pam = { path = "../crates/hytte-pam" }
+nix = { version = "0.29", default-features = false, features = ["user"] }
+tokio = { version = "1.52.1", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }

@@ -2054,7 +2054,7 @@ fn sink_row(s: &Sink) -> gtk::Widget {
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     slider.set_draw_value(false);
     slider.set_hexpand(true);
-    slider.set_size_request(160, -1);
+    slider.set_size_request(110, -1);
     slider.set_value(s.volume);
 
     let sink_name_for_slider = s.name.clone();
@@ -2130,7 +2130,7 @@ fn source_row(s: &Source) -> gtk::Widget {
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     slider.set_draw_value(false);
     slider.set_hexpand(true);
-    slider.set_size_request(160, -1);
+    slider.set_size_request(110, -1);
     slider.set_value(s.volume);
 
     let source_name_for_slider = s.name.clone();
@@ -2190,7 +2190,7 @@ fn stream_row(s: &PlaybackStream) -> gtk::Widget {
     let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     slider.set_draw_value(false);
     slider.set_hexpand(true);
-    slider.set_size_request(160, -1);
+    slider.set_size_request(110, -1);
     slider.set_value(s.volume);
 
     let stream_id = s.id;
@@ -3076,11 +3076,14 @@ pub fn page_clipboard() -> gtk::Widget {
 /// Drawer page exposing trollshell-wide preferences. v1 (minimal) covers two
 /// knobs:
 ///
-/// - Theme (Light / Dark / Follow system) — mediated by `gsettings` on
+/// - Theme (Light / Dark) — mediated by `gsettings` on
 ///   `org.gnome.desktop.interface color-scheme`. The dropdown reads the
 ///   current value once at page mount and writes back on selection change.
 ///   We do NOT live-track external `gsettings` changes; for v1 the dropdown
-///   is the source of truth while the page is open.
+///   is the source of truth while the page is open. Trollshell *is* the
+///   compositor session, so "follow system" is meaningless — if gsettings
+///   reads back `default` (externally set), we surface Dark and let the
+///   next user pick make it canonical.
 /// - Do Not Disturb — duplicates the toggle at the top of `page_notifications`.
 ///   Both bindings drive the same `dnd::set_enabled` setter and observe the
 ///   same `dnd::enabled` signal, so they stay in sync.
@@ -3100,19 +3103,19 @@ pub fn page_settings() -> gtk::Widget {
 
     let theme_row = adw::ActionRow::builder()
         .title("Theme")
-        .subtitle("Light, dark, or follow system.")
+        .subtitle("Light or dark.")
         .build();
 
     // Order matches THEME_KEYS below — the DropDown's selected index maps
     // 1:1 to the gsettings color-scheme value.
-    let theme_dropdown = gtk::DropDown::from_strings(&["Light", "Dark", "Follow system"]);
+    let theme_dropdown = gtk::DropDown::from_strings(&["Light", "Dark"]);
     theme_dropdown.set_valign(gtk::Align::Center);
     theme_dropdown.set_selected(read_color_scheme_index());
     theme_dropdown.connect_selected_notify(|dd| {
         let key = THEME_KEYS
             .get(dd.selected() as usize)
             .copied()
-            .unwrap_or("default");
+            .unwrap_or("prefer-dark");
         write_color_scheme(key);
     });
     theme_row.add_suffix(&theme_dropdown);
@@ -3199,12 +3202,14 @@ fn deep_link_row(
 
 /// Index ↔ gsettings value mapping for the theme dropdown. Order must match
 /// the strings passed to `gtk::DropDown::from_strings` in `page_settings`.
-const THEME_KEYS: [&str; 3] = ["prefer-light", "prefer-dark", "default"];
+/// Trollshell is the compositor session, so we don't expose `default`
+/// ("follow system") — Light/Dark only.
+const THEME_KEYS: [&str; 2] = ["prefer-light", "prefer-dark"];
 
 /// Read the current `org.gnome.desktop.interface color-scheme` value via a
 /// one-shot synchronous `gsettings get` and map it to a dropdown index.
-/// Returns the "Follow system" index (2) on any error so the UI is never
-/// blank — including when `gsettings-desktop-schemas` is missing.
+/// Returns the Dark index (1) on any error or `default` so the UI is never
+/// blank — matches the app's `adw::ColorScheme::PreferDark` default.
 fn read_color_scheme_index() -> u32 {
     let output = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
@@ -3218,18 +3223,18 @@ fn read_color_scheme_index() -> u32 {
                 .iter()
                 .position(|k| *k == trimmed)
                 .and_then(|i| u32::try_from(i).ok())
-                .unwrap_or(2)
+                .unwrap_or(1)
         }
         Ok(out) => {
             tracing::warn!(
                 stderr = %String::from_utf8_lossy(&out.stderr),
                 "settings: gsettings get color-scheme failed",
             );
-            2
+            1
         }
         Err(e) => {
             tracing::warn!(error = %e, "settings: gsettings unavailable");
-            2
+            1
         }
     }
 }

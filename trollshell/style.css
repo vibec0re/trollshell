@@ -6,9 +6,16 @@
  */
 
 * {
-    font-family: "JetBrains Mono", "Fira Code", "Cantarell", system-ui, sans-serif;
+    font-family: "Cantarell", system-ui, sans-serif;
     font-size: 13px;
     font-weight: 500;
+}
+
+.ts-clock,
+.ts-clock label,
+.ts-workspaces button,
+.ts-workspaces button label {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
 }
 
 /* ─── Bar — transparent layer-shell window, floating rounded pill
@@ -230,14 +237,13 @@
 .ts-tray-item image {
     -gtk-icon-size: 16px;
 }
-.ts-notif-indicator .ts-notif-badge {
-    color: #ffffff;
-    font-size: 10px;
-    padding: 0 5px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, #ff006e, #ff4d4d);
-    min-width: 14px;
-    box-shadow: 0 0 8px rgba(255, 0, 110, 0.6);
+.ts-notif-indicator .ts-notif-dot {
+    min-width: 6px;
+    min-height: 6px;
+    margin: 1px 1px 0 0;
+    border-radius: 3px;
+    background: #ff006e;
+    box-shadow: 0 0 4px rgba(255, 0, 110, 0.7);
 }
 .ts-mpris {
     padding: 0 6px;
@@ -278,9 +284,9 @@
  * the bar so no top rounding; bottom corners rounded; drop shadow aims
  * downward only. Colors inherit the Adwaita theme. */
 .ts-drawer {
-    background: @window_bg_color; 
+    background: @window_bg_color;
     background-image: linear-gradient(180deg,
-        rgba(15, 15, 35, 1) 0%,
+        shade(@window_bg_color, 0.82) 0%,
         @window_bg_color 100%);
 
     color: @window_fg_color;
@@ -290,6 +296,15 @@
     border-top: none;
     padding-top: 10px;
     margin-bottom: 20px;
+}
+/* Light mode: shade() darkens, but dark-on-light gradients read as a
+ * dirty smudge. Lift the top slightly instead so the drawer reads as a
+ * subtle highlight feathering down into the surface. */
+window:not(.dark) .ts-drawer {
+    background-image: linear-gradient(180deg,
+        shade(@window_bg_color, 1.04) 0%,
+        @window_bg_color 100%);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
 }
 .ts-modal-page {
     padding: 12px;

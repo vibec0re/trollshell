@@ -24,12 +24,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 .or_else(|| win.app_id.clone())
                 .unwrap_or_else(|| format!("window {}", win.id));
             // Bounded label — ellipsize at render, tooltip has the full title.
-            // max_width_chars(40) bounds pathological titles so the left cluster
-            // doesn't push the right cluster off the monitor; ordinary titles
-            // fit within the cap and the button sizes to natural label width.
+            // Cap is tight (20 chars) because GtkCenterBox doesn't prevent
+            // the left cluster from growing into the centered MPRIS row;
+            // wider titles caused visible overlap in the wild.
             let label_widget = gtk::Label::new(Some(&label_text));
             label_widget.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            label_widget.set_max_width_chars(40);
+            label_widget.set_max_width_chars(30);
             let btn = gtk::Button::new();
             btn.set_child(Some(&label_widget));
             btn.set_tooltip_text(Some(&label_text));

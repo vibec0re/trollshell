@@ -7,22 +7,24 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-notif-indicator");
 
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let overlay = gtk::Overlay::new();
     let icon = gtk::Image::from_icon_name("notification-symbolic");
-    row.append(&icon);
-    let badge = gtk::Label::new(None);
-    badge.add_css_class("ts-notif-badge");
-    row.append(&badge);
-    btn.set_child(Some(&row));
+    overlay.set_child(Some(&icon));
 
-    bind(notifications::active(), &badge, |w, list| {
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.add_css_class("ts-notif-dot");
+    dot.set_halign(gtk::Align::End);
+    dot.set_valign(gtk::Align::Start);
+    overlay.add_overlay(&dot);
+    btn.set_child(Some(&overlay));
+
+    bind(notifications::active(), &dot, |w, list| {
         let n = list.len();
-        if n == 0 {
-            w.set_text("");
-            w.set_visible(false);
+        w.set_visible(n > 0);
+        if n > 0 {
+            w.set_tooltip_text(Some(&n.to_string()));
         } else {
-            w.set_text(&n.to_string());
-            w.set_visible(true);
+            w.set_tooltip_text(None);
         }
     });
 

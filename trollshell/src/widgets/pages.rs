@@ -2668,10 +2668,10 @@ pub fn page_power_menu() -> gtk::Widget {
         None,
         || {
             // niri's `quit` shows its own confirmation overlay, which is the
-            // right UX for a destructive session-end action. Pass
-            // `--skip-confirmation` to suppress it if you want this row to
-            // be the single point of confirmation.
-            spawn_detached("niri", &["msg", "action", "quit"]);
+            // right UX for a destructive session-end action. Pass `true` to
+            // suppress it if this row should be the single point of
+            // confirmation.
+            hytte::services::niri::quit(false);
         },
     ));
 
@@ -2681,7 +2681,7 @@ pub fn page_power_menu() -> gtk::Widget {
         "system-suspend-symbolic",
         None,
         || {
-            spawn_detached("systemctl", &["suspend"]);
+            hytte::services::logind::suspend();
         },
     ));
 
@@ -2691,7 +2691,7 @@ pub fn page_power_menu() -> gtk::Widget {
         "system-reboot-symbolic",
         None,
         || {
-            spawn_detached("systemctl", &["reboot"]);
+            hytte::services::logind::reboot();
         },
     ));
 
@@ -2701,7 +2701,7 @@ pub fn page_power_menu() -> gtk::Widget {
         "system-shutdown-symbolic",
         Some("destructive-action"),
         || {
-            spawn_detached("systemctl", &["poweroff"]);
+            hytte::services::logind::poweroff();
         },
     ));
 
@@ -2750,21 +2750,6 @@ fn power_action_row(
         crate::modal::dismiss_all();
     });
     row
-}
-
-/// Fire-and-forget process spawn for power-menu actions. systemctl calls
-/// hit polkit (wired up in task #27); auth flows through the trollshell
-/// polkit dialog. Errors are logged at warn level — the user already sees
-/// the drawer close, so a silent failure would be confusing.
-fn spawn_detached(program: &str, args: &[&str]) {
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    if let Err(e) = cmd.spawn() {
-        tracing::warn!(program, ?args, error = %e, "power-menu: spawn failed");
-    }
 }
 
 // ── Appearance page ──────────────────────────────────────────────────────────

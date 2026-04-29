@@ -308,25 +308,37 @@ fn fmt_us(us: u64) -> String {
 // ── Network page ──────────────────────────────────────────────────────────────
 
 pub fn page_network() -> gtk::Widget {
-    let column = page_box();
-    column.add_css_class("ts-popup-column");
-    column.set_spacing(16);
+    // Outer container holds the two-column grid up top, then full-width
+    // sections (Phase 3 will append "Active connections" here too).
+    let outer = page_box();
+    outer.add_css_class("ts-popup-column");
+    outer.set_spacing(16);
 
-    column.append(build_connection_group_v2().upcast_ref::<gtk::Widget>());
-    column.append(build_traffic_group_v2().upcast_ref::<gtk::Widget>());
+    let grid = page_grid();
+
+    // Left column: configuration.
+    let left = panel("Configuration");
+    left.append(&build_connection_group_v2());
+    grid.attach(&left, 0, 0, 1, 1);
+
+    // Right column: live stats.
+    let right = panel("Live");
+    right.append(&build_traffic_group_v2());
 
     let wifi_group = build_wifi_group_v2();
     // Hide the Wi-Fi section entirely when no adapter is present (e.g. a
-    // desktop machine with no wireless hardware) so the popup doesn't show
-    // dead pixels / an empty group.
+    // desktop machine with no wireless hardware).
     bind(
         wifi::adapter().map(|a| a.is_some()),
         &wifi_group,
         gtk::prelude::WidgetExt::set_visible,
     );
-    column.append(wifi_group.upcast_ref::<gtk::Widget>());
+    right.append(&wifi_group);
+    grid.attach(&right, 1, 0, 1, 1);
 
-    finish_page(&column)
+    outer.append(&grid);
+
+    finish_page(&outer)
 }
 
 fn build_connection_group_v2() -> adw::PreferencesGroup {

@@ -192,7 +192,7 @@ pub fn install(monitor: &Monitor) {
         Some(Page::Displays.stack_name()),
     );
     stack.add_named(
-        &pages::page_clipboard(),
+        &crate::panels::panel_clipboard(),
         Some(Page::Clipboard.stack_name()),
     );
     stack.add_named(

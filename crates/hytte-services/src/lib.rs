@@ -10,6 +10,7 @@ pub mod displays;
 pub mod dnd;
 pub mod logind;
 pub mod mpris;
+pub mod netconn;
 pub mod networkd;
 pub mod niri;
 pub mod notifications;

@@ -200,7 +200,7 @@ pub fn install(monitor: &Monitor) {
         Some(Page::Calendar.stack_name()),
     );
     stack.add_named(
-        &pages::page_settings(),
+        &crate::panels::panel_settings(),
         Some(Page::Settings.stack_name()),
     );
 

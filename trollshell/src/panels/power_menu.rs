@@ -6,7 +6,6 @@
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk;
-use hytte::prelude::*;
 
 use crate::components::layout::{finish_page, page_box};
 

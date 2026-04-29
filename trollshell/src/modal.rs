@@ -176,7 +176,7 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(&crate::panels::panel_audio(), Some(Page::Audio.stack_name()));
     stack.add_named(&crate::panels::panel_power(), Some(Page::Power.stack_name()));
     stack.add_named(
-        &pages::page_power_menu(),
+        &crate::panels::panel_power_menu(),
         Some(Page::PowerMenu.stack_name()),
     );
     stack.add_named(

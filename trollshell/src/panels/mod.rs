@@ -14,6 +14,7 @@ pub mod media;
 pub mod network;
 pub mod notifications;
 pub mod power;
+pub mod power_menu;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
@@ -26,3 +27,4 @@ pub use media::panel_media;
 pub use network::panel_network;
 pub use notifications::panel_notifications;
 pub use power::panel_power;
+pub use power_menu::panel_power_menu;

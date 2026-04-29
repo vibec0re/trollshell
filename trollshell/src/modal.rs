@@ -188,7 +188,7 @@ pub fn install(monitor: &Monitor) {
         Some(Page::Appearance.stack_name()),
     );
     stack.add_named(
-        &pages::page_displays(),
+        &crate::panels::panel_displays(),
         Some(Page::Displays.stack_name()),
     );
     stack.add_named(

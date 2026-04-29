@@ -10,6 +10,7 @@ pub mod calendar;
 pub mod clipboard;
 pub mod connections;
 pub mod displays;
+pub mod media;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
@@ -18,3 +19,4 @@ pub use calendar::panel_calendar;
 pub use clipboard::panel_clipboard;
 pub use connections::panel_connections;
 pub use displays::panel_displays;
+pub use media::panel_media;

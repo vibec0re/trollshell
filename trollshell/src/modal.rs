@@ -164,7 +164,7 @@ pub fn install(monitor: &Monitor) {
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
 
-    stack.add_named(&pages::page_media(), Some(Page::Media.stack_name()));
+    stack.add_named(&crate::panels::panel_media(), Some(Page::Media.stack_name()));
     stack.add_named(&pages::page_network(), Some(Page::Network.stack_name()));
     stack.add_named(&pages::page_vpn(), Some(Page::Vpn.stack_name()));
     stack.add_named(

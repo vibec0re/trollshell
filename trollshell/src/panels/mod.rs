@@ -5,6 +5,8 @@
 
 pub mod appearance;
 pub mod audio;
+pub mod bluetooth;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
+pub use bluetooth::panel_bluetooth;

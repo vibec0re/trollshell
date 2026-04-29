@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod clock;
 pub mod displays;
 pub mod dnd;
+pub mod logind;
 pub mod mpris;
 pub mod networkd;
 pub mod niri;

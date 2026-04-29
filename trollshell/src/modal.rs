@@ -174,7 +174,7 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(&crate::panels::panel_bluetooth(), Some(Page::Bluetooth.stack_name()));
     stack.add_named(&pages::page_stats(), Some(Page::Stats.stack_name()));
     stack.add_named(&crate::panels::panel_audio(), Some(Page::Audio.stack_name()));
-    stack.add_named(&pages::page_power(), Some(Page::Power.stack_name()));
+    stack.add_named(&crate::panels::panel_power(), Some(Page::Power.stack_name()));
     stack.add_named(
         &pages::page_power_menu(),
         Some(Page::PowerMenu.stack_name()),

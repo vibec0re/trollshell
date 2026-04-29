@@ -13,6 +13,7 @@ pub mod displays;
 pub mod media;
 pub mod network;
 pub mod notifications;
+pub mod power;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
@@ -24,3 +25,4 @@ pub use displays::panel_displays;
 pub use media::panel_media;
 pub use network::panel_network;
 pub use notifications::panel_notifications;
+pub use power::panel_power;

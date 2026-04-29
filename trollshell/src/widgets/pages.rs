@@ -341,113 +341,28 @@ pub fn page_network() -> gtk::Widget {
 
     outer.append(&grid);
 
-    // Active connections — full-width section below the grid.
-    let conn_group = adw::PreferencesGroup::builder()
+    // Active connections drill-down — opens Page::Connections for the full list.
+    let drill = adw::ActionRow::builder()
         .title("Active connections")
+        .activatable(true)
         .build();
+    drill.add_prefix(&gtk::Image::from_icon_name("system-search-symbolic"));
+    drill.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     bind(
         netconn::connections().map(|cs| {
             let total = cs.len();
             let with_pid = cs.iter().filter(|c| c.pid.is_some()).count();
             format!("{total} sockets, {with_pid} with PID")
         }),
-        &conn_group,
-        |g, txt| g.set_description(Some(&txt)),
+        &drill,
+        |row, txt| row.set_subtitle(&txt),
     );
-
-    // Top-level rows: own-user sockets sorted by program. Other users
-    // (where ss can't see PID) collapse into a single expander at the
-    // bottom so they don't dominate.
-    let owned_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let owned_overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
-    let other_expander = adw::ExpanderRow::builder().title("Other users").build();
-    let other_rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-
-    let group_for_bind = conn_group.clone();
-    let owned_for_bind = owned_track.clone();
-    let overflow_for_bind = owned_overflow_track.clone();
-    let other_for_bind = other_expander.clone();
-    let other_rows_for_bind = other_rows_track.clone();
-    bind(
-        netconn::connections(),
-        &conn_group,
-        move |_g, mut conns| {
-            // Sort: own-user (has PID) first by program, then no-PID by local addr.
-            conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (true, true) => a
-                    .program
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.program.as_deref().unwrap_or("")),
-                (false, false) => a.local.to_string().cmp(&b.local.to_string()),
-            });
-
-            // Raw bucket totals, used so the truncation hint and expander
-            // subtitle can reflect what's actually there (not just what's shown).
-            let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
-            let total_other = conns.len() - total_owned;
-
-            // Drain previous rows.
-            let mut owned = owned_for_bind.borrow_mut();
-            for r in owned.drain(..) {
-                group_for_bind.remove(&r);
-            }
-            let mut others = other_rows_for_bind.borrow_mut();
-            for r in others.drain(..) {
-                other_for_bind.remove(&r);
-            }
-            // Drain any previous overflow hint row.
-            if let Some(prev) = overflow_for_bind.borrow_mut().take() {
-                group_for_bind.remove(&prev);
-            }
-
-            let mut owned_count = 0usize;
-            let mut other_count = 0usize;
-            for c in &conns {
-                if c.pid.is_some() {
-                    if owned_count >= CONN_BUCKET_CAP {
-                        continue;
-                    }
-                    let row = build_connection_row(c);
-                    group_for_bind.add(&row);
-                    owned.push(row);
-                    owned_count += 1;
-                } else {
-                    if other_count >= CONN_BUCKET_CAP {
-                        continue;
-                    }
-                    let row = build_connection_row(c);
-                    other_for_bind.add_row(&row);
-                    others.push(row);
-                    other_count += 1;
-                }
-            }
-
-            // Owner-bucket truncation hint.
-            if total_owned > owned_count {
-                let hint = adw::ActionRow::builder()
-                    .title(format!("(+{} more)", total_owned - owned_count))
-                    .activatable(false)
-                    .selectable(false)
-                    .build();
-                hint.set_subtitle("Top sockets shown.");
-                group_for_bind.add(&hint);
-                *overflow_for_bind.borrow_mut() = Some(hint);
-            }
-
-            // Other-bucket subtitle: show capped vs total when truncated.
-            if total_other > other_count {
-                other_for_bind.set_subtitle(&format!("{other_count} of {total_other} sockets"));
-            } else {
-                other_for_bind.set_subtitle(&format!("{other_count} sockets"));
-            }
-            other_for_bind.set_visible(total_other > 0);
-        },
-    );
-    conn_group.add(&other_expander);
-    outer.append(&conn_group);
+    drill.connect_activated(|_| {
+        crate::modal::switch_active(crate::modal::Page::Connections);
+    });
+    let drill_group = adw::PreferencesGroup::new();
+    drill_group.add(&drill);
+    outer.append(&drill_group);
 
     finish_page(&outer)
 }
@@ -3403,6 +3318,124 @@ fn theme_to_index(t: hytte::services::theme::Theme) -> u32 {
         hytte::services::theme::Theme::Light => 0,
         hytte::services::theme::Theme::Dark => 1,
     }
+}
+
+// ── Connections page ──────────────────────────────────────────────────────────
+
+/// Drawer drill-down listing per-process active sockets.
+///
+/// Surfaces every entry of `hytte::services::netconn::connections()`. Own-user
+/// sockets (PID present) appear at top sorted by program name; other-user
+/// sockets (where ss can't see PID) collapse into a single "Other users"
+/// expander at the bottom. Each bucket is capped at `CONN_BUCKET_CAP` rows;
+/// truncation is surfaced via a "(+N more)" hint row in the own bucket and a
+/// "{shown} of {total} sockets" subtitle on the other-users expander.
+pub fn page_connections() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+    column.set_spacing(16);
+
+    let conn_group = adw::PreferencesGroup::builder()
+        .title("Active connections")
+        .build();
+    bind(
+        netconn::connections().map(|cs| {
+            let total = cs.len();
+            let with_pid = cs.iter().filter(|c| c.pid.is_some()).count();
+            format!("{total} sockets, {with_pid} with PID")
+        }),
+        &conn_group,
+        |g, txt| g.set_description(Some(&txt)),
+    );
+
+    // Top-level rows: own-user sockets sorted by program. Other users
+    // (where ss can't see PID) collapse into a single expander at the
+    // bottom so they don't dominate.
+    let owned_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let owned_overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
+    let other_expander = adw::ExpanderRow::builder().title("Other users").build();
+    let other_rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let group_for_bind = conn_group.clone();
+    let owned_for_bind = owned_track.clone();
+    let overflow_for_bind = owned_overflow_track.clone();
+    let other_for_bind = other_expander.clone();
+    let other_rows_for_bind = other_rows_track.clone();
+    bind(
+        netconn::connections(),
+        &conn_group,
+        move |_g, mut conns| {
+            conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => a
+                    .program
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.program.as_deref().unwrap_or("")),
+                (false, false) => a.local.to_string().cmp(&b.local.to_string()),
+            });
+
+            let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
+            let total_other = conns.len() - total_owned;
+
+            let mut owned = owned_for_bind.borrow_mut();
+            for r in owned.drain(..) {
+                group_for_bind.remove(&r);
+            }
+            let mut others = other_rows_for_bind.borrow_mut();
+            for r in others.drain(..) {
+                other_for_bind.remove(&r);
+            }
+            if let Some(prev) = overflow_for_bind.borrow_mut().take() {
+                group_for_bind.remove(&prev);
+            }
+
+            let mut owned_count = 0usize;
+            let mut other_count = 0usize;
+            for c in &conns {
+                if c.pid.is_some() {
+                    if owned_count >= CONN_BUCKET_CAP {
+                        continue;
+                    }
+                    let row = build_connection_row(c);
+                    group_for_bind.add(&row);
+                    owned.push(row);
+                    owned_count += 1;
+                } else {
+                    if other_count >= CONN_BUCKET_CAP {
+                        continue;
+                    }
+                    let row = build_connection_row(c);
+                    other_for_bind.add_row(&row);
+                    others.push(row);
+                    other_count += 1;
+                }
+            }
+
+            if total_owned > owned_count {
+                let hint = adw::ActionRow::builder()
+                    .title(format!("(+{} more)", total_owned - owned_count))
+                    .activatable(false)
+                    .selectable(false)
+                    .build();
+                hint.set_subtitle("Top sockets shown.");
+                group_for_bind.add(&hint);
+                *overflow_for_bind.borrow_mut() = Some(hint);
+            }
+
+            if total_other > other_count {
+                other_for_bind.set_subtitle(&format!("{other_count} of {total_other} sockets"));
+            } else {
+                other_for_bind.set_subtitle(&format!("{other_count} sockets"));
+            }
+            other_for_bind.set_visible(total_other > 0);
+        },
+    );
+    conn_group.add(&other_expander);
+    column.append(&conn_group);
+
+    finish_page(&column)
 }
 
 // ── VPN page ──────────────────────────────────────────────────────────────────

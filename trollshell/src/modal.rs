@@ -16,6 +16,7 @@ pub enum Page {
     Media,
     Network,
     Vpn,
+    Connections,
     Bluetooth,
     Stats,
     Audio,
@@ -35,6 +36,7 @@ impl Page {
             Self::Media => "media",
             Self::Network => "network",
             Self::Vpn => "vpn",
+            Self::Connections => "connections",
             Self::Bluetooth => "bluetooth",
             Self::Stats => "stats",
             Self::Audio => "audio",
@@ -165,6 +167,10 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(&pages::page_media(), Some(Page::Media.stack_name()));
     stack.add_named(&pages::page_network(), Some(Page::Network.stack_name()));
     stack.add_named(&pages::page_vpn(), Some(Page::Vpn.stack_name()));
+    stack.add_named(
+        &pages::page_connections(),
+        Some(Page::Connections.stack_name()),
+    );
     stack.add_named(&pages::page_bluetooth(), Some(Page::Bluetooth.stack_name()));
     stack.add_named(&pages::page_stats(), Some(Page::Stats.stack_name()));
     stack.add_named(&pages::page_audio(), Some(Page::Audio.stack_name()));

@@ -180,7 +180,7 @@ pub fn install(monitor: &Monitor) {
         Some(Page::PowerMenu.stack_name()),
     );
     stack.add_named(
-        &pages::page_notifications(),
+        &crate::panels::panel_notifications(),
         Some(Page::Notifications.stack_name()),
     );
     stack.add_named(

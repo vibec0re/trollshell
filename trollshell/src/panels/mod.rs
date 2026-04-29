@@ -12,6 +12,7 @@ pub mod connections;
 pub mod displays;
 pub mod media;
 pub mod network;
+pub mod notifications;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
@@ -22,3 +23,4 @@ pub use connections::panel_connections;
 pub use displays::panel_displays;
 pub use media::panel_media;
 pub use network::panel_network;
+pub use notifications::panel_notifications;

@@ -654,7 +654,7 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
             cache_mut.retain(|name, entry| {
                 let keep = live.contains(name);
                 if !keep {
-                    group_for_bind.remove(&entry.row);
+                    group_for_bind.remove(&entry.container);
                 }
                 keep
             });
@@ -679,7 +679,7 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
                     // the group synchronously before any iface row, so
                     // they remain at the bottom of the visual stack.
                     for entry in cache_mut.values() {
-                        group_for_bind.remove(&entry.row);
+                        group_for_bind.remove(&entry.container);
                     }
                     let entry = build_iface_traffic_row(iface);
                     entry.spark.push(combined);
@@ -689,7 +689,7 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
                     sorted_names.sort();
                     for name in sorted_names {
                         if let Some(entry) = cache_mut.get(name) {
-                            group_for_bind.add(&entry.row);
+                            group_for_bind.add(&entry.container);
                         }
                     }
                 }
@@ -739,28 +739,27 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
 /// Per-interface traffic row holding the widgets the bind updates each
 /// `sensors::network()` emission. Returned by `build_iface_traffic_row`
 /// and stored in the network drawer's interface cache.
+///
+/// `container` is a plain `gtk::Box` matching the `build_history_row`
+/// shape used by `page_stats` — name on the left, sparkline taking the
+/// row's full hexpand, value on the right. `adw::PreferencesGroup::add`
+/// accepts the box as a child, same as `build_stats_history_group` does.
 struct IfaceRow {
-    row: adw::ActionRow,
+    container: gtk::Box,
     spark: Sparkline,
     value: gtk::Label,
 }
 
-/// One per-interface traffic row: name on the left, sparkline center,
-/// current ↓rx ↑tx label on the right. Returned widgets are stored by
-/// the caller so subsequent emissions can `spark.push(...)` and
-/// `value.set_text(...)` instead of rebuilding the row.
+/// One per-interface traffic row: name on the left, sparkline taking
+/// the row's full hexpand, current ↓rx ↑tx label on the right.
+///
+/// Wraps the existing `build_history_row(name)` helper used by
+/// `page_stats`. The returned widgets are stored by the caller so
+/// subsequent emissions can `spark.push(...)` and `value.set_text(...)`
+/// instead of rebuilding the row.
 fn build_iface_traffic_row(iface: &sensors::NetInterface) -> IfaceRow {
-    let row = adw::ActionRow::builder().title(&iface.name).build();
-    let suffix_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    suffix_box.set_valign(gtk::Align::Center);
-    let spark = Sparkline::new(60);
-    spark.widget().set_width_request(120);
-    suffix_box.append(spark.widget());
-    let value = gtk::Label::new(None);
-    value.add_css_class("ts-mono");
-    suffix_box.append(&value);
-    row.add_suffix(&suffix_box);
-    IfaceRow { row, spark, value }
+    let (container, spark, value) = build_history_row(&iface.name);
+    IfaceRow { container, spark, value }
 }
 
 fn build_wifi_group_v2() -> adw::PreferencesGroup {

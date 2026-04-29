@@ -2707,21 +2707,6 @@ pub fn page_power_menu() -> gtk::Widget {
 
     column.append(&group);
 
-    // Cancel row: just retract the drawer. ESC also closes (modal.rs handles
-    // it) but a visible affordance helps when the page was opened by chip.
-    let close_group = adw::PreferencesGroup::new();
-    let close_row = adw::ActionRow::builder()
-        .title("Close")
-        .activatable(true)
-        .build();
-    let close_icon = gtk::Image::from_icon_name("window-close-symbolic");
-    close_row.add_prefix(&close_icon);
-    close_row.connect_activated(|_| {
-        crate::modal::dismiss_all();
-    });
-    close_group.add(&close_row);
-    column.append(&close_group);
-
     finish_page(&column)
 }
 

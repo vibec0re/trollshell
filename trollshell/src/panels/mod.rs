@@ -6,7 +6,9 @@
 pub mod appearance;
 pub mod audio;
 pub mod bluetooth;
+pub mod calendar;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
 pub use bluetooth::panel_bluetooth;
+pub use calendar::panel_calendar;

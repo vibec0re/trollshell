@@ -196,7 +196,7 @@ pub fn install(monitor: &Monitor) {
         Some(Page::Clipboard.stack_name()),
     );
     stack.add_named(
-        &pages::page_calendar(),
+        &crate::panels::panel_calendar(),
         Some(Page::Calendar.stack_name()),
     );
     stack.add_named(

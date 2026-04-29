@@ -168,7 +168,7 @@ pub fn install(monitor: &Monitor) {
     stack.add_named(&pages::page_network(), Some(Page::Network.stack_name()));
     stack.add_named(&pages::page_vpn(), Some(Page::Vpn.stack_name()));
     stack.add_named(
-        &pages::page_connections(),
+        &crate::panels::panel_connections(),
         Some(Page::Connections.stack_name()),
     );
     stack.add_named(&crate::panels::panel_bluetooth(), Some(Page::Bluetooth.stack_name()));

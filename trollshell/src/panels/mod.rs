@@ -8,9 +8,11 @@ pub mod audio;
 pub mod bluetooth;
 pub mod calendar;
 pub mod clipboard;
+pub mod connections;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
 pub use bluetooth::panel_bluetooth;
 pub use calendar::panel_calendar;
 pub use clipboard::panel_clipboard;
+pub use connections::panel_connections;

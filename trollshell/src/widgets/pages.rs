@@ -740,26 +740,50 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
 /// `sensors::network()` emission. Returned by `build_iface_traffic_row`
 /// and stored in the network drawer's interface cache.
 ///
-/// `container` is a plain `gtk::Box` matching the `build_history_row`
-/// shape used by `page_stats` — name on the left, sparkline taking the
-/// row's full hexpand, value on the right. `adw::PreferencesGroup::add`
-/// accepts the box as a child, same as `build_stats_history_group` does.
+/// `container` is a vertical `gtk::Box` stacking a `build_history_row`
+/// (name + full-hexpand sparkline + small unit) on top, and a detail
+/// label carrying the rate breakdown below — matching the
+/// `build_history_network_row` pattern in `page_stats` so the rate
+/// label reads under the graph rather than crammed beside it.
 struct IfaceRow {
     container: gtk::Box,
     spark: Sparkline,
     value: gtk::Label,
 }
 
-/// One per-interface traffic row: name on the left, sparkline taking
-/// the row's full hexpand, current ↓rx ↑tx label on the right.
+/// One per-interface traffic row laid out vertically:
 ///
-/// Wraps the existing `build_history_row(name)` helper used by
-/// `page_stats`. The returned widgets are stored by the caller so
-/// subsequent emissions can `spark.push(...)` and `value.set_text(...)`
-/// instead of rebuilding the row.
+/// ```text
+/// [iface  | sparkline......| B/s ]
+/// [          ↓ X ↑ Y                ]
+/// ```
+///
+/// Mirrors `build_history_network_row` from `page_stats`: top row is
+/// `build_history_row` with a static "B/s" unit on the right; bottom
+/// row is a detail label indented to align under the sparkline column
+/// (80 px name col + 8 px box spacing = 88 px). The bind updates the
+/// sparkline samples and the detail label text in place across
+/// `sensors::network()` emissions.
 fn build_iface_traffic_row(iface: &sensors::NetInterface) -> IfaceRow {
-    let (container, spark, value) = build_history_row(&iface.name);
-    IfaceRow { container, spark, value }
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+
+    let (top_row, spark, top_value) = build_history_row(&iface.name);
+    top_value.set_text("B/s");
+    outer.append(&top_row);
+
+    let detail = gtk::Label::new(None);
+    detail.add_css_class("ts-stat-value");
+    detail.add_css_class("ts-mono");
+    detail.set_xalign(0.0);
+    detail.set_margin_start(88);
+    detail.set_margin_bottom(4);
+    outer.append(&detail);
+
+    IfaceRow {
+        container: outer,
+        spark,
+        value: detail,
+    }
 }
 
 fn build_wifi_group_v2() -> adw::PreferencesGroup {

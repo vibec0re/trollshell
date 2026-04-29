@@ -9,7 +9,6 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
 
-use crate::widgets::pages;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
@@ -116,7 +115,7 @@ pub fn install(monitor: &Monitor) {
     window.set_exclusive_zone(-1);
     // Content-driven sizing: the layer-shell surface auto-negotiates its
     // size from the visible page's natural request. AdwClamp inside each
-    // page caps width at 680 (see `pages::finish_page`); height is the
+    // page caps width at 680 (see `components::layout::finish_page`); height is the
     // page's natural height. The min-width floor (360) keeps very sparse
     // pages from collapsing to a sliver. niri honors the surface-size
     // commit when switching pages, so the modal grows/shrinks live.
@@ -166,13 +165,13 @@ pub fn install(monitor: &Monitor) {
 
     stack.add_named(&crate::panels::panel_media(), Some(Page::Media.stack_name()));
     stack.add_named(&crate::panels::panel_network(), Some(Page::Network.stack_name()));
-    stack.add_named(&pages::page_vpn(), Some(Page::Vpn.stack_name()));
+    stack.add_named(&crate::panels::panel_vpn(), Some(Page::Vpn.stack_name()));
     stack.add_named(
         &crate::panels::panel_connections(),
         Some(Page::Connections.stack_name()),
     );
     stack.add_named(&crate::panels::panel_bluetooth(), Some(Page::Bluetooth.stack_name()));
-    stack.add_named(&pages::page_stats(), Some(Page::Stats.stack_name()));
+    stack.add_named(&crate::panels::panel_stats(), Some(Page::Stats.stack_name()));
     stack.add_named(&crate::panels::panel_audio(), Some(Page::Audio.stack_name()));
     stack.add_named(&crate::panels::panel_power(), Some(Page::Power.stack_name()));
     stack.add_named(

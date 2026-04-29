@@ -1,10 +1,10 @@
 //! Bluetooth drawer panel — adapter power, scan/discovery, pairing
 //! prompts, and per-device rows.
 //!
-//! Wraps `hytte::services::bluetooth` (BlueZ over D-Bus) plus
+//! Wraps `hytte::services::bluetooth` (`BlueZ` over D-Bus) plus
 //! `hytte::services::bluetooth_audio` for the auto-switch toggle. Pair
 //! prompts surface inline as a banner above the device list while
-//! BlueZ's `Agent1` callback is awaiting user response.
+//! `BlueZ`'s `Agent1` callback is awaiting user response.
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;

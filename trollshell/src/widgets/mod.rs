@@ -10,7 +10,6 @@ pub mod microphone;
 pub mod mpris;
 pub mod network;
 pub mod notif_indicator;
-pub mod pages;
 pub mod power_chip;
 pub mod settings_chip;
 pub mod tray;

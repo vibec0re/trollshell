@@ -20,7 +20,7 @@ use crate::widgets::window_list;
 
 /// Hide MPRIS once the left cluster gets this busy. Even at 2 windows the
 /// title labels can grow wide enough to collide with the centered MPRIS
-/// row (CenterBox doesn't enforce non-overlap when content exceeds
+/// row (`CenterBox` doesn't enforce non-overlap when content exceeds
 /// capacity), so we yield early.
 const HIDE_WHEN_WINDOWS_GTE: usize = 2;
 

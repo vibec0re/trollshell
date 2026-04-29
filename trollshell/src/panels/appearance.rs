@@ -9,7 +9,7 @@
 //! "Clear" button are deliberately deferred. See `etc/wallpaper/README.md`.
 
 use hytte::adw::{self, prelude::*};
-use hytte::gtk::{self, gio, prelude::*};
+use hytte::gtk::{self, gio};
 use hytte::prelude::*;
 use hytte::services::wallpaper;
 

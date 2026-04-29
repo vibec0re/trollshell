@@ -13,7 +13,7 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, Local};
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
-use hytte::gtk::{self, gdk, gio, glib};
+use hytte::gtk::{self, gdk, glib};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
@@ -34,7 +34,6 @@ use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::services::vpn;
-use hytte::services::wallpaper;
 use hytte::services::wifi;
 use hytte::ui::Sparkline;
 

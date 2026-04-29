@@ -311,8 +311,8 @@ fn fmt_us(us: u64) -> String {
 // ── Network page ──────────────────────────────────────────────────────────────
 
 pub fn page_network() -> gtk::Widget {
-    // Outer container holds the two-column grid up top, then full-width
-    // sections (Phase 3 will append "Active connections" here too).
+    // Outer container holds the two-column grid up top, then a drill-down
+    // row to the Connections page.
     let outer = page_box();
     outer.add_css_class("ts-popup-column");
     outer.set_spacing(16);
@@ -342,12 +342,13 @@ pub fn page_network() -> gtk::Widget {
     outer.append(&grid);
 
     // Active connections drill-down — opens Page::Connections for the full list.
-    let drill = adw::ActionRow::builder()
-        .title("Active connections")
-        .activatable(true)
-        .build();
-    drill.add_prefix(&gtk::Image::from_icon_name("system-search-symbolic"));
-    drill.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    // Subtitle is bound below so the count stays live without expanding.
+    let drill = deep_link_row(
+        "Active connections",
+        None,
+        "network-workgroup-symbolic",
+        crate::modal::Page::Connections,
+    );
     bind(
         netconn::connections().map(|cs| {
             let total = cs.len();
@@ -357,9 +358,6 @@ pub fn page_network() -> gtk::Widget {
         &drill,
         |row, txt| row.set_subtitle(&txt),
     );
-    drill.connect_activated(|_| {
-        crate::modal::switch_active(crate::modal::Page::Connections);
-    });
     let drill_group = adw::PreferencesGroup::new();
     drill_group.add(&drill);
     outer.append(&drill_group);

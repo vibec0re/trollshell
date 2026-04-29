@@ -1,4 +1,7 @@
+mod components;
 mod modal;
+mod overlays;
+mod panels;
 mod widgets;
 
 use std::cell::RefCell;

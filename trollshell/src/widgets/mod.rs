@@ -19,7 +19,6 @@ pub mod power_chip;
 pub mod prompt;
 pub mod settings_chip;
 pub mod tray;
-pub mod util;
 pub mod volume;
 pub mod vpn;
 pub mod window_list;

@@ -9,7 +9,6 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Local};
 use hytte::adw::{self, prelude::*};
@@ -24,7 +23,7 @@ use hytte::services::clipboard::{self, ClipEntry, ClipKind};
 use hytte::services::displays::{self, Output};
 use hytte::services::dnd;
 use hytte::services::mpris::{self, PlaybackStatus};
-use hytte::services::netconn::{self, ConnState, Connection, Proto};
+use hytte::services::netconn;
 use hytte::services::networkd::{self, OperationalState};
 use hytte::services::notifications;
 use hytte::services::notifications_mute;
@@ -39,57 +38,11 @@ use hytte::services::wallpaper;
 use hytte::services::wifi;
 use hytte::ui::Sparkline;
 
-use super::util::{fmt_bytes, fmt_rate};
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn page_box() -> gtk::Box {
-    let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    b.add_css_class("ts-modal-page");
-    b
-}
-
-/// Wrap a finished page widget (Box or Grid) in an `AdwClamp` so a child
-/// reporting a pathological natural width (e.g. an `AdwActionRow` subtitle
-/// that ends up holding a long single-line list) can't push the
-/// layer-shell modal surface to full-screen width. Belt-and-suspenders
-/// against the same class of bug — individual rows should still constrain
-/// themselves (multi-line subtitles, `subtitle_lines(0)`, etc.) but this
-/// catches the ones that don't.
-fn finish_page(content: &impl IsA<gtk::Widget>) -> gtk::Widget {
-    let clamp = adw::Clamp::builder()
-        .maximum_size(680)
-        .tightening_threshold(560)
-        .child(content)
-        .build();
-    clamp.upcast()
-}
-
-/// Two-column (or more) grid for rich modal pages. Panels attach via
-/// `grid.attach(&panel, col, row, 1, 1)`.
-fn page_grid() -> gtk::Grid {
-    let g = gtk::Grid::new();
-    g.add_css_class("ts-modal-page");
-    g.add_css_class("ts-page-grid");
-    g.set_row_spacing(12);
-    g.set_column_spacing(12);
-    g.set_column_homogeneous(true);
-    g
-}
-
-/// Card-style section with a title header. Caller appends content by
-/// calling `outer.append(&child)` on the returned Box.
-fn panel(title: &str) -> gtk::Box {
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    outer.add_css_class("ts-panel");
-    outer.set_hexpand(true);
-    outer.set_vexpand(true);
-    let title_label = gtk::Label::new(Some(title));
-    title_label.add_css_class("ts-panel-title");
-    title_label.set_xalign(0.0);
-    outer.append(&title_label);
-    outer
-}
+use crate::components::connection_row::{build_connection_row, CONN_BUCKET_CAP};
+use crate::components::deep_link_row::deep_link_row;
+use crate::components::format::{fmt_bytes, fmt_rate, fmt_us, humanize_since};
+use crate::components::history_row::build_history_row;
+use crate::components::layout::{finish_page, page_box, page_grid, section};
 
 // ── Media page ────────────────────────────────────────────────────────────────
 
@@ -99,7 +52,7 @@ pub fn page_media() -> gtk::Widget {
     grid.set_column_homogeneous(false);
 
     // ── Art panel (col 0) ─────────────────────────────────────────────────────
-    let art_box = panel("");
+    let art_box = section("");
     art_box.set_size_request(220, 220);
     art_box.add_css_class("ts-media-art");
     let art_image = gtk::Image::new();
@@ -109,7 +62,7 @@ pub fn page_media() -> gtk::Widget {
     grid.attach(&art_box, 0, 0, 1, 1);
 
     // ── Metadata + controls panel (col 1) ─────────────────────────────────────
-    let info = panel("Now Playing");
+    let info = section("Now Playing");
 
     let title_label = gtk::Label::new(Some("\u{2014}"));
     title_label.add_css_class("ts-media-title");
@@ -301,13 +254,6 @@ pub fn page_media() -> gtk::Widget {
     finish_page(&grid)
 }
 
-fn fmt_us(us: u64) -> String {
-    let secs = us / 1_000_000;
-    let m = secs / 60;
-    let s = secs % 60;
-    format!("{m}:{s:02}")
-}
-
 // ── Network page ──────────────────────────────────────────────────────────────
 
 pub fn page_network() -> gtk::Widget {
@@ -320,12 +266,12 @@ pub fn page_network() -> gtk::Widget {
     let grid = page_grid();
 
     // Left column: configuration.
-    let left = panel("Configuration");
+    let left = section("Configuration");
     left.append(&build_connection_group_v2());
     grid.attach(&left, 0, 0, 1, 1);
 
     // Right column: live stats.
-    let right = panel("Live");
+    let right = section("Live");
     right.append(&build_traffic_group_v2());
 
     let wifi_group = build_wifi_group_v2();
@@ -989,43 +935,6 @@ fn build_network_row_v2(net: &wifi::WifiNetwork) -> adw::ActionRow {
         }
     });
 
-    row
-}
-
-/// Top-N cap for each bucket of the active-connections section.
-const CONN_BUCKET_CAP: usize = 30;
-
-/// Single-line render of an active connection: program (or "(unknown)")
-/// plus monospace `proto local→remote (state)` subtitle. Used by the
-/// network drawer's Active connections section.
-fn build_connection_row(c: &Connection) -> adw::ActionRow {
-    let title = match c.program.as_deref() {
-        Some(p) => match c.pid {
-            Some(pid) => format!("{p} · pid {pid}"),
-            None => p.to_string(),
-        },
-        None => "(unknown)".to_string(),
-    };
-    let row = adw::ActionRow::builder().title(&title).build();
-    let proto = match c.proto {
-        Proto::Tcp => "tcp",
-        Proto::Tcp6 => "tcp6",
-        Proto::Udp => "udp",
-        Proto::Udp6 => "udp6",
-    };
-    let state = match c.state {
-        ConnState::Established => "ESTAB",
-        ConnState::Listen => "LISTEN",
-        ConnState::TimeWait => "TIME-WAIT",
-        ConnState::Close => "CLOSE",
-        ConnState::Other => "·",
-    };
-    let remote = c
-        .remote
-        .map(|a| format!(" → {a}"))
-        .unwrap_or_default();
-    row.set_subtitle(&format!("{proto} {}{remote} ({state})", c.local));
-    row.add_css_class("ts-mono");
     row
 }
 
@@ -1881,31 +1790,6 @@ fn build_stats_history_group() -> adw::PreferencesGroup {
     group
 }
 
-/// Build a `[name | Sparkline | value]` row styled `.ts-history-row`.
-/// Returns the box, the Sparkline (caller pushes samples), and the
-/// value label (caller binds text on it).
-fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.add_css_class("ts-history-row");
-
-    let name_label = gtk::Label::new(Some(name));
-    name_label.add_css_class("ts-stat-name");
-    name_label.set_xalign(0.0);
-    name_label.set_size_request(80, -1);
-    row.append(&name_label);
-
-    let spark = Sparkline::new(60);
-    spark.widget().set_hexpand(true);
-    row.append(spark.widget());
-
-    let value_label = gtk::Label::new(None);
-    value_label.add_css_class("ts-stat-value");
-    value_label.set_xalign(1.0);
-    value_label.set_size_request(80, -1);
-    row.append(&value_label);
-
-    (row, spark, value_label)
-}
 
 fn build_history_cpu_row() -> gtk::Box {
     let (row, spark, value) = build_history_row("CPU");
@@ -2387,7 +2271,7 @@ pub fn page_power() -> gtk::Widget {
     let grid = page_grid();
 
     // ── Battery panel (col 0) ─────────────────────────────────────────────────
-    let battery = panel("Battery");
+    let battery = section("Battery");
 
     let battery_group = adw::PreferencesGroup::new();
     let battery_row = adw::ActionRow::builder().title("Charge").build();
@@ -2408,7 +2292,7 @@ pub fn page_power() -> gtk::Widget {
     battery.append(&battery_group);
     grid.attach(&battery, 0, 0, 1, 1);
 
-    let bright = panel("Brightness");
+    let bright = section("Brightness");
     bright.append(&build_brightness_row());
     grid.attach(&bright, 1, 0, 1, 1);
 
@@ -3300,30 +3184,6 @@ pub fn page_settings() -> gtk::Widget {
     finish_page(&column)
 }
 
-/// Build an `AdwActionRow` that, on activation, swaps every open drawer to
-/// `target` via `modal::switch_active`. Used by the Settings page "More"
-/// group to surface drawer pages that don't have a dedicated bar chip.
-fn deep_link_row(
-    title: &str,
-    subtitle: Option<&str>,
-    icon_name: &str,
-    target: crate::modal::Page,
-) -> adw::ActionRow {
-    let mut builder = adw::ActionRow::builder().title(title).activatable(true);
-    if let Some(s) = subtitle {
-        builder = builder.subtitle(s);
-    }
-    let row = builder.build();
-    let icon = gtk::Image::from_icon_name(icon_name);
-    row.add_prefix(&icon);
-    let go_next = gtk::Image::from_icon_name("go-next-symbolic");
-    row.add_suffix(&go_next);
-    row.connect_activated(move |_| {
-        crate::modal::switch_active(target);
-    });
-    row
-}
-
 // Theme dropdown index <-> hytte::services::theme::Theme. Order matches
 // the strings passed to `gtk::DropDown::from_strings` in `page_settings`.
 fn theme_from_index(i: u32) -> hytte::services::theme::Theme {
@@ -3593,26 +3453,6 @@ fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
     ));
     row.set_subtitle(&subtitle_parts.join(" \u{00b7} "));
     row
-}
-
-/// Render a `SystemTime` as a relative `Xs`/`m`/`h` ago string, or "in the future".
-fn humanize_since(t: SystemTime) -> String {
-    let now = SystemTime::now();
-    match now.duration_since(t) {
-        Ok(d) => {
-            let secs = d.as_secs();
-            if secs < 60 {
-                format!("{secs}s ago")
-            } else if secs < 3600 {
-                format!("{}m ago", secs / 60)
-            } else if secs < 86400 {
-                format!("{}h ago", secs / 3600)
-            } else {
-                format!("{}d ago", secs / 86400)
-            }
-        }
-        Err(_) => "moments from now".to_string(),
-    }
 }
 
 // ── Calendar page ─────────────────────────────────────────────────────────────

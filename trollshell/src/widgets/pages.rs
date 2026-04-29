@@ -24,6 +24,7 @@ use hytte::services::clipboard::{self, ClipEntry, ClipKind};
 use hytte::services::displays::{self, Output};
 use hytte::services::dnd;
 use hytte::services::mpris::{self, PlaybackStatus};
+use hytte::services::netconn::{self, ConnState, Connection, Proto};
 use hytte::services::networkd::{self, OperationalState};
 use hytte::services::notifications;
 use hytte::services::notifications_mute;
@@ -339,6 +340,88 @@ pub fn page_network() -> gtk::Widget {
     grid.attach(&right, 1, 0, 1, 1);
 
     outer.append(&grid);
+
+    // Active connections — full-width section below the grid.
+    let conn_group = adw::PreferencesGroup::builder()
+        .title("Active connections")
+        .build();
+    bind(
+        netconn::connections().map(|cs| {
+            let total = cs.len();
+            let with_pid = cs.iter().filter(|c| c.pid.is_some()).count();
+            format!("{total} sockets, {with_pid} with PID")
+        }),
+        &conn_group,
+        |g, txt| g.set_description(Some(&txt)),
+    );
+
+    // Top-level rows: own-user sockets sorted by program. Other users
+    // (where ss can't see PID) collapse into a single expander at the
+    // bottom so they don't dominate.
+    let owned_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let other_expander = adw::ExpanderRow::builder().title("Other users").build();
+    let other_rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let group_for_bind = conn_group.clone();
+    let owned_for_bind = owned_track.clone();
+    let other_for_bind = other_expander.clone();
+    let other_rows_for_bind = other_rows_track.clone();
+    bind(
+        netconn::connections(),
+        &conn_group,
+        move |_g, mut conns| {
+            // Sort: own-user (has PID) first by program, then no-PID by local addr.
+            conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => a
+                    .program
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.program.as_deref().unwrap_or("")),
+                (false, false) => a.local.to_string().cmp(&b.local.to_string()),
+            });
+
+            // Drain previous rows.
+            let mut owned = owned_for_bind.borrow_mut();
+            for r in owned.drain(..) {
+                group_for_bind.remove(&r);
+            }
+            let mut others = other_rows_for_bind.borrow_mut();
+            for r in others.drain(..) {
+                other_for_bind.remove(&r);
+            }
+
+            // Cap at 30 owned + N others (where N is also capped at 30).
+            let mut owned_count = 0;
+            let mut other_count = 0;
+            let cap = 30;
+            for c in &conns {
+                if c.pid.is_some() {
+                    if owned_count >= cap {
+                        continue;
+                    }
+                    let row = build_connection_row(c);
+                    group_for_bind.add(&row);
+                    owned.push(row);
+                    owned_count += 1;
+                } else {
+                    if other_count >= cap {
+                        continue;
+                    }
+                    let row = build_connection_row(c);
+                    other_for_bind.add_row(&row);
+                    others.push(row);
+                    other_count += 1;
+                }
+            }
+
+            other_for_bind.set_subtitle(&format!("{other_count} sockets"));
+            other_for_bind.set_visible(other_count > 0);
+        },
+    );
+    conn_group.add(&other_expander);
+    outer.append(&conn_group);
 
     finish_page(&outer)
 }
@@ -945,6 +1028,40 @@ fn build_network_row_v2(net: &wifi::WifiNetwork) -> adw::ActionRow {
         }
     });
 
+    row
+}
+
+/// Single-line render of an active connection: program (or "(unknown)")
+/// plus monospace `proto local→remote (state)` subtitle. Used by the
+/// network drawer's Active connections section.
+fn build_connection_row(c: &Connection) -> adw::ActionRow {
+    let title = match c.program.as_deref() {
+        Some(p) => match c.pid {
+            Some(pid) => format!("{p} · pid {pid}"),
+            None => p.to_string(),
+        },
+        None => "(unknown)".to_string(),
+    };
+    let row = adw::ActionRow::builder().title(&title).build();
+    let proto = match c.proto {
+        Proto::Tcp => "tcp",
+        Proto::Tcp6 => "tcp6",
+        Proto::Udp => "udp",
+        Proto::Udp6 => "udp6",
+    };
+    let state = match c.state {
+        ConnState::Established => "ESTAB",
+        ConnState::Listen => "LISTEN",
+        ConnState::TimeWait => "TIME-WAIT",
+        ConnState::Close => "CLOSE",
+        ConnState::Other => "·",
+    };
+    let remote = c
+        .remote
+        .map(|a| format!(" → {a}"))
+        .unwrap_or_default();
+    row.set_subtitle(&format!("{proto} {}{remote} ({state})", c.local));
+    row.add_css_class("ts-mono");
     row
 }
 

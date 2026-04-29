@@ -24,5 +24,6 @@ pub mod systemd;
 pub mod theme;
 pub mod tray;
 pub mod upower;
+pub mod vpn;
 pub mod wallpaper;
 pub mod wifi;

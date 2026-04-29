@@ -608,31 +608,51 @@ fn build_dns_expander() -> adw::ExpanderRow {
 fn build_traffic_group_v2() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Traffic").build();
 
-    // Per-interface sparkline rows. The set of interfaces is dynamic
-    // (hot-plug, VPN tunnels coming and going), so we drain & rebuild
-    // on every emission of `sensors::network()` rather than holding
-    // permanent per-interface state.
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // Per-interface rows keyed by interface name. We keep widgets across
+    // emissions so the Sparkline accumulates history; only the set of
+    // keys changes (hot-plug, VPN tunnels coming/going).
+    let cache: Rc<RefCell<HashMap<String, IfaceRow>>> = Rc::new(RefCell::new(HashMap::new()));
     let group_for_bind = group.clone();
-    let rows_for_bind = rows_track.clone();
+    let cache_for_bind = cache.clone();
     bind(
         sensors::network(),
         &group,
         move |_g, net| {
-            // Drain previous rows.
-            let mut tracked = rows_for_bind.borrow_mut();
-            for row in tracked.drain(..) {
-                group_for_bind.remove(&row);
-            }
-            // Build a fresh row per non-loopback interface, ordered by
-            // name for stability.
             let mut interfaces: Vec<&sensors::NetInterface> =
                 net.interfaces.iter().filter(|i| i.name != "lo").collect();
             interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let mut cache_mut = cache_for_bind.borrow_mut();
+
+            // Remove interfaces that disappeared.
+            let live: std::collections::HashSet<String> =
+                interfaces.iter().map(|i| i.name.clone()).collect();
+            cache_mut.retain(|name, entry| {
+                let keep = live.contains(name);
+                if !keep {
+                    group_for_bind.remove(&entry.row);
+                }
+                keep
+            });
+
+            // Update existing rows; create new ones for unseen names.
             for iface in interfaces {
-                let row = build_iface_traffic_row(iface);
-                group_for_bind.add(&row);
-                tracked.push(row);
+                let combined = iface.rx_rate_bps + iface.tx_rate_bps;
+                let value_text = format!(
+                    "\u{2193} {} \u{2191} {}",
+                    fmt_rate(iface.rx_rate_bps),
+                    fmt_rate(iface.tx_rate_bps),
+                );
+                if let Some(entry) = cache_mut.get(&iface.name) {
+                    entry.spark.push(combined);
+                    entry.value.set_text(&value_text);
+                } else {
+                    let entry = build_iface_traffic_row(iface);
+                    entry.spark.push(combined);
+                    entry.value.set_text(&value_text);
+                    group_for_bind.add(&entry.row);
+                    cache_mut.insert(iface.name.clone(), entry);
+                }
             }
         },
     );
@@ -676,27 +696,31 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
     group
 }
 
+/// Per-interface traffic row holding the widgets the bind updates each
+/// `sensors::network()` emission. Returned by `build_iface_traffic_row`
+/// and stored in the network drawer's interface cache.
+struct IfaceRow {
+    row: adw::ActionRow,
+    spark: Sparkline,
+    value: gtk::Label,
+}
+
 /// One per-interface traffic row: name on the left, sparkline center,
-/// current ↓rx ↑tx on the right. Built fresh each `sensors::network()`
-/// emission since the interface set is dynamic.
-fn build_iface_traffic_row(iface: &sensors::NetInterface) -> adw::ActionRow {
+/// current ↓rx ↑tx label on the right. Returned widgets are stored by
+/// the caller so subsequent emissions can `spark.push(...)` and
+/// `value.set_text(...)` instead of rebuilding the row.
+fn build_iface_traffic_row(iface: &sensors::NetInterface) -> IfaceRow {
     let row = adw::ActionRow::builder().title(&iface.name).build();
     let suffix_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    suffix_box.set_valign(gtk::Align::Center);
     let spark = Sparkline::new(60);
     spark.widget().set_width_request(120);
-    // Seed with the current combined rate so the row isn't empty on
-    // first paint. We push only one sample per emission below.
-    spark.push((iface.rx_rate_bps + iface.tx_rate_bps) as f64);
     suffix_box.append(spark.widget());
-    let value = gtk::Label::new(Some(&format!(
-        "\u{2193} {} \u{2191} {}",
-        fmt_rate(iface.rx_rate_bps),
-        fmt_rate(iface.tx_rate_bps),
-    )));
+    let value = gtk::Label::new(None);
     value.add_css_class("ts-mono");
     suffix_box.append(&value);
     row.add_suffix(&suffix_box);
-    row
+    IfaceRow { row, spark, value }
 }
 
 fn build_wifi_group_v2() -> adw::PreferencesGroup {

@@ -241,6 +241,16 @@ pub fn focus_window(id: u64) {
     send_action(Action::FocusWindow { id });
 }
 
+/// Ask niri to exit the session (fire-and-forget).
+///
+/// `skip_confirmation = false` lets niri's built-in confirmation overlay
+/// fire, which is the right UX when this is invoked from a power menu
+/// where the menu itself is the only confirmation. Pass `true` if the
+/// caller has already confirmed externally.
+pub fn quit(skip_confirmation: bool) {
+    send_action(Action::Quit { skip_confirmation });
+}
+
 fn send_action(action: Action) {
     runtime::handle().spawn_blocking(move || {
         match Socket::connect() {

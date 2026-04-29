@@ -174,7 +174,6 @@ fn apply_event(
             drop(list);
             focused_window.set(new_focused);
         }
-        // TODO(v0.3+): handle WorkspaceUrgencyChanged, KeyboardLayoutSwitched, etc.
         _ => {}
     }
 }

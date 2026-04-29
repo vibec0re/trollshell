@@ -697,8 +697,14 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
         },
     );
 
-    // Totals row: sum across non-loopback interfaces.
+    // Totals row: sum across non-loopback interfaces. Value sits in a
+    // mono suffix label so it visually aligns with the iface detail
+    // labels below the sparklines (also mono).
     let totals_row = adw::ActionRow::builder().title("Total").build();
+    let totals_value = gtk::Label::new(None);
+    totals_value.add_css_class("ts-mono");
+    totals_value.set_valign(gtk::Align::Center);
+    totals_row.add_suffix(&totals_value);
     bind(
         sensors::network().map(|net| {
             let (rx, tx) = net
@@ -714,12 +720,16 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
                 fmt_bytes(tx),
             )
         }),
-        &totals_row,
-        |row, text| row.set_subtitle(&text),
+        &totals_value,
+        |label, text| label.set_text(&text),
     );
     group.add(&totals_row);
 
     let tcp_row = adw::ActionRow::builder().title("TCP").build();
+    let tcp_value = gtk::Label::new(None);
+    tcp_value.add_css_class("ts-mono");
+    tcp_value.set_valign(gtk::Align::Center);
+    tcp_row.add_suffix(&tcp_value);
     bind(
         sensors::net_connections().map(|c| {
             format!(
@@ -728,8 +738,8 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
                 c.tcp_listen + c.tcp6_listen,
             )
         }),
-        &tcp_row,
-        |row, text| row.set_subtitle(&text),
+        &tcp_value,
+        |label, text| label.set_text(&text),
     );
     group.add(&tcp_row);
 

@@ -1,6 +1,6 @@
 //! Per-process active-connections service.
 //!
-//! Polls `ss -tunipnH` every 2s and parses the output into a flat list
+//! Polls `ss -tunpH` every 2s and parses the output into a flat list
 //! of `Connection { proto, local, remote, state, pid, program }`. The
 //! PID/program columns appear only for sockets owned by the running
 //! user; trollshell does not run as root, so other users' sockets show
@@ -38,10 +38,10 @@ pub struct Connection {
 
 // ── Parser ───────────────────────────────────────────────────────────────────
 
-/// Parse a single line of `ss -tunipnH`. Returns `None` for unparseable
+/// Parse a single line of `ss -tunpH`. Returns `None` for unparseable
 /// lines (we'd rather lose one line than panic the poll loop).
 ///
-/// Expected line format with -tunipnH:
+/// Expected line format with -tunpH:
 ///   <netid> <state> <recv-q> <send-q> <local> <peer> [users:((..pid=N..))]
 ///
 /// Where:
@@ -172,6 +172,8 @@ async fn poll_loop(writer: Mutable<Vec<Connection>>) {
     loop {
         if let Some(out) = run_ss().await {
             let next = parse_ss_output(&out);
+            // Avoid no-op re-emissions: the signal would still emit because
+            // `set` always notifies, so compare and skip when unchanged.
             if writer.lock_ref().clone() != next {
                 writer.set(next);
             }
@@ -182,7 +184,7 @@ async fn poll_loop(writer: Mutable<Vec<Connection>>) {
 
 async fn run_ss() -> Option<String> {
     let result = tokio::process::Command::new("ss")
-        .args(["-tunipnH"])
+        .args(["-tunpH"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()

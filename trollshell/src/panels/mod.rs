@@ -4,5 +4,7 @@
 //! file.
 
 pub mod appearance;
+pub mod audio;
 
 pub use appearance::panel_appearance;
+pub use audio::panel_audio;

@@ -625,7 +625,7 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
             let mut cache_mut = cache_for_bind.borrow_mut();
 
             // Remove interfaces that disappeared.
-            let live: std::collections::HashSet<String> =
+            let live: HashSet<String> =
                 interfaces.iter().map(|i| i.name.clone()).collect();
             cache_mut.retain(|name, entry| {
                 let keep = live.contains(name);
@@ -647,11 +647,27 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
                     entry.spark.push(combined);
                     entry.value.set_text(&value_text);
                 } else {
+                    // New interface arrived mid-session. Remove every
+                    // surviving iface row from the group, insert the new
+                    // entry into the cache, then re-add all rows in
+                    // sorted order so display order matches name order.
+                    // Totals/TCP rows are unaffected: they were added to
+                    // the group synchronously before any iface row, so
+                    // they remain at the bottom of the visual stack.
+                    for entry in cache_mut.values() {
+                        group_for_bind.remove(&entry.row);
+                    }
                     let entry = build_iface_traffic_row(iface);
                     entry.spark.push(combined);
                     entry.value.set_text(&value_text);
-                    group_for_bind.add(&entry.row);
                     cache_mut.insert(iface.name.clone(), entry);
+                    let mut sorted_names: Vec<&String> = cache_mut.keys().collect();
+                    sorted_names.sort();
+                    for name in sorted_names {
+                        if let Some(entry) = cache_mut.get(name) {
+                            group_for_bind.add(&entry.row);
+                        }
+                    }
                 }
             }
         },

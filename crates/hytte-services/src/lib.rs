@@ -20,6 +20,7 @@ pub mod resolved;
 pub mod screensaver;
 pub mod sensors;
 pub mod systemd;
+pub mod theme;
 pub mod tray;
 pub mod upower;
 pub mod wallpaper;

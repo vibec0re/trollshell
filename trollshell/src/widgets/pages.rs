@@ -3076,14 +3076,13 @@ pub fn page_clipboard() -> gtk::Widget {
 /// Drawer page exposing trollshell-wide preferences. v1 (minimal) covers two
 /// knobs:
 ///
-/// - Theme (Light / Dark) — mediated by `gsettings` on
-///   `org.gnome.desktop.interface color-scheme`. The dropdown reads the
-///   current value once at page mount and writes back on selection change.
-///   We do NOT live-track external `gsettings` changes; for v1 the dropdown
-///   is the source of truth while the page is open. Trollshell *is* the
-///   compositor session, so "follow system" is meaningless — if gsettings
-///   reads back `default` (externally set), we surface Dark and let the
-///   next user pick make it canonical.
+/// - Theme (Light / Dark) — delegated to `hytte::services::theme`, which
+///   fans out across GTK4/libadwaita, legacy GTK (gsettings + settings.ini),
+///   and Qt (qt[56]ct.conf). The dropdown reads the current theme once at
+///   page mount and writes back on selection change; we do NOT live-track
+///   external changes. Trollshell *is* the compositor session, so "follow
+///   system" is meaningless — if gsettings reads back `default` (externally
+///   set), the service surfaces Dark and the next user pick makes it canonical.
 /// - Do Not Disturb — duplicates the toggle at the top of `page_notifications`.
 ///   Both bindings drive the same `dnd::set_enabled` setter and observe the
 ///   same `dnd::enabled` signal, so they stay in sync.
@@ -3106,17 +3105,12 @@ pub fn page_settings() -> gtk::Widget {
         .subtitle("Light or dark.")
         .build();
 
-    // Order matches THEME_KEYS below — the DropDown's selected index maps
-    // 1:1 to the gsettings color-scheme value.
+    // Order: ["Light", "Dark"] — matches `theme_from_index` mapping.
     let theme_dropdown = gtk::DropDown::from_strings(&["Light", "Dark"]);
     theme_dropdown.set_valign(gtk::Align::Center);
-    theme_dropdown.set_selected(read_color_scheme_index());
+    theme_dropdown.set_selected(theme_to_index(hytte::services::theme::current()));
     theme_dropdown.connect_selected_notify(|dd| {
-        let key = THEME_KEYS
-            .get(dd.selected() as usize)
-            .copied()
-            .unwrap_or("prefer-dark");
-        write_color_scheme(key);
+        hytte::services::theme::set(theme_from_index(dd.selected()));
     });
     theme_row.add_suffix(&theme_dropdown);
     theme_row.set_activatable_widget(Some(&theme_dropdown));
@@ -3200,56 +3194,19 @@ fn deep_link_row(
     row
 }
 
-/// Index ↔ gsettings value mapping for the theme dropdown. Order must match
-/// the strings passed to `gtk::DropDown::from_strings` in `page_settings`.
-/// Trollshell is the compositor session, so we don't expose `default`
-/// ("follow system") — Light/Dark only.
-const THEME_KEYS: [&str; 2] = ["prefer-light", "prefer-dark"];
-
-/// Read the current `org.gnome.desktop.interface color-scheme` value via a
-/// one-shot synchronous `gsettings get` and map it to a dropdown index.
-/// Returns the Dark index (1) on any error or `default` so the UI is never
-/// blank — matches the app's `adw::ColorScheme::PreferDark` default.
-fn read_color_scheme_index() -> u32 {
-    let output = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            // gsettings get prints quoted strings, e.g. `'prefer-dark'\n`.
-            let raw = String::from_utf8_lossy(&out.stdout);
-            let trimmed = raw.trim().trim_matches('\'').trim_matches('"');
-            THEME_KEYS
-                .iter()
-                .position(|k| *k == trimmed)
-                .and_then(|i| u32::try_from(i).ok())
-                .unwrap_or(1)
-        }
-        Ok(out) => {
-            tracing::warn!(
-                stderr = %String::from_utf8_lossy(&out.stderr),
-                "settings: gsettings get color-scheme failed",
-            );
-            1
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "settings: gsettings unavailable");
-            1
-        }
+// Theme dropdown index <-> hytte::services::theme::Theme. Order matches
+// the strings passed to `gtk::DropDown::from_strings` in `page_settings`.
+fn theme_from_index(i: u32) -> hytte::services::theme::Theme {
+    match i {
+        0 => hytte::services::theme::Theme::Light,
+        _ => hytte::services::theme::Theme::Dark,
     }
 }
 
-/// Set `org.gnome.desktop.interface color-scheme` to `value`. Spawned
-/// detached — we don't care to wait on the exit; failures are logged when
-/// the spawn itself fails, but a non-zero exit (e.g. unknown schema) is
-/// silently dropped by the OS reaping the child. That's fine for v1: the
-/// next page mount will re-read and surface the actual current value.
-fn write_color_scheme(value: &str) {
-    let result = std::process::Command::new("gsettings")
-        .args(["set", "org.gnome.desktop.interface", "color-scheme", value])
-        .spawn();
-    if let Err(e) = result {
-        tracing::warn!(error = %e, value, "settings: gsettings set color-scheme failed");
+fn theme_to_index(t: hytte::services::theme::Theme) -> u32 {
+    match t {
+        hytte::services::theme::Theme::Light => 0,
+        hytte::services::theme::Theme::Dark => 1,
     }
 }
 

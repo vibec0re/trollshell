@@ -101,6 +101,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             group([
                 widgets::bluetooth::widget(monitor),
                 widgets::network::widget(monitor),
+                widgets::vpn::widget(monitor),
             ]),
             group([
                 widgets::volume::widget(monitor),

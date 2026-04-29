@@ -73,18 +73,18 @@ fn main() -> hytte::ui::Result<()> {
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             // Polkit auth dialog — reacts to polkit::auth_prompts() signal.
             if let Some(primary) = app.monitors().first() {
-                widgets::prompt::install(primary);
-                widgets::polkit_dialog::install(primary);
+                overlays::prompt::install(primary);
+                overlays::polkit_dialog::install(primary);
             }
 
             // Lock screen surfaces mount on all monitors; the subscription
             // reacts to screensaver::is_locked() and shows/hides them.
-            widgets::lock_screen::install(&app.monitors());
+            overlays::lock_screen::install(&app.monitors());
 
             // Notifications + OSD mount on every monitor; routing picks the focused one.
             for monitor in &app.monitors() {
-                widgets::notifications::install(monitor);
-                widgets::osd::install(monitor);
+                overlays::notifications::install(monitor);
+                overlays::osd::install(monitor);
             }
         })
 }

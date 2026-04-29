@@ -359,11 +359,13 @@ pub fn page_network() -> gtk::Widget {
     // (where ss can't see PID) collapse into a single expander at the
     // bottom so they don't dominate.
     let owned_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let owned_overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     let other_expander = adw::ExpanderRow::builder().title("Other users").build();
     let other_rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
     let group_for_bind = conn_group.clone();
     let owned_for_bind = owned_track.clone();
+    let overflow_for_bind = owned_overflow_track.clone();
     let other_for_bind = other_expander.clone();
     let other_rows_for_bind = other_rows_track.clone();
     bind(
@@ -382,6 +384,11 @@ pub fn page_network() -> gtk::Widget {
                 (false, false) => a.local.to_string().cmp(&b.local.to_string()),
             });
 
+            // Raw bucket totals, used so the truncation hint and expander
+            // subtitle can reflect what's actually there (not just what's shown).
+            let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
+            let total_other = conns.len() - total_owned;
+
             // Drain previous rows.
             let mut owned = owned_for_bind.borrow_mut();
             for r in owned.drain(..) {
@@ -391,14 +398,16 @@ pub fn page_network() -> gtk::Widget {
             for r in others.drain(..) {
                 other_for_bind.remove(&r);
             }
+            // Drain any previous overflow hint row.
+            if let Some(prev) = overflow_for_bind.borrow_mut().take() {
+                group_for_bind.remove(&prev);
+            }
 
-            // Cap at 30 owned + N others (where N is also capped at 30).
-            let mut owned_count = 0;
-            let mut other_count = 0;
-            let cap = 30;
+            let mut owned_count = 0usize;
+            let mut other_count = 0usize;
             for c in &conns {
                 if c.pid.is_some() {
-                    if owned_count >= cap {
+                    if owned_count >= CONN_BUCKET_CAP {
                         continue;
                     }
                     let row = build_connection_row(c);
@@ -406,7 +415,7 @@ pub fn page_network() -> gtk::Widget {
                     owned.push(row);
                     owned_count += 1;
                 } else {
-                    if other_count >= cap {
+                    if other_count >= CONN_BUCKET_CAP {
                         continue;
                     }
                     let row = build_connection_row(c);
@@ -416,8 +425,25 @@ pub fn page_network() -> gtk::Widget {
                 }
             }
 
-            other_for_bind.set_subtitle(&format!("{other_count} sockets"));
-            other_for_bind.set_visible(other_count > 0);
+            // Owner-bucket truncation hint.
+            if total_owned > owned_count {
+                let hint = adw::ActionRow::builder()
+                    .title(format!("(+{} more)", total_owned - owned_count))
+                    .activatable(false)
+                    .selectable(false)
+                    .build();
+                hint.set_subtitle("Top sockets shown.");
+                group_for_bind.add(&hint);
+                *overflow_for_bind.borrow_mut() = Some(hint);
+            }
+
+            // Other-bucket subtitle: show capped vs total when truncated.
+            if total_other > other_count {
+                other_for_bind.set_subtitle(&format!("{other_count} of {total_other} sockets"));
+            } else {
+                other_for_bind.set_subtitle(&format!("{other_count} sockets"));
+            }
+            other_for_bind.set_visible(total_other > 0);
         },
     );
     conn_group.add(&other_expander);
@@ -1030,6 +1056,9 @@ fn build_network_row_v2(net: &wifi::WifiNetwork) -> adw::ActionRow {
 
     row
 }
+
+/// Top-N cap for each bucket of the active-connections section.
+const CONN_BUCKET_CAP: usize = 30;
 
 /// Single-line render of an active connection: program (or "(unknown)")
 /// plus monospace `proto local→remote (state)` subtitle. Used by the

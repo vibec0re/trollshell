@@ -199,7 +199,7 @@ pub(crate) fn parse_tailscale_status(json: &str) -> Option<TailscaleStatus> {
     })
 }
 
-// ── Service stub (filled in by Task 6) ───────────────────────────────────────
+// ── Service ───────────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub struct VpnHandles {
@@ -219,10 +219,118 @@ pub struct VpnService;
 impl Service for VpnService {
     type Handles = VpnHandles;
 
-    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        // Poll loop lands in Task 6.
-        VpnHandles::default()
+    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+        let handles = VpnHandles::default();
+        let writer = handles.tunnels.clone();
+        rt.spawn(async move {
+            poll_loop(writer).await;
+        });
+        handles
     }
+}
+
+async fn poll_loop(writer: Mutable<Vec<Tunnel>>) {
+    loop {
+        let next = collect_tunnels().await;
+        // Avoid no-op re-emissions: the signal would still emit because
+        // `set` always notifies, so compare and skip when unchanged.
+        if writer.lock_ref().clone() != next {
+            writer.set(next);
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn collect_tunnels() -> Vec<Tunnel> {
+    // Step 1: enumerate candidate tunnel-kind links via `ip -d -j link show`.
+    let probes = match run_capture(&["ip", "-d", "-j", "link", "show"]).await {
+        Some(out) => parse_ip_link_json(&out),
+        None => Vec::new(),
+    };
+    if probes.is_empty() {
+        return Vec::new();
+    }
+
+    // Step 2: enrich WireGuard with `wg show all dump`.
+    let wg_peers = if probes.iter().any(|p| {
+        matches!(p.kind, TunnelKind::Wireguard | TunnelKind::Tailscale)
+    }) {
+        match run_capture(&["wg", "show", "all", "dump"]).await {
+            Some(out) => parse_wg_show_dump(&out),
+            None => std::collections::BTreeMap::new(),
+        }
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    // Step 3: enrich Tailscale.
+    let tailscale_status = if probes
+        .iter()
+        .any(|p| matches!(p.kind, TunnelKind::Tailscale))
+    {
+        run_capture(&["tailscale", "status", "--json"])
+            .await
+            .as_deref()
+            .and_then(parse_tailscale_status)
+    } else {
+        None
+    };
+
+    // Step 4: build Tunnels.
+    probes
+        .into_iter()
+        .map(|p| {
+            let (rx_bytes, tx_bytes) = read_iface_stats(&p.name);
+            let peers = wg_peers.get(&p.name).cloned().unwrap_or_default();
+            let since = peers.iter().filter_map(|peer| peer.last_handshake).min();
+            let summary = match p.kind {
+                TunnelKind::Tailscale => tailscale_status.as_ref().map(|s| {
+                    let exit = s.exit_node.as_deref().unwrap_or("none");
+                    format!("{} · exit-node: {}", s.backend_state, exit)
+                }),
+                _ => None,
+            };
+            Tunnel {
+                name: p.name,
+                kind: p.kind,
+                since,
+                rx_bytes,
+                tx_bytes,
+                peers,
+                summary,
+            }
+        })
+        .collect()
+}
+
+async fn run_capture(argv: &[&str]) -> Option<String> {
+    let prog = argv[0];
+    let result = tokio::process::Command::new(prog)
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    match result {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(_) => None, // non-zero exit; treat as "not telling us anything"
+        Err(e) => {
+            tracing::warn!(prog, error = %e, "vpn: spawn failed");
+            None
+        }
+    }
+}
+
+fn read_iface_stats(name: &str) -> (u64, u64) {
+    let rx = std::fs::read_to_string(format!("/sys/class/net/{name}/statistics/rx_bytes"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let tx = std::fs::read_to_string(format!("/sys/class/net/{name}/statistics/tx_bytes"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    (rx, tx)
 }
 
 #[must_use]

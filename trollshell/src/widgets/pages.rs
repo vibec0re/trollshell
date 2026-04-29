@@ -608,34 +608,36 @@ fn build_dns_expander() -> adw::ExpanderRow {
 fn build_traffic_group_v2() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Traffic").build();
 
-    let rate_row = adw::ActionRow::builder().title("Live").build();
-    rate_row.set_subtitle_lines(0);
+    // Per-interface sparkline rows. The set of interfaces is dynamic
+    // (hot-plug, VPN tunnels coming and going), so we drain & rebuild
+    // on every emission of `sensors::network()` rather than holding
+    // permanent per-interface state.
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let group_for_bind = group.clone();
+    let rows_for_bind = rows_track.clone();
     bind(
-        sensors::network().map(|net| {
-            let parts: Vec<String> = net
-                .interfaces
-                .iter()
-                .filter(|i| i.name != "lo")
-                .map(|i| {
-                    format!(
-                        "{}: \u{2193} {} \u{2191} {}",
-                        i.name,
-                        fmt_rate(i.rx_rate_bps),
-                        fmt_rate(i.tx_rate_bps),
-                    )
-                })
-                .collect();
-            if parts.is_empty() {
-                "(no active interfaces)".to_string()
-            } else {
-                parts.join("\n")
+        sensors::network(),
+        &group,
+        move |_g, net| {
+            // Drain previous rows.
+            let mut tracked = rows_for_bind.borrow_mut();
+            for row in tracked.drain(..) {
+                group_for_bind.remove(&row);
             }
-        }),
-        &rate_row,
-        |row, text| row.set_subtitle(&text),
+            // Build a fresh row per non-loopback interface, ordered by
+            // name for stability.
+            let mut interfaces: Vec<&sensors::NetInterface> =
+                net.interfaces.iter().filter(|i| i.name != "lo").collect();
+            interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+            for iface in interfaces {
+                let row = build_iface_traffic_row(iface);
+                group_for_bind.add(&row);
+                tracked.push(row);
+            }
+        },
     );
-    group.add(&rate_row);
 
+    // Totals row: sum across non-loopback interfaces.
     let totals_row = adw::ActionRow::builder().title("Total").build();
     bind(
         sensors::network().map(|net| {
@@ -672,6 +674,29 @@ fn build_traffic_group_v2() -> adw::PreferencesGroup {
     group.add(&tcp_row);
 
     group
+}
+
+/// One per-interface traffic row: name on the left, sparkline center,
+/// current ↓rx ↑tx on the right. Built fresh each `sensors::network()`
+/// emission since the interface set is dynamic.
+fn build_iface_traffic_row(iface: &sensors::NetInterface) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(&iface.name).build();
+    let suffix_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spark = Sparkline::new(60);
+    spark.widget().set_width_request(120);
+    // Seed with the current combined rate so the row isn't empty on
+    // first paint. We push only one sample per emission below.
+    spark.push((iface.rx_rate_bps + iface.tx_rate_bps) as f64);
+    suffix_box.append(spark.widget());
+    let value = gtk::Label::new(Some(&format!(
+        "\u{2193} {} \u{2191} {}",
+        fmt_rate(iface.rx_rate_bps),
+        fmt_rate(iface.tx_rate_bps),
+    )));
+    value.add_css_class("ts-mono");
+    suffix_box.append(&value);
+    row.add_suffix(&suffix_box);
+    row
 }
 
 fn build_wifi_group_v2() -> adw::PreferencesGroup {

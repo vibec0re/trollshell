@@ -1,31 +1,51 @@
 //! Audio drawer panel — output sinks, input sources, and per-stream
 //! playback volume.
 //!
-//! Each section is a `boxed-list`-styled `gtk::ListBox` rebuilt on every
-//! signal emission from `hytte::services::pipewire`. Rows render the
-//! default-radio button, name, volume slider, and mute toggle.
+//! Each section is a `boxed-list`-styled `gtk::ListBox` that diffs every
+//! pipewire snapshot against a live per-row map and updates fields in
+//! place. Rebuilding rows on each emission would tear down the slider
+//! the user is holding, so rows are kept alive across emissions and the
+//! snapshot drives field-level updates.
+//!
+//! Echo cancellation: pipewire's polling is async, so a snapshot that
+//! arrives after a `pactl` write may still report the OLD volume. Each
+//! row tracks a `pending` value the user just sent; while pending,
+//! mismatched snapshots are ignored to keep the slider thumb where the
+//! user left it. Pending clears once pipewire confirms (snapshot ≈
+//! pending) or after `ECHO_TIMEOUT` as a safety net.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::pipewire::{self, PlaybackStream, Sink, Source};
 
 use crate::components::layout::{finish_page, page_box};
 
+/// Snapshot considered to match our pending write when within this much
+/// of the value we sent. `pactl` rounds to integer percent so 0.005 is a
+/// comfortable margin below the 0.01 step.
+const ECHO_TOLERANCE: f64 = 0.005;
+
+/// Stop ignoring snapshots after this long, in case `pactl` failed and
+/// no confirming snapshot will ever arrive.
+const ECHO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Tolerance for skipping a redundant programmatic `set_value` when the
+/// slider already shows the same volume as the snapshot.
+const SLIDER_NOOP_TOLERANCE: f64 = 0.001;
+
 pub fn panel_audio() -> gtk::Widget {
     let column = page_box();
-
     column.append(&audio_section("Output", &build_sink_list()));
     column.append(&audio_section("Input", &build_source_list()));
     column.append(&audio_section("Playback", &build_playback_list()));
-
     finish_page(&column)
 }
 
-/// Wrap a section title + `boxed-list`-styled `ListBox` in a vertical Box so
-/// every audio section has the same Adwaita-style framing.
 fn audio_section(title: &str, list: &gtk::ListBox) -> gtk::Box {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let title_lbl = gtk::Label::new(Some(title));
@@ -43,60 +63,343 @@ fn boxed_list() -> gtk::ListBox {
     list
 }
 
+fn truncate_desc(s: &str) -> String {
+    if s.len() > 40 {
+        format!("{}…", &s[..39])
+    } else {
+        s.to_string()
+    }
+}
+
+fn default_radio_glyph(is_default: bool) -> &'static str {
+    if is_default { "\u{25cf}" } else { "\u{25cb}" }
+}
+
+fn toggle_class<W: IsA<gtk::Widget>>(widget: &W, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
+}
+
+/// Should the snapshot value be applied to the UI? Returns `true` when
+/// no write is pending, the snapshot confirms the pending write, or the
+/// pending write has timed out. Mutates `pending` to clear on
+/// confirmation/timeout.
+fn echo_settled<T: Copy + PartialEq>(
+    pending: &Cell<Option<(T, Instant)>>,
+    snapshot: T,
+    matches: impl FnOnce(T, T) -> bool,
+) -> bool {
+    match pending.get() {
+        None => true,
+        Some((expected, sent)) => {
+            if matches(expected, snapshot) || sent.elapsed() > ECHO_TIMEOUT {
+                pending.set(None);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+// ── Sinks ────────────────────────────────────────────────────────────────────
+
+struct SinkRow {
+    widget: gtk::Box,
+    radio_btn: gtk::Button,
+    radio_lbl: gtk::Label,
+    name_lbl: gtk::Label,
+    slider: gtk::Scale,
+    /// Volume the user just sent + when. Cleared once pipewire confirms.
+    pending_volume: Rc<Cell<Option<(f64, Instant)>>>,
+    mute_btn: gtk::Button,
+    muted_cell: Rc<Cell<bool>>,
+    pending_mute: Rc<Cell<Option<(bool, Instant)>>>,
+    cached_desc: RefCell<String>,
+}
+
+impl SinkRow {
+    fn new(s: &Sink) -> Self {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        widget.add_css_class("ts-audio-row");
+
+        let radio_lbl = gtk::Label::new(Some(default_radio_glyph(s.is_default)));
+        let radio_btn = gtk::Button::new();
+        radio_btn.set_child(Some(&radio_lbl));
+        radio_btn.add_css_class("ts-audio-default-btn");
+        let name_for_radio = s.name.clone();
+        radio_btn.connect_clicked(move |_| pipewire::set_default_sink(&name_for_radio));
+        widget.append(&radio_btn);
+
+        let initial_desc = truncate_desc(&s.description);
+        let name_lbl = gtk::Label::new(Some(&initial_desc));
+        name_lbl.set_xalign(0.0);
+        name_lbl.set_hexpand(true);
+        name_lbl.add_css_class("ts-audio-row-name");
+        widget.append(&name_lbl);
+
+        let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        slider.set_draw_value(false);
+        slider.set_hexpand(true);
+        slider.set_size_request(110, -1);
+        slider.set_value(s.volume);
+
+        let pending_volume: Rc<Cell<Option<(f64, Instant)>>> = Rc::new(Cell::new(None));
+        let pending_for_handler = pending_volume.clone();
+        let name_for_slider = s.name.clone();
+        // `change-value` only fires for user input (drag, scroll, keys);
+        // programmatic `set_value` does NOT trigger it, so the
+        // snapshot-driven update path can't echo back to pactl.
+        slider.connect_change_value(move |_, _, val| {
+            pending_for_handler.set(Some((val, Instant::now())));
+            pipewire::set_sink_volume(&name_for_slider, val);
+            glib::Propagation::Proceed
+        });
+        widget.append(&slider);
+
+        let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+        mute_btn.add_css_class("ts-audio-mute-btn");
+        let muted_cell = Rc::new(Cell::new(s.muted));
+        let pending_mute: Rc<Cell<Option<(bool, Instant)>>> = Rc::new(Cell::new(None));
+        let muted_for_click = muted_cell.clone();
+        let pending_for_click = pending_mute.clone();
+        let name_for_mute = s.name.clone();
+        mute_btn.connect_clicked(move |btn| {
+            let new_mute = !muted_for_click.get();
+            muted_for_click.set(new_mute);
+            pending_for_click.set(Some((new_mute, Instant::now())));
+            pipewire::set_sink_mute(&name_for_mute, new_mute);
+            toggle_class(btn, "muted", new_mute);
+        });
+        widget.append(&mute_btn);
+
+        let row = SinkRow {
+            widget,
+            radio_btn,
+            radio_lbl,
+            name_lbl,
+            slider,
+            pending_volume,
+            mute_btn,
+            muted_cell,
+            pending_mute,
+            cached_desc: RefCell::new(initial_desc),
+        };
+        row.apply_meta(s);
+        row
+    }
+
+    fn apply_meta(&self, s: &Sink) {
+        toggle_class(&self.widget, "default", s.is_default);
+        toggle_class(&self.radio_btn, "active", s.is_default);
+        self.radio_lbl.set_text(default_radio_glyph(s.is_default));
+        toggle_class(&self.name_lbl, "dim", !s.is_default);
+        let desc = truncate_desc(&s.description);
+        if *self.cached_desc.borrow() != desc {
+            self.name_lbl.set_text(&desc);
+            if s.description.len() > 40 {
+                self.name_lbl.set_tooltip_text(Some(&s.description));
+            } else {
+                self.name_lbl.set_tooltip_text(None);
+            }
+            *self.cached_desc.borrow_mut() = desc;
+        }
+    }
+
+    fn update(&self, s: &Sink) {
+        self.apply_meta(s);
+
+        if echo_settled(&self.pending_mute, s.muted, |a, b| a == b) {
+            self.muted_cell.set(s.muted);
+            toggle_class(&self.mute_btn, "muted", s.muted);
+        }
+
+        if echo_settled(&self.pending_volume, s.volume, |a, b| (a - b).abs() < ECHO_TOLERANCE)
+            && (self.slider.value() - s.volume).abs() > SLIDER_NOOP_TOLERANCE
+        {
+            self.slider.set_value(s.volume);
+        }
+    }
+}
+
 fn build_sink_list() -> gtk::ListBox {
     let list = boxed_list();
+    let rows: Rc<RefCell<HashMap<String, SinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
     let list_for_bind = list.clone();
+    let rows_for_bind = rows.clone();
     bind(pipewire::sinks(), &list, move |_, sinks: Vec<Sink>| {
-        while let Some(child) = list_for_bind.first_child() {
-            list_for_bind.remove(&child);
+        let mut rows = rows_for_bind.borrow_mut();
+        let new_keys: HashSet<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
+        let gone: Vec<String> = rows
+            .keys()
+            .filter(|k| !new_keys.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for k in gone {
+            if let Some(r) = rows.remove(&k) {
+                list_for_bind.remove(&r.widget);
+            }
         }
         for s in &sinks {
-            list_for_bind.append(&sink_row(s));
+            if let Some(row) = rows.get(&s.name) {
+                row.update(s);
+            } else {
+                let row = SinkRow::new(s);
+                list_for_bind.append(&row.widget);
+                rows.insert(s.name.clone(), row);
+            }
         }
     });
     list
 }
 
+// ── Sources ──────────────────────────────────────────────────────────────────
+
+struct SourceRow {
+    widget: gtk::Box,
+    radio_btn: gtk::Button,
+    radio_lbl: gtk::Label,
+    name_lbl: gtk::Label,
+    slider: gtk::Scale,
+    pending_volume: Rc<Cell<Option<(f64, Instant)>>>,
+    mute_btn: gtk::Button,
+    muted_cell: Rc<Cell<bool>>,
+    pending_mute: Rc<Cell<Option<(bool, Instant)>>>,
+    cached_desc: RefCell<String>,
+}
+
+impl SourceRow {
+    fn new(s: &Source) -> Self {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        widget.add_css_class("ts-audio-row");
+
+        let radio_lbl = gtk::Label::new(Some(default_radio_glyph(s.is_default)));
+        let radio_btn = gtk::Button::new();
+        radio_btn.set_child(Some(&radio_lbl));
+        radio_btn.add_css_class("ts-audio-default-btn");
+        let name_for_radio = s.name.clone();
+        radio_btn.connect_clicked(move |_| pipewire::set_default_source(&name_for_radio));
+        widget.append(&radio_btn);
+
+        let initial_desc = truncate_desc(&s.description);
+        let name_lbl = gtk::Label::new(Some(&initial_desc));
+        name_lbl.set_xalign(0.0);
+        name_lbl.set_hexpand(true);
+        name_lbl.add_css_class("ts-audio-row-name");
+        widget.append(&name_lbl);
+
+        let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        slider.set_draw_value(false);
+        slider.set_hexpand(true);
+        slider.set_size_request(110, -1);
+        slider.set_value(s.volume);
+
+        let pending_volume: Rc<Cell<Option<(f64, Instant)>>> = Rc::new(Cell::new(None));
+        let pending_for_handler = pending_volume.clone();
+        let name_for_slider = s.name.clone();
+        slider.connect_change_value(move |_, _, val| {
+            pending_for_handler.set(Some((val, Instant::now())));
+            pipewire::set_source_volume(&name_for_slider, val);
+            glib::Propagation::Proceed
+        });
+        widget.append(&slider);
+
+        let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+        mute_btn.add_css_class("ts-audio-mute-btn");
+        let muted_cell = Rc::new(Cell::new(s.muted));
+        let pending_mute: Rc<Cell<Option<(bool, Instant)>>> = Rc::new(Cell::new(None));
+        let muted_for_click = muted_cell.clone();
+        let pending_for_click = pending_mute.clone();
+        let name_for_mute = s.name.clone();
+        mute_btn.connect_clicked(move |btn| {
+            let new_mute = !muted_for_click.get();
+            muted_for_click.set(new_mute);
+            pending_for_click.set(Some((new_mute, Instant::now())));
+            pipewire::set_source_mute(&name_for_mute, new_mute);
+            toggle_class(btn, "muted", new_mute);
+        });
+        widget.append(&mute_btn);
+
+        let row = SourceRow {
+            widget,
+            radio_btn,
+            radio_lbl,
+            name_lbl,
+            slider,
+            pending_volume,
+            mute_btn,
+            muted_cell,
+            pending_mute,
+            cached_desc: RefCell::new(initial_desc),
+        };
+        row.apply_meta(s);
+        row
+    }
+
+    fn apply_meta(&self, s: &Source) {
+        toggle_class(&self.widget, "default", s.is_default);
+        toggle_class(&self.radio_btn, "active", s.is_default);
+        self.radio_lbl.set_text(default_radio_glyph(s.is_default));
+        toggle_class(&self.name_lbl, "dim", !s.is_default);
+        let desc = truncate_desc(&s.description);
+        if *self.cached_desc.borrow() != desc {
+            self.name_lbl.set_text(&desc);
+            if s.description.len() > 40 {
+                self.name_lbl.set_tooltip_text(Some(&s.description));
+            } else {
+                self.name_lbl.set_tooltip_text(None);
+            }
+            *self.cached_desc.borrow_mut() = desc;
+        }
+    }
+
+    fn update(&self, s: &Source) {
+        self.apply_meta(s);
+
+        if echo_settled(&self.pending_mute, s.muted, |a, b| a == b) {
+            self.muted_cell.set(s.muted);
+            toggle_class(&self.mute_btn, "muted", s.muted);
+        }
+
+        if echo_settled(&self.pending_volume, s.volume, |a, b| (a - b).abs() < ECHO_TOLERANCE)
+            && (self.slider.value() - s.volume).abs() > SLIDER_NOOP_TOLERANCE
+        {
+            self.slider.set_value(s.volume);
+        }
+    }
+}
+
 fn build_source_list() -> gtk::ListBox {
     let list = boxed_list();
+    let rows: Rc<RefCell<HashMap<String, SourceRow>>> = Rc::new(RefCell::new(HashMap::new()));
     let list_for_bind = list.clone();
+    let rows_for_bind = rows.clone();
     bind(
         pipewire::sources(),
         &list,
         move |_, sources: Vec<Source>| {
-            while let Some(child) = list_for_bind.first_child() {
-                list_for_bind.remove(&child);
+            let mut rows = rows_for_bind.borrow_mut();
+            let new_keys: HashSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
+            let gone: Vec<String> = rows
+                .keys()
+                .filter(|k| !new_keys.contains(k.as_str()))
+                .cloned()
+                .collect();
+            for k in gone {
+                if let Some(r) = rows.remove(&k) {
+                    list_for_bind.remove(&r.widget);
+                }
             }
             for s in &sources {
-                list_for_bind.append(&source_row(s));
-            }
-        },
-    );
-    list
-}
-
-fn build_playback_list() -> gtk::ListBox {
-    let list = boxed_list();
-    let list_for_bind = list.clone();
-    bind(
-        pipewire::playback_streams(),
-        &list,
-        move |_, streams: Vec<PlaybackStream>| {
-            while let Some(child) = list_for_bind.first_child() {
-                list_for_bind.remove(&child);
-            }
-            if streams.is_empty() {
-                let placeholder = gtk::Label::new(Some("No active streams"));
-                placeholder.set_xalign(0.0);
-                placeholder.add_css_class("dim-label");
-                placeholder.set_margin_start(12);
-                placeholder.set_margin_end(12);
-                placeholder.set_margin_top(8);
-                placeholder.set_margin_bottom(8);
-                list_for_bind.append(&placeholder);
-            } else {
-                for s in &streams {
-                    list_for_bind.append(&stream_row(s));
+                if let Some(row) = rows.get(&s.name) {
+                    row.update(s);
+                } else {
+                    let row = SourceRow::new(s);
+                    list_for_bind.append(&row.widget);
+                    rows.insert(s.name.clone(), row);
                 }
             }
         },
@@ -104,212 +407,158 @@ fn build_playback_list() -> gtk::ListBox {
     list
 }
 
-fn sink_row(s: &Sink) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("ts-audio-row");
-    if s.is_default {
-        row.add_css_class("default");
-    }
+// ── Playback streams ─────────────────────────────────────────────────────────
 
-    // Radio indicator / default button.
-    let radio_lbl = gtk::Label::new(Some(if s.is_default { "\u{25cf}" } else { "\u{25cb}" }));
-    let radio_btn = gtk::Button::new();
-    radio_btn.set_child(Some(&radio_lbl));
-    radio_btn.add_css_class("ts-audio-default-btn");
-    if s.is_default {
-        radio_btn.add_css_class("active");
-    }
-    let sink_name_for_click = s.name.clone();
-    radio_btn.connect_clicked(move |_| {
-        pipewire::set_default_sink(&sink_name_for_click);
-    });
-    row.append(&radio_btn);
-
-    // Name / description label.
-    let desc = if s.description.len() > 40 {
-        format!("{}…", &s.description[..39])
-    } else {
-        s.description.clone()
-    };
-    let name_lbl = gtk::Label::new(Some(&desc));
-    name_lbl.set_xalign(0.0);
-    name_lbl.set_hexpand(true);
-    name_lbl.add_css_class("ts-audio-row-name");
-    if !s.is_default {
-        name_lbl.add_css_class("dim");
-    }
-    if s.description.len() > 40 {
-        name_lbl.set_tooltip_text(Some(&s.description));
-    }
-    row.append(&name_lbl);
-
-    // Volume slider.
-    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
-    slider.set_draw_value(false);
-    slider.set_hexpand(true);
-    slider.set_size_request(110, -1);
-    slider.set_value(s.volume);
-
-    let sink_name_for_slider = s.name.clone();
-    slider.connect_value_changed(move |sl| {
-        pipewire::set_sink_volume(&sink_name_for_slider, sl.value());
-    });
-    // No signal bind here — we rebuild the whole row on each poll emission.
-    row.append(&slider);
-
-    // Mute button.
-    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
-    mute_btn.add_css_class("ts-audio-mute-btn");
-    if s.muted {
-        mute_btn.add_css_class("muted");
-    }
-    let muted_cell = Rc::new(Cell::new(s.muted));
-    let sink_name_for_mute = s.name.clone();
-    mute_btn.connect_clicked(move |btn| {
-        let new_mute = !muted_cell.get();
-        muted_cell.set(new_mute);
-        pipewire::set_sink_mute(&sink_name_for_mute, new_mute);
-        if new_mute {
-            btn.add_css_class("muted");
-        } else {
-            btn.remove_css_class("muted");
-        }
-    });
-    row.append(&mute_btn);
-
-    row.upcast()
+struct StreamRow {
+    widget: gtk::Box,
+    name_lbl: gtk::Label,
+    slider: gtk::Scale,
+    pending_volume: Rc<Cell<Option<(f64, Instant)>>>,
+    mute_btn: gtk::Button,
+    muted_cell: Rc<Cell<bool>>,
+    pending_mute: Rc<Cell<Option<(bool, Instant)>>>,
+    cached_app: RefCell<String>,
 }
 
-fn source_row(s: &Source) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("ts-audio-row");
-    if s.is_default {
-        row.add_css_class("default");
-    }
+impl StreamRow {
+    fn new(s: &PlaybackStream) -> Self {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        widget.add_css_class("ts-audio-row");
 
-    // Radio indicator / default button.
-    let radio_lbl = gtk::Label::new(Some(if s.is_default { "\u{25cf}" } else { "\u{25cb}" }));
-    let radio_btn = gtk::Button::new();
-    radio_btn.set_child(Some(&radio_lbl));
-    radio_btn.add_css_class("ts-audio-default-btn");
-    if s.is_default {
-        radio_btn.add_css_class("active");
-    }
-    let source_name_for_click = s.name.clone();
-    radio_btn.connect_clicked(move |_| {
-        pipewire::set_default_source(&source_name_for_click);
-    });
-    row.append(&radio_btn);
+        let spacer = gtk::Label::new(Some("  "));
+        spacer.add_css_class("ts-audio-default-btn");
+        widget.append(&spacer);
 
-    // Name / description label.
-    let desc = if s.description.len() > 40 {
-        format!("{}…", &s.description[..39])
-    } else {
-        s.description.clone()
-    };
-    let name_lbl = gtk::Label::new(Some(&desc));
-    name_lbl.set_xalign(0.0);
-    name_lbl.set_hexpand(true);
-    name_lbl.add_css_class("ts-audio-row-name");
-    if !s.is_default {
-        name_lbl.add_css_class("dim");
-    }
-    if s.description.len() > 40 {
-        name_lbl.set_tooltip_text(Some(&s.description));
-    }
-    row.append(&name_lbl);
-
-    // Volume slider.
-    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
-    slider.set_draw_value(false);
-    slider.set_hexpand(true);
-    slider.set_size_request(110, -1);
-    slider.set_value(s.volume);
-
-    let source_name_for_slider = s.name.clone();
-    slider.connect_value_changed(move |sl| {
-        pipewire::set_source_volume(&source_name_for_slider, sl.value());
-    });
-    row.append(&slider);
-
-    // Mute button.
-    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
-    mute_btn.add_css_class("ts-audio-mute-btn");
-    if s.muted {
-        mute_btn.add_css_class("muted");
-    }
-    let muted_cell = Rc::new(Cell::new(s.muted));
-    let source_name_for_mute = s.name.clone();
-    mute_btn.connect_clicked(move |btn| {
-        let new_mute = !muted_cell.get();
-        muted_cell.set(new_mute);
-        pipewire::set_source_mute(&source_name_for_mute, new_mute);
-        if new_mute {
-            btn.add_css_class("muted");
-        } else {
-            btn.remove_css_class("muted");
+        let initial_app = truncate_desc(&s.app_name);
+        let name_lbl = gtk::Label::new(Some(&initial_app));
+        name_lbl.set_xalign(0.0);
+        name_lbl.set_hexpand(true);
+        name_lbl.add_css_class("ts-audio-row-name");
+        if s.app_name.len() > 40 {
+            name_lbl.set_tooltip_text(Some(&s.app_name));
         }
-    });
-    row.append(&mute_btn);
+        widget.append(&name_lbl);
 
-    row.upcast()
+        let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        slider.set_draw_value(false);
+        slider.set_hexpand(true);
+        slider.set_size_request(110, -1);
+        slider.set_value(s.volume);
+
+        let pending_volume: Rc<Cell<Option<(f64, Instant)>>> = Rc::new(Cell::new(None));
+        let pending_for_handler = pending_volume.clone();
+        let stream_id = s.id;
+        slider.connect_change_value(move |_, _, val| {
+            pending_for_handler.set(Some((val, Instant::now())));
+            pipewire::set_stream_volume(stream_id, val);
+            glib::Propagation::Proceed
+        });
+        widget.append(&slider);
+
+        let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
+        mute_btn.add_css_class("ts-audio-mute-btn");
+        let muted_cell = Rc::new(Cell::new(s.muted));
+        let pending_mute: Rc<Cell<Option<(bool, Instant)>>> = Rc::new(Cell::new(None));
+        let muted_for_click = muted_cell.clone();
+        let pending_for_click = pending_mute.clone();
+        mute_btn.connect_clicked(move |btn| {
+            let new_mute = !muted_for_click.get();
+            muted_for_click.set(new_mute);
+            pending_for_click.set(Some((new_mute, Instant::now())));
+            pipewire::set_stream_mute(stream_id, new_mute);
+            toggle_class(btn, "muted", new_mute);
+        });
+        widget.append(&mute_btn);
+
+        StreamRow {
+            widget,
+            name_lbl,
+            slider,
+            pending_volume,
+            mute_btn,
+            muted_cell,
+            pending_mute,
+            cached_app: RefCell::new(initial_app),
+        }
+    }
+
+    fn update(&self, s: &PlaybackStream) {
+        let app = truncate_desc(&s.app_name);
+        if *self.cached_app.borrow() != app {
+            self.name_lbl.set_text(&app);
+            if s.app_name.len() > 40 {
+                self.name_lbl.set_tooltip_text(Some(&s.app_name));
+            } else {
+                self.name_lbl.set_tooltip_text(None);
+            }
+            *self.cached_app.borrow_mut() = app;
+        }
+
+        if echo_settled(&self.pending_mute, s.muted, |a, b| a == b) {
+            self.muted_cell.set(s.muted);
+            toggle_class(&self.mute_btn, "muted", s.muted);
+        }
+
+        if echo_settled(&self.pending_volume, s.volume, |a, b| (a - b).abs() < ECHO_TOLERANCE)
+            && (self.slider.value() - s.volume).abs() > SLIDER_NOOP_TOLERANCE
+        {
+            self.slider.set_value(s.volume);
+        }
+    }
 }
 
-fn stream_row(s: &PlaybackStream) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("ts-audio-row");
+fn build_playback_list() -> gtk::ListBox {
+    let list = boxed_list();
+    let rows: Rc<RefCell<HashMap<u32, StreamRow>>> = Rc::new(RefCell::new(HashMap::new()));
+    let placeholder = gtk::Label::new(Some("No active streams"));
+    placeholder.set_xalign(0.0);
+    placeholder.add_css_class("dim-label");
+    placeholder.set_margin_start(12);
+    placeholder.set_margin_end(12);
+    placeholder.set_margin_top(8);
+    placeholder.set_margin_bottom(8);
+    list.append(&placeholder);
+    let placeholder_attached = Rc::new(Cell::new(true));
 
-    // Spacer matching radio button width so labels align with sink/source rows.
-    let spacer = gtk::Label::new(Some("  "));
-    spacer.add_css_class("ts-audio-default-btn");
-    row.append(&spacer);
+    let list_for_bind = list.clone();
+    let rows_for_bind = rows.clone();
+    let placeholder_for_bind = placeholder.clone();
+    let attached_for_bind = placeholder_attached.clone();
+    bind(
+        pipewire::playback_streams(),
+        &list,
+        move |_, streams: Vec<PlaybackStream>| {
+            // Toggle the empty-state placeholder.
+            if streams.is_empty() && !attached_for_bind.get() {
+                list_for_bind.append(&placeholder_for_bind);
+                attached_for_bind.set(true);
+            } else if !streams.is_empty() && attached_for_bind.get() {
+                list_for_bind.remove(&placeholder_for_bind);
+                attached_for_bind.set(false);
+            }
 
-    // App name label.
-    let app_name = if s.app_name.len() > 40 {
-        format!("{}…", &s.app_name[..39])
-    } else {
-        s.app_name.clone()
-    };
-    let name_lbl = gtk::Label::new(Some(&app_name));
-    name_lbl.set_xalign(0.0);
-    name_lbl.set_hexpand(true);
-    name_lbl.add_css_class("ts-audio-row-name");
-    if s.app_name.len() > 40 {
-        name_lbl.set_tooltip_text(Some(&s.app_name));
-    }
-    row.append(&name_lbl);
-
-    // Volume slider.
-    let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
-    slider.set_draw_value(false);
-    slider.set_hexpand(true);
-    slider.set_size_request(110, -1);
-    slider.set_value(s.volume);
-
-    let stream_id = s.id;
-    slider.connect_value_changed(move |sl| {
-        pipewire::set_stream_volume(stream_id, sl.value());
-    });
-    row.append(&slider);
-
-    // Mute button.
-    let mute_btn = gtk::Button::from_icon_name("audio-volume-muted-symbolic");
-    mute_btn.add_css_class("ts-audio-mute-btn");
-    if s.muted {
-        mute_btn.add_css_class("muted");
-    }
-    let muted_cell = Rc::new(Cell::new(s.muted));
-    mute_btn.connect_clicked(move |btn| {
-        let new_mute = !muted_cell.get();
-        muted_cell.set(new_mute);
-        pipewire::set_stream_mute(stream_id, new_mute);
-        if new_mute {
-            btn.add_css_class("muted");
-        } else {
-            btn.remove_css_class("muted");
-        }
-    });
-    row.append(&mute_btn);
-
-    row.upcast()
+            let mut rows = rows_for_bind.borrow_mut();
+            let new_ids: HashSet<u32> = streams.iter().map(|s| s.id).collect();
+            let gone: Vec<u32> = rows
+                .keys()
+                .copied()
+                .filter(|id| !new_ids.contains(id))
+                .collect();
+            for id in gone {
+                if let Some(r) = rows.remove(&id) {
+                    list_for_bind.remove(&r.widget);
+                }
+            }
+            for s in &streams {
+                if let Some(row) = rows.get(&s.id) {
+                    row.update(s);
+                } else {
+                    let row = StreamRow::new(s);
+                    list_for_bind.append(&row.widget);
+                    rows.insert(s.id, row);
+                }
+            }
+        },
+    );
+    list
 }

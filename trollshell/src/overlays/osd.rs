@@ -120,17 +120,20 @@ pub fn install(monitor: &Monitor) {
 
     // Subscribe to the drawer-open state for this monitor so route_show
     // can suppress the OSD while the user is looking at the live slider.
-    if let Some(signal) = crate::modal::drawer_open_signal(monitor) {
-        let connector_for_sub = connector.clone();
-        glib::MainContext::default().spawn_local(signal.for_each(move |open| {
+    // The signal is backed by a lazily-allocated `Mutable` keyed by
+    // connector, so this works even though `osd::install` runs before
+    // `modal::install` during boot.
+    let connector_for_sub = connector.clone();
+    glib::MainContext::default().spawn_local(
+        crate::modal::drawer_open_signal(monitor).for_each(move |open| {
             OSDS.with(|map| {
                 if let Some(view) = map.borrow().get(&connector_for_sub) {
                     view.drawer_open.set(open);
                 }
             });
             std::future::ready(())
-        }));
-    }
+        }),
+    );
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));

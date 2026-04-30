@@ -70,6 +70,19 @@ struct ModalPanel {
 
 thread_local! {
     static PANELS: RefCell<HashMap<String, ModalPanel>> = RefCell::new(HashMap::new());
+    /// Per-connector drawer-open state, decoupled from `ModalPanel` lifetime
+    /// so subscribers (OSD, bar CSS) can wire up before `install` runs and
+    /// survive bar rebuilds on hot-plug.
+    static DRAWER_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
+}
+
+fn drawer_open_state(key: &str) -> Mutable<bool> {
+    DRAWER_OPEN.with(|map| {
+        map.borrow_mut()
+            .entry(key.to_string())
+            .or_insert_with(|| Mutable::new(false))
+            .clone()
+    })
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -235,7 +248,7 @@ pub fn install(monitor: &Monitor) {
                 current: RefCell::new(None),
                 monitor: monitor.clone(),
                 catcher,
-                open_state: Mutable::new(false),
+                open_state: drawer_open_state(&key),
             },
         );
     });
@@ -371,15 +384,12 @@ fn show_panel(panel: &ModalPanel, _key: &str, page: Page) {
 
 /// Signal that emits `true` while the drawer on `monitor` is open (the
 /// retract animation hasn't completed yet), and `false` when it's closed.
-/// Returns `None` if `install` hasn't been called for this monitor yet.
-pub fn drawer_open_signal(monitor: &Monitor) -> Option<impl Signal<Item = bool> + 'static> {
-    let key = monitor_key(monitor);
-    PANELS.with(|panels| {
-        panels
-            .borrow()
-            .get(&key)
-            .map(|panel| panel.open_state.signal())
-    })
+/// Backed by [`DRAWER_OPEN`] so callers can subscribe before `install` has
+/// run for this monitor — needed because the OSD and bar both wire up
+/// during synchronous boot, while modal panels are built later inside the
+/// `monitors_changed` task.
+pub fn drawer_open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
+    drawer_open_state(&monitor_key(monitor)).signal()
 }
 
 /// Full-screen transparent layer-shell window that closes the drawer on any

@@ -130,9 +130,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
 
     // When the drawer is open on this monitor, mark the bar window so CSS
     // can square off the bottom-right corner (seam between bar and drawer).
-    if let Some(signal) = modal::drawer_open_signal(monitor) {
-        bind_class(signal, bar.window(), "drawer-open");
-    }
+    bind_class(modal::drawer_open_signal(monitor), bar.window(), "drawer-open");
 
     bar
 }

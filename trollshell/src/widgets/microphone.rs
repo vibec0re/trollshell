@@ -27,12 +27,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         combined,
         &icon,
         move |w, (default, recording): (Option<Source>, bool)| {
-            let (name, off) = icon_state(default.as_ref(), recording);
+            let (name, recording) = icon_state(default.as_ref(), recording);
             w.set_icon_name(Some(name));
-            if off {
-                btn_for_bind.add_css_class("ts-microphone-off");
+            if recording {
+                btn_for_bind.add_css_class("ts-microphone-recording");
             } else {
-                btn_for_bind.remove_css_class("ts-microphone-off");
+                btn_for_bind.remove_css_class("ts-microphone-recording");
             }
         },
     );
@@ -44,15 +44,15 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.upcast()
 }
 
-/// Returns (icon name, whether to apply the dimmed-off style).
+/// Returns (icon name, whether an app is actively recording).
 fn icon_state(source: Option<&Source>, recording: bool) -> (&'static str, bool) {
     match source {
-        None => ("audio-input-microphone-symbolic", true),
+        None => ("audio-input-microphone-symbolic", false),
         Some(s) if s.muted => ("microphone-sensitivity-muted-symbolic", false),
-        _ if !recording => ("audio-input-microphone-symbolic", true),
-        Some(s) if s.volume < 0.34 => ("microphone-sensitivity-low-symbolic", false),
-        Some(s) if s.volume < 0.67 => ("microphone-sensitivity-medium-symbolic", false),
-        Some(_) => ("microphone-sensitivity-high-symbolic", false),
+        _ if !recording => ("audio-input-microphone-symbolic", false),
+        Some(s) if s.volume < 0.34 => ("microphone-sensitivity-low-symbolic", true),
+        Some(s) if s.volume < 0.67 => ("microphone-sensitivity-medium-symbolic", true),
+        Some(_) => ("microphone-sensitivity-high-symbolic", true),
     }
 }
 

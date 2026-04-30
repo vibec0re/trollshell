@@ -161,8 +161,8 @@
     background: linear-gradient(135deg, #ff006e, #8338ec);
     box-shadow: 0 0 20px rgba(255, 0, 110, 0.7);
 }
-.ts-microphone-off image {
-    opacity: 0.35;
+.ts-microphone-recording image {
+    color: #ff3b5c;
 }
 
 /* ─── Tiny vertical mini bar-graphs (white fill on trough). ─────── */

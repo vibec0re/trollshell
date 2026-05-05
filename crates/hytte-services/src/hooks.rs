@@ -7,11 +7,9 @@
 
 #[allow(unused_imports)]
 use std::os::unix::fs::PermissionsExt;
-#[allow(unused_imports)]
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[allow(dead_code)]
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the user's hook script for `event`, if one exists.
@@ -41,7 +39,7 @@ where
 
 async fn run_inner(event: &str, env: &[(String, String)]) {
     let Some(path) = resolve_path(event) else { return; };
-    let _meta = match tokio::fs::metadata(&path).await {
+    let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::debug!(event, path = %path.display(), "hooks: no script configured");
@@ -52,7 +50,68 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
             return;
         }
     };
-    let _ = env; // remaining branches arrive in later tasks
+    if !meta.is_file() {
+        tracing::warn!(event, path = %path.display(), "hooks: not a regular file");
+        return;
+    }
+
+    let mut cmd = tokio::process::Command::new(&path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("TROLLSHELL_EVENT", event);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(event, path = %path.display(), error = %e, "hooks: spawn failed");
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let read_outputs = async {
+        use tokio::io::AsyncReadExt;
+        let mut sout = Vec::new();
+        let mut serr = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut sout).await;
+        }
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_end(&mut serr).await;
+        }
+        (sout, serr)
+    };
+    let wait = async {
+        tokio::join!(read_outputs, child.wait())
+    };
+
+    match tokio::time::timeout(HOOK_TIMEOUT, wait).await {
+        Ok(((sout, serr), Ok(status))) if status.success() => {
+            tracing::info!(event, "hooks: ran");
+            if !sout.is_empty() {
+                tracing::debug!(
+                    event,
+                    stdout = %String::from_utf8_lossy(&sout),
+                    "hooks: stdout",
+                );
+            }
+            if !serr.is_empty() {
+                tracing::debug!(
+                    event,
+                    stderr = %String::from_utf8_lossy(&serr),
+                    "hooks: stderr",
+                );
+            }
+        }
+        Ok(_) | Err(_) => {
+            // remaining branches arrive in later tasks
+        }
+    }
 }
 
 fn resolve_path(event: &str) -> Option<PathBuf> {
@@ -175,6 +234,44 @@ mod tests {
         let dispatch = tracing::Dispatch::new(Registry::default().with(cap.clone()));
         let guard = tracing::dispatcher::set_default(&dispatch);
         (cap, guard)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn success_logs_info_and_captures_stdout() {
+        TestHome::with(|home| async move {
+            home.write_script("theme-changed", "#!/bin/sh\necho hi\nexit 0\n", 0o755);
+            let (cap, _guard) = capture();
+
+            super::run("theme-changed", &[]);
+
+            // Wait up to 2s for completion + log emission.
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if cap
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.level == tracing::Level::INFO)
+                {
+                    break;
+                }
+            }
+
+            let events = cap.events.lock().unwrap().clone();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.level == tracing::Level::INFO && e.message.contains("ran")),
+                "expected an INFO 'ran' event, got: {events:#?}",
+            );
+            assert!(
+                events.iter().any(|e| e.level == tracing::Level::DEBUG
+                    && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))),
+                "expected a DEBUG event with stdout=hi, got: {events:#?}",
+            );
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

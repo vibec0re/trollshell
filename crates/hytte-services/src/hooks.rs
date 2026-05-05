@@ -5,7 +5,6 @@
 //! the caller's POV: all outcomes go to `tracing`. See
 //! `docs/superpowers/specs/2026-05-05-settings-hooks-design.md`.
 
-#[allow(unused_imports)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,6 +51,10 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
     };
     if !meta.is_file() {
         tracing::warn!(event, path = %path.display(), "hooks: not a regular file");
+        return;
+    }
+    if meta.permissions().mode() & 0o111 == 0 {
+        tracing::warn!(event, path = %path.display(), "hooks: script not executable");
         return;
     }
 
@@ -339,6 +342,29 @@ mod tests {
                 "expected status to mention 7, got: {:#?}",
                 warn.fields,
             );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_executable_warns_and_does_not_run() {
+        TestHome::with(|home| async move {
+            let sentinel = home.root.join("sentinel");
+            let body = format!("#!/bin/sh\ntouch {}\n", sentinel.display());
+            home.write_script("theme-changed", &body, 0o644); // no exec bit
+            let (cap, _guard) = capture();
+
+            super::run("theme-changed", &[]);
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let events = cap.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e.level == tracing::Level::WARN
+                    && e.message.contains("not executable")),
+                "expected WARN 'not executable', got: {events:#?}",
+            );
+            assert!(!sentinel.exists(), "script must not have been executed");
         })
         .await;
     }

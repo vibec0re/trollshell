@@ -750,6 +750,68 @@ fn read_gpu() -> Option<GpuState> {
     read_amd_gpu().or_else(read_nvidia_gpu)
 }
 
+// ── /proc/self/mountinfo parsing ─────────────────────────────────────────────
+
+/// Internal representation of one mounted filesystem.
+///
+/// Not part of the public sensors API; consumed only by the disk poller.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct MountSpec {
+    /// Mount point (mountinfo field 5), with octal escapes decoded.
+    path: String,
+    /// `(major, minor)` from mountinfo field 3 — used for dedup.
+    dev_id: (u32, u32),
+    /// fstype (right-half token 1) — diagnostic only.
+    #[allow(dead_code)]
+    fstype: String,
+}
+
+/// Filesystems considered "pseudo" — kernel synthetic filesystems we never
+/// want to show as a "disk". Matches the spirit of `findmnt --real`.
+#[allow(dead_code)]
+const PSEUDO_FSTYPES: &[&str] = &[
+    "proc", "sysfs", "cgroup", "cgroup2", "devtmpfs", "devpts", "tmpfs",
+    "mqueue", "securityfs", "pstore", "bpf", "tracefs", "debugfs",
+    "hugetlbfs", "configfs", "fusectl", "binfmt_misc", "autofs",
+    "efivarfs", "ramfs", "rpc_pipefs", "nsfs", "selinuxfs", "overlay",
+    "squashfs",
+];
+
+/// Decode `\NNN` octal escapes used by `/proc/self/mountinfo` for special
+/// characters in mount-point paths (e.g. `\040` for space, `\134` for `\`,
+/// `\011` for tab, `\012` for newline).
+///
+/// A backslash not followed by exactly three octal digits is preserved
+/// verbatim — mountinfo only uses the `\NNN` form, so anything else is
+/// either a literal backslash in a path or malformed input we leave alone.
+#[allow(dead_code)]
+fn decode_octal_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let is_octal = |c: u8| (b'0'..=b'7').contains(&c);
+        if b == b'\\'
+            && i + 3 < bytes.len()
+            && is_octal(bytes[i + 1])
+            && is_octal(bytes[i + 2])
+            && is_octal(bytes[i + 3])
+        {
+            let v = (bytes[i + 1] - b'0') * 64
+                + (bytes[i + 2] - b'0') * 8
+                + (bytes[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 // ── Disk usage ────────────────────────────────────────────────────────────────
 
 fn read_disk(paths: &[&str]) -> DiskUsage {
@@ -824,5 +886,32 @@ MemAvailable:    8000000 kB
         let m = parse_meminfo(text);
         assert_eq!(m.swap_total, 0);
         assert_eq!(m.swap_used, 0);
+    }
+
+    #[test]
+    fn decode_octal_escapes_passthrough() {
+        assert_eq!(decode_octal_escapes("/home/choom"), "/home/choom");
+        assert_eq!(decode_octal_escapes(""), "");
+    }
+
+    #[test]
+    fn decode_octal_escapes_decodes_space() {
+        // \040 = octal 40 = decimal 32 = ASCII space
+        assert_eq!(decode_octal_escapes("/mnt/My\\040Drive"), "/mnt/My Drive");
+    }
+
+    #[test]
+    fn decode_octal_escapes_decodes_tab_and_backslash() {
+        // \011 = tab, \134 = backslash
+        assert_eq!(decode_octal_escapes("a\\011b"), "a\tb");
+        assert_eq!(decode_octal_escapes("a\\134b"), "a\\b");
+    }
+
+    #[test]
+    fn decode_octal_escapes_preserves_lone_or_invalid_backslash() {
+        // Backslash not followed by 3 octal digits is preserved verbatim.
+        assert_eq!(decode_octal_escapes("/foo\\bar"), "/foo\\bar");
+        assert_eq!(decode_octal_escapes("/foo\\12"), "/foo\\12");
+        assert_eq!(decode_octal_escapes("/foo\\99x"), "/foo\\99x");
     }
 }

@@ -144,6 +144,9 @@ pub struct SensorsHandles {
     pub(crate) disk: Mutable<DiskUsage>,
     pub(crate) net_connections: Mutable<NetConnections>,
     pub(crate) process_count: Mutable<u32>,
+    /// Live list of real mounts from `/proc/self/mountinfo`. Updated by
+    /// `mount_watch_loop`; consumed by `poll_loop`'s disk branch.
+    pub(crate) mount_list: Mutable<Vec<MountSpec>>,
 }
 
 impl Default for SensorsHandles {
@@ -157,6 +160,7 @@ impl Default for SensorsHandles {
             disk: Mutable::new(DiskUsage::default()),
             net_connections: Mutable::new(NetConnections::default()),
             process_count: Mutable::new(0),
+            mount_list: Mutable::new(Vec::new()),
         }
     }
 }
@@ -179,6 +183,8 @@ impl Service for SensorsService {
         let disk_writer = handles.disk.clone();
         let net_conn_writer = handles.net_connections.clone();
         let proc_count_writer = handles.process_count.clone();
+        let mount_list_for_poll = handles.mount_list.clone();
+        let mount_list_for_watch = handles.mount_list.clone();
 
         rt.spawn(async move {
             poll_loop(
@@ -190,9 +196,11 @@ impl Service for SensorsService {
                 disk_writer,
                 net_conn_writer,
                 proc_count_writer,
+                mount_list_for_poll,
             )
             .await;
         });
+        rt.spawn(mount_watch_loop(mount_list_for_watch));
 
         handles
     }
@@ -317,6 +325,7 @@ async fn poll_loop(
     disk_writer: Mutable<DiskUsage>,
     net_conn_writer: Mutable<NetConnections>,
     proc_count_writer: Mutable<u32>,
+    mount_list_reader: Mutable<Vec<MountSpec>>,
 ) {
     let mut state = PollState::new();
 
@@ -394,20 +403,7 @@ async fn poll_loop(
 
         // ── Disk (every 5 ticks) ──────────────────────────────────────────
         if state.tick.is_multiple_of(5) {
-            // Temporary: same hardcoded paths as before, expressed as
-            // MountSpecs. Task 6 swaps this for a live mount list.
-            let specs = vec![
-                MountSpec {
-                    path: "/".to_string(),
-                    dev_id: (0, 0),
-                    fstype: String::new(),
-                },
-                MountSpec {
-                    path: "/home".to_string(),
-                    dev_id: (0, 0),
-                    fstype: String::new(),
-                },
-            ];
+            let specs = mount_list_reader.get_cloned();
             disk_writer.set(read_disk_for_specs(&specs));
         }
 
@@ -421,6 +417,58 @@ async fn poll_loop(
 
         state.tick = state.tick.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+// ── Mount table watcher ──────────────────────────────────────────────────────
+
+/// Background task: keep `mount_list` in sync with `/proc/self/mountinfo`.
+///
+/// Seeds the Mutable once, then waits for `POLLPRI` events on the open file
+/// — the kernel signals POLLPRI on `/proc/self/mountinfo` whenever the mount
+/// table changes (mount, unmount, remount). On each event we re-parse the
+/// file from scratch via [`read_mountlist`].
+///
+/// Failure modes (open error, `AsyncFd` registration error, poll error) all
+/// log a warning and exit. The Mutable then either stays empty (if the
+/// initial open failed) or holds whatever was last successfully read.
+async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
+    use std::os::fd::OwnedFd;
+    use tokio::io::unix::AsyncFd;
+    use tokio::io::Interest;
+
+    // Seed once before we even attempt to register for events. This way a
+    // POLLPRI registration failure still leaves us with a correct list as
+    // of startup.
+    mount_list.set(read_mountlist());
+
+    let file = match std::fs::File::open("/proc/self/mountinfo") {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "sensors: failed to open mountinfo for watch");
+            return;
+        }
+    };
+    let fd: OwnedFd = file.into();
+    let async_fd = match AsyncFd::with_interest(fd, Interest::PRIORITY) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "sensors: failed to register mountinfo AsyncFd");
+            return;
+        }
+    };
+
+    loop {
+        match async_fd.ready(Interest::PRIORITY).await {
+            Ok(mut guard) => {
+                guard.clear_ready();
+                mount_list.set(read_mountlist());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sensors: mountinfo poll error, exiting watcher");
+                return;
+            }
+        }
     }
 }
 
@@ -770,13 +818,13 @@ fn read_gpu() -> Option<GpuState> {
 ///
 /// Not part of the public sensors API; consumed only by the disk poller.
 #[derive(Clone, Debug)]
-struct MountSpec {
+pub(crate) struct MountSpec {
     /// Mount point (mountinfo field 5), with octal escapes decoded.
-    path: String,
+    pub(crate) path: String,
     /// `(major, minor)` from mountinfo field 3 — used for dedup.
-    dev_id: (u32, u32),
+    pub(crate) dev_id: (u32, u32),
     /// fstype (right-half token 1) — diagnostic only.
-    fstype: String,
+    pub(crate) fstype: String,
 }
 
 /// Filesystems considered "pseudo" — kernel synthetic filesystems we never
@@ -899,7 +947,6 @@ fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
 ///
 /// Returns an empty list on read failure (e.g. sandboxed runtime); the
 /// caller's only failure mode in that case is reporting zero mounts.
-#[allow(dead_code)]
 fn read_mountlist() -> Vec<MountSpec> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .map(|t| parse_mountinfo(&t))

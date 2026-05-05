@@ -9,7 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(not(test))]
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Run the user's hook script for `event`, if one exists.
 ///
@@ -62,6 +65,7 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .env("TROLLSHELL_EVENT", event);
     for (k, v) in env {
         cmd.env(k, v);
@@ -130,7 +134,7 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
             tracing::warn!(event, error = %e, "hooks: wait failed");
         }
         Err(_) => {
-            // timeout — handled in a later task
+            tracing::warn!(event, "hooks: script timed out, killing");
         }
     }
 }
@@ -365,6 +369,40 @@ mod tests {
                 "expected WARN 'not executable', got: {events:#?}",
             );
             assert!(!sentinel.exists(), "script must not have been executed");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_kills_child_and_warns() {
+        TestHome::with(|home| async move {
+            home.write_script("theme-changed", "#!/bin/sh\nsleep 30\n", 0o755);
+            let (cap, _guard) = capture();
+
+            let started = std::time::Instant::now();
+            super::run("theme-changed", &[]);
+
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if cap.events.lock().unwrap().iter().any(|e| {
+                    e.level == tracing::Level::WARN && e.message.contains("timed out")
+                }) {
+                    break;
+                }
+            }
+
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout should fire well before 10s; took {elapsed:?}",
+            );
+
+            let events = cap.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e.level == tracing::Level::WARN
+                    && e.message.contains("timed out")),
+                "expected WARN 'timed out', got: {events:#?}",
+            );
         })
         .await;
     }

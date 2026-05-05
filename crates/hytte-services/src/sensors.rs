@@ -799,10 +799,11 @@ fn decode_octal_escapes(s: &str) -> String {
             && is_octal(bytes[i + 2])
             && is_octal(bytes[i + 3])
         {
-            let v = (bytes[i + 1] - b'0') * 64
-                + (bytes[i + 2] - b'0') * 8
-                + (bytes[i + 3] - b'0');
-            out.push(v);
+            let v = u32::from(bytes[i + 1] - b'0') * 64
+                + u32::from(bytes[i + 2] - b'0') * 8
+                + u32::from(bytes[i + 3] - b'0');
+            #[allow(clippy::cast_possible_truncation)]
+            out.push(v as u8);  // safe: mountinfo only emits \000–\377
             i += 4;
         } else {
             out.push(b);

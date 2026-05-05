@@ -41,23 +41,28 @@ mod tests {
     }
 
     impl TestHome {
-        /// Run `f` with `$HOME` temporarily set to a fresh temp directory.
-        ///
-        /// `temp_env::with_var` serializes env mutation and restores the
-        /// previous value on return or panic — replacing the manual
-        /// `HOME_LOCK` + `unsafe set_var` pattern from the original design.
-        pub fn with<F, R>(f: F) -> R
+        /// Run `f` with `$HOME` temporarily set to a fresh tempdir, awaiting
+        /// the future it returns. `temp_env::async_with_vars` serializes env
+        /// mutation across tests and restores the previous value on return
+        /// or panic.
+        pub async fn with<F, Fut, R>(f: F) -> R
         where
-            F: FnOnce(&Self) -> R,
+            F: FnOnce(TestHome) -> Fut,
+            Fut: std::future::Future<Output = R>,
         {
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir()
                 .join(format!("hytte-hooks-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
-            let home = Self { root: root.clone() };
-            let result = temp_env::with_var("HOME", Some(&root), || f(&home));
-            let _ = std::fs::remove_dir_all(&root);
+            let cleanup = root.clone();
+            let home = TestHome { root: root.clone() };
+            let result = temp_env::async_with_vars(
+                [("HOME", Some(root.into_os_string()))],
+                f(home),
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&cleanup);
             result
         }
 

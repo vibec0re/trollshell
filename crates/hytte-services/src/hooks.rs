@@ -431,4 +431,31 @@ mod tests {
         })
         .await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn env_vars_reach_script() {
+        TestHome::with(|home| async move {
+            let sentinel = home.root.join("env-out");
+            let body = format!(
+                "#!/bin/sh\nprintf 'event=%s theme=%s' \"$TROLLSHELL_EVENT\" \"$TROLLSHELL_THEME\" > {}\n",
+                sentinel.display(),
+            );
+            home.write_script("theme-changed", &body, 0o755);
+            let (_cap, _guard) = capture();
+
+            super::run("theme-changed", &[("TROLLSHELL_THEME", "dark")]);
+
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if sentinel.exists() {
+                    break;
+                }
+            }
+
+            let contents = std::fs::read_to_string(&sentinel)
+                .expect("script should have written sentinel");
+            assert_eq!(contents, "event=theme-changed theme=dark");
+        })
+        .await;
+    }
 }

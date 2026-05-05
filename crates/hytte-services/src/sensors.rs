@@ -851,6 +851,41 @@ fn parse_mountinfo_line(line: &str) -> Option<MountSpec> {
     })
 }
 
+/// Parse `/proc/self/mountinfo` text into a deduplicated, filtered list.
+///
+/// 1. Drops lines whose fstype is in [`PSEUDO_FSTYPES`].
+/// 2. Dedups by `dev_id`, keeping the entry with the shortest path; ties
+///    broken by mountinfo order.
+/// 3. Preserves the original mountinfo order of the surviving entries.
+#[allow(dead_code)]
+fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
+    let all: Vec<MountSpec> = text
+        .lines()
+        .filter_map(parse_mountinfo_line)
+        .filter(|s| !PSEUDO_FSTYPES.contains(&s.fstype.as_str()))
+        .collect();
+
+    // Pick the winning index per dev_id (shortest path; first-seen wins ties).
+    let mut winner_idx: HashMap<(u32, u32), usize> = HashMap::new();
+    for (i, spec) in all.iter().enumerate() {
+        winner_idx
+            .entry(spec.dev_id)
+            .and_modify(|j| {
+                if spec.path.len() < all[*j].path.len() {
+                    *j = i;
+                }
+            })
+            .or_insert(i);
+    }
+    let winners: std::collections::HashSet<usize> =
+        winner_idx.values().copied().collect();
+
+    all.into_iter()
+        .enumerate()
+        .filter_map(|(i, s)| if winners.contains(&i) { Some(s) } else { None })
+        .collect()
+}
+
 // ── Disk usage ────────────────────────────────────────────────────────────────
 
 fn read_disk(paths: &[&str]) -> DiskUsage {
@@ -992,5 +1027,51 @@ MemAvailable:    8000000 kB
             parse_mountinfo_line("36 35 98:0 / /mnt rw").is_none(),
             "missing ' - ' separator should fail",
         );
+    }
+
+    #[test]
+    fn parse_mountinfo_filters_pseudo() {
+        let text = "\
+1 0 0:1 / /proc rw - proc proc rw
+2 0 0:2 / /sys rw - sysfs sys rw
+3 0 0:3 / /tmp rw - tmpfs none rw
+4 0 8:1 / /home rw - ext4 /dev/sda1 rw
+5 0 8:2 / /data rw - btrfs /dev/sdb1 rw
+";
+        let v = parse_mountinfo(text);
+        assert_eq!(v.len(), 2, "only ext4 and btrfs should survive");
+        assert_eq!(v[0].path, "/home");
+        assert_eq!(v[0].fstype, "ext4");
+        assert_eq!(v[1].path, "/data");
+        assert_eq!(v[1].fstype, "btrfs");
+    }
+
+    #[test]
+    fn parse_mountinfo_dedups_by_dev_id_keeping_shortest_path() {
+        // Two ext4 entries on the same major:minor — should collapse into
+        // one, with the shorter path winning. A separate btrfs on a
+        // different major:minor survives independently.
+        let text = "\
+1 0 8:1 /a /run/host/os-release rw - ext4 /dev/sda1 rw
+2 0 8:1 / / rw - ext4 /dev/sda1 rw
+3 0 8:2 / /home rw - btrfs /dev/sdb1 rw
+";
+        let v = parse_mountinfo(text);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].path, "/", "shortest path wins for dev (8,1)");
+        assert_eq!(v[1].path, "/home");
+    }
+
+    #[test]
+    fn parse_mountinfo_skips_malformed_lines() {
+        let text = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+not a real line at all
+2 0 8:2 / /home rw - btrfs /dev/sdb1 rw
+";
+        let v = parse_mountinfo(text);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].path, "/");
+        assert_eq!(v[1].path, "/home");
     }
 }

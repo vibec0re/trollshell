@@ -763,7 +763,6 @@ struct MountSpec {
     /// `(major, minor)` from mountinfo field 3 — used for dedup.
     dev_id: (u32, u32),
     /// fstype (right-half token 1) — diagnostic only.
-    #[allow(dead_code)]
     fstype: String,
 }
 
@@ -811,6 +810,45 @@ fn decode_octal_escapes(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse one line of `/proc/self/mountinfo`.
+///
+/// Format (man `proc(5)` §5):
+/// ```text
+/// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw
+///  ^  ^  ^    ^     ^                          ^
+///  1  2  3    4     5                          fstype (after " - ")
+/// ```
+///
+/// Fields after position 6 and before the literal `" - "` separator are
+/// optional tags (variable count) — we ignore them.
+#[allow(dead_code)]
+fn parse_mountinfo_line(line: &str) -> Option<MountSpec> {
+    let (left, right) = line.split_once(" - ")?;
+
+    let mut left_fields = left.split_ascii_whitespace();
+    // Skip fields 1 (mount ID) and 2 (parent ID).
+    let _ = left_fields.next()?;
+    let _ = left_fields.next()?;
+    // Field 3: major:minor.
+    let dev = left_fields.next()?;
+    let (maj_s, min_s) = dev.split_once(':')?;
+    let major: u32 = maj_s.parse().ok()?;
+    let minor: u32 = min_s.parse().ok()?;
+    // Skip field 4 (root inside fs).
+    let _ = left_fields.next()?;
+    // Field 5: mount point.
+    let mount_point = left_fields.next()?;
+
+    // Right half: fstype is the first whitespace-separated token.
+    let fstype = right.split_ascii_whitespace().next()?.to_string();
+
+    Some(MountSpec {
+        path: decode_octal_escapes(mount_point),
+        dev_id: (major, minor),
+        fstype,
+    })
 }
 
 // ── Disk usage ────────────────────────────────────────────────────────────────
@@ -914,5 +952,45 @@ MemAvailable:    8000000 kB
         assert_eq!(decode_octal_escapes("/foo\\bar"), "/foo\\bar");
         assert_eq!(decode_octal_escapes("/foo\\12"), "/foo\\12");
         assert_eq!(decode_octal_escapes("/foo\\99x"), "/foo\\99x");
+    }
+
+    #[test]
+    fn parse_mountinfo_line_basic() {
+        let line = "36 35 98:0 / /mnt rw,noatime - ext3 /dev/root rw";
+        let spec = parse_mountinfo_line(line).expect("parse");
+        assert_eq!(spec.dev_id, (98, 0));
+        assert_eq!(spec.path, "/mnt");
+        assert_eq!(spec.fstype, "ext3");
+    }
+
+    #[test]
+    fn parse_mountinfo_line_with_optional_tags() {
+        // mountinfo lines may carry zero or more optional tag fields between
+        // field 6 and the literal " - " separator.
+        let line = "26 1 8:1 / / rw,relatime shared:1 master:2 - btrfs /dev/sda1 rw";
+        let spec = parse_mountinfo_line(line).expect("parse");
+        assert_eq!(spec.dev_id, (8, 1));
+        assert_eq!(spec.path, "/");
+        assert_eq!(spec.fstype, "btrfs");
+    }
+
+    #[test]
+    fn parse_mountinfo_line_octal_path() {
+        let line = "1 1 8:1 / /mnt/My\\040Drive rw - ext4 /dev/sda1 rw";
+        let spec = parse_mountinfo_line(line).expect("parse");
+        assert_eq!(spec.path, "/mnt/My Drive");
+    }
+
+    #[test]
+    fn parse_mountinfo_line_malformed_returns_none() {
+        assert!(parse_mountinfo_line("not a real line").is_none());
+        assert!(
+            parse_mountinfo_line("36 35 noslash / /mnt rw - ext3 /dev/root rw").is_none(),
+            "missing colon in field 3 should fail",
+        );
+        assert!(
+            parse_mountinfo_line("36 35 98:0 / /mnt rw").is_none(),
+            "missing ' - ' separator should fail",
+        );
     }
 }

@@ -114,8 +114,20 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
                 );
             }
         }
-        Ok(_) | Err(_) => {
-            // remaining branches arrive in later tasks
+        Ok(((sout, serr), Ok(status))) => {
+            tracing::warn!(
+                event,
+                status = ?status,
+                stdout = %String::from_utf8_lossy(&sout),
+                stderr = %String::from_utf8_lossy(&serr),
+                "hooks: script failed",
+            );
+        }
+        Ok(((_sout, _serr), Err(e))) => {
+            tracing::warn!(event, error = %e, "hooks: wait failed");
+        }
+        Err(_) => {
+            // timeout — handled in a later task
         }
     }
 }
@@ -275,6 +287,57 @@ mod tests {
                 events.iter().any(|e| e.level == tracing::Level::DEBUG
                     && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))),
                 "expected a DEBUG event with stdout=hi, got: {events:#?}",
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nonzero_exit_logs_warn_with_outputs() {
+        TestHome::with(|home| async move {
+            home.write_script(
+                "theme-changed",
+                "#!/bin/sh\necho boom 1>&2\nexit 7\n",
+                0o755,
+            );
+            let (cap, _guard) = capture();
+
+            super::run("theme-changed", &[]);
+
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if cap
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.level == tracing::Level::WARN)
+                {
+                    break;
+                }
+            }
+
+            let events = cap.events.lock().unwrap().clone();
+            let warn = events
+                .iter()
+                .find(|e| e.level == tracing::Level::WARN)
+                .unwrap_or_else(|| panic!("expected a WARN event, got: {events:#?}"));
+            assert!(
+                warn.message.contains("failed"),
+                "warn msg: {:?}",
+                warn.message,
+            );
+            assert!(
+                warn.fields
+                    .get("stderr")
+                    .is_some_and(|s| s.contains("boom")),
+                "expected stderr=boom, got: {:#?}",
+                warn.fields,
+            );
+            assert!(
+                warn.fields.get("status").is_some_and(|s| s.contains('7')),
+                "expected status to mention 7, got: {:#?}",
+                warn.fields,
             );
         })
         .await;

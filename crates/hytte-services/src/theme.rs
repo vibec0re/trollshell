@@ -9,12 +9,13 @@
 //! 2. **Legacy GTK (2/3) and non-libadwaita GTK4** — `gtk-theme` gsettings
 //!    key (`Adwaita` / `Adwaita-dark`) plus `~/.config/gtk-{3,4}.0/settings.ini`
 //!    fallbacks for apps that don't go through xsettings/dconf.
-//! 3. **Qt** — `~/.config/qt[56]ct/qt[56]ct.conf [Appearance] style=`.
-//!    Effective when the user has `qt[56]ct` + `adwaita-qt[5|6]` installed
-//!    and `QT_QPA_PLATFORMTHEME=qt[56]ct`. The conf is written
-//!    unconditionally; `qt[56]ct` ignores an unknown style and falls back
-//!    to Fusion, so writing it costs nothing on systems that don't have
-//!    those packages.
+//! 3. **Qt** — `~/.config/qt[56]ct/qt[56]ct.conf [Appearance]` keys
+//!    `style`, `custom_palette`, `color_scheme_path`. Sets `style=Fusion`
+//!    (Qt built-in, always present) and toggles a dark palette via
+//!    qt[56]ct's bundled `darker.conf`. Effective when `qt[56]ct` is
+//!    installed and `QT_QPA_PLATFORMTHEME=qt[56]ct` is exported. The conf
+//!    is written unconditionally; with no qt[56]ct platform theme loaded
+//!    it costs nothing.
 //!
 //! gsettings calls are spawned detached (we don't wait on them); file
 //! updates are synchronous and preserve every unrelated key/section the
@@ -44,13 +45,6 @@ impl Theme {
         match self {
             Theme::Light => "Adwaita",
             Theme::Dark => "Adwaita-dark",
-        }
-    }
-
-    fn qt_style(self) -> &'static str {
-        match self {
-            Theme::Light => "Adwaita",
-            Theme::Dark => "Adwaita-Dark",
         }
     }
 
@@ -143,7 +137,25 @@ fn update_gtk_settings_ini(subdir: &str, theme: Theme) -> std::io::Result<()> {
 
 fn update_qtct_conf(subdir: &str, theme: Theme) -> std::io::Result<()> {
     let path = config_subdir(subdir)?.join(format!("{subdir}.conf"));
-    let kvs = [("style", theme.qt_style())];
+    // Fusion is the always-available Qt built-in style. "Adwaita" /
+    // "Adwaita-Dark" used to ship via adwaita-qt[5|6], dropped from Arch
+    // repos in 2025. Fusion + qt[56]ct's bundled "darker" palette via
+    // custom_palette gives equivalent visual coverage without extra
+    // packages. Light mode unsets custom_palette so Fusion's built-in
+    // light palette takes over.
+    let dark_palette = format!("/usr/share/{subdir}/colors/darker.conf");
+    let kvs: [(&str, &str); 3] = match theme {
+        Theme::Dark => [
+            ("style", "Fusion"),
+            ("custom_palette", "true"),
+            ("color_scheme_path", &dark_palette),
+        ],
+        Theme::Light => [
+            ("style", "Fusion"),
+            ("custom_palette", "false"),
+            ("color_scheme_path", ""),
+        ],
+    };
     update_ini_keys(&path, "Appearance", &kvs)
 }
 
@@ -276,8 +288,6 @@ mod tests {
         assert_eq!(Theme::Dark.color_scheme(), "prefer-dark");
         assert_eq!(Theme::Light.gtk_theme(), "Adwaita");
         assert_eq!(Theme::Dark.gtk_theme(), "Adwaita-dark");
-        assert_eq!(Theme::Light.qt_style(), "Adwaita");
-        assert_eq!(Theme::Dark.qt_style(), "Adwaita-Dark");
     }
 
     #[test]

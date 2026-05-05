@@ -76,15 +76,21 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
     let stderr = child.stderr.take();
     let read_outputs = async {
         use tokio::io::AsyncReadExt;
-        let mut sout = Vec::new();
-        let mut serr = Vec::new();
-        if let Some(mut s) = stdout {
-            let _ = s.read_to_end(&mut sout).await;
-        }
-        if let Some(mut s) = stderr {
-            let _ = s.read_to_end(&mut serr).await;
-        }
-        (sout, serr)
+        let read_one = |stream: Option<tokio::process::ChildStdout>| async move {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let read_one_err = |stream: Option<tokio::process::ChildStderr>| async move {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        tokio::join!(read_one(stdout), read_one_err(stderr))
     };
     let wait = async {
         tokio::join!(read_outputs, child.wait())

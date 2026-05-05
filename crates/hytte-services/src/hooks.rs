@@ -20,8 +20,47 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// `hytte_reactive` tokio runtime (or the current runtime, if any).
 /// Outcomes are logged via `tracing`; errors never propagate.
 pub fn run(event: &str, env: &[(&str, &str)]) {
-    let _ = (event, env);
-    // TODO(impl in later tasks)
+    let event = event.to_string();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    spawn_task(async move { run_inner(&event, &env).await });
+}
+
+fn spawn_task<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(fut);
+        return;
+    }
+    hytte_reactive::runtime::handle().spawn(fut);
+}
+
+async fn run_inner(event: &str, env: &[(String, String)]) {
+    let Some(path) = resolve_path(event) else { return; };
+    let _meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(event, path = %path.display(), "hooks: no script configured");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(event, path = %path.display(), error = %e, "hooks: stat failed");
+            return;
+        }
+    };
+    let _ = env; // remaining branches arrive in later tasks
+}
+
+fn resolve_path(event: &str) -> Option<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        tracing::warn!(event, "hooks: $HOME not set");
+        return None;
+    };
+    Some(PathBuf::from(home).join(".config/trollshell/hooks").join(event))
 }
 
 #[cfg(test)]
@@ -136,5 +175,30 @@ mod tests {
         let dispatch = tracing::Dispatch::new(Registry::default().with(cap.clone()));
         let guard = tracing::dispatcher::set_default(&dispatch);
         (cap, guard)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_script_logs_debug_only() {
+        TestHome::with(|home| async move {
+            let _ = home.hooks_dir(); // dir exists, no script written
+            let (cap, _guard) = capture();
+
+            super::run("theme-changed", &[]);
+
+            // Spawn happens on a background task — give it a tick to land.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let events = cap.events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|e| e.level == tracing::Level::DEBUG
+                    && e.message.contains("no script")),
+                "expected a DEBUG 'no script' event, got: {events:#?}",
+            );
+            assert!(
+                !events.iter().any(|e| e.level == tracing::Level::WARN),
+                "expected no WARN events, got: {events:#?}",
+            );
+        })
+        .await;
     }
 }

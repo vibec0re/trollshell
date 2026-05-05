@@ -115,6 +115,17 @@ pub fn set(theme: Theme) {
     if let Err(e) = update_qtct_conf("qt6ct", theme) {
         tracing::warn!(error = %e, "theme: qt6ct.conf update failed");
     }
+
+    crate::hooks::run(
+        "theme-changed",
+        &[(
+            "TROLLSHELL_THEME",
+            match theme {
+                Theme::Light => "light",
+                Theme::Dark => "dark",
+            },
+        )],
+    );
 }
 
 fn spawn_gsettings(args: &[&str]) {

@@ -394,7 +394,21 @@ async fn poll_loop(
 
         // ── Disk (every 5 ticks) ──────────────────────────────────────────
         if state.tick.is_multiple_of(5) {
-            disk_writer.set(read_disk(&["/", "/home"]));
+            // Temporary: same hardcoded paths as before, expressed as
+            // MountSpecs. Task 6 swaps this for a live mount list.
+            let specs = vec![
+                MountSpec {
+                    path: "/".to_string(),
+                    dev_id: (0, 0),
+                    fstype: String::new(),
+                },
+                MountSpec {
+                    path: "/home".to_string(),
+                    dev_id: (0, 0),
+                    fstype: String::new(),
+                },
+            ];
+            disk_writer.set(read_disk_for_specs(&specs));
         }
 
         // ── TCP socket counts (every 2 ticks) ─────────────────────────────
@@ -756,7 +770,6 @@ fn read_gpu() -> Option<GpuState> {
 ///
 /// Not part of the public sensors API; consumed only by the disk poller.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct MountSpec {
     /// Mount point (mountinfo field 5), with octal escapes decoded.
     path: String,
@@ -768,7 +781,6 @@ struct MountSpec {
 
 /// Filesystems considered "pseudo" — kernel synthetic filesystems we never
 /// want to show as a "disk". Matches the spirit of `findmnt --real`.
-#[allow(dead_code)]
 const PSEUDO_FSTYPES: &[&str] = &[
     "proc", "sysfs", "cgroup", "cgroup2", "devtmpfs", "devpts", "tmpfs",
     "mqueue", "securityfs", "pstore", "bpf", "tracefs", "debugfs",
@@ -784,7 +796,6 @@ const PSEUDO_FSTYPES: &[&str] = &[
 /// A backslash not followed by exactly three octal digits is preserved
 /// verbatim — mountinfo only uses the `\NNN` form, so anything else is
 /// either a literal backslash in a path or malformed input we leave alone.
-#[allow(dead_code)]
 fn decode_octal_escapes(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -823,7 +834,6 @@ fn decode_octal_escapes(s: &str) -> String {
 ///
 /// Fields after position 6 and before the literal `" - "` separator are
 /// optional tags (variable count) — we ignore them.
-#[allow(dead_code)]
 fn parse_mountinfo_line(line: &str) -> Option<MountSpec> {
     let (left, right) = line.split_once(" - ")?;
 
@@ -857,7 +867,6 @@ fn parse_mountinfo_line(line: &str) -> Option<MountSpec> {
 /// 2. Dedups by `dev_id`, keeping the entry with the shortest path; ties
 ///    broken by mountinfo order.
 /// 3. Preserves the original mountinfo order of the surviving entries.
-#[allow(dead_code)]
 fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
     let all: Vec<MountSpec> = text
         .lines()
@@ -886,13 +895,24 @@ fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
         .collect()
 }
 
+/// Read and parse the live `/proc/self/mountinfo`.
+///
+/// Returns an empty list on read failure (e.g. sandboxed runtime); the
+/// caller's only failure mode in that case is reporting zero mounts.
+#[allow(dead_code)]
+fn read_mountlist() -> Vec<MountSpec> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|t| parse_mountinfo(&t))
+        .unwrap_or_default()
+}
+
 // ── Disk usage ────────────────────────────────────────────────────────────────
 
-fn read_disk(paths: &[&str]) -> DiskUsage {
+fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
     use nix::sys::statvfs::statvfs;
-    let mut mounts = Vec::new();
-    for p in paths {
-        let Ok(s) = statvfs(*p) else {
+    let mut mounts = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let Ok(s) = statvfs(spec.path.as_str()) else {
             continue;
         };
         let block_size = s.fragment_size();
@@ -902,7 +922,7 @@ fn read_disk(paths: &[&str]) -> DiskUsage {
         #[allow(clippy::cast_precision_loss)]
         let usage = if total == 0 { 0.0 } else { used as f64 / total as f64 };
         mounts.push(DiskMount {
-            path: (*p).to_string(),
+            path: spec.path.clone(),
             total_bytes: total,
             used_bytes: used,
             free_bytes: free,

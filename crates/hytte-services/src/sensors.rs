@@ -835,6 +835,10 @@ const PSEUDO_FSTYPES: &[&str] = &[
     "hugetlbfs", "configfs", "fusectl", "binfmt_misc", "autofs",
     "efivarfs", "ramfs", "rpc_pipefs", "nsfs", "selinuxfs", "overlay",
     "squashfs",
+    // Userspace pseudo-fuse mounts: gvfs auto-mounts and Flatpak portals.
+    // Real user fuse storage (sshfs, gocryptfs, etc.) uses other fuse.*
+    // subtypes and stays visible.
+    "fuse.gvfsd-fuse", "fuse.portal",
 ];
 
 /// Decode `\NNN` octal escapes used by `/proc/self/mountinfo` for special
@@ -1140,5 +1144,23 @@ not a real line at all
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].path, "/");
         assert_eq!(v[1].path, "/home");
+    }
+
+    #[test]
+    fn parse_mountinfo_filters_pseudo_fuse_mounts() {
+        // gvfs and Flatpak portal fuse mounts are pseudo and should be
+        // filtered. Real user fuse storage (e.g. fuse.sshfs) survives.
+        let text = "\
+1 0 0:50 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw
+2 0 0:51 / /run/user/1000/doc rw - fuse.portal portal rw
+3 0 0:52 / /mnt/server rw - fuse.sshfs user@host:/ rw
+4 0 8:1 / / rw - ext4 /dev/sda1 rw
+";
+        let v = parse_mountinfo(text);
+        assert_eq!(v.len(), 2, "fuse.sshfs + ext4 survive; gvfs + portal filtered");
+        assert_eq!(v[0].path, "/mnt/server");
+        assert_eq!(v[0].fstype, "fuse.sshfs");
+        assert_eq!(v[1].path, "/");
+        assert_eq!(v[1].fstype, "ext4");
     }
 }

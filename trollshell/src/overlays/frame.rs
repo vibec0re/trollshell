@@ -14,8 +14,10 @@
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
+use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
+use hytte::services::niri;
 use hytte::ui::{layer_window, LayerShell};
 
 /// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
@@ -29,8 +31,19 @@ const FRAME_THICKNESS: f64 = 8.0;
 /// Corner radius for all four corners of the workspace cutout.
 const CUTOUT_RADIUS: f64 = 10.0;
 
+/// Tolerance (logical pixels) when comparing a window's tile size to the
+/// monitor size to detect fullscreen. niri reports both in logical
+/// pixels, so an exact match is expected; a few pixels of slack covers
+/// fractional-scale rounding.
+const FULLSCREEN_TOL: f64 = 4.0;
+
 /// Mount one frame overlay on `monitor`.
 pub fn install(monitor: &Monitor) {
+    let connector = monitor.connector().unwrap_or_default();
+    let (mon_w, mon_h) = monitor.size();
+    let mon_w = f64::from(mon_w);
+    let mon_h = f64::from(mon_h);
+
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
         .anchor(Anchor::Top)
@@ -61,7 +74,47 @@ pub fn install(monitor: &Monitor) {
     // the surface exists.
     install_click_through(&window);
 
+    // Reactively hide the frame whenever this monitor's active workspace
+    // has a fullscreen-sized window. `Layer::Overlay` is always above
+    // niri's apps by spec — including fullscreen ones — so without this
+    // toggle the frame would paint over fullscreen content.
+    bind_fullscreen_visibility(&window, connector, mon_w, mon_h);
+
     window.set_visible(true);
+}
+
+/// Hide the frame on `window` whenever the active workspace on the output
+/// named `connector` contains a fullscreen-sized window. A "fullscreen-sized"
+/// window is one whose `tile_size` matches the monitor's logical size
+/// within `FULLSCREEN_TOL`. niri reserves struts for non-fullscreen tiling,
+/// so a normally-maximized window has `tile_size` = output size minus
+/// struts — measurably smaller than fullscreen, so no false positives.
+fn bind_fullscreen_visibility(
+    window: &gtk::Window,
+    connector: String,
+    mon_w: f64,
+    mon_h: f64,
+) {
+    let workspaces = niri::workspaces();
+    let windows = niri::windows();
+    let visible = map_ref! {
+        let workspaces = workspaces,
+        let windows = windows => {
+            let active_id = workspaces
+                .iter()
+                .find(|ws| ws.output.as_deref() == Some(connector.as_str()) && ws.is_active)
+                .map(|ws| ws.id);
+            let fullscreen = active_id.is_some_and(|id| {
+                windows.iter().any(|w| {
+                    w.workspace_id == Some(id)
+                        && (w.layout.tile_size.0 - mon_w).abs() < FULLSCREEN_TOL
+                        && (w.layout.tile_size.1 - mon_h).abs() < FULLSCREEN_TOL
+                })
+            });
+            !fullscreen
+        }
+    };
+    bind_visible(visible, window);
 }
 
 /// Set an empty input region on the window's surface so every pointer

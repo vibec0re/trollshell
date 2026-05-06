@@ -82,22 +82,7 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_outputs = async {
-        use tokio::io::AsyncReadExt;
-        let read_one = |stream: Option<tokio::process::ChildStdout>| async move {
-            let mut buf = Vec::new();
-            if let Some(mut s) = stream {
-                let _ = s.read_to_end(&mut buf).await;
-            }
-            buf
-        };
-        let read_one_err = |stream: Option<tokio::process::ChildStderr>| async move {
-            let mut buf = Vec::new();
-            if let Some(mut s) = stream {
-                let _ = s.read_to_end(&mut buf).await;
-            }
-            buf
-        };
-        tokio::join!(read_one(stdout), read_one_err(stderr))
+        tokio::join!(drain(stdout), drain(stderr))
     };
     let wait = async {
         tokio::join!(read_outputs, child.wait())
@@ -147,8 +132,19 @@ fn resolve_path(event: &str) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/trollshell/hooks").join(event))
 }
 
+async fn drain<R>(stream: Option<R>) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    if let Some(mut s) = stream {
+        let _ = s.read_to_end(&mut buf).await;
+    }
+    buf
+}
+
 #[cfg(test)]
-#[allow(dead_code)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

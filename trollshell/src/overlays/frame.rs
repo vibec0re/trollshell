@@ -1,0 +1,235 @@
+//! Per-monitor OVERLAY-layer window that paints the dark frame around
+//! the workspace cutout. Full-screen, click-through, no exclusive zone.
+//!
+//! Layered above the bar (which is on `Layer::Top`). Bar widgets remain
+//! interactive because the frame's input region is empty — every click
+//! falls through to the layer below.
+//!
+//! The frame paints the bar's dark gradient (3-stop, 90deg, screen-width
+//! aligned) into the L/R/bottom border regions and carves four rounded
+//! inner corners around the workspace cutout. Top inset is the bar's
+//! exclusive zone.
+//!
+//! Visual constants — match `etc/niri/frame.kdl` struts and the
+//! post-restyle bar geometry from `style.css`. If any of these change,
+//! update both sides.
+
+use hytte::futures_signals::map_ref;
+use hytte::gtk::{self, prelude::*};
+use hytte::prelude::*;
+use hytte::services::niri;
+use hytte::ui::{layer_window, LayerShell};
+
+/// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
+/// Top inset of the frame (= top of the workspace cutout).
+const BAR_HEIGHT: f64 = 44.0;
+
+/// Frame thickness on left, right, and bottom. Must match the niri
+/// `struts` values in `etc/niri/frame.kdl`.
+const FRAME_THICKNESS: f64 = 8.0;
+
+/// Corner radius for all four corners of the workspace cutout.
+const CUTOUT_RADIUS: f64 = 10.0;
+
+/// Tolerance (logical pixels) when comparing a window's tile size to the
+/// monitor size to detect fullscreen. niri reports both in logical
+/// pixels, so an exact match is expected; a few pixels of slack covers
+/// fractional-scale rounding.
+const FULLSCREEN_TOL: f64 = 4.0;
+
+/// Mount one frame overlay on `monitor`.
+pub fn install(monitor: &Monitor) {
+    let connector = monitor.connector().unwrap_or_default();
+    let (mon_w, mon_h) = monitor.size();
+    let mon_w = f64::from(mon_w);
+    let mon_h = f64::from(mon_h);
+
+    let window = layer_window(monitor)
+        .layer(Layer::Overlay)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Bottom)
+        .anchor(Anchor::Left)
+        .anchor(Anchor::Right)
+        .namespace("hytte-frame")
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::None)
+        .build();
+    // Span the full output ignoring the bar's exclusive zone. Default is 0
+    // ("don't reserve, but be pushed by other surfaces' zones"), which would
+    // offset our surface down by the bar's height — leaving a visible gap
+    // between the bar's bottom and the frame's top. -1 means "ignore".
+    window.set_exclusive_zone(-1);
+    window.add_css_class("ts-frame");
+
+    // Transparent drawing area — fills the layer-shell surface.
+    let area = gtk::DrawingArea::new();
+    area.set_hexpand(true);
+    area.set_vexpand(true);
+    window.set_child(Some(&area));
+
+    install_draw(&area);
+
+    // Empty input region: clicks pass through to the bar (Layer::Top below)
+    // and to niri's apps (normal layer below that). Set after realize so
+    // the surface exists.
+    install_click_through(&window);
+
+    // Reactively hide the frame whenever this monitor's active workspace
+    // has a fullscreen-sized window. `Layer::Overlay` is always above
+    // niri's apps by spec — including fullscreen ones — so without this
+    // toggle the frame would paint over fullscreen content.
+    bind_fullscreen_visibility(&window, connector, mon_w, mon_h);
+
+    window.set_visible(true);
+}
+
+/// Hide the frame on `window` whenever the active workspace on the output
+/// named `connector` contains a fullscreen-sized window. A "fullscreen-sized"
+/// window is one whose `tile_size` matches the monitor's logical size
+/// within `FULLSCREEN_TOL`. niri reserves struts for non-fullscreen tiling,
+/// so a normally-maximized window has `tile_size` = output size minus
+/// struts — measurably smaller than fullscreen, so no false positives.
+fn bind_fullscreen_visibility(
+    window: &gtk::Window,
+    connector: String,
+    mon_w: f64,
+    mon_h: f64,
+) {
+    let workspaces = niri::workspaces();
+    let windows = niri::windows();
+    let visible = map_ref! {
+        let workspaces = workspaces,
+        let windows = windows => {
+            let active_id = workspaces
+                .iter()
+                .find(|ws| ws.output.as_deref() == Some(connector.as_str()) && ws.is_active)
+                .map(|ws| ws.id);
+            let fullscreen = active_id.is_some_and(|id| {
+                windows.iter().any(|w| {
+                    w.workspace_id == Some(id)
+                        && (w.layout.tile_size.0 - mon_w).abs() < FULLSCREEN_TOL
+                        && (w.layout.tile_size.1 - mon_h).abs() < FULLSCREEN_TOL
+                })
+            });
+            !fullscreen
+        }
+    };
+    bind_visible(visible, window);
+}
+
+/// Set an empty input region on the window's surface so every pointer
+/// event falls through to the layer below. Layer-shell does not give
+/// us this directly; we go through the underlying `GdkSurface` once
+/// it's realized.
+fn install_click_through(window: &gtk::Window) {
+    use hytte::gtk::cairo;
+
+    window.connect_realize(|w| {
+        if let Some(surface) = w.surface() {
+            // An empty cairo region == no pointer area == fully click-through.
+            let empty = cairo::Region::create();
+            surface.set_input_region(Some(&empty));
+        } else {
+            tracing::warn!("frame: window has no surface at realize");
+        }
+    });
+}
+
+fn install_draw(area: &gtk::DrawingArea) {
+    use hytte::gtk::cairo;
+
+    area.set_draw_func(move |_area, cr: &cairo::Context, width: i32, height: i32| {
+        let w = f64::from(width);
+        let h = f64::from(height);
+
+        // Skip if the area is too small to contain the bar + bottom inset.
+        if h <= BAR_HEIGHT + FRAME_THICKNESS || w <= 2.0 * FRAME_THICKNESS {
+            return;
+        }
+
+        let (cx, cy, cw, ch) = cutout_rect(w, h);
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+
+        // Build a path with two sub-paths: the outer "frame region" rect
+        // (everything below the bar), and the rounded cutout. Fill with
+        // EvenOdd so the cutout is excluded.
+        cr.set_fill_rule(cairo::FillRule::EvenOdd);
+
+        // Outer region: from (0, BAR_HEIGHT) to (w, h). Bar area above is
+        // left untouched (transparent), so the bar paints its own gradient.
+        cr.rectangle(0.0, BAR_HEIGHT, w, h - BAR_HEIGHT);
+
+        // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
+        rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
+
+        // Source: 3-stop horizontal gradient matching the bar's CSS,
+        // aligned to the full screen width so the bar's gradient and the
+        // frame's L/R borders are continuous at every x.
+        let gradient = cairo::LinearGradient::new(0.0, 0.0, w, 0.0);
+        gradient.add_color_stop_rgba(0.0, 15.0 / 255.0, 15.0 / 255.0, 35.0 / 255.0, 1.0);
+        gradient.add_color_stop_rgba(0.5, 25.0 / 255.0, 15.0 / 255.0, 45.0 / 255.0, 1.0);
+        gradient.add_color_stop_rgba(1.0, 15.0 / 255.0, 15.0 / 255.0, 35.0 / 255.0, 1.0);
+
+        if let Err(e) = cr.set_source(&gradient) {
+            tracing::warn!(error = %e, "frame: failed to set gradient source");
+            return;
+        }
+        if let Err(e) = cr.fill() {
+            tracing::warn!(error = %e, "frame: cairo fill failed");
+        }
+    });
+}
+
+/// Trace a closed rounded-rectangle sub-path of size (`rw`, `rh`) at (`rx`, `ry`)
+/// with corner radius `radius`, on the given cairo context. Does not stroke or fill.
+#[allow(clippy::many_single_char_names)]
+fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, radius: f64) {
+    use std::f64::consts::PI;
+    let r = radius.min(rw / 2.0).min(rh / 2.0);
+    cr.new_sub_path();
+    cr.arc(rx + rw - r, ry + r,      r, -PI / 2.0, 0.0);        // top-right
+    cr.arc(rx + rw - r, ry + rh - r, r, 0.0,       PI / 2.0);   // bottom-right
+    cr.arc(rx + r,      ry + rh - r, r, PI / 2.0,  PI);          // bottom-left
+    cr.arc(rx + r,      ry + r,      r, PI,         1.5 * PI);   // top-left
+    cr.close_path();
+}
+
+/// Cutout bounds for a monitor of size (`width`, `height`). The cutout
+/// is the rounded transparent rectangle inside which apps tile. Returns
+/// `(x, y, w, h)` of the cutout's bounding box (corner radius applied
+/// at draw time, not in this rect).
+fn cutout_rect(width: f64, height: f64) -> (f64, f64, f64, f64) {
+    let x = FRAME_THICKNESS;
+    let y = BAR_HEIGHT;
+    let w = (width - 2.0 * FRAME_THICKNESS).max(0.0);
+    let h = (height - BAR_HEIGHT - FRAME_THICKNESS).max(0.0);
+    (x, y, w, h)
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutout_rect_normal_monitor() {
+        // 1920x1080: bar 44 (top) + bottom inset N + L/R inset N each.
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0);
+        assert_eq!(x, FRAME_THICKNESS);
+        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
+    }
+
+    #[test]
+    fn cutout_rect_tiny_monitor_clamps_to_zero() {
+        // Pathological tiny monitor: cutout would be negative; clamp to 0
+        // to avoid passing negative dimensions into cairo. Use sub-frame
+        // dimensions so the clamp engages regardless of FRAME_THICKNESS.
+        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0);
+        assert_eq!(w, 0.0);
+        assert_eq!(h, 0.0);
+    }
+}

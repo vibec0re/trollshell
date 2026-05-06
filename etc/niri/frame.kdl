@@ -1,0 +1,12 @@
+// Inset the niri tiling area to match trollshell's frame overlay.
+// Top inset is reserved by the bar's exclusive zone — only L/R/bottom
+// need struts here. Numbers MUST match
+// trollshell/src/overlays/frame.rs::FRAME_THICKNESS (8.0).
+
+layout {
+    struts {
+        left 8
+        right 8
+        bottom 8
+    }
+}

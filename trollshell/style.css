@@ -27,6 +27,16 @@
     border: none;
     box-shadow: none;
 }
+
+/* ─── Frame overlay — full-screen click-through layer-shell window;
+ *     cairo draws the dark gradient frame around the workspace cutout.
+ *     Without explicit transparency the GtkWindow's default libadwaita
+ *     bg paints over everything below. ──────────────────────────────── */
+
+.ts-frame,
+.ts-frame drawingarea {
+    background: transparent;
+}
 .hytte-bar-top,
 .hytte-bar-bottom,
 .hytte-bar-left,

@@ -83,6 +83,7 @@ fn main() -> hytte::ui::Result<()> {
 
             // Notifications + OSD mount on every monitor; routing picks the focused one.
             for monitor in &app.monitors() {
+                overlays::frame::install(monitor);
                 overlays::notifications::install(monitor);
                 overlays::osd::install(monitor);
             }

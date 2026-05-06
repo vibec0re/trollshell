@@ -135,3 +135,49 @@ outright, drop them from the affected lines and re-load.
 - It does NOT ship a complete niri `config.kdl`. Only the `binds { }`
   fragment relevant to media keys lives here; the rest of niri configuration
   (layout, output, input) is the user's call.
+
+## Frame struts
+
+trollshell's frame overlay (added in 2026-05-06) draws a dark gradient
+border around the workspace and rounds the inner corners. For the
+border to align with niri's tiling area, niri needs matching struts on
+the left, right, and bottom — top is already reserved by the bar's
+exclusive zone.
+
+The snippet at `etc/niri/frame.kdl` defines those struts. niri does
+**not** support `include`, so the snippet has to be merged into your
+config by hand. Two cases:
+
+### You don't have a `layout { }` block yet
+
+Open `~/.config/niri/config.kdl` and paste the entire `layout { … }`
+block from `etc/niri/frame.kdl` near the top of the file (or anywhere
+at the top level). Reload niri (it picks up config changes
+automatically; otherwise `niri msg action reload-config`).
+
+### You already have a `layout { }` block
+
+Copy only the `struts { … }` sub-block into your existing `layout { }`.
+If you already have a `struts { }` block of your own, merge values: any
+existing inset on left / right / bottom should be the larger of the two,
+or 12 to match the frame.
+
+### Verification
+
+1. Restart trollshell (or wait for auto-reload). The bar should be a
+   flush full-width strip at top, with a 12px dark border on the left,
+   right, and bottom of the workspace and rounded corners on all four
+   sides of the cutout.
+2. Open a window and snap it into a corner. The window's edge should
+   stop 12px inside the screen edge (struts working) and the visible
+   corner should appear rounded (frame overlay working).
+3. If the window touches the screen edge, the strut isn't in effect —
+   re-check the merged `layout { }` block.
+
+### Tuning
+
+Both numbers (frame thickness in trollshell, struts in niri) MUST match.
+If you change one, change the other:
+
+- niri: `etc/niri/frame.kdl` → `struts { left N; right N; bottom N }`
+- trollshell: `trollshell/src/overlays/frame.rs::FRAME_THICKNESS`

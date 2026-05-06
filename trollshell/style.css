@@ -35,15 +35,13 @@
 }
 .hytte-bar-content {
     padding: 6px 12px;
-    margin: 5px 5px;
-    margin-bottom: 10px;
+    margin: 0;
     min-height: 32px;
-    border-radius: 12px;
+    border-radius: 0;
     background: linear-gradient(90deg,
         rgba(15, 15, 35, 1) 0%,
         rgba(25, 15, 45, 1) 50%,
         rgba(15, 15, 35, 1) 100%);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
 }
 /* Drawer open: square off the bar's bottom-right corner so the bar and
  * drawer share a clean vertical edge on the right. */

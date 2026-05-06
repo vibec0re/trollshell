@@ -16,7 +16,7 @@
 
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
-use hytte::ui::layer_window;
+use hytte::ui::{layer_window, LayerShell};
 
 /// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
 /// Top inset of the frame (= top of the workspace cutout).
@@ -41,6 +41,11 @@ pub fn install(monitor: &Monitor) {
         .exclusive(false)
         .keyboard_mode(KeyboardMode::None)
         .build();
+    // Span the full output ignoring the bar's exclusive zone. Default is 0
+    // ("don't reserve, but be pushed by other surfaces' zones"), which would
+    // offset our surface down by the bar's height — leaving a visible gap
+    // between the bar's bottom and the frame's top. -1 means "ignore".
+    window.set_exclusive_zone(-1);
     window.add_css_class("ts-frame");
 
     // Transparent drawing area — fills the layer-shell surface.

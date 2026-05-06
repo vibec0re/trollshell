@@ -160,16 +160,16 @@ automatically; otherwise `niri msg action reload-config`).
 Copy only the `struts { … }` sub-block into your existing `layout { }`.
 If you already have a `struts { }` block of your own, merge values: any
 existing inset on left / right / bottom should be the larger of the two,
-or 12 to match the frame.
+or 8 to match the frame.
 
 ### Verification
 
 1. Restart trollshell (or wait for auto-reload). The bar should be a
-   flush full-width strip at top, with a 12px dark border on the left,
+   flush full-width strip at top, with an 8px dark border on the left,
    right, and bottom of the workspace and rounded corners on all four
    sides of the cutout.
 2. Open a window and snap it into a corner. The window's edge should
-   stop 12px inside the screen edge (struts working) and the visible
+   stop 8px inside the screen edge (struts working) and the visible
    corner should appear rounded (frame overlay working).
 3. If the window touches the screen edge, the strut isn't in effect —
    re-check the merged `layout { }` block.

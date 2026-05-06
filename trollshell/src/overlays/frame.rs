@@ -24,10 +24,10 @@ const BAR_HEIGHT: f64 = 44.0;
 
 /// Frame thickness on left, right, and bottom. Must match the niri
 /// `struts` values in `etc/niri/frame.kdl`.
-const FRAME_THICKNESS: f64 = 12.0;
+const FRAME_THICKNESS: f64 = 8.0;
 
 /// Corner radius for all four corners of the workspace cutout.
-const CUTOUT_RADIUS: f64 = 16.0;
+const CUTOUT_RADIUS: f64 = 10.0;
 
 /// Mount one frame overlay on `monitor`.
 pub fn install(monitor: &Monitor) {
@@ -162,19 +162,20 @@ mod tests {
 
     #[test]
     fn cutout_rect_normal_monitor() {
-        // 1920x1080: bar 44 + bottom inset 12 + L/R inset 12 each.
+        // 1920x1080: bar 44 (top) + bottom inset N + L/R inset N each.
         let (x, y, w, h) = cutout_rect(1920.0, 1080.0);
-        assert_eq!(x, 12.0);
-        assert_eq!(y, 44.0);
-        assert_eq!(w, 1920.0 - 24.0);
-        assert_eq!(h, 1080.0 - 44.0 - 12.0);
+        assert_eq!(x, FRAME_THICKNESS);
+        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
     }
 
     #[test]
     fn cutout_rect_tiny_monitor_clamps_to_zero() {
         // Pathological tiny monitor: cutout would be negative; clamp to 0
-        // to avoid passing negative dimensions into cairo.
-        let (_x, _y, w, h) = cutout_rect(20.0, 30.0);
+        // to avoid passing negative dimensions into cairo. Use sub-frame
+        // dimensions so the clamp engages regardless of FRAME_THICKNESS.
+        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0);
         assert_eq!(w, 0.0);
         assert_eq!(h, 0.0);
     }

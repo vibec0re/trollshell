@@ -45,7 +45,11 @@
 }
 .hytte-bar-content {
     padding: 6px 12px;
-    margin: 0;
+    /* L/R margin must match trollshell/src/overlays/frame.rs::FRAME_THICKNESS
+     * so the bar's left/right edges line up vertically with the workspace
+     * cutout below. The frame paints the L/R slivers at the top of the
+     * screen with the same gradient. */
+    margin: 0 8px;
     min-height: 32px;
     border-radius: 0;
     background: linear-gradient(90deg,

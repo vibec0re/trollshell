@@ -108,6 +108,12 @@ fn echo_settled<T: Copy + PartialEq>(
 // ── Sinks ────────────────────────────────────────────────────────────────────
 
 struct SinkRow {
+    /// `ListBox::append` auto-wraps any non-`ListBoxRow` child in a
+    /// generated `ListBoxRow` and uses *that* as its child — so passing
+    /// the inner widget back to `ListBox::remove` later silently fails
+    /// ("Tried to remove non-child"). We wrap explicitly so the same
+    /// handle is used for both append and remove.
+    row: gtk::ListBoxRow,
     widget: gtk::Box,
     radio_btn: gtk::Button,
     radio_lbl: gtk::Label,
@@ -176,7 +182,10 @@ impl SinkRow {
         });
         widget.append(&mute_btn);
 
+        let lbr = gtk::ListBoxRow::new();
+        lbr.set_child(Some(&widget));
         let row = SinkRow {
+            row: lbr,
             widget,
             radio_btn,
             radio_lbl,
@@ -240,7 +249,7 @@ fn build_sink_list() -> gtk::ListBox {
             .collect();
         for k in gone {
             if let Some(r) = rows.remove(&k) {
-                list_for_bind.remove(&r.widget);
+                list_for_bind.remove(&r.row);
             }
         }
         for s in &sinks {
@@ -248,7 +257,7 @@ fn build_sink_list() -> gtk::ListBox {
                 row.update(s);
             } else {
                 let row = SinkRow::new(s);
-                list_for_bind.append(&row.widget);
+                list_for_bind.append(&row.row);
                 rows.insert(s.name.clone(), row);
             }
         }
@@ -259,6 +268,7 @@ fn build_sink_list() -> gtk::ListBox {
 // ── Sources ──────────────────────────────────────────────────────────────────
 
 struct SourceRow {
+    row: gtk::ListBoxRow,
     widget: gtk::Box,
     radio_btn: gtk::Button,
     radio_lbl: gtk::Label,
@@ -323,7 +333,10 @@ impl SourceRow {
         });
         widget.append(&mute_btn);
 
+        let lbr = gtk::ListBoxRow::new();
+        lbr.set_child(Some(&widget));
         let row = SourceRow {
+            row: lbr,
             widget,
             radio_btn,
             radio_lbl,
@@ -390,7 +403,7 @@ fn build_source_list() -> gtk::ListBox {
                 .collect();
             for k in gone {
                 if let Some(r) = rows.remove(&k) {
-                    list_for_bind.remove(&r.widget);
+                    list_for_bind.remove(&r.row);
                 }
             }
             for s in &sources {
@@ -398,7 +411,7 @@ fn build_source_list() -> gtk::ListBox {
                     row.update(s);
                 } else {
                     let row = SourceRow::new(s);
-                    list_for_bind.append(&row.widget);
+                    list_for_bind.append(&row.row);
                     rows.insert(s.name.clone(), row);
                 }
             }
@@ -410,7 +423,7 @@ fn build_source_list() -> gtk::ListBox {
 // ── Playback streams ─────────────────────────────────────────────────────────
 
 struct StreamRow {
-    widget: gtk::Box,
+    row: gtk::ListBoxRow,
     name_lbl: gtk::Label,
     slider: gtk::Scale,
     pending_volume: Rc<Cell<Option<(f64, Instant)>>>,
@@ -470,8 +483,10 @@ impl StreamRow {
         });
         widget.append(&mute_btn);
 
+        let lbr = gtk::ListBoxRow::new();
+        lbr.set_child(Some(&widget));
         StreamRow {
-            widget,
+            row: lbr,
             name_lbl,
             slider,
             pending_volume,
@@ -510,13 +525,15 @@ impl StreamRow {
 fn build_playback_list() -> gtk::ListBox {
     let list = boxed_list();
     let rows: Rc<RefCell<HashMap<u32, StreamRow>>> = Rc::new(RefCell::new(HashMap::new()));
-    let placeholder = gtk::Label::new(Some("No active streams"));
-    placeholder.set_xalign(0.0);
-    placeholder.add_css_class("dim-label");
-    placeholder.set_margin_start(12);
-    placeholder.set_margin_end(12);
-    placeholder.set_margin_top(8);
-    placeholder.set_margin_bottom(8);
+    let placeholder_lbl = gtk::Label::new(Some("No active streams"));
+    placeholder_lbl.set_xalign(0.0);
+    placeholder_lbl.add_css_class("dim-label");
+    placeholder_lbl.set_margin_start(12);
+    placeholder_lbl.set_margin_end(12);
+    placeholder_lbl.set_margin_top(8);
+    placeholder_lbl.set_margin_bottom(8);
+    let placeholder = gtk::ListBoxRow::new();
+    placeholder.set_child(Some(&placeholder_lbl));
     list.append(&placeholder);
     let placeholder_attached = Rc::new(Cell::new(true));
 
@@ -546,7 +563,7 @@ fn build_playback_list() -> gtk::ListBox {
                 .collect();
             for id in gone {
                 if let Some(r) = rows.remove(&id) {
-                    list_for_bind.remove(&r.widget);
+                    list_for_bind.remove(&r.row);
                 }
             }
             for s in &streams {
@@ -554,7 +571,7 @@ fn build_playback_list() -> gtk::ListBox {
                     row.update(s);
                 } else {
                     let row = StreamRow::new(s);
-                    list_for_bind.append(&row.widget);
+                    list_for_bind.append(&row.row);
                     rows.insert(s.id, row);
                 }
             }

@@ -152,25 +152,14 @@ fn install_draw(area: &gtk::DrawingArea) {
             return;
         }
 
-        // Build a path with three sub-paths: the outer full-screen rect,
-        // the bar interior (transparent so the bar shows through), and
-        // the rounded workspace cutout. Fill with EvenOdd so both inner
-        // sub-paths are excluded.
+        // Build a path with two sub-paths: the outer "frame region" rect
+        // (everything below the bar), and the rounded cutout. Fill with
+        // EvenOdd so the cutout is excluded.
         cr.set_fill_rule(cairo::FillRule::EvenOdd);
 
-        // Outer region: full screen.
-        cr.rectangle(0.0, 0.0, w, h);
-
-        // Bar interior: the bar's `.hytte-bar-content` is inset by
-        // FRAME_THICKNESS on L/R via CSS, so the frame paints the L/R
-        // slivers at the top of the screen. Leaving the bar interior
-        // transparent here lets the bar's own gradient show through.
-        cr.rectangle(
-            FRAME_THICKNESS,
-            0.0,
-            w - 2.0 * FRAME_THICKNESS,
-            BAR_HEIGHT,
-        );
+        // Outer region: from (0, BAR_HEIGHT) to (w, h). Bar area above is
+        // left untouched (transparent), so the bar paints its own gradient.
+        cr.rectangle(0.0, BAR_HEIGHT, w, h - BAR_HEIGHT);
 
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);

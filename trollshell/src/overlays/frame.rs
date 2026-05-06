@@ -14,6 +14,7 @@
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
+use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::ui::layer_window;
 
@@ -29,6 +30,145 @@ const FRAME_THICKNESS: f64 = 12.0;
 const CUTOUT_RADIUS: f64 = 16.0;
 
 /// Mount one frame overlay on `monitor`.
-pub fn install(_monitor: &Monitor) {
-    // Skeleton — implementation lands in tasks 3 and 4.
+pub fn install(monitor: &Monitor) {
+    let window = layer_window(monitor)
+        .layer(Layer::Overlay)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Bottom)
+        .anchor(Anchor::Left)
+        .anchor(Anchor::Right)
+        .namespace("hytte-frame")
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::None)
+        .build();
+    window.add_css_class("ts-frame");
+
+    // Transparent drawing area — fills the layer-shell surface.
+    let area = gtk::DrawingArea::new();
+    area.set_hexpand(true);
+    area.set_vexpand(true);
+    window.set_child(Some(&area));
+
+    install_draw(&area);
+
+    // Empty input region: clicks pass through to the bar (Layer::Top below)
+    // and to niri's apps (normal layer below that). Set after realize so
+    // the surface exists.
+    install_click_through(&window);
+
+    window.set_visible(true);
+}
+
+/// Set an empty input region on the window's surface so every pointer
+/// event falls through to the layer below. Layer-shell does not give
+/// us this directly; we go through the underlying `GdkSurface` once
+/// it's realized.
+fn install_click_through(window: &gtk::Window) {
+    use hytte::gtk::cairo;
+
+    window.connect_realize(|w| {
+        if let Some(surface) = w.surface() {
+            // An empty cairo region == no pointer area == fully click-through.
+            let empty = cairo::Region::create();
+            surface.set_input_region(Some(&empty));
+        } else {
+            tracing::warn!("frame: window has no surface at realize");
+        }
+    });
+}
+
+fn install_draw(area: &gtk::DrawingArea) {
+    use hytte::gtk::cairo;
+
+    area.set_draw_func(move |_area, cr: &cairo::Context, width: i32, height: i32| {
+        let w = f64::from(width);
+        let h = f64::from(height);
+
+        // Skip if the area is too small to contain the bar + bottom inset.
+        if h <= BAR_HEIGHT + FRAME_THICKNESS || w <= 2.0 * FRAME_THICKNESS {
+            return;
+        }
+
+        let (cx, cy, cw, ch) = cutout_rect(w, h);
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+
+        // Build a path with two sub-paths: the outer "frame region" rect
+        // (everything below the bar), and the rounded cutout. Fill with
+        // EvenOdd so the cutout is excluded.
+        cr.set_fill_rule(cairo::FillRule::EvenOdd);
+
+        // Outer region: from (0, BAR_HEIGHT) to (w, h). Bar area above is
+        // left untouched (transparent), so the bar paints its own gradient.
+        cr.rectangle(0.0, BAR_HEIGHT, w, h - BAR_HEIGHT);
+
+        // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
+        rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
+
+        // Source: 3-stop horizontal gradient matching the bar's CSS,
+        // aligned to the full screen width so the bar's gradient and the
+        // frame's L/R borders are continuous at every x.
+        let gradient = cairo::LinearGradient::new(0.0, 0.0, w, 0.0);
+        gradient.add_color_stop_rgba(0.0, 15.0 / 255.0, 15.0 / 255.0, 35.0 / 255.0, 1.0);
+        gradient.add_color_stop_rgba(0.5, 25.0 / 255.0, 15.0 / 255.0, 45.0 / 255.0, 1.0);
+        gradient.add_color_stop_rgba(1.0, 15.0 / 255.0, 15.0 / 255.0, 35.0 / 255.0, 1.0);
+
+        if let Err(e) = cr.set_source(&gradient) {
+            tracing::warn!(error = %e, "frame: failed to set gradient source");
+            return;
+        }
+        if let Err(e) = cr.fill() {
+            tracing::warn!(error = %e, "frame: cairo fill failed");
+        }
+    });
+}
+
+/// Trace a closed rounded-rectangle sub-path of size (`w`, `h`) at (`x`, `y`)
+/// with corner radius `r`, on the given cairo context. Does not stroke or fill.
+fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    use std::f64::consts::PI;
+    let r = r.min(w / 2.0).min(h / 2.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r,     r, -PI / 2.0, 0.0);        // top-right
+    cr.arc(x + w - r, y + h - r, r, 0.0,       PI / 2.0);   // bottom-right
+    cr.arc(x + r,     y + h - r, r, PI / 2.0,  PI);          // bottom-left
+    cr.arc(x + r,     y + r,     r, PI,         1.5 * PI);   // top-left
+    cr.close_path();
+}
+
+/// Cutout bounds for a monitor of size (`width`, `height`). The cutout
+/// is the rounded transparent rectangle inside which apps tile. Returns
+/// `(x, y, w, h)` of the cutout's bounding box (corner radius applied
+/// at draw time, not in this rect).
+fn cutout_rect(width: f64, height: f64) -> (f64, f64, f64, f64) {
+    let x = FRAME_THICKNESS;
+    let y = BAR_HEIGHT;
+    let w = (width - 2.0 * FRAME_THICKNESS).max(0.0);
+    let h = (height - BAR_HEIGHT - FRAME_THICKNESS).max(0.0);
+    (x, y, w, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutout_rect_normal_monitor() {
+        // 1920x1080: bar 44 + bottom inset 12 + L/R inset 12 each.
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0);
+        assert_eq!(x, 12.0);
+        assert_eq!(y, 44.0);
+        assert_eq!(w, 1920.0 - 24.0);
+        assert_eq!(h, 1080.0 - 44.0 - 12.0);
+    }
+
+    #[test]
+    fn cutout_rect_tiny_monitor_clamps_to_zero() {
+        // Pathological tiny monitor: cutout would be negative; clamp to 0
+        // to avoid passing negative dimensions into cairo.
+        let (_x, _y, w, h) = cutout_rect(20.0, 30.0);
+        assert_eq!(w, 0.0);
+        assert_eq!(h, 0.0);
+    }
 }

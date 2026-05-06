@@ -13,7 +13,7 @@
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{registry, Service};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -144,12 +144,9 @@ impl Service for PipewireService {
                 }
             };
 
-            // Initial seed.
-            if let Some(state) = read_full_state() {
-                emit(state);
-            }
-
-            // Subscribe loop with restart-on-death backoff.
+            // Subscribe loop with restart-on-death backoff. Each session
+            // re-seeds via `read_full_state` at start, so the initial fetch
+            // is implicit in the first iteration.
             loop {
                 let Ok(mut child) = Command::new("pactl")
                     .arg("subscribe")
@@ -167,15 +164,11 @@ impl Service for PipewireService {
                     continue;
                 };
 
-                for line in BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if !is_relevant_event(&line) {
-                        continue;
-                    }
-                    if let Some(state) = read_full_state() {
-                        emit(state);
-                    }
-                }
+                run_subscribe_session(
+                    read_full_state,
+                    BufReader::new(stdout).lines(),
+                    &mut emit,
+                );
 
                 // pactl subscribe died — clean up and retry shortly.
                 let _ = child.kill();
@@ -185,6 +178,35 @@ impl Service for PipewireService {
         });
 
         handles
+    }
+}
+
+/// Drive one `pactl subscribe` session: re-seed once at start, then refetch
+/// and emit on every relevant event line. Returns when `events` ends — the
+/// caller owns the restart loop.
+///
+/// The start-of-session re-seed catches state changes that happened between
+/// the previous session ending and this one starting — those changes never
+/// produce a wakeup event of their own, so without re-seeding they linger
+/// until something else fires (e.g. a closed-tab sink-input never going
+/// away in the UI).
+fn run_subscribe_session<R, E, F>(read_state: R, events: E, mut emit: F)
+where
+    R: Fn() -> Option<FullState>,
+    E: IntoIterator<Item = io::Result<String>>,
+    F: FnMut(FullState),
+{
+    if let Some(state) = read_state() {
+        emit(state);
+    }
+    for line in events {
+        let Ok(line) = line else { break };
+        if !is_relevant_event(&line) {
+            continue;
+        }
+        if let Some(state) = read_state() {
+            emit(state);
+        }
     }
 }
 
@@ -898,6 +920,39 @@ Sink Input #77\n\
         assert!(super::parse_pactl_mute("yes"));
         assert!(super::parse_pactl_mute("  yes  "));
         assert!(!super::parse_pactl_mute("no"));
+    }
+
+    #[test]
+    fn run_subscribe_session_reseeds_on_start() {
+        // Bug repro: when `pactl subscribe` dies and respawns, any state
+        // changes that happened during the gap arrive on no event line —
+        // they're already in pactl's snapshot but no "remove"/"change"
+        // wakeup ever fires. Each session must therefore call read_state +
+        // emit at start, before consuming events. Otherwise stale streams
+        // (closed Firefox tabs, etc.) linger in the UI forever.
+        use std::cell::Cell;
+        use std::io;
+
+        let read_calls = Cell::new(0);
+        let read_state = || {
+            read_calls.set(read_calls.get() + 1);
+            Some(super::FullState {
+                sinks: vec![],
+                sources: vec![],
+                streams: vec![],
+                record_streams: vec![],
+            })
+        };
+        // No events arrive — simulates subscribe attaching and immediately
+        // dying, or a quiet system after a pipewire-pulse restart.
+        let events: Vec<io::Result<String>> = vec![];
+        let mut emit_count = 0;
+        super::run_subscribe_session(read_state, events, |_| {
+            emit_count += 1;
+        });
+
+        assert_eq!(read_calls.get(), 1, "should re-seed via read_state");
+        assert_eq!(emit_count, 1, "should emit the re-seeded state");
     }
 
     #[test]

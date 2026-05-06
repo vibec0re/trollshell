@@ -124,16 +124,17 @@ fn install_draw(area: &gtk::DrawingArea) {
     });
 }
 
-/// Trace a closed rounded-rectangle sub-path of size (`w`, `h`) at (`x`, `y`)
-/// with corner radius `r`, on the given cairo context. Does not stroke or fill.
-fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+/// Trace a closed rounded-rectangle sub-path of size (`rw`, `rh`) at (`rx`, `ry`)
+/// with corner radius `radius`, on the given cairo context. Does not stroke or fill.
+#[allow(clippy::many_single_char_names)]
+fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, radius: f64) {
     use std::f64::consts::PI;
-    let r = r.min(w / 2.0).min(h / 2.0);
+    let r = radius.min(rw / 2.0).min(rh / 2.0);
     cr.new_sub_path();
-    cr.arc(x + w - r, y + r,     r, -PI / 2.0, 0.0);        // top-right
-    cr.arc(x + w - r, y + h - r, r, 0.0,       PI / 2.0);   // bottom-right
-    cr.arc(x + r,     y + h - r, r, PI / 2.0,  PI);          // bottom-left
-    cr.arc(x + r,     y + r,     r, PI,         1.5 * PI);   // top-left
+    cr.arc(rx + rw - r, ry + r,      r, -PI / 2.0, 0.0);        // top-right
+    cr.arc(rx + rw - r, ry + rh - r, r, 0.0,       PI / 2.0);   // bottom-right
+    cr.arc(rx + r,      ry + rh - r, r, PI / 2.0,  PI);          // bottom-left
+    cr.arc(rx + r,      ry + r,      r, PI,         1.5 * PI);   // top-left
     cr.close_path();
 }
 
@@ -150,6 +151,7 @@ fn cutout_rect(width: f64, height: f64) -> (f64, f64, f64, f64) {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

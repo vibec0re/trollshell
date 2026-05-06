@@ -107,14 +107,14 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
         Ok(((sout, serr), Ok(status))) if status.success() => {
             tracing::info!(event, "hooks: ran");
             if !sout.is_empty() {
-                tracing::debug!(
+                tracing::info!(
                     event,
                     stdout = %String::from_utf8_lossy(&sout),
                     "hooks: stdout",
                 );
             }
             if !serr.is_empty() {
-                tracing::debug!(
+                tracing::info!(
                     event,
                     stderr = %String::from_utf8_lossy(&serr),
                     "hooks: stderr",
@@ -291,9 +291,9 @@ mod tests {
                 "expected an INFO 'ran' event, got: {events:#?}",
             );
             assert!(
-                events.iter().any(|e| e.level == tracing::Level::DEBUG
+                events.iter().any(|e| e.level == tracing::Level::INFO
                     && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))),
-                "expected a DEBUG event with stdout=hi, got: {events:#?}",
+                "expected an INFO event with stdout=hi, got: {events:#?}",
             );
         })
         .await;

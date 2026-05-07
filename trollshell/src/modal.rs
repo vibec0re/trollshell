@@ -102,16 +102,16 @@ pub fn install(monitor: &Monitor) {
     // the drawer above its catcher.
     let catcher = build_catcher(monitor, key.clone());
 
-    // Drawer and bar both live on `Layer::Top`; the drawer butts flush up
-    // against the bar's bottom (no overlap) so there's no z-order conflict
-    // at the seam to worry about. Bar stays on the default Top layer so
-    // fullscreen apps can still cover it.
+    // Drawer and bar both live on `Layer::Top`. There's a 10 px gap below
+    // the bar before the drawer starts, so the drawer reads as a separate
+    // floating card rather than an extension of the bar. Bar stays on the
+    // default Top layer so fullscreen apps can still cover it.
     let window = layer_window(monitor)
         .layer(Layer::Top)
         .anchor(Anchor::Top)
         .anchor(Anchor::Right)
         .margin(Margin {
-            top: 49,
+            top: 59,
             right: 0,
             bottom: 0,
             left: 0,

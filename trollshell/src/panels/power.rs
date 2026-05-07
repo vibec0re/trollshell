@@ -11,12 +11,11 @@ use hytte::services::brightness;
 use hytte::services::power_profiles::{self, humanize_profile};
 use hytte::services::upower::{self, Battery, BatteryState};
 
-use crate::components::layout::{finish_page, page_grid, section};
+use crate::components::layout::{finish_page, page_box, section};
 
 pub fn panel_power() -> gtk::Widget {
-    let grid = page_grid();
+    let column = page_box();
 
-    // ── Battery panel (col 0) ─────────────────────────────────────────────────
     let battery = section("Battery");
 
     let battery_group = adw::PreferencesGroup::new();
@@ -36,13 +35,13 @@ pub fn panel_power() -> gtk::Widget {
     battery_group.add(&battery_row);
     battery_group.add(&build_power_profile_expander());
     battery.append(&battery_group);
-    grid.attach(&battery, 0, 0, 1, 1);
+    column.append(&battery);
 
     let bright = section("Brightness");
     bright.append(&build_brightness_row());
-    grid.attach(&bright, 1, 0, 1, 1);
+    column.append(&bright);
 
-    finish_page(&grid)
+    finish_page(&column)
 }
 
 /// Boxed `gtk::ListBox` matching Adwaita's `boxed-list` style.

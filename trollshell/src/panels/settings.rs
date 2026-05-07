@@ -1,13 +1,13 @@
 //! Drawer panel exposing trollshell-wide preferences. v1 (minimal) covers two
 //! knobs:
 //!
-//! - Theme (Light / Dark) — delegated to `hytte::services::theme`, which
-//!   fans out across GTK4/libadwaita, legacy GTK (gsettings + settings.ini),
-//!   and Qt (qt[56]ct.conf). The dropdown reads the current theme once at
-//!   page mount and writes back on selection change; we do NOT live-track
-//!   external changes. Trollshell *is* the compositor session, so "follow
-//!   system" is meaningless — if gsettings reads back `default` (externally
-//!   set), the service surfaces Dark and the next user pick makes it canonical.
+//! - Dark mode — delegated to `hytte::services::theme`, which fans out across
+//!   GTK4/libadwaita, legacy GTK (gsettings + settings.ini), and Qt
+//!   (qt[56]ct.conf). The switch reads the current theme once at page mount
+//!   and writes back on toggle; we do NOT live-track external changes.
+//!   Trollshell *is* the compositor session, so "follow system" is
+//!   meaningless — if gsettings reads back `default` (externally set), the
+//!   service surfaces Dark and the next user pick makes it canonical.
 //! - Do Not Disturb — duplicates the toggle at the top of `panel_notifications`.
 //!   Both bindings drive the same `dnd::set_enabled` setter and observe the
 //!   same `dnd::enabled` signal, so they stay in sync.
@@ -34,20 +34,23 @@ pub fn panel_settings() -> gtk::Widget {
     // ── Appearance ────────────────────────────────────────────────────────
     let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
 
-    let theme_row = adw::ActionRow::builder()
-        .title("Theme")
-        .subtitle("Light or dark.")
-        .build();
+    let theme_row = adw::ActionRow::builder().title("Dark mode").build();
 
-    // Order: ["Light", "Dark"] — matches `theme_from_index` mapping.
-    let theme_dropdown = gtk::DropDown::from_strings(&["Light", "Dark"]);
-    theme_dropdown.set_valign(gtk::Align::Center);
-    theme_dropdown.set_selected(theme_to_index(hytte::services::theme::current()));
-    theme_dropdown.connect_selected_notify(|dd| {
-        hytte::services::theme::set(theme_from_index(dd.selected()));
+    let theme_switch = gtk::Switch::new();
+    theme_switch.set_valign(gtk::Align::Center);
+    theme_switch.set_active(matches!(
+        hytte::services::theme::current(),
+        hytte::services::theme::Theme::Dark
+    ));
+    theme_switch.connect_active_notify(|sw| {
+        hytte::services::theme::set(if sw.is_active() {
+            hytte::services::theme::Theme::Dark
+        } else {
+            hytte::services::theme::Theme::Light
+        });
     });
-    theme_row.add_suffix(&theme_dropdown);
-    theme_row.set_activatable_widget(Some(&theme_dropdown));
+    theme_row.add_suffix(&theme_switch);
+    theme_row.set_activatable_widget(Some(&theme_switch));
     appearance.add(&theme_row);
 
     column.append(&appearance);
@@ -188,21 +191,5 @@ fn profile_icon_name(active: &str) -> &'static str {
         "balanced" => "power-profile-balanced-symbolic",
         "power-saver" => "power-profile-power-saver-symbolic",
         _ => "system-run-symbolic",
-    }
-}
-
-/// Theme dropdown index <-> `hytte::services::theme::Theme`. Order matches
-/// the strings passed to `gtk::DropDown::from_strings` in `panel_settings`.
-fn theme_from_index(i: u32) -> hytte::services::theme::Theme {
-    match i {
-        0 => hytte::services::theme::Theme::Light,
-        _ => hytte::services::theme::Theme::Dark,
-    }
-}
-
-fn theme_to_index(t: hytte::services::theme::Theme) -> u32 {
-    match t {
-        hytte::services::theme::Theme::Light => 0,
-        hytte::services::theme::Theme::Dark => 1,
     }
 }

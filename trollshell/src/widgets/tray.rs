@@ -66,54 +66,92 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
         btn.set_tooltip_markup(Some(&tooltip_markup));
     }
 
-    // Primary click → Activate.
-    let bus = item.bus_name.clone();
-    let path = item.object_path.clone();
-    btn.connect_clicked(move |_| tray::activate(&bus, &path));
+    let bus_name = item.bus_name.clone();
+    let object_path = item.object_path.clone();
+    let menu_path = item.menu_path.clone();
+    let item_is_menu = item.item_is_menu;
 
-    // Secondary click → open DBusMenu if available.
-    if let Some(menu_path) = item.menu_path.clone() {
-        let bus_name = item.bus_name.clone();
+    // Primary click. Per SNI spec, when `ItemIsMenu` is true the app has no
+    // separate primary action — left-click should show the menu instead.
+    {
+        let bus_name = bus_name.clone();
+        let object_path = object_path.clone();
+        let menu_path = menu_path.clone();
+        let btn_weak = btn.downgrade();
+        btn.connect_clicked(move |_| {
+            if item_is_menu {
+                show_context_menu(
+                    btn_weak.clone(),
+                    bus_name.clone(),
+                    object_path.clone(),
+                    menu_path.clone(),
+                );
+            } else {
+                tray::activate(&bus_name, &object_path);
+            }
+        });
+    }
+
+    // Secondary click → DBusMenu popover if available, otherwise fall back to
+    // the SNI's own `ContextMenu(x, y)` method (apps without a DBusMenu still
+    // expect right-click to do *something*).
+    {
         let gesture = gtk::GestureClick::new();
         gesture.set_button(gdk::BUTTON_SECONDARY);
-        // Capture phase so we see the event before gtk::Button's own
-        // built-in click gesture has a chance to swallow it.
+        // Capture phase so we see the event before gtk::Button's built-in
+        // click gesture has a chance to swallow it.
         gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
         let btn_weak = btn.downgrade();
+        let bus_name = bus_name.clone();
+        let object_path = object_path.clone();
+        let menu_path = menu_path.clone();
         gesture.connect_pressed(move |gesture, _, _, _| {
-            tracing::info!(bus = %bus_name, path = %menu_path, "tray right-click");
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            let bus_name = bus_name.clone();
-            let menu_path = menu_path.clone();
-            let btn_weak = btn_weak.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let Some(btn) = btn_weak.upgrade() else {
-                    tracing::info!("tray button dropped before menu fetch finished");
-                    return;
-                };
-                let menu = tray::fetch_menu(&bus_name, &menu_path).await;
-                let items = if let Some(m) = menu {
-                    tracing::info!(count = m.items.len(), "tray menu fetched");
-                    m.items
-                } else {
-                    tracing::info!("tray menu fetch returned None");
-                    return;
-                };
-                if items.is_empty() {
-                    tracing::info!("tray menu has zero entries");
-                    return;
-                }
-                let popover = build_menu_popover(&bus_name, &menu_path, &items);
-                popover.set_parent(&btn);
-                popover.popup();
-            });
+            show_context_menu(
+                btn_weak.clone(),
+                bus_name.clone(),
+                object_path.clone(),
+                menu_path.clone(),
+            );
         });
         btn.add_controller(gesture);
-    } else {
-        tracing::debug!(item = %item.bus_name, "tray item has no menu_path");
     }
 
     btn
+}
+
+/// Display the context menu for a tray item. Prefers the `com.canonical.dbusmenu`
+/// popover when the app exports one; falls back to calling `ContextMenu(x, y)`
+/// on the `StatusNotifierItem` so the app can show its own menu.
+fn show_context_menu(
+    btn_weak: glib::WeakRef<gtk::Button>,
+    bus_name: String,
+    object_path: String,
+    menu_path: Option<String>,
+) {
+    glib::MainContext::default().spawn_local(async move {
+        let Some(btn) = btn_weak.upgrade() else {
+            return;
+        };
+
+        if let Some(mp) = menu_path {
+            let menu = tray::fetch_menu(&bus_name, &mp).await;
+            if let Some(m) = menu {
+                if !m.items.is_empty() {
+                    let popover = build_menu_popover(&bus_name, &mp, &m.items);
+                    popover.set_parent(&btn);
+                    popover.popup();
+                    return;
+                }
+                tracing::debug!(bus = %bus_name, path = %mp, "DBusMenu empty, falling back to ContextMenu");
+            } else {
+                tracing::debug!(bus = %bus_name, path = %mp, "DBusMenu fetch failed, falling back to ContextMenu");
+            }
+        }
+
+        // No DBusMenu (or it was empty/failed) — let the app show its own menu.
+        tray::context_menu(&bus_name, &object_path);
+    });
 }
 
 /// Build a `gtk::Popover` containing a vertical box of menu items.

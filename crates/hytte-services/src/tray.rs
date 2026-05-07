@@ -78,6 +78,10 @@ pub struct TrayItem {
     pub tooltip_description: String,
     /// Object path of the `com.canonical.dbusmenu` menu, if any.
     pub menu_path: Option<String>,
+    /// `ItemIsMenu` — when `true`, the SNI spec asks visualizations to treat
+    /// primary click as "show menu" rather than `Activate`. Common for Qt/KDE
+    /// status icons that have no separate primary action.
+    pub item_is_menu: bool,
 }
 
 // ── DBusMenu public types ─────────────────────────────────────────────────────
@@ -213,6 +217,19 @@ pub fn activate(bus_name: &str, object_path: &str) {
         .at_path(object_path)
         .iface(SNI_IFACE)
         .method("Activate")
+        .args((0i32, 0i32))
+        .fire_and_forget();
+}
+
+/// Fire-and-forget: send `ContextMenu(0, 0)` — asks the app to show its own
+/// context menu. Used as a fallback when an item has no `com.canonical.dbusmenu`
+/// path, and as the primary "show menu" action for `ItemIsMenu` items.
+pub fn context_menu(bus_name: &str, object_path: &str) {
+    call(bus_name)
+        .bus(BusKind::Session)
+        .at_path(object_path)
+        .iface(SNI_IFACE)
+        .method("ContextMenu")
         .args((0i32, 0i32))
         .fire_and_forget();
 }
@@ -783,6 +800,11 @@ async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> 
     // Menu object path.
     let menu_path = read_menu_path(bus_name, object_path).await;
 
+    // `ItemIsMenu` defaults to false when the property is absent.
+    let item_is_menu: bool = get_sni_property(bus_name, object_path, "ItemIsMenu")
+        .await
+        .unwrap_or(false);
+
     Ok(TrayItem {
         key: format!("{bus_name}{object_path}"),
         bus_name: bus_name.to_string(),
@@ -794,6 +816,7 @@ async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> 
         tooltip_title,
         tooltip_description,
         menu_path,
+        item_is_menu,
     })
 }
 

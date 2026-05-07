@@ -53,9 +53,14 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gdk::BUTTON_PRIMARY);
     let monitor_for_label = monitor.clone();
+    let label_for_anchor = label.clone();
     gesture.connect_pressed(move |gesture, _, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        crate::modal::toggle(&monitor_for_label, crate::modal::Page::Media);
+        crate::modal::toggle(
+            &monitor_for_label,
+            crate::modal::Page::Media,
+            &label_for_anchor,
+        );
     });
     label.add_controller(gesture);
 

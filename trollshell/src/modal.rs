@@ -2,12 +2,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::gtk::{self, gdk, glib, prelude::*};
+use hytte::gtk::{self, gdk, glib, graphene, prelude::*};
 use hytte::prelude::*;
 use hytte::services::calendar;
 use hytte::services::clipboard;
 use hytte::services::notifications;
-use hytte::ui::{layer_window, Anchor, Layer, LayerShell, Margin};
+use hytte::ui::{layer_window, Anchor, Layer, LayerEdge, LayerShell, Margin};
+
+/// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
+/// Used to clamp the per-trigger margin so the card never falls off-screen left.
+const DRAWER_MAX_WIDTH: i32 = 680;
 
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -333,15 +337,19 @@ pub fn open(monitor: &Monitor, page: Page) {
         let Some(panel) = panels.get(&key) else {
             return;
         };
-        show_panel(panel, &key, page);
+        // No bar chip context here (called from a notification toast click);
+        // anchor the drawer flush with the screen's right edge.
+        show_panel(panel, page, 0);
     });
 }
 
-/// Toggle the drawer on `monitor` to the given `page`:
+/// Toggle the drawer on `monitor` to the given `page`, anchoring the
+/// drawer's right edge under `trigger`'s right edge:
 /// - Same page open → start retract.
-/// - Different page open → swap stack child in place (crossfade + height).
-/// - Closed → present surface and reveal.
-pub fn toggle(monitor: &Monitor, page: Page) {
+/// - Different page open → swap stack child in place (crossfade + height);
+///   the drawer surface keeps its existing position.
+/// - Closed → reposition under `trigger`, present surface, reveal.
+pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {
         let panels = panels.borrow();
@@ -359,20 +367,29 @@ pub fn toggle(monitor: &Monitor, page: Page) {
                 on_page_show(page);
             }
             None => {
-                show_panel(panel, &key, page);
+                // Set the visible child first so `measure` reflects the
+                // target page's natural width, not whatever was last shown.
+                // `show_panel` re-sets it (idempotent).
+                panel.stack.set_visible_child_name(page.stack_name());
+                let margin_right =
+                    margin_right_for_trigger(monitor, panel, trigger.upcast_ref());
+                show_panel(panel, page, margin_right);
             }
         }
     });
 }
 
-/// Present the drawer on `page`. Show the catcher before the drawer so
-/// that within `Layer::Top` the drawer's surface commits most recently
-/// and stacks above the catcher.
-fn show_panel(panel: &ModalPanel, _key: &str, page: Page) {
+/// Present the drawer on `page` at `margin_right` pixels from the screen's
+/// right edge. Show the catcher before the drawer so that within
+/// `Layer::Top` the drawer's surface commits most recently and stacks above
+/// the catcher.
+fn show_panel(panel: &ModalPanel, page: Page, margin_right: i32) {
     panel.stack.set_visible_child_name(page.stack_name());
     *panel.current.borrow_mut() = Some(page);
     panel.open_state.set(true);
     on_page_show(page);
+
+    panel.window.set_margin(LayerEdge::Right, margin_right);
 
     panel.catcher.set_visible(true);
     panel.catcher.present();
@@ -380,6 +397,40 @@ fn show_panel(panel: &ModalPanel, _key: &str, page: Page) {
     panel.window.set_visible(true);
     panel.window.present();
     panel.revealer.set_reveal_child(true);
+}
+
+/// Distance from the screen's right edge to where the drawer's right edge
+/// should land so the drawer's horizontal center sits under `trigger`'s
+/// center. Clamped to `[0, mon_w - drawer_width]` so the drawer can't fall
+/// off either edge — for triggers near the screen's right or left edge
+/// this collapses to flush-right or flush-left respectively.
+///
+/// Uses `panel.stack.measure(...)` so the offset matches the target page's
+/// natural width; the caller must `set_visible_child_name` first.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn margin_right_for_trigger(
+    monitor: &Monitor,
+    panel: &ModalPanel,
+    trigger: &gtk::Widget,
+) -> i32 {
+    let (mon_w, _) = monitor.size();
+    let chip_center = trigger.root().and_then(|root| {
+        let mid = graphene::Point::new(trigger.width() as f32 / 2.0, 0.0);
+        trigger
+            .compute_point(root.upcast_ref::<gtk::Widget>(), &mid)
+            .map(|p| p.x() as i32)
+    });
+    let Some(chip_center) = chip_center else {
+        return 0;
+    };
+    // Min-width floor matches `window.set_size_request(360, -1)` above; max
+    // matches `AdwClamp.maximum_size` in `components::layout::finish_page`.
+    // If `measure` returns 0 (unrealized on first open), clamp lifts to 360.
+    let (_, nat_w, _, _) = panel.stack.measure(gtk::Orientation::Horizontal, -1);
+    let drawer_w = nat_w.clamp(360, DRAWER_MAX_WIDTH);
+    let desired = mon_w - chip_center - drawer_w / 2;
+    let max = (mon_w - drawer_w).max(0);
+    desired.clamp(0, max)
 }
 
 /// Signal that emits `true` while the drawer on `monitor` is open (the

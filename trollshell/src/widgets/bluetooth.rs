@@ -45,8 +45,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
     let _ = icon; // moved into button child above; keep reference for bind
     let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |_| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Bluetooth);
+    btn.connect_clicked(move |b| {
+        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Bluetooth, b);
     });
     btn.upcast()
 }

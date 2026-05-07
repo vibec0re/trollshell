@@ -38,8 +38,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     );
 
     let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |_| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Audio);
+    btn.connect_clicked(move |b| {
+        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Audio, b);
     });
     btn.upcast()
 }

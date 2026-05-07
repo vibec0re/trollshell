@@ -50,8 +50,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     bind_visible(sensors::gpu().map(|g| g.is_some()), &btn);
 
     let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |_| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Stats);
+    btn.connect_clicked(move |b| {
+        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Stats, b);
     });
     btn.upcast()
 }

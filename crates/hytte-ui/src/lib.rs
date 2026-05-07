@@ -16,7 +16,8 @@ pub use monitor::Monitor;
 pub use popup::{Popup, PopupBuilder, Position as PopupPosition};
 pub use sparkline::Sparkline;
 
-pub use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
+// `Edge` re-exported as `LayerEdge` to avoid colliding with `bar::Edge`.
+pub use gtk4_layer_shell::{Edge as LayerEdge, KeyboardMode, Layer, LayerShell};
 
 // Re-export so consumers don't need their own gtk/adw deps.
 pub use ::adw;

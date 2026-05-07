@@ -27,7 +27,7 @@ use std::time::Duration;
 
 // Re-export the niri-ipc data types consumers need so trollshell etc.
 // don't have to depend on niri-ipc directly.
-pub use niri_ipc::{Window, Workspace};
+pub use niri_ipc::{Window, WindowLayout, Workspace};
 
 /// The niri IPC service handle.
 pub struct NiriService;
@@ -228,6 +228,56 @@ pub fn focused_window() -> impl Signal<Item = Option<Window>> {
     })
 }
 
+/// Tolerance (logical pixels) when comparing a window's tile size to a
+/// monitor's logical size to detect an edge-spanning window. niri reports
+/// sizes in logical pixels; a few pixels of slack cover fractional-scale
+/// rounding (e.g. at 1.25× scale, logical sizes are non-integer).
+const EDGE_TOL: f64 = 4.0;
+
+/// Signal: `true` when the active workspace on `connector` contains a
+/// window whose tile size matches the monitor's logical size on both
+/// axes (within [`EDGE_TOL`]). Useful for overlays that must hide when
+/// a window fills the output — currently fullscreen, soon also
+/// maximize-to-edges (see [`has_edge_window`]).
+pub fn edge_window_on(
+    connector: String,
+    mon_w: f64,
+    mon_h: f64,
+) -> impl Signal<Item = bool> {
+    use futures_signals::map_ref;
+    let workspaces = workspaces();
+    let windows = windows();
+    map_ref! {
+        let ws = workspaces,
+        let w = windows =>
+        has_edge_window(ws, w, &connector, mon_w, mon_h)
+    }
+}
+
+/// Pure predicate behind [`edge_window_on`]. Returns `true` when the
+/// active workspace on `connector` contains a window whose tile size
+/// matches `(mon_w, mon_h)` on both axes within [`EDGE_TOL`]. Module-
+/// private so callers go through the signal API.
+fn has_edge_window(
+    workspaces: &[Workspace],
+    windows: &[Window],
+    connector: &str,
+    mon_w: f64,
+    mon_h: f64,
+) -> bool {
+    let active_id = workspaces
+        .iter()
+        .find(|ws| ws.output.as_deref() == Some(connector) && ws.is_active)
+        .map(|ws| ws.id);
+    active_id.is_some_and(|id| {
+        windows.iter().any(|w| {
+            w.workspace_id == Some(id)
+                && (w.layout.tile_size.0 - mon_w).abs() < EDGE_TOL
+                && (w.layout.tile_size.1 - mon_h).abs() < EDGE_TOL
+        })
+    })
+}
+
 /// Focus the workspace with the given id (fire-and-forget).
 pub fn focus_workspace(id: u64) {
     send_action(Action::FocusWorkspace {
@@ -261,4 +311,89 @@ fn send_action(action: Action) {
             Err(e) => tracing::warn!(error = %e, "niri socket open for action failed"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MON_W: f64 = 1920.0;
+    const MON_H: f64 = 1080.0;
+    const BAR_H: f64 = 44.0;
+    const CONNECTOR: &str = "DP-1";
+
+    fn mk_workspace(id: u64, output: &str, is_active: bool) -> Workspace {
+        Workspace {
+            id,
+            idx: 1,
+            name: None,
+            output: Some(output.to_string()),
+            is_urgent: false,
+            is_active,
+            is_focused: is_active,
+            active_window_id: None,
+        }
+    }
+
+    fn mk_window(id: u64, workspace_id: u64, tile: (f64, f64)) -> Window {
+        Window {
+            id,
+            title: None,
+            app_id: None,
+            pid: None,
+            workspace_id: Some(workspace_id),
+            is_focused: false,
+            is_floating: false,
+            is_urgent: false,
+            layout: WindowLayout {
+                pos_in_scrolling_layout: Some((1, 1)),
+                tile_size: tile,
+                window_size: (tile.0 as i32, tile.1 as i32),
+                tile_pos_in_workspace_view: Some((0.0, 0.0)),
+                window_offset_in_tile: (0.0, 0.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn has_edge_window_normal_tiled() {
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W - 16.0, MON_H - BAR_H - 8.0))];
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_edge_window_fullscreen() {
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_edge_window_other_workspace_ignored() {
+        let ws = vec![
+            mk_workspace(1, CONNECTOR, true),
+            mk_workspace(2, CONNECTOR, false),
+        ];
+        let w = vec![
+            mk_window(10, 1, (MON_W - 16.0, MON_H - BAR_H - 8.0)),
+            mk_window(20, 2, (MON_W, MON_H)),
+        ];
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_edge_window_other_output_ignored() {
+        let ws = vec![mk_workspace(1, "HDMI-A-1", true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_edge_window_no_active_workspace() {
+        let ws = vec![mk_workspace(1, CONNECTOR, false)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
 }

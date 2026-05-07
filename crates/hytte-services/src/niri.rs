@@ -228,42 +228,48 @@ pub fn focused_window() -> impl Signal<Item = Option<Window>> {
     })
 }
 
-/// Tolerance (logical pixels) when comparing a window's tile size to a
-/// monitor's logical size to detect an edge-spanning window. niri reports
-/// sizes in logical pixels; a few pixels of slack cover fractional-scale
-/// rounding (e.g. at 1.25× scale, logical sizes are non-integer).
+/// Tolerance (logical pixels) when comparing a window's tile width to a
+/// monitor's logical width to detect an edge-spanning window. niri
+/// reports sizes in logical pixels; a few pixels of slack cover
+/// fractional-scale rounding (e.g. at 1.25× scale, logical sizes are
+/// non-integer).
 const EDGE_TOL: f64 = 4.0;
 
 /// Signal: `true` when the active workspace on `connector` contains a
-/// window whose tile size matches the monitor's logical size on both
-/// axes (within [`EDGE_TOL`]). Useful for overlays that must hide when
-/// a window fills the output — currently fullscreen, soon also
-/// maximize-to-edges (see [`has_edge_window`]).
-pub fn edge_window_on(
-    connector: String,
-    mon_w: f64,
-    mon_h: f64,
-) -> impl Signal<Item = bool> {
+/// window whose tile width spans the full output (within [`EDGE_TOL`]).
+/// That covers fullscreen, niri's `MaximizeWindowToEdges`, and any
+/// floating window manually sized to `mon_w` — every state where a
+/// window touches the L/R edges of the output.
+///
+/// Useful for overlays that paint along those edges (e.g. the trollshell
+/// frame): they must hide when an edge-spanning window is active, since
+/// every pixel of their gradient or border would overlap the window.
+pub fn edge_window_on(connector: String, mon_w: f64) -> impl Signal<Item = bool> {
     use futures_signals::map_ref;
     let workspaces = workspaces();
     let windows = windows();
     map_ref! {
         let ws = workspaces,
         let w = windows =>
-        has_edge_window(ws, w, &connector, mon_w, mon_h)
+        has_edge_window(ws, w, &connector, mon_w)
     }
 }
 
 /// Pure predicate behind [`edge_window_on`]. Returns `true` when the
-/// active workspace on `connector` contains a window whose tile size
-/// matches `(mon_w, mon_h)` on both axes within [`EDGE_TOL`]. Module-
-/// private so callers go through the signal API.
+/// active workspace on `connector` contains any window whose tile width
+/// is within [`EDGE_TOL`] of `mon_w`.
+///
+/// Width alone suffices: niri's maximize-to-edges always covers the
+/// full available width AND height (no horizontal-only maximize state),
+/// fullscreen does the same, and an edge-stretched floating window is
+/// treated identically — also the correct visual response. The `>=`
+/// comparison is robust against fractional-scale rounding: tile width
+/// can never *exceed* `mon_w` in practice.
 fn has_edge_window(
     workspaces: &[Workspace],
     windows: &[Window],
     connector: &str,
     mon_w: f64,
-    mon_h: f64,
 ) -> bool {
     let active_id = workspaces
         .iter()
@@ -271,9 +277,7 @@ fn has_edge_window(
         .map(|ws| ws.id);
     active_id.is_some_and(|id| {
         windows.iter().any(|w| {
-            w.workspace_id == Some(id)
-                && (w.layout.tile_size.0 - mon_w).abs() < EDGE_TOL
-                && (w.layout.tile_size.1 - mon_h).abs() < EDGE_TOL
+            w.workspace_id == Some(id) && w.layout.tile_size.0 >= mon_w - EDGE_TOL
         })
     })
 }
@@ -348,7 +352,8 @@ mod tests {
             layout: WindowLayout {
                 pos_in_scrolling_layout: Some((1, 1)),
                 tile_size: tile,
-                window_size: (tile.0 as i32, tile.1 as i32),
+                // window_size isn't read by has_edge_window; arbitrary stub.
+                window_size: (0, 0),
                 tile_pos_in_workspace_view: Some((0.0, 0.0)),
                 window_offset_in_tile: (0.0, 0.0),
             },
@@ -360,14 +365,14 @@ mod tests {
     fn has_edge_window_normal_tiled() {
         let ws = vec![mk_workspace(1, CONNECTOR, true)];
         let w = vec![mk_window(10, 1, (MON_W - 16.0, MON_H - BAR_H - 8.0))];
-        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W));
     }
 
     #[test]
     fn has_edge_window_fullscreen() {
         let ws = vec![mk_workspace(1, CONNECTOR, true)];
         let w = vec![mk_window(10, 1, (MON_W, MON_H))];
-        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W));
     }
 
     #[test]
@@ -380,20 +385,38 @@ mod tests {
             mk_window(10, 1, (MON_W - 16.0, MON_H - BAR_H - 8.0)),
             mk_window(20, 2, (MON_W, MON_H)),
         ];
-        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W));
     }
 
     #[test]
     fn has_edge_window_other_output_ignored() {
         let ws = vec![mk_workspace(1, "HDMI-A-1", true)];
         let w = vec![mk_window(10, 1, (MON_W, MON_H))];
-        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W));
     }
 
     #[test]
     fn has_edge_window_no_active_workspace() {
         let ws = vec![mk_workspace(1, CONNECTOR, false)];
         let w = vec![mk_window(10, 1, (MON_W, MON_H))];
-        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+        assert!(!has_edge_window(&ws, &w, CONNECTOR, MON_W));
+    }
+
+    #[test]
+    fn has_edge_window_maximize_to_edges() {
+        // niri's MaximizeWindowToEdges: window covers full output width
+        // AND full height-minus-bar (bar's exclusive zone still applies).
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H - BAR_H))];
+        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W));
+    }
+
+    #[test]
+    fn has_edge_window_within_tolerance() {
+        // Fractional-scale rounding can put tile width a hair under
+        // mon_w. EDGE_TOL = 4.0, so mon_w - 2.0 should still trigger.
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W - 2.0, MON_H - BAR_H))];
+        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W));
     }
 }

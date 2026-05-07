@@ -33,9 +33,8 @@ const CUTOUT_RADIUS: f64 = 10.0;
 /// Mount one frame overlay on `monitor`.
 pub fn install(monitor: &Monitor) {
     let connector = monitor.connector().unwrap_or_default();
-    let (mon_w, mon_h) = monitor.size();
+    let (mon_w, _mon_h) = monitor.size();
     let mon_w = f64::from(mon_w);
-    let mon_h = f64::from(mon_h);
 
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
@@ -68,11 +67,11 @@ pub fn install(monitor: &Monitor) {
     install_click_through(&window);
 
     // Reactively hide the frame whenever this monitor's active workspace
-    // has an edge-spanning window (fullscreen, or any future state where
-    // a window covers the L/R edges). `Layer::Overlay` is always above
-    // niri's apps by spec — including fullscreen ones — so without this
-    // toggle the frame would paint over them.
-    let visible = niri::edge_window_on(connector, mon_w, mon_h).map(|edge| !edge);
+    // has an edge-spanning window — fullscreen, maximize-to-edges, or a
+    // floating window stretched to the output's width. `Layer::Overlay`
+    // sits above niri's apps by spec, so without this toggle the frame
+    // would paint over those windows.
+    let visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
     bind_visible(visible, &window);
 
     window.set_visible(true);

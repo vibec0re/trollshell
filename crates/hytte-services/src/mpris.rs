@@ -346,8 +346,17 @@ impl State {
     /// when the player should be dropped (property read failed).
     async fn refresh_player(&self, bus_name: &str) -> bool {
         match read_player_props(bus_name).await {
-            Ok(player) => {
-                self.map.lock().await.insert(bus_name.to_string(), player);
+            Ok(mut player) => {
+                let mut map = self.map.lock().await;
+                // `Position` is intentionally not part of `PropertiesChanged`
+                // per MPRIS spec, so `read_player_props` always returns 0 for
+                // it. Preserve whatever the position poller last published so
+                // a property change (e.g. CanGoNext flipping) doesn't snap
+                // the seek bar back to 0.
+                if let Some(prev) = map.get(bus_name) {
+                    player.position_us = prev.position_us;
+                }
+                map.insert(bus_name.to_string(), player);
                 true
             }
             Err(e) => {
@@ -640,22 +649,31 @@ const MPRIS_IFACE: &str = "org.mpris.MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 
 /// Helper: read a single D-Bus property via `org.freedesktop.DBus.Properties.Get`.
+///
+/// The reply body is always a `Variant` (signature `v`), so we deserialize as
+/// `OwnedValue` first and unwrap to the requested `T` via `TryFrom`. Asking
+/// zbus to deserialize the body directly as e.g. `bool` or `String` fails
+/// with `SignatureMismatch` because the wire signature is `v`, not `b`/`s`.
 async fn get_property<T>(
     bus_name: &str,
     iface: &'static str,
     prop: &'static str,
 ) -> Result<T, hytte_bus::BusError>
 where
-    T: serde::de::DeserializeOwned + zbus::zvariant::Type + 'static,
+    T: TryFrom<OwnedValue> + 'static,
 {
-    call(bus_name)
+    let v: OwnedValue = call(bus_name)
         .bus(BusKind::Session)
         .at_path(MPRIS_PATH)
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")
         .args((iface, prop))
-        .send::<T>()
-        .await
+        .send::<OwnedValue>()
+        .await?;
+    T::try_from(v).map_err(|_| hytte_bus::BusError::Permanent {
+        reason: format!("type mismatch reading {iface}.{prop}"),
+        dbus_name: None,
+    })
 }
 
 async fn read_player_props(bus_name: &str) -> Result<Player> {

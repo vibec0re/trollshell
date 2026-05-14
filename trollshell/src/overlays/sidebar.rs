@@ -12,7 +12,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
+use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
 /// "frame border ~220px" geometry from the spec; the frame's cutout left
@@ -28,6 +30,16 @@ thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
     /// or earlier (e.g., the frame); writers go through `toggle`.
     static SIDEBAR_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
+
+    /// Per-connector sidebar surface handle. Populated by `install`;
+    /// read by `current_visible_width_for_key` and `is_settled_for_key`.
+    static PANELS: RefCell<HashMap<String, SidebarPanel>> = RefCell::new(HashMap::new());
+}
+
+struct SidebarPanel {
+    window: gtk::Window,
+    revealer: gtk::Revealer,
+    open_state: Mutable<bool>,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -67,10 +79,14 @@ pub fn current_visible_width(monitor: &Monitor) -> i32 {
 }
 
 /// Internal: keyed lookup used by both the public API and tests.
-fn current_visible_width_for_key(_key: &str) -> i32 {
-    // Real implementation lands in Task 4 when PANELS exists. For now,
-    // always return the frame's default left inset.
-    FRAME_THICKNESS_I32
+fn current_visible_width_for_key(key: &str) -> i32 {
+    PANELS.with(|panels| {
+        panels
+            .borrow()
+            .get(key)
+            .map(|p| p.revealer.width().max(FRAME_THICKNESS_I32))
+            .unwrap_or(FRAME_THICKNESS_I32)
+    })
 }
 
 /// True when the sidebar's revealer animation is at rest on `monitor`
@@ -81,10 +97,128 @@ pub fn is_settled(monitor: &Monitor) -> bool {
 }
 
 /// Internal: keyed lookup used by both the public API and tests.
-fn is_settled_for_key(_key: &str) -> bool {
-    // Real implementation lands in Task 4. With no panel installed there
-    // is nothing animating, so we report settled.
-    true
+fn is_settled_for_key(key: &str) -> bool {
+    PANELS.with(|panels| {
+        panels
+            .borrow()
+            .get(key)
+            .map(|p| p.revealer.is_child_revealed() == p.open_state.get())
+            .unwrap_or(true)
+    })
+}
+
+/// Build the sidebar surface for one monitor, mount it as a hidden
+/// layer-shell window, and wire its open-state subscription. Mirrors
+/// `modal::install` in shape; called from `main.rs` per monitor.
+#[allow(clippy::too_many_lines)]
+pub fn install(monitor: &Monitor) {
+    let key = monitor_key(monitor);
+    let open_state = sidebar_open_state(&key);
+
+    // Layer-shell window: anchored Left + Top + Bottom so the surface
+    // spans the full screen height and exclusive_zone reserves on the
+    // single (Left) edge — well-defined push semantics.
+    let window = layer_window(monitor)
+        .layer(Layer::Top)
+        .anchor(Anchor::Left)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Bottom)
+        .namespace(format!("hytte-sidebar-{key}"))
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::OnDemand)
+        .build();
+    window.add_css_class("ts-sidebar-surface");
+    // Fixed surface width so niri sees a stable 220-wide column when open.
+    window.set_size_request(SIDEBAR_WIDTH, -1);
+
+    // Revealer drives the slide animation. SlideRight pushes the card out
+    // from the screen's left edge, in time with niri's tile reflow.
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    revealer.set_transition_duration(180);
+    revealer.set_reveal_child(false);
+    revealer.set_halign(gtk::Align::Start);
+    revealer.set_valign(gtk::Align::Fill);
+
+    // Card — vertical box that holds the placeholder label (Phase 1) and
+    // future content (Phase 2+). Margins place the card inside the cutout
+    // area: top under the bar+gap, bottom flush with the frame's bottom
+    // strut, start flush with the frame's left strut.
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("ts-sidebar");
+    card.set_valign(gtk::Align::Fill);
+    card.set_vexpand(true);
+    card.set_margin_top(54); // BAR_HEIGHT (44) + 10 gap (matches drawer float)
+    card.set_margin_bottom(FRAME_THICKNESS_I32);
+    card.set_margin_start(FRAME_THICKNESS_I32);
+
+    let placeholder = gtk::Label::new(Some("sidebar"));
+    placeholder.add_css_class("ts-sidebar-placeholder");
+    placeholder.set_halign(gtk::Align::Center);
+    placeholder.set_valign(gtk::Align::Center);
+    placeholder.set_vexpand(true);
+    card.append(&placeholder);
+
+    revealer.set_child(Some(&card));
+    window.set_child(Some(&revealer));
+    window.set_visible(false);
+
+    // Stash the panel so accessors can find it.
+    PANELS.with(|panels| {
+        panels.borrow_mut().insert(
+            key.clone(),
+            SidebarPanel {
+                window: window.clone().upcast(),
+                revealer: revealer.clone(),
+                open_state: open_state.clone(),
+            },
+        );
+    });
+
+    // Drive open/close transitions from the shared mutable. Toggle flips
+    // the bool; this subscription does the surface work.
+    let window_for_open = window.clone();
+    let revealer_for_open = revealer.clone();
+    glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
+        if open {
+            window_for_open.set_visible(true);
+            window_for_open.present();
+            window_for_open.set_exclusive_zone(SIDEBAR_WIDTH - FRAME_THICKNESS_I32);
+            revealer_for_open.set_reveal_child(true);
+        } else {
+            // Start the close animation. Surface stays visible + zone stays
+            // reserved until the revealer reports it has fully collapsed
+            // (see connect_child_revealed_notify below) — otherwise niri
+            // reclaims the space while the card is still on-screen.
+            revealer_for_open.set_reveal_child(false);
+        }
+        async {}
+    }));
+
+    // After the close animation finishes, drop the exclusive zone and hide
+    // the surface. (When the open animation finishes, child_revealed flips
+    // to true — we don't need to do anything.)
+    let window_for_settled = window.clone();
+    revealer.connect_child_revealed_notify(move |r| {
+        if !r.is_child_revealed() {
+            window_for_settled.set_exclusive_zone(0);
+            window_for_settled.set_visible(false);
+        }
+    });
+}
+
+/// Close every sidebar surface and drop the per-monitor entries. Called
+/// before rebuilding bars on hot-plug, so stale layer-shell windows don't
+/// linger after a monitor disappears.
+pub fn close_all() {
+    PANELS.with(|panels| {
+        for (_, panel) in panels.borrow_mut().drain() {
+            // Reset the bool so subscribers see the closed state, then
+            // tear down the surface.
+            panel.open_state.set(false);
+            panel.window.close();
+        }
+    });
 }
 
 #[cfg(test)]

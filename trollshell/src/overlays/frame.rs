@@ -152,7 +152,18 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         // closed, left_inset = FRAME_THICKNESS (8) and this is identical to the
         // previous "from 0" rect minus the now-empty L-strut. Bar area above is
         // left untouched (transparent), so the bar paints its own gradient.
-        cr.rectangle(left_inset, BAR_HEIGHT, w - left_inset, h - BAR_HEIGHT);
+        // When the sidebar is open (left_inset > FRAME_THICKNESS), start the
+        // outer paint rect at left_inset so the frame's gradient never enters
+        // the sidebar's region — letting the sidebar surface (Layer::Top, below
+        // this Layer::Overlay frame) show through. When closed (left_inset ==
+        // FRAME_THICKNESS), start at 0 so the standard 8px L-strut paints
+        // normally — same visual as before the sidebar feature.
+        let outer_left = if left_inset > FRAME_THICKNESS {
+            left_inset
+        } else {
+            0.0
+        };
+        cr.rectangle(outer_left, BAR_HEIGHT, w - outer_left, h - BAR_HEIGHT);
 
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);

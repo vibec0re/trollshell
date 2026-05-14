@@ -98,6 +98,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
         panels
             .borrow()
             .get(key)
+            .filter(|p| p.open_state.get())
             .map(|p| p.revealer.width().max(FRAME_THICKNESS_I32))
             .unwrap_or(FRAME_THICKNESS_I32)
     })

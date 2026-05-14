@@ -68,6 +68,40 @@ fn row(d: &Departure) -> gtk::Widget {
     row.upcast()
 }
 
+fn loading_row() -> gtk::Widget {
+    let lbl = gtk::Label::new(Some("loading departures…"));
+    lbl.add_css_class("ts-departures-loading");
+    lbl.set_halign(gtk::Align::Start);
+    lbl.upcast()
+}
+
+fn empty_row() -> gtk::Widget {
+    let lbl = gtk::Label::new(Some("no S-Bahn departures in the next 30 min"));
+    lbl.add_css_class("ts-departures-empty");
+    lbl.set_halign(gtk::Align::Start);
+    lbl.upcast()
+}
+
+fn error_row(err: &str) -> gtk::Widget {
+    let lbl = gtk::Label::new(Some(&format!("can't reach BVG: {err}")));
+    lbl.add_css_class("ts-departures-error");
+    lbl.set_halign(gtk::Align::Start);
+    lbl.set_wrap(true);
+    lbl.upcast()
+}
+
+fn stale_footer(err: &str, at: DateTime<Local>) -> gtk::Widget {
+    let lbl = gtk::Label::new(Some(&format!(
+        "· stale (last good {} — {})",
+        at.format("%H:%M"),
+        err
+    )));
+    lbl.add_css_class("ts-departures-stale-footer");
+    lbl.set_halign(gtk::Align::Start);
+    lbl.set_wrap(true);
+    lbl.upcast()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

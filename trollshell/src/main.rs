@@ -11,9 +11,9 @@ use hytte::gtk;
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
-    bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, displays, dnd, mpris,
-    netconn, networkd, niri, notifications, notifications_mute, pipewire, polkit, power_profiles,
-    resolved, screensaver, sensors, systemd, tray, upower, vpn, wallpaper, wifi,
+    bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures, displays,
+    dnd, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire, polkit,
+    power_profiles, resolved, screensaver, sensors, systemd, tray, upower, vpn, wallpaper, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -21,6 +21,7 @@ fn main() -> hytte::ui::Result<()> {
 
     App::new("cc.hannig.trollshell")
         .with(clock::service())
+        .with(departures::service())
         .with(niri::service())
         .with(upower::service())
         .with(vpn::service())

@@ -159,6 +159,11 @@ pub fn install(monitor: &Monitor) {
     card.set_margin_top(CARD_MARGIN_TOP);
     card.set_margin_bottom(FRAME_THICKNESS_I32);
     card.set_margin_start(FRAME_THICKNESS_I32);
+    // Force the card to claim the full surface width minus margin_start, so
+    // the revealer's measure (= child measure, scaled by transition progress)
+    // animates the cutout's left edge all the way to SIDEBAR_WIDTH instead of
+    // stopping at the placeholder label's natural ~80 px width.
+    card.set_size_request(SIDEBAR_WIDTH - FRAME_THICKNESS_I32, -1);
 
     let placeholder = gtk::Label::new(Some("sidebar"));
     placeholder.add_css_class("ts-sidebar-placeholder");

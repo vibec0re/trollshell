@@ -102,6 +102,47 @@ fn stale_footer(err: &str, at: DateTime<Local>) -> gtk::Widget {
     lbl.upcast()
 }
 
+use hytte::services::departures::DeparturesState;
+
+/// Drain `list` and re-populate it from `state`. Eight rows max, so a
+/// remove-all + append-fresh cycle per emission is cheap.
+fn rebuild(list: &gtk::Box, state: &DeparturesState) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    match state {
+        DeparturesState::Loading => list.append(&loading_row()),
+        DeparturesState::Err { err } => list.append(&error_row(err)),
+        DeparturesState::Ok { items, .. } | DeparturesState::Stale { items, .. } => {
+            if items.is_empty() {
+                list.append(&empty_row());
+            } else {
+                for d in items {
+                    list.append(&row(d));
+                }
+            }
+            if let DeparturesState::Stale { err, at, .. } = state {
+                list.append(&stale_footer(err, *at));
+            }
+        }
+    }
+}
+
+/// Build the departures widget. Subscribes to
+/// [`departures::current()`] and rebuilds the list on every emission.
+#[must_use]
+pub fn widget() -> gtk::Widget {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    list.add_css_class("ts-departures");
+    list.set_valign(gtk::Align::Start);
+
+    bind(departures::current(), &list, |list, state| {
+        rebuild(list, &state);
+    });
+
+    list.upcast()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

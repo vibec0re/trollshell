@@ -4,6 +4,10 @@
 //! re-render on every emission of [`hytte::services::clock::now()`].
 
 use chrono::{DateTime, Local};
+use hytte::gtk::{self, prelude::*};
+use hytte::prelude::*;
+use hytte::services::{clock, departures};
+use hytte::services::departures::{delay_string, Departure};
 
 /// Human-readable "minutes from now" label. Negative deltas and anything
 /// within the next 60 s render as `"now"`. Above that, we round to the
@@ -16,6 +20,52 @@ pub fn relative_label(now: DateTime<Local>, departure: DateTime<Local>) -> Strin
     }
     let minutes = (seconds + 30) / 60;
     format!("{minutes} min")
+}
+
+/// Build one row widget for `d`. The time cell re-renders on every clock
+/// tick by binding to `clock::now()`. The row's CSS classes encode line
+/// and cancellation state so styling is purely declarative.
+fn row(d: &Departure) -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("ts-departure-row");
+    if d.cancelled {
+        row.add_css_class("ts-cancelled");
+    }
+
+    // Line badge.
+    let badge = gtk::Label::new(Some(&d.line));
+    badge.add_css_class("ts-line-badge");
+    badge.add_css_class(&format!("ts-line-{}", d.line));
+    badge.set_halign(gtk::Align::Start);
+    row.append(&badge);
+
+    // Direction (takes the slack).
+    let direction = gtk::Label::new(Some(&d.direction));
+    direction.add_css_class("ts-departure-direction");
+    direction.set_halign(gtk::Align::Start);
+    direction.set_hexpand(true);
+    direction.set_xalign(0.0);
+    direction.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.append(&direction);
+
+    // Time cell — re-renders each clock tick.
+    let time_lbl = gtk::Label::new(None);
+    time_lbl.add_css_class("ts-departure-time");
+    let actual = d.actual;
+    bind(clock::now(), &time_lbl, move |lbl, now| {
+        let rel = relative_label(now, actual);
+        lbl.set_text(&format!("{rel} · {}", actual.format("%H:%M")));
+    });
+    row.append(&time_lbl);
+
+    // Delay indicator (hidden when on time).
+    if let Some(text) = delay_string(d.delay_minutes) {
+        let delay = gtk::Label::new(Some(&text));
+        delay.add_css_class("ts-departure-delay");
+        row.append(&delay);
+    }
+
+    row.upcast()
 }
 
 #[cfg(test)]

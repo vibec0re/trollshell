@@ -59,6 +59,7 @@ fn main() -> hytte::ui::Result<()> {
                     .for_each(move |monitors| {
                         // Close all existing modals before rebuilding.
                         modal::close_all();
+                        overlays::sidebar::close_all();
                         *bars.borrow_mut() = monitors.iter().map(build_bar).collect();
                         std::future::ready(())
                     })
@@ -92,11 +93,13 @@ fn main() -> hytte::ui::Result<()> {
 
 fn build_bar(monitor: &Monitor) -> BarHandle {
     modal::install(monitor);
+    overlays::sidebar::install(monitor);
     let bar = Bar::new(monitor)
         .edge(Edge::Top)
         .exclusive(true)
         .keyboard_interactivity(KeyboardMode::OnDemand)
         .left([
+            widgets::sidebar_toggle::widget(monitor),
             widgets::workspaces::widget(monitor),
             widgets::window_list::widget(monitor),
         ])

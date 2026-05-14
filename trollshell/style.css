@@ -310,29 +310,24 @@ window:not(.dark) .ts-drawer {
         @window_bg_color 100%);
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
 }
-/* Sidebar card — matches the bar/frame dark gradient, oriented vertically.
+/* Sidebar window surface is transparent; the visible content is the
+   inner card with class `.ts-sidebar`. Without this rule, the default
+   @window_bg_color paints in the area outside the card (margin gaps),
+   producing a white rectangle below the bar. */
+.ts-sidebar-surface {
+    background: transparent;
+}
+
+/* Sidebar card — matches the bar's leftmost edge color so the sidebar
+   reads as a vertical extension of the bar's left side. Always dark
+   (no light-mode override) for the same reason — the bar is always dark.
    Rounded only on the right side so the cutout's left-edge rounding
    transfers visually onto the sidebar's right edge. */
 .ts-sidebar {
-    background: linear-gradient(
-        180deg,
-        rgb(15, 15, 35),
-        rgb(25, 15, 45) 50%,
-        rgb(15, 15, 35)
-    );
+    background: rgb(15, 15, 35);
     border-radius: 0 10px 10px 0;
     padding: 12px;
-    color: @window_fg_color;
-}
-
-window:not(.dark) .ts-sidebar {
-    background: linear-gradient(
-        180deg,
-        rgb(245, 240, 250),
-        rgb(235, 230, 245) 50%,
-        rgb(245, 240, 250)
-    );
-    color: @window_fg_color;
+    color: white;
 }
 
 .ts-sidebar-placeholder {

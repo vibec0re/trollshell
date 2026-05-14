@@ -58,6 +58,35 @@ pub fn toggle(monitor: &Monitor) {
     state.set(!now);
 }
 
+/// Currently visible width of the sidebar card on `monitor`, in CSS px.
+/// Returns `FRAME_THICKNESS` when the sidebar is closed, hasn't been
+/// installed yet, or the per-monitor panel is missing. The frame uses
+/// this to compute its cutout's left edge each animation tick.
+pub fn current_visible_width(monitor: &Monitor) -> i32 {
+    current_visible_width_for_key(&monitor_key(monitor))
+}
+
+/// Internal: keyed lookup used by both the public API and tests.
+fn current_visible_width_for_key(_key: &str) -> i32 {
+    // Real implementation lands in Task 4 when PANELS exists. For now,
+    // always return the frame's default left inset.
+    FRAME_THICKNESS_I32
+}
+
+/// True when the sidebar's revealer animation is at rest on `monitor`
+/// (fully open or fully closed). The frame's tick callback uses this to
+/// know when to stop redrawing after the slide finishes.
+pub fn is_settled(monitor: &Monitor) -> bool {
+    is_settled_for_key(&monitor_key(monitor))
+}
+
+/// Internal: keyed lookup used by both the public API and tests.
+fn is_settled_for_key(_key: &str) -> bool {
+    // Real implementation lands in Task 4. With no panel installed there
+    // is nothing animating, so we report settled.
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +108,22 @@ mod tests {
         assert!(b.get());
         // Different key → independent state.
         assert!(!c.get());
+    }
+
+    /// When no sidebar surface has been installed yet (or the connector is
+    /// unknown), `current_visible_width` must return `FRAME_THICKNESS_I32`
+    /// so the frame's cutout draws at its default left edge.
+    #[test]
+    fn current_visible_width_defaults_to_frame_thickness_when_no_panel() {
+        // No PANELS map yet, no install() call — the frame might query us
+        // during early bootstrap. Use a fake monitor key directly via the
+        // private fallback path.
+        assert_eq!(current_visible_width_for_key("nonexistent"), FRAME_THICKNESS_I32);
+    }
+
+    #[test]
+    fn is_settled_defaults_to_true_when_no_panel() {
+        // Same situation: no panel installed → nothing animating → settled.
+        assert!(is_settled_for_key("nonexistent"));
     }
 }

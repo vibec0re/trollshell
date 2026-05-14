@@ -13,7 +13,7 @@ use hytte::services::calendar::CalendarEvent;
 /// Build the sidebar calendar widget. Caller appends the returned widget
 /// to `.ts-sidebar`; the widget owns its own subscriptions to
 /// `calendar::events()` and `sidebar::open_signal(monitor)`.
-pub fn widget(_monitor: &Monitor) -> gtk::Widget {
+pub fn widget(monitor: &Monitor) -> gtk::Widget {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -113,6 +113,52 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
         });
     }
 
+    {
+        let rows_for_select = rows_track.clone();
+        let scrolled_for_select = scrolled.clone();
+        cal.connect_day_selected(move |c| {
+            let gdt = c.date();
+            let y = gdt.year();
+            let Ok(m) = u32::try_from(gdt.month()) else {
+                return;
+            };
+            let Ok(day) = u32::try_from(gdt.day_of_month()) else {
+                return;
+            };
+            let Some(d) = chrono::NaiveDate::from_ymd_opt(y, m, day) else {
+                return;
+            };
+            let rows = rows_for_select.borrow();
+            let Some((_d, row)) = rows.iter().find(|(date, _)| *date == d) else {
+                return;
+            };
+            scroll_row_into_view(&scrolled_for_select, row);
+            flash_row_highlight(row);
+        });
+    }
+
+    // Force a fresh scan when the user opens the sidebar — avoids
+    // showing up-to-60-second-stale data on open. Edge-triggered via
+    // a Cell so the initial state replay from `signal()` doesn't fire
+    // a refresh when the sidebar starts closed.
+    {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use hytte::gtk::glib;
+
+        let last_open = Rc::new(Cell::new(false));
+        let last_open_for_sub = last_open.clone();
+        glib::MainContext::default().spawn_local(
+            crate::overlays::sidebar::open_signal(monitor).for_each(move |open| {
+                let prev = last_open_for_sub.replace(open);
+                if open && !prev {
+                    hytte::services::calendar::refresh();
+                }
+                async {}
+            }),
+        );
+    }
+
     column.upcast()
 }
 
@@ -168,6 +214,38 @@ fn build_calendar_row(ev: &CalendarEvent) -> hytte::adw::ActionRow {
     row.add_prefix(&icon);
 
     row
+}
+
+/// Scroll `scrolled` so that `row` is visible. Uses `compute_point` to
+/// translate the row's origin into the scrolled-window child's coordinate
+/// space; an 8px lead-in keeps the row from butting against the top edge.
+fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &hytte::adw::ActionRow) {
+    use hytte::gtk::prelude::{AdjustmentExt, WidgetExt};
+    let Some(child) = scrolled.child() else {
+        return;
+    };
+    let origin = gtk::graphene::Point::new(0.0, 0.0);
+    let Some(point) = row.compute_point(&child, &origin) else {
+        return;
+    };
+    let y = f64::from(point.y());
+    let adj = scrolled.vadjustment();
+    let target = (y - 8.0).max(adj.lower());
+    let max = (adj.upper() - adj.page_size()).max(adj.lower());
+    adj.set_value(target.min(max));
+}
+
+/// Add `.ts-cal-day-hit` to `row` for ~1.5s, then remove it. The existing
+/// CSS rule on `.ts-cal-day-hit` has a 600ms transition so the highlight
+/// fades rather than flashes.
+fn flash_row_highlight(row: &hytte::adw::ActionRow) {
+    use hytte::gtk::glib;
+    use hytte::gtk::prelude::WidgetExt;
+    row.add_css_class("ts-cal-day-hit");
+    let row_for_clear = row.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+        row_for_clear.remove_css_class("ts-cal-day-hit");
+    });
 }
 
 #[cfg(test)]

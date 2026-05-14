@@ -107,7 +107,7 @@ fn install_draw(area: &gtk::DrawingArea) {
             return;
         }
 
-        let (cx, cy, cw, ch) = cutout_rect(w, h);
+        let (cx, cy, cw, ch) = cutout_rect(w, h, FRAME_THICKNESS);
         if cw <= 0.0 || ch <= 0.0 {
             return;
         }
@@ -156,14 +156,15 @@ fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, ra
     cr.close_path();
 }
 
-/// Cutout bounds for a monitor of size (`width`, `height`). The cutout
-/// is the rounded transparent rectangle inside which apps tile. Returns
-/// `(x, y, w, h)` of the cutout's bounding box (corner radius applied
-/// at draw time, not in this rect).
-fn cutout_rect(width: f64, height: f64) -> (f64, f64, f64, f64) {
-    let x = FRAME_THICKNESS;
+/// Cutout bounds for a monitor of size (`width`, `height`), with the cutout's
+/// left edge starting at `left_inset` px from the screen's left edge. Pass
+/// `FRAME_THICKNESS` for the default frame-only inset; pass the sidebar's
+/// current visible width when the sidebar is open. Returns `(x, y, w, h)` of
+/// the cutout's bounding box (corner radius applied at draw time).
+fn cutout_rect(width: f64, height: f64, left_inset: f64) -> (f64, f64, f64, f64) {
+    let x = left_inset;
     let y = BAR_HEIGHT;
-    let w = (width - 2.0 * FRAME_THICKNESS).max(0.0);
+    let w = (width - left_inset - FRAME_THICKNESS).max(0.0);
     let h = (height - BAR_HEIGHT - FRAME_THICKNESS).max(0.0);
     (x, y, w, h)
 }
@@ -176,7 +177,7 @@ mod tests {
     #[test]
     fn cutout_rect_normal_monitor() {
         // 1920x1080: bar 44 (top) + bottom inset N + L/R inset N each.
-        let (x, y, w, h) = cutout_rect(1920.0, 1080.0);
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS);
         assert_eq!(x, FRAME_THICKNESS);
         assert_eq!(y, BAR_HEIGHT);
         assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
@@ -188,8 +189,19 @@ mod tests {
         // Pathological tiny monitor: cutout would be negative; clamp to 0
         // to avoid passing negative dimensions into cairo. Use sub-frame
         // dimensions so the clamp engages regardless of FRAME_THICKNESS.
-        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0);
+        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0, FRAME_THICKNESS);
         assert_eq!(w, 0.0);
         assert_eq!(h, 0.0);
+    }
+
+    #[test]
+    fn cutout_rect_with_sidebar_open() {
+        // Sidebar fully open at SIDEBAR_WIDTH (220) means the cutout's left
+        // edge starts at x = 220 instead of the default FRAME_THICKNESS.
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 220.0);
+        assert_eq!(x, 220.0);
+        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(w, 1920.0 - 220.0 - FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
     }
 }

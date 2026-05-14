@@ -76,3 +76,36 @@ impl Default for DeparturesState {
         Self::Loading
     }
 }
+
+/// Formats the delay indicator shown after the time cell. `None` means
+/// "render no badge"; `Some("+5")` means render `+5` in the delay style.
+/// We only surface lateness — negative deltas (early trains) are silent
+/// since they're not actionable to the passenger.
+#[must_use]
+pub fn delay_string(delay_minutes: i64) -> Option<String> {
+    if delay_minutes > 0 {
+        Some(format!("+{delay_minutes}"))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delay_string_hidden_when_on_time() {
+        assert_eq!(delay_string(0), None);
+    }
+
+    #[test]
+    fn delay_string_hidden_when_early() {
+        assert_eq!(delay_string(-2), None);
+    }
+
+    #[test]
+    fn delay_string_shows_when_late() {
+        assert_eq!(delay_string(5), Some("+5".to_string()));
+    }
+}

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use hytte::gtk::{self};
+use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::calendar::CalendarEvent;
 
@@ -14,13 +14,15 @@ use hytte::services::calendar::CalendarEvent;
 /// to `.ts-sidebar`; the widget owns its own subscriptions to
 /// `calendar::events()` and `sidebar::open_signal(monitor)`.
 pub fn widget(_monitor: &Monitor) -> gtk::Widget {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use hytte::adw::{self, prelude::*};
+    use hytte::services::calendar;
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.add_css_class("ts-sidebar-calendar");
 
-    // Month grid. GtkCalendar self-scrolls to the current month on
-    // construction. Marks are applied later by apply_event_marks.
     let cal = gtk::Calendar::new();
     cal.set_show_heading(true);
     cal.set_show_day_names(true);
@@ -28,20 +30,14 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
     cal.add_css_class("ts-calendar");
     column.append(&cal);
 
-    // Small section header above the events list.
     let header = gtk::Label::new(Some("UPCOMING"));
     header.add_css_class("ts-sidebar-cal-header");
     header.set_halign(gtk::Align::Start);
     column.append(&header);
 
-    // adw::PreferencesGroup styled as a list. The group's `title` ends
-    // up large; we use a separate `header` label above instead so we
-    // can match the small-caps sidebar typography. The group itself
-    // gets no title.
     let group = adw::PreferencesGroup::new();
     group.add_css_class("ts-sidebar-cal-list");
 
-    // Bounded ScrolledWindow so the list scrolls independently when long.
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
@@ -49,6 +45,58 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
     scrolled.set_max_content_height(360);
     scrolled.set_child(Some(&group));
     column.append(&scrolled);
+
+    // Tracked rows + placeholder so each emission can remove the previous
+    // contents before re-adding. The drawer panel uses the same pattern.
+    let rows_track: Rc<RefCell<Vec<(chrono::NaiveDate, adw::ActionRow)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> =
+        Rc::new(RefCell::new(None));
+    // Latest events snapshot, shared between the bind closure and the
+    // prev/next-month handlers added in Task 5.
+    let current_events: Rc<RefCell<Vec<CalendarEvent>>> =
+        Rc::new(RefCell::new(Vec::new()));
+
+    let group_for_bind = group.clone();
+    let rows_for_bind = rows_track.clone();
+    let placeholder_for_bind = placeholder_track.clone();
+    let cal_for_bind = cal.clone();
+    let current_events_for_bind = current_events.clone();
+    bind(calendar::events(), &group, move |_, evs| {
+        // Drop previous rows.
+        for (_d, row) in rows_for_bind.borrow_mut().drain(..) {
+            group_for_bind.remove(&row);
+        }
+        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
+            group_for_bind.remove(&p);
+        }
+
+        // Stash the snapshot so month-nav handlers see fresh data.
+        current_events_for_bind.borrow_mut().clone_from(&evs);
+
+        // Re-mark the visible month with the new event set.
+        apply_event_marks(&cal_for_bind, &evs);
+
+        if evs.is_empty() {
+            let placeholder = adw::ActionRow::builder()
+                .title("No upcoming events")
+                .subtitle("Add a calendar via Settings \u{2192} Online Accounts.")
+                .activatable(false)
+                .build();
+            group_for_bind.add(&placeholder);
+            *placeholder_for_bind.borrow_mut() = Some(placeholder);
+            return;
+        }
+
+        let mut new_rows: Vec<(chrono::NaiveDate, adw::ActionRow)> =
+            Vec::with_capacity(evs.len());
+        for ev in &evs {
+            let row = build_calendar_row(ev);
+            group_for_bind.add(&row);
+            new_rows.push((ev.start.date_naive(), row));
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
 
     column.upcast()
 }
@@ -77,6 +125,36 @@ fn apply_event_marks(cal: &gtk::Calendar, events: &[CalendarEvent]) {
     for day in marked_days(events, year, month) {
         cal.mark_day(day);
     }
+}
+
+/// Build an `adw::ActionRow` for a single calendar event.
+/// The subtitle shows the when-string and, if present, the location on
+/// a separate line so long venue names wrap without inflating sidebar width.
+fn build_calendar_row(ev: &CalendarEvent) -> hytte::adw::ActionRow {
+    use hytte::adw::{self, prelude::*};
+    use hytte::services::calendar::format_when;
+
+    // Subtitle: when-string, plus optional location on its own line. Lets
+    // long venue names wrap without inflating the sidebar's width.
+    let when = format_when(ev);
+    let subtitle = match &ev.location {
+        Some(loc) => format!("{when}\n{loc}"),
+        None => when,
+    };
+
+    let row = adw::ActionRow::builder()
+        .title(&ev.summary)
+        .subtitle(&subtitle)
+        .activatable(false)
+        .build();
+    row.set_subtitle_lines(0); // wrap
+    row.set_title_lines(1);
+
+    let icon = gtk::Image::from_icon_name("x-office-calendar-symbolic");
+    icon.set_valign(gtk::Align::Center);
+    row.add_prefix(&icon);
+
+    row
 }
 
 #[cfg(test)]

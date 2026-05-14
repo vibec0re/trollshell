@@ -2,6 +2,7 @@ pub mod battery;
 pub mod bluetooth;
 pub mod brightness;
 pub mod clock;
+pub mod departures;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;

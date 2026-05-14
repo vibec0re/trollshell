@@ -222,9 +222,12 @@ Light-mode override mirrors `.ts-drawer`'s light-mode rule (line 307) — palett
 
 ### Lifecycle
 
-`main.rs` already loops monitors after `monitors_changed` and installs frame + bar + modal. Add `sidebar::install(monitor)` to that loop, right next to `frame::install(monitor)`. Order: install sidebar *before* frame, so the frame's subscription to `sidebar::open_signal` has a non-empty per-monitor entry to read from.
+`main.rs` has two relevant call sites:
 
-On hot-unplug: extend `modal::close_all()`-style teardown — add `sidebar::close_all()` to the rebuild-bars path so stale sidebars don't linger.
+1. `build_bar(monitor)` calls `modal::install(monitor)` synchronously per monitor and is itself called on every `monitors_changed` emission (initial + hot-plug). Sidebar mirrors this: add `overlays::sidebar::install(monitor)` immediately after `modal::install(monitor)` in `build_bar`. The sidebar's per-bar lifecycle matches the modal's, so hot-plug works the same way.
+2. The `monitors_changed` reactor calls `modal::close_all()` before rebuilding. Add `overlays::sidebar::close_all()` on the next line, so stale sidebar surfaces are torn down before `build_bar` reinstalls them.
+
+The frame's `install` (in the separate init-once `for monitor in &app.monitors()` loop) subscribes to `sidebar::open_signal(monitor)`, which reads from the `SIDEBAR_OPEN` thread-local — that map is populated lazily on first read, so the frame can subscribe even before `sidebar::install` has run for that monitor. `current_visible_width` returns `FRAME_THICKNESS` in the interim, which is the correct closed-state default.
 
 ## Touched files
 

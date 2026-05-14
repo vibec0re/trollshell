@@ -145,9 +145,14 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         // EvenOdd so the cutout is excluded.
         cr.set_fill_rule(cairo::FillRule::EvenOdd);
 
-        // Outer region: from (0, BAR_HEIGHT) to (w, h). Bar area above is
+        // Outer region: from (left_inset, BAR_HEIGHT) to (w, h). Starting at
+        // left_inset (instead of 0) means the frame's cairo paint never enters
+        // the sidebar's region — the sidebar's surface (Layer::Top, below this
+        // Layer::Overlay frame) shows through naturally. When the sidebar is
+        // closed, left_inset = FRAME_THICKNESS (8) and this is identical to the
+        // previous "from 0" rect minus the now-empty L-strut. Bar area above is
         // left untouched (transparent), so the bar paints its own gradient.
-        cr.rectangle(0.0, BAR_HEIGHT, w, h - BAR_HEIGHT);
+        cr.rectangle(left_inset, BAR_HEIGHT, w - left_inset, h - BAR_HEIGHT);
 
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);

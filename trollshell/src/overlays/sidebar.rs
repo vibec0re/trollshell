@@ -1,8 +1,14 @@
 //! Per-monitor pushable left sidebar. Layer-shell window anchored
-//! `Left + Top + Bottom`; toggles via `widgets::sidebar_toggle`. When open,
-//! reserves space via `exclusive_zone` so niri reflows tiles right; the
-//! frame's draw fn reads `current_visible_width` and offsets the workspace
-//! cutout's left edge in lockstep with the slide animation.
+//! `Left + Top + Bottom` on `Layer::Top`; toggles via `widgets::sidebar_toggle`.
+//! When open, reserves space via `exclusive_zone` so niri reflows tiles right;
+//! the frame's draw fn reads `current_visible_width` and offsets the outer rect's
+//! left edge so it never paints over the sidebar's region.
+//!
+//! The sidebar sits on `Layer::Top` (below the frame's `Layer::Overlay`). The
+//! frame carves out the sidebar's region from its own paint, so the sidebar's
+//! surface shows through regardless of compositor stacking order. Fullscreen
+//! apps on `Layer::Top`'s level naturally cover the sidebar — no explicit hide
+//! logic needed.
 //!
 //! State is per-connector, mirroring `modal::DRAWER_OPEN`. Subscribers (the
 //! sidebar surface, the frame draw, future bar-CSS bindings) read
@@ -14,7 +20,6 @@ use std::collections::HashMap;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::niri;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
@@ -128,7 +133,7 @@ pub fn install(monitor: &Monitor) {
     // spans the full screen height and exclusive_zone reserves on the
     // single (Left) edge — well-defined push semantics.
     let window = layer_window(monitor)
-        .layer(Layer::Overlay)
+        .layer(Layer::Top)
         .anchor(Anchor::Left)
         .anchor(Anchor::Top)
         .anchor(Anchor::Bottom)
@@ -139,14 +144,6 @@ pub fn install(monitor: &Monitor) {
     window.add_css_class("ts-sidebar-surface");
     // Fixed surface width so niri sees a stable 320-wide column when open.
     window.set_size_request(SIDEBAR_WIDTH, -1);
-
-    // Layer::Overlay sits above niri's apps by spec. Hide the sidebar
-    // whenever this monitor's active workspace has an edge-spanning window
-    // (fullscreen, maximize-to-edges) — mirroring frame.rs's same guard.
-    let connector = monitor.connector().unwrap_or_default();
-    let mon_w = f64::from(monitor.size().0);
-    let edge_visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
-    bind_visible(edge_visible, &window);
 
     // Revealer drives the slide animation. SlideRight pushes the card out
     // from the screen's left edge, in time with niri's tile reflow.

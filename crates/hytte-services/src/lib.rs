@@ -6,6 +6,7 @@ pub mod brightness;
 pub mod calendar;
 pub mod clipboard;
 pub mod clock;
+pub mod departures;
 pub mod displays;
 pub mod dnd;
 pub mod hooks;

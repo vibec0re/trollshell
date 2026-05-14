@@ -162,6 +162,7 @@ pub fn install(monitor: &Monitor) {
     card.set_vexpand(true);
 
     card.append(&crate::widgets::calendar::widget(monitor));
+    card.append(&crate::widgets::departures::widget());
 
     revealer.set_child(Some(&card));
     window.set_child(Some(&revealer));
@@ -195,6 +196,7 @@ pub fn install(monitor: &Monitor) {
                 window_for_open.present();
                 window_for_open.set_exclusive_zone(SIDEBAR_WIDTH - FRAME_THICKNESS_I32);
                 revealer_for_open.set_reveal_child(true);
+                hytte::services::departures::refresh();
             } else {
                 // Start the close animation. Surface stays visible + zone stays
                 // reserved until the revealer reports it has fully collapsed

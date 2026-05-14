@@ -12,8 +12,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::gtk::{self, glib, prelude::*};
+use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
+use hytte::services::niri;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
@@ -127,7 +128,7 @@ pub fn install(monitor: &Monitor) {
     // spans the full screen height and exclusive_zone reserves on the
     // single (Left) edge — well-defined push semantics.
     let window = layer_window(monitor)
-        .layer(Layer::Top)
+        .layer(Layer::Overlay)
         .anchor(Anchor::Left)
         .anchor(Anchor::Top)
         .anchor(Anchor::Bottom)
@@ -138,6 +139,14 @@ pub fn install(monitor: &Monitor) {
     window.add_css_class("ts-sidebar-surface");
     // Fixed surface width so niri sees a stable 220-wide column when open.
     window.set_size_request(SIDEBAR_WIDTH, -1);
+
+    // Layer::Overlay sits above niri's apps by spec. Hide the sidebar
+    // whenever this monitor's active workspace has an edge-spanning window
+    // (fullscreen, maximize-to-edges) — mirroring frame.rs's same guard.
+    let connector = monitor.connector().unwrap_or_default();
+    let mon_w = f64::from(monitor.size().0);
+    let edge_visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
+    bind_visible(edge_visible, &window);
 
     // Revealer drives the slide animation. SlideRight pushes the card out
     // from the screen's left edge, in time with niri's tile reflow.
@@ -213,6 +222,19 @@ pub fn install(monitor: &Monitor) {
             }
             async {}
         }));
+
+    // ESC → close. Bound to the sidebar window so it fires when the
+    // sidebar has keyboard focus (KeyboardMode::OnDemand).
+    let key_ctrl = gtk::EventControllerKey::new();
+    let monitor_for_esc = monitor.clone();
+    key_ctrl.connect_key_pressed(move |_, k, _, _| {
+        if k == gdk::Key::Escape {
+            toggle(&monitor_for_esc);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(key_ctrl);
 
     // Stash the panel so accessors can find it.
     PANELS.with(|panels| {

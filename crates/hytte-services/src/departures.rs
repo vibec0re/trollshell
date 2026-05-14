@@ -169,6 +169,18 @@ fn into_departure(row: ApiDeparture, now: DateTime<Local>) -> Option<Departure> 
     })
 }
 
+/// Parse a raw response body into a `Vec<Departure>`, filtering as
+/// described on [`into_departure`].
+fn parse_response(body: &str, now: DateTime<Local>) -> Result<Vec<Departure>, String> {
+    let api: ApiResponse =
+        serde_json::from_str(body).map_err(|e| format!("decode: {e}"))?;
+    Ok(api
+        .departures
+        .into_iter()
+        .filter_map(|r| into_departure(r, now))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +250,29 @@ mod tests {
         let now = Local.with_ymd_and_hms(2030, 1, 1, 17, 0, 0).unwrap();
         let row = api.departures.into_iter().next().unwrap();
         assert!(into_departure(row, now).is_none());
+    }
+
+    #[test]
+    fn parse_response_drops_bus_keeps_three_suburban() {
+        let body = include_str!("../tests/fixtures/departures-schoeneweide.json");
+        let parsed = parse_response(body, future_now()).unwrap();
+        assert_eq!(parsed.len(), 3);
+        // Order preserved from the wire format.
+        assert_eq!(parsed[0].line, "S9");
+        assert_eq!(parsed[1].line, "S46");
+        assert_eq!(parsed[2].line, "S8");
+    }
+
+    #[test]
+    fn parse_response_empty_array() {
+        let parsed = parse_response(r#"{"departures": []}"#, future_now()).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_response_malformed_json_is_err() {
+        let err = parse_response("{not json", future_now()).unwrap_err();
+        assert!(err.to_lowercase().contains("decode"), "got: {err}");
     }
 
     #[test]

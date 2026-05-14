@@ -322,6 +322,7 @@ window:not(.dark) .ts-drawer {
     );
     border-radius: 0 10px 10px 0;
     padding: 12px;
+    color: @window_fg_color;
 }
 
 window:not(.dark) .ts-sidebar {
@@ -331,6 +332,7 @@ window:not(.dark) .ts-sidebar {
         rgb(235, 230, 245) 50%,
         rgb(245, 240, 250)
     );
+    color: @window_fg_color;
 }
 
 .ts-sidebar-placeholder {
@@ -338,6 +340,7 @@ window:not(.dark) .ts-sidebar {
     font-style: italic;
     font-size: 13px;
 }
+
 .ts-modal-page {
     padding: 12px;
 }

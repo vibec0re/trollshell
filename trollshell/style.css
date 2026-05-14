@@ -310,6 +310,34 @@ window:not(.dark) .ts-drawer {
         @window_bg_color 100%);
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
 }
+/* Sidebar card — matches the bar/frame dark gradient, oriented vertically.
+   Rounded only on the right side so the cutout's left-edge rounding
+   transfers visually onto the sidebar's right edge. */
+.ts-sidebar {
+    background: linear-gradient(
+        180deg,
+        rgb(15, 15, 35),
+        rgb(25, 15, 45) 50%,
+        rgb(15, 15, 35)
+    );
+    border-radius: 0 10px 10px 0;
+    padding: 12px;
+}
+
+window:not(.dark) .ts-sidebar {
+    background: linear-gradient(
+        180deg,
+        rgb(245, 240, 250),
+        rgb(235, 230, 245) 50%,
+        rgb(245, 240, 250)
+    );
+}
+
+.ts-sidebar-placeholder {
+    color: alpha(currentColor, 0.5);
+    font-style: italic;
+    font-size: 13px;
+}
 .ts-modal-page {
     padding: 12px;
 }

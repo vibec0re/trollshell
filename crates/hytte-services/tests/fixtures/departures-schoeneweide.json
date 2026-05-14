@@ -1,0 +1,40 @@
+{
+  "departures": [
+    {
+      "tripId": "trip-1-ontime",
+      "when":        "2030-01-01T16:42:00+01:00",
+      "plannedWhen": "2030-01-01T16:42:00+01:00",
+      "delay": 0,
+      "cancelled": false,
+      "direction": "Spandau",
+      "line": { "name": "S9", "product": "suburban" }
+    },
+    {
+      "tripId": "trip-2-delayed",
+      "when":        "2030-01-01T16:49:00+01:00",
+      "plannedWhen": "2030-01-01T16:44:00+01:00",
+      "delay": 300,
+      "cancelled": false,
+      "direction": "Königs Wusterhausen",
+      "line": { "name": "S46", "product": "suburban" }
+    },
+    {
+      "tripId": "trip-3-cancelled",
+      "when":        null,
+      "plannedWhen": "2030-01-01T16:49:00+01:00",
+      "delay": null,
+      "cancelled": true,
+      "direction": "Wildau",
+      "line": { "name": "S8", "product": "suburban" }
+    },
+    {
+      "tripId": "trip-4-bus-noise",
+      "when":        "2030-01-01T16:50:00+01:00",
+      "plannedWhen": "2030-01-01T16:50:00+01:00",
+      "delay": 0,
+      "cancelled": false,
+      "direction": "Bus stop bus stop",
+      "line": { "name": "164", "product": "bus" }
+    }
+  ]
+}

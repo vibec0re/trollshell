@@ -223,6 +223,35 @@ fn next_state(
     }
 }
 
+/// One blocking HTTP fetch + parse. Runs on a blocking thread via
+/// `tokio::task::spawn_blocking`. Failures (any layer) are collapsed to a
+/// short error string used in [`DeparturesState::Err`].
+fn fetch_once() -> Result<Vec<Departure>, String> {
+    let url = format!(
+        "https://v6.bvg.transport.rest/stops/{SCHOENEWEIDE_ID}/departures\
+         ?results={RESULTS}&suburban=true&subway=false&bus=false&tram=false\
+         &regional=false&express=false&ferry=false&tariff=false&language=de"
+    );
+
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+        .timeout_global(Some(HTTP_READ_TIMEOUT))
+        .build();
+    let agent: ureq::Agent = config.into();
+
+    let mut resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("http: {e}"))?;
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(4 * 1024 * 1024)
+        .read_to_string()
+        .map_err(|e| format!("body: {e}"))?;
+    parse_response(&body, Local::now())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

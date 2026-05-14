@@ -604,6 +604,9 @@ window:not(.dark) .ts-drawer {
 .ts-sidebar-calendar .ts-calendar > grid > label.other-month {
     color: alpha(currentColor, 0.25);
 }
+.ts-sidebar-calendar .ts-calendar > grid > label.marked {
+    font-weight: 600;
+}
 
 /* adw::PreferencesGroup palette swap for the dark sidebar. The exact
  * selectors below target the inner adw `list.boxed-list` element; if

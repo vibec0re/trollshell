@@ -150,10 +150,10 @@ pub fn install(monitor: &Monitor) {
     revealer.set_halign(gtk::Align::Fill);
     revealer.set_valign(gtk::Align::Fill);
 
-    // Card — vertical box that holds the placeholder label (Phase 1) and
-    // future content (Phase 2+). Fills the entire 320-px surface: no margins
-    // so there is no gap around the dark area. The bar (Layer::Top, mapped
-    // after sidebar) naturally paints over y=0..44, so no top margin is needed.
+    // Card — vertical box that holds the sidebar's content widgets. Fills
+    // the entire surface: no margins so there is no gap around the dark area.
+    // The bar (Layer::Top, mapped after sidebar) naturally paints over
+    // y=0..44, so no top margin is needed.
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");
     card.set_halign(gtk::Align::Fill);

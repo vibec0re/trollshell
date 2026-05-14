@@ -252,6 +252,70 @@ fn fetch_once() -> Result<Vec<Departure>, String> {
     parse_response(&body, Local::now())
 }
 
+// ── Service ─────────────────────────────────────────────────────────────────
+
+pub struct DeparturesService;
+
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct DeparturesHandles {
+    pub(crate) state: Mutable<DeparturesState>,
+    pub(crate) notify: Arc<Notify>,
+}
+
+impl Service for DeparturesService {
+    type Handles = DeparturesHandles;
+
+    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+        let handles = DeparturesHandles::default();
+        let state = handles.state.clone();
+        let notify = handles.notify.clone();
+        rt.spawn(async move {
+            poll_loop(state, notify).await;
+        });
+        handles
+    }
+}
+
+#[must_use]
+pub fn service() -> DeparturesService {
+    DeparturesService
+}
+
+async fn poll_loop(state: Mutable<DeparturesState>, notify: Arc<Notify>) {
+    // `interval` ticks immediately on first `.tick()` — so the loop body
+    // fires once at boot, then every POLL_INTERVAL afterwards.
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Single-flight guard so a refresh() during an in-flight tick is a
+    // no-op rather than a stampede on the public API.
+    let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = notify.notified() => {}
+        }
+        if in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+
+        let result = match tokio::task::spawn_blocking(fetch_once).await {
+            Ok(r) => r,
+            Err(join) => Err(format!("join: {join}")),
+        };
+        in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let now = Local::now();
+        let prev = state.get_cloned();
+        let next = next_state(prev, result, now);
+        if next != state.get_cloned() {
+            state.set(next);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

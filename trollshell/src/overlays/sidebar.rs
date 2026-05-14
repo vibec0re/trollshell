@@ -26,11 +26,18 @@ pub const SIDEBAR_WIDTH: i32 = 220;
 /// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
 const FRAME_THICKNESS_I32: i32 = 8;
 
+/// Top margin for the sidebar card: bar height (44) + 10 px gap below the
+/// bar (matches `modal::install`'s drawer-float offset). Keep in sync with
+/// `frame.rs::BAR_HEIGHT`.
+const CARD_MARGIN_TOP: i32 = 54;
+
 thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
     /// or earlier (e.g., the frame); writers go through `toggle`.
     static SIDEBAR_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
+}
 
+thread_local! {
     /// Per-connector sidebar surface handle. Populated by `install`;
     /// read by `current_visible_width_for_key` and `is_settled_for_key`.
     static PANELS: RefCell<HashMap<String, SidebarPanel>> = RefCell::new(HashMap::new());
@@ -40,6 +47,7 @@ struct SidebarPanel {
     window: gtk::Window,
     revealer: gtk::Revealer,
     open_state: Mutable<bool>,
+    subscription: glib::JoinHandle<()>,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -148,7 +156,7 @@ pub fn install(monitor: &Monitor) {
     card.add_css_class("ts-sidebar");
     card.set_valign(gtk::Align::Fill);
     card.set_vexpand(true);
-    card.set_margin_top(54); // BAR_HEIGHT (44) + 10 gap (matches drawer float)
+    card.set_margin_top(CARD_MARGIN_TOP);
     card.set_margin_bottom(FRAME_THICKNESS_I32);
     card.set_margin_start(FRAME_THICKNESS_I32);
 
@@ -163,47 +171,55 @@ pub fn install(monitor: &Monitor) {
     window.set_child(Some(&revealer));
     window.set_visible(false);
 
+    // After the close animation finishes, drop the exclusive zone and hide
+    // the surface. (When the open animation finishes, child_revealed flips
+    // to true — we don't need to do anything.) Cross-check open_state so
+    // that a rapid open→close→open doesn't let the stale close-completion
+    // tear down state the re-open has already set.
+    let open_state_for_notify = open_state.clone();
+    let window_for_settled = window.clone();
+    revealer.connect_child_revealed_notify(move |r| {
+        if !r.is_child_revealed() && !open_state_for_notify.get() {
+            window_for_settled.set_exclusive_zone(0);
+            window_for_settled.set_visible(false);
+        }
+    });
+
+    // Drive open/close transitions from the shared mutable. Toggle flips
+    // the bool; this subscription does the surface work. Capture the
+    // JoinHandle so close_all can abort the subscription before closing the
+    // window, preventing a zombie subscription from firing into a dead window
+    // after a hot-plug cycle.
+    let window_for_open = window.clone();
+    let revealer_for_open = revealer.clone();
+    let subscription =
+        glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
+            if open {
+                window_for_open.set_visible(true);
+                window_for_open.present();
+                window_for_open.set_exclusive_zone(SIDEBAR_WIDTH - FRAME_THICKNESS_I32);
+                revealer_for_open.set_reveal_child(true);
+            } else {
+                // Start the close animation. Surface stays visible + zone stays
+                // reserved until the revealer reports it has fully collapsed
+                // (see connect_child_revealed_notify above) — otherwise niri
+                // reclaims the space while the card is still on-screen.
+                revealer_for_open.set_reveal_child(false);
+            }
+            async {}
+        }));
+
     // Stash the panel so accessors can find it.
     PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key.clone(),
             SidebarPanel {
-                window: window.clone().upcast(),
+                window: window.clone(),
                 revealer: revealer.clone(),
                 open_state: open_state.clone(),
+                subscription,
             },
         );
-    });
-
-    // Drive open/close transitions from the shared mutable. Toggle flips
-    // the bool; this subscription does the surface work.
-    let window_for_open = window.clone();
-    let revealer_for_open = revealer.clone();
-    glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
-        if open {
-            window_for_open.set_visible(true);
-            window_for_open.present();
-            window_for_open.set_exclusive_zone(SIDEBAR_WIDTH - FRAME_THICKNESS_I32);
-            revealer_for_open.set_reveal_child(true);
-        } else {
-            // Start the close animation. Surface stays visible + zone stays
-            // reserved until the revealer reports it has fully collapsed
-            // (see connect_child_revealed_notify below) — otherwise niri
-            // reclaims the space while the card is still on-screen.
-            revealer_for_open.set_reveal_child(false);
-        }
-        async {}
-    }));
-
-    // After the close animation finishes, drop the exclusive zone and hide
-    // the surface. (When the open animation finishes, child_revealed flips
-    // to true — we don't need to do anything.)
-    let window_for_settled = window.clone();
-    revealer.connect_child_revealed_notify(move |r| {
-        if !r.is_child_revealed() {
-            window_for_settled.set_exclusive_zone(0);
-            window_for_settled.set_visible(false);
-        }
     });
 }
 
@@ -213,8 +229,11 @@ pub fn install(monitor: &Monitor) {
 pub fn close_all() {
     PANELS.with(|panels| {
         for (_, panel) in panels.borrow_mut().drain() {
-            // Reset the bool so subscribers see the closed state, then
-            // tear down the surface.
+            // Abort the subscription first so it cannot dispatch into the
+            // (about to be closed) window. Then reset the bool so any other
+            // subscribers see the closed state, and finally tear down the
+            // surface.
+            panel.subscription.abort();
             panel.open_state.set(false);
             panel.window.close();
         }

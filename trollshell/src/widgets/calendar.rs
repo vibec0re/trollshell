@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::calendar::CalendarEvent;
 
@@ -98,6 +98,21 @@ pub fn widget(_monitor: &Monitor) -> gtk::Widget {
         *rows_for_bind.borrow_mut() = new_rows;
     });
 
+    // Re-mark on month navigation. connect_next_month bumps year on
+    // December rollover internally, so connect_year_changed isn't needed.
+    {
+        let events_for_next = current_events.clone();
+        cal.connect_next_month(move |c| {
+            apply_event_marks(c, &events_for_next.borrow());
+        });
+    }
+    {
+        let events_for_prev = current_events.clone();
+        cal.connect_prev_month(move |c| {
+            apply_event_marks(c, &events_for_prev.borrow());
+        });
+    }
+
     column.upcast()
 }
 
@@ -134,8 +149,6 @@ fn build_calendar_row(ev: &CalendarEvent) -> hytte::adw::ActionRow {
     use hytte::adw::{self, prelude::*};
     use hytte::services::calendar::format_when;
 
-    // Subtitle: when-string, plus optional location on its own line. Lets
-    // long venue names wrap without inflating the sidebar's width.
     let when = format_when(ev);
     let subtitle = match &ev.location {
         Some(loc) => format!("{when}\n{loc}"),

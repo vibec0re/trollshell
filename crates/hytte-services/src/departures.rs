@@ -181,6 +181,42 @@ fn parse_response(body: &str, now: DateTime<Local>) -> Result<Vec<Departure>, St
         .collect())
 }
 
+/// Apply a fetch result to the current state and return the next state.
+/// Pure function so the transition rules can be unit-tested without any
+/// runtime. The rules are:
+///
+/// | previous                                                  | result   | next                                  |
+/// |-----------------------------------------------------------|----------|---------------------------------------|
+/// | any                                                       | `Ok`     | `Ok { at: now, items }`               |
+/// | `Ok` or `Stale` with `now - at < STALE_DROP_AFTER`        | `Err(e)` | `Stale { at, items, err: e }`         |
+/// | `Stale` with `now - at >= STALE_DROP_AFTER`               | `Err(e)` | `Err { err: e }`                      |
+/// | `Loading` or `Err`                                        | `Err(e)` | `Err { err: e }`                      |
+fn next_state(
+    prev: DeparturesState,
+    result: Result<Vec<Departure>, String>,
+    now: DateTime<Local>,
+) -> DeparturesState {
+    match result {
+        Ok(items) => DeparturesState::Ok { at: now, items },
+        Err(err) => match prev {
+            DeparturesState::Ok { at, items } => {
+                DeparturesState::Stale { at, items, err }
+            }
+            DeparturesState::Stale { at, items, err: _ } => {
+                let age = now.signed_duration_since(at);
+                if age >= chrono::Duration::from_std(STALE_DROP_AFTER).unwrap() {
+                    DeparturesState::Err { err }
+                } else {
+                    DeparturesState::Stale { at, items, err }
+                }
+            }
+            DeparturesState::Loading | DeparturesState::Err { .. } => {
+                DeparturesState::Err { err }
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +286,84 @@ mod tests {
         let now = Local.with_ymd_and_hms(2030, 1, 1, 17, 0, 0).unwrap();
         let row = api.departures.into_iter().next().unwrap();
         assert!(into_departure(row, now).is_none());
+    }
+
+    fn sample_items() -> Vec<Departure> {
+        vec![Departure {
+            line: "S9".into(),
+            direction: "Spandau".into(),
+            planned: future_now() + chrono::Duration::minutes(5),
+            actual:  future_now() + chrono::Duration::minutes(5),
+            delay_minutes: 0,
+            cancelled: false,
+            trip_id: "trip-1-ontime".into(),
+        }]
+    }
+
+    #[test]
+    fn next_state_ok_replaces_anything() {
+        let now = future_now();
+        let next = next_state(DeparturesState::Err { err: "boom".into() },
+                              Ok(sample_items()), now);
+        match next {
+            DeparturesState::Ok { at, items } => {
+                assert_eq!(at, now);
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_state_ok_then_err_becomes_stale() {
+        let now = future_now();
+        let prev = DeparturesState::Ok { at: now, items: sample_items() };
+        // Later by 10 minutes — below the stale-drop threshold.
+        let later = now + chrono::Duration::minutes(10);
+        let next = next_state(prev, Err("net".into()), later);
+        match next {
+            DeparturesState::Stale { at, items, err } => {
+                assert_eq!(at, now);
+                assert_eq!(items.len(), 1);
+                assert_eq!(err, "net");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_state_stale_beyond_threshold_becomes_err() {
+        let now = future_now();
+        let prev = DeparturesState::Stale {
+            at: now,
+            items: sample_items(),
+            err: "earlier".into(),
+        };
+        // 31 minutes later — past STALE_DROP_AFTER (30 min).
+        let much_later = now + chrono::Duration::minutes(31);
+        let next = next_state(prev, Err("still net".into()), much_later);
+        match next {
+            DeparturesState::Err { err } => assert_eq!(err, "still net"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_state_loading_err_becomes_err() {
+        let now = future_now();
+        let next = next_state(DeparturesState::Loading, Err("boom".into()), now);
+        assert!(matches!(next, DeparturesState::Err { .. }));
+    }
+
+    #[test]
+    fn next_state_err_err_stays_err_with_new_message() {
+        let now = future_now();
+        let prev = DeparturesState::Err { err: "old".into() };
+        let next = next_state(prev, Err("new".into()), now);
+        match next {
+            DeparturesState::Err { err } => assert_eq!(err, "new"),
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 
     #[test]

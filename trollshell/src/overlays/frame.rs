@@ -14,7 +14,7 @@
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 use hytte::ui::{layer_window, LayerShell};
@@ -59,7 +59,7 @@ pub fn install(monitor: &Monitor) {
     area.set_vexpand(true);
     window.set_child(Some(&area));
 
-    install_draw(&area);
+    install_draw(&area, monitor.clone());
 
     // Empty input region: clicks pass through to the bar (Layer::Top below)
     // and to niri's apps (normal layer below that). Set after realize so
@@ -73,6 +73,27 @@ pub fn install(monitor: &Monitor) {
     // would paint over those windows.
     let visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
     bind_visible(visible, &window);
+
+    // Redraw the frame's cutout each animation frame while the sidebar's
+    // revealer is in transition, so the cutout's left edge stays in sync
+    // with the slide. Stop ticking once the revealer settles.
+    let area_for_sidebar = area.clone();
+    let monitor_for_sidebar = monitor.clone();
+    glib::MainContext::default().spawn_local(
+        crate::overlays::sidebar::open_signal(monitor).for_each(move |_open| {
+            let area = area_for_sidebar.clone();
+            let monitor = monitor_for_sidebar.clone();
+            area.add_tick_callback(move |a, _clock| {
+                a.queue_draw();
+                if crate::overlays::sidebar::is_settled(&monitor) {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            async {}
+        }),
+    );
 
     window.set_visible(true);
 }
@@ -95,9 +116,10 @@ fn install_click_through(window: &gtk::Window) {
     });
 }
 
-fn install_draw(area: &gtk::DrawingArea) {
+fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
     use hytte::gtk::cairo;
 
+    let monitor_for_draw = monitor;
     area.set_draw_func(move |_area, cr: &cairo::Context, width: i32, height: i32| {
         let w = f64::from(width);
         let h = f64::from(height);
@@ -107,7 +129,13 @@ fn install_draw(area: &gtk::DrawingArea) {
             return;
         }
 
-        let (cx, cy, cw, ch) = cutout_rect(w, h, FRAME_THICKNESS);
+        // Sidebar's current visible width drives the cutout's left edge.
+        // When closed, this is FRAME_THICKNESS (8) — same as before.
+        let left_inset = f64::from(crate::overlays::sidebar::current_visible_width(
+            &monitor_for_draw,
+        ));
+
+        let (cx, cy, cw, ch) = cutout_rect(w, h, left_inset);
         if cw <= 0.0 || ch <= 0.0 {
             return;
         }

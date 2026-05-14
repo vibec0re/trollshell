@@ -62,9 +62,10 @@ pub struct Departure {
 }
 
 /// The whole service surface, observed by the widget.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum DeparturesState {
     /// Initial value before the first fetch returns.
+    #[default]
     Loading,
     /// Most recent fetch succeeded; `at` is when it landed.
     Ok { at: DateTime<Local>, items: Vec<Departure> },
@@ -73,12 +74,6 @@ pub enum DeparturesState {
     Stale { at: DateTime<Local>, items: Vec<Departure>, err: String },
     /// No usable data on hand and the latest fetch failed.
     Err { err: String },
-}
-
-impl Default for DeparturesState {
-    fn default() -> Self {
-        Self::Loading
-    }
 }
 
 /// Formats the delay indicator shown after the time cell. `None` means
@@ -295,7 +290,7 @@ async fn poll_loop(state: Mutable<DeparturesState>, notify: Arc<Notify>) {
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = notify.notified() => {}
+            () = notify.notified() => {}
         }
         if in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) {
             continue;
@@ -342,9 +337,10 @@ pub fn refresh() {
         r.get::<DeparturesHandles>()
             .map(|h| h.notify.clone())
     });
-    match notify {
-        Some(n) => n.notify_one(),
-        None => tracing::warn!("departures::refresh: service not registered"),
+    if let Some(n) = notify {
+        n.notify_one();
+    } else {
+        tracing::warn!("departures::refresh: service not registered");
     }
 }
 

@@ -30,6 +30,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// list has gone cold.
 pub const STALE_DROP_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// Same threshold as [`STALE_DROP_AFTER`], typed as `chrono::Duration`
+/// so it can be compared against age deltas without a runtime conversion.
+const STALE_DROP_AFTER_CHRONO: chrono::Duration = chrono::Duration::seconds(30 * 60);
+
 /// How many departures to request and display.
 pub const RESULTS: usize = 8;
 
@@ -155,6 +159,8 @@ fn into_departure(row: ApiDeparture, now: DateTime<Local>) -> Option<Departure> 
         return None;
     }
 
+    // Integer division intentionally truncates toward zero; sub-minute precision
+    // isn't displayed and trains rarely report non-round delays.
     let delay_seconds = row.delay.unwrap_or(0);
     let delay_minutes = delay_seconds / 60;
 
@@ -204,7 +210,7 @@ fn next_state(
             }
             DeparturesState::Stale { at, items, err: _ } => {
                 let age = now.signed_duration_since(at);
-                if age >= chrono::Duration::from_std(STALE_DROP_AFTER).unwrap() {
+                if age >= STALE_DROP_AFTER_CHRONO {
                     DeparturesState::Err { err }
                 } else {
                     DeparturesState::Stale { at, items, err }
@@ -402,5 +408,50 @@ mod tests {
     #[test]
     fn delay_string_shows_when_late() {
         assert_eq!(delay_string(5), Some("+5".to_string()));
+    }
+
+    #[test]
+    fn next_state_stale_to_ok_recovers() {
+        let now = future_now();
+        let prev = DeparturesState::Stale {
+            at: now,
+            items: sample_items(),
+            err: "old".into(),
+        };
+        // 5 minutes later — well within STALE_DROP_AFTER.
+        let later = now + chrono::Duration::minutes(5);
+        let fresh = vec![Departure {
+            line: "S46".into(),
+            direction: "Königs Wusterhausen".into(),
+            planned: later + chrono::Duration::minutes(7),
+            actual:  later + chrono::Duration::minutes(7),
+            delay_minutes: 0,
+            cancelled: false,
+            trip_id: "trip-fresh".into(),
+        }];
+        let next = next_state(prev, Ok(fresh), later);
+        match next {
+            DeparturesState::Ok { at, items } => {
+                assert_eq!(at, later);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].line, "S46");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_state_stale_at_exact_threshold_drops_to_err() {
+        // At STALE_DROP_AFTER exactly (30 min), the >= comparison must drop.
+        let now = future_now();
+        let prev = DeparturesState::Stale {
+            at: now,
+            items: sample_items(),
+            err: "old".into(),
+        };
+        let exactly_threshold = now + chrono::Duration::minutes(30);
+        let next = next_state(prev, Err("still net".into()), exactly_threshold);
+        assert!(matches!(next, DeparturesState::Err { .. }),
+                "exact-threshold age must drop to Err, got {next:?}");
     }
 }

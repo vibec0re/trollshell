@@ -629,6 +629,53 @@ window:not(.dark) .ts-drawer {
     color: alpha(white, 0.6);
 }
 
+/* ─── Sidebar — departures widget ─────────────────────────────── */
+
+.ts-departures {
+    padding: 12px;
+}
+
+.ts-departure-row {
+    padding: 6px 4px;
+}
+
+.ts-line-badge {
+    min-width: 36px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-weight: 700;
+    color: white;
+    margin-right: 8px;
+}
+.ts-line-S8  { background: #5DAB46; }   /* dark green */
+.ts-line-S9  { background: #882D7A; }   /* violet     */
+.ts-line-S41 { background: #AA5D3D; }
+.ts-line-S42 { background: #C36F33; }
+.ts-line-S46 { background: #C4923D; }   /* chestnut   */
+.ts-line-S47 { background: #C4923D; }
+.ts-line-S85 { background: #A7C539; }   /* yellow-green */
+
+.ts-departure-direction { color: alpha(white, 0.95); }
+
+.ts-departure-time      { color: alpha(white, 0.85); font-variant-numeric: tabular-nums; }
+.ts-departure-delay     { color: #ff6b6b; margin-left: 6px; font-variant-numeric: tabular-nums; }
+
+.ts-departure-row.ts-cancelled .ts-departure-time,
+.ts-departure-row.ts-cancelled .ts-departure-direction {
+    text-decoration: line-through;
+    color: alpha(#ff6b6b, 0.7);
+}
+
+.ts-departures-loading,
+.ts-departures-empty,
+.ts-departures-stale-footer {
+    color: alpha(white, 0.45);
+    font-style: italic;
+    padding: 12px;
+}
+
+.ts-departures-error { color: #ff6b6b; padding: 12px; }
+
 /* ─── Calendar — transient highlight when click-day matches a row ─ */
 
 .ts-cal-day-hit {

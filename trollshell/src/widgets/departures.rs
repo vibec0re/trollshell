@@ -8,6 +8,19 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{clock, departures};
 use hytte::services::departures::{delay_string, Departure, DeparturesState};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// Handle to one row's mutable time cell — used by the widget-level clock
+/// subscription to update the "X min · HH:MM" string in place each tick,
+/// without rebuilding the list.
+struct TimeRowRef {
+    actual: DateTime<Local>,
+    time_lbl: gtk::Label,
+}
+
+#[derive(Default, Clone)]
+struct TimeRows(Rc<RefCell<Vec<TimeRowRef>>>);
 
 /// Human-readable "minutes from now" label. Negative deltas and anything
 /// within the next 60 s render as `"now"`. Above that, we round to the
@@ -22,40 +35,48 @@ pub fn relative_label(now: DateTime<Local>, departure: DateTime<Local>) -> Strin
     format!("{minutes} min")
 }
 
-/// Build one row widget for `d`. The time cell re-renders on every clock
-/// tick by binding to `clock::now()`. The row's CSS classes encode line
-/// and cancellation state so styling is purely declarative.
-fn row(d: &Departure) -> gtk::Widget {
+/// Build one row widget for `d` and a `TimeRowRef` for the widget-level
+/// clock subscription to update the time label in place. No per-row
+/// `bind(clock::now(), …)` — that would spawn a new glib task on every
+/// rebuild, leaking without bound.
+fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("ts-departure-row");
     if d.cancelled {
         row.add_css_class("ts-cancelled");
     }
 
-    // Line badge.
+    // Line badge. Sanitize the line name for the CSS class so a stray
+    // non-alphanumeric character from the API (e.g. "Bus 194", "SEV S9")
+    // doesn't trip gtk::add_css_class's debug-mode assertion.
     let badge = gtk::Label::new(Some(&d.line));
     badge.add_css_class("ts-line-badge");
-    badge.add_css_class(&format!("ts-line-{}", d.line));
+    let safe_line: String = d.line.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    badge.add_css_class(&format!("ts-line-{safe_line}"));
     badge.set_halign(gtk::Align::Start);
     row.append(&badge);
 
-    // Direction (takes the slack).
+    // Direction (takes the slack). max_width_chars guarantees ellipsis
+    // triggers even when the sidebar is wide enough that hexpand alone
+    // wouldn't have constrained the label.
     let direction = gtk::Label::new(Some(&d.direction));
     direction.add_css_class("ts-departure-direction");
     direction.set_halign(gtk::Align::Start);
     direction.set_hexpand(true);
     direction.set_xalign(0.0);
     direction.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    direction.set_max_width_chars(22);
     row.append(&direction);
 
-    // Time cell — re-renders each clock tick.
+    // Time cell — text is set initially against the current clock, then
+    // updated in place by the widget-level clock subscription. No bind here.
     let time_lbl = gtk::Label::new(None);
     time_lbl.add_css_class("ts-departure-time");
     let actual = d.actual;
-    bind(clock::now(), &time_lbl, move |lbl, now| {
-        let rel = relative_label(now, actual);
-        lbl.set_text(&format!("{rel} · {}", actual.format("%H:%M")));
-    });
+    let now = chrono::Local::now();
+    time_lbl.set_text(&format!("{} · {}", relative_label(now, actual), actual.format("%H:%M")));
     row.append(&time_lbl);
 
     // Delay indicator (hidden when on time).
@@ -65,7 +86,8 @@ fn row(d: &Departure) -> gtk::Widget {
         row.append(&delay);
     }
 
-    row.upcast()
+    let row_ref = TimeRowRef { actual, time_lbl: time_lbl.clone() };
+    (row.upcast(), row_ref)
 }
 
 fn loading_row() -> gtk::Widget {
@@ -103,11 +125,15 @@ fn stale_footer(err: &str, at: DateTime<Local>) -> gtk::Widget {
 }
 
 /// Drain `list` and re-populate it from `state`. Eight rows max, so a
-/// remove-all + append-fresh cycle per emission is cheap.
-fn rebuild(list: &gtk::Box, state: &DeparturesState) {
+/// remove-all + append-fresh cycle per emission is cheap. Clears and
+/// refills `time_rows` so the widget-level clock subscription always
+/// addresses exactly the current set of labels.
+fn rebuild(list: &gtk::Box, state: &DeparturesState, time_rows: &TimeRows) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    let mut rows = time_rows.0.borrow_mut();
+    rows.clear();
     match state {
         DeparturesState::Loading => list.append(&loading_row()),
         DeparturesState::Err { err } => list.append(&error_row(err)),
@@ -116,7 +142,9 @@ fn rebuild(list: &gtk::Box, state: &DeparturesState) {
                 list.append(&empty_row());
             } else {
                 for d in items {
-                    list.append(&row(d));
+                    let (w, r) = row(d);
+                    list.append(&w);
+                    rows.push(r);
                 }
             }
             if let DeparturesState::Stale { err, at, .. } = state {
@@ -126,16 +154,35 @@ fn rebuild(list: &gtk::Box, state: &DeparturesState) {
     }
 }
 
-/// Build the departures widget. Subscribes to
-/// [`departures::current()`] and rebuilds the list on every emission.
+/// Build the departures widget. Uses exactly two `bind` subscriptions on
+/// the long-lived `list` widget: one for state changes (rebuilds the list
+/// and refreshes `time_rows`), one for clock ticks (updates each row's
+/// time label in place). This avoids the per-row leak where
+/// `bind(clock::now(), &time_lbl, …)` would spawn a new glib task on
+/// every rebuild without a cancellation handle.
 #[must_use]
 pub fn widget() -> gtk::Widget {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
     list.add_css_class("ts-departures");
     list.set_valign(gtk::Align::Start);
 
-    bind(departures::current(), &list, |list, state| {
-        rebuild(list, &state);
+    let time_rows = TimeRows::default();
+
+    // State changes rebuild the list (clears + repopulates time_rows).
+    let time_rows_for_state = time_rows.clone();
+    bind(departures::current(), &list, move |list, state| {
+        rebuild(list, &state, &time_rows_for_state);
+    });
+
+    // One clock subscription, updates every time label in place. The bind
+    // future lives as long as `list` does, which is the lifetime of the
+    // sidebar — exactly what we want.
+    let time_rows_for_clock = time_rows.clone();
+    bind(clock::now(), &list, move |_list, now| {
+        for r in time_rows_for_clock.0.borrow().iter() {
+            let rel = relative_label(now, r.actual);
+            r.time_lbl.set_text(&format!("{} · {}", rel, r.actual.format("%H:%M")));
+        }
     });
 
     list.upcast()

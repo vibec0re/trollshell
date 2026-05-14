@@ -152,7 +152,7 @@ pub fn install(monitor: &Monitor) {
     // from the screen's left edge, in time with niri's tile reflow.
     let revealer = gtk::Revealer::new();
     revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
-    revealer.set_transition_duration(180);
+    revealer.set_transition_duration(0);
     revealer.set_reveal_child(false);
     revealer.set_halign(gtk::Align::Start);
     revealer.set_valign(gtk::Align::Fill);

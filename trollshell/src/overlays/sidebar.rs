@@ -18,10 +18,10 @@ use hytte::services::niri;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
-/// "frame border ~220px" geometry from the spec; the frame's cutout left
+/// "frame border ~320px" geometry from the spec; the frame's cutout left
 /// edge animates from `FRAME_THICKNESS` (8) up to this value while the
 /// sidebar reveals.
-pub const SIDEBAR_WIDTH: i32 = 220;
+pub const SIDEBAR_WIDTH: i32 = 320;
 
 /// Frame-strut thickness, duplicated from `frame.rs` so this module stays
 /// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
@@ -137,7 +137,7 @@ pub fn install(monitor: &Monitor) {
         .keyboard_mode(KeyboardMode::OnDemand)
         .build();
     window.add_css_class("ts-sidebar-surface");
-    // Fixed surface width so niri sees a stable 220-wide column when open.
+    // Fixed surface width so niri sees a stable 320-wide column when open.
     window.set_size_request(SIDEBAR_WIDTH, -1);
 
     // Layer::Overlay sits above niri's apps by spec. Hide the sidebar
@@ -272,10 +272,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sidebar_width_is_220() {
+    fn sidebar_width_is_320() {
         // Frame integration assumes this exact value when computing how
         // much the cutout's left edge moves. Guard against accidental edits.
-        assert_eq!(SIDEBAR_WIDTH, 220);
+        assert_eq!(SIDEBAR_WIDTH, 320);
     }
 
     #[test]

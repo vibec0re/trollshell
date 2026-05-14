@@ -224,12 +224,12 @@ mod tests {
 
     #[test]
     fn cutout_rect_with_sidebar_open() {
-        // Sidebar fully open at SIDEBAR_WIDTH (220) means the cutout's left
-        // edge starts at x = 220 instead of the default FRAME_THICKNESS.
-        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 220.0);
-        assert_eq!(x, 220.0);
+        // Sidebar fully open at SIDEBAR_WIDTH (320) means the cutout's left
+        // edge starts at x = 320 instead of the default FRAME_THICKNESS.
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 320.0);
+        assert_eq!(x, 320.0);
         assert_eq!(y, BAR_HEIGHT);
-        assert_eq!(w, 1920.0 - 220.0 - FRAME_THICKNESS);
+        assert_eq!(w, 1920.0 - 320.0 - FRAME_THICKNESS);
         assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
     }
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
-use futures_signals::signal::{Mutable, Signal, SignalExt};
+use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{registry, Service};
 use tokio::sync::Notify;
 
@@ -313,6 +313,33 @@ async fn poll_loop(state: Mutable<DeparturesState>, notify: Arc<Notify>) {
         if next != state.get_cloned() {
             state.set(next);
         }
+    }
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/// Signal of the current departures state. Subscribers receive every
+/// transition. The very first emission is [`DeparturesState::Loading`].
+pub fn current() -> impl Signal<Item = DeparturesState> {
+    registry::with(|r| {
+        r.get::<DeparturesHandles>()
+            .expect("departures::service() not registered")
+            .state
+            .signal_cloned()
+    })
+}
+
+/// Wake the poll task once, triggering a fresh fetch. Idempotent and
+/// cheap — coalesced if another wake-up is already pending. No-op if the
+/// service hasn't been registered.
+pub fn refresh() {
+    let notify = registry::with(|r| {
+        r.get::<DeparturesHandles>()
+            .map(|h| h.notify.clone())
+    });
+    match notify {
+        Some(n) => n.notify_one(),
+        None => tracing::warn!("departures::refresh: service not registered"),
     }
 }
 

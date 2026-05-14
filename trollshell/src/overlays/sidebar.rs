@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use hytte::futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::prelude::*;
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the

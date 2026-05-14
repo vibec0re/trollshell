@@ -1,6 +1,7 @@
 pub mod battery;
 pub mod bluetooth;
 pub mod brightness;
+pub mod calendar;
 pub mod clock;
 pub mod departures;
 pub mod cpu;
@@ -13,6 +14,7 @@ pub mod network;
 pub mod notif_indicator;
 pub mod power_chip;
 pub mod settings_chip;
+pub mod sidebar_toggle;
 pub mod tray;
 pub mod volume;
 pub mod vpn;

@@ -14,7 +14,7 @@
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 use hytte::ui::{layer_window, LayerShell};
@@ -59,7 +59,7 @@ pub fn install(monitor: &Monitor) {
     area.set_vexpand(true);
     window.set_child(Some(&area));
 
-    install_draw(&area);
+    install_draw(&area, monitor.clone());
 
     // Empty input region: clicks pass through to the bar (Layer::Top below)
     // and to niri's apps (normal layer below that). Set after realize so
@@ -73,6 +73,27 @@ pub fn install(monitor: &Monitor) {
     // would paint over those windows.
     let visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
     bind_visible(visible, &window);
+
+    // Redraw the frame's cutout each animation frame while the sidebar's
+    // revealer is in transition, so the cutout's left edge stays in sync
+    // with the slide. Stop ticking once the revealer settles.
+    let area_for_sidebar = area.clone();
+    let monitor_for_sidebar = monitor.clone();
+    glib::MainContext::default().spawn_local(
+        crate::overlays::sidebar::open_signal(monitor).for_each(move |_open| {
+            let area = area_for_sidebar.clone();
+            let monitor = monitor_for_sidebar.clone();
+            area.add_tick_callback(move |a, _clock| {
+                a.queue_draw();
+                if crate::overlays::sidebar::is_settled(&monitor) {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+            async {}
+        }),
+    );
 
     window.set_visible(true);
 }
@@ -95,9 +116,10 @@ fn install_click_through(window: &gtk::Window) {
     });
 }
 
-fn install_draw(area: &gtk::DrawingArea) {
+fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
     use hytte::gtk::cairo;
 
+    let monitor_for_draw = monitor;
     area.set_draw_func(move |_area, cr: &cairo::Context, width: i32, height: i32| {
         let w = f64::from(width);
         let h = f64::from(height);
@@ -107,7 +129,13 @@ fn install_draw(area: &gtk::DrawingArea) {
             return;
         }
 
-        let (cx, cy, cw, ch) = cutout_rect(w, h);
+        // Sidebar's current visible width drives the cutout's left edge.
+        // When closed, this is FRAME_THICKNESS (8) — same as before.
+        let left_inset = f64::from(crate::overlays::sidebar::current_visible_width(
+            &monitor_for_draw,
+        ));
+
+        let (cx, cy, cw, ch) = cutout_rect(w, h, left_inset);
         if cw <= 0.0 || ch <= 0.0 {
             return;
         }
@@ -117,9 +145,25 @@ fn install_draw(area: &gtk::DrawingArea) {
         // EvenOdd so the cutout is excluded.
         cr.set_fill_rule(cairo::FillRule::EvenOdd);
 
-        // Outer region: from (0, BAR_HEIGHT) to (w, h). Bar area above is
+        // Outer region: from (left_inset, BAR_HEIGHT) to (w, h). Starting at
+        // left_inset (instead of 0) means the frame's cairo paint never enters
+        // the sidebar's region — the sidebar's surface (Layer::Top, below this
+        // Layer::Overlay frame) shows through naturally. When the sidebar is
+        // closed, left_inset = FRAME_THICKNESS (8) and this is identical to the
+        // previous "from 0" rect minus the now-empty L-strut. Bar area above is
         // left untouched (transparent), so the bar paints its own gradient.
-        cr.rectangle(0.0, BAR_HEIGHT, w, h - BAR_HEIGHT);
+        // When the sidebar is open (left_inset > FRAME_THICKNESS), start the
+        // outer paint rect at left_inset so the frame's gradient never enters
+        // the sidebar's region — letting the sidebar surface (Layer::Top, below
+        // this Layer::Overlay frame) show through. When closed (left_inset ==
+        // FRAME_THICKNESS), start at 0 so the standard 8px L-strut paints
+        // normally — same visual as before the sidebar feature.
+        let outer_left = if left_inset > FRAME_THICKNESS {
+            left_inset
+        } else {
+            0.0
+        };
+        cr.rectangle(outer_left, BAR_HEIGHT, w - outer_left, h - BAR_HEIGHT);
 
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
@@ -156,14 +200,15 @@ fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, ra
     cr.close_path();
 }
 
-/// Cutout bounds for a monitor of size (`width`, `height`). The cutout
-/// is the rounded transparent rectangle inside which apps tile. Returns
-/// `(x, y, w, h)` of the cutout's bounding box (corner radius applied
-/// at draw time, not in this rect).
-fn cutout_rect(width: f64, height: f64) -> (f64, f64, f64, f64) {
-    let x = FRAME_THICKNESS;
+/// Cutout bounds for a monitor of size (`width`, `height`), with the cutout's
+/// left edge starting at `left_inset` px from the screen's left edge. Pass
+/// `FRAME_THICKNESS` for the default frame-only inset; pass the sidebar's
+/// current visible width when the sidebar is open. Returns `(x, y, w, h)` of
+/// the cutout's bounding box (corner radius applied at draw time).
+fn cutout_rect(width: f64, height: f64, left_inset: f64) -> (f64, f64, f64, f64) {
+    let x = left_inset;
     let y = BAR_HEIGHT;
-    let w = (width - 2.0 * FRAME_THICKNESS).max(0.0);
+    let w = (width - left_inset - FRAME_THICKNESS).max(0.0);
     let h = (height - BAR_HEIGHT - FRAME_THICKNESS).max(0.0);
     (x, y, w, h)
 }
@@ -176,7 +221,7 @@ mod tests {
     #[test]
     fn cutout_rect_normal_monitor() {
         // 1920x1080: bar 44 (top) + bottom inset N + L/R inset N each.
-        let (x, y, w, h) = cutout_rect(1920.0, 1080.0);
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS);
         assert_eq!(x, FRAME_THICKNESS);
         assert_eq!(y, BAR_HEIGHT);
         assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
@@ -188,8 +233,19 @@ mod tests {
         // Pathological tiny monitor: cutout would be negative; clamp to 0
         // to avoid passing negative dimensions into cairo. Use sub-frame
         // dimensions so the clamp engages regardless of FRAME_THICKNESS.
-        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0);
+        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0, FRAME_THICKNESS);
         assert_eq!(w, 0.0);
         assert_eq!(h, 0.0);
+    }
+
+    #[test]
+    fn cutout_rect_with_sidebar_open() {
+        // Sidebar fully open at SIDEBAR_WIDTH (320) means the cutout's left
+        // edge starts at x = 320 instead of the default FRAME_THICKNESS.
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 320.0);
+        assert_eq!(x, 320.0);
+        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(w, 1920.0 - 320.0 - FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
     }
 }

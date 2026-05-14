@@ -161,12 +161,7 @@ pub fn install(monitor: &Monitor) {
     card.set_valign(gtk::Align::Fill);
     card.set_vexpand(true);
 
-    let placeholder = gtk::Label::new(Some("sidebar"));
-    placeholder.add_css_class("ts-sidebar-placeholder");
-    placeholder.set_halign(gtk::Align::Center);
-    placeholder.set_valign(gtk::Align::Center);
-    placeholder.set_vexpand(true);
-    card.append(&placeholder);
+    card.append(&crate::widgets::calendar::widget(monitor));
 
     revealer.set_child(Some(&card));
     window.set_child(Some(&revealer));

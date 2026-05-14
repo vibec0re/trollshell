@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::calendar::CalendarEvent;
 
@@ -14,8 +14,42 @@ use hytte::services::calendar::CalendarEvent;
 /// to `.ts-sidebar`; the widget owns its own subscriptions to
 /// `calendar::events()` and `sidebar::open_signal(monitor)`.
 pub fn widget(_monitor: &Monitor) -> gtk::Widget {
+    use hytte::adw::{self, prelude::*};
+
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.add_css_class("ts-sidebar-calendar");
+
+    // Month grid. GtkCalendar self-scrolls to the current month on
+    // construction. Marks are applied later by apply_event_marks.
+    let cal = gtk::Calendar::new();
+    cal.set_show_heading(true);
+    cal.set_show_day_names(true);
+    cal.set_show_week_numbers(false);
+    cal.add_css_class("ts-calendar");
+    column.append(&cal);
+
+    // Small section header above the events list.
+    let header = gtk::Label::new(Some("UPCOMING"));
+    header.add_css_class("ts-sidebar-cal-header");
+    header.set_halign(gtk::Align::Start);
+    column.append(&header);
+
+    // adw::PreferencesGroup styled as a list. The group's `title` ends
+    // up large; we use a separate `header` label above instead so we
+    // can match the small-caps sidebar typography. The group itself
+    // gets no title.
+    let group = adw::PreferencesGroup::new();
+    group.add_css_class("ts-sidebar-cal-list");
+
+    // Bounded ScrolledWindow so the list scrolls independently when long.
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_min_content_height(220);
+    scrolled.set_max_content_height(360);
+    scrolled.set_child(Some(&group));
+    column.append(&scrolled);
+
     column.upcast()
 }
 

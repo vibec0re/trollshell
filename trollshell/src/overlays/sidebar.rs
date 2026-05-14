@@ -32,11 +32,6 @@ pub const SIDEBAR_WIDTH: i32 = 320;
 /// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
 const FRAME_THICKNESS_I32: i32 = 8;
 
-/// Top margin for the sidebar card: bar height (44) + 10 px gap below the
-/// bar (matches `modal::install`'s drawer-float offset). Keep in sync with
-/// `frame.rs::BAR_HEIGHT`.
-const CARD_MARGIN_TOP: i32 = 54;
-
 thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
     /// or earlier (e.g., the frame); writers go through `toggle`.
@@ -99,7 +94,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map(|p| p.revealer.width().max(FRAME_THICKNESS_I32))
+            .map(|_p| SIDEBAR_WIDTH)
             .unwrap_or(FRAME_THICKNESS_I32)
     })
 }
@@ -152,25 +147,19 @@ pub fn install(monitor: &Monitor) {
     revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
     revealer.set_transition_duration(0);
     revealer.set_reveal_child(false);
-    revealer.set_halign(gtk::Align::Start);
+    revealer.set_halign(gtk::Align::Fill);
     revealer.set_valign(gtk::Align::Fill);
 
     // Card — vertical box that holds the placeholder label (Phase 1) and
-    // future content (Phase 2+). Margins place the card inside the cutout
-    // area: top under the bar+gap, bottom flush with the frame's bottom
-    // strut, start flush with the frame's left strut.
+    // future content (Phase 2+). Fills the entire 320-px surface: no margins
+    // so there is no gap around the dark area. The bar (Layer::Top, mapped
+    // after sidebar) naturally paints over y=0..44, so no top margin is needed.
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");
+    card.set_halign(gtk::Align::Fill);
+    card.set_hexpand(true);
     card.set_valign(gtk::Align::Fill);
     card.set_vexpand(true);
-    card.set_margin_top(CARD_MARGIN_TOP);
-    card.set_margin_bottom(FRAME_THICKNESS_I32);
-    card.set_margin_start(FRAME_THICKNESS_I32);
-    // Force the card to claim the full surface width minus margin_start, so
-    // the revealer's measure (= child measure, scaled by transition progress)
-    // animates the cutout's left edge all the way to SIDEBAR_WIDTH instead of
-    // stopping at the placeholder label's natural ~80 px width.
-    card.set_size_request(SIDEBAR_WIDTH - FRAME_THICKNESS_I32, -1);
 
     let placeholder = gtk::Label::new(Some("sidebar"));
     placeholder.add_css_class("ts-sidebar-placeholder");

@@ -307,10 +307,15 @@ async fn poll_loop(state: Mutable<DeparturesState>, notify: Arc<Notify>) {
         };
         in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
 
+        if let Err(ref e) = result {
+            tracing::warn!("departures: fetch failed: {e}");
+        }
+
         let now = Local::now();
         let prev = state.get_cloned();
+        let prev_for_cmp = prev.clone();
         let next = next_state(prev, result, now);
-        if next != state.get_cloned() {
+        if next != prev_for_cmp {
             state.set(next);
         }
     }

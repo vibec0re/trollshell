@@ -7,7 +7,7 @@ use chrono::{DateTime, Local};
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{clock, departures};
-use hytte::services::departures::{delay_string, Departure};
+use hytte::services::departures::{delay_string, Departure, DeparturesState};
 
 /// Human-readable "minutes from now" label. Negative deltas and anything
 /// within the next 60 s render as `"now"`. Above that, we round to the
@@ -101,8 +101,6 @@ fn stale_footer(err: &str, at: DateTime<Local>) -> gtk::Widget {
     lbl.set_wrap(true);
     lbl.upcast()
 }
-
-use hytte::services::departures::DeparturesState;
 
 /// Drain `list` and re-populate it from `state`. Eight rows max, so a
 /// remove-all + append-fresh cycle per emission is cheap.

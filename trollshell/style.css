@@ -329,12 +329,6 @@ window:not(.dark) .ts-drawer {
     color: white;
 }
 
-.ts-sidebar-placeholder {
-    color: alpha(currentColor, 0.5);
-    font-style: italic;
-    font-size: 13px;
-}
-
 .ts-modal-page {
     padding: 12px;
 }
@@ -576,6 +570,60 @@ window:not(.dark) .ts-drawer {
 }
 .ts-tray-menu separator {
     margin: 2px 0;
+}
+
+/* ─── Calendar widget — sidebar surface ─────────────────────────── */
+
+.ts-sidebar-calendar {
+    padding-top: 4px;
+}
+
+.ts-sidebar-cal-header {
+    color: alpha(currentColor, 0.5);
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    margin: 14px 4px 6px 4px;
+}
+
+/* GtkCalendar on the dark sidebar gradient. Default light card styling
+ * is wrong here — neutralise the background and lift the text. */
+.ts-sidebar-calendar .ts-calendar {
+    background: transparent;
+    color: white;
+    padding: 4px;
+}
+.ts-sidebar-calendar .ts-calendar > header {
+    color: white;
+}
+.ts-sidebar-calendar .ts-calendar > grid > label {
+    color: alpha(currentColor, 0.85);
+}
+.ts-sidebar-calendar .ts-calendar > grid > label.day-name {
+    color: alpha(currentColor, 0.5);
+}
+.ts-sidebar-calendar .ts-calendar > grid > label.other-month {
+    color: alpha(currentColor, 0.25);
+}
+
+/* adw::PreferencesGroup palette swap for the dark sidebar. The exact
+ * selectors below target the inner adw `list.boxed-list` element; if
+ * the rendered tree differs, the rules degrade gracefully and only the
+ * row colours change. */
+.ts-sidebar-cal-list {
+    margin-top: 0;
+}
+.ts-sidebar-cal-list listview,
+.ts-sidebar-cal-list list.boxed-list,
+.ts-sidebar-cal-list list.boxed-list > row {
+    background: alpha(white, 0.04);
+    color: white;
+    border-radius: 8px;
+}
+.ts-sidebar-cal-list .title {
+    color: white;
+}
+.ts-sidebar-cal-list .subtitle {
+    color: alpha(white, 0.6);
 }
 
 /* ─── Calendar — transient highlight when click-day matches a row ─ */

@@ -49,6 +49,14 @@ struct SidebarPanel {
     revealer: gtk::Revealer,
     open_state: Mutable<bool>,
     subscription: glib::JoinHandle<()>,
+    /// Natural horizontal size of the surface, measured once after the
+    /// widget tree is built. `set_size_request(SIDEBAR_WIDTH, -1)` is a
+    /// *minimum* — the calendar widget's natural width plus
+    /// `.ts-sidebar`'s 12 px padding regularly lifts the surface past
+    /// 320. Using this measured value for both `exclusive_zone` and
+    /// `current_visible_width` keeps niri's tile inset and the frame's
+    /// cutout aligned with whatever the surface actually committed to.
+    surface_width: i32,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -94,7 +102,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map(|_p| SIDEBAR_WIDTH)
+            .map(|p| p.surface_width)
             .unwrap_or(FRAME_THICKNESS_I32)
     })
 }
@@ -168,6 +176,16 @@ pub fn install(monitor: &Monitor) {
     window.set_child(Some(&revealer));
     window.set_visible(false);
 
+    // Measure the natural surface width now that the widget tree is
+    // wired up. We use this for the exclusive_zone (so niri's tile inset
+    // matches the surface's actual right edge given the 8 px left strut
+    // from etc/niri/frame.kdl) and for `current_visible_width` (so the
+    // frame's cutout left edge lines up with the same right edge). Floor
+    // at SIDEBAR_WIDTH so a smaller-than-expected natural width still
+    // hits the spec'd 320 px reveal.
+    let (_, nat_w, _, _) = window.measure(gtk::Orientation::Horizontal, -1);
+    let surface_width = nat_w.max(SIDEBAR_WIDTH);
+
     // After the close animation finishes, drop the exclusive zone and hide
     // the surface. (When the open animation finishes, child_revealed flips
     // to true — we don't need to do anything.) Cross-check open_state so
@@ -192,9 +210,18 @@ pub fn install(monitor: &Monitor) {
     let subscription =
         glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
             if open {
+                // Order matters: set the exclusive_zone in the LayerShell
+                // state *before* the surface is created via set_visible +
+                // present. gtk4-layer-shell stores the value and applies
+                // it to the surface's initial commit, so niri sees the
+                // correct reservation on the first configure. Setting
+                // it after present() leaves the first commit at the
+                // default (0), and the subsequent update isn't reliably
+                // honored — that was the "works only the first time"
+                // symptom of the previous lifecycle.
+                window_for_open.set_exclusive_zone(surface_width - FRAME_THICKNESS_I32);
                 window_for_open.set_visible(true);
                 window_for_open.present();
-                window_for_open.set_exclusive_zone(SIDEBAR_WIDTH - FRAME_THICKNESS_I32);
                 revealer_for_open.set_reveal_child(true);
                 hytte::services::departures::refresh();
             } else {
@@ -229,6 +256,7 @@ pub fn install(monitor: &Monitor) {
                 revealer: revealer.clone(),
                 open_state: open_state.clone(),
                 subscription,
+                surface_width,
             },
         );
     });

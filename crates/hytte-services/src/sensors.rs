@@ -187,17 +187,17 @@ impl Service for SensorsService {
         let mount_list_for_watch = handles.mount_list.clone();
 
         rt.spawn(async move {
-            poll_loop(
-                cpu_writer,
-                mem_writer,
-                net_writer,
-                cpu_temp_writer,
-                gpu_writer,
-                disk_writer,
-                net_conn_writer,
-                proc_count_writer,
-                mount_list_for_poll,
-            )
+            poll_loop(PollWriters {
+                cpu: cpu_writer,
+                mem: mem_writer,
+                net: net_writer,
+                cpu_temp: cpu_temp_writer,
+                gpu: gpu_writer,
+                disk: disk_writer,
+                net_conn: net_conn_writer,
+                proc_count: proc_count_writer,
+                mount_list: mount_list_for_poll,
+            })
             .await;
         });
         rt.spawn(mount_watch_loop(mount_list_for_watch));
@@ -315,18 +315,31 @@ impl PollState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn poll_loop(
-    cpu_writer: Mutable<CpuLoad>,
-    mem_writer: Mutable<Memory>,
-    net_writer: Mutable<NetIo>,
-    cpu_temp_writer: Mutable<CpuTemp>,
-    gpu_writer: Mutable<Option<GpuState>>,
-    disk_writer: Mutable<DiskUsage>,
-    net_conn_writer: Mutable<NetConnections>,
-    proc_count_writer: Mutable<u32>,
-    mount_list_reader: Mutable<Vec<MountSpec>>,
-) {
+/// Bundle of `Mutable` writers + the mount-list reader the poll loop needs.
+/// Constructed in `SensorsService::start` from the `SensorsHandles` clones.
+struct PollWriters {
+    cpu: Mutable<CpuLoad>,
+    mem: Mutable<Memory>,
+    net: Mutable<NetIo>,
+    cpu_temp: Mutable<CpuTemp>,
+    gpu: Mutable<Option<GpuState>>,
+    disk: Mutable<DiskUsage>,
+    net_conn: Mutable<NetConnections>,
+    proc_count: Mutable<u32>,
+    /// Read-only on this side; the watcher loop mutates.
+    mount_list: Mutable<Vec<MountSpec>>,
+}
+
+async fn poll_loop(w: PollWriters) {
+    let cpu_writer = w.cpu;
+    let mem_writer = w.mem;
+    let net_writer = w.net;
+    let cpu_temp_writer = w.cpu_temp;
+    let gpu_writer = w.gpu;
+    let disk_writer = w.disk;
+    let net_conn_writer = w.net_conn;
+    let proc_count_writer = w.proc_count;
+    let mount_list_reader = w.mount_list;
     let mut state = PollState::new();
 
     loop {

@@ -8,3 +8,4 @@ pub mod deep_link_row;
 pub mod format;
 pub mod history_row;
 pub mod layout;
+pub mod mpris_controls;

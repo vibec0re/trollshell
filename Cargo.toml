@@ -20,7 +20,13 @@ rust-version = "1.85"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+# `all` covers correctness, style, complexity, perf, suspicious — the
+# default-warn groups. Bumping to deny locks in the 0-warning state so a
+# regression breaks `cargo check`, not just clippy. Individual `allow`
+# entries below still win because their priority is the default 0 while
+# the umbrella settings carry priority -1.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 disallowed_methods = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"

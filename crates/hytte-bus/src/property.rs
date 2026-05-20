@@ -168,14 +168,17 @@ where
         let weak = Arc::downgrade(&inner);
         let writer = inner.state.clone();
 
-        let shared = self.shared;
-        let dest = self.destination;
-        let path = self.path;
-        let iface = self.iface;
-        let name = self.name;
+        let ctx = PropCtx {
+            shared: self.shared,
+            dest: self.destination,
+            path: self.path,
+            iface: self.iface,
+            name: self.name,
+            weak,
+        };
 
         hytte_reactive::runtime::handle().spawn(async move {
-            run_property::<T>(shared, dest, path, iface, name, writer, weak, task_done_tx).await;
+            run_property::<T>(ctx, writer, task_done_tx).await;
         });
 
         PropertySignal { inner }
@@ -195,15 +198,9 @@ struct PropCtx<T> {
 
 // ── Core property-tracking loop ──────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn run_property<T>(
-    shared: SharedConnection,
-    dest: String,
-    path: String,
-    iface: String,
-    name: String,
+    ctx: PropCtx<T>,
     writer: Mutable<PropState<T>>,
-    weak: std::sync::Weak<PropertyInner<T>>,
     task_done_tx: tokio::sync::oneshot::Sender<()>,
 ) where
     T: Clone
@@ -213,7 +210,6 @@ async fn run_property<T>(
         + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
-    let ctx = PropCtx { shared, dest, path, iface, name, weak };
     let mut last: Option<T> = None;
     let mut task_done_tx = Some(task_done_tx);
 

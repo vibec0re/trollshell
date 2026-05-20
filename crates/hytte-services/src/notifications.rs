@@ -397,6 +397,8 @@ impl NotificationsIface {
     ///   - `0`  → use server default (5s)
     ///   - `<0` → notification is sticky (never auto-dismissed)
     ///   - `>0` → milliseconds
+    // Signature mirrors the `org.freedesktop.Notifications.Notify` D-Bus
+    // method — wire shape is fixed, can't bundle args.
     #[allow(clippy::too_many_arguments)]
     async fn notify(
         &self,

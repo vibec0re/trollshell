@@ -7,10 +7,11 @@ use std::rc::Rc;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::mpris::{self, PlaybackStatus};
+use hytte::services::mpris;
 
 use crate::components::format::fmt_us;
 use crate::components::layout::{finish_page, page_grid, section};
+use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 
 /// Labels + buttons that the bind closure updates on every emission.
 #[derive(Clone)]
@@ -27,10 +28,12 @@ struct InfoWidgets {
 }
 
 /// Mutable per-render state shared between the bind closure and the
-/// click/seek handlers.
+/// click/seek handlers. `bus` is its own `Rc<RefCell<…>>` so the shared
+/// transport-button helper in `components::mpris_controls` can hold a
+/// clone without taking the whole `PlayerState`.
 #[derive(Default)]
 struct PlayerState {
-    bus: RefCell<Option<String>>,
+    bus: Rc<RefCell<Option<String>>>,
     track_id: RefCell<Option<String>>,
     length_us: Cell<u64>,
     last_art_url: RefCell<String>,
@@ -132,18 +135,9 @@ fn ellipsized_label(css_class: &str, max_chars: i32) -> gtk::Label {
 }
 
 fn wire_transport_buttons(w: &InfoWidgets, state: &Rc<PlayerState>) {
-    bind_bus_action(&w.prev_btn, state, mpris::previous);
-    bind_bus_action(&w.play_pause_btn, state, mpris::play_pause);
-    bind_bus_action(&w.next_btn, state, mpris::next);
-}
-
-fn bind_bus_action(btn: &gtk::Button, state: &Rc<PlayerState>, action: fn(&str)) {
-    let state = state.clone();
-    btn.connect_clicked(move |_| {
-        if let Some(b) = state.bus.borrow().as_ref() {
-            action(b);
-        }
-    });
+    bind_transport_button(&w.prev_btn, &state.bus, mpris::previous);
+    bind_transport_button(&w.play_pause_btn, &state.bus, mpris::play_pause);
+    bind_transport_button(&w.next_btn, &state.bus, mpris::next);
 }
 
 fn wire_player_bind(w: &InfoWidgets, art_image: &gtk::Image, state: &Rc<PlayerState>) {
@@ -192,12 +186,7 @@ fn render_player(
     w.play_pause_btn.set_sensitive(player.can_play_pause);
     w.next_btn.set_sensitive(player.can_go_next);
 
-    let icon = if player.status == PlaybackStatus::Playing {
-        "media-playback-pause-symbolic"
-    } else {
-        "media-playback-start-symbolic"
-    };
-    w.play_pause_btn.set_icon_name(icon);
+    w.play_pause_btn.set_icon_name(play_pause_icon(player.status));
 
     w.pos.set_text(&fmt_us(player.position_us));
     w.len.set_text(&fmt_us(player.length_us));

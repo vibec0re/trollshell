@@ -495,6 +495,8 @@ struct AuthAgent {}
 
 #[zbus::interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl AuthAgent {
+    // Signature mirrors the polkit `BeginAuthentication` D-Bus method on
+    // the Authority — wire shape is fixed, can't bundle args.
     #[allow(clippy::too_many_arguments)]
     async fn begin_authentication(
         &self,

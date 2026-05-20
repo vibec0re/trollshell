@@ -14,8 +14,9 @@ use std::rc::Rc;
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, prelude::*};
 use hytte::prelude::*;
-use hytte::services::mpris::{self, PlaybackStatus, Player};
+use hytte::services::mpris::{self, Player};
 
+use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 use crate::widgets::window_list;
 
 /// Hide MPRIS once the left cluster gets this busy. Even at 2 windows the
@@ -40,9 +41,9 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     container.append(&label);
 
     let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    wire_transport(&prev_btn, &current_bus, mpris::previous);
-    wire_transport(&play_pause_btn, &current_bus, mpris::play_pause);
-    wire_transport(&next_btn, &current_bus, mpris::next);
+    bind_transport_button(&prev_btn, &current_bus, mpris::previous);
+    bind_transport_button(&play_pause_btn, &current_bus, mpris::play_pause);
+    bind_transport_button(&next_btn, &current_bus, mpris::next);
 
     wire_visibility_and_state(
         &container,
@@ -79,15 +80,6 @@ fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
     });
     label.add_controller(gesture);
     label
-}
-
-fn wire_transport(btn: &gtk::Button, bus: &Rc<RefCell<Option<String>>>, action: fn(&str)) {
-    let bus = bus.clone();
-    btn.connect_clicked(move |_| {
-        if let Some(b) = bus.borrow().as_ref() {
-            action(b);
-        }
-    });
 }
 
 /// MPRIS hides when there's no active player OR when the left cluster is
@@ -156,11 +148,7 @@ fn apply_player_to_widgets(
     play_pause_btn.set_sensitive(player.can_play_pause);
     next_btn.set_sensitive(player.can_go_next);
 
-    let icon_name = if player.status == PlaybackStatus::Playing {
-        "media-playback-pause-symbolic"
-    } else {
-        "media-playback-start-symbolic"
-    };
+    let icon_name = play_pause_icon(player.status);
     if let Some(img) = play_pause_btn.child().and_downcast::<gtk::Image>() {
         img.set_icon_name(Some(icon_name));
     }

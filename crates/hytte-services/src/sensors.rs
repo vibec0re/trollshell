@@ -987,7 +987,7 @@ fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
 
 fn read_process_count() -> u32 {
     std::fs::read_dir("/proc")
-        .map(|iter| {
+        .map_or(0, |iter| {
             #[allow(clippy::cast_possible_truncation)]
             let count = iter
                 .filter_map(std::result::Result::ok)
@@ -999,7 +999,6 @@ fn read_process_count() -> u32 {
                 .count();
             count.try_into().unwrap_or(u32::MAX)
         })
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

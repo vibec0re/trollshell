@@ -235,20 +235,6 @@ fn is_bluez_sink_name(name: &str) -> bool {
 /// True when this sink is owned by *some* connected BT audio device in the
 /// current device list.
 ///
-/// Currently unused at call sites — `react()`'s bookkeeping arm switched to
-/// the structural `is_bluez_sink_name` check (see C1/C2 race fix) and the
-/// edge-detection arms drive off `find_bt_target` instead. Kept around as
-/// the device-list-aware classifier in case future reactor logic needs to
-/// answer "is this specific sink owned by a connected BT audio device?"
-/// without reaching for `find_bt_target`.
-#[allow(dead_code)]
-fn sink_is_bt(sink_name: &str, devices: &[Device]) -> bool {
-    devices
-        .iter()
-        .filter(|d| d.connected && is_bt_audio_icon(&d.icon))
-        .any(|d| sink_belongs_to_device(sink_name, d))
-}
-
 /// Among connected BT audio devices, return the first one whose pipewire
 /// sink we can find. None means no candidate to switch to right now.
 fn find_bt_target<'a>(devices: &[Device], sinks: &'a [Sink]) -> Option<&'a Sink> {

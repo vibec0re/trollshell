@@ -105,13 +105,11 @@ pub struct PolkitHandles {
     pub(crate) prompt: Mutable<Option<AuthPrompt>>,
     /// Sender half of the oneshot the agent method is awaiting.  Mutators
     /// now go through SHARED; kept here so the Arc is not dropped prematurely.
-    #[allow(dead_code)]
-    pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
+    pub(crate) _pending_response: Arc<AsyncMutex<Option<oneshot::Sender<UserReply>>>>,
     /// Keeps the `own_name` watcher task alive for the process lifetime so
     /// the system bus holds `ANCHOR_NAME` and the `AuthAgent` interface
     /// remains reachable at `AGENT_PATH`.
-    #[allow(dead_code)]
-    ownership: OwnNameSignal,
+    _ownership: OwnNameSignal,
 }
 
 /// User's resolution of a pending prompt.
@@ -171,8 +169,8 @@ impl Service for PolkitService {
 
         PolkitHandles {
             prompt,
-            pending_response,
-            ownership,
+            _pending_response: pending_response,
+            _ownership: ownership,
         }
     }
 }
@@ -479,7 +477,6 @@ async fn run_helper(
 /// polkitd map them onto the correct internal failure modes.
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.freedesktop.PolicyKit1.Error")]
-#[allow(dead_code)]
 enum AgentError {
     #[zbus(error)]
     ZBus(zbus::Error),

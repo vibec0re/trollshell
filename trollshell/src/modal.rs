@@ -63,8 +63,6 @@ struct ModalPanel {
     revealer: gtk::Revealer,
     stack: gtk::Stack,
     current: RefCell<Option<Page>>,
-    #[allow(dead_code)]
-    monitor: Monitor,
     catcher: gtk::Window,
     /// Emits `true` while the drawer is open (between `show_panel` and the
     /// retract animation finishing). Consumers — e.g. the bar — bind CSS
@@ -127,7 +125,6 @@ pub fn install(monitor: &Monitor) {
                 revealer,
                 stack,
                 current: RefCell::new(None),
-                monitor: monitor.clone(),
                 catcher,
                 open_state: drawer_open_state(&key),
             },
@@ -170,7 +167,7 @@ fn wire_escape(window: &gtk::Window, key: String) {
     window.add_controller(key_ctrl);
 }
 
-/// SlideDown revealer pinned to the top of the 720-tall surface so the card
+/// `SlideDown` revealer pinned to the top of the 720-tall surface so the card
 /// pulls out of the bar's bottom rather than floating mid-screen. Height
 /// animates automatically on page swaps.
 fn build_revealer() -> gtk::Revealer {
@@ -192,9 +189,11 @@ fn build_drawer_card() -> gtk::Box {
 }
 
 /// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible*
-/// child's natural size — without this, sparse pages (Calendar, PowerMenu)
+/// child's natural size — without this, sparse pages (Calendar, `PowerMenu`)
 /// render at the size of the largest mounted page (Stats / Audio).
 fn build_pages_stack() -> gtk::Stack {
+    use crate::panels;
+
     let stack = gtk::Stack::new();
     stack.set_vexpand(false);
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -203,7 +202,6 @@ fn build_pages_stack() -> gtk::Stack {
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
 
-    use crate::panels;
     let pages: [(Page, gtk::Widget); 15] = [
         (Page::Media, panels::panel_media()),
         (Page::Network, panels::panel_network()),
@@ -242,18 +240,6 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
         });
-    });
-}
-
-/// Close and remove the drawer for a monitor that has been unplugged.
-#[allow(dead_code)]
-pub fn uninstall(monitor: &Monitor) {
-    let key = monitor_key(monitor);
-    PANELS.with(|panels| {
-        if let Some(panel) = panels.borrow_mut().remove(&key) {
-            panel.catcher.close();
-            panel.window.close();
-        }
     });
 }
 
@@ -311,12 +297,6 @@ fn retract_by_key(key: &str) {
     });
 }
 
-#[allow(dead_code)]
-pub fn close(monitor: &Monitor) {
-    retract_by_key(&monitor_key(monitor));
-}
-
-#[allow(dead_code)]
 pub fn open(monitor: &Monitor, page: Page) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {

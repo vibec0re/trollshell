@@ -107,22 +107,19 @@ pub struct Inhibitor {
 pub struct ScreenSaverHandles {
     /// Live inhibitor list, keyed by cookie. Mutators now go through SHARED;
     /// kept here so the Arc isn't dropped (its backing Mutex is shared).
-    #[allow(dead_code)]
-    pub(crate) state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
+    pub(crate) _state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
     /// Reactive view of `state` for UI subscribers. Kept in sync after
     /// every mutation by [`publish_inhibitors`].
     pub(crate) inhibitors: Mutable<Vec<Inhibitor>>,
     /// Monotonic cookie counter. Mutators now go through SHARED; kept here
     /// so the Arc is not dropped prematurely.
-    #[allow(dead_code)]
-    pub(crate) next_cookie: Arc<AtomicU32>,
+    pub(crate) _next_cookie: Arc<AtomicU32>,
     /// `true` while the native lock UI is mounted on all monitors, `false`
     /// otherwise. Set by [`lock`] and cleared by [`handle_unlock_success`].
     /// Subscribers: `widgets::lock_screen`.
     pub(crate) is_locked: Mutable<bool>,
     /// Keeps the name-ownership task alive for the process lifetime.
-    #[allow(dead_code)]
-    ownership: hytte_bus::OwnNameSignal,
+    _ownership: hytte_bus::OwnNameSignal,
 }
 
 // ── Service marker ────────────────────────────────────────────────────────────
@@ -163,11 +160,11 @@ impl Service for ScreenSaverService {
         });
 
         ScreenSaverHandles {
-            state,
+            _state: state,
             inhibitors,
-            next_cookie,
+            _next_cookie: next_cookie,
             is_locked,
-            ownership,
+            _ownership: ownership,
         }
     }
 }
@@ -513,11 +510,15 @@ struct ScreenSaverIface {
     next_cookie: Arc<AtomicU32>,
 }
 
+// zbus's `#[interface]` macro requires every method to be `async fn` even
+// when the body doesn't await; some handlers also don't need `&self` to
+// reach state (they call free functions or trivially return constants).
+// Allowing at the impl-block keeps the noise out of each method.
+#[allow(clippy::unused_async, clippy::unused_self)]
 #[zbus::interface(name = "org.freedesktop.ScreenSaver")]
 impl ScreenSaverIface {
     /// Lock the screen now. Flips `is_locked` to `true`. Apps and
     /// `gnome-screensaver-command --lock` use this.
-    #[allow(clippy::unused_async, clippy::unused_self)]
     async fn lock(&self) {
         lock();
     }
@@ -525,7 +526,6 @@ impl ScreenSaverIface {
     /// Register an inhibitor. Returns a cookie the app must keep + pass
     /// back to `UnInhibit`. Pauses swayidle on the empty → non-empty
     /// transition.
-    #[allow(clippy::unused_async)]
     async fn inhibit(&self, application_name: String, reason_for_inhibit: String) -> u32 {
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
         let inh = Inhibitor {
@@ -545,7 +545,6 @@ impl ScreenSaverIface {
     /// Release an inhibitor. Resumes swayidle on the non-empty → empty
     /// transition. Unknown cookies are silently ignored (apps double-call
     /// `UnInhibit` on shutdown).
-    #[allow(clippy::unused_async)]
     async fn un_inhibit(&self, cookie: u32) {
         tracing::debug!(cookie, "UnInhibit");
         let became_empty = remove_inhibitor(&self.state, cookie);
@@ -561,7 +560,6 @@ impl ScreenSaverIface {
     /// shipping our own `ext-idle-notify-v1` client. Deprioritised; apps
     /// that rely on this for video-pause heuristics already fall back to
     /// querying input device events.
-    #[allow(clippy::unused_self, clippy::unused_async)]
     async fn get_active(&self) -> bool {
         false
     }
@@ -571,7 +569,6 @@ impl ScreenSaverIface {
     /// and compute, but no app on a sane configuration depends on the
     /// value being >0 (it's a hint, not load-bearing). Track for follow-up
     /// alongside a real `GetActive()` when we add `ext-idle-notify-v1`.
-    #[allow(clippy::unused_self, clippy::unused_async)]
     async fn get_active_time(&self) -> u32 {
         0
     }
@@ -580,7 +577,6 @@ impl ScreenSaverIface {
     /// reset the idle timer when entering full-screen, which is precisely
     /// the case Inhibit/UnInhibit handles for us. Logging at debug so we
     /// can tell from a journal whether anyone in the wild is calling it.
-    #[allow(clippy::unused_self, clippy::unused_async)]
     async fn simulate_user_activity(&self) {
         tracing::debug!("SimulateUserActivity (ignored)");
     }

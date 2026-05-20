@@ -348,7 +348,7 @@ where
     }
 }
 
-/// Pump the PropertiesChanged stream until reconnect / invalidation / handle
+/// Pump the `PropertiesChanged` stream until reconnect / invalidation / handle
 /// drop. Returns `true` when all handles have been dropped and the watcher
 /// should exit entirely. Periodic liveness ticks wake the loop so we detect
 /// handle-drops while parked (same pattern as the signals primitive). The
@@ -404,7 +404,7 @@ where
     }
 }
 
-/// Apply one PropertiesChanged signal. Returns `true` when the caller should
+/// Apply one `PropertiesChanged` signal. Returns `true` when the caller should
 /// break the drain loop (invalidation → re-Get on outer iteration).
 fn apply_change<T>(
     ctx: &PropCtx<T>,

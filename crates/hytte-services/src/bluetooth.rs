@@ -176,8 +176,7 @@ pub struct BluetoothHandles {
     /// remains reachable at `AGENT_PATH`. Stored here for parity with other
     /// services (polkit, notifications, etc.) that keep their ownership handle
     /// in Handles.
-    #[allow(dead_code)]
-    pub(crate) ownership: hytte_bus::OwnNameSignal,
+    pub(crate) _ownership: hytte_bus::OwnNameSignal,
 }
 
 /// Internal reply variants from the UI back to the agent's awaiting
@@ -220,7 +219,7 @@ impl Service for BluetoothService {
             device_actions: Mutable::new(HashSet::new()),
             pair_prompt: Mutable::new(None),
             pending_response: Arc::new(AsyncMutex::new(None)),
-            ownership: ownership.clone(),
+            _ownership: ownership.clone(),
         };
         let _ = SHARED.set(BluetoothShared {
             devices: handles.devices.clone(),
@@ -1104,7 +1103,6 @@ const AGENT_ANCHOR_NAME: &str = "cc.hannig.trollshell.bluez-agent";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]
-#[allow(dead_code)]
 enum AgentError {
     #[zbus(error)]
     ZBus(zbus::Error),
@@ -1115,9 +1113,13 @@ enum AgentError {
 #[derive(Clone)]
 struct PairAgent;
 
+// zbus's `#[interface]` macro requires every method to be `async fn` even
+// when the body doesn't await; display/authorize-service handlers also
+// receive owned values they only acknowledge. Allowing at the impl-block
+// keeps the noise out of each method.
+#[allow(clippy::unused_async, clippy::needless_pass_by_value)]
 #[zbus::interface(name = "org.bluez.Agent1")]
 impl PairAgent {
-    #[allow(clippy::unused_async)]
     async fn release(&self) {
         tracing::debug!("agent released");
     }
@@ -1138,7 +1140,6 @@ impl PairAgent {
         }
     }
 
-    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
     async fn display_pin_code(&self, device: OwnedObjectPath, pincode: String) {
         // Display-only acknowledgement — there is no return value to gate.
         // The user enters the PIN on the remote device. Nothing to do.
@@ -1161,7 +1162,6 @@ impl PairAgent {
         }
     }
 
-    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
     async fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, entered: u16) {
         // Same as DisplayPinCode — no input from us.
         let _ = (device, passkey, entered);
@@ -1203,7 +1203,6 @@ impl PairAgent {
         }
     }
 
-    #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
     async fn authorize_service(&self, device: OwnedObjectPath, uuid: String) {
         // Auto-accept service authorization. BlueZ asks per-service for
         // unknown protocols; for trusted/already-paired devices this is

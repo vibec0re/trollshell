@@ -102,8 +102,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map(|p| p.surface_width)
-            .unwrap_or(FRAME_THICKNESS_I32)
+            .map_or(FRAME_THICKNESS_I32, |p| p.surface_width)
     })
 }
 
@@ -120,8 +119,7 @@ fn is_settled_for_key(key: &str) -> bool {
         panels
             .borrow()
             .get(key)
-            .map(|p| p.revealer.is_child_revealed() == p.open_state.get())
-            .unwrap_or(true)
+            .is_none_or(|p| p.revealer.is_child_revealed() == p.open_state.get())
     })
 }
 
@@ -184,7 +182,7 @@ fn build_sidebar_window(monitor: &Monitor, key: &str) -> gtk::Window {
     window
 }
 
-/// SlideRight revealer that pushes the card out from the screen's left edge
+/// `SlideRight` revealer that pushes the card out from the screen's left edge
 /// in time with niri's tile reflow.
 fn build_revealer() -> gtk::Revealer {
     let revealer = gtk::Revealer::new();
@@ -197,7 +195,7 @@ fn build_revealer() -> gtk::Revealer {
 }
 
 /// Card fills the entire surface — no margins so there's no gap around the
-/// dark area. The bar (Layer::Top, mapped after sidebar) naturally paints
+/// dark area. The bar (`Layer::Top`, mapped after sidebar) naturally paints
 /// over y=0..44, so no top margin is needed.
 fn build_card(monitor: &Monitor) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);

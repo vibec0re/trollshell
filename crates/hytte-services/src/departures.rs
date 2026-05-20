@@ -23,12 +23,12 @@ pub const SCHOENEWEIDE_ID: &str = "900180001";
 
 /// Background poll cadence. The sidebar's open-edge handler additionally
 /// kicks [`refresh()`] for an immediate fetch.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub const POLL_INTERVAL: Duration = Duration::from_mins(15);
 
 /// After this much time elapses since the last successful fetch, a
 /// continuing error transitions `Stale` → `Err` so the user sees the
 /// list has gone cold.
-pub const STALE_DROP_AFTER: Duration = Duration::from_secs(30 * 60);
+pub const STALE_DROP_AFTER: Duration = Duration::from_mins(30);
 
 /// Same threshold as [`STALE_DROP_AFTER`], typed as `chrono::Duration`
 /// so it can be compared against age deltas without a runtime conversion.

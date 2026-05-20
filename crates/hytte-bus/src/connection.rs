@@ -7,7 +7,6 @@
 
 // Production-only accessors (session/system/start) are forward-declared for
 // Task 6; they are wired up in Task 12.
-#![allow(dead_code)]
 
 use crate::error::is_transient_zbus_error;
 use crate::BusError;

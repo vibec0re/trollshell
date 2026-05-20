@@ -174,7 +174,7 @@ fn wrapped_subtitle(text: &str) -> gtk::Label {
 
 /// When polkit offers a single identity (the common case — the user's
 /// own uid) we show a static row.  When it offers multiple, we show a
-/// DropDown with the local uid pre-selected by `auth_prompts`'s sort.
+/// `DropDown` with the local uid pre-selected by `auth_prompts`'s sort.
 fn append_identity_row(vbox: &gtk::Box, identities: &[AuthIdentity]) -> Rc<Cell<u32>> {
     let selected_uid = Rc::new(Cell::new(identities.first().map_or(0, |id| id.uid)));
 

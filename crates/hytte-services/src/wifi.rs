@@ -172,8 +172,7 @@ pub struct WifiHandles {
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
     pub(crate) prompts: Mutable<Option<PromptRequest>>,
     pub(crate) adapter: Mutable<Option<Adapter>>,
-    #[allow(dead_code)]
-    ownership: hytte_bus::OwnNameSignal,
+    _ownership: hytte_bus::OwnNameSignal,
 }
 
 impl Default for WifiHandles {
@@ -230,7 +229,7 @@ impl Service for WifiService {
             networks: networks_mutable,
             prompts: prompts_mutable,
             adapter: adapter_mutable,
-            ownership,
+            _ownership: ownership,
         }
     }
 }
@@ -577,9 +576,13 @@ struct IwdAgent {
     waiters: WaitersMap,
 }
 
+// zbus's `#[interface]` macro requires every method to be `async fn` even
+// when the body doesn't await; the EAP stubs also have unused parameters
+// since they reject the request without inspecting it. Allowing at the
+// impl-block keeps the noise out of each method.
+#[allow(clippy::unused_async, unused_variables)]
 #[zbus::interface(name = "net.connman.iwd.Agent")]
 impl IwdAgent {
-    #[allow(clippy::unused_async)]
     async fn release(&self) {
         tracing::info!("iwd Agent::Release");
     }
@@ -613,8 +616,6 @@ impl IwdAgent {
         }
     }
 
-    #[allow(clippy::unused_async)]
-    #[allow(unused_variables)]
     async fn request_private_key_passphrase(
         &self,
         network: zbus::zvariant::OwnedObjectPath,
@@ -624,8 +625,6 @@ impl IwdAgent {
         ))
     }
 
-    #[allow(clippy::unused_async)]
-    #[allow(unused_variables)]
     async fn request_user_name_and_password(
         &self,
         network: zbus::zvariant::OwnedObjectPath,
@@ -635,8 +634,6 @@ impl IwdAgent {
         ))
     }
 
-    #[allow(clippy::unused_async)]
-    #[allow(unused_variables)]
     async fn request_user_password(
         &self,
         network: zbus::zvariant::OwnedObjectPath,
@@ -869,7 +866,9 @@ async fn run_wifi_watcher(
         }
 
         let station_path_str = station_path.as_str().to_string();
-        let restart = pump_iwd_events(
+        // Returns only when the station was removed — falls through to
+        // re-discover on the next iteration of 'discovery.
+        pump_iwd_events(
             subs,
             &station_path_str,
             &station_mutable,
@@ -878,10 +877,6 @@ async fn run_wifi_watcher(
             &adapter_mutable,
         )
         .await;
-
-        if restart {
-            continue 'discovery;
-        }
     }
 }
 
@@ -944,9 +939,8 @@ fn subscribe_iwd_events(station_path: &zbus::zvariant::OwnedObjectPath) -> IwdSu
     IwdSubs { station_props, added, removed }
 }
 
-/// Drive the iwd event loop. Returns `true` when the station was removed and
-/// the watcher needs to restart discovery, `false` to keep pumping (currently
-/// unreachable — the loop only exits via restart).
+/// Drive the iwd event loop. Returns when the station was removed and the
+/// watcher needs to restart discovery.
 async fn pump_iwd_events(
     subs: IwdSubs,
     station_path_str: &str,
@@ -954,7 +948,7 @@ async fn pump_iwd_events(
     networks_mutable: &Mutable<Vec<WifiNetwork>>,
     prompts_mutable: &Mutable<Option<PromptRequest>>,
     adapter_mutable: &Mutable<Option<Adapter>>,
-) -> bool {
+) {
     let mut station_events = subs.station_props.events();
     let mut added_events = subs.added.events();
     let mut removed_events = subs.removed.events();
@@ -980,7 +974,7 @@ async fn pump_iwd_events(
                     prompts_mutable.set(None);
                     adapter_mutable.set(None);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    return true;
+                    return;
                 }
                 refresh_networks(station_path_str, station_mutable, networks_mutable).await;
             }
@@ -989,7 +983,7 @@ async fn pump_iwd_events(
 }
 
 /// Decode `PropertiesChanged` body. Applies the delta directly for known
-/// interfaces (Station/Adapter1) to avoid a full GetAll round-trip, and
+/// interfaces (Station/Adapter1) to avoid a full `GetAll` round-trip, and
 /// signals whether the caller should refresh the network list.
 async fn handle_station_props_event(
     evt: &hytte_bus::SignalEvent,

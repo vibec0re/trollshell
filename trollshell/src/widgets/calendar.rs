@@ -9,7 +9,7 @@
 //! today/selected highlight is a proper Adwaita-style filled pill instead
 //! of GTK's default underline. See
 //! `docs/superpowers/specs/2026-05-14-calendar-widget-design.md` for the
-//! original (gtk::Calendar) design — this is the v2 redesign.
+//! original (`gtk::Calendar`) design — this is the v2 redesign.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

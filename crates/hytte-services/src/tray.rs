@@ -131,8 +131,7 @@ pub struct TrayHandles {
     pub(crate) items: Mutable<Vec<TrayItem>>,
     /// Kept alive so the `own_name` task continues owning
     /// `org.kde.StatusNotifierWatcher` for the process lifetime.
-    #[allow(dead_code)]
-    ownership: OwnNameSignal,
+    _ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -188,7 +187,7 @@ impl Service for TrayService {
             }
         });
 
-        TrayHandles { items, ownership }
+        TrayHandles { items, _ownership: ownership }
     }
 }
 
@@ -549,6 +548,10 @@ struct Watcher {
     state: State,
 }
 
+// zbus's `#[interface]` macro requires every method to be `async fn` even
+// when the body doesn't await. Allowing at the impl-block keeps the noise
+// out of each method.
+#[allow(clippy::unused_async)]
 #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
 impl Watcher {
     /// Register a `StatusNotifierItem` client.
@@ -595,7 +598,6 @@ impl Watcher {
     }
 
     /// No-op: we are the host.
-    #[allow(clippy::unused_async)]
     async fn register_status_notifier_host(&self, service: &str) {
         let _ = service;
     }

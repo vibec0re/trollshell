@@ -144,13 +144,11 @@ pub struct NotificationsHandles {
     pub(crate) active: Mutable<Vec<Notification>>,
     /// Shared counter for allocating notification IDs. Stored here so that
     /// `NotificationsIface` clones across reconnects share the same sequence.
-    #[allow(dead_code)]
-    pub(crate) next_id: Arc<AtomicU32>,
+    pub(crate) _next_id: Arc<AtomicU32>,
     pub(crate) history: Mutable<Vec<HistoryEntry>>,
     /// Kept alive so the `own_name` task continues owning
     /// `org.freedesktop.Notifications` for the process lifetime.
-    #[allow(dead_code)]
-    ownership: OwnNameSignal,
+    _ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -195,9 +193,9 @@ impl Service for NotificationsService {
 
         NotificationsHandles {
             active,
-            next_id,
+            _next_id: next_id,
             history,
-            ownership,
+            _ownership: ownership,
         }
     }
 }
@@ -387,6 +385,10 @@ impl NotificationsIface {
     }
 }
 
+// zbus's `#[interface]` macro requires every method to be `async fn` even
+// when the body doesn't await. Allowing at the impl-block keeps the noise
+// out of each method.
+#[allow(clippy::unused_async)]
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
@@ -396,7 +398,6 @@ impl NotificationsIface {
     ///   - `<0` → notification is sticky (never auto-dismissed)
     ///   - `>0` → milliseconds
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::unused_async)]
     async fn notify(
         &self,
         app_name: &str,
@@ -490,7 +491,6 @@ impl NotificationsIface {
     }
 
     /// Close a notification by id (reason 3 = closed by call).
-    #[allow(clippy::unused_async)]
     async fn close_notification(&self, id: u32) {
         if let Some(n) = self.remove_from_active(id) {
             self.push_to_history(n, 3);

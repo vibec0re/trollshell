@@ -214,7 +214,7 @@ pub fn own_name_with(shared: &SharedConnection, name: impl Into<String>) -> OwnN
         shared: shared.clone(),
         name: name.into(),
         permanent_after: 3,
-        cooldown: Duration::from_secs(5 * 60),
+        cooldown: Duration::from_mins(5),
         mounts: Vec::new(),
     }
 }
@@ -331,7 +331,7 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!(error = %e, %name, "invalid well-known name");
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
                 return;
             }
         };

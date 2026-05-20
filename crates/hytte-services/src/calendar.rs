@@ -89,7 +89,7 @@ const NEXT_DAYS: i64 = 7;
 /// Background refresh cadence. EDS rewrites `.ics` files on its own sync
 /// cycle (typically minutes); 60 s catches changes within a minute without
 /// hammering the disk.
-const POLL_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const POLL_INTERVAL: StdDuration = StdDuration::from_mins(1);
 
 // ── Service handle ───────────────────────────────────────────────────────────
 

@@ -1,14 +1,33 @@
 //! Per-monitor pushable left sidebar. Layer-shell window anchored
 //! `Left + Top + Bottom` on `Layer::Top`; toggles via `widgets::sidebar_toggle`.
-//! When open, reserves space via `exclusive_zone` so niri reflows tiles right;
-//! the frame's draw fn reads `current_visible_width` and offsets the outer rect's
-//! left edge so it never paints over the sidebar's region.
 //!
-//! The sidebar sits on `Layer::Top` (below the frame's `Layer::Overlay`). The
-//! frame carves out the sidebar's region from its own paint, so the sidebar's
-//! surface shows through regardless of compositor stacking order. Fullscreen
-//! apps on `Layer::Top`'s level naturally cover the sidebar — no explicit hide
-//! logic needed.
+//! ## Persistence + z-order
+//!
+//! The surface is created **once** at install time and stays alive for the
+//! process lifetime. `widgets::sidebar_toggle` only flips the open state
+//! `Mutable`; the surface itself is never hidden, recreated, or re-presented.
+//! Within `Layer::Top`, z-order is fixed by surface creation order — install
+//! runs before `Bar::new().show()`, so the sidebar sits **below** the bar.
+//! Re-presenting the sidebar on each open used to bump it above the bar and
+//! produced a ~44 px overlap on the bar's bottom edge.
+//!
+//! ## Animation + exclusive zone
+//!
+//! `GtkRevealer` (`SlideRight`) animates the card's allocated width between 0
+//! and `SIDEBAR_WIDTH` on open/close. The exclusive zone is set **explicitly**
+//! from the open-state subscription (`SIDEBAR_WIDTH` open, `0` closed) rather
+//! than driven by `auto_exclusive_zone_enable()` — the auto path failed to
+//! reclaim space cleanly on close (the bar stayed pushed even after the
+//! revealer settled at 0 width), so we drive it directly. Niri snaps tiles +
+//! the bar to the new value immediately; the revealer's slide is cosmetic.
+//!
+//! ## Frame integration
+//!
+//! The frame overlay (`Layer::Overlay`, above the bar) reads
+//! [`current_visible_width`] each animation tick and shifts its cutout's
+//! left edge to match — the sidebar surface (below the frame) shows
+//! through the cutout. `SIDEBAR_WIDTH` is the authoritative width on both
+//! sides.
 //!
 //! State is per-connector, mirroring `modal::DRAWER_OPEN`. Subscribers (the
 //! sidebar surface, the frame draw, future bar-CSS bindings) read
@@ -49,14 +68,6 @@ struct SidebarPanel {
     revealer: gtk::Revealer,
     open_state: Mutable<bool>,
     subscription: glib::JoinHandle<()>,
-    /// Natural horizontal size of the surface, measured once after the
-    /// widget tree is built. `set_size_request(SIDEBAR_WIDTH, -1)` is a
-    /// *minimum* — the calendar widget's natural width plus
-    /// `.ts-sidebar`'s 12 px padding regularly lifts the surface past
-    /// 320. Using this measured value for both `exclusive_zone` and
-    /// `current_visible_width` keeps niri's tile inset and the frame's
-    /// cutout aligned with whatever the surface actually committed to.
-    surface_width: i32,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -88,7 +99,7 @@ pub fn toggle(monitor: &Monitor) {
 }
 
 /// Currently visible width of the sidebar card on `monitor`, in CSS px.
-/// Returns `FRAME_THICKNESS` when the sidebar is closed, hasn't been
+/// Returns `FRAME_THICKNESS_I32` when the sidebar is closed, hasn't been
 /// installed yet, or the per-monitor panel is missing. The frame uses
 /// this to compute its cutout's left edge each animation tick.
 pub fn current_visible_width(monitor: &Monitor) -> i32 {
@@ -102,7 +113,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map_or(FRAME_THICKNESS_I32, |p| p.surface_width)
+            .map_or(FRAME_THICKNESS_I32, |_| SIDEBAR_WIDTH)
     })
 }
 
@@ -123,9 +134,11 @@ fn is_settled_for_key(key: &str) -> bool {
     })
 }
 
-/// Build the sidebar surface for one monitor, mount it as a hidden
-/// layer-shell window, and wire its open-state subscription. Mirrors
-/// `modal::install` in shape; called from `main.rs` per monitor.
+/// Build the sidebar surface for one monitor, mount it as a layer-shell
+/// window, and wire its open-state subscription. Mirrors `modal::install`
+/// in shape; called from `main.rs` per monitor — must run **before** the
+/// bar's `Bar::new().show()` so the sidebar surface stays below the bar
+/// in z-order (`Layer::Top` orders by creation, not by re-commit).
 pub fn install(monitor: &Monitor) {
     let key = monitor_key(monitor);
     let open_state = sidebar_open_state(&key);
@@ -135,19 +148,12 @@ pub fn install(monitor: &Monitor) {
     let card = build_card(monitor);
     revealer.set_child(Some(&card));
     window.set_child(Some(&revealer));
-    window.set_visible(false);
+    // Present the surface ONCE, here at install. Stays alive for the
+    // process lifetime — toggle goes through the revealer + open_state,
+    // never through set_visible/present. See module-level note on z-order.
+    window.set_visible(true);
 
-    // Measure the natural surface width now that the widget tree is wired
-    // up. Used for both `exclusive_zone` (niri tile inset matches the
-    // surface's actual right edge given the 8 px frame strut) and
-    // `current_visible_width` (frame cutout left edge aligns). Floor at
-    // SIDEBAR_WIDTH so smaller-than-expected natural widths still reveal
-    // the spec'd 320 px column.
-    let (_, nat_w, _, _) = window.measure(gtk::Orientation::Horizontal, -1);
-    let surface_width = nat_w.max(SIDEBAR_WIDTH);
-
-    wire_close_finish(&revealer, &window, &open_state);
-    let subscription = wire_open_subscription(&window, &revealer, &open_state, surface_width);
+    let subscription = wire_open_subscription(&window, &revealer, &open_state);
     wire_escape(&window, monitor.clone());
 
     PANELS.with(|panels| {
@@ -158,7 +164,6 @@ pub fn install(monitor: &Monitor) {
                 revealer,
                 open_state,
                 subscription,
-                surface_width,
             },
         );
     });
@@ -166,7 +171,10 @@ pub fn install(monitor: &Monitor) {
 
 /// Layer-shell window anchored Left + Top + Bottom — full screen height,
 /// `exclusive_zone` reserves on the single Left edge for well-defined push
-/// semantics. Fixed `SIDEBAR_WIDTH` so niri sees a stable column on open.
+/// semantics. **No `set_size_request`** — the window's natural width is
+/// driven by the revealer's allocated child width, which animates between
+/// 0 (closed) and `SIDEBAR_WIDTH` (open). The zone itself is set explicitly
+/// from the open subscription, not via auto — see module-level note.
 fn build_sidebar_window(monitor: &Monitor, key: &str) -> gtk::Window {
     let window = layer_window(monitor)
         .layer(Layer::Top)
@@ -178,85 +186,62 @@ fn build_sidebar_window(monitor: &Monitor, key: &str) -> gtk::Window {
         .keyboard_mode(KeyboardMode::OnDemand)
         .build();
     window.add_css_class("ts-sidebar-surface");
-    window.set_size_request(SIDEBAR_WIDTH, -1);
+    window.set_exclusive_zone(0);
     window
 }
 
 /// `SlideRight` revealer that pushes the card out from the screen's left edge
-/// in time with niri's tile reflow.
+/// in time with niri's tile reflow. The 180 ms duration matches the modal
+/// drawer's slide so both surfaces feel like one design system.
 fn build_revealer() -> gtk::Revealer {
     let revealer = gtk::Revealer::new();
     revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
-    revealer.set_transition_duration(0);
+    revealer.set_transition_duration(180);
     revealer.set_reveal_child(false);
-    revealer.set_halign(gtk::Align::Fill);
+    revealer.set_halign(gtk::Align::Start);
     revealer.set_valign(gtk::Align::Fill);
     revealer
 }
 
-/// Card fills the entire surface — no margins so there's no gap around the
-/// dark area. The bar (`Layer::Top`, mapped after sidebar) naturally paints
-/// over y=0..44, so no top margin is needed.
+/// Card has a fixed `SIDEBAR_WIDTH` so when the revealer is fully expanded
+/// the surface settles at exactly that width — and at exactly 0 when fully
+/// collapsed. No margins so there's no gap around the dark area. The bar
+/// (`Layer::Top`, mapped after sidebar) naturally paints over y=0..44 in
+/// the overlap, so no top margin is needed.
 fn build_card(monitor: &Monitor) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");
+    card.set_size_request(SIDEBAR_WIDTH, -1);
     card.set_halign(gtk::Align::Fill);
-    card.set_hexpand(true);
+    card.set_hexpand(false);
     card.set_valign(gtk::Align::Fill);
-    card.set_vexpand(true);
+    card.set_vexpand(false);
 
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::departures::widget());
     card
 }
 
-/// After the close animation finishes, drop the exclusive zone and hide the
-/// surface. Cross-check `open_state` so a rapid open→close→open doesn't let
-/// the stale close-completion tear down state the re-open already set.
-fn wire_close_finish(revealer: &gtk::Revealer, window: &gtk::Window, open_state: &Mutable<bool>) {
-    let open_state = open_state.clone();
-    let window = window.clone();
-    revealer.connect_child_revealed_notify(move |r| {
-        if !r.is_child_revealed() && !open_state.get() {
-            window.set_exclusive_zone(0);
-            window.set_visible(false);
-        }
-    });
-}
-
-/// Drive open/close transitions from the shared mutable. Returns the
-/// `JoinHandle` so `close_all` can abort the subscription before closing the
-/// window — prevents a zombie subscription firing into a dead window after a
-/// hot-plug cycle.
+/// Drive open/close transitions from the shared mutable. The surface stays
+/// alive across toggles (see module note on z-order); we flip the revealer
+/// AND the exclusive zone in lockstep. Niri snaps tiles + bar to the new
+/// zone immediately; the revealer's slide is cosmetic.
+///
+/// Returns the `JoinHandle` so `close_all` can abort the subscription
+/// before closing the window — prevents a zombie subscription firing into
+/// a dead window after a hot-plug cycle.
 fn wire_open_subscription(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
     open_state: &Mutable<bool>,
-    surface_width: i32,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
+        window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
+        revealer.set_reveal_child(open);
         if open {
-            // Order matters: set `exclusive_zone` in the LayerShell state
-            // *before* the surface is created via set_visible + present.
-            // gtk4-layer-shell stores the value and applies it to the
-            // surface's initial commit, so niri sees the correct
-            // reservation on the first configure. Setting it after
-            // present() leaves the first commit at the default (0), and
-            // the subsequent update isn't reliably honored — that was the
-            // "works only the first time" symptom of the previous lifecycle.
-            window.set_exclusive_zone(surface_width + FRAME_THICKNESS_I32);
-            window.set_visible(true);
-            window.present();
-            revealer.set_reveal_child(true);
             hytte::services::departures::refresh();
-        } else {
-            // Start the close animation. Surface stays visible + zone stays
-            // reserved until the revealer reports it has fully collapsed
-            // (see `wire_close_finish` above) — otherwise niri reclaims the
-            // space while the card is still on-screen.
-            revealer.set_reveal_child(false);
         }
         async {}
     }))

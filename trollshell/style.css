@@ -575,43 +575,135 @@ window:not(.dark) .ts-drawer {
 /* ─── Calendar widget — sidebar surface ─────────────────────────── */
 
 .ts-sidebar-calendar {
-    padding-top: 4px;
+    padding: 8px 8px 0 8px;
 }
 
-.ts-sidebar-cal-header {
-    color: alpha(currentColor, 0.5);
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    margin: 14px 4px 6px 4px;
+/* Header row: < | "Month YYYY" | > */
+.ts-cal-header {
+    margin: 0 0 6px 0;
 }
-
-/* GtkCalendar on the dark sidebar gradient. Default light card styling
- * is wrong here — neutralise the background and lift the text. */
-.ts-sidebar-calendar .ts-calendar {
+.ts-cal-month-label {
+    color: white;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 0.2px;
+}
+.ts-cal-nav-btn {
     background: transparent;
+    color: alpha(white, 0.7);
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    border-radius: 14px;
+    -gtk-icon-size: 14px;
+}
+.ts-cal-nav-btn:hover {
+    background: alpha(white, 0.08);
     color: white;
-    padding: 4px;
 }
-.ts-sidebar-calendar .ts-calendar > header {
+
+/* MO TU WE TH FR SA SU header row */
+.ts-cal-daynames {
+    margin: 4px 0 2px 0;
+}
+.ts-cal-dayname {
+    color: alpha(white, 0.4);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+}
+
+/* 6×7 day grid */
+.ts-cal-grid {
+    margin-bottom: 6px;
+}
+
+/* Each day cell — Adwaita-style flat button with a circular hover/selected
+ * pill behind the day number. Min-width/height keep the cells square
+ * enough to land the pill on. */
+.ts-cal-day {
+    background: transparent;
+    color: alpha(white, 0.85);
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    border-radius: 18px;
+    box-shadow: none;
+    border: none;
+    font-size: 13px;
+}
+.ts-cal-day:hover {
+    background: alpha(white, 0.08);
     color: white;
 }
-.ts-sidebar-calendar .ts-calendar > grid > label {
-    color: alpha(currentColor, 0.85);
+.ts-cal-day-number {
+    font-size: 13px;
+    line-height: 1;
 }
-.ts-sidebar-calendar .ts-calendar > grid > label.day-name {
-    color: alpha(currentColor, 0.5);
+/* "Other month" days appear faded but stay clickable so users can jump
+ * to neighbouring months by clicking the trailing days. */
+.ts-cal-day-othermonth {
+    color: alpha(white, 0.25);
 }
-.ts-sidebar-calendar .ts-calendar > grid > label.other-month {
-    color: alpha(currentColor, 0.25);
+.ts-cal-day-othermonth .ts-cal-day-number {
+    color: alpha(white, 0.25);
 }
-.ts-sidebar-calendar .ts-calendar > grid > label.marked {
+/* Today: accent-colored ring (transparent fill so it composes with hover). */
+.ts-cal-day-today {
+    color: @accent_color;
+    font-weight: 700;
+    box-shadow: inset 0 0 0 1.5px @accent_color;
+}
+/* Selected day: filled accent pill. Wins over today when both apply. */
+.ts-cal-day-selected,
+.ts-cal-day-selected:hover {
+    background: @accent_color;
+    color: white;
+    box-shadow: none;
+}
+.ts-cal-day-selected .ts-cal-day-number {
+    color: white;
     font-weight: 600;
 }
 
-/* adw::PreferencesGroup palette swap for the dark sidebar. The exact
- * selectors below target the inner adw `list.boxed-list` element; if
- * the rendered tree differs, the rules degrade gracefully and only the
- * row colours change. */
+/* Event dots — a row of small colored squares under the day number. */
+.ts-cal-event-dots {
+    min-height: 4px;
+    margin-top: 2px;
+}
+.ts-cal-event-dot {
+    min-width: 4px;
+    min-height: 4px;
+    border-radius: 2px;
+    margin: 0 1px;
+}
+/* On the selected day, dots invert to white so they read against the
+ * accent pill. */
+.ts-cal-day-selected .ts-cal-event-dot {
+    background: alpha(white, 0.85) !important;
+}
+
+/* Calendar-source palette — `color_index_for_calendar` maps the source
+ * name to one of these. Adwaita-friendly hues chosen to read on the dark
+ * sidebar gradient. */
+.ts-cal-color-0 { background: #62a0ea; }   /* blue */
+.ts-cal-color-1 { background: #57e389; }   /* green */
+.ts-cal-color-2 { background: #f9f06b; }   /* yellow */
+.ts-cal-color-3 { background: #ffa348; }   /* orange */
+.ts-cal-color-4 { background: #ed333b; }   /* red */
+.ts-cal-color-5 { background: #c061cb; }   /* purple */
+.ts-cal-color-6 { background: #5bc8af; }   /* teal */
+.ts-cal-color-7 { background: #f76fa5; }   /* pink */
+
+/* "UPCOMING" header above the events list */
+.ts-sidebar-cal-header {
+    color: alpha(white, 0.5);
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    margin: 10px 4px 6px 4px;
+}
+
+/* adw::PreferencesGroup palette swap for the dark sidebar. */
 .ts-sidebar-cal-list {
     margin-top: 0;
 }
@@ -627,6 +719,15 @@ window:not(.dark) .ts-drawer {
 }
 .ts-sidebar-cal-list .subtitle {
     color: alpha(white, 0.6);
+}
+
+/* Source-color dot at the start of each upcoming-list row — mirrors the
+ * grid dots so users can scan colors → calendar at a glance. */
+.ts-cal-source-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 5px;
+    margin: 0 8px 0 4px;
 }
 
 /* ─── Sidebar — departures widget ─────────────────────────────── */

@@ -144,7 +144,6 @@ pub fn install(monitor: &Monitor) {
 /// Construct one `OsdView` for `monitor`. Pure widget construction —
 /// signal wiring lives in [`install_subscriptions`] and runs once
 /// regardless of monitor count.
-#[allow(clippy::too_many_lines)]
 fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
     let window = layer_window(monitor)
         .layer(Layer::Top)

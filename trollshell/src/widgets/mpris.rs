@@ -29,74 +29,79 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     container.add_css_class("ts-mpris");
 
-    // Buttons.
-    let prev_btn = gtk::Button::new();
-    prev_btn.set_child(Some(
-        &gtk::Image::from_icon_name("media-skip-backward-symbolic"),
-    ));
-
-    let play_pause_btn = gtk::Button::new();
-    let play_icon = gtk::Image::from_icon_name("media-playback-start-symbolic");
-    play_pause_btn.set_child(Some(&play_icon));
-
-    let next_btn = gtk::Button::new();
-    next_btn.set_child(Some(
-        &gtk::Image::from_icon_name("media-skip-forward-symbolic"),
-    ));
-
-    // Label — clicking it opens the Media modal page.
-    let label = gtk::Label::new(None);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_max_width_chars(60);
-
-    // Add a GestureClick on the label for modal toggle.
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_PRIMARY);
-    let monitor_for_label = monitor.clone();
-    let label_for_anchor = label.clone();
-    gesture.connect_pressed(move |gesture, _, _, _| {
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-        crate::modal::toggle(
-            &monitor_for_label,
-            crate::modal::Page::Media,
-            &label_for_anchor,
-        );
-    });
-    label.add_controller(gesture);
+    let prev_btn = icon_button("media-skip-backward-symbolic");
+    let play_pause_btn = icon_button("media-playback-start-symbolic");
+    let next_btn = icon_button("media-skip-forward-symbolic");
+    let label = build_clickable_label(monitor);
 
     container.append(&prev_btn);
     container.append(&play_pause_btn);
     container.append(&next_btn);
     container.append(&label);
 
-    // Shared bus name so click handlers always use the latest active player.
     let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    wire_transport(&prev_btn, &current_bus, mpris::previous);
+    wire_transport(&play_pause_btn, &current_bus, mpris::play_pause);
+    wire_transport(&next_btn, &current_bus, mpris::next);
 
-    let bus_for_prev = current_bus.clone();
-    prev_btn.connect_clicked(move |_| {
-        if let Some(b) = bus_for_prev.borrow().as_ref() {
-            mpris::previous(b);
+    wire_visibility_and_state(
+        &container,
+        &label,
+        &prev_btn,
+        &play_pause_btn,
+        &next_btn,
+        &current_bus,
+        monitor,
+    );
+
+    container.set_visible(false);
+    container.upcast()
+}
+
+fn icon_button(icon: &str) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.set_child(Some(&gtk::Image::from_icon_name(icon)));
+    btn
+}
+
+fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(60);
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+    let monitor = monitor.clone();
+    let label_for_anchor = label.clone();
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        crate::modal::toggle(&monitor, crate::modal::Page::Media, &label_for_anchor);
+    });
+    label.add_controller(gesture);
+    label
+}
+
+fn wire_transport(btn: &gtk::Button, bus: &Rc<RefCell<Option<String>>>, action: fn(&str)) {
+    let bus = bus.clone();
+    btn.connect_clicked(move |_| {
+        if let Some(b) = bus.borrow().as_ref() {
+            action(b);
         }
     });
+}
 
-    let bus_for_pp = current_bus.clone();
-    play_pause_btn.connect_clicked(move |_| {
-        if let Some(b) = bus_for_pp.borrow().as_ref() {
-            mpris::play_pause(b);
-        }
-    });
-
-    let bus_for_next = current_bus.clone();
-    next_btn.connect_clicked(move |_| {
-        if let Some(b) = bus_for_next.borrow().as_ref() {
-            mpris::next(b);
-        }
-    });
-
-    // Bind the active player signal combined with the per-monitor window
-    // count. MPRIS hides when there's no active player OR when the left
-    // cluster is crowded enough that keeping it visible would risk pushing
-    // the right cluster off-screen.
+/// MPRIS hides when there's no active player OR when the left cluster is
+/// crowded enough that keeping it visible would risk pushing the right
+/// cluster off-screen.
+fn wire_visibility_and_state(
+    container: &gtk::Box,
+    label: &gtk::Label,
+    prev_btn: &gtk::Button,
+    play_pause_btn: &gtk::Button,
+    next_btn: &gtk::Button,
+    current_bus: &Rc<RefCell<Option<String>>>,
+    monitor: &Monitor,
+) {
     let combined = map_ref! {
         let player = mpris::active_player(),
         let wins = window_list::active_workspace_windows(monitor.connector()) => {
@@ -104,9 +109,15 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         }
     };
 
+    let label = label.clone();
+    let prev_btn = prev_btn.clone();
+    let play_pause_btn = play_pause_btn.clone();
+    let next_btn = next_btn.clone();
+    let current_bus = current_bus.clone();
+
     bind(
         combined,
-        &container,
+        container,
         move |container, (maybe_player, win_count): (Option<Player>, usize)| {
             match maybe_player {
                 None => {
@@ -118,42 +129,39 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 }
                 Some(player) => {
                     *current_bus.borrow_mut() = Some(player.bus_name.clone());
-
-                    // Update label text (truncate to 60 chars by max_width_chars,
-                    // and show full text in the tooltip).
-                    let text = if player.artists.is_empty() {
-                        player.title.clone()
-                    } else {
-                        format!("{} \u{2013} {}", player.artists, player.title)
-                    };
-                    label.set_text(&text);
-                    label.set_tooltip_text(Some(&text));
-
-                    // Button sensitivity.
-                    prev_btn.set_sensitive(player.can_go_previous);
-                    play_pause_btn.set_sensitive(player.can_play_pause);
-                    next_btn.set_sensitive(player.can_go_next);
-
-                    // Play/pause icon toggles with status.
-                    let icon_name = if player.status == PlaybackStatus::Playing {
-                        "media-playback-pause-symbolic"
-                    } else {
-                        "media-playback-start-symbolic"
-                    };
-                    play_pause_btn
-                        .child()
-                        .and_downcast::<gtk::Image>()
-                        .iter()
-                        .for_each(|img| img.set_icon_name(Some(icon_name)));
-
+                    apply_player_to_widgets(&player, &label, &prev_btn, &play_pause_btn, &next_btn);
                     container.set_visible(true);
                 }
             }
         },
     );
+}
 
-    // Hide by default until first emission.
-    container.set_visible(false);
+fn apply_player_to_widgets(
+    player: &Player,
+    label: &gtk::Label,
+    prev_btn: &gtk::Button,
+    play_pause_btn: &gtk::Button,
+    next_btn: &gtk::Button,
+) {
+    let text = if player.artists.is_empty() {
+        player.title.clone()
+    } else {
+        format!("{} \u{2013} {}", player.artists, player.title)
+    };
+    label.set_text(&text);
+    label.set_tooltip_text(Some(&text));
 
-    container.upcast()
+    prev_btn.set_sensitive(player.can_go_previous);
+    play_pause_btn.set_sensitive(player.can_play_pause);
+    next_btn.set_sensitive(player.can_go_next);
+
+    let icon_name = if player.status == PlaybackStatus::Playing {
+        "media-playback-pause-symbolic"
+    } else {
+        "media-playback-start-symbolic"
+    };
+    if let Some(img) = play_pause_btn.child().and_downcast::<gtk::Image>() {
+        img.set_icon_name(Some(icon_name));
+    }
 }

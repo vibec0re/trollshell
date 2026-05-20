@@ -251,62 +251,27 @@ fn build_noc_match_rule(dest: &str) -> Result<zbus::OwnedMatchRule, zbus::Error>
 /// 3. Emit Live.
 /// 4. Drain the NOC stream + epoch signal until the stream ends or epoch bumps.
 /// 5. Set Reconnecting, loop.
-#[allow(clippy::too_many_lines)]
 async fn run_proxy_watcher(
     weak: Weak<ProxyInner>,
     task_done_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut first_iteration = true;
+    let mut task_done_tx = Some(task_done_tx);
 
     loop {
-        // Exit if all BusProxy handles have been dropped.
         let Some(inner) = weak.upgrade() else {
             tracing::debug!("proxy watcher: all handles dropped; exiting");
-            let _ = task_done_tx.send(());
+            if let Some(tx) = task_done_tx.take() {
+                let _ = tx.send(());
+            }
             return;
         };
-
         let dest = inner.destination.clone();
 
-        // Build the NOC match rule (infallible in practice — destination names
-        // were validated by the builder, but errors are handled gracefully).
-        let match_rule = match build_noc_match_rule(&dest) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, %dest,
-                    "proxy watcher: failed to build match rule; retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
+        let Some(mut stream) = subscribe_noc(&inner, &dest).await else {
+            continue;
         };
 
-        // Subscribe to NameOwnerChanged FIRST, before emitting Live.
-        // This ensures any NOC signal fired after the subscription is set up
-        // (even if it arrived between proxy-build and subscribe) is buffered.
-        let subscribe_result = inner
-            .shared
-            .with_conn(|conn| {
-                let rule = match_rule.clone();
-                async move {
-                    let stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
-                    Ok(stream)
-                }
-            })
-            .await;
-
-        let mut stream = match subscribe_result {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, %dest,
-                    "proxy watcher: subscribe failed; will retry");
-                inner.liveness.set(ProxyState::Reconnecting);
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
-        };
-
-        // On iterations after the first, rebuild the proxy cache against the
-        // current (post-reconnect) connection.
         if !first_iteration && let Err(e) = do_rebuild_proxy_cache(&inner).await {
             tracing::debug!(error = %e, %dest,
                 "proxy watcher: proxy rebuild failed; will retry");
@@ -316,99 +281,148 @@ async fn run_proxy_watcher(
         }
         first_iteration = false;
 
-        // Record the epoch at the time we subscribed so we can detect a
-        // bus reconnect that bumps the epoch.
         let current_epoch = inner.shared.epoch();
-        let mut epoch_stream = inner.shared.epoch_signal().to_stream();
-
-        // Now that we're subscribed and have a working proxy, emit Live.
         inner.liveness.set(ProxyState::Live);
 
-        // Periodic liveness tick — lets us detect handle-drops while parked.
-        let mut liveness_tick = tokio::time::interval(std::time::Duration::from_millis(100));
-        liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        'drain: loop {
-            // Check if all handles have been dropped.
-            if weak.upgrade().is_none() {
-                tracing::debug!(%dest,
-                    "proxy watcher: all handles dropped (inner loop); exiting");
-                let _ = task_done_tx.send(());
-                return;
-            }
-
-            tokio::select! {
-                maybe_msg = stream.next() => {
-                    match maybe_msg {
-                        None => {
-                            // Stream ended — bus disconnected or match rule removed.
-                            tracing::debug!(%dest,
-                                "proxy watcher: NOC stream ended; reconnecting");
-                            {
-                                let mut cached = inner.cached.write().await;
-                                *cached = None;
-                            }
-                            inner.liveness.set(ProxyState::Reconnecting);
-                            break 'drain;
-                        }
-                        Some(Ok(msg)) => {
-                            // Deserialize the NameOwnerChanged body:
-                            // (name, old_owner, new_owner).
-                            let body = msg.body();
-                            match body.deserialize::<(String, String, String)>() {
-                                Ok((name, _old, new_owner)) if name == dest => {
-                                    if new_owner.is_empty() {
-                                        tracing::debug!(%dest,
-                                            "proxy watcher: peer gone");
-                                        {
-                                            let mut cached = inner.cached.write().await;
-                                            *cached = None;
-                                        }
-                                        inner.liveness.set(ProxyState::PeerGone);
-                                    } else {
-                                        tracing::debug!(%dest, %new_owner,
-                                            "proxy watcher: peer back; rebuilding");
-                                        let _ = do_rebuild_proxy_cache(&inner).await;
-                                        inner.liveness.set(ProxyState::Live);
-                                    }
-                                }
-                                _ => {} // ignore signals for other names or decode errors
-                            }
-                        }
-                        Some(Err(e)) => {
-                            tracing::debug!(error = %e, %dest,
-                                "proxy watcher: message error; reconnecting");
-                            {
-                                let mut cached = inner.cached.write().await;
-                                *cached = None;
-                            }
-                            inner.liveness.set(ProxyState::Reconnecting);
-                            break 'drain;
-                        }
-                    }
-                }
-                maybe_epoch = epoch_stream.next() => {
-                    if let Some(new_epoch) = maybe_epoch
-                        && new_epoch > current_epoch
-                    {
-                        tracing::debug!(%dest, new_epoch,
-                            "proxy watcher: epoch advanced; rebuilding");
-                        {
-                            let mut cached = inner.cached.write().await;
-                            *cached = None;
-                        }
-                        inner.liveness.set(ProxyState::Reconnecting);
-                        break 'drain;
-                    }
-                }
-                _ = liveness_tick.tick() => {
-                    // Liveness tick — loop back to the handle-drop check above.
-                }
-            }
+        let exited = drain_noc_stream(
+            &inner, &weak, &dest, &mut stream, current_epoch, &mut task_done_tx,
+        ).await;
+        if exited {
+            return;
         }
 
-        // Brief pause before re-subscribing to avoid tight loops when the bus
-        // is cycling rapidly.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Build the NOC match rule and subscribe before emitting Live, so any NOC
+/// signal fired after subscription (even between proxy-build and subscribe)
+/// is buffered. Returns None on transient failure (caller should retry).
+async fn subscribe_noc(
+    inner: &Arc<ProxyInner>,
+    dest: &str,
+) -> Option<zbus::MessageStream> {
+    let match_rule = match build_noc_match_rule(dest) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, %dest,
+                "proxy watcher: failed to build match rule; retrying");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            return None;
+        }
+    };
+
+    let subscribe_result = inner
+        .shared
+        .with_conn(|conn| {
+            let rule = match_rule.clone();
+            async move {
+                let stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
+                Ok(stream)
+            }
+        })
+        .await;
+
+    match subscribe_result {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::debug!(error = %e, %dest,
+                "proxy watcher: subscribe failed; will retry");
+            inner.liveness.set(ProxyState::Reconnecting);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            None
+        }
+    }
+}
+
+/// Returns `true` if the watcher should exit entirely (all handles dropped).
+async fn drain_noc_stream(
+    inner: &Arc<ProxyInner>,
+    weak: &Weak<ProxyInner>,
+    dest: &str,
+    stream: &mut zbus::MessageStream,
+    current_epoch: u64,
+    task_done_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> bool {
+    let mut epoch_stream = inner.shared.epoch_signal().to_stream();
+    let mut liveness_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if weak.upgrade().is_none() {
+            tracing::debug!(%dest, "proxy watcher: all handles dropped (inner loop); exiting");
+            if let Some(tx) = task_done_tx.take() {
+                let _ = tx.send(());
+            }
+            return true;
+        }
+
+        tokio::select! {
+            maybe_msg = stream.next() => {
+                if handle_noc_msg(maybe_msg, inner, dest).await {
+                    return false;
+                }
+            }
+            maybe_epoch = epoch_stream.next() => {
+                if let Some(new_epoch) = maybe_epoch
+                    && new_epoch > current_epoch
+                {
+                    tracing::debug!(%dest, new_epoch,
+                        "proxy watcher: epoch advanced; rebuilding");
+                    mark_reconnecting(inner).await;
+                    return false;
+                }
+            }
+            _ = liveness_tick.tick() => {}
+        }
+    }
+}
+
+/// Returns `true` when the caller should break the drain loop.
+async fn handle_noc_msg(
+    maybe_msg: Option<Result<zbus::Message, zbus::Error>>,
+    inner: &Arc<ProxyInner>,
+    dest: &str,
+) -> bool {
+    match maybe_msg {
+        None => {
+            tracing::debug!(%dest, "proxy watcher: NOC stream ended; reconnecting");
+            mark_reconnecting(inner).await;
+            true
+        }
+        Some(Err(e)) => {
+            tracing::debug!(error = %e, %dest,
+                "proxy watcher: message error; reconnecting");
+            mark_reconnecting(inner).await;
+            true
+        }
+        Some(Ok(msg)) => {
+            let body = msg.body();
+            if let Ok((name, _old, new_owner)) =
+                body.deserialize::<(String, String, String)>()
+                && name == dest
+            {
+                if new_owner.is_empty() {
+                    tracing::debug!(%dest, "proxy watcher: peer gone");
+                    let mut cached = inner.cached.write().await;
+                    *cached = None;
+                    drop(cached);
+                    inner.liveness.set(ProxyState::PeerGone);
+                } else {
+                    tracing::debug!(%dest, %new_owner,
+                        "proxy watcher: peer back; rebuilding");
+                    let _ = do_rebuild_proxy_cache(inner).await;
+                    inner.liveness.set(ProxyState::Live);
+                }
+            }
+            false
+        }
+    }
+}
+
+async fn mark_reconnecting(inner: &Arc<ProxyInner>) {
+    let mut cached = inner.cached.write().await;
+    *cached = None;
+    drop(cached);
+    inner.liveness.set(ProxyState::Reconnecting);
 }

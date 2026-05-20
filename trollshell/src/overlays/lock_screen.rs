@@ -67,8 +67,26 @@ pub fn install(monitors: &[Monitor]) {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn build_lock_surface(monitor: &Monitor, primary: bool) -> LockSurface {
+    let window = build_lock_window(monitor);
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.set_valign(gtk::Align::Center);
+    outer.set_halign(gtk::Align::Center);
+
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    card.add_css_class("ts-lock-card");
+    card.set_halign(gtk::Align::Center);
+
+    append_clock_and_date(&card);
+    let primary_ui = primary.then(|| build_primary_ui(&card));
+
+    outer.append(&card);
+    window.set_child(Some(&outer));
+
+    LockSurface { window, primary: primary_ui }
+}
+
+fn build_lock_window(monitor: &Monitor) -> gtk::Window {
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
         .anchor(Anchor::Top)
@@ -81,15 +99,10 @@ fn build_lock_surface(monitor: &Monitor, primary: bool) -> LockSurface {
         .build();
     window.add_css_class("ts-lock-root");
     window.set_visible(false);
+    window
+}
 
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    outer.set_valign(gtk::Align::Center);
-    outer.set_halign(gtk::Align::Center);
-
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    card.add_css_class("ts-lock-card");
-    card.set_halign(gtk::Align::Center);
-
+fn append_clock_and_date(card: &gtk::Box) {
     let clock_label = gtk::Label::new(None);
     clock_label.add_css_class("ts-lock-clock");
     clock_label.set_xalign(0.5);
@@ -109,73 +122,59 @@ fn build_lock_surface(monitor: &Monitor, primary: bool) -> LockSurface {
         |w, t| w.set_text(&t),
     );
     card.append(&date_label);
+}
 
-    let primary_ui = if primary {
-        let user_label = gtk::Label::new(Some(&current_username()));
-        user_label.add_css_class("ts-lock-user");
-        user_label.set_xalign(0.5);
-        card.append(&user_label);
+fn build_primary_ui(card: &gtk::Box) -> PrimaryUi {
+    let user_label = gtk::Label::new(Some(&current_username()));
+    user_label.add_css_class("ts-lock-user");
+    user_label.set_xalign(0.5);
+    card.append(&user_label);
 
-        let entry = gtk::PasswordEntry::new();
-        // No peek icon: prevents shoulder-surf reveal on a lock screen.
-        entry.set_show_peek_icon(false);
-        entry.add_css_class("ts-lock-entry");
-        entry.set_width_chars(28);
-        card.append(&entry);
+    let entry = gtk::PasswordEntry::new();
+    // No peek icon: prevents shoulder-surf reveal on a lock screen.
+    entry.set_show_peek_icon(false);
+    entry.add_css_class("ts-lock-entry");
+    entry.set_width_chars(28);
+    card.append(&entry);
 
-        let error_label = gtk::Label::new(None);
-        error_label.add_css_class("ts-lock-error");
-        error_label.set_xalign(0.5);
-        error_label.set_visible(false);
-        card.append(&error_label);
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("ts-lock-error");
+    error_label.set_xalign(0.5);
+    error_label.set_visible(false);
+    card.append(&error_label);
 
-        let spinner = gtk::Spinner::new();
-        spinner.set_visible(false);
-        card.append(&spinner);
+    let spinner = gtk::Spinner::new();
+    spinner.set_visible(false);
+    card.append(&spinner);
 
-        let submit_btn = gtk::Button::with_label("Authenticate");
-        submit_btn.add_css_class("suggested-action");
-        submit_btn.set_halign(gtk::Align::Center);
-        card.append(&submit_btn);
+    let submit_btn = gtk::Button::with_label("Authenticate");
+    submit_btn.add_css_class("suggested-action");
+    submit_btn.set_halign(gtk::Align::Center);
+    card.append(&submit_btn);
 
-        let entry_for_submit = entry.clone();
-        let card_for_submit = card.clone();
-        let error_for_submit = error_label.clone();
-        let spinner_for_submit = spinner.clone();
-        let submit_btn_for_submit = submit_btn.clone();
-        let submit = move || {
-            submit_password(
-                &entry_for_submit,
-                &card_for_submit,
-                &error_for_submit,
-                &spinner_for_submit,
-                &submit_btn_for_submit,
-            );
-        };
+    wire_submit(&entry, card, &error_label, &spinner, &submit_btn);
 
-        let submit_for_enter = submit.clone();
-        entry.connect_activate(move |_| submit_for_enter());
+    PrimaryUi { entry, error_label, spinner, submit_btn }
+}
 
-        let submit_for_btn = submit;
-        submit_btn.connect_clicked(move |_| submit_for_btn());
+fn wire_submit(
+    entry: &gtk::PasswordEntry,
+    card: &gtk::Box,
+    error_label: &gtk::Label,
+    spinner: &gtk::Spinner,
+    submit_btn: &gtk::Button,
+) {
+    let entry_c = entry.clone();
+    let card_c = card.clone();
+    let error_c = error_label.clone();
+    let spinner_c = spinner.clone();
+    let btn_c = submit_btn.clone();
+    let submit = move || submit_password(&entry_c, &card_c, &error_c, &spinner_c, &btn_c);
 
-        Some(PrimaryUi {
-            entry,
-            error_label,
-            spinner,
-            submit_btn,
-        })
-    } else {
-        None
-    };
-
-    outer.append(&card);
-    window.set_child(Some(&outer));
-
-    LockSurface {
-        window,
-        primary: primary_ui,
-    }
+    let submit_for_enter = submit.clone();
+    entry.connect_activate(move |_| submit_for_enter());
+    let submit_for_btn = submit;
+    submit_btn.connect_clicked(move |_| submit_for_btn());
 }
 
 fn submit_password(

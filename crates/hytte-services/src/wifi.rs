@@ -843,7 +843,6 @@ async fn register_iwd_agent() -> Result<(), hytte_bus::BusError> {
 
 // ── Main watcher task ─────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
 async fn run_wifi_watcher(
     station_mutable: Mutable<Option<Station>>,
     networks_mutable: Mutable<Vec<WifiNetwork>>,
@@ -851,127 +850,169 @@ async fn run_wifi_watcher(
     adapter_mutable: Mutable<Option<Adapter>>,
 ) {
     'discovery: loop {
-        // 1. Discover paths via GetManagedObjects.
-        let managed = match get_managed_objects().await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue 'discovery;
-            }
-        };
-
-        // 2. Find the first Station path.
-        let Some(station_path) = managed.iter().find_map(|(path, ifaces)| {
-            ifaces
-                .contains_key("net.connman.iwd.Station")
-                .then(|| path.clone())
-        }) else {
-            tracing::debug!("iwd has no Station object yet");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let Some((managed, station_path)) = discover_station().await else {
             continue 'discovery;
         };
 
-        // 3. Update STATION_PATH + ADAPTER_PATH statics.
-        set_station_path(station_path.as_str()).await;
-        let adapter_path = adapter_path_from_station(station_path.as_str());
-        if !adapter_path.is_empty() {
-            set_current_adapter_path(&adapter_path).await;
-        }
-
+        publish_paths(&station_path).await;
         tracing::info!(path = station_path.as_str(), "wifi station found");
 
-        // 4. Populate initial state from managed objects.
         refresh_adapter_from_managed(&managed, station_path.as_str(), &adapter_mutable);
         refresh_station_from_managed(&managed, &station_path, &station_mutable);
-
-        // Initial network list.
         refresh_networks(station_path.as_str(), &station_mutable, &networks_mutable).await;
 
-        // 5. Subscribe to Station PropertiesChanged.
-        let station_props_sub = hytte_bus::signals("net.connman.iwd")
-            .bus(BusKind::System)
-            .at_path(station_path.as_str().to_string())
-            .iface("org.freedesktop.DBus.Properties")
-            .signal("PropertiesChanged")
-            .start();
+        let subs = subscribe_iwd_events(&station_path);
 
-        // 6. Subscribe to ObjectManager InterfacesAdded/Removed.
-        let added_sub = hytte_bus::signals("net.connman.iwd")
-            .bus(BusKind::System)
-            .at_path("/")
-            .iface("org.freedesktop.DBus.ObjectManager")
-            .signal("InterfacesAdded")
-            .start();
-        let removed_sub = hytte_bus::signals("net.connman.iwd")
-            .bus(BusKind::System)
-            .at_path("/")
-            .iface("org.freedesktop.DBus.ObjectManager")
-            .signal("InterfacesRemoved")
-            .start();
-
-        // 7. Register with iwd AgentManager.
         match register_iwd_agent().await {
             Ok(()) => tracing::info!("hytte iwd agent registered"),
             Err(e) => tracing::warn!(error = %e, "iwd RegisterAgent failed"),
         }
 
-        // 8. Pump events.
-        let mut station_events = station_props_sub.events();
-        let mut added_events = added_sub.events();
-        let mut removed_events = removed_sub.events();
-
         let station_path_str = station_path.as_str().to_string();
+        let restart = pump_iwd_events(
+            subs,
+            &station_path_str,
+            &station_mutable,
+            &networks_mutable,
+            &prompts_mutable,
+            &adapter_mutable,
+        )
+        .await;
 
-        loop {
-            tokio::select! {
-                Some(evt) = station_events.next() => {
-                    // Decode the PropertiesChanged body: (interface_name, changed, invalidated)
-                    // Only handle changes for the Station interface.
-                    let should_refresh = if let Ok((iface, changed, _)) = evt.body.body()
-                        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-                    {
-                        if iface == "net.connman.iwd.Station" {
-                            // Apply the delta directly to avoid a full GetAll round-trip
-                            // for simple Scanning/State flips, then refresh networks for
-                            // ConnectedNetwork changes.
-                            apply_station_props_delta(&changed, &station_mutable);
-                            true
-                        } else if iface == "net.connman.iwd.Adapter1" {
-                            apply_adapter_props_delta(&changed, &adapter_mutable);
-                            false
-                        } else {
-                            // Network property changed — refresh network list.
-                            true
-                        }
-                    } else {
-                        // Can't decode — do a full refresh to be safe.
-                        refresh_station(&station_path_str, &station_mutable).await;
-                        true
-                    };
-                    if should_refresh {
-                        refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
-                    }
-                }
-                Some(_) = added_events.next() => {
-                    refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
-                }
-                Some(evt) = removed_events.next() => {
-                    // Check if the station itself was removed.
-                    if station_removed_from_event(&evt.body, &station_path_str) {
-                        tracing::warn!(path = station_path_str, "iwd station removed — rewatching");
-                        // Clear state and restart discovery.
-                        station_mutable.set(None);
-                        networks_mutable.set(Vec::new());
-                        prompts_mutable.set(None);
-                        adapter_mutable.set(None);
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        continue 'discovery;
-                    }
-                    refresh_networks(&station_path_str, &station_mutable, &networks_mutable).await;
+        if restart {
+            continue 'discovery;
+        }
+    }
+}
+
+async fn discover_station() -> Option<(ManagedObjects, zbus::zvariant::OwnedObjectPath)> {
+    let managed = match get_managed_objects().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(error = %e, "iwd GetManagedObjects failed (iwd not running?)");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            return None;
+        }
+    };
+
+    let Some(station_path) = managed.iter().find_map(|(path, ifaces)| {
+        ifaces
+            .contains_key("net.connman.iwd.Station")
+            .then(|| path.clone())
+    }) else {
+        tracing::debug!("iwd has no Station object yet");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        return None;
+    };
+
+    Some((managed, station_path))
+}
+
+async fn publish_paths(station_path: &zbus::zvariant::OwnedObjectPath) {
+    set_station_path(station_path.as_str()).await;
+    let adapter_path = adapter_path_from_station(station_path.as_str());
+    if !adapter_path.is_empty() {
+        set_current_adapter_path(&adapter_path).await;
+    }
+}
+
+struct IwdSubs {
+    station_props: hytte_bus::SignalSubscription,
+    added: hytte_bus::SignalSubscription,
+    removed: hytte_bus::SignalSubscription,
+}
+
+fn subscribe_iwd_events(station_path: &zbus::zvariant::OwnedObjectPath) -> IwdSubs {
+    let station_props = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path(station_path.as_str().to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .signal("PropertiesChanged")
+        .start();
+    let added = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesAdded")
+        .start();
+    let removed = hytte_bus::signals("net.connman.iwd")
+        .bus(BusKind::System)
+        .at_path("/")
+        .iface("org.freedesktop.DBus.ObjectManager")
+        .signal("InterfacesRemoved")
+        .start();
+    IwdSubs { station_props, added, removed }
+}
+
+/// Drive the iwd event loop. Returns `true` when the station was removed and
+/// the watcher needs to restart discovery, `false` to keep pumping (currently
+/// unreachable — the loop only exits via restart).
+async fn pump_iwd_events(
+    subs: IwdSubs,
+    station_path_str: &str,
+    station_mutable: &Mutable<Option<Station>>,
+    networks_mutable: &Mutable<Vec<WifiNetwork>>,
+    prompts_mutable: &Mutable<Option<PromptRequest>>,
+    adapter_mutable: &Mutable<Option<Adapter>>,
+) -> bool {
+    let mut station_events = subs.station_props.events();
+    let mut added_events = subs.added.events();
+    let mut removed_events = subs.removed.events();
+
+    loop {
+        tokio::select! {
+            Some(evt) = station_events.next() => {
+                let should_refresh = handle_station_props_event(
+                    &evt, station_path_str, station_mutable, adapter_mutable,
+                ).await;
+                if should_refresh {
+                    refresh_networks(station_path_str, station_mutable, networks_mutable).await;
                 }
             }
+            Some(_) = added_events.next() => {
+                refresh_networks(station_path_str, station_mutable, networks_mutable).await;
+            }
+            Some(evt) = removed_events.next() => {
+                if station_removed_from_event(&evt.body, station_path_str) {
+                    tracing::warn!(path = station_path_str, "iwd station removed — rewatching");
+                    station_mutable.set(None);
+                    networks_mutable.set(Vec::new());
+                    prompts_mutable.set(None);
+                    adapter_mutable.set(None);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    return true;
+                }
+                refresh_networks(station_path_str, station_mutable, networks_mutable).await;
+            }
         }
+    }
+}
+
+/// Decode `PropertiesChanged` body. Applies the delta directly for known
+/// interfaces (Station/Adapter1) to avoid a full GetAll round-trip, and
+/// signals whether the caller should refresh the network list.
+async fn handle_station_props_event(
+    evt: &hytte_bus::SignalEvent,
+    station_path_str: &str,
+    station_mutable: &Mutable<Option<Station>>,
+    adapter_mutable: &Mutable<Option<Adapter>>,
+) -> bool {
+    let Ok((iface, changed, _)) = evt.body.body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
+        // Can't decode — full refresh to be safe.
+        refresh_station(station_path_str, station_mutable).await;
+        return true;
+    };
+
+    if iface == "net.connman.iwd.Station" {
+        apply_station_props_delta(&changed, station_mutable);
+        true
+    } else if iface == "net.connman.iwd.Adapter1" {
+        apply_adapter_props_delta(&changed, adapter_mutable);
+        false
+    } else {
+        true
     }
 }
 

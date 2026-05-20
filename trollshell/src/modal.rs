@@ -95,7 +95,6 @@ fn monitor_key(m: &Monitor) -> String {
 }
 
 /// Build the drawer for one monitor and mount it as a layer-shell window.
-#[allow(clippy::too_many_lines)]
 pub fn install(monitor: &Monitor) {
     let key = monitor_key(monitor);
 
@@ -106,140 +105,18 @@ pub fn install(monitor: &Monitor) {
     // the drawer above its catcher.
     let catcher = build_catcher(monitor, key.clone());
 
-    // Drawer and bar both live on `Layer::Top`. There's a 10 px gap below
-    // the bar before the drawer starts, so the drawer reads as a separate
-    // floating card rather than an extension of the bar. Bar stays on the
-    // default Top layer so fullscreen apps can still cover it.
-    let window = layer_window(monitor)
-        .layer(Layer::Top)
-        .anchor(Anchor::Top)
-        .anchor(Anchor::Right)
-        .margin(Margin {
-            top: 59,
-            right: 0,
-            bottom: 0,
-            left: 0,
-        })
-        .exclusive(false)
-        .keyboard_mode(KeyboardMode::OnDemand)
-        .namespace(format!("hytte-modal-{key}"))
-        .build();
-    window.add_css_class("ts-modal");
-    // Ignore other layer-shell surfaces' exclusive zones so `margin.top` is
-    // measured from the true screen edge, not from below the bar's reserved
-    // zone. Without this, the bar's auto-exclusive-zone (≈59 px) stacks
-    // with our margin and pushes the drawer ~60 px lower than intended.
-    window.set_exclusive_zone(-1);
-    // Content-driven sizing: the layer-shell surface auto-negotiates its
-    // size from the visible page's natural request. AdwClamp inside each
-    // page caps width at 680 (see `components::layout::finish_page`); height is the
-    // page's natural height. The min-width floor (360) keeps very sparse
-    // pages from collapsing to a sliver. niri honors the surface-size
-    // commit when switching pages, so the modal grows/shrinks live.
-    window.set_size_request(360, -1);
+    let window = build_drawer_window(monitor, &key);
+    wire_escape(&window, key.clone());
 
-    // ESC → animated retract.
-    let key_ctrl = gtk::EventControllerKey::new();
-    let key_for_esc = key.clone();
-    key_ctrl.connect_key_pressed(move |_, k, _, _| {
-        if k == gdk::Key::Escape {
-            retract_by_key(&key_for_esc);
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    window.add_controller(key_ctrl);
-
-    // Revealer with SlideDown transition — the drawer "pulls out" of the
-    // bar's bottom. Height animates automatically when the revealed child
-    // (the stack) picks a different page with a different natural height.
-    // `valign = Start` pins the revealer to the top of the 720-tall surface
-    // so the card doesn't float in the middle of the transparent envelope.
-    let revealer = gtk::Revealer::new();
-    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-    revealer.set_transition_duration(180);
-    revealer.set_reveal_child(false);
-    revealer.set_valign(gtk::Align::Start);
-    revealer.set_vexpand(false);
-
-    // Card — dark surface with rounded bottom corners.
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    card.add_css_class("ts-drawer");
-    card.set_valign(gtk::Align::Start);
-    card.set_vexpand(false);
-
-    let stack = gtk::Stack::new();
-    stack.set_vexpand(false);
-    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    stack.set_transition_duration(140);
-    stack.set_interpolate_size(true);
-    // Disable homogeneous sizing (default true on both axes in GTK4) so the
-    // stack reports the *visible* child's natural size, not the max across
-    // all children. Without this, sparse pages (Calendar, PowerMenu) render
-    // at the size of the largest mounted page (Stats / Audio).
-    stack.set_hhomogeneous(false);
-    stack.set_vhomogeneous(false);
-
-    stack.add_named(&crate::panels::panel_media(), Some(Page::Media.stack_name()));
-    stack.add_named(&crate::panels::panel_network(), Some(Page::Network.stack_name()));
-    stack.add_named(&crate::panels::panel_vpn(), Some(Page::Vpn.stack_name()));
-    stack.add_named(
-        &crate::panels::panel_connections(),
-        Some(Page::Connections.stack_name()),
-    );
-    stack.add_named(&crate::panels::panel_bluetooth(), Some(Page::Bluetooth.stack_name()));
-    stack.add_named(&crate::panels::panel_stats(), Some(Page::Stats.stack_name()));
-    stack.add_named(&crate::panels::panel_audio(), Some(Page::Audio.stack_name()));
-    stack.add_named(&crate::panels::panel_power(), Some(Page::Power.stack_name()));
-    stack.add_named(
-        &crate::panels::panel_power_menu(),
-        Some(Page::PowerMenu.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_notifications(),
-        Some(Page::Notifications.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_appearance(),
-        Some(Page::Appearance.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_displays(),
-        Some(Page::Displays.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_clipboard(),
-        Some(Page::Clipboard.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_calendar(),
-        Some(Page::Calendar.stack_name()),
-    );
-    stack.add_named(
-        &crate::panels::panel_settings(),
-        Some(Page::Settings.stack_name()),
-    );
+    let revealer = build_revealer();
+    let card = build_drawer_card();
+    let stack = build_pages_stack();
 
     card.append(&stack);
     revealer.set_child(Some(&card));
     window.set_child(Some(&revealer));
 
-    // When the retract animation finishes (child-revealed goes false),
-    // hide both the drawer surface and the persistent catcher.
-    let key_for_revealed = key.clone();
-    revealer.connect_child_revealed_notify(move |r| {
-        if !r.is_child_revealed() {
-            PANELS.with(|panels| {
-                if let Some(panel) = panels.borrow().get(&key_for_revealed) {
-                    panel.window.set_visible(false);
-                    panel.catcher.set_visible(false);
-                    *panel.current.borrow_mut() = None;
-                    panel.open_state.set(false);
-                }
-            });
-        }
-    });
-
+    wire_retract_finish(&revealer, key.clone());
     window.set_visible(false);
 
     PANELS.with(|panels| {
@@ -255,6 +132,116 @@ pub fn install(monitor: &Monitor) {
                 open_state: drawer_open_state(&key),
             },
         );
+    });
+}
+
+/// Drawer surface: 360 min width, content-driven natural size, ignores
+/// other layer-shell exclusive zones so its `margin.top` is measured from
+/// the true screen edge (the bar's ≈59 px reservation would otherwise stack
+/// with our margin and push the drawer down).
+fn build_drawer_window(monitor: &Monitor, key: &str) -> gtk::Window {
+    let window = layer_window(monitor)
+        .layer(Layer::Top)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Right)
+        .margin(Margin { top: 59, right: 0, bottom: 0, left: 0 })
+        .exclusive(false)
+        .keyboard_mode(KeyboardMode::OnDemand)
+        .namespace(format!("hytte-modal-{key}"))
+        .build();
+    window.add_css_class("ts-modal");
+    window.set_exclusive_zone(-1);
+    // AdwClamp inside each page caps width at 680; 360 floor keeps sparse
+    // pages from collapsing. niri honors live surface-size commits so the
+    // drawer grows/shrinks as pages switch.
+    window.set_size_request(360, -1);
+    window
+}
+
+fn wire_escape(window: &gtk::Window, key: String) {
+    let key_ctrl = gtk::EventControllerKey::new();
+    key_ctrl.connect_key_pressed(move |_, k, _, _| {
+        if k == gdk::Key::Escape {
+            retract_by_key(&key);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(key_ctrl);
+}
+
+/// SlideDown revealer pinned to the top of the 720-tall surface so the card
+/// pulls out of the bar's bottom rather than floating mid-screen. Height
+/// animates automatically on page swaps.
+fn build_revealer() -> gtk::Revealer {
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(180);
+    revealer.set_reveal_child(false);
+    revealer.set_valign(gtk::Align::Start);
+    revealer.set_vexpand(false);
+    revealer
+}
+
+fn build_drawer_card() -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("ts-drawer");
+    card.set_valign(gtk::Align::Start);
+    card.set_vexpand(false);
+    card
+}
+
+/// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible*
+/// child's natural size — without this, sparse pages (Calendar, PowerMenu)
+/// render at the size of the largest mounted page (Stats / Audio).
+fn build_pages_stack() -> gtk::Stack {
+    let stack = gtk::Stack::new();
+    stack.set_vexpand(false);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_transition_duration(140);
+    stack.set_interpolate_size(true);
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
+
+    use crate::panels;
+    let pages: [(Page, gtk::Widget); 15] = [
+        (Page::Media, panels::panel_media()),
+        (Page::Network, panels::panel_network()),
+        (Page::Vpn, panels::panel_vpn()),
+        (Page::Connections, panels::panel_connections()),
+        (Page::Bluetooth, panels::panel_bluetooth()),
+        (Page::Stats, panels::panel_stats()),
+        (Page::Audio, panels::panel_audio()),
+        (Page::Power, panels::panel_power()),
+        (Page::PowerMenu, panels::panel_power_menu()),
+        (Page::Notifications, panels::panel_notifications()),
+        (Page::Appearance, panels::panel_appearance()),
+        (Page::Displays, panels::panel_displays()),
+        (Page::Clipboard, panels::panel_clipboard()),
+        (Page::Calendar, panels::panel_calendar()),
+        (Page::Settings, panels::panel_settings()),
+    ];
+    for (page, widget) in pages {
+        stack.add_named(&widget, Some(page.stack_name()));
+    }
+    stack
+}
+
+/// When the retract animation finishes, hide the drawer + catcher and clear
+/// the open state for downstream subscribers.
+fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
+    revealer.connect_child_revealed_notify(move |r| {
+        if r.is_child_revealed() {
+            return;
+        }
+        PANELS.with(|panels| {
+            let panels = panels.borrow();
+            let Some(panel) = panels.get(&key) else { return };
+            panel.window.set_visible(false);
+            panel.catcher.set_visible(false);
+            *panel.current.borrow_mut() = None;
+            panel.open_state.set(false);
+        });
     });
 }
 

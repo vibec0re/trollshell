@@ -12,12 +12,47 @@ use hytte::services::mpris::{self, PlaybackStatus};
 use crate::components::format::fmt_us;
 use crate::components::layout::{finish_page, page_grid, section};
 
-#[allow(clippy::too_many_lines)]
+/// Labels + buttons that the bind closure updates on every emission.
+#[derive(Clone)]
+struct InfoWidgets {
+    title: gtk::Label,
+    artist: gtk::Label,
+    album: gtk::Label,
+    prev_btn: gtk::Button,
+    play_pause_btn: gtk::Button,
+    next_btn: gtk::Button,
+    seek: gtk::Scale,
+    pos: gtk::Label,
+    len: gtk::Label,
+}
+
+/// Mutable per-render state shared between the bind closure and the
+/// click/seek handlers.
+#[derive(Default)]
+struct PlayerState {
+    bus: RefCell<Option<String>>,
+    track_id: RefCell<Option<String>>,
+    length_us: Cell<u64>,
+    last_art_url: RefCell<String>,
+}
+
 pub fn panel_media() -> gtk::Widget {
     let grid = page_grid();
     grid.set_column_homogeneous(false);
 
-    // ── Art panel (col 0) ─────────────────────────────────────────────────────
+    let art_image = build_art_panel(&grid);
+    let info = build_info_panel();
+    grid.attach(&info.section, 1, 0, 1, 1);
+
+    let state = Rc::new(PlayerState::default());
+    wire_transport_buttons(&info.widgets, &state);
+    wire_player_bind(&info.widgets, &art_image, &state);
+    wire_seek(&info.widgets.seek, &state);
+
+    finish_page(&grid)
+}
+
+fn build_art_panel(grid: &gtk::Grid) -> gtk::Image {
     let art_box = section("");
     art_box.set_size_request(220, 220);
     art_box.add_css_class("ts-media-art");
@@ -26,30 +61,24 @@ pub fn panel_media() -> gtk::Widget {
     art_image.set_pixel_size(200);
     art_box.append(&art_image);
     grid.attach(&art_box, 0, 0, 1, 1);
+    art_image
+}
 
-    // ── Metadata + controls panel (col 1) ─────────────────────────────────────
-    let info = section("Now Playing");
+struct InfoPanel {
+    section: gtk::Box,
+    widgets: InfoWidgets,
+}
 
-    let title_label = gtk::Label::new(Some("\u{2014}"));
-    title_label.add_css_class("ts-media-title");
-    title_label.set_xalign(0.0);
-    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title_label.set_max_width_chars(40);
-    info.append(&title_label);
+fn build_info_panel() -> InfoPanel {
+    let section = section("Now Playing");
 
-    let artist_label = gtk::Label::new(None);
-    artist_label.set_xalign(0.0);
-    artist_label.add_css_class("ts-media-artist");
-    artist_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    artist_label.set_max_width_chars(40);
-    info.append(&artist_label);
-
-    let album_label = gtk::Label::new(None);
-    album_label.set_xalign(0.0);
-    album_label.add_css_class("ts-media-album");
-    album_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    album_label.set_max_width_chars(40);
-    info.append(&album_label);
+    let title = ellipsized_label("ts-media-title", 40);
+    title.set_text("\u{2014}");
+    let artist = ellipsized_label("ts-media-artist", 40);
+    let album = ellipsized_label("ts-media-album", 40);
+    section.append(&title);
+    section.append(&artist);
+    section.append(&album);
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     controls.set_margin_top(8);
@@ -59,163 +88,170 @@ pub fn panel_media() -> gtk::Widget {
     controls.append(&prev_btn);
     controls.append(&play_pause_btn);
     controls.append(&next_btn);
-    info.append(&controls);
+    section.append(&controls);
 
     let seek = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
     seek.set_draw_value(false);
     seek.set_hexpand(true);
-    info.append(&seek);
+    section.append(&seek);
 
     let time_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    let pos_label = gtk::Label::new(Some("0:00"));
-    pos_label.set_xalign(0.0);
-    pos_label.set_hexpand(true);
-    let len_label = gtk::Label::new(Some("0:00"));
-    len_label.set_xalign(1.0);
-    len_label.set_hexpand(true);
-    time_line.append(&pos_label);
-    time_line.append(&len_label);
-    info.append(&time_line);
+    let pos = gtk::Label::new(Some("0:00"));
+    pos.set_xalign(0.0);
+    pos.set_hexpand(true);
+    let len = gtk::Label::new(Some("0:00"));
+    len.set_xalign(1.0);
+    len.set_hexpand(true);
+    time_line.append(&pos);
+    time_line.append(&len);
+    section.append(&time_line);
 
-    grid.attach(&info, 1, 0, 1, 1);
-
-    // ── Shared state for click handlers and signal closure ────────────────────
-    let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let current_track_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let current_length: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-    let last_art_url: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-
-    // Controls.
-    {
-        let bus = current_bus.clone();
-        prev_btn.connect_clicked(move |_| {
-            if let Some(b) = bus.borrow().as_ref() {
-                mpris::previous(b);
-            }
-        });
+    InfoPanel {
+        section,
+        widgets: InfoWidgets {
+            title,
+            artist,
+            album,
+            prev_btn,
+            play_pause_btn,
+            next_btn,
+            seek,
+            pos,
+            len,
+        },
     }
-    {
-        let bus = current_bus.clone();
-        play_pause_btn.connect_clicked(move |_| {
-            if let Some(b) = bus.borrow().as_ref() {
-                mpris::play_pause(b);
-            }
-        });
-    }
-    {
-        let bus = current_bus.clone();
-        next_btn.connect_clicked(move |_| {
-            if let Some(b) = bus.borrow().as_ref() {
-                mpris::next(b);
-            }
-        });
-    }
+}
 
-    // Signal binding — handles ALL UI updates.
-    let art_image_for_bind = art_image.clone();
-    let title_label_for_bind = title_label.clone();
-    let artist_label_for_bind = artist_label.clone();
-    let album_label_for_bind = album_label.clone();
-    let prev_for_bind = prev_btn.clone();
-    let pp_for_bind = play_pause_btn.clone();
-    let next_for_bind = next_btn.clone();
-    let pos_label_for_bind = pos_label.clone();
-    let len_label_for_bind = len_label.clone();
+fn ellipsized_label(css_class: &str, max_chars: i32) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.add_css_class(css_class);
+    label.set_xalign(0.0);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(max_chars);
+    label
+}
 
-    // Pre-clone shared state for the seek bind_two_way below (the big bind
-    // takes ownership of the originals via `move`).
-    let bus_for_seek = current_bus.clone();
-    let tid_for_seek = current_track_id.clone();
-    let len_for_seek = current_length.clone();
+fn wire_transport_buttons(w: &InfoWidgets, state: &Rc<PlayerState>) {
+    bind_bus_action(&w.prev_btn, state, mpris::previous);
+    bind_bus_action(&w.play_pause_btn, state, mpris::play_pause);
+    bind_bus_action(&w.next_btn, state, mpris::next);
+}
 
-    bind(mpris::active_player(), &title_label, move |_, maybe_player| {
-        match maybe_player {
-            None => {
-                *current_bus.borrow_mut() = None;
-                *current_track_id.borrow_mut() = None;
-                current_length.set(0);
-                title_label_for_bind.set_text("No player");
-                artist_label_for_bind.set_text("");
-                album_label_for_bind.set_text("");
-                pos_label_for_bind.set_text("0:00");
-                len_label_for_bind.set_text("0:00");
-                art_image_for_bind.set_paintable(None::<&gdk::Paintable>);
-                art_image_for_bind.set_icon_name(Some("audio-x-generic-symbolic"));
-                art_image_for_bind.set_pixel_size(200);
-                prev_for_bind.set_sensitive(false);
-                pp_for_bind.set_sensitive(false);
-                next_for_bind.set_sensitive(false);
-            }
-            Some(player) => {
-                *current_bus.borrow_mut() = Some(player.bus_name.clone());
-                (*current_track_id.borrow_mut()).clone_from(&player.track_id);
-                current_length.set(player.length_us);
-
-                title_label_for_bind.set_text(&player.title);
-                artist_label_for_bind.set_text(&player.artists);
-                album_label_for_bind.set_text(&player.album);
-
-                prev_for_bind.set_sensitive(player.can_go_previous);
-                pp_for_bind.set_sensitive(player.can_play_pause);
-                next_for_bind.set_sensitive(player.can_go_next);
-
-                let icon = if player.status == PlaybackStatus::Playing {
-                    "media-playback-pause-symbolic"
-                } else {
-                    "media-playback-start-symbolic"
-                };
-                pp_for_bind.set_icon_name(icon);
-
-                pos_label_for_bind.set_text(&fmt_us(player.position_us));
-                len_label_for_bind.set_text(&fmt_us(player.length_us));
-
-                // Art: only re-fetch when URL changes.
-                if *last_art_url.borrow() != player.art_url {
-                    (*last_art_url.borrow_mut()).clone_from(&player.art_url);
-                    let url = player.art_url.clone();
-                    let art = art_image_for_bind.clone();
-                    glib::MainContext::default().spawn_local(async move {
-                        if let Some(bytes) = mpris::art_for_url(&url).await {
-                            let glib_bytes = glib::Bytes::from(&bytes);
-                            if let Ok(texture) = gdk::Texture::from_bytes(&glib_bytes) {
-                                art.set_pixel_size(-1);
-                                art.set_paintable(Some(&texture));
-                                art.set_size_request(200, 200);
-                            }
-                        }
-                    });
-                }
-            }
+fn bind_bus_action(btn: &gtk::Button, state: &Rc<PlayerState>, action: fn(&str)) {
+    let state = state.clone();
+    btn.connect_clicked(move |_| {
+        if let Some(b) = state.bus.borrow().as_ref() {
+            action(b);
         }
     });
-
-    // Seek value mirror + user-driven SetPosition. Subscribes to active_player
-    // independently of the title/art bind above; futures-signals allows
-    // multiple subscribers and bind_two_way owns the user-handler block.
-    bind_two_way(
-        mpris::active_player().map(|maybe| {
-            let Some(p) = maybe else { return 0.0; };
-            if p.length_us == 0 { 0.0 } else {
-                #[allow(clippy::cast_precision_loss)]
-                ((p.position_us as f64) / (p.length_us as f64)).clamp(0.0, 1.0)
-            }
-        }),
-        &seek,
-        gtk::prelude::RangeExt::set_value,
-        move |s| s.connect_value_changed(move |s| {
-            let bus_opt = bus_for_seek.borrow();
-            let tid_opt = tid_for_seek.borrow();
-            let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else {
-                return;
-            };
-            let pos_fraction = s.value().clamp(0.0, 1.0);
-            let length = len_for_seek.get();
-            if length == 0 { return; }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-            let pos_us = (pos_fraction * length as f64) as i64;
-            mpris::set_position(b, t, pos_us);
-        }),
-    );
-
-    finish_page(&grid)
 }
+
+fn wire_player_bind(w: &InfoWidgets, art_image: &gtk::Image, state: &Rc<PlayerState>) {
+    let w = w.clone();
+    let state = state.clone();
+    let art = art_image.clone();
+    let title = w.title.clone();
+    bind(mpris::active_player(), &title, move |_, maybe_player| match maybe_player {
+        None => render_no_player(&w, &art, &state),
+        Some(player) => render_player(&w, &art, &state, &player),
+    });
+}
+
+fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
+    *state.bus.borrow_mut() = None;
+    *state.track_id.borrow_mut() = None;
+    state.length_us.set(0);
+    w.title.set_text("No player");
+    w.artist.set_text("");
+    w.album.set_text("");
+    w.pos.set_text("0:00");
+    w.len.set_text("0:00");
+    art.set_paintable(None::<&gdk::Paintable>);
+    art.set_icon_name(Some("audio-x-generic-symbolic"));
+    art.set_pixel_size(200);
+    w.prev_btn.set_sensitive(false);
+    w.play_pause_btn.set_sensitive(false);
+    w.next_btn.set_sensitive(false);
+}
+
+fn render_player(
+    w: &InfoWidgets,
+    art: &gtk::Image,
+    state: &PlayerState,
+    player: &mpris::Player,
+) {
+    *state.bus.borrow_mut() = Some(player.bus_name.clone());
+    (*state.track_id.borrow_mut()).clone_from(&player.track_id);
+    state.length_us.set(player.length_us);
+
+    w.title.set_text(&player.title);
+    w.artist.set_text(&player.artists);
+    w.album.set_text(&player.album);
+
+    w.prev_btn.set_sensitive(player.can_go_previous);
+    w.play_pause_btn.set_sensitive(player.can_play_pause);
+    w.next_btn.set_sensitive(player.can_go_next);
+
+    let icon = if player.status == PlaybackStatus::Playing {
+        "media-playback-pause-symbolic"
+    } else {
+        "media-playback-start-symbolic"
+    };
+    w.play_pause_btn.set_icon_name(icon);
+
+    w.pos.set_text(&fmt_us(player.position_us));
+    w.len.set_text(&fmt_us(player.length_us));
+
+    if *state.last_art_url.borrow() != player.art_url {
+        (*state.last_art_url.borrow_mut()).clone_from(&player.art_url);
+        spawn_art_fetch(art.clone(), player.art_url.clone());
+    }
+}
+
+fn spawn_art_fetch(art: gtk::Image, url: String) {
+    glib::MainContext::default().spawn_local(async move {
+        let Some(bytes) = mpris::art_for_url(&url).await else { return };
+        let glib_bytes = glib::Bytes::from(&bytes);
+        let Ok(texture) = gdk::Texture::from_bytes(&glib_bytes) else { return };
+        art.set_pixel_size(-1);
+        art.set_paintable(Some(&texture));
+        art.set_size_request(200, 200);
+    });
+}
+
+fn wire_seek(seek: &gtk::Scale, state: &Rc<PlayerState>) {
+    let state_for_handler = state.clone();
+    bind_two_way(
+        mpris::active_player().map(player_seek_fraction),
+        seek,
+        gtk::prelude::RangeExt::set_value,
+        move |s| {
+            let state = state_for_handler.clone();
+            s.connect_value_changed(move |s| send_seek(s, &state))
+        },
+    );
+}
+
+fn player_seek_fraction(maybe: Option<mpris::Player>) -> f64 {
+    let Some(p) = maybe else { return 0.0 };
+    if p.length_us == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    ((p.position_us as f64) / (p.length_us as f64)).clamp(0.0, 1.0)
+}
+
+fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
+    let bus_opt = state.bus.borrow();
+    let tid_opt = state.track_id.borrow();
+    let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else { return };
+    let length = state.length_us.get();
+    if length == 0 {
+        return;
+    }
+    let pos_fraction = scale.value().clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    let pos_us = (pos_fraction * length as f64) as i64;
+    mpris::set_position(b, t, pos_us);
+}
+

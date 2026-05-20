@@ -159,7 +159,6 @@ fn route_emission(notifs: &[Notification], dnd_on: bool, muted: &HashSet<String>
 /// Applies DND + per-app-mute gates, GCs the suppressed set, partitions
 /// critical vs non-critical, collapses the non-critical tail into an
 /// overflow card, and toggles window visibility.
-#[allow(clippy::too_many_lines)]
 fn apply_emission(
     view: &ToastView,
     notifs: &[Notification],
@@ -169,49 +168,10 @@ fn apply_emission(
     let mut map = view.card_map.borrow_mut();
     let mut suppressed = view.suppressed_during_dnd.borrow_mut();
 
-    // Apply DND + per-app-mute gates. Critical urgency always shows and
-    // never touches the suppressed set. Non-critical notifications that
-    // arrive while DND is on, or whose app_name is in the muted set,
-    // are recorded in `suppressed` and stay hidden even after DND is
-    // toggled off / the app is unmuted — flipping a gate off must NOT
-    // unleash the backlog.
-    let visible: Vec<&Notification> = notifs
-        .iter()
-        .filter(|n| {
-            if n.urgency == Urgency::Critical {
-                return true;
-            }
-            if suppressed.contains(&n.id) {
-                return false;
-            }
-            if dnd_on || muted.contains(&n.app_name) {
-                suppressed.insert(n.id);
-                return false;
-            }
-            true
-        })
-        .collect();
-
-    // GC the suppressed set: drop any ids whose notifications are no
-    // longer in the upstream active list (dismissed or expired). Once
-    // gone upstream, we'll never need to suppress them again. O(N) per
-    // emit.
-    let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
-    suppressed.retain(|id| active_ids.contains(id));
-
-    // Partition non-critical visible into head (rendered as cards) and
-    // tail (collapsed into a +N overflow card). Critical urgency always
-    // renders individually and never counts toward the cap.
-    let (critical_visible, noncritical_visible): (Vec<&Notification>, Vec<&Notification>) =
-        visible
-            .iter()
-            .copied()
-            .partition(|n| n.urgency == Urgency::Critical);
-    let nc_head_start = noncritical_visible
-        .len()
-        .saturating_sub(MAX_VISIBLE_NONCRITICAL);
-    let head_noncritical = &noncritical_visible[nc_head_start..];
-    let tail_noncritical_count = nc_head_start;
+    let visible = filter_visible(notifs, dnd_on, muted, &mut suppressed);
+    gc_suppressed(notifs, &mut suppressed);
+    let Partition { critical_visible, head_noncritical, tail_noncritical_count } =
+        partition_visible(&visible);
 
     // Build id sets.
     let new_ids: HashMap<u32, &Notification> = critical_visible
@@ -263,6 +223,69 @@ fn apply_emission(
     // Show/hide window based on whether any cards are mounted.
     view.window
         .set_visible(!map.is_empty() || view.overflow_card.borrow().is_some());
+}
+
+struct Partition<'a> {
+    critical_visible: Vec<&'a Notification>,
+    head_noncritical: Vec<&'a Notification>,
+    tail_noncritical_count: usize,
+}
+
+/// Apply DND + per-app-mute gates. Critical urgency always shows and never
+/// touches the suppressed set. Non-critical notifications that arrive while
+/// DND is on, or whose `app_name` is muted, are recorded in `suppressed` and
+/// stay hidden even after the gate flips off — toggling DND off must NOT
+/// unleash the backlog.
+fn filter_visible<'a>(
+    notifs: &'a [Notification],
+    dnd_on: bool,
+    muted: &HashSet<String>,
+    suppressed: &mut HashSet<u32>,
+) -> Vec<&'a Notification> {
+    notifs
+        .iter()
+        .filter(|n| {
+            if n.urgency == Urgency::Critical {
+                return true;
+            }
+            if suppressed.contains(&n.id) {
+                return false;
+            }
+            if dnd_on || muted.contains(&n.app_name) {
+                suppressed.insert(n.id);
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Drop suppressed ids whose notifications are no longer in the upstream
+/// active list (dismissed or expired) — once gone upstream we'll never need
+/// to suppress them again. O(N) per emit.
+fn gc_suppressed(notifs: &[Notification], suppressed: &mut HashSet<u32>) {
+    let active_ids: HashSet<u32> = notifs.iter().map(|n| n.id).collect();
+    suppressed.retain(|id| active_ids.contains(id));
+}
+
+/// Split visible toasts into critical (always rendered individually) and the
+/// non-critical head + collapsed tail count. Critical urgency never counts
+/// toward the cap.
+fn partition_visible<'a>(visible: &[&'a Notification]) -> Partition<'a> {
+    let (critical_visible, noncritical_visible): (Vec<&Notification>, Vec<&Notification>) =
+        visible
+            .iter()
+            .copied()
+            .partition(|n| n.urgency == Urgency::Critical);
+    let nc_head_start = noncritical_visible
+        .len()
+        .saturating_sub(MAX_VISIBLE_NONCRITICAL);
+    let head_noncritical = noncritical_visible[nc_head_start..].to_vec();
+    Partition {
+        critical_visible,
+        head_noncritical,
+        tail_noncritical_count: nc_head_start,
+    }
 }
 
 // ── Toast view constructor ────────────────────────────────────────────────────

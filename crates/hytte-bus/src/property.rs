@@ -196,7 +196,6 @@ struct PropCtx<T> {
 // ── Core property-tracking loop ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 async fn run_property<T>(
     shared: SharedConnection,
     dest: String,
@@ -216,199 +215,229 @@ async fn run_property<T>(
 {
     let ctx = PropCtx { shared, dest, path, iface, name, weak };
     let mut last: Option<T> = None;
+    let mut task_done_tx = Some(task_done_tx);
 
     loop {
-        // Exit cleanly if all handles have been dropped (checked at each
-        // reconnect boundary — mirrors the signals primitive pattern).
         if ctx.weak.upgrade().is_none() {
             tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
                 name = ctx.name, "all property handles dropped; exiting task");
-            let _ = task_done_tx.send(());
+            if let Some(tx) = task_done_tx.take() {
+                let _ = tx.send(());
+            }
             return;
         }
 
-        // Mark state: Stale if we have a prior value, Loading otherwise.
         match &last {
             Some(v) => writer.set(PropState::Stale(v.clone())),
             None => writer.set(PropState::Loading),
         }
 
-        // ── Cold Get ────────────────────────────────────────────────────────
-
-        let get_result = ctx
-            .shared
-            .with_conn(|conn| {
-                let dest = ctx.dest.clone();
-                let path = ctx.path.clone();
-                let iface = ctx.iface.clone();
-                let name = ctx.name.clone();
-                async move {
-                    let props = zbus::fdo::PropertiesProxy::builder(&conn)
-                        .destination(dest.as_str())?
-                        .path(path.as_str())?
-                        .build()
-                        .await?;
-                    let raw: OwnedValue = props
-                        .get(iface.as_str().try_into()?, name.as_str())
-                        .await
-                        .map_err(zbus::Error::from)?;
-                    let typed: T = raw
-                        .try_into()
-                        .map_err(|e: zbus::zvariant::Error| {
-                            zbus::Error::Failure(e.to_string())
-                        })?;
-                    Ok(typed)
-                }
-            })
-            .await;
-
-        let initial = match get_result {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    dest = ctx.dest,
-                    path = ctx.path,
-                    iface = ctx.iface,
-                    name = ctx.name,
-                    "property Get failed; will retry"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                continue;
-            }
+        let Some(initial) = cold_get::<T>(&ctx).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
         };
-
         last = Some(initial.clone());
         writer.set(PropState::Loaded(initial));
 
-        // ── PropertiesChanged listener ────────────────────────────────────
-
-        // Grab the current connection to subscribe to `PropertiesChanged`.
-        let conn_result = ctx
-            .shared
-            .with_conn(|conn| async move { Ok(conn) })
-            .await;
-
-        // Capture epoch AFTER with_conn returns so that current_epoch reflects
-        // the epoch under which the subscription was actually built — same
-        // lesson as signals.rs's cold-start fix.
-        let current_epoch = ctx.shared.epoch();
-
-        let conn = match conn_result {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    dest = ctx.dest,
-                    "property: failed to get connection for PropertiesChanged; will retry"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
+        let Some((mut changes, current_epoch)) = subscribe_properties_changed(&ctx).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
         };
 
-        // Build `PropertiesProxy` and subscribe to `PropertiesChanged`.
-        let subscribe_result = async {
-            let props = zbus::fdo::PropertiesProxy::builder(&conn)
-                .destination(ctx.dest.as_str())?
-                .path(ctx.path.as_str())?
-                .build()
-                .await?;
-            props.receive_properties_changed().await
-        }
+        let exited = drain_changes::<T>(
+            &ctx, &mut last, &writer, &mut changes, current_epoch, &mut task_done_tx,
+        )
         .await;
-
-        let mut changes = match subscribe_result {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    dest = ctx.dest,
-                    "property: PropertiesChanged subscribe failed; will retry"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
-        };
-
-        // Drain the PropertiesChanged stream until it ends, an invalidation
-        // triggers a re-Get, or all handles are dropped.
-        //
-        // A periodic liveness tick wakes the loop even when no D-Bus events
-        // arrive so that we detect handle-drops promptly (same pattern as the
-        // signals primitive).
-        //
-        // The epoch_stream arm detects supervisor reconnects so that the
-        // property task does not remain stuck on the old connection's stream.
-        let mut epoch_stream = ctx.shared.epoch_signal().to_stream();
-        let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
-        liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        'changes: loop {
-            // Check liveness before parking in select! — covers the case where
-            // all handles were dropped while we were processing a prior event.
-            if ctx.weak.upgrade().is_none() {
-                tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
-                    name = ctx.name,
-                    "all property handles dropped (inner loop); exiting task");
-                let _ = task_done_tx.send(());
-                return;
-            }
-
-            tokio::select! {
-                maybe_sig = changes.next() => {
-                    let Some(sig) = maybe_sig else {
-                        // Stream ended — reconnect.
-                        break 'changes;
-                    };
-                    let Ok(args) = sig.args() else { continue };
-
-                    if args.interface_name != ctx.iface.as_str() {
-                        continue;
-                    }
-
-                    // Check for an inline value in `changed_properties`.
-                    if let Some(raw) = args.changed_properties.get(ctx.name.as_str()) {
-                        let decode: Result<T, _> = T::try_from(raw.clone());
-                        match decode {
-                            Ok(typed) => {
-                                last = Some(typed.clone());
-                                writer.set(PropState::Loaded(typed));
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    error = %e,
-                                    name = ctx.name,
-                                    "PropertiesChanged: failed to decode value"
-                                );
-                            }
-                        }
-                    }
-
-                    // Invalidation: break to trigger a re-Get on the next loop iteration.
-                    if args.invalidated_properties.contains(&ctx.name.as_str()) {
-                        break 'changes;
-                    }
-                }
-                epoch_update = epoch_stream.next() => {
-                    if let Some(new_epoch) = epoch_update && new_epoch > current_epoch {
-                        tracing::debug!(
-                            dest = ctx.dest, path = ctx.path, iface = ctx.iface,
-                            name = ctx.name, new_epoch,
-                            "epoch advanced; breaking to re-Get on fresh connection"
-                        );
-                        break 'changes;
-                    }
-                }
-                _ = liveness.tick() => {
-                    // Woke to check liveness — loop back to the upgrade check
-                    // at the top of 'changes.
-                }
-            }
+        if exited {
+            return;
         }
 
-        // Stream ended (bus disconnect or invalidation) — loop to re-Get.
-        // Brief pause before re-subscribing to avoid a tight loop.
+        // Brief pause before re-subscribing to avoid a tight loop on bus
+        // disconnect / invalidation.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+async fn cold_get<T>(ctx: &PropCtx<T>) -> Option<T>
+where
+    T: Clone
+        + Send
+        + Sync
+        + 'static
+        + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
+{
+    let result = ctx
+        .shared
+        .with_conn(|conn| {
+            let dest = ctx.dest.clone();
+            let path = ctx.path.clone();
+            let iface = ctx.iface.clone();
+            let name = ctx.name.clone();
+            async move {
+                let props = zbus::fdo::PropertiesProxy::builder(&conn)
+                    .destination(dest.as_str())?
+                    .path(path.as_str())?
+                    .build()
+                    .await?;
+                let raw: OwnedValue = props
+                    .get(iface.as_str().try_into()?, name.as_str())
+                    .await
+                    .map_err(zbus::Error::from)?;
+                let typed: T = raw
+                    .try_into()
+                    .map_err(|e: zbus::zvariant::Error| zbus::Error::Failure(e.to_string()))?;
+                Ok(typed)
+            }
+        })
+        .await;
+
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                iface = ctx.iface, name = ctx.name, "property Get failed; will retry");
+            None
+        }
+    }
+}
+
+/// Returns the `PropertiesChanged` stream and the epoch under which it was
+/// built. Epoch is captured *after* `with_conn` returns so a mid-build
+/// reconnect doesn't leave us watching the wrong connection — same lesson
+/// as signals.rs's cold-start fix.
+async fn subscribe_properties_changed<T>(
+    ctx: &PropCtx<T>,
+) -> Option<(zbus::fdo::PropertiesChangedStream, u64)>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let conn_result = ctx
+        .shared
+        .with_conn(|conn| async move { Ok(conn) })
+        .await;
+
+    let current_epoch = ctx.shared.epoch();
+
+    let conn = match conn_result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, dest = ctx.dest,
+                "property: failed to get connection for PropertiesChanged; will retry");
+            return None;
+        }
+    };
+
+    let subscribe_result = async {
+        let props = zbus::fdo::PropertiesProxy::builder(&conn)
+            .destination(ctx.dest.as_str())?
+            .path(ctx.path.as_str())?
+            .build()
+            .await?;
+        props.receive_properties_changed().await
+    }
+    .await;
+
+    match subscribe_result {
+        Ok(s) => Some((s, current_epoch)),
+        Err(e) => {
+            tracing::debug!(error = %e, dest = ctx.dest,
+                "property: PropertiesChanged subscribe failed; will retry");
+            None
+        }
+    }
+}
+
+/// Pump the PropertiesChanged stream until reconnect / invalidation / handle
+/// drop. Returns `true` when all handles have been dropped and the watcher
+/// should exit entirely. Periodic liveness ticks wake the loop so we detect
+/// handle-drops while parked (same pattern as the signals primitive). The
+/// epoch arm catches supervisor reconnects so we don't stay stuck on the old
+/// connection's stream.
+async fn drain_changes<T>(
+    ctx: &PropCtx<T>,
+    last: &mut Option<T>,
+    writer: &Mutable<PropState<T>>,
+    changes: &mut zbus::fdo::PropertiesChangedStream,
+    current_epoch: u64,
+    task_done_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> bool
+where
+    T: Clone
+        + Send
+        + Sync
+        + 'static
+        + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
+{
+    let mut epoch_stream = ctx.shared.epoch_signal().to_stream();
+    let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if ctx.weak.upgrade().is_none() {
+            tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
+                name = ctx.name, "all property handles dropped (inner loop); exiting task");
+            if let Some(tx) = task_done_tx.take() {
+                let _ = tx.send(());
+            }
+            return true;
+        }
+
+        tokio::select! {
+            maybe_sig = changes.next() => {
+                let Some(sig) = maybe_sig else { return false };
+                if apply_change::<T>(ctx, &sig, last, writer) {
+                    return false;
+                }
+            }
+            epoch_update = epoch_stream.next() => {
+                if let Some(new_epoch) = epoch_update && new_epoch > current_epoch {
+                    tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
+                        name = ctx.name, new_epoch,
+                        "epoch advanced; breaking to re-Get on fresh connection");
+                    return false;
+                }
+            }
+            _ = liveness.tick() => {}
+        }
+    }
+}
+
+/// Apply one PropertiesChanged signal. Returns `true` when the caller should
+/// break the drain loop (invalidation → re-Get on outer iteration).
+fn apply_change<T>(
+    ctx: &PropCtx<T>,
+    sig: &zbus::fdo::PropertiesChanged,
+    last: &mut Option<T>,
+    writer: &Mutable<PropState<T>>,
+) -> bool
+where
+    T: Clone
+        + Send
+        + Sync
+        + 'static
+        + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
+{
+    let Ok(args) = sig.args() else { return false };
+
+    if args.interface_name != ctx.iface.as_str() {
+        return false;
+    }
+
+    if let Some(raw) = args.changed_properties.get(ctx.name.as_str()) {
+        match T::try_from(raw.clone()) {
+            Ok(typed) => {
+                *last = Some(typed.clone());
+                writer.set(PropState::Loaded(typed));
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, name = ctx.name,
+                    "PropertiesChanged: failed to decode value");
+            }
+        }
+    }
+
+    args.invalidated_properties.contains(&ctx.name.as_str())
 }

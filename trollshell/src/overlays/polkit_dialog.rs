@@ -9,20 +9,17 @@
 //!
 //! Mirrors the wifi password prompt window in `widgets::prompt`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
-use hytte::services::polkit::{self, AuthPrompt, Zeroizing};
+use hytte::services::polkit::{self, AuthIdentity, AuthPrompt, Zeroizing};
 use hytte::ui::{layer_window, Layer};
-
-// ── Thread-local window storage ───────────────────────────────────────────────
 
 thread_local! {
     static DIALOG_WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
 }
-
-// ── Public entry-point ────────────────────────────────────────────────────────
 
 /// Build and subscribe the polkit auth dialog for the given monitor.
 /// Idempotent in practice — called once from `main.rs` on the primary
@@ -41,8 +38,6 @@ pub fn install(monitor: &Monitor) {
     );
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
-
 fn close_dialog() {
     DIALOG_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
         if let Some(w) = slot.borrow_mut().take() {
@@ -54,23 +49,11 @@ fn close_dialog() {
 /// Update the existing dialog in-place for a follow-up PAM prompt
 /// (e.g. "Retype new password"). The window stays mounted and
 /// keyboard-grabbed; only the prompt label and entry contents change.
-/// If no dialog is currently mounted (shouldn't happen — follow-ups
-/// only emit while the first dialog is up), log a warning so the
-/// missing window is visible in the journal.
 fn update_dialog_for_followup(prompt: &AuthPrompt) {
     let updated = DIALOG_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
         let slot = slot.borrow();
-        let Some(window) = slot.as_ref() else {
-            return false;
-        };
-        // Walk the child tree to find the prompt label and the
-        // PasswordEntry. The dialog is a fixed shape; the labels are
-        // appended in show_dialog in a known order. Use widget names
-        // to stay robust to layout tweaks: tag the relevant widgets in
-        // show_dialog with set_widget_name(...).
-        let Some(root) = window.child() else {
-            return false;
-        };
+        let Some(window) = slot.as_ref() else { return false };
+        let Some(root) = window.child() else { return false };
         let mut walker = WidgetWalker::new(root);
         if let Some(label) = walker.find_named("ts-prompt-followup-label")
             && let Ok(label) = label.downcast::<gtk::Label>()
@@ -91,7 +74,6 @@ fn update_dialog_for_followup(prompt: &AuthPrompt) {
     }
 }
 
-/// Iterator over a widget's descendants for `find_named`.
 struct WidgetWalker {
     queue: std::collections::VecDeque<gtk::Widget>,
 }
@@ -116,11 +98,31 @@ impl WidgetWalker {
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
-    // Ensure any previous dialog is gone before creating the new one.
     close_dialog();
 
+    let window = build_dialog_window(monitor);
+    let vbox = build_dialog_body();
+
+    append_header(&vbox, &prompt);
+    let selected_uid = append_identity_row(&vbox, &prompt.identities);
+    let entry = append_password_entry(&vbox);
+    let _followup = append_followup_label(&vbox);
+    let (cancel_btn, auth_btn) = append_buttons(&vbox);
+
+    window.set_child(Some(&vbox));
+    wire_escape(&window, &entry);
+    wire_submit(&entry, &auth_btn, &cancel_btn, &selected_uid);
+
+    window.set_visible(true);
+    window.present();
+    entry.grab_focus();
+
+    DIALOG_WINDOW.with(|slot| *slot.borrow_mut() = Some(window));
+}
+
+fn build_dialog_window(monitor: &Monitor) -> gtk::Window {
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
         .exclusive(false)
@@ -129,28 +131,27 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
         .build();
     window.add_css_class("ts-prompt");
     window.set_size_request(520, 280);
+    window
+}
 
-    // ── Layout ────────────────────────────────────────────────────────────────
-
+fn build_dialog_body() -> gtk::Box {
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
     vbox.add_css_class("ts-prompt-root");
     vbox.set_margin_start(18);
     vbox.set_margin_end(18);
     vbox.set_margin_top(18);
     vbox.set_margin_bottom(18);
+    vbox
+}
 
-    // Title — high-level "what's asking" line.  Action-id is shown as the
-    // subtitle so the user can verify what's about to be authorised.
+fn append_header(vbox: &gtk::Box, prompt: &AuthPrompt) {
     let title = gtk::Label::new(Some("Authentication required"));
     title.add_css_class("ts-prompt-title");
     title.set_xalign(0.0);
     vbox.append(&title);
 
     if !prompt.action_id.is_empty() {
-        let action = gtk::Label::new(Some(&prompt.action_id));
-        action.add_css_class("ts-prompt-subtitle");
-        action.set_xalign(0.0);
-        action.set_wrap(true);
+        let action = wrapped_subtitle(&prompt.action_id);
         vbox.append(&action);
     }
 
@@ -161,69 +162,75 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
         msg.set_margin_top(4);
         vbox.append(&msg);
     }
+}
 
-    // ── Identity selection ────────────────────────────────────────────────────
-    //
-    // When polkit offers a single identity (the common case — the user's
-    // own uid) we show a static row.  When it offers multiple, we show a
-    // DropDown with the local uid pre-selected by `auth_prompts`'s sort.
+fn wrapped_subtitle(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("ts-prompt-subtitle");
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label
+}
 
-    let identities = prompt.identities.clone();
-    let selected_uid: std::rc::Rc<std::cell::Cell<u32>> =
-        std::rc::Rc::new(std::cell::Cell::new(
-            identities.first().map_or(0, |id| id.uid),
-        ));
+/// When polkit offers a single identity (the common case — the user's
+/// own uid) we show a static row.  When it offers multiple, we show a
+/// DropDown with the local uid pre-selected by `auth_prompts`'s sort.
+fn append_identity_row(vbox: &gtk::Box, identities: &[AuthIdentity]) -> Rc<Cell<u32>> {
+    let selected_uid = Rc::new(Cell::new(identities.first().map_or(0, |id| id.uid)));
 
     if identities.len() <= 1 {
         if let Some(only) = identities.first() {
-            let row = gtk::Label::new(Some(&format!("Authenticate as {}", only.pretty_name)));
-            row.set_xalign(0.0);
-            row.add_css_class("ts-prompt-subtitle");
+            let row = wrapped_subtitle(&format!("Authenticate as {}", only.pretty_name));
             row.set_margin_top(6);
             vbox.append(&row);
         }
-    } else {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.set_margin_top(6);
-        let lbl = gtk::Label::new(Some("Authenticate as:"));
-        lbl.set_xalign(0.0);
-        row.append(&lbl);
-        let names: Vec<&str> = identities.iter().map(|i| i.pretty_name.as_str()).collect();
-        let dropdown = gtk::DropDown::from_strings(&names);
-        dropdown.set_selected(0);
-        dropdown.set_hexpand(true);
-        let selected_for_drop = selected_uid.clone();
-        let identities_for_drop = identities.clone();
-        dropdown.connect_selected_notify(move |dd| {
-            let idx = dd.selected() as usize;
-            if let Some(id) = identities_for_drop.get(idx) {
-                selected_for_drop.set(id.uid);
-            }
-        });
-        row.append(&dropdown);
-        vbox.append(&row);
+        return selected_uid;
     }
 
-    // ── Password entry ────────────────────────────────────────────────────────
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.set_margin_top(6);
+    let lbl = gtk::Label::new(Some("Authenticate as:"));
+    lbl.set_xalign(0.0);
+    row.append(&lbl);
 
+    let names: Vec<&str> = identities.iter().map(|i| i.pretty_name.as_str()).collect();
+    let dropdown = gtk::DropDown::from_strings(&names);
+    dropdown.set_selected(0);
+    dropdown.set_hexpand(true);
+    let selected_for_drop = selected_uid.clone();
+    let identities_for_drop: Vec<AuthIdentity> = identities.to_vec();
+    dropdown.connect_selected_notify(move |dd| {
+        let idx = dd.selected() as usize;
+        if let Some(id) = identities_for_drop.get(idx) {
+            selected_for_drop.set(id.uid);
+        }
+    });
+    row.append(&dropdown);
+    vbox.append(&row);
+    selected_uid
+}
+
+fn append_password_entry(vbox: &gtk::Box) -> gtk::PasswordEntry {
     let entry = gtk::PasswordEntry::new();
     entry.set_show_peek_icon(true);
     entry.set_margin_top(8);
     entry.set_widget_name("ts-prompt-password-entry");
     vbox.append(&entry);
+    entry
+}
 
-    // Hidden by default; populated and shown when a follow-up PAM prompt
-    // arrives (e.g. "Retype new password" in a password-change flow).
-    let followup_label = gtk::Label::new(None);
-    followup_label.set_widget_name("ts-prompt-followup-label");
-    followup_label.set_xalign(0.0);
-    followup_label.set_wrap(true);
-    followup_label.add_css_class("ts-prompt-followup");
-    followup_label.set_visible(false);
-    vbox.append(&followup_label);
+fn append_followup_label(vbox: &gtk::Box) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.set_widget_name("ts-prompt-followup-label");
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.add_css_class("ts-prompt-followup");
+    label.set_visible(false);
+    vbox.append(&label);
+    label
+}
 
-    // ── Buttons ───────────────────────────────────────────────────────────────
-
+fn append_buttons(vbox: &gtk::Box) -> (gtk::Button, gtk::Button) {
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
     buttons.set_margin_top(4);
@@ -233,11 +240,10 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
     buttons.append(&cancel_btn);
     buttons.append(&auth_btn);
     vbox.append(&buttons);
+    (cancel_btn, auth_btn)
+}
 
-    window.set_child(Some(&vbox));
-
-    // ── ESC → cancel ──────────────────────────────────────────────────────────
-
+fn wire_escape(window: &gtk::Window, entry: &gtk::PasswordEntry) {
     let key_ctrl = gtk::EventControllerKey::new();
     let entry_for_esc = entry.clone();
     key_ctrl.connect_key_pressed(move |_, key, _, _| {
@@ -250,17 +256,21 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
         glib::Propagation::Proceed
     });
     window.add_controller(key_ctrl);
+}
 
-    // ── Submit (Enter or Authenticate button) ─────────────────────────────────
-
+fn wire_submit(
+    entry: &gtk::PasswordEntry,
+    auth_btn: &gtk::Button,
+    cancel_btn: &gtk::Button,
+    selected_uid: &Rc<Cell<u32>>,
+) {
     let submit = {
         let entry = entry.clone();
         let selected_uid = selected_uid.clone();
         move || {
             let text = Zeroizing::new(entry.text().to_string());
             polkit::respond_to_auth(Some((text, selected_uid.get())));
-            // Drop cleartext from the GtkEntry buffer immediately; the
-            // dialog stays up until the helper round-trip resolves.
+            // Drop cleartext immediately; dialog stays up until helper round-trip resolves.
             entry.set_text("");
         }
     };
@@ -270,21 +280,9 @@ fn show_dialog(monitor: &Monitor, prompt: AuthPrompt) {
     let submit_for_button = submit.clone();
     auth_btn.connect_clicked(move |_| submit_for_button());
 
-    // ── Cancel ────────────────────────────────────────────────────────────────
-
     let entry_for_cancel = entry.clone();
     cancel_btn.connect_clicked(move |_| {
         polkit::respond_to_auth(None);
         entry_for_cancel.set_text("");
-    });
-
-    // ── Show ──────────────────────────────────────────────────────────────────
-
-    window.set_visible(true);
-    window.present();
-    entry.grab_focus();
-
-    DIALOG_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
-        *slot.borrow_mut() = Some(window);
     });
 }

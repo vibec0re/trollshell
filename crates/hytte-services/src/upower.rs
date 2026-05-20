@@ -11,7 +11,7 @@
 //! `power_profiles`).
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_bus::{property, BusKind, PropState};
+use hytte_bus::{property, BusKind, PropState, PropertySignal};
 use hytte_reactive::{registry, Service};
 use std::time::Duration;
 
@@ -88,132 +88,66 @@ impl Default for UpowerHandles {
 impl Service for UpowerService {
     type Handles = UpowerHandles;
 
-    #[allow(clippy::too_many_lines)]
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = UpowerHandles::default();
         let writer = handles.battery.clone();
 
-        // ── Percentage ────────────────────────────────────────────────────────
-        let percentage_signal = property::<f64>(UPOWER_NAME)
-            .bus(BusKind::System)
-            .at_path(DISPLAY_DEVICE_PATH)
-            .iface(DEVICE_IFACE)
-            .name("Percentage")
-            .start();
-
-        // ── State ─────────────────────────────────────────────────────────────
-        let state_signal = property::<u32>(UPOWER_NAME)
-            .bus(BusKind::System)
-            .at_path(DISPLAY_DEVICE_PATH)
-            .iface(DEVICE_IFACE)
-            .name("State")
-            .start();
-
-        // ── TimeToEmpty ───────────────────────────────────────────────────────
-        let time_to_empty_signal = property::<i64>(UPOWER_NAME)
-            .bus(BusKind::System)
-            .at_path(DISPLAY_DEVICE_PATH)
-            .iface(DEVICE_IFACE)
-            .name("TimeToEmpty")
-            .start();
-
-        // ── TimeToFull ────────────────────────────────────────────────────────
-        let time_to_full_signal = property::<i64>(UPOWER_NAME)
-            .bus(BusKind::System)
-            .at_path(DISPLAY_DEVICE_PATH)
-            .iface(DEVICE_IFACE)
-            .name("TimeToFull")
-            .start();
-
-        // ── IconName ──────────────────────────────────────────────────────────
-        let icon_name_signal = property::<String>(UPOWER_NAME)
-            .bus(BusKind::System)
-            .at_path(DISPLAY_DEVICE_PATH)
-            .iface(DEVICE_IFACE)
-            .name("IconName")
-            .start();
-
-        // ── Coalesce into Battery ─────────────────────────────────────────────
-
-        let percentage_writer = writer.clone();
-        rt.spawn(async move {
-            percentage_signal
-                .signal()
-                .for_each(move |s| {
-                    let pct = match s {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => 0.0,
-                    };
-                    percentage_writer.lock_mut().percentage = pct;
-                    std::future::ready(())
-                })
-                .await;
-        });
-
-        let state_writer = writer.clone();
-        rt.spawn(async move {
-            state_signal
-                .signal()
-                .for_each(move |s| {
-                    let raw = match s {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => 0,
-                    };
-                    state_writer.lock_mut().state = BatteryState::from_u32(raw);
-                    std::future::ready(())
-                })
-                .await;
-        });
-
-        let tte_writer = writer.clone();
-        rt.spawn(async move {
-            time_to_empty_signal
-                .signal()
-                .for_each(move |s| {
-                    let secs = match s {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => 0,
-                    };
-                    tte_writer.lock_mut().time_to_empty =
-                        u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs);
-                    std::future::ready(())
-                })
-                .await;
-        });
-
-        let ttf_writer = writer.clone();
-        rt.spawn(async move {
-            time_to_full_signal
-                .signal()
-                .for_each(move |s| {
-                    let secs = match s {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => 0,
-                    };
-                    ttf_writer.lock_mut().time_to_full =
-                        u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs);
-                    std::future::ready(())
-                })
-                .await;
-        });
-
-        let icon_writer = writer.clone();
-        rt.spawn(async move {
-            icon_name_signal
-                .signal()
-                .for_each(move |s| {
-                    let name = match s {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => String::new(),
-                    };
-                    icon_writer.lock_mut().icon_name = name;
-                    std::future::ready(())
-                })
-                .await;
-        });
+        bind_prop_field(rt, display_device_prop::<f64>("Percentage"), 0.0, writer.clone(),
+            |b, v| b.percentage = v);
+        bind_prop_field(rt, display_device_prop::<u32>("State"), 0, writer.clone(),
+            |b, v| b.state = BatteryState::from_u32(v));
+        bind_prop_field(rt, display_device_prop::<i64>("TimeToEmpty"), 0, writer.clone(),
+            |b, v| b.time_to_empty = secs_to_duration(v));
+        bind_prop_field(rt, display_device_prop::<i64>("TimeToFull"), 0, writer.clone(),
+            |b, v| b.time_to_full = secs_to_duration(v));
+        bind_prop_field(rt, display_device_prop::<String>("IconName"), String::new(), writer,
+            |b, v| b.icon_name = v);
 
         handles
     }
+}
+
+fn display_device_prop<T>(name: &'static str) -> PropertySignal<T>
+where
+    T: Clone + Send + Sync + 'static
+        + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
+{
+    property::<T>(UPOWER_NAME)
+        .bus(BusKind::System)
+        .at_path(DISPLAY_DEVICE_PATH)
+        .iface(DEVICE_IFACE)
+        .name(name)
+        .start()
+}
+
+fn secs_to_duration(secs: i64) -> Option<Duration> {
+    u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs)
+}
+
+fn bind_prop_field<T>(
+    rt: &tokio::runtime::Handle,
+    prop: PropertySignal<T>,
+    default: T,
+    writer: Mutable<Battery>,
+    apply: impl Fn(&mut Battery, T) + Send + 'static,
+) where
+    T: Clone + Send + Sync + 'static
+        + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
+{
+    rt.spawn(async move {
+        prop.signal()
+            .for_each(move |s| {
+                let v = match s {
+                    PropState::Loaded(v) | PropState::Stale(v) => v,
+                    PropState::Loading => default.clone(),
+                };
+                apply(&mut writer.lock_mut(), v);
+                std::future::ready(())
+            })
+            .await;
+    });
 }
 
 #[must_use]

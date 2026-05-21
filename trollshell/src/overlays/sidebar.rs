@@ -36,8 +36,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::gtk::{self, gdk, glib, prelude::*};
+use hytte::gtk::{self, gdk, glib};
 use hytte::prelude::*;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
@@ -146,7 +147,12 @@ pub fn install(monitor: &Monitor) {
     let window = build_sidebar_window(monitor, &key);
     let revealer = build_revealer();
     let card = build_card(monitor);
-    revealer.set_child(Some(&card));
+    let clamp = adw::Clamp::builder()
+        .maximum_size(SIDEBAR_WIDTH)
+        .tightening_threshold(SIDEBAR_WIDTH)
+        .child(&card)
+        .build();
+    revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
     // Present the surface ONCE, here at install. Stays alive for the
     // process lifetime — toggle goes through the revealer + open_state,
@@ -208,6 +214,15 @@ fn build_revealer() -> gtk::Revealer {
 /// collapsed. No margins so there's no gap around the dark area. The bar
 /// (`Layer::Top`, mapped after sidebar) naturally paints over y=0..44 in
 /// the overlap, so no top margin is needed.
+///
+/// `set_size_request` only sets the **minimum** width, so a child with a
+/// pathological natural width (e.g. a long calendar event title, or an
+/// `AdwActionRow` subtitle that doesn't wrap) would otherwise push the
+/// card — and the layer-shell surface above it — past `SIDEBAR_WIDTH`,
+/// visually overlapping niri tiles, the bar, and the frame. The
+/// `AdwClamp` wrapping this card in `install` caps the natural width at
+/// `SIDEBAR_WIDTH`; see also `components::layout::finish_page` for the
+/// same belt-and-suspenders pattern in the drawer.
 fn build_card(monitor: &Monitor) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");

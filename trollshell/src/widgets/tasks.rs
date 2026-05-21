@@ -1,8 +1,9 @@
 //! Sidebar tasks widget. Subscribes to
 //! [`hytte::services::tasks::tasks()`] and renders incomplete VTODOs from
-//! every EDS task list. Rows in the editable list ([`EDITABLE_LIST_UID`])
-//! get full CRUD affordances — checkbox, click-to-edit, context delete —
-//! while rows from other (CalDAV/Google/etc.) lists render read-only.
+//! every EDS task list. Reads + writes go through libecal via
+//! [`hytte_services::tasks`], so the widget treats every task (local
+//! and remote-synced alike) as editable — the service handles per-
+//! backend transport.
 //!
 //! ## Layout
 //!
@@ -17,7 +18,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, glib};
 use hytte::prelude::*;
-use hytte::services::tasks::{self, Task};
+use hytte::services::tasks::{self, Task, TaskList};
 
 /// Build the sidebar tasks widget. Owns its own subscription to
 /// `tasks::tasks()`; refreshes on each sidebar open like the calendar
@@ -32,7 +33,12 @@ fn build_block() -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.add_css_class("ts-sidebar-tasks");
 
-    column.append(&build_header());
+    // Shared track of the currently-known task lists. The header's create
+    // popover binds to this to render its list-picker dropdown; refreshes
+    // come in via [`tasks::task_lists`].
+    let lists_track: Rc<RefCell<Vec<TaskList>>> = Rc::new(RefCell::new(Vec::new()));
+
+    column.append(&build_header(&lists_track));
 
     let group = adw::PreferencesGroup::new();
     group.add_css_class("ts-sidebar-tasks-list");
@@ -48,13 +54,29 @@ fn build_block() -> gtk::Box {
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     wire_tasks_bind(&group, &rows_track, &placeholder_track);
+    wire_lists_bind(&group, &lists_track);
 
     column
 }
 
+/// Track the latest `tasks::task_lists()` snapshot on `lists_track` so
+/// the create popover always picks from a current set. We anchor the
+/// bind to a long-lived widget that lives at least as long as the
+/// popover (the prefs group). No widget mutation needed — just keep the
+/// `Rc<RefCell<Vec<TaskList>>>` warm.
+fn wire_lists_bind(
+    anchor: &adw::PreferencesGroup,
+    lists_track: &Rc<RefCell<Vec<TaskList>>>,
+) {
+    let lists_track = lists_track.clone();
+    bind(tasks::task_lists(), anchor, move |_, ls| {
+        *lists_track.borrow_mut() = ls;
+    });
+}
+
 // ── Header row ───────────────────────────────────────────────────────────────
 
-fn build_header() -> gtk::Box {
+fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>) -> gtk::Box {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.add_css_class("ts-sidebar-tasks-header");
 
@@ -69,7 +91,7 @@ fn build_header() -> gtk::Box {
     add_btn.set_icon_name("list-add-symbolic");
     add_btn.add_css_class("flat");
     add_btn.add_css_class("ts-sidebar-tasks-add-btn");
-    add_btn.set_popover(Some(&build_create_popover(&add_btn)));
+    add_btn.set_popover(Some(&build_create_popover(&add_btn, lists_track)));
     header.append(&add_btn);
 
     header
@@ -127,7 +149,7 @@ fn rebuild_list(
 fn build_task_row(task: &Task) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&task.summary).as_str())
-        .activatable(task.editable)
+        .activatable(true)
         .build();
     row.add_css_class("ts-task-row");
     let subtitle = subtitle_text(task);
@@ -135,62 +157,48 @@ fn build_task_row(task: &Task) -> adw::ActionRow {
         row.set_subtitle(&glib::markup_escape_text(&subtitle));
     }
 
-    // Checkbox prefix — wired to set_completed for editable rows, disabled
-    // for read-only ones. Mark NeedsAction+InProcess rows as not-yet-done
-    // (we only get those from the service).
+    // Checkbox prefix — wired to set_completed. NeedsAction + InProcess
+    // both render unchecked (those are the only states the service
+    // surfaces; Completed/Cancelled never reach the widget).
     let check = gtk::CheckButton::new();
     check.set_valign(gtk::Align::Center);
     check.set_active(false);
-    check.set_sensitive(task.editable);
-    if task.editable {
-        let uid = task.uid.clone();
-        check.connect_toggled(move |c| {
-            tasks::set_completed(&uid, c.is_active());
-        });
-    }
+    let list_uid = task.list_uid.clone();
+    let uid = task.uid.clone();
+    check.connect_toggled(move |c| {
+        tasks::set_completed(&list_uid, &uid, c.is_active());
+    });
     row.add_prefix(&check);
 
-    // Tap-to-edit on the row body for editable rows. AdwActionRow's own
-    // `activated` signal fires when the body (not the checkbox) is
-    // clicked.
-    if task.editable {
-        let task = task.clone();
-        row.connect_activated(move |r| {
-            open_edit_popover(r, &task);
-        });
-    }
-
-    if !task.editable {
-        // Tiny lock indicator on non-editable rows so the user knows why
-        // their checkbox doesn't budge.
-        let lock = gtk::Image::from_icon_name("changes-prevent-symbolic");
-        lock.add_css_class("dim-label");
-        lock.set_tooltip_text(Some(&format!(
-            "Read-only — lives in '{}'. Edits happen in the Trollshell Tasks list.",
-            task.list_name,
-        )));
-        row.add_suffix(&lock);
-    }
+    // Tap-to-edit on the row body. AdwActionRow's own `activated`
+    // signal fires when the body (not the checkbox) is clicked.
+    let task_for_edit = task.clone();
+    row.connect_activated(move |r| {
+        open_edit_popover(r, &task_for_edit);
+    });
 
     row
 }
 
-/// Subtitle: due label, optionally followed by ` · <list name>` when the
-/// task lives outside the editable list. Skipped entirely when both parts
-/// would be empty so the row stays compact.
+/// Subtitle: due label, followed by `· <list name>` so the user can
+/// see at a glance which backend the task lives on (helpful when
+/// multiple accounts are configured). Skipped entirely when the task
+/// has no due AND there's only one list to show.
 fn subtitle_text(task: &Task) -> String {
     let due = tasks::format_due(task);
-    match (due.is_empty(), task.editable) {
-        (true, true) => String::new(),
-        (true, false) => task.list_name.clone(),
-        (false, true) => due,
-        (false, false) => format!("{due} \u{00b7} {}", task.list_name),
+    if due.is_empty() {
+        task.list_name.clone()
+    } else {
+        format!("{due} \u{00b7} {}", task.list_name)
     }
 }
 
 // ── Create popover (add button) ──────────────────────────────────────────────
 
-fn build_create_popover(anchor: &gtk::MenuButton) -> gtk::Popover {
+fn build_create_popover(
+    anchor: &gtk::MenuButton,
+    lists_track: &Rc<RefCell<Vec<TaskList>>>,
+) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.add_css_class("ts-task-popover");
 
@@ -199,12 +207,19 @@ fn build_create_popover(anchor: &gtk::MenuButton) -> gtk::Popover {
     column.set_margin_bottom(8);
     column.set_margin_start(8);
     column.set_margin_end(8);
-    column.set_width_request(260);
+    column.set_width_request(280);
 
     let entry = gtk::Entry::new();
     entry.set_placeholder_text(Some("New task…"));
     entry.add_css_class("ts-task-entry");
     column.append(&entry);
+
+    // List picker — populated each time the popover opens from the
+    // shared `lists_track`. Hidden when there's only one list (clutter
+    // when there's no choice to make).
+    let list_picker = gtk::DropDown::from_strings(&[]);
+    list_picker.add_css_class("ts-task-list-picker");
+    column.append(&list_picker);
 
     let due_picker = DuePicker::new();
     column.append(due_picker.widget());
@@ -220,10 +235,15 @@ fn build_create_popover(anchor: &gtk::MenuButton) -> gtk::Popover {
     actions.append(&create);
     column.append(&actions);
 
-    // Enable Create button only when the entry has non-whitespace text.
+    // Enable Create button only when the entry has non-whitespace text
+    // AND at least one task list exists (otherwise there's nowhere to
+    // put the new task).
     let create_for_changed = create.clone();
+    let lists_for_changed = lists_track.clone();
     entry.connect_changed(move |e| {
-        create_for_changed.set_sensitive(!e.text().trim().is_empty());
+        let has_text = !e.text().trim().is_empty();
+        let has_list = !lists_for_changed.borrow().is_empty();
+        create_for_changed.set_sensitive(has_text && has_list);
     });
 
     // Cancel: just close the popover and reset state.
@@ -241,12 +261,20 @@ fn build_create_popover(anchor: &gtk::MenuButton) -> gtk::Popover {
     let entry_for_create = entry.clone();
     let anchor_for_create = anchor.clone();
     let due_picker_for_create = due_picker.clone();
+    let lists_for_create = lists_track.clone();
+    let list_picker_for_create = list_picker.clone();
     let do_create = move || {
         let summary = entry_for_create.text().trim().to_string();
         if summary.is_empty() {
             return;
         }
-        let _ = tasks::create_task(summary, due_picker_for_create.value());
+        let lists = lists_for_create.borrow();
+        let idx = list_picker_for_create.selected() as usize;
+        let Some(list) = lists.get(idx) else {
+            return;
+        };
+        let _ = tasks::create_task(list.uid.clone(), summary, due_picker_for_create.value());
+        drop(lists);
         entry_for_create.set_text("");
         due_picker_for_create.reset();
         popover_for_create.popdown();
@@ -258,17 +286,38 @@ fn build_create_popover(anchor: &gtk::MenuButton) -> gtk::Popover {
     let do_create_for_entry = do_create;
     entry.connect_activate(move |_| do_create_for_entry());
 
-    // Reset state every time the popover opens.
+    // Reset state every time the popover opens; sync the list picker
+    // to whatever the current `lists_track` contains.
     let entry_for_show = entry.clone();
     let due_picker_for_show = due_picker.clone();
+    let list_picker_for_show = list_picker.clone();
+    let lists_for_show = lists_track.clone();
+    let create_for_show = create.clone();
     popover.connect_show(move |_| {
         entry_for_show.set_text("");
         due_picker_for_show.reset();
+        sync_list_picker(&list_picker_for_show, &lists_for_show.borrow());
+        // Re-evaluate the Add button: empty entry but maybe now with
+        // lists (or still without).
+        create_for_show.set_sensitive(false);
         entry_for_show.grab_focus();
     });
 
     popover.set_child(Some(&column));
     popover
+}
+
+/// Rebuild the `GtkDropDown`'s items from `lists`. Hides the picker
+/// entirely when there's zero or one list (no choice to make). Selects
+/// the first item by default.
+fn sync_list_picker(picker: &gtk::DropDown, lists: &[TaskList]) {
+    let names: Vec<&str> = lists.iter().map(|l| l.display_name.as_str()).collect();
+    let strings = gtk::StringList::new(&names);
+    picker.set_model(Some(&strings));
+    if !lists.is_empty() {
+        picker.set_selected(0);
+    }
+    picker.set_visible(lists.len() > 1);
 }
 
 // ── Edit popover (row body click) ────────────────────────────────────────────
@@ -313,13 +362,19 @@ fn open_edit_popover(parent: &adw::ActionRow, task: &Task) {
     let popover_for_save = popover.clone();
     let entry_for_save = entry.clone();
     let due_picker_for_save = due_picker.clone();
+    let list_uid_for_save = task.list_uid.clone();
     let uid_for_save = task.uid.clone();
     let do_save = move || {
         let summary = entry_for_save.text().trim().to_string();
         if summary.is_empty() {
             return;
         }
-        tasks::edit_task(&uid_for_save, summary, due_picker_for_save.value());
+        tasks::edit_task(
+            &list_uid_for_save,
+            &uid_for_save,
+            summary,
+            due_picker_for_save.value(),
+        );
         popover_for_save.popdown();
     };
     let do_save_for_button = do_save.clone();
@@ -332,9 +387,10 @@ fn open_edit_popover(parent: &adw::ActionRow, task: &Task) {
     cancel.connect_clicked(move |_| popover_for_cancel.popdown());
 
     let popover_for_delete = popover.clone();
+    let list_uid_for_delete = task.list_uid.clone();
     let uid_for_delete = task.uid.clone();
     delete.connect_clicked(move |_| {
-        tasks::delete_task(&uid_for_delete);
+        tasks::delete_task(&list_uid_for_delete, &uid_for_delete);
         popover_for_delete.popdown();
     });
 

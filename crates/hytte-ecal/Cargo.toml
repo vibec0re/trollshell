@@ -1,0 +1,45 @@
+[package]
+name = "hytte-ecal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal hand-written FFI for evolution-data-server's libecal-2.0 + libedataserver-1.2: source enumeration, ECalClient connect, VTODO/VEVENT CRUD."
+
+[dependencies]
+anyhow = "1.0.102"
+tracing = "0.1.44"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+# Crate-level FFI requires `unsafe`; this is the only crate in the
+# workspace that overrides the global `forbid`. Safe wrappers in
+# `lib.rs` confine the unsafety; downstream crates stay safe.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# FFI bindings will pass *mut pointers around; ignore the borrow-checker's
+# concerns about those — the safe wrappers in lib.rs are the contract.
+missing_safety_doc = "allow"
+# This crate is half FFI surface. The remaining allows below tame
+# clippy::pedantic's noise that's intrinsic to wrapping a C library:
+# - doc_markdown:        every GObject/GLib type name is "missing backticks"
+# - must_use_candidate:  most of the safe wrappers return values that ARE
+#                         the API; marking each is noise
+# - ref_as_ptr:          `&mut err` for `*mut *mut GError` is idiomatic FFI
+# - missing_docs_in_private_items: not applicable, sys.rs is documented at
+#                         module level
+doc_markdown = "allow"
+must_use_candidate = "allow"
+ref_as_ptr = "allow"
+borrow_as_ptr = "allow"

@@ -880,6 +880,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-ecal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pkg-config",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "hytte-pam"
 version = "0.1.0"
 dependencies = [
@@ -911,6 +921,7 @@ dependencies = [
  "futures-util",
  "gtk4",
  "hytte-bus",
+ "hytte-ecal",
  "hytte-reactive",
  "icalendar",
  "niri-ipc",

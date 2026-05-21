@@ -1,118 +1,163 @@
-//! Task list service backed by evolution-data-server's on-disk VTODO cache.
+//! Task list service backed by Evolution Data Server via libecal FFI.
 //!
-//! Mirrors [`crate::calendar`] in shape: we read EDS's local file cache
-//! (`~/.local/share/evolution/tasks/<source-uid>/calendar.ics`) and parse
-//! VTODO components with the `icalendar` crate. The signal [`tasks()`]
-//! emits a sorted, filtered list of incomplete tasks across every task
-//! list EDS knows about.
+//! Reads and writes go through [`hytte_ecal`] (our hand-written
+//! libecal-2.0 / libedataserver-1.2 / libical-glib bindings). Same API
+//! libecal provides to gnome-tasks and Evolution, so this works against
+//! ANY EDS backend the user has configured: local files, `CalDAV`
+//! (Nextcloud, generic), Google Tasks (via the `goa-google` bridge),
+//! Microsoft EWS, etc.
 //!
-//! ## Writes
+//! ## Threading
 //!
-//! Unlike [`crate::calendar`] (which is read-only), this service supports
-//! create/edit/complete/delete via direct iCalendar file rewrites on a
-//! dedicated **local-backend** task list provisioned at install time
-//! (UID [`EDITABLE_LIST_UID`]).
+//! Calling libecal from arbitrary tokio worker threads doesn't compose
+//! with `GObject`'s main-context model and isn't [`Sync`]-safe — so all
+//! EDS work happens on a single dedicated thread that owns one
+//! [`hytte_ecal::Registry`] and a [`HashMap`] of cached
+//! [`hytte_ecal::CalClient`] connections (one per source UID, opened
+//! lazily on first use).
 //!
-//! Writes are scoped to that one list — EDS's local backend just owns
-//! the `.ics` file with no remote sync, so atomic write (tempfile + rename)
-//! in the cache directory is safe. EDS's inotify watch on the file picks
-//! up changes the next time any client queries.
+//! Public functions enqueue [`Op`] variants onto the worker's channel
+//! and return immediately. Writes are fire-and-forget — errors are
+//! logged via `tracing::warn`. Reads are pushed to a `Mutable<Vec<Task>>`
+//! signal that subscribers (the sidebar widget) bind to.
 //!
-//! Tasks belonging to other lists (CalDAV/Google/etc.) are surfaced
-//! read-only — their `editable` flag is `false`. Writing to those lists
-//! would require driving EDS's per-source private bus connection, which
-//! is libecal-only (no rust bindings).
+//! ## Refresh cadence
 //!
-//! ## Provisioning the editable list
-//!
-//! [`ensure_editable_list`] writes
-//! `~/.config/evolution/sources/<EDITABLE_LIST_UID>.source` if missing
-//! and seeds the cache `.ics` with an empty VCALENDAR so the first read
-//! doesn't race the first write. Called from the polling loop on every
-//! refresh — idempotent.
-//!
-//! ## Background refresh
-//!
-//! 60-second polling parallel to the calendar service. EDS rewrites its
-//! local `.ics` files on sync (for backends that sync); polling catches
-//! changes within a minute without an inotify dep.
+//! [`POLL_INTERVAL`] (60 s) refreshes from the tokio runtime — same
+//! shape as the calendar service. Writes also enqueue an immediate
+//! refresh so subscribers see the result in seconds rather than
+//! minutes.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, Service};
+use hytte_ecal::sys::ECalClientSourceType;
+use hytte_ecal::{CalClient, Registry, Source};
+use hytte_reactive::{Service, registry};
 use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
 };
-use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
 
 // ── Public data types ────────────────────────────────────────────────────────
 
-/// One incomplete task ready for rendering. Mirrors the shape of
-/// [`crate::calendar::CalendarEvent`] but for VTODO components.
+/// One incomplete task ready for rendering. Surfaced in the
+/// [`tasks()`] signal; the sidebar widget binds to that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
-    /// VTODO UID. Stable across edits; used as the row key in the widget
-    /// and as the lookup key for write operations.
+    /// VTODO UID assigned by EDS. Stable for the lifetime of the task.
     pub uid: String,
     /// SUMMARY field, trimmed. Empty SUMMARYs become `"(no title)"`.
     pub summary: String,
-    /// Local-time due, if DUE was present on the VTODO. `None` for tasks
-    /// with no due date — these sort after dated tasks in [`tasks()`].
+    /// Local-time due, if DUE was present on the VTODO.
     pub due: Option<DateTime<Local>>,
-    /// True when DUE was a DATE (no time-of-day). Drives the "All day"
-    /// vs. "HH:MM" branch in [`format_due`].
+    /// True when DUE was a DATE (no time-of-day).
     pub due_all_day: bool,
-    /// RFC 5545 PRIORITY: 1 = highest, 9 = lowest, 0 / absent = undefined.
-    pub priority: Option<u8>,
-    /// Coarse STATUS bucket. Filtered to `NeedsAction` or `InProcess` in
-    /// the signal — Completed and Cancelled are dropped at parse time.
+    /// Coarse STATUS bucket — Completed and Cancelled are dropped at
+    /// parse time.
     pub status: TaskStatus,
-    /// Source-dir name (UID) of the task list this task lives in.
+    /// EDS source UID; needed to dispatch writes to the right client.
     pub list_uid: String,
-    /// Best-effort display name for the list, from the `.source` file
-    /// when available, else the source-dir name.
+    /// Best-effort display name (from the source's `DisplayName=`).
     pub list_name: String,
-    /// True iff the task lives in [`EDITABLE_LIST_UID`]. The widget
-    /// surfaces this as: full edit affordances vs. read-only display.
-    pub editable: bool,
 }
 
-/// Subset of `icalendar::TodoStatus` we care about. The signal drops
-/// Completed + Cancelled, so widget code only ever sees the first two.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskStatus {
     NeedsAction,
     InProcess,
 }
 
-/// UID of the dedicated local-backend task list trollshell owns for
-/// writes. Provisioned by [`ensure_editable_list`]. Matches the file name
-/// `<uid>.source` in `~/.config/evolution/sources/` and the cache dir
-/// `~/.local/share/evolution/tasks/<uid>/`.
-pub const EDITABLE_LIST_UID: &str = "trollshell-tasks";
+/// One configured task list (EDS source). Surfaced via [`task_lists()`]
+/// so the widget can populate a list picker in the create popover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskList {
+    /// EDS source UID — the value to pass back as `list_uid` on
+    /// [`create_task`]/etc.
+    pub uid: String,
+    /// `DisplayName=` from the `.source` file.
+    pub display_name: String,
+}
 
-/// Background refresh cadence — matches `calendar::POLL_INTERVAL`.
 const POLL_INTERVAL: StdDuration = StdDuration::from_mins(1);
+
+// ── Worker channel ───────────────────────────────────────────────────────────
+
+/// Operations the EDS worker thread processes. All fire-and-forget;
+/// writes that need to surface success/failure log via `tracing`.
+enum Op {
+    /// Re-query every task list and push a fresh `Vec<Task>` to the signal.
+    Refresh,
+    /// Create a new VTODO on `list_uid` with the given summary + optional
+    /// due. The caller-provided UID is included in the iCal payload so
+    /// the same string can later identify the row.
+    Create {
+        list_uid: String,
+        uid: String,
+        summary: String,
+        due: Option<DateTime<Local>>,
+    },
+    /// Flip an existing VTODO between NEEDS-ACTION and COMPLETED (with
+    /// PERCENT-COMPLETE=100 + COMPLETED stamp on the way to done).
+    SetCompleted {
+        list_uid: String,
+        uid: String,
+        completed: bool,
+    },
+    /// Replace SUMMARY + DUE on an existing VTODO, preserving every
+    /// other property by reading the current iCal, mutating, and
+    /// writing back.
+    Edit {
+        list_uid: String,
+        uid: String,
+        summary: String,
+        due: Option<DateTime<Local>>,
+    },
+    /// Remove a VTODO. No undo.
+    Delete {
+        list_uid: String,
+        uid: String,
+    },
+}
+
+/// Channel handle to the worker. `OnceLock` so the service can be
+/// registered exactly once; subsequent `service()` calls overwrite
+/// nothing.
+static SENDER: OnceLock<mpsc::Sender<Op>> = OnceLock::new();
+
+fn send_op(op: Op) {
+    let Some(tx) = SENDER.get() else {
+        tracing::warn!("tasks: worker not started; op dropped");
+        return;
+    };
+    if let Err(e) = tx.send(op) {
+        tracing::warn!(error = %e, "tasks: worker channel closed");
+    }
+}
 
 // ── Service handle ───────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub struct TaskHandles {
     pub(crate) tasks: Mutable<Vec<Task>>,
+    pub(crate) lists: Mutable<Vec<TaskList>>,
 }
 
 impl Default for TaskHandles {
     fn default() -> Self {
         Self {
             tasks: Mutable::new(Vec::new()),
+            lists: Mutable::new(Vec::new()),
         }
     }
 }
 
 /// Service marker. Pass to `App::with` to register handles + spawn the
-/// 60 s refresh task. The first refresh runs immediately and also
-/// provisions the editable local list if it doesn't exist yet.
+/// EDS worker thread + start the 60 s refresh ticker.
 pub struct TasksService;
 
 impl Service for TasksService {
@@ -120,10 +165,30 @@ impl Service for TasksService {
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = TaskHandles::default();
-        let writer = handles.tasks.clone();
-        rt.spawn(async move {
-            poll_loop(writer).await;
+        let tasks_writer = handles.tasks.clone();
+        let lists_writer = handles.lists.clone();
+
+        // Channel: tokio polling task + public API → EDS worker.
+        let (tx, rx) = mpsc::channel::<Op>();
+        let _ = SENDER.set(tx);
+
+        // Dedicated thread. EDS state lives here exclusively. We don't
+        // store a JoinHandle — shell processes that quit cleanly let
+        // the thread drop along with the OnceLock; ungraceful exits get
+        // the same OS cleanup either way.
+        thread::Builder::new()
+            .name("hytte-eds".into())
+            .spawn(move || run_worker(&rx, &tasks_writer, &lists_writer))
+            .expect("spawn EDS worker thread");
+
+        // Refresh ticker on the tokio runtime.
+        rt.spawn(async {
+            loop {
+                send_op(Op::Refresh);
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         });
+
         handles
     }
 }
@@ -135,13 +200,9 @@ pub fn service() -> TasksService {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Signal of incomplete tasks across every EDS task list. Sorted so:
-/// 1. tasks with a `due` come first, ascending (overdue → soonest);
-/// 2. tasks without a `due` come last, alphabetised by summary.
-///
-/// Completed + Cancelled tasks are dropped at parse time. Empty until the
-/// first refresh completes (or if the EDS tasks cache directory is
-/// missing).
+/// Signal of incomplete tasks across every EDS task list. Sorted so
+/// dated tasks ascend by due (overdue → soonest), then no-due tasks
+/// alphabetised. Empty until the first refresh completes.
 pub fn tasks() -> impl Signal<Item = Vec<Task>> {
     registry::with(|r| {
         r.get::<TaskHandles>()
@@ -151,227 +212,380 @@ pub fn tasks() -> impl Signal<Item = Vec<Task>> {
     })
 }
 
-/// Re-scan the EDS tasks cache and update the [`tasks()`] signal. Safe to
-/// call from page-show / open handlers. Heavy work (filesystem walk +
-/// iCal parse) runs on a blocking pool.
-pub fn refresh() {
-    let writer = registry::with(|r| r.get::<TaskHandles>().map(|h| h.tasks.clone()));
-    let Some(writer) = writer else {
-        tracing::warn!("tasks::refresh: service not registered");
-        return;
-    };
-    hytte_reactive::runtime::handle().spawn_blocking(move || {
-        do_refresh(&writer);
-    });
+/// Signal of the EDS task lists this account knows about. The widget
+/// uses this to populate the create-popover's list picker. Refreshed
+/// in lockstep with [`tasks()`].
+pub fn task_lists() -> impl Signal<Item = Vec<TaskList>> {
+    registry::with(|r| {
+        r.get::<TaskHandles>()
+            .expect("tasks::service() not registered")
+            .lists
+            .signal_cloned()
+    })
 }
 
-/// Create a new task in the editable list. `due` may be `None` for
-/// no-deadline tasks. Returns the generated UID. After the write the
-/// signal is refreshed asynchronously so subscribers see the new row.
-///
-/// All writes target [`EDITABLE_LIST_UID`] — there's no per-list write
-/// support yet (would require libecal for non-local backends).
+/// Trigger an out-of-cycle refresh. Safe to call from page-show /
+/// sidebar-open handlers.
+pub fn refresh() {
+    send_op(Op::Refresh);
+}
+
+/// Create a new task on `list_uid` with the given summary + optional
+/// due. The returned UID is generated client-side and burned into the
+/// VTODO before submission, so the caller can correlate the new row
+/// without waiting for the refresh round-trip.
 #[must_use = "the returned UID is the only way to address the new task"]
-pub fn create_task(summary: String, due: Option<DateTime<Local>>) -> String {
+pub fn create_task(
+    list_uid: String,
+    summary: String,
+    due: Option<DateTime<Local>>,
+) -> String {
     let uid = generate_uid();
-    let uid_clone = uid.clone();
-    spawn_write(move || {
-        let mut todo = Todo::new();
-        todo.summary(&summary);
-        todo.uid(&uid_clone);
-        todo.status(TodoStatus::NeedsAction);
-        stamp_now(&mut todo);
-        if let Some(due) = due {
-            todo.due(date_perhaps_time_from_local(due));
-        }
-        rewrite_editable(|cal| {
-            cal.components.push(CalendarComponent::Todo(todo));
-        })?;
-        Ok(())
+    send_op(Op::Create {
+        list_uid,
+        uid: uid.clone(),
+        summary,
+        due,
     });
     uid
 }
 
-/// Mark a task as completed (or re-open it). Only affects tasks in
-/// [`EDITABLE_LIST_UID`]; calls against tasks from other lists are
-/// silently ignored (the widget hides the checkbox in those cases).
-pub fn set_completed(uid: &str, completed: bool) {
-    let uid = uid.to_string();
-    spawn_write(move || {
-        rewrite_editable(|cal| {
-            for c in &mut cal.components {
-                let CalendarComponent::Todo(todo) = c else {
-                    continue;
-                };
-                if todo.get_uid().is_some_and(|u| u == uid) {
-                    if completed {
-                        todo.status(TodoStatus::Completed);
-                        todo.percent_complete(100);
-                        todo.completed(chrono::Utc::now());
-                    } else {
-                        todo.mark_uncompleted();
-                    }
-                    bump_last_modified(todo);
-                }
-            }
-        })?;
-        Ok(())
+/// Toggle a task's completed flag. Reads the current VTODO from EDS,
+/// flips STATUS + PERCENT-COMPLETE + COMPLETED, writes it back —
+/// preserves every other property (DESCRIPTION, CATEGORIES, etc.).
+pub fn set_completed(list_uid: &str, uid: &str, completed: bool) {
+    send_op(Op::SetCompleted {
+        list_uid: list_uid.to_string(),
+        uid: uid.to_string(),
+        completed,
     });
 }
 
-/// Edit a task's summary + due. Same scope rules as [`set_completed`].
-pub fn edit_task(uid: &str, summary: String, due: Option<DateTime<Local>>) {
-    let uid = uid.to_string();
-    spawn_write(move || {
-        rewrite_editable(|cal| {
-            for c in &mut cal.components {
-                let CalendarComponent::Todo(todo) = c else {
-                    continue;
-                };
-                if todo.get_uid().is_some_and(|u| u == uid) {
-                    todo.summary(&summary);
-                    if let Some(due) = due {
-                        todo.due(date_perhaps_time_from_local(due));
-                    } else {
-                        todo.remove_due();
-                    }
-                    bump_last_modified(todo);
-                }
-            }
-        })?;
-        Ok(())
+/// Edit a task's SUMMARY + DUE. Same read-modify-write cycle as
+/// [`set_completed`].
+pub fn edit_task(
+    list_uid: &str,
+    uid: &str,
+    summary: String,
+    due: Option<DateTime<Local>>,
+) {
+    send_op(Op::Edit {
+        list_uid: list_uid.to_string(),
+        uid: uid.to_string(),
+        summary,
+        due,
     });
 }
 
-/// Remove a task. Same scope rules as [`set_completed`].
-pub fn delete_task(uid: &str) {
-    let uid = uid.to_string();
-    spawn_write(move || {
-        rewrite_editable(|cal| {
-            cal.components.retain(|c| match c {
-                CalendarComponent::Todo(t) => t.get_uid().is_none_or(|u| u != uid),
-                _ => true,
+/// Remove a task. No undo path; the widget should confirm before
+/// calling.
+pub fn delete_task(list_uid: &str, uid: &str) {
+    send_op(Op::Delete {
+        list_uid: list_uid.to_string(),
+        uid: uid.to_string(),
+    });
+}
+
+// ── EDS worker thread ───────────────────────────────────────────────────────
+
+struct Worker {
+    registry: Registry,
+    clients: HashMap<String, CalClient>,
+    list_names: HashMap<String, String>,
+}
+
+impl Worker {
+    fn new() -> anyhow::Result<Self> {
+        let registry = Registry::new()?;
+        let mut list_names = HashMap::new();
+        for src in registry.task_lists() {
+            list_names.insert(src.uid(), src.display_name());
+        }
+        Ok(Self {
+            registry,
+            clients: HashMap::new(),
+            list_names,
+        })
+    }
+
+    /// Open the [`CalClient`] for `list_uid` (lazily) and return a borrow.
+    /// 5 s connect budget — bumped for CalDAV/EWS at the cost of slower
+    /// initial-open feedback on broken networks.
+    fn client(&mut self, list_uid: &str) -> anyhow::Result<&CalClient> {
+        if !self.clients.contains_key(list_uid) {
+            let src = self.lookup_source(list_uid)?;
+            let client = CalClient::connect(&src, ECalClientSourceType::Tasks, 5)?;
+            self.clients.insert(list_uid.to_string(), client);
+        }
+        Ok(self
+            .clients
+            .get(list_uid)
+            .expect("just inserted; lookup can't miss"))
+    }
+
+    fn lookup_source(&self, list_uid: &str) -> anyhow::Result<Source> {
+        match self.registry.ref_source(list_uid)? {
+            Some(s) => Ok(s),
+            None => anyhow::bail!("EDS source '{list_uid}' not found"),
+        }
+    }
+
+    /// Re-scan every task list and emit fresh signals if either the
+    /// tasks Vec or the lists Vec differs from the current snapshot.
+    fn refresh(&mut self, tasks_writer: &Mutable<Vec<Task>>, lists_writer: &Mutable<Vec<TaskList>>) {
+        let (tasks, lists) = self.scan_all();
+        let tasks_changed = {
+            let cur = tasks_writer.lock_ref();
+            *cur != tasks
+        };
+        if tasks_changed {
+            tasks_writer.set(tasks);
+        }
+        let lists_changed = {
+            let cur = lists_writer.lock_ref();
+            *cur != lists
+        };
+        if lists_changed {
+            lists_writer.set(lists);
+        }
+    }
+
+    fn scan_all(&mut self) -> (Vec<Task>, Vec<TaskList>) {
+        // Re-read the source list each refresh — a user adding/removing
+        // an account at runtime is rare, but cheap to handle.
+        let sources = self.registry.task_lists();
+        let mut tasks: Vec<Task> = Vec::new();
+        let mut lists: Vec<TaskList> = Vec::with_capacity(sources.len());
+        for src in sources {
+            let list_uid = src.uid();
+            let list_name = src.display_name();
+            self.list_names.insert(list_uid.clone(), list_name.clone());
+            lists.push(TaskList {
+                uid: list_uid.clone(),
+                display_name: list_name.clone(),
             });
-        })?;
+            let client = match self.client(&list_uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(list = %list_uid, error = %e, "tasks: client connect failed");
+                    continue;
+                }
+            };
+            let objects = match client.get_object_strings("#t") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(list = %list_uid, error = %e, "tasks: query failed");
+                    continue;
+                }
+            };
+            for body in objects {
+                if let Some(t) = parse_one(&body, &list_uid, &list_name) {
+                    tasks.push(t);
+                }
+            }
+        }
+        tasks.sort_by(sort_tasks);
+        (tasks, lists)
+    }
+
+    fn create(
+        &mut self,
+        list_uid: &str,
+        uid: &str,
+        summary: &str,
+        due: Option<DateTime<Local>>,
+    ) -> anyhow::Result<()> {
+        let mut todo = Todo::new();
+        todo.uid(uid);
+        todo.summary(summary);
+        todo.status(TodoStatus::NeedsAction);
+        stamp_now(&mut todo);
+        if let Some(dt) = due {
+            todo.due(date_perhaps_time_from_local(dt));
+        }
+        let ical = wrap(&todo);
+        let client = self.client(list_uid)?;
+        client.create_from_ical(&ical)?;
         Ok(())
-    });
-}
+    }
 
-// ── Polling loop ─────────────────────────────────────────────────────────────
+    fn modify_in_place<F: FnOnce(&mut Todo)>(
+        &mut self,
+        list_uid: &str,
+        uid: &str,
+        mutate: F,
+    ) -> anyhow::Result<()> {
+        let client = self.client(list_uid)?;
+        let current = client
+            .get_object_as_string(uid, None)?
+            .ok_or_else(|| anyhow::anyhow!("task '{uid}' not found on list '{list_uid}'"))?;
+        let parsed: Calendar = current.parse().map_err(|e| anyhow::anyhow!("parse current: {e}"))?;
+        // Take ownership of the first VTODO so we can mutate via &mut.
+        let mut todo = parsed
+            .components
+            .into_iter()
+            .find_map(|c| match c {
+                CalendarComponent::Todo(t) => Some(t),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("current iCal has no VTODO"))?;
+        mutate(&mut todo);
+        bump_last_modified(&mut todo);
+        let ical = wrap(&todo);
+        // Re-borrow: `client()` previously borrowed `self.clients` while
+        // we held `current`; that borrow ended at `?`. Now we can ask
+        // for the client again — it's already in the cache, so the
+        // hit-path is cheap.
+        let client = self.client(list_uid)?;
+        client.modify_from_ical(&ical)?;
+        Ok(())
+    }
 
-async fn poll_loop(writer: Mutable<Vec<Task>>) {
-    loop {
-        let writer_for_blocking = writer.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await
-        {
-            tracing::error!(error = %e, "tasks refresh task panicked");
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+    fn delete(&mut self, list_uid: &str, uid: &str) -> anyhow::Result<()> {
+        let client = self.client(list_uid)?;
+        client.remove(uid, None)?;
+        Ok(())
     }
 }
 
-fn do_refresh(writer: &Mutable<Vec<Task>>) {
-    // Idempotent provisioning on every tick — costs almost nothing and
-    // means a fresh user account works the first time the shell starts
-    // without any out-of-band setup.
-    if let Err(e) = ensure_editable_list() {
-        tracing::debug!(error = %e, "tasks: ensure_editable_list failed");
-    }
-
-    let snapshot = scan_cache_dir();
-    let changed = {
-        let cur = writer.lock_ref();
-        *cur != snapshot
-    };
-    if changed {
-        writer.set(snapshot);
-    }
-}
-
-// ── Filesystem scanning ──────────────────────────────────────────────────────
-
-fn xdg_data_home() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg));
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local/share"))
-}
-
-fn xdg_config_home() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg));
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config"))
-}
-
-fn cache_root() -> Option<PathBuf> {
-    Some(xdg_data_home()?.join("evolution").join("tasks"))
-}
-
-fn editable_cache_dir() -> Option<PathBuf> {
-    Some(cache_root()?.join(EDITABLE_LIST_UID))
-}
-
-fn editable_ics_path() -> Option<PathBuf> {
-    Some(editable_cache_dir()?.join("calendar.ics"))
-}
-
-fn sources_dir() -> Option<PathBuf> {
-    Some(xdg_config_home()?.join("evolution").join("sources"))
-}
-
-fn editable_source_path() -> Option<PathBuf> {
-    Some(sources_dir()?.join(format!("{EDITABLE_LIST_UID}.source")))
-}
-
-fn scan_cache_dir() -> Vec<Task> {
-    let Some(root) = cache_root() else {
-        return Vec::new();
-    };
-    let entries = match std::fs::read_dir(&root) {
-        Ok(rd) => rd,
+fn run_worker(
+    rx: &mpsc::Receiver<Op>,
+    tasks_writer: &Mutable<Vec<Task>>,
+    lists_writer: &Mutable<Vec<TaskList>>,
+) {
+    let mut worker = match Worker::new() {
+        Ok(w) => w,
         Err(e) => {
-            tracing::debug!(error = %e, dir = %root.display(), "tasks: cache dir read failed");
-            return Vec::new();
+            tracing::error!(error = %e, "tasks: EDS worker init failed; service inert");
+            // Drain the channel anyway so senders don't get backpressure
+            // errors. We can't recover without restart.
+            for _ in rx {}
+            return;
         }
     };
-
-    let mut out: Vec<Task> = Vec::new();
-    for entry in entries.flatten() {
-        let source_dir = entry.path();
-        if !source_dir.is_dir() {
-            continue;
-        }
-        let ics = source_dir.join("calendar.ics");
-        if !ics.is_file() {
-            continue;
-        }
-        let list_uid = source_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("tasks")
-            .to_string();
-        let list_name = source_display_name(&list_uid).unwrap_or_else(|| list_uid.clone());
-        let editable = list_uid == EDITABLE_LIST_UID;
-        match parse_ics_file(&ics, &list_uid, &list_name, editable) {
-            Ok(mut ts) => out.append(&mut ts),
-            Err(e) => tracing::warn!(error = %e, file = %ics.display(), "tasks: parse failed"),
-        }
+    while let Ok(op) = rx.recv() {
+        handle(&mut worker, op, tasks_writer, lists_writer);
     }
-
-    out.sort_by(sort_tasks);
-    out
 }
 
-/// Sort: dated tasks ascending by due (overdue → soonest), then no-due
-/// tasks alphabetised. Treats `None` as +∞ so the comparison is total.
+fn handle(
+    worker: &mut Worker,
+    op: Op,
+    tasks_writer: &Mutable<Vec<Task>>,
+    lists_writer: &Mutable<Vec<TaskList>>,
+) {
+    match op {
+        Op::Refresh => worker.refresh(tasks_writer, lists_writer),
+        Op::Create {
+            list_uid,
+            uid,
+            summary,
+            due,
+        } => {
+            if let Err(e) = worker.create(&list_uid, &uid, &summary, due) {
+                tracing::warn!(error = %e, "tasks: create failed");
+            }
+            worker.refresh(tasks_writer, lists_writer);
+        }
+        Op::SetCompleted {
+            list_uid,
+            uid,
+            completed,
+        } => {
+            let res = worker.modify_in_place(&list_uid, &uid, |todo| {
+                if completed {
+                    todo.status(TodoStatus::Completed);
+                    todo.percent_complete(100);
+                    todo.completed(chrono::Utc::now());
+                } else {
+                    todo.mark_uncompleted();
+                }
+            });
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "tasks: set_completed failed");
+            }
+            worker.refresh(tasks_writer, lists_writer);
+        }
+        Op::Edit {
+            list_uid,
+            uid,
+            summary,
+            due,
+        } => {
+            let res = worker.modify_in_place(&list_uid, &uid, |todo| {
+                todo.summary(&summary);
+                if let Some(dt) = due {
+                    todo.due(date_perhaps_time_from_local(dt));
+                } else {
+                    todo.remove_due();
+                }
+            });
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "tasks: edit failed");
+            }
+            worker.refresh(tasks_writer, lists_writer);
+        }
+        Op::Delete { list_uid, uid } => {
+            if let Err(e) = worker.delete(&list_uid, &uid) {
+                tracing::warn!(error = %e, "tasks: delete failed");
+            }
+            worker.refresh(tasks_writer, lists_writer);
+        }
+    }
+}
+
+// ── iCalendar parsing + helpers ──────────────────────────────────────────────
+
+/// Parse one iCalendar body that came back from libecal into a [`Task`],
+/// or `None` when the body wasn't a usable VTODO (parse error, status
+/// = COMPLETED/CANCELLED, or PERCENT-COMPLETE = 100).
+fn parse_one(body: &str, list_uid: &str, list_name: &str) -> Option<Task> {
+    let parsed: Calendar = body.parse().ok().or_else(|| {
+        // libecal hands us bare VTODO without VCALENDAR wrapper sometimes —
+        // wrap it ourselves before retrying.
+        let wrapped = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte//\r\n{body}\r\nEND:VCALENDAR\r\n"
+        );
+        wrapped.parse().ok()
+    })?;
+    let todo = parsed.components.iter().find_map(|c| match c {
+        CalendarComponent::Todo(t) => Some(t),
+        _ => None,
+    })?;
+
+    let status = match todo.get_status() {
+        Some(TodoStatus::Completed | TodoStatus::Cancelled) => return None,
+        Some(TodoStatus::InProcess) => TaskStatus::InProcess,
+        Some(TodoStatus::NeedsAction) | None => TaskStatus::NeedsAction,
+    };
+    if todo.get_percent_complete() == Some(100) {
+        return None;
+    }
+
+    let (due, due_all_day) = todo
+        .get_due()
+        .and_then(dpt_to_local)
+        .map_or((None, false), |(dt, all_day)| (Some(dt), all_day));
+    let uid = todo
+        .get_uid()
+        .map_or_else(|| format!("anon:{list_uid}"), str::to_string);
+    let summary = todo
+        .property_value("SUMMARY")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(no title)".to_string());
+
+    Some(Task {
+        uid,
+        summary,
+        due,
+        due_all_day,
+        status,
+        list_uid: list_uid.to_string(),
+        list_name: list_name.to_string(),
+    })
+}
+
 fn sort_tasks(a: &Task, b: &Task) -> std::cmp::Ordering {
     match (a.due, b.due) {
         (Some(x), Some(y)) => x.cmp(&y),
@@ -381,89 +595,6 @@ fn sort_tasks(a: &Task, b: &Task) -> std::cmp::Ordering {
     }
 }
 
-/// Best-effort `DisplayName` lookup from
-/// `~/.config/evolution/sources/<uid>.source`. EDS keys are
-/// `DisplayName=…` (plus localised variants); we honour only the
-/// untagged value to avoid pulling a full locale-resolution helper in.
-fn source_display_name(uid: &str) -> Option<String> {
-    let path = sources_dir()?.join(format!("{uid}.source"));
-    let body = std::fs::read_to_string(path).ok()?;
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("DisplayName=") {
-            let name = rest.trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn parse_ics_file(
-    path: &Path,
-    list_uid: &str,
-    list_name: &str,
-    editable: bool,
-) -> anyhow::Result<Vec<Task>> {
-    let body = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    let parsed: Calendar = body
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
-
-    let mut out = Vec::new();
-    for todo in parsed.components.iter().filter_map(|c| match c {
-        CalendarComponent::Todo(t) => Some(t),
-        _ => None,
-    }) {
-        let status = match todo.get_status() {
-            // Drop completed + cancelled at parse time — the signal only
-            // ever surfaces actionable tasks.
-            Some(TodoStatus::Completed | TodoStatus::Cancelled) => continue,
-            Some(TodoStatus::InProcess) => TaskStatus::InProcess,
-            // Absent STATUS defaults to NEEDS-ACTION per RFC 5545 §3.8.1.11.
-            Some(TodoStatus::NeedsAction) | None => TaskStatus::NeedsAction,
-        };
-
-        // Belt-and-suspenders: some clients set PERCENT-COMPLETE=100
-        // without flipping STATUS. Treat that as completed too.
-        if todo.get_percent_complete() == Some(100) {
-            continue;
-        }
-
-        let (due, due_all_day) = todo.get_due().and_then(dpt_to_local).map_or((None, false), |(dt, all_day)| (Some(dt), all_day));
-
-        let uid = todo
-            .get_uid()
-            .map_or_else(|| format!("anon:{list_uid}:{}", out.len()), str::to_string);
-        let summary = todo
-            .property_value("SUMMARY")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(no title)".to_string());
-        let priority = todo
-            .property_value("PRIORITY")
-            .and_then(|s| s.trim().parse::<u8>().ok())
-            .filter(|p| *p > 0);
-
-        out.push(Task {
-            uid,
-            summary,
-            due,
-            due_all_day,
-            priority,
-            status,
-            list_uid: list_uid.to_string(),
-            list_name: list_name.to_string(),
-            editable,
-        });
-    }
-    Ok(out)
-}
-
-/// Same conversion as `calendar::dpt_to_local`. Kept in-module to avoid
-/// re-exporting a sibling crate's internal helper. Returns `(local_dt,
-/// all_day)`, or `None` if normalisation failed.
 fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
     match dpt {
         DatePerhapsTime::Date(d) => {
@@ -483,118 +614,33 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
     }
 }
 
-// ── Write path: editable list provisioning + atomic rewrite ──────────────────
-
-/// Ensure the editable local task list is provisioned. Creates the
-/// `.source` file and an empty cache `.ics` if they're missing. Safe to
-/// call concurrently with EDS — the operations are idempotent and the
-/// cache write is an atomic `rename`.
-pub fn ensure_editable_list() -> anyhow::Result<()> {
-    let src_path =
-        editable_source_path().ok_or_else(|| anyhow::anyhow!("no $HOME for sources dir"))?;
-    if !src_path.exists() {
-        if let Some(parent) = src_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            &src_path,
-            "[Data Source]\nDisplayName=Trollshell Tasks\nEnabled=true\nParent=local-stub\n\n\
-             [Task List]\nBackendName=local\nColor=#e6194b\nSelected=true\n",
-        )?;
-        // Best-effort: nudge EDS to re-scan. If the bus isn't running
-        // (headless test rig), we silently move on — the next refresh
-        // tick or shell restart picks it up.
-        let _ = std::process::Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.evolution.dataserver.Sources5",
-                "--object-path",
-                "/org/gnome/evolution/dataserver/SourceManager",
-                "--method",
-                "org.gnome.evolution.dataserver.SourceManager.Reload",
-            ])
-            .output();
-    }
-    let ics_path = editable_ics_path().ok_or_else(|| anyhow::anyhow!("no $HOME for cache dir"))?;
-    if !ics_path.exists() {
-        if let Some(parent) = ics_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            &ics_path,
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte//trollshell//EN\r\n\
-             END:VCALENDAR\r\n",
-        )?;
-    }
-    Ok(())
-}
-
-/// Drop the work onto the tokio runtime's blocking pool. The closure
-/// performs the load-mutate-save cycle; after success we trigger a
-/// refresh so subscribers see the new state without waiting for the
-/// 60-second poll tick.
-fn spawn_write(work: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
-    hytte_reactive::runtime::handle().spawn_blocking(move || {
-        if let Err(e) = work() {
-            tracing::warn!(error = %e, "tasks: write failed");
-            return;
-        }
-        // Push fresh state to subscribers immediately.
-        if let Some(writer) = registry::with(|r| r.get::<TaskHandles>().map(|h| h.tasks.clone())) {
-            do_refresh(&writer);
-        }
-    });
-}
-
-/// Load the editable list's `.ics`, hand the parsed `Calendar` to `edit`,
-/// then write the result back atomically (tempfile + rename in the same
-/// directory). Caller is responsible for keeping the mutation O(1)/O(n)
-/// — we hold no locks beyond the file's natural rename atomicity.
-fn rewrite_editable(edit: impl FnOnce(&mut Calendar)) -> anyhow::Result<()> {
-    ensure_editable_list()?;
-    let ics_path =
-        editable_ics_path().ok_or_else(|| anyhow::anyhow!("no $HOME for cache dir"))?;
-    let body = std::fs::read_to_string(&ics_path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", ics_path.display()))?;
-    let mut cal: Calendar = body
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parse {}: {e}", ics_path.display()))?;
-    edit(&mut cal);
-
-    let serialized = cal.to_string();
-    let parent = ics_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("editable .ics has no parent dir"))?;
-    let tmp = parent.join(format!(".calendar.ics.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serialized.as_bytes())?;
-    std::fs::rename(&tmp, &ics_path)?;
-    Ok(())
+fn date_perhaps_time_from_local(dt: DateTime<Local>) -> DatePerhapsTime {
+    DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt.with_timezone(&chrono::Utc)))
 }
 
 fn stamp_now(todo: &mut Todo) {
     let now = chrono::Utc::now();
-    // DTSTAMP is required by RFC 5545; LAST-MODIFIED is conventional so
-    // clients displaying "edited at" timestamps don't show 1970.
-    todo.add_property("DTSTAMP", format_utc_for_ical(now).as_str());
-    todo.add_property("CREATED", format_utc_for_ical(now).as_str());
-    todo.add_property("LAST-MODIFIED", format_utc_for_ical(now).as_str());
+    todo.add_property("DTSTAMP", format_utc(now).as_str());
+    todo.add_property("CREATED", format_utc(now).as_str());
+    todo.add_property("LAST-MODIFIED", format_utc(now).as_str());
 }
 
 fn bump_last_modified(todo: &mut Todo) {
     let now = chrono::Utc::now();
-    todo.add_property("LAST-MODIFIED", format_utc_for_ical(now).as_str());
-    todo.add_property("DTSTAMP", format_utc_for_ical(now).as_str());
+    todo.add_property("LAST-MODIFIED", format_utc(now).as_str());
+    todo.add_property("DTSTAMP", format_utc(now).as_str());
 }
 
-fn format_utc_for_ical(dt: chrono::DateTime<chrono::Utc>) -> String {
+fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-/// UUIDs would be nicer but the project doesn't yet take a `uuid` dep;
-/// `pid + nanos + counter` is collision-resistant enough for a single
-/// local user's task list.
+fn wrap(todo: &Todo) -> String {
+    let mut cal = Calendar::new();
+    cal.push(todo.clone());
+    cal.to_string()
+}
+
 fn generate_uid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -605,48 +651,35 @@ fn generate_uid() -> String {
     format!("trollshell-{}-{nanos}-{n}", std::process::id())
 }
 
-/// Map a `chrono::DateTime<Local>` back into `icalendar`'s
-/// `DatePerhapsTime` for the DUE property — UTC datetime, or DATE-only
-/// when `due_all_day` is set on the original `Task`.
-fn date_perhaps_time_from_local(dt: DateTime<Local>) -> DatePerhapsTime {
-    // We always serialise as DATE-TIME (UTC) for simplicity — callers
-    // wanting an all-day task can pass a midnight `dt`; the round-trip
-    // through dpt_to_local will still surface it. Full DATE-only writes
-    // are a future enhancement once the widget grows a "date only" UX.
-    DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt.with_timezone(&chrono::Utc)))
-}
+// ── Display helpers used by the widget (unchanged from the prior impl) ──────
 
-// ── Display helpers used by the widget ───────────────────────────────────────
-
-/// Format a task's due for an `AdwActionRow` subtitle. Returns labels like:
-/// - `"Overdue \u{00b7} Yesterday"` / `"Overdue \u{00b7} 3 days ago"`
-/// - `"Today, 14:00"` / `"Today"`
-/// - `"Tomorrow"` / `"Mon 14 Apr"`
-/// - empty string for tasks with no due date
+/// Format a task's due for an `AdwActionRow` subtitle. Empty string when
+/// the task has no due.
 #[must_use]
 pub fn format_due(task: &Task) -> String {
-    let Some(due) = task.due else { return String::new(); };
+    let Some(due) = task.due else {
+        return String::new();
+    };
     let now = Local::now();
     let today = now.date_naive();
     let due_date = due.date_naive();
     let delta_days = due_date.signed_duration_since(today).num_days();
-    let day_label = day_label(due_date, today);
+    let day_label_str = day_label(due_date, today);
 
     if delta_days < 0 {
-        return overdue_label(delta_days, &day_label);
+        return overdue_label(delta_days, &day_label_str);
     }
-
     if task.due_all_day {
-        return day_label;
+        return day_label_str;
     }
-    format!("{day_label}, {}", due.format("%H:%M"))
+    format!("{day_label_str}, {}", due.format("%H:%M"))
 }
 
-fn overdue_label(delta_days: i64, day_label: &str) -> String {
+fn overdue_label(delta_days: i64, day_label_str: &str) -> String {
     match delta_days {
         -1 => "Overdue \u{00b7} Yesterday".to_string(),
         d if d > -7 => format!("Overdue \u{00b7} {} days ago", -d),
-        _ => format!("Overdue \u{00b7} {day_label}"),
+        _ => format!("Overdue \u{00b7} {day_label_str}"),
     }
 }
 
@@ -697,7 +730,7 @@ fn month_short(m: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, TimeZone};
+    use chrono::Duration;
 
     fn task_with(due: Option<DateTime<Local>>) -> Task {
         Task {
@@ -705,52 +738,14 @@ mod tests {
             summary: "s".into(),
             due,
             due_all_day: false,
-            priority: None,
             status: TaskStatus::NeedsAction,
             list_uid: "l".into(),
             list_name: "L".into(),
-            editable: false,
         }
     }
 
     #[test]
-    fn editable_list_uid_is_trollshell_tasks() {
-        // Widget code keys off this constant for the editable affordances;
-        // changing the literal would silently break write routing.
-        assert_eq!(EDITABLE_LIST_UID, "trollshell-tasks");
-    }
-
-    #[test]
-    fn parse_filters_completed_and_cancelled() {
-        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
-                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Done\r\nSTATUS:COMPLETED\r\nEND:VTODO\r\n\
-                    BEGIN:VTODO\r\nUID:b\r\nSUMMARY:Killed\r\nSTATUS:CANCELLED\r\nEND:VTODO\r\n\
-                    BEGIN:VTODO\r\nUID:c\r\nSUMMARY:Live\r\nEND:VTODO\r\n\
-                    END:VCALENDAR\r\n";
-        let path = std::env::temp_dir().join("hytte-tasks-test-filter.ics");
-        std::fs::write(&path, body).unwrap();
-        let ts = parse_ics_file(&path, "l", "L", false).unwrap();
-        assert_eq!(ts.len(), 1);
-        assert_eq!(ts[0].uid, "c");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn parse_filters_percent_complete_100() {
-        // Some clients (gnome-tasks) set PERCENT-COMPLETE=100 without
-        // STATUS=COMPLETED. Treat that as completed regardless.
-        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
-                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:HiddenDone\r\nPERCENT-COMPLETE:100\r\nEND:VTODO\r\n\
-                    END:VCALENDAR\r\n";
-        let path = std::env::temp_dir().join("hytte-tasks-test-pc100.ics");
-        std::fs::write(&path, body).unwrap();
-        let ts = parse_ics_file(&path, "l", "L", false).unwrap();
-        assert!(ts.is_empty());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn sort_dated_before_undated_then_by_due() {
+    fn sort_dated_before_undated() {
         let now = Local::now();
         let mut v = [
             task_with(None),
@@ -763,29 +758,45 @@ mod tests {
     }
 
     #[test]
-    fn format_due_overdue() {
-        let now = Local::now();
-        let yesterday = now - Duration::days(1);
-        let t = Task { due: Some(yesterday), due_all_day: true, ..task_with(Some(yesterday)) };
-        let s = format_due(&t);
-        assert!(s.starts_with("Overdue"), "got {s}");
+    fn parse_drops_completed() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Done\r\nSTATUS:COMPLETED\r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        assert!(parse_one(body, "l", "L").is_none());
     }
 
     #[test]
-    fn format_due_today_with_time() {
-        let now = Local::now();
-        let t_dt = Local
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 14, 0, 0)
-            .single()
-            .unwrap();
-        let t = task_with(Some(t_dt));
-        let s = format_due(&t);
-        assert!(s.starts_with("Today"), "got {s}");
-        assert!(s.contains("14:00"), "got {s}");
+    fn parse_keeps_needs_action() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Live\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        let t = parse_one(body, "l", "L").unwrap();
+        assert_eq!(t.uid, "a");
+        assert_eq!(t.summary, "Live");
+        assert_eq!(t.status, TaskStatus::NeedsAction);
+    }
+
+    #[test]
+    fn parse_drops_percent_complete_100() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Hidden\r\nPERCENT-COMPLETE:100\r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        assert!(parse_one(body, "l", "L").is_none());
     }
 
     #[test]
     fn format_due_no_due_is_empty() {
         assert_eq!(format_due(&task_with(None)), "");
+    }
+
+    #[test]
+    fn format_due_overdue_prefixed() {
+        let now = Local::now();
+        let s = format_due(&Task {
+            due: Some(now - Duration::days(1)),
+            due_all_day: true,
+            ..task_with(Some(now - Duration::days(1)))
+        });
+        assert!(s.starts_with("Overdue"), "got {s}");
     }
 }

@@ -38,7 +38,7 @@ use std::collections::HashMap;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::gtk::{self, gdk, glib};
+use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
 use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
 
@@ -158,6 +158,10 @@ pub fn install(monitor: &Monitor) {
     // process lifetime — toggle goes through the revealer + open_state,
     // never through set_visible/present. See module-level note on z-order.
     window.set_visible(true);
+    // Start clickthrough — the persistent surface keeps a full input
+    // region by default even after the revealer collapses to 0 width,
+    // so without this the closed sidebar's region still swallows clicks.
+    apply_input_passthrough(&window, false);
 
     let subscription = wire_open_subscription(&window, &revealer, &open_state);
     wire_escape(&window, monitor.clone());
@@ -238,9 +242,10 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
 }
 
 /// Drive open/close transitions from the shared mutable. The surface stays
-/// alive across toggles (see module note on z-order); we flip the revealer
-/// AND the exclusive zone in lockstep. Niri snaps tiles + bar to the new
-/// zone immediately; the revealer's slide is cosmetic.
+/// alive across toggles (see module note on z-order); we flip the revealer,
+/// the exclusive zone, AND the surface's input region in lockstep. Niri
+/// snaps tiles + bar to the new zone immediately; the revealer's slide is
+/// cosmetic.
 ///
 /// Returns the `JoinHandle` so `close_all` can abort the subscription
 /// before closing the window — prevents a zombie subscription firing into
@@ -255,11 +260,29 @@ fn wire_open_subscription(
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
         revealer.set_reveal_child(open);
+        apply_input_passthrough(&window, !open);
         if open {
             hytte::services::departures::refresh();
         }
         async {}
     }))
+}
+
+/// Toggle the surface's input region so the closed sidebar's persistent
+/// layer-shell surface doesn't swallow pointer events in the (revealer-
+/// shrunk) sidebar region. `passthrough == true` → empty region (clicks
+/// fall through to niri tiles below); `false` → full surface accepts
+/// input. Mirrors the click-through pattern in `frame::install_click_through`.
+fn apply_input_passthrough(window: &gtk::Window, passthrough: bool) {
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    if passthrough {
+        let empty = cairo::Region::create();
+        surface.set_input_region(Some(&empty));
+    } else {
+        surface.set_input_region(None);
+    }
 }
 
 /// ESC → close. Bound to the sidebar window so it fires when the sidebar has

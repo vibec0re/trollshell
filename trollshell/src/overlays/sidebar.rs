@@ -237,6 +237,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.set_vexpand(false);
 
     card.append(&crate::widgets::calendar::widget(monitor));
+    card.append(&crate::widgets::tasks::widget(monitor));
     card.append(&crate::widgets::departures::widget());
     card
 }

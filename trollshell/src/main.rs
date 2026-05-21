@@ -13,7 +13,8 @@ use hytte::prelude::*;
 use hytte::services::{
     bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures, displays,
     dnd, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire, polkit,
-    power_profiles, resolved, screensaver, sensors, systemd, tray, upower, vpn, wallpaper, wifi,
+    power_profiles, resolved, screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper,
+    wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -47,6 +48,7 @@ fn main() -> hytte::ui::Result<()> {
         .with(displays::service())
         .with(clipboard::service())
         .with(calendar::service())
+        .with(tasks::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
         .run(|app| {
             // Spawn a task on the GTK main loop that owns the live set of

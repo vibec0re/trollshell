@@ -15,6 +15,7 @@ pub mod notif_indicator;
 pub mod power_chip;
 pub mod settings_chip;
 pub mod sidebar_toggle;
+pub mod tasks;
 pub mod tray;
 pub mod volume;
 pub mod vpn;

@@ -777,6 +777,77 @@ window:not(.dark) .ts-drawer {
 
 .ts-departures-error { color: #ff6b6b; padding: 12px; }
 
+/* ─── Sidebar — tasks widget ──────────────────────────────────── */
+
+.ts-sidebar-tasks {
+    padding: 0 12px;
+    margin-top: 10px;
+}
+
+.ts-sidebar-tasks-header {
+    /* Row carries the "TASKS" label + the add button. .ts-sidebar-cal-header
+     * (reused on the label) supplies its own margin; we just align here. */
+    margin-bottom: 4px;
+}
+
+.ts-sidebar-tasks-add-btn {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+    border-radius: 6px;
+    color: alpha(white, 0.65);
+}
+.ts-sidebar-tasks-add-btn:hover {
+    background: alpha(white, 0.08);
+    color: white;
+}
+
+/* Same dark-sidebar palette swap we use for the calendar's UPCOMING list. */
+.ts-sidebar-tasks-list listview,
+.ts-sidebar-tasks-list list.boxed-list,
+.ts-sidebar-tasks-list list.boxed-list > row {
+    background: alpha(white, 0.04);
+    color: white;
+    border-radius: 8px;
+}
+.ts-sidebar-tasks-list .title    { color: white; }
+.ts-sidebar-tasks-list .subtitle { color: alpha(white, 0.6); font-size: 0.85em; }
+
+.ts-task-row checkbutton {
+    margin-right: 4px;
+}
+
+/* The "+" popover and edit popover share this. */
+.ts-task-popover contents {
+    background: #1b1b2a;
+    color: white;
+    border-radius: 10px;
+}
+
+.ts-task-entry {
+    background: alpha(white, 0.08);
+    color: white;
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+.ts-task-entry:focus {
+    background: alpha(white, 0.12);
+}
+
+.ts-task-due-picker {
+    /* Tight vertical rhythm between the chip row, summary, and calendar. */
+    margin-top: 2px;
+}
+.ts-task-due-chip {
+    padding: 2px 8px;
+    font-size: 0.85em;
+}
+.ts-task-due-summary {
+    font-size: 0.85em;
+    color: alpha(white, 0.6);
+    padding: 0 4px;
+}
+
 /* ─── Calendar — transient highlight when click-day matches a row ─ */
 
 .ts-cal-day-hit {

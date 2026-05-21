@@ -29,6 +29,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     column.upcast()
 }
 
+/// Maximum number of task rows rendered inline. The list isn't
+/// scrollable (an inner SW inside the sidebar swallowed mouse-wheel
+/// events for nested scroll, and felt visually cramped) — anything
+/// past this surfaces as a "+N more" indicator.
+const MAX_VISIBLE_TASKS: usize = 5;
+
 fn build_block() -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.add_css_class("ts-sidebar-tasks");
@@ -42,18 +48,12 @@ fn build_block() -> gtk::Box {
 
     let group = adw::PreferencesGroup::new();
     group.add_css_class("ts-sidebar-tasks-list");
-
-    let scrolled = gtk::ScrolledWindow::new();
-    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
-    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-    scrolled.set_min_content_height(160);
-    scrolled.set_max_content_height(320);
-    scrolled.set_child(Some(&group));
-    column.append(&scrolled);
+    column.append(&group);
 
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
-    wire_tasks_bind(&group, &rows_track, &placeholder_track);
+    let overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
+    wire_tasks_bind(&group, &rows_track, &placeholder_track, &overflow_track);
     wire_lists_bind(&group, &lists_track);
 
     column
@@ -103,11 +103,13 @@ fn wire_tasks_bind(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
+    overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     let rows_track = rows_track.clone();
     let placeholder_track = placeholder_track.clone();
+    let overflow_track = overflow_track.clone();
     bind(tasks::tasks(), group, move |group, ts| {
-        rebuild_list(group, &rows_track, &placeholder_track, &ts);
+        rebuild_list(group, &rows_track, &placeholder_track, &overflow_track, &ts);
     });
 }
 
@@ -115,6 +117,7 @@ fn rebuild_list(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
+    overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     ts: &[Task],
 ) {
     for row in rows_track.borrow_mut().drain(..) {
@@ -122,6 +125,9 @@ fn rebuild_list(
     }
     if let Some(p) = placeholder_track.borrow_mut().take() {
         group.remove(&p);
+    }
+    if let Some(o) = overflow_track.borrow_mut().take() {
+        group.remove(&o);
     }
 
     if ts.is_empty() {
@@ -135,13 +141,26 @@ fn rebuild_list(
         return;
     }
 
-    let mut new_rows: Vec<adw::ActionRow> = Vec::with_capacity(ts.len());
-    for t in ts {
+    let visible = ts.len().min(MAX_VISIBLE_TASKS);
+    let mut new_rows: Vec<adw::ActionRow> = Vec::with_capacity(visible);
+    for t in ts.iter().take(visible) {
         let row = build_task_row(t);
         group.add(&row);
         new_rows.push(row);
     }
     *rows_track.borrow_mut() = new_rows;
+
+    if ts.len() > visible {
+        let hidden = ts.len() - visible;
+        let overflow = adw::ActionRow::builder()
+            .title(format!("+ {hidden} more"))
+            .subtitle("Open in Evolution / GNOME To Do for the full list.")
+            .activatable(false)
+            .build();
+        overflow.add_css_class("dim-label");
+        group.add(&overflow);
+        *overflow_track.borrow_mut() = Some(overflow);
+    }
 }
 
 // ── One row ──────────────────────────────────────────────────────────────────

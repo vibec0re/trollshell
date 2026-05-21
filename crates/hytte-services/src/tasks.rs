@@ -301,6 +301,33 @@ impl Worker {
         for src in registry.task_lists() {
             list_names.insert(src.uid(), src.display_name());
         }
+        // Make sure the user always has somewhere to put a new task.
+        // Users with only Calendar sources configured (no Task List
+        // sources) would otherwise see a "+" with a disabled Add
+        // button — provision a local "Trollshell Tasks" source so the
+        // widget can write somewhere on a fresh account.
+        if list_names.is_empty() {
+            match ensure_default_local_list() {
+                Ok(()) => {
+                    tracing::info!("tasks: provisioned default local list 'trollshell-tasks'");
+                    // The newly-written .source file races EDS's
+                    // inotify pickup; refresh the registry so we don't
+                    // miss it on this first scan.
+                    let registry = Registry::new()?;
+                    for src in registry.task_lists() {
+                        list_names.insert(src.uid(), src.display_name());
+                    }
+                    return Ok(Self {
+                        registry,
+                        clients: HashMap::new(),
+                        list_names,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tasks: failed to provision default local list");
+                }
+            }
+        }
         Ok(Self {
             registry,
             clients: HashMap::new(),
@@ -482,6 +509,7 @@ fn handle(
             summary,
             due,
         } => {
+            tracing::info!(list = %list_uid, uid = %uid, %summary, "tasks: creating");
             if let Err(e) = worker.create(&list_uid, &uid, &summary, due) {
                 tracing::warn!(error = %e, "tasks: create failed");
             }
@@ -639,6 +667,45 @@ fn wrap(todo: &Todo) -> String {
     let mut cal = Calendar::new();
     cal.push(todo.clone());
     cal.to_string()
+}
+
+/// Write `~/.config/evolution/sources/trollshell-tasks.source` if it
+/// doesn't already exist, then ping EDS's `SourceManager.Reload` so the
+/// registry picks it up immediately. Idempotent and best-effort — if
+/// gdbus isn't on $PATH we just return the file-write result.
+fn ensure_default_local_list() -> anyhow::Result<()> {
+    let home = std::env::var("HOME").map_err(|e| anyhow::anyhow!("HOME unset: {e}"))?;
+    let xdg_config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{home}/.config"));
+    let sources_dir = std::path::PathBuf::from(xdg_config).join("evolution/sources");
+    let src_path = sources_dir.join("trollshell-tasks.source");
+    if src_path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&sources_dir)?;
+    std::fs::write(
+        &src_path,
+        "[Data Source]\nDisplayName=Trollshell Tasks\nEnabled=true\nParent=local-stub\n\n\
+         [Task List]\nBackendName=local\nColor=#e6194b\nSelected=true\n",
+    )?;
+    // Best-effort: SourceManager.Reload picks up our .source immediately.
+    // EDS also inotify-watches the dir, so missing this is recoverable —
+    // the source shows up on the next refresh tick either way.
+    let _ = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.evolution.dataserver.Sources5",
+            "--object-path",
+            "/org/gnome/evolution/dataserver/SourceManager",
+            "--method",
+            "org.gnome.evolution.dataserver.SourceManager.Reload",
+        ])
+        .output();
+    Ok(())
 }
 
 fn generate_uid() -> String {

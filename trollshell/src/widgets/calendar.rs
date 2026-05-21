@@ -99,8 +99,13 @@ fn build_block() -> gtk::Box {
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-    scrolled.set_min_content_height(220);
-    scrolled.set_max_content_height(360);
+    // No min_content_height: the previous 220 px floor reserved a slab
+    // of empty space when the upcoming list had 0–2 entries, leaving a
+    // visible gap before the next sibling widget. The SW now shrinks
+    // to natural content height; max caps it at 280 so a packed list
+    // doesn't squeeze tasks + departures.
+    scrolled.set_max_content_height(280);
+    scrolled.set_propagate_natural_height(true);
     scrolled.set_child(Some(&group));
     column.append(&scrolled);
 

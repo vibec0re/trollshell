@@ -234,10 +234,21 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.set_halign(gtk::Align::Fill);
     card.set_hexpand(false);
     card.set_valign(gtk::Align::Fill);
-    card.set_vexpand(false);
+    // vexpand so the card stretches to the full sidebar height — needed
+    // for the spacer below to actually have slack to absorb, which is
+    // what anchors the departures widget to the bottom edge.
+    card.set_vexpand(true);
 
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
+
+    // Flex gap: eats whatever vertical space the calendar + tasks
+    // didn't claim, so the departures widget settles against the
+    // bottom edge of the sidebar instead of floating in the middle.
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_vexpand(true);
+    card.append(&spacer);
+
     card.append(&crate::widgets::departures::widget());
     card
 }

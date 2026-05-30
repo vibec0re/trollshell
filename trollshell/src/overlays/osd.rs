@@ -486,7 +486,9 @@ fn render_brightness(b: Brightness) -> State {
 fn render_battery(event: BatteryEvent, batt: &Battery) -> State {
     let (icon, label, value) = match event {
         BatteryEvent::PluggedIn => (
-            "battery-charging-symbolic",
+            // Adwaita 49+ moved this to the `legacy/` set; `battery-good-charging`
+            // is the closest equivalent that resolves cleanly in modern themes.
+            "battery-good-charging-symbolic",
             "Charging",
             format!("{:.0}%", batt.percentage),
         ),

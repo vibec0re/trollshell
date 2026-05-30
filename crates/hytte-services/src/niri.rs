@@ -7,7 +7,7 @@
 //!
 //! On connection loss the loop sleeps 1s then reconnects.
 //!
-//! # API notes (niri-ipc 25.11.0)
+//! # API notes (niri-ipc 26.4.0)
 //!
 //! - `Socket::send()` returns `io::Result<Reply>`.
 //! - After sending `Request::EventStream`, call `socket.read_events()` which
@@ -62,7 +62,7 @@ impl Service for NiriService {
         rt.spawn_blocking(move || loop {
             match listen_once(&ws_writer, &win_list_writer, &win_focus_writer) {
                 Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
-                Err(e) => tracing::warn!(error = %e, "niri ipc error, reconnecting in 1s"),
+                Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
             }
             thread::sleep(Duration::from_secs(1));
         });

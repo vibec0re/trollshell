@@ -8,7 +8,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-notif-indicator");
 
     let overlay = gtk::Overlay::new();
-    let icon = gtk::Image::from_icon_name("notification-symbolic");
+    let icon = gtk::Image::from_file(crate::assets::path("icons/notification.svg"));
+    icon.set_pixel_size(16);
     overlay.set_child(Some(&icon));
 
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);

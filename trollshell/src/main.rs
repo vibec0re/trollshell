@@ -1,3 +1,4 @@
+mod assets;
 mod components;
 mod modal;
 mod overlays;
@@ -49,8 +50,20 @@ fn main() -> hytte::ui::Result<()> {
         .with(clipboard::service())
         .with(calendar::service())
         .with(tasks::service())
-        .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))
+        .with_user_style(assets::path("style.css"))
         .run(|app| {
+            // GSettings schemas often aren't visible to `cargo run` from the
+            // devShell (Nix puts them under share/gsettings-schemas/<pkg>/...,
+            // not share/glib-2.0/schemas/). Without the schemas GTK can't
+            // read `org.gnome.desktop.interface icon-theme` and falls back
+            // to a hicolor-only scan — most Adwaita symbolics render as
+            // image-missing because only the subset libadwaita bundles as
+            // a gresource is found. Force the theme name so GTK scans
+            // adwaita-icon-theme's filesystem Adwaita/ directory directly.
+            if let Some(s) = gtk::Settings::default() {
+                s.set_gtk_icon_theme_name(Some("Adwaita"));
+            }
+
             // Spawn a task on the GTK main loop that owns the live set of
             // bars. Each emission of monitors_changed (initial + every
             // hot-plug) tears down the old bars and rebuilds for the

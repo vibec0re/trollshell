@@ -347,6 +347,19 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
         {
             Ok(r) => r,
             Err(e) => {
+                // AccessDenied = the broker's policy refuses this user the
+                // right to own the name. No retry will fix it; only
+                // installing a /etc/dbus-1/system.d/ rule will. Log once
+                // at info and park the task forever so consumers see the
+                // service as silently inert instead of a 5s warn-storm.
+                if matches!(e, fdo::Error::AccessDenied(_)) {
+                    tracing::info!(
+                        %name,
+                        "DBus name ownership refused by policy; service inert (install a /etc/dbus-1/system.d/ rule granting it)"
+                    );
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
                 let as_zbus = zbus::Error::FDO(Box::new(e));
                 if is_transient_zbus_error(&as_zbus) {
                     writer.set(OwnState::Acquiring);

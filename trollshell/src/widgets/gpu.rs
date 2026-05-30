@@ -9,7 +9,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
-    let icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/gpu.svg"));
+    let icon = gtk::Image::from_file(crate::assets::path("icons/gpu.svg"));
     icon.set_pixel_size(16);
     row.append(&icon);
 

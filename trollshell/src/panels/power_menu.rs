@@ -42,7 +42,9 @@ pub fn panel_power_menu() -> gtk::Widget {
     group.add(&power_action_row(
         "Suspend",
         "Sleep until next interaction",
-        "system-suspend-symbolic",
+        // `system-suspend-symbolic` was dropped from Adwaita; the crescent-moon
+        // weather glyph is the conventional "sleep" stand-in.
+        "weather-clear-night-symbolic",
         None,
         || {
             hytte::services::logind::suspend();

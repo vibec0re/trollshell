@@ -7,7 +7,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-settings");
 
-    let icon = gtk::Image::from_icon_name("emblem-system-symbolic");
+    let icon = gtk::Image::from_file(crate::assets::path("icons/emblem-system.svg"));
+    icon.set_pixel_size(16);
     btn.set_child(Some(&icon));
 
     let monitor_for_click = monitor.clone();

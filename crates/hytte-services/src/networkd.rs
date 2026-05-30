@@ -115,10 +115,18 @@ impl Service for NetworkdService {
         let primary_writer = handles.primary.clone();
 
         rt.spawn(async move {
+            // Startup probe: if the initial refresh fails, networkd isn't
+            // running on this host (e.g. NetworkManager-only setups). Log
+            // once at info and stay inert rather than entering a 2s retry
+            // loop that hammers dbus for the rest of the process lifetime.
+            if let Err(e) = refresh(&links_writer, &primary_writer).await {
+                tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
+                return;
+            }
             loop {
                 match listen(&links_writer, &primary_writer).await {
                     Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
-                    Err(e) => tracing::warn!(error = %e, "networkd error, retrying in 2s"),
+                    Err(e) => tracing::warn!(error = ?e, "networkd error, retrying in 2s"),
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -159,12 +167,12 @@ async fn listen(
             _ = events.next() => {
                 tracing::debug!("networkd StateChanged; refreshing links");
                 if let Err(e) = refresh(links_out, primary_out).await {
-                    tracing::warn!(error = %e, "networkd refresh after StateChanged failed");
+                    tracing::warn!(error = ?e, "networkd refresh after StateChanged failed");
                 }
             }
             _ = interval.tick() => {
                 if let Err(e) = refresh(links_out, primary_out).await {
-                    tracing::warn!(error = %e, "networkd periodic refresh failed");
+                    tracing::warn!(error = ?e, "networkd periodic refresh failed");
                 }
             }
         }

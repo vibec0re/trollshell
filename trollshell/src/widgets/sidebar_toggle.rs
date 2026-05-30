@@ -11,10 +11,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     btn.add_css_class("ts-indicator");
     btn.add_css_class("ts-sidebar-toggle");
 
-    // `view-sidebar-symbolic` is the freedesktop-standard sidebar glyph.
-    // If a theme lacks it, GTK falls back to its built-in missing-image
-    // icon; we don't try a multi-name fallback here to keep the chip simple.
-    let icon = gtk::Image::from_icon_name("view-sidebar-symbolic");
+    // Bundled Material icon: modern Adwaita dropped `view-sidebar-symbolic`
+    // (it lives at `sidebar-show-symbolic` now, but Material's view_sidebar
+    // matches the rest of the bar's icon style — see icons/cpu.svg etc.).
+    let icon = gtk::Image::from_file(crate::assets::path("icons/view-sidebar.svg"));
+    icon.set_pixel_size(16);
     btn.set_child(Some(&icon));
 
     let monitor_for_click = monitor.clone();

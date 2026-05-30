@@ -137,7 +137,7 @@
 
               package = lib.mkOption {
                 type = lib.types.package;
-                default = self.packages.${pkgs.system}.trollshell;
+                default = self.packages.${pkgs.stdenv.hostPlatform.system}.trollshell;
                 defaultText = lib.literalExpression "trollshell.packages.\${system}.trollshell";
                 description = "The trollshell package to install.";
               };

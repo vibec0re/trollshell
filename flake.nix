@@ -153,6 +153,12 @@
               # = false;` in user config intact for the rare desktop case.
               services.upower.enable = lib.mkDefault true;
 
+              # power-profiles-daemon (net.hadess.PowerProfiles) feeds the
+              # power-profile selector. Without it, ActiveProfile + Profiles
+              # stay in PropState::Loading and the chip can't show or set
+              # Performance/Balanced/Power-Saver.
+              services.power-profiles-daemon.enable = lib.mkDefault true;
+
               # System-bus policy: allow any user to own the three trollshell
               # agent names. BlueZ / polkit / iwd policies still gate the
               # actual method ACLs; this only grants the right to RequestName.

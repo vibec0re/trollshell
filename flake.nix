@@ -146,6 +146,13 @@
             config = lib.mkIf cfg.enable {
               environment.systemPackages = [ cfg.package ];
 
+              # UPower drives the battery chip + plug/unplug OSDs. Without
+              # it, the chip stays hidden (BatteryState::Unknown) and the
+              # five property subscriptions sit in PropState::Loading
+              # forever. mkDefault leaves explicit `services.upower.enable
+              # = false;` in user config intact for the rare desktop case.
+              services.upower.enable = lib.mkDefault true;
+
               # System-bus policy: allow any user to own the three trollshell
               # agent names. BlueZ / polkit / iwd policies still gate the
               # actual method ACLs; this only grants the right to RequestName.

@@ -10,11 +10,13 @@
 //!   * Query active state (stubbed in v1 — see method docs).
 //!
 //! `screensaver::lock()` flips an `is_locked: Mutable<bool>` signal;
-//! `widgets::lock_screen` subscribes and mounts per-monitor layer-shell
-//! lock surfaces with PAM-backed unlock. External triggers
-//! (`loginctl lock-session`, `systemd-logind` Lock signal, swayidle
-//! before-sleep) flow through the same signal via the login1 listen
-//! loop in this module.
+//! `widgets::lock_screen` subscribes and drives an
+//! `ext-session-lock-v1` client (per-monitor lock surfaces with
+//! PAM-backed unlock, compositor-enforced input isolation, and
+//! crash-safe — see `overlays/lock_screen.rs` for the lifecycle).
+//! External triggers (`loginctl lock-session`, `systemd-logind` Lock
+//! signal, swayidle before-sleep) flow through the same signal via
+//! the login1 listen loop in this module.
 //!
 //! While at least one inhibitor is active, swayidle is paused via
 //! `SIGSTOP`; when the last inhibitor releases, we send `SIGCONT`. swayidle
@@ -114,9 +116,10 @@ pub struct ScreenSaverHandles {
     /// Monotonic cookie counter. Mutators now go through SHARED; kept here
     /// so the Arc is not dropped prematurely.
     pub(crate) _next_cookie: Arc<AtomicU32>,
-    /// `true` while the native lock UI is mounted on all monitors, `false`
-    /// otherwise. Set by [`lock`] and cleared by [`handle_unlock_success`].
-    /// Subscribers: `widgets::lock_screen`.
+    /// `true` while the ext-session-lock-v1 client owns the screen,
+    /// `false` otherwise. Set by [`lock`] (and the login1 Lock
+    /// signal); cleared by [`handle_unlock_success`] after PAM auth.
+    /// Subscribers: `overlays::lock_screen`.
     pub(crate) is_locked: Mutable<bool>,
     /// Keeps the name-ownership task alive for the process lifetime.
     _ownership: hytte_bus::OwnNameSignal,
@@ -188,9 +191,9 @@ pub fn inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
     })
 }
 
-/// Signal emitting `true` while the lock UI is mounted, `false`
-/// otherwise. Subscribed by `widgets::lock_screen` to drive the
-/// per-monitor surfaces.
+/// Signal emitting `true` while the session is locked, `false`
+/// otherwise. Subscribed by `overlays::lock_screen` to create and
+/// destroy the ext-session-lock-v1 client.
 pub fn is_locked() -> impl Signal<Item = bool> {
     registry::with(|r| {
         r.get::<ScreenSaverHandles>()
@@ -201,9 +204,10 @@ pub fn is_locked() -> impl Signal<Item = bool> {
 }
 
 /// Called by the lock UI after a successful PAM authentication.
-/// Flips `is_locked` to false (which clears the lock surfaces) and
-/// tells logind to release its session-level lock state via
-/// `Session.SetLockedHint(false)`.
+/// Flips `is_locked` to false (the `overlays::lock_screen`
+/// subscription then calls `Instance::unlock()` on the active
+/// session-lock client) and tells logind to release its
+/// session-level lock state via `Session.SetLockedHint(false)`.
 pub fn handle_unlock_success() {
     let Some(shared) = SHARED.get() else {
         tracing::warn!("handle_unlock_success called before service registered");
@@ -357,7 +361,8 @@ async fn get_locked_hint(session_path: &str) -> Result<bool, hytte_bus::BusError
 }
 
 /// Trigger the lock surface. Flips `is_locked` to `true`; the
-/// `widgets::lock_screen` subscription mounts the per-monitor lock
+/// `overlays::lock_screen` subscription instantiates an
+/// ext-session-lock-v1 client and mounts the per-monitor lock
 /// surfaces in response.
 pub fn lock() {
     let Some(shared) = SHARED.get() else {

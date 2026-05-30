@@ -791,6 +791,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "gtk4-session-lock"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2267b4acc07f3125a5cea6d27254a737125a722de4fcc45aa3ad1f1f543af35"
+dependencies = [
+ "gdk4",
+ "glib",
+ "glib-sys",
+ "gtk4",
+ "gtk4-session-lock-sys",
+ "libc",
+]
+
+[[package]]
+name = "gtk4-session-lock-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "141184b5b7b5951ae55012c338a0f681ee58af63b5d4ff7e3166c6f2229b1f9b"
+dependencies = [
+ "gdk4-sys",
+ "glib-sys",
+ "gobject-sys",
+ "gtk4-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "gtk4-sys"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -945,6 +973,7 @@ dependencies = [
  "gio",
  "gtk4",
  "gtk4-layer-shell",
+ "gtk4-session-lock",
  "hytte-reactive",
  "libadwaita",
 ]

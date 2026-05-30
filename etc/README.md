@@ -30,6 +30,11 @@ Without this file the lock UI mounts but authentication fails with
 "Authentication unavailable" — there's no PAM service named
 `trollshell` for libpam to consult.
 
+NixOS users using the flake's `nixosModules.default` get this
+automatically (`security.pam.services.trollshell` is declared when
+`programs.trollshell.enable = true;`). Skip the `install` step and
+rebuild.
+
 Build-time deps: `libpam` headers (Arch `pam` package, Nix
 `pkgs.pam`). Runtime deps: standard `pam_unix` stack (default on
 every distro that has working login).

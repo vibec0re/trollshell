@@ -159,6 +159,17 @@
               # Performance/Balanced/Power-Saver.
               services.power-profiles-daemon.enable = lib.mkDefault true;
 
+              # PAM service for the lock screen. hytte_pam::authenticate
+              # opens service "trollshell"; without this file libpam has
+              # nothing to consult and every unlock returns
+              # PamError::Service → "Authentication unavailable". The
+              # shipped etc/pam.d/trollshell is `auth include login` —
+              # mirror that so users inherit whatever auth stack (fprint,
+              # yubikey, …) they already have on login.
+              security.pam.services.trollshell.text = ''
+                auth include login
+              '';
+
               # System-bus policy: allow any user to own the three trollshell
               # agent names. BlueZ / polkit / iwd policies still gate the
               # actual method ACLs; this only grants the right to RequestName.

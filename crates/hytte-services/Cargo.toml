@@ -21,6 +21,13 @@ hytte-bus = { path = "../hytte-bus" }
 hytte-ecal = { path = "../hytte-ecal" }
 hytte-reactive = { path = "../hytte-reactive" }
 niri-ipc = "26.4.0"
+# Native PipeWire client. libpipewire-sys / libspa-sys discover the C
+# libs via pkg-config; flake.nix supplies `pipewire` in buildInputs so
+# the .pc files for libpipewire-0.3 and libspa-0.2 are on PKG_CONFIG_PATH.
+# The mainloop is single-threaded + non-Send; the audio service runs it
+# on a dedicated std::thread and bridges to tokio via pipewire::channel.
+pipewire = "0.10.0"
+libspa = "0.10.0"
 tokio = { version = "1.52.1", features = ["net", "rt", "io-util", "process", "sync", "time"] }
 tracing = "0.1.44"
 icalendar = { version = "0.17", default-features = false, features = ["parser", "chrono-tz"] }

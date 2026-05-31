@@ -43,6 +43,12 @@
           pam
 
           openssl
+
+          # libpipewire-0.3 + libspa-0.2 — pipewire-rs (libpipewire-sys /
+          # libspa-sys) discovers headers + .so via pkg-config (.pc files
+          # ship in the dev output and pkg-config is already in
+          # nativeBuildInputs).
+          pipewire
         ];
 
         rustPlatform = pkgs.makeRustPlatform {
@@ -110,6 +116,16 @@
 
           shellHook = ''
             export RUST_BACKTRACE=1
+            # Put libclang.so on the dynamic loader's search path so every
+            # bindgen consumer (pam-sys + libpipewire-sys + libspa-sys)
+            # can `dlopen` it without TLS contention. Without this, the
+            # pam-sys build script panics with "a libclang shared library
+            # is not loaded on this thread" once libpipewire-sys is also
+            # in the dep graph — clang-sys's libloading fallback otherwise
+            # leans on LIBCLANG_PATH alone, which races with sibling
+            # bindgen invocations in workspace builds.
+            export LD_LIBRARY_PATH="$LIBCLANG_PATH:''${LD_LIBRARY_PATH:-}"
+
             # mkShell doesn't export icon-theme share paths into XDG_DATA_DIRS
             # via setup hooks, so GTK's icon loader can't find Adwaita symbolics
             # (audio-volume-*-symbolic, display-brightness-symbolic, etc.).

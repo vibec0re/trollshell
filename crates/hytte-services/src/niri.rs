@@ -174,6 +174,25 @@ fn apply_event(
             drop(list);
             focused_window.set(new_focused);
         }
+        // Fullscreen / maximize-to-edges / resize-to-edges land here, not in
+        // WindowsChanged or WindowOpenedOrChanged. Without this arm the cached
+        // tile_size stays stale and `edge_window_on` (which the frame uses to
+        // hide itself) never flips.
+        Event::WindowLayoutsChanged { changes } => {
+            let mut list = windows.lock_mut();
+            for (id, layout) in &changes {
+                if let Some(w) = list.iter_mut().find(|w| w.id == *id) {
+                    w.layout = layout.clone();
+                }
+            }
+            let focused_id = focused_window.lock_ref().as_ref().map(|w| w.id);
+            if let Some(fid) = focused_id {
+                if let Some(updated) = list.iter().find(|w| w.id == fid).cloned() {
+                    drop(list);
+                    focused_window.set(Some(updated));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -418,5 +437,100 @@ mod tests {
         let ws = vec![mk_workspace(1, CONNECTOR, true)];
         let w = vec![mk_window(10, 1, (MON_W - 2.0, MON_H - BAR_H))];
         assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W));
+    }
+
+    fn mk_layout(tile: (f64, f64)) -> WindowLayout {
+        WindowLayout {
+            pos_in_scrolling_layout: Some((1, 1)),
+            tile_size: tile,
+            window_size: (0, 0),
+            tile_pos_in_workspace_view: Some((0.0, 0.0)),
+            window_offset_in_tile: (0.0, 0.0),
+        }
+    }
+
+    /// Regression: niri emits `WindowLayoutsChanged` (not `WindowsChanged`
+    /// or `WindowOpenedOrChanged`) on fullscreen / maximize-to-edges
+    /// toggles. The arm must update each cached window's `layout` so
+    /// `has_edge_window` flips and the frame hides.
+    #[test]
+    fn window_layouts_changed_updates_tile_size() {
+        let workspaces = Mutable::new(vec![mk_workspace(1, CONNECTOR, true)]);
+        // Seed the cache with a tiled window — tile_size below MON_W.
+        let small = mk_window(10, 1, (MON_W - 200.0, MON_H - BAR_H - 8.0));
+        let windows = Mutable::new(vec![small]);
+        let focused_window = Mutable::new(None);
+
+        // Pre-condition: not edge-spanning.
+        assert!(!has_edge_window(
+            &workspaces.lock_ref(),
+            &windows.lock_ref(),
+            CONNECTOR,
+            MON_W,
+        ));
+
+        // Fullscreen toggle: layout grows to full output.
+        apply_event(
+            Event::WindowLayoutsChanged {
+                changes: vec![(10, mk_layout((MON_W, MON_H)))],
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+        );
+
+        assert!(has_edge_window(
+            &workspaces.lock_ref(),
+            &windows.lock_ref(),
+            CONNECTOR,
+            MON_W,
+        ));
+    }
+
+    /// When the changed window is also the currently-focused one, the
+    /// `focused_window` mirror must pick up the new layout too so any
+    /// subscribers reading focused_window directly see fresh state.
+    #[test]
+    fn window_layouts_changed_mirrors_into_focused_window() {
+        let workspaces = Mutable::new(vec![mk_workspace(1, CONNECTOR, true)]);
+        let mut w = mk_window(10, 1, (MON_W - 200.0, MON_H - BAR_H - 8.0));
+        w.is_focused = true;
+        let windows = Mutable::new(vec![w.clone()]);
+        let focused_window = Mutable::new(Some(w));
+
+        apply_event(
+            Event::WindowLayoutsChanged {
+                changes: vec![(10, mk_layout((MON_W, MON_H)))],
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+        );
+
+        let focused = focused_window.lock_ref().clone().expect("focused set");
+        assert_eq!(focused.layout.tile_size, (MON_W, MON_H));
+    }
+
+    /// A layout change for a window the cache hasn't seen yet is a no-op
+    /// (no insertion, no panic). Niri-side ordering guarantees the prior
+    /// add event arrives first in practice, but the arm shouldn't trust
+    /// that — the cache must remain consistent on stray ids.
+    #[test]
+    fn window_layouts_changed_ignores_unknown_id() {
+        let workspaces = Mutable::new(vec![mk_workspace(1, CONNECTOR, true)]);
+        let windows: Mutable<Vec<Window>> = Mutable::new(Vec::new());
+        let focused_window = Mutable::new(None);
+
+        apply_event(
+            Event::WindowLayoutsChanged {
+                changes: vec![(999, mk_layout((MON_W, MON_H)))],
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+        );
+
+        assert!(windows.lock_ref().is_empty());
+        assert!(focused_window.lock_ref().is_none());
     }
 }

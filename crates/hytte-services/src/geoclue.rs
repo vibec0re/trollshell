@@ -200,14 +200,15 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
 
     let lat = get_f64_prop(&loc_path, "Latitude").await?;
     let lon = get_f64_prop(&loc_path, "Longitude").await?;
-    let label_hint = get_string_prop(&loc_path, "Description")
-        .await
-        .filter(|s| !s.is_empty());
 
+    // Deliberately ignore the location's `Description`: it's a source/method
+    // blurb ("ipv4", "wifi", "IP fallback (from WiFi data)"), not a place
+    // name. Leaving `label_hint` `None` lets `weather` reverse-geocode the
+    // coordinates into a real city name (see `LocationSnapshot::label_hint`).
     Some(LocationSnapshot {
         lat,
         lon,
-        label_hint,
+        label_hint: None,
         source: LocationSource::GeoClue,
     })
 }
@@ -228,11 +229,6 @@ async fn set_client_prop(client_path: &str, name: &'static str, value: Value<'_>
 async fn get_f64_prop(path: &str, name: &'static str) -> Option<f64> {
     let v = get_prop(path, name).await?;
     f64::try_from(v).ok()
-}
-
-async fn get_string_prop(path: &str, name: &'static str) -> Option<String> {
-    let v = get_prop(path, name).await?;
-    String::try_from(v).ok()
 }
 
 async fn get_prop(path: &str, name: &'static str) -> Option<OwnedValue> {

@@ -94,14 +94,14 @@ GET https://api.open-meteo.com/v1/forecast
 
 Synchronous `ureq` call (matches `calendar.rs`'s existing pattern). Parse the `current` object via serde.
 
-Reverse-geocode for friendly name (only when `source = GeoClue`; Configured source already has the name in `label_hint`):
+Reverse-geocode for friendly name (only when `source = GeoClue`; Configured source already has the name in `label_hint`). Open-Meteo has **no** reverse endpoint — `/v1/reverse` 404s — so use OSM Nominatim, sending a descriptive `User-Agent` (its policy rejects stock library ones):
 
 ```
-GET https://geocoding-api.open-meteo.com/v1/reverse
-  ?latitude={lat}&longitude={lon}&count=1&language=en
+GET https://nominatim.openstreetmap.org/reverse
+  ?lat={lat}&lon={lon}&format=jsonv2&zoom=14&accept-language=en
 ```
 
-Cache the result by rounded `(lat * 100, lon * 100) as (i32, i32)` so we don't re-geocode every 15-min refresh when location is unchanged.
+Take `name` (the district at `zoom=14`, e.g. "Oberschöneweide"), falling back to the first segment of `display_name`. Cache the result by rounded `(lat * 100, lon * 100) as (i32, i32)` so we don't re-geocode every 15-min refresh when location is unchanged — which also keeps us polite to Nominatim.
 
 Weather-code mapping is a pure `condition_for_code(u8) -> Condition`. WMO codes:
 

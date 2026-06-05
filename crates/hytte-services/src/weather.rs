@@ -259,15 +259,21 @@ fn pct_to_u8(v: f64) -> u8 {
 
 // ── Reverse geocoding (GeoClue source only) ────────────────────────────────
 
+/// Descriptive User-Agent for Nominatim, whose usage policy rejects stock
+/// library User-Agents. Volume is tiny — we only reverse-geocode on a location
+/// *change*, and cache the result below.
+const NOMINATIM_UA: &str = "trollshell/0.1 (+https://github.com/vibec0re/trollshell)";
+
+/// Subset of a Nominatim `jsonv2` reverse response. `name` is the localized
+/// name of the matched feature at our requested zoom (a district like
+/// "Oberschöneweide"); `display_name` is the full comma-joined address, used
+/// only as a fallback when `name` is empty.
 #[derive(serde::Deserialize)]
 struct ReverseResponse {
     #[serde(default)]
-    results: Vec<ReverseResult>,
-}
-
-#[derive(serde::Deserialize)]
-struct ReverseResult {
     name: String,
+    #[serde(default)]
+    display_name: String,
 }
 
 /// Cache of rounded `(lat*100, lon*100)` → place name, so we don't re-geocode
@@ -279,9 +285,12 @@ fn cache_key(lat: f64, lon: f64) -> (i32, i32) {
     ((lat * 100.0).round() as i32, (lon * 100.0).round() as i32)
 }
 
-/// Reverse-geocode `(lat, lon)` to a place name via Open-Meteo, memoized by a
-/// coarse coordinate key. Returns `None` on any failure — the caller falls
+/// Reverse-geocode `(lat, lon)` to a place name via OSM Nominatim, memoized by
+/// a coarse coordinate key. Returns `None` on any failure — the caller falls
 /// back to a generic label.
+///
+/// Open-Meteo (our forecast + forward-geocode provider) has no reverse
+/// endpoint — `/v1/reverse` 404s — so this one call reaches for Nominatim.
 fn reverse_geocode(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<String> {
     let key = cache_key(lat, lon);
     let cache = GEO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -291,10 +300,17 @@ fn reverse_geocode(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<String> {
         return Some(name.clone());
     }
 
+    // zoom=14 ≈ suburb/district granularity ("Oberschöneweide", not just
+    // "Berlin"); accept-language=en matches the forward-geocode path.
     let url = format!(
-        "https://geocoding-api.open-meteo.com/v1/reverse?latitude={lat}&longitude={lon}&count=1&language=en"
+        "https://nominatim.openstreetmap.org/reverse\
+         ?lat={lat}&lon={lon}&format=jsonv2&zoom=14&accept-language=en"
     );
-    let mut resp = agent.get(&url).call().ok()?;
+    let mut resp = agent
+        .get(&url)
+        .header("User-Agent", NOMINATIM_UA)
+        .call()
+        .ok()?;
     let body = resp
         .body_mut()
         .with_config()
@@ -311,7 +327,14 @@ fn reverse_geocode(agent: &ureq::Agent, lat: f64, lon: f64) -> Option<String> {
 
 fn parse_reverse(body: &str) -> Option<String> {
     let parsed: ReverseResponse = serde_json::from_str(body).ok()?;
-    parsed.results.into_iter().next().map(|r| r.name)
+    let name = parsed.name.trim();
+    if !name.is_empty() {
+        return Some(name.to_owned());
+    }
+    // No primary name (or an error response) — take the most specific segment
+    // of the full address, if any.
+    let first = parsed.display_name.split(',').next()?.trim();
+    (!first.is_empty()).then(|| first.to_owned())
 }
 
 fn http_agent() -> ureq::Agent {
@@ -373,9 +396,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_reverse_takes_first_name() {
-        let body = r#"{"results":[{"name":"Oslo"},{"name":"Other"}]}"#;
-        assert_eq!(parse_reverse(body).as_deref(), Some("Oslo"));
-        assert_eq!(parse_reverse(r#"{"results":[]}"#), None);
+    fn parse_reverse_prefers_name() {
+        let body = r#"{"name":"Oberschöneweide",
+            "display_name":"Oberschöneweide, Treptow-Köpenick, Berlin, Germany"}"#;
+        assert_eq!(parse_reverse(body).as_deref(), Some("Oberschöneweide"));
+    }
+
+    #[test]
+    fn parse_reverse_falls_back_to_display_name() {
+        let body = r#"{"name":"","display_name":"Reinbeckstraße, Berlin, Germany"}"#;
+        assert_eq!(parse_reverse(body).as_deref(), Some("Reinbeckstraße"));
+    }
+
+    #[test]
+    fn parse_reverse_error_or_garbage_is_none() {
+        assert_eq!(parse_reverse(r#"{"error":"Unable to geocode"}"#), None);
+        assert_eq!(parse_reverse("not json"), None);
     }
 }

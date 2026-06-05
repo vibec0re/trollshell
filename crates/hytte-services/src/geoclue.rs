@@ -11,10 +11,11 @@
 //!    Open-Meteo's geocoding endpoint. Used when `GeoClue2` is absent,
 //!    denied, or times out.
 //!
-//! The resolved [`LocationSnapshot`] is published on a `Mutable` exposed both
-//! via [`current`] (registry signal, for main-thread widgets) and via
-//! [`shared_location`] (a process-global clone, so `weather`'s tokio task can
-//! read it without touching the thread-local registry).
+//! The [`LocationState`] (Resolving → Resolved/Unavailable) is published on a
+//! `Mutable` exposed both via [`current`] (registry signal, for main-thread
+//! widgets) and via [`shared_location`] (a process-global clone, so
+//! `weather`'s tokio task can read it without touching the thread-local
+//! registry).
 
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
@@ -65,10 +66,24 @@ pub struct LocationSnapshot {
     pub source: LocationSource,
 }
 
+/// Lifecycle of location resolution, published to `weather`. Starts
+/// [`LocationState::Resolving`] (the first attempt is in flight); a successful
+/// attempt yields [`LocationState::Resolved`]; an attempt that finds no source
+/// (no `GeoClue2`, `TROLLSHELL_WEATHER_CITY` unset/empty) yields
+/// [`LocationState::Unavailable`]. The split lets `weather` keep its loading
+/// state at boot instead of flashing an error before the first fix lands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum LocationState {
+    #[default]
+    Resolving,
+    Resolved(LocationSnapshot),
+    Unavailable,
+}
+
 #[doc(hidden)]
 #[derive(Default)]
 pub struct GeoclueHandles {
-    pub(crate) location: Mutable<Option<LocationSnapshot>>,
+    pub(crate) location: Mutable<LocationState>,
     pub(crate) notify: Arc<Notify>,
 }
 
@@ -76,7 +91,7 @@ pub struct GeoclueHandles {
 // (main thread only); `weather`'s tokio task reads location from here
 // instead. `Mutable` + `Arc<Notify>` are `Send + Sync`.
 struct Shared {
-    location: Mutable<Option<LocationSnapshot>>,
+    location: Mutable<LocationState>,
     notify: Arc<Notify>,
 }
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -104,9 +119,10 @@ pub fn service() -> GeoclueService {
     GeoclueService
 }
 
-/// Signal of the currently resolved location, or `None` before the first
-/// resolution (or when both sources fail).
-pub fn current() -> impl Signal<Item = Option<LocationSnapshot>> {
+/// Signal of the location lifecycle: [`LocationState::Resolving`] until the
+/// first attempt settles, then [`LocationState::Resolved`] or
+/// [`LocationState::Unavailable`].
+pub fn current() -> impl Signal<Item = LocationState> {
     registry::with(|r| {
         r.get::<GeoclueHandles>()
             .expect("geoclue::service() not registered")
@@ -126,20 +142,25 @@ pub fn refresh() {
 /// Cross-thread accessor: a clone of the location `Mutable`, for tokio tasks
 /// in sibling services that can't reach the thread-local registry. `None`
 /// until [`service`] has started.
-pub(crate) fn shared_location() -> Option<Mutable<Option<LocationSnapshot>>> {
+pub(crate) fn shared_location() -> Option<Mutable<LocationState>> {
     SHARED.get().map(|s| s.location.clone())
 }
 
 /// Resolve once at boot, then again on every [`refresh`]. We take a single
 /// location per attempt (no live re-subscription) — matches the design's
 /// "first `LocationUpdated` wins" rule.
-async fn resolve_loop(location: Mutable<Option<LocationSnapshot>>, notify: Arc<Notify>) {
+async fn resolve_loop(location: Mutable<LocationState>, notify: Arc<Notify>) {
     loop {
-        let resolved = resolve_once().await;
-        if resolved.is_some() {
-            location.set(resolved);
+        if let Some(loc) = resolve_once().await {
+            location.set(LocationState::Resolved(loc));
         } else {
             tracing::info!("geoclue: no location (GeoClue2 unavailable, TROLLSHELL_WEATHER_CITY unset?)");
+            // Don't clobber a previously-resolved fix on a transient re-resolve
+            // failure; only surface Unavailable if we never had one (i.e.
+            // genuinely no source at boot).
+            if !matches!(location.get_cloned(), LocationState::Resolved(_)) {
+                location.set(LocationState::Unavailable);
+            }
         }
         notify.notified().await;
     }

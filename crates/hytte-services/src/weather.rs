@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
-use crate::geoclue::{self, LocationSnapshot};
+use crate::geoclue::{self, LocationSnapshot, LocationState};
 
 /// Periodic refresh cadence. The first `interval` tick fires immediately, so
 /// boot triggers one fetch without waiting 15 minutes.
@@ -147,27 +147,41 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
             _ = tick.tick() => {}
             () = notify.notified() => {}
         }
+        // Cheap synchronous location check before the single-flight guard,
+        // which only needs to wrap the HTTP fetch. `Resolving` means geoclue's
+        // first attempt is still in flight — stay on whatever we're showing
+        // (Loading at boot) rather than flashing an error before the fix lands.
+        let loc = match geoclue::shared_location().map(|m| m.get_cloned()) {
+            Some(LocationState::Resolved(loc)) => loc,
+            None | Some(LocationState::Resolving) => continue,
+            Some(LocationState::Unavailable) => {
+                let err = WeatherState::Error(
+                    "No location — enable GeoClue or set $TROLLSHELL_WEATHER_CITY".to_string(),
+                );
+                if state.get_cloned() != err {
+                    state.set(err);
+                }
+                continue;
+            }
+        };
+
         if in_flight.swap(true, Ordering::SeqCst) {
             continue;
         }
-
-        let next = match geoclue::shared_location().and_then(|m| m.get_cloned()) {
-            None => WeatherState::Error("set $TROLLSHELL_WEATHER_CITY".to_string()),
-            Some(loc) => match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {
-                Ok(Ok(snap)) => WeatherState::Resolved(snap),
-                Ok(Err(e)) => {
-                    tracing::warn!("weather: fetch failed: {e}");
-                    // Keep a good prior value rather than flashing an error.
-                    match state.get_cloned() {
-                        prev @ WeatherState::Resolved(_) => prev,
-                        _ => WeatherState::Error("network error".to_string()),
-                    }
+        let next = match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {
+            Ok(Ok(snap)) => WeatherState::Resolved(snap),
+            Ok(Err(e)) => {
+                tracing::warn!("weather: fetch failed: {e}");
+                // Keep a good prior value rather than flashing an error.
+                match state.get_cloned() {
+                    prev @ WeatherState::Resolved(_) => prev,
+                    _ => WeatherState::Error("network error".to_string()),
                 }
-                Err(join) => {
-                    tracing::warn!("weather: fetch join failed: {join}");
-                    WeatherState::Error("network error".to_string())
-                }
-            },
+            }
+            Err(join) => {
+                tracing::warn!("weather: fetch join failed: {join}");
+                WeatherState::Error("network error".to_string())
+            }
         };
         in_flight.store(false, Ordering::SeqCst);
 

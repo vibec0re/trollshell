@@ -9,17 +9,28 @@ enum Tier {
     Good,
     Warn,
     Low,
+    /// Red, steady.
     Critical,
+    /// Red, pulsing.
+    Emergency,
 }
+
+/// Charge below this (%) colors the icon red.
+const RED_PCT: f64 = 10.0;
+/// Charge below this (%) makes the red icon pulse.
+const FLASH_PCT: f64 = 5.0;
 
 /// Pure mapping of charge level to a color tier.
 ///
-/// `Critical` requires `Discharging` so that being plugged in at a low
-/// charge does not blink — it falls through to `Low` (steady orange). The
-/// `UPower` `icon_name` already swaps to a `*-charging-symbolic` glyph on AC,
-/// so the charging state stays visually clear.
+/// Red appears below [`RED_PCT`] regardless of charging state; the pulse
+/// ([`Tier::Emergency`]) only kicks in below [`FLASH_PCT`] **and** while
+/// discharging — so a battery plugged in at a low charge shows steady red,
+/// not a blink. The `UPower` `icon_name` already swaps to a
+/// `*-charging-symbolic` glyph on AC, so the charging state stays clear.
 fn tier(percentage: f64, state: &BatteryState) -> Tier {
-    if percentage < 10.0 && *state == BatteryState::Discharging {
+    if percentage < FLASH_PCT && *state == BatteryState::Discharging {
+        Tier::Emergency
+    } else if percentage < RED_PCT {
         Tier::Critical
     } else if percentage < 30.0 {
         Tier::Low
@@ -36,15 +47,17 @@ fn class_name(t: Tier) -> &'static str {
         Tier::Warn => "ts-battery-warn",
         Tier::Low => "ts-battery-low",
         Tier::Critical => "ts-battery-critical",
+        Tier::Emergency => "ts-battery-emergency",
     }
 }
 
 /// Every tier class, stripped before each re-apply so rebinds stay idempotent.
-const TIER_CLASSES: [&str; 4] = [
+const TIER_CLASSES: [&str; 5] = [
     "ts-battery-good",
     "ts-battery-warn",
     "ts-battery-low",
     "ts-battery-critical",
+    "ts-battery-emergency",
 ];
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
@@ -79,8 +92,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         &label,
     );
 
-    // Icon color tier: green / amber / orange, pulsing red when critically
-    // low and discharging. Strip all four tier classes before adding the
+    // Icon color tier: green / amber / orange, then red below 10% — pulsing
+    // below 5% while discharging. Strip all tier classes before adding the
     // active one so the apply is idempotent across re-emissions.
     bind(
         upower::battery().map(|b| tier(b.percentage, &b.state)),
@@ -119,16 +132,21 @@ mod tests {
         assert_eq!(tier(30.0, &BatteryState::Discharging), Tier::Warn);
         assert_eq!(tier(29.9, &BatteryState::Discharging), Tier::Low);
         assert_eq!(tier(10.0, &BatteryState::Discharging), Tier::Low);
+        // Red steady from just under 10% down to the flash threshold…
         assert_eq!(tier(9.9, &BatteryState::Discharging), Tier::Critical);
-        assert_eq!(tier(0.0, &BatteryState::Discharging), Tier::Critical);
+        assert_eq!(tier(5.0, &BatteryState::Discharging), Tier::Critical);
+        // …then pulsing red below it.
+        assert_eq!(tier(4.9, &BatteryState::Discharging), Tier::Emergency);
+        assert_eq!(tier(0.0, &BatteryState::Discharging), Tier::Emergency);
     }
 
     #[test]
-    fn critical_requires_discharging() {
-        // Low charge but not discharging never blinks — falls through to Low.
-        assert_eq!(tier(5.0, &BatteryState::Charging), Tier::Low);
-        assert_eq!(tier(5.0, &BatteryState::FullyCharged), Tier::Low);
+    fn red_shows_when_charging_but_never_pulses() {
+        // Below 10% while not discharging → steady red, never Emergency.
+        assert_eq!(tier(9.0, &BatteryState::Charging), Tier::Critical);
+        assert_eq!(tier(3.0, &BatteryState::Charging), Tier::Critical);
+        assert_eq!(tier(3.0, &BatteryState::FullyCharged), Tier::Critical);
         // Unknown means no battery (chip hidden anyway), but well-defined.
-        assert_eq!(tier(5.0, &BatteryState::Unknown), Tier::Low);
+        assert_eq!(tier(3.0, &BatteryState::Unknown), Tier::Critical);
     }
 }

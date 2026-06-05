@@ -19,5 +19,6 @@ pub mod tasks;
 pub mod tray;
 pub mod volume;
 pub mod vpn;
+pub mod weather;
 pub mod window_list;
 pub mod workspaces;

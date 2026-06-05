@@ -13,9 +13,9 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures, displays,
-    dnd, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire, polkit,
+    dnd, geoclue, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire,
     power_profiles, resolved, screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper,
-    wifi,
+    weather, wifi,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -24,6 +24,8 @@ fn main() -> hytte::ui::Result<()> {
     App::new("cc.hannig.trollshell")
         .with(clock::service())
         .with(departures::service())
+        .with(geoclue::service())
+        .with(weather::service())
         .with(niri::service())
         .with(upower::service())
         .with(vpn::service())
@@ -41,7 +43,6 @@ fn main() -> hytte::ui::Result<()> {
         .with(brightness::service())
         .with(sensors::service())
         .with(wifi::service())
-        .with(polkit::service())
         .with(power_profiles::service())
         .with(screensaver::service())
         .with(systemd::service())
@@ -88,10 +89,8 @@ fn main() -> hytte::ui::Result<()> {
             bluetooth_audio::init();
 
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
-            // Polkit auth dialog — reacts to polkit::auth_prompts() signal.
             if let Some(primary) = app.monitors().first() {
                 overlays::prompt::install(primary);
-                overlays::polkit_dialog::install(primary);
             }
 
             // Lock screen: ext-session-lock-v1 client. The subscription

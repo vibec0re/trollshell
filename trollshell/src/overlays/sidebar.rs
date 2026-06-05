@@ -239,6 +239,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // what anchors the departures widget to the bottom edge.
     card.set_vexpand(true);
 
+    card.append(&crate::widgets::weather::widget());
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
 
@@ -275,6 +276,7 @@ fn wire_open_subscription(
         apply_input_passthrough(&window, !open);
         if open {
             hytte::services::departures::refresh();
+            hytte::services::weather::refresh();
         }
         async {}
     }))

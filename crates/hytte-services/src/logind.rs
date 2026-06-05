@@ -3,8 +3,8 @@
 //! Exposes `suspend`, `reboot`, `poweroff` as fire-and-forget free
 //! functions that route through the system bus via `hytte-bus`. Polkit
 //! authorization (when required by pkla) flows through the active
-//! session's auth agent — for trollshell sessions, that's the in-shell
-//! polkit dialog wired by `widgets::polkit_dialog`.
+//! session's auth agent — the standalone polkit-gnome agent run as a user
+//! service alongside the session (see the flake's nixosModule / `etc/`).
 //!
 //! No reactive state is published from this module: these are pure
 //! actions, so there is no `Service` struct or `service()` registration.

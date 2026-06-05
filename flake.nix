@@ -186,8 +186,8 @@
                 auth include login
               '';
 
-              # System-bus policy: allow any user to own the three trollshell
-              # agent names. BlueZ / polkit / iwd policies still gate the
+              # System-bus policy: allow any user to own the two trollshell
+              # agent names. BlueZ / iwd policies still gate the
               # actual method ACLs; this only grants the right to RequestName.
               # Without it, hytte_bus::own_name detects AccessDenied at the
               # broker and parks the agent inert with one info-level log.
@@ -199,12 +199,30 @@
                   <busconfig>
                     <policy context="default">
                       <allow own="cc.hannig.trollshell.bluez-agent"/>
-                      <allow own="cc.hannig.trollshell.polkit-agent"/>
                       <allow own="cc.hannig.trollshell.iwd-agent"/>
                     </policy>
                   </busconfig>
                 '')
               ];
+
+              # Polkit authentication agent. trollshell no longer ships its
+              # own in-process agent; run the standard standalone polkit-gnome
+              # agent as a user service bound to the graphical session. Swap
+              # polkit_gnome for another agent (mate-polkit, hyprpolkitagent,
+              # …) by overriding this unit's ExecStart.
+              systemd.user.services.polkit-gnome-authentication-agent-1 = {
+                description = "polkit-gnome authentication agent";
+                wantedBy = [ "graphical-session.target" ];
+                partOf = [ "graphical-session.target" ];
+                after = [ "graphical-session.target" ];
+                serviceConfig = {
+                  Type = "simple";
+                  ExecStart = "${pkgs.polkit_gnome}/libexec/polkit-gnome-authentication-agent-1";
+                  Restart = "on-failure";
+                  RestartSec = 1;
+                  TimeoutStopSec = 10;
+                };
+              };
             };
           };
       };

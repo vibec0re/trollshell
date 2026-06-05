@@ -20,10 +20,11 @@ graphical-session.target              (systemd's wayland-session anchor)
 niri-session.target                   (this directory's umbrella target)
         │
         │ pulls in (WantedBy)
-        ├── trollshell.service        (bar + drawer + polkit + screensaver
+        ├── trollshell.service        (bar + drawer + screensaver
         │                              + bluetooth-audio + … all in-process)
         ├── swayidle.service          (dim → lock → suspend)
-        └── swaybg.service            (wallpaper)
+        ├── swaybg.service            (wallpaper)
+        └── polkit-gnome-authentication-agent-1.service  (polkit prompts)
 ```
 
 `niri-session.target` is `Requires=graphical-session.target`, so the chain
@@ -38,8 +39,6 @@ real wayland-session target, not our umbrella.
 A deliberately incomplete list, because the answer is "almost everything":
 
 - The bar and the drawer (GTK4 + libadwaita).
-- The polkit auth agent (#27) — registered via `.with(polkit::service())`
-  inside the trollshell binary, so it lives in the same process.
 - The ScreenSaver D-Bus interface (#29).
 - The bluetooth-audio auto-switch service (#37).
 - The OSD popup (#30), pipewire / brightness / mpris / network / etc.
@@ -59,6 +58,10 @@ Just niri itself — the components have their own package lists:
 
 - `niri` — the compositor. Provides `graphical-session.target` once it's
   up and running.
+- `polkit-gnome` — the standalone polkit authentication agent. Provides the
+  `polkit-gnome-authentication-agent-1` binary the new unit runs. (Swap for
+  `mate-polkit` / `hyprpolkitagent` if you prefer; adjust the unit's
+  `ExecStart` accordingly.)
 
 Each child unit's README documents its own dependencies (swayidle pulls in
 brightnessctl; swaybg pulls in swaybg the binary; trollshell is
@@ -87,9 +90,12 @@ ln -sf "$PWD/etc/systemd/user/swayidle.service"   \
        ~/.config/systemd/user/swayidle.service
 ln -sf "$PWD/etc/systemd/user/swaybg.service"     \
        ~/.config/systemd/user/swaybg.service
+ln -sf "$PWD/etc/systemd/user/polkit-gnome-authentication-agent-1.service" \
+       ~/.config/systemd/user/polkit-gnome-authentication-agent-1.service
 
 systemctl --user daemon-reload
-systemctl --user enable trollshell.service swayidle.service swaybg.service
+systemctl --user enable trollshell.service swayidle.service swaybg.service \
+                        polkit-gnome-authentication-agent-1.service
 ```
 
 `enable` (no `--now`) is correct here — these units start when
@@ -198,12 +204,13 @@ journalctl --user -f -u niri-session.target \
   fragment relevant to session bring-up lives here; everything else
   (layout, output, input) is the user's call. Keybinds are in
   `../../niri/binds.kdl`, also as a snippet.
-- It does NOT add a polkit-agent unit. The polkit agent is part of
-  trollshell itself (`.with(polkit::service())` in the trollshell binary),
-  so it lives inside `trollshell.service`'s process. Same for screensaver,
-  bluetooth-audio, OSD, and the various media-key services — splitting any
-  of them into their own unit would just add D-Bus round-trips between
-  things that already share a main loop.
+- It runs polkit's auth agent as its OWN unit
+  (`polkit-gnome-authentication-agent-1.service`), not inside trollshell.
+  trollshell used to register an in-process agent; it now delegates to the
+  standard standalone polkit-gnome agent. The remaining in-process pieces
+  (screensaver, bluetooth-audio, OSD, the media-key services) DO stay inside
+  `trollshell.service` — splitting them into their own units would just add
+  D-Bus round-trips between things that already share a main loop.
 - It does NOT install niri itself. Use your distro package or the niri
   upstream's install instructions; this directory only wires niri up
   *after* it's running.

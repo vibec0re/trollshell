@@ -168,6 +168,20 @@
     color: #ff3b5c;
 }
 
+/* Battery chip: tier-colored icon, pulsing when critically low + discharging.
+ * Only the symbolic icon takes the color; chip bg + % label keep defaults. */
+.ts-battery-good     image { color: #66e07a; }
+.ts-battery-warn     image { color: #ffce4d; }
+.ts-battery-low      image { color: #ff8a3d; }
+.ts-battery-critical image {
+    color: #ff3b5c;
+    animation: ts-battery-pulse 1s ease-in-out infinite;
+}
+@keyframes ts-battery-pulse {
+    0%, 100% { opacity: 1.0; }
+    50%      { opacity: 0.3; }
+}
+
 /* ─── Tiny vertical mini bar-graphs (white fill on trough). ─────── */
 
 .ts-cpu, .ts-memory, .ts-gpu, .ts-battery-label, .ts-clock, .ts-cpu-temp, .ts-gpu-temp {
@@ -327,6 +341,44 @@ window:not(.dark) .ts-drawer {
     background: rgb(15, 15, 35);
     padding: 12px;
     color: white;
+}
+
+/* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
+ * only the symbolic condition icon + detail rows tweak alpha/size. */
+.ts-weather {
+    padding: 4px;
+}
+.ts-weather-location {
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    color: alpha(currentColor, 0.6);
+    margin-bottom: 8px;
+}
+.ts-weather-headline {
+    margin-bottom: 2px;
+}
+.ts-weather-icon {
+    -gtk-icon-size: 28px;
+}
+.ts-weather-temp {
+    font-size: 32px;
+    font-weight: 300;
+}
+.ts-weather-condition {
+    color: alpha(currentColor, 0.85);
+    margin-bottom: 12px;
+}
+.ts-weather-details {
+    font-size: 12px;
+}
+.ts-weather-detail-label {
+    color: alpha(currentColor, 0.55);
+}
+.ts-weather-detail-value {
+    color: white;
+}
+.ts-weather-error image {
+    color: #ffce4d;
 }
 
 .ts-modal-page {

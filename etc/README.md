@@ -18,23 +18,12 @@ into your user config directory per the per-feature README.
 For the entire stack: see [systemd/user/README.md](systemd/user/README.md) for the
 full install sequence.
 
-## PAM lock screen
+## Screen locking
 
-Install the screen-unlock PAM service file:
-
-```sh
-sudo install -m 644 etc/pam.d/trollshell /etc/pam.d/trollshell
-```
-
-Without this file the lock UI mounts but authentication fails with
-"Authentication unavailable" — there's no PAM service named
-`trollshell` for libpam to consult.
-
-NixOS users using the flake's `nixosModules.default` get this
-automatically (`security.pam.services.trollshell` is declared when
-`programs.trollshell.enable = true;`). Skip the `install` step and
-rebuild.
-
-Build-time deps: `libpam` headers (Arch `pam` package, Nix
-`pkgs.pam`). Runtime deps: standard `pam_unix` stack (default on
-every distro that has working login).
+trollshell does **not** ship a lock screen — locking is delegated to an
+established, security-audited tool. This config uses `swaylock` (driven by
+`swayidle`); the trollshell bar's Power → Lock button and any
+`loginctl lock-session` both trigger it via logind's `Lock` signal. Wire
+swaylock's own PAM stack (`/etc/pam.d/swaylock`; NixOS:
+`security.pam.services.swaylock = {};`) — without it swaylock can never
+verify a password.

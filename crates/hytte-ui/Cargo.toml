@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "GTK4 + libadwaita + layer-shell + session-lock primitives for hytte"
+description = "GTK4 + libadwaita + layer-shell primitives for hytte"
 
 [lints]
 workspace = true
@@ -15,9 +15,4 @@ futures-signals = "0.3.34"
 gio = { version = "0.22.5", default-features = false }
 gtk = { version = "0.11.2", package = "gtk4", features = ["v4_14"] }
 gtk4-layer-shell = "0.8.0"
-# Lock-surface protocol (ext-session-lock-v1). v1_2 feature enables
-# connect_monitor, which fires for both existing and hot-plugged outputs —
-# spec requires a lock surface on every output or the compositor blanks
-# it instead of revealing the desktop.
-gtk4-session-lock = { version = "0.4", features = ["v1_2"] }
 hytte-reactive = { path = "../hytte-reactive" }

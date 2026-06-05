@@ -4,7 +4,6 @@
 //! `widgets/` reads strictly as bar chips.
 
 pub mod frame;
-pub mod lock_screen;
 pub mod notifications;
 pub mod osd;
 pub mod prompt;

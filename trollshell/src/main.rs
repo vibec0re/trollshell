@@ -93,13 +93,6 @@ fn main() -> hytte::ui::Result<()> {
                 overlays::prompt::install(primary);
             }
 
-            // Lock screen: ext-session-lock-v1 client. The subscription
-            // reacts to screensaver::is_locked() and creates/destroys a
-            // session-lock Instance each cycle. Monitor enumeration +
-            // hot-plug coverage are handled by the compositor's
-            // connect_monitor fires; no monitor list needed at install.
-            overlays::lock_screen::install();
-
             // Notifications + OSD mount on every monitor; routing picks the focused one.
             for monitor in &app.monitors() {
                 overlays::frame::install(monitor);

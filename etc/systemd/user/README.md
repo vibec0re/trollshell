@@ -182,9 +182,10 @@ journalctl --user -f -u niri-session.target \
   goes into `failed` state after systemd's default start-limit kicks in.
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
-- **swayidle starts but the lock never fires.** The PAM service file is
-  probably missing — trollshell's lock screen requires `/etc/pam.d/trollshell`.
-  See `etc/pam.d/` and the install step in `etc/README.md`.
+- **swayidle starts but the lock never fires.** swayidle runs `swaylock`,
+  which authenticates via PAM — make sure `/etc/pam.d/swaylock` exists
+  (NixOS: `security.pam.services.swaylock = {};`). trollshell no longer
+  ships its own locker.
 - **`niri-session.target` is `inactive`.** niri's spawn-at-startup didn't
   fire, or `import-environment` failed. Log into niri however you normally
   do (greetd, TTY exec, etc.), then watch `journalctl --user -f` for the

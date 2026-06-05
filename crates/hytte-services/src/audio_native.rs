@@ -1,4 +1,4 @@
-//! Native PipeWire audio backend (work in progress).
+//! Native `PipeWire` audio backend (work in progress).
 //!
 //! This module is being built phase by phase to replace the `pactl`/`wpctl`
 //! shell-out in [`super::pipewire`]. Until Phase 6 lands, it is NOT wired
@@ -26,7 +26,7 @@
 //!
 //! For each classified Audio Node, `registry.bind` a `Node` proxy, attach
 //! a `.param` listener, and `subscribe_params(&[ParamType::Props])`.
-//! Decode the spa_pod payload: `SPA_PROP_channelVolumes` (array of f32
+//! Decode the `spa_pod` payload: `SPA_PROP_channelVolumes` (array of f32
 //! linear gains per channel) and `SPA_PROP_mute` (bool). Walk the cache
 //! after every change and `Mutable::set` fresh `Vec<Sink>`, `Vec<Source>`,
 //! `Vec<PlaybackStream>`, `Vec<RecordStream>`, and `Volume` snapshots into
@@ -55,11 +55,11 @@
 //!
 //! # Phase 5 (this commit)
 //!
-//! Stream→sink routing via PipeWire Link globals. Each Link's props dict
+//! Stream→sink routing via `PipeWire` Link globals. Each Link's props dict
 //! carries `link.output.node` and `link.input.node` (pipewire node ids).
 //! We index links by their output node id; on snapshot emission, every
 //! `PlaybackStream` reads its `sink_id` from the link whose output is the
-//! stream itself. RecordStreams mirror: `source_id` comes from the link's
+//! stream itself. `RecordStreams` mirror: `source_id` comes from the link's
 //! `output` node (the source) when the stream is the `input`. With this
 //! the audio modal can group streams under their target sink.
 
@@ -76,9 +76,9 @@ use super::pipewire::{
     PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume,
 };
 
-/// Coarse classification of a PipeWire Node by its `media.class` property.
+/// Coarse classification of a `PipeWire` Node by its `media.class` property.
 ///
-/// PipeWire nodes can be many things (cameras, MIDI, ALSA cards, virtual
+/// `PipeWire` nodes can be many things (cameras, MIDI, ALSA cards, virtual
 /// devices, application streams). For volume-control purposes only four
 /// kinds matter; everything else is filtered out at registry-walk time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +122,7 @@ struct NodeEntry {
     /// For streams: best-effort app name. `None` for Audio/Sink, Audio/Source.
     app_name: Option<String>,
     /// Per-channel linear gain, populated from `SPA_PROP_channelVolumes`.
-    /// Empty until the first Props event arrives. PipeWire's channelVolumes
+    /// Empty until the first Props event arrives. `PipeWire`'s channelVolumes
     /// is already in linear-gain space (1.0 = 100%), matching the `Sink`
     /// public API field — no cube transform needed.
     channel_volumes: Vec<f32>,
@@ -151,7 +151,7 @@ struct MetadataProxy {
     listener: pw::metadata::MetadataListener,
 }
 
-/// One edge of the PipeWire graph — used to resolve stream→sink (or
+/// One edge of the `PipeWire` graph — used to resolve stream→sink (or
 /// stream→source) routing without binding the Link proxy. The values are
 /// the node ids on each side; the Link's own id is the [`AudioState::links`]
 /// map key.
@@ -164,7 +164,7 @@ struct LinkEdge {
 /// State owned by the pipewire-loop thread. Wrapped in `Rc<RefCell<_>>` so
 /// registry-event callbacks (each its own `FnMut`-bound closure) share access.
 struct AudioState {
-    /// Node identity + volume cache, keyed by PipeWire global id.
+    /// Node identity + volume cache, keyed by `PipeWire` global id.
     nodes: HashMap<u32, NodeEntry>,
     /// Live proxies for every bound Node. Dropping the entry destroys the
     /// proxy and detaches its listener, ending param events.
@@ -190,7 +190,7 @@ struct AudioState {
     handles: PipewireHandles,
     /// Last snapshot pushed to each Mutable, used to skip redundant
     /// `set()` calls that would tear down subscribers' diff state for a
-    /// no-op. The Mutables already dedup by PartialEq, but doing the
+    /// no-op. The Mutables already dedup by `PartialEq`, but doing the
     /// comparison here saves the Vec clone on a hot path.
     last_sink_volume: Volume,
     last_sinks: Vec<Sink>,
@@ -227,6 +227,8 @@ impl AudioState {
 /// receives messages asynchronously and may process them after the caller's
 /// stack has unwound.
 #[derive(Clone, Debug)]
+// `Set*` prefix on every variant is intentional — this is a command enum.
+#[allow(clippy::enum_variant_names)]
 enum Command {
     /// Set channelVolumes on a sink, identified by `node.name`. The new
     /// linear gain is replicated across every channel currently in the
@@ -333,6 +335,9 @@ fn spawn_mainloop(handles: PipewireHandles) {
 
 /// One mainloop session. Returns the receiver (so `spawn_mainloop` can
 /// re-attach it on the next session) along with the run result.
+// One cohesive PipeWire registry + listener wiring block; splitting it would
+// scatter shared closure state across helpers for no real readability gain.
+#[allow(clippy::too_many_lines)]
 fn run_once(
     handles: PipewireHandles,
     rx: pw::channel::Receiver<Command>,
@@ -408,9 +413,7 @@ fn run_once(
                         return;
                     }
                     let description = props
-                        .get("node.description")
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| name.clone());
+                        .get("node.description").map_or_else(|| name.clone(), str::to_owned);
                     let app_name = matches!(
                         role,
                         AudioRole::OutputStream | AudioRole::InputStream
@@ -599,18 +602,16 @@ fn bind_node_for_params(
             let mut s = state.borrow_mut();
             if let Some(entry) = s.nodes.get_mut(&id) {
                 let mut changed = false;
-                if let Some(cv) = channel_volumes {
-                    if cv != entry.channel_volumes {
+                if let Some(cv) = channel_volumes
+                    && cv != entry.channel_volumes {
                         entry.channel_volumes = cv;
                         changed = true;
                     }
-                }
-                if let Some(m) = mute {
-                    if m != entry.mute {
+                if let Some(m) = mute
+                    && m != entry.mute {
                         entry.mute = m;
                         changed = true;
                     }
-                }
                 if changed {
                     emit_snapshots(&mut s);
                 }
@@ -690,7 +691,7 @@ fn bind_default_metadata(
 }
 
 /// Extract `node.name` from a `default.audio.{sink,source}` metadata
-/// payload. PipeWire encodes these as JSON: `{"name":"<node.name>"}`.
+/// payload. `PipeWire` encodes these as JSON: `{"name":"<node.name>"}`.
 /// Returns `None` if the JSON is malformed or missing the `name` field —
 /// safer than guessing, the previous default just stays in place.
 fn parse_default_name(json: &str) -> Option<String> {
@@ -832,6 +833,8 @@ fn write_default(state: &Rc<RefCell<AudioState>>, key: &str, name: &str) {
 /// `node.set_param`. If `channels == 0` the cache hasn't seen a Props event
 /// yet — silently skip rather than publishing a mono array that would
 /// clobber a stereo sink's layout.
+// `linear` gain is in [0,1]; f32 is PipeWire's channelVolumes element type.
+#[allow(clippy::cast_possible_truncation)]
 fn send_volume(node: &pw::node::Node, channels: usize, linear: f64) {
     if channels == 0 {
         tracing::debug!("audio_native: skip set_volume — channel count unknown");
@@ -900,7 +903,7 @@ fn build_props_pod(
     Some(buf)
 }
 
-/// Decode a Props spa_pod payload, extracting `channelVolumes` and `mute`
+/// Decode a Props `spa_pod` payload, extracting `channelVolumes` and `mute`
 /// when present. Returns `None` only if the pod itself is unparseable; a
 /// successful parse with neither key present returns `Some((None, None))`,
 /// which the caller treats as a no-op update.
@@ -1037,7 +1040,7 @@ fn emit_snapshots(state: &mut AudioState) {
 
 /// Resolve a playback stream's target sink id by scanning the link cache
 /// for an edge whose `output_node` matches the stream. Returns the input
-/// (sink) side of the first match. PipeWire usually creates one link per
+/// (sink) side of the first match. `PipeWire` usually creates one link per
 /// stereo pair, so any of them works.
 ///
 /// A stream typically has multiple ports → multiple links, but every
@@ -1046,8 +1049,7 @@ fn resolve_link_dest(links: &HashMap<u32, LinkEdge>, stream_id: u32) -> u32 {
     links
         .values()
         .find(|e| e.output_node == stream_id)
-        .map(|e| e.input_node)
-        .unwrap_or(0)
+        .map_or(0, |e| e.input_node)
 }
 
 /// Mirror of [`resolve_link_dest`] for record streams: the stream is the
@@ -1056,16 +1058,17 @@ fn resolve_link_source(links: &HashMap<u32, LinkEdge>, stream_id: u32) -> u32 {
     links
         .values()
         .find(|e| e.input_node == stream_id)
-        .map(|e| e.output_node)
-        .unwrap_or(0)
+        .map_or(0, |e| e.output_node)
 }
 
-/// Average of per-channel linear gains. PipeWire spec doesn't require all
+/// Average of per-channel linear gains. `PipeWire` spec doesn't require all
 /// channels to agree (you can pan via uneven channelVolumes), but pactl's
 /// historical convention — which the UI is calibrated against — reports
 /// the first channel's value. Averaging is friendlier when the UI shows
 /// a single slider for a stereo sink: a 100%/0% pair reads 50% instead of
 /// 100%, matching what the user perceives. Empty array → 0.0.
+// Channel count is a handful of elements; usize→f64 loses no precision here.
+#[allow(clippy::cast_precision_loss)]
 fn avg_volume(channels: &[f32]) -> f64 {
     if channels.is_empty() {
         return 0.0;
@@ -1271,6 +1274,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // exact 0.0 sentinel for the empty-input case
     fn avg_volume_empty_is_zero() {
         // A node we haven't received Props for yet has an empty
         // channelVolumes Vec. The UI reads `volume` and divides by
@@ -1297,7 +1301,7 @@ mod tests {
     /// Locks the public Props key codes against drift in libspa-sys: if
     /// these constants ever change upstream, the decoder will silently
     /// stop seeing volume/mute updates. Asserting against the raw values
-    /// (rather than the spa_sys constants) means a libspa-sys version
+    /// (rather than the `spa_sys` constants) means a libspa-sys version
     /// bump that changes them shows up here as a hard failure, not as
     /// "the slider just stopped moving".
     #[test]
@@ -1310,7 +1314,7 @@ mod tests {
     /// confirm the decoder sees exactly the channelVolumes we put in.
     /// Guards both the serializer's Object-encoding and the decoder's
     /// pattern-match arms — a single broken byte in either side would
-    /// silently make set_volume a no-op.
+    /// silently make `set_volume` a no-op.
     #[test]
     fn build_props_pod_volume_roundtrips() {
         let bytes = build_props_pod(Some(vec![0.5, 0.5]), None).expect("pod bytes");
@@ -1320,7 +1324,7 @@ mod tests {
     }
 
     /// Same round-trip for mute. Bool encoding lives in a different code
-    /// path inside the spa_pod format (Bool vs Float-array), so the two
+    /// path inside the `spa_pod` format (Bool vs Float-array), so the two
     /// guards aren't redundant.
     #[test]
     fn build_props_pod_mute_roundtrips() {
@@ -1342,13 +1346,13 @@ mod tests {
 
     /// An empty Props payload is a degenerate request — neither key is
     /// supplied. The builder returns None so the caller doesn't pay for
-    /// an empty-Object set_param round-trip.
+    /// an empty-Object `set_param` round-trip.
     #[test]
     fn build_props_pod_empty_returns_none() {
         assert!(build_props_pod(None, None).is_none());
     }
 
-    /// `default.audio.sink` payloads from PipeWire come as a JSON object
+    /// `default.audio.sink` payloads from `PipeWire` come as a JSON object
     /// with a `name` key. Verify the canonical extraction.
     #[test]
     fn parse_default_name_canonical() {
@@ -1359,7 +1363,7 @@ mod tests {
         );
     }
 
-    /// JSON with extra keys (PipeWire sometimes adds `value` or hints).
+    /// JSON with extra keys (`PipeWire` sometimes adds `value` or hints).
     /// We only care about `name`.
     #[test]
     fn parse_default_name_ignores_extra_keys() {
@@ -1377,7 +1381,7 @@ mod tests {
     }
 
     /// Playback-stream routing: link goes stream → sink, so the link's
-    /// output_node is the stream and input_node is the sink.
+    /// `output_node` is the stream and `input_node` is the sink.
     #[test]
     fn resolve_link_dest_finds_sink() {
         let mut links = HashMap::new();
@@ -1392,7 +1396,7 @@ mod tests {
     }
 
     /// Record-stream routing reverses: link goes source → stream, so the
-    /// stream is the link's input_node.
+    /// stream is the link's `input_node`.
     #[test]
     fn resolve_link_source_finds_source() {
         let mut links = HashMap::new();

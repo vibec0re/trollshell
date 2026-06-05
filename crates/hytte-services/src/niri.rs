@@ -186,12 +186,11 @@ fn apply_event(
                 }
             }
             let focused_id = focused_window.lock_ref().as_ref().map(|w| w.id);
-            if let Some(fid) = focused_id {
-                if let Some(updated) = list.iter().find(|w| w.id == fid).cloned() {
+            if let Some(fid) = focused_id
+                && let Some(updated) = list.iter().find(|w| w.id == fid).cloned() {
                     drop(list);
                     focused_window.set(Some(updated));
                 }
-            }
         }
         _ => {}
     }
@@ -489,7 +488,7 @@ mod tests {
 
     /// When the changed window is also the currently-focused one, the
     /// `focused_window` mirror must pick up the new layout too so any
-    /// subscribers reading focused_window directly see fresh state.
+    /// subscribers reading `focused_window` directly see fresh state.
     #[test]
     fn window_layouts_changed_mirrors_into_focused_window() {
         let workspaces = Mutable::new(vec![mk_workspace(1, CONNECTOR, true)]);

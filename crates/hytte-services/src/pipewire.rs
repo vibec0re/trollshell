@@ -1,7 +1,7 @@
 //! Audio device + stream state.
 //!
 //! Facade module: all I/O lives in [`super::audio_native`], which talks
-//! the native PipeWire protocol via the `pipewire` crate. This file owns
+//! the native `PipeWire` protocol via the `pipewire` crate. This file owns
 //! only the public data types, the runtime-registered [`PipewireHandles`]
 //! and the read-side `Signal` accessors. The eight mutation functions
 //! (`set_*` / `toggle_*`) and the service constructor are re-exported
@@ -38,7 +38,7 @@ pub struct Volume {
 /// One audio output device.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sink {
-    /// PipeWire global id of the sink Node.
+    /// `PipeWire` global id of the sink Node.
     pub id: u32,
     /// `node.name` — canonical identifier across sessions, used by every
     /// mutation function in this module.
@@ -53,7 +53,7 @@ pub struct Sink {
     pub is_default: bool,
 }
 
-/// One audio input device. Same shape as [`Sink`]; PipeWire treats the
+/// One audio input device. Same shape as [`Sink`]; `PipeWire` treats the
 /// graph symmetrically and so do we. Monitor sources (loopback from sinks)
 /// are filtered out at the backend.
 #[derive(Clone, Debug, PartialEq)]
@@ -73,7 +73,7 @@ pub struct PlaybackStream {
     /// Best-effort app name. Falls back to `node.name` / `media.name` if
     /// the application doesn't set `application.name` (Spotify).
     pub app_name: String,
-    /// PipeWire id of the sink this stream is currently routed to, or `0`
+    /// `PipeWire` id of the sink this stream is currently routed to, or `0`
     /// when no link has been seen yet (brief transitional state).
     pub sink_id: u32,
     pub volume: f64,
@@ -85,7 +85,7 @@ pub struct PlaybackStream {
 pub struct RecordStream {
     pub id: u32,
     pub app_name: String,
-    /// PipeWire id of the source this stream is currently reading from.
+    /// `PipeWire` id of the source this stream is currently reading from.
     pub source_id: u32,
     pub volume: f64,
     pub muted: bool,

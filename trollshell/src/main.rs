@@ -12,20 +12,39 @@ use hytte::gtk;
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
-    bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures, displays,
-    dnd, geoclue, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire,
+    bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures, displays, dnd,
+    geoclue, mpris, netconn, networkd, niri, notifications, notifications_mute, pipewire, places,
     power_profiles, resolved, screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper,
-    weather, wifi,
+    weather, wifi, wifiscan,
 };
 
 fn main() -> hytte::ui::Result<()> {
+    // `trollshell --scan-aps`: one-shot dump of visible Wi-Fi APs as a
+    // paste-ready `bssids = [...]` block for ~/.config/trollshell/places.toml,
+    // then exit. Runs before the App, so it needs no Wayland session.
+    if std::env::args().any(|a| a == "--scan-aps") {
+        let aps = wifiscan::scan_aps_blocking();
+        if aps.is_empty() {
+            // Distinguish "scan failed / NM down" from "genuinely nothing" —
+            // a hint to stderr keeps stdout paste-clean.
+            eprintln!(
+                "trollshell --scan-aps: no Wi-Fi APs visible — is NetworkManager running and Wi-Fi on? (a scan may also just need a retry)"
+            );
+        }
+        print!("{}", wifiscan::format_scan_block(&aps));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     App::new("cc.hannig.trollshell")
         .with(clock::service())
-        // geoclue before departures + weather: both read its shared location
-        // handle in their start() to wire re-fetch-on-location-change.
+        .with(wifiscan::service())
+        // wifiscan + geoclue feed `places` (the location resolver); `places`
+        // must precede departures + weather, which read its shared handles in
+        // their start() to wire re-fetch-on-place-change.
         .with(geoclue::service())
+        .with(places::service())
         .with(departures::service())
         .with(weather::service())
         .with(niri::service())

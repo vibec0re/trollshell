@@ -1,10 +1,11 @@
 //! Current-weather service. Fetches Open-Meteo for the location resolved by
-//! [`crate::geoclue`], maps WMO weather codes to freedesktop symbolic icons,
+//! [`crate::places`], maps WMO weather codes to freedesktop symbolic icons,
 //! and refreshes every [`POLL_INTERVAL`] (plus on demand via [`refresh`] and
 //! whenever the location changes).
 //!
-//! `geoclue::service()` MUST be registered before `weather::service()` in the
-//! `App` builder — `start` reads geoclue's shared location handle to wire the
+//! `places::service()` MUST be registered before `weather::service()` in the
+//! `App` builder — `start` reads places' shared location handle (place coords
+//! when a place is matched, else the raw `GeoClue` fix) to wire the
 //! re-fetch-on-location-change bridge.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
-use crate::geoclue::{self, LocationSnapshot, LocationState};
+use crate::geoclue::{LocationSnapshot, LocationState};
+use crate::places;
 
 /// Periodic refresh cadence. The first `interval` tick fires immediately, so
 /// boot triggers one fetch without waiting 15 minutes.
@@ -95,10 +97,10 @@ impl Service for WeatherService {
         let notify = handles.notify.clone();
         rt.spawn(poll_loop(state, notify.clone()));
 
-        // Bridge: re-fetch whenever geoclue's location changes (including its
-        // first resolution). Reads the shared handle, which exists because
-        // geoclue::service() is registered first.
-        if let Some(loc) = geoclue::shared_location() {
+        // Bridge: re-fetch whenever the resolved location changes (including
+        // its first resolution). Reads places' shared handle, which exists
+        // because places::service() is registered first.
+        if let Some(loc) = places::shared_location() {
             rt.spawn(async move {
                 loc.signal_ref(|_| ())
                     .for_each(move |()| {
@@ -108,7 +110,7 @@ impl Service for WeatherService {
                     .await;
             });
         } else {
-            tracing::warn!("weather: geoclue not registered before weather; auto-refresh-on-location disabled");
+            tracing::warn!("weather: places not registered before weather; auto-refresh-on-location disabled");
         }
 
         handles
@@ -155,7 +157,7 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
         // which only needs to wrap the HTTP fetch. `Resolving` means geoclue's
         // first attempt is still in flight — stay on whatever we're showing
         // (Loading at boot) rather than flashing an error before the fix lands.
-        let loc = match geoclue::shared_location().map(|m| m.get_cloned()) {
+        let loc = match places::shared_location().map(|m| m.get_cloned()) {
             Some(LocationState::Resolved(loc)) => loc,
             None | Some(LocationState::Resolving) => continue,
             Some(LocationState::Unavailable) => {

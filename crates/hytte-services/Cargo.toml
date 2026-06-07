@@ -39,6 +39,7 @@ icalendar = { version = "0.17", default-features = false, features = ["parser", 
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1"
 zeroize = "1.8"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 

@@ -98,7 +98,7 @@ fn loading_row() -> gtk::Widget {
 }
 
 fn empty_row() -> gtk::Widget {
-    let lbl = gtk::Label::new(Some("no S-Bahn departures in the next 30 min"));
+    let lbl = gtk::Label::new(Some("no matching S-Bahn departures right now"));
     lbl.add_css_class("ts-departures-empty");
     lbl.set_halign(gtk::Align::Start);
     lbl.upcast()

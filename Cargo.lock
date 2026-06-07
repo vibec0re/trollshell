@@ -945,6 +945,7 @@ dependencies = [
  "serde_json",
  "temp-env",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",

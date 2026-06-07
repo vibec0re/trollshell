@@ -23,8 +23,10 @@ fn main() -> hytte::ui::Result<()> {
 
     App::new("cc.hannig.trollshell")
         .with(clock::service())
-        .with(departures::service())
+        // geoclue before departures + weather: both read its shared location
+        // handle in their start() to wire re-fetch-on-location-change.
         .with(geoclue::service())
+        .with(departures::service())
         .with(weather::service())
         .with(niri::service())
         .with(upower::service())

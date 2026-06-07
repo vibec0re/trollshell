@@ -41,6 +41,13 @@ pub fn widget() -> gtk::Widget {
     loc_label.set_halign(gtk::Align::Start);
     resolved.append(&loc_label);
 
+    // Two columns: left = icon/temp/condition/min-max, right = detail rows.
+    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    columns.add_css_class("ts-weather-columns");
+
+    let left = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    left.set_valign(gtk::Align::Center);
+
     let headline = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     headline.add_css_class("ts-weather-headline");
     let cond_icon = gtk::Image::new();
@@ -49,22 +56,34 @@ pub fn widget() -> gtk::Widget {
     let temp_label = gtk::Label::new(None);
     temp_label.add_css_class("ts-weather-temp");
     headline.append(&temp_label);
-    resolved.append(&headline);
+    left.append(&headline);
 
     let cond_label = gtk::Label::new(None);
     cond_label.add_css_class("ts-weather-condition");
     cond_label.set_halign(gtk::Align::Start);
-    resolved.append(&cond_label);
+    left.append(&cond_label);
+
+    // Today's expected high / low.
+    let minmax_label = gtk::Label::new(None);
+    minmax_label.add_css_class("ts-weather-minmax");
+    minmax_label.set_halign(gtk::Align::Start);
+    left.append(&minmax_label);
+
+    columns.append(&left);
 
     let details = gtk::Box::new(gtk::Orientation::Vertical, 2);
     details.add_css_class("ts-weather-details");
+    details.set_hexpand(true);
+    details.set_valign(gtk::Align::Center);
     let (feels_row, feels_val) = detail_row("Feels like");
     let (wind_row, wind_val) = detail_row("Wind");
     let (humid_row, humid_val) = detail_row("Humidity");
     details.append(&feels_row);
     details.append(&wind_row);
     details.append(&humid_row);
-    resolved.append(&details);
+    columns.append(&details);
+
+    resolved.append(&columns);
 
     stack.add_named(&resolved, Some("resolved"));
     root.append(&stack);
@@ -81,6 +100,7 @@ pub fn widget() -> gtk::Widget {
             cond_icon.set_icon_name(Some(s.condition.icon));
             temp_label.set_text(&format!("{:.0}°", s.temp_c));
             cond_label.set_text(s.condition.label);
+            minmax_label.set_text(&format!("↑ {:.0}°   ↓ {:.0}°", s.temp_max_c, s.temp_min_c));
             feels_val.set_text(&format!("{:.0}°", s.apparent_c));
             wind_val.set_text(&format!("{:.0} km/h", s.wind_kmh));
             humid_val.set_text(&format!("{}%", s.humidity_pct));

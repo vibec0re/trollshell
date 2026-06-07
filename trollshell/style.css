@@ -366,7 +366,14 @@ window:not(.dark) .ts-drawer {
 }
 .ts-weather-condition {
     color: alpha(currentColor, 0.85);
-    margin-bottom: 12px;
+}
+.ts-weather-columns {
+    margin-top: 2px;
+}
+.ts-weather-minmax {
+    font-size: 12px;
+    color: alpha(currentColor, 0.7);
+    margin-top: 2px;
 }
 .ts-weather-details {
     font-size: 12px;

@@ -40,6 +40,10 @@ pub struct WeatherSnapshot {
     pub location: String,
     pub temp_c: f64,
     pub apparent_c: f64,
+    /// Forecast daily high/low for today. Falls back to the current temp when
+    /// the API omits the daily block.
+    pub temp_max_c: f64,
+    pub temp_min_c: f64,
     pub humidity_pct: u8,
     pub wind_kmh: f64,
     pub condition: Condition,
@@ -194,6 +198,8 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
 #[derive(serde::Deserialize)]
 struct ForecastResponse {
     current: CurrentBlock,
+    #[serde(default)]
+    daily: Option<DailyBlock>,
 }
 
 #[derive(serde::Deserialize)]
@@ -205,6 +211,23 @@ struct CurrentBlock {
     weather_code: u8,
 }
 
+/// Open-Meteo returns daily fields as parallel arrays (one entry per forecast
+/// day); with `forecast_days=1` we want index 0.
+#[derive(serde::Deserialize)]
+struct DailyBlock {
+    #[serde(default)]
+    temperature_2m_max: Vec<f64>,
+    #[serde(default)]
+    temperature_2m_min: Vec<f64>,
+}
+
+/// Today's `(max, min)` from the daily block, or `None` if the API omitted it
+/// (or returned empty arrays).
+fn daily_min_max(f: &ForecastResponse) -> Option<(f64, f64)> {
+    let d = f.daily.as_ref()?;
+    Some((*d.temperature_2m_max.first()?, *d.temperature_2m_min.first()?))
+}
+
 /// One blocking Open-Meteo fetch + parse for `loc`. Runs on a
 /// `spawn_blocking` thread. For a `GeoClue`-sourced location (no name) it
 /// also reverse-geocodes a friendly place name.
@@ -214,6 +237,7 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
         "https://api.open-meteo.com/v1/forecast\
          ?latitude={lat}&longitude={lon}\
          &current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code\
+         &daily=temperature_2m_max,temperature_2m_min&forecast_days=1\
          &timezone=auto",
         lat = loc.lat,
         lon = loc.lon,
@@ -226,7 +250,11 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
         .limit(1024 * 1024)
         .read_to_string()
         .map_err(|e| format!("body: {e}"))?;
-    let current = parse_forecast(&body)?;
+    let forecast = parse_forecast(&body)?;
+    let current = &forecast.current;
+    // Daily high/low for today; degrade to the current temp if absent.
+    let (temp_max_c, temp_min_c) =
+        daily_min_max(&forecast).unwrap_or((current.temperature_2m, current.temperature_2m));
 
     let location = match &loc.label_hint {
         Some(name) => name.clone(),
@@ -238,6 +266,8 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
         location,
         temp_c: current.temperature_2m,
         apparent_c: current.apparent_temperature,
+        temp_max_c,
+        temp_min_c,
         humidity_pct: pct_to_u8(current.relative_humidity_2m),
         wind_kmh: current.wind_speed_10m,
         condition: condition_for_code(current.weather_code),
@@ -245,10 +275,8 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
     })
 }
 
-fn parse_forecast(body: &str) -> Result<CurrentBlock, String> {
-    serde_json::from_str::<ForecastResponse>(body)
-        .map(|r| r.current)
-        .map_err(|e| format!("decode: {e}"))
+fn parse_forecast(body: &str) -> Result<ForecastResponse, String> {
+    serde_json::from_str::<ForecastResponse>(body).map_err(|e| format!("decode: {e}"))
 }
 
 /// Clamp a humidity percentage into `0..=100` and round to a `u8`.
@@ -375,17 +403,32 @@ mod tests {
     #[test]
     fn parse_forecast_ok() {
         let body = r#"{"current":{"temperature_2m":18.4,"apparent_temperature":16.1,
-            "relative_humidity_2m":64,"wind_speed_10m":12.3,"weather_code":3}}"#;
-        let cur = parse_forecast(body).expect("parses");
-        assert!((cur.temperature_2m - 18.4).abs() < 1e-6);
-        assert_eq!(cur.weather_code, 3);
-        assert_eq!(pct_to_u8(cur.relative_humidity_2m), 64);
+            "relative_humidity_2m":64,"wind_speed_10m":12.3,"weather_code":3},
+            "daily":{"temperature_2m_max":[22.0],"temperature_2m_min":[14.0]}}"#;
+        let f = parse_forecast(body).expect("parses");
+        assert!((f.current.temperature_2m - 18.4).abs() < 1e-6);
+        assert_eq!(f.current.weather_code, 3);
+        assert_eq!(pct_to_u8(f.current.relative_humidity_2m), 64);
+        assert_eq!(daily_min_max(&f), Some((22.0, 14.0)));
     }
 
     #[test]
     fn parse_forecast_missing_current_is_err() {
         assert!(parse_forecast(r#"{"latitude":59.3}"#).is_err());
         assert!(parse_forecast("nonsense").is_err());
+    }
+
+    #[test]
+    fn daily_min_max_absent_or_empty_is_none() {
+        // No daily block at all.
+        let body = r#"{"current":{"temperature_2m":18.0,"apparent_temperature":18.0,
+            "relative_humidity_2m":50,"wind_speed_10m":5.0,"weather_code":0}}"#;
+        assert_eq!(daily_min_max(&parse_forecast(body).unwrap()), None);
+        // Daily block present but arrays empty.
+        let body = r#"{"current":{"temperature_2m":18.0,"apparent_temperature":18.0,
+            "relative_humidity_2m":50,"wind_speed_10m":5.0,"weather_code":0},
+            "daily":{"temperature_2m_max":[],"temperature_2m_min":[]}}"#;
+        assert_eq!(daily_min_max(&parse_forecast(body).unwrap()), None);
     }
 
     #[test]

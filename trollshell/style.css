@@ -172,7 +172,6 @@
  * Only the symbolic icon takes the color; chip bg + % label keep defaults. */
 .ts-battery-good      image { color: #66e07a; }
 .ts-battery-warn      image { color: #ffce4d; }
-.ts-battery-low       image { color: #ff8a3d; }
 .ts-battery-critical  image { color: #ff3b5c; }
 .ts-battery-emergency image {
     color: #ff3b5c;

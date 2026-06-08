@@ -1,16 +1,17 @@
 //! Shared "places" model + the current-place resolver.
 //!
 //! A *place* is somewhere you frequent (home, office): coordinates, a Wi-Fi
-//! fingerprint (the set of AP BSSIDs you see there), and optional transit
+//! fingerprint (the set of network SSIDs you see there), and optional transit
 //! config (a station + line/direction filter for [`crate::departures`]).
 //! Places load from `~/.config/trollshell/places.toml`; a documented default
 //! is written on first run.
 //!
 //! The resolver fuses sensors into "where am I", in priority order:
-//!   1. **Wi-Fi fingerprint** — at least `match_min` of a place's BSSIDs are
+//!   1. **Wi-Fi fingerprint** — at least `match_min` of a place's SSIDs are
 //!      currently visible (via [`crate::wifiscan`]). Definite, precise, no
-//!      network calls. Different APs per place → BSSIDs are unique, so a small
-//!      overlap is decisive.
+//!      network calls. Keyed on SSID not BSSID so it survives router swaps; the
+//!      neighbouring networks discriminate between places even when your own
+//!      SSID is deployed at all of them.
 //!   2. **`GeoClue2` / `beaconDB`** raw fix — nearest place within `radius_km`.
 //!   3. **Away** — no place matches; weather uses the raw `GeoClue` fix and
 //!      departures shows the nearest station. Before the first fix at startup
@@ -43,10 +44,11 @@ const DEFAULT_CONFIG: &str = r#"# trollshell places — where you frequent, how 
 # (optionally) which departures to show there.
 #
 # Current place is resolved in order:
-#   1. Wi-Fi fingerprint — at least `match_min` of a place's listed BSSIDs are
+#   1. Wi-Fi fingerprint — at least `match_min` of a place's listed SSIDs are
 #      visible. Capture them by standing there and running:
 #          trollshell --scan-aps
-#      then pasting the block below. (Different APs per place → unique BSSIDs.)
+#      then pasting the block below. (SSIDs, not BSSIDs, so it survives router
+#      swaps; lean on neighbouring networks to tell your places apart.)
 #   2. GeoClue2 / beaconDB location, nearest place within `radius_km`.
 #   3. Otherwise "away": weather uses your raw location; departures shows the
 #      nearest station. Before the first fix at startup the FIRST [[place]] is
@@ -59,9 +61,10 @@ name = "Schöneweide"
 lat = 52.4556
 lon = 13.5085
 
-# Wi-Fi fingerprint — paste from `trollshell --scan-aps`. Empty = never matches
-# (falls through to GeoClue). `match_min` is how many must be visible.
-bssids = []
+# Wi-Fi fingerprint — paste from `trollshell --scan-aps`. List a few SSIDs you
+# reliably see HERE but not at your other places (usually neighbours). Empty =
+# never matches (falls through to GeoClue). `match_min` = how many must be seen.
+ssids = []
 match_min = 2
 
 # GeoClue fallback radius (km) when no fingerprint matches. Generous because
@@ -83,9 +86,9 @@ struct Place {
     lat: f64,
     lon: f64,
     radius_km: f64,
-    /// Normalized (lowercased) AP BSSIDs forming this place's fingerprint.
-    bssids: Vec<String>,
-    /// How many of `bssids` must be visible to call it a match.
+    /// Network SSIDs forming this place's fingerprint (matched verbatim).
+    ssids: Vec<String>,
+    /// How many of `ssids` must be visible to call it a match.
     match_min: usize,
     station: Option<String>,
     lines: Vec<String>,
@@ -136,7 +139,7 @@ struct PlaceCfg {
     #[serde(default = "default_radius_km")]
     radius_km: f64,
     #[serde(default)]
-    bssids: Vec<String>,
+    ssids: Vec<String>,
     #[serde(default = "default_match_min")]
     match_min: usize,
     #[serde(default)]
@@ -177,10 +180,8 @@ fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
             lat: p.lat,
             lon: p.lon,
             radius_km: p.radius_km,
-            bssids: nonblank(p.bssids)
-                .into_iter()
-                .map(|b| b.to_ascii_lowercase())
-                .collect(),
+            // SSIDs are matched verbatim (case-sensitive); just drop blanks.
+            ssids: nonblank(p.ssids),
             match_min: p.match_min,
             station: p.station,
             lines: nonblank(p.lines),
@@ -267,15 +268,15 @@ fn migrate_legacy_departures(places_path: &Path) -> Option<Vec<Place>> {
 }
 
 /// Warn (once, at load) about places whose `match_min` exceeds their number of
-/// listed `bssids` — an unsatisfiable fingerprint that silently never matches.
+/// listed `ssids` — an unsatisfiable fingerprint that silently never matches.
 fn warn_unsatisfiable_fingerprints(places: &[Place]) {
     for p in places {
-        if !p.bssids.is_empty() && p.match_min > p.bssids.len() {
+        if !p.ssids.is_empty() && p.match_min > p.ssids.len() {
             tracing::warn!(
                 place = %p.name,
                 match_min = p.match_min,
-                bssids = p.bssids.len(),
-                "places: match_min exceeds listed bssids; this fingerprint can never match (falling back to GeoClue radius)"
+                ssids = p.ssids.len(),
+                "places: match_min exceeds listed ssids; this fingerprint can never match (falling back to GeoClue radius)"
             );
         }
     }
@@ -303,17 +304,17 @@ fn nearest_place(places: &[Place], lat: f64, lon: f64) -> Option<&Place> {
         .map(|(p, _)| p)
 }
 
-/// The place whose fingerprint overlaps the currently-visible BSSIDs the most,
+/// The place whose fingerprint overlaps the currently-visible SSIDs the most,
 /// provided the overlap meets its `match_min` (and at least one). Places with
 /// no fingerprint never match here.
 fn fingerprint_match<'a>(places: &'a [Place], visible: &HashSet<String>) -> Option<&'a Place> {
     places
         .iter()
-        .filter(|p| !p.bssids.is_empty())
-        .map(|p| (p, p.bssids.iter().filter(|b| visible.contains(*b)).count()))
+        .filter(|p| !p.ssids.is_empty())
+        .map(|p| (p, p.ssids.iter().filter(|s| visible.contains(*s)).count()))
         .filter(|(p, overlap)| *overlap >= p.match_min.max(1))
-        // `max_by_key` keeps the LAST of equal-overlap places; ties are
-        // unreachable under unique-per-place BSSIDs, and deterministic anyway.
+        // `max_by_key` keeps the LAST of equal-overlap places; a tie needs
+        // overlapping SSID sets across places, and is deterministic anyway.
         .max_by_key(|(_, overlap)| *overlap)
         .map(|(p, _)| p)
 }
@@ -339,7 +340,7 @@ fn resolve(
     aps: &[AccessPoint],
     geoloc: &LocationState,
 ) -> (Option<ResolvedPlace>, LocationState) {
-    let visible: HashSet<String> = aps.iter().map(|a| a.bssid.clone()).collect();
+    let visible: HashSet<String> = aps.iter().map(|a| a.ssid.clone()).collect();
 
     // 1. Wi-Fi fingerprint — definite, beats everything.
     if let Some(p) = fingerprint_match(places, &visible) {
@@ -524,10 +525,9 @@ async fn resolve_loop(
 mod tests {
     use super::*;
 
-    fn ap(bssid: &str) -> AccessPoint {
+    fn ap(ssid: &str) -> AccessPoint {
         AccessPoint {
-            bssid: bssid.to_string(),
-            ssid: String::new(),
+            ssid: ssid.to_string(),
             strength: 70,
         }
     }
@@ -536,13 +536,13 @@ mod tests {
         parse_places(DEFAULT_CONFIG).expect("default config parses")
     }
 
-    fn place(name: &str, lat: f64, lon: f64, bssids: &[&str], match_min: usize) -> Place {
+    fn place(name: &str, lat: f64, lon: f64, ssids: &[&str], match_min: usize) -> Place {
         Place {
             name: name.to_string(),
             lat,
             lon,
             radius_km: 12.0,
-            bssids: bssids.iter().map(|b| (*b).to_string()).collect(),
+            ssids: ssids.iter().map(|s| (*s).to_string()).collect(),
             match_min,
             station: Some(format!("station-{name}")),
             lines: Vec::new(),
@@ -559,21 +559,21 @@ mod tests {
         assert_eq!(places[0].name, "Schöneweide");
         assert_eq!(places[0].station.as_deref(), Some("900180001"));
         assert_eq!(places[0].match_min, 2);
-        assert!(places[0].bssids.is_empty());
+        assert!(places[0].ssids.is_empty());
         assert_eq!(places[0].lines, ["S8", "S85", "S9"]);
         assert!((places[0].radius_km - 12.0).abs() < 1e-9);
     }
 
     #[test]
-    fn parse_normalizes_and_filters_bssids() {
+    fn parse_keeps_ssids_verbatim_and_drops_blanks() {
         let toml = "\
             [[place]]\n\
             name = \"T\"\n\
             lat = 1.0\n\
             lon = 2.0\n\
-            bssids = [\"A4:2B:8C:11:22:33\", \"\", \"  \"]\n";
+            ssids = [\"FRITZ!Box 7590\", \"\", \"  \"]\n";
         let places = parse_places(toml).expect("parses");
-        assert_eq!(places[0].bssids, ["a4:2b:8c:11:22:33"]); // lowercased, blanks dropped
+        assert_eq!(places[0].ssids, ["FRITZ!Box 7590"]); // case kept, blanks dropped
         assert!(places[0].station.is_none()); // optional
         assert_eq!(places[0].match_min, 2); // default
     }
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_empty_bssids_never_matches() {
+    fn fingerprint_empty_ssids_never_matches() {
         let places = vec![place("Home", 0.0, 0.0, &[], 1)];
         let visible: HashSet<String> = ["x".into()].into_iter().collect();
         assert!(fingerprint_match(&places, &visible).is_none());

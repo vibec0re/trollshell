@@ -19,8 +19,8 @@ use hytte::services::{
 };
 
 fn main() -> hytte::ui::Result<()> {
-    // `trollshell --scan-aps`: one-shot dump of visible Wi-Fi APs as a
-    // paste-ready `bssids = [...]` block for ~/.config/trollshell/places.toml,
+    // `trollshell --scan-aps`: one-shot dump of visible Wi-Fi networks as a
+    // paste-ready `ssids = [...]` block for ~/.config/trollshell/places.toml,
     // then exit. Runs before the App, so it needs no Wayland session.
     if std::env::args().any(|a| a == "--scan-aps") {
         let aps = wifiscan::scan_aps_blocking();

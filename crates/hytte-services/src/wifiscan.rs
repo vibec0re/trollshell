@@ -1,20 +1,25 @@
-//! Visible Wi-Fi access points from `NetworkManager` (system D-Bus).
+//! Visible Wi-Fi networks from `NetworkManager` (system D-Bus).
 //!
-//! Enumerates every AP `NetworkManager` currently sees — `{bssid, ssid,
-//! strength}` — purely for location fingerprinting (see [`crate::places`]).
-//! This is **not** a Wi-Fi manager (that's [`crate::wifi`], an iwd client); it
-//! only reads the scan list, so it stays a thin read-only sensor.
+//! Enumerates the SSIDs `NetworkManager` currently sees (with signal strength)
+//! purely for location fingerprinting (see [`crate::places`]). This is **not**
+//! a Wi-Fi manager (that's [`crate::wifi`], an iwd client); it only reads the
+//! scan list, so it stays a thin read-only sensor.
 //!
-//! `NetworkManager` scans on its own cadence; we re-read the list every
-//! [`SCAN_INTERVAL`] (the AP set only changes when you physically move, so a
-//! leisurely poll is plenty).
+//! We key on **SSID, not BSSID**: a place is recognised by the *set* of
+//! network names visible there (your own plus the neighbours). That survives
+//! router swaps — a replacement AP keeps the SSID even though its BSSID
+//! changes — and the neighbours discriminate between places even when your own
+//! SSID is deployed everywhere.
 //!
-//! Published via [`current`] (registry signal, GTK thread) and
-//! [`shared_aps`] (a process-global clone) so the `places` resolver's tokio
-//! task can read it without touching the thread-local registry — mirroring
-//! the geoclue shared-handle pattern.
+//! `NetworkManager` scans on its own cadence; we re-read every [`SCAN_INTERVAL`]
+//! (the visible set only changes when you physically move, so a leisurely poll
+//! is plenty).
+//!
+//! Published via [`current`] (registry signal, GTK thread) and [`shared_aps`]
+//! (a process-global clone) so the `places` resolver's tokio task can read it
+//! without touching the thread-local registry — mirroring geoclue.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -34,14 +39,14 @@ const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 /// Re-read cadence. Location changes at building scale, so this is leisurely.
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One visible access point. The `bssid` is the AP's MAC (`HwAddress`),
-/// lowercased; it's globally unique per radio, which is what makes a
-/// constellation of them a location fingerprint.
+/// One visible network: its SSID and the strongest signal it's been seen at. A
+/// mesh broadcasting one SSID from several APs collapses to a single entry —
+/// we key on the name, not the per-radio BSSID, so the fingerprint survives
+/// hardware swaps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessPoint {
-    pub bssid: String,
     pub ssid: String,
-    /// Signal strength, 0..=100.
+    /// Signal strength, 0..=100 (strongest sighting of this SSID).
     pub strength: u8,
 }
 
@@ -52,7 +57,7 @@ pub struct WifiScanHandles {
 }
 
 // Cross-thread shared handle: `registry` is GTK-thread-only, so the `places`
-// resolver's tokio task reads visible APs from here instead.
+// resolver's tokio task reads visible networks from here instead.
 struct Shared {
     aps: Mutable<Vec<AccessPoint>>,
 }
@@ -77,8 +82,8 @@ pub fn service() -> WifiScanService {
     WifiScanService
 }
 
-/// Signal of the currently-visible access points. First emission is the empty
-/// list (before the first scan read lands).
+/// Signal of the currently-visible networks. First emission is the empty list
+/// (before the first scan read lands).
 pub fn current() -> impl Signal<Item = Vec<AccessPoint>> {
     registry::with(|r| {
         r.get::<WifiScanHandles>()
@@ -88,43 +93,40 @@ pub fn current() -> impl Signal<Item = Vec<AccessPoint>> {
     })
 }
 
-/// Process-global clone of the visible-AP handle, for tokio-side readers
+/// Process-global clone of the visible-network handle, for tokio-side readers
 /// (the `places` resolver). `None` until [`service`] has started.
 #[must_use]
 pub fn shared_aps() -> Option<Mutable<Vec<AccessPoint>>> {
     SHARED.get().map(|s| s.aps.clone())
 }
 
-/// One-shot blocking scan for the `--scan-aps` CLI: forces a fresh scan,
-/// waits briefly, and returns the visible APs. Drives the process runtime, so
-/// it must be called from a non-async context (e.g. `main` before the App).
+/// One-shot blocking scan for the `--scan-aps` CLI: forces a fresh scan, waits
+/// briefly, and returns the visible networks. Drives the process runtime, so it
+/// must be called from a non-async context (e.g. `main` before the App).
 #[must_use]
 pub fn scan_aps_blocking() -> Vec<AccessPoint> {
     runtime::handle().block_on(async { collect_aps(true).await.unwrap_or_default() })
 }
 
-/// Render visible APs as a paste-ready `bssids = [...]` TOML block for the
-/// `--scan-aps` capture tool. Strongest first; SSID + strength as comments.
+/// Render visible networks as a paste-ready `ssids = [...]` TOML block for the
+/// `--scan-aps` capture tool. Strongest first; signal as a comment.
 #[must_use]
 pub fn format_scan_block(aps: &[AccessPoint]) -> String {
     let mut sorted: Vec<&AccessPoint> = aps.iter().collect();
     sorted.sort_by(|a, b| {
         b.strength
             .cmp(&a.strength)
-            .then_with(|| a.bssid.cmp(&b.bssid))
+            .then_with(|| a.ssid.cmp(&b.ssid))
     });
 
     let mut out = String::new();
-    out.push_str("# Visible access points (strongest first). Paste the stable ones into\n");
-    out.push_str("# a [[place]] in ~/.config/trollshell/places.toml:\n");
-    out.push_str("bssids = [\n");
+    out.push_str("# Visible networks (strongest first). Paste the ones you reliably see\n");
+    out.push_str("# HERE but not at your other places (often neighbours) into a [[place]]\n");
+    out.push_str("# in ~/.config/trollshell/places.toml:\n");
+    out.push_str("ssids = [\n");
     for ap in sorted {
-        let ssid = if ap.ssid.is_empty() {
-            "<hidden>"
-        } else {
-            ap.ssid.as_str()
-        };
-        let _ = writeln!(out, "  \"{}\",  # {} ({}%)", ap.bssid, ssid, ap.strength);
+        // {:?} quotes + escapes, so names with spaces/quotes paste as valid TOML.
+        let _ = writeln!(out, "  {:?},  # {}%", ap.ssid, ap.strength);
     }
     out.push_str("]\n");
     out
@@ -141,15 +143,17 @@ async fn scan_loop(aps: Mutable<Vec<AccessPoint>>) {
                     aps.set(list);
                 }
             }
-            Err(e) => tracing::debug!(error = %e, "wifiscan: read failed (NetworkManager absent?)"),
+            Err(e) => {
+                tracing::debug!(error = %e, "wifiscan: read failed (NetworkManager absent?)");
+            }
         }
     }
 }
 
-/// Read every visible AP across all wireless devices, de-duplicated by BSSID.
-/// When `force_scan`, nudges a fresh `RequestScan` first and waits briefly for
-/// it to land (used by the one-shot CLI; the poll loop relies on NM's own
-/// periodic scans).
+/// Read every visible network across all wireless devices, de-duplicated by
+/// SSID (keeping the strongest signal). When `force_scan`, nudges a fresh
+/// `RequestScan` first and waits briefly for it to land (the one-shot CLI; the
+/// poll loop relies on NM's own periodic scans).
 async fn collect_aps(force_scan: bool) -> Result<Vec<AccessPoint>, hytte_bus::BusError> {
     let devices = get_devices().await?;
 
@@ -164,23 +168,25 @@ async fn collect_aps(force_scan: bool) -> Result<Vec<AccessPoint>, hytte_bus::Bu
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    // SSID → strongest strength. A mesh (one SSID, many APs) collapses here.
+    let mut by_ssid: HashMap<String, u8> = HashMap::new();
     for dev in &devices {
-        // GetAllAccessPoints only exists on wireless devices; a non-wifi
-        // device errors here and is skipped — no DeviceType check needed.
+        // GetAllAccessPoints only exists on wireless devices; a non-wifi device
+        // errors here and is skipped — no DeviceType check needed.
         let Ok(ap_paths) = get_all_access_points(dev).await else {
             continue;
         };
         for ap in ap_paths {
-            if let Some(sighting) = read_ap(&ap).await
-                && seen.insert(sighting.bssid.clone())
-            {
-                out.push(sighting);
+            if let Some(sighting) = read_ap(&ap).await {
+                let entry = by_ssid.entry(sighting.ssid).or_insert(0);
+                *entry = (*entry).max(sighting.strength);
             }
         }
     }
-    Ok(out)
+    Ok(by_ssid
+        .into_iter()
+        .map(|(ssid, strength)| AccessPoint { ssid, strength })
+        .collect())
 }
 
 async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
@@ -233,22 +239,18 @@ async fn read_ap(ap_path: &OwnedObjectPath) -> Option<AccessPoint> {
 }
 
 /// Pure extraction of an [`AccessPoint`] from NM's `AccessPoint` property map.
-/// `HwAddress` (the BSSID) is required and lowercased; `Ssid` (`ay`) is
-/// decoded lossily and may be empty (hidden network).
+/// `Ssid` (`ay`) is decoded lossily and is required: a hidden network (empty
+/// SSID) can't anchor a fingerprint, so it's dropped.
 fn ap_from_props(props: &HashMap<String, OwnedValue>) -> Option<AccessPoint> {
-    let bssid = property::<String>(props, "HwAddress")?;
-    if bssid.is_empty() {
-        return None;
-    }
     let ssid = prop_bytes(props, "Ssid")
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
+    let ssid = ssid.trim().to_string();
+    if ssid.is_empty() {
+        return None;
+    }
     let strength = property::<u8>(props, "Strength").unwrap_or(0);
-    Some(AccessPoint {
-        bssid: bssid.to_ascii_lowercase(),
-        ssid,
-        strength,
-    })
+    Some(AccessPoint { ssid, strength })
 }
 
 fn property<T>(props: &HashMap<String, OwnedValue>, key: &str) -> Option<T>
@@ -275,78 +277,59 @@ mod tests {
         OwnedValue::try_from(v).expect("ownable")
     }
 
-    fn props(bssid: &str, ssid: &[u8], strength: u8) -> HashMap<String, OwnedValue> {
+    fn props(ssid: &[u8], strength: u8) -> HashMap<String, OwnedValue> {
         let mut p = HashMap::new();
-        p.insert("HwAddress".to_string(), owned(Value::from(bssid)));
         p.insert("Ssid".to_string(), owned(Value::from(ssid.to_vec())));
         p.insert("Strength".to_string(), owned(Value::from(strength)));
         p
     }
 
     #[test]
-    fn ap_from_props_extracts_and_lowercases_bssid() {
-        let p = props("A4:2B:8C:11:22:33", b"FRITZ!Box Annika", 87);
-        let ap = ap_from_props(&p).expect("parses");
-        assert_eq!(ap.bssid, "a4:2b:8c:11:22:33");
+    fn ap_from_props_extracts_ssid_and_strength() {
+        let ap = ap_from_props(&props(b"FRITZ!Box Annika", 87)).expect("parses");
         assert_eq!(ap.ssid, "FRITZ!Box Annika");
         assert_eq!(ap.strength, 87);
     }
 
     #[test]
-    fn ap_from_props_hidden_ssid_is_empty_not_fatal() {
-        let p = props("aa:bb:cc:dd:ee:ff", b"", 40);
-        let ap = ap_from_props(&p).expect("parses");
-        assert_eq!(ap.bssid, "aa:bb:cc:dd:ee:ff");
-        assert!(ap.ssid.is_empty());
+    fn ap_from_props_hidden_or_blank_ssid_is_dropped() {
+        assert!(ap_from_props(&props(b"", 40)).is_none());
+        assert!(ap_from_props(&props(b"   ", 40)).is_none());
     }
 
     #[test]
-    fn ap_from_props_missing_bssid_is_none() {
-        let mut p = HashMap::new();
-        p.insert("Strength".to_string(), owned(Value::from(50u8)));
-        assert!(ap_from_props(&p).is_none());
-    }
-
-    #[test]
-    fn ap_from_props_non_utf8_ssid_is_lossy() {
-        // 0xFF 0xFE is not valid UTF-8 — must not panic, decodes lossily.
-        let p = props("aa:bb:cc:dd:ee:ff", &[0xff, 0xfe], 10);
-        let ap = ap_from_props(&p).expect("parses");
-        assert!(!ap.ssid.is_empty()); // replacement chars, but present
+    fn ap_from_props_non_utf8_ssid_is_lossy_not_fatal() {
+        // 0xFF 0xFE isn't valid UTF-8 — must not panic, decodes lossily.
+        let ap = ap_from_props(&props(&[0xff, 0xfe], 10)).expect("parses");
+        assert!(!ap.ssid.is_empty());
     }
 
     #[test]
     fn format_scan_block_sorts_by_strength_desc() {
         let aps = vec![
             AccessPoint {
-                bssid: "11:11:11:11:11:11".into(),
                 ssid: "Weak".into(),
                 strength: 20,
             },
             AccessPoint {
-                bssid: "22:22:22:22:22:22".into(),
                 ssid: "Strong".into(),
                 strength: 90,
             },
         ];
         let block = format_scan_block(&aps);
-        let strong_at = block.find("22:22:22:22:22:22").unwrap();
-        let weak_at = block.find("11:11:11:11:11:11").unwrap();
-        assert!(
-            strong_at < weak_at,
-            "strongest AP should come first:\n{block}"
-        );
-        assert!(block.starts_with("# Visible"));
-        assert!(block.contains("bssids = ["));
+        let strong_at = block.find("Strong").unwrap();
+        let weak_at = block.find("Weak").unwrap();
+        assert!(strong_at < weak_at, "strongest first:\n{block}");
+        assert!(block.contains("ssids = ["));
     }
 
     #[test]
-    fn format_scan_block_marks_hidden_ssid() {
+    fn format_scan_block_quotes_ssids_for_toml() {
         let aps = vec![AccessPoint {
-            bssid: "aa:aa:aa:aa:aa:aa".into(),
-            ssid: String::new(),
+            ssid: "My Net".into(),
             strength: 55,
         }];
-        assert!(format_scan_block(&aps).contains("<hidden>"));
+        // {:?} quotes + escapes, so SSIDs with spaces paste as valid TOML.
+        assert!(format_scan_block(&aps).contains("\"My Net\""));
     }
 }

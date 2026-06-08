@@ -155,11 +155,7 @@ fn show_context_menu(
 }
 
 /// Build a `gtk::Popover` containing a vertical box of menu items.
-fn build_menu_popover(
-    bus_name: &str,
-    menu_path: &str,
-    items: &[MenuEntry],
-) -> gtk::Popover {
+fn build_menu_popover(bus_name: &str, menu_path: &str, items: &[MenuEntry]) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("ts-tray-menu");
@@ -215,8 +211,7 @@ fn build_menu_item_widget(
         let btn_weak = btn.downgrade();
         btn.connect_clicked(move |_| {
             let Some(b) = btn_weak.upgrade() else { return };
-            let sub_popover =
-                build_menu_popover(&bus_name, &menu_path, &sub_items_cloned);
+            let sub_popover = build_menu_popover(&bus_name, &menu_path, &sub_items_cloned);
             sub_popover.set_parent(&b);
             sub_popover.popup();
         });

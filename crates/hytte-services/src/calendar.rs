@@ -51,7 +51,7 @@
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use icalendar::{Calendar, CalendarDateTime, Component, DatePerhapsTime, EventLike, EventStatus};
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
@@ -163,8 +163,7 @@ async fn poll_loop(writer: Mutable<Vec<CalendarEvent>>) {
         // Refresh inline on a blocking thread so we don't park a tokio
         // worker on filesystem I/O.
         let writer_for_blocking = writer.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await
+        if let Err(e) = tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await
         {
             tracing::error!(error = %e, "calendar refresh task panicked");
         }
@@ -304,9 +303,10 @@ fn parse_ics_file(
             continue;
         }
 
-        let uid = event
-            .get_uid()
-            .map_or_else(|| format!("anon:{calendar_name}:{}", out.len()), str::to_string);
+        let uid = event.get_uid().map_or_else(
+            || format!("anon:{calendar_name}:{}", out.len()),
+            str::to_string,
+        );
         let summary = event
             .get_summary()
             .map(|s| s.trim().to_string())
@@ -347,7 +347,10 @@ fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
             CalendarDateTime::Floating(naive) => {
                 Some((Local.from_local_datetime(&naive).single()?, false))
             }
-            ref other @ CalendarDateTime::WithTimezone { ref date_time, ref tzid } => {
+            ref other @ CalendarDateTime::WithTimezone {
+                ref date_time,
+                ref tzid,
+            } => {
                 // WithTimezone: chrono-tz-backed conversion when the TZID
                 // is one chrono-tz knows; otherwise interpret the wall-
                 // clock time as local. The fallback is wrong for events
@@ -607,13 +610,7 @@ mod tests {
         );
         let path = std::env::temp_dir().join("hytte-calendar-test2.ics");
         std::fs::write(&path, body).unwrap();
-        let evs = parse_ics_file(
-            &path,
-            "test-cal",
-            now,
-            now + Duration::days(NEXT_DAYS),
-        )
-        .unwrap();
+        let evs = parse_ics_file(&path, "test-cal", now, now + Duration::days(NEXT_DAYS)).unwrap();
         assert!(evs.is_empty());
         let _ = std::fs::remove_file(&path);
     }

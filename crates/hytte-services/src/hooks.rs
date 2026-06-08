@@ -40,7 +40,9 @@ where
 }
 
 async fn run_inner(event: &str, env: &[(String, String)]) {
-    let Some(path) = resolve_path(event) else { return; };
+    let Some(path) = resolve_path(event) else {
+        return;
+    };
     let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -81,12 +83,8 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let read_outputs = async {
-        tokio::join!(drain(stdout), drain(stderr))
-    };
-    let wait = async {
-        tokio::join!(read_outputs, child.wait())
-    };
+    let read_outputs = async { tokio::join!(drain(stdout), drain(stderr)) };
+    let wait = async { tokio::join!(read_outputs, child.wait()) };
 
     match tokio::time::timeout(HOOK_TIMEOUT, wait).await {
         Ok(((sout, serr), Ok(status))) if status.success() => {
@@ -129,7 +127,11 @@ fn resolve_path(event: &str) -> Option<PathBuf> {
         tracing::warn!(event, "hooks: $HOME not set");
         return None;
     };
-    Some(PathBuf::from(home).join(".config/trollshell/hooks").join(event))
+    Some(
+        PathBuf::from(home)
+            .join(".config/trollshell/hooks")
+            .join(event),
+    )
 }
 
 async fn drain<R>(stream: Option<R>) -> Vec<u8>
@@ -147,11 +149,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tracing::{Event, Subscriber};
-    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
     use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -170,17 +172,13 @@ mod tests {
             Fut: std::future::Future<Output = R>,
         {
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("hytte-hooks-{}-{n}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("hytte-hooks-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             let cleanup = root.clone();
             let home = TestHome { root: root.clone() };
-            let result = temp_env::async_with_vars(
-                [("HOME", Some(root.into_os_string()))],
-                f(home),
-            )
-            .await;
+            let result =
+                temp_env::async_with_vars([("HOME", Some(root.into_os_string()))], f(home)).await;
             let _ = std::fs::remove_dir_all(&cleanup);
             result
         }
@@ -237,7 +235,8 @@ mod tests {
             if field.name() == "message" {
                 self.message = value.to_string();
             } else {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -360,8 +359,9 @@ mod tests {
 
             let events = cap.events.lock().unwrap().clone();
             assert!(
-                events.iter().any(|e| e.level == tracing::Level::WARN
-                    && e.message.contains("not executable")),
+                events.iter().any(
+                    |e| e.level == tracing::Level::WARN && e.message.contains("not executable")
+                ),
                 "expected WARN 'not executable', got: {events:#?}",
             );
             assert!(!sentinel.exists(), "script must not have been executed");
@@ -380,9 +380,13 @@ mod tests {
 
             for _ in 0..40 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if cap.events.lock().unwrap().iter().any(|e| {
-                    e.level == tracing::Level::WARN && e.message.contains("timed out")
-                }) {
+                if cap
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.level == tracing::Level::WARN && e.message.contains("timed out"))
+                {
                     break;
                 }
             }
@@ -395,8 +399,9 @@ mod tests {
 
             let events = cap.events.lock().unwrap().clone();
             assert!(
-                events.iter().any(|e| e.level == tracing::Level::WARN
-                    && e.message.contains("timed out")),
+                events
+                    .iter()
+                    .any(|e| e.level == tracing::Level::WARN && e.message.contains("timed out")),
                 "expected WARN 'timed out', got: {events:#?}",
             );
         })
@@ -416,8 +421,9 @@ mod tests {
 
             let events = cap.events.lock().unwrap().clone();
             assert!(
-                events.iter().any(|e| e.level == tracing::Level::DEBUG
-                    && e.message.contains("no script")),
+                events
+                    .iter()
+                    .any(|e| e.level == tracing::Level::DEBUG && e.message.contains("no script")),
                 "expected a DEBUG 'no script' event, got: {events:#?}",
             );
             assert!(

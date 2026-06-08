@@ -9,7 +9,7 @@
 //! re-fetch-on-location-change bridge.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -110,7 +110,9 @@ impl Service for WeatherService {
                     .await;
             });
         } else {
-            tracing::warn!("weather: places not registered before weather; auto-refresh-on-location disabled");
+            tracing::warn!(
+                "weather: places not registered before weather; auto-refresh-on-location disabled"
+            );
         }
 
         handles
@@ -227,7 +229,10 @@ struct DailyBlock {
 /// (or returned empty arrays).
 fn daily_min_max(f: &ForecastResponse) -> Option<(f64, f64)> {
     let d = f.daily.as_ref()?;
-    Some((*d.temperature_2m_max.first()?, *d.temperature_2m_min.first()?))
+    Some((
+        *d.temperature_2m_max.first()?,
+        *d.temperature_2m_min.first()?,
+    ))
 }
 
 /// One blocking Open-Meteo fetch + parse for `loc`. Runs on a

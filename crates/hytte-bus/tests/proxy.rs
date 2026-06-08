@@ -4,7 +4,7 @@ use common::ephemeral_bus;
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{proxy_with, ProxyState};
+use hytte_bus::{ProxyState, proxy_with};
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -77,8 +77,7 @@ async fn peer_gone_then_back() {
     let mut saw_peer_gone = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(s)) =
-            tokio::time::timeout(Duration::from_millis(50), liveness.next()).await
+        if let Ok(Some(s)) = tokio::time::timeout(Duration::from_millis(50), liveness.next()).await
             && matches!(s, ProxyState::PeerGone)
         {
             saw_peer_gone = true;

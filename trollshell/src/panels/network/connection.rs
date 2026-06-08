@@ -119,14 +119,10 @@ fn primary_addr_row(
     let value = gtk::Label::new(None);
     value.add_css_class("ts-mono");
     row.add_suffix(&value);
-    bind(
-        networkd::primary().map(derive),
-        &row,
-        move |row, txt| {
-            value.set_text(&txt);
-            row.set_visible(!txt.is_empty());
-        },
-    );
+    bind(networkd::primary().map(derive), &row, move |row, txt| {
+        value.set_text(&txt);
+        row.set_visible(!txt.is_empty());
+    });
     row
 }
 

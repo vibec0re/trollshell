@@ -19,7 +19,7 @@
 //! ```
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -376,10 +376,7 @@ async fn poll_loop(w: PollWriters) {
                 for (name, rx, tx) in net_now {
                     let (rx_rate, tx_rate) = match state.net_prev.get(&name) {
                         Some((prev_rx, prev_tx, prev_when)) => {
-                            let dt = now
-                                .duration_since(*prev_when)
-                                .as_secs_f64()
-                                .max(0.1);
+                            let dt = now.duration_since(*prev_when).as_secs_f64().max(0.1);
                             #[allow(clippy::cast_precision_loss)]
                             let rx_r = (rx.saturating_sub(*prev_rx) as f64) / dt;
                             #[allow(clippy::cast_precision_loss)]
@@ -447,8 +444,8 @@ async fn poll_loop(w: PollWriters) {
 /// initial open failed) or holds whatever was last successfully read.
 async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
     use std::os::fd::OwnedFd;
-    use tokio::io::unix::AsyncFd;
     use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
 
     // Seed once before we even attempt to register for events. This way a
     // POLLPRI registration failure still leaves us with a correct list as
@@ -508,7 +505,9 @@ fn count_tcp_states(path: &str) -> (u32, u32) {
     let mut established = 0u32;
     let mut listen = 0u32;
     for line in text.lines().skip(1) {
-        let Some(state) = line.split_ascii_whitespace().nth(3) else { continue };
+        let Some(state) = line.split_ascii_whitespace().nth(3) else {
+            continue;
+        };
         match state {
             "01" => established += 1,
             "0A" => listen += 1,
@@ -533,17 +532,14 @@ fn read_proc_stat() -> Result<Vec<(u64, u64)>, std::io::Error> {
         }
         let mut fields = line.split_ascii_whitespace();
         let _label = fields.next(); // "cpu" or "cpu0", etc.
-        let nums: Vec<u64> = fields
-            .map(|f| f.parse::<u64>().unwrap_or(0))
-            .collect();
+        let nums: Vec<u64> = fields.map(|f| f.parse::<u64>().unwrap_or(0)).collect();
         if nums.is_empty() {
             continue;
         }
         // field layout after the label: user nice system idle iowait …
         // nums[0]=user, nums[1]=nice, nums[2]=system, nums[3]=idle, nums[4]=iowait
         let total: u64 = nums.iter().sum();
-        let idle_jiffies = nums.get(3).copied().unwrap_or(0)
-            + nums.get(4).copied().unwrap_or(0);
+        let idle_jiffies = nums.get(3).copied().unwrap_or(0) + nums.get(4).copied().unwrap_or(0);
         let active = total.saturating_sub(idle_jiffies);
         entries.push((active, total));
     }
@@ -708,7 +704,9 @@ fn read_cpu_temp() -> CpuTemp {
         }
         if let Some(m) = max_milli {
             #[allow(clippy::cast_precision_loss)]
-            return CpuTemp { package_celsius: Some(m as f64 / 1000.0) };
+            return CpuTemp {
+                package_celsius: Some(m as f64 / 1000.0),
+            };
         }
     }
     CpuTemp::default()
@@ -843,15 +841,36 @@ pub(crate) struct MountSpec {
 /// Filesystems considered "pseudo" — kernel synthetic filesystems we never
 /// want to show as a "disk". Matches the spirit of `findmnt --real`.
 const PSEUDO_FSTYPES: &[&str] = &[
-    "proc", "sysfs", "cgroup", "cgroup2", "devtmpfs", "devpts", "tmpfs",
-    "mqueue", "securityfs", "pstore", "bpf", "tracefs", "debugfs",
-    "hugetlbfs", "configfs", "fusectl", "binfmt_misc", "autofs",
-    "efivarfs", "ramfs", "rpc_pipefs", "nsfs", "selinuxfs", "overlay",
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "devtmpfs",
+    "devpts",
+    "tmpfs",
+    "mqueue",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "tracefs",
+    "debugfs",
+    "hugetlbfs",
+    "configfs",
+    "fusectl",
+    "binfmt_misc",
+    "autofs",
+    "efivarfs",
+    "ramfs",
+    "rpc_pipefs",
+    "nsfs",
+    "selinuxfs",
+    "overlay",
     "squashfs",
     // Userspace pseudo-fuse mounts: gvfs auto-mounts and Flatpak portals.
     // Real user fuse storage (sshfs, gocryptfs, etc.) uses other fuse.*
     // subtypes and stays visible.
-    "fuse.gvfsd-fuse", "fuse.portal",
+    "fuse.gvfsd-fuse",
+    "fuse.portal",
 ];
 
 /// Decode `\NNN` octal escapes used by `/proc/self/mountinfo` for special
@@ -878,7 +897,7 @@ fn decode_octal_escapes(s: &str) -> String {
                 + u32::from(bytes[i + 2] - b'0') * 8
                 + u32::from(bytes[i + 3] - b'0');
             #[allow(clippy::cast_possible_truncation)]
-            out.push(v as u8);  // safe: mountinfo only emits \000–\377
+            out.push(v as u8); // safe: mountinfo only emits \000–\377
             i += 4;
         } else {
             out.push(b);
@@ -951,8 +970,7 @@ fn parse_mountinfo(text: &str) -> Vec<MountSpec> {
             })
             .or_insert(i);
     }
-    let winners: std::collections::HashSet<usize> =
-        winner_idx.values().copied().collect();
+    let winners: std::collections::HashSet<usize> = winner_idx.values().copied().collect();
 
     all.into_iter()
         .enumerate()
@@ -984,7 +1002,11 @@ fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
         let free = s.blocks_available() * block_size;
         let used = total.saturating_sub(free);
         #[allow(clippy::cast_precision_loss)]
-        let usage = if total == 0 { 0.0 } else { used as f64 / total as f64 };
+        let usage = if total == 0 {
+            0.0
+        } else {
+            used as f64 / total as f64
+        };
         mounts.push(DiskMount {
             path: spec.path.clone(),
             total_bytes: total,
@@ -999,19 +1021,18 @@ fn read_disk_for_specs(specs: &[MountSpec]) -> DiskUsage {
 // ── Process count ─────────────────────────────────────────────────────────────
 
 fn read_process_count() -> u32 {
-    std::fs::read_dir("/proc")
-        .map_or(0, |iter| {
-            #[allow(clippy::cast_possible_truncation)]
-            let count = iter
-                .filter_map(std::result::Result::ok)
-                .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.parse::<u32>().is_ok())
-                })
-                .count();
-            count.try_into().unwrap_or(u32::MAX)
-        })
+    std::fs::read_dir("/proc").map_or(0, |iter| {
+        #[allow(clippy::cast_possible_truncation)]
+        let count = iter
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+            })
+            .count();
+        count.try_into().unwrap_or(u32::MAX)
+    })
 }
 
 #[cfg(test)]
@@ -1169,7 +1190,11 @@ not a real line at all
 4 0 8:1 / / rw - ext4 /dev/sda1 rw
 ";
         let v = parse_mountinfo(text);
-        assert_eq!(v.len(), 2, "fuse.sshfs + ext4 survive; gvfs + portal filtered");
+        assert_eq!(
+            v.len(),
+            2,
+            "fuse.sshfs + ext4 survive; gvfs + portal filtered"
+        );
         assert_eq!(v[0].path, "/mnt/server");
         assert_eq!(v[0].fstype, "fuse.sshfs");
         assert_eq!(v[1].path, "/");

@@ -89,24 +89,28 @@ pub fn widget() -> gtk::Widget {
     root.append(&stack);
 
     // Switch page + repaint labels on each state emission.
-    bind(weather::current(), &stack, move |stack, state| match state {
-        WeatherState::Loading => stack.set_visible_child_name("loading"),
-        WeatherState::Error(msg) => {
-            error_label.set_text(&msg);
-            stack.set_visible_child_name("error");
-        }
-        WeatherState::Resolved(s) => {
-            loc_label.set_text(&s.location.to_uppercase());
-            cond_icon.set_icon_name(Some(s.condition.icon));
-            temp_label.set_text(&format!("{:.0}°", s.temp_c));
-            cond_label.set_text(s.condition.label);
-            minmax_label.set_text(&format!("↑ {:.0}°   ↓ {:.0}°", s.temp_max_c, s.temp_min_c));
-            feels_val.set_text(&format!("{:.0}°", s.apparent_c));
-            wind_val.set_text(&format!("{:.0} km/h", s.wind_kmh));
-            humid_val.set_text(&format!("{}%", s.humidity_pct));
-            stack.set_visible_child_name("resolved");
-        }
-    });
+    bind(
+        weather::current(),
+        &stack,
+        move |stack, state| match state {
+            WeatherState::Loading => stack.set_visible_child_name("loading"),
+            WeatherState::Error(msg) => {
+                error_label.set_text(&msg);
+                stack.set_visible_child_name("error");
+            }
+            WeatherState::Resolved(s) => {
+                loc_label.set_text(&s.location.to_uppercase());
+                cond_icon.set_icon_name(Some(s.condition.icon));
+                temp_label.set_text(&format!("{:.0}°", s.temp_c));
+                cond_label.set_text(s.condition.label);
+                minmax_label.set_text(&format!("↑ {:.0}°   ↓ {:.0}°", s.temp_max_c, s.temp_min_c));
+                feels_val.set_text(&format!("{:.0}°", s.apparent_c));
+                wind_val.set_text(&format!("{:.0} km/h", s.wind_kmh));
+                humid_val.set_text(&format!("{}%", s.humidity_pct));
+                stack.set_visible_child_name("resolved");
+            }
+        },
+    );
 
     root.upcast()
 }

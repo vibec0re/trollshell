@@ -15,12 +15,12 @@
 //! `IconPixmap` fallback, rich `Tooltip`, and `DBusMenu` via
 //! `com.canonical.dbusmenu`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use futures_signals::signal::SignalExt;
 use hytte_bus::{BusKind, OwnNameSignal, ProxyState, call, proxy, signals};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -187,7 +187,10 @@ impl Service for TrayService {
             }
         });
 
-        TrayHandles { items, _ownership: ownership }
+        TrayHandles {
+            items,
+            _ownership: ownership,
+        }
     }
 }
 
@@ -314,9 +317,10 @@ fn parse_layout_node(val: OwnedValue) -> Result<Menu> {
 
     // Children: av
     let children_val = fields.remove(0);
-    let children_arr =
-        zbus::zvariant::Array::try_from(OwnedValue::try_from(children_val).context("children to owned")?)
-            .context("node children")?;
+    let children_arr = zbus::zvariant::Array::try_from(
+        OwnedValue::try_from(children_val).context("children to owned")?,
+    )
+    .context("node children")?;
 
     let visible = bool_prop(&props, "visible", true);
     if !visible {
@@ -365,11 +369,10 @@ fn parse_menu_entry(val: OwnedValue) -> Result<Option<MenuEntry>> {
             .context("entry props")?;
 
     let children_val = fields.remove(0);
-    let children_arr =
-        zbus::zvariant::Array::try_from(
-            OwnedValue::try_from(children_val).context("entry children to owned")?,
-        )
-        .context("entry children")?;
+    let children_arr = zbus::zvariant::Array::try_from(
+        OwnedValue::try_from(children_val).context("entry children to owned")?,
+    )
+    .context("entry children")?;
 
     let visible = bool_prop(&props, "visible", true);
     if !visible {

@@ -64,10 +64,7 @@ fn build_block() -> gtk::Box {
 /// bind to a long-lived widget that lives at least as long as the
 /// popover (the prefs group). No widget mutation needed — just keep the
 /// `Rc<RefCell<Vec<TaskList>>>` warm.
-fn wire_lists_bind(
-    anchor: &adw::PreferencesGroup,
-    lists_track: &Rc<RefCell<Vec<TaskList>>>,
-) {
+fn wire_lists_bind(anchor: &adw::PreferencesGroup, lists_track: &Rc<RefCell<Vec<TaskList>>>) {
     let lists_track = lists_track.clone();
     bind(tasks::task_lists(), anchor, move |_, ls| {
         *lists_track.borrow_mut() = ls;
@@ -510,13 +507,29 @@ impl DuePicker {
 
         // Hook up the chips.
         let p = picker.clone();
-        none_btn.connect_toggled(move |b| if b.is_active() { p.set_mode(DueMode::None); });
+        none_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                p.set_mode(DueMode::None);
+            }
+        });
         let p = picker.clone();
-        today_btn.connect_toggled(move |b| if b.is_active() { p.set_mode(DueMode::Today); });
+        today_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                p.set_mode(DueMode::Today);
+            }
+        });
         let p = picker.clone();
-        tomorrow_btn.connect_toggled(move |b| if b.is_active() { p.set_mode(DueMode::Tomorrow); });
+        tomorrow_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                p.set_mode(DueMode::Tomorrow);
+            }
+        });
         let p = picker.clone();
-        pick_btn.connect_toggled(move |b| if b.is_active() { p.set_mode(DueMode::Pick); });
+        pick_btn.connect_toggled(move |b| {
+            if b.is_active() {
+                p.set_mode(DueMode::Pick);
+            }
+        });
 
         let p = picker.clone();
         calendar.connect_day_selected(move |c| {
@@ -524,7 +537,8 @@ impl DuePicker {
             let m = c.month() + 1; // gtk::Calendar months are 0-indexed
             let d = c.day();
             if let (Ok(m_u32), Ok(d_u32)) = (u32::try_from(m), u32::try_from(d))
-                && let Some(date) = NaiveDate::from_ymd_opt(y, m_u32, d_u32) {
+                && let Some(date) = NaiveDate::from_ymd_opt(y, m_u32, d_u32)
+            {
                 *p.selected.borrow_mut() = Some(date);
                 p.refresh_summary();
             }
@@ -572,10 +586,10 @@ impl DuePicker {
                 self.summary_label.set_text("Due tomorrow");
             }
             DueMode::Pick => {
-                let label = self
-                    .selected
-                    .borrow()
-                    .map_or_else(|| "Pick a date".to_string(), |d| format!("Due {}", short_date(d)));
+                let label = self.selected.borrow().map_or_else(
+                    || "Pick a date".to_string(),
+                    |d| format!("Due {}", short_date(d)),
+                );
                 self.summary_label.set_visible(true);
                 self.summary_label.set_text(&label);
             }
@@ -621,8 +635,7 @@ impl DuePicker {
         };
         *self.mode.borrow_mut() = mode;
         self.set_active_chip(mode);
-        self.calendar_wrap
-            .set_reveal_child(mode == DueMode::Pick);
+        self.calendar_wrap.set_reveal_child(mode == DueMode::Pick);
         self.refresh_summary();
     }
 

@@ -2,7 +2,7 @@ mod common;
 
 use common::ephemeral_bus;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{call_with, BusError, RetryPolicy};
+use hytte_bus::{BusError, RetryPolicy, call_with};
 use zbus::connection::Builder;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -70,5 +70,8 @@ async fn retry_once_recovers_from_transient_disconnect() {
         .send()
         .await;
 
-    assert!(names.is_ok(), "expected retry-Once to succeed; got {names:?}");
+    assert!(
+        names.is_ok(),
+        "expected retry-Once to succeed; got {names:?}"
+    );
 }

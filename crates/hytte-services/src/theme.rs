@@ -225,9 +225,7 @@ fn update_ini_keys(path: &Path, section: &str, kvs: &[(&str, &str)]) -> std::io:
         }
         out.push_str(&blank_buffer);
         blank_buffer.clear();
-        if in_target
-            && let Some((lhs, _)) = t.split_once('=')
-        {
+        if in_target && let Some((lhs, _)) = t.split_once('=') {
             let key = lhs.trim();
             if let Some(&(_, v)) = kvs.iter().find(|(k, _)| *k == key) {
                 push_kv(&mut out, key, v);
@@ -275,7 +273,7 @@ fn push_kv(out: &mut String, k: &str, v: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{update_ini_keys, Theme};
+    use super::{Theme, update_ini_keys};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);

@@ -6,8 +6,8 @@
 //! and `PropertiesChanged` tracking are handled by the bus layer.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_bus::{property, BusKind, PropState};
-use hytte_reactive::{registry, Service};
+use hytte_bus::{BusKind, PropState, property};
+use hytte_reactive::{Service, registry};
 use std::net::IpAddr;
 
 pub struct ResolvedService;
@@ -120,12 +120,11 @@ mod tests {
 
     #[test]
     fn parses_ipv6() {
-        let bytes = [0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88];
+        let bytes = [
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ];
         let ip = parse_addr(10, &bytes).unwrap();
-        assert_eq!(
-            ip,
-            IpAddr::V6("2001:4860:4860::8888".parse().unwrap())
-        );
+        assert_eq!(ip, IpAddr::V6("2001:4860:4860::8888".parse().unwrap()));
     }
 
     #[test]

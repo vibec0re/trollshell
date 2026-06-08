@@ -19,7 +19,7 @@
 //! process.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashSet;
 use std::path::PathBuf;
 

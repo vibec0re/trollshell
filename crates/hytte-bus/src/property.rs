@@ -86,7 +86,10 @@ pub struct PropertyBuilder<T> {
 /// ```
 #[doc(hidden)]
 #[must_use]
-pub fn property_with<T>(shared: &SharedConnection, destination: impl Into<String>) -> PropertyBuilder<T>
+pub fn property_with<T>(
+    shared: &SharedConnection,
+    destination: impl Into<String>,
+) -> PropertyBuilder<T>
 where
     T: Clone
         + Send
@@ -215,8 +218,13 @@ async fn run_property<T>(
 
     loop {
         if ctx.weak.upgrade().is_none() {
-            tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
-                name = ctx.name, "all property handles dropped; exiting task");
+            tracing::debug!(
+                dest = ctx.dest,
+                path = ctx.path,
+                iface = ctx.iface,
+                name = ctx.name,
+                "all property handles dropped; exiting task"
+            );
             if let Some(tx) = task_done_tx.take() {
                 let _ = tx.send(());
             }
@@ -241,7 +249,12 @@ async fn run_property<T>(
         };
 
         let exited = drain_changes::<T>(
-            &ctx, &mut last, &writer, &mut changes, current_epoch, &mut task_done_tx,
+            &ctx,
+            &mut last,
+            &writer,
+            &mut changes,
+            current_epoch,
+            &mut task_done_tx,
         )
         .await;
         if exited {
@@ -308,10 +321,7 @@ async fn subscribe_properties_changed<T>(
 where
     T: Clone + Send + Sync + 'static,
 {
-    let conn_result = ctx
-        .shared
-        .with_conn(|conn| async move { Ok(conn) })
-        .await;
+    let conn_result = ctx.shared.with_conn(|conn| async move { Ok(conn) }).await;
 
     let current_epoch = ctx.shared.epoch();
 
@@ -372,8 +382,13 @@ where
 
     loop {
         if ctx.weak.upgrade().is_none() {
-            tracing::debug!(dest = ctx.dest, path = ctx.path, iface = ctx.iface,
-                name = ctx.name, "all property handles dropped (inner loop); exiting task");
+            tracing::debug!(
+                dest = ctx.dest,
+                path = ctx.path,
+                iface = ctx.iface,
+                name = ctx.name,
+                "all property handles dropped (inner loop); exiting task"
+            );
             if let Some(tx) = task_done_tx.take() {
                 let _ = tx.send(());
             }

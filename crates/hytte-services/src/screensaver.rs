@@ -52,9 +52,9 @@
 //! screensaver::inhibitors() -> impl Signal<Item = Vec<Inhibitor>>
 //! ```
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -279,7 +279,14 @@ fn publish_inhibitors(state: &Mutex<HashMap<u32, Inhibitor>>, view: &Mutable<Vec
 /// is best-effort, not load-bearing.
 async fn swayidle_pid() -> Option<i32> {
     let out = tokio::process::Command::new("systemctl")
-        .args(["--user", "show", "-p", "MainPID", "--value", "swayidle.service"])
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "MainPID",
+            "--value",
+            "swayidle.service",
+        ])
         .output()
         .await
         .ok()?;

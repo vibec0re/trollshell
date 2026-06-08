@@ -11,8 +11,8 @@
 //! `power_profiles`).
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_bus::{property, BusKind, PropState, PropertySignal};
-use hytte_reactive::{registry, Service};
+use hytte_bus::{BusKind, PropState, PropertySignal, property};
+use hytte_reactive::{Service, registry};
 use std::time::Duration;
 
 const UPOWER_NAME: &str = "org.freedesktop.UPower";
@@ -92,16 +92,41 @@ impl Service for UpowerService {
         let handles = UpowerHandles::default();
         let writer = handles.battery.clone();
 
-        bind_prop_field(rt, display_device_prop::<f64>("Percentage"), 0.0, writer.clone(),
-            |b, v| b.percentage = v);
-        bind_prop_field(rt, display_device_prop::<u32>("State"), 0, writer.clone(),
-            |b, v| b.state = BatteryState::from_u32(v));
-        bind_prop_field(rt, display_device_prop::<i64>("TimeToEmpty"), 0, writer.clone(),
-            |b, v| b.time_to_empty = secs_to_duration(v));
-        bind_prop_field(rt, display_device_prop::<i64>("TimeToFull"), 0, writer.clone(),
-            |b, v| b.time_to_full = secs_to_duration(v));
-        bind_prop_field(rt, display_device_prop::<String>("IconName"), String::new(), writer,
-            |b, v| b.icon_name = v);
+        bind_prop_field(
+            rt,
+            display_device_prop::<f64>("Percentage"),
+            0.0,
+            writer.clone(),
+            |b, v| b.percentage = v,
+        );
+        bind_prop_field(
+            rt,
+            display_device_prop::<u32>("State"),
+            0,
+            writer.clone(),
+            |b, v| b.state = BatteryState::from_u32(v),
+        );
+        bind_prop_field(
+            rt,
+            display_device_prop::<i64>("TimeToEmpty"),
+            0,
+            writer.clone(),
+            |b, v| b.time_to_empty = secs_to_duration(v),
+        );
+        bind_prop_field(
+            rt,
+            display_device_prop::<i64>("TimeToFull"),
+            0,
+            writer.clone(),
+            |b, v| b.time_to_full = secs_to_duration(v),
+        );
+        bind_prop_field(
+            rt,
+            display_device_prop::<String>("IconName"),
+            String::new(),
+            writer,
+            |b, v| b.icon_name = v,
+        );
 
         handles
     }
@@ -109,7 +134,10 @@ impl Service for UpowerService {
 
 fn display_device_prop<T>(name: &'static str) -> PropertySignal<T>
 where
-    T: Clone + Send + Sync + 'static
+    T: Clone
+        + Send
+        + Sync
+        + 'static
         + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
 {
@@ -122,7 +150,10 @@ where
 }
 
 fn secs_to_duration(secs: i64) -> Option<Duration> {
-    u64::try_from(secs).ok().filter(|&s| s > 0).map(Duration::from_secs)
+    u64::try_from(secs)
+        .ok()
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
 }
 
 fn bind_prop_field<T>(
@@ -132,7 +163,10 @@ fn bind_prop_field<T>(
     writer: Mutable<Battery>,
     apply: impl Fn(&mut Battery, T) + Send + 'static,
 ) where
-    T: Clone + Send + Sync + 'static
+    T: Clone
+        + Send
+        + Sync
+        + 'static
         + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
 {

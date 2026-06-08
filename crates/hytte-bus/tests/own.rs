@@ -4,7 +4,7 @@ use common::ephemeral_bus;
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{own_name_with, OwnState};
+use hytte_bus::{OwnState, own_name_with};
 use std::time::Duration;
 use zbus::connection::Builder;
 use zbus::fdo::RequestNameFlags;
@@ -16,11 +16,10 @@ async fn acquires_unowned_name() {
     shared.spawn_supervisor_for_test();
 
     let state = own_name_with(&shared, "cc.hannig.test.unique").start();
-    let final_state =
-        wait_for_state(state.signal_cloned(), Duration::from_secs(2), |s| {
-            matches!(s, OwnState::Owned)
-        })
-        .await;
+    let final_state = wait_for_state(state.signal_cloned(), Duration::from_secs(2), |s| {
+        matches!(s, OwnState::Owned)
+    })
+    .await;
 
     assert!(
         matches!(final_state, OwnState::Owned),
@@ -57,11 +56,10 @@ async fn lost_then_reacquired() {
         .await
         .unwrap();
 
-    let lost_state =
-        wait_for_state(state.signal_cloned(), Duration::from_secs(3), |s| {
-            matches!(s, OwnState::Lost { .. })
-        })
-        .await;
+    let lost_state = wait_for_state(state.signal_cloned(), Duration::from_secs(3), |s| {
+        matches!(s, OwnState::Lost { .. })
+    })
+    .await;
     assert!(
         matches!(lost_state, OwnState::Lost { .. }),
         "expected Lost, got {lost_state:?}"
@@ -75,11 +73,10 @@ async fn lost_then_reacquired() {
     drop(dbus);
     drop(conn2);
 
-    let reacquired =
-        wait_for_state(state.signal_cloned(), Duration::from_secs(5), |s| {
-            matches!(s, OwnState::Owned)
-        })
-        .await;
+    let reacquired = wait_for_state(state.signal_cloned(), Duration::from_secs(5), |s| {
+        matches!(s, OwnState::Owned)
+    })
+    .await;
     assert!(
         matches!(reacquired, OwnState::Owned),
         "expected re-acquired Owned, got {reacquired:?}"
@@ -150,20 +147,14 @@ async fn permanently_taken_after_three_losses() {
                 if tokio::time::Instant::now() > deadline {
                     break;
                 }
-                if let Ok(Some(sig)) = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    changes.next(),
-                )
-                .await
+                if let Ok(Some(sig)) =
+                    tokio::time::timeout(Duration::from_millis(100), changes.next()).await
                     && let Ok(args) = sig.args()
                 {
-                    let new_owner =
-                        args.new_owner().as_ref().map(|n| n.as_str().to_string());
+                    let new_owner = args.new_owner().as_ref().map(|n| n.as_str().to_string());
                     // The primitive re-acquired when new_owner is neither empty
                     // nor the camper's unique name.
-                    if new_owner.as_deref() != camper_unique.as_deref()
-                        && new_owner.is_some()
-                    {
+                    if new_owner.as_deref() != camper_unique.as_deref() && new_owner.is_some() {
                         break;
                     }
                 }
@@ -247,9 +238,7 @@ where
     let mut last = OwnState::Acquiring;
     let end = tokio::time::Instant::now() + deadline;
     while tokio::time::Instant::now() < end {
-        if let Ok(Some(s)) =
-            tokio::time::timeout(Duration::from_millis(50), stream.next()).await
-        {
+        if let Ok(Some(s)) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
             last = s.clone();
             if pred(&s) {
                 return s;

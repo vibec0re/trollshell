@@ -110,20 +110,18 @@ fn wire_visibility_and_state(
     bind(
         combined,
         container,
-        move |container, (maybe_player, win_count): (Option<Player>, usize)| {
-            match maybe_player {
-                None => {
-                    container.set_visible(false);
-                    *current_bus.borrow_mut() = None;
-                }
-                Some(_) if win_count >= HIDE_WHEN_WINDOWS_GTE => {
-                    container.set_visible(false);
-                }
-                Some(player) => {
-                    *current_bus.borrow_mut() = Some(player.bus_name.clone());
-                    apply_player_to_widgets(&player, &label, &prev_btn, &play_pause_btn, &next_btn);
-                    container.set_visible(true);
-                }
+        move |container, (maybe_player, win_count): (Option<Player>, usize)| match maybe_player {
+            None => {
+                container.set_visible(false);
+                *current_bus.borrow_mut() = None;
+            }
+            Some(_) if win_count >= HIDE_WHEN_WINDOWS_GTE => {
+                container.set_visible(false);
+            }
+            Some(player) => {
+                *current_bus.borrow_mut() = Some(player.bus_name.clone());
+                apply_player_to_widgets(&player, &label, &prev_btn, &play_pause_btn, &next_btn);
+                container.set_visible(true);
             }
         },
     );

@@ -16,7 +16,6 @@ const COMPILED_BASE: &str = match option_env!("TROLLSHELL_DATA_DIR") {
 
 #[must_use]
 pub fn path(rel: &str) -> PathBuf {
-    let base = std::env::var("TROLLSHELL_DATA_DIR")
-        .unwrap_or_else(|_| COMPILED_BASE.to_string());
+    let base = std::env::var("TROLLSHELL_DATA_DIR").unwrap_or_else(|_| COMPILED_BASE.to_string());
     PathBuf::from(base).join(rel)
 }

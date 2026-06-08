@@ -10,7 +10,7 @@
 
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::OwnNameSignal;
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};

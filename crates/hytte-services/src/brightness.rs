@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -121,17 +121,16 @@ fn read_state() -> Option<Brightness> {
     let (name, current_raw, max) = pick_device()?;
 
     // Cache device identity for future writes.
-    let _ = DEVICE.set(Device {
-        name,
-        max,
-    });
+    let _ = DEVICE.set(Device { name, max });
 
     if max == 0 {
         return None;
     }
     #[allow(clippy::cast_precision_loss)]
     let level = f64::from(current_raw) / f64::from(max);
-    Some(Brightness { level: level.clamp(0.0, 1.0) })
+    Some(Brightness {
+        level: level.clamp(0.0, 1.0),
+    })
 }
 
 /// Walks `/sys/class/backlight/` and returns the first device with a readable

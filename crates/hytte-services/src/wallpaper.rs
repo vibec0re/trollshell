@@ -34,7 +34,7 @@
 //! "clear" / "unset" path — the user re-picks via the drawer.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -175,8 +175,10 @@ fn restart_swaybg_unit() {
         .status();
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => tracing::warn!(?s, "wallpaper: systemctl --user restart swaybg.service exited non-zero"),
+        Ok(s) => tracing::warn!(
+            ?s,
+            "wallpaper: systemctl --user restart swaybg.service exited non-zero"
+        ),
         Err(e) => tracing::warn!(error = %e, "wallpaper: failed to spawn systemctl"),
     }
 }
-

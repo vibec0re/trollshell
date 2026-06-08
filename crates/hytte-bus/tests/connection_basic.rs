@@ -1,8 +1,8 @@
 mod common;
 
 use common::ephemeral_bus;
-use hytte_bus::test_support::SharedConnection;
 use hytte_bus::BusKind;
+use hytte_bus::test_support::SharedConnection;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_conn_returns_connection_on_healthy_bus() {
@@ -18,9 +18,9 @@ async fn with_conn_returns_connection_on_healthy_bus() {
 
     let shared = SharedConnection::for_test_session(test_conn.clone());
     let unique_name_via_shared: Option<String> = shared
-        .with_conn(|c| async move {
-            Ok::<_, zbus::Error>(c.unique_name().map(ToString::to_string))
-        })
+        .with_conn(
+            |c| async move { Ok::<_, zbus::Error>(c.unique_name().map(ToString::to_string)) },
+        )
         .await
         .expect("with_conn returns Ok on healthy bus");
 

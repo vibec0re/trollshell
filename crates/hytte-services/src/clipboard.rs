@@ -31,7 +31,7 @@
 //! paste. The page is a plain history list with click-to-paste.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::process::Stdio;
 
 // ── Public data types ────────────────────────────────────────────────────────
@@ -234,10 +234,7 @@ fn is_image_preview(preview: &str) -> bool {
 /// `"Image"`. Best-effort — if cliphist changes its format we fall back.
 fn image_label(preview: &str) -> String {
     // Typical: "[[ binary data 12.3 KiB png ]]"
-    let inside = preview
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim();
+    let inside = preview.trim_start_matches('[').trim_end_matches(']').trim();
     let Some(rest) = inside.strip_prefix("binary data") else {
         return "Image".to_string();
     };
@@ -330,7 +327,10 @@ fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
         .output()
         .map_err(|e| anyhow::anyhow!("spawn cliphist list (for delete): {e}"))?;
     if !list.status.success() {
-        return Err(anyhow::anyhow!("cliphist list (for delete) exited {:?}", list.status));
+        return Err(anyhow::anyhow!(
+            "cliphist list (for delete) exited {:?}",
+            list.status
+        ));
     }
     let stdout = String::from_utf8_lossy(&list.stdout);
     let Some(line) = select_delete_line(&stdout, id) else {
@@ -347,14 +347,19 @@ fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn cliphist delete: {e}"))?;
     {
-        let mut stdin = delete.stdin.take()
+        let mut stdin = delete
+            .stdin
+            .take()
             .ok_or_else(|| anyhow::anyhow!("cliphist delete: no stdin pipe"))?;
-        stdin.write_all(line.as_bytes())
+        stdin
+            .write_all(line.as_bytes())
             .map_err(|e| anyhow::anyhow!("write cliphist delete stdin: {e}"))?;
-        stdin.write_all(b"\n")
+        stdin
+            .write_all(b"\n")
             .map_err(|e| anyhow::anyhow!("write cliphist delete newline: {e}"))?;
     }
-    let status = delete.wait()
+    let status = delete
+        .wait()
         .map_err(|e| anyhow::anyhow!("wait cliphist delete: {e}"))?;
     if !status.success() {
         return Err(anyhow::anyhow!("cliphist delete exited {status:?}"));

@@ -56,7 +56,9 @@ pub fn panel_settings() -> gtk::Widget {
     column.append(&appearance);
 
     // ── Notifications ─────────────────────────────────────────────────────
-    let notif = adw::PreferencesGroup::builder().title("Notifications").build();
+    let notif = adw::PreferencesGroup::builder()
+        .title("Notifications")
+        .build();
 
     let dnd_row = adw::ActionRow::builder()
         .title("Do Not Disturb")
@@ -64,12 +66,9 @@ pub fn panel_settings() -> gtk::Widget {
         .build();
     let dnd_switch = gtk::Switch::new();
     dnd_switch.set_valign(gtk::Align::Center);
-    bind_two_way(
-        dnd::enabled(),
-        &dnd_switch,
-        gtk::Switch::set_active,
-        |w| w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active())),
-    );
+    bind_two_way(dnd::enabled(), &dnd_switch, gtk::Switch::set_active, |w| {
+        w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active()))
+    });
     dnd_row.add_suffix(&dnd_switch);
     dnd_row.set_activatable_widget(Some(&dnd_switch));
     notif.add(&dnd_row);
@@ -129,9 +128,7 @@ pub fn panel_settings() -> gtk::Widget {
 /// Do-Not-Disturb as a top-level preference. Both expanders observe the same
 /// signal and call the same setter, so flipping one updates the other in place.
 fn build_power_profile_expander() -> adw::ExpanderRow {
-    let expander = adw::ExpanderRow::builder()
-        .title("Power profile")
-        .build();
+    let expander = adw::ExpanderRow::builder().title("Power profile").build();
 
     bind(
         power_profiles::state().map(|s| !s.available.is_empty()),

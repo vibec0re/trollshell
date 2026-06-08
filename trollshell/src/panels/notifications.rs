@@ -27,12 +27,9 @@ pub fn panel_notifications() -> gtk::Widget {
         .build();
     let dnd_switch = gtk::Switch::new();
     dnd_switch.set_valign(gtk::Align::Center);
-    bind_two_way(
-        dnd::enabled(),
-        &dnd_switch,
-        gtk::Switch::set_active,
-        |w| w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active())),
-    );
+    bind_two_way(dnd::enabled(), &dnd_switch, gtk::Switch::set_active, |w| {
+        w.connect_active_notify(|sw| dnd::set_enabled(sw.is_active()))
+    });
     dnd_row.add_suffix(&dnd_switch);
     dnd_row.set_activatable_widget(Some(&dnd_switch));
     dnd_group.add(&dnd_row);
@@ -91,9 +88,7 @@ pub fn panel_notifications() -> gtk::Widget {
         }
         if entries.is_empty() {
             let group = adw::PreferencesGroup::new();
-            let empty = adw::ActionRow::builder()
-                .title("No notifications")
-                .build();
+            let empty = adw::ActionRow::builder().title("No notifications").build();
             group.add(&empty);
             groups_for_signal.append(&group);
             return;
@@ -179,9 +174,7 @@ fn build_history_app_row(
 }
 
 fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(&entry.summary)
-        .build();
+    let row = adw::ActionRow::builder().title(&entry.summary).build();
     if !entry.body.is_empty() {
         row.set_subtitle(&entry.body);
     }
@@ -216,8 +209,7 @@ fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionR
 }
 
 fn fmt_notif_time(unix_secs: u64) -> String {
-    let dt = DateTime::<Local>::from(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs),
-    );
+    let dt =
+        DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs));
     dt.format("%H:%M").to_string()
 }

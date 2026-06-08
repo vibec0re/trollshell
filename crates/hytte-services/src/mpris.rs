@@ -31,8 +31,8 @@
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
-use hytte_bus::{call, proxy, signals, BusKind, BusProxy, ProxyState};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -371,10 +371,7 @@ impl State {
     async fn publish(&self) {
         let map = self.map.lock().await;
         let order = self.order.lock().await;
-        let list: Vec<Player> = order
-            .iter()
-            .filter_map(|k| map.get(k).cloned())
-            .collect();
+        let list: Vec<Player> = order.iter().filter_map(|k| map.get(k).cloned()).collect();
         drop(map);
         drop(order);
         let active = pick_active(&list);
@@ -393,10 +390,7 @@ impl State {
     /// Remove a bus name from tracking and publish.
     async fn unregister(&self, bus_name: &str) {
         self.map.lock().await.remove(bus_name);
-        self.order
-            .lock()
-            .await
-            .retain(|k| k != bus_name);
+        self.order.lock().await.retain(|k| k != bus_name);
         self.publish().await;
     }
 }
@@ -482,16 +476,15 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 
 /// Watch `PropertiesChanged` for a player. Re-reads all properties on each
 /// emission for the `org.mpris.MediaPlayer2.Player` interface.
-async fn watch_properties(
-    state: State,
-    bus_name: String,
-    sub: hytte_bus::SignalSubscription,
-) {
+async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::SignalSubscription) {
     let mut events = sub.events();
     while let Some(event) = events.next().await {
         // Decode body: (interface_name, changed_properties, invalidated_properties)
         let Ok((iface, _changed, _invalidated)) =
-            event.body.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+            event
+                .body
+                .body()
+                .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
         else {
             continue;
         };
@@ -570,10 +563,7 @@ async fn poll_position(state: State, bus_name: String) {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-async fn listen(
-    players: &Mutable<Vec<Player>>,
-    active: &Mutable<Option<Player>>,
-) -> Result<()> {
+async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<Option<Player>>) -> Result<()> {
     let state = State::new(players.clone(), active.clone());
 
     // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
@@ -696,8 +686,7 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
         .await
         .unwrap_or(false);
 
-    let (title, artists, album, art_url, length_us, track_id) =
-        read_metadata(bus_name).await;
+    let (title, artists, album, art_url, length_us, track_id) = read_metadata(bus_name).await;
 
     Ok(Player {
         bus_name: bus_name.to_string(),
@@ -730,7 +719,7 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
                 String::new(),
                 0,
                 None,
-            )
+            );
         }
     };
 
@@ -744,7 +733,7 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
                 String::new(),
                 0,
                 None,
-            )
+            );
         }
     };
 
@@ -820,7 +809,9 @@ fn parse_length(val: Option<&OwnedValue>) -> u64 {
 /// string as a `String`, or `None` if absent or unparseable.
 fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
     let v = val?;
-    let Ok(owned) = v.try_clone() else { return None };
+    let Ok(owned) = v.try_clone() else {
+        return None;
+    };
 
     // Try ObjectPath first (most common).
     if let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(owned.clone()) {

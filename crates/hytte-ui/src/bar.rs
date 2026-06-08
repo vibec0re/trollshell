@@ -4,8 +4,8 @@
 //! Returns a `BarHandle` which keeps the underlying window alive; dropping
 //! it closes the bar.
 
-use crate::layer_window::{layer_window, Anchor, Margin};
 use crate::Monitor;
+use crate::layer_window::{Anchor, Margin, layer_window};
 use gtk::prelude::*;
 use gtk4_layer_shell::KeyboardMode;
 

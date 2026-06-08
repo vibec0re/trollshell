@@ -167,7 +167,10 @@ fn build_day_names_row() -> gtk::Grid {
     let row = gtk::Grid::new();
     row.add_css_class("ts-cal-daynames");
     row.set_column_homogeneous(true);
-    for (i, name) in ["MO", "TU", "WE", "TH", "FR", "SA", "SU"].iter().enumerate() {
+    for (i, name) in ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+        .iter()
+        .enumerate()
+    {
         let lbl = gtk::Label::new(Some(name));
         lbl.add_css_class("ts-cal-dayname");
         row.attach(&lbl, i32::try_from(i).unwrap_or(0), 0, 1, 1);
@@ -231,7 +234,9 @@ fn wire_day_clicks(
         let rows_track = rows_track.clone();
         let scrolled = scrolled.clone();
         cell.button.connect_clicked(move |_| {
-            let Some(d) = state.cells[idx].date.get() else { return };
+            let Some(d) = state.cells[idx].date.get() else {
+                return;
+            };
             on_day_clicked(d, &state, &rows_track, &scrolled);
         });
     }
@@ -412,11 +417,19 @@ fn repaint_dots(dots: &gtk::Box, sources: Option<&Vec<String>>) {
 // ── Month arithmetic ──────────────────────────────────────────────────────────
 
 fn prev_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 1 { (year - 1, 12) } else { (year, month - 1) }
+    if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
 }
 
 fn next_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 12 { (year + 1, 1) } else { (year, month + 1) }
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
 }
 
 fn month_label_text(year: i32, month: u32) -> String {
@@ -511,9 +524,13 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
 
 fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &adw::ActionRow) {
     use hytte::gtk::prelude::{AdjustmentExt, WidgetExt};
-    let Some(child) = scrolled.child() else { return };
+    let Some(child) = scrolled.child() else {
+        return;
+    };
     let origin = gtk::graphene::Point::new(0.0, 0.0);
-    let Some(point) = row.compute_point(&child, &origin) else { return };
+    let Some(point) = row.compute_point(&child, &origin) else {
+        return;
+    };
     let y = f64::from(point.y());
     let adj = scrolled.vadjustment();
     let target = (y - 8.0).max(adj.lower());
@@ -571,8 +588,14 @@ mod tests {
         // Sample names should land on more than one index — guards
         // against a hash collapse.
         let names = [
-            "personal", "work", "shared-team", "birthdays",
-            "holidays", "school", "fitness", "side-project",
+            "personal",
+            "work",
+            "shared-team",
+            "birthdays",
+            "holidays",
+            "school",
+            "fitness",
+            "side-project",
         ];
         let mut seen = std::collections::BTreeSet::new();
         for n in names {

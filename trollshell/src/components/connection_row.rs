@@ -31,10 +31,7 @@ pub(crate) fn build_connection_row(c: &Connection) -> adw::ActionRow {
         ConnState::Close => "CLOSE",
         ConnState::Other => "·",
     };
-    let remote = c
-        .remote
-        .map(|a| format!(" → {a}"))
-        .unwrap_or_default();
+    let remote = c.remote.map(|a| format!(" → {a}")).unwrap_or_default();
     row.set_subtitle(&format!("{proto} {}{remote} ({state})", c.local));
     row.add_css_class("ts-mono");
     row

@@ -28,7 +28,7 @@ use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::BusKind;
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -222,7 +222,9 @@ impl Service for WifiService {
         let prompts_m = prompts_mutable.clone();
         let adapter_m = adapter_mutable.clone();
 
-        rt.spawn(run_wifi_watcher(station_m, networks_m, prompts_m, adapter_m));
+        rt.spawn(run_wifi_watcher(
+            station_m, networks_m, prompts_m, adapter_m,
+        ));
 
         WifiHandles {
             station: station_mutable,
@@ -466,10 +468,8 @@ fn parse_state(s: &str) -> StationState {
 
 // ── ObjectManager types ───────────────────────────────────────────────────────
 
-type ManagedObjects = HashMap<
-    zbus::zvariant::OwnedObjectPath,
-    HashMap<String, HashMap<String, OwnedValue>>,
->;
+type ManagedObjects =
+    HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
 async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
     hytte_bus::call("net.connman.iwd")
@@ -490,23 +490,22 @@ async fn read_networks(
     connected_network_path: Option<&str>,
 ) -> Vec<WifiNetwork> {
     // GetOrderedNetworks returns Vec<(ObjectPath, i16)>
-    let ordered: Vec<(zbus::zvariant::OwnedObjectPath, i16)> = match hytte_bus::call(
-        "net.connman.iwd",
-    )
-    .bus(BusKind::System)
-    .at_path(station_path.to_string())
-    .iface("net.connman.iwd.Station")
-    .method("GetOrderedNetworks")
-    .args(())
-    .send::<Vec<(zbus::zvariant::OwnedObjectPath, i16)>>()
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "Station.GetOrderedNetworks failed");
-            return Vec::new();
-        }
-    };
+    let ordered: Vec<(zbus::zvariant::OwnedObjectPath, i16)> =
+        match hytte_bus::call("net.connman.iwd")
+            .bus(BusKind::System)
+            .at_path(station_path.to_string())
+            .iface("net.connman.iwd.Station")
+            .method("GetOrderedNetworks")
+            .args(())
+            .send::<Vec<(zbus::zvariant::OwnedObjectPath, i16)>>()
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Station.GetOrderedNetworks failed");
+                return Vec::new();
+            }
+        };
 
     let mut networks = Vec::with_capacity(ordered.len());
 
@@ -540,13 +539,12 @@ async fn read_networks(
             .and_then(|v| zbus::zvariant::OwnedObjectPath::try_from(v).ok())
             .map(|p| p.as_str().to_string())
             .unwrap_or_default();
-        let known_network_path: Option<String> = if known_network_path_raw.is_empty()
-            || known_network_path_raw == "/"
-        {
-            None
-        } else {
-            Some(known_network_path_raw)
-        };
+        let known_network_path: Option<String> =
+            if known_network_path_raw.is_empty() || known_network_path_raw == "/" {
+                None
+            } else {
+                Some(known_network_path_raw)
+            };
         let known = known_network_path.is_some();
 
         let connected = connected_network_path.is_some_and(|cp| cp == net_path_str);
@@ -807,9 +805,9 @@ async fn refresh_networks(
     let nets = read_networks(station_path, connected.as_deref()).await;
 
     // Update connected_ssid from the refreshed network list.
-    let connected_ssid = connected.as_deref().and_then(|cp| {
-        nets.iter().find(|n| n.path == cp).map(|n| n.ssid.clone())
-    });
+    let connected_ssid = connected
+        .as_deref()
+        .and_then(|cp| nets.iter().find(|n| n.path == cp).map(|n| n.ssid.clone()));
 
     networks_mutable.set(nets);
 
@@ -936,7 +934,11 @@ fn subscribe_iwd_events(station_path: &zbus::zvariant::OwnedObjectPath) -> IwdSu
         .iface("org.freedesktop.DBus.ObjectManager")
         .signal("InterfacesRemoved")
         .start();
-    IwdSubs { station_props, added, removed }
+    IwdSubs {
+        station_props,
+        added,
+        removed,
+    }
 }
 
 /// Drive the iwd event loop. Returns when the station was removed and the
@@ -991,7 +993,9 @@ async fn handle_station_props_event(
     station_mutable: &Mutable<Option<Station>>,
     adapter_mutable: &Mutable<Option<Adapter>>,
 ) -> bool {
-    let Ok((iface, changed, _)) = evt.body.body()
+    let Ok((iface, changed, _)) = evt
+        .body
+        .body()
         .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
     else {
         // Can't decode — full refresh to be safe.
@@ -1025,11 +1029,11 @@ fn apply_station_props_delta(
                     OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
                 })) {
                     st.state = parse_state(&s);
-                } else if let Ok(s) = zbus::zvariant::Str::try_from(
-                    value.try_clone().unwrap_or_else(|_| {
+                } else if let Ok(s) =
+                    zbus::zvariant::Str::try_from(value.try_clone().unwrap_or_else(|_| {
                         OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
-                    }),
-                ) {
+                    }))
+                {
                     st.state = parse_state(s.as_str());
                 }
             }
@@ -1067,9 +1071,9 @@ fn apply_adapter_props_delta(
 
 /// Returns `true` when the `InterfacesRemoved` signal indicates the station was removed.
 fn station_removed_from_event(msg: &zbus::Message, station_path: &str) -> bool {
-    let Ok((path, removed_ifaces)) =
-        msg.body()
-            .deserialize::<(zbus::zvariant::OwnedObjectPath, Vec<String>)>()
+    let Ok((path, removed_ifaces)) = msg
+        .body()
+        .deserialize::<(zbus::zvariant::OwnedObjectPath, Vec<String>)>()
     else {
         return false;
     };

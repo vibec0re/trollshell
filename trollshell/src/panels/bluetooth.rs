@@ -141,13 +141,15 @@ fn build_bluetooth_controls() -> gtk::Widget {
             w.set_active(discovering);
             w.set_label(if discovering { "Stop" } else { "Scan" });
         },
-        |w| w.connect_toggled(|btn| {
-            if btn.is_active() {
-                bluetooth::start_discovery();
-            } else {
-                bluetooth::stop_discovery();
-            }
-        }),
+        |w| {
+            w.connect_toggled(|btn| {
+                if btn.is_active() {
+                    bluetooth::start_discovery();
+                } else {
+                    bluetooth::stop_discovery();
+                }
+            })
+        },
     );
     scan_row.add_suffix(&scan_btn);
     scan_row.set_activatable_widget(Some(&scan_btn));
@@ -245,9 +247,7 @@ fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
         }
         (PromptKind::ConfirmPasskey, None) => "Confirm pairing.".to_string(),
         (PromptKind::Authorize, _) => "Allow this device to pair with you.".to_string(),
-        (PromptKind::EnterPinCode, _) => {
-            "Enter the PIN shown on the other device.".to_string()
-        }
+        (PromptKind::EnterPinCode, _) => "Enter the PIN shown on the other device.".to_string(),
         (PromptKind::EnterPasskey, _) => {
             "Enter the numeric passkey shown on the other device.".to_string()
         }

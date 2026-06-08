@@ -107,9 +107,7 @@ fn build_brightness_row() -> gtk::ListBox {
 }
 
 fn build_power_profile_expander() -> adw::ExpanderRow {
-    let expander = adw::ExpanderRow::builder()
-        .title("Power profile")
-        .build();
+    let expander = adw::ExpanderRow::builder().title("Power profile").build();
 
     bind(
         power_profiles::state().map(|s| !s.available.is_empty()),

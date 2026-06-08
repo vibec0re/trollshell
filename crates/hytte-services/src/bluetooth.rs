@@ -29,12 +29,12 @@
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, SignalSubscription};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -194,7 +194,6 @@ pub(crate) enum AgentReply {
     /// User submitted a numeric passkey for `RequestPasskey`.
     Passkey(u32),
 }
-
 
 // ── Service marker ────────────────────────────────────────────────────────────
 
@@ -537,7 +536,11 @@ pub fn remove_device(device_path: &str) {
 
 // ── Command helpers ───────────────────────────────────────────────────────────
 
-async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result<(), hytte_bus::BusError> {
+async fn do_set_adapter_bool(
+    adapter_path: &str,
+    prop: &str,
+    on: bool,
+) -> Result<(), hytte_bus::BusError> {
     let value = zbus::zvariant::Value::from(on)
         .try_to_owned()
         .map_err(|e| hytte_bus::BusError::Permanent {
@@ -555,7 +558,11 @@ async fn do_set_adapter_bool(adapter_path: &str, prop: &str, on: bool) -> Result
         .await
 }
 
-async fn do_set_device_bool(device_path: &str, prop: &str, on: bool) -> Result<(), hytte_bus::BusError> {
+async fn do_set_device_bool(
+    device_path: &str,
+    prop: &str,
+    on: bool,
+) -> Result<(), hytte_bus::BusError> {
     let value = zbus::zvariant::Value::from(on)
         .try_to_owned()
         .map_err(|e| hytte_bus::BusError::Permanent {
@@ -595,7 +602,10 @@ async fn do_device_call(device_path: &str, method: &str) -> Result<(), hytte_bus
         .await
 }
 
-async fn do_remove_device(adapter_path: &str, device_path: &str) -> Result<(), hytte_bus::BusError> {
+async fn do_remove_device(
+    adapter_path: &str,
+    device_path: &str,
+) -> Result<(), hytte_bus::BusError> {
     let dev_op = zbus::zvariant::ObjectPath::try_from(device_path)
         .map_err(|e| hytte_bus::BusError::Permanent {
             reason: format!("invalid device object path: {e}"),
@@ -745,10 +755,8 @@ impl State {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-type ManagedObjects = HashMap<
-    zbus::zvariant::OwnedObjectPath,
-    HashMap<String, HashMap<String, OwnedValue>>,
->;
+type ManagedObjects =
+    HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
 async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
     hytte_bus::call("org.bluez")
@@ -849,8 +857,7 @@ async fn event_loop(state: &State, adapter_path: &str) -> Result<(), anyhow::Err
 
     // Channel for device-level PropertiesChanged events forwarded from
     // per-device subscriptions (added/removed as devices appear/disappear).
-    let (props_tx, mut props_rx) =
-        tokio::sync::mpsc::unbounded_channel::<PropChangedEvent>();
+    let (props_tx, mut props_rx) = tokio::sync::mpsc::unbounded_channel::<PropChangedEvent>();
 
     // Subscribe PropertiesChanged for all devices already in the map.
     let mut device_subs: HashMap<String, SignalSubscription> = {
@@ -1001,10 +1008,10 @@ async fn handle_ifaces_removed(
     msg: zbus::Message,
     device_subs: &mut HashMap<String, SignalSubscription>,
 ) -> bool {
-    let Ok((path, removed_ifaces)) = msg.body().deserialize::<(
-        zbus::zvariant::OwnedObjectPath,
-        Vec<String>,
-    )>() else {
+    let Ok((path, removed_ifaces)) = msg
+        .body()
+        .deserialize::<(zbus::zvariant::OwnedObjectPath, Vec<String>)>()
+    else {
         return false;
     };
 
@@ -1039,16 +1046,11 @@ async fn handle_ifaces_removed(
     false
 }
 
-fn handle_adapter_props_changed(
-    state: &State,
-    adapter_path: &str,
-    msg: &zbus::Message,
-) {
-    let Ok((iface_name, changed, _)) = msg.body().deserialize::<(
-        String,
-        HashMap<String, OwnedValue>,
-        Vec<String>,
-    )>() else {
+fn handle_adapter_props_changed(state: &State, adapter_path: &str, msg: &zbus::Message) {
+    let Ok((iface_name, changed, _)) = msg
+        .body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
         return;
     };
 
@@ -1059,11 +1061,11 @@ fn handle_adapter_props_changed(
 }
 
 async fn handle_device_props_changed(state: &State, evt: PropChangedEvent) {
-    let Ok((iface_name, changed, _)) = evt.body.body().deserialize::<(
-        String,
-        HashMap<String, OwnedValue>,
-        Vec<String>,
-    )>() else {
+    let Ok((iface_name, changed, _)) =
+        evt.body
+            .body()
+            .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
         return;
     };
 
@@ -1299,7 +1301,6 @@ async fn await_reply(prompt: PairPrompt) -> AgentReply {
 /// stored in `BluetoothHandles`) to keep the interface alive for the duration
 /// of this task.
 async fn run_agent(_ownership: hytte_bus::OwnNameSignal) {
-
     // Watch for org.bluez owner changes. When bluetoothd restarts (loses
     // its name), our registration is gone and we must re-register.
     // We re-register once the owner comes back.

@@ -41,7 +41,7 @@ use hytte::services::dnd;
 use hytte::services::niri;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::services::notifications_mute;
-use hytte::ui::{layer_window, Anchor, Margin};
+use hytte::ui::{Anchor, Margin, layer_window};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -170,8 +170,11 @@ fn apply_emission(
 
     let visible = filter_visible(notifs, dnd_on, muted, &mut suppressed);
     gc_suppressed(notifs, &mut suppressed);
-    let Partition { critical_visible, head_noncritical, tail_noncritical_count } =
-        partition_visible(&visible);
+    let Partition {
+        critical_visible,
+        head_noncritical,
+        tail_noncritical_count,
+    } = partition_visible(&visible);
 
     // Build id sets.
     let new_ids: HashMap<u32, &Notification> = critical_visible
@@ -184,7 +187,9 @@ fn apply_emission(
 
     // Remove cards whose notifications have gone.
     for id in &old_ids {
-        if !new_ids.contains_key(id) && let Some(card) = map.remove(id) {
+        if !new_ids.contains_key(id)
+            && let Some(card) = map.remove(id)
+        {
             view.vbox.remove(&card);
         }
     }
@@ -272,11 +277,10 @@ fn gc_suppressed(notifs: &[Notification], suppressed: &mut HashSet<u32>) {
 /// non-critical head + collapsed tail count. Critical urgency never counts
 /// toward the cap.
 fn partition_visible<'a>(visible: &[&'a Notification]) -> Partition<'a> {
-    let (critical_visible, noncritical_visible): (Vec<&Notification>, Vec<&Notification>) =
-        visible
-            .iter()
-            .copied()
-            .partition(|n| n.urgency == Urgency::Critical);
+    let (critical_visible, noncritical_visible): (Vec<&Notification>, Vec<&Notification>) = visible
+        .iter()
+        .copied()
+        .partition(|n| n.urgency == Urgency::Critical);
     let nc_head_start = noncritical_visible
         .len()
         .saturating_sub(MAX_VISIBLE_NONCRITICAL);

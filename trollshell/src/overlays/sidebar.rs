@@ -40,7 +40,7 @@ use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
-use hytte::ui::{layer_window, Anchor, Layer, LayerShell};
+use hytte::ui::{Anchor, Layer, LayerShell, layer_window};
 
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
 /// "frame border ~320px" geometry from the spec; the frame's cutout left
@@ -361,7 +361,10 @@ mod tests {
         // No PANELS map yet, no install() call — the frame might query us
         // during early bootstrap. Use a fake monitor key directly via the
         // private fallback path.
-        assert_eq!(current_visible_width_for_key("nonexistent"), FRAME_THICKNESS_I32);
+        assert_eq!(
+            current_visible_width_for_key("nonexistent"),
+            FRAME_THICKNESS_I32
+        );
     }
 
     #[test]

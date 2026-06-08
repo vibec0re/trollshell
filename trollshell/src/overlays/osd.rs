@@ -81,8 +81,8 @@ struct OsdView {
     window: gtk::Window,
     card: gtk::Box,
     icon: gtk::Image,
-    label: gtk::Label,        // kind name: "Volume" / "Microphone" / "Brightness"
-    value: gtk::Label,        // percent / "Muted"
+    label: gtk::Label, // kind name: "Volume" / "Microphone" / "Brightness"
+    value: gtk::Label, // percent / "Muted"
     progress: gtk::ProgressBar,
     /// Pending hide timeout. Held so each new event can cancel and
     /// re-arm it (latest-wins debounce).
@@ -124,16 +124,16 @@ pub fn install(monitor: &Monitor) {
     // connector, so this works even though `osd::install` runs before
     // `modal::install` during boot.
     let connector_for_sub = connector.clone();
-    glib::MainContext::default().spawn_local(
-        crate::modal::drawer_open_signal(monitor).for_each(move |open| {
+    glib::MainContext::default().spawn_local(crate::modal::drawer_open_signal(monitor).for_each(
+        move |open| {
             OSDS.with(|map| {
                 if let Some(view) = map.borrow().get(&connector_for_sub) {
                     view.drawer_open.set(open);
                 }
             });
             std::future::ready(())
-        }),
-    );
+        },
+    ));
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));
@@ -215,16 +215,16 @@ fn install_subscriptions() {
     // ── Volume ────────────────────────────────────────────────────────
     {
         let first = Cell::new(true);
-        glib::MainContext::default().spawn_local(
-            pipewire::default_sink().for_each(move |v: Volume| {
+        glib::MainContext::default().spawn_local(pipewire::default_sink().for_each(
+            move |v: Volume| {
                 if first.replace(false) {
                     return std::future::ready(());
                 }
                 let state = render_volume(v);
                 route_show(&state);
                 std::future::ready(())
-            }),
-        );
+            },
+        ));
     }
 
     // ── Microphone (default source) ───────────────────────────────────
@@ -575,24 +575,19 @@ fn show(view: &Rc<OsdView>, state: &State) {
         prev.remove();
     }
     let view_for_timeout = view.clone();
-    let id = glib::timeout_add_local_once(
-        Duration::from_millis(u64::from(HIDE_AFTER_MS)),
-        move || {
+    let id =
+        glib::timeout_add_local_once(Duration::from_millis(u64::from(HIDE_AFTER_MS)), move || {
             view_for_timeout.timeout.set(None);
             view_for_timeout.card.remove_css_class("shown");
             // Wait for the 200ms CSS transition + 20ms safety buffer
             // before actually hiding the layer-shell window.
             let view_for_fade = view_for_timeout.clone();
-            let fade_id = glib::timeout_add_local_once(
-                Duration::from_millis(220),
-                move || {
-                    view_for_fade.fade_out_timeout.set(None);
-                    view_for_fade.window.set_visible(false);
-                },
-            );
+            let fade_id = glib::timeout_add_local_once(Duration::from_millis(220), move || {
+                view_for_fade.fade_out_timeout.set(None);
+                view_for_fade.window.set_visible(false);
+            });
             view_for_timeout.fade_out_timeout.set(Some(fade_id));
-        },
-    );
+        });
     view.timeout.set(Some(id));
 }
 
@@ -638,8 +633,14 @@ mod tests {
 
     #[test]
     fn volume_icon_medium_band() {
-        assert_eq!(volume_icon(&vol(0.5, false)), "audio-volume-medium-symbolic");
-        assert_eq!(volume_icon(&vol(0.66, false)), "audio-volume-medium-symbolic");
+        assert_eq!(
+            volume_icon(&vol(0.5, false)),
+            "audio-volume-medium-symbolic"
+        );
+        assert_eq!(
+            volume_icon(&vol(0.66, false)),
+            "audio-volume-medium-symbolic"
+        );
     }
 
     #[test]
@@ -650,19 +651,34 @@ mod tests {
 
     #[test]
     fn mic_icon_muted() {
-        assert_eq!(mic_icon(&src(0.5, true)), "microphone-sensitivity-muted-symbolic");
+        assert_eq!(
+            mic_icon(&src(0.5, true)),
+            "microphone-sensitivity-muted-symbolic"
+        );
     }
 
     #[test]
     fn mic_icon_high_band() {
-        assert_eq!(mic_icon(&src(0.5, false)), "microphone-sensitivity-high-symbolic");
-        assert_eq!(mic_icon(&src(1.0, false)), "microphone-sensitivity-high-symbolic");
+        assert_eq!(
+            mic_icon(&src(0.5, false)),
+            "microphone-sensitivity-high-symbolic"
+        );
+        assert_eq!(
+            mic_icon(&src(1.0, false)),
+            "microphone-sensitivity-high-symbolic"
+        );
     }
 
     #[test]
     fn mic_icon_medium_band() {
-        assert_eq!(mic_icon(&src(0.0, false)), "microphone-sensitivity-medium-symbolic");
-        assert_eq!(mic_icon(&src(0.49, false)), "microphone-sensitivity-medium-symbolic");
+        assert_eq!(
+            mic_icon(&src(0.0, false)),
+            "microphone-sensitivity-medium-symbolic"
+        );
+        assert_eq!(
+            mic_icon(&src(0.49, false)),
+            "microphone-sensitivity-medium-symbolic"
+        );
     }
 
     fn batt(percentage: f64, state: BatteryState) -> Battery {

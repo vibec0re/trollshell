@@ -55,4 +55,3 @@ fn icon_state(source: Option<&Source>, recording: bool) -> (&'static str, bool) 
         Some(_) => ("microphone-sensitivity-high-symbolic", true),
     }
 }
-

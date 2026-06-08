@@ -2,8 +2,8 @@ mod common;
 
 use common::ephemeral_bus;
 use futures_util::StreamExt;
-use hytte_bus::test_support::SharedConnection;
 use hytte_bus::signals_with;
+use hytte_bus::test_support::SharedConnection;
 use std::time::Duration;
 use zbus::connection::Builder;
 use zbus::object_server::SignalEmitter;

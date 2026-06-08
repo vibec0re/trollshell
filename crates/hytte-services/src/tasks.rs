@@ -118,10 +118,7 @@ enum Op {
         due: Option<DateTime<Local>>,
     },
     /// Remove a VTODO. No undo.
-    Delete {
-        list_uid: String,
-        uid: String,
-    },
+    Delete { list_uid: String, uid: String },
 }
 
 /// Channel handle to the worker. `OnceLock` so the service can be
@@ -235,11 +232,7 @@ pub fn refresh() {
 /// VTODO before submission, so the caller can correlate the new row
 /// without waiting for the refresh round-trip.
 #[must_use = "the returned UID is the only way to address the new task"]
-pub fn create_task(
-    list_uid: String,
-    summary: String,
-    due: Option<DateTime<Local>>,
-) -> String {
+pub fn create_task(list_uid: String, summary: String, due: Option<DateTime<Local>>) -> String {
     let uid = generate_uid();
     send_op(Op::Create {
         list_uid,
@@ -263,12 +256,7 @@ pub fn set_completed(list_uid: &str, uid: &str, completed: bool) {
 
 /// Edit a task's SUMMARY + DUE. Same read-modify-write cycle as
 /// [`set_completed`].
-pub fn edit_task(
-    list_uid: &str,
-    uid: &str,
-    summary: String,
-    due: Option<DateTime<Local>>,
-) {
+pub fn edit_task(list_uid: &str, uid: &str, summary: String, due: Option<DateTime<Local>>) {
     send_op(Op::Edit {
         list_uid: list_uid.to_string(),
         uid: uid.to_string(),
@@ -359,7 +347,11 @@ impl Worker {
 
     /// Re-scan every task list and emit fresh signals if either the
     /// tasks Vec or the lists Vec differs from the current snapshot.
-    fn refresh(&mut self, tasks_writer: &Mutable<Vec<Task>>, lists_writer: &Mutable<Vec<TaskList>>) {
+    fn refresh(
+        &mut self,
+        tasks_writer: &Mutable<Vec<Task>>,
+        lists_writer: &Mutable<Vec<TaskList>>,
+    ) {
         let (tasks, lists) = self.scan_all();
         let tasks_changed = {
             let cur = tasks_writer.lock_ref();
@@ -446,7 +438,9 @@ impl Worker {
         let current = client
             .get_object_as_string(uid, None)?
             .ok_or_else(|| anyhow::anyhow!("task '{uid}' not found on list '{list_uid}'"))?;
-        let parsed: Calendar = current.parse().map_err(|e| anyhow::anyhow!("parse current: {e}"))?;
+        let parsed: Calendar = current
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parse current: {e}"))?;
         // Take ownership of the first VTODO so we can mutate via &mut.
         let mut todo = parsed
             .components

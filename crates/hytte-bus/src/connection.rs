@@ -8,8 +8,8 @@
 // Production-only accessors (session/system/start) are forward-declared for
 // Task 6; they are wired up in Task 12.
 
-use crate::error::is_transient_zbus_error;
 use crate::BusError;
+use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -9,8 +9,8 @@
 //! UI hides itself when `available.is_empty()`.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_bus::{call, property, BusKind, PropState};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_bus::{BusKind, PropState, call, property};
+use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use zbus::zvariant::{OwnedValue, Value};
 

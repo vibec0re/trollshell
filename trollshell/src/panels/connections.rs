@@ -15,7 +15,7 @@ use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::netconn;
 
-use crate::components::connection_row::{build_connection_row, CONN_BUCKET_CAP};
+use crate::components::connection_row::{CONN_BUCKET_CAP, build_connection_row};
 use crate::components::layout::{finish_page, page_box};
 
 pub fn panel_connections() -> gtk::Widget {
@@ -49,77 +49,73 @@ pub fn panel_connections() -> gtk::Widget {
     let overflow_for_bind = owned_overflow_track.clone();
     let other_for_bind = other_expander.clone();
     let other_rows_for_bind = other_rows_track.clone();
-    bind(
-        netconn::connections(),
-        &conn_group,
-        move |_g, mut conns| {
-            conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (true, true) => a
-                    .program
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.program.as_deref().unwrap_or("")),
-                (false, false) => a.local.to_string().cmp(&b.local.to_string()),
-            });
+    bind(netconn::connections(), &conn_group, move |_g, mut conns| {
+        conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => a
+                .program
+                .as_deref()
+                .unwrap_or("")
+                .cmp(b.program.as_deref().unwrap_or("")),
+            (false, false) => a.local.to_string().cmp(&b.local.to_string()),
+        });
 
-            let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
-            let total_other = conns.len() - total_owned;
+        let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
+        let total_other = conns.len() - total_owned;
 
-            let mut owned = owned_for_bind.borrow_mut();
-            for r in owned.drain(..) {
-                group_for_bind.remove(&r);
-            }
-            let mut others = other_rows_for_bind.borrow_mut();
-            for r in others.drain(..) {
-                other_for_bind.remove(&r);
-            }
-            if let Some(prev) = overflow_for_bind.borrow_mut().take() {
-                group_for_bind.remove(&prev);
-            }
+        let mut owned = owned_for_bind.borrow_mut();
+        for r in owned.drain(..) {
+            group_for_bind.remove(&r);
+        }
+        let mut others = other_rows_for_bind.borrow_mut();
+        for r in others.drain(..) {
+            other_for_bind.remove(&r);
+        }
+        if let Some(prev) = overflow_for_bind.borrow_mut().take() {
+            group_for_bind.remove(&prev);
+        }
 
-            let mut owned_count = 0usize;
-            let mut other_count = 0usize;
-            for c in &conns {
-                if c.pid.is_some() {
-                    if owned_count >= CONN_BUCKET_CAP {
-                        continue;
-                    }
-                    let row = build_connection_row(c);
-                    group_for_bind.add(&row);
-                    owned.push(row);
-                    owned_count += 1;
-                } else {
-                    if other_count >= CONN_BUCKET_CAP {
-                        continue;
-                    }
-                    let row = build_connection_row(c);
-                    other_for_bind.add_row(&row);
-                    others.push(row);
-                    other_count += 1;
+        let mut owned_count = 0usize;
+        let mut other_count = 0usize;
+        for c in &conns {
+            if c.pid.is_some() {
+                if owned_count >= CONN_BUCKET_CAP {
+                    continue;
                 }
-            }
-
-            if total_owned > owned_count {
-                let hint = adw::ActionRow::builder()
-                    .title(format!("(+{} more)", total_owned - owned_count))
-                    .activatable(false)
-                    .selectable(false)
-                    .build();
-                hint.set_subtitle("Top sockets shown.");
-                group_for_bind.add(&hint);
-                *overflow_for_bind.borrow_mut() = Some(hint);
-            }
-
-            if total_other > other_count {
-                other_for_bind.set_subtitle(&format!("{other_count} of {total_other} sockets"));
+                let row = build_connection_row(c);
+                group_for_bind.add(&row);
+                owned.push(row);
+                owned_count += 1;
             } else {
-                other_for_bind.set_subtitle(&format!("{other_count} sockets"));
+                if other_count >= CONN_BUCKET_CAP {
+                    continue;
+                }
+                let row = build_connection_row(c);
+                other_for_bind.add_row(&row);
+                others.push(row);
+                other_count += 1;
             }
-            other_for_bind.set_visible(total_other > 0);
-        },
-    );
+        }
+
+        if total_owned > owned_count {
+            let hint = adw::ActionRow::builder()
+                .title(format!("(+{} more)", total_owned - owned_count))
+                .activatable(false)
+                .selectable(false)
+                .build();
+            hint.set_subtitle("Top sockets shown.");
+            group_for_bind.add(&hint);
+            *overflow_for_bind.borrow_mut() = Some(hint);
+        }
+
+        if total_other > other_count {
+            other_for_bind.set_subtitle(&format!("{other_count} of {total_other} sockets"));
+        } else {
+            other_for_bind.set_subtitle(&format!("{other_count} sockets"));
+        }
+        other_for_bind.set_visible(total_other > 0);
+    });
     conn_group.add(&other_expander);
     column.append(&conn_group);
 

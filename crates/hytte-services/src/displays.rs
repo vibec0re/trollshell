@@ -18,7 +18,7 @@
 //! shape lives here.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use niri_ipc::socket::Socket;
 use niri_ipc::{OutputAction, Request, Response, Transform as NiriTransform};
 use std::time::Duration;
@@ -109,7 +109,11 @@ pub fn outputs() -> impl Signal<Item = Vec<Output>> {
 pub fn set_output_enabled(name: &str, on: bool) {
     let name = name.to_string();
     runtime::handle().spawn_blocking(move || {
-        let action = if on { OutputAction::On } else { OutputAction::Off };
+        let action = if on {
+            OutputAction::On
+        } else {
+            OutputAction::Off
+        };
         if let Err(e) = send_output_action(&name, action) {
             tracing::warn!(output = %name, on, error = %e, "displays: output toggle failed");
         }
@@ -118,7 +122,10 @@ pub fn set_output_enabled(name: &str, on: bool) {
 
 fn send_output_action(name: &str, action: OutputAction) -> anyhow::Result<()> {
     let mut sock = Socket::connect().map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let req = Request::Output { output: name.to_string(), action };
+    let req = Request::Output {
+        output: name.to_string(),
+        action,
+    };
     match sock.send(req).map_err(|e| anyhow::anyhow!("send: {e}"))? {
         Ok(_) => Ok(()),
         Err(msg) => Err(anyhow::anyhow!("niri: {msg}")),

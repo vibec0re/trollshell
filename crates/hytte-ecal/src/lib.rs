@@ -44,7 +44,9 @@ impl Registry {
         let mut err: *mut sys::GError = ptr::null_mut();
         let raw = unsafe { sys::e_source_registry_new_sync(ptr::null_mut(), &mut err) };
         if raw.is_null() {
-            return Err(take_error(err).unwrap_or_else(|| anyhow!("ESourceRegistry: unknown error")));
+            return Err(
+                take_error(err).unwrap_or_else(|| anyhow!("ESourceRegistry: unknown error"))
+            );
         }
         Ok(Self { raw })
     }
@@ -102,7 +104,6 @@ impl Registry {
         unsafe { sys::g_list_free_full(list, no_op_destroy) }
         out
     }
-
 }
 
 impl Drop for Registry {
@@ -437,11 +438,17 @@ fn parse_component(ical: &str) -> Result<Component> {
     }
     let parsed = Component { raw };
     let kind = unsafe { sys::i_cal_component_isa(parsed.raw) };
-    if matches!(kind, sys::ICalComponentKind::Vtodo | sys::ICalComponentKind::Vevent) {
+    if matches!(
+        kind,
+        sys::ICalComponentKind::Vtodo | sys::ICalComponentKind::Vevent
+    ) {
         return Ok(parsed);
     }
     // Try VTODO first, then VEVENT.
-    for k in [sys::ICalComponentKind::Vtodo, sys::ICalComponentKind::Vevent] {
+    for k in [
+        sys::ICalComponentKind::Vtodo,
+        sys::ICalComponentKind::Vevent,
+    ] {
         let inner = unsafe { sys::i_cal_component_get_first_component(parsed.raw, k) };
         if !inner.is_null() {
             // `get_first_component` returns a NEW ref (libical-glib

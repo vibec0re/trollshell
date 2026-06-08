@@ -251,10 +251,7 @@ fn build_noc_match_rule(dest: &str) -> Result<zbus::OwnedMatchRule, zbus::Error>
 /// 3. Emit Live.
 /// 4. Drain the NOC stream + epoch signal until the stream ends or epoch bumps.
 /// 5. Set Reconnecting, loop.
-async fn run_proxy_watcher(
-    weak: Weak<ProxyInner>,
-    task_done_tx: tokio::sync::oneshot::Sender<()>,
-) {
+async fn run_proxy_watcher(weak: Weak<ProxyInner>, task_done_tx: tokio::sync::oneshot::Sender<()>) {
     let mut first_iteration = true;
     let mut task_done_tx = Some(task_done_tx);
 
@@ -285,8 +282,14 @@ async fn run_proxy_watcher(
         inner.liveness.set(ProxyState::Live);
 
         let exited = drain_noc_stream(
-            &inner, &weak, &dest, &mut stream, current_epoch, &mut task_done_tx,
-        ).await;
+            &inner,
+            &weak,
+            &dest,
+            &mut stream,
+            current_epoch,
+            &mut task_done_tx,
+        )
+        .await;
         if exited {
             return;
         }
@@ -298,10 +301,7 @@ async fn run_proxy_watcher(
 /// Build the NOC match rule and subscribe before emitting Live, so any NOC
 /// signal fired after subscription (even between proxy-build and subscribe)
 /// is buffered. Returns None on transient failure (caller should retry).
-async fn subscribe_noc(
-    inner: &Arc<ProxyInner>,
-    dest: &str,
-) -> Option<zbus::MessageStream> {
+async fn subscribe_noc(inner: &Arc<ProxyInner>, dest: &str) -> Option<zbus::MessageStream> {
     let match_rule = match build_noc_match_rule(dest) {
         Ok(r) => r,
         Err(e) => {
@@ -398,8 +398,7 @@ async fn handle_noc_msg(
         }
         Some(Ok(msg)) => {
             let body = msg.body();
-            if let Ok((name, _old, new_owner)) =
-                body.deserialize::<(String, String, String)>()
+            if let Ok((name, _old, new_owner)) = body.deserialize::<(String, String, String)>()
                 && name == dest
             {
                 if new_owner.is_empty() {

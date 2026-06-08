@@ -79,4 +79,3 @@ pub fn active_workspace_windows(
         }
     }
 }
-

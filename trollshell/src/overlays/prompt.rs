@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::wifi;
-use hytte::ui::{layer_window, Layer};
+use hytte::ui::{Layer, layer_window};
 
 // ── Thread-local window storage ───────────────────────────────────────────────
 
@@ -26,15 +26,13 @@ thread_local! {
 /// in practice — called once from `main.rs` before the GTK loop starts.
 pub fn install(monitor: &Monitor) {
     let monitor = monitor.clone();
-    glib::MainContext::default().spawn_local(
-        wifi::active_prompt().for_each(move |prompt| {
-            match prompt {
-                Some(req) => show_prompt(&monitor, req),
-                None => close_prompt(),
-            }
-            std::future::ready(())
-        }),
-    );
+    glib::MainContext::default().spawn_local(wifi::active_prompt().for_each(move |prompt| {
+        match prompt {
+            Some(req) => show_prompt(&monitor, req),
+            None => close_prompt(),
+        }
+        std::future::ready(())
+    }));
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

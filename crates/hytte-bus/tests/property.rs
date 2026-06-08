@@ -4,7 +4,7 @@ use common::ephemeral_bus;
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{property_with, PropState};
+use hytte_bus::{PropState, property_with};
 use std::time::Duration;
 
 struct Counter {
@@ -175,7 +175,10 @@ async fn reconnect_emits_stale_then_loaded() {
             saw_loaded_initial = true;
         }
     }
-    assert!(saw_loaded_initial, "did not observe Loaded(42) before simulated disconnect");
+    assert!(
+        saw_loaded_initial,
+        "did not observe Loaded(42) before simulated disconnect"
+    );
 
     // Give the tracking task time to enter the PropertiesChanged listen loop
     // before we trigger the disconnect (mirrors the sleep in
@@ -195,9 +198,7 @@ async fn reconnect_emits_stale_then_loaded() {
     let mut saw_stale = false;
     let mut saw_loaded_after = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline
-        && !(saw_stale && saw_loaded_after)
-    {
+    while tokio::time::Instant::now() < deadline && !(saw_stale && saw_loaded_after) {
         let next = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
         if let Ok(Some(state)) = next {
             match state {

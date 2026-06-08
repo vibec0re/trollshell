@@ -20,8 +20,10 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         }
     };
 
-    bind(combined, &btn, |w, (adapter, any_connected)| {
-        match &adapter {
+    bind(
+        combined,
+        &btn,
+        |w, (adapter, any_connected)| match &adapter {
             None => {
                 w.set_visible(false);
             }
@@ -40,8 +42,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 };
                 img.set_icon_name(Some(icon_name));
             }
-        }
-    });
+        },
+    );
 
     let _ = icon; // moved into button child above; keep reference for bind
     let monitor_for_click = monitor.clone();

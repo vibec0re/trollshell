@@ -1,6 +1,6 @@
 use hytte_reactive::runtime;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[test]
@@ -26,5 +26,8 @@ fn handle_spawns_tasks_on_a_background_thread() {
 fn handle_is_stable_across_calls() {
     let h1 = runtime::handle();
     let h2 = runtime::handle();
-    assert!(std::ptr::eq(h1, h2), "handle() should return the same Handle");
+    assert!(
+        std::ptr::eq(h1, h2),
+        "handle() should return the same Handle"
+    );
 }

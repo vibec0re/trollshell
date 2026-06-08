@@ -29,8 +29,8 @@
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_bus::{call, signals, BusKind};
-use hytte_reactive::{registry, Service};
+use hytte_bus::{BusKind, call, signals};
+use hytte_reactive::{Service, registry};
 use std::time::Duration;
 
 const SYSTEMD_NAME: &str = "org.freedesktop.systemd1";
@@ -165,11 +165,13 @@ async fn refresh_failed(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
 pub(crate) fn parse_units(units: Vec<UnitTuple>) -> Vec<FailedUnit> {
     let mut out: Vec<FailedUnit> = units
         .into_iter()
-        .map(|(name, description, _load, _active, sub_state, ..)| FailedUnit {
-            name,
-            description,
-            sub_state,
-        })
+        .map(
+            |(name, description, _load, _active, sub_state, ..)| FailedUnit {
+                name,
+                description,
+                sub_state,
+            },
+        )
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out

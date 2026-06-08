@@ -105,8 +105,9 @@ impl StreamRow {
             toggle_class(&self.mute_btn, "muted", s.muted);
         }
 
-        if echo_settled(&self.pending_volume, s.volume, |a, b| (a - b).abs() < ECHO_TOLERANCE)
-            && (self.slider.value() - s.volume).abs() > SLIDER_NOOP_TOLERANCE
+        if echo_settled(&self.pending_volume, s.volume, |a, b| {
+            (a - b).abs() < ECHO_TOLERANCE
+        }) && (self.slider.value() - s.volume).abs() > SLIDER_NOOP_TOLERANCE
         {
             self.slider.set_value(s.volume);
         }

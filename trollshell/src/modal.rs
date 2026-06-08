@@ -7,12 +7,11 @@ use hytte::prelude::*;
 use hytte::services::calendar;
 use hytte::services::clipboard;
 use hytte::services::notifications;
-use hytte::ui::{layer_window, Anchor, Layer, LayerEdge, LayerShell, Margin};
+use hytte::ui::{Anchor, Layer, LayerEdge, LayerShell, Margin, layer_window};
 
 /// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
 /// Used to clamp the per-trigger margin so the card never falls off-screen left.
 const DRAWER_MAX_WIDTH: i32 = 680;
-
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
@@ -141,7 +140,12 @@ fn build_drawer_window(monitor: &Monitor, key: &str) -> gtk::Window {
         .layer(Layer::Top)
         .anchor(Anchor::Top)
         .anchor(Anchor::Right)
-        .margin(Margin { top: 59, right: 0, bottom: 0, left: 0 })
+        .margin(Margin {
+            top: 59,
+            right: 0,
+            bottom: 0,
+            left: 0,
+        })
         .exclusive(false)
         .keyboard_mode(KeyboardMode::OnDemand)
         .namespace(format!("hytte-modal-{key}"))
@@ -234,7 +238,9 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         }
         PANELS.with(|panels| {
             let panels = panels.borrow();
-            let Some(panel) = panels.get(&key) else { return };
+            let Some(panel) = panels.get(&key) else {
+                return;
+            };
             panel.window.set_visible(false);
             panel.catcher.set_visible(false);
             *panel.current.borrow_mut() = None;
@@ -338,8 +344,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
                 // target page's natural width, not whatever was last shown.
                 // `show_panel` re-sets it (idempotent).
                 panel.stack.set_visible_child_name(page.stack_name());
-                let margin_right =
-                    margin_right_for_trigger(monitor, panel, trigger.upcast_ref());
+                let margin_right = margin_right_for_trigger(monitor, panel, trigger.upcast_ref());
                 show_panel(panel, page, margin_right);
             }
         }
@@ -375,11 +380,7 @@ fn show_panel(panel: &ModalPanel, page: Page, margin_right: i32) {
 /// Uses `panel.stack.measure(...)` so the offset matches the target page's
 /// natural width; the caller must `set_visible_child_name` first.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn margin_right_for_trigger(
-    monitor: &Monitor,
-    panel: &ModalPanel,
-    trigger: &gtk::Widget,
-) -> i32 {
+fn margin_right_for_trigger(monitor: &Monitor, panel: &ModalPanel, trigger: &gtk::Widget) -> i32 {
     let (mon_w, _) = monitor.size();
     let chip_center = trigger.root().and_then(|root| {
         let mid = graphene::Point::new(trigger.width() as f32 / 2.0, 0.0);

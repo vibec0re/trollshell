@@ -19,8 +19,8 @@
 
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_bus::{call, BusKind};
-use hytte_reactive::{registry, Service};
+use hytte_bus::{BusKind, call};
+use hytte_reactive::{Service, registry};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -154,7 +154,9 @@ async fn resolve_loop(location: Mutable<LocationState>, notify: Arc<Notify>) {
         if let Some(loc) = resolve_once().await {
             location.set(LocationState::Resolved(loc));
         } else {
-            tracing::info!("geoclue: no location (GeoClue2 unavailable, TROLLSHELL_WEATHER_CITY unset?)");
+            tracing::info!(
+                "geoclue: no location (GeoClue2 unavailable, TROLLSHELL_WEATHER_CITY unset?)"
+            );
             // Don't clobber a previously-resolved fix on a transient re-resolve
             // failure; only surface Unavailable if we never had one (i.e.
             // genuinely no source at boot).
@@ -191,9 +193,13 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
     set_client_prop(&client_path, "DesktopId", Value::from("trollshell"))
         .await
         .ok()?;
-    set_client_prop(&client_path, "RequestedAccuracyLevel", Value::U32(ACCURACY_CITY))
-        .await
-        .ok()?;
+    set_client_prop(
+        &client_path,
+        "RequestedAccuracyLevel",
+        Value::U32(ACCURACY_CITY),
+    )
+    .await
+    .ok()?;
 
     // Subscribe BEFORE Start so we don't miss the first LocationUpdated.
     let updates = hytte_bus::signals(GEOCLUE_NAME)
@@ -215,8 +221,7 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
 
     let event = events.next().await?;
     // LocationUpdated(o old, o new); we want the new Location object path.
-    let (_old, new): (OwnedObjectPath, OwnedObjectPath) =
-        event.body.body().deserialize().ok()?;
+    let (_old, new): (OwnedObjectPath, OwnedObjectPath) = event.body.body().deserialize().ok()?;
     let loc_path = new.as_str().to_owned();
 
     let lat = get_f64_prop(&loc_path, "Latitude").await?;
@@ -234,7 +239,11 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
     })
 }
 
-async fn set_client_prop(client_path: &str, name: &'static str, value: Value<'_>) -> Result<(), ()> {
+async fn set_client_prop(
+    client_path: &str,
+    name: &'static str,
+    value: Value<'_>,
+) -> Result<(), ()> {
     let owned = value.try_to_owned().map_err(|_| ())?;
     call(GEOCLUE_NAME)
         .bus(BusKind::System)
@@ -320,7 +329,11 @@ fn geocode_city(city: &str) -> Result<LocationSnapshot, String> {
 
 fn parse_geocode(body: &str) -> Result<LocationSnapshot, String> {
     let parsed: GeocodeResponse = serde_json::from_str(body).map_err(|e| format!("decode: {e}"))?;
-    let first = parsed.results.into_iter().next().ok_or("no geocoding match")?;
+    let first = parsed
+        .results
+        .into_iter()
+        .next()
+        .ok_or("no geocoding match")?;
     Ok(LocationSnapshot {
         lat: first.latitude,
         lon: first.longitude,

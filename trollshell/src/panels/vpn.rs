@@ -56,21 +56,17 @@ pub fn panel_vpn() -> gtk::Widget {
     let groups_track: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
     let column_for_bind = column.clone();
     let groups_for_bind = groups_track.clone();
-    bind(
-        vpn::tunnels(),
-        &column,
-        move |_col, tunnels| {
-            let mut tracked = groups_for_bind.borrow_mut();
-            for g in tracked.drain(..) {
-                column_for_bind.remove(&g);
-            }
-            for tunnel in &tunnels {
-                let g = build_tunnel_group(tunnel);
-                column_for_bind.append(&g);
-                tracked.push(g);
-            }
-        },
-    );
+    bind(vpn::tunnels(), &column, move |_col, tunnels| {
+        let mut tracked = groups_for_bind.borrow_mut();
+        for g in tracked.drain(..) {
+            column_for_bind.remove(&g);
+        }
+        for tunnel in &tunnels {
+            let g = build_tunnel_group(tunnel);
+            column_for_bind.append(&g);
+            tracked.push(g);
+        }
+    });
 
     finish_page(&column)
 }

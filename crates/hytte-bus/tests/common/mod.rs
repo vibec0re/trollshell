@@ -13,8 +13,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use zbus::connection::Builder;
 use zbus::Connection;
+use zbus::connection::Builder;
 
 pub struct BusGuard {
     child: Option<Child>,

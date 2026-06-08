@@ -55,11 +55,11 @@
 
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bluetooth::{self, Device};
 use crate::pipewire::{self, Sink};
@@ -170,14 +170,13 @@ pub fn auto_switch_enabled() -> impl Signal<Item = bool> {
 /// value already matches.
 pub fn set_auto_switch_enabled(on: bool) {
     let prev = registry::with(|r| {
-        r.get::<BluetoothAudioHandles>()
-            .map(|h| {
-                let cur = h.enabled.get();
-                if cur != on {
-                    h.enabled.set(on);
-                }
-                cur
-            })
+        r.get::<BluetoothAudioHandles>().map(|h| {
+            let cur = h.enabled.get();
+            if cur != on {
+                h.enabled.set(on);
+            }
+            cur
+        })
     });
     if prev != Some(on) {
         // File I/O off the GTK main thread.
@@ -238,7 +237,10 @@ fn is_bluez_sink_name(name: &str) -> bool {
 /// Among connected BT audio devices, return the first one whose pipewire
 /// sink we can find. None means no candidate to switch to right now.
 fn find_bt_target<'a>(devices: &[Device], sinks: &'a [Sink]) -> Option<&'a Sink> {
-    for dev in devices.iter().filter(|d| d.connected && is_bt_audio_icon(&d.icon)) {
+    for dev in devices
+        .iter()
+        .filter(|d| d.connected && is_bt_audio_icon(&d.icon))
+    {
         if let Some(sink) = sinks.iter().find(|s| sink_belongs_to_device(&s.name, dev)) {
             return Some(sink);
         }
@@ -607,7 +609,10 @@ mod tests {
         react(&st, &[], &sinks, true);
         let state = st.lock().unwrap();
         assert!(state.last_observed_bt_default.is_none());
-        assert_eq!(state.last_non_bt_default.as_deref(), Some("alsa_output.builtin"));
+        assert_eq!(
+            state.last_non_bt_default.as_deref(),
+            Some("alsa_output.builtin")
+        );
     }
 
     #[test]
@@ -626,7 +631,10 @@ mod tests {
         react(&st, &[], &sinks, true);
         let state = st.lock().unwrap();
         assert!(state.last_observed_bt_default.is_none());
-        assert_eq!(state.last_non_bt_default.as_deref(), Some("alsa_output.builtin"));
+        assert_eq!(
+            state.last_non_bt_default.as_deref(),
+            Some("alsa_output.builtin")
+        );
     }
 
     #[test]

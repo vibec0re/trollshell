@@ -6,7 +6,7 @@ use crate::connection::SharedConnection;
 use crate::error::BusError;
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use zbus::zvariant::Type;
 

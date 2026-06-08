@@ -10,12 +10,17 @@
 //! at its last known value.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use std::net::SocketAddr;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Proto { Tcp, Tcp6, Udp, Udp6 }
+pub enum Proto {
+    Tcp,
+    Tcp6,
+    Udp,
+    Udp6,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnState {
@@ -222,7 +227,8 @@ mod tests {
 
     #[test]
     fn parse_ss_line_with_users_field() {
-        let line = "tcp ESTAB 0 0 192.168.1.10:54321 1.2.3.4:443 users:((\"firefox\",pid=1234,fd=78))";
+        let line =
+            "tcp ESTAB 0 0 192.168.1.10:54321 1.2.3.4:443 users:((\"firefox\",pid=1234,fd=78))";
         let c = parse_ss_line(line).unwrap();
         assert_eq!(c.proto, Proto::Tcp);
         assert_eq!(c.state, ConnState::Established);

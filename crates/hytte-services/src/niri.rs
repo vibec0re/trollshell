@@ -16,12 +16,10 @@
 //! - Commands open a fresh short-lived socket (cheap unix-socket connect)
 //!   so they don't have to share the long-lived event-stream socket.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
-use niri_ipc::{
-    socket::Socket, Action, Event, Request, Response, WorkspaceReferenceArg,
-};
+use hytte_reactive::{Service, registry, runtime};
+use niri_ipc::{Action, Event, Request, Response, WorkspaceReferenceArg, socket::Socket};
 use std::thread;
 use std::time::Duration;
 
@@ -59,12 +57,14 @@ impl Service for NiriService {
         let win_list_writer = handles.windows.clone();
         let win_focus_writer = handles.focused_window.clone();
 
-        rt.spawn_blocking(move || loop {
-            match listen_once(&ws_writer, &win_list_writer, &win_focus_writer) {
-                Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
-                Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
+        rt.spawn_blocking(move || {
+            loop {
+                match listen_once(&ws_writer, &win_list_writer, &win_focus_writer) {
+                    Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
+                    Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
+                }
+                thread::sleep(Duration::from_secs(1));
             }
-            thread::sleep(Duration::from_secs(1));
         });
 
         handles
@@ -187,10 +187,11 @@ fn apply_event(
             }
             let focused_id = focused_window.lock_ref().as_ref().map(|w| w.id);
             if let Some(fid) = focused_id
-                && let Some(updated) = list.iter().find(|w| w.id == fid).cloned() {
-                    drop(list);
-                    focused_window.set(Some(updated));
-                }
+                && let Some(updated) = list.iter().find(|w| w.id == fid).cloned()
+            {
+                drop(list);
+                focused_window.set(Some(updated));
+            }
         }
         _ => {}
     }
@@ -294,9 +295,9 @@ fn has_edge_window(
         .find(|ws| ws.output.as_deref() == Some(connector) && ws.is_active)
         .map(|ws| ws.id);
     active_id.is_some_and(|id| {
-        windows.iter().any(|w| {
-            w.workspace_id == Some(id) && w.layout.tile_size.0 >= mon_w - EDGE_TOL
-        })
+        windows
+            .iter()
+            .any(|w| w.workspace_id == Some(id) && w.layout.tile_size.0 >= mon_w - EDGE_TOL)
     })
 }
 
@@ -323,15 +324,13 @@ pub fn quit(skip_confirmation: bool) {
 }
 
 fn send_action(action: Action) {
-    runtime::handle().spawn_blocking(move || {
-        match Socket::connect() {
-            Ok(mut sock) => {
-                if let Err(e) = sock.send(Request::Action(action)) {
-                    tracing::warn!(error = %e, "niri action send failed");
-                }
+    runtime::handle().spawn_blocking(move || match Socket::connect() {
+        Ok(mut sock) => {
+            if let Err(e) = sock.send(Request::Action(action)) {
+                tracing::warn!(error = %e, "niri action send failed");
             }
-            Err(e) => tracing::warn!(error = %e, "niri socket open for action failed"),
         }
+        Err(e) => tracing::warn!(error = %e, "niri socket open for action failed"),
     });
 }
 

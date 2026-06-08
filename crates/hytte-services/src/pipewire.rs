@@ -21,9 +21,9 @@ use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::registry;
 
 pub use super::audio_native::{
-    service, set_default_sink, set_default_source, set_sink_mute, set_sink_volume,
+    PipewireService, service, set_default_sink, set_default_source, set_sink_mute, set_sink_volume,
     set_source_mute, set_source_volume, set_stream_mute, set_stream_volume, set_volume,
-    toggle_mute, PipewireService,
+    toggle_mute,
 };
 
 /// Default-sink volume snapshot, surfaced to the bar chip.

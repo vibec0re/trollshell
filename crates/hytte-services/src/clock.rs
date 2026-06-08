@@ -4,7 +4,7 @@
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal};
 use gtk::glib;
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use std::time::Duration;
 
 pub struct ClockService;

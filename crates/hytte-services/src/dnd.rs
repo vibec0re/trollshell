@@ -17,7 +17,7 @@
 //! the in-memory state is the source of truth for the running process.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, runtime, Service};
+use hytte_reactive::{Service, registry, runtime};
 use std::path::PathBuf;
 
 // ── Persistence ──────────────────────────────────────────────────────────────

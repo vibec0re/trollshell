@@ -17,7 +17,7 @@
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
-use hytte::ui::{layer_window, LayerShell};
+use hytte::ui::{LayerShell, layer_window};
 
 /// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
 /// Top inset of the frame (= top of the workspace cutout).
@@ -193,10 +193,10 @@ fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, ra
     use std::f64::consts::PI;
     let r = radius.min(rw / 2.0).min(rh / 2.0);
     cr.new_sub_path();
-    cr.arc(rx + rw - r, ry + r,      r, -PI / 2.0, 0.0);        // top-right
-    cr.arc(rx + rw - r, ry + rh - r, r, 0.0,       PI / 2.0);   // bottom-right
-    cr.arc(rx + r,      ry + rh - r, r, PI / 2.0,  PI);          // bottom-left
-    cr.arc(rx + r,      ry + r,      r, PI,         1.5 * PI);   // top-left
+    cr.arc(rx + rw - r, ry + r, r, -PI / 2.0, 0.0); // top-right
+    cr.arc(rx + rw - r, ry + rh - r, r, 0.0, PI / 2.0); // bottom-right
+    cr.arc(rx + r, ry + rh - r, r, PI / 2.0, PI); // bottom-left
+    cr.arc(rx + r, ry + r, r, PI, 1.5 * PI); // top-left
     cr.close_path();
 }
 

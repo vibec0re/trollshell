@@ -2,9 +2,9 @@
 //!
 //! See spec section 3.1.
 
+use crate::BusError;
 use crate::connection::SharedConnection;
 use crate::error::is_transient_zbus_error;
-use crate::BusError;
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
 use std::future::Future;

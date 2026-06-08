@@ -31,9 +31,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         w.set_tooltip_text(Some(&format!("CPU {:.0}%", c.overall * 100.0)));
     });
 
-    bind(sensors::cpu_temp(), &temp_label, |w, t| match t.package_celsius {
-        Some(c) => w.set_label(&format!("{c:.0}°")),
-        None => w.set_label(""),
+    bind(sensors::cpu_temp(), &temp_label, |w, t| {
+        match t.package_celsius {
+            Some(c) => w.set_label(&format!("{c:.0}°")),
+            None => w.set_label(""),
+        }
     });
 
     let monitor_for_click = monitor.clone();

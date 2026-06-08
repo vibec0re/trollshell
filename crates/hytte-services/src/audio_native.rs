@@ -63,7 +63,7 @@
 //! `output` node (the source) when the stream is the `input`. With this
 //! the audio modal can group streams under their target sink.
 
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use pipewire as pw;
 use pw::types::ObjectType;
 use std::cell::RefCell;
@@ -72,9 +72,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::thread;
 
-use super::pipewire::{
-    PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume,
-};
+use super::pipewire::{PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume};
 
 /// Coarse classification of a `PipeWire` Node by its `media.class` property.
 ///
@@ -235,20 +233,42 @@ enum Command {
     /// cache so a stereo sink stays stereo. If the cache is empty (no
     /// Props event received yet) the command is dropped — we'd otherwise
     /// publish a mono channelVolumes array and clobber the sink's layout.
-    SetSinkVolume { name: String, linear: f64 },
+    SetSinkVolume {
+        name: String,
+        linear: f64,
+    },
     /// Set channelVolumes on a source (microphone, line-in).
-    SetSourceVolume { name: String, linear: f64 },
+    SetSourceVolume {
+        name: String,
+        linear: f64,
+    },
     /// Set channelVolumes on a playback stream, identified by pipewire
     /// global id (streams have no stable `node.name`).
-    SetStreamVolume { id: u32, linear: f64 },
+    SetStreamVolume {
+        id: u32,
+        linear: f64,
+    },
     /// Set `SPA_PROP_mute` on a sink.
-    SetSinkMute { name: String, mute: bool },
-    SetSourceMute { name: String, mute: bool },
-    SetStreamMute { id: u32, mute: bool },
+    SetSinkMute {
+        name: String,
+        mute: bool,
+    },
+    SetSourceMute {
+        name: String,
+        mute: bool,
+    },
+    SetStreamMute {
+        id: u32,
+        mute: bool,
+    },
     /// Write `default.audio.sink` on the `default` Metadata. Phase 4 wires
     /// this — for Phase 3 the dispatcher logs and drops the command.
-    SetDefaultSink { name: String },
-    SetDefaultSource { name: String },
+    SetDefaultSink {
+        name: String,
+    },
+    SetDefaultSource {
+        name: String,
+    },
 }
 
 /// Sender shared across all callers. Populated by [`spawn_mainloop`] before
@@ -413,12 +433,10 @@ fn run_once(
                         return;
                     }
                     let description = props
-                        .get("node.description").map_or_else(|| name.clone(), str::to_owned);
-                    let app_name = matches!(
-                        role,
-                        AudioRole::OutputStream | AudioRole::InputStream
-                    )
-                    .then(|| pick_app_name(props));
+                        .get("node.description")
+                        .map_or_else(|| name.clone(), str::to_owned);
+                    let app_name = matches!(role, AudioRole::OutputStream | AudioRole::InputStream)
+                        .then(|| pick_app_name(props));
 
                     tracing::debug!(
                         id = obj.id,
@@ -444,11 +462,7 @@ fn run_once(
                     // Bind a proxy so we can receive param events for
                     // volume + mute. Errors here usually mean the global
                     // was destroyed mid-bind; log and move on.
-                    match bind_node_for_params(
-                        &registry_for_bind,
-                        obj.id,
-                        Rc::clone(&state_add),
-                    ) {
+                    match bind_node_for_params(&registry_for_bind, obj.id, Rc::clone(&state_add)) {
                         Ok(proxy) => {
                             state_add.borrow_mut().proxies.insert(obj.id, proxy);
                         }
@@ -510,12 +524,7 @@ fn run_once(
                     else {
                         return;
                     };
-                    tracing::trace!(
-                        id = obj.id,
-                        out,
-                        input,
-                        "audio_native: + link",
-                    );
+                    tracing::trace!(id = obj.id, out, input, "audio_native: + link",);
                     let mut s = state_add.borrow_mut();
                     s.links.insert(
                         obj.id,
@@ -603,15 +612,17 @@ fn bind_node_for_params(
             if let Some(entry) = s.nodes.get_mut(&id) {
                 let mut changed = false;
                 if let Some(cv) = channel_volumes
-                    && cv != entry.channel_volumes {
-                        entry.channel_volumes = cv;
-                        changed = true;
-                    }
+                    && cv != entry.channel_volumes
+                {
+                    entry.channel_volumes = cv;
+                    changed = true;
+                }
                 if let Some(m) = mute
-                    && m != entry.mute {
-                        entry.mute = m;
-                        changed = true;
-                    }
+                    && m != entry.mute
+                {
+                    entry.mute = m;
+                    changed = true;
+                }
                 if changed {
                     emit_snapshots(&mut s);
                 }
@@ -652,8 +663,7 @@ fn bind_default_metadata(
             // defaults. `None` for value means "delete this property".
             let Some(key) = key else {
                 let mut s = state.borrow_mut();
-                let changed_any = s.default_sink_name.is_some()
-                    || s.default_source_name.is_some();
+                let changed_any = s.default_sink_name.is_some() || s.default_source_name.is_some();
                 s.default_sink_name = None;
                 s.default_source_name = None;
                 if changed_any {
@@ -735,12 +745,8 @@ fn handle_command(cmd: Command, state: &Rc<RefCell<AudioState>>) {
 /// with its pipewire id and current channel count. The closure builds the
 /// appropriate Props pod and calls `set_param`. Returns silently if the
 /// node isn't in the cache yet (e.g. a stale name from a UI race).
-fn with_named_node<F>(
-    state: &Rc<RefCell<AudioState>>,
-    name: &str,
-    role: AudioRole,
-    f: F,
-) where
+fn with_named_node<F>(state: &Rc<RefCell<AudioState>>, name: &str, role: AudioRole, f: F)
+where
     F: FnOnce(&pw::node::Node, usize),
 {
     let s = state.borrow();
@@ -777,12 +783,7 @@ where
     f(&proxy.proxy, channels);
 }
 
-fn apply_volume_by_name(
-    state: &Rc<RefCell<AudioState>>,
-    name: &str,
-    role: AudioRole,
-    linear: f64,
-) {
+fn apply_volume_by_name(state: &Rc<RefCell<AudioState>>, name: &str, role: AudioRole, linear: f64) {
     with_named_node(state, name, role, |node, channels| {
         send_volume(node, channels, linear);
     });
@@ -794,12 +795,7 @@ fn apply_volume_by_id(state: &Rc<RefCell<AudioState>>, id: u32, linear: f64) {
     });
 }
 
-fn apply_mute_by_name(
-    state: &Rc<RefCell<AudioState>>,
-    name: &str,
-    role: AudioRole,
-    mute: bool,
-) {
+fn apply_mute_by_name(state: &Rc<RefCell<AudioState>>, name: &str, role: AudioRole, mute: bool) {
     with_named_node(state, name, role, |node, _channels| send_mute(node, mute));
 }
 
@@ -872,11 +868,8 @@ fn send_mute(node: &pw::node::Node, mute: bool) {
 /// wraps with `Pod::from_bytes` before passing to `set_param`. Both fields
 /// optional so we can issue volume-only and mute-only updates without
 /// clobbering the other.
-fn build_props_pod(
-    channel_volumes: Option<Vec<f32>>,
-    mute: Option<bool>,
-) -> Option<Vec<u8>> {
-    use pw::spa::pod::{serialize::PodSerializer, Object, Property, Value, ValueArray};
+fn build_props_pod(channel_volumes: Option<Vec<f32>>, mute: Option<bool>) -> Option<Vec<u8>> {
+    use pw::spa::pod::{Object, Property, Value, ValueArray, serialize::PodSerializer};
     let mut properties = Vec::new();
     if let Some(mute) = mute {
         properties.push(Property::new(
@@ -908,7 +901,7 @@ fn build_props_pod(
 /// successful parse with neither key present returns `Some((None, None))`,
 /// which the caller treats as a no-op update.
 fn decode_props(bytes: &[u8]) -> Option<(Option<Vec<f32>>, Option<bool>)> {
-    use pw::spa::pod::{deserialize::PodDeserializer, Value, ValueArray};
+    use pw::spa::pod::{Value, ValueArray, deserialize::PodDeserializer};
     let (_rest, value) = PodDeserializer::deserialize_from::<Value>(bytes).ok()?;
     let Value::Object(obj) = value else {
         return Some((None, None));
@@ -1167,14 +1160,13 @@ pub fn set_default_source(name: &str) {
 #[allow(dead_code)]
 pub fn set_volume(linear: f64) {
     let name = registry::with(|r| {
-        r.get::<PipewireHandles>()
-            .and_then(|h| {
-                h.sinks
-                    .lock_ref()
-                    .iter()
-                    .find(|s| s.is_default)
-                    .map(|s| s.name.clone())
-            })
+        r.get::<PipewireHandles>().and_then(|h| {
+            h.sinks
+                .lock_ref()
+                .iter()
+                .find(|s| s.is_default)
+                .map(|s| s.name.clone())
+        })
     });
     if let Some(name) = name {
         set_sink_volume(&name, linear);

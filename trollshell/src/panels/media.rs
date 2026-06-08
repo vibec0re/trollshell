@@ -145,10 +145,14 @@ fn wire_player_bind(w: &InfoWidgets, art_image: &gtk::Image, state: &Rc<PlayerSt
     let state = state.clone();
     let art = art_image.clone();
     let title = w.title.clone();
-    bind(mpris::active_player(), &title, move |_, maybe_player| match maybe_player {
-        None => render_no_player(&w, &art, &state),
-        Some(player) => render_player(&w, &art, &state, &player),
-    });
+    bind(
+        mpris::active_player(),
+        &title,
+        move |_, maybe_player| match maybe_player {
+            None => render_no_player(&w, &art, &state),
+            Some(player) => render_player(&w, &art, &state, &player),
+        },
+    );
 }
 
 fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
@@ -168,12 +172,7 @@ fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
     w.next_btn.set_sensitive(false);
 }
 
-fn render_player(
-    w: &InfoWidgets,
-    art: &gtk::Image,
-    state: &PlayerState,
-    player: &mpris::Player,
-) {
+fn render_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState, player: &mpris::Player) {
     *state.bus.borrow_mut() = Some(player.bus_name.clone());
     (*state.track_id.borrow_mut()).clone_from(&player.track_id);
     state.length_us.set(player.length_us);
@@ -186,7 +185,8 @@ fn render_player(
     w.play_pause_btn.set_sensitive(player.can_play_pause);
     w.next_btn.set_sensitive(player.can_go_next);
 
-    w.play_pause_btn.set_icon_name(play_pause_icon(player.status));
+    w.play_pause_btn
+        .set_icon_name(play_pause_icon(player.status));
 
     w.pos.set_text(&fmt_us(player.position_us));
     w.len.set_text(&fmt_us(player.length_us));
@@ -199,9 +199,13 @@ fn render_player(
 
 fn spawn_art_fetch(art: gtk::Image, url: String) {
     glib::MainContext::default().spawn_local(async move {
-        let Some(bytes) = mpris::art_for_url(&url).await else { return };
+        let Some(bytes) = mpris::art_for_url(&url).await else {
+            return;
+        };
         let glib_bytes = glib::Bytes::from(&bytes);
-        let Ok(texture) = gdk::Texture::from_bytes(&glib_bytes) else { return };
+        let Ok(texture) = gdk::Texture::from_bytes(&glib_bytes) else {
+            return;
+        };
         art.set_pixel_size(-1);
         art.set_paintable(Some(&texture));
         art.set_size_request(200, 200);
@@ -233,14 +237,19 @@ fn player_seek_fraction(maybe: Option<mpris::Player>) -> f64 {
 fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
     let bus_opt = state.bus.borrow();
     let tid_opt = state.track_id.borrow();
-    let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else { return };
+    let (Some(b), Some(t)) = (bus_opt.as_ref(), tid_opt.as_ref()) else {
+        return;
+    };
     let length = state.length_us.get();
     if length == 0 {
         return;
     }
     let pos_fraction = scale.value().clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     let pos_us = (pos_fraction * length as f64) as i64;
     mpris::set_position(b, t, pos_us);
 }
-

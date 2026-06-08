@@ -6,8 +6,8 @@
 use chrono::{DateTime, Local};
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
+use hytte::services::departures::{Departure, DeparturesState, delay_string};
 use hytte::services::{clock, departures};
-use hytte::services::departures::{delay_string, Departure, DeparturesState};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -51,7 +51,9 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     // doesn't trip gtk::add_css_class's debug-mode assertion.
     let badge = gtk::Label::new(Some(&d.line));
     badge.add_css_class("ts-line-badge");
-    let safe_line: String = d.line.chars()
+    let safe_line: String = d
+        .line
+        .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     badge.add_css_class(&format!("ts-line-{safe_line}"));
@@ -76,7 +78,11 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     time_lbl.add_css_class("ts-departure-time");
     let actual = d.actual;
     let now = chrono::Local::now();
-    time_lbl.set_text(&format!("{} · {}", relative_label(now, actual), actual.format("%H:%M")));
+    time_lbl.set_text(&format!(
+        "{} · {}",
+        relative_label(now, actual),
+        actual.format("%H:%M")
+    ));
     row.append(&time_lbl);
 
     // Delay indicator (hidden when on time).
@@ -86,7 +92,10 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
         row.append(&delay);
     }
 
-    let row_ref = TimeRowRef { actual, time_lbl: time_lbl.clone() };
+    let row_ref = TimeRowRef {
+        actual,
+        time_lbl: time_lbl.clone(),
+    };
     (row.upcast(), row_ref)
 }
 
@@ -181,7 +190,8 @@ pub fn widget() -> gtk::Widget {
     bind(clock::now(), &list, move |_list, now| {
         for r in time_rows_for_clock.0.borrow().iter() {
             let rel = relative_label(now, r.actual);
-            r.time_lbl.set_text(&format!("{} · {}", rel, r.actual.format("%H:%M")));
+            r.time_lbl
+                .set_text(&format!("{} · {}", rel, r.actual.format("%H:%M")));
         }
     });
 

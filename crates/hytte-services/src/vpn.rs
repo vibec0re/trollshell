@@ -20,7 +20,7 @@
 //! listed, just with empty peers / no summary.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{registry, Service};
+use hytte_reactive::{Service, registry};
 use std::time::{Duration, SystemTime};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -252,9 +252,10 @@ async fn collect_tunnels() -> Vec<Tunnel> {
     }
 
     // Step 2: enrich WireGuard with `wg show all dump`.
-    let wg_peers = if probes.iter().any(|p| {
-        matches!(p.kind, TunnelKind::Wireguard | TunnelKind::Tailscale)
-    }) {
+    let wg_peers = if probes
+        .iter()
+        .any(|p| matches!(p.kind, TunnelKind::Wireguard | TunnelKind::Tailscale))
+    {
         match run_capture(&["wg", "show", "all", "dump"]).await {
             Some(out) => parse_wg_show_dump(&out),
             None => std::collections::BTreeMap::new(),

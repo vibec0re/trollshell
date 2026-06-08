@@ -10,8 +10,8 @@
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_bus::{call, signals, BusKind};
-use hytte_reactive::{registry, Service};
+use hytte_bus::{BusKind, call, signals};
+use hytte_reactive::{Service, registry};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -136,10 +136,7 @@ impl Service for NetworkdService {
     }
 }
 
-async fn listen(
-    links_out: &Mutable<Vec<Link>>,
-    primary_out: &Mutable<Option<Link>>,
-) -> Result<()> {
+async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Link>>) -> Result<()> {
     // Subscribe to StateChanged on the Manager so we react quickly to
     // link state transitions.  Missed-emissions on reconnect trigger a
     // re-poll too, so we never miss a change across a D-Bus restart.
@@ -197,16 +194,15 @@ async fn refresh(
 
 async fn read_links() -> Result<Vec<Link>> {
     // ListLinks returns array of (idx: i32, name: String, path: ObjectPath).
-    let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> =
-        call(NETWORKD_NAME)
-            .bus(BusKind::System)
-            .at_path(MANAGER_PATH)
-            .iface(MANAGER_IFACE)
-            .method("ListLinks")
-            .args(())
-            .send()
-            .await
-            .context("ListLinks")?;
+    let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> = call(NETWORKD_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("ListLinks")
+        .args(())
+        .send()
+        .await
+        .context("ListLinks")?;
 
     let mut out = Vec::with_capacity(list.len());
     for (idx, name, path) in list {
@@ -321,7 +317,9 @@ pub(crate) fn parse_describe(json: &str) -> anyhow::Result<ParsedDescribe> {
     }
 
     for r in raw.route_data {
-        let Some(dest) = bytes_to_ip(r.family, &r.destination) else { continue };
+        let Some(dest) = bytes_to_ip(r.family, &r.destination) else {
+            continue;
+        };
         let gw = r.gateway.as_ref().and_then(|g| bytes_to_ip(r.family, g));
         let is_default = r.destination_prefix_length == 0
             && match dest {
@@ -348,7 +346,9 @@ pub(crate) fn parse_describe(json: &str) -> anyhow::Result<ParsedDescribe> {
 
 fn bytes_to_ip(family: i32, bytes: &[u8]) -> Option<IpAddr> {
     match (family, bytes.len()) {
-        (2, 4) => Some(IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))),
+        (2, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
         (10, 16) => {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(bytes);
@@ -388,9 +388,15 @@ mod tests {
     fn parses_describe_json_minimal() {
         let parsed = parse_describe(SAMPLE_DESCRIBE).expect("parse");
         assert_eq!(parsed.addresses.len(), 1);
-        assert_eq!(parsed.addresses[0].addr, IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42)));
+        assert_eq!(
+            parsed.addresses[0].addr,
+            IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42))
+        );
         assert_eq!(parsed.addresses[0].prefix_len, 24);
-        assert_eq!(parsed.gateway_v4, Some(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(
+            parsed.gateway_v4,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
         assert_eq!(parsed.gateway_v6, None);
         assert_eq!(parsed.routes.len(), 2);
     }
@@ -415,6 +421,9 @@ mod tests {
             ]
         }"#;
         let parsed = parse_describe(json).expect("parse");
-        assert_eq!(parsed.gateway_v4, Some(std::net::Ipv4Addr::new(192, 168, 0, 1)));
+        assert_eq!(
+            parsed.gateway_v4,
+            Some(std::net::Ipv4Addr::new(192, 168, 0, 1))
+        );
     }
 }

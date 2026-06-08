@@ -263,23 +263,43 @@ async fn drain_signal_stream(
         }
         // After each select arm: exit if all subscription handles are gone.
         if dc.weak.upgrade().is_none() {
-            tracing::debug!(dest = dc.dest, path = dc.path, iface = dc.iface,
+            tracing::debug!(
+                dest = dc.dest,
+                path = dc.path,
+                iface = dc.iface,
                 signal_name = dc.signal_name,
-                "all subscribers dropped; exiting subscription task");
+                "all subscribers dropped; exiting subscription task"
+            );
             return DrainOutcome::NoSubscribers;
         }
     }
 }
 
 async fn run_subscription(ctx: RunCtx) {
-    let RunCtx { shared, dest, path, iface, signal_name, tx, weak, missed, missed_counter, task_done_tx } = ctx;
+    let RunCtx {
+        shared,
+        dest,
+        path,
+        iface,
+        signal_name,
+        tx,
+        weak,
+        missed,
+        missed_counter,
+        task_done_tx,
+    } = ctx;
 
     let mut first_iteration = true;
     loop {
         // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
         if weak.upgrade().is_none() {
-            tracing::debug!(dest, path, iface, signal_name,
-                "all subscribers dropped; exiting subscription task");
+            tracing::debug!(
+                dest,
+                path,
+                iface,
+                signal_name,
+                "all subscribers dropped; exiting subscription task"
+            );
             let _ = task_done_tx.send(());
             return;
         }
@@ -308,9 +328,11 @@ async fn run_subscription(ctx: RunCtx) {
         };
 
         let stream_result = async {
-            let proxy = zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str()).await?;
+            let proxy =
+                zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str()).await?;
             proxy.receive_signal(signal_name.as_str()).await
-        }.await;
+        }
+        .await;
 
         let stream = match stream_result {
             Ok(s) => s,
@@ -322,16 +344,20 @@ async fn run_subscription(ctx: RunCtx) {
             }
         };
 
-        let outcome = drain_signal_stream(stream, DrainCtx {
-            shared: &shared,
-            current_epoch,
-            tx: &tx,
-            weak: &weak,
-            dest: &dest,
-            path: &path,
-            iface: &iface,
-            signal_name: &signal_name,
-        }).await;
+        let outcome = drain_signal_stream(
+            stream,
+            DrainCtx {
+                shared: &shared,
+                current_epoch,
+                tx: &tx,
+                weak: &weak,
+                dest: &dest,
+                path: &path,
+                iface: &iface,
+                signal_name: &signal_name,
+            },
+        )
+        .await;
 
         if matches!(outcome, DrainOutcome::NoSubscribers) {
             let _ = task_done_tx.send(());

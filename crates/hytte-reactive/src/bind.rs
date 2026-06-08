@@ -109,8 +109,8 @@ mod tests {
     use super::*;
     use futures_signals::signal::Mutable;
     use gtk::glib;
-    use std::rc::Rc;
     use std::cell::Cell;
+    use std::rc::Rc;
 
     /// A signal emission applies the value, and the user-event handler is
     /// NOT re-fired while the apply runs.
@@ -124,15 +124,10 @@ mod tests {
         let user_calls = Rc::new(Cell::new(0u32));
 
         let user_calls_for_handler = user_calls.clone();
-        bind_two_way(
-            state.signal(),
-            &switch,
-            gtk::Switch::set_active,
-            move |w| {
-                let counter = user_calls_for_handler.clone();
-                w.connect_active_notify(move |_| counter.set(counter.get() + 1))
-            },
-        );
+        bind_two_way(state.signal(), &switch, gtk::Switch::set_active, move |w| {
+            let counter = user_calls_for_handler.clone();
+            w.connect_active_notify(move |_| counter.set(counter.get() + 1))
+        });
 
         // Pump until the initial Mutable emission applies.
         while ctx.iteration(false) {}
@@ -142,8 +137,11 @@ mod tests {
         state.set(true);
         while ctx.iteration(false) {}
 
-        assert_eq!(user_calls.get(), 0,
-            "user handler must not fire during signal-driven apply");
+        assert_eq!(
+            user_calls.get(),
+            0,
+            "user handler must not fire during signal-driven apply"
+        );
         assert!(switch.is_active(), "apply did set the property");
     }
 
@@ -159,15 +157,10 @@ mod tests {
         let user_calls = Rc::new(Cell::new(0u32));
 
         let user_calls_for_handler = user_calls.clone();
-        bind_two_way(
-            state.signal(),
-            &switch,
-            gtk::Switch::set_active,
-            move |w| {
-                let counter = user_calls_for_handler.clone();
-                w.connect_active_notify(move |_| counter.set(counter.get() + 1))
-            },
-        );
+        bind_two_way(state.signal(), &switch, gtk::Switch::set_active, move |w| {
+            let counter = user_calls_for_handler.clone();
+            w.connect_active_notify(move |_| counter.set(counter.get() + 1))
+        });
 
         while ctx.iteration(false) {}
 
@@ -176,7 +169,10 @@ mod tests {
         switch.set_active(true);
         while ctx.iteration(false) {}
 
-        assert_eq!(user_calls.get(), 1,
-            "user-driven set_active must fire the user handler exactly once");
+        assert_eq!(
+            user_calls.get(),
+            1,
+            "user-driven set_active must fire the user handler exactly once"
+        );
     }
 }

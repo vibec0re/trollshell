@@ -13,13 +13,13 @@ mod property;
 mod proxy;
 mod signals;
 
-pub use call::{call_with, CallBuilder, RetryPolicy};
+pub use call::{CallBuilder, RetryPolicy, call_with};
 pub use connection::BusKind;
 pub use error::BusError;
-pub use own::{own_name_with, OwnNameBuilder, OwnNameSignal, OwnState};
-pub use property::{property_with, PropState, PropertyBuilder, PropertySignal};
-pub use proxy::{proxy_with, BusProxy, ProxyBuilder, ProxyState};
-pub use signals::{signals_with, SignalEvent, SignalSubscription, SignalsBuilder};
+pub use own::{OwnNameBuilder, OwnNameSignal, OwnState, own_name_with};
+pub use property::{PropState, PropertyBuilder, PropertySignal, property_with};
+pub use proxy::{BusProxy, ProxyBuilder, ProxyState, proxy_with};
+pub use signals::{SignalEvent, SignalSubscription, SignalsBuilder, signals_with};
 
 #[doc(hidden)]
 pub use connection::test_support;

@@ -19,9 +19,9 @@ pub use hytte_ui::{adw, gtk};
 /// ```
 pub mod prelude {
     pub use hytte_reactive::futures_signals::signal::SignalExt;
-    pub use hytte_reactive::{bind, bind_class, bind_text, bind_two_way, bind_visible, Service};
+    pub use hytte_reactive::{Service, bind, bind_class, bind_text, bind_two_way, bind_visible};
     pub use hytte_ui::{
-        App, Anchor, Bar, BarHandle, Edge, KeyboardMode, Layer, Margin, Monitor, Popup,
+        Anchor, App, Bar, BarHandle, Edge, KeyboardMode, Layer, Margin, Monitor, Popup,
         PopupBuilder, PopupPosition,
     };
 }

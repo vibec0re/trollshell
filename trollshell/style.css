@@ -826,6 +826,13 @@ window:not(.dark) .ts-drawer {
     color: alpha(#ff6b6b, 0.7);
 }
 
+/* Walk budget exceeded: you can no longer make this train. Fade the whole row
+   (badge included) so the glance lands on the first one you can still catch.
+   Opacity is theme-independent, so no light-mode mirror is needed. */
+.ts-departure-row.ts-departure-unreachable {
+    opacity: 0.4;
+}
+
 .ts-departures-loading,
 .ts-departures-empty,
 .ts-departures-stale-footer {

@@ -12,11 +12,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Handle to one row's mutable time cell — used by the widget-level clock
-/// subscription to update the "X min · HH:MM" string in place each tick,
-/// without rebuilding the list.
+/// subscription to update the "X min · HH:MM" string (and the leave-by fade)
+/// in place each tick, without rebuilding the list.
 struct TimeRowRef {
     actual: DateTime<Local>,
+    /// Walk budget to the platform (minutes); `0` = plain departs-in label.
+    walk_minutes: u32,
     time_lbl: gtk::Label,
+    /// The row container, so the clock tick can toggle the unreachable fade.
+    row_box: gtk::Box,
 }
 
 #[derive(Default, Clone)]
@@ -33,6 +37,47 @@ pub fn relative_label(now: DateTime<Local>, departure: DateTime<Local>) -> Strin
     }
     let minutes = (seconds + 30) / 60;
     format!("{minutes} min")
+}
+
+/// The relative token shown before "· HH:MM". With no walk budget
+/// (`walk_minutes == 0`) it's the plain departs-in label from
+/// [`relative_label`]. With a positive budget it's a leave-by countdown — whole
+/// minutes until you must leave to still catch the train (`"leave 7 min"`),
+/// collapsing to `"leave now"` once that hits zero. The returned bool is
+/// whether the train is already unreachable (you can't make it even leaving
+/// this instant), which the caller renders faded.
+#[must_use]
+pub fn lead_label(
+    now: DateTime<Local>,
+    departs: DateTime<Local>,
+    walk_minutes: u32,
+) -> (String, bool) {
+    if walk_minutes == 0 {
+        return (relative_label(now, departs), false);
+    }
+    // Seconds of slack: how long you can still wait before you must leave.
+    let slack = departs.signed_duration_since(now).num_seconds() - i64::from(walk_minutes) * 60;
+    let minutes = (slack + 30) / 60;
+    let token = if minutes <= 0 {
+        "leave now".to_string()
+    } else {
+        format!("leave {minutes} min")
+    };
+    (token, slack < 0)
+}
+
+/// Apply the current time/leave label and the unreachable fade to one row.
+/// Shared by the initial paint in [`row`] and the per-tick clock subscription
+/// so they never drift.
+fn apply_row(r: &TimeRowRef, now: DateTime<Local>) {
+    let (token, unreachable) = lead_label(now, r.actual, r.walk_minutes);
+    r.time_lbl
+        .set_text(&format!("{token} · {}", r.actual.format("%H:%M")));
+    if unreachable {
+        r.row_box.add_css_class("ts-departure-unreachable");
+    } else {
+        r.row_box.remove_css_class("ts-departure-unreachable");
+    }
 }
 
 /// Build one row widget for `d` and a `TimeRowRef` for the widget-level
@@ -72,17 +117,11 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     direction.set_max_width_chars(22);
     row.append(&direction);
 
-    // Time cell — text is set initially against the current clock, then
-    // updated in place by the widget-level clock subscription. No bind here.
+    // Time cell — text is set initially via apply_row against the current
+    // clock, then updated in place by the widget-level clock subscription.
+    // No per-row bind here.
     let time_lbl = gtk::Label::new(None);
     time_lbl.add_css_class("ts-departure-time");
-    let actual = d.actual;
-    let now = chrono::Local::now();
-    time_lbl.set_text(&format!(
-        "{} · {}",
-        relative_label(now, actual),
-        actual.format("%H:%M")
-    ));
     row.append(&time_lbl);
 
     // Delay indicator (hidden when on time).
@@ -93,9 +132,13 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     }
 
     let row_ref = TimeRowRef {
-        actual,
-        time_lbl: time_lbl.clone(),
+        actual: d.actual,
+        walk_minutes: d.walk_minutes,
+        time_lbl,
+        row_box: row.clone(),
     };
+    // Initial paint so a freshly-built row is correct before the first tick.
+    apply_row(&row_ref, chrono::Local::now());
     (row.upcast(), row_ref)
 }
 
@@ -189,9 +232,7 @@ pub fn widget() -> gtk::Widget {
     let time_rows_for_clock = time_rows.clone();
     bind(clock::now(), &list, move |_list, now| {
         for r in time_rows_for_clock.0.borrow().iter() {
-            let rel = relative_label(now, r.actual);
-            r.time_lbl
-                .set_text(&format!("{} · {}", rel, r.actual.format("%H:%M")));
+            apply_row(r, now);
         }
     });
 
@@ -237,5 +278,61 @@ mod tests {
     fn relative_label_one_minute_at_61s() {
         let now = at(16, 0, 0);
         assert_eq!(relative_label(now, at(16, 1, 1)), "1 min");
+    }
+
+    // ── lead_label (leave-by countdown) ────────────────────────────────────--
+
+    #[test]
+    fn lead_label_zero_walk_is_plain_relative() {
+        let now = at(16, 0, 0);
+        // Falls back to the existing departs-in label; never unreachable.
+        assert_eq!(
+            lead_label(now, at(16, 7, 0), 0),
+            ("7 min".to_string(), false)
+        );
+        assert_eq!(
+            lead_label(now, at(16, 0, 30), 0),
+            ("now".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn lead_label_counts_down_to_leave_time() {
+        let now = at(16, 0, 0);
+        // 14 min out, 10 min walk → 4 min of slack before you must leave.
+        assert_eq!(
+            lead_label(now, at(16, 14, 0), 10),
+            ("leave 4 min".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn lead_label_one_minute_slack() {
+        let now = at(16, 0, 0);
+        // 11 min out, 10 min walk → 1 min slack.
+        assert_eq!(
+            lead_label(now, at(16, 11, 0), 10),
+            ("leave 1 min".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn lead_label_zero_slack_is_leave_now_but_still_reachable() {
+        let now = at(16, 0, 0);
+        // Exactly the walk window: leave this instant, still catchable (not faded).
+        assert_eq!(
+            lead_label(now, at(16, 10, 0), 10),
+            ("leave now".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn lead_label_negative_slack_is_unreachable() {
+        let now = at(16, 0, 0);
+        // 3 min out, 10 min walk → already missed: "leave now" + faded.
+        assert_eq!(
+            lead_label(now, at(16, 3, 0), 10),
+            ("leave now".to_string(), true)
+        );
     }
 }

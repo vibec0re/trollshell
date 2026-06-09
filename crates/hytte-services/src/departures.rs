@@ -100,6 +100,11 @@ pub struct Departure {
     pub cancelled: bool,
     /// HAFAS trip identifier, stable across refreshes for a given run.
     pub trip_id: String,
+    /// Walk budget (minutes) to the platform, copied from the resolved place.
+    /// `0` means no budget — the widget shows the plain departs-in countdown;
+    /// positive turns the row into a leave-by countdown. Carried per-row so the
+    /// widget needs no second subscription and `Stale` keeps the right budget.
+    pub walk_minutes: u32,
 }
 
 /// The whole service surface, observed by the widget.
@@ -215,6 +220,9 @@ fn into_departure(row: ApiDeparture, now: DateTime<Local>) -> Option<Departure> 
         delay_minutes,
         cancelled: row.cancelled,
         trip_id: row.trip_id,
+        // Stamped from the resolved place in `fetch_for_place`; the wire format
+        // has no notion of a walk budget.
+        walk_minutes: 0,
     })
 }
 
@@ -336,10 +344,12 @@ fn fetch_for_place(place: &ResolvedPlace) -> Result<Vec<Departure>, String> {
     tracing::debug!(station = %station, place = %place.name, "departures: fetching");
 
     let all = fetch_departures(&agent, &station)?;
+    let walk_minutes = place.walk_minutes;
     Ok(all
         .into_iter()
         .filter(|d| filter.matches(d))
         .take(DISPLAY_COUNT)
+        .map(|d| Departure { walk_minutes, ..d })
         .collect())
 }
 
@@ -519,6 +529,7 @@ mod tests {
             delay_minutes: 0,
             cancelled: false,
             trip_id: "t".into(),
+            walk_minutes: 0,
         }
     }
 
@@ -584,6 +595,7 @@ mod tests {
             delay_minutes: 0,
             cancelled: false,
             trip_id: "trip-1-ontime".into(),
+            walk_minutes: 0,
         }]
     }
 
@@ -715,6 +727,7 @@ mod tests {
             delay_minutes: 0,
             cancelled: false,
             trip_id: "trip-fresh".into(),
+            walk_minutes: 0,
         }];
         let next = next_state(prev, Ok(fresh), later);
         match next {

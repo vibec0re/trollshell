@@ -74,6 +74,13 @@ radius_km = 12.0
 # Departures here (optional): station id + "toward the centre" filter. Omit a
 # filter axis to allow everything on it.
 station = "900180001"
+
+# Walk time from here to the platform, in minutes. With this set, the list
+# shows a leave-by countdown ("leave 7 min") instead of the raw departs-in
+# time, and fades trains you can no longer make. 0 (the default) keeps the
+# plain "departs in" label.
+walk_minutes = 10
+
 lines = ["S8", "S85", "S9"]
 directions = ["Spandau", "Birkenwerder", "Hohen Neuendorf", "Waidmannslust"]
 "#;
@@ -91,6 +98,9 @@ struct Place {
     /// How many of `ssids` must be visible to call it a match.
     match_min: usize,
     station: Option<String>,
+    /// Walking minutes from here to the platform; drives departures'
+    /// leave-by countdown. `0` = no walk budget (plain departs-in label).
+    walk_minutes: u32,
     lines: Vec<String>,
     directions: Vec<String>,
 }
@@ -102,6 +112,7 @@ impl Place {
             lat: self.lat,
             lon: self.lon,
             station: self.station.clone(),
+            walk_minutes: self.walk_minutes,
             lines: self.lines.clone(),
             directions: self.directions.clone(),
         }
@@ -119,6 +130,9 @@ pub struct ResolvedPlace {
     /// Transit station id when this place has one; `None` means "away / look
     /// up the nearest station for `(lat, lon)`".
     pub station: Option<String>,
+    /// Walking minutes from here to the platform; `0` = no walk budget. The
+    /// departures widget renders a leave-by countdown when this is positive.
+    pub walk_minutes: u32,
     /// Allowed line names (case-insensitive). Empty = all lines.
     pub lines: Vec<String>,
     /// Allowed destination substrings (case-insensitive). Empty = all.
@@ -144,6 +158,8 @@ struct PlaceCfg {
     match_min: usize,
     #[serde(default)]
     station: Option<String>,
+    #[serde(default)]
+    walk_minutes: u32,
     #[serde(default)]
     lines: Vec<String>,
     #[serde(default)]
@@ -184,6 +200,7 @@ fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
             ssids: nonblank(p.ssids),
             match_min: p.match_min,
             station: p.station,
+            walk_minutes: p.walk_minutes,
             lines: nonblank(p.lines),
             directions: nonblank(p.directions),
         })
@@ -363,6 +380,7 @@ fn resolve(
                     lat: snap.lat,
                     lon: snap.lon,
                     station: None,
+                    walk_minutes: 0,
                     lines: Vec::new(),
                     directions: Vec::new(),
                 };
@@ -545,6 +563,7 @@ mod tests {
             ssids: ssids.iter().map(|s| (*s).to_string()).collect(),
             match_min,
             station: Some(format!("station-{name}")),
+            walk_minutes: 0,
             lines: Vec::new(),
             directions: Vec::new(),
         }
@@ -560,8 +579,28 @@ mod tests {
         assert_eq!(places[0].station.as_deref(), Some("900180001"));
         assert_eq!(places[0].match_min, 2);
         assert!(places[0].ssids.is_empty());
+        assert_eq!(places[0].walk_minutes, 10);
         assert_eq!(places[0].lines, ["S8", "S85", "S9"]);
         assert!((places[0].radius_km - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn walk_minutes_defaults_to_zero_and_survives_resolve() {
+        // Absent in config → 0; present → carried through to ResolvedPlace.
+        let toml = "\
+            [[place]]\n\
+            name = \"NoWalk\"\n\
+            lat = 1.0\n\
+            lon = 2.0\n\
+            [[place]]\n\
+            name = \"Walk\"\n\
+            lat = 3.0\n\
+            lon = 4.0\n\
+            walk_minutes = 7\n";
+        let places = parse_places(toml).expect("parses");
+        assert_eq!(places[0].walk_minutes, 0); // omitted → default
+        assert_eq!(places[1].walk_minutes, 7);
+        assert_eq!(places[1].resolved().walk_minutes, 7);
     }
 
     #[test]

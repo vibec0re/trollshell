@@ -2,6 +2,12 @@
 //! [`hytte::services::departures::current()`] and renders the current
 //! eight S-Bahn departures as a vertical list. Relative time labels
 //! re-render on every emission of [`hytte::services::clock::now()`].
+//!
+//! That same per-second tick also prunes the list: a row whose train has
+//! actually departed (past [`DEPARTED_GRACE`]) is hidden, so already-gone
+//! trains don't linger as "now" between the service's polls. With a walk
+//! budget the lead cell is a `walk` icon + the leave-by remainder ("7 min" /
+//! "now") rather than the wordy "leave …", keeping the row narrow.
 
 use chrono::{DateTime, Local};
 use hytte::gtk::{self, prelude::*};
@@ -42,8 +48,10 @@ pub fn relative_label(now: DateTime<Local>, departure: DateTime<Local>) -> Strin
 /// The relative token shown before "· HH:MM". With no walk budget
 /// (`walk_minutes == 0`) it's the plain departs-in label from
 /// [`relative_label`]. With a positive budget it's a leave-by countdown — whole
-/// minutes until you must leave to still catch the train (`"leave 7 min"`),
-/// collapsing to `"leave now"` once that hits zero. The returned bool is
+/// minutes until you must leave to still catch the train (`"7 min"`),
+/// collapsing to `"now"` once that hits zero. The leave-by case is marked by a
+/// `walk` icon the caller prepends (so the bare number reads as "leave in"),
+/// which is why the token here omits the word "leave". The returned bool is
 /// whether the train is already unreachable (you can't make it even leaving
 /// this instant), which the caller renders faded.
 #[must_use]
@@ -59,17 +67,33 @@ pub fn lead_label(
     let slack = departs.signed_duration_since(now).num_seconds() - i64::from(walk_minutes) * 60;
     let minutes = (slack + 30) / 60;
     let token = if minutes <= 0 {
-        "leave now".to_string()
+        "now".to_string()
     } else {
-        format!("leave {minutes} min")
+        format!("{minutes} min")
     };
     (token, slack < 0)
 }
 
-/// Apply the current time/leave label and the unreachable fade to one row.
-/// Shared by the initial paint in [`row`] and the per-tick clock subscription
-/// so they never drift.
+/// How long after a train's actual departure time we keep its row on screen
+/// before hiding it. A small grace absorbs clock skew and lets "now" linger a
+/// beat rather than vanishing the instant the scheduled second ticks past.
+const DEPARTED_GRACE: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Whether a train counts as already gone — its actual departure is more than
+/// [`DEPARTED_GRACE`] in the past. Pure so the prune boundary is unit-testable.
+#[must_use]
+pub fn departed(now: DateTime<Local>, actual: DateTime<Local>) -> bool {
+    now.signed_duration_since(actual) > DEPARTED_GRACE
+}
+
+/// Apply the current time/leave label, the unreachable fade, and the
+/// departed-row prune to one row. Shared by the initial paint in [`row`] and
+/// the per-tick clock subscription so they never drift. A train that has
+/// already left (past [`DEPARTED_GRACE`]) is hidden, so the open board doesn't
+/// keep showing departures from the past between the service's polls.
 fn apply_row(r: &TimeRowRef, now: DateTime<Local>) {
+    r.row_box.set_visible(!departed(now, r.actual));
+
     let (token, unreachable) = lead_label(now, r.actual, r.walk_minutes);
     r.time_lbl
         .set_text(&format!("{token} · {}", r.actual.format("%H:%M")));
@@ -117,12 +141,23 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     direction.set_max_width_chars(22);
     row.append(&direction);
 
-    // Time cell — text is set initially via apply_row against the current
-    // clock, then updated in place by the widget-level clock subscription.
-    // No per-row bind here.
+    // Time cell — an optional walk icon (leave-by mode) followed by the
+    // "{token} · HH:MM" label. The label text is set initially via apply_row
+    // against the current clock, then updated in place by the widget-level
+    // clock subscription; the icon is static (a row's walk budget never
+    // changes). No per-row bind here.
+    let time_cell = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    if d.walk_minutes > 0 {
+        let walk = gtk::Image::from_file(crate::assets::path("icons/walk.svg"));
+        walk.set_pixel_size(14);
+        walk.set_valign(gtk::Align::Center);
+        walk.add_css_class("ts-departure-walk-icon");
+        time_cell.append(&walk);
+    }
     let time_lbl = gtk::Label::new(None);
     time_lbl.add_css_class("ts-departure-time");
-    row.append(&time_lbl);
+    time_cell.append(&time_lbl);
+    row.append(&time_cell);
 
     // Delay indicator (hidden when on time).
     if let Some(text) = delay_string(d.delay_minutes) {
@@ -302,7 +337,7 @@ mod tests {
         // 14 min out, 10 min walk → 4 min of slack before you must leave.
         assert_eq!(
             lead_label(now, at(16, 14, 0), 10),
-            ("leave 4 min".to_string(), false)
+            ("4 min".to_string(), false)
         );
     }
 
@@ -312,7 +347,7 @@ mod tests {
         // 11 min out, 10 min walk → 1 min slack.
         assert_eq!(
             lead_label(now, at(16, 11, 0), 10),
-            ("leave 1 min".to_string(), false)
+            ("1 min".to_string(), false)
         );
     }
 
@@ -322,17 +357,27 @@ mod tests {
         // Exactly the walk window: leave this instant, still catchable (not faded).
         assert_eq!(
             lead_label(now, at(16, 10, 0), 10),
-            ("leave now".to_string(), false)
+            ("now".to_string(), false)
         );
     }
 
     #[test]
     fn lead_label_negative_slack_is_unreachable() {
         let now = at(16, 0, 0);
-        // 3 min out, 10 min walk → already missed: "leave now" + faded.
-        assert_eq!(
-            lead_label(now, at(16, 3, 0), 10),
-            ("leave now".to_string(), true)
-        );
+        // 3 min out, 10 min walk → already missed: "now" + faded.
+        assert_eq!(lead_label(now, at(16, 3, 0), 10), ("now".to_string(), true));
+    }
+
+    // ── departed prune ─────────────────────────────────────────────────────--
+
+    #[test]
+    fn departed_hides_only_after_grace() {
+        let train = at(16, 0, 0);
+        // Future and on-the-dot trains stay visible.
+        assert!(!departed(at(15, 59, 0), train));
+        assert!(!departed(at(16, 0, 0), train));
+        // Within the 30 s grace → still shown; past it → hidden.
+        assert!(!departed(at(16, 0, 30), train));
+        assert!(departed(at(16, 0, 31), train));
     }
 }

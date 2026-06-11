@@ -1,7 +1,14 @@
 # Departures reachability: a per-place walk budget + leave-by countdown
 
-**Status:** design approved 2026-06-09
+**Status:** design approved 2026-06-09; revised 2026-06-11
 **Scope:** `crates/hytte-services/src/places.rs` (config + `ResolvedPlace`), `crates/hytte-services/src/departures.rs` (carry the budget), `trollshell/src/widgets/departures.rs` (leave-by label + fade), `trollshell/style.css` (one rule).
+
+**Revision 2026-06-11 (field-report fixes).** (1) The leave-by token dropped the
+word "leave" for a prepended `walk` icon (`icons/walk.svg`) — the row was too
+wide. (2) Departed rows are now pruned live on the same clock tick, and the
+sidebar re-polls every 30 s while open (`overlays/sidebar.rs`) so the board no
+longer freezes on the open-time fetch — the staleness that made *every* row read
+"leave now" on a 15-minute-old list.
 
 ## Motivation
 
@@ -69,12 +76,14 @@ the right budget for free (it keeps the prior `items`, which already carry it).
 
 ### Reachability is a per-tick display concern, not a fetch concern
 
-The "can I still make it?" verdict depends on _now_, which drifts continuously;
-the service only polls every 15 minutes. So the verdict lives in the **widget**,
-on the same `clock::now()` tick that already counts the relative time down — no
-new polling, no new subscription. The service stays a thin fetch+filter that just
-attaches the budget. As you watch the open sidebar, trains cross the boundary and
-fade live.
+The "can I still make it?" verdict depends on *now*, which drifts continuously;
+the service's background poll is coarse (15 min). So the verdict lives in the
+**widget**, on the same `clock::now()` tick that already counts the relative time
+down — no new polling, no new subscription. The service stays a thin fetch+filter
+that just attaches the budget. As you watch the open sidebar, trains cross the
+boundary and fade live; a departed train's row is pruned on the same tick. (The
+sidebar separately re-polls every 30 s while open so fresh trains keep arriving —
+see the 2026-06-11 revision.)
 
 ### The label rule — `lead_label(now, departs, walk_minutes) -> (String, bool)`
 
@@ -83,23 +92,24 @@ walk_minutes == 0            → (relative_label(now, departs), false)   // unch
 else:
   slack   = (departs - now) - walk_minutes          // seconds you can still wait
   minutes = (slack + 30) / 60                        // nearest minute (same rounding as relative_label)
-  token   = minutes <= 0 ? "leave now" : "leave {minutes} min"
+  token   = minutes <= 0 ? "now" : "{minutes} min"   // bare; a walk icon adds "leave"
   faded   = slack < 0                                // already missed
 ```
 
-So `"leave now"` covers both "go right now to make it" (slack ≈ 0, **not** faded)
-and "that window closed" (slack < 0, **faded**) — the fade is what disambiguates.
-Rendered cell stays `"{token} · {HH:MM}"`; the `· HH:MM` is still the train's
-departure clock time.
+So `"now"` covers both "go right now to make it" (slack ≈ 0, **not** faded) and
+"that window closed" (slack < 0, **faded**) — the fade is what disambiguates. The
+widget prepends a `walk` symbolic (bundled `icons/walk.svg`) whenever
+`walk_minutes > 0`, so the cell reads `[walk] 7 min · HH:MM` / `[walk] now · HH:MM`:
+the icon carries the "leave in" sense the word "leave" used to, keeping the row
+narrow. The `· HH:MM` is still the train's departure clock time.
 
 ### CSS
 
-One theme-independent rule (opacity, so no light-mode mirror):
+Two theme-independent rules (opacity, so no light-mode mirror):
 
 ```css
-.ts-departure-row.ts-departure-unreachable {
-  opacity: 0.4;
-}
+.ts-departure-row.ts-departure-unreachable { opacity: 0.4; }
+.ts-departure-walk-icon { opacity: 0.85; }   /* match the time text's dimness */
 ```
 
 Dims the whole row (badge included) so the glance lands on the first catchable
@@ -113,15 +123,16 @@ and an unreachable one read differently — and a row can be both.
 - `departures.rs`: existing transition/parse tests unchanged (budget is additive);
   test constructors gain `walk_minutes: 0`.
 - `widgets/departures.rs`: `lead_label` — zero-walk falls back to the plain label;
-  positive slack → "leave N min"; zero slack → "leave now" not faded; negative
-  slack → "leave now" + faded; the 1-minute-slack boundary reads "leave 1 min".
+  positive slack → "N min"; zero slack → "now" not faded; negative slack → "now"
+  + faded; the 1-minute-slack boundary reads "1 min". Plus `departed` — a row is
+  hidden only once its train is past the 30 s grace.
 
 ## Out of scope
 
 - Reordering/promoting the first catchable train (the fade already directs the eye).
 - A walk budget for the "away / nearest station" case (we don't know it).
 - Per-line or time-of-day walk variation; door-to-platform vs door-to-station nuance.
-- Hot-reloading `places.toml` (still process-start only).
+- ~~Hot-reloading `places.toml`~~ — shipped 2026-06-11 (live mtime-poll reload in `places.rs`).
 
 ## Migration note
 

@@ -35,6 +35,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -51,6 +52,14 @@ pub const SIDEBAR_WIDTH: i32 = 320;
 /// Frame-strut thickness, duplicated from `frame.rs` so this module stays
 /// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
 const FRAME_THICKNESS_I32: i32 = 8;
+
+/// While the sidebar is open, re-poll departures on this cadence so the board
+/// stays live — new trains in, departed trains out — instead of freezing on the
+/// single fetch taken at open. The departures service already drops past rows
+/// and coalesces overlapping refreshes, so this is cheap; when the sidebar is
+/// closed the timer is a no-op (nobody's looking). Weather is left on its
+/// open-time refresh — it doesn't change minute-to-minute.
+const REFRESH_WHILE_OPEN: Duration = Duration::from_secs(30);
 
 thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
@@ -69,6 +78,9 @@ struct SidebarPanel {
     revealer: gtk::Revealer,
     open_state: Mutable<bool>,
     subscription: glib::JoinHandle<()>,
+    /// Periodic departures-refresh timer (fires only while open). Removed in
+    /// [`close_all`] so it doesn't outlive the surface across a hot-plug.
+    refresh_source: glib::SourceId,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -166,6 +178,17 @@ pub fn install(monitor: &Monitor) {
     let subscription = wire_open_subscription(&window, &revealer, &open_state);
     wire_escape(&window, monitor.clone());
 
+    // Keep the board live while open: re-poll departures on a fixed cadence
+    // (a no-op while closed). The captured open-state clone is independent of
+    // the one stored on the panel.
+    let refresh_open = open_state.clone();
+    let refresh_source = glib::timeout_add_local(REFRESH_WHILE_OPEN, move || {
+        if refresh_open.get() {
+            hytte::services::departures::refresh();
+        }
+        glib::ControlFlow::Continue
+    });
+
     PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key,
@@ -174,6 +197,7 @@ pub fn install(monitor: &Monitor) {
                 revealer,
                 open_state,
                 subscription,
+                refresh_source,
             },
         );
     });
@@ -319,11 +343,12 @@ fn wire_escape(window: &gtk::Window, monitor: Monitor) {
 pub fn close_all() {
     PANELS.with(|panels| {
         for (_, panel) in panels.borrow_mut().drain() {
-            // Abort the subscription first so it cannot dispatch into the
-            // (about to be closed) window. Then reset the bool so any other
-            // subscribers see the closed state, and finally tear down the
-            // surface.
+            // Abort the subscription and drop the refresh timer first so neither
+            // can dispatch into the (about to be closed) window. Then reset the
+            // bool so any other subscribers see the closed state, and finally
+            // tear down the surface.
             panel.subscription.abort();
+            panel.refresh_source.remove();
             panel.open_state.set(false);
             panel.window.close();
         }

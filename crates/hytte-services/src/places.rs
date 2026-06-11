@@ -4,7 +4,8 @@
 //! fingerprint (the set of network SSIDs you see there), and optional transit
 //! config (a station + line/direction filter for [`crate::departures`]).
 //! Places load from `~/.config/trollshell/places.toml`; a documented default
-//! is written on first run.
+//! is written on first run. The file's mtime is polled, so saved edits are
+//! picked up live — the resolver re-resolves on change, no restart needed.
 //!
 //! The resolver fuses sensors into "where am I", in priority order:
 //!   1. **Wi-Fi fingerprint** — at least `match_min` of a place's SSIDs are
@@ -25,6 +26,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry};
@@ -37,11 +39,17 @@ use crate::wifiscan::{self, AccessPoint};
 
 const CONFIG_REL_PATH: &str = ".config/trollshell/places.toml";
 
+/// How often the running shell re-checks `places.toml` for live reload. Each
+/// tick is a single `stat` on a cached inode, so it stays snappy while you edit
+/// with no measurable idle cost; the file is only re-read when the mtime moves.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Documented default, written on first run and used as the fallback for a
 /// missing/empty/malformed config. Kept *as TOML* so the loader has one parse
 /// path and the written file matches behaviour.
 const DEFAULT_CONFIG: &str = r#"# trollshell places — where you frequent, how the shell recognises each, and
-# (optionally) which departures to show there.
+# (optionally) which departures to show there. Edits are picked up live: save
+# the file and the shell re-resolves within a few seconds, no restart needed.
 #
 # Current place is resolved in order:
 #   1. Wi-Fi fingerprint — at least `match_min` of a place's listed SSIDs are
@@ -299,6 +307,43 @@ fn warn_unsatisfiable_fingerprints(places: &[Place]) {
     }
 }
 
+/// File modification time, or `None` when it can't be stat'd (missing or
+/// unreadable). [`ConfigWatcher`] compares this across polls to detect edits.
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Watches `places.toml` for live reload by polling its mtime. Remembers the
+/// last-seen mtime so a poll only re-reads the file when it actually moved, and
+/// content-checks the reparse so a `touch` or no-op save doesn't churn a
+/// re-resolve.
+struct ConfigWatcher {
+    path: Option<PathBuf>,
+    last: Option<SystemTime>,
+}
+
+impl ConfigWatcher {
+    fn new() -> Self {
+        let path = config_path();
+        let last = path.as_deref().and_then(mtime);
+        Self { path, last }
+    }
+
+    /// Reload and return the fresh places when the file's mtime has moved since
+    /// the previous poll *and* the parsed list differs from `current`; otherwise
+    /// `None` (unchanged mtime, no config path, or an identical reparse).
+    fn poll(&mut self, current: &[Place]) -> Option<Vec<Place>> {
+        let path = self.path.as_deref()?;
+        let now = mtime(path);
+        if now == self.last {
+            return None;
+        }
+        self.last = now;
+        let reloaded = load_places();
+        (reloaded.as_slice() != current).then_some(reloaded)
+    }
+}
+
 // ── Resolution ──────────────────────────────────────────────────────────────
 
 /// Great-circle distance between two `(lat, lon)` points in kilometres.
@@ -430,7 +475,8 @@ impl Service for PlacesService {
         });
         let loaded = load_places();
         warn_unsatisfiable_fingerprints(&loaded);
-        let places = Arc::new(loaded);
+        let places = Mutable::new(Arc::new(loaded));
+        rt.spawn(watch_config(places.clone()));
         rt.spawn(resolve_loop(place, location, places));
         handles
     }
@@ -476,10 +522,29 @@ pub fn shared_location() -> Option<Mutable<LocationState>> {
     SHARED.get().map(|s| s.location.clone())
 }
 
+/// Poll `places.toml` and republish the parsed list when it changes, so config
+/// edits take effect within [`CONFIG_POLL_INTERVAL`] without restarting the
+/// shell. [`resolve_loop`] subscribes to the same handle and re-resolves on
+/// each swap, exactly as it does for the Wi-Fi and `GeoClue` sensors.
+async fn watch_config(places: Mutable<Arc<Vec<Place>>>) {
+    let mut watcher = ConfigWatcher::new();
+    let mut tick = tokio::time::interval(CONFIG_POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let current = places.get_cloned();
+        if let Some(reloaded) = watcher.poll(&current) {
+            warn_unsatisfiable_fingerprints(&reloaded);
+            tracing::info!(count = reloaded.len(), "places: config changed; reloaded");
+            places.set(Arc::new(reloaded));
+        }
+    }
+}
+
 async fn resolve_loop(
     place_out: Mutable<Option<ResolvedPlace>>,
     location_out: Mutable<LocationState>,
-    places: Arc<Vec<Place>>,
+    places: Mutable<Arc<Vec<Place>>>,
 ) {
     let aps = wifiscan::shared_aps();
     let geo = geoclue::shared_location();
@@ -513,8 +578,22 @@ async fn resolve_loop(
     } else {
         tracing::warn!("places: geoclue not registered; location fallback disabled");
     }
+    // Re-resolve whenever the config is reloaded (watch_config swaps the list).
+    {
+        let n = notify.clone();
+        let p = places.clone();
+        tokio::spawn(async move {
+            p.signal_ref(|_| ())
+                .for_each(move |()| {
+                    n.notify_one();
+                    std::future::ready(())
+                })
+                .await;
+        });
+    }
 
     loop {
+        let current = places.get_cloned();
         let ap_list = match &aps {
             Some(m) => m.get_cloned(),
             None => Vec::new(),
@@ -523,7 +602,7 @@ async fn resolve_loop(
             Some(m) => m.get_cloned(),
             None => LocationState::Unavailable,
         };
-        let (place, location) = resolve(&places, &ap_list, &geoloc);
+        let (place, location) = resolve(&current, &ap_list, &geoloc);
 
         if place_out.get_cloned() != place {
             if let Some(p) = &place {
@@ -723,5 +802,56 @@ mod tests {
             assert_eq!(place.as_ref().map(|p| p.name.as_str()), Some("Home"));
             assert_eq!(loc, geoloc);
         }
+    }
+
+    // ── Live reload ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_watcher_reloads_only_on_changed_content() {
+        use std::time::UNIX_EPOCH;
+
+        let root = std::env::temp_dir().join(format!("hytte-places-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
+
+        // `temp_env` serializes $HOME mutation across tests and restores it after.
+        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+            let cfg = root.join(".config/trollshell/places.toml");
+            let one = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n";
+            let two = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n\
+                       [[place]]\nname = \"Office\"\nlat = 3.0\nlon = 4.0\n";
+            // Set the file's mtime to a fixed instant so change-detection is
+            // deterministic (no sleeps, no filesystem-granularity flakiness).
+            let set_mtime = |secs: u64| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&cfg)
+                    .unwrap()
+                    .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                    .unwrap();
+            };
+
+            // One place on disk; the watcher records its mtime at construction.
+            std::fs::write(&cfg, one).unwrap();
+            set_mtime(1);
+            let mut watcher = ConfigWatcher::new();
+            let current = load_places();
+            assert_eq!(current.len(), 1);
+
+            // Unchanged mtime → no reload.
+            assert!(watcher.poll(&current).is_none());
+
+            // Add a place and move the mtime → reload sees both.
+            std::fs::write(&cfg, two).unwrap();
+            set_mtime(2);
+            let reloaded = watcher.poll(&current).expect("changed → reload");
+            assert_eq!(reloaded.len(), 2);
+
+            // mtime moves but content is identical → no spurious republish.
+            set_mtime(3);
+            assert!(watcher.poll(&reloaded).is_none());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

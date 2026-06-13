@@ -11,13 +11,23 @@ pkgs.mkShell {
     rust-analyzer
   ];
 
+  # Fixed (non-prepending) values live as env attrs; only the two vars that
+  # have to prepend to an existing runtime value stay in the shellHook.
   env = {
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
+
+    RUST_BACKTRACE = "1";
+
+    # Nix packages GSettings schemas under share/gsettings-schemas/<pkg>/...,
+    # but GLib only finds them at share/glib-2.0/schemas/. wrapGAppsHook
+    # translates this at install time; for `cargo run` we point GLib at
+    # the raw schema dirs ourselves so org.gnome.desktop.interface (and
+    # therefore the active GTK icon theme name) reads cleanly.
+    GSETTINGS_SCHEMA_DIR = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}/glib-2.0/schemas";
   };
 
   shellHook = ''
-    export RUST_BACKTRACE=1
     # Put libclang.so on the dynamic loader's search path so the
     # bindgen consumers (libpipewire-sys + libspa-sys) can `dlopen`
     # it. clang-sys's libloading fallback otherwise leans on
@@ -30,12 +40,5 @@ pkgs.mkShell {
     # (audio-volume-*-symbolic, display-brightness-symbolic, etc.).
     # Prepend them explicitly so `cargo run` from the devShell sees them.
     export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share:$XDG_DATA_DIRS"
-
-    # Nix packages GSettings schemas under share/gsettings-schemas/<pkg>/...,
-    # but GLib only finds them at share/glib-2.0/schemas/. wrapGAppsHook
-    # translates this at install time; for `cargo run` we point GLib at
-    # the raw schema dirs ourselves so org.gnome.desktop.interface (and
-    # therefore the active GTK icon theme name) reads cleanly.
-    export GSETTINGS_SCHEMA_DIR="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}/glib-2.0/schemas"
   '';
 }

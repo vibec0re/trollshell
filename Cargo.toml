@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/hytte-reactive",
-    "crates/hytte-ui",
-    "crates/hytte-services",
-    "crates/hytte",
-    "crates/hytte-bus",
-    "crates/hytte-ecal",
-    "trollshell",
+  "crates/hytte-reactive",
+  "crates/hytte-ui",
+  "crates/hytte-services",
+  "crates/hytte",
+  "crates/hytte-bus",
+  "crates/hytte-ecal",
+  "trollshell",
 ]
 
 [workspace.package]

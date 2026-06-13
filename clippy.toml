@@ -1,4 +1,4 @@
 disallowed-methods = [
-    { path = "zbus::Connection::session", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
-    { path = "zbus::Connection::system", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
+  { path = "zbus::Connection::session", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
+  { path = "zbus::Connection::system", reason = "use hytte::bus::* primitives instead — see docs/superpowers/specs/2026-04-27-shared-bus-connections-design.md" },
 ]

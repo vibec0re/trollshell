@@ -13,7 +13,9 @@ workspace = true
 anyhow = "1.0.102"
 async-stream = "0.3"
 futures-signals = "0.3.34"
-futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.32", default-features = false, features = [
+  "std",
+] }
 hytte-reactive = { path = "../hytte-reactive" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -23,4 +25,9 @@ zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "time", "process"] }
+tokio = { version = "1.52.1", features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "process",
+] }

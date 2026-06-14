@@ -3,9 +3,11 @@
   trollshell,
 }:
 pkgs.mkShell {
-  # Reuse exactly the build/runtime deps the package pulls in, so the dev
-  # shell and the packaged build never drift.
-  inherit (trollshell) nativeBuildInputs buildInputs;
+  # Reuse exactly the build/runtime deps the package pulls in, so the dev shell
+  # and the packaged build never drift. Use the raw passthru lists rather than
+  # trollshell.nativeBuildInputs — the latter carries crane's vendoring hooks,
+  # which warn noisily ("cargoVendorDir not set") when sourced in a shell.
+  inherit (trollshell.devInputs) nativeBuildInputs buildInputs;
 
   # crane builds the package on nixpkgs' rust but doesn't expose it as a
   # buildInput, so the dev shell pulls the toolchain in directly.

@@ -32,6 +32,41 @@ let
       || (lib.hasInfix "/trollshell/icons/" path);
   };
 
+  # Pulled out of commonArgs so the dev shell can reuse the exact same deps via
+  # passthru.devInputs — crane appends its own build-orchestration hooks to the
+  # final derivation's nativeBuildInputs, which spam "cargoVendorDir not set"
+  # warnings when inherited into a shell, so the shell takes these raw lists.
+  nativeBuildInputs = [
+    pkg-config
+    wrapGAppsHook4
+    # Sets LIBCLANG_PATH + a complete BINDGEN_EXTRA_CLANG_ARGS so the bindgen
+    # consumers (pam-sys, pipewire-sys/libspa-sys) find libclang and the libc /
+    # clang resource headers in the sandbox.
+    rustPlatform.bindgenHook
+  ];
+
+  buildInputs = [
+    glib
+    gtk4
+    libadwaita
+    gtk4-layer-shell
+    gsettings-desktop-schemas
+    adwaita-icon-theme
+    hicolor-icon-theme
+
+    evolution-data-server
+    libical
+    gobject-introspection
+
+    openssl
+
+    # libpipewire-0.3 + libspa-0.2 — pipewire-rs (libpipewire-sys /
+    # libspa-sys) discovers headers + .so via pkg-config (.pc files
+    # ship in the dev output and pkg-config is already in
+    # nativeBuildInputs).
+    pipewire
+  ];
+
   # Args shared between the deps-only build (cached on Cargo.lock changes only)
   # and the final crate build. The bindgen consumers (hytte-pam via pam-sys,
   # pipewire-sys/libspa-sys) run during the deps build, so bindgenHook (which
@@ -39,7 +74,7 @@ let
   commonArgs = {
     pname = "trollshell";
     version = "0.1.0";
-    inherit src;
+    inherit src nativeBuildInputs buildInputs;
 
     # strictDeps stays off (crane's default): the bindgen build scripts read the
     # pipewire headers from buildInputs, simplest with one shared include path.
@@ -48,37 +83,6 @@ let
     cargoExtraArgs = "-p trollshell";
     # Tests touch live system daemons (dbus, etc.); skip in the nix sandbox.
     doCheck = false;
-
-    nativeBuildInputs = [
-      pkg-config
-      wrapGAppsHook4
-      # Sets LIBCLANG_PATH + a complete BINDGEN_EXTRA_CLANG_ARGS so the bindgen
-      # consumers (pam-sys, pipewire-sys/libspa-sys) find libclang and the libc
-      # / clang resource headers in the sandbox.
-      rustPlatform.bindgenHook
-    ];
-
-    buildInputs = [
-      glib
-      gtk4
-      libadwaita
-      gtk4-layer-shell
-      gsettings-desktop-schemas
-      adwaita-icon-theme
-      hicolor-icon-theme
-
-      evolution-data-server
-      libical
-      gobject-introspection
-
-      openssl
-
-      # libpipewire-0.3 + libspa-0.2 — pipewire-rs (libpipewire-sys /
-      # libspa-sys) discovers headers + .so via pkg-config (.pc files
-      # ship in the dev output and pkg-config is already in
-      # nativeBuildInputs).
-      pipewire
-    ];
 
     # Baked into the binary at compile time; trollshell::assets reads
     # this with option_env! and falls back to CARGO_MANIFEST_DIR when
@@ -113,6 +117,9 @@ craneLib.buildPackage (
   commonArgs
   // {
     inherit cargoArtifacts;
+
+    # Raw input lists for the dev shell to reuse without crane's build hooks.
+    passthru.devInputs = { inherit nativeBuildInputs buildInputs; };
 
     postInstall = ''
       mkdir -p $out/share/trollshell

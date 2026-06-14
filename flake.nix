@@ -3,22 +3,19 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      rust-overlay,
       treefmt-nix,
+      crane,
       ...
     }:
     let
@@ -31,19 +28,18 @@
         nixpkgs.lib.genAttrs systems (
           system:
           fn rec {
-            pkgs = import nixpkgs {
-              inherit system;
-              overlays = [ (import rust-overlay) ];
-            };
+            pkgs = import nixpkgs { inherit system; };
+            # crane drives the build on nixpkgs' own rust toolchain.
+            craneLib = crane.mkLib pkgs;
             treefmt-eval = treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix;
           }
         );
     in
     {
       packages = forAllSystems (
-        { pkgs, ... }:
+        { pkgs, craneLib, ... }:
         let
-          trollshell = pkgs.callPackage ./nix/package.nix { };
+          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
         in
         {
           inherit trollshell;

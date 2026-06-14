@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets        # must be clean
 cargo fmt --all
 ```
 
-Edition 2024, MSRV 1.85, toolchain pinned to stable (`rust-toolchain.toml`).
+Edition 2024, MSRV 1.85. The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
 
 ## Architecture — the reactive core
 

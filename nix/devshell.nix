@@ -7,7 +7,13 @@ pkgs.mkShell {
   # shell and the packaged build never drift.
   inherit (trollshell) nativeBuildInputs buildInputs;
 
+  # crane builds the package on nixpkgs' rust but doesn't expose it as a
+  # buildInput, so the dev shell pulls the toolchain in directly.
   packages = with pkgs; [
+    cargo
+    rustc
+    clippy
+    rustfmt
     rust-analyzer
   ];
 

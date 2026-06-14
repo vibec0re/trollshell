@@ -87,24 +87,13 @@ in
           };
         };
 
-        # Weather widget location: a session-wide TROLLSHELL_WEATHER_CITY
-        # fallback plus geoclue auto-location (also feeds future
-        # location-aware features like departures).
+        # Weather widget location fallback. Stays outside the recommended-
+        # services switch on purpose: it's the manual alternative to geoclue,
+        # so it must keep working when auto-location is turned off. weather
+        # forward-geocodes this city when GeoClue2 is absent.
         environment.sessionVariables.TROLLSHELL_WEATHER_CITY = lib.mkIf (
           cfg.weather.fallbackCity != null
         ) cfg.weather.fallbackCity;
-
-        services.geoclue2 = lib.mkIf cfg.weather.geoclue.enable {
-          enable = lib.mkDefault true;
-          # MLS is dead — point geoclue's wifi backend at beaconDB.
-          geoProviderUrl = lib.mkDefault cfg.weather.geoclue.providerUrl;
-          # Let trollshell's geoclue client (DesktopId "trollshell")
-          # request location.
-          appConfig.trollshell = {
-            isAllowed = true;
-            isSystem = false;
-          };
-        };
       }
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its
@@ -122,6 +111,22 @@ in
         # PropState::Loading; the profile group hides itself (panels gate on
         # available.is_empty()) so the drawer stays clean.
         services.power-profiles-daemon.enable = lib.mkDefault true;
+
+        # geoclue2 auto-locates the weather widget (and future location-aware
+        # features). Without it the geoclue service times out and falls back to
+        # TROLLSHELL_WEATHER_CITY; with neither, weather shows a "set a city"
+        # hint rather than breaking. Still individually gated by its own toggle.
+        services.geoclue2 = lib.mkIf cfg.weather.geoclue.enable {
+          enable = lib.mkDefault true;
+          # MLS is dead — point geoclue's wifi backend at beaconDB.
+          geoProviderUrl = lib.mkDefault cfg.weather.geoclue.providerUrl;
+          # Let trollshell's geoclue client (DesktopId "trollshell")
+          # request location.
+          appConfig.trollshell = {
+            isAllowed = true;
+            isSystem = false;
+          };
+        };
       })
       # When the home-manager NixOS module is in use, register trollshell's HM
       # module as a shared module so per-user `programs.trollshell` config is

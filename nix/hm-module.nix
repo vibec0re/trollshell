@@ -91,7 +91,7 @@ in
             Description = "trollshell — bar, drawer, services";
             PartOf = [ cfg.systemd.target ];
             After = [ cfg.systemd.target ];
-            Requisite = [ "graphical-session.target" ];
+            Requisite = [ cfg.systemd.target ];
           };
           Service = {
             Type = "simple";
@@ -181,7 +181,11 @@ in
             Documentation = "man:swaybg(1)";
             PartOf = [ cfg.systemd.target ];
             After = [ cfg.systemd.target ];
-            Requisite = [ "graphical-session.target" ];
+            Requisite = [ cfg.systemd.target ];
+            # Stay inactive until the Appearance picker has written a wallpaper
+            # path; otherwise ExecStart's `cat` yields empty, swaybg fails, and
+            # Restart=on-failure loops it on a fresh install.
+            ConditionPathExists = "%h/.config/trollshell/wallpaper.path";
           };
           Service = {
             Type = "simple";

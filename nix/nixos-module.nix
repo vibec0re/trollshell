@@ -138,6 +138,47 @@ in
           };
         };
 
+        # The GNOME Online Accounts → evolution-data-server stack that feeds
+        # the calendar + tasks drawer pages. trollshell has no in-shell
+        # account UI by design (system-daemon-as-state-store): EDS *is* the
+        # account store, and hytte-ecal is a thin read-only client of it
+        # (crates/hytte-ecal/src/lib.rs). The flow is:
+        #   Settings → Online Accounts (gnome-control-center) adds a
+        #   Google/iCloud/CalDAV account → GOA writes an EDS source →
+        #   evolution-data-server syncs it into the local .ics cache →
+        #   hytte-ecal reads it → calendar/tasks populate.
+        # Without this stack a fresh NixOS install has no way to acquire an
+        # account, so those panels sit in their empty state. mkDefault per
+        # service so an explicit `services.gnome.<svc>.enable = false;` still
+        # wins even with the master switch on.
+
+        # GOA daemon (org.gnome.OnlineAccounts) — the account backend EDS
+        # consumes. This is the "add an account" half of the flow.
+        services.gnome.gnome-online-accounts.enable = lib.mkDefault true;
+
+        # evolution-data-server provides the evolution-*-factory services and
+        # the on-disk .ics/.vcf cache that hytte-ecal reads. (EDS's own module
+        # already turns gnome-keyring on; we set it below explicitly too.)
+        services.gnome.evolution-data-server.enable = lib.mkDefault true;
+
+        # gnome-keyring is where GOA stores the OAuth tokens / CalDAV
+        # passwords for the accounts you add; without it GOA can't persist
+        # credentials and re-prompts (or fails) on every session.
+        services.gnome.gnome-keyring.enable = lib.mkDefault true;
+
+        # dconf is the GSettings backend gnome-control-center (and the GOA
+        # panel) read/write their state through. A trollshell user typically
+        # runs no full GNOME desktop-manager to enable it, so wire it here —
+        # otherwise the Online Accounts panel can't persist its settings.
+        programs.dconf.enable = lib.mkDefault true;
+
+        # gnome-control-center is the actual UI to add accounts: its
+        # "Online Accounts" panel (`gnome-control-center online-accounts`) is
+        # where you sign in to Google/iCloud/CalDAV. It's a heavy dependency,
+        # but without an account-adding UI the rest of the stack is inert.
+        # Merged into the list rather than replacing the base systemPackages.
+        environment.systemPackages = [ pkgs.gnome-control-center ];
+
         # System-bus policy: allow any user to own the two trollshell agent
         # names. BlueZ / iwd policies still gate the actual method ACLs; this
         # only grants the right to RequestName. Without it, hytte_bus::own_name

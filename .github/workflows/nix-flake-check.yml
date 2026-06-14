@@ -1,0 +1,28 @@
+name: nix flake check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-flight run when new commits land on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Runs everything the flake exposes as a check: treefmt formatting, the
+      # NixOS + home-manager module evals, and the package build (which runs the
+      # hermetic internals test suite via doCheck). No binary cache is wired up,
+      # so the first cold build of the GTK/crane closure is slow — add a Cachix
+      # or FlakeHub cache step here to speed CI up if it becomes a bottleneck.
+      - run: nix flake check -L
+

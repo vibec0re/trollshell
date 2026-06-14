@@ -9,6 +9,11 @@ description = "GTK4 ↔ futures-signals bridge and service registry for hytte"
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the tests that need a real display server (GTK).
+# Off by default so `cargo test` stays hermetic.
+system-tests = []
+
 [dependencies]
 futures-signals = "0.3.34"
 gtk = { version = "0.11.2", package = "gtk4" }

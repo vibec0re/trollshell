@@ -1,14 +1,14 @@
 //! Smoke: build an `App`, register no services, and assert that the body
 //! closure runs and that we can enumerate at least one monitor.
 //!
-//! Requires a display server.
+//! Needs a display server, so it lives in the `system-tests` bucket.
+#![cfg(feature = "system-tests")]
 
 use hytte_ui::App;
 use std::cell::Cell;
 use std::rc::Rc;
 
 #[test]
-#[ignore = "requires a display server"]
 fn body_runs_on_activate() {
     let ran = Rc::new(Cell::new(false));
     let ran_writer = ran.clone();

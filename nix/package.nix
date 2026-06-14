@@ -20,8 +20,9 @@
 let
   # crane's default cleanCargoSource keeps only .rs/.toml/.lock; also keep the
   # stylesheets (hytte-ui/src/style.css is include_str!'d at compile time;
-  # trollshell/style.css is copied into the output by postInstall) and the
-  # trollshell icons that postInstall ships.
+  # trollshell/style.css is copied into the output by postInstall), the
+  # trollshell icons that postInstall ships, and the test fixtures the
+  # internals suite include_str!'s (doCheck runs `cargo test` in the sandbox).
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
@@ -29,7 +30,8 @@ let
       path: type:
       (craneLib.filterCargoSources path type)
       || (lib.hasSuffix ".css" path)
-      || (lib.hasInfix "/trollshell/icons/" path);
+      || (lib.hasInfix "/trollshell/icons/" path)
+      || (lib.hasInfix "/tests/fixtures/" path);
   };
 
   # Pulled out of commonArgs so the dev shell can reuse the exact same deps via
@@ -81,8 +83,14 @@ let
 
     # Workspace has multiple crates; only build the trollshell binary.
     cargoExtraArgs = "-p trollshell";
-    # Tests touch live system daemons (dbus, etc.); skip in the nix sandbox.
-    doCheck = false;
+    # Run the hermetic internals suite as part of the build. The real-system
+    # tests (dbus-daemon + display server) sit behind the `system-tests` cargo
+    # feature, which we deliberately don't enable here, so the default workspace
+    # `cargo test` needs no live daemons and runs cleanly in the sandbox.
+    # cargoExtraArgs scopes the *build* to trollshell; --workspace broadens the
+    # *test* run to every member crate's internals.
+    doCheck = true;
+    cargoTestExtraArgs = "--workspace";
 
     # Baked into the binary at compile time; trollshell::assets reads
     # this with option_env! and falls back to CARGO_MANIFEST_DIR when

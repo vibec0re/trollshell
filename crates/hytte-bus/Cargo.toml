@@ -9,6 +9,12 @@ description = "Shared D-Bus capability layer for hytte services"
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the integration tests under tests/ that spawn a real
+# dbus-daemon. Off by default so `cargo test` stays hermetic; enable with
+# `--features system-tests` to run them.
+system-tests = []
+
 [dependencies]
 anyhow = "1.0.102"
 async-stream = "0.3"

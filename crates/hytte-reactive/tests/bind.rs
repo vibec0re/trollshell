@@ -1,8 +1,10 @@
 //! Integration test: drive a `Mutable<String>` from the GTK main loop and
 //! assert the bound `gtk::Label`'s text follows.
 //!
-//! Requires a display server. Run with `xvfb-run cargo test -p hytte-reactive
-//! --test bind -- --ignored` or under an existing X/Wayland session.
+//! Needs a display server, so it lives in the `system-tests` bucket. Run with
+//! `xvfb-run cargo test -p hytte-reactive --features system-tests --test bind`
+//! or under an existing X/Wayland session.
+#![cfg(feature = "system-tests")]
 
 use futures_signals::signal::Mutable;
 use gtk::glib;
@@ -20,7 +22,6 @@ fn run_briefly(ms: u64) {
 }
 
 #[gtk::test]
-#[ignore = "requires a display server"]
 fn bind_text_follows_mutable_updates() {
     let label = gtk::Label::new(None);
     let m = Mutable::new(String::from("hello"));
@@ -35,7 +36,6 @@ fn bind_text_follows_mutable_updates() {
 }
 
 #[gtk::test]
-#[ignore = "requires a display server"]
 fn bind_visible_toggles_widget() {
     let label = gtk::Label::new(Some("x"));
     let m = Mutable::new(false);

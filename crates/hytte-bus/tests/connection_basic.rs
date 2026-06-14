@@ -1,3 +1,5 @@
+#![cfg(feature = "system-tests")]
+
 mod common;
 
 use common::ephemeral_bus;

@@ -9,6 +9,11 @@ description = "GTK4 + libadwaita + layer-shell primitives for hytte"
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the tests that need a real display server (GTK).
+# Off by default so `cargo test` stays hermetic.
+system-tests = []
+
 [dependencies]
 adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
 futures-signals = "0.3.34"

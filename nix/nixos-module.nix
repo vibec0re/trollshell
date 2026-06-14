@@ -13,6 +13,18 @@ in
   # enable / package / weather.fallbackCity are declared in the shared base.
   imports = [ (import ./module-common.nix self) ];
 
+  options.programs.trollshell.enableRecommendedServices = lib.mkOption {
+    type = lib.types.bool;
+    default = true;
+    description = ''
+      Enable the system daemons trollshell's optional chips lean on (UPower,
+      power-profiles-daemon, geoclue, plus the polkit agent and the agent-name
+      D-Bus policy). Each is still individually overridable; this is a master
+      switch for the lot. Turning it off leaves a working bar — the chips that
+      back onto a missing daemon simply hide themselves.
+    '';
+  };
+
   # geoclue is system-only, so it lives here rather than in the shared base.
   options.programs.trollshell.weather.geoclue = {
     enable = lib.mkOption {
@@ -42,7 +54,7 @@ in
         # five property subscriptions sit in PropState::Loading
         # forever. mkDefault leaves explicit `services.upower.enable
         # = false;` in user config intact for the rare desktop case.
-        services.upower.enable = lib.mkDefault true;
+        services.upower.enable = lib.mkIf cfg.enableRecommendedServices (lib.mkDefault true);
 
         # power-profiles-daemon (net.hadess.PowerProfiles) feeds the
         # power-profile selector. Without it, ActiveProfile + Profiles

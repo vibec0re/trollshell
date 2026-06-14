@@ -48,10 +48,12 @@
     margin: 0;
     min-height: 32px;
     border-radius: 0;
-    background: linear-gradient(90deg,
+    background: linear-gradient(
+        90deg,
         rgba(15, 15, 35, 1) 0%,
         rgba(25, 15, 45, 1) 50%,
-        rgba(15, 15, 35, 1) 100%);
+        rgba(15, 15, 35, 1) 100%
+    );
 }
 .hytte-bar-group-left button,
 .hytte-bar-group-center button {
@@ -81,21 +83,30 @@
     background: rgba(255, 255, 255, 0.05);
     color: #ffffff;
     border-radius: 10px;
-    opacity: 1.0;
+    opacity: 1;
     transition: all 0.3s ease;
 }
 .ts-workspaces button:hover {
-    background: linear-gradient(135deg, rgba(58, 134, 255, 0.3), rgba(6, 255, 165, 0.3));
+    background: linear-gradient(
+        135deg,
+        rgba(58, 134, 255, 0.3),
+        rgba(6, 255, 165, 0.3)
+    );
     box-shadow: 0 0 15px rgba(58, 134, 255, 0.5);
 }
 .ts-workspaces button.active {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.5), rgba(58, 134, 255, 0.5));
+    background: linear-gradient(
+        135deg,
+        rgba(131, 56, 236, 0.5),
+        rgba(58, 134, 255, 0.5)
+    );
     box-shadow: 0 0 12px rgba(131, 56, 236, 0.5);
 }
 .ts-workspaces button.focused {
     background: linear-gradient(135deg, #8338ec, #3a86ff);
-    box-shadow: 0 0 20px rgba(131, 56, 236, 0.75),
-                inset 0 0 10px rgba(255, 255, 255, 0.2);
+    box-shadow:
+        0 0 20px rgba(131, 56, 236, 0.75),
+        inset 0 0 10px rgba(255, 255, 255, 0.2);
     color: #ffffff;
 }
 
@@ -112,14 +123,22 @@
     transition: all 0.3s ease;
 }
 .ts-windows button:hover {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.3), rgba(58, 134, 255, 0.3));
+    background: linear-gradient(
+        135deg,
+        rgba(131, 56, 236, 0.3),
+        rgba(58, 134, 255, 0.3)
+    );
     box-shadow: 0 0 15px rgba(131, 56, 236, 0.4);
-    opacity: 1.0;
+    opacity: 1;
 }
 .ts-windows button.focused {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.55), rgba(58, 134, 255, 0.55));
+    background: linear-gradient(
+        135deg,
+        rgba(131, 56, 236, 0.55),
+        rgba(58, 134, 255, 0.55)
+    );
     box-shadow: 0 0 10px rgba(131, 56, 236, 0.4);
-    opacity: 1.0;
+    opacity: 1;
 }
 
 /* ─── Right-cluster — single rainbow-gradient pill wrapping all
@@ -144,7 +163,11 @@
  * margin, so the gradient line between them is just a hair of rainbow. */
 .ts-indicator {
     color: #ffffff;
-    background: linear-gradient(135deg, rgba(25, 20, 40, 0.88), rgba(40, 20, 55, 0.88));
+    background: linear-gradient(
+        135deg,
+        rgba(25, 20, 40, 0.88),
+        rgba(40, 20, 55, 0.88)
+    );
     border: none;
     border-radius: 8px;
     padding: 2px 6px;
@@ -154,7 +177,11 @@
     transition: all 0.3s ease;
 }
 .ts-indicator:hover {
-    background: linear-gradient(135deg, rgba(131, 56, 236, 0.55), rgba(58, 134, 255, 0.55));
+    background: linear-gradient(
+        135deg,
+        rgba(131, 56, 236, 0.55),
+        rgba(58, 134, 255, 0.55)
+    );
     box-shadow: 0 0 18px rgba(131, 56, 236, 0.55);
 }
 .ts-indicator image {
@@ -170,24 +197,42 @@
 
 /* Battery chip: tier-colored icon, pulsing when critically low + discharging.
  * Only the symbolic icon takes the color; chip bg + % label keep defaults. */
-.ts-battery-good      image { color: #66e07a; }
-.ts-battery-warn      image { color: #ffce4d; }
-.ts-battery-critical  image { color: #ff3b5c; }
+.ts-battery-good image {
+    color: #66e07a;
+}
+.ts-battery-warn image {
+    color: #ffce4d;
+}
+.ts-battery-critical image {
+    color: #ff3b5c;
+}
 .ts-battery-emergency image {
     color: #ff3b5c;
     animation: ts-battery-pulse 1s ease-in-out infinite;
 }
 @keyframes ts-battery-pulse {
-    0%, 100% { opacity: 1.0; }
-    50%      { opacity: 0.3; }
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.3;
+    }
 }
 
 /* ─── Tiny vertical mini bar-graphs (white fill on trough). ─────── */
 
-.ts-cpu, .ts-memory, .ts-gpu, .ts-battery-label, .ts-clock, .ts-cpu-temp, .ts-gpu-temp {
+.ts-cpu,
+.ts-memory,
+.ts-gpu,
+.ts-battery-label,
+.ts-clock,
+.ts-cpu-temp,
+.ts-gpu-temp {
     font-feature-settings: "tnum" 1;
 }
-.ts-cpu-temp, .ts-gpu-temp {
+.ts-cpu-temp,
+.ts-gpu-temp {
     font-size: 11px;
     opacity: 0.85;
 }
@@ -224,7 +269,7 @@
     min-width: 8px;
     min-height: 56px;
     border-radius: 3px;
-    background: alpha(@accent_color, 0.10);
+    background: alpha(@accent_color, 0.1);
     border: none;
     padding: 0;
 }
@@ -272,7 +317,11 @@
     transition: all 0.3s ease;
 }
 .ts-mpris button:hover {
-    background: linear-gradient(135deg, rgba(6, 255, 165, 0.3), rgba(58, 134, 255, 0.3));
+    background: linear-gradient(
+        135deg,
+        rgba(6, 255, 165, 0.3),
+        rgba(58, 134, 255, 0.3)
+    );
     box-shadow: 0 0 10px rgba(6, 255, 165, 0.4);
 }
 .ts-mpris label {
@@ -295,16 +344,18 @@
     box-shadow: none;
     border: none;
     padding-right: 5px;
-    padding-left:  20px;
+    padding-left: 20px;
 }
 /* Drawer card — floats 10 px below the bar's bottom edge as an
  * independent card; all four corners rounded; drop shadow surrounds the
  * card. Colors inherit the Adwaita theme. */
 .ts-drawer {
     background: @window_bg_color;
-    background-image: linear-gradient(180deg,
+    background-image: linear-gradient(
+        180deg,
         shade(@window_bg_color, 0.82) 0%,
-        @window_bg_color 100%);
+        @window_bg_color 100%
+    );
 
     color: @window_fg_color;
     border-radius: 14px;
@@ -319,9 +370,11 @@
  * dirty smudge. Lift the top slightly instead so the drawer reads as a
  * subtle highlight feathering down into the surface. */
 window:not(.dark) .ts-drawer {
-    background-image: linear-gradient(180deg,
+    background-image: linear-gradient(
+        180deg,
         shade(@window_bg_color, 1.04) 0%,
-        @window_bg_color 100%);
+        @window_bg_color 100%
+    );
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
 }
 /* Sidebar window surface is transparent; the visible content is the
@@ -745,14 +798,30 @@ window:not(.dark) .ts-drawer {
 /* Calendar-source palette — `color_index_for_calendar` maps the source
  * name to one of these. Adwaita-friendly hues chosen to read on the dark
  * sidebar gradient. */
-.ts-cal-color-0 { background: #62a0ea; }   /* blue */
-.ts-cal-color-1 { background: #57e389; }   /* green */
-.ts-cal-color-2 { background: #f9f06b; }   /* yellow */
-.ts-cal-color-3 { background: #ffa348; }   /* orange */
-.ts-cal-color-4 { background: #ed333b; }   /* red */
-.ts-cal-color-5 { background: #c061cb; }   /* purple */
-.ts-cal-color-6 { background: #5bc8af; }   /* teal */
-.ts-cal-color-7 { background: #f76fa5; }   /* pink */
+.ts-cal-color-0 {
+    background: #62a0ea;
+} /* blue */
+.ts-cal-color-1 {
+    background: #57e389;
+} /* green */
+.ts-cal-color-2 {
+    background: #f9f06b;
+} /* yellow */
+.ts-cal-color-3 {
+    background: #ffa348;
+} /* orange */
+.ts-cal-color-4 {
+    background: #ed333b;
+} /* red */
+.ts-cal-color-5 {
+    background: #c061cb;
+} /* purple */
+.ts-cal-color-6 {
+    background: #5bc8af;
+} /* teal */
+.ts-cal-color-7 {
+    background: #f76fa5;
+} /* pink */
 
 /* "UPCOMING" header above the events list */
 .ts-sidebar-cal-header {
@@ -807,18 +876,41 @@ window:not(.dark) .ts-drawer {
     color: white;
     margin-right: 8px;
 }
-.ts-line-S8  { background: #5DAB46; }   /* dark green */
-.ts-line-S9  { background: #882D7A; }   /* violet     */
-.ts-line-S41 { background: #AA5D3D; }
-.ts-line-S42 { background: #C36F33; }
-.ts-line-S46 { background: #C4923D; }   /* chestnut   */
-.ts-line-S47 { background: #C4923D; }
-.ts-line-S85 { background: #A7C539; }   /* yellow-green */
+.ts-line-S8 {
+    background: #5dab46;
+} /* dark green */
+.ts-line-S9 {
+    background: #882d7a;
+} /* violet     */
+.ts-line-S41 {
+    background: #aa5d3d;
+}
+.ts-line-S42 {
+    background: #c36f33;
+}
+.ts-line-S46 {
+    background: #c4923d;
+} /* chestnut   */
+.ts-line-S47 {
+    background: #c4923d;
+}
+.ts-line-S85 {
+    background: #a7c539;
+} /* yellow-green */
 
-.ts-departure-direction { color: alpha(white, 0.95); }
+.ts-departure-direction {
+    color: alpha(white, 0.95);
+}
 
-.ts-departure-time      { color: alpha(white, 0.85); font-variant-numeric: tabular-nums; }
-.ts-departure-delay     { color: #ff6b6b; margin-left: 6px; font-variant-numeric: tabular-nums; }
+.ts-departure-time {
+    color: alpha(white, 0.85);
+    font-variant-numeric: tabular-nums;
+}
+.ts-departure-delay {
+    color: #ff6b6b;
+    margin-left: 6px;
+    font-variant-numeric: tabular-nums;
+}
 
 .ts-departure-row.ts-cancelled .ts-departure-time,
 .ts-departure-row.ts-cancelled .ts-departure-direction {
@@ -841,7 +933,10 @@ window:not(.dark) .ts-drawer {
     padding: 12px;
 }
 
-.ts-departures-error { color: #ff6b6b; padding: 12px; }
+.ts-departures-error {
+    color: #ff6b6b;
+    padding: 12px;
+}
 
 /* ─── Sidebar — tasks widget ──────────────────────────────────── */
 
@@ -876,8 +971,13 @@ window:not(.dark) .ts-drawer {
     color: white;
     border-radius: 8px;
 }
-.ts-sidebar-tasks-list .title    { color: white; }
-.ts-sidebar-tasks-list .subtitle { color: alpha(white, 0.6); font-size: 0.85em; }
+.ts-sidebar-tasks-list .title {
+    color: white;
+}
+.ts-sidebar-tasks-list .subtitle {
+    color: alpha(white, 0.6);
+    font-size: 0.85em;
+}
 
 .ts-task-row checkbutton {
     margin-right: 4px;
@@ -929,13 +1029,13 @@ window:not(.dark) .ts-drawer {
 }
 
 .ts-pill-connected {
-    background: alpha(@accent_color, 0.20);
+    background: alpha(@accent_color, 0.2);
     color: @accent_color;
 }
 
 .ts-pill-known {
     background: alpha(@accent_color, 0.08);
-    color: alpha(@accent_color, 0.70);
+    color: alpha(@accent_color, 0.7);
 }
 
 /* New: VPN tunnel-state pill (used by page_vpn). */
@@ -964,8 +1064,9 @@ window:not(.dark) .ts-drawer {
 
     opacity: 0;
     margin-top: 0px;
-    transition: opacity 200ms ease-out,
-                margin-top 200ms ease-out;
+    transition:
+        opacity 200ms ease-out,
+        margin-top 200ms ease-out;
 }
 
 .ts-osd-card.shown {
@@ -1051,7 +1152,7 @@ window:not(.dark) .ts-drawer {
     border-radius: 9999px;
     font-size: 0.8em;
     font-weight: 600;
-    background: alpha(@error_color, 0.20);
+    background: alpha(@error_color, 0.2);
     color: @error_color;
 }
 
@@ -1069,7 +1170,7 @@ window:not(.dark) .ts-drawer {
     padding: 32px 48px;
     border-radius: 18px;
     background: alpha(@card_bg_color, 0.92);
-    box-shadow: 0 8px 32px alpha(black, 0.40);
+    box-shadow: 0 8px 32px alpha(black, 0.4);
 }
 
 .ts-lock-clock {
@@ -1102,11 +1203,22 @@ window:not(.dark) .ts-drawer {
 }
 
 @keyframes ts-lock-shake-keyframes {
-    0%, 100% { margin-left: 0; }
-    20%      { margin-left: -8px; }
-    40%      { margin-left:  8px; }
-    60%      { margin-left: -6px; }
-    80%      { margin-left:  4px; }
+    0%,
+    100% {
+        margin-left: 0;
+    }
+    20% {
+        margin-left: -8px;
+    }
+    40% {
+        margin-left: 8px;
+    }
+    60% {
+        margin-left: -6px;
+    }
+    80% {
+        margin-left: 4px;
+    }
 }
 
 .ts-lock-shake {

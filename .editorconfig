@@ -1,0 +1,7 @@
+# Prettier reads .editorconfig by default. Keep CSS at the repo's 4-space
+# indent; markdown stays on prettier's 2-space default (no rule needed).
+root = true
+
+[*.css]
+indent_style = space
+indent_size = 4

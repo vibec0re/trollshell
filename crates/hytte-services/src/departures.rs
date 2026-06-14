@@ -511,8 +511,14 @@ mod tests {
     use chrono::TimeZone;
 
     fn future_now() -> DateTime<Local> {
-        // 2030-01-01T16:00:00+01:00 — before every fixture row.
-        Local.with_ymd_and_hms(2030, 1, 1, 16, 0, 0).unwrap()
+        // The same absolute instant as 2030-01-01T16:00:00+01:00 (before every
+        // fixture row), pinned via Utc so it doesn't shift with the machine
+        // timezone — under `nix build`'s sandbox there's no tzdata, so Local
+        // there resolves to UTC and a Local-built literal would land elsewhere.
+        chrono::Utc
+            .with_ymd_and_hms(2030, 1, 1, 15, 0, 0)
+            .unwrap()
+            .with_timezone(&Local)
     }
 
     fn load_fixture() -> ApiResponse {
@@ -580,8 +586,12 @@ mod tests {
     #[test]
     fn into_departure_drops_already_departed() {
         let api = load_fixture();
-        // now > every fixture timestamp.
-        let now = Local.with_ymd_and_hms(2030, 1, 1, 17, 0, 0).unwrap();
+        // now > every fixture timestamp (17:00+01:00), pinned via Utc so it's
+        // timezone-independent (see future_now).
+        let now = chrono::Utc
+            .with_ymd_and_hms(2030, 1, 1, 16, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
         let row = api.departures.into_iter().next().unwrap();
         assert!(into_departure(row, now).is_none());
     }

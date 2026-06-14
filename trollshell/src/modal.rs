@@ -7,11 +7,154 @@ use hytte::prelude::*;
 use hytte::services::calendar;
 use hytte::services::clipboard;
 use hytte::services::notifications;
-use hytte::ui::{Anchor, Layer, LayerEdge, LayerShell, Margin, layer_window};
+use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 
 /// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
 /// Used to clamp the per-trigger margin so the card never falls off-screen left.
 const DRAWER_MAX_WIDTH: i32 = 680;
+
+/// Chrome between the layer-shell surface edge and the visible `.ts-drawer`
+/// card, on the *leading* side of the bar's main axis. Derived from
+/// `trollshell/style.css`:
+/// - Top/Bottom bars (horizontal axis): `.ts-modal` `padding-left: 20px`
+///   plus `.ts-drawer` `margin-left: 0`.
+/// - Left/Right bars (vertical axis): `.ts-drawer` `margin-top: 0`
+///   (`.ts-modal` has no vertical padding).
+///
+/// The card centering math must account for this so the *card* — not the
+/// transparent surface — lands centered under the trigger chip. Keep these
+/// in sync with the stylesheet.
+const CARD_CHROME_MAIN_START_HORIZONTAL: i32 = 20;
+const CARD_CHROME_MAIN_START_VERTICAL: i32 = 0;
+
+/// Chrome between the surface edge and the card on the *trailing* side of the
+/// bar's main axis (the side the drawer hugs):
+/// - Horizontal: `.ts-modal` `padding-right: 5px` + `.ts-drawer`
+///   `margin-right: 10px` = 15.
+/// - Vertical: `.ts-drawer` `margin-bottom: 20px` = 20.
+const CARD_CHROME_MAIN_END_HORIZONTAL: i32 = 15;
+const CARD_CHROME_MAIN_END_VERTICAL: i32 = 20;
+
+/// Where the bar sits, so the drawer can anchor to the bar's *actual* edge
+/// with a perpendicular margin derived from the bar's real offset + measured
+/// thickness — instead of the old hardcoded `Anchor::Top` + `margin.top = 59`
+/// (where 59 was a guessed top-bar height that breaks the moment the bar is
+/// inset, moved to another edge, or sits under another exclusive surface).
+///
+/// `thickness` is read live from the (by-open-time mapped) bar window rather
+/// than measured once, so CSS-driven height changes and hot-plug rebuilds
+/// stay correct.
+#[derive(Clone)]
+struct BarGeometry {
+    /// The bar's screen edge.
+    edge: Edge,
+    /// The bar's own margin on `edge` (gap between the screen edge and the
+    /// bar). Usually 0 for a flush bar.
+    offset: i32,
+    /// Monitor size in logical pixels, captured at install. Used to clamp the
+    /// card on-screen along the main axis.
+    mon_w: i32,
+    mon_h: i32,
+    /// The bar's layer-shell window, measured at open time for its real
+    /// thickness (height for Top/Bottom, width for Left/Right).
+    bar_window: gtk::Window,
+}
+
+impl BarGeometry {
+    /// Bar thickness along the axis perpendicular to the bar, read from the
+    /// live (mapped) bar window.
+    fn thickness(&self) -> i32 {
+        match self.edge {
+            Edge::Top | Edge::Bottom => self.bar_window.height(),
+            Edge::Left | Edge::Right => self.bar_window.width(),
+        }
+    }
+
+    /// Distance from the screen edge the drawer anchors to, out to the
+    /// drawer's near edge: the bar's offset plus its measured thickness.
+    /// Replaces the literal `59`.
+    fn perpendicular_margin(&self) -> i32 {
+        self.offset + self.thickness()
+    }
+
+    /// True when the bar runs horizontally (Top/Bottom) so the drawer
+    /// positions along the X axis; false for vertical bars (Left/Right).
+    fn horizontal(&self) -> bool {
+        matches!(self.edge, Edge::Top | Edge::Bottom)
+    }
+
+    /// Chrome between the surface edge and the card on the side the drawer
+    /// hugs (where its main-axis margin is anchored).
+    fn chrome_main_end(&self) -> i32 {
+        if self.horizontal() {
+            CARD_CHROME_MAIN_END_HORIZONTAL
+        } else {
+            CARD_CHROME_MAIN_END_VERTICAL
+        }
+    }
+
+    /// Chrome between the surface edge and the card on the opposite side.
+    fn chrome_main_start(&self) -> i32 {
+        if self.horizontal() {
+            CARD_CHROME_MAIN_START_HORIZONTAL
+        } else {
+            CARD_CHROME_MAIN_START_VERTICAL
+        }
+    }
+
+    /// The perpendicular anchor + main-axis anchor the drawer surface uses.
+    /// The main-axis anchor is the *trailing* edge so the under-the-chip
+    /// margin is uniformly measured from there: horizontal bars hug the right
+    /// and slide along X; vertical bars hug the bottom and slide along Y.
+    fn anchors(&self) -> (Anchor, Anchor) {
+        match self.edge {
+            Edge::Top => (Anchor::Top, Anchor::Right),
+            Edge::Bottom => (Anchor::Bottom, Anchor::Right),
+            Edge::Left => (Anchor::Left, Anchor::Bottom),
+            Edge::Right => (Anchor::Right, Anchor::Bottom),
+        }
+    }
+
+    /// Layer-shell edge carrying the perpendicular (bar-thickness) margin.
+    fn perpendicular_layer_edge(&self) -> LayerEdge {
+        match self.edge {
+            Edge::Top => LayerEdge::Top,
+            Edge::Bottom => LayerEdge::Bottom,
+            Edge::Left => LayerEdge::Left,
+            Edge::Right => LayerEdge::Right,
+        }
+    }
+
+    /// Layer-shell edge carrying the main-axis (under-the-chip) margin — the
+    /// trailing edge: horizontal bars hug the right, vertical bars the bottom.
+    /// The margin is the distance from this edge back to the card.
+    fn main_layer_edge(&self) -> LayerEdge {
+        if self.horizontal() {
+            LayerEdge::Right
+        } else {
+            LayerEdge::Bottom
+        }
+    }
+
+    /// Revealer slide direction so the card pulls out of the bar's far edge.
+    fn slide(&self) -> gtk::RevealerTransitionType {
+        match self.edge {
+            Edge::Top => gtk::RevealerTransitionType::SlideDown,
+            Edge::Bottom => gtk::RevealerTransitionType::SlideUp,
+            Edge::Left => gtk::RevealerTransitionType::SlideRight,
+            Edge::Right => gtk::RevealerTransitionType::SlideLeft,
+        }
+    }
+
+    /// Alignment that pins the card against the bar so it slides out of the
+    /// bar's far edge rather than floating mid-surface.
+    fn perpendicular_align(&self) -> gtk::Align {
+        match self.edge {
+            Edge::Top | Edge::Left => gtk::Align::Start,
+            Edge::Bottom | Edge::Right => gtk::Align::End,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Page {
@@ -55,14 +198,27 @@ impl Page {
 }
 
 /// Per-monitor drawer handle. Internally owns the layer-shell window, a
-/// `GtkRevealer` that slides the card out of the bar's bottom edge, and a
-/// persistent fullscreen click-catcher that's toggled alongside the drawer.
+/// `GtkRevealer` that slides the card out of the bar's far edge (direction
+/// chosen per `BarGeometry`), and a persistent fullscreen click-catcher
+/// that's toggled alongside the drawer.
 struct ModalPanel {
     window: gtk::Window,
     revealer: gtk::Revealer,
     stack: gtk::Stack,
+    /// The visible `.ts-drawer` card. Measured (post-map) for its real
+    /// allocated size so the *card*, not the transparent surface, centers
+    /// under the trigger chip.
+    card: gtk::Box,
     current: RefCell<Option<Page>>,
     catcher: gtk::Window,
+    /// The bar this drawer hangs off — its edge/offset/thickness drive the
+    /// drawer's anchoring and perpendicular margin.
+    geometry: BarGeometry,
+    /// Main-axis center (X for horizontal bars, Y for vertical) of the chip
+    /// that opened the drawer, in screen coordinates. Stashed at open time so
+    /// the window-map handler can recompute the margin once the card has a
+    /// real allocation (`measure` can return 0 before the surface is mapped).
+    pending_center: RefCell<Option<i32>>,
     /// Emits `true` while the drawer is open (between `show_panel` and the
     /// retract animation finishing). Consumers — e.g. the bar — bind CSS
     /// classes to this so the seam between bar and drawer can restyle.
@@ -92,8 +248,22 @@ fn monitor_key(m: &Monitor) -> String {
 }
 
 /// Build the drawer for one monitor and mount it as a layer-shell window.
-pub fn install(monitor: &Monitor) {
+///
+/// `bar` is the bar this drawer hangs off; its `edge` and `offset` (the
+/// bar's own margin on that edge) are plumbed through so the drawer anchors
+/// to the bar's *actual* edge with a perpendicular margin derived from the
+/// bar's real offset + measured thickness. Must be called after the bar is
+/// built so the bar window exists to be measured at open time.
+pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     let key = monitor_key(monitor);
+    let (mon_w, mon_h) = monitor.size();
+    let geometry = BarGeometry {
+        edge,
+        offset,
+        mon_w,
+        mon_h,
+        bar_window: bar.window().clone(),
+    };
 
     // Build the catcher FIRST so that within `Layer::Top` the catcher's
     // surface is committed before the drawer's. Within the same layer,
@@ -102,11 +272,11 @@ pub fn install(monitor: &Monitor) {
     // the drawer above its catcher.
     let catcher = build_catcher(monitor, key.clone());
 
-    let window = build_drawer_window(monitor, &key);
+    let window = build_drawer_window(monitor, &key, &geometry);
     wire_escape(&window, key.clone());
 
-    let revealer = build_revealer();
-    let card = build_drawer_card();
+    let revealer = build_revealer(&geometry);
+    let card = build_drawer_card(&geometry);
     let stack = build_pages_stack();
 
     card.append(&stack);
@@ -114,6 +284,7 @@ pub fn install(monitor: &Monitor) {
     window.set_child(Some(&revealer));
 
     wire_retract_finish(&revealer, key.clone());
+    wire_recenter_on_map(&window, key.clone());
     window.set_visible(false);
 
     PANELS.with(|panels| {
@@ -123,29 +294,31 @@ pub fn install(monitor: &Monitor) {
                 window,
                 revealer,
                 stack,
+                card,
                 current: RefCell::new(None),
                 catcher,
+                geometry,
+                pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
             },
         );
     });
 }
 
-/// Drawer surface: 360 min width, content-driven natural size, ignores
-/// other layer-shell exclusive zones so its `margin.top` is measured from
-/// the true screen edge (the bar's ≈59 px reservation would otherwise stack
-/// with our margin and push the drawer down).
-fn build_drawer_window(monitor: &Monitor, key: &str) -> gtk::Window {
+/// Drawer surface, anchored to the bar's *actual* edge. Content-driven
+/// natural size; ignores other layer-shell exclusive zones (sets
+/// `exclusive_zone(-1)`) so its perpendicular margin is measured from the
+/// true screen edge — the bar's own exclusive reservation would otherwise
+/// stack with our margin and push the drawer off the bar. The perpendicular
+/// margin is set live in `show_panel` from `geometry.perpendicular_margin()`
+/// (bar offset + measured thickness), not a hardcoded constant; the
+/// main-axis margin (under the chip) is set per-open.
+fn build_drawer_window(monitor: &Monitor, key: &str, geometry: &BarGeometry) -> gtk::Window {
+    let (anchor_perp, anchor_main) = geometry.anchors();
     let window = layer_window(monitor)
         .layer(Layer::Top)
-        .anchor(Anchor::Top)
-        .anchor(Anchor::Right)
-        .margin(Margin {
-            top: 59,
-            right: 0,
-            bottom: 0,
-            left: 0,
-        })
+        .anchor(anchor_perp)
+        .anchor(anchor_main)
         .exclusive(false)
         .keyboard_mode(KeyboardMode::OnDemand)
         .namespace(format!("hytte-modal-{key}"))
@@ -154,8 +327,13 @@ fn build_drawer_window(monitor: &Monitor, key: &str) -> gtk::Window {
     window.set_exclusive_zone(-1);
     // AdwClamp inside each page caps width at 680; 360 floor keeps sparse
     // pages from collapsing. niri honors live surface-size commits so the
-    // drawer grows/shrinks as pages switch.
-    window.set_size_request(360, -1);
+    // drawer grows/shrinks as pages switch. The floor applies on the bar's
+    // main axis (width for horizontal bars, height for vertical).
+    if geometry.horizontal() {
+        window.set_size_request(360, -1);
+    } else {
+        window.set_size_request(-1, 360);
+    }
     window
 }
 
@@ -171,24 +349,35 @@ fn wire_escape(window: &gtk::Window, key: String) {
     window.add_controller(key_ctrl);
 }
 
-/// `SlideDown` revealer pinned to the top of the 720-tall surface so the card
-/// pulls out of the bar's bottom rather than floating mid-screen. Height
-/// animates automatically on page swaps.
-fn build_revealer() -> gtk::Revealer {
+/// Revealer pinned against the bar so the card pulls out of the bar's far
+/// edge rather than floating mid-surface. Slide direction + alignment match
+/// the bar's edge (`SlideDown`/`Start` for a top bar, `SlideUp`/`End` for a
+/// bottom bar, and the left/right cases). Size animates on page swaps.
+fn build_revealer(geometry: &BarGeometry) -> gtk::Revealer {
     let revealer = gtk::Revealer::new();
-    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_type(geometry.slide());
     revealer.set_transition_duration(180);
     revealer.set_reveal_child(false);
-    revealer.set_valign(gtk::Align::Start);
-    revealer.set_vexpand(false);
+    if geometry.horizontal() {
+        revealer.set_valign(geometry.perpendicular_align());
+        revealer.set_vexpand(false);
+    } else {
+        revealer.set_halign(geometry.perpendicular_align());
+        revealer.set_hexpand(false);
+    }
     revealer
 }
 
-fn build_drawer_card() -> gtk::Box {
+fn build_drawer_card(geometry: &BarGeometry) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-drawer");
-    card.set_valign(gtk::Align::Start);
-    card.set_vexpand(false);
+    if geometry.horizontal() {
+        card.set_valign(geometry.perpendicular_align());
+        card.set_vexpand(false);
+    } else {
+        card.set_halign(geometry.perpendicular_align());
+        card.set_hexpand(false);
+    }
     card
 }
 
@@ -311,15 +500,16 @@ pub fn open(monitor: &Monitor, page: Page) {
             return;
         };
         // No bar chip context here (called from a notification toast click);
-        // anchor the drawer flush with the screen's right edge.
+        // anchor the drawer flush with the bar's trailing main-axis edge.
+        *panel.pending_center.borrow_mut() = None;
         show_panel(panel, page, 0);
     });
 }
 
-/// Toggle the drawer on `monitor` to the given `page`, anchoring the
-/// drawer's right edge under `trigger`'s right edge:
+/// Toggle the drawer on `monitor` to the given `page`, centering the drawer
+/// card under `trigger` along the bar's main axis:
 /// - Same page open → start retract.
-/// - Different page open → swap stack child in place (crossfade + height);
+/// - Different page open → swap stack child in place (crossfade + size);
 ///   the drawer surface keeps its existing position.
 /// - Closed → reposition under `trigger`, present surface, reveal.
 pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
@@ -341,27 +531,42 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
             }
             None => {
                 // Set the visible child first so `measure` reflects the
-                // target page's natural width, not whatever was last shown.
+                // target page's natural size, not whatever was last shown.
                 // `show_panel` re-sets it (idempotent).
                 panel.stack.set_visible_child_name(page.stack_name());
-                let margin_right = margin_right_for_trigger(monitor, panel, trigger.upcast_ref());
-                show_panel(panel, page, margin_right);
+                let chip_center = trigger_center(panel, trigger.upcast_ref());
+                *panel.pending_center.borrow_mut() = chip_center;
+                // Best-effort margin now (may use a pre-map measure that
+                // underestimates); the window-map handler recomputes from the
+                // real card allocation once the surface is mapped.
+                let margin = chip_center.map_or(0, |c| main_margin_for_center(panel, c));
+                show_panel(panel, page, margin);
             }
         }
     });
 }
 
-/// Present the drawer on `page` at `margin_right` pixels from the screen's
-/// right edge. Show the catcher before the drawer so that within
+/// Present the drawer on `page` at `main_margin` pixels from the bar's
+/// trailing main-axis edge (screen right for horizontal bars, screen top for
+/// vertical). Also sets the perpendicular margin live from the bar's real
+/// offset + thickness. Show the catcher before the drawer so that within
 /// `Layer::Top` the drawer's surface commits most recently and stacks above
 /// the catcher.
-fn show_panel(panel: &ModalPanel, page: Page, margin_right: i32) {
+fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
     panel.stack.set_visible_child_name(page.stack_name());
     *panel.current.borrow_mut() = Some(page);
     panel.open_state.set(true);
     on_page_show(page);
 
-    panel.window.set_margin(LayerEdge::Right, margin_right);
+    // Perpendicular margin: bar offset + live-measured thickness, replacing
+    // the old hardcoded 59. The bar window is mapped by open time.
+    panel.window.set_margin(
+        panel.geometry.perpendicular_layer_edge(),
+        panel.geometry.perpendicular_margin(),
+    );
+    panel
+        .window
+        .set_margin(panel.geometry.main_layer_edge(), main_margin);
 
     panel.catcher.set_visible(true);
     panel.catcher.present();
@@ -371,33 +576,111 @@ fn show_panel(panel: &ModalPanel, page: Page, margin_right: i32) {
     panel.revealer.set_reveal_child(true);
 }
 
-/// Distance from the screen's right edge to where the drawer's right edge
-/// should land so the drawer's horizontal center sits under `trigger`'s
-/// center. Clamped to `[0, mon_w - drawer_width]` so the drawer can't fall
-/// off either edge — for triggers near the screen's right or left edge
-/// this collapses to flush-right or flush-left respectively.
-///
-/// Uses `panel.stack.measure(...)` so the offset matches the target page's
-/// natural width; the caller must `set_visible_child_name` first.
+/// Recompute the main-axis margin from the *real* card allocation once the
+/// surface is mapped. `measure` can return 0 before the surface is realized
+/// (per the original centering docstring), flooring the drawer width and
+/// shifting the card. `connect_map` fires *before* the first size-allocate,
+/// so the recompute is deferred to the next main-loop idle — by then the card
+/// has a real allocation (`card.width()`/`card.height()`, which include the
+/// card's borders and padding). Fires on every map.
+fn wire_recenter_on_map(window: &gtk::Window, key: String) {
+    window.connect_map(move |_| {
+        let key = key.clone();
+        glib::idle_add_local_once(move || {
+            PANELS.with(|panels| {
+                let panels = panels.borrow();
+                let Some(panel) = panels.get(&key) else {
+                    return;
+                };
+                let Some(center) = *panel.pending_center.borrow() else {
+                    return;
+                };
+                let margin = main_margin_for_center(panel, center);
+                panel
+                    .window
+                    .set_margin(panel.geometry.main_layer_edge(), margin);
+            });
+        });
+    });
+}
+
+/// The trigger chip's center along the bar's *main axis*, in screen
+/// coordinates: X for horizontal (Top/Bottom) bars, Y for vertical
+/// (Left/Right) bars. `None` if the chip isn't rooted yet (shouldn't happen
+/// for a mapped bar widget).
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn margin_right_for_trigger(monitor: &Monitor, panel: &ModalPanel, trigger: &gtk::Widget) -> i32 {
-    let (mon_w, _) = monitor.size();
-    let chip_center = trigger.root().and_then(|root| {
-        let mid = graphene::Point::new(trigger.width() as f32 / 2.0, 0.0);
+fn trigger_center(panel: &ModalPanel, trigger: &gtk::Widget) -> Option<i32> {
+    trigger.root().and_then(|root| {
+        let mid = graphene::Point::new(trigger.width() as f32 / 2.0, trigger.height() as f32 / 2.0);
         trigger
             .compute_point(root.upcast_ref::<gtk::Widget>(), &mid)
-            .map(|p| p.x() as i32)
-    });
-    let Some(chip_center) = chip_center else {
-        return 0;
+            .map(|p| {
+                if panel.geometry.horizontal() {
+                    p.x() as i32
+                } else {
+                    p.y() as i32
+                }
+            })
+    })
+}
+
+/// Main-axis margin (distance from the bar's trailing edge — screen right for
+/// horizontal bars, screen top for vertical) so the *visible card* (not the
+/// transparent surface) centers under `center` (a screen-coordinate point on
+/// the main axis).
+///
+/// The card is inset from the trailing surface edge by `chrome_main_end`
+/// (`.ts-modal` padding + `.ts-drawer` margin on that side), so the card's
+/// trailing edge sits at `screen_extent - main_margin - chrome_main_end` and
+/// its center at `screen_extent - main_margin - chrome_main_end -
+/// card_extent/2`. Solving `card_center == center`:
+///
+/// ```text
+/// main_margin = screen_extent - center - chrome_main_end - card_extent/2
+/// ```
+///
+/// where `screen_extent` is `mon_w` (horizontal) or `mon_h` (vertical) and
+/// `card_extent` is the card's real allocated size on the main axis (its
+/// border box; CSS borders + padding included). Clamped to
+/// `[0, screen_extent - card_footprint]` so the card can't fall off either
+/// end — near the trailing/leading screen edge it collapses to flush.
+fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
+    let geometry = &panel.geometry;
+    let screen_extent = if geometry.horizontal() {
+        geometry.mon_w
+    } else {
+        geometry.mon_h
     };
-    // Min-width floor matches `window.set_size_request(360, -1)` above; max
-    // matches `AdwClamp.maximum_size` in `components::layout::finish_page`.
-    // If `measure` returns 0 (unrealized on first open), clamp lifts to 360.
-    let (_, nat_w, _, _) = panel.stack.measure(gtk::Orientation::Horizontal, -1);
-    let drawer_w = nat_w.clamp(360, DRAWER_MAX_WIDTH);
-    let desired = mon_w - chip_center - drawer_w / 2;
-    let max = (mon_w - drawer_w).max(0);
+
+    // Card's real allocated main-axis size once mapped (its border box —
+    // CSS borders + padding included). The eager call from `toggle` runs
+    // before the surface is allocated, so `width()`/`height()` can be 0;
+    // fall back to the card's *natural* measure there. The post-map idle
+    // recompute then lands the final position from the real allocation.
+    let orientation = if geometry.horizontal() {
+        gtk::Orientation::Horizontal
+    } else {
+        gtk::Orientation::Vertical
+    };
+    let allocated = if geometry.horizontal() {
+        panel.card.width()
+    } else {
+        panel.card.height()
+    };
+    let card_extent = if allocated > 0 {
+        allocated
+    } else {
+        let (_, nat, _, _) = panel.card.measure(orientation, -1);
+        nat
+    };
+    let card_extent = card_extent.clamp(360, DRAWER_MAX_WIDTH);
+
+    let chrome_end = geometry.chrome_main_end();
+    let chrome_start = geometry.chrome_main_start();
+    let card_footprint = card_extent + chrome_start + chrome_end;
+
+    let desired = screen_extent - center - chrome_end - card_extent / 2;
+    let max = (screen_extent - card_footprint).max(0);
     desired.clamp(0, max)
 }
 

@@ -49,6 +49,10 @@ in
     clipboard history (text + images) via home-manager's services.cliphist,
     which feeds the Clipboard drawer page'';
 
+  options.programs.trollshell.portals.enable = lib.mkEnableOption ''
+    the niri xdg-desktop-portal routing + backends via home-manager's
+    xdg.portal. You still set XDG_CURRENT_DESKTOP=niri:GNOME yourself'';
+
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
@@ -153,6 +157,35 @@ in
       # defaults true, so this starts both the text and image wl-paste watchers.
       (lib.mkIf cfg.cliphist.enable {
         services.cliphist.enable = lib.mkDefault true;
+      })
+
+      # portals — niri's xdg-desktop-portal routing via home-manager's xdg.portal
+      # module. config.niri is rendered to niri-portals.conf; extraPortals pulls
+      # in the backends. mkDefault throughout keeps every piece overridable.
+      (lib.mkIf cfg.portals.enable {
+        xdg.portal = {
+          enable = lib.mkDefault true;
+          extraPortals = lib.mkDefault [
+            pkgs.xdg-desktop-portal-gnome
+            pkgs.xdg-desktop-portal-wlr
+          ];
+          config.niri = {
+            default = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.FileChooser" = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.Settings" = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.Screenshot" = lib.mkDefault [ "wlr" ];
+            "org.freedesktop.impl.portal.ScreenCast" = lib.mkDefault [ "wlr" ];
+          };
+        };
       })
     ]
   );

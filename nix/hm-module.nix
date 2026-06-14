@@ -1,15 +1,22 @@
 self:
 {
   config,
+  options,
   lib,
   pkgs,
   ...
 }:
 let
   cfg = config.programs.trollshell;
+  backend = cfg.wallpaper.backend;
+  # The awww backend is driven through home-manager's `services.awww` module
+  # (the swww successor; swww is deprecated). It's guarded on existence and
+  # asserted clearly if absent (below) rather than branching on option layout —
+  # a pre-0.12 channel that still only ships `services.swww` won't have it.
 in
 {
-  # enable / package / weather.fallbackCity are declared in the shared base.
+  # enable / package / weather.fallbackCity / wallpaper.* are declared in the
+  # shared base.
   imports = [ (import ./module-common.nix self) ];
 
   # The systemd user service is home-manager-only, so it lives here.
@@ -34,9 +41,11 @@ in
   # individual setting. niri keybinds/session live in KDL and have no clean
   # home-manager path, so they stay manual — see etc/niri/.
   options.programs.trollshell.enableSessionExtras = lib.mkEnableOption ''
-    all of the session-integration extras below (fuzzel, swayidle, swaybg,
-    cliphist, portals) as a group. Each is set with mkDefault, so you can still
-    flip an individual one off (e.g. programs.trollshell.swaybg.enable = false)'';
+    all of the session-integration extras below (fuzzel, swayidle, the
+    wallpaper daemon, cliphist, portals) as a group. Each is set with mkDefault,
+    so you can still flip an individual one off. The wallpaper daemon is the one
+    selected by programs.trollshell.wallpaper.backend (default swaybg), not
+    hardcoded — set backend = "none" to opt out of daemon management entirely'';
 
   options.programs.trollshell.fuzzel.enable = lib.mkEnableOption ''
     the bundled fuzzel launcher config via home-manager's programs.fuzzel.
@@ -47,8 +56,16 @@ in
     sleep) via home-manager's services.swayidle'';
 
   options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
-    the swaybg wallpaper service. Reads the image path from
-    ~/.config/trollshell/wallpaper.path, which the Appearance drawer page writes'';
+    the bundled swaybg wallpaper user unit standalone, which reads the image
+    path from ~/.config/trollshell/wallpaper.path (the Appearance drawer page
+    writes it). Gently deprecated in favor of
+    programs.trollshell.wallpaper.backend = "swaybg" + enableSessionExtras: the
+    extras bundle now starts the swaybg unit when backend is "swaybg" (the
+    default). This option is still honored — set it true to run the swaybg unit
+    without the rest of the bundle. Two wallpaper daemons can never run at once
+    because backend selects exactly one, but if you set this true AND
+    backend = "awww", swaybg and awww would both start; don't.
+    Leave it false unless you specifically want swaybg without the bundle'';
 
   options.programs.trollshell.cliphist.enable = lib.mkEnableOption ''
     clipboard history (text + images) via home-manager's services.cliphist,
@@ -105,19 +122,49 @@ in
       }
 
       # Group switch: turn the whole extras bundle on, each via mkDefault so an
-      # explicit per-feature `enable = false` still wins.
+      # explicit per-feature `enable = false` still wins. The wallpaper daemon
+      # is whichever wallpaper.backend selects (default swaybg) — backend picks
+      # exactly one, so two daemons can never run at once.
       (lib.mkIf cfg.enableSessionExtras {
         programs.trollshell = {
           fuzzel.enable = lib.mkDefault true;
           swayidle.enable = lib.mkDefault true;
-          # Only auto-start swaybg when no custom reload command is set —
-          # otherwise the bundle would launch swaybg alongside the swww/awww (or
-          # other) daemon that reloadCommand points at, and the two fight over
-          # the wallpaper layer.
-          swaybg.enable = lib.mkDefault (cfg.wallpaper.reloadCommand == null);
+          # Start the swaybg unit only when it's the chosen backend; awww is
+          # driven through home-manager's services.awww module below.
+          swaybg.enable = lib.mkIf (backend == "swaybg") (lib.mkDefault true);
           cliphist.enable = lib.mkDefault true;
           portals.enable = lib.mkDefault true;
         };
+        # awww goes through home-manager's own services.awww module (which
+        # manages the daemon unit + has its own package option). Guarded on the
+        # module actually existing so an absent module surfaces as the clear
+        # assertion below rather than a raw "option does not exist" error.
+        services = lib.mkIf (backend == "awww" && options.services ? awww) {
+          awww.enable = lib.mkDefault true;
+        };
+      })
+
+      # Naming-wrinkle guard: the awww backend needs home-manager's
+      # `services.awww` module, which only exists on 0.12+ channels (upstream
+      # renamed swww → awww; swww is deprecated). We assert with a clear message
+      # rather than silently branch on option layout. A pre-0.12 channel that
+      # still only ships `services.swww` won't have `services.awww` — upgrade,
+      # or use backend = "none" and wire the daemon yourself.
+      (lib.mkIf (cfg.enableSessionExtras && backend == "awww") {
+        assertions = [
+          {
+            assertion = options.services ? awww;
+            message = ''
+              programs.trollshell.wallpaper.backend = "awww", but your
+              home-manager channel has no `services.awww` module to manage the
+              daemon. awww is the 0.12+ successor of the now-deprecated swww;
+              older channels ship it as `services.swww`. Upgrade home-manager to
+              a channel with `services.awww`, or set
+              programs.trollshell.wallpaper.backend = "none" and wire the daemon
+              yourself.
+            '';
+          }
+        ];
       })
 
       # fuzzel — config-only launcher (niri spawns it on a chord, so no unit).

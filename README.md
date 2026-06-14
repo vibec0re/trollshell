@@ -84,14 +84,39 @@ just work. Non-NixOS session integration (systemd user units, niri binds,
 swayidle, kanshi, the PAM file, …) ships under `etc/` —
 see [etc/README.md](etc/README.md).
 
-The Appearance drawer applies a picked wallpaper by restarting the bundled
-`swaybg` unit. To drive a different daemon instead — `swww`/`awww`, `hyprpaper`,
-… — set `programs.trollshell.wallpaper.reloadCommand`; a `{}` in it is replaced
-with the chosen path (shell-quoted):
+### Wallpaper
+
+The Appearance drawer page writes the picked image to
+`~/.config/trollshell/wallpaper.path`, then tells a wallpaper daemon to reload.
+`wallpaper.backend` picks the daemon and the reload command from a single enum
+value (so two daemons can never run at once):
+
+```nix
+programs.trollshell.wallpaper.backend = "swaybg";  # the default — today's behavior
+# or "awww" / "none"
+```
+
+- **`swaybg`** (default): the bundled `swaybg` unit; the picker restarts it. No
+  reload command needed.
+- **`awww`**: the swww successor (upstream renamed swww → awww at 0.12; swww
+  itself is deprecated). Sets `wallpaper.reloadCommand` to `awww img {}`. The
+  daemon is run by home-manager's `services.awww`; the NixOS module only exports
+  the reload command (a NixOS-only user without home-manager runs the awww
+  daemon themselves). Needs a home-manager channel with `services.awww` (0.12+)
+  — otherwise the build fails with a clear assertion.
+- **`none`**: trollshell manages no daemon; the picker only writes the path file
+  (and runs `reloadCommand` if you set one). Use this to wire your own daemon.
+
+You can still set `wallpaper.reloadCommand` by hand to override the per-backend
+default; a `{}` in it is replaced with the chosen path (shell-quoted, **not** a
+`$VAR` — sessionVariables would expand it away at login):
 
 ```nix
 programs.trollshell.wallpaper.reloadCommand = "awww img {}";
 ```
+
+The legacy home-manager `programs.trollshell.swaybg.enable` still works as a
+standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
 
 ## Repo layout
 

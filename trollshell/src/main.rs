@@ -137,7 +137,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
         ])
         .center([widgets::mpris::widget(monitor)])
         .right([
-            group([widgets::tray::widget()]),
+            group([widgets::tray::widget(monitor)]),
             group([
                 widgets::bluetooth::widget(monitor),
                 widgets::network::widget(monitor),

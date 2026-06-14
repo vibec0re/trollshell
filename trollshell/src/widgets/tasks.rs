@@ -24,7 +24,7 @@ use hytte::services::tasks::{self, Task, TaskList};
 /// `tasks::tasks()`; refreshes on each sidebar open like the calendar
 /// widget so the user never sees up-to-60-second-stale data.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let column = build_block();
+    let column = build_block(monitor);
     wire_open_refresh(monitor);
     column.upcast()
 }
@@ -35,7 +35,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 /// past this surfaces as a "+N more" indicator.
 const MAX_VISIBLE_TASKS: usize = 5;
 
-fn build_block() -> gtk::Box {
+fn build_block(monitor: &Monitor) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     column.add_css_class("ts-sidebar-tasks");
 
@@ -44,7 +44,7 @@ fn build_block() -> gtk::Box {
     // come in via [`tasks::task_lists`].
     let lists_track: Rc<RefCell<Vec<TaskList>>> = Rc::new(RefCell::new(Vec::new()));
 
-    column.append(&build_header(&lists_track));
+    column.append(&build_header(&lists_track, monitor));
 
     let group = adw::PreferencesGroup::new();
     group.add_css_class("ts-sidebar-tasks-list");
@@ -53,7 +53,13 @@ fn build_block() -> gtk::Box {
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     let overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
-    wire_tasks_bind(&group, &rows_track, &placeholder_track, &overflow_track);
+    wire_tasks_bind(
+        &group,
+        &rows_track,
+        &placeholder_track,
+        &overflow_track,
+        monitor,
+    );
     wire_lists_bind(&group, &lists_track);
 
     column
@@ -73,7 +79,7 @@ fn wire_lists_bind(anchor: &adw::PreferencesGroup, lists_track: &Rc<RefCell<Vec<
 
 // ── Header row ───────────────────────────────────────────────────────────────
 
-fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>) -> gtk::Box {
+fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>, monitor: &Monitor) -> gtk::Box {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.add_css_class("ts-sidebar-tasks-header");
 
@@ -88,7 +94,7 @@ fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>) -> gtk::Box {
     add_btn.set_icon_name("list-add-symbolic");
     add_btn.add_css_class("flat");
     add_btn.add_css_class("ts-sidebar-tasks-add-btn");
-    add_btn.set_popover(Some(&build_create_popover(&add_btn, lists_track)));
+    add_btn.set_popover(Some(&build_create_popover(&add_btn, lists_track, monitor)));
     header.append(&add_btn);
 
     header
@@ -101,12 +107,21 @@ fn wire_tasks_bind(
     rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
+    monitor: &Monitor,
 ) {
     let rows_track = rows_track.clone();
     let placeholder_track = placeholder_track.clone();
     let overflow_track = overflow_track.clone();
+    let monitor = monitor.clone();
     bind(tasks::tasks(), group, move |group, ts| {
-        rebuild_list(group, &rows_track, &placeholder_track, &overflow_track, &ts);
+        rebuild_list(
+            group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &ts,
+            &monitor,
+        );
     });
 }
 
@@ -116,6 +131,7 @@ fn rebuild_list(
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     ts: &[Task],
+    monitor: &Monitor,
 ) {
     for row in rows_track.borrow_mut().drain(..) {
         group.remove(&row);
@@ -141,7 +157,7 @@ fn rebuild_list(
     let visible = ts.len().min(MAX_VISIBLE_TASKS);
     let mut new_rows: Vec<adw::ActionRow> = Vec::with_capacity(visible);
     for t in ts.iter().take(visible) {
-        let row = build_task_row(t);
+        let row = build_task_row(t, monitor);
         group.add(&row);
         new_rows.push(row);
     }
@@ -162,7 +178,7 @@ fn rebuild_list(
 
 // ── One row ──────────────────────────────────────────────────────────────────
 
-fn build_task_row(task: &Task) -> adw::ActionRow {
+fn build_task_row(task: &Task, monitor: &Monitor) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&task.summary).as_str())
         .activatable(true)
@@ -189,8 +205,9 @@ fn build_task_row(task: &Task) -> adw::ActionRow {
     // Tap-to-edit on the row body. AdwActionRow's own `activated`
     // signal fires when the body (not the checkbox) is clicked.
     let task_for_edit = task.clone();
+    let monitor_for_edit = monitor.clone();
     row.connect_activated(move |r| {
-        open_edit_popover(r, &task_for_edit);
+        open_edit_popover(r, &task_for_edit, &monitor_for_edit);
     });
 
     row
@@ -214,9 +231,13 @@ fn subtitle_text(task: &Task) -> String {
 fn build_create_popover(
     anchor: &gtk::MenuButton,
     lists_track: &Rc<RefCell<Vec<TaskList>>>,
+    monitor: &Monitor,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.add_css_class("ts-task-popover");
+    // The sidebar is a layer-shell surface; without a catcher this popover
+    // wouldn't dismiss on outside-click under niri (issue #9).
+    hytte::ui::attach_dismiss_catcher(&popover, monitor);
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     column.set_margin_top(8);
@@ -338,10 +359,13 @@ fn sync_list_picker(picker: &gtk::DropDown, lists: &[TaskList]) {
 
 // ── Edit popover (row body click) ────────────────────────────────────────────
 
-fn open_edit_popover(parent: &adw::ActionRow, task: &Task) {
+fn open_edit_popover(parent: &adw::ActionRow, task: &Task, monitor: &Monitor) {
     let popover = gtk::Popover::new();
     popover.add_css_class("ts-task-popover");
     popover.set_parent(parent);
+    // Same as the create popover: the sidebar surface needs a catcher for
+    // outside-click dismissal under niri (issue #9).
+    hytte::ui::attach_dismiss_catcher(&popover, monitor);
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     column.set_margin_top(8);

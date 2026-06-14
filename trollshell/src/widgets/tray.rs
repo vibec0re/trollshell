@@ -2,17 +2,18 @@ use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
 
-pub fn widget() -> gtk::Widget {
+pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-tray");
 
     let container_for_signal = container.clone();
+    let monitor = monitor.clone();
     bind(tray::items(), &container, move |_, items| {
         while let Some(child) = container_for_signal.first_child() {
             container_for_signal.remove(&child);
         }
         for item in items {
-            let btn = build_item_button(&item);
+            let btn = build_item_button(&item, &monitor);
             container_for_signal.append(&btn);
         }
     });
@@ -20,7 +21,7 @@ pub fn widget() -> gtk::Widget {
     container.upcast()
 }
 
-fn build_item_button(item: &TrayItem) -> gtk::Button {
+fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-tray-item");
 
@@ -78,6 +79,7 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
         let object_path = object_path.clone();
         let menu_path = menu_path.clone();
         let btn_weak = btn.downgrade();
+        let monitor = monitor.clone();
         btn.connect_clicked(move |_| {
             if item_is_menu {
                 show_context_menu(
@@ -85,6 +87,7 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
                     bus_name.clone(),
                     object_path.clone(),
                     menu_path.clone(),
+                    monitor.clone(),
                 );
             } else {
                 tray::activate(&bus_name, &object_path);
@@ -105,6 +108,7 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
         let bus_name = bus_name.clone();
         let object_path = object_path.clone();
         let menu_path = menu_path.clone();
+        let monitor = monitor.clone();
         gesture.connect_pressed(move |gesture, _, _, _| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             show_context_menu(
@@ -112,6 +116,7 @@ fn build_item_button(item: &TrayItem) -> gtk::Button {
                 bus_name.clone(),
                 object_path.clone(),
                 menu_path.clone(),
+                monitor.clone(),
             );
         });
         btn.add_controller(gesture);
@@ -128,6 +133,7 @@ fn show_context_menu(
     bus_name: String,
     object_path: String,
     menu_path: Option<String>,
+    monitor: Monitor,
 ) {
     glib::MainContext::default().spawn_local(async move {
         let Some(btn) = btn_weak.upgrade() else {
@@ -138,7 +144,7 @@ fn show_context_menu(
             let menu = tray::fetch_menu(&bus_name, &mp).await;
             if let Some(m) = menu {
                 if !m.items.is_empty() {
-                    let popover = build_menu_popover(&bus_name, &mp, &m.items);
+                    let popover = build_menu_popover(&bus_name, &mp, &m.items, &monitor);
                     popover.set_parent(&btn);
                     popover.popup();
                     return;
@@ -155,7 +161,17 @@ fn show_context_menu(
 }
 
 /// Build a `gtk::Popover` containing a vertical box of menu items.
-fn build_menu_popover(bus_name: &str, menu_path: &str, items: &[MenuEntry]) -> gtk::Popover {
+///
+/// The popover gets a full-screen outside-click catcher
+/// ([`hytte::ui::attach_dismiss_catcher`]) because, hosted on the bar's
+/// layer-shell surface under niri, its autohide grab isn't routed and it
+/// would otherwise never dismiss on outside-click (issue #9).
+fn build_menu_popover(
+    bus_name: &str,
+    menu_path: &str,
+    items: &[MenuEntry],
+    monitor: &Monitor,
+) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("ts-tray-menu");
@@ -170,11 +186,13 @@ fn build_menu_popover(bus_name: &str, menu_path: &str, items: &[MenuEntry]) -> g
                 vbox.append(&sep);
             }
             MenuEntry::Item(item) => {
-                let widget = build_menu_item_widget(bus_name, menu_path, item, &popover);
+                let widget = build_menu_item_widget(bus_name, menu_path, item, &popover, monitor);
                 vbox.append(&widget);
             }
         }
     }
+
+    hytte::ui::attach_dismiss_catcher(&popover, monitor);
 
     // Close the popover when it loses focus.
     popover.connect_closed(|p| {
@@ -190,6 +208,7 @@ fn build_menu_item_widget(
     menu_path: &str,
     item: &MenuItem,
     parent_popover: &gtk::Popover,
+    monitor: &Monitor,
 ) -> gtk::Widget {
     // Build display label with toggle prefix.
     let label_text = if item.toggle_type == tray::ToggleType::None {
@@ -209,9 +228,11 @@ fn build_menu_item_widget(
         let bus_name = bus_name.to_string();
         let menu_path = menu_path.to_string();
         let btn_weak = btn.downgrade();
+        let monitor = monitor.clone();
         btn.connect_clicked(move |_| {
             let Some(b) = btn_weak.upgrade() else { return };
-            let sub_popover = build_menu_popover(&bus_name, &menu_path, &sub_items_cloned);
+            let sub_popover =
+                build_menu_popover(&bus_name, &menu_path, &sub_items_cloned, &monitor);
             sub_popover.set_parent(&b);
             sub_popover.popup();
         });

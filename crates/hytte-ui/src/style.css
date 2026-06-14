@@ -69,3 +69,11 @@
     padding: 8px 10px;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
+
+/* Full-screen outside-click catcher behind layer-shell popovers
+   (see popup::attach_dismiss_catcher). Must be fully transparent so it
+   only intercepts clicks and never paints over the screen. */
+.hytte-popup-catcher,
+.hytte-popup-catcher > box {
+    background: transparent;
+}

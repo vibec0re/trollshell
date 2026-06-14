@@ -13,7 +13,7 @@ pub use bar::{Bar, BarHandle, Edge};
 pub use error::{Error, Result};
 pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window};
 pub use monitor::Monitor;
-pub use popup::{Popup, PopupBuilder, Position as PopupPosition};
+pub use popup::{Popup, PopupBuilder, Position as PopupPosition, attach_dismiss_catcher};
 pub use sparkline::Sparkline;
 
 // `Edge` re-exported as `LayerEdge` to avoid colliding with `bar::Edge`.

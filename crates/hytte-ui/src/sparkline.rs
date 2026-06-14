@@ -161,7 +161,9 @@ fn draw_sparkline(
     let _ = cr.fill();
 }
 
-#[cfg(test)]
+// These call gtk::init() / build widgets, so they need a display server —
+// gated into the `system-tests` bucket rather than run by default.
+#[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;
 
@@ -173,7 +175,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a display server"]
     fn push_caps_at_capacity() {
         ensure_gtk_init();
         let s = Sparkline::new(3);
@@ -186,7 +187,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a display server"]
     fn clear_empties() {
         ensure_gtk_init();
         let s = Sparkline::new(10);
@@ -197,7 +197,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a display server"]
     fn set_domain_max_round_trips() {
         ensure_gtk_init();
         let s = Sparkline::new(5);

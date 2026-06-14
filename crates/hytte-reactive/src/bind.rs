@@ -104,7 +104,9 @@ pub fn bind_two_way<S, W, V, Apply, Connect>(
     });
 }
 
-#[cfg(test)]
+// These exercise live GTK widgets, so they need a display server — gated into
+// the `system-tests` bucket rather than run by default.
+#[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;
     use futures_signals::signal::Mutable;
@@ -114,7 +116,6 @@ mod tests {
 
     /// A signal emission applies the value, and the user-event handler is
     /// NOT re-fired while the apply runs.
-    #[ignore = "requires a display server"]
     #[gtk::test]
     fn signal_apply_does_not_refire_user_handler() {
         let ctx = glib::MainContext::default();
@@ -147,7 +148,6 @@ mod tests {
 
     /// A genuine user action still fires the user handler — the block is
     /// released between applies.
-    #[ignore = "requires a display server"]
     #[gtk::test]
     fn user_event_still_fires_after_apply() {
         let ctx = glib::MainContext::default();

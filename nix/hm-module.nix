@@ -37,6 +37,10 @@ in
     the bundled fuzzel launcher config via home-manager's programs.fuzzel.
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
 
+  options.programs.trollshell.swayidle.enable = lib.mkEnableOption ''
+    the idle pipeline (dim at 4 min, lock at 5, suspend at 10, lock before
+    sleep) via home-manager's services.swayidle'';
+
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
@@ -86,6 +90,32 @@ in
               width = lib.mkDefault 2;
             };
           };
+        };
+      })
+
+      # swayidle — idle dim/lock/suspend pipeline via home-manager's module.
+      # Commands use absolute store paths because swayidle's unit only puts a
+      # shell on PATH. mkDefault keeps the timeouts/events overridable wholesale.
+      (lib.mkIf cfg.swayidle.enable {
+        services.swayidle = {
+          enable = lib.mkDefault true;
+          timeouts = lib.mkDefault [
+            {
+              timeout = 240;
+              command = "${lib.getExe pkgs.brightnessctl} -s set 10%";
+              resumeCommand = "${lib.getExe pkgs.brightnessctl} -r";
+            }
+            {
+              timeout = 300;
+              command = "${pkgs.systemd}/bin/loginctl lock-session";
+            }
+            {
+              timeout = 600;
+              command = "${pkgs.systemd}/bin/systemctl suspend";
+            }
+          ];
+          # loginctl lock-session → logind Lock → trollshell's lock surface.
+          events.before-sleep = lib.mkDefault "${pkgs.systemd}/bin/loginctl lock-session";
         };
       })
     ]

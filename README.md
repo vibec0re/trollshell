@@ -93,6 +93,18 @@ with the chosen path (shell-quoted):
 programs.trollshell.wallpaper.reloadCommand = "awww img {}";
 ```
 
+For `swww`/`awww` there is a shortcut, `programs.trollshell.swww.enable`, that
+sets that `reloadCommand` for you (and so makes the `enableSessionExtras` bundle
+skip swaybg — the two never run together):
+
+```nix
+programs.trollshell.swww.enable = true;
+# Enable the daemon yourself — the home-manager option is `services.swww` before
+# the upstream 0.12 rename and `services.awww` after, so it depends on your
+# home-manager channel:
+services.awww.enable = true; # or services.swww.enable on older home-manager
+```
+
 ## Repo layout
 
 - `crates/hytte-reactive/` — `Service` trait, thread-local handle registry,

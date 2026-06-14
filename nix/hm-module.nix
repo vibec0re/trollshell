@@ -50,6 +50,17 @@ in
     the swaybg wallpaper service. Reads the image path from
     ~/.config/trollshell/wallpaper.path, which the Appearance drawer page writes'';
 
+  options.programs.trollshell.swww.enable = lib.mkEnableOption ''
+    swww/awww as the wallpaper backend instead of swaybg. This only points
+    `wallpaper.reloadCommand` at `awww img {}` (so the Appearance picker reloads
+    via the daemon) and, because that sets reloadCommand, disables the bundled
+    swaybg auto-start — the two never run together. It does NOT enable the
+    daemon module for you: the home-manager option is `services.swww` before the
+    upstream 0.12 rename and `services.awww` after, and trollshell can't know
+    which one your home-manager channel defines, so you enable your own
+    `services.awww`/`services.swww` (and adjust reloadCommand if your binary
+    isn't `awww`)'';
+
   options.programs.trollshell.cliphist.enable = lib.mkEnableOption ''
     clipboard history (text + images) via home-manager's services.cliphist,
     which feeds the Clipboard drawer page'';
@@ -191,6 +202,18 @@ in
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };
+      })
+
+      # swww/awww — backend selector, not a daemon unit. It only points the
+      # Appearance picker's reload command at the daemon; because that sets
+      # reloadCommand, the enableSessionExtras bundle stops auto-starting swaybg
+      # (see the swaybg.enable mkDefault above), so the two never fight over the
+      # wallpaper layer. mkDefault keeps an explicit reloadCommand override
+      # winning. The daemon module itself (services.swww vs services.awww — the
+      # 0.12 rename) is the user's to enable; trollshell can't pick the name for
+      # them without breaking the other home-manager release.
+      (lib.mkIf cfg.swww.enable {
+        programs.trollshell.wallpaper.reloadCommand = lib.mkDefault "awww img {}";
       })
 
       # cliphist — clipboard history via home-manager's module. allowImages

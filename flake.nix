@@ -72,5 +72,9 @@
       # (craneLib) wired into the consumer's nixpkgs; threading `self` reuses the
       # package we already built here rather than pushing that onto consumers.
       nixosModules.default = import ./nix/nixos-module.nix self;
+
+      # Curried the same way and for the same reason as the NixOS module above.
+      homeModules.default = import ./nix/hm-module.nix self;
+      homeManagerModules.default = self.homeModules.default;
     };
 }

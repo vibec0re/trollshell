@@ -9,45 +9,25 @@ let
   cfg = config.programs.trollshell;
 in
 {
-  options.programs.trollshell = {
-    enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
+  # enable / package / weather.fallbackCity are declared in the shared base.
+  imports = [ (import ./module-common.nix self) ];
 
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.trollshell;
-      defaultText = lib.literalExpression "trollshell.packages.\${system}.trollshell";
-      description = "The trollshell package to install.";
+  # geoclue is system-only, so it lives here rather than in the shared base.
+  options.programs.trollshell.weather.geoclue = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Enable geoclue2 auto-location for the weather widget (and future location-aware features).";
     };
 
-    weather = {
-      fallbackCity = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "Berlin";
-        description = ''
-          City the weather widget falls back to when geolocation is
-          unavailable. Sets TROLLSHELL_WEATHER_CITY session-wide.
-          Leave null to rely on geoclue.
-        '';
-      };
-
-      geoclue = {
-        enable = lib.mkOption {
-          type = lib.types.bool;
-          default = true;
-          description = "Enable geoclue2 auto-location for the weather widget (and future location-aware features).";
-        };
-
-        providerUrl = lib.mkOption {
-          type = lib.types.str;
-          default = "https://api.beacondb.net/v1/geolocate";
-          description = ''
-            WiFi-positioning backend for geoclue. Mozilla Location
-            Service (geoclue's historical default) shut down in 2024;
-            beaconDB is the community successor.
-          '';
-        };
-      };
+    providerUrl = lib.mkOption {
+      type = lib.types.str;
+      default = "https://api.beacondb.net/v1/geolocate";
+      description = ''
+        WiFi-positioning backend for geoclue. Mozilla Location
+        Service (geoclue's historical default) shut down in 2024;
+        beaconDB is the community successor.
+      '';
     };
   };
 

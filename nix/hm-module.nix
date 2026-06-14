@@ -74,9 +74,17 @@ in
         ];
         fonts.fontconfig.enable = lib.mkDefault true;
 
-        home.sessionVariables = lib.mkIf (cfg.weather.fallbackCity != null) {
-          TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
-        };
+        # Session vars, each set only when its option is non-null. optionalAttrs
+        # + // keeps the two independent (mkIf on a whole attrset would force an
+        # all-or-nothing block).
+        home.sessionVariables =
+          (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
+            TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
+          })
+          // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
+            # Appearance picker reload command; null = the shell's swaybg default.
+            TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
+          });
 
         systemd.user.services.trollshell = lib.mkIf cfg.systemd.enable {
           Unit = {
@@ -102,7 +110,11 @@ in
         programs.trollshell = {
           fuzzel.enable = lib.mkDefault true;
           swayidle.enable = lib.mkDefault true;
-          swaybg.enable = lib.mkDefault true;
+          # Only auto-start swaybg when no custom reload command is set —
+          # otherwise the bundle would launch swaybg alongside the swww/awww (or
+          # other) daemon that reloadCommand points at, and the two fight over
+          # the wallpaper layer.
+          swaybg.enable = lib.mkDefault (cfg.wallpaper.reloadCommand == null);
           cliphist.enable = lib.mkDefault true;
           portals.enable = lib.mkDefault true;
         };

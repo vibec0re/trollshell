@@ -26,5 +26,29 @@ self:
         geoclue (enabled system-side by the NixOS module).
       '';
     };
+
+    wallpaper.reloadCommand = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "awww img {}";
+      description = ''
+        Shell command the Appearance picker runs (via `sh -c`) after writing
+        `~/.config/trollshell/wallpaper.path`, to tell your wallpaper daemon to
+        reload. A `{}` in the command is replaced with the chosen path,
+        shell-quoted. Sets TROLLSHELL_WALLPAPER_RELOAD_CMD for the session.
+
+        Use the `{}` placeholder, not a `$VAR` reference: this value is delivered
+        through sessionVariables, which expands `$`-references at login (before
+        the path exists), so `awww img "$TROLLSHELL_WALLPAPER_PATH"` would expand
+        to `awww img ""`. The path is still also exported as
+        TROLLSHELL_WALLPAPER_PATH for daemons that read it directly.
+
+        Leave null to keep the default — restart the bundled swaybg user unit.
+        Set it to drive a different daemon, e.g. swww/awww: `awww img {}`.
+        Setting it also tells the home-manager `enableSessionExtras` bundle not
+        to start swaybg, which would otherwise fight your daemon over the
+        wallpaper layer.
+      '';
+    };
   };
 }

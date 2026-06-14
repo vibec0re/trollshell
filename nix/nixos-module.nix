@@ -67,6 +67,14 @@ in
         environment.sessionVariables.TROLLSHELL_WEATHER_CITY = lib.mkIf (
           cfg.weather.fallbackCity != null
         ) cfg.weather.fallbackCity;
+
+        # Wallpaper reload command for the Appearance picker. null = the shell's
+        # built-in default (restart swaybg.service); set it to drive swww/awww
+        # or another daemon. The chosen path reaches the command as
+        # TROLLSHELL_WALLPAPER_PATH.
+        environment.sessionVariables.TROLLSHELL_WALLPAPER_RELOAD_CMD = lib.mkIf (
+          cfg.wallpaper.reloadCommand != null
+        ) cfg.wallpaper.reloadCommand;
       }
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its

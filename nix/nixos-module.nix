@@ -49,44 +49,6 @@ in
       {
         environment.systemPackages = [ cfg.package ];
 
-        # System-bus policy: allow any user to own the two trollshell
-        # agent names. BlueZ / iwd policies still gate the
-        # actual method ACLs; this only grants the right to RequestName.
-        # Without it, hytte_bus::own_name detects AccessDenied at the
-        # broker and parks the agent inert with one info-level log.
-        services.dbus.packages = [
-          (pkgs.writeTextDir "share/dbus-1/system.d/cc.hannig.trollshell.conf" ''
-            <!DOCTYPE busconfig PUBLIC
-              "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
-              "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-            <busconfig>
-              <policy context="default">
-                <allow own="cc.hannig.trollshell.bluez-agent"/>
-                <allow own="cc.hannig.trollshell.iwd-agent"/>
-              </policy>
-            </busconfig>
-          '')
-        ];
-
-        # Polkit authentication agent. trollshell no longer ships its
-        # own in-process agent; run the standard standalone polkit-gnome
-        # agent as a user service bound to the graphical session. Swap
-        # polkit_gnome for another agent (mate-polkit, hyprpolkitagent,
-        # …) by overriding this unit's ExecStart.
-        systemd.user.services.polkit-gnome-authentication-agent-1 = {
-          description = "polkit-gnome authentication agent";
-          wantedBy = [ "graphical-session.target" ];
-          partOf = [ "graphical-session.target" ];
-          after = [ "graphical-session.target" ];
-          serviceConfig = {
-            Type = "simple";
-            ExecStart = "${pkgs.polkit_gnome}/libexec/polkit-gnome-authentication-agent-1";
-            Restart = "on-failure";
-            RestartSec = 1;
-            TimeoutStopSec = 10;
-          };
-        };
-
         # Weather widget location fallback. Stays outside the recommended-
         # services switch on purpose: it's the manual alternative to geoclue,
         # so it must keep working when auto-location is turned off. weather
@@ -125,6 +87,46 @@ in
           appConfig.trollshell = {
             isAllowed = true;
             isSystem = false;
+          };
+        };
+
+        # System-bus policy: allow any user to own the two trollshell agent
+        # names. BlueZ / iwd policies still gate the actual method ACLs; this
+        # only grants the right to RequestName. Without it, hytte_bus::own_name
+        # hits AccessDenied at the broker and parks the agent inert with one
+        # info-level log (own.rs) — the bluetooth/wifi pairing agents just go
+        # quiet, nothing crashes.
+        services.dbus.packages = [
+          (pkgs.writeTextDir "share/dbus-1/system.d/cc.hannig.trollshell.conf" ''
+            <!DOCTYPE busconfig PUBLIC
+              "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+              "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+            <busconfig>
+              <policy context="default">
+                <allow own="cc.hannig.trollshell.bluez-agent"/>
+                <allow own="cc.hannig.trollshell.iwd-agent"/>
+              </policy>
+            </busconfig>
+          '')
+        ];
+
+        # Polkit authentication agent. trollshell no longer ships its own
+        # in-process agent; run the standard standalone polkit-gnome agent as a
+        # user service bound to the graphical session. Without it the bar still
+        # runs — only polkit-mediated privilege prompts lose their GUI. Swap
+        # polkit_gnome for another agent (mate-polkit, hyprpolkitagent, …) by
+        # overriding this unit's ExecStart.
+        systemd.user.services.polkit-gnome-authentication-agent-1 = {
+          description = "polkit-gnome authentication agent";
+          wantedBy = [ "graphical-session.target" ];
+          partOf = [ "graphical-session.target" ];
+          after = [ "graphical-session.target" ];
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${pkgs.polkit_gnome}/libexec/polkit-gnome-authentication-agent-1";
+            Restart = "on-failure";
+            RestartSec = 1;
+            TimeoutStopSec = 10;
           };
         };
       })

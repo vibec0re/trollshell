@@ -84,6 +84,15 @@ just work. Non-NixOS session integration (systemd user units, niri binds,
 swayidle, kanshi, the PAM file, …) ships under `etc/` —
 see [etc/README.md](etc/README.md).
 
+The Appearance drawer applies a picked wallpaper by restarting the bundled
+`swaybg` unit. To drive a different daemon instead — `swww`/`awww`, `hyprpaper`,
+… — set `programs.trollshell.wallpaper.reloadCommand`; a `{}` in it is replaced
+with the chosen path (shell-quoted):
+
+```nix
+programs.trollshell.wallpaper.reloadCommand = "awww img {}";
+```
+
 ## Repo layout
 
 - `crates/hytte-reactive/` — `Service` trait, thread-local handle registry,

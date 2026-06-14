@@ -41,10 +41,14 @@ session**.
 
 NixOS users can consume `nixosModules.default` from the flake
 (`programs.trollshell.enable = true;`), which installs the package and wires up
-the PAM service for the lock screen, the system-bus policy for the agent names,
-and UPower / power-profiles-daemon. Non-NixOS session integration (systemd
-user units, niri binds, swayidle, kanshi, the PAM file, …) ships under `etc/` —
-see [etc/README.md](etc/README.md).
+the PAM service for the lock screen plus a bundle of recommended-but-optional
+bits — the system-bus agent-name policy, the polkit agent, UPower,
+power-profiles-daemon, and geoclue. That bundle sits behind
+`programs.trollshell.enableRecommendedServices` (default `true`); flip it off for
+a bare bar where each chip simply hides when its daemon is absent. A
+home-manager module (`homeModules.default`) runs the shell as a user service.
+Non-NixOS session integration (systemd user units, niri binds, swayidle, kanshi,
+the PAM file, …) ships under `etc/` — see [etc/README.md](etc/README.md).
 
 ## Repo layout
 

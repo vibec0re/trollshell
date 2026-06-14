@@ -41,6 +41,10 @@ in
     the idle pipeline (dim at 4 min, lock at 5, suspend at 10, lock before
     sleep) via home-manager's services.swayidle'';
 
+  options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
+    the swaybg wallpaper service. Reads the image path from
+    ~/.config/trollshell/wallpaper.path, which the Appearance drawer page writes'';
+
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
@@ -116,6 +120,28 @@ in
           ];
           # loginctl lock-session → logind Lock → trollshell's lock surface.
           events.before-sleep = lib.mkDefault "${pkgs.systemd}/bin/loginctl lock-session";
+        };
+      })
+
+      # swaybg — no home-manager module exists, so a plain user unit. It reads
+      # the wallpaper path at start; the Appearance drawer page rewrites that
+      # file and restarts this unit to apply a new image. %h = home dir.
+      (lib.mkIf cfg.swaybg.enable {
+        systemd.user.services.swaybg = {
+          Unit = {
+            Description = "Wallpaper background via swaybg";
+            Documentation = "man:swaybg(1)";
+            PartOf = [ cfg.systemd.target ];
+            After = [ cfg.systemd.target ];
+            Requisite = [ "graphical-session.target" ];
+          };
+          Service = {
+            Type = "simple";
+            ExecStart = "${pkgs.bash}/bin/sh -c 'exec ${pkgs.swaybg}/bin/swaybg -i \"$(${pkgs.coreutils}/bin/cat %h/.config/trollshell/wallpaper.path)\" -m fill'";
+            Restart = "on-failure";
+            RestartSec = 2;
+          };
+          Install.WantedBy = [ cfg.systemd.target ];
         };
       })
     ]

@@ -8,9 +8,11 @@ self:
 }:
 let
   cfg = config.programs.trollshell;
+  backend = cfg.wallpaper.backend;
 in
 {
-  # enable / package / weather.fallbackCity are declared in the shared base.
+  # enable / package / weather.fallbackCity / wallpaper.* are declared in the
+  # shared base.
   imports = [ (import ./module-common.nix self) ];
 
   options.programs.trollshell.enableRecommendedServices = lib.mkOption {
@@ -68,14 +70,38 @@ in
           cfg.weather.fallbackCity != null
         ) cfg.weather.fallbackCity;
 
-        # Wallpaper reload command for the Appearance picker. null = the shell's
-        # built-in default (restart swaybg.service); set it to drive swww/awww
-        # or another daemon. The chosen path reaches the command as
-        # TROLLSHELL_WALLPAPER_PATH.
+        # Wallpaper reload command for the Appearance picker. Defaults follow
+        # wallpaper.backend: null for swaybg (restart swaybg.service — the
+        # shell's built-in default) and none; `awww img {}` for awww. The chosen
+        # path reaches the command as TROLLSHELL_WALLPAPER_PATH.
         environment.sessionVariables.TROLLSHELL_WALLPAPER_RELOAD_CMD = lib.mkIf (
           cfg.wallpaper.reloadCommand != null
         ) cfg.wallpaper.reloadCommand;
       }
+
+      # Wallpaper daemon (NixOS side): only swaybg is managed here. swaybg is the
+      # bundled default and reads the wallpaper.path file itself (the Appearance
+      # picker restarts this unit). The awww backend's daemon is run by
+      # home-manager's services.awww — a NixOS-only user without home-manager
+      # runs the awww daemon themselves — so for awww the NixOS module just
+      # exports the reload command above. backend = "none" manages nothing.
+      (lib.mkIf (backend == "swaybg") {
+        systemd.user.services.swaybg = {
+          description = "trollshell wallpaper daemon (swaybg)";
+          wantedBy = [ "graphical-session.target" ];
+          partOf = [ "graphical-session.target" ];
+          after = [ "graphical-session.target" ];
+          # Stay inactive until the Appearance picker has written a path —
+          # otherwise `swaybg -i ""` fails and Restart loops on a fresh install.
+          unitConfig.ConditionPathExists = "%h/.config/trollshell/wallpaper.path";
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${pkgs.bash}/bin/sh -c 'exec ${pkgs.swaybg}/bin/swaybg -i \"$(${pkgs.coreutils}/bin/cat %h/.config/trollshell/wallpaper.path)\" -m fill'";
+            Restart = "on-failure";
+            RestartSec = 2;
+          };
+        };
+      })
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its
       # daemon is missing, so dropping the lot still leaves a working bar.

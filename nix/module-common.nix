@@ -4,7 +4,12 @@
 # its own platform-specific options (geoclue system-side, systemd user service
 # home-side) plus the matching config.
 self:
-{ lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 {
   options.programs.trollshell = {
     enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
@@ -27,9 +32,51 @@ self:
       '';
     };
 
+    wallpaper.backend = lib.mkOption {
+      type = lib.types.enum [
+        "swaybg"
+        "awww"
+        "none"
+      ];
+      default = "swaybg";
+      example = "awww";
+      description = ''
+        Which wallpaper daemon trollshell manages for the session, and what the
+        Appearance picker tells to reload. One enum value drives the daemon
+        wiring and the `reloadCommand` default together, so two daemons can never
+        run at once — backend selection is structural, not an assertion.
+
+        - `swaybg` (default — today's behavior): the bundled swaybg user unit;
+          the Appearance picker restarts it (the shell's built-in default), so
+          `reloadCommand` stays null.
+        - `awww`: the swww successor (upstream renamed swww → awww at 0.12; swww
+          itself is deprecated). Defaults `reloadCommand` to `awww img {}`. The
+          daemon is run by home-manager's `services.awww`; the NixOS module only
+          exports the reload command (a NixOS-only user without home-manager
+          runs the awww daemon themselves).
+        - `none`: manage no daemon at all — the Appearance picker only writes
+          `~/.config/trollshell/wallpaper.path` (and runs `reloadCommand` if you
+          set one yourself). Use this to wire your own daemon.
+
+        The legacy `programs.trollshell.swaybg.enable` (home-manager) and a
+        hand-set `wallpaper.reloadCommand` both still work and take precedence;
+        they are gently deprecated in favor of this enum.
+      '';
+    };
+
     wallpaper.reloadCommand = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
-      default = null;
+      # Per backend (`awww img {}` for awww). An option default, so any explicit
+      # `reloadCommand = "…"` the user sets already wins over it (defaults are the
+      # lowest merge priority). `{}` is the shell-quoted path, NOT a $VAR.
+      default =
+        {
+          swaybg = null;
+          awww = "awww img {}";
+          none = null;
+        }
+        .${config.programs.trollshell.wallpaper.backend};
+      defaultText = lib.literalExpression ''# per backend: null (swaybg/none) or "awww img {}" (awww)'';
       example = "awww img {}";
       description = ''
         Shell command the Appearance picker runs (via `sh -c`) after writing
@@ -43,11 +90,10 @@ self:
         to `awww img ""`. The path is still also exported as
         TROLLSHELL_WALLPAPER_PATH for daemons that read it directly.
 
-        Leave null to keep the default — restart the bundled swaybg user unit.
-        Set it to drive a different daemon, e.g. swww/awww: `awww img {}`.
-        Setting it also tells the home-manager `enableSessionExtras` bundle not
-        to start swaybg, which would otherwise fight your daemon over the
-        wallpaper layer.
+        Defaults follow `wallpaper.backend`: null for `swaybg` (restart the
+        bundled swaybg unit — the shell's built-in default) and `none`, and
+        `awww img {}` for `awww`. Set it explicitly to override; an explicit
+        value wins over the per-backend default.
       '';
     };
   };

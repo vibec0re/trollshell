@@ -83,12 +83,12 @@ see task #34 (session autostart units) if it doesn't.
 
 The four directives in `etc/swayidle/config` are:
 
-| Directive                              | When        | Action                            |
-| -------------------------------------- | ----------- | --------------------------------- |
+| Directive                              | When        | Action                                          |
+| -------------------------------------- | ----------- | ----------------------------------------------- |
 | `timeout 240 ... resume ...`           | 4 min idle  | Save brightness, dim to 10%; restore on resume. |
-| `timeout 300 'loginctl lock-session'`  | 5 min idle  | Lock the screen.                  |
-| `timeout 600 'systemctl suspend'`      | 10 min idle | Suspend the system.               |
-| `before-sleep 'loginctl lock-session'` | pre-suspend | Lock right before any suspend.    |
+| `timeout 300 'loginctl lock-session'`  | 5 min idle  | Lock the screen.                                |
+| `timeout 600 'systemctl suspend'`      | 10 min idle | Suspend the system.                             |
+| `before-sleep 'loginctl lock-session'` | pre-suspend | Lock right before any suspend.                  |
 
 `loginctl lock-session` fires logind's `Session.Lock` signal, which trollshell's
 screensaver listen loop translates into the native lock surface.

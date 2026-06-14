@@ -14,6 +14,7 @@ The fix is a new `hytte-bus` crate that hides `zbus::Connection` behind a small 
 ## Symptom and root cause
 
 **Symptom (BUGS.md, observed 2026-04-27):**
+
 - After ~10 minutes of `cargo run -p trollshell`, the shell crashes.
 - All GTK applications die simultaneously.
 - `ps aux` shows `niri-session.target` shutting down.
@@ -384,19 +385,20 @@ The `SharedConnection` supervisor is the authoritative source of "is the bus ali
 
 Behavior on bus reconnect (epoch bump), per primitive:
 
-| Primitive | Behavior |
-|---|---|
-| `own_name` | emit `Acquiring`, re-mount objects, re-`RequestName`, on success emit `Owned` |
-| `signals` | drop subscription, bump `missed_emissions`, re-subscribe — events between disconnect and re-subscribe are lost; the consumer is informed |
-| `call` | retry policy applies (default `Once` retries against the new connection) |
-| `property` | emit `Stale(last)`, re-`Get`, on success emit `Loaded(new)` |
-| `proxy` | emit `Reconnecting`, rebuild proxy, on success emit `Live` |
+| Primitive  | Behavior                                                                                                                                 |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `own_name` | emit `Acquiring`, re-mount objects, re-`RequestName`, on success emit `Owned`                                                            |
+| `signals`  | drop subscription, bump `missed_emissions`, re-subscribe — events between disconnect and re-subscribe are lost; the consumer is informed |
+| `call`     | retry policy applies (default `Once` retries against the new connection)                                                                 |
+| `property` | emit `Stale(last)`, re-`Get`, on success emit `Loaded(new)`                                                                              |
+| `proxy`    | emit `Reconnecting`, rebuild proxy, on success emit `Live`                                                                               |
 
 **The "events are lost" rule for `signals` is non-negotiable:** D-Bus guarantees nothing about delivery during disconnect. The primitive cannot fake delivery. Consumers that need authoritative state across reconnects must watch `missed_emissions()` and re-fetch. Documented in the `signals` module docs.
 
 **Backoff is owned by the supervisor.** A primitive never sleeps in a retry loop — it awaits the supervisor's epoch signal. This is the architectural property that prevents the FD storm: exactly one entity in the process opens connections, and it has bounded backoff.
 
 **Connection-level vs. method errors:** the `with_conn` accessor inspects `zbus::Error` and routes:
+
 - `Disconnected`, `Io`, `Failure(InputOutput*)` → `BusError::Transient` + signal supervisor to reconnect.
 - `MethodError`, `InvalidReply`, `Unmarshal` → `BusError::Permanent` (or pass through).
 
@@ -412,6 +414,7 @@ Four recognized permanent-failure modes:
 4. **No bus at all** — supervisor stays in connect loop with capped backoff. State-bearing primitives stay at their "no bus" variant (`OwnState::Acquiring`, `PropState::Loading`, `ProxyState::Reconnecting`); `SignalSubscription`'s `events()` stream simply produces nothing during the gap (and `missed_emissions` does not bump until the supervisor successfully reconnects and re-establishes the subscription, since "missed" is only knowable in retrospect).
 
 **Explicitly not implemented:**
+
 - Circuit-breaker beyond `PermanentlyTaken` for `own_name`. For `signals` and `property`, "remote object doesn't exist" loops forever — but with bounded backoff and **no FD allocation per attempt**, harmless.
 - `BusError::Transient` exposure to the `call` consumer when `Once` retries succeeds. Consumer sees `Ok`. `Transient` is internal noise unless the consumer asks for `Never`.
 - `bus::supervisor_state()` public signal in v1.
@@ -437,6 +440,7 @@ Each phase is a separate commit cluster. Trollshell compiles, runs, and passes t
 **Phase 3 — Smoke-test migration: `resolved`.** Smallest, simplest D-Bus consumer — system bus only, no name ownership, no signal subscriptions, no property cache, one or two method calls against systemd-resolved. Exercises `bus::call(...)` end-to-end. If the API does not fit `resolved` cleanly, the design is wrong; better to find out in one file than five.
 
 **Phase 4 — Loud offenders (the actual bug fix):**
+
 - `notifications` (`own_name` + `signals` + `call`)
 - `wifi` (`signals` + `call`)
 - `polkit` (`own_name` + `signals` + `call`)
@@ -446,6 +450,7 @@ Each phase is a separate commit cluster. Trollshell compiles, runs, and passes t
 Checkpoint: trollshell can run for 24h without `dbus-broker` `EMFILE`.
 
 **Phase 5 — Remaining services:**
+
 - `bluetooth` (`proxy` + `signals` + `property` + `own_name` for pairing agent)
 - `mpris` (`proxy` + `signals`)
 - `tray` (`own_name` + `proxy` fan-out)

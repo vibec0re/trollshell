@@ -129,7 +129,7 @@ a different `major:minor` survives dedup and shows as its own bar.
  1  2  3    4     5                          9 (after the " - " separator)
 ```
 
-Fields 7..N before the literal ` - ` token are optional tags (variable count).
+Fields 7..N before the literal `-` token are optional tags (variable count).
 
 Implementation:
 

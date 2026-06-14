@@ -12,10 +12,10 @@
 
 ## File Structure
 
-| File                                   | Responsibility |
-| -------------------------------------- | -------------- |
-| `trollshell/src/modal.rs`              | Add `Page::Connections` variant + `stack_name` arm + `add_named` mount alongside the other pages. |
-| `trollshell/src/widgets/pages.rs`      | Add `pub fn page_connections()` (active-connections content lifted verbatim). Strip the same content from `page_network()` and replace with a drill-down `ActionRow`. Refactor `build_iface_traffic_row` + `IfaceRow` struct to use `build_history_row`. |
+| File                              | Responsibility                                                                                                                                                                                                                                           |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trollshell/src/modal.rs`         | Add `Page::Connections` variant + `stack_name` arm + `add_named` mount alongside the other pages.                                                                                                                                                        |
+| `trollshell/src/widgets/pages.rs` | Add `pub fn page_connections()` (active-connections content lifted verbatim). Strip the same content from `page_network()` and replace with a drill-down `ActionRow`. Refactor `build_iface_traffic_row` + `IfaceRow` struct to use `build_history_row`. |
 
 Spec reference: `/home/choom/src/trollshell/docs/superpowers/specs/2026-04-29-network-panel-tightening-design.md`.
 
@@ -24,6 +24,7 @@ Spec reference: `/home/choom/src/trollshell/docs/superpowers/specs/2026-04-29-ne
 ## Task 1: Move "Active connections" to `Page::Connections` drill-down
 
 **Files:**
+
 - Modify: `trollshell/src/modal.rs` (Page enum + stack_name + install stack mount)
 - Modify: `trollshell/src/widgets/pages.rs` (new `page_connections()`; strip + replace in `page_network()`)
 
@@ -402,6 +403,7 @@ EOF
 ## Task 2: Per-interface traffic rows use `build_history_row`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` — `IfaceRow` struct and `build_iface_traffic_row()` (around lines 826-851), plus the bind closure callsites in `build_traffic_group_v2()` (around lines 741-784).
 
 - [ ] **Step 1: Update `IfaceRow` struct**
@@ -637,6 +639,7 @@ Expected: bar appears, network drawer opens.
 - [ ] **Step 2: Verify network drawer is no longer dense**
 
 Open the network drawer. Confirm:
+
 - Two-column grid at top (Configuration left, Live right) renders as before.
 - Per-interface traffic rows now show the sparkline filling the row width with name on the left and `↓ X ↑ Y` on the right (sysstats-style), not a small 120px sparkline jammed into a suffix.
 - Below the grid: a single "Active connections" row with subtitle "{N} sockets, {M} with PID" and a chevron suffix. NO inline list of socket rows.
@@ -644,6 +647,7 @@ Open the network drawer. Confirm:
 - [ ] **Step 3: Drill into Page::Connections**
 
 Click the "Active connections" row. Confirm:
+
 - Modal stack swaps to the new page.
 - Layout matches the previous inline section: own-user sockets at top sorted by program, "Other users" expander with no-PID sockets, "(+N more)" hint when truncated.
 - Subtitle on the group reflects the live total, same as before.

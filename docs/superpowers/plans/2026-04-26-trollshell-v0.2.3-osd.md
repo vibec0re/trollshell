@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita, `futures-signals`, `glib::idle_add_local_once` + `glib::timeout_add_local_once`, no new deps.
 
 **Conventions used in every task:**
+
 - TDD where unit tests are practical (Task 1's signal helper, Task 7's icon thresholds). UI restructure tasks verify via `cargo build` + `cargo clippy --workspace --all-targets -- -D warnings` and a deferred manual smoke-test note.
 - Commits use existing project prefixes: `feat(de):` for shell UI work, `feat(niri):` for service work, `style:` for CSS, `refactor(de):` for restructures.
 - Co-author trailer on every commit:
@@ -32,6 +33,7 @@
 ## Task 1: `niri::focused_output()` derived signal
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/niri.rs`
 
 **Background:** `Workspace.output: Option<String>` and `Workspace.is_focused: bool` are already published by the existing `workspaces()` Mutable. A small derived signal exposes the currently-focused monitor's connector name without new listening logic.
@@ -84,6 +86,7 @@ EOF
 ## Task 2: OSD widget tree rewrite (Adwaita card structure)
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Replace the vertical `Box(Image + ProgressBar + Label)` with a horizontal-header layout: `[icon | label+value column]` above the progress bar. Add a `value: gtk::Label` field for the percent / "Muted" readout, and a `fade_out_timeout: Cell<Option<glib::SourceId>>` for the animation work in Task 3.
@@ -270,11 +273,13 @@ fn render_brightness(b: Brightness) -> State {
 Find `fn show(view: &Rc<OsdView>, state: &State)` (around line 273). Replace the body's text-setting line:
 
 Before:
+
 ```rust
 view.text.set_text(&state.text);
 ```
 
 After:
+
 ```rust
 view.label.set_text(state.label);
 view.value.set_text(&state.value);
@@ -329,6 +334,7 @@ EOF
 ## Task 3: OSD animations (fade + slide-in)
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Animations are CSS-driven (transitions on `opacity` and `margin-top` in Task 6's stylesheet). This task adds the Rust-side hooks: toggle `.shown` class with a one-frame delay so GTK4's CSS engine sees the from-state before the to-state, and a fade-out timer that defers `set_visible(false)` until after the transition completes.
@@ -418,6 +424,7 @@ EOF
 ## Task 4: OSD multi-monitor mount + focused-output routing
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Replace the single `OSD_VIEW` thread-local with `OSDS: HashMap<String, Rc<OsdView>>` keyed by `Monitor.connector()`. Subscriptions move to module-level (set up exactly once on first `install` call); each emission routes to the focused-output's OSD via a new `route_show` helper.
@@ -669,6 +676,7 @@ EOF
 ## Task 5: `main.rs` — install OSD on every monitor
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs`
 
 **Background:** With Task 4's per-monitor mount in place, the OSD only needs main.rs to call `install()` for each monitor. The other primary-only widgets (notifications, prompt, polkit_dialog) stay primary-only — their semantics differ.
@@ -729,6 +737,7 @@ EOF
 ## Task 6: CSS — `.ts-osd*` styling + transitions
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 **Background:** ~70 lines. All rules use existing tokens (`@accent_color`, `@window_bg_color`); confirm by grepping the file before adding. If `@window_bg_color` isn't present, fall back to whatever shell-wide background token is in use (e.g. `@theme_bg_color`, `@card_bg_color`).
@@ -746,59 +755,60 @@ At the bottom of the file:
 /* ── OSD ────────────────────────────────────────────────────────────────── */
 
 .ts-osd {
-    background: transparent;
+  background: transparent;
 }
 
 .ts-osd-card {
-    min-width: 280px;
-    max-width: 320px;
-    padding: 16px;
-    border-radius: 14px;
-    background: alpha(@window_bg_color, 0.92);
-    box-shadow: 0 4px 16px alpha(black, 0.25);
+  min-width: 280px;
+  max-width: 320px;
+  padding: 16px;
+  border-radius: 14px;
+  background: alpha(@window_bg_color, 0.92);
+  box-shadow: 0 4px 16px alpha(black, 0.25);
 
-    opacity: 0;
-    margin-top: 0px;
-    transition: opacity 200ms ease-out,
-                margin-top 200ms ease-out;
+  opacity: 0;
+  margin-top: 0px;
+  transition:
+    opacity 200ms ease-out,
+    margin-top 200ms ease-out;
 }
 
 .ts-osd-card.shown {
-    opacity: 1;
-    margin-top: 8px;
+  opacity: 1;
+  margin-top: 8px;
 }
 
 .ts-osd-icon {
-    color: @accent_color;
+  color: @accent_color;
 }
 
 .ts-osd-label {
-    font-weight: 600;
+  font-weight: 600;
 }
 
 .ts-osd-value {
-    font-size: 0.85em;
-    opacity: 0.7;
+  font-size: 0.85em;
+  opacity: 0.7;
 }
 
 .ts-osd-progress trough {
-    min-height: 6px;
-    background: alpha(@accent_color, 0.15);
-    border-radius: 9999px;
+  min-height: 6px;
+  background: alpha(@accent_color, 0.15);
+  border-radius: 9999px;
 }
 
 .ts-osd-progress progress {
-    background: @accent_color;
-    border-radius: 9999px;
+  background: @accent_color;
+  border-radius: 9999px;
 }
 
 .ts-osd-card.muted .ts-osd-icon {
-    color: alpha(@accent_color, 0.5);
+  color: alpha(@accent_color, 0.5);
 }
 
 .ts-osd-card.muted .ts-osd-progress progress,
 .ts-osd-card.muted .ts-osd-progress trough {
-    opacity: 0.3;
+  opacity: 0.3;
 }
 ```
 
@@ -832,6 +842,7 @@ EOF
 ## Task 7: Per-kind icon helpers + unit tests
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Task 2 stubbed `volume_icon(&Volume)` and `mic_icon(&Source)` with single-icon placeholders. This task replaces them with level-banded variants (low/medium/high) and adds unit tests for the thresholds.
@@ -968,6 +979,7 @@ EOF
 ## Self-review notes
 
 **Spec coverage:**
+
 - Spec §1 UI structure → Task 2.
 - Spec §2 CSS + animations → Task 3 (Rust hooks) + Task 6 (CSS).
 - Spec §3 multi-monitor + focused-output routing → Task 1 (signal) + Task 4 (mount/route) + Task 5 (main.rs).
@@ -975,6 +987,7 @@ EOF
 - Spec §5 implementation hand-off ordering → matches Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 → Task 7.
 
 **Final verification:**
+
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` green (8 new icon-helper tests).
 - Manual smoke test (deferred) covers each spec success criterion.

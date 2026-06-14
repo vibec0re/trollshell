@@ -60,6 +60,7 @@ trollshell-workspace/
 ```
 
 **Responsibility split:**
+
 - `hytte-reactive` is the only crate that knows about both `tokio` and `glib`/`gtk` together. Everyone bridges through it.
 - `hytte-ui` knows nothing about specific services — only widgets, windows, and how to start the registered services on activate.
 - `hytte-services` knows nothing about widgets — it just exposes signals and commands.
@@ -97,6 +98,7 @@ If missing: `sudo pacman -S --needed xorg-server-xvfb`. (Tests that need a displ
 Set up an empty but `cargo check`-clean workspace with all five crates declared and depending on each other.
 
 **Files:**
+
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `.gitignore`
@@ -337,6 +339,7 @@ git commit -m "feat: workspace scaffold for hytte + trollshell"
 Provide a process-wide multi-thread `tokio::runtime::Runtime` initialized once on first access, plus a `handle()` accessor used by services to spawn their I/O tasks.
 
 **Files:**
+
 - Modify: `crates/hytte-reactive/Cargo.toml` (add `tokio`)
 - Create: `crates/hytte-reactive/src/runtime.rs`
 - Modify: `crates/hytte-reactive/src/lib.rs` (export `runtime`)
@@ -452,6 +455,7 @@ git commit -m "feat(reactive): tokio runtime accessor"
 Define the `Service` trait, a `Registry` (typed insert/get over `TypeId`), and a `REGISTRY` thread-local on the GTK main thread. Services register their handles here at startup; service free-functions read them out.
 
 **Files:**
+
 - Modify: `crates/hytte-reactive/Cargo.toml` (add `futures-signals`)
 - Create: `crates/hytte-reactive/src/registry.rs`
 - Modify: `crates/hytte-reactive/src/lib.rs`
@@ -661,6 +665,7 @@ git commit -m "feat(reactive): Service trait + thread-local typed registry"
 Add `bind`, `bind_text`, `bind_visible`, and `bind_class`. Each spawns a future on the GTK main loop via `glib::MainContext::spawn_local` that consumes the signal and applies updates to the widget.
 
 **Files:**
+
 - Modify: `crates/hytte-reactive/Cargo.toml` (add `gtk4` deps)
 - Create: `crates/hytte-reactive/src/bind.rs`
 - Modify: `crates/hytte-reactive/src/lib.rs`
@@ -850,6 +855,7 @@ git commit -m "feat(reactive): bind, bind_text, bind_visible, bind_class"
 Stand up the `App`/`AppBuilder` builder pattern, a `Monitor` newtype, and a `hytte_ui::Result`/`Error`. App holds an `adw::Application` and on activate: starts services, loads the (still-empty) default CSS, calls the consumer body once.
 
 **Files:**
+
 - Modify: `crates/hytte-ui/Cargo.toml` (add gtk4, libadwaita, gio)
 - Create: `crates/hytte-ui/src/error.rs`
 - Create: `crates/hytte-ui/src/monitor.rs`
@@ -1198,6 +1204,7 @@ git commit -m "feat(ui): App, AppBuilder, Monitor, error types"
 Wrap `gtk4-layer-shell` into a `LayerWindow` builder that produces a `gtk::Window` with layer-shell already configured. `Bar` will be built on top of this in the next task.
 
 **Files:**
+
 - Modify: `crates/hytte-ui/Cargo.toml` (add gtk4-layer-shell)
 - Create: `crates/hytte-ui/src/layer_window.rs`
 - Modify: `crates/hytte-ui/src/lib.rs`
@@ -1373,6 +1380,7 @@ git commit -m "feat(ui): LayerWindow primitive over gtk4-layer-shell"
 A `Bar` is a layer-shell window anchored to a single monitor edge (Top by default), containing a `gtk::CenterBox` with left/center/right widget groups.
 
 **Files:**
+
 - Create: `crates/hytte-ui/src/bar.rs`
 - Modify: `crates/hytte-ui/src/lib.rs`
 
@@ -1590,6 +1598,7 @@ git commit -m "feat(ui): Bar with left/center/right groups over LayerWindow"
 Replace the placeholder `DEFAULT_STYLESHEET` constant with `include_str!("style.css")` and ship a tasteful default.
 
 **Files:**
+
 - Create: `crates/hytte-ui/src/style.css`
 - Modify: `crates/hytte-ui/src/lib.rs`
 
@@ -1602,50 +1611,62 @@ Create `crates/hytte-ui/src/style.css`:
  * App::with_user_style(path). */
 
 .hytte-bar {
-    background: rgba(20, 20, 22, 0.86);
-    color: #f5f5f7;
-    border: none;
-    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05);
-    font: 13px/1.0 "Inter", "Cantarell", system-ui, sans-serif;
+  background: rgba(20, 20, 22, 0.86);
+  color: #f5f5f7;
+  border: none;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05);
+  font:
+    13px/1 "Inter",
+    "Cantarell",
+    system-ui,
+    sans-serif;
 }
 
-.hytte-bar-top    { border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
-.hytte-bar-bottom { border-top:    1px solid rgba(255, 255, 255, 0.06); }
-.hytte-bar-left   { border-right:  1px solid rgba(255, 255, 255, 0.06); }
-.hytte-bar-right  { border-left:   1px solid rgba(255, 255, 255, 0.06); }
+.hytte-bar-top {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.hytte-bar-bottom {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.hytte-bar-left {
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+.hytte-bar-right {
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+}
 
 .hytte-bar-content {
-    padding: 0 12px;
-    min-height: 30px;
+  padding: 0 12px;
+  min-height: 30px;
 }
 
 .hytte-bar-group-left,
 .hytte-bar-group-center,
 .hytte-bar-group-right {
-    padding: 0 4px;
+  padding: 0 4px;
 }
 
 .hytte-bar-group-left button,
 .hytte-bar-group-center button,
 .hytte-bar-group-right button {
-    background: transparent;
-    border: none;
-    border-radius: 6px;
-    padding: 2px 8px;
-    color: inherit;
-    box-shadow: none;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 8px;
+  color: inherit;
+  box-shadow: none;
 }
 
 .hytte-bar-group-left button:hover,
 .hytte-bar-group-center button:hover,
 .hytte-bar-group-right button:hover {
-    background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .hytte-bar-group-left button.active,
 .hytte-bar-group-center button.active,
 .hytte-bar-group-right button.active {
-    background: rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.1);
 }
 ```
 
@@ -1683,6 +1704,7 @@ git commit -m "feat(ui): ship opinionated default shell stylesheet"
 Tick once per second on the GTK main loop, push `chrono::DateTime<Local>` into a `Mutable`. No tokio task needed because `glib::timeout_add_seconds_local` lives on the main loop directly — but we still go through the `Service`/registry machinery so the API stays uniform with the network-y services.
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml` (add chrono, gtk4)
 - Create: `crates/hytte-services/src/clock.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
@@ -1839,6 +1861,7 @@ git commit -m "feat(services): clock service ticking once per second"
 Connect to `$NIRI_SOCKET`, send `Request::EventStream`, push workspace and focused-window updates into `Mutable`s as events arrive. Reconnect with backoff on socket loss.
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml` (add niri-ipc, anyhow)
 - Create: `crates/hytte-services/src/niri.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
@@ -1995,6 +2018,7 @@ pub fn focused_window() -> impl Signal<Item = Option<Window>> {
 > returning `(Reply, Option<EventStream>)` where `EventStream: Iterator<Item = io::Result<Event>>`,
 > and the `Event::*` variants used above. If the on-disk `niri-ipc`
 > version differs (it may be 0.x and surface drift is real), adapt:
+>
 > - Reach the same shape (subscribe → iterate events → write to Mutable).
 > - The `apply_event` mapping for `Workspace`/`Window` field names may
 >   need tweaks (`is_active`, `is_focused`, `id` may be named slightly
@@ -2030,6 +2054,7 @@ git commit -m "feat(services): niri compositor ipc — workspaces, focused windo
 Confirm the umbrella crate exports everything cleanly so consumers write `use hytte::{ui, reactive, services};`. The crate body is already stubbed in Task 1 — just verify it compiles after Tasks 2–10 add real content.
 
 **Files:**
+
 - Verify: `crates/hytte/src/lib.rs` already correct from Task 1.
 
 - [ ] **Step 1: Build the umbrella**
@@ -2041,7 +2066,7 @@ Expected: clean build.
 
 Append to `crates/hytte/src/lib.rs`:
 
-```rust
+````rust
 
 /// Convenience re-exports for shell binaries:
 ///
@@ -2052,7 +2077,7 @@ pub mod prelude {
     pub use hytte_reactive::{bind, bind_class, bind_text, bind_visible, Service};
     pub use hytte_ui::{App, Anchor, Bar, BarHandle, Edge, Layer, Margin, Monitor};
 }
-```
+````
 
 - [ ] **Step 3: Build again**
 
@@ -2073,6 +2098,7 @@ git commit -m "feat(hytte): umbrella prelude for shell binaries"
 Replace the placeholder `main` with the real shell: a top edge bar on every connected monitor, workspaces cluster on the left, clock on the right.
 
 **Files:**
+
 - Modify: `trollshell/Cargo.toml` (add chrono dep for the format helper)
 - Create: `trollshell/src/widgets/mod.rs`
 - Create: `trollshell/src/widgets/clock.rs`
@@ -2093,16 +2119,16 @@ Create `trollshell/style.css`:
 /* trollshell user overrides on top of hytte-ui defaults. */
 
 .trollshell-clock {
-    font-feature-settings: "tnum" 1;
-    padding: 0 6px;
+  font-feature-settings: "tnum" 1;
+  padding: 0 6px;
 }
 
 .trollshell-workspaces button {
-    min-width: 22px;
-    padding: 2px 0;
+  min-width: 22px;
+  padding: 2px 0;
 }
 .trollshell-workspaces button.focused {
-    background: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.18);
 }
 ```
 
@@ -2248,13 +2274,14 @@ git commit -m "feat(trollshell): top bar with workspaces and clock"
 Document how to build and run, list the manual smoke checklist that v0.1 has to pass.
 
 **Files:**
+
 - Create: `README.md`
 
 - [ ] **Step 1: Write the README**
 
 Create `README.md`:
 
-```markdown
+````markdown
 # trollshell + hytte
 
 A library-first Rust toolkit (`hytte`) for composing GTK4 + libadwaita + layer-shell desktop shells, and `trollshell` — the personal shell built on it.
@@ -2266,6 +2293,7 @@ This repo holds the v0.1 milestone: a top-edge bar on every Niri monitor with wo
 ```sh
 cargo build --release -p trollshell
 ```
+````
 
 ## Run (Niri only, v0.1)
 
@@ -2288,7 +2316,8 @@ cargo run --release -p trollshell
 ```sh
 RUST_LOG=hytte_services=debug,trollshell=debug cargo run -p trollshell
 ```
-```
+
+````
 
 - [ ] **Step 2: Run the manual smoke checklist on real Niri**
 
@@ -2307,13 +2336,14 @@ RUST_LOG=hytte_services=debug,trollshell=debug cargo run -p trollshell
 ```bash
 git add README.md
 git commit -m "docs: README + v0.1 manual smoke checklist"
-```
+````
 
 ---
 
 ## Self-Review
 
 **Spec coverage:**
+
 - Repo + crate layout — Task 1.
 - Thread-local registry + tokio backend — Tasks 2, 3.
 - bind / bind_text / bind_visible / bind_class — Task 4.
@@ -2329,6 +2359,7 @@ git commit -m "docs: README + v0.1 manual smoke checklist"
 **Out of scope for v0.1 (per the spec):** `Popup`/`Panel`, all v0.2/v0.3/v0.4 services. Not gaps, deferred.
 
 **Type consistency check:**
+
 - `ClockHandles` defined in Task 9 used only inside `hytte_services::clock`, not crossed against other tasks. ✓
 - `NiriHandles` defined in Task 10 used only inside `hytte_services::niri`. ✓
 - `Service::Handles` associated type referenced consistently in Tasks 3, 9, 10.
@@ -2337,4 +2368,4 @@ git commit -m "docs: README + v0.1 manual smoke checklist"
 - `bind`, `bind_text`, `bind_visible`, `bind_class` defined Task 4, re-exported via prelude Task 11, used Task 12. ✓
 - `Anchor` (layer-shell-level edges) vs `Edge` (Bar-level edges) — distinct types living in distinct modules; mapped via `perpendicular_anchors` inside `bar.rs`. Intentional separation; documented implicitly by namespace. Acceptable.
 
-**Placeholder scan:** No "TBD" / "implement later" / "appropriate error handling". The niri-ipc API note in Task 10 is a *labelled* uncertainty about an external crate's surface — paired with a concrete fallback instruction ("adapt the apply_event mapping"), not a placeholder.
+**Placeholder scan:** No "TBD" / "implement later" / "appropriate error handling". The niri-ipc API note in Task 10 is a _labelled_ uncertainty about an external crate's surface — paired with a concrete fallback instruction ("adapt the apply_event mapping"), not a placeholder.

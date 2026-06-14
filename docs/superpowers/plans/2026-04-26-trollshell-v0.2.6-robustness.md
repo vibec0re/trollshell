@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita, `futures-signals`, `zbus`, `tokio`. No new top-level deps.
 
 **Conventions:**
+
 - TDD where unit-testable (`networkd::parse_describe`, no other practical surface).
 - Commits use existing prefixes: `feat(de):`, `feat(bluetooth):`, `feat(wifi):`, `feat(networkd):`, `refactor(de):`.
 - Co-author trailer on every commit:
@@ -34,6 +35,7 @@
 ## Task 1: Refactor `notifications.rs` — extract `build_toast_view`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/notifications.rs`
 
 **Background:** Today `install(&Monitor)` builds the layer-shell window AND wires the signal subscription in one ~180-line function. Task 2 will split signal wiring into a separate module-level function. This task extracts pure widget construction into `build_toast_view(&Monitor) -> ToastView` while keeping the subscription wiring inline. Single-monitor mount is preserved — no behavior change visible to the user.
@@ -137,6 +139,7 @@ EOF
 ## Task 2: Multi-monitor notifications — install_subscriptions, route_emission, apply_emission
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/notifications.rs`
 
 **Background:** Replace the single `TOAST_WINDOW` thread-local with `TOAST_WINDOWS: HashMap<String, ToastView>` keyed by `Monitor.connector()`. Add `FOCUSED_OUTPUT` cell + `SUBS_INSTALLED` first-call guard. Subscriptions wire once across all `install` calls and call `route_emission`, which picks the target view by focused output and runs the existing notification-management logic against THAT view's per-window state.
@@ -423,6 +426,7 @@ EOF
 ## Task 3: `main.rs` — install notifications per monitor
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs`
 
 **Background:** Move `widgets::notifications::install` from the primary-only block into the existing per-monitor loop alongside `osd::install`. `prompt` and `polkit_dialog` stay primary-only.
@@ -486,6 +490,7 @@ EOF
 ## Task 4: BlueZ `CMD_CONN` reconnect
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/bluetooth.rs`
 
 **Background:** Replace `static CMD_CONN: OnceCell<Connection>` (set-once) with `static CMD_CONN: tokio::sync::Mutex<Option<Connection>>`. `cmd_conn()` returns `Result<Connection>` (owned Arc-clone) instead of `&'static Connection`. On each call, lock + check `is_closed()`, reopen if dead.
@@ -596,6 +601,7 @@ EOF
 ## Task 5: Wi-Fi `CMD_CONN` reconnect
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/wifi.rs`
 
 **Background:** Mirror of Task 4 in `wifi.rs`. Same pattern, only the error-context string changes.
@@ -674,6 +680,7 @@ EOF
 ## Task 6: `networkd::Link.addresses` → `Vec<LinkAddress>`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/networkd.rs`
 
 **Background:** `Link.addresses: Vec<IpAddr>` discards prefix length. The `parse_describe` parser already extracts `prefix_length` from each `DescribeAddress` but throws it away. Add a `LinkAddress { addr, prefix_len }` struct, update the parser, update the existing `parses_describe_json_minimal` test.
@@ -810,6 +817,7 @@ EOF
 ## Task 7: `pages.rs` — render IPv4/v6 prefix length
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Consume the new `LinkAddress` shape in the IPv4 and IPv6 address rows of `build_primary_expander`. Render `192.168.1.42/24` instead of `192.168.1.42`. The `(+N more)` collapse and link-local filter for IPv6 stay in place.
@@ -931,6 +939,7 @@ EOF
 ## Task 8: `pages.rs` — "No connection" hide-and-replace
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Today the Primary expander sets its title to "No connection" via the title bind's `None` arm. Reviewer flag (v0.2.2): hide the expander entirely and show a separate non-activatable placeholder row instead.
@@ -1050,12 +1059,14 @@ EOF
 ## Self-review notes
 
 **Spec coverage:**
+
 - Spec §1 multi-monitor notifications → Tasks 1, 2, 3.
 - Spec §2 service reconnect → Tasks 4, 5.
 - Spec §3a IPv4/v6 prefix length → Tasks 6, 7.
 - Spec §3b "No connection" hide-and-replace → Task 8.
 
 **Final verification:**
+
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` green (one updated test in `networkd::tests::parses_describe_json_minimal`).
 - Manual smoke tests deferred per success criteria.

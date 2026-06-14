@@ -24,19 +24,19 @@ Spec reference: `/home/choom/src/trollshell/docs/superpowers/specs/2026-04-29-ne
 
 ## File Structure
 
-| File                                                       | Responsibility |
-| ---------------------------------------------------------- | -------------- |
-| `docs/FUTURE.md`                                           | **New.** Index of deferred ideas. Initial entries: eBPF per-PID byte counts, VPN connect/disconnect, connections search, port-name resolution, Wi-Fi UX. |
-| `trollshell/style.css`                                     | **Modify.** Tighten `.ts-net-pill`. Add `.ts-pill-vpn`. |
-| `trollshell/src/widgets/pages.rs::page_network`            | **Reflow.** Two-column via existing `page_grid()`/`panel()` helpers. Traffic group gains per-interface sparklines. New "Active connections" section appended below the grid (Phase 3). |
-| `trollshell/src/widgets/pages.rs::page_vpn`                | **New (Phase 2).** Per-tunnel cards. WireGuard peers expander. Tailscale special-casing. |
-| `crates/hytte-services/src/vpn.rs`                         | **New (Phase 2).** `Tunnel`/`TunnelKind`/`Peer` types. `tunnels()`, `is_active()` signals. Polls `ip -d -j link show`, `wg show all dump`, `tailscale status --json`. |
-| `crates/hytte-services/src/netconn.rs`                     | **New (Phase 3).** `Connection`/`Proto`/`ConnState` types. `connections()` signal. Polls `ss -tunipnH`. |
-| `crates/hytte-services/src/lib.rs`                         | **Modify.** Add `pub mod vpn;` (Phase 2) and `pub mod netconn;` (Phase 3) alphabetically. |
-| `trollshell/src/widgets/vpn.rs`                            | **New (Phase 2).** Bar chip. Visible only when `vpn::is_active()` is true. |
-| `trollshell/src/widgets/mod.rs`                            | **Modify.** `mod vpn;` (Phase 2). |
-| `trollshell/src/modal.rs`                                  | **Modify.** `Page::Vpn` enum variant. `stack_name` arm. Mount `pages::page_vpn()` keyed `"vpn"`. |
-| `trollshell/src/main.rs`                                   | **Modify.** `.with(vpn::service())` (Phase 2), `.with(netconn::service())` (Phase 3). Add `widgets::vpn::widget(monitor)` to the network/bluetooth bar group. |
+| File                                            | Responsibility                                                                                                                                                                         |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docs/FUTURE.md`                                | **New.** Index of deferred ideas. Initial entries: eBPF per-PID byte counts, VPN connect/disconnect, connections search, port-name resolution, Wi-Fi UX.                               |
+| `trollshell/style.css`                          | **Modify.** Tighten `.ts-net-pill`. Add `.ts-pill-vpn`.                                                                                                                                |
+| `trollshell/src/widgets/pages.rs::page_network` | **Reflow.** Two-column via existing `page_grid()`/`panel()` helpers. Traffic group gains per-interface sparklines. New "Active connections" section appended below the grid (Phase 3). |
+| `trollshell/src/widgets/pages.rs::page_vpn`     | **New (Phase 2).** Per-tunnel cards. WireGuard peers expander. Tailscale special-casing.                                                                                               |
+| `crates/hytte-services/src/vpn.rs`              | **New (Phase 2).** `Tunnel`/`TunnelKind`/`Peer` types. `tunnels()`, `is_active()` signals. Polls `ip -d -j link show`, `wg show all dump`, `tailscale status --json`.                  |
+| `crates/hytte-services/src/netconn.rs`          | **New (Phase 3).** `Connection`/`Proto`/`ConnState` types. `connections()` signal. Polls `ss -tunipnH`.                                                                                |
+| `crates/hytte-services/src/lib.rs`              | **Modify.** Add `pub mod vpn;` (Phase 2) and `pub mod netconn;` (Phase 3) alphabetically.                                                                                              |
+| `trollshell/src/widgets/vpn.rs`                 | **New (Phase 2).** Bar chip. Visible only when `vpn::is_active()` is true.                                                                                                             |
+| `trollshell/src/widgets/mod.rs`                 | **Modify.** `mod vpn;` (Phase 2).                                                                                                                                                      |
+| `trollshell/src/modal.rs`                       | **Modify.** `Page::Vpn` enum variant. `stack_name` arm. Mount `pages::page_vpn()` keyed `"vpn"`.                                                                                       |
+| `trollshell/src/main.rs`                        | **Modify.** `.with(vpn::service())` (Phase 2), `.with(netconn::service())` (Phase 3). Add `widgets::vpn::widget(monitor)` to the network/bluetooth bar group.                          |
 
 ---
 
@@ -45,6 +45,7 @@ Spec reference: `/home/choom/src/trollshell/docs/superpowers/specs/2026-04-29-ne
 ### Task 1: Create `docs/FUTURE.md`
 
 **Files:**
+
 - Create: `docs/FUTURE.md`
 
 - [ ] **Step 1: Write the new file**
@@ -103,6 +104,7 @@ EOF
 ### Task 2: Tighten `.ts-net-pill` and add `.ts-pill-vpn`
 
 **Files:**
+
 - Modify: `trollshell/style.css` (around line 559 for `.ts-net-pill`; add `.ts-pill-vpn` after the existing pill rules)
 
 - [ ] **Step 1: Update `.ts-net-pill` and append `.ts-pill-vpn`**
@@ -111,10 +113,10 @@ Open `trollshell/style.css`. Find the block:
 
 ```css
 .ts-net-pill {
-    padding: 2px 10px;
-    border-radius: 9999px;
-    font-size: 0.8em;
-    font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-size: 0.8em;
+  font-weight: 600;
 }
 ```
 
@@ -122,10 +124,10 @@ Replace it with:
 
 ```css
 .ts-net-pill {
-    padding: 1px 8px;
-    border-radius: 9999px;
-    font-size: 0.72em;
-    font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 9999px;
+  font-size: 0.72em;
+  font-weight: 600;
 }
 ```
 
@@ -133,19 +135,18 @@ Find the block ending with `.ts-pill-known` (around line 571):
 
 ```css
 .ts-pill-known {
-    background: alpha(@accent_color, 0.08);
-    color: alpha(@accent_color, 0.70);
+  background: alpha(@accent_color, 0.08);
+  color: alpha(@accent_color, 0.7);
 }
 ```
 
 Insert immediately after it (with one blank line separator):
 
 ```css
-
 /* New: VPN tunnel-state pill (used by page_vpn). */
 .ts-pill-vpn {
-    background: alpha(@success_color, 0.18);
-    color: @success_color;
+  background: alpha(@success_color, 0.18);
+  color: @success_color;
 }
 ```
 
@@ -175,6 +176,7 @@ EOF
 ### Task 3: Reflow `page_network` top section into two-column
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs::page_network` (around lines 310-330)
 
 - [ ] **Step 1: Inspect the current page_network entry point**
@@ -280,6 +282,7 @@ EOF
 ### Task 4: Add per-interface traffic sparklines
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs::build_traffic_group_v2` (around lines 596-665)
 
 - [ ] **Step 1: Inspect the current traffic group**
@@ -421,6 +424,7 @@ EOF
 ### Task 5: `vpn` module — types + parsers + parser tests
 
 **Files:**
+
 - Create: `crates/hytte-services/src/vpn.rs`
 
 - [ ] **Step 1: Create the new file with public types and parser fns**
@@ -812,6 +816,7 @@ EOF
 ### Task 6: `vpn` poll loop + main.rs registration
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/vpn.rs` (replace the stubbed `start` with a real poll loop)
 - Modify: `trollshell/src/main.rs` (add `.with(vpn::service())`)
 
@@ -1020,6 +1025,7 @@ EOF
 ### Task 7: `Page::Vpn` enum entry + `page_vpn()` builder
 
 **Files:**
+
 - Modify: `trollshell/src/modal.rs` (add `Vpn` to `Page` enum and `stack_name` arm; mount `pages::page_vpn()` in the stack)
 - Modify: `trollshell/src/widgets/pages.rs` (add `pub fn page_vpn() -> gtk::Widget` and use the existing `vpn` import)
 
@@ -1318,6 +1324,7 @@ EOF
 ### Task 8: `widgets::vpn` bar chip + bar group wiring
 
 **Files:**
+
 - Create: `trollshell/src/widgets/vpn.rs`
 - Modify: `trollshell/src/widgets/mod.rs` (add `pub mod vpn;`)
 - Modify: `trollshell/src/main.rs` (add the chip to the network/bluetooth bar group)
@@ -1424,6 +1431,7 @@ EOF
 ### Task 9: `netconn` module — types + parser + parser tests
 
 **Files:**
+
 - Create: `crates/hytte-services/src/netconn.rs`
 - Modify: `crates/hytte-services/src/lib.rs` (add `pub mod netconn;`)
 
@@ -1765,6 +1773,7 @@ EOF
 ### Task 10: Register `netconn::service()` in main.rs
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs`
 
 - [ ] **Step 1: Add `netconn` to the imports**
@@ -1815,6 +1824,7 @@ EOF
 ### Task 11: Active-connections section in `page_network`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs::page_network` (append a new full-width section below the two-column grid)
 
 - [ ] **Step 1: Add the netconn import**

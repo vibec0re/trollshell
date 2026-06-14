@@ -14,20 +14,24 @@ Replace the current bespoke `panel("CPU") / panel("Memory") / panel("GPU")` grid
 ### In scope
 
 **New widget primitive (`crates/hytte-ui/src/sparkline.rs`):**
+
 - `Sparkline` struct backed by a `gtk::DrawingArea` with a fixed-capacity ring buffer of `f64` samples. Renders a single-stroke line + 15%-alpha fill via cairo. Theme accent color via `widget.color()`. Public API: `new(capacity)`, `widget()`, `push(f64)`, `set_domain_max(Option<f64>)`, `clear()`.
 - Re-exported from `hytte_ui::Sparkline` and `hytte::ui::Sparkline`.
 
 **Service extensions (`crates/hytte-services/src/sensors.rs`):**
+
 - `Memory` struct gains `swap_used: u64`, `swap_total: u64` (parsed from existing `/proc/meminfo` read).
 - New `pub fn process_count() -> impl Signal<Item = u32>` (count of `/proc/<num>/` entries; piggybacks on existing 1Hz polling tick).
 
 **New service (`crates/hytte-services/src/systemd.rs`):**
+
 - Subscribe to `org.freedesktop.systemd1.Manager.JobRemoved` signal. Seed initial state via `ListUnitsFiltered(["failed"])`. Re-fetch on each `JobRemoved`. Required: call `Manager.Subscribe()` on the connection (systemd doesn't emit signals to non-subscribed clients).
 - Public `FailedUnit { name, description, sub_state }` + `failed_units() -> impl Signal<Item = Vec<FailedUnit>>`.
 - Reconnect-on-error via the existing service-loop pattern (mirror bluetooth/networkd listen loops).
 - Registered in `main.rs::App::with(systemd::service())`.
 
 **UI restructure (`trollshell/src/widgets/pages.rs::page_stats`):**
+
 - Drop `page_grid` + `panel("…")` shape.
 - Three vertically-stacked `AdwPreferencesGroup`s inside `finish_page` Clamp:
   - **Live** group: CPU row (overall % + temp suffix), Per-core expander (with the migrated bars), Memory row (with progress suffix), Swap row (when present), Processes row, GPU row (when present), Disk expander (one row per mount).
@@ -35,6 +39,7 @@ Replace the current bespoke `panel("CPU") / panel("Memory") / panel("GPU")` grid
   - **Services** group: live description ("All services running" / "{N} failed unit(s)"), single AdwExpanderRow listing failed units (or single non-activatable "All units running" placeholder when empty). Failed units carry an `.ts-pill-error` suffix using `@error_color`.
 
 **CSS additions (`trollshell/style.css`):**
+
 - Per-core bar rules switched from hex-gradient to `@accent_color` (drops `linear-gradient(180deg, #ff006e, #8338ec 60%, #3a86ff)`).
 - `.ts-stat-progress` (memory/swap suffix bars), `.ts-history-row`, `.ts-stat-name`, `.ts-stat-value` (with `tabular-nums`), `.ts-sparkline { color: @accent_color }`, `.ts-pill-error` using `@error_color` (or fallback `@destructive_color` if absent).
 
@@ -298,17 +303,17 @@ The `Service::start` impl spawns the outer retry loop (5-second backoff on error
 
 Title: `"Live"`.
 
-| Row | Type | Title | Subtitle (live) | Suffix (live) |
-|-----|------|-------|-----------------|---------------|
-| CPU | `AdwActionRow` | `"CPU"` | `format!("{:.0}%", c.overall * 100.0)` | `gtk::Label` `"{temp} °C"` from `cpu_temp().package_celsius`; hidden when None |
-| Per-core | `AdwExpanderRow` | `"Per-core"` | `format!("{} cores", c.per_core.len())` | — |
-| (nested) | `gtk::Box` row | — | — | per-core mini-bars (existing build_core_bars logic, accent color) |
-| Memory | `AdwActionRow` | `"Memory"` | `format!("{} / {} ({}%)", fmt_bytes(used), fmt_bytes(total), pct)` | `.ts-stat-progress` `gtk::ProgressBar` at `used/total` |
-| Swap | `AdwActionRow` (visible only when `swap_total > 0`) | `"Swap"` | `format!("{} / {} ({}%)", swap_used, swap_total, pct)` | `.ts-stat-progress` ProgressBar |
-| Processes | `AdwActionRow` | `"Processes"` | — | `gtk::Label` count |
-| GPU | `AdwActionRow` (only when `gpu()` is `Some`) | `"GPU"` | `gpu.name` | `gtk::Label` `"{temp} °C"` (or `"{load}%"` if no temp) |
-| Disk | `AdwExpanderRow` | `"Disk"` | `format!("{} mount(s)", count)` | — |
-| (nested) | `AdwActionRow` per mount | mount path | — | `format!("{}/{} ({}%)", used, total, pct)` |
+| Row       | Type                                                | Title         | Subtitle (live)                                                    | Suffix (live)                                                                  |
+| --------- | --------------------------------------------------- | ------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| CPU       | `AdwActionRow`                                      | `"CPU"`       | `format!("{:.0}%", c.overall * 100.0)`                             | `gtk::Label` `"{temp} °C"` from `cpu_temp().package_celsius`; hidden when None |
+| Per-core  | `AdwExpanderRow`                                    | `"Per-core"`  | `format!("{} cores", c.per_core.len())`                            | —                                                                              |
+| (nested)  | `gtk::Box` row                                      | —             | —                                                                  | per-core mini-bars (existing build_core_bars logic, accent color)              |
+| Memory    | `AdwActionRow`                                      | `"Memory"`    | `format!("{} / {} ({}%)", fmt_bytes(used), fmt_bytes(total), pct)` | `.ts-stat-progress` `gtk::ProgressBar` at `used/total`                         |
+| Swap      | `AdwActionRow` (visible only when `swap_total > 0`) | `"Swap"`      | `format!("{} / {} ({}%)", swap_used, swap_total, pct)`             | `.ts-stat-progress` ProgressBar                                                |
+| Processes | `AdwActionRow`                                      | `"Processes"` | —                                                                  | `gtk::Label` count                                                             |
+| GPU       | `AdwActionRow` (only when `gpu()` is `Some`)        | `"GPU"`       | `gpu.name`                                                         | `gtk::Label` `"{temp} °C"` (or `"{load}%"` if no temp)                         |
+| Disk      | `AdwExpanderRow`                                    | `"Disk"`      | `format!("{} mount(s)", count)`                                    | —                                                                              |
+| (nested)  | `AdwActionRow` per mount                            | mount path    | —                                                                  | `format!("{}/{} ({}%)", used, total, pct)`                                     |
 
 ### History group
 
@@ -339,6 +344,7 @@ Title: `"Services"`. Description bound to `failed_units()`:
 Single child:
 
 `AdwExpanderRow`:
+
 - Title: `"Failed units"`.
 - Subtitle: bound to `failed_units().len()` count or `"None"` when empty.
 - Drain+rebuild on emission:
@@ -357,68 +363,68 @@ The four sparkline subscriptions are wired during `page_stats()` execution. Draw
 /* Replace existing .ts-core-bar > trough rules (~line 199-212) */
 
 .ts-core-bar > trough {
-    min-width: 8px;
-    min-height: 56px;
-    border-radius: 3px;
-    background: alpha(@accent_color, 0.10);
-    border: none;
-    padding: 0;
+  min-width: 8px;
+  min-height: 56px;
+  border-radius: 3px;
+  background: alpha(@accent_color, 0.1);
+  border: none;
+  padding: 0;
 }
 
 .ts-core-bar > trough > progress {
-    min-width: 8px;
-    border-radius: 3px;
-    background: @accent_color;
-    border: none;
+  min-width: 8px;
+  border-radius: 3px;
+  background: @accent_color;
+  border: none;
 }
 
 /* Append: stats live progress (memory/swap suffix bars) */
 
 .ts-stat-progress {
-    min-height: 6px;
-    min-width: 100px;
+  min-height: 6px;
+  min-width: 100px;
 }
 
 .ts-stat-progress > trough {
-    min-height: 6px;
-    background: alpha(@accent_color, 0.15);
-    border-radius: 9999px;
+  min-height: 6px;
+  background: alpha(@accent_color, 0.15);
+  border-radius: 9999px;
 }
 
 .ts-stat-progress > trough > progress {
-    background: @accent_color;
-    border-radius: 9999px;
+  background: @accent_color;
+  border-radius: 9999px;
 }
 
 /* Append: stats history rows */
 
 .ts-history-row {
-    padding: 8px 12px;
+  padding: 8px 12px;
 }
 
 .ts-stat-name {
-    font-weight: 600;
+  font-weight: 600;
 }
 
 .ts-stat-value {
-    opacity: 0.7;
-    font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
 }
 
 .ts-sparkline {
-    color: @accent_color;
-    min-height: 24px;
+  color: @accent_color;
+  min-height: 24px;
 }
 
 /* Append: failed-unit pill */
 
 .ts-pill-error {
-    padding: 2px 10px;
-    border-radius: 9999px;
-    font-size: 0.8em;
-    font-weight: 600;
-    background: alpha(@error_color, 0.20);
-    color: @error_color;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-size: 0.8em;
+  font-weight: 600;
+  background: alpha(@error_color, 0.2);
+  color: @error_color;
 }
 ```
 

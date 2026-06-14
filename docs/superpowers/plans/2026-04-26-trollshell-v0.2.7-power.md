@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita, `futures-signals`, `zbus`, `tokio`. No new top-level deps.
 
 **Conventions:**
+
 - TDD where unit-testable (`humanize_profile`, `detect_battery_event`).
 - Commits use existing prefixes: `feat(power-profiles):`, `feat(de):`, `feat(osd):`, `style:`.
 - Co-author trailer on every commit:
@@ -21,9 +22,11 @@
 ## File Structure
 
 **Created:**
+
 - `crates/hytte-services/src/power_profiles.rs` — new service module.
 
 **Modified:**
+
 - `crates/hytte-services/src/lib.rs` — re-export `power_profiles` module.
 - `trollshell/src/main.rs` — register `power_profiles::service()` in the `App::with(...)` chain.
 - `trollshell/src/widgets/pages.rs` — `page_power` Battery group gains `build_power_profile_expander()`; `humanize_profile` + `profile_icon_name` helpers.
@@ -35,6 +38,7 @@
 ## Task 1: `power_profiles` service module
 
 **Files:**
+
 - Create: `crates/hytte-services/src/power_profiles.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 - Modify: `trollshell/src/main.rs`
@@ -342,6 +346,7 @@ EOF
 ## Task 2: Power profile UI in `page_power`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Add an `AdwExpanderRow` to the existing Battery group in `page_power`. Title "Power profile"; subtitle binds to humanized active profile. Prefix is a `gtk::Image` that swaps icon name per active profile. Nested rows drain-and-rebuild on each `state()` emission, with a checkmark suffix on the active profile's row.
@@ -465,6 +470,7 @@ EOF
 ## Task 3: OSD `Kind::Battery` + `BatteryEvent` + `detect_battery_event`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Extend the OSD `Kind` enum, add a `BatteryEvent` enum modeling the five fire conditions, and write `detect_battery_event` as a pure helper unit-tested for plug/unplug + 3 threshold crossings + steady-state suppression + Unknown-state suppression. No subscription wiring yet (Task 4 wires it).
@@ -674,6 +680,7 @@ EOF
 ## Task 4: OSD battery subscription + `render_battery`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/osd.rs`
 
 **Background:** Wire a fourth subscription in `install_subscriptions` that reads `upower::battery()`, maintains a `last_battery: RefCell<Option<Battery>>` baseline (seeded silently on first emission), runs `detect_battery_event`, and on `Some(event)` calls `render_battery(event, &batt)` then `route_show(&state)`.
@@ -783,6 +790,7 @@ EOF
 ## Task 5: CSS — `.ts-osd-card.battery` tint hook
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 **Background:** Reserved per-kind tint hook. Same accent treatment as Volume / Brightness — the icon name (`battery-low-symbolic`, `battery-caution-symbolic`) carries the visual urgency on its own. Future polish could add an `.urgent` class with `@error_color`.
@@ -793,7 +801,7 @@ At the bottom of `trollshell/style.css`, after the existing OSD rules:
 
 ```css
 .ts-osd-card.battery .ts-osd-icon {
-    color: @accent_color;
+  color: @accent_color;
 }
 ```
 
@@ -831,6 +839,7 @@ EOF
 ## Self-review notes
 
 **Spec coverage:**
+
 - Spec §1 power_profiles service → Task 1.
 - Spec §2 power_profiles UI → Task 2.
 - Spec §3 OSD Kind::Battery + BatteryEvent + detect_battery_event → Task 3.
@@ -838,6 +847,7 @@ EOF
 - Spec §3 CSS → Task 5.
 
 **Final verification:**
+
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` green; new unit tests in `power_profiles::tests` (2) + `osd::tests` (7).
 - Manual smoke test (deferred) covers each spec success criterion.

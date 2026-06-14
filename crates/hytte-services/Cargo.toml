@@ -11,11 +11,20 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-nix = { version = "0.29", default-features = false, features = ["fs", "signal", "user"] }
-chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+nix = { version = "0.29", default-features = false, features = [
+  "fs",
+  "signal",
+  "user",
+] }
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }
 futures-channel = "0.3.32"
 futures-signals = "0.3.34"
-futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.32", default-features = false, features = [
+  "std",
+] }
 gtk = { version = "0.11.2", package = "gtk4" }
 hytte-bus = { path = "../hytte-bus" }
 hytte-ecal = { path = "../hytte-ecal" }
@@ -28,9 +37,19 @@ niri-ipc = "26.4.0"
 # on a dedicated std::thread and bridges to tokio via pipewire::channel.
 pipewire = "0.10.0"
 libspa = "0.10.0"
-tokio = { version = "1.52.1", features = ["net", "rt", "io-util", "process", "sync", "time"] }
+tokio = { version = "1.52.1", features = [
+  "net",
+  "rt",
+  "io-util",
+  "process",
+  "sync",
+  "time",
+] }
 tracing = "0.1.44"
-icalendar = { version = "0.17", default-features = false, features = ["parser", "chrono-tz"] }
+icalendar = { version = "0.17", default-features = false, features = [
+  "parser",
+  "chrono-tz",
+] }
 # Direct zbus dep retained for zvariant::{OwnedValue, Value, ObjectPath} types
 # used as data shapes (D-Bus Variants in property/signal payloads), for the
 # #[zbus::interface] / #[zbus::DBusError] macros, and for zbus::fdo::Error /
@@ -48,4 +67,6 @@ futures-executor = "0.3.32"
 futures-util = "0.3.32"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { version = "1.52.1", features = ["macros", "rt", "time"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+  "registry",
+] }

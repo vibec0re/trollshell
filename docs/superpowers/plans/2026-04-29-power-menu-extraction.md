@@ -12,12 +12,12 @@
 
 ## File Structure
 
-| File                                              | Responsibility                                              |
-| ------------------------------------------------- | ----------------------------------------------------------- |
-| `crates/hytte-services/src/niri.rs`               | Compositor IPC client. **Add** `pub fn quit(skip_confirmation: bool)` reusing `send_action`. |
-| `crates/hytte-services/src/logind.rs`             | **New.** Free fns wrapping `org.freedesktop.login1.Manager.{Suspend,Reboot,PowerOff}` over the system bus. No reactive state, no service struct — action-only. |
-| `crates/hytte-services/src/lib.rs`                | **Add** `pub mod logind;` line. |
-| `trollshell/src/widgets/pages.rs`                 | **Modify** `page_power_menu` rows (lines ~2660-2706 in current file): replace four `spawn_detached(...)` calls with calls into `hytte::services::logind` / `hytte::services::niri`. **Delete** `fn spawn_detached` once it has no callers. |
+| File                                  | Responsibility                                                                                                                                                                                                                             |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/hytte-services/src/niri.rs`   | Compositor IPC client. **Add** `pub fn quit(skip_confirmation: bool)` reusing `send_action`.                                                                                                                                               |
+| `crates/hytte-services/src/logind.rs` | **New.** Free fns wrapping `org.freedesktop.login1.Manager.{Suspend,Reboot,PowerOff}` over the system bus. No reactive state, no service struct — action-only.                                                                             |
+| `crates/hytte-services/src/lib.rs`    | **Add** `pub mod logind;` line.                                                                                                                                                                                                            |
+| `trollshell/src/widgets/pages.rs`     | **Modify** `page_power_menu` rows (lines ~2660-2706 in current file): replace four `spawn_detached(...)` calls with calls into `hytte::services::logind` / `hytte::services::niri`. **Delete** `fn spawn_detached` once it has no callers. |
 
 Spec reference: `docs/superpowers/specs/2026-04-29-power-menu-extraction-design.md`.
 
@@ -26,6 +26,7 @@ Spec reference: `docs/superpowers/specs/2026-04-29-power-menu-extraction-design.
 ## Task 1: Extend `niri` service with `quit`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/niri.rs` (add fn after `focus_window`, around line 242)
 
 - [ ] **Step 1: Verify the existing send_action plumbing is still intact**
@@ -62,7 +63,7 @@ pub fn quit(skip_confirmation: bool) {
 - [ ] **Step 3: Build the crate to verify the Action::Quit variant matches**
 
 Run: `cargo build -p hytte-services --message-format=short 2>&1 | tail -10`
-Expected: `Finished \`dev\` profile` with no errors. If `Action::Quit { skip_confirmation }` is not the right variant shape, the compiler will reject it — `niri-ipc` 25.11.0 has been verified (`grep -E 'Quit|skip_confirmation' ~/.cargo/registry/src/*/niri-ipc-25.11.0/src/lib.rs`) to expose exactly this shape.
+Expected: `Finished \`dev\` profile`with no errors. If`Action::Quit { skip_confirmation }`is not the right variant shape, the compiler will reject it —`niri-ipc` 25.11.0 has been verified (`grep -E 'Quit|skip_confirmation' ~/.cargo/registry/src/\*/niri-ipc-25.11.0/src/lib.rs`) to expose exactly this shape.
 
 - [ ] **Step 4: Run clippy to confirm no new warnings on the touched file**
 
@@ -90,6 +91,7 @@ EOF
 ## Task 2: New `logind` module
 
 **Files:**
+
 - Create: `crates/hytte-services/src/logind.rs`
 - Modify: `crates/hytte-services/src/lib.rs` (add `pub mod logind;`)
 
@@ -212,6 +214,7 @@ EOF
 ## Task 3: Rewire `page_power_menu` and delete `spawn_detached`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` (4 call sites in `page_power_menu`, around lines 2664-2706; delete `spawn_detached` around lines 2755-2768)
 
 - [ ] **Step 1: Confirm the four call sites and the helper are still where the spec expects**
@@ -317,7 +320,7 @@ Delete the entire block (including the trailing blank line so the file doesn't a
 - [ ] **Step 8: Build the binary**
 
 Run: `cargo build -p trollshell --message-format=short 2>&1 | tail -10`
-Expected: `Finished \`dev\` profile` with no errors and no warnings about an unused `spawn_detached` symbol.
+Expected: `Finished \`dev\` profile`with no errors and no warnings about an unused`spawn_detached` symbol.
 
 - [ ] **Step 9: Run workspace clippy to catch anything stale**
 

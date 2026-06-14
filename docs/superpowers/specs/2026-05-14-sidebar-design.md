@@ -7,7 +7,7 @@
 
 trollshell currently has two HUD surfaces: the bar (top, exclusive zone) and the modal drawer (slides out from under the bar, overlay-style). Everything user-facing lives in one of those two places. The workspace area is otherwise dedicated to niri's tiled apps.
 
-We want a third surface — a **left sidebar** — to host quick-access content (future phases). For the MVP, the goal is to land the *mechanism*: an animated slide-out surface anchored to the left edge that **pushes** niri tiles aside (real reflow, not overlay), visually extends the existing frame's left strut, and is toggled by a chip in the bar.
+We want a third surface — a **left sidebar** — to host quick-access content (future phases). For the MVP, the goal is to land the _mechanism_: an animated slide-out surface anchored to the left edge that **pushes** niri tiles aside (real reflow, not overlay), visually extends the existing frame's left strut, and is toggled by a chip in the bar.
 
 The push behavior is the load-bearing requirement. The drawer overlays apps; the sidebar must reserve space so niri reflows tiles when it opens. That way the user can leave it open while working.
 
@@ -15,11 +15,11 @@ The push behavior is the load-bearing requirement. The drawer overlays apps; the
 
 ### Three pieces
 
-| piece | file | role |
-|---|---|---|
-| sidebar surface | `trollshell/src/overlays/sidebar.rs` *(new)* | layer-shell window, one per monitor, owns the slide animation and the exclusive zone. |
-| toggle chip | `trollshell/src/widgets/sidebar_toggle.rs` *(new)* | bar widget. mounts as the leftmost item in `.left([…])`, flips the open-state mutable. |
-| frame integration | `trollshell/src/overlays/frame.rs` *(edit)* | reads the sidebar's current visible width and offsets the cutout's left edge so the cutout's left-side rounded corners land flush with the sidebar's right edge. |
+| piece             | file                                               | role                                                                                                                                                             |
+| ----------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| sidebar surface   | `trollshell/src/overlays/sidebar.rs` _(new)_       | layer-shell window, one per monitor, owns the slide animation and the exclusive zone.                                                                            |
+| toggle chip       | `trollshell/src/widgets/sidebar_toggle.rs` _(new)_ | bar widget. mounts as the leftmost item in `.left([…])`, flips the open-state mutable.                                                                           |
+| frame integration | `trollshell/src/overlays/frame.rs` _(edit)_        | reads the sidebar's current visible width and offsets the cutout's left edge so the cutout's left-side rounded corners land flush with the sidebar's right edge. |
 
 Shared state lives in a thread-local `HashMap<connector, Mutable<bool>>` named `SIDEBAR_OPEN`, mirroring `modal::DRAWER_OPEN`. Subscribers (sidebar surface, frame draw) read it; the toggle chip writes it. Per-monitor key is the connector string.
 
@@ -43,11 +43,13 @@ window (layer-shell)
 ```
 
 Margins on the card:
+
 - `margin_top = BAR_HEIGHT + 10` (44 + 10 = 54) — matches the drawer's float-below-bar offset (`f322ab3 / 6f8e853`).
 - `margin_bottom = FRAME_THICKNESS` (8) — flush with the frame's bottom strut.
 - `margin_start = FRAME_THICKNESS` (8) — flush with the frame's left strut.
 
 Card visuals (CSS in `style.css`):
+
 - Same dark gradient as the bar and frame, but oriented vertically (top → bottom uses the bar's 3-stop palette).
 - Rounded **right** corners at `CUTOUT_RADIUS` (10) so the cutout's left-side rounding visually transfers onto the sidebar's right edge.
 - Left side: flat (sidebar is flush with the screen's left edge).
@@ -89,6 +91,7 @@ State is a `Mutable<bool>`. Both the chip and `toggle()` flip it. The sidebar su
 2. On `connect_child_revealed_notify` when `is_child_revealed()` becomes false: `set_exclusive_zone(0)`, then `window.set_visible(false)`. niri reflows tiles back left.
 
 The ordering is asymmetric on purpose:
+
 - On open, change the zone **first** so niri starts its own animation as early as possible; by the time the GTK slide finishes, niri's tile motion is close to settled. Brief overshoot is invisible because the sliding sidebar covers it.
 - On close, change the zone **last** so niri doesn't reclaim the space while the sidebar is still visible (which would let tiles render through the sidebar for a frame).
 
@@ -202,19 +205,19 @@ New rules:
 
 ```css
 .ts-sidebar {
-    background: linear-gradient(
-        180deg,
-        rgb(15, 15, 35),
-        rgb(25, 15, 45) 50%,
-        rgb(15, 15, 35)
-    );
-    border-radius: 0 10px 10px 0;   /* round only the right side */
-    padding: 12px;
+  background: linear-gradient(
+    180deg,
+    rgb(15, 15, 35),
+    rgb(25, 15, 45) 50%,
+    rgb(15, 15, 35)
+  );
+  border-radius: 0 10px 10px 0; /* round only the right side */
+  padding: 12px;
 }
 
 .ts-sidebar-placeholder {
-    color: alpha(white, 0.5);
-    font-style: italic;
+  color: alpha(white, 0.5);
+  font-style: italic;
 }
 ```
 
@@ -245,18 +248,18 @@ No changes to `etc/niri/frame.kdl`. No new dependencies.
 
 `#[cfg(test)] mod tests` in `sidebar.rs`:
 
-| test | scenario | expected |
-|---|---|---|
-| `width_constant` | `SIDEBAR_WIDTH` is 220 | exact equality (guard against accidental edits) |
-| `closed_width_returns_frame_thickness` | helper returns `FRAME_THICKNESS_I32` when revealer width is 0 | `8` |
+| test                                   | scenario                                                      | expected                                        |
+| -------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------- |
+| `width_constant`                       | `SIDEBAR_WIDTH` is 220                                        | exact equality (guard against accidental edits) |
+| `closed_width_returns_frame_thickness` | helper returns `FRAME_THICKNESS_I32` when revealer width is 0 | `8`                                             |
 
 `#[cfg(test)] mod tests` in `frame.rs` (extend existing):
 
-| test | scenario | expected |
-|---|---|---|
-| `cutout_rect_with_sidebar_open` | `cutout_rect(1920, 1080, 220.0)` | x=220, w=1920-220-8=1692 |
-| `cutout_rect_with_sidebar_closed` | `cutout_rect(1920, 1080, 8.0)` | x=8, w=1920-16=1904 (matches existing `cutout_rect_normal_monitor`) |
-| `cutout_rect_tiny_monitor_clamps_to_zero` | unchanged, but now passes `FRAME_THICKNESS` as the third arg | preserved |
+| test                                      | scenario                                                     | expected                                                            |
+| ----------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `cutout_rect_with_sidebar_open`           | `cutout_rect(1920, 1080, 220.0)`                             | x=220, w=1920-220-8=1692                                            |
+| `cutout_rect_with_sidebar_closed`         | `cutout_rect(1920, 1080, 8.0)`                               | x=8, w=1920-16=1904 (matches existing `cutout_rect_normal_monitor`) |
+| `cutout_rect_tiny_monitor_clamps_to_zero` | unchanged, but now passes `FRAME_THICKNESS` as the third arg | preserved                                                           |
 
 Existing `cutout_rect_*` tests get their call sites updated to pass `FRAME_THICKNESS` as the new third argument.
 

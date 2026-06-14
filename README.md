@@ -39,11 +39,49 @@ nix build                              # build the packaged binary (.#trollshell
 live system daemons, so it only does anything meaningful **inside a Niri
 session**.
 
-NixOS users can consume `nixosModules.default` from the flake
-(`programs.trollshell.enable = true;`), which installs the package and wires up
-the PAM service for the lock screen, the system-bus policy for the agent names,
-and UPower / power-profiles-daemon. Non-NixOS session integration (systemd
-user units, niri binds, swayidle, kanshi, the PAM file, …) ships under `etc/` —
+## Install
+
+The flake exposes the package (`packages.default`) plus NixOS and home-manager
+modules. To try the binary without installing it (still needs a live Niri
+session):
+
+```sh
+nix run github:vibec0re/trollshell
+```
+
+**NixOS** — add the flake as an input and import its module:
+
+```nix
+{
+  inputs.trollshell.url = "github:vibec0re/trollshell";
+
+  # …then in your nixosConfigurations' modules list:
+  imports = [ inputs.trollshell.nixosModules.default ];
+  programs.trollshell.enable = true;
+}
+```
+
+This installs the package and the lock-screen PAM service, plus a bundle of
+recommended-but-optional daemons — the agent-name D-Bus policy, the polkit
+agent, UPower, power-profiles-daemon, and geoclue — gated behind
+`programs.trollshell.enableRecommendedServices` (default `true`). Set it to
+`false` for a bare bar, where each chip simply hides when its daemon is absent.
+
+**Home-manager** — import the module to run the shell as a user service:
+
+```nix
+{
+  inputs.trollshell.url = "github:vibec0re/trollshell";
+
+  imports = [ inputs.trollshell.homeModules.default ];
+  programs.trollshell.enable = true;
+}
+```
+
+When home-manager runs as a NixOS module, the NixOS module wires the
+home-manager one in automatically, so per-user `programs.trollshell` settings
+just work. Non-NixOS session integration (systemd user units, niri binds,
+swayidle, kanshi, the PAM file, …) ships under `etc/` —
 see [etc/README.md](etc/README.md).
 
 ## Repo layout

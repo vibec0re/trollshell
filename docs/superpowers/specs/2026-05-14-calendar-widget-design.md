@@ -124,60 +124,60 @@ The `last_open` cell makes the trigger genuinely edge-based: the initial signal 
 
 ```css
 .ts-sidebar-calendar {
-    padding: 8px 4px 0 4px;
+  padding: 8px 4px 0 4px;
 }
 
 /* Header above the events list. */
 .ts-sidebar-cal-header {
-    color: alpha(white, 0.55);
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    margin: 10px 4px 4px 4px;
+  color: alpha(white, 0.55);
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  margin: 10px 4px 4px 4px;
 }
 
 /* GtkCalendar lives on the dark sidebar gradient. Default light card
  * styling is wrong here; override to a transparent/translucent surface. */
 .ts-sidebar-calendar .ts-calendar {
-    background: transparent;
-    color: white;
+  background: transparent;
+  color: white;
 }
 .ts-sidebar-calendar .ts-calendar > header {
-    color: white;
+  color: white;
 }
 .ts-sidebar-calendar .ts-calendar > grid > label {
-    color: alpha(white, 0.85);
+  color: alpha(white, 0.85);
 }
 .ts-sidebar-calendar .ts-calendar > grid > label.day-name {
-    color: alpha(white, 0.5);
+  color: alpha(white, 0.5);
 }
 .ts-sidebar-calendar .ts-calendar > grid > label.other-month {
-    color: alpha(white, 0.25);
+  color: alpha(white, 0.25);
 }
 .ts-sidebar-calendar .ts-calendar > grid > label.marked {
-    /* Marked-day dot uses currentColor in the GTK default; matches white text. */
-    font-weight: 600;
+  /* Marked-day dot uses currentColor in the GTK default; matches white text. */
+  font-weight: 600;
 }
 
 /* adw::PreferencesGroup palette swap for the dark sidebar. */
 .ts-sidebar-cal-list .boxed-list,
 .ts-sidebar-cal-list list.boxed-list,
 .ts-sidebar-cal-list list > row {
-    background: alpha(white, 0.04);
-    color: white;
-    border-radius: 8px;
+  background: alpha(white, 0.04);
+  color: white;
+  border-radius: 8px;
 }
 .ts-sidebar-cal-list list > row > box > box.title > .title {
-    color: white;
+  color: white;
 }
 .ts-sidebar-cal-list list > row > box > box.title > .subtitle {
-    color: alpha(white, 0.6);
+  color: alpha(white, 0.6);
 }
 
 /* Click-day flash. Reuses the existing .ts-cal-day-hit transition rule
  * if present; if not, declare it here. */
 .ts-sidebar-cal-list .ts-cal-day-hit {
-    background: alpha(white, 0.12);
-    transition: background 600ms ease;
+  background: alpha(white, 0.12);
+  transition: background 600ms ease;
 }
 ```
 
@@ -223,11 +223,11 @@ No other sidebar wiring changes.
 
 Unit tests in `widgets/calendar.rs` (`#[cfg(test)] mod tests`):
 
-| test | scenario | expected |
-|---|---|---|
-| `apply_event_marks_picks_current_month_only` | events in month X and month X-1; calendar shows month X | only month-X days are inserted into the marked set |
-| `apply_event_marks_handles_zero_indexed_gtk_month` | call `apply_event_marks` with a calendar whose `month()` returns `cal_month_minus_one`; events on day 15 of the matching real month | day 15 ends up in the marked set (no off-by-one) |
-| `apply_event_marks_deduplicates_per_day` | two events both starting on the same day | day appears once in the marked set (HashSet semantics confirmed) |
+| test                                               | scenario                                                                                                                            | expected                                                         |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `apply_event_marks_picks_current_month_only`       | events in month X and month X-1; calendar shows month X                                                                             | only month-X days are inserted into the marked set               |
+| `apply_event_marks_handles_zero_indexed_gtk_month` | call `apply_event_marks` with a calendar whose `month()` returns `cal_month_minus_one`; events on day 15 of the matching real month | day 15 ends up in the marked set (no off-by-one)                 |
+| `apply_event_marks_deduplicates_per_day`           | two events both starting on the same day                                                                                            | day appears once in the marked set (HashSet semantics confirmed) |
 
 GtkCalendar instantiation, scroll-into-view, and flash behaviour are not unit-tested — they need a real GTK display and are covered by interactive verification. The `apply_event_marks` tests can run headless because the function takes a `&gtk::Calendar` only for `month()`/`year()` reads and `clear_marks()`/`mark_day()` writes; we can pass a freshly-constructed `gtk::Calendar` without mapping it (gtk-rs allows this in `#[gtk::test]`-annotated tests or with `gtk::init()` in the test setup). If the harness doesn't allow that, the tests degrade gracefully into pure-function tests by refactoring `apply_event_marks` to compute the `HashSet<u32>` separately and call `mark_day` from a thin shim — see Verification.
 

@@ -15,11 +15,13 @@
 ## File map
 
 **Create:**
+
 - `crates/hytte-services/src/departures.rs` — service: types, parser, state transitions, fetch, tokio poll task, public API.
 - `crates/hytte-services/tests/fixtures/departures-schoeneweide.json` — hand-crafted fixture for parser tests (one normal, one delayed, one cancelled, one non-suburban).
 - `trollshell/src/widgets/departures.rs` — widget: row builder, state→list rebuild, time-tick subscription, status rows (loading/error/empty/stale).
 
 **Modify:**
+
 - `crates/hytte-services/src/lib.rs` — add `pub mod departures;`.
 - `trollshell/src/widgets/mod.rs` — add `pub mod departures;`.
 - `trollshell/src/overlays/sidebar.rs` — replace placeholder `Label` with `widgets::departures::widget()`; call `hytte::services::departures::refresh()` on open.
@@ -31,6 +33,7 @@
 ## Task 1: Add the empty module to hytte-services
 
 **Files:**
+
 - Create: `crates/hytte-services/src/departures.rs`
 - Modify: `crates/hytte-services/src/lib.rs:1-30`
 
@@ -74,6 +77,7 @@ git commit -m "feat(departures): empty module skeleton in hytte-services"
 ## Task 2: Public types and constants
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add constants and `Departure` type**
@@ -169,6 +173,7 @@ git commit -m "feat(departures): Departure and DeparturesState types"
 ## Task 3: `delay_string` helper (pure)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 A small helper used by the widget; lives in the service module because its rules (when to show, what to format) belong with the data definition.
@@ -244,6 +249,7 @@ git commit -m "feat(departures): delay_string helper"
 ## Task 4: Hand-crafted JSON fixture
 
 **Files:**
+
 - Create: `crates/hytte-services/tests/fixtures/departures-schoeneweide.json`
 
 - [ ] **Step 1: Create the fixture directory and file**
@@ -257,7 +263,7 @@ Create `crates/hytte-services/tests/fixtures/departures-schoeneweide.json` with 
   "departures": [
     {
       "tripId": "trip-1-ontime",
-      "when":        "2030-01-01T16:42:00+01:00",
+      "when": "2030-01-01T16:42:00+01:00",
       "plannedWhen": "2030-01-01T16:42:00+01:00",
       "delay": 0,
       "cancelled": false,
@@ -266,7 +272,7 @@ Create `crates/hytte-services/tests/fixtures/departures-schoeneweide.json` with 
     },
     {
       "tripId": "trip-2-delayed",
-      "when":        "2030-01-01T16:49:00+01:00",
+      "when": "2030-01-01T16:49:00+01:00",
       "plannedWhen": "2030-01-01T16:44:00+01:00",
       "delay": 300,
       "cancelled": false,
@@ -275,7 +281,7 @@ Create `crates/hytte-services/tests/fixtures/departures-schoeneweide.json` with 
     },
     {
       "tripId": "trip-3-cancelled",
-      "when":        null,
+      "when": null,
       "plannedWhen": "2030-01-01T16:49:00+01:00",
       "delay": null,
       "cancelled": true,
@@ -284,7 +290,7 @@ Create `crates/hytte-services/tests/fixtures/departures-schoeneweide.json` with 
     },
     {
       "tripId": "trip-4-bus-noise",
-      "when":        "2030-01-01T16:50:00+01:00",
+      "when": "2030-01-01T16:50:00+01:00",
       "plannedWhen": "2030-01-01T16:50:00+01:00",
       "delay": 0,
       "cancelled": false,
@@ -309,6 +315,7 @@ git commit -m "test(departures): hand-crafted fixture covering 4 row shapes"
 ## Task 5: API serde structs + `into_departure` conversion
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add the internal API structs and `into_departure` stub**
@@ -503,6 +510,7 @@ git commit -m "feat(departures): JSON parsing and row conversion"
 ## Task 6: `parse_response` end-to-end
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add the stub and tests**
@@ -582,6 +590,7 @@ git commit -m "feat(departures): parse_response wraps deserialize + filter"
 ## Task 7: `next_state` transition function
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add the stub and tests**
@@ -744,6 +753,7 @@ git commit -m "feat(departures): pure next_state transition function"
 ## Task 8: `fetch_once` HTTP + parse
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 No tests — live HTTP is flaky and the parser is already covered. We just wire the pieces together.
@@ -805,6 +815,7 @@ git commit -m "feat(departures): fetch_once HTTP wrapper"
 ## Task 9: Service trait + tokio poll loop + Notify wiring
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add `DeparturesService`, `DeparturesHandles`, and the poll loop**
@@ -899,6 +910,7 @@ git commit -m "feat(departures): Service impl with tokio poll loop"
 ## Task 10: Public API — `current()` and `refresh()`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/departures.rs`
 
 - [ ] **Step 1: Add the two public entry points**
@@ -951,6 +963,7 @@ git commit -m "feat(departures): public current() and refresh()"
 ## Task 11: Trollshell widget — empty module scaffold
 
 **Files:**
+
 - Create: `trollshell/src/widgets/departures.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -986,6 +999,7 @@ git commit -m "feat(widgets): empty departures module"
 ## Task 12: `relative_label` helper (pure)
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/departures.rs`
 
 - [ ] **Step 1: Add stub + tests**
@@ -1083,6 +1097,7 @@ git commit -m "feat(widgets/departures): relative_label helper"
 ## Task 13: `row()` — one departure row widget
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/departures.rs`
 
 This task wires GTK widgets; the helpers themselves are tested via `relative_label` + `delay_string`. The row builder is integration code, no unit test for it.
@@ -1162,6 +1177,7 @@ git commit -m "feat(widgets/departures): row builder"
 ## Task 14: Status rows — loading, empty, error, stale footer
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/departures.rs`
 
 - [ ] **Step 1: Add the four small builders**
@@ -1221,6 +1237,7 @@ git commit -m "feat(widgets/departures): loading/empty/error/stale rows"
 ## Task 15: `rebuild()` and public `widget()`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/departures.rs`
 
 - [ ] **Step 1: Add `rebuild` and `widget`**
@@ -1287,6 +1304,7 @@ git commit -m "feat(widgets/departures): rebuild + widget public API"
 ## Task 16: Swap sidebar placeholder for the widget
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/sidebar.rs` (around lines 162-169 and 196-211)
 
 - [ ] **Step 1: Replace the placeholder Label**
@@ -1356,6 +1374,7 @@ git commit -m "feat(sidebar): swap placeholder for departures widget"
 ## Task 17: Register the service in `main.rs`
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs:13-48`
 
 - [ ] **Step 1: Add `departures` to the import group**
@@ -1409,6 +1428,7 @@ git commit -m "feat(main): register departures service"
 ## Task 18: CSS — departures rules + per-line colors + light-mode mirror
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 - [ ] **Step 1: Find the right insertion point**
@@ -1425,49 +1445,75 @@ Insert this block immediately after `.ts-sidebar { … }` (or in the same dark-m
 
 ```css
 .ts-departures {
-    padding: 12px;
+  padding: 12px;
 }
 
 .ts-departure-row {
-    padding: 6px 4px;
+  padding: 6px 4px;
 }
 
 .ts-line-badge {
-    min-width: 36px;
-    padding: 2px 6px;
-    border-radius: 6px;
-    font-weight: 700;
-    color: white;
-    margin-right: 8px;
+  min-width: 36px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-weight: 700;
+  color: white;
+  margin-right: 8px;
 }
-.ts-line-S8  { background: #5DAB46; }   /* dark green */
-.ts-line-S9  { background: #882D7A; }   /* violet     */
-.ts-line-S41 { background: #AA5D3D; }
-.ts-line-S42 { background: #C36F33; }
-.ts-line-S46 { background: #C4923D; }   /* chestnut   */
-.ts-line-S47 { background: #C4923D; }
-.ts-line-S85 { background: #A7C539; }   /* yellow-green */
+.ts-line-S8 {
+  background: #5dab46;
+} /* dark green */
+.ts-line-S9 {
+  background: #882d7a;
+} /* violet     */
+.ts-line-S41 {
+  background: #aa5d3d;
+}
+.ts-line-S42 {
+  background: #c36f33;
+}
+.ts-line-S46 {
+  background: #c4923d;
+} /* chestnut   */
+.ts-line-S47 {
+  background: #c4923d;
+}
+.ts-line-S85 {
+  background: #a7c539;
+} /* yellow-green */
 
-.ts-departure-direction { color: alpha(white, 0.95); }
+.ts-departure-direction {
+  color: alpha(white, 0.95);
+}
 
-.ts-departure-time      { color: alpha(white, 0.85); font-variant-numeric: tabular-nums; }
-.ts-departure-delay     { color: #ff6b6b; margin-left: 6px; font-variant-numeric: tabular-nums; }
+.ts-departure-time {
+  color: alpha(white, 0.85);
+  font-variant-numeric: tabular-nums;
+}
+.ts-departure-delay {
+  color: #ff6b6b;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
 
 .ts-departure-row.ts-cancelled .ts-departure-time,
 .ts-departure-row.ts-cancelled .ts-departure-direction {
-    text-decoration: line-through;
-    color: alpha(#ff6b6b, 0.7);
+  text-decoration: line-through;
+  color: alpha(#ff6b6b, 0.7);
 }
 
 .ts-departures-loading,
 .ts-departures-empty,
 .ts-departures-stale-footer {
-    color: alpha(white, 0.45);
-    font-style: italic;
-    padding: 12px;
+  color: alpha(white, 0.45);
+  font-style: italic;
+  padding: 12px;
 }
 
-.ts-departures-error { color: #ff6b6b; padding: 12px; }
+.ts-departures-error {
+  color: #ff6b6b;
+  padding: 12px;
+}
 ```
 
 - [ ] **Step 4: Add the light-mode mirror**
@@ -1475,14 +1521,18 @@ Insert this block immediately after `.ts-sidebar { … }` (or in the same dark-m
 Find the existing light-mode section (the one with the `.ts-drawer` and `.ts-sidebar` light overrides; look for `@media (prefers-color-scheme: light)` or whatever the project uses — grep the file for the existing `.ts-sidebar` light-mode rule). Inside that block, append:
 
 ```css
-    .ts-departure-direction { color: alpha(black, 0.95); }
-    .ts-departure-time      { color: alpha(black, 0.85); }
-    .ts-departures-loading,
-    .ts-departures-empty,
-    .ts-departures-stale-footer {
-        color: alpha(black, 0.45);
-    }
-    /* Badge colours are theme-independent — no overrides. */
+.ts-departure-direction {
+  color: alpha(black, 0.95);
+}
+.ts-departure-time {
+  color: alpha(black, 0.85);
+}
+.ts-departures-loading,
+.ts-departures-empty,
+.ts-departures-stale-footer {
+  color: alpha(black, 0.45);
+}
+/* Badge colours are theme-independent — no overrides. */
 ```
 
 - [ ] **Step 5: Run trollshell briefly to confirm CSS parses**
@@ -1511,6 +1561,7 @@ These steps mirror the spec's verification list. Run them on a real Niri session
 
 Run: `cargo build && cargo test 2>&1 | tail -40`
 Expected: clean build; all tests pass — at least these new ones:
+
 - `departures::tests::delay_string_*` (3)
 - `departures::tests::into_departure_*` (5)
 - `departures::tests::parse_response_*` (3)

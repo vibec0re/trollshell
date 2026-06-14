@@ -10,7 +10,10 @@ description = "Personal Wayland desktop shell built on hytte"
 workspace = true
 
 [dependencies]
-chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }
 hytte = { path = "../crates/hytte" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }

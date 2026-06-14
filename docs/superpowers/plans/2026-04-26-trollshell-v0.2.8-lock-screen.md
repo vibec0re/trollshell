@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.85+ stable (workspace edition 2024), GTK4 + libadwaita, `pam` 0.8 crate (system `libpam` headers required at build time), `zeroize`, `thiserror`, `zbus`, existing `nix` crate for username lookup.
 
 **Conventions:**
+
 - Workspace lints `pedantic = warn`, `module_name_repetitions = allow`, `missing_errors_doc = allow`, `missing_panics_doc = allow`. `unsafe_code = "forbid"` workspace-wide; the new code adds no `unsafe`.
 - TDD where unit-testable (`hytte-pam` API smoke test only — real PAM needs a live stack).
 - Commits use existing prefixes: `feat(pam):`, `feat(screensaver):`, `feat(de):`, `style:`.
@@ -22,12 +23,14 @@
 ## File Structure
 
 **Created:**
+
 - `crates/hytte-pam/Cargo.toml`
 - `crates/hytte-pam/src/lib.rs`
 - `trollshell/src/widgets/lock_screen.rs`
 - `etc/pam.d/trollshell` (one-line PAM service file)
 
 **Modified:**
+
 - `Cargo.toml` (workspace root) — add `crates/hytte-pam` to members.
 - `trollshell/Cargo.toml` — add `hytte-pam` dep.
 - `crates/hytte-services/src/screensaver.rs` — add `is_locked` signal, `handle_unlock_success`, `call_login1_unlock`, `listen_login1`, rewrite `lock()`, drop gtklock paths.
@@ -42,6 +45,7 @@
 ## Task 1: `hytte-pam` crate
 
 **Files:**
+
 - Create: `crates/hytte-pam/Cargo.toml`
 - Create: `crates/hytte-pam/src/lib.rs`
 - Modify: `Cargo.toml` (workspace root)
@@ -178,6 +182,7 @@ EOF
 ## Task 2: `screensaver.rs` — `is_locked` signal + `handle_unlock_success` + `call_login1_unlock`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/screensaver.rs`
 
 **Background:** Add a `Mutable<bool>` field to `ScreenSaverHandles` (note: existing struct name uses `ScreenSaver` capitalized in CamelCase, with lowercase `screensaver` in function paths). Expose via `is_locked()`. Add `handle_unlock_success()` that flips the mutable to false and asynchronously calls `Session.SetLockedHint(false)` on logind. `lock()` body rewrite + login1 listen loop come in Tasks 3 + 4.
@@ -319,6 +324,7 @@ EOF
 ## Task 3: `screensaver.rs` — rewrite `lock()` + drop gtklock paths
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/screensaver.rs`
 
 **Background:** Replace the body of `pub fn lock()` (which currently calls `spawn_locker`) with a flip of `is_locked` to true. Delete the now-unused gtklock spawn helpers, `TROLL_LOCK_CMD` env-var read, and update the module docstring.
@@ -390,6 +396,7 @@ EOF
 ## Task 4: `screensaver.rs` — login1 `Session.Lock`/`Unlock` listen loop
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/screensaver.rs`
 
 **Background:** Add a background task (alongside the existing inhibitor-server spawn in `Service::start`) that subscribes to the user's logind session and translates `Session.Lock` / `Session.Unlock` signals into flips of `is_locked`. Reconnect-on-error with 5-second backoff.
@@ -501,6 +508,7 @@ EOF
 ## Task 5: `widgets/lock_screen.rs` — full module
 
 **Files:**
+
 - Create: `trollshell/src/widgets/lock_screen.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 - Modify: `trollshell/Cargo.toml`
@@ -853,6 +861,7 @@ EOF
 ## Task 6: `main.rs` install order
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs`
 
 **Background:** Insert `widgets::lock_screen::install(&app.monitors())` between the primary-only widget block and the per-monitor (notifications + osd) loop. Lock surfaces should be mounted before bars / drawers so they're ready when the first lock signal arrives.
@@ -916,6 +925,7 @@ EOF
 ## Task 7: `etc/` configuration files
 
 **Files:**
+
 - Create: `etc/pam.d/trollshell`
 - Modify: `etc/swayidle/config`
 - Modify: `etc/README.md`
@@ -995,6 +1005,7 @@ EOF
 ## Task 8: Lock-screen CSS
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 **Background:** Append rules for the lock surfaces. All tokens already in use elsewhere in the file (`@window_bg_color`, `@card_bg_color`, `@error_color`). No new color tokens.
@@ -1007,55 +1018,66 @@ At the bottom of the file:
 /* ── Lock screen ────────────────────────────────────────────────────────── */
 
 .ts-lock-root {
-    background: alpha(@window_bg_color, 0.95);
+  background: alpha(@window_bg_color, 0.95);
 }
 
 .ts-lock-card {
-    padding: 32px 48px;
-    border-radius: 18px;
-    background: alpha(@card_bg_color, 0.92);
-    box-shadow: 0 8px 32px alpha(black, 0.40);
+  padding: 32px 48px;
+  border-radius: 18px;
+  background: alpha(@card_bg_color, 0.92);
+  box-shadow: 0 8px 32px alpha(black, 0.4);
 }
 
 .ts-lock-clock {
-    font-size: 4em;
-    font-weight: 300;
-    font-variant-numeric: tabular-nums;
-    margin-bottom: -8px;
+  font-size: 4em;
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: -8px;
 }
 
 .ts-lock-date {
-    font-size: 1.1em;
-    opacity: 0.7;
-    margin-bottom: 8px;
+  font-size: 1.1em;
+  opacity: 0.7;
+  margin-bottom: 8px;
 }
 
 .ts-lock-user {
-    font-size: 0.95em;
-    opacity: 0.8;
-    margin-top: 16px;
+  font-size: 0.95em;
+  opacity: 0.8;
+  margin-top: 16px;
 }
 
 .ts-lock-entry {
-    margin-top: 8px;
+  margin-top: 8px;
 }
 
 .ts-lock-error {
-    color: @error_color;
-    font-size: 0.9em;
-    margin-top: 4px;
+  color: @error_color;
+  font-size: 0.9em;
+  margin-top: 4px;
 }
 
 @keyframes ts-lock-shake-keyframes {
-    0%, 100% { margin-left: 0; }
-    20%      { margin-left: -8px; }
-    40%      { margin-left:  8px; }
-    60%      { margin-left: -6px; }
-    80%      { margin-left:  4px; }
+  0%,
+  100% {
+    margin-left: 0;
+  }
+  20% {
+    margin-left: -8px;
+  }
+  40% {
+    margin-left: 8px;
+  }
+  60% {
+    margin-left: -6px;
+  }
+  80% {
+    margin-left: 4px;
+  }
 }
 
 .ts-lock-shake {
-    animation: ts-lock-shake-keyframes 400ms ease-in-out;
+  animation: ts-lock-shake-keyframes 400ms ease-in-out;
 }
 ```
 
@@ -1101,6 +1123,7 @@ EOF
 ## Self-review notes
 
 **Spec coverage:**
+
 - Spec §1 hytte-pam crate → Task 1.
 - Spec §2 screensaver `is_locked` + `handle_unlock_success` + `call_login1_unlock` → Task 2.
 - Spec §2 `lock()` rewrite + drop gtklock paths → Task 3.
@@ -1111,6 +1134,7 @@ EOF
 - Spec §5 CSS additions → Task 8.
 
 **Final verification:**
+
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` green; new smoke test in `hytte-pam::tests::api_surface_compiles`.
 - Manual smoke (deferred): see Task 8 step 3.

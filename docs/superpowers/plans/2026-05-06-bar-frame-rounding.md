@@ -11,6 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-05-06-bar-frame-rounding-design.md`
 
 **Visual constants (used throughout):**
+
 - `BAR_HEIGHT = 44` (post-restyle, computed from `padding: 6px 12px` + `min-height: 32px`, no margin)
 - `FRAME_THICKNESS = 12` (left, right, bottom inset around the workspace cutout)
 - `CUTOUT_RADIUS = 16` (corner radius on all four cutout corners)
@@ -20,14 +21,14 @@
 
 ## File structure
 
-| File | Status | Responsibility |
-|---|---|---|
-| `trollshell/style.css` | Modify (lines 36-47) | flatten `.hytte-bar-content` (margin / border-radius / box-shadow) |
-| `trollshell/src/overlays/frame.rs` | Create | per-monitor OVERLAY-layer window + cairo draw fn for the frame shape |
-| `trollshell/src/overlays/mod.rs` | Modify | `pub mod frame;` |
-| `trollshell/src/main.rs` | Modify (run-callback's per-monitor loop, around line 85) | `overlays::frame::install(monitor);` |
-| `etc/niri/frame.kdl` | Create | `layout { struts { left 12; right 12; bottom 12 } }` snippet |
-| `etc/niri/README.md` | Modify | new "Frame struts" section explaining how to merge the snippet |
+| File                               | Status                                                   | Responsibility                                                       |
+| ---------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------- |
+| `trollshell/style.css`             | Modify (lines 36-47)                                     | flatten `.hytte-bar-content` (margin / border-radius / box-shadow)   |
+| `trollshell/src/overlays/frame.rs` | Create                                                   | per-monitor OVERLAY-layer window + cairo draw fn for the frame shape |
+| `trollshell/src/overlays/mod.rs`   | Modify                                                   | `pub mod frame;`                                                     |
+| `trollshell/src/main.rs`           | Modify (run-callback's per-monitor loop, around line 85) | `overlays::frame::install(monitor);`                                 |
+| `etc/niri/frame.kdl`               | Create                                                   | `layout { struts { left 12; right 12; bottom 12 } }` snippet         |
+| `etc/niri/README.md`               | Modify                                                   | new "Frame struts" section explaining how to merge the snippet       |
 
 No new crate dependencies. cairo and `gtk4-layer-shell` are already in the dependency tree (used by the bar and existing overlays).
 
@@ -38,6 +39,7 @@ No new crate dependencies. cairo and `gtk4-layer-shell` are already in the depen
 ### Task 1: Bar restyle (CSS only, build verification)
 
 **Files:**
+
 - Modify: `trollshell/style.css:36-47`
 
 - [ ] **Step 1: Apply the CSS change**
@@ -46,16 +48,18 @@ In `trollshell/style.css`, replace the current `.hytte-bar-content` block (lines
 
 ```css
 .hytte-bar-content {
-    padding: 6px 12px;
-    margin: 5px 5px;
-    margin-bottom: 10px;
-    min-height: 32px;
-    border-radius: 12px;
-    background: linear-gradient(90deg,
-        rgba(15, 15, 35, 1) 0%,
-        rgba(25, 15, 45, 1) 50%,
-        rgba(15, 15, 35, 1) 100%);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
+  padding: 6px 12px;
+  margin: 5px 5px;
+  margin-bottom: 10px;
+  min-height: 32px;
+  border-radius: 12px;
+  background: linear-gradient(
+    90deg,
+    rgba(15, 15, 35, 1) 0%,
+    rgba(25, 15, 45, 1) 50%,
+    rgba(15, 15, 35, 1) 100%
+  );
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
 }
 ```
 
@@ -63,14 +67,16 @@ with:
 
 ```css
 .hytte-bar-content {
-    padding: 6px 12px;
-    margin: 0;
-    min-height: 32px;
-    border-radius: 0;
-    background: linear-gradient(90deg,
-        rgba(15, 15, 35, 1) 0%,
-        rgba(25, 15, 45, 1) 50%,
-        rgba(15, 15, 35, 1) 100%);
+  padding: 6px 12px;
+  margin: 0;
+  min-height: 32px;
+  border-radius: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(15, 15, 35, 1) 0%,
+    rgba(25, 15, 45, 1) 50%,
+    rgba(15, 15, 35, 1) 100%
+  );
 }
 ```
 
@@ -93,6 +99,7 @@ git commit -m "feat(bar): flatten bar — drop margin, border-radius, box-shadow
 ### Task 2: Add `frame` module skeleton with empty `install` + wire it
 
 **Files:**
+
 - Create: `trollshell/src/overlays/frame.rs`
 - Modify: `trollshell/src/overlays/mod.rs`
 - Modify: `trollshell/src/main.rs` (per-monitor overlay install loop)
@@ -190,6 +197,7 @@ git commit -m "feat(overlays): scaffold frame overlay module + install hook"
 ### Task 3: Implement layer-shell window plumbing (no drawing yet)
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/frame.rs`
 
 Stand up the OVERLAY-layer window with the right anchors, layer, exclusive-zone-off, click-through input region. Render a fully transparent `gtk::DrawingArea` so we can confirm the window mounts without affecting anything visually.
@@ -266,6 +274,7 @@ Expected: build succeeds. If `cairo::Region::create` is not in scope, the import
 
 Run: `RUST_LOG=trollshell=debug cargo run -p trollshell` from inside a niri session.
 Expected:
+
 - Bar appears as a flush full-width strip at the top (Task 1's CSS change is now visible).
 - No new visual artifacts; no panics on startup.
 - `niri msg layers` (or equivalent) shows a layer named `hytte-frame` on the OVERLAY layer with full-screen geometry.
@@ -285,6 +294,7 @@ git commit -m "feat(frame): mount overlay-layer window with click-through input 
 ### Task 4: Cairo draw — paint the dark frame with rounded cutout
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/frame.rs`
 
 This is the visual payload. Wire a `set_draw_func` on the `DrawingArea` that paints the dark gradient into the frame region (everything below `BAR_HEIGHT` minus the rounded cutout) using cairo's even-odd fill rule.
@@ -424,6 +434,7 @@ Expected: build succeeds. If a method name (e.g., `set_draw_func`, `rectangle`, 
 Run: `RUST_LOG=trollshell=debug cargo run -p trollshell` inside a niri session.
 
 Expected:
+
 - Bar is a flush strip at top (no margin, no rounded corners).
 - Below the bar, a dark gradient strip runs along the left edge (12px wide), the right edge (12px wide), and the bottom (12px tall), all in the same dark color as the bar.
 - At the four corners of the workspace area (just below the bar's L/R, and at the bottom L/R), there's visible rounded-corner shaping — the dark frame curves inward, leaving a rounded transparent cutout where the wallpaper / apps appear.
@@ -444,6 +455,7 @@ git commit -m "feat(frame): paint dark gradient with rounded cutout via cairo"
 ### Task 5: niri config snippet + README
 
 **Files:**
+
 - Create: `etc/niri/frame.kdl`
 - Modify: `etc/niri/README.md`
 

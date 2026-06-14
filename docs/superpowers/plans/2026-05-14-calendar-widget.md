@@ -26,6 +26,7 @@ No changes to `panels/calendar.rs`, `crates/hytte-services/src/calendar.rs`, `wi
 ### Task 1: Skeleton module + register
 
 **Files:**
+
 - Create: `trollshell/src/widgets/calendar.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -83,6 +84,7 @@ git commit -m "feat(widgets/calendar): module skeleton" -m "Empty sidebar calend
 ### Task 2: Pure helper `apply_event_marks` with TDD
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/calendar.rs`
 
 The drawer panel's `apply_event_marks` is private to `panels/calendar.rs`. We copy + test it here. The function is the only piece of this widget that's straightforwardly unit-testable; the rest is GTK widget plumbing covered by interactive verification.
@@ -217,6 +219,7 @@ git commit -m "feat(widgets/calendar): apply_event_marks + tests" -m "Mirrors pa
 ### Task 3: Widget tree skeleton + sidebar wiring
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/calendar.rs`
 - Modify: `trollshell/src/overlays/sidebar.rs`
 
@@ -304,6 +307,7 @@ git commit -m "feat(widgets/calendar): widget tree + sidebar wiring" -m "Builds 
 ### Task 4: Bind to `calendar::events()` + empty-state placeholder
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/calendar.rs`
 
 - [ ] **Step 4.1: Add `build_calendar_row`**
@@ -450,6 +454,7 @@ git commit -m "feat(widgets/calendar): bind to calendar::events" -m "Populate ad
 ### Task 5: Month-navigation re-mark
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/calendar.rs`
 
 The bind from Task 4 re-marks only when the events signal emits. When the user clicks `>` or `<` to navigate months, the visible month changes but the events vec doesn't — we need to re-call `apply_event_marks` on month change too. The `current_events` `Rc<RefCell<…>>` introduced in Task 4 is exactly the stash these handlers borrow from.
@@ -492,6 +497,7 @@ git commit -m "feat(widgets/calendar): re-mark on month navigation" -m "connect_
 ### Task 6: Click-day → scroll-and-flash + sidebar-open refresh
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/calendar.rs`
 
 - [ ] **Step 6.1: Add `scroll_row_into_view` and `flash_row_highlight` helpers**
@@ -608,6 +614,7 @@ git commit -m "feat(widgets/calendar): click-day scroll + open-refresh" -m "conn
 ### Task 7: CSS additions + drop `.ts-sidebar-placeholder`
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 - [ ] **Step 7.1: Remove the now-unused placeholder rule**
@@ -616,9 +623,9 @@ In `trollshell/style.css`, find this block (around line 332):
 
 ```css
 .ts-sidebar-placeholder {
-    color: alpha(currentColor, 0.5);
-    font-style: italic;
-    font-size: 13px;
+  color: alpha(currentColor, 0.5);
+  font-style: italic;
+  font-size: 13px;
 }
 ```
 
@@ -634,34 +641,34 @@ Add a new section above or below `.ts-cal-day-hit` (whichever keeps the file log
 /* ─── Calendar widget — sidebar surface ─────────────────────────── */
 
 .ts-sidebar-calendar {
-    padding-top: 4px;
+  padding-top: 4px;
 }
 
 .ts-sidebar-cal-header {
-    color: alpha(currentColor, 0.5);
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    margin: 14px 4px 6px 4px;
+  color: alpha(currentColor, 0.5);
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  margin: 14px 4px 6px 4px;
 }
 
 /* GtkCalendar on the dark sidebar gradient. Default light card styling
  * is wrong here — neutralise the background and lift the text. */
 .ts-sidebar-calendar .ts-calendar {
-    background: transparent;
-    color: white;
-    padding: 4px;
+  background: transparent;
+  color: white;
+  padding: 4px;
 }
 .ts-sidebar-calendar .ts-calendar > header {
-    color: white;
+  color: white;
 }
 .ts-sidebar-calendar .ts-calendar > grid > label {
-    color: alpha(currentColor, 0.85);
+  color: alpha(currentColor, 0.85);
 }
 .ts-sidebar-calendar .ts-calendar > grid > label.day-name {
-    color: alpha(currentColor, 0.5);
+  color: alpha(currentColor, 0.5);
 }
 .ts-sidebar-calendar .ts-calendar > grid > label.other-month {
-    color: alpha(currentColor, 0.25);
+  color: alpha(currentColor, 0.25);
 }
 
 /* adw::PreferencesGroup palette swap for the dark sidebar. The exact
@@ -669,20 +676,20 @@ Add a new section above or below `.ts-cal-day-hit` (whichever keeps the file log
  * the rendered tree differs, the rules degrade gracefully and only the
  * row colours change. */
 .ts-sidebar-cal-list {
-    margin-top: 0;
+  margin-top: 0;
 }
 .ts-sidebar-cal-list listview,
 .ts-sidebar-cal-list list.boxed-list,
 .ts-sidebar-cal-list list.boxed-list > row {
-    background: alpha(white, 0.04);
-    color: white;
-    border-radius: 8px;
+  background: alpha(white, 0.04);
+  color: white;
+  border-radius: 8px;
 }
 .ts-sidebar-cal-list .title {
-    color: white;
+  color: white;
 }
 .ts-sidebar-cal-list .subtitle {
-    color: alpha(white, 0.6);
+  color: alpha(white, 0.6);
 }
 ```
 

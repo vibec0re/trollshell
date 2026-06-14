@@ -24,9 +24,10 @@ No other files. CSS, niri config, and other crates are unchanged.
 
 ## Task 1: Extract pure helper with baseline tests (no behavior change)
 
-Refactor only. The helper `has_edge_window` is introduced with the *current* dual-axis fullscreen logic. The existing reactive closure in `bind_fullscreen_visibility` becomes a thin wrapper that calls the helper. Baseline tests cover the existing behavior so Task 2 can change the predicate with confidence.
+Refactor only. The helper `has_edge_window` is introduced with the _current_ dual-axis fullscreen logic. The existing reactive closure in `bind_fullscreen_visibility` becomes a thin wrapper that calls the helper. Baseline tests cover the existing behavior so Task 2 can change the predicate with confidence.
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/frame.rs:92-118` (replace closure body) and add a `#[cfg(test)] mod tests` block (extending the existing one at line 213).
 
 - [ ] **Step 1: Add baseline tests against a not-yet-existing helper**
@@ -229,6 +230,7 @@ detection."
 Now change the predicate to width-only, drop the now-redundant `mon_h` parameter, and rename the constant + binding function to reflect that the trigger is "any edge-spanning window" (covers fullscreen, maximize-to-edges, and edge-stretched floating).
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/frame.rs` — predicate body, signature changes, renames, doc-comment rewrite, two more tests.
 
 - [ ] **Step 1: Write the failing test for maximize-to-edges**
@@ -465,7 +467,7 @@ constant + binding function to *EDGE* for accuracy."
 
 ## Self-review notes (for the implementer)
 
-- The plan introduces `has_edge_window` in Task 1 with the *current* dual-axis logic so the refactor is behavior-preserving. Task 2 then changes the predicate, drops one parameter, and renames everything. Splitting it this way keeps each commit small and reviewable.
+- The plan introduces `has_edge_window` in Task 1 with the _current_ dual-axis logic so the refactor is behavior-preserving. Task 2 then changes the predicate, drops one parameter, and renames everything. Splitting it this way keeps each commit small and reviewable.
 - `niri_ipc::{Window, Workspace}` are re-exported via `hytte::services::niri` (`crates/hytte-services/src/niri.rs:30`). The plan imports them through that re-export to match the rest of the codebase.
 - `niri_ipc::WindowLayout` is needed in tests only for fixture construction; import it directly from `niri_ipc` inside `mod tests`.
 - `mk_window`/`mk_workspace` use `is_focused: false` and `pos_in_scrolling_layout: Some((1, 1))` because the predicate doesn't read those fields — any valid value works. Keep the builders minimal so that future additions to `Window`/`Workspace` only break compilation in one place.

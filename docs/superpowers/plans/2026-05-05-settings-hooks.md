@@ -25,15 +25,16 @@
 
 The tests mutate `$HOME` (cargo runs tests multi-threaded by default), so all tests acquire a process-wide `Mutex<()>` before touching env. Each test also uses a unique tempdir keyed by `(pid, atomic counter)` so leftover state from a prior run never collides.
 
-Tracing assertions use a per-test `tracing_subscriber::fmt` layer composed with a custom `Layer` that pushes events into a `Vec<CapturedEvent>`. Setting it as the *thread* default (`with_default`) keeps test isolation simple; combined with the `$HOME` mutex, only one test runs at a time anyway.
+Tracing assertions use a per-test `tracing_subscriber::fmt` layer composed with a custom `Layer` that pushes events into a `Vec<CapturedEvent>`. Setting it as the _thread_ default (`with_default`) keeps test isolation simple; combined with the `$HOME` mutex, only one test runs at a time anyway.
 
-The runtime: tests are `#[tokio::test(flavor = "current_thread", start_paused = false)]`. The production code uses `hytte_reactive::runtime::handle().spawn(...)`, but in tests we don't have that runtime initialized — the production fn must therefore detect the absence and fall back to spawning on the *current* tokio runtime when one is available. Implementation detail: use `tokio::runtime::Handle::try_current()` first; if `Err`, try `hytte_reactive::runtime::handle()`; if neither is available, log a warn and return.
+The runtime: tests are `#[tokio::test(flavor = "current_thread", start_paused = false)]`. The production code uses `hytte_reactive::runtime::handle().spawn(...)`, but in tests we don't have that runtime initialized — the production fn must therefore detect the absence and fall back to spawning on the _current_ tokio runtime when one is available. Implementation detail: use `tokio::runtime::Handle::try_current()` first; if `Err`, try `hytte_reactive::runtime::handle()`; if neither is available, log a warn and return.
 
 ---
 
 ## Task 1: Scaffold the module + dev-deps + test harness
 
 **Files:**
+
 - Create: `crates/hytte-services/src/hooks.rs`
 - Modify: `crates/hytte-services/src/lib.rs` (add `pub mod hooks;` alphabetically — between `dnd` and `logind`)
 - Modify: `crates/hytte-services/Cargo.toml` (`[dev-dependencies]`)
@@ -230,6 +231,7 @@ git commit -m "feat(hooks): scaffold module + test harness"
 Behavior: when `$HOME/.config/trollshell/hooks/<event>` does not exist, `run` logs at `DEBUG` and emits no `WARN`.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -337,6 +339,7 @@ git commit -m "feat(hooks): debug-log absent script, warn on missing HOME"
 Behavior: an executable script that exits 0 is spawned; stdout is captured and logged at `DEBUG`; an `INFO` event marks success.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -479,6 +482,7 @@ git commit -m "feat(hooks): spawn script, log success with captured output"
 ## Task 4: Non-zero exit → WARN with status + stdout + stderr
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -564,6 +568,7 @@ git commit -m "feat(hooks): warn on non-zero exit with status + outputs"
 ## Task 5: Non-executable file → WARN, never spawn
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -632,6 +637,7 @@ git commit -m "feat(hooks): refuse non-executable scripts with WARN"
 ## Task 6: Timeout → kill child, WARN
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 This task lowers `HOOK_TIMEOUT` to a faster value gated by `cfg(test)` so the test doesn't take 10s. The production const stays at 10s.
@@ -687,7 +693,7 @@ Append to `mod tests`:
 Run: `cargo test -p hytte-services hooks::tests::timeout_kills_child_and_warns -- --nocapture`
 Expected: FAIL — currently the timeout arm is a no-op and `child` keeps being awaited until it exits or the test itself times out.
 
-Note: because `tokio::time::timeout` *cancels* its inner future (which drops the `Child` and kills it on Linux via `kill_on_drop` if set), we need a) `kill_on_drop(true)` on the Command, b) explicit logging in the timeout arm.
+Note: because `tokio::time::timeout` _cancels_ its inner future (which drops the `Child` and kills it on Linux via `kill_on_drop` if set), we need a) `kill_on_drop(true)` on the Command, b) explicit logging in the timeout arm.
 
 - [ ] **Step 4: Implement kill-on-drop + timeout WARN**
 
@@ -743,6 +749,7 @@ git commit -m "feat(hooks): enforce 10s timeout, kill child on drop"
 Behavior: caller-supplied env (and `TROLLSHELL_EVENT`) reach the script.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/hooks.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -798,6 +805,7 @@ git commit -m "test(hooks): assert env vars reach the script"
 ## Task 8: Wire `theme::set` to fire `theme-changed`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/theme.rs`
 
 - [ ] **Step 1: Read the current `theme::set`**

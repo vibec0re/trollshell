@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita via gtk4-rs / cairo (already a transitive dep), `futures-signals`, `zbus`. No new top-level deps.
 
 **Conventions used in every task:**
+
 - TDD where unit-testable (sparkline ring buffer, swap parser, systemd parser).
 - Commits use existing project prefixes: `feat(ui):`, `feat(sensors):`, `feat(systemd):`, `feat(de):`, `style:`, `refactor(de):`.
 - Co-author trailer on every commit:
@@ -21,10 +22,12 @@
 ## File Structure
 
 **Created:**
+
 - `crates/hytte-ui/src/sparkline.rs` — new `Sparkline` widget primitive.
 - `crates/hytte-services/src/systemd.rs` — new service module.
 
 **Modified:**
+
 - `crates/hytte-ui/src/lib.rs` — re-export `Sparkline`.
 - `crates/hytte-ui/Cargo.toml` — verify cairo accessibility (already transitive; add `cairo-rs` only if needed).
 - `crates/hytte-services/src/sensors.rs` — extend `Memory`, add `process_count()` signal + reader.
@@ -39,6 +42,7 @@
 ## Task 1: sensors `Memory` swap fields + parser test
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs`
 
 **Background:** `Memory` currently has `{ total, free, available, used }`. Add `swap_used` + `swap_total` parsed from `SwapTotal` and `SwapFree` lines in the existing `/proc/meminfo` reader. Backward-compat: `Default` initializes to 0, existing consumers ignore the new fields.
@@ -186,6 +190,7 @@ EOF
 ## Task 2: sensors `process_count()` signal
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs`
 
 **Background:** Counts entries in `/proc/<num>/` once per existing 1Hz tick. Storage on `SensorsHandles`; pollster piggybacks on the existing listen loop.
@@ -279,6 +284,7 @@ EOF
 ## Task 3: `systemd` service module
 
 **Files:**
+
 - Create: `crates/hytte-services/src/systemd.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 - Modify: `trollshell/src/main.rs`
@@ -289,7 +295,7 @@ EOF
 
 Create `crates/hytte-services/src/systemd.rs`:
 
-```rust
+````rust
 //! systemd service — surfaces the current set of failed units via
 //! `org.freedesktop.systemd1.Manager`. Signal-driven: subscribes to
 //! `JobRemoved` and re-fetches `ListUnitsFiltered(["failed"])` on
@@ -504,7 +510,7 @@ mod tests {
         assert!(out.is_empty());
     }
 }
-```
+````
 
 - [ ] **Step 2: Re-export from `crates/hytte-services/src/lib.rs`**
 
@@ -559,6 +565,7 @@ EOF
 ## Task 4: `hytte-ui::Sparkline` widget
 
 **Files:**
+
 - Create: `crates/hytte-ui/src/sparkline.rs`
 - Modify: `crates/hytte-ui/src/lib.rs`
 
@@ -568,7 +575,7 @@ EOF
 
 Create `crates/hytte-ui/src/sparkline.rs`:
 
-```rust
+````rust
 //! Minimal time-series visualization. Owns a fixed-capacity ring
 //! buffer of `f64` samples and renders them as a single-stroke line
 //! + 15%-alpha fill via cairo. Color resolves through the widget's
@@ -777,7 +784,7 @@ mod tests {
         assert_eq!(s.domain_max.get(), None);
     }
 }
-```
+````
 
 - [ ] **Step 2: Re-export from `lib.rs`**
 
@@ -826,6 +833,7 @@ EOF
 ## Task 5: `page_stats` skeleton — three-group vertical stack
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Drop `page_grid()` + `panel("CPU"|"Memory"|"GPU"|"Disk")`. Replace with three vertical `AdwPreferencesGroup`s (Live / History / Services) inside `finish_page`. Group bodies are stubs in this task — populated in Tasks 6/7/8.
@@ -896,6 +904,7 @@ EOF
 ## Task 6: Stats Live group — rows + per-core expander
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Populate `build_stats_live_group_v2` with the rows specified in spec §4 Live group. Per-core mini-bars (existing logic) move into an `AdwExpanderRow`. Memory and Swap rows get progress-bar suffixes. Rows for GPU and Swap render only when the underlying signal indicates presence.
@@ -1240,6 +1249,7 @@ EOF
 ## Task 7: Stats History group — sparkline rows
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Four custom `gtk::Box` rows: `[name | Sparkline | value]`. CPU% / Memory% / Network throughput / GPU temp (conditional). Each pushes samples on every emission of its source signal; ring buffer resets on page rebuild (drawer reopens trigger a fresh `page_stats()` call).
@@ -1428,6 +1438,7 @@ EOF
 ## Task 8: Stats Services group — failed-unit expander
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Single `AdwExpanderRow` listing `systemd::failed_units()`. Empty state: a single non-activatable "All units running" placeholder. Non-empty: one ActionRow per unit with `.ts-pill-error` suffix.
@@ -1553,6 +1564,7 @@ EOF
 ## Task 9: Stats CSS — replace per-core gradient + new rules
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 **Background:** Drop the hex-gradient background (`linear-gradient(180deg, #ff006e, #8338ec 60%, #3a86ff)`) from the per-core bar. Replace with `@accent_color`. Append new rules for `.ts-stat-progress`, `.ts-history-row`, `.ts-stat-name`, `.ts-stat-value`, `.ts-sparkline`, `.ts-pill-error`.
@@ -1569,19 +1581,19 @@ Find the existing `.ts-core-bar > trough` and `.ts-core-bar > trough > progress`
 
 ```css
 .ts-core-bar > trough {
-    min-width: 8px;
-    min-height: 56px;
-    border-radius: 3px;
-    background: alpha(@accent_color, 0.10);
-    border: none;
-    padding: 0;
+  min-width: 8px;
+  min-height: 56px;
+  border-radius: 3px;
+  background: alpha(@accent_color, 0.1);
+  border: none;
+  padding: 0;
 }
 
 .ts-core-bar > trough > progress {
-    min-width: 8px;
-    border-radius: 3px;
-    background: @accent_color;
-    border: none;
+  min-width: 8px;
+  border-radius: 3px;
+  background: @accent_color;
+  border: none;
 }
 ```
 
@@ -1593,50 +1605,50 @@ Then append at the bottom of the file:
 /* ── Stats: live progress (memory + swap suffix bars) ──────────────────── */
 
 .ts-stat-progress {
-    min-height: 6px;
-    min-width: 100px;
+  min-height: 6px;
+  min-width: 100px;
 }
 
 .ts-stat-progress > trough {
-    min-height: 6px;
-    background: alpha(@accent_color, 0.15);
-    border-radius: 9999px;
+  min-height: 6px;
+  background: alpha(@accent_color, 0.15);
+  border-radius: 9999px;
 }
 
 .ts-stat-progress > trough > progress {
-    background: @accent_color;
-    border-radius: 9999px;
+  background: @accent_color;
+  border-radius: 9999px;
 }
 
 /* ── Stats: history sparkline rows ─────────────────────────────────────── */
 
 .ts-history-row {
-    padding: 8px 12px;
+  padding: 8px 12px;
 }
 
 .ts-stat-name {
-    font-weight: 600;
+  font-weight: 600;
 }
 
 .ts-stat-value {
-    opacity: 0.7;
-    font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
 }
 
 .ts-sparkline {
-    color: @accent_color;
-    min-height: 24px;
+  color: @accent_color;
+  min-height: 24px;
 }
 
 /* ── Stats: failed-unit pill ───────────────────────────────────────────── */
 
 .ts-pill-error {
-    padding: 2px 10px;
-    border-radius: 9999px;
-    font-size: 0.8em;
-    font-weight: 600;
-    background: alpha(@error_color, 0.20);
-    color: @error_color;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-size: 0.8em;
+  font-weight: 600;
+  background: alpha(@error_color, 0.2);
+  color: @error_color;
 }
 ```
 
@@ -1681,6 +1693,7 @@ EOF
 ## Self-review notes
 
 **Spec coverage:**
+
 - Spec §1 Sparkline → Task 4.
 - Spec §2 sensors swap → Task 1.
 - Spec §2 sensors process_count → Task 2.
@@ -1691,6 +1704,7 @@ EOF
 - Spec §5 stylesheet → Task 9.
 
 **Final verification:**
+
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `cargo test --workspace` green (sparkline tests `#[ignore]`'d for headless; swap parser + systemd parse_units tests run unconditionally).
 - Manual smoke test (deferred) covers the success criteria.

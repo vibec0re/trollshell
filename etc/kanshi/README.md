@@ -117,7 +117,7 @@ niri's `~/.config/niri/config` also has a `[output]` section that can pin
 modes, scales, and positions. **Don't try to drive the same connector
 from both** — pick one. The recommended split:
 
-- **kanshi** owns connector-set-aware *profiles* (laptop alone, docked,
+- **kanshi** owns connector-set-aware _profiles_ (laptop alone, docked,
   multi-monitor desk, …).
 - **niri** owns nothing output-related when kanshi is enabled. Comment out
   `[output …]` blocks in `~/.config/niri/config` to be safe; kanshi's

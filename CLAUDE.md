@@ -14,7 +14,8 @@ A Rust workspace with two layers:
 ## Build / run / test
 
 **You must work inside the Nix devShell.** `.envrc` is `use flake` (direnv); if direnv isn't active, run `nix develop` first. The devShell sets env that the build and runtime both require:
-- `LD_LIBRARY_PATH`/`LIBCLANG_PATH` so the two bindgen consumers (`hytte-pam` via pam-sys, and pipewire-sys/libspa-sys) can load libclang. Outside the shell, the build panics with *"a libclang shared library is not loaded on this thread."*
+
+- `LD_LIBRARY_PATH`/`LIBCLANG_PATH` so the two bindgen consumers (`hytte-pam` via pam-sys, and pipewire-sys/libspa-sys) can load libclang. Outside the shell, the build panics with _"a libclang shared library is not loaded on this thread."_
 - `XDG_DATA_DIRS` + `GSETTINGS_SCHEMA_DIR` so GTK finds Adwaita symbolic icons and GSettings schemas. Outside the shell, most bar icons render as `image-missing`.
 
 ```sh
@@ -40,6 +41,7 @@ cargo test -p hytte-services clock            # tests matching a name
 ### Lint — strict, treat as the gate
 
 The workspace lint config (`Cargo.toml`) is deliberately severe; a violation fails `cargo check`, not just clippy:
+
 - `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal`** overrides this (it's pure FFI; unsafety is confined to safe wrappers in its `lib.rs`).
 - clippy `all` **and** `pedantic` at `deny`. Code must be pedantic-clean.
 - `disallowed_methods`: `zbus::Connection::session`/`::system` are **banned** (see `clippy.toml`). All D-Bus access goes through the `hytte-bus` primitives, never a raw zbus connection.
@@ -49,7 +51,7 @@ cargo clippy --workspace --all-targets        # must be clean
 cargo fmt --all
 ```
 
-Edition 2024, MSRV 1.85, toolchain pinned to stable (`rust-toolchain.toml`).
+Edition 2024, MSRV 1.85. The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
 
 ## Architecture — the reactive core
 
@@ -111,6 +113,7 @@ All D-Bus goes through here, never raw zbus. Connections are pooled singletons (
 `main.rs` builds the `App`, registers ~28 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
 
 Source layout (each module has a consistent shape — match it when adding):
+
 - `widgets/` — bar chips. Each `pub fn widget(monitor) -> gtk::Widget`, binds to service signals, and on click calls `modal::toggle(monitor, Page::…, &btn)`.
 - `panels/` — drawer pages mounted into `modal.rs`'s per-monitor `gtk::Stack`. Each `pub fn panel_<name>() -> gtk::Widget`.
 - `overlays/` — per-monitor layer-shell overlays (lock_screen, osd, notifications, frame, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
@@ -126,10 +129,10 @@ Source layout (each module has a consistent shape — match it when adding):
 
 ## Deployment & session integration
 
-`etc/` holds the full Niri-session config the shell expects (systemd user units incl. `trollshell.service` and `niri-session.target`, niri keybinds, swayidle idle/lock pipeline, kanshi display profiles, cliphist, the PAM service file) — see `etc/README.md`. The flake exposes `nixosModules.default` (`programs.trollshell.enable`) which, beyond installing the package, declares the `trollshell` PAM service, a system-bus policy permitting the three agent names, and enables UPower + power-profiles-daemon (the battery/power chips stay hidden without them).
+`etc/` holds the full Niri-session config the shell expects (systemd user units incl. `trollshell.service` and `niri-session.target`, niri keybinds, swayidle idle/lock pipeline, kanshi display profiles, cliphist, the PAM service file) — see `etc/README.md`. The flake exposes `nixosModules.default` (`programs.trollshell.enable`) which, beyond installing the package, declares the `trollshell` PAM service. Everything else it pulls in — the system-bus policy permitting the two agent names (`bluez`/`iwd`), the polkit-gnome user service, UPower, power-profiles-daemon, and geoclue2 — sits behind `programs.trollshell.enableRecommendedServices` (default `true`); each is `mkDefault` so an explicit `enable = false;` still wins. With the switch off, the chips that back onto a missing daemon hide themselves (battery on `BatteryState::Unknown`, the power-profile group on empty `available`, weather falls back to `TROLLSHELL_WEATHER_CITY`) and the bluez/iwd agents park inert on `AccessDenied`. A `homeModules.default` (home-manager) runs the shell as a user service and shares the same option base (`nix/module-common.nix`).
 
 ## Known gotchas
 
-- **Niri fullscreen detection:** `WindowLayoutsChanged` is the *only* niri-ipc event that fires on a fullscreen toggle (`WindowsChanged`/`WindowOpenedOrChanged` do not). The frame overlay relies on this.
+- **Niri fullscreen detection:** `WindowLayoutsChanged` is the _only_ niri-ipc event that fires on a fullscreen toggle (`WindowsChanged`/`WindowOpenedOrChanged` do not). The frame overlay relies on this.
 - **Icons render as `image-missing`** if you run outside the devShell, or if the icon theme isn't forced — `main.rs` calls `set_gtk_icon_theme_name("Adwaita")` to work around GSettings schemas not being visible under `cargo run`.
 - **bindgen 0.69 vs 0.72:** `hytte-pam` force-enables bindgen 0.69's `runtime` feature in its build-deps because the pipewire crates pull bindgen 0.72 and flip clang-sys to runtime linking workspace-wide; the two majors don't share features. Don't remove that otherwise-unused build-dep.

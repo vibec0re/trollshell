@@ -15,11 +15,11 @@ This module is the first concrete sidebar payload; future panels (calendar, weat
 
 ### Three pieces
 
-| piece | file | role |
-|---|---|---|
-| departures service | `crates/hytte-services/src/departures.rs` *(new)* | background 15-minute poll of v6.bvg.transport.rest, exposes `Mutable<DeparturesState>` and `refresh()`. |
-| departures widget | `trollshell/src/widgets/departures.rs` *(new)* | GTK vertical list of departure rows, subscribes to service signal, re-renders relative time on every clock tick. |
-| sidebar wiring | `trollshell/src/overlays/sidebar.rs` *(edit)* | replaces the placeholder `Label` with the widget; nudges `departures::refresh()` on the open false→true edge so a freshly-opened sidebar reflects current state. |
+| piece              | file                                              | role                                                                                                                                                             |
+| ------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| departures service | `crates/hytte-services/src/departures.rs` _(new)_ | background 15-minute poll of v6.bvg.transport.rest, exposes `Mutable<DeparturesState>` and `refresh()`.                                                          |
+| departures widget  | `trollshell/src/widgets/departures.rs` _(new)_    | GTK vertical list of departure rows, subscribes to service signal, re-renders relative time on every clock tick.                                                 |
+| sidebar wiring     | `trollshell/src/overlays/sidebar.rs` _(edit)_     | replaces the placeholder `Label` with the widget; nudges `departures::refresh()` on the open false→true edge so a freshly-opened sidebar reflects current state. |
 
 Service registration lives in `main.rs`, parallel to `clock::service()`.
 
@@ -111,12 +111,12 @@ fn fetch_once() -> Result<Vec<Departure>, String> {
 
 **State transition rules** (in `update_state`):
 
-| previous | fetch result | next |
-|---|---|---|
-| any | `Ok(items)` | `Ok { at: now, items }` |
-| `Ok` or `Stale (age < STALE_DROP_AFTER)` | `Err(e)` | `Stale { at: previous.at, items: previous.items, err: e }` |
-| `Stale (age ≥ STALE_DROP_AFTER)` | `Err(e)` | `Err { err: e }` |
-| `Loading` or `Err` | `Err(e)` | `Err { err: e }` |
+| previous                                 | fetch result | next                                                       |
+| ---------------------------------------- | ------------ | ---------------------------------------------------------- |
+| any                                      | `Ok(items)`  | `Ok { at: now, items }`                                    |
+| `Ok` or `Stale (age < STALE_DROP_AFTER)` | `Err(e)`     | `Stale { at: previous.at, items: previous.items, err: e }` |
+| `Stale (age ≥ STALE_DROP_AFTER)`         | `Err(e)`     | `Err { err: e }`                                           |
+| `Loading` or `Err`                       | `Err(e)`     | `Err { err: e }`                                           |
 
 **Server-side filter + client-side guard:** the URL excludes every non-S-Bahn product (`suburban=true` plus all others false). As a defensive layer, `into_departure` also discards rows whose `line.product` is not `"suburban"` — protects against transport.rest interpreting unknown query params loosely.
 
@@ -129,14 +129,14 @@ fn fetch_once() -> Result<Vec<Departure>, String> {
   "departures": [
     {
       "tripId": "1|123|0|80|14052026",
-      "when":        "2026-05-14T16:43:00+02:00",   // actual
+      "when": "2026-05-14T16:43:00+02:00", // actual
       "plannedWhen": "2026-05-14T16:42:00+02:00",
-      "delay": 60,                                   // seconds, or null
+      "delay": 60, // seconds, or null
       "cancelled": false,
       "direction": "Spandau",
-      "line": { "name": "S9", "product": "suburban" }
-    }
-  ]
+      "line": { "name": "S9", "product": "suburban" },
+    },
+  ],
 }
 ```
 
@@ -213,11 +213,11 @@ bind(clock::now(), &time_lbl, move |lbl, now| {
 
 `relative_label`:
 
-| seconds until departure | label |
-|---|---|
-| `<= 60` (incl. negative) | `"now"` |
-| `60 < s ≤ 90` | `"1 min"` |
-| `s > 90` | `"{(s + 30) / 60} min"` (rounded to nearest min) |
+| seconds until departure  | label                                            |
+| ------------------------ | ------------------------------------------------ |
+| `<= 60` (incl. negative) | `"now"`                                          |
+| `60 < s ≤ 90`            | `"1 min"`                                        |
+| `s > 90`                 | `"{(s + 30) / 60} min"` (rounded to nearest min) |
 
 `loading_row` / `error_row` / `empty_row` / `stale_footer` are one-line `gtk::Label` builders with the corresponding CSS class. Names of those classes are defined under "CSS" below.
 
@@ -226,6 +226,7 @@ bind(clock::now(), &time_lbl, move |lbl, now| {
 Two changes, both small:
 
 1. Replace the placeholder card content. In `install`, swap:
+
    ```rust
    let placeholder = gtk::Label::new(Some("sidebar"));
    placeholder.add_css_class("ts-sidebar-placeholder");
@@ -234,7 +235,9 @@ Two changes, both small:
    placeholder.set_vexpand(true);
    card.append(&placeholder);
    ```
+
    for:
+
    ```rust
    card.append(&crate::widgets::departures::widget());
    ```
@@ -273,49 +276,75 @@ New rules (insert in the existing dark-mode section, adjacent to the `.ts-sideba
 
 ```css
 .ts-departures {
-    padding: 12px;
+  padding: 12px;
 }
 
 .ts-departure-row {
-    padding: 6px 4px;
+  padding: 6px 4px;
 }
 
 .ts-line-badge {
-    min-width: 36px;
-    padding: 2px 6px;
-    border-radius: 6px;
-    font-weight: 700;
-    color: white;
-    margin-right: 8px;
+  min-width: 36px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-weight: 700;
+  color: white;
+  margin-right: 8px;
 }
-.ts-line-S8  { background: #5DAB46; }   /* dark green */
-.ts-line-S9  { background: #882D7A; }   /* violet */
-.ts-line-S41 { background: #AA5D3D; }
-.ts-line-S42 { background: #C36F33; }
-.ts-line-S46 { background: #C4923D; }   /* chestnut */
-.ts-line-S47 { background: #C4923D; }
-.ts-line-S85 { background: #A7C539; }   /* yellow-green */
+.ts-line-S8 {
+  background: #5dab46;
+} /* dark green */
+.ts-line-S9 {
+  background: #882d7a;
+} /* violet */
+.ts-line-S41 {
+  background: #aa5d3d;
+}
+.ts-line-S42 {
+  background: #c36f33;
+}
+.ts-line-S46 {
+  background: #c4923d;
+} /* chestnut */
+.ts-line-S47 {
+  background: #c4923d;
+}
+.ts-line-S85 {
+  background: #a7c539;
+} /* yellow-green */
 
-.ts-departure-direction { color: alpha(white, 0.95); }
+.ts-departure-direction {
+  color: alpha(white, 0.95);
+}
 
-.ts-departure-time      { color: alpha(white, 0.85); font-variant-numeric: tabular-nums; }
-.ts-departure-delay     { color: #ff6b6b; margin-left: 6px; font-variant-numeric: tabular-nums; }
+.ts-departure-time {
+  color: alpha(white, 0.85);
+  font-variant-numeric: tabular-nums;
+}
+.ts-departure-delay {
+  color: #ff6b6b;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
 
 .ts-departure-row.ts-cancelled .ts-departure-time,
 .ts-departure-row.ts-cancelled .ts-departure-direction {
-    text-decoration: line-through;
-    color: alpha(#ff6b6b, 0.7);
+  text-decoration: line-through;
+  color: alpha(#ff6b6b, 0.7);
 }
 
 .ts-departures-loading,
 .ts-departures-empty,
 .ts-departures-stale-footer {
-    color: alpha(white, 0.45);
-    font-style: italic;
-    padding: 12px;
+  color: alpha(white, 0.45);
+  font-style: italic;
+  padding: 12px;
 }
 
-.ts-departures-error { color: #ff6b6b; padding: 12px; }
+.ts-departures-error {
+  color: #ff6b6b;
+  padding: 12px;
+}
 ```
 
 Light-mode override mirrors the existing `.ts-sidebar` light rule: same per-line colors (S-Bahn line colors are theme-independent), body text flips to dark, `alpha(white, ...)` becomes `alpha(black, ...)`.
@@ -341,30 +370,30 @@ No new workspace deps. `hytte-services` already has `ureq`, `serde`, `serde_json
 
 `#[cfg(test)] mod tests` in `hytte-services/src/departures.rs`:
 
-| test | scenario | expected |
-|---|---|---|
-| `parse_normal_response` | feed the fixture JSON into the parser | 8 `Departure`s with correct line, direction, planned, actual, delay |
-| `parse_with_delay_and_cancellation` | fixture-derived sample: one `cancelled: true`, one `delay: 300` | `cancelled` flag set; `delay_minutes == 5` on that row |
-| `parse_empty_array` | `{"departures": []}` | `Ok(items: vec![])`, not `Err` |
-| `parse_malformed_json` | truncated body | parser returns `Err` |
-| `parse_filters_non_suburban` | injected row with `line.product == "bus"` | row dropped (defensive client-side filter) |
-| `parse_hides_already_departed` | row with `when` 2 minutes in the past | row dropped |
-| `state_transitions_ok_to_stale_on_error` | seed `Ok`, simulate fetch error | new state is `Stale` keeping old `items` |
-| `state_transitions_stale_to_err_after_threshold` | seed `Stale` with `at` older than `STALE_DROP_AFTER`, simulate another error | result is `Err` |
-| `state_transitions_err_to_ok_on_success` | seed `Err`, simulate ok fetch | new state is `Ok` |
+| test                                             | scenario                                                                     | expected                                                            |
+| ------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `parse_normal_response`                          | feed the fixture JSON into the parser                                        | 8 `Departure`s with correct line, direction, planned, actual, delay |
+| `parse_with_delay_and_cancellation`              | fixture-derived sample: one `cancelled: true`, one `delay: 300`              | `cancelled` flag set; `delay_minutes == 5` on that row              |
+| `parse_empty_array`                              | `{"departures": []}`                                                         | `Ok(items: vec![])`, not `Err`                                      |
+| `parse_malformed_json`                           | truncated body                                                               | parser returns `Err`                                                |
+| `parse_filters_non_suburban`                     | injected row with `line.product == "bus"`                                    | row dropped (defensive client-side filter)                          |
+| `parse_hides_already_departed`                   | row with `when` 2 minutes in the past                                        | row dropped                                                         |
+| `state_transitions_ok_to_stale_on_error`         | seed `Ok`, simulate fetch error                                              | new state is `Stale` keeping old `items`                            |
+| `state_transitions_stale_to_err_after_threshold` | seed `Stale` with `at` older than `STALE_DROP_AFTER`, simulate another error | result is `Err`                                                     |
+| `state_transitions_err_to_ok_on_success`         | seed `Err`, simulate ok fetch                                                | new state is `Ok`                                                   |
 
 State-transition tests call a pure `next_state(prev, fetch_result, now)` helper — keeps the test loop synchronous and trivially deterministic.
 
 `#[cfg(test)] mod tests` in `trollshell/src/widgets/departures.rs`:
 
-| test | scenario | expected |
-|---|---|---|
-| `relative_label_now` | departure 30 s in the future | `"now"` |
-| `relative_label_one_minute` | departure 75 s in the future | `"1 min"` |
-| `relative_label_rounds` | departure 449 s in the future | `"7 min"`; 451 s → `"8 min"` |
-| `relative_label_negative` | departure 30 s in the past | `"now"` |
-| `format_time_with_delay` | delay = 2, actual = some `DateTime` | composed string contains `" · HH:MM"` and the row's separate delay label reads `"+2"` |
-| `format_time_without_delay` | delay = 0 | no `+N` label visible (helper returns `None`) |
+| test                        | scenario                            | expected                                                                              |
+| --------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------- |
+| `relative_label_now`        | departure 30 s in the future        | `"now"`                                                                               |
+| `relative_label_one_minute` | departure 75 s in the future        | `"1 min"`                                                                             |
+| `relative_label_rounds`     | departure 449 s in the future       | `"7 min"`; 451 s → `"8 min"`                                                          |
+| `relative_label_negative`   | departure 30 s in the past          | `"now"`                                                                               |
+| `format_time_with_delay`    | delay = 2, actual = some `DateTime` | composed string contains `" · HH:MM"` and the row's separate delay label reads `"+2"` |
+| `format_time_without_delay` | delay = 0                           | no `+N` label visible (helper returns `None`)                                         |
 
 These are pure-function tests on the formatting helpers — no GTK widget instantiation needed.
 

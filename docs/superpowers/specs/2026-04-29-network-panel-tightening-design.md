@@ -187,10 +187,10 @@ When navigating to `Page::Connections`, the modal stack's `switch_active` retain
 
 ## File touch summary
 
-| File                                   | Change |
-| -------------------------------------- | ------ |
-| `trollshell/src/modal.rs`              | `Page::Connections` variant + `stack_name` arm + `add_named` mount |
-| `trollshell/src/widgets/pages.rs`      | New `pub fn page_connections()`; remove inline active-connections block from `page_network` and replace with drill-down row; refactor `build_iface_traffic_row` to use `build_history_row` |
+| File                              | Change                                                                                                                                                                                     |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `trollshell/src/modal.rs`         | `Page::Connections` variant + `stack_name` arm + `add_named` mount                                                                                                                         |
+| `trollshell/src/widgets/pages.rs` | New `pub fn page_connections()`; remove inline active-connections block from `page_network` and replace with drill-down row; refactor `build_iface_traffic_row` to use `build_history_row` |
 
 Net: roughly +60/−60 LOC inside one file (the connections block moves) plus ~20 LOC of new drill-down + page wiring. Modal.rs gets 3 new lines.
 

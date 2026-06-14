@@ -27,6 +27,18 @@ nix build                                     # build the packaged binary (.#tro
 
 `trollshell` is a real Wayland shell — running it meaningfully requires being **inside a Niri session**. Layer-shell surfaces, the lock screen, and most services need live system daemons.
 
+### Faster inner loop (devShell only)
+
+Link time dominates the tail of every incremental build (heavy native deps). The devShell wires the **mold** linker by default via `RUSTFLAGS = "-C link-arg=-fuse-ld=mold"` (see `nix/devshell.nix`) — nothing to do, `cargo build`/`clippy`/`test` just link faster. This is deliberately **devShell-only**: the packaged crane build (`nix/package.nix`) has no mold in its sandbox, so a repo-level `.cargo/config.toml` linker setting would break `nix build .#trollshell`.
+
+**sccache** (also in the devShell) caches rustc artifacts across worktrees/branches — handy for the review workflow. It's opt-in to keep the default `cargo` path unsurprising:
+
+```sh
+export RUSTC_WRAPPER=sccache        # then build as usual; `sccache --show-stats` to inspect
+```
+
+For quick feedback while iterating, `cargo clippy -p <crate> --lib` is much faster than the full `cargo clippy --workspace --all-targets` gate.
+
 ### Tests
 
 ```sh

@@ -17,6 +17,16 @@ pkgs.mkShell {
     clippy
     rustfmt
     rust-analyzer
+
+    # Dev inner-loop accelerators (devShell ONLY — see RUSTFLAGS below).
+    # mold: a much faster linker; link time dominates the tail of every
+    # incremental build given the heavy native deps (gtk4, libadwaita,
+    # pipewire/libspa bindgen, evolution-data-server).
+    mold
+    # sccache: caches rustc artifacts across worktrees/branches, which the
+    # review workflow spins up frequently. Opt-in (see CLAUDE.md) — not wired
+    # via RUSTC_WRAPPER here to keep the default `cargo` path unsurprising.
+    sccache
   ];
 
   # Fixed (non-prepending) values live as env attrs; only the two vars that
@@ -29,6 +39,16 @@ pkgs.mkShell {
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
     RUST_BACKTRACE = "1";
+
+    # Use mold as the linker for dev builds. gcc (the stdenv cc) accepts
+    # -fuse-ld=mold natively from gcc 12+ and resolves `mold` off PATH, which
+    # the devShell `packages` above provides — so no clang or extra wiring is
+    # needed. This MUST live in the devShell only: the packaged crane build
+    # (nix/package.nix) runs in a sandbox without mold in its buildInputs, so a
+    # repo-level .cargo/config.toml linker setting would make `nix build
+    # .#trollshell` fail to link. Keeping it in the shell env leaves the
+    # package build untouched.
+    RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
 
     # Nix packages GSettings schemas under share/gsettings-schemas/<pkg>/...,
     # but GLib only finds them at share/glib-2.0/schemas/. wrapGAppsHook

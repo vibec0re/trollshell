@@ -61,7 +61,18 @@ in
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
-        home.packages = [ cfg.package ];
+        # cfg.package plus the fonts the stylesheets name (Inter + Cantarell for
+        # the bar UI, JetBrains Mono / Fira Code for the clock + workspace chips)
+        # — the NixOS module puts these in fonts.packages; here they go through
+        # the user profile, so fontconfig must be on to discover them.
+        home.packages = [
+          cfg.package
+          pkgs.inter
+          pkgs.cantarell-fonts
+          pkgs.jetbrains-mono
+          pkgs.fira-code
+        ];
+        fonts.fontconfig.enable = lib.mkDefault true;
 
         home.sessionVariables = lib.mkIf (cfg.weather.fallbackCity != null) {
           TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;

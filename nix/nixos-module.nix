@@ -49,6 +49,17 @@ in
       {
         environment.systemPackages = [ cfg.package ];
 
+        # Fonts the stylesheets name explicitly: Inter + Cantarell for the bar
+        # UI (hytte-ui/src/style.css, trollshell/style.css), JetBrains Mono /
+        # Fira Code for the clock + workspace chips. Without them fontconfig
+        # silently falls back and the bar renders in the wrong typeface.
+        fonts.packages = [
+          pkgs.inter
+          pkgs.cantarell-fonts
+          pkgs.jetbrains-mono
+          pkgs.fira-code
+        ];
+
         # Weather widget location fallback. Stays outside the recommended-
         # services switch on purpose: it's the manual alternative to geoclue,
         # so it must keep working when auto-location is turned off. weather

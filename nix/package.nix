@@ -41,9 +41,8 @@ let
     version = "0.1.0";
     inherit src;
 
-    # No strictDeps: the bindgen build scripts (pam-sys, pipewire-sys/libspa-sys)
-    # run libclang against headers from buildInputs, which is simplest when host
-    # and target deps share one include path — matching the old buildRustPackage.
+    # strictDeps stays off (crane's default): the bindgen build scripts read the
+    # pipewire headers from buildInputs, simplest with one shared include path.
 
     # Workspace has multiple crates; only build the trollshell binary.
     cargoExtraArgs = "-p trollshell";

@@ -19,9 +19,12 @@ pkgs.mkShell {
 
   # Fixed (non-prepending) values live as env attrs; only the two vars that
   # have to prepend to an existing runtime value stay in the shellHook.
+  # (BINDGEN_EXTRA_CLANG_ARGS is left to bindgenHook, inherited via the package's
+  # nativeBuildInputs — it sets a more complete value than we could here.)
   env = {
+    # Kept explicit so the shellHook's LD_LIBRARY_PATH line below sees it
+    # regardless of when bindgenHook's hook fires.
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-    BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
 
     RUST_BACKTRACE = "1";
 

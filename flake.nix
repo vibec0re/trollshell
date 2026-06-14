@@ -66,11 +66,11 @@
         }
       );
 
-      # `import … self` (not a bare path) because the module's `package`
-      # option defaults to self.packages.<system>.trollshell — built against
-      # our rust-overlay/crane pkgs. A bare-path module would default via
-      # `pkgs.callPackage ./package.nix`, which needs rust-overlay in the
-      # consumer's nixpkgs; threading `self` keeps that our problem, not theirs.
+      # `import … self` (not a bare path) because the module's `package` option
+      # defaults to self.packages.<system>.trollshell. A bare-path module would
+      # instead build via `pkgs.callPackage ./package.nix`, which needs crane
+      # (craneLib) wired into the consumer's nixpkgs; threading `self` reuses the
+      # package we already built here rather than pushing that onto consumers.
       nixosModules.default = import ./nix/nixos-module.nix self;
     };
 }

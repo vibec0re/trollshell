@@ -33,6 +33,11 @@ in
   # tool, drives that module with mkDefault values so you can still override any
   # individual setting. niri keybinds/session live in KDL and have no clean
   # home-manager path, so they stay manual — see etc/niri/.
+  options.programs.trollshell.enableSessionExtras = lib.mkEnableOption ''
+    all of the session-integration extras below (fuzzel, swayidle, swaybg,
+    cliphist, portals) as a group. Each is set with mkDefault, so you can still
+    flip an individual one off (e.g. programs.trollshell.swaybg.enable = false)'';
+
   options.programs.trollshell.fuzzel.enable = lib.mkEnableOption ''
     the bundled fuzzel launcher config via home-manager's programs.fuzzel.
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
@@ -79,6 +84,18 @@ in
           Install.WantedBy = [ cfg.systemd.target ];
         };
       }
+
+      # Group switch: turn the whole extras bundle on, each via mkDefault so an
+      # explicit per-feature `enable = false` still wins.
+      (lib.mkIf cfg.enableSessionExtras {
+        programs.trollshell = {
+          fuzzel.enable = lib.mkDefault true;
+          swayidle.enable = lib.mkDefault true;
+          swaybg.enable = lib.mkDefault true;
+          cliphist.enable = lib.mkDefault true;
+          portals.enable = lib.mkDefault true;
+        };
+      })
 
       # fuzzel — config-only launcher (niri spawns it on a chord, so no unit).
       # Goes through programs.fuzzel so every key stays individually overridable.

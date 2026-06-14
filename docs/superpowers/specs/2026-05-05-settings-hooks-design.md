@@ -61,7 +61,7 @@ hooks::run(
 );
 ```
 
-Order matters: hooks run *after* the toolkit writes so a script that `gsettings get`s the current scheme sees the new value.
+Order matters: hooks run _after_ the toolkit writes so a script that `gsettings get`s the current scheme sees the new value.
 
 ### Module placement
 
@@ -69,18 +69,18 @@ Order matters: hooks run *after* the toolkit writes so a script that `gsettings 
 
 ## Failure-mode summary
 
-| Condition | Action | Log level |
-|---|---|---|
-| `$HOME` unset | return | `warn` |
-| Script absent | return silently | `debug` |
-| `metadata()` errors with non-`NotFound` | return | `warn` |
-| Path is not a regular file | return | `warn` |
-| Regular file, no exec bit | return | `warn` |
-| Spawn fails (ENOENT race, ENOMEM, …) | return | `warn` |
-| Exit 0 | success; stdout/stderr at `debug` if non-empty | `info` |
-| Exit non-zero | logged with status + captured stdout/stderr | `warn` |
-| Wall-clock > 10s | child killed, output abandoned | `warn` |
-| No tokio runtime when `run` is called | return | `warn` |
+| Condition                               | Action                                         | Log level |
+| --------------------------------------- | ---------------------------------------------- | --------- |
+| `$HOME` unset                           | return                                         | `warn`    |
+| Script absent                           | return silently                                | `debug`   |
+| `metadata()` errors with non-`NotFound` | return                                         | `warn`    |
+| Path is not a regular file              | return                                         | `warn`    |
+| Regular file, no exec bit               | return                                         | `warn`    |
+| Spawn fails (ENOENT race, ENOMEM, …)    | return                                         | `warn`    |
+| Exit 0                                  | success; stdout/stderr at `debug` if non-empty | `info`    |
+| Exit non-zero                           | logged with status + captured stdout/stderr    | `warn`    |
+| Wall-clock > 10s                        | child killed, output abandoned                 | `warn`    |
+| No tokio runtime when `run` is called   | return                                         | `warn`    |
 
 No panics. No errors propagated to caller. All tracing events carry structured fields: `event`, `path`, `status`, `stdout`, `stderr` as applicable.
 

@@ -28,23 +28,23 @@ After every migration commit: `cargo check --workspace && cargo test --workspace
 
 **Modified across all phases:**
 
-| File | Phase | What changes |
-|---|---|---|
-| `crates/hytte-bus/src/signals.rs` | 4 (prereq) | Move epoch capture to AFTER `with_conn` succeeds |
-| `crates/hytte-services/src/notifications.rs` | 4 | Migrate to `bus::{own_name, call}` |
-| `crates/hytte-services/src/wifi.rs` | 4 | Migrate to `bus::{signals, call, property}` |
-| `crates/hytte-services/src/polkit.rs` | 4 | Migrate to `bus::{own_name, signals, call}` |
-| `crates/hytte-services/src/screensaver.rs` | 4 | Migrate to `bus::{own_name, signals, call}` |
-| `crates/hytte-services/src/power_profiles.rs` | 4 | Migrate to `bus::{property, call}` |
-| `crates/hytte-services/src/bluetooth.rs` | 5 | Migrate to `bus::{own_name, signals, call, property, proxy}` |
-| `crates/hytte-services/src/mpris.rs` | 5 | Migrate to `bus::{signals, call, proxy}` |
-| `crates/hytte-services/src/tray.rs` | 5 | Migrate to `bus::{own_name, signals, call, proxy}` |
-| `crates/hytte-services/src/networkd.rs` | 5 | Migrate to `bus::{signals, property}` |
-| `crates/hytte-services/src/upower.rs` | 5 | Migrate to `bus::{property, signals}` |
-| `crates/hytte-services/src/brightness.rs` | 5 | Migrate to `bus::call` |
-| `crates/hytte-services/src/systemd.rs` | 5 | Migrate to `bus::{call, signals}` |
-| `crates/hytte-services/Cargo.toml` | 6 | Remove direct `zbus` dependency |
-| `Cargo.toml` (workspace root) | 6 | Add clippy `disallowed_methods` rule |
+| File                                          | Phase      | What changes                                                 |
+| --------------------------------------------- | ---------- | ------------------------------------------------------------ |
+| `crates/hytte-bus/src/signals.rs`             | 4 (prereq) | Move epoch capture to AFTER `with_conn` succeeds             |
+| `crates/hytte-services/src/notifications.rs`  | 4          | Migrate to `bus::{own_name, call}`                           |
+| `crates/hytte-services/src/wifi.rs`           | 4          | Migrate to `bus::{signals, call, property}`                  |
+| `crates/hytte-services/src/polkit.rs`         | 4          | Migrate to `bus::{own_name, signals, call}`                  |
+| `crates/hytte-services/src/screensaver.rs`    | 4          | Migrate to `bus::{own_name, signals, call}`                  |
+| `crates/hytte-services/src/power_profiles.rs` | 4          | Migrate to `bus::{property, call}`                           |
+| `crates/hytte-services/src/bluetooth.rs`      | 5          | Migrate to `bus::{own_name, signals, call, property, proxy}` |
+| `crates/hytte-services/src/mpris.rs`          | 5          | Migrate to `bus::{signals, call, proxy}`                     |
+| `crates/hytte-services/src/tray.rs`           | 5          | Migrate to `bus::{own_name, signals, call, proxy}`           |
+| `crates/hytte-services/src/networkd.rs`       | 5          | Migrate to `bus::{signals, property}`                        |
+| `crates/hytte-services/src/upower.rs`         | 5          | Migrate to `bus::{property, signals}`                        |
+| `crates/hytte-services/src/brightness.rs`     | 5          | Migrate to `bus::call`                                       |
+| `crates/hytte-services/src/systemd.rs`        | 5          | Migrate to `bus::{call, signals}`                            |
+| `crates/hytte-services/Cargo.toml`            | 6          | Remove direct `zbus` dependency                              |
+| `Cargo.toml` (workspace root)                 | 6          | Add clippy `disallowed_methods` rule                         |
 
 **Public API contract (must be preserved across every migration):**
 
@@ -65,6 +65,7 @@ Each service exposes a stable surface that consumers (widgets, other services) c
 **Why first:** Phase 4's `notifications`, `polkit`, `screensaver` all consume `signals` at boot. Without this fix, every shell start spuriously bumps `missed_emissions`, which would cascade into spurious re-fetches across multiple services. Single targeted commit before any service migration.
 
 **Files:**
+
 - Modify: `crates/hytte-bus/src/signals.rs` (around line 259 — the `current_epoch` capture in `run_subscription`)
 
 - [ ] **Step 1.1: Reproduce the race in a test**
@@ -176,9 +177,11 @@ After Tasks 2-6, dbus-broker should no longer hit EMFILE. The five services resp
 **Why first in Phase 4:** smallest service, exercises `bus::property` (well-tested in foundation) plus a `bus::call` for the setter. Validates the pattern on a service slightly more complex than `resolved` before tackling the larger ones.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/power_profiles.rs` (rewrite the listen loop and command channel)
 
 **Public API contract (must be preserved):**
+
 - `pub fn service() -> PowerProfilesService`
 - `pub fn state() -> impl Signal<Item = PowerProfilesState>`
 - `pub fn set_active(profile: &str)` — fire-and-forget
@@ -191,6 +194,7 @@ After Tasks 2-6, dbus-broker should no longer hit EMFILE. The five services resp
 Run: Read `/home/choom/src/trollshell/crates/hytte-services/src/power_profiles.rs` end-to-end to understand the current dual-name fallback (`net.hadess.PowerProfiles` → `org.freedesktop.UPower.PowerProfiles`) and the Properties.Set command path.
 
 The migration will:
+
 1. Replace the polling listen loop with two `bus::property` subscriptions (one for `ActiveProfile: String`, one for `Profiles: Vec<HashMap<String, OwnedValue>>`) — both on the canonical `net.hadess.PowerProfiles` name.
 2. Replace `do_set_active` with `bus::call(...).fire_and_forget()`.
 3. Drop the `CMD_CONN` static + `cmd_conn`/`evict_cmd_conn`/`is_io_error` helpers entirely — the bus layer handles all of it.
@@ -420,9 +424,11 @@ EOF
 ## Task 3: Migrate `notifications`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/notifications.rs`
 
 **Public API contract:**
+
 - `pub fn service() -> NotificationsService`
 - `pub fn active() -> impl Signal<Item = Vec<Notification>>`
 - `pub fn history() -> impl Signal<Item = Vec<HistoryEntry>>`
@@ -431,6 +437,7 @@ EOF
 - `pub fn invoke_action(id: u32, action_key: &str)`
 
 **Migration intent:**
+
 1. The `Service::start` impl currently spawns a task that loops `listen()` with a 2-second flat-rate sleep. `listen()` opens a `Connection::session()`, calls `RequestName("org.freedesktop.Notifications")`, mounts the interface, and pumps the event loop.
 2. Replace the entire loop with `bus::own_name("org.freedesktop.Notifications").at_path("/org/freedesktop/Notifications", iface).start()`. The returned `OwnNameSignal` provides reactive state if the UI ever wants to surface "notifications daemon: PermanentlyTaken (mako)".
 3. `do_dismiss` and `do_invoke_action` open a fresh `Connection::session()` to emit `NotificationClosed` and `ActionInvoked` signals on the session bus. These become `bus::call(...).fire_and_forget()` (since they're on a session bus and emit a SIGNAL, not a method call... actually D-Bus signals are emitted differently from method calls — see Step 3.1 carefully).
@@ -445,7 +452,7 @@ Since we OWN the interface (`org.freedesktop.Notifications`), and the interface 
 #[zbus::interface]
 impl NotificationsIface {
     // Existing methods (Notify, CloseNotification, GetCapabilities, etc.)
-    
+
     // Programmatic-emit method (rare — usually signals are emitted from inside
     // method handlers). Marked private (starts with _) by D-Bus convention but
     // accessible from our own code via bus::call.
@@ -634,6 +641,7 @@ async fn do_invoke_action(id: u32, action_key: &str) -> Result<()> {
 - [ ] **Step 3.5: Drop dead code**
 
 Remove from `notifications.rs`:
+
 - `use zbus::Connection;` (no longer used)
 - Any `Connection::session()` calls anywhere in the file
 - The `State` struct's `conn: Connection` field if it has one (and adjust `State::new`)
@@ -674,9 +682,11 @@ EOF
 ## Task 4: Migrate `screensaver`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/screensaver.rs`
 
 **Public API contract:**
+
 - `pub fn service() -> ScreenSaverService`
 - `pub fn inhibitors() -> impl Signal<Item = Vec<Inhibitor>>`
 - `pub fn is_locked() -> impl Signal<Item = bool>`
@@ -686,6 +696,7 @@ EOF
 - `pub fn handle_unlock_success()`
 
 **Migration intent:**
+
 1. The current `Service::start` spawns TWO tasks: one runs `run_server` (owns the `org.freedesktop.ScreenSaver` name + mounts the interface at TWO paths `/org/freedesktop/ScreenSaver` and `/ScreenSaver`); the other runs `listen_login1` (subscribes to `Session.Lock`/`Unlock` on the user's logind session).
 2. `run_server` becomes `bus::own_name(...).at_path(canonical, iface).at_path(legacy, iface).start()`. (The `at_path` builder method allows multiple calls per the foundation spec.)
 3. `listen_login1` becomes `bus::signals(LOGIN1).at_path(session_path).iface(...).signal("Lock").start()` + same for `Unlock`. Subscribe to events. Use `missed_emissions` to re-fetch authoritative state on reconnect (specifically: GetLockedHint).
@@ -879,6 +890,7 @@ async fn call_login1_unlock() -> anyhow::Result<()> {
 - [ ] **Step 4.4: Drop dead code**
 
 Remove from `screensaver.rs`:
+
 - `async fn run_server(...)` and the body that constructed the connection + RequestName + NameOwnerChanged loop (whole function gone).
 - `async fn listen_login1(...)` (whole function gone — replaced by `spawn_login1_listener`).
 - `use zbus::{fdo, Connection};` if unused (Connection definitely unused now; fdo may still be used for RequestNameFlags etc — verify).
@@ -924,19 +936,23 @@ EOF
 ## Task 5: Migrate `polkit`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/polkit.rs`
 
 **Public API contract:**
+
 - `pub fn service() -> PolkitService`
 - `pub fn auth_prompts() -> impl Signal<Item = Option<AuthPrompt>>`
 - `pub fn respond_to_auth(reply: Option<(Zeroizing<String>, u32)>)`
 
 **Migration intent:**
+
 1. The polkit agent has a peculiar architecture: the `AuthAgent` interface is mounted on the SESSION bus (so polkitd can call back into us); registration happens on the SYSTEM bus by calling `RegisterAuthenticationAgent` on the polkit Authority.
 2. The current `run_agent` opens both a `Connection::session()` (mounts the interface) and a `Connection::system()` (calls RegisterAuthenticationAgent + watches NameOwnerChanged on `org.freedesktop.PolicyKit1` to detect polkitd restart).
 3. After migration: `bus::own_name` for an EMPTY name on session bus won't work — we don't want to OWN a name, we just want to mount our interface at a path on the session bus. Hmm.
 
 **Key insight:** the polkit AuthAgent isn't owning a well-known name. It mounts an object at a path (the AGENT_PATH constant) and registers THAT path with polkit. polkit calls the agent via `<our_unique_name> + AGENT_PATH`. So we need:
+
 1. A way to mount an interface on the SESSION bus without owning a name. The current `bus::own_name` requires a name. Workaround: own a unique name that nobody else cares about, or don't go through `own_name` at all.
 
 This is a real gap in the bus API. Options:
@@ -1053,6 +1069,7 @@ The current `AuthAgent` holds `system_conn: Arc<Connection>` because its methods
 Locate the `struct AuthAgent { ... }` definition and the `#[zbus::interface] impl AuthAgent { ... }` block. Remove the `system_conn` field. Inside the interface methods that previously used `self.system_conn`, replace with `bus::call(...)`.
 
 Specifically, look for places like:
+
 ```rust
 self.system_conn.call_method(
     Some("org.freedesktop.PolicyKit1"),
@@ -1064,6 +1081,7 @@ self.system_conn.call_method(
 ```
 
 Replace with:
+
 ```rust
 hytte_bus::call("org.freedesktop.PolicyKit1")
     .bus(hytte_bus::BusKind::System)
@@ -1118,9 +1136,11 @@ EOF
 ## Task 6: Migrate `wifi`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/wifi.rs` (largest of Phase 4 — ~1100 lines)
 
 **Public API contract:**
+
 - `pub fn service() -> WifiService`
 - `pub fn station() -> impl Signal<Item = Option<Station>>`
 - `pub fn adapter() -> impl Signal<Item = Option<Adapter>>`
@@ -1132,6 +1152,7 @@ EOF
 **Migration intent:**
 
 iwd's bus layout:
+
 - Service: `net.connman.iwd` on system bus
 - ObjectManager at root: `net.connman.iwd:/` exposes `org.freedesktop.DBus.ObjectManager`
 - Per-station object: `net.connman.iwd:/.../Station` exposes `net.connman.iwd.Station`
@@ -1139,6 +1160,7 @@ iwd's bus layout:
 - Per-adapter object: `net.connman.iwd:/.../Adapter` exposes `net.connman.iwd.Adapter`
 
 The current `listen()` function:
+
 1. Connects to system bus
 2. ObjectManager.GetManagedObjects → discover Station path
 3. Subscribe to Station's PropertiesChanged
@@ -1148,6 +1170,7 @@ The current `listen()` function:
 Plus a parallel passphrase-prompt agent (the `Agent` interface mounted at our path so iwd can prompt us for passwords).
 
 After migration:
+
 - Use `bus::signals(...)` for ObjectManager.InterfacesAdded/Removed and Station.PropertiesChanged
 - Use `bus::call(...)` for GetManagedObjects, Scan, Connect, Disconnect, SetPowered
 - Use `bus::own_name(...)` for the Agent (same anchor-name trick as polkit — own a private name like `cc.hannig.trollshell.iwd-agent`)
@@ -1187,6 +1210,7 @@ impl Service for WifiService {
 - [ ] **Step 6.2: Implement `run_wifi_watcher`**
 
 This function:
+
 1. Calls `bus::call(...).method("GetManagedObjects")` against `net.connman.iwd:/` to discover the Station object path.
 2. Subscribes to `bus::signals(...).iface("net.connman.iwd.Station").signal("PropertiesChanged")` for state updates.
 3. Subscribes to `bus::signals(...).iface("org.freedesktop.DBus.ObjectManager").signal("InterfacesAdded")` and `InterfacesRemoved` for network add/remove.
@@ -1390,6 +1414,7 @@ EOF
 ## Phase 4 checkpoint
 
 After Tasks 2-6 land:
+
 - `notifications`, `wifi`, `polkit`, `screensaver`, `power_profiles` all use `hytte::bus::*`. Zero `Connection::session/system` calls in any of them.
 - `bluetooth`, `mpris`, `tray`, `networkd`, `upower`, `brightness`, `systemd` still use direct zbus.
 - Workspace tests pass; clippy clean.
@@ -1410,9 +1435,11 @@ These services are NOT contributing meaningfully to the dbus-broker FD pressure 
 Smallest of Phase 5 — just one method call.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/brightness.rs`
 
 **Public API contract:**
+
 - `pub fn set_brightness(percent: u32)`
 
 **Migration intent:**
@@ -1487,6 +1514,7 @@ EOF
 ## Task 8: Migrate `upower`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/upower.rs`
 
 **Public API contract:** read the file for the exact shape — typically `state() -> impl Signal<Item = BatteryState>`.
@@ -1501,6 +1529,7 @@ Read `crates/hytte-services/src/upower.rs`. Note the current device path discove
 - [ ] **Step 8.2: Refactor**
 
 Apply the pattern:
+
 1. Replace device discovery with `bus::call(...).method("EnumerateDevices")` once at startup.
 2. For the discovered battery path, mount one `bus::property` per tracked field (Percentage, State, IconName, TimeToEmpty, TimeToFull, etc).
 3. Coalesce into `BatteryState` via per-property `for_each` tasks updating the shared `Mutable<BatteryState>`.
@@ -1531,6 +1560,7 @@ EOF
 ## Task 9: Migrate `networkd`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/networkd.rs`
 
 **Migration intent:**
@@ -1554,6 +1584,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 10: Migrate `systemd`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/systemd.rs`
 
 **Migration intent:**
@@ -1577,6 +1608,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 11: Migrate `mpris`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/mpris.rs`
 
 **Migration intent:**
@@ -1591,6 +1623,7 @@ The file is ~600+ lines — a lot of player metadata parsing. The bus-touching p
 - [ ] **Step 11.2: Replace per-player Connection with bus::proxy**
 
 For each discovered player:
+
 ```rust
 let player = hytte_bus::proxy(format!("org.mpris.MediaPlayer2.{name}"))
     .at_path("/org/mpris/MediaPlayer2")
@@ -1635,6 +1668,7 @@ EOF
 ## Task 12: Migrate `tray`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/tray.rs`
 
 **Migration intent:**
@@ -1666,6 +1700,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 Largest of Phase 5 — uses all five primitives. ~1300 lines.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/bluetooth.rs`
 - Modify: `crates/hytte-services/src/bluetooth_audio.rs` (if it has its own bus calls — check)
 
@@ -1673,6 +1708,7 @@ Largest of Phase 5 — uses all five primitives. ~1300 lines.
 BlueZ exposes adapters and devices on `org.bluez` (system bus). Adapter has `Powered`, `Discovering`, etc.; Device has `Connected`, `Paired`, `Trusted`, `Name`, etc. Pairing requires registering a pairing Agent.
 
 After migration:
+
 - `bus::own_name("cc.hannig.trollshell.bluez-agent")` for the pairing agent (anchor name like polkit/wifi)
 - `bus::call` for all method invocations (Pair, Connect, Disconnect, Trust, RemoveDevice, StartDiscovery, etc.)
 - `bus::signals` for ObjectManager InterfacesAdded/Removed (device hot-plug)
@@ -1686,6 +1722,7 @@ The file likely has: ObjectManager-driven discovery, adapter selection, per-devi
 - [ ] **Step 13.2-13.N: Migrate piece-by-piece**
 
 Recommended order:
+
 - a. Drop the listen-loop's connection; replace with bus::signals on ObjectManager.
 - b. Replace each direct `Connection::system()` with `bus::call`.
 - c. Replace per-device Proxy<'static> with `bus::proxy`.
@@ -1719,6 +1756,7 @@ EOF
 After Tasks 7-13: zero `Connection::session()` / `Connection::system()` calls in `crates/hytte-services/src/*.rs`. Workspace tests + clippy still clean.
 
 Verify with:
+
 ```sh
 grep -nE 'Connection::(session|system)' crates/hytte-services/src/*.rs
 # Expected: no output
@@ -1735,6 +1773,7 @@ If output is non-empty, that file's migration isn't complete — back-fill befor
 ## Task 14: Drop direct `zbus` dependency from `hytte-services` + add clippy regression guard
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml` (remove `zbus = ...` line)
 - Modify: `Cargo.toml` (workspace root — add clippy `disallowed_methods` rule)
 
@@ -1752,9 +1791,11 @@ If any service still uses zbus types beyond zvariant value-types, EITHER add the
 - [ ] **Step 14.2: Remove the dep from `hytte-services/Cargo.toml`**
 
 Edit `crates/hytte-services/Cargo.toml`. Find the line:
+
 ```toml
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 ```
+
 Delete it. Save.
 
 - [ ] **Step 14.3: Verify it still compiles**
@@ -1835,17 +1876,20 @@ EOF
 After Task 14:
 
 1. Build trollshell release:
+
    ```sh
    cargo build --release -p trollshell
    ```
 
 2. Replace running trollshell with the new build:
+
    ```sh
    systemctl --user restart trollshell.service  # if installed via systemd
    # OR kill the running process and start fresh
    ```
 
 3. Soak for 24 hours. Monitor:
+
    ```sh
    # Stable FD count
    while true; do

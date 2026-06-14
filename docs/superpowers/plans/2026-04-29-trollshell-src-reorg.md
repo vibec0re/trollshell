@@ -62,6 +62,7 @@ trollshell/src/
 ## Task 1: Extract `components/`, scaffold `panels/` and `overlays/`
 
 **Files:**
+
 - Create: `trollshell/src/components/mod.rs`
 - Create: `trollshell/src/components/layout.rs`
 - Create: `trollshell/src/components/format.rs`
@@ -450,6 +451,7 @@ pub mod util;
 
 Run: `cargo build --workspace --message-format=short 2>&1 | tail -10`
 Expected: `Finished` cleanly. Common compile errors at this step:
+
 - `unresolved import super::util` — leftover; grep `super::util` in pages.rs to confirm none remain.
 - `cannot find function panel` — leftover `panel("…")` callsite; grep `\bpanel(` in pages.rs.
 - `cannot find function build_history_row` etc. — missing `use crate::components::*` line.
@@ -504,6 +506,7 @@ EOF
 ## Task 2: Move overlays out of `widgets/`
 
 **Files:**
+
 - Create: `trollshell/src/overlays/mod.rs` (replace stub from Task 1).
 - Move (`git mv`): `trollshell/src/widgets/lock_screen.rs` → `trollshell/src/overlays/lock_screen.rs`.
 - Move (`git mv`): `trollshell/src/widgets/notifications.rs` → `trollshell/src/overlays/notifications.rs`.
@@ -664,6 +667,7 @@ The 15 panel-move tasks below differ only in:
 ### Task 3: Move `panel_appearance`
 
 **Files:**
+
 - Create: `trollshell/src/panels/appearance.rs`
 - Modify: `trollshell/src/widgets/pages.rs` (delete `pub fn page_appearance` body and its private helpers)
 - Modify: `trollshell/src/panels/mod.rs` (add `pub mod appearance;` + `pub use appearance::panel_appearance;`)
@@ -680,18 +684,21 @@ Open `trollshell/src/widgets/pages.rs`, copy the full text of `pub fn page_appea
 
 - Module docstring: copy the existing rustdoc on `pub fn page_appearance` (lift verbatim).
 - Imports (use only what this panel actually references):
+
   ```rust
   use std::cell::RefCell;
   use std::rc::Rc;
-  
+
   use hytte::adw::{self, prelude::*};
   use hytte::gtk::{self, gio};
   use hytte::prelude::*;
   use hytte::services::wallpaper;
-  
+
   use crate::components::layout::{finish_page, page_box};
   ```
+
   (Add or remove imports based on what the source body references.)
+
 - Function rename: `pub fn page_appearance(...)` → `pub fn panel_appearance(...)`.
 
 - [ ] **Step 3: Update `panels/mod.rs`**
@@ -760,6 +767,7 @@ EOF
 ### Task 4: Move `panel_audio`
 
 **Files:**
+
 - Create: `trollshell/src/panels/audio.rs`
 - Modify: `trollshell/src/widgets/pages.rs` (delete `pub fn page_audio` body + private helpers)
 - Modify: `trollshell/src/panels/mod.rs` (append `pub mod audio;` + `pub use audio::panel_audio;`)
@@ -767,7 +775,7 @@ EOF
 
 - [ ] **Step 1: Locate the panel source**
 
-Run: `grep -n 'pub fn page_audio' trollshell/src/widgets/pages.rs` and find the closing `}` of the function. Identify any panel-private helpers (build_*_row helpers for streams/sinks if any) that are referenced only by this panel.
+Run: `grep -n 'pub fn page_audio' trollshell/src/widgets/pages.rs` and find the closing `}` of the function. Identify any panel-private helpers (build\_\*\_row helpers for streams/sinks if any) that are referenced only by this panel.
 
 - [ ] **Step 2: Write `panels/audio.rs`**
 
@@ -839,6 +847,7 @@ EOF
 ### Task 5: Move `panel_bluetooth`
 
 **Files:**
+
 - Create: `trollshell/src/panels/bluetooth.rs`
 - Modify: `pages.rs`, `panels/mod.rs`, `modal.rs`
 
@@ -858,11 +867,13 @@ use crate::components::layout::{finish_page, page_box};
 ```
 
 - [ ] **Step 3:** Append to `panels/mod.rs`:
+
 ```rust
 pub mod bluetooth;
 …
 pub use bluetooth::panel_bluetooth;
 ```
+
 - [ ] **Step 4:** Strip from `pages.rs`.
 - [ ] **Step 5:** Update `modal.rs`: `pages::page_bluetooth()` → `panels::panel_bluetooth()`.
 - [ ] **Step 6:** Build / test / commit:
@@ -1158,6 +1169,7 @@ use crate::components::layout::{finish_page, page_box};
 ## Task 18: Delete the now-empty `widgets/pages.rs`
 
 **Files:**
+
 - Delete: `trollshell/src/widgets/pages.rs`
 - Modify: `trollshell/src/widgets/mod.rs` — drop `pub mod pages;`
 - Modify: `trollshell/src/modal.rs` — drop `use crate::widgets::pages;` if any remains.

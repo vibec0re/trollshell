@@ -64,6 +64,7 @@ sudo pacman -S --needed upower wireplumber
 `gtk::Popover` opened from a layer-shell window needs the surface to declare keyboard interactivity, otherwise the compositor won't route input to the popover. Plumb a setter through `LayerWindowBuilder` and `Bar`.
 
 **Files:**
+
 - Modify: `crates/hytte-ui/src/layer_window.rs`
 - Modify: `crates/hytte-ui/src/bar.rs`
 - Modify: `crates/hytte-ui/src/lib.rs`
@@ -199,6 +200,7 @@ git commit -m "feat(ui): Bar::keyboard_interactivity() for popover support"
 Wraps `gtk::Popover`, parented to a trigger widget. Builder takes the trigger + content; `show()`/`hide()`/`toggle()` control visibility. Click-outside dismisses automatically (Popover default).
 
 **Files:**
+
 - Create: `crates/hytte-ui/src/popup.rs`
 - Modify: `crates/hytte-ui/src/lib.rs`
 - Modify: `crates/hytte-ui/src/style.css` (add popup content default)
@@ -356,12 +358,12 @@ Append to `crates/hytte-ui/src/style.css`:
 ```css
 /* Popup defaults */
 .hytte-popup > contents {
-    background: rgba(28, 28, 32, 0.94);
-    color: #f5f5f7;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    padding: 8px 10px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  background: rgba(28, 28, 32, 0.94);
+  color: #f5f5f7;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 8px 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
 ```
 
@@ -397,6 +399,7 @@ git commit -m "feat(ui): Popup primitive over gtk::Popover + prelude exports"
 Read battery state from UPower's `DisplayDevice` (the aggregated battery, suitable for laptops with one main battery). Subscribe to `PropertiesChanged` on the system bus.
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml` (add zbus)
 - Create: `crates/hytte-services/src/upower.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
@@ -612,6 +615,7 @@ Volume: 0.65 [MUTED]
 ```
 
 **Files:**
+
 - Create: `crates/hytte-services/src/pipewire.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 
@@ -767,6 +771,7 @@ git commit -m "feat(services): pipewire volume + mute via wpctl polling"
 DBus client to `org.freedesktop.network1.Manager`. Lists links, watches per-link `OperationalState`. Emits two signals: a primary-link state (best routable interface) and a full list.
 
 **Files:**
+
 - Create: `crates/hytte-services/src/networkd.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 
@@ -990,6 +995,7 @@ git commit -m "feat(services): networkd link state via DBus"
 Read the configured DNS servers from systemd-resolved. v0.2.0 just exposes whether resolution is configured + the server addresses; richer per-link state can come later.
 
 **Files:**
+
 - Create: `crates/hytte-services/src/resolved.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 
@@ -1171,6 +1177,7 @@ git commit -m "feat(services): resolved DNS state via DBus"
 Right-cluster icon showing the battery. On click, popup with percentage + time remaining + state.
 
 **Files:**
+
 - Create: `trollshell/src/widgets/battery.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -1302,6 +1309,7 @@ git commit -m "feat(trollshell): battery indicator + popup"
 Icon shows volume level + mute. Popup shows percentage. (No slider yet — read-only.)
 
 **Files:**
+
 - Create: `trollshell/src/widgets/volume.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -1406,6 +1414,7 @@ git commit -m "feat(trollshell): volume indicator + popup"
 Network indicator showing primary link's operational state. Popup combines per-link list (from networkd) with DNS server count (from resolved).
 
 **Files:**
+
 - Create: `trollshell/src/widgets/network.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -1547,6 +1556,7 @@ git commit -m "feat(trollshell): network indicator + popup with links/DNS"
 Wire the four new services into `App`, enable keyboard interactivity on the bar so popovers work, add the right-cluster widgets, and ship some indicator/popup styling.
 
 **Files:**
+
 - Modify: `trollshell/src/main.rs`
 - Modify: `trollshell/style.css`
 
@@ -1598,20 +1608,20 @@ Append to `trollshell/style.css`:
 ```css
 /* Right-cluster indicator buttons */
 .ts-indicator {
-    padding: 0 6px;
-    min-width: 22px;
+  padding: 0 6px;
+  min-width: 22px;
 }
 .ts-indicator image {
-    -gtk-icon-size: 16px;
+  -gtk-icon-size: 16px;
 }
 
 /* Popup column layout */
 .ts-popup-column {
-    min-width: 180px;
+  min-width: 180px;
 }
 .ts-popup-headline {
-    font-weight: 600;
-    font-size: 14px;
+  font-weight: 600;
+  font-size: 14px;
 }
 ```
 
@@ -1649,6 +1659,7 @@ Bars now use KeyboardMode::OnDemand so popovers receive input."
 ## Self-Review
 
 **Spec coverage (vs design `2026-04-24-hytte-trollshell-design.md`, v0.2 row):**
+
 - `Popup` primitive — Task 2.
 - `Panel` primitive — **deliberately deferred** to v0.3+ (not needed for read-only indicators).
 - `pipewire` (read) — Task 4 (wpctl polling; pipewire-rs in v0.3).
@@ -1661,11 +1672,13 @@ Bars now use KeyboardMode::OnDemand so popovers receive input."
 **Placeholder scan:** No "TBD"/"TODO"-as-acceptance. The pipewire-rs migration noted in Task 4's docstring is a forward-looking comment, not a deferred requirement.
 
 **Type consistency:**
+
 - `BatteryState`, `Battery`, `Volume`, `OperationalState`, `Link`, `DnsState` referenced consistently across services and widget tasks.
 - `Popup`, `PopupPosition`, `KeyboardMode` exported through prelude (Task 2 step 5) and used in tasks 7-10.
 - `service()` constructor + free signal-returning fn pattern matches v0.1 services.
 
 **Risks / unknowns:**
+
 - `wpctl` polling interval (250ms) is a feel choice — bump to 500ms if CPU-noisy.
 - networkd has no global PropertiesChanged for link state — we re-poll every 2s. May feel sluggish; v0.3 should explore `PropertiesChanged` per-link signal subscription.
 - UPower `DisplayDevice` may not exist on systems with no battery (desktops). The service falls back to default state silently; trollshell's battery widget will show `battery-missing-symbolic`. Document in v0.2.1 README.

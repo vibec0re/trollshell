@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita via `gtk4-rs`, `futures-signals`, `zbus`, `tokio`, plus new deps `serde` + `serde_json` for parsing networkd's `Describe()` JSON.
 
 **Conventions used in every task:**
+
 - TDD where unit tests are practical. UI tasks verify via `cargo build` + `cargo clippy --workspace --all-targets -- -D warnings` and a deferred manual smoke-test note.
 - Commits use the existing project prefixes (`feat(de):`, `fix(de):`, `feat(...)` for service work, `polish:`, `style:`).
 - Co-author trailer on every commit:
@@ -35,6 +36,7 @@
 ## Task 1: Extend `networkd::Link` with IP / gateway / routes
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml`
 - Modify: `crates/hytte-services/src/networkd.rs`
 
@@ -311,9 +313,10 @@ EOF
 ## Task 2: Wifi shared `CMD_CONN`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/wifi.rs`
 
-**Background:** Mirroring the BlueZ fix landed in v0.2.1 (`bluetooth.rs` Task 4), each wifi command (`scan`, `connect_network`, `disconnect`) currently opens a fresh `Connection::system().await`. iwd doesn't have the same per-client session model as BlueZ (so this isn't a *bug* like BUGS.md was), but consolidating to a single connection per service is the same correctness/efficiency win. The new `set_powered` and `forget` will use the same shared connection.
+**Background:** Mirroring the BlueZ fix landed in v0.2.1 (`bluetooth.rs` Task 4), each wifi command (`scan`, `connect_network`, `disconnect`) currently opens a fresh `Connection::system().await`. iwd doesn't have the same per-client session model as BlueZ (so this isn't a _bug_ like BUGS.md was), but consolidating to a single connection per service is the same correctness/efficiency win. The new `set_powered` and `forget` will use the same shared connection.
 
 - [ ] **Step 1: Add the shared command connection accessor**
 
@@ -423,6 +426,7 @@ EOF
 ## Task 3: Wifi `Adapter` listening + `set_powered`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/wifi.rs`
 
 **Background:** iwd exposes `net.connman.iwd.Adapter1` on `/net/connman/iwd/<adapter_idx>` (e.g. `/net/connman/iwd/0`). Properties: `Powered: bool`, `Name: String`, `Vendor`, `Model`. We store `path`, `powered`, and `name` only. The wifi listen loop already enumerates the iwd object tree; extending it to capture the adapter object is straightforward — the adapter path is the prefix of the station path.
@@ -581,6 +585,7 @@ if !adapter_path.is_empty() {
 (If `managed_objects` is named differently in the real code — verify by reading the surrounding lines — match the local name. The intent: read Adapter1 props out of the same dictionary we already have.)
 
 The function signature of `listen` needs `adapter_mutable: &Mutable<Option<Adapter>>`. Update both:
+
 - The `listen` signature (around line 672) to accept `adapter_mutable`.
 - The `start()` impl (around line 161) where `listen` is called inside the retry loop — pass the new `adapter_mutable` argument cloned from `WifiHandles.adapter`.
 
@@ -641,6 +646,7 @@ EOF
 ## Task 4: `WifiNetwork.known_network_path` + `forget()`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/wifi.rs`
 
 **Background:** The listen loop's `read_networks` already extracts the iwd `KnownNetwork` object path (around line 437) and uses it to derive the boolean `known`. The path is then discarded. Surfacing it on `WifiNetwork` lets the UI call iwd's `KnownNetwork.Forget()`.
@@ -794,6 +800,7 @@ EOF
 ## Task 5: UI — `page_network` skeleton + Connection group
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Restructure `page_network` from the 2-col grid layout into a vertical stack of three `AdwPreferencesGroup`s. This task lands the new skeleton AND the full Connection group. Traffic and Wi-Fi will be migrated in Tasks 6 & 7; until those land, `page_network` will call the existing legacy `build_traffic_group` and `append_wifi_section` so the page keeps rendering.
@@ -1127,6 +1134,7 @@ EOF
 ## Task 6: UI — Traffic group as `AdwPreferencesGroup`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Wrap the existing two Traffic rows (`Live`, `Total`) in a native `AdwPreferencesGroup` titled "Traffic", replacing the legacy `panel("Traffic")` wrapper. Row contents are unchanged.
@@ -1242,6 +1250,7 @@ EOF
 ## Task 7: UI — Wi-Fi group structure (header suffix + description)
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Replace the legacy `panel("Wi-Fi") + append_wifi_section(...)` with a native `AdwPreferencesGroup`. The group's title is `"Wi-Fi"`; description binds to a live SSID + state + dBm string. Header suffix carries a `gtk::Switch` (adapter Powered, via `bind_two_way`), a `gtk::Button("Scan")`, and a `gtk::Spinner` (visible-bind on `station.scanning`).
@@ -1476,6 +1485,7 @@ EOF
 ## Task 8: UI — Network row rewrite (pill suffix + ⋮ popover)
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs`
 
 **Background:** Replace the row's subtitle-as-status with a status pill suffix; subtitle becomes `"{dbm} dBm · {sec}"`. Add a ⋮ MenuButton suffix with a popover containing state-driven Connect / Disconnect / Forget. Row activation calls connect (only when not connected). Per project memory, Disconnect / Forget live in the popover, never on the primary click target.
@@ -1636,6 +1646,7 @@ EOF
 ## Task 9: CSS — pill classes + monospace helper
 
 **Files:**
+
 - Modify: `trollshell/style.css`
 
 **Background:** Three pill classes plus a monospace helper. All use existing `@accent_color` token; per project memory, no new color tokens are introduced.
@@ -1646,24 +1657,24 @@ At the bottom of `trollshell/style.css`:
 
 ```css
 .ts-net-pill {
-    padding: 2px 10px;
-    border-radius: 9999px;
-    font-size: 0.8em;
-    font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-size: 0.8em;
+  font-weight: 600;
 }
 
 .ts-pill-connected {
-    background: alpha(@accent_color, 0.20);
-    color: @accent_color;
+  background: alpha(@accent_color, 0.2);
+  color: @accent_color;
 }
 
 .ts-pill-known {
-    background: alpha(@accent_color, 0.08);
-    color: alpha(@accent_color, 0.70);
+  background: alpha(@accent_color, 0.08);
+  color: alpha(@accent_color, 0.7);
 }
 
 .ts-mono {
-    font-family: monospace;
+  font-family: monospace;
 }
 ```
 

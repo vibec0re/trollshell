@@ -17,6 +17,7 @@
 ## File Structure
 
 **Created in this plan:**
+
 - `crates/hytte-bus/Cargo.toml` — new workspace member
 - `crates/hytte-bus/src/lib.rs` — module wiring, public re-exports
 - `crates/hytte-bus/src/error.rs` — `BusError`
@@ -34,12 +35,14 @@
 - `crates/hytte-bus/tests/proxy.rs` — proxy integration tests
 
 **Modified in this plan:**
+
 - `Cargo.toml` (workspace root) — add `crates/hytte-bus` to members
 - `crates/hytte/Cargo.toml` — add `hytte-bus` dep
 - `crates/hytte/src/lib.rs` — re-export as `hytte::bus`
 - `crates/hytte-services/src/resolved.rs` — migrate to `hytte::bus::*`
 
 **File responsibilities — single-purpose per file:**
+
 - `error.rs`: maps `zbus::Error` to `BusError`. Single source of truth for "is this a transient bus problem or a permanent one."
 - `connection.rs`: only place that calls `Connection::session/system`. Hosts the supervisor task per `BusKind`.
 - Each primitive file: builder + state enum + internal task. Roughly 200–400 lines each.
@@ -59,6 +62,7 @@
 ## Task 1: Workspace scaffold for `hytte-bus`
 
 **Files:**
+
 - Modify: `Cargo.toml` (workspace members list)
 - Create: `crates/hytte-bus/Cargo.toml`
 - Create: `crates/hytte-bus/src/lib.rs`
@@ -146,6 +150,7 @@ EOF
 ## Task 2: `BusError` type and zbus error mapping
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/error.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Test: inline `#[cfg(test)]` module in `error.rs`
@@ -300,6 +305,7 @@ EOF
 ## Task 3: `BusKind` enum
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/connection.rs` (initial — just the enum)
 - Modify: `crates/hytte-bus/src/lib.rs`
 
@@ -363,6 +369,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ## Task 4: Ephemeral D-Bus harness for integration tests
 
 **Files:**
+
 - Create: `crates/hytte-bus/tests/common/mod.rs`
 - Create: `crates/hytte-bus/tests/harness_smoke.rs`
 
@@ -503,9 +510,11 @@ Run: `cargo test -p hytte-bus --test harness_smoke -- --nocapture`
 Expected: PASS.
 
 If it fails because `dbus-daemon` isn't installed:
+
 ```sh
 sudo pacman -S dbus
 ```
+
 …then re-run.
 
 If the daemon prints its address on a different line format in your dbus version, adjust the line parser. The contract is: the harness returns `(Connection, BusGuard)` and the daemon is reachable via the returned connection.
@@ -534,6 +543,7 @@ EOF
 **Goal of this task:** get an accessor that returns a connection if there is one, opens lazily otherwise. Supervisor and reconnect come in Task 6 — this task is the minimum for Tasks 7+ to compile against.
 
 **Files:**
+
 - Modify: `crates/hytte-bus/src/connection.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/connection_basic.rs`
@@ -736,6 +746,7 @@ EOF
 ## Task 6: Supervisor task with reconnect + `epoch_signal`
 
 **Files:**
+
 - Modify: `crates/hytte-bus/src/connection.rs`
 - Create: `crates/hytte-bus/tests/connection_reconnect.rs`
 
@@ -1027,6 +1038,7 @@ EOF
 ## Task 7: `own_name` primitive
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/own.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/own.rs`
@@ -1363,6 +1375,7 @@ async fn lost_then_reacquired() {
 ```
 
 This test as written has a known weakness: the second connection rebuild relies on `DBUS_SESSION_BUS_ADDRESS`. The harness in `common::ephemeral_bus()` doesn't set that env var by default. The implementer should:
+
 - Either: extend `ephemeral_bus()` to return the address as a third tuple field and set it on the env (or pass it explicitly), and then `Builder::address(addr)` against that string.
 - Or: extend `BusGuard` with an `address()` accessor.
 
@@ -1418,6 +1431,7 @@ async fn permanently_taken_after_three_losses() {
 ```
 
 This test is timing-sensitive. If it flakes, the implementer should:
+
 - Verify the "consecutive losses to the same owner" counter increments correctly (the camper's unique name should be the same string in `prev_owner` across all three losses if the camper holds a stable connection — refactor the test to use ONE camper connection that re-acquires after each loss).
 
 - [ ] **Step 7.8: Run, expect PASS**
@@ -1450,6 +1464,7 @@ EOF
 ## Task 8: `signals` primitive
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/signals.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/signals.rs`
@@ -1806,6 +1821,7 @@ EOF
 ## Task 9: `call` primitive
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/call.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/call.rs`
@@ -2089,6 +2105,7 @@ EOF
 ## Task 10: `property` primitive
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/property.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/property.rs`
@@ -2448,6 +2465,7 @@ EOF
 ## Task 11: `proxy` primitive
 
 **Files:**
+
 - Create: `crates/hytte-bus/src/proxy.rs`
 - Modify: `crates/hytte-bus/src/lib.rs`
 - Create: `crates/hytte-bus/tests/proxy.rs`
@@ -2779,6 +2797,7 @@ EOF
 ## Task 12: Production accessors + `hytte` umbrella re-export
 
 **Files:**
+
 - Modify: `crates/hytte-bus/src/lib.rs` (add public `own_name`, `signals`, `call`, `property`, `proxy` that hit the global session/system)
 - Modify: `crates/hytte/Cargo.toml`
 - Modify: `crates/hytte/src/lib.rs`
@@ -2918,6 +2937,7 @@ EOF
 ## Task 13: Migrate `resolved` to `hytte::bus`
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/resolved.rs`
 
 Smoke-test migration. Per spec section 5.3 (Phase 3). After this task: `resolved` opens zero connections of its own; everything routes through `hytte::bus::property`.
@@ -3097,6 +3117,7 @@ kill %1
 ```
 
 Expected:
+
 - `trollshell` starts cleanly.
 - The journal shows `hytte_bus` "bus connected" once for the system bus, then `resolved` consuming a `Loaded(...)` state for the DNS property.
 - `lsof` socket count is small and stable (the migration's purpose) — single-digit number of sockets, not the dozens we'd see with the old per-call connection pattern. (Other services unmigrated still open their own connections; the count is informative, not a hard assertion.)

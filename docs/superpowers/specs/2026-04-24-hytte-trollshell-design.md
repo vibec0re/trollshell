@@ -175,29 +175,29 @@ Consistent pattern per service module:
 
 Modules in v1:
 
-| Module          | Backend                                                        |
-|-----------------|----------------------------------------------------------------|
-| `clock`         | `glib` timer + `chrono::Local`                                 |
-| `niri`          | `niri-ipc` socket                                              |
-| `mpris`         | `org.mpris.MediaPlayer2.*` via zbus                            |
-| `tray`          | StatusNotifierItem host (zbus)                                 |
-| `networkd`      | `org.freedesktop.network1` (systemd-networkd, zbus)            |
-| `resolved`      | `org.freedesktop.resolve1` (systemd-resolved, zbus)            |
-| `wifi`          | `net.connman.iwd` (zbus)                                       |
-| `bluetooth`     | `org.bluez` (zbus)                                             |
-| `pipewire`      | `pipewire-rs`                                                  |
-| `notifications` | own daemon, registers `org.freedesktop.Notifications`          |
-| `brightness`    | logind `org.freedesktop.login1.Session.SetBrightness`          |
-| `upower`        | `org.freedesktop.UPower` (zbus)                                |
+| Module          | Backend                                               |
+| --------------- | ----------------------------------------------------- |
+| `clock`         | `glib` timer + `chrono::Local`                        |
+| `niri`          | `niri-ipc` socket                                     |
+| `mpris`         | `org.mpris.MediaPlayer2.*` via zbus                   |
+| `tray`          | StatusNotifierItem host (zbus)                        |
+| `networkd`      | `org.freedesktop.network1` (systemd-networkd, zbus)   |
+| `resolved`      | `org.freedesktop.resolve1` (systemd-resolved, zbus)   |
+| `wifi`          | `net.connman.iwd` (zbus)                              |
+| `bluetooth`     | `org.bluez` (zbus)                                    |
+| `pipewire`      | `pipewire-rs`                                         |
+| `notifications` | own daemon, registers `org.freedesktop.Notifications` |
+| `brightness`    | logind `org.freedesktop.login1.Session.SetBrightness` |
+| `upower`        | `org.freedesktop.UPower` (zbus)                       |
 
 Feature-flagged opt-in modules:
 
-| Module     | Backend                                              |
-|------------|------------------------------------------------------|
-| `weather`  | `libgweather` via gobject-introspection bindings     |
-| `calendar` | `evolution-data-server` (zbus)                       |
-| `accounts` | `gnome-online-accounts` (zbus)                       |
-| `location` | `GeoClue2` (zbus)                                    |
+| Module     | Backend                                          |
+| ---------- | ------------------------------------------------ |
+| `weather`  | `libgweather` via gobject-introspection bindings |
+| `calendar` | `evolution-data-server` (zbus)                   |
+| `accounts` | `gnome-online-accounts` (zbus)                   |
+| `location` | `GeoClue2` (zbus)                                |
 
 ## Styling
 

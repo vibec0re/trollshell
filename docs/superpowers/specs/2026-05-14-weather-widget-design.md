@@ -33,6 +33,7 @@ pub fn service() -> impl HytteService;  // for .with() registration in main.rs
 ```
 
 D-Bus flow on the system bus, via `hytte_bus::call`:
+
 1. `GeoClue2.Manager.GetClient()` returns a client `ObjectPath`.
 2. On the client, set `DesktopId = "trollshell"` and `RequestedAccuracyLevel = 4` (City).
 3. Subscribe to `GeoClue2.Client.LocationUpdated(o old, o new)` signal.
@@ -105,25 +106,27 @@ Take `name` (the district at `zoom=14`, e.g. "Oberschöneweide"), falling back t
 
 Weather-code mapping is a pure `condition_for_code(u8) -> Condition`. WMO codes:
 
-| code(s) | label | icon (freedesktop) |
-|---|---|---|
-| 0 | Clear | `weather-clear-symbolic` |
-| 1, 2, 3 | Partly cloudy | `weather-few-clouds-symbolic` |
-| 45, 48 | Fog | `weather-fog-symbolic` |
-| 51, 53, 55, 56, 57, 61, 63, 65, 66, 67 | Rain | `weather-showers-symbolic` |
-| 71, 73, 75, 77 | Snow | `weather-snow-symbolic` |
-| 80, 81, 82 | Showers | `weather-showers-scattered-symbolic` |
-| 85, 86 | Snow showers | `weather-snow-symbolic` |
-| 95, 96, 99 | Thunderstorm | `weather-storm-symbolic` |
-| _ | Unknown | `weather-severe-alert-symbolic` |
+| code(s)                                | label         | icon (freedesktop)                   |
+| -------------------------------------- | ------------- | ------------------------------------ |
+| 0                                      | Clear         | `weather-clear-symbolic`             |
+| 1, 2, 3                                | Partly cloudy | `weather-few-clouds-symbolic`        |
+| 45, 48                                 | Fog           | `weather-fog-symbolic`               |
+| 51, 53, 55, 56, 57, 61, 63, 65, 66, 67 | Rain          | `weather-showers-symbolic`           |
+| 71, 73, 75, 77                         | Snow          | `weather-snow-symbolic`              |
+| 80, 81, 82                             | Showers       | `weather-showers-scattered-symbolic` |
+| 85, 86                                 | Snow showers  | `weather-snow-symbolic`              |
+| 95, 96, 99                             | Thunderstorm  | `weather-storm-symbolic`             |
+| \_                                     | Unknown       | `weather-severe-alert-symbolic`      |
 
 Polling: `glib::timeout_add_seconds(15 * 60, …)` schedules the periodic refresh. On startup, fire one immediate fetch (don't make the user wait 15 minutes for the first paint).
 
 `refresh()` semantics:
+
 - If the current state is `Loading` (a fetch is in flight), no-op.
 - Otherwise, kick off a fresh fetch. Don't reset state to `Loading` unless the previous state was `Error` (or initial) — when we already have a `Resolved` value, we keep showing it while the new fetch is in flight and replace atomically on success. Avoids a visible flicker every 15 minutes.
 
 Error handling:
+
 - Network failure / non-200 status / JSON parse error → `WeatherState::Error("network error")`.
 - Geoclue resolved `None` (no env var, geoclue failed) → `WeatherState::Error("set $TROLLSHELL_WEATHER_CITY")`. Tells the user how to fix.
 
@@ -177,34 +180,34 @@ CSS additions (`trollshell/style.css`):
 
 ```css
 .ts-weather {
-    padding: 4px;
+  padding: 4px;
 }
 .ts-weather-location {
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    color: alpha(currentColor, 0.6);
-    margin-bottom: 10px;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: alpha(currentColor, 0.6);
+  margin-bottom: 10px;
 }
 .ts-weather-headline {
-    /* horizontal Box. icon left of temp, both vertically centered */
+  /* horizontal Box. icon left of temp, both vertically centered */
 }
 .ts-weather-temp {
-    font-size: 32px;
-    font-weight: 300;
+  font-size: 32px;
+  font-weight: 300;
 }
 .ts-weather-condition {
-    color: alpha(currentColor, 0.85);
-    margin-top: -4px;
-    margin-bottom: 14px;
+  color: alpha(currentColor, 0.85);
+  margin-top: -4px;
+  margin-bottom: 14px;
 }
 .ts-weather-detail {
-    /* horizontal Box. label hexpands left; value pinned right */
+  /* horizontal Box. label hexpands left; value pinned right */
 }
 .ts-weather-detail-label {
-    color: alpha(currentColor, 0.55);
+  color: alpha(currentColor, 0.55);
 }
 .ts-weather-detail-value {
-    color: white;
+  color: white;
 }
 ```
 
@@ -256,23 +259,23 @@ Both services start their reactive loops when the app boots. The widget can subs
 
 Unit tests in `weather.rs`:
 
-| test | scenario | expected |
-|---|---|---|
-| `condition_clear` | `condition_for_code(0)` | `Condition { code: 0, label: "Clear", icon: "weather-clear-symbolic" }` |
-| `condition_partly_cloudy` | code 1, 2, 3 | partly cloudy condition |
-| `condition_fog` | code 45, 48 | fog condition |
-| `condition_rain` | code 61, 65 | rain condition |
-| `condition_snow` | code 71, 75 | snow condition |
-| `condition_thunderstorm` | code 95, 99 | thunderstorm condition |
-| `condition_unknown_code` | code 200 (unmapped) | unknown condition with `weather-severe-alert-symbolic` |
-| `parse_current_response_ok` | parse a fixture JSON payload | populated `Current` struct |
-| `parse_current_response_missing_field` | partial payload | parse error returned, not panic |
+| test                                   | scenario                     | expected                                                                |
+| -------------------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
+| `condition_clear`                      | `condition_for_code(0)`      | `Condition { code: 0, label: "Clear", icon: "weather-clear-symbolic" }` |
+| `condition_partly_cloudy`              | code 1, 2, 3                 | partly cloudy condition                                                 |
+| `condition_fog`                        | code 45, 48                  | fog condition                                                           |
+| `condition_rain`                       | code 61, 65                  | rain condition                                                          |
+| `condition_snow`                       | code 71, 75                  | snow condition                                                          |
+| `condition_thunderstorm`               | code 95, 99                  | thunderstorm condition                                                  |
+| `condition_unknown_code`               | code 200 (unmapped)          | unknown condition with `weather-severe-alert-symbolic`                  |
+| `parse_current_response_ok`            | parse a fixture JSON payload | populated `Current` struct                                              |
+| `parse_current_response_missing_field` | partial payload              | parse error returned, not panic                                         |
 
 Unit tests in `geoclue.rs`:
 
-| test | scenario | expected |
-|---|---|---|
-| `env_var_unset_returns_none` | `TROLLSHELL_WEATHER_CITY` unset | resolve_configured_city returns None |
+| test                          | scenario                                            | expected                                                               |
+| ----------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------- |
+| `env_var_unset_returns_none`  | `TROLLSHELL_WEATHER_CITY` unset                     | resolve_configured_city returns None                                   |
 | `env_var_set_calls_geocoding` | env var = "Stockholm", mock HTTP returns one result | resolves to LocationSnapshot with that lat/lon and `Configured` source |
 
 D-Bus geoclue interaction is NOT unit-tested (compositor-dependent). The 15-min timer + sidebar-open refresh are also covered by interactive verification.

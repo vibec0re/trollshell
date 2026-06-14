@@ -15,6 +15,7 @@
 ## File Structure
 
 **Modified:**
+
 - `crates/hytte-services/Cargo.toml` — add `"net"` to tokio features.
 - `crates/hytte-services/src/sensors.rs` — single-file change. Adds: `MountSpec`, `PSEUDO_FSTYPES` const, `decode_octal_escapes`, `parse_mountinfo_line`, `parse_mountinfo`, `read_mountlist`, `mount_watch_loop`, `read_disk_for_specs`, `mount_list` field on `SensorsHandles`. Removes: `read_disk(&[&str])`.
 
@@ -27,6 +28,7 @@
 `tokio::io::unix::AsyncFd` is gated behind the `net` cargo feature; the watcher task needs it. The crate currently has `["rt", "io-util", "process", "sync", "time"]`.
 
 **Files:**
+
 - Modify: `crates/hytte-services/Cargo.toml:23`
 
 - [ ] **Step 1: Edit the tokio dep line**
@@ -62,7 +64,8 @@ git commit -m "chore(services): enable tokio net feature for AsyncFd"
 These three pieces are pure helpers needed by the parser. Write tests first for `decode_octal_escapes` (the only one that has interesting behavior to test in isolation).
 
 **Files:**
-- Modify: `crates/hytte-services/src/sensors.rs` — add a new section "── /proc/self/mountinfo parsing ──" near the existing "── Disk usage ──" section (just *before* it, around line 753).
+
+- Modify: `crates/hytte-services/src/sensors.rs` — add a new section "── /proc/self/mountinfo parsing ──" near the existing "── Disk usage ──" section (just _before_ it, around line 753).
 - Test: same file's existing `#[cfg(test)] mod tests` block (around line 798).
 
 - [ ] **Step 1: Write the failing tests**
@@ -192,6 +195,7 @@ git commit -m "feat(sensors): add MountSpec, pseudo-fs denylist, octal decoder"
 A pure function that turns one mountinfo line into a `MountSpec` (or `None`).
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs` (same parsing section)
 
 - [ ] **Step 1: Write the failing tests**
@@ -249,7 +253,7 @@ Expected: FAIL with "cannot find function `parse_mountinfo_line`".
 
 Add this function in the `── /proc/self/mountinfo parsing ──` section, immediately after `decode_octal_escapes`:
 
-```rust
+````rust
 /// Parse one line of `/proc/self/mountinfo`.
 ///
 /// Format (man `proc(5)` §5):
@@ -287,7 +291,7 @@ fn parse_mountinfo_line(line: &str) -> Option<MountSpec> {
         fstype,
     })
 }
-```
+````
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -313,6 +317,7 @@ git commit -m "feat(sensors): parse single mountinfo line into MountSpec"
 The full parser: walk all lines, filter pseudo fstypes, dedup by `dev_id` keeping the shortest path within each group while preserving original order of survivors.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs` (same section)
 
 - [ ] **Step 1: Write the failing tests**
@@ -436,6 +441,7 @@ git commit -m "feat(sensors): filter pseudo fs and dedup mounts by dev_id"
 Add the I/O wrapper. Replace `read_disk(&[&str])` with `read_disk_for_specs(&[MountSpec])`. Inside `poll_loop`, build a temporary `Vec<MountSpec>` from the still-hardcoded `["/", "/home"]` paths. End-state behavior is **unchanged** in this commit — same two mounts shown — but the plumbing is now ready for Task 6.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs`
   - mountinfo section: add `read_mountlist`.
   - disk-usage section (around line 755): replace `read_disk` with `read_disk_for_specs`.
@@ -573,6 +579,7 @@ git commit -m "refactor(sensors): disk poll now consumes MountSpec list"
 The behavior change. Add the `mount_list: Mutable<Vec<MountSpec>>` to `SensorsHandles`. Add `mount_watch_loop`. Spawn it from `SensorsService::start` and pass a clone of the handle to `poll_loop`. Drop the temporary specs from Task 5; read from the Mutable instead.
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/sensors.rs`
   - `SensorsHandles` struct (around line 138) and its `Default` impl (around line 149).
   - `SensorsService::start` (around line 172).
@@ -805,6 +812,7 @@ Expected: clean build.
 - [ ] **Step 2: Compute the expected mount count**
 
 Run:
+
 ```bash
 findmnt --real --output TARGET,SOURCE --noheadings \
   | awk '{print $2}' \
@@ -812,6 +820,7 @@ findmnt --real --output TARGET,SOURCE --noheadings \
   | sort -u \
   | wc -l
 ```
+
 Note the number — that's the upper bound (we dedup by `major:minor` of the kernel device, which is a slightly coarser grouping than `findmnt` source-uniqueness, but on most setups they match).
 
 Also run plain `findmnt --real` and inspect the unique `major:minor` columns — the chip should show one bar per unique `major:minor`.
@@ -821,6 +830,7 @@ Also run plain `findmnt --real` and inspect the unique `major:minor` columns —
 Run: `cargo run --bin trollshell` (or however the user normally launches it; `./trollshell` is also a checked-in symlink).
 
 Verify visually:
+
 - The disk chip in the bar shows N tiny vertical bars where N matches the unique-`major:minor` count from Step 2.
 - Hovering each bar shows a tooltip with that mount's path and percentage.
 - Opening the Stats modal (click the chip) shows the same mount set inside the "Disk" expander, with `M used / N total (P%)` per row.
@@ -828,6 +838,7 @@ Verify visually:
 - [ ] **Step 4: Test live updates (optional, if user wants to verify the watcher)**
 
 If the user has an extra device or can `mount --bind /tmp /mnt/test` (with sudo):
+
 1. While trollshell is running, mount something new.
 2. The chip should grow by one bar within ~5 s (next disk tick after the watcher updates the Mutable).
 3. Unmount; the bar should disappear within ~5 s.
@@ -843,6 +854,7 @@ Skip this step if unwanted — the parser tests cover the logic; this is a smoke
 After writing this plan I checked it against the spec:
 
 **Spec coverage:**
+
 - Goal & non-goals: covered by Task 0 (file-structure section) and overall task scope.
 - Architecture (a) mount list event-driven: Tasks 5, 6.
 - Architecture (b) disk usage periodic: Task 5 (refactor) + Task 6 (live wiring).

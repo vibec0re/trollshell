@@ -86,6 +86,7 @@ trollshell/src/
 Note the panel-vs-overlay-name disambiguation: `panels/notifications.rs` (drawer history list) and `overlays/notifications.rs` (transient toasts) are distinct concerns — the drawer panel reads notification history, the overlay renders incoming toasts. Same domain, different surfaces, different files.
 
 **Naming notes**
+
 - `panels/<name>.rs` exposes one `pub fn panel_<name>() -> gtk::Widget`. Per-page private helpers stay in the same file.
 - `components/<name>.rs` exposes one or two related helpers. `layout.rs` keeps `page_box`/`finish_page`/`page_grid`/`panel` together because they're a cohesive set used by every panel.
 - `components::layout::panel(title)` — the function name `panel` clashes with the directory name `panels/`. Rename `fn panel(title)` → `fn section(title)` to avoid confusion. The function builds a vertically-stacked section inside `page_grid`, "section" describes it accurately.
@@ -93,34 +94,34 @@ Note the panel-vs-overlay-name disambiguation: `panels/notifications.rs` (drawer
 
 ## Function rename summary
 
-| Old (in `pages.rs`)                               | New (in `panels/<file>.rs`)                                            |
-| ------------------------------------------------- | ---------------------------------------------------------------------- |
-| `pub fn page_media()`                             | `pub fn panel_media()`                                                 |
-| `pub fn page_network()`                           | `pub fn panel_network()`                                               |
-| `pub fn page_bluetooth()`                         | `pub fn panel_bluetooth()`                                             |
-| `pub fn page_stats()`                             | `pub fn panel_stats()`                                                 |
-| `pub fn page_audio()`                             | `pub fn panel_audio()`                                                 |
-| `pub fn page_power()`                             | `pub fn panel_power()`                                                 |
-| `pub fn page_notifications()`                     | `pub fn panel_notifications()`                                         |
-| `pub fn page_power_menu()`                        | `pub fn panel_power_menu()`                                            |
-| `pub fn page_appearance()`                        | `pub fn panel_appearance()`                                            |
-| `pub fn page_displays()`                          | `pub fn panel_displays()`                                              |
-| `pub fn page_clipboard()`                         | `pub fn panel_clipboard()`                                             |
-| `pub fn page_settings()`                          | `pub fn panel_settings()`                                              |
-| `pub fn page_calendar()`                          | `pub fn panel_calendar()`                                              |
-| `pub fn page_vpn()`                               | `pub fn panel_vpn()`                                                   |
-| `pub fn page_connections()`                       | `pub fn panel_connections()`                                           |
-| `fn page_box() -> gtk::Box`                       | `pub(crate) fn page_box() -> gtk::Box` (in `components/layout.rs`)     |
-| `fn finish_page(...)` → `gtk::Widget`             | `pub(crate) fn finish_page(...)` (in `components/layout.rs`)           |
-| `fn page_grid() -> gtk::Grid`                     | `pub(crate) fn page_grid() -> gtk::Grid` (in `components/layout.rs`)   |
-| `fn panel(title) -> gtk::Box`                     | `pub(crate) fn section(title) -> gtk::Box` (in `components/layout.rs` — renamed to avoid module-name clash) |
-| `fn build_history_row(name)`                      | `pub(crate) fn build_history_row(name)` (in `components/history_row.rs`) |
-| `fn deep_link_row(...)`                           | `pub(crate) fn deep_link_row(...)` (in `components/deep_link_row.rs`)   |
-| `fn build_connection_row(...)`                    | `pub(crate) fn build_connection_row(...)` (in `components/connection_row.rs`) |
-| `const CONN_BUCKET_CAP`                           | `pub(crate) const CONN_BUCKET_CAP` (in `components/connection_row.rs`) |
-| `fn humanize_since(t)`                            | `pub(crate) fn humanize_since(t)` (in `components/format.rs`)          |
-| `fn fmt_us(us)`                                   | `pub(crate) fn fmt_us(us)` (in `components/format.rs`)                 |
-| `widgets::util::{fmt_bytes, fmt_rate}`            | `components::format::{fmt_bytes, fmt_rate}` (file moves wholesale)     |
+| Old (in `pages.rs`)                    | New (in `panels/<file>.rs`)                                                                                 |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `pub fn page_media()`                  | `pub fn panel_media()`                                                                                      |
+| `pub fn page_network()`                | `pub fn panel_network()`                                                                                    |
+| `pub fn page_bluetooth()`              | `pub fn panel_bluetooth()`                                                                                  |
+| `pub fn page_stats()`                  | `pub fn panel_stats()`                                                                                      |
+| `pub fn page_audio()`                  | `pub fn panel_audio()`                                                                                      |
+| `pub fn page_power()`                  | `pub fn panel_power()`                                                                                      |
+| `pub fn page_notifications()`          | `pub fn panel_notifications()`                                                                              |
+| `pub fn page_power_menu()`             | `pub fn panel_power_menu()`                                                                                 |
+| `pub fn page_appearance()`             | `pub fn panel_appearance()`                                                                                 |
+| `pub fn page_displays()`               | `pub fn panel_displays()`                                                                                   |
+| `pub fn page_clipboard()`              | `pub fn panel_clipboard()`                                                                                  |
+| `pub fn page_settings()`               | `pub fn panel_settings()`                                                                                   |
+| `pub fn page_calendar()`               | `pub fn panel_calendar()`                                                                                   |
+| `pub fn page_vpn()`                    | `pub fn panel_vpn()`                                                                                        |
+| `pub fn page_connections()`            | `pub fn panel_connections()`                                                                                |
+| `fn page_box() -> gtk::Box`            | `pub(crate) fn page_box() -> gtk::Box` (in `components/layout.rs`)                                          |
+| `fn finish_page(...)` → `gtk::Widget`  | `pub(crate) fn finish_page(...)` (in `components/layout.rs`)                                                |
+| `fn page_grid() -> gtk::Grid`          | `pub(crate) fn page_grid() -> gtk::Grid` (in `components/layout.rs`)                                        |
+| `fn panel(title) -> gtk::Box`          | `pub(crate) fn section(title) -> gtk::Box` (in `components/layout.rs` — renamed to avoid module-name clash) |
+| `fn build_history_row(name)`           | `pub(crate) fn build_history_row(name)` (in `components/history_row.rs`)                                    |
+| `fn deep_link_row(...)`                | `pub(crate) fn deep_link_row(...)` (in `components/deep_link_row.rs`)                                       |
+| `fn build_connection_row(...)`         | `pub(crate) fn build_connection_row(...)` (in `components/connection_row.rs`)                               |
+| `const CONN_BUCKET_CAP`                | `pub(crate) const CONN_BUCKET_CAP` (in `components/connection_row.rs`)                                      |
+| `fn humanize_since(t)`                 | `pub(crate) fn humanize_since(t)` (in `components/format.rs`)                                               |
+| `fn fmt_us(us)`                        | `pub(crate) fn fmt_us(us)` (in `components/format.rs`)                                                      |
+| `widgets::util::{fmt_bytes, fmt_rate}` | `components::format::{fmt_bytes, fmt_rate}` (file moves wholesale)                                          |
 
 Per-panel private helpers (`build_traffic_group_v2`, `build_iface_traffic_row`, `IfaceRow`, `build_tunnel_group`, `build_peer_row`, `build_history_*_row`, theme-dropdown helpers, …) keep their names; visibility stays `fn` (file-private).
 
@@ -187,14 +188,14 @@ Each panel imports only what it uses; the full block above is the maximum a sing
 
 ## File touch summary
 
-| Operation                 | Count | Notes                                                                   |
-| ------------------------- | ----- | ----------------------------------------------------------------------- |
-| New files (`panels/`)     | 16    | `mod.rs` + 15 panels                                                    |
-| New files (`components/`) | 6     | `mod.rs` + 5 helper files                                               |
+| Operation                 | Count | Notes                                                                                 |
+| ------------------------- | ----- | ------------------------------------------------------------------------------------- |
+| New files (`panels/`)     | 16    | `mod.rs` + 15 panels                                                                  |
+| New files (`components/`) | 6     | `mod.rs` + 5 helper files                                                             |
 | New files (`overlays/`)   | 6     | `mod.rs` + 5 overlay modules (lock_screen, osd, polkit_dialog, prompt, notifications) |
-| Renamed files (git mv)    | 5     | `widgets/{lock_screen,osd,polkit_dialog,prompt,notifications}.rs` → `overlays/` |
-| Deleted files             | 2     | `widgets/pages.rs`, `widgets/util.rs`                                   |
-| Modified files            | ~3    | `widgets/mod.rs`, `modal.rs`, `main.rs`                                 |
-| Renamed fns               | 16    | 15 `page_*` → `panel_*`, 1 `panel(title)` → `section(title)`            |
+| Renamed files (git mv)    | 5     | `widgets/{lock_screen,osd,polkit_dialog,prompt,notifications}.rs` → `overlays/`       |
+| Deleted files             | 2     | `widgets/pages.rs`, `widgets/util.rs`                                                 |
+| Modified files            | ~3    | `widgets/mod.rs`, `modal.rs`, `main.rs`                                               |
+| Renamed fns               | 16    | 15 `page_*` → `panel_*`, 1 `panel(title)` → `section(title)`                          |
 
 Net: ~28 new/moved files, 2 deleted, 3 modified. About 3750 LOC of `pages.rs` redistributed across 21 small/medium panel+component files (largest expected: `panels/network.rs` at ~700 LOC; smallest: `panels/media.rs` at ~210 LOC). Five overlay files move ~1950 LOC out of `widgets/` unchanged.

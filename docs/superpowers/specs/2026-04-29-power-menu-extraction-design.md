@@ -110,7 +110,7 @@ After the migration, `spawn_detached` has zero callers and is deleted. The funct
 
 ## Behavior
 
-- **Polkit auth.** Calling `Manager.Suspend(false)` (interactive=false) makes logind ask polkit to authorize the action against the *active session*. trollshell's polkit agent service answers that prompt with the standard auth dialog (already wired via `polkit::service()` and `widgets::polkit_dialog`). No new auth UI.
+- **Polkit auth.** Calling `Manager.Suspend(false)` (interactive=false) makes logind ask polkit to authorize the action against the _active session_. trollshell's polkit agent service answers that prompt with the standard auth dialog (already wired via `polkit::service()` and `widgets::polkit_dialog`). No new auth UI.
 - **Failure modes.** D-Bus errors (logind not reachable, polkit denial, no active session) are logged at `tracing::warn!` and silently consumed — same observability ceiling as the current `spawn_detached` (which loses systemctl exit codes today). The drawer dismisses regardless, matching current UX.
 - **Ordering.** Fire-and-forget. The drawer's `dismiss_all()` and the system action race; logind's actual suspend takes ~tens of milliseconds to begin, by which time the drawer animation is well underway. No user-visible difference from today.
 
@@ -119,6 +119,7 @@ After the migration, `spawn_detached` has zero callers and is deleted. The funct
 D-Bus calls against logind are integration-tested by running the shell on a real session, the same way the existing `screensaver`, `upower`, `polkit`, etc. services are tested. The wrapper functions are thin enough (a couple of lines each, all mechanical) that unit tests would only verify the constants — not worthwhile.
 
 Manual integration test plan:
+
 1. `cargo run -p trollshell` on a niri session.
 2. Open power menu; click Logout — niri shows its built-in confirmation overlay; cancel.
 3. Click Suspend — logind authenticates via polkit (auth dialog appears if pkla requires it; otherwise no dialog), system suspends.
@@ -132,11 +133,11 @@ Manual integration test plan:
 
 ## File touch summary
 
-| File                                              | Change                                                       |
-| ------------------------------------------------- | ------------------------------------------------------------ |
-| `crates/hytte-services/src/logind.rs`             | new — ~80 LOC                                                |
-| `crates/hytte-services/src/niri.rs`               | extend — add `pub fn quit(skip_confirmation: bool)` (~10 LOC) |
-| `crates/hytte-services/src/lib.rs`                | `pub mod logind;`                                            |
-| `trollshell/src/widgets/pages.rs`                 | rewire 4 call sites; delete `spawn_detached` (~10 LOC net)   |
+| File                                  | Change                                                        |
+| ------------------------------------- | ------------------------------------------------------------- |
+| `crates/hytte-services/src/logind.rs` | new — ~80 LOC                                                 |
+| `crates/hytte-services/src/niri.rs`   | extend — add `pub fn quit(skip_confirmation: bool)` (~10 LOC) |
+| `crates/hytte-services/src/lib.rs`    | `pub mod logind;`                                             |
+| `trollshell/src/widgets/pages.rs`     | rewire 4 call sites; delete `spawn_detached` (~10 LOC net)    |
 
 Net: roughly +90 / −10 LOC. Library gains capability; binary loses an unwanted detour.

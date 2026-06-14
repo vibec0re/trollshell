@@ -14,16 +14,16 @@
 
 ## File Map
 
-| file | role | new/edit |
-|---|---|---|
-| `crates/hytte-services/src/weather.rs` | weather service: types, condition mapping, Open-Meteo fetch, polling, public API | new |
-| `crates/hytte-services/src/geoclue.rs` | location service: D-Bus + env var fallback, forward-geocode | new |
-| `crates/hytte-services/src/lib.rs` | `pub mod weather; pub mod geoclue;` | edit |
-| `trollshell/src/widgets/weather.rs` | sidebar weather widget — Loading/Resolved/Error rendering | new |
-| `trollshell/src/widgets/mod.rs` | `pub mod weather;` | edit |
-| `trollshell/src/overlays/sidebar.rs` | replace placeholder label with `weather::widget(monitor)`; add on-open refresh subscription | edit |
-| `trollshell/src/main.rs` | register both services via `.with(weather::service()).with(geoclue::service())` | edit |
-| `trollshell/style.css` | `.ts-weather*` rules; drop `.ts-sidebar-placeholder` | edit |
+| file                                   | role                                                                                        | new/edit |
+| -------------------------------------- | ------------------------------------------------------------------------------------------- | -------- |
+| `crates/hytte-services/src/weather.rs` | weather service: types, condition mapping, Open-Meteo fetch, polling, public API            | new      |
+| `crates/hytte-services/src/geoclue.rs` | location service: D-Bus + env var fallback, forward-geocode                                 | new      |
+| `crates/hytte-services/src/lib.rs`     | `pub mod weather; pub mod geoclue;`                                                         | edit     |
+| `trollshell/src/widgets/weather.rs`    | sidebar weather widget — Loading/Resolved/Error rendering                                   | new      |
+| `trollshell/src/widgets/mod.rs`        | `pub mod weather;`                                                                          | edit     |
+| `trollshell/src/overlays/sidebar.rs`   | replace placeholder label with `weather::widget(monitor)`; add on-open refresh subscription | edit     |
+| `trollshell/src/main.rs`               | register both services via `.with(weather::service()).with(geoclue::service())`             | edit     |
+| `trollshell/style.css`                 | `.ts-weather*` rules; drop `.ts-sidebar-placeholder`                                        | edit     |
 
 No new workspace dependencies. `ureq`, `serde`, `serde_json`, `zbus`, `hytte_bus`, `tokio`, `chrono` are all already present in `hytte-services/Cargo.toml`.
 
@@ -32,6 +32,7 @@ No new workspace dependencies. `ureq`, `serde`, `serde_json`, `zbus`, `hytte_bus
 ## Task 1: Weather condition mapping (pure function, TDD)
 
 **Files:**
+
 - Create: `crates/hytte-services/src/weather.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 
@@ -148,6 +149,7 @@ mod tests {
 cd /home/choom/src/trollshell
 cargo test -p hytte-services --tests weather
 ```
+
 Expected: 7 tests pass.
 
 - [ ] **Step 4: Commit**
@@ -170,6 +172,7 @@ EOF
 ## Task 2: Open-Meteo response parser (TDD)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/weather.rs`
 
 - [ ] **Step 1: Add the response types + parser**
@@ -247,6 +250,7 @@ Inside the existing `#[cfg(test)] mod tests` block, append:
 ```bash
 cargo test -p hytte-services --tests weather
 ```
+
 Expected: 9 tests pass (7 from Task 1 + 2 new).
 
 - [ ] **Step 4: Commit**
@@ -269,6 +273,7 @@ EOF
 ## Task 3: Weather service skeleton (state, Service impl, public API)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/weather.rs`
 
 This task adds `WeatherSnapshot`, `WeatherState`, the public API (`current()`, `refresh()`, `service()`), and the `Service` trait impl. The actual fetch isn't wired yet — `refresh()` is a no-op stub until Task 8.
@@ -363,6 +368,7 @@ pub fn refresh() {
 ```bash
 cargo build -p hytte-services
 ```
+
 Expected: builds clean. (Some `dead_code` warnings on the unused `pub(crate)` parser may appear — acceptable, will clear when Task 4 calls `parse_open_meteo`.)
 
 - [ ] **Step 3: Run the tests**
@@ -370,6 +376,7 @@ Expected: builds clean. (Some `dead_code` warnings on the unused `pub(crate)` pa
 ```bash
 cargo test -p hytte-services --tests weather
 ```
+
 Expected: 9 tests pass.
 
 - [ ] **Step 4: Commit**
@@ -393,6 +400,7 @@ EOF
 ## Task 4: Blocking HTTP helper for current weather
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/weather.rs`
 
 The Open-Meteo fetch is a blocking call (`ureq`), wrapped here so the runtime task can use `tokio::task::spawn_blocking`.
@@ -434,6 +442,7 @@ pub(crate) fn fetch_current_blocking(lat: f64, lon: f64) -> Result<OpenMeteoCurr
 ```bash
 cargo build -p hytte-services
 ```
+
 Expected: builds clean.
 
 - [ ] **Step 3: Commit**
@@ -457,6 +466,7 @@ EOF
 ## Task 5: Reverse-geocode helper + in-process cache
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/weather.rs`
 
 When location source is `GeoClue`, the snapshot has no friendly name — we reverse-geocode lat/lon via Open-Meteo's geocoding API. Cache by rounded `(i32, i32)` coordinates so we don't refetch on every 15-min weather poll.
@@ -558,6 +568,7 @@ Inside the `#[cfg(test)] mod tests` block, append:
 ```bash
 cargo test -p hytte-services --tests weather
 ```
+
 Expected: 10 tests pass (9 + new cache test).
 
 - [ ] **Step 4: Commit**
@@ -581,6 +592,7 @@ EOF
 ## Task 6: Geoclue service skeleton + env-var fallback
 
 **Files:**
+
 - Create: `crates/hytte-services/src/geoclue.rs`
 - Modify: `crates/hytte-services/src/lib.rs`
 
@@ -803,6 +815,7 @@ mod tests {
 cargo build -p hytte-services
 cargo test -p hytte-services --tests geoclue
 ```
+
 Expected: build clean, 3 geoclue tests pass.
 
 - [ ] **Step 4: Commit**
@@ -826,6 +839,7 @@ EOF
 ## Task 7: Geoclue D-Bus client
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/geoclue.rs`
 
 Add the actual D-Bus path that takes precedence over the env var. Failure (no service, timeout, permission denied) falls back to `resolve_from_env`.
@@ -981,6 +995,7 @@ async fn read_double_property(path: &str, prop: &str) -> Option<f64> {
 ```
 
 Notes for the implementer:
+
 - The exact `hytte_bus::call(...).args(...).send()` API may differ slightly from this pseudocode. Check `crates/hytte-bus/src/call.rs` for the actual builder methods and `crates/hytte-services/src/upower.rs` / `logind.rs` for working call examples. Adapt the call shape but preserve the sequence.
 - `hytte_bus::signals::subscribe` similarly — check `crates/hytte-bus/src/signals.rs` for the actual builder.
 - If `OwnedObjectPath` is awkward, `String` may be acceptable for `path()` parameters.
@@ -991,6 +1006,7 @@ Notes for the implementer:
 ```bash
 cargo build -p hytte-services
 ```
+
 Expected: builds clean. If there are API mismatches with `hytte_bus`, adapt the call shape; if unsure, report DONE_WITH_CONCERNS and let the reviewer flag.
 
 - [ ] **Step 3: Run tests**
@@ -998,6 +1014,7 @@ Expected: builds clean. If there are API mismatches with `hytte_bus`, adapt the 
 ```bash
 cargo test -p hytte-services --tests geoclue
 ```
+
 Expected: 3 geoclue tests still pass (the D-Bus path is not unit-tested; integration is interactive).
 
 - [ ] **Step 4: Commit**
@@ -1022,6 +1039,7 @@ EOF
 ## Task 8: Weather fetch loop + on-demand refresh
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/weather.rs`
 
 Wire `geoclue::current()` to drive Open-Meteo fetches. 15-min periodic timer; `refresh()` sends an immediate fetch via an mpsc channel.
@@ -1218,7 +1236,7 @@ async fn fetch_once(state: &Mutable<WeatherState>) {
 }
 ```
 
-Note for the implementer: `geoclue::current().to_future().await` reads the *current* Mutable value via the futures-signals first-emission semantic. If `signal_cloned()` doesn't expose `to_future()`, use:
+Note for the implementer: `geoclue::current().to_future().await` reads the _current_ Mutable value via the futures-signals first-emission semantic. If `signal_cloned()` doesn't expose `to_future()`, use:
 
 ```rust
 use futures_util::StreamExt;
@@ -1235,6 +1253,7 @@ A simpler alternative if the above proves fiddly: expose a `pub(crate) fn curren
 ```bash
 cargo build -p hytte-services
 ```
+
 Expected: builds clean. If `to_future` or `to_stream` aren't available on this signal type, follow the simpler alternative — add a sync `current_snapshot()` helper in `geoclue.rs` and use it.
 
 - [ ] **Step 3: Run tests**
@@ -1242,6 +1261,7 @@ Expected: builds clean. If `to_future` or `to_stream` aren't available on this s
 ```bash
 cargo test -p hytte-services
 ```
+
 Expected: all weather + geoclue tests still pass.
 
 - [ ] **Step 4: Commit**
@@ -1271,6 +1291,7 @@ EOF
 ## Task 9: Widget renders WeatherState
 
 **Files:**
+
 - Create: `trollshell/src/widgets/weather.rs`
 - Modify: `trollshell/src/widgets/mod.rs`
 
@@ -1495,6 +1516,7 @@ fn build_error_skeleton() -> ErrorBox {
 ```bash
 cargo build -p trollshell
 ```
+
 Expected: builds clean. (Unused-warning on `widget` is acceptable — Task 10 mounts it.)
 
 - [ ] **Step 4: Commit**
@@ -1518,6 +1540,7 @@ EOF
 ## Task 10: Wire into sidebar + main.rs + CSS
 
 **Files:**
+
 - Modify: `trollshell/src/overlays/sidebar.rs`
 - Modify: `trollshell/src/main.rs`
 - Modify: `trollshell/style.css`
@@ -1586,9 +1609,9 @@ Find:
 
 ```css
 .ts-sidebar-placeholder {
-    color: alpha(currentColor, 0.5);
-    font-style: italic;
-    font-size: 13px;
+  color: alpha(currentColor, 0.5);
+  font-style: italic;
+  font-size: 13px;
 }
 ```
 
@@ -1596,28 +1619,28 @@ Replace it with the weather rules:
 
 ```css
 .ts-weather {
-    padding: 4px;
+  padding: 4px;
 }
 .ts-weather-location {
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    color: alpha(currentColor, 0.6);
-    margin-bottom: 10px;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: alpha(currentColor, 0.6);
+  margin-bottom: 10px;
 }
 .ts-weather-temp {
-    font-size: 32px;
-    font-weight: 300;
+  font-size: 32px;
+  font-weight: 300;
 }
 .ts-weather-condition {
-    color: alpha(currentColor, 0.85);
-    margin-top: -4px;
-    margin-bottom: 14px;
+  color: alpha(currentColor, 0.85);
+  margin-top: -4px;
+  margin-bottom: 14px;
 }
 .ts-weather-detail-label {
-    color: alpha(currentColor, 0.55);
+  color: alpha(currentColor, 0.55);
 }
 .ts-weather-detail-value {
-    color: white;
+  color: white;
 }
 ```
 
@@ -1626,6 +1649,7 @@ Replace it with the weather rules:
 ```bash
 cargo build -p trollshell
 ```
+
 Expected: builds clean.
 
 - [ ] **Step 6: Run the full test suite**
@@ -1633,6 +1657,7 @@ Expected: builds clean.
 ```bash
 cargo test -p hytte-services -p trollshell
 ```
+
 Expected: all tests pass (10 weather + 3 geoclue + sidebar/frame + whatever else).
 
 - [ ] **Step 7: Commit**
@@ -1664,6 +1689,7 @@ EOF
 ```bash
 cargo build -p trollshell --release
 ```
+
 Expected: clean build.
 
 - [ ] **Step 2: Restart trollshell with the configured city set**
@@ -1740,6 +1766,7 @@ The sidebar's surface, the frame's cutout, and the bar should all look identical
 ## Done
 
 After Task 11 passes, the weather widget MVP is complete. Phase-3 candidates:
+
 - Settings panel entry: switch units, change refresh rate, override location label
 - Forecast (hourly + daily) — collapsible section below the current weather block
 - An active-state CSS rule on `.ts-sidebar-toggle.active` so the chip lights up while sidebar is open (`bind_class(sidebar::open_signal(monitor), &btn, "active")`)

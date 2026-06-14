@@ -112,12 +112,12 @@ finish_page(
 
 **Group description** (bind on `networkd::primary()`):
 
-| Primary state                  | Description text             |
-|--------------------------------|------------------------------|
-| `Some(link)`, Routable          | `Online via {link.name}`     |
+| Primary state                            | Description text                       |
+| ---------------------------------------- | -------------------------------------- |
+| `Some(link)`, Routable                   | `Online via {link.name}`               |
 | `Some(link)`, Carrier or DegradedCarrier | `Limited connectivity via {link.name}` |
-| `Some(link)`, anything else    | `{describe_state(op)} via {link.name}` |
-| `None`                          | `Offline`                    |
+| `Some(link)`, anything else              | `{describe_state(op)} via {link.name}` |
+| `None`                                   | `Offline`                              |
 
 **Primary expander row:**
 
@@ -150,14 +150,14 @@ Unchanged content. Existing two `AdwActionRow`s (`Live`, `Total`) move into a `A
 
 **Group description** (bind):
 
-| Adapter / station state                             | Description text                       |
-|-----------------------------------------------------|----------------------------------------|
-| `wifi::adapter()` is `None`                         | `No adapter`                            |
-| Adapter `powered=false`                              | `Disabled`                              |
-| Connected                                            | `{ssid} · {dbm} dBm ({signal_label})`   |
-| Connecting                                           | `Connecting…`                           |
-| Roaming                                              | `Roaming`                               |
-| Otherwise                                            | `Disconnected`                          |
+| Adapter / station state     | Description text                      |
+| --------------------------- | ------------------------------------- |
+| `wifi::adapter()` is `None` | `No adapter`                          |
+| Adapter `powered=false`     | `Disabled`                            |
+| Connected                   | `{ssid} · {dbm} dBm ({signal_label})` |
+| Connecting                  | `Connecting…`                         |
+| Roaming                     | `Roaming`                             |
+| Otherwise                   | `Disconnected`                        |
 
 `signal_label` derives from dBm bins matching the existing `signal_icon` thresholds: `excellent` (≥-50), `good` (≥-60), `ok` (≥-75), `weak` (else). Connected dBm comes from finding the `WifiNetwork` with `connected==true` in `wifi::networks()`; if no match (transient state), omit the `· {dbm} dBm (…)` fragment and just show the SSID.
 
@@ -195,6 +195,7 @@ Unchanged content. Existing two `AdwActionRow`s (`Live`, `Total`) move into a `A
 **Power-off greying:**
 
 When `adapter.powered == false`:
+
 - Description shows `"Disabled"`.
 - Scan button + ScrolledWindow `set_sensitive(false)`.
 - Switch stays sensitive (it's how you turn it back on).
@@ -368,6 +369,7 @@ serde_json = "1"
 - `known_network_path_round_trips` — `WifiNetwork::known_network_path` is `Some(path)` when iwd reports a non-`/` KnownNetwork path; `None` for `/`. (Use a small synthetic input map — not testing zbus end-to-end.)
 
 Adapter Powered round-trip and Forget aren't unit-testable without zbus mocks. Manual verification step:
+
 - `iwctl device list` should reflect Powered toggling.
 - `iwctl known-networks list` should drop the SSID after Forget.
 
@@ -377,24 +379,24 @@ Append to `trollshell/style.css`:
 
 ```css
 .ts-net-pill {
-    padding: 2px 10px;
-    border-radius: 9999px;
-    font-size: 0.8em;
-    font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  font-size: 0.8em;
+  font-weight: 600;
 }
 
 .ts-pill-connected {
-    background: alpha(@accent_color, 0.20);
-    color: @accent_color;
+  background: alpha(@accent_color, 0.2);
+  color: @accent_color;
 }
 
 .ts-pill-known {
-    background: alpha(@accent_color, 0.08);
-    color: alpha(@accent_color, 0.70);
+  background: alpha(@accent_color, 0.08);
+  color: alpha(@accent_color, 0.7);
 }
 
 .ts-mono {
-    font-family: monospace;
+  font-family: monospace;
 }
 ```
 

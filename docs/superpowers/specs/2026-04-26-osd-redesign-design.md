@@ -14,9 +14,11 @@ Replace the unstyled, primary-monitor-only OSD widget with an Adwaita-card desig
 ### In scope
 
 **Service extension:**
+
 - `crates/hytte-services/src/niri.rs` — add `pub fn focused_output() -> impl Signal<Item = Option<String>>`. Derived from existing `workspaces()` by finding the workspace where `is_focused == true` and reading its `output`.
 
 **UI work in `trollshell/src/widgets/osd.rs`:**
+
 - Restructure the widget tree (Adwaita card; horizontal header [icon | label+value]; progress bar below). Keep the `Kind { Volume, Mic, Brightness }` enum.
 - Add `OsdView.value: gtk::Label` for the percent / "Muted" readout.
 - Per-monitor mount: replace the single `OSD_VIEW` thread-local with a `OSDS: HashMap<String, Rc<OsdView>>` keyed by `Monitor.connector()`. Public `install(&Monitor)` now appends to that map; `main.rs` calls it once per monitor.
@@ -26,9 +28,11 @@ Replace the unstyled, primary-monitor-only OSD widget with an Adwaita-card desig
 - Latest-wins debounce stays per-view (each OsdView has its own `timeout` + `fade_out_timeout`).
 
 **CSS additions in `trollshell/style.css`:**
+
 - ~70 lines of `.ts-osd*` rules. Card backdrop, accent progress, sized icon, muted-state dim, transitions on opacity + margin-top. All using existing `@accent_color` + `@window_bg_color` (or closest available shell-wide tokens, confirmed during implementation by grepping the existing stylesheet).
 
 **`main.rs` change:**
+
 - Replace the single `osd::install(&primary_monitor)` call with a loop over all monitors.
 
 ### Out of scope
@@ -86,11 +90,11 @@ struct OsdView {
 
 Per-kind content matrix:
 
-| Kind        | Icon                                                                  | Label name     | Value (when not muted)            | Value (muted) | Progress fraction        |
-|-------------|-----------------------------------------------------------------------|----------------|-----------------------------------|---------------|--------------------------|
-| Volume      | `audio-volume-{muted,low,medium,high}-symbolic`                       | `Volume`       | `{n}%` (rounded from linear×100)  | `Muted`       | `volume.linear` (0..1)   |
-| Mic         | `microphone-sensitivity-{muted,medium,high}-symbolic`                 | `Microphone`   | `{n}%`                            | `Muted`       | `source.volume.linear`   |
-| Brightness  | `display-brightness-symbolic` (single icon)                           | `Brightness`   | `{n}%` (rounded from level×100)   | (n/a)         | `brightness.level` (0..1)|
+| Kind       | Icon                                                  | Label name   | Value (when not muted)           | Value (muted) | Progress fraction         |
+| ---------- | ----------------------------------------------------- | ------------ | -------------------------------- | ------------- | ------------------------- |
+| Volume     | `audio-volume-{muted,low,medium,high}-symbolic`       | `Volume`     | `{n}%` (rounded from linear×100) | `Muted`       | `volume.linear` (0..1)    |
+| Mic        | `microphone-sensitivity-{muted,medium,high}-symbolic` | `Microphone` | `{n}%`                           | `Muted`       | `source.volume.linear`    |
+| Brightness | `display-brightness-symbolic` (single icon)           | `Brightness` | `{n}%` (rounded from level×100)  | (n/a)         | `brightness.level` (0..1) |
 
 Helper functions added in `osd.rs`:
 
@@ -123,59 +127,60 @@ Append to `trollshell/style.css` (existing `@accent_color` + closest-available s
 
 ```css
 .ts-osd {
-    background: transparent;
+  background: transparent;
 }
 
 .ts-osd-card {
-    min-width: 280px;
-    max-width: 320px;
-    padding: 16px;
-    border-radius: 14px;
-    background: alpha(@window_bg_color, 0.92);
-    box-shadow: 0 4px 16px alpha(black, 0.25);
+  min-width: 280px;
+  max-width: 320px;
+  padding: 16px;
+  border-radius: 14px;
+  background: alpha(@window_bg_color, 0.92);
+  box-shadow: 0 4px 16px alpha(black, 0.25);
 
-    opacity: 0;
-    margin-top: 0px;
-    transition: opacity 200ms ease-out,
-                margin-top 200ms ease-out;
+  opacity: 0;
+  margin-top: 0px;
+  transition:
+    opacity 200ms ease-out,
+    margin-top 200ms ease-out;
 }
 
 .ts-osd-card.shown {
-    opacity: 1;
-    margin-top: 8px;
+  opacity: 1;
+  margin-top: 8px;
 }
 
 .ts-osd-icon {
-    color: @accent_color;
+  color: @accent_color;
 }
 
 .ts-osd-label {
-    font-weight: 600;
+  font-weight: 600;
 }
 
 .ts-osd-value {
-    font-size: 0.85em;
-    opacity: 0.7;
+  font-size: 0.85em;
+  opacity: 0.7;
 }
 
 .ts-osd-progress trough {
-    min-height: 6px;
-    background: alpha(@accent_color, 0.15);
-    border-radius: 9999px;
+  min-height: 6px;
+  background: alpha(@accent_color, 0.15);
+  border-radius: 9999px;
 }
 
 .ts-osd-progress progress {
-    background: @accent_color;
-    border-radius: 9999px;
+  background: @accent_color;
+  border-radius: 9999px;
 }
 
 .ts-osd-card.muted .ts-osd-icon {
-    color: alpha(@accent_color, 0.5);
+  color: alpha(@accent_color, 0.5);
 }
 
 .ts-osd-card.muted .ts-osd-progress progress,
 .ts-osd-card.muted .ts-osd-progress trough {
-    opacity: 0.3;
+  opacity: 0.3;
 }
 ```
 
@@ -184,6 +189,7 @@ Per-kind tints (`.ts-osd-card.volume`, `.mic`, `.brightness`) are reserved. Defa
 **Animation mechanism (load-bearing):**
 
 - On show:
+
   ```rust
   window.set_visible(true);
   let card_for_idle = card.clone();
@@ -191,9 +197,11 @@ Per-kind tints (`.ts-osd-card.volume`, `.mic`, `.brightness`) are reserved. Defa
       card_for_idle.add_css_class("shown");
   });
   ```
+
   The `idle_add_local_once` defers the class flip by one frame so GTK4's CSS engine sees the transition's "from" state (opacity 0 / margin-top 0) before the "to" state (opacity 1 / margin-top 8). Without the defer, the same-frame visibility-and-class flip skips the transition.
 
 - On hide (latest-wins timer fires):
+
   ```rust
   card.remove_css_class("shown");
   let window_for_fade = window.clone();
@@ -202,6 +210,7 @@ Per-kind tints (`.ts-osd-card.volume`, `.mic`, `.brightness`) are reserved. Defa
   });
   view.fade_out_timeout.set(Some(fade_id));
   ```
+
   The 220ms = 200ms transition + 20ms safety buffer.
 
 - New event arrives mid-fade-out: cancel `fade_out_timeout`, re-add `.shown`, set `window.set_visible(true)` (idempotent), arm a fresh `timeout` for the 1500ms hide.

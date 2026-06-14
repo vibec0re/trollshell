@@ -84,7 +84,7 @@ pub fn bind_two_way<S, W, V, Apply, Connect>(
    - `widget.block_signal(&handler_id)`
    - `apply(&widget, value)`
    - `widget.unblock_signal(&handler_id)`
-3. The handler stays registered across emissions; only the *delivery* of `notify::active` / `value-changed` / `toggled` is suppressed during apply, so genuine user actions still fire.
+3. The handler stays registered across emissions; only the _delivery_ of `notify::active` / `value-changed` / `toggled` is suppressed during apply, so genuine user actions still fire.
 4. Lifetime is tied to the widget (cheap clone, GTK refcount) — same model as `bind()`.
 
 ### Design choices not taken
@@ -117,7 +117,7 @@ BlueZ owns discovery sessions per bus client. `StartDiscovery` from a transient 
 
 ### Fix
 
-Hold a single shared `zbus::Connection` for the lifetime of the service and use it for *every* command (not only discovery — same identity issue affects Connect/Disconnect/Pair/Trust under contention).
+Hold a single shared `zbus::Connection` for the lifetime of the service and use it for _every_ command (not only discovery — same identity issue affects Connect/Disconnect/Pair/Trust under contention).
 
 ### Implementation outline
 

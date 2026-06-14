@@ -89,7 +89,7 @@ To clear the history entirely:
 cliphist wipe
 ```
 
-The trollshell drawer caps the *visible* list at 50 entries regardless of
+The trollshell drawer caps the _visible_ list at 50 entries regardless of
 how many cliphist holds — that's purely a UI cap, not a storage cap.
 
 ## Opening the clipboard page
@@ -122,7 +122,7 @@ helper to toggle the page directly.
   use `cliphist list | grep …` from a terminal if you need to search.
 - **No multi-select / batch paste.**
 - **No rich-format paste.** wl-copy receives whatever bytes `cliphist
-  decode` produced — for text, that's text; for images, the original blob
+decode` produced — for text, that's text; for images, the original blob
   goes back to the clipboard with cliphist's recorded MIME type.
 - **No delete-from-UI.** cliphist's `delete` reads `<id>\t<preview>` lines
   on stdin (not an id argument), which makes per-row delete from the

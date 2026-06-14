@@ -243,16 +243,16 @@ Below the grid (full width):
 ```css
 /* tightened from padding: 2px 10px; font-size: 0.8em */
 .ts-net-pill {
-    padding: 1px 8px;
-    border-radius: 9999px;
-    font-size: 0.72em;
-    font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 9999px;
+  font-size: 0.72em;
+  font-weight: 600;
 }
 
 /* New: VPN tunnel-state pill. */
 .ts-pill-vpn {
-    background: alpha(@success_color, 0.18);
-    color: @success_color;
+  background: alpha(@success_color, 0.18);
+  color: @success_color;
 }
 ```
 
@@ -303,18 +303,18 @@ The plan will sequence three independent commits/PRs, each independently testabl
 
 ## File touch summary
 
-| File                                                  | Change                                             |
-| ----------------------------------------------------- | -------------------------------------------------- |
-| `crates/hytte-services/src/vpn.rs`                    | new — ~250 LOC including parser tests             |
-| `crates/hytte-services/src/netconn.rs`                | new — ~150 LOC including parser tests             |
-| `crates/hytte-services/src/lib.rs`                    | `pub mod vpn;` `pub mod netconn;`                  |
-| `trollshell/src/widgets/vpn.rs`                       | new — ~30 LOC                                      |
-| `trollshell/src/widgets/mod.rs`                       | `mod vpn;` + `pub use`                             |
-| `trollshell/src/modal.rs`                             | `Page::Vpn` enum variant + `stack_name` arm        |
-| `trollshell/src/widgets/pages.rs`                     | `page_vpn` (~120 LOC), `page_network` reflow + active-connections section (~150 LOC delta) |
-| `trollshell/src/main.rs`                              | `.with(vpn::service())` `.with(netconn::service())`, vpn chip in bar group |
-| `trollshell/style.css`                                | `.ts-net-pill` tightened, `.ts-pill-vpn` added     |
-| `docs/FUTURE.md`                                      | new                                                |
+| File                                   | Change                                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `crates/hytte-services/src/vpn.rs`     | new — ~250 LOC including parser tests                                                      |
+| `crates/hytte-services/src/netconn.rs` | new — ~150 LOC including parser tests                                                      |
+| `crates/hytte-services/src/lib.rs`     | `pub mod vpn;` `pub mod netconn;`                                                          |
+| `trollshell/src/widgets/vpn.rs`        | new — ~30 LOC                                                                              |
+| `trollshell/src/widgets/mod.rs`        | `mod vpn;` + `pub use`                                                                     |
+| `trollshell/src/modal.rs`              | `Page::Vpn` enum variant + `stack_name` arm                                                |
+| `trollshell/src/widgets/pages.rs`      | `page_vpn` (~120 LOC), `page_network` reflow + active-connections section (~150 LOC delta) |
+| `trollshell/src/main.rs`               | `.with(vpn::service())` `.with(netconn::service())`, vpn chip in bar group                 |
+| `trollshell/style.css`                 | `.ts-net-pill` tightened, `.ts-pill-vpn` added                                             |
+| `docs/FUTURE.md`                       | new                                                                                        |
 
 Net: roughly +700 / −30 LOC across services + UI + docs.
 

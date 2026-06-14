@@ -15,12 +15,12 @@ the system is on battery (not plugged in).
 
 A pure function maps `(percentage, state)` to one of four tiers:
 
-| Tier       | Condition                                    | Icon color | Animation |
-| ---------- | -------------------------------------------- | ---------- | --------- |
-| `Good`     | `percentage >= 60`                           | `#66e07a`  | —         |
-| `Warn`     | `30 <= percentage < 60`                      | `#ffce4d`  | —         |
-| `Low`      | `10 <= percentage < 30`                      | `#ff8a3d`  | —         |
-| `Critical` | `percentage < 10` **and** `state == Discharging` | `#ff3b5c` | pulse     |
+| Tier       | Condition                                        | Icon color | Animation |
+| ---------- | ------------------------------------------------ | ---------- | --------- |
+| `Good`     | `percentage >= 60`                               | `#66e07a`  | —         |
+| `Warn`     | `30 <= percentage < 60`                          | `#ffce4d`  | —         |
+| `Low`      | `10 <= percentage < 30`                          | `#ff8a3d`  | —         |
+| `Critical` | `percentage < 10` **and** `state == Discharging` | `#ff3b5c`  | pulse     |
 
 `Critical` requires `Discharging` so that being plugged in at 5% does
 not blink — `tier()` falls through to `Low` (orange icon, steady). The
@@ -90,17 +90,28 @@ Append to `trollshell/style.css` after the existing indicator block
 "color the icon only" pattern):
 
 ```css
-.ts-battery-good     image { color: #66e07a; }
-.ts-battery-warn     image { color: #ffce4d; }
-.ts-battery-low      image { color: #ff8a3d; }
+.ts-battery-good image {
+  color: #66e07a;
+}
+.ts-battery-warn image {
+  color: #ffce4d;
+}
+.ts-battery-low image {
+  color: #ff8a3d;
+}
 .ts-battery-critical image {
-    color: #ff3b5c;
-    animation: ts-battery-pulse 1s ease-in-out infinite;
+  color: #ff3b5c;
+  animation: ts-battery-pulse 1s ease-in-out infinite;
 }
 
 @keyframes ts-battery-pulse {
-    0%, 100% { opacity: 1.0; }
-    50%      { opacity: 0.3; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
 }
 ```
 
@@ -119,11 +130,12 @@ Unit tests in `widgets/battery.rs` covering boundaries of `tier()`:
 - `tier(10.0,  Discharging) == Low`
 - `tier(9.9,   Discharging) == Critical`
 - `tier(0.0,   Discharging) == Critical`
-- `tier(5.0,   Charging)    == Low`        — no blink while charging
-- `tier(5.0,   FullyCharged) == Low`       — non-Discharging never blinks
-- `tier(5.0,   Unknown)     == Low`        — hidden anyway, but well-defined
+- `tier(5.0,   Charging)    == Low` — no blink while charging
+- `tier(5.0,   FullyCharged) == Low` — non-Discharging never blinks
+- `tier(5.0,   Unknown)     == Low` — hidden anyway, but well-defined
 
 Manual visual verification:
+
 - Run `trollshell` and confirm icon color matches the current charge
   bucket.
 - On a low-battery laptop, confirm `< 10%` discharging produces a

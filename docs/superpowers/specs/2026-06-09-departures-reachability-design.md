@@ -9,25 +9,25 @@ The departures list is a DFI board: the next eight S-Bahn trains from your home
 station. But the platform is a walk away — ~10 minutes to S Schöneweide — so a
 train leaving in 4 minutes is noise, not signal. The original departures spec
 ([2026-05-14-sidebar-departures-design.md](2026-05-14-sidebar-departures-design.md))
-listed **"Reachability / 'walk to platform' budget"** under *Out of scope*; this
+listed **"Reachability / 'walk to platform' budget"** under _Out of scope_; this
 closes that gap.
 
 Each place gains a **walk time to its station**, and the list reframes its
-countdown around it: instead of *when the train leaves*, show *when **you** must
-leave to catch it*, and fade the trains whose window has already closed.
+countdown around it: instead of _when the train leaves_, show _when **you** must
+leave to catch it_, and fade the trains whose window has already closed.
 
 ## Decision: leave-by countdown (not hide, not dim-only)
 
 Three treatments were on the table:
 
-| option | behaviour | why not |
-|---|---|---|
-| **Hide unreachable** | drop trains you can't make | hides information; risks a short/empty list late at night; needs a bigger upstream fetch |
-| **Dim + highlight** | keep all, grey the unmakeable, accent the first catchable | good, but the *number* still shows departure time — you still do the mental subtraction |
-| **Leave-by countdown** ✅ | the relative number becomes "leave in N min" (departs − walk); negative collapses to "leave now" + faded | the number is the one you act on; no mental math; faded rows still visible for context |
+| option                    | behaviour                                                                                                | why not                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **Hide unreachable**      | drop trains you can't make                                                                               | hides information; risks a short/empty list late at night; needs a bigger upstream fetch |
+| **Dim + highlight**       | keep all, grey the unmakeable, accent the first catchable                                                | good, but the _number_ still shows departure time — you still do the mental subtraction  |
+| **Leave-by countdown** ✅ | the relative number becomes "leave in N min" (departs − walk); negative collapses to "leave now" + faded | the number is the one you act on; no mental math; faded rows still visible for context   |
 
 The leave-by countdown was chosen: it surfaces the single actionable number and
-keeps the missed trains on screen (faded) so you still see you *just* missed one.
+keeps the missed trains on screen (faded) so you still see you _just_ missed one.
 
 ## Design
 
@@ -69,7 +69,7 @@ the right budget for free (it keeps the prior `items`, which already carry it).
 
 ### Reachability is a per-tick display concern, not a fetch concern
 
-The "can I still make it?" verdict depends on *now*, which drifts continuously;
+The "can I still make it?" verdict depends on _now_, which drifts continuously;
 the service only polls every 15 minutes. So the verdict lives in the **widget**,
 on the same `clock::now()` tick that already counts the relative time down — no
 new polling, no new subscription. The service stays a thin fetch+filter that just
@@ -97,7 +97,9 @@ departure clock time.
 One theme-independent rule (opacity, so no light-mode mirror):
 
 ```css
-.ts-departure-row.ts-departure-unreachable { opacity: 0.4; }
+.ts-departure-row.ts-departure-unreachable {
+  opacity: 0.4;
+}
 ```
 
 Dims the whole row (badge included) so the glance lands on the first catchable

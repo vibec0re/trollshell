@@ -9,7 +9,7 @@ The frame overlay paints L/R/bottom gradient strips and four rounded inner corne
 
 niri 25.x has a per-window `MaximizeWindowToEdges` action (`Mod+M` by default; also triggered by titlebar maximize-button or double-click). A maximized-to-edges window expands to "the edges of the available screen area" — bypassing struts, gaps, and borders, but still respecting the bar's exclusive zone. Its `tile_size` becomes `(mon_w, mon_h − bar_height)`.
 
-The frame's L/R/bottom strips and corner masks now sit *over* the window. There is no way to paint the frame that doesn't overlap the window content, because every pixel the frame paints is, by definition, where the window now is. The only sensible response is to hide the frame, exactly the same way it's already hidden on fullscreen.
+The frame's L/R/bottom strips and corner masks now sit _over_ the window. There is no way to paint the frame that doesn't overlap the window content, because every pixel the frame paints is, by definition, where the window now is. The only sensible response is to hide the frame, exactly the same way it's already hidden on fullscreen.
 
 The existing detection (`tile_size ≈ (mon_w, mon_h)`) only catches true fullscreen — maximize-to-edges has a smaller height because the bar's exclusive zone still applies, so the existing two-axis check misses it.
 
@@ -24,7 +24,7 @@ When `tile_size.0 ≈ mon_w` (window spans full output width), the window touche
 - **Edge-stretched floating window**: a floating window manually sized to `tile_size.0 == mon_w` would also overlap the frame's L/R strips, so hiding is still the correct visual response. Treating this case the same as maximize-to-edges is a feature, not a bug.
 - **Normal tiled**: `tile_size.0 ≤ mon_w − 16` (struts) → width does not match → frame stays visible.
 
-niri's maximize-to-edges always covers the full available *width* AND *height*; there is no "horizontal-only maximize" state in niri. So checking width alone is sufficient — a window with full height but partial width does not exist as a niri state, and even if it did, it wouldn't overlap the frame's L/R strips.
+niri's maximize-to-edges always covers the full available _width_ AND _height_; there is no "horizontal-only maximize" state in niri. So checking width alone is sufficient — a window with full height but partial width does not exist as a niri state, and even if it did, it wouldn't overlap the frame's L/R strips.
 
 `Window` in `niri-ipc` 25.11 exposes only `is_focused`, `is_floating`, `is_urgent` — there is no `is_maximized_to_edges` boolean. Detection via `tile_size` comparison is the only available path, and matches the pattern the existing fullscreen detection already uses.
 
@@ -41,7 +41,8 @@ In `trollshell/src/overlays/frame.rs`:
        && w.layout.tile_size.0 >= mon_w - EDGE_TOL
    ```
 
-   `>=` is more robust than the two-sided `abs` form: tile width can never *exceed* `mon_w` in practice, so a one-sided check is symmetric in effect and tolerates fractional-scale rounding the same way.
+   `>=` is more robust than the two-sided `abs` form: tile width can never _exceed_ `mon_w` in practice, so a one-sided check is symmetric in effect and tolerates fractional-scale rounding the same way.
+
 4. Lift the predicate out of the reactive closure into a pure helper, so it's testable:
 
    ```rust
@@ -65,21 +66,22 @@ In `trollshell/src/overlays/frame.rs`:
    ```
 
    `bind_edge_visibility` becomes a thin wrapper that calls `has_edge_window` inside the `map_ref!` and inverts to `visible`.
+
 5. Update the `install` callsite — drop the `mon_h` argument, rename the function call.
 
 ### Tests
 
 Add unit tests for `has_edge_window` in the existing `#[cfg(test)] mod tests` block. Each test constructs minimal `Workspace` and `Window` fixtures (only the fields the helper reads) and asserts the boolean.
 
-| test | scenario | expected |
-|---|---|---|
-| `has_edge_window_normal_tiled` | tile_size = (mon_w − 16, mon_h − 52) on active workspace | `false` |
-| `has_edge_window_maximize_to_edges` | tile_size = (mon_w, mon_h − 44) on active workspace | `true` |
-| `has_edge_window_fullscreen` | tile_size = (mon_w, mon_h) on active workspace | `true` |
-| `has_edge_window_within_tolerance` | tile_size = (mon_w − 2, _) on active workspace, tol=4 | `true` |
-| `has_edge_window_other_workspace_ignored` | edge-sized window exists, but on a non-active workspace on this output | `false` |
-| `has_edge_window_other_output_ignored` | edge-sized window exists, but the active workspace is on a different output (different connector) | `false` |
-| `has_edge_window_no_active_workspace` | no workspace on this output is active | `false` |
+| test                                      | scenario                                                                                          | expected |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------- | -------- |
+| `has_edge_window_normal_tiled`            | tile_size = (mon_w − 16, mon_h − 52) on active workspace                                          | `false`  |
+| `has_edge_window_maximize_to_edges`       | tile_size = (mon_w, mon_h − 44) on active workspace                                               | `true`   |
+| `has_edge_window_fullscreen`              | tile_size = (mon_w, mon_h) on active workspace                                                    | `true`   |
+| `has_edge_window_within_tolerance`        | tile*size = (mon_w − 2, *) on active workspace, tol=4                                             | `true`   |
+| `has_edge_window_other_workspace_ignored` | edge-sized window exists, but on a non-active workspace on this output                            | `false`  |
+| `has_edge_window_other_output_ignored`    | edge-sized window exists, but the active workspace is on a different output (different connector) | `false`  |
+| `has_edge_window_no_active_workspace`     | no workspace on this output is active                                                             | `false`  |
 
 Construction note: `niri_ipc::Window` and `niri_ipc::Workspace` are re-exported via `hytte_services::niri`. Tests build them with `..Default::default()` if available, else field-by-field. If `Default` isn't derived, add a small private `mk_window(...)`/`mk_workspace(...)` builder in the test module.
 

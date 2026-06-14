@@ -9,6 +9,7 @@
 **Tech Stack:** Rust 1.94 stable, GTK4 + libadwaita via `gtk4-rs`, `futures-signals`, `zbus`, `tokio`. Workspace uses `cargo` with the project clippy lint set enforced workspace-wide.
 
 **Conventions used in every task:**
+
 - TDD where unit tests are practical. Refactor-only tasks (migrations) verify via `cargo build` + `cargo clippy --workspace --all-targets -- -D warnings` and call out manual checks.
 - Commits use Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`). The repo's existing prefixes are `feat(de):`, `fix(de):`, `polish:`, `style:`. Match those.
 - Co-author trailer on every commit:
@@ -39,11 +40,12 @@
 ## Task 1: `bind_two_way` primitive + tests in `hytte-reactive`
 
 **Files:**
+
 - Modify: `crates/hytte-reactive/src/bind.rs`
 - Modify: `crates/hytte-reactive/src/lib.rs`
 - Modify: `crates/hytte/src/lib.rs`
 
-**Background:** `bind` (existing helper) is one-way: a signal drives a widget property. When the widget is *also* writable by the user (Switch active, Scale value, ToggleButton active), the signal-driven `apply` can re-fire the user's `notify::active` / `value-changed` / `toggled` handler, which then writes the same value back to the service, which echoes back. Three sites in `trollshell` already invented `Rc<Cell<bool>> suppress` to break that loop. This task lifts the pattern into one reusable primitive that uses GTK signal-handler-block, the canonical fix.
+**Background:** `bind` (existing helper) is one-way: a signal drives a widget property. When the widget is _also_ writable by the user (Switch active, Scale value, ToggleButton active), the signal-driven `apply` can re-fire the user's `notify::active` / `value-changed` / `toggled` handler, which then writes the same value back to the service, which echoes back. Three sites in `trollshell` already invented `Rc<Cell<bool>> suppress` to break that loop. This task lifts the pattern into one reusable primitive that uses GTK signal-handler-block, the canonical fix.
 
 **API target (already approved in spec §1):**
 
@@ -271,6 +273,7 @@ EOF
 ## Task 2: Migrate the 6 Switch sites to `bind_two_way`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` (sites at approx lines 625, 675, 699, 1684, 1828, 2395)
 
 **Background:** Six Switch widgets currently use a defensive `if w.is_active() != on { w.set_active(on) }` guard inside their bind. The guard is benign (GTK's `set_active` no-ops on equal values) but redundant once handler-blocking is structural. Migrating means: drop the guard, restructure the two calls (separate `bind` for state + `connect_active_notify` for user) into one `bind_two_way` call.
@@ -511,6 +514,7 @@ EOF
 ## Task 3: Migrate the 2 Scale sites to `bind_two_way`
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` (sites at approx lines 196 / 232 mpris seek bar, ~1601 brightness slider)
 
 **Background:** Brightness slider and mpris seek bar each maintain a hand-rolled `Rc<Cell<bool>> suppress` flag to gate `connect_value_changed` while the bind reflects external state. With `bind_two_way`, the Cell goes away and the bind becomes a single call.
@@ -571,6 +575,7 @@ If the surrounding scope still has unused `use std::cell::Cell;` or `use std::rc
 - [ ] **Step 2: Migrate mpris seek bar — extract from the active_player bind**
 
 The current code:
+
 - Around line 162, declares `seek_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false))`.
 - Around line 196, `seek.connect_value_changed(move |s| { if suppress.get() { return; } /* bus/track_id checks; mpris::set_position(...) */ });`
 - Inside the big bind on `mpris::active_player()` (line 232), each `seek_for_bind.set_value(...)` is wrapped:
@@ -585,7 +590,7 @@ Migration steps:
 
 1. Delete the `seek_suppress` declaration (line 162).
 2. Delete the `connect_value_changed` block at line 196 entirely — it moves into a `bind_two_way` call below.
-3. Inside the big bind on `active_player`, drop every `seek_suppress.set(true); ... seek_suppress.set(false);` triplet, leaving only the `seek_for_bind.set_value(...)` lines exposed. **Important:** the big bind subscription is now **plain `bind`** updating the *seek value* programmatically — but `bind_two_way` blocks the user handler around its own apply, NOT around third-party programmatic writes. Solution: move the seek-value updates OUT of the big bind and let the dedicated `bind_two_way` (added below) own the seek-value mirror.
+3. Inside the big bind on `active_player`, drop every `seek_suppress.set(true); ... seek_suppress.set(false);` triplet, leaving only the `seek_for_bind.set_value(...)` lines exposed. **Important:** the big bind subscription is now **plain `bind`** updating the _seek value_ programmatically — but `bind_two_way` blocks the user handler around its own apply, NOT around third-party programmatic writes. Solution: move the seek-value updates OUT of the big bind and let the dedicated `bind_two_way` (added below) own the seek-value mirror.
 
 After step 3, the big bind on `active_player()` no longer touches `seek_for_bind.set_value(...)`. The big bind keeps title/artist/album/buttons/labels/art-image only.
 
@@ -641,7 +646,7 @@ Expected: clean.
 In Niri: `cargo run --release -p trollshell`.
 
 - Brightness drawer: drag the slider; observe brightness applies. Wait through one or two backend polls (`hytte-services::brightness` polls actual backlight) — slider should not jitter back, even when the polled level rounds slightly differently.
-- Media drawer with a player active (e.g. `mpv some.mp3`): drag the seek bar — track should jump. Let it play and watch the seek bar advance smoothly with no jitter while *not* being dragged.
+- Media drawer with a player active (e.g. `mpv some.mp3`): drag the seek bar — track should jump. Let it play and watch the seek bar advance smoothly with no jitter while _not_ being dragged.
 
 - [ ] **Step 5: Commit**
 
@@ -664,6 +669,7 @@ EOF
 ## Task 4: BlueZ shared command connection (the `BUGS.md` fix, part 1)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/bluetooth.rs`
 
 **Background:** Per BlueZ semantics, a discovery session is owned by the bus client that called `StartDiscovery`. The current `do_adapter_call` / `do_device_call` / `do_set_*_bool` helpers each open a fresh `Connection::system().await` and drop it after the call. `StartDiscovery` from connection-A → conn-A drops → BlueZ tears down its session. `StopDiscovery` from connection-B → BlueZ returns `org.bluez.Error.Failed: No discovery started` (silently logged at warn). Same identity problem affects Connect/Disconnect/Pair/Trust under contention.
@@ -749,7 +755,7 @@ Expected: only two surviving call sites — the listen loop's `listen()` (line ~
 
 - [ ] **Step 8: Decide whether to migrate the agent registration**
 
-The agent registration (`register_agent`, line ~1204) opens `Connection::system()` to call `org.bluez.AgentManager1.RegisterAgent`. The agent path it registers belongs to that specific connection — the agent service needs to receive callbacks on the same connection. Migrating *that* registration to `cmd_conn()` would change the agent's owning connection, which couples agent dispatch with command dispatch.
+The agent registration (`register_agent`, line ~1204) opens `Connection::system()` to call `org.bluez.AgentManager1.RegisterAgent`. The agent path it registers belongs to that specific connection — the agent service needs to receive callbacks on the same connection. Migrating _that_ registration to `cmd_conn()` would change the agent's owning connection, which couples agent dispatch with command dispatch.
 
 Decision for v0.2.1: **leave agent registration on its own dedicated `Connection::system()`**. This is intentional — keeping the agent's bus identity stable across command churn matters for pairing-prompt semantics. Add a one-line comment above the existing `let conn = Connection::system()...` in the agent registration path:
 
@@ -796,6 +802,7 @@ EOF
 ## Task 5: Migrate BT scan toggle to `bind_two_way` + verify the bug is fixed
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` (~line 732)
 - Modify: `BUGS.md`
 
@@ -878,7 +885,7 @@ If `Discovering = no` does not arrive after Stop, the fix is incomplete — re-i
 Open `BUGS.md`. The contents are:
 
 ```
-# Bluetooth 
+# Bluetooth
 
 Stop button not stops scanning
 ```
@@ -914,6 +921,7 @@ EOF
 ## Task 6: BT-audio MAC casing
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/bluetooth_audio.rs`
 
 **Background:** `sink_belongs_to_device` substring-matches a pipewire sink name against `MAC_TO_PW_TOKEN(addr)`. BlueZ paths use uppercase MACs; pipewire sometimes uses lowercase node names (observed on `bluez_input.aa_bb_…`). Mismatch → auto-switch fails.
@@ -1041,6 +1049,7 @@ EOF
 ## Task 7: Cliphist id-based delete (service + UI)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/clipboard.rs`
 - Modify: `trollshell/src/widgets/pages.rs` (around the `build_clipboard_row` function, ~line 2660)
 
@@ -1310,6 +1319,7 @@ EOF
 ## Task 8: Polkit second `PAM_PROMPT_ECHO_OFF` (confirm-new-password flow)
 
 **Files:**
+
 - Modify: `crates/hytte-services/src/polkit.rs` (around line 360)
 - Modify: `trollshell/src/widgets/polkit_dialog.rs`
 
@@ -1319,11 +1329,12 @@ This is the most complex of the TODOs because it requires coordinating service s
 
 **Approach:**
 
-1. Service-side: `run_helper` no longer takes a single `Zeroizing<String> password`. Instead, on every `PAM_PROMPT_ECHO_OFF`, it asks the dialog for *fresh input* via a new internal channel, mirroring how the first password is fetched today.
+1. Service-side: `run_helper` no longer takes a single `Zeroizing<String> password`. Instead, on every `PAM_PROMPT_ECHO_OFF`, it asks the dialog for _fresh input_ via a new internal channel, mirroring how the first password is fetched today.
 2. The first prompt is delivered by populating `AuthPrompt::message` from polkit's caller-supplied text; subsequent prompts are delivered through the same channel.
 3. Dialog-side: keep the window mounted, swap the prompt label, clear the entry, await user input.
 
 **Existing service shape (relevant pieces, from prior grep):**
+
 - `AuthPrompt` carries `action_id`, `message`, `identities`. (Line 63.)
 - `auth_prompts() -> impl Signal<Item = Option<AuthPrompt>>`. (Line 156.)
 - `respond_to_auth(Option<(Zeroizing<String>, u32)>)` is how the dialog returns. (Line 173.)
@@ -1332,7 +1343,7 @@ This is the most complex of the TODOs because it requires coordinating service s
 
 **Approach to coordinating multi-prompt state:**
 
-Add a second one-shot-channel-cycle: after the first `respond_to_auth(Some((pw, uid)))`, if the helper issues another `PAM_PROMPT_ECHO_OFF`, the service emits a *new* `AuthPrompt` (same action_id/identities, new prompt text). The dialog widget treats this as an in-place re-prompt instead of a fresh dialog: it observes the existing `DIALOG_WINDOW` thread-local and updates the prompt label + clears the entry instead of building a new window.
+Add a second one-shot-channel-cycle: after the first `respond_to_auth(Some((pw, uid)))`, if the helper issues another `PAM_PROMPT_ECHO_OFF`, the service emits a _new_ `AuthPrompt` (same action_id/identities, new prompt text). The dialog widget treats this as an in-place re-prompt instead of a fresh dialog: it observes the existing `DIALOG_WINDOW` thread-local and updates the prompt label + clears the entry instead of building a new window.
 
 To distinguish "first prompt" from "follow-up", add a field:
 
@@ -1358,7 +1369,7 @@ Locate the `AuthPrompt` definition in `crates/hytte-services/src/polkit.rs` (aro
 
 Locate `run_helper` (line 324). The current flow holds `password_slot: Option<Zeroizing<String>>` initialized to the user-supplied first password and consumed on the first `PAM_PROMPT_ECHO_OFF`.
 
-Rewrite so each `PAM_PROMPT_ECHO_OFF` after the first issues a fresh `AuthPrompt { follow_up: true, message: <prompt-text-from-helper> }` and awaits a response via the existing `set_prompt` / `await_reply` channel. The function signature changes to accept ONLY the *first* password; subsequent responses are obtained from the user via the dialog.
+Rewrite so each `PAM_PROMPT_ECHO_OFF` after the first issues a fresh `AuthPrompt { follow_up: true, message: <prompt-text-from-helper> }` and awaits a response via the existing `set_prompt` / `await_reply` channel. The function signature changes to accept ONLY the _first_ password; subsequent responses are obtained from the user via the dialog.
 
 Replace the `match tag` arm:
 
@@ -1613,11 +1624,13 @@ EOF
 ## Task 9: Notification toast overflow ("+N more")
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/notifications.rs`
 
 **Background:** The toast surface currently renders one card per active notification. Under a fast burst of 5+ active notifications, the column grows tall and busy. Per the existing `TODO(notif-followup)` (line 27): cap visible toasts and add a synthetic "+N more" overflow card. The full history continues to live on the Notifications drawer page.
 
 **Behavior:**
+
 - Up to 4 individual toasts visible.
 - When a 5th would appear, drop the oldest and ensure a single `+N more` overflow card exists. N counts how many active notifications are NOT individually toasted.
 - Increment N on subsequent arrivals; decrement when an underlying notification leaves the active set (dismissed, expired, or invoked-action). When N drops to 0, remove the overflow card.
@@ -1642,7 +1655,7 @@ Modify the visible-set construction so that:
 
 Pick `const MAX_VISIBLE_NONCRITICAL: usize = 4;`.
 
-The "most recent" ordering: `notifications::active()` is already ordered by arrival (verify by reading the notifications service if uncertain, but the existing widget treats arrival order implicitly). Take the *last* `MAX_VISIBLE_NONCRITICAL` non-critical entries as `head`; everything before becomes `tail`.
+The "most recent" ordering: `notifications::active()` is already ordered by arrival (verify by reading the notifications service if uncertain, but the existing widget treats arrival order implicitly). Take the _last_ `MAX_VISIBLE_NONCRITICAL` non-critical entries as `head`; everything before becomes `tail`.
 
 Add a new piece of state above the for-each (next to `card_map`):
 
@@ -1828,6 +1841,7 @@ EOF
 ## Task 10: Calendar click-day → highlight + scroll
 
 **Files:**
+
 - Modify: `trollshell/src/widgets/pages.rs` (`page_calendar`, ~line 2533, and `build_calendar_row`, ~line 2633)
 
 **Background:** Calendar shows day-marks for events; clicking a day currently does nothing. The TODO at line 2553 wants click-day to scroll the events list to the first event of that date and visually highlight it.
@@ -1980,8 +1994,8 @@ Per project memory: do not introduce new color tokens. Use an existing accent or
 
 ```css
 .ts-cal-day-hit {
-    background: alpha(@theme_selected_bg_color, 0.2);
-    transition: background 600ms ease-out;
+  background: alpha(@theme_selected_bg_color, 0.2);
+  transition: background 600ms ease-out;
 }
 ```
 

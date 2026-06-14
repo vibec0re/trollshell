@@ -176,10 +176,10 @@ journalctl --user -f -u niri-session.target \
 ## Troubleshooting
 
 - **trollshell crashes on startup.** `systemctl --user status
-  trollshell.service` shows the exit code; `journalctl --user -u
-  trollshell.service -b` has the panic / log output. `Restart=on-failure`
-  + `RestartSec=2` will rate-limit retries; if it's a real bug, the unit
-  goes into `failed` state after systemd's default start-limit kicks in.
+trollshell.service` shows the exit code; `journalctl --user -u
+trollshell.service -b` has the panic / log output. `Restart=on-failure`
+  - `RestartSec=2` will rate-limit retries; if it's a real bug, the unit
+    goes into `failed` state after systemd's default start-limit kicks in.
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
 - **swayidle starts but the lock never fires.** swayidle runs `swaylock`,
@@ -214,6 +214,6 @@ journalctl --user -f -u niri-session.target \
   D-Bus round-trips between things that already share a main loop.
 - It does NOT install niri itself. Use your distro package or the niri
   upstream's install instructions; this directory only wires niri up
-  *after* it's running.
+  _after_ it's running.
 - It does NOT set `XDG_CURRENT_DESKTOP` or other env vars. That's
   `environment.d`'s job — see the README for task #26.

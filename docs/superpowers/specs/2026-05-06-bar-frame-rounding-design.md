@@ -16,11 +16,11 @@ This is purely a presentation change. No new services, no new state. swaybg keep
 
 Three layers, top to bottom:
 
-| layer | window | role |
-|---|---|---|
-| `OVERLAY` | trollshell `frame` overlay (new) | full-screen, click-through; paints the dark gradient in L/R/bottom borders and carves rounded inner corners around the workspace cutout. Sits above the bar so the cutout's top corners can shape the bar's bottom-L/R as concave indentations. |
-| `TOP` | trollshell `Bar` (existing, restyled) | same widgets as today, `margin: 0; border-radius: 0;` — flush strip across full width. Bar's existing dark gradient bg unchanged; exclusive zone reserves the top inset. |
-| `BACKGROUND` | swaybg (unchanged) | wallpaper |
+| layer        | window                                | role                                                                                                                                                                                                                                            |
+| ------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OVERLAY`    | trollshell `frame` overlay (new)      | full-screen, click-through; paints the dark gradient in L/R/bottom borders and carves rounded inner corners around the workspace cutout. Sits above the bar so the cutout's top corners can shape the bar's bottom-L/R as concave indentations. |
+| `TOP`        | trollshell `Bar` (existing, restyled) | same widgets as today, `margin: 0; border-radius: 0;` — flush strip across full width. Bar's existing dark gradient bg unchanged; exclusive zone reserves the top inset.                                                                        |
+| `BACKGROUND` | swaybg (unchanged)                    | wallpaper                                                                                                                                                                                                                                       |
 
 niri tiles apps in the rectangle bounded by the bar's exclusive zone (top) and the new struts (`left 12; right 12; bottom 12`). The visible rounded corners come from the frame overlay painting the dark gradient OVER niri's app surfaces in the corner regions — no per-window `geometry-corner-radius` is required for the look to land. (We can add one later if app corners poke through visibly under specific apps; not in scope here.)
 
@@ -41,15 +41,17 @@ niri tiles apps in the rectangle bounded by the bar's exclusive zone (top) and t
 
 ```css
 .hytte-bar-content {
-    padding: 6px 12px;
-    min-height: 32px;
-    margin: 0;                 /* was: 5px 5px; margin-bottom: 10px */
-    border-radius: 0;          /* was: 12px */
-    background: linear-gradient(90deg,
-        rgba(15,15,35,1) 0%,
-        rgba(25,15,45,1) 50%,
-        rgba(15,15,35,1) 100%);
-    /* drop box-shadow — bar no longer floats */
+  padding: 6px 12px;
+  min-height: 32px;
+  margin: 0; /* was: 5px 5px; margin-bottom: 10px */
+  border-radius: 0; /* was: 12px */
+  background: linear-gradient(
+    90deg,
+    rgba(15, 15, 35, 1) 0%,
+    rgba(25, 15, 45, 1) 50%,
+    rgba(15, 15, 35, 1) 100%
+  );
+  /* drop box-shadow — bar no longer floats */
 }
 ```
 

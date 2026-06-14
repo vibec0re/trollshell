@@ -82,12 +82,11 @@ that lets you add Google / iCloud / CalDAV accounts.
    week populate the "Upcoming" boxed list below.
 
 3. If the list is empty:
-
    - No GOA accounts? Add one as above.
    - Cache files exist but no events? Likely all of your events are
      more than 7 days in the future. Check the raw `.ics` file.
    - Cache files missing entirely? Check `journalctl --user -u
-     evolution-calendar-factory.service` for sync errors, and confirm
+evolution-calendar-factory.service` for sync errors, and confirm
      the account is "Calendar" enabled in the GOA panel.
 
 ## What this does NOT do

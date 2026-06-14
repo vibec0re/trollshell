@@ -85,7 +85,10 @@ in
       # home-manager's services.awww — a NixOS-only user without home-manager
       # runs the awww daemon themselves — so for awww the NixOS module just
       # exports the reload command above. backend = "none" manages nothing.
-      (lib.mkIf (backend == "swaybg") {
+      # Also skip swaybg when an explicit reloadCommand is set: that's the
+      # pre-enum way to drive another daemon, and a config that set it but not
+      # `backend` (default "swaybg") must not get swaybg started over its daemon.
+      (lib.mkIf (backend == "swaybg" && cfg.wallpaper.reloadCommand == null) {
         systemd.user.services.swaybg = {
           description = "trollshell wallpaper daemon (swaybg)";
           wantedBy = [ "graphical-session.target" ];

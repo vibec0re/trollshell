@@ -129,9 +129,15 @@ in
         programs.trollshell = {
           fuzzel.enable = lib.mkDefault true;
           swayidle.enable = lib.mkDefault true;
-          # Start the swaybg unit only when it's the chosen backend; awww is
-          # driven through home-manager's services.awww module below.
-          swaybg.enable = lib.mkIf (backend == "swaybg") (lib.mkDefault true);
+          # Start the swaybg unit only when it's the chosen backend AND no
+          # explicit reloadCommand is set. A hand-set reloadCommand is the
+          # pre-enum way to drive another daemon (e.g. `awww img {}`); honoring
+          # it here means an existing config that set reloadCommand but not
+          # `backend` (which defaults to "swaybg") doesn't get swaybg started
+          # alongside its own daemon. awww proper goes through services.awww.
+          swaybg.enable = lib.mkIf (backend == "swaybg" && cfg.wallpaper.reloadCommand == null) (
+            lib.mkDefault true
+          );
           cliphist.enable = lib.mkDefault true;
           portals.enable = lib.mkDefault true;
         };

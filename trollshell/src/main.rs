@@ -124,10 +124,17 @@ fn main() -> hytte::ui::Result<()> {
 }
 
 fn build_bar(monitor: &Monitor) -> BarHandle {
-    modal::install(monitor);
+    // The bar's edge + its margin on that edge. Plumbed into the modal so the
+    // drawer anchors to the bar's actual edge with a perpendicular margin
+    // derived from the bar's real offset + measured thickness (replacing the
+    // old hardcoded top/59). Keep `BAR_EDGE`/`BAR_EDGE_OFFSET` in sync with
+    // the `Bar::new(...)` builder below.
+    const BAR_EDGE: Edge = Edge::Top;
+    const BAR_EDGE_OFFSET: i32 = 0;
+
     overlays::sidebar::install(monitor);
     let bar = Bar::new(monitor)
-        .edge(Edge::Top)
+        .edge(BAR_EDGE)
         .exclusive(true)
         .keyboard_interactivity(KeyboardMode::OnDemand)
         .left([
@@ -163,6 +170,10 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             ]),
         ])
         .show();
+
+    // Install the drawer *after* the bar so its window exists to be measured
+    // for the perpendicular (bar-thickness) margin at open time.
+    modal::install(monitor, &bar, BAR_EDGE, BAR_EDGE_OFFSET);
 
     // When the drawer is open on this monitor, mark the bar window so CSS
     // can square off the bottom-right corner (seam between bar and drawer).

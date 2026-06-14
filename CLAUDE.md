@@ -41,14 +41,27 @@ For quick feedback while iterating, `cargo clippy -p <crate> --lib` is much fast
 
 ### Tests
 
+Tests split into two buckets via the `system-tests` cargo feature (defined in
+`hytte-bus`, `hytte-reactive`, `hytte-ui`). **Internals** (pure logic) run by
+default; **real-system** tests (those needing a `dbus-daemon` or a display
+server) are gated behind the feature so the default run stays hermetic.
+
 ```sh
-cargo test                                    # whole workspace
-cargo test -p hytte-bus --test signals        # one integration-test binary
-cargo test -p hytte-services clock            # tests matching a name
+cargo test                                       # internals only — hermetic, no system deps
+cargo test --workspace --features system-tests   # + real-system (dbus-daemon + display)
+cargo test -p hytte-services clock               # tests matching a name
+xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headless
 ```
 
-- `hytte-bus` integration tests **spawn a real `dbus-daemon`** (one ephemeral broker per test; must be on `PATH`). They don't touch the host session bus.
-- GTK-dependent tests are marked `#[ignore]` — they need a display server. The Nix package sets `doCheck = false` because tests touch live daemons.
+- The real-system tests carry `#[cfg(feature = "system-tests")]` (whole-file
+  for integration tests, on the `mod tests` for the GTK unit tests) rather than
+  `#[ignore]`, so the default `cargo test` doesn't even compile them.
+- `hytte-bus`'s system tests **spawn a real `dbus-daemon`** (one ephemeral
+  broker per test; must be on `PATH`). They don't touch the host session bus.
+- The GTK-dependent system tests need a display server (`xvfb-run` works).
+- The Nix package sets `doCheck = false`; with the split, the default
+  (internals) suite is now hermetic enough to run in the sandbox if you want to
+  flip it on.
 
 ### Lint — strict, treat as the gate
 

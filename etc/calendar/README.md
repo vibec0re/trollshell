@@ -21,6 +21,17 @@ that lets you add Google / iCloud / CalDAV accounts.
 
 > If you already have GNOME installed, all three are typically pulled in.
 
+### NixOS
+
+The flake's `nixosModules.default` wires this whole stack behind
+`programs.trollshell.enableRecommendedServices` (default `true`):
+`services.gnome.gnome-online-accounts`, `services.gnome.evolution-data-server`,
+`services.gnome.gnome-keyring` (token storage), `programs.dconf` (the GSettings
+backend the panel persists through), and `gnome-control-center` in
+`environment.systemPackages`. Just set `programs.trollshell.enable = true;` — no
+extra calendar config needed. Each is `mkDefault`, so an explicit
+`services.gnome.<svc>.enable = false;` still wins.
+
 ## One-time setup
 
 1. Make sure GOA / EDS user services start under your session. The `dbus`

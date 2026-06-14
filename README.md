@@ -63,9 +63,16 @@ nix run github:vibec0re/trollshell
 
 This installs the package and the lock-screen PAM service, plus a bundle of
 recommended-but-optional daemons — the agent-name D-Bus policy, the polkit
-agent, UPower, power-profiles-daemon, and geoclue — gated behind
+agent, UPower, power-profiles-daemon, geoclue, and the GNOME Online
+Accounts → evolution-data-server stack (with `gnome-control-center` to add
+accounts) that the calendar + tasks panels read from — gated behind
 `programs.trollshell.enableRecommendedServices` (default `true`). Set it to
 `false` for a bare bar, where each chip simply hides when its daemon is absent.
+
+Calendars/tasks have no in-shell account UI: add an account in **Settings →
+Online Accounts** (`gnome-control-center online-accounts`) and trollshell reads
+it back from evolution-data-server — see
+[etc/calendar/README.md](etc/calendar/README.md).
 
 **Home-manager** — import the module to run the shell as a user service:
 

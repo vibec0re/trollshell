@@ -45,6 +45,10 @@ in
     the swaybg wallpaper service. Reads the image path from
     ~/.config/trollshell/wallpaper.path, which the Appearance drawer page writes'';
 
+  options.programs.trollshell.cliphist.enable = lib.mkEnableOption ''
+    clipboard history (text + images) via home-manager's services.cliphist,
+    which feeds the Clipboard drawer page'';
+
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
@@ -143,6 +147,12 @@ in
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };
+      })
+
+      # cliphist — clipboard history via home-manager's module. allowImages
+      # defaults true, so this starts both the text and image wl-paste watchers.
+      (lib.mkIf cfg.cliphist.enable {
+        services.cliphist.enable = lib.mkDefault true;
       })
     ]
   );

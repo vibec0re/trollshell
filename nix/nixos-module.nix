@@ -49,19 +49,6 @@ in
       {
         environment.systemPackages = [ cfg.package ];
 
-        # UPower drives the battery chip + plug/unplug OSDs. Without
-        # it, the chip stays hidden (BatteryState::Unknown) and the
-        # five property subscriptions sit in PropState::Loading
-        # forever. mkDefault leaves explicit `services.upower.enable
-        # = false;` in user config intact for the rare desktop case.
-        services.upower.enable = lib.mkIf cfg.enableRecommendedServices (lib.mkDefault true);
-
-        # power-profiles-daemon (net.hadess.PowerProfiles) feeds the
-        # power-profile selector. Without it, ActiveProfile + Profiles
-        # stay in PropState::Loading and the chip can't show or set
-        # Performance/Balanced/Power-Saver.
-        services.power-profiles-daemon.enable = lib.mkDefault true;
-
         # System-bus policy: allow any user to own the two trollshell
         # agent names. BlueZ / iwd policies still gate the
         # actual method ACLs; this only grants the right to RequestName.
@@ -119,6 +106,23 @@ in
           };
         };
       }
+      # The recommended-but-optional system daemons trollshell's chips lean
+      # on, grouped behind the master switch. Each chip hides itself when its
+      # daemon is missing, so dropping the lot still leaves a working bar.
+      # Per-daemon mkDefault keeps an explicit `services.<d>.enable = false;`
+      # in user config intact even while the switch is on.
+      (lib.mkIf cfg.enableRecommendedServices {
+        # UPower drives the battery chip + plug/unplug OSDs. Without it the
+        # chip stays hidden (BatteryState::Unknown) and the five property
+        # subscriptions sit in PropState::Loading forever.
+        services.upower.enable = lib.mkDefault true;
+
+        # power-profiles-daemon (net.hadess.PowerProfiles) feeds the
+        # power-profile selector. Without it ActiveProfile + Profiles stay in
+        # PropState::Loading; the profile group hides itself (panels gate on
+        # available.is_empty()) so the drawer stays clean.
+        services.power-profiles-daemon.enable = lib.mkDefault true;
+      })
       # When the home-manager NixOS module is in use, register trollshell's HM
       # module as a shared module so per-user `programs.trollshell` config is
       # available everywhere (the user service starts once a user also sets

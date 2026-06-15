@@ -41,6 +41,14 @@ backend the panel persists through), and `gnome-control-center` in
 extra calendar config needed. Each is `mkDefault`, so an explicit
 `services.gnome.<svc>.enable = false;` still wins.
 
+A second switch, `programs.trollshell.enableRecommendedSoftware` (default
+`true`), installs the companion GNOME desktop apps for the data this stack
+provisions: **GNOME Calendar** (`gnome-calendar` — read/write events, since
+trollshell's Calendar page is read-only), **GNOME Tasks** (`endeavour`), and
+**GNOME Contacts** (`gnome-contacts`). It's separate from the services switch so
+a minimal install can keep the daemons + the account-add UI but drop the heavier
+apps with `programs.trollshell.enableRecommendedSoftware = false;`.
+
 ## One-time setup
 
 1. Make sure GOA / EDS user services start under your session. The `dbus`

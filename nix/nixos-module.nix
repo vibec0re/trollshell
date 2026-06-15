@@ -27,6 +27,22 @@ in
     '';
   };
 
+  options.programs.trollshell.enableRecommendedSoftware = lib.mkOption {
+    type = lib.types.bool;
+    default = true;
+    description = ''
+      Install the optional GNOME desktop apps that pair with the GOA →
+      evolution-data-server stack trollshell reads: GNOME Calendar (a
+      read/write UI for the same calendars trollshell's Calendar page shows
+      read-only), GNOME Tasks (Endeavour, for the EDS task lists), and GNOME
+      Contacts. Kept separate from `enableRecommendedServices` because these
+      are heavier GUI apps rather than daemons — turn this off to keep the
+      services + the `gnome-control-center` account-add UI while dropping the
+      apps. (`gnome-control-center` itself stays under the services switch,
+      since it's the essential way to add an account.)
+    '';
+  };
+
   # geoclue is system-only, so it lives here rather than in the shared base.
   options.programs.trollshell.weather.geoclue = {
     enable = lib.mkOption {
@@ -231,6 +247,25 @@ in
             TimeoutStopSec = 10;
           };
         };
+      })
+      # Optional GNOME desktop apps that complement the GOA/EDS stack: a real
+      # calendar UI (trollshell's own Calendar page is read-only), plus task
+      # and contact managers for the lists GOA provisions. Gated separately
+      # from the services so a minimal install can keep the daemons + the
+      # account-add UI without pulling in the heavier GUI apps.
+      (lib.mkIf cfg.enableRecommendedSoftware {
+        environment.systemPackages = [
+          # Read/write calendar UI over the same EDS sources trollshell's
+          # Calendar page reads — the way to actually create/edit events,
+          # which the shell's read-only page can't.
+          pkgs.gnome-calendar
+          # GNOME Tasks (Endeavour): full UI for the EDS task lists the
+          # trollshell Tasks page surfaces.
+          pkgs.endeavour
+          # GNOME Contacts: GOA also syncs contacts; this views/edits them
+          # (trollshell doesn't surface contacts itself).
+          pkgs.gnome-contacts
+        ];
       })
       # When the home-manager NixOS module is in use, register trollshell's HM
       # module as a shared module so per-user `programs.trollshell` config is

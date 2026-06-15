@@ -7,7 +7,7 @@
 word "leave" for a prepended `walk` icon (`icons/walk.svg`) — the row was too
 wide. (2) Departed rows are now pruned live on the same clock tick, and the
 sidebar re-polls every 30 s while open (`overlays/sidebar.rs`) so the board no
-longer freezes on the open-time fetch — the staleness that made *every* row read
+longer freezes on the open-time fetch — the staleness that made _every_ row read
 "leave now" on a 15-minute-old list.
 
 ## Motivation
@@ -76,7 +76,7 @@ the right budget for free (it keeps the prior `items`, which already carry it).
 
 ### Reachability is a per-tick display concern, not a fetch concern
 
-The "can I still make it?" verdict depends on *now*, which drifts continuously;
+The "can I still make it?" verdict depends on _now_, which drifts continuously;
 the service's background poll is coarse (15 min). So the verdict lives in the
 **widget**, on the same `clock::now()` tick that already counts the relative time
 down — no new polling, no new subscription. The service stays a thin fetch+filter
@@ -108,8 +108,12 @@ narrow. The `· HH:MM` is still the train's departure clock time.
 Two theme-independent rules (opacity, so no light-mode mirror):
 
 ```css
-.ts-departure-row.ts-departure-unreachable { opacity: 0.4; }
-.ts-departure-walk-icon { opacity: 0.85; }   /* match the time text's dimness */
+.ts-departure-row.ts-departure-unreachable {
+  opacity: 0.4;
+}
+.ts-departure-walk-icon {
+  opacity: 0.85;
+} /* match the time text's dimness */
 ```
 
 Dims the whole row (badge included) so the glance lands on the first catchable
@@ -124,8 +128,8 @@ and an unreachable one read differently — and a row can be both.
   test constructors gain `walk_minutes: 0`.
 - `widgets/departures.rs`: `lead_label` — zero-walk falls back to the plain label;
   positive slack → "N min"; zero slack → "now" not faded; negative slack → "now"
-  + faded; the 1-minute-slack boundary reads "1 min". Plus `departed` — a row is
-  hidden only once its train is past the 30 s grace.
+  - faded; the 1-minute-slack boundary reads "1 min". Plus `departed` — a row is
+    hidden only once its train is past the 30 s grace.
 
 ## Out of scope
 

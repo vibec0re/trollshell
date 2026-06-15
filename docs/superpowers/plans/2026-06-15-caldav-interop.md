@@ -50,38 +50,38 @@ collection-source provisioning code** (§1 of the spec) is needed.
 ### Task 1: `Registry::calendars()` in hytte-ecal — ✅
 
 - [x] Add `pub fn calendars(&self) -> Vec<Source>` calling
-  `self.sources_by_extension(c"Calendar")`, documented as the Events sibling of
-  `task_lists()`. (`crates/hytte-ecal/src/lib.rs`)
+      `self.sources_by_extension(c"Calendar")`, documented as the Events sibling of
+      `task_lists()`. (`crates/hytte-ecal/src/lib.rs`)
 
 ### Task 2: Rewrite `calendar.rs` onto libecal — ✅
 
 - [x] **2.1** Replace the tokio poll-loop + filesystem walk (`cache_root`,
-  `scan_cache_dir`, `parse_ics_file`) with the `tasks.rs` worker shape:
-  `OnceLock<mpsc::Sender<()>>` + a `hytte-eds-cal` thread running `run_worker`,
-  plus a tokio ticker that sends a unit "refresh now" every `POLL_INTERVAL`.
+      `scan_cache_dir`, `parse_ics_file`) with the `tasks.rs` worker shape:
+      `OnceLock<mpsc::Sender<()>>` + a `hytte-eds-cal` thread running `run_worker`,
+      plus a tokio ticker that sends a unit "refresh now" every `POLL_INTERVAL`.
 - [x] **2.2** `Worker` owns `Registry` + `HashMap<uid, CalClient>`;
-  `scan_all()` enumerates `registry.calendars()`, opens an
-  `ECalClientSourceType::Events` client per source (5 s connect budget, cached),
-  queries `"#t"`, and parses each returned body.
+      `scan_all()` enumerates `registry.calendars()`, opens an
+      `ECalClientSourceType::Events` client per source (5 s connect budget, cached),
+      queries `"#t"`, and parses each returned body.
 - [x] **2.3** Factor the per-VEVENT conversion into
-  `event_to_calendar_event(...) -> Option<CalendarEvent>` and a
-  `parse_ics_body(...)` that wraps a bare-VEVENT body when the first parse
-  fails (mirrors `tasks::parse_one`). DTEND/DURATION/all-day logic unchanged.
+      `event_to_calendar_event(...) -> Option<CalendarEvent>` and a
+      `parse_ics_body(...)` that wraps a bare-VEVENT body when the first parse
+      fails (mirrors `tasks::parse_one`). DTEND/DURATION/all-day logic unchanged.
 - [x] **2.4** `calendar_name` now comes from `Source::display_name()` — the
-  human-readable calendar title, not the UUID dir-name the poller was stuck
-  with. (Partial fix of the long-standing "no friendly names" TODO.)
+      human-readable calendar title, not the UUID dir-name the poller was stuck
+      with. (Partial fix of the long-standing "no friendly names" TODO.)
 - [x] **2.5** Keep `events()`, `refresh()`, `format_when`, `CalendarEvent`
-  identical. `refresh()` now just enqueues onto the worker channel.
+      identical. `refresh()` now just enqueues onto the worker channel.
 - [x] **2.6** Port the unit tests to call `parse_ics_body` directly (no temp
-  files); add a bare-VEVENT-without-wrapper case. 12 tests green.
+      files); add a bare-VEVENT-without-wrapper case. 12 tests green.
 
 ### Task 3: Niri launch fix for gnome-control-center — ✅
 
 - [x] Add `trollshell-online-accounts` (`pkgs.writeShellScriptBin`) to the
-  module's `environment.systemPackages`, exec-ing control-center's
-  `online-accounts` panel with `XDG_CURRENT_DESKTOP=GNOME` so it doesn't
-  hard-exit with "only supported under GNOME and Unity" under Niri.
-  (`nix/nixos-module.nix`)
+      module's `environment.systemPackages`, exec-ing control-center's
+      `online-accounts` panel with `XDG_CURRENT_DESKTOP=GNOME` so it doesn't
+      hard-exit with "only supported under GNOME and Unity" under Niri.
+      (`nix/nixos-module.nix`)
 
 ### Task 4: Docs — ✅
 

@@ -359,6 +359,11 @@
 
     color: @window_fg_color;
     border-radius: 14px;
+    /* Clip children to the rounded shape — without this the top page's
+     * opaque background paints square corners over the card's rounded top
+     * (it sits flush at padding-top: 0), so the top reads square while the
+     * bottom looks rounded. See #34. */
+    overflow: hidden;
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
     border: 1px solid @borders;
     padding-top: 0px;

@@ -199,6 +199,10 @@ fn build_day_cell() -> DayCell {
     let button = gtk::Button::new();
     button.add_css_class("ts-cal-day");
     button.add_css_class("flat");
+    // Don't let the homogeneous grid column stretch the button into a wide
+    // rectangle — keep it at its 36×36 min size so the 18px border-radius reads
+    // as a circle (the grid itself still spans the full width).
+    button.set_halign(gtk::Align::Center);
 
     let cell_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     cell_box.set_valign(gtk::Align::Center);
@@ -211,6 +215,10 @@ fn build_day_cell() -> DayCell {
     let dots = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     dots.add_css_class("ts-cal-event-dots");
     dots.set_halign(gtk::Align::Center);
+    // Hidden until a day actually has events; an empty-but-visible dots row
+    // reserves vertical space that pushes the day number above the circle's
+    // centre. `repaint_dots` flips this back on for days with events.
+    dots.set_visible(false);
     cell_box.append(&dots);
 
     button.set_child(Some(&cell_box));
@@ -405,13 +413,19 @@ fn repaint_dots(dots: &gtk::Box, sources: Option<&Vec<String>>) {
     while let Some(child) = dots.first_child() {
         dots.remove(&child);
     }
-    let Some(sources) = sources else { return };
+    let Some(sources) = sources else {
+        dots.set_visible(false);
+        return;
+    };
     for name in sources.iter().take(MAX_DOTS_PER_DAY) {
         let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         dot.add_css_class("ts-cal-event-dot");
         dot.add_css_class(color_class_for_calendar(name));
         dots.append(&dot);
     }
+    // Only reserve the dots row's vertical space when there's actually a dot to
+    // show, so days without events keep the number vertically centred.
+    dots.set_visible(!sources.is_empty());
 }
 
 // ── Month arithmetic ──────────────────────────────────────────────────────────

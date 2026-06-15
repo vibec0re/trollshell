@@ -101,10 +101,10 @@ pub struct Notification {
     pub urgency: Urgency,
     /// Resolved timeout: `Some(Duration)` for finite, `None` for sticky.
     ///
-    /// Mapping from `expire_timeout`:
-    /// - `0`  → `Some(5s)` (server default)
-    /// - `<0` → `None` (sticky / never expires)
-    /// - `>0` → `Some(millis)` (as requested)
+    /// Mapping from `expire_timeout`, per the freedesktop notification spec:
+    /// - `<0` (e.g. `-1`) → `Some(5s)` (server default)
+    /// - `0`             → `None` (sticky / never expires)
+    /// - `>0`            → `Some(millis)` (as requested)
     pub timeout: Option<Duration>,
     /// Action buttons to display below the notification body.
     pub actions: Vec<Action>,
@@ -393,10 +393,10 @@ impl NotificationsIface {
 impl NotificationsIface {
     /// Show a notification. Returns the notification id.
     ///
-    /// `expire_timeout`:
-    ///   - `0`  → use server default (5s)
-    ///   - `<0` → notification is sticky (never auto-dismissed)
-    ///   - `>0` → milliseconds
+    /// `expire_timeout` (freedesktop notification spec):
+    ///   - `<0` (e.g. `-1`) → use server default (5s)
+    ///   - `0`             → notification is sticky (never auto-dismissed)
+    ///   - `>0`            → milliseconds
     // Signature mirrors the `org.freedesktop.Notifications.Notify` D-Bus
     // method — wire shape is fixed, can't bundle args.
     #[allow(clippy::too_many_arguments)]
@@ -429,17 +429,8 @@ impl NotificationsIface {
             })
             .unwrap_or_default();
 
-        // Resolve timeout.
-        // expire_timeout: 0 → server default (5s), <0 → sticky, >0 → millis.
-        let timeout = match expire_timeout.cmp(&0) {
-            std::cmp::Ordering::Equal => Some(Duration::from_secs(5)),
-            std::cmp::Ordering::Less => None,
-            std::cmp::Ordering::Greater => {
-                // expire_timeout > 0 here so the cast to u64 is safe.
-                #[allow(clippy::cast_sign_loss)]
-                Some(Duration::from_millis(expire_timeout as u64))
-            }
-        };
+        // Resolve timeout (see `resolve_timeout`).
+        let timeout = resolve_timeout(expire_timeout);
 
         // Strip any HTML-like markup from body conservatively.
         let body_clean = strip_markup(body);
@@ -536,6 +527,37 @@ impl NotificationsIface {
     ) -> zbus::Result<()>;
 }
 
+// ── Helper: resolve timeout ───────────────────────────────────────────────────
+
+/// Server default applied when an app delegates the timeout (`expire_timeout
+/// < 0`, conventionally `-1`).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolve a freedesktop `expire_timeout` into a finite auto-dismiss duration
+/// (`Some`) or a sticky notification (`None`).
+///
+/// Per the [notification spec][spec]:
+/// - `< 0` (conventionally `-1`) → server decides; we apply [`DEFAULT_TIMEOUT`].
+/// - `0` → never expire (sticky).
+/// - `> 0` → that many milliseconds.
+///
+/// Note the `0` and `-1` cases are easy to invert — `-1` ("you decide") is by
+/// far the most common value (it's `notify-send`'s default), so mapping it to
+/// sticky makes ordinary toasts pile up forever (see issue #15).
+///
+/// [spec]: https://specifications.freedesktop.org/notification-spec/latest/protocol.html
+fn resolve_timeout(expire_timeout: i32) -> Option<Duration> {
+    match expire_timeout.cmp(&0) {
+        std::cmp::Ordering::Less => Some(DEFAULT_TIMEOUT),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            // expire_timeout > 0 here so the cast to u64 is safe.
+            #[allow(clippy::cast_sign_loss)]
+            Some(Duration::from_millis(expire_timeout as u64))
+        }
+    }
+}
+
 // ── Helper: parse actions ─────────────────────────────────────────────────────
 
 /// Parse the flat interleaved `[key1, label1, key2, label2, ...]` actions
@@ -620,4 +642,34 @@ fn strip_markup(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_TIMEOUT, resolve_timeout};
+    use std::time::Duration;
+
+    #[test]
+    fn negative_timeout_uses_server_default() {
+        // -1 ("you decide") is notify-send's default and the common case;
+        // it must NOT be sticky (regression test for issue #15).
+        assert_eq!(resolve_timeout(-1), Some(DEFAULT_TIMEOUT));
+        assert_eq!(resolve_timeout(i32::MIN), Some(DEFAULT_TIMEOUT));
+    }
+
+    #[test]
+    fn zero_timeout_is_sticky() {
+        // Per spec, 0 means never expire.
+        assert_eq!(resolve_timeout(0), None);
+    }
+
+    #[test]
+    fn positive_timeout_is_exact_millis() {
+        assert_eq!(resolve_timeout(1), Some(Duration::from_millis(1)));
+        assert_eq!(resolve_timeout(2500), Some(Duration::from_millis(2500)));
+        assert_eq!(
+            resolve_timeout(i32::MAX),
+            Some(Duration::from_millis(i32::MAX as u64))
+        );
+    }
 }

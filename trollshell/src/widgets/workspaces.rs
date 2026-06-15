@@ -2,6 +2,8 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 
+use crate::components::focus::yield_to_niri_focus;
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-workspaces");
@@ -33,7 +35,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 btn.add_css_class("active");
             }
             let id = ws.id;
-            btn.connect_clicked(move |_| niri::focus_workspace(id));
+            btn.connect_clicked(move |btn| {
+                niri::focus_workspace(id);
+                // Same on-demand-keyboard tie-break as the window pills — the
+                // bar would otherwise keep keyboard focus after the switch.
+                yield_to_niri_focus(btn);
+            });
             container_for_signal.append(&btn);
         }
     });

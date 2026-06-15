@@ -5,6 +5,7 @@
 
 pub mod connection_row;
 pub mod deep_link_row;
+pub mod focus;
 pub mod format;
 pub mod history_row;
 pub mod layout;

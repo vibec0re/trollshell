@@ -3,6 +3,8 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri::{self, Window};
 
+use crate::components::focus::yield_to_niri_focus;
+
 /// Per-monitor list of windows on the monitor's currently-active workspace.
 /// Each window is a button labeled with its title (falling back to app id).
 /// Clicking focuses that window.
@@ -37,7 +39,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 btn.add_css_class("focused");
             }
             let id = win.id;
-            btn.connect_clicked(move |_| niri::focus_window(id));
+            btn.connect_clicked(move |btn| {
+                niri::focus_window(id);
+                // Without this the bar's on-demand keyboard grab swallows the
+                // focus the click just requested — see `components::focus`.
+                yield_to_niri_focus(btn);
+            });
             container_for_signal.append(&btn);
         }
     });

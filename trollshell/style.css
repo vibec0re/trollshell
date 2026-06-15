@@ -915,7 +915,9 @@ window:not(.dark) .ts-drawer {
 /* Leave-by mode: a walk icon marks the number as "minutes until you must
    leave", so the bare "7 min" / "now" needs no wordy "leave …" prefix. Dimmed
    to match the time text; the unreachable fade still dims the whole row. */
-.ts-departure-walk-icon { opacity: 0.85; }
+.ts-departure-walk-icon {
+    opacity: 0.85;
+}
 
 .ts-departure-row.ts-cancelled .ts-departure-time,
 .ts-departure-row.ts-cancelled .ts-departure-direction {

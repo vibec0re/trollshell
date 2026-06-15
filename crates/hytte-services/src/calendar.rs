@@ -320,7 +320,8 @@ fn parse_ics_body(
         CalendarComponent::Event(e) => Some(e),
         _ => None,
     }) {
-        if let Some(ev) = event_to_calendar_event(event, calendar_name, now, window_end, out.len()) {
+        if let Some(ev) = event_to_calendar_event(event, calendar_name, now, window_end, out.len())
+        {
             out.push(ev);
         }
     }

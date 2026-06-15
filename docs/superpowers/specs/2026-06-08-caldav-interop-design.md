@@ -189,9 +189,9 @@ the plan doesn't silently assume it.
 - [x] **D1 / D2 answered** — (c) GOA, read-only calendar (2026-06-15).
 - [x] **§2 calendar→libecal refactor** + `Registry::calendars()` — done.
 - [x] **GOA provisioning** — already wired in `nix/nixos-module.nix`; §1
-  collection-source provisioning dropped (GOA owns it). Niri launch fix added.
+      collection-source provisioning dropped (GOA owns it). Niri launch fix added.
 - [ ] **Verify on a live session** (the part that needs a real Niri box +
-  Nextcloud account; can't be done from CI):
+      Nextcloud account; can't be done from CI):
   1. `trollshell-online-accounts` → add the Nextcloud account (Calendar + Tasks
      enabled).
   2. Nextcloud calendars appear in the trollshell sidebar/drawer Calendar page
@@ -199,5 +199,5 @@ the plan doesn't silently assume it.
   3. A task ticked in the shell shows up in Thunderbird + the Nextcloud Tasks
      web UI, and vice-versa (tasks were already read-write; unchanged).
 - [ ] **Follow-ups unlocked but not done:** RRULE expansion via
-  `e_cal_client_generate_instances_sync` (needs a new hytte-ecal binding);
-  per-source calendar colour. See [§Out of scope](#out-of-scope--future).
+      `e_cal_client_generate_instances_sync` (needs a new hytte-ecal binding);
+      per-source calendar colour. See [§Out of scope](#out-of-scope--future).

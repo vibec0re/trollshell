@@ -1,8 +1,32 @@
 # Calendar + Tasks ⇆ Thunderbird interop via shared Nextcloud CalDAV
 
-**Status:** **PARKED** — brainstorm captured 2026-06-08. Awaiting two decisions
-before a plan is written (see [§Open decisions](#open-decisions--the-pin)). **No
-code has been written.**
+**Status:** **IN PROGRESS** — brainstorm captured 2026-06-08; decisions taken
+2026-06-15 (see [§Open decisions](#open-decisions--the-pin)). Paired plan:
+[`plans/2026-06-15-caldav-interop.md`](../plans/2026-06-15-caldav-interop.md).
+
+**Decisions (2026-06-15):**
+
+- **D1 → (c) GOA.** Provision accounts through goa-daemon + the GNOME Online
+  Accounts panel (`gnome-control-center online-accounts`). Chosen for "least
+  trollshell code"; the extra daemon + contacts/files baggage is accepted. The
+  whole stack was already wired in `nix/nixos-module.nix` behind
+  `enableRecommendedServices`, so this is the status-quo provisioning path —
+  no new provisioning code, and **§1 (collection-source provisioning) is
+  dropped**: GOA writes the EDS sources.
+- **D2 → read-only calendar.** Display only; no event create/edit from the
+  shell. (Tasks remain read-write as before.)
+
+**Done so far:**
+
+- §2 calendar→libecal refactor — `crates/hytte-services/src/calendar.rs` now
+  mirrors `tasks.rs` (dedicated EDS thread + per-source `CalClient` cache),
+  reading VEVENTs via `get_object_strings`. The `.ics` file-poller is gone, so
+  CalDAV calendars are now visible. Public surface (`events`, `refresh`,
+  `format_when`, `CalendarEvent`) unchanged — no consumer edits.
+- `Registry::calendars()` added in `crates/hytte-ecal` (extension `"Calendar"`,
+  sibling of `task_lists()`).
+- Niri launch fix for gnome-control-center: `trollshell-online-accounts`
+  wrapper in the NixOS module (spoofs `XDG_CURRENT_DESKTOP=GNOME`).
 
 **Scope (anticipated):** rework `crates/hytte-services/src/calendar.rs`
 (file-poller → libecal); new EDS source-provisioning for a Nextcloud CalDAV
@@ -121,7 +145,8 @@ task list (it needs `[Authentication]`, `[Security]`, `[WebDAV Backend]` /
 
 ## Open decisions — THE PIN 📌
 
-These two block writing the plan. Everything above is settled; these are not.
+**Resolved 2026-06-15: D1 → (c) GOA, D2 → read-only.** See the status block at
+the top. The original analysis is kept below for the record.
 
 ### D1. Credentials / provisioning approach
 
@@ -161,8 +186,18 @@ the plan doesn't silently assume it.
 
 ## Resume here ▶
 
-1. Answer **D1** (credentials: a/b/c + keyring-daemon question) and **D2** (calendar read-only vs event-write).
-2. Write the paired plan: `docs/superpowers/plans/2026-MM-DD-caldav-interop.md`.
-3. Likely first code step regardless of D1/D2: the §2 calendar→libecal refactor (self-contained, independently valuable, unblocks CalDAV visibility) — plus `Registry::calendars()` in hytte-ecal.
-4. Then the §1 collection-source provisioning per the D1 choice.
-5. Verify: Nextcloud calendars appear in the sidebar/drawer; a task ticked in the shell shows up in Thunderbird + the Nextcloud Tasks web UI, and vice-versa.
+- [x] **D1 / D2 answered** — (c) GOA, read-only calendar (2026-06-15).
+- [x] **§2 calendar→libecal refactor** + `Registry::calendars()` — done.
+- [x] **GOA provisioning** — already wired in `nix/nixos-module.nix`; §1
+  collection-source provisioning dropped (GOA owns it). Niri launch fix added.
+- [ ] **Verify on a live session** (the part that needs a real Niri box +
+  Nextcloud account; can't be done from CI):
+  1. `trollshell-online-accounts` → add the Nextcloud account (Calendar + Tasks
+     enabled).
+  2. Nextcloud calendars appear in the trollshell sidebar/drawer Calendar page
+     within ~60 s (the libecal poll tick).
+  3. A task ticked in the shell shows up in Thunderbird + the Nextcloud Tasks
+     web UI, and vice-versa (tasks were already read-write; unchanged).
+- [ ] **Follow-ups unlocked but not done:** RRULE expansion via
+  `e_cal_client_generate_instances_sync` (needs a new hytte-ecal binding);
+  per-source calendar colour. See [§Out of scope](#out-of-scope--future).

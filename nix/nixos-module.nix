@@ -177,7 +177,20 @@ in
         # where you sign in to Google/iCloud/CalDAV. It's a heavy dependency,
         # but without an account-adding UI the rest of the stack is inert.
         # Merged into the list rather than replacing the base systemPackages.
-        environment.systemPackages = [ pkgs.gnome-control-center ];
+        #
+        # `trollshell-online-accounts` is a thin launcher for that panel.
+        # gnome-control-center hard-refuses to start unless XDG_CURRENT_DESKTOP
+        # names GNOME or Unity ("Running gnome-control-center is only supported
+        # under GNOME and Unity, exiting"); under a Niri session it's `niri`,
+        # so the bare command bails. The wrapper spoofs the desktop just for
+        # this invocation — bind it to a niri keybind, or run it by name.
+        environment.systemPackages = [
+          pkgs.gnome-control-center
+          (pkgs.writeShellScriptBin "trollshell-online-accounts" ''
+            exec env XDG_CURRENT_DESKTOP=GNOME \
+              ${pkgs.gnome-control-center}/bin/gnome-control-center online-accounts "$@"
+          '')
+        ];
 
         # System-bus policy: allow any user to own the two trollshell agent
         # names. BlueZ / iwd policies still gate the actual method ACLs; this

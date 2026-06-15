@@ -1,60 +1,57 @@
-//! Calendar service backed by evolution-data-server's on-disk .ics cache.
+//! Calendar service backed by Evolution Data Server via libecal FFI.
 //!
-//! GNOME's evolution-data-server (EDS), provisioned by GNOME Online Accounts
-//! (GOA) via `gnome-control-center → Online Accounts`, keeps a synced copy
-//! of every calendar source in iCalendar form at
-//! `~/.local/share/evolution/calendar/<source-uid>/calendar.ics`.
+//! Reads go through [`hytte_ecal`] (our hand-written libecal-2.0 /
+//! libedataserver-1.2 / libical-glib bindings) — the same path the task
+//! service uses, so this sees **ANY** EDS backend the user has
+//! configured: local `.ics`, `CalDAV` (Nextcloud / generic), Google (via
+//! the GOA bridge), Microsoft EWS, etc. This replaces the original
+//! `.ics`-cache file-poller, which could only see local sources: `CalDAV`
+//! calendars cache to an `SQLite` `cache.db` under `~/.cache/evolution`, not
+//! the `calendar.ics` the poller walked, so they were invisible by
+//! construction. libecal reads them all uniformly.
 //!
-//! v1 reads those files directly and parses them with the `icalendar`
-//! crate — no D-Bus, no `ECalClient` bindings. The trade-off is up to one
-//! [`POLL_INTERVAL`] of sync lag; the win is dramatically simpler code.
+//! ## Threading
+//!
+//! Calling libecal from arbitrary tokio worker threads doesn't compose
+//! with `GObject`'s main-context model and isn't [`Sync`]-safe — so (as in
+//! [`crate::tasks`]) all EDS work happens on a single dedicated thread that
+//! owns one [`hytte_ecal::Registry`] and a [`HashMap`] of cached
+//! [`hytte_ecal::CalClient`] connections (one per calendar source UID,
+//! opened lazily on first use).
 //!
 //! The service exposes [`events()`] — `Signal<Vec<CalendarEvent>>`, sorted
 //! by start time, filtered to events that haven't ended and start within
-//! [`NEXT_DAYS`] days. [`refresh()`] re-scans the cache directory and
-//! re-parses every `.ics` file. The service spawns a background tokio task
-//! that polls every [`POLL_INTERVAL`].
+//! [`NEXT_DAYS`] days. [`refresh()`] enqueues an out-of-cycle re-scan onto
+//! the worker. The public surface is read-only and identical to the prior
+//! file-poller, so the bar widget + drawer page need no changes.
 //!
-//! # Limitations (v1)
+//! # Limitations
 //!
 //! - Recurring events: only the master entry's DTSTART is surfaced, and
-//!   only if it falls in the upcoming window. Full RRULE expansion is a
-//!   v2 task; see `etc/calendar/README.md`.
-//! - Calendar names: best-effort from the source-dir basename. EDS picks
-//!   UUID-flavoured directory names, so the title isn't human-friendly
-//!   until a v2 helper reads `metadata.xml` (or asks GOA over D-Bus).
+//!   only if it falls in the upcoming window. `get_object_strings` returns
+//!   master components, not expanded instances. Full RRULE expansion now
+//!   becomes *feasible* (`e_cal_client_generate_instances_sync` expands a
+//!   range server-side) but needs a new hytte-ecal binding — a follow-up.
 //! - Timezones: `WithTimezone` DTSTARTs are converted via
 //!   `try_into_utc()` (which uses chrono-tz when available); when that
 //!   fails we treat the inner naive datetime as local time. Floating
 //!   datetimes are interpreted as local time.
-//!
-// TODO(calendar-followup): tracked items that intentionally aren't fixed
-// in this iteration:
-//   * I2  — try a `*.ics` glob fallback when `calendar.ics` is missing
-//           (some EDS versions name it differently). Defer until we hit
-//           a real cache layout that needs it.
-//   * I5  — "this week" relative labels in `short_date` (cosmetic).
-//   * I6  — anonymous UID synthesis based on a hash of (calendar, dtstart,
-//           summary) so the row identity is stable across refreshes when
-//           the master VEVENT really has no UID.
-//   * I11 — README sync-lag wording: re-state as "tens of minutes" once we
-//           know EDS's actual cadence on real-world accounts.
-//   * I13 — TZ-roundtrip test coverage. Add when a real bug surfaces.
-//
-//! # Background refresh
-//!
-//! Pure 60-second polling — no inotify. The cache directory turn-over is
-//! infrequent enough that polling is fine, and avoiding the `notify` dep
-//! keeps the build matrix small. If GOA pushes a sync inside the polling
-//! gap the user sees up to 60 s of staleness; the drawer page can also
-//! call [`refresh()`] on open if a future task wants near-zero lag.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
+use hytte_ecal::sys::ECalClientSourceType;
+use hytte_ecal::{CalClient, Registry, Source};
 use hytte_reactive::{Service, registry};
-use icalendar::{Calendar, CalendarDateTime, Component, DatePerhapsTime, EventLike, EventStatus};
-use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
+use icalendar::{
+    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
+    EventStatus,
+};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -77,8 +74,10 @@ pub struct CalendarEvent {
     /// True when DTSTART was a DATE (no time-of-day). Drives the "All day"
     /// label in the page.
     pub all_day: bool,
-    /// Best-effort calendar source label, from the EDS source-dir name.
-    /// Often a UUID; mapping to GOA-friendly names is a v2 task.
+    /// Calendar source label, from the EDS source's `DisplayName=`. With
+    /// the libecal backend this is the human-readable calendar title
+    /// (e.g. "Personal", "Work") rather than the UUID dir-name the old
+    /// `.ics` poller was limited to.
     pub calendar_name: String,
 }
 
@@ -86,10 +85,27 @@ pub struct CalendarEvent {
 /// is dropped from the signal.
 const NEXT_DAYS: i64 = 7;
 
-/// Background refresh cadence. EDS rewrites `.ics` files on its own sync
-/// cycle (typically minutes); 60 s catches changes within a minute without
-/// hammering the disk.
+/// Background refresh cadence. EDS syncs upstream on its own schedule
+/// (typically minutes); 60 s catches changes within a minute without
+/// hammering the backend.
 const POLL_INTERVAL: StdDuration = StdDuration::from_mins(1);
+
+// ── Worker channel ───────────────────────────────────────────────────────────
+
+/// Channel handle to the dedicated EDS thread. A unit message is a
+/// "re-scan now" request — the calendar is read-only, so there's nothing
+/// richer to carry (cf. `tasks::Op`, which also encodes writes).
+static SENDER: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+fn send_refresh() {
+    let Some(tx) = SENDER.get() else {
+        tracing::warn!("calendar: worker not started; refresh dropped");
+        return;
+    };
+    if let Err(e) = tx.send(()) {
+        tracing::warn!(error = %e, "calendar: worker channel closed");
+    }
+}
 
 // ── Service handle ───────────────────────────────────────────────────────────
 
@@ -106,8 +122,9 @@ impl Default for CalendarHandles {
     }
 }
 
-/// Service marker. Pass to `App::with` to register handles + spawn the
-/// 60 s refresh task. An initial refresh is fired immediately.
+/// Service marker. Pass to `App::with` to register handles, spawn the EDS
+/// worker thread, and start the 60 s refresh ticker. The ticker fires an
+/// initial refresh immediately.
 pub struct CalendarService;
 
 impl Service for CalendarService {
@@ -116,9 +133,28 @@ impl Service for CalendarService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = CalendarHandles::default();
         let writer = handles.events.clone();
-        rt.spawn(async move {
-            poll_loop(writer).await;
+
+        // Channel: tokio ticker + public refresh() → dedicated EDS thread.
+        let (tx, rx) = mpsc::channel::<()>();
+        let _ = SENDER.set(tx);
+
+        // libecal isn't Sync and wants to be pinned to one thread (the same
+        // constraint the tasks service handles); give the calendar its own
+        // EDS worker thread owning a Registry + a per-source CalClient cache.
+        thread::Builder::new()
+            .name("hytte-eds-cal".into())
+            .spawn(move || run_worker(&rx, &writer))
+            .expect("spawn calendar EDS worker thread");
+
+        // Refresh ticker. The first send fires immediately (initial
+        // populate); thereafter every POLL_INTERVAL.
+        rt.spawn(async {
+            loop {
+                send_refresh();
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         });
+
         handles
     }
 }
@@ -131,8 +167,8 @@ pub fn service() -> CalendarService {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Signal of the next [`NEXT_DAYS`] days of events, sorted ascending by
-/// start. Empty until the first refresh completes (or if the EDS cache
-/// directory doesn't exist).
+/// start. Empty until the first refresh completes (or if EDS has no
+/// calendar sources configured).
 pub fn events() -> impl Signal<Item = Vec<CalendarEvent>> {
     registry::with(|r| {
         r.get::<CalendarHandles>()
@@ -142,192 +178,225 @@ pub fn events() -> impl Signal<Item = Vec<CalendarEvent>> {
     })
 }
 
-/// Re-scan the EDS cache directory and update the [`events()`] signal.
-/// Idempotent — safe to call from page-show handlers or other event hooks.
-/// Heavy work (filesystem walk + iCal parse) runs on a blocking pool.
+/// Trigger an out-of-cycle refresh. Idempotent — safe to call from
+/// page-show handlers (the drawer calls this on `Page::Calendar`). The
+/// EDS round-trip runs on the dedicated worker thread, so this returns
+/// immediately.
 pub fn refresh() {
-    let writer = registry::with(|r| r.get::<CalendarHandles>().map(|h| h.events.clone()));
-    let Some(writer) = writer else {
-        tracing::warn!("calendar::refresh: service not registered");
-        return;
-    };
-    hytte_reactive::runtime::handle().spawn_blocking(move || {
-        do_refresh(&writer);
-    });
+    send_refresh();
 }
 
-// ── Polling loop ─────────────────────────────────────────────────────────────
+// ── EDS worker thread ────────────────────────────────────────────────────────
 
-async fn poll_loop(writer: Mutable<Vec<CalendarEvent>>) {
-    loop {
-        // Refresh inline on a blocking thread so we don't park a tokio
-        // worker on filesystem I/O.
-        let writer_for_blocking = writer.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || do_refresh(&writer_for_blocking)).await
-        {
-            tracing::error!(error = %e, "calendar refresh task panicked");
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+struct Worker {
+    registry: Registry,
+    clients: HashMap<String, CalClient>,
+}
+
+impl Worker {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            registry: Registry::new()?,
+            clients: HashMap::new(),
+        })
     }
-}
 
-fn do_refresh(writer: &Mutable<Vec<CalendarEvent>>) {
-    let snapshot = scan_cache_dir();
-    // PartialEq dedup: avoid re-emitting identical lists every minute.
-    let changed = {
-        let cur = writer.lock_ref();
-        *cur != snapshot
-    };
-    if changed {
-        writer.set(snapshot);
+    /// Open (lazily, cached) the Events [`CalClient`] for `source_uid`.
+    /// 5 s connect budget — same as the task service; bumped above the
+    /// libecal default so CalDAV/Google backends have time to come online.
+    fn client(&mut self, source_uid: &str) -> anyhow::Result<&CalClient> {
+        if !self.clients.contains_key(source_uid) {
+            let src = self.lookup_source(source_uid)?;
+            let client = CalClient::connect(&src, ECalClientSourceType::Events, 5)?;
+            self.clients.insert(source_uid.to_string(), client);
+        }
+        Ok(self
+            .clients
+            .get(source_uid)
+            .expect("just inserted; lookup can't miss"))
     }
-}
 
-// ── Filesystem scanning ──────────────────────────────────────────────────────
-
-fn cache_root() -> Option<PathBuf> {
-    // EDS itself follows the XDG Base Directory spec, writing under
-    // `$XDG_DATA_HOME/evolution/calendar`. Honour the override before
-    // falling back to the spec's default of `$HOME/.local/share`.
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        return Some(PathBuf::from(xdg).join("evolution").join("calendar"));
+    fn lookup_source(&self, source_uid: &str) -> anyhow::Result<Source> {
+        match self.registry.ref_source(source_uid)? {
+            Some(s) => Ok(s),
+            None => anyhow::bail!("EDS source '{source_uid}' not found"),
+        }
     }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local/share/evolution/calendar"))
-}
 
-fn scan_cache_dir() -> Vec<CalendarEvent> {
-    let Some(root) = cache_root() else {
-        tracing::debug!("calendar: $HOME unset; skipping scan");
-        return Vec::new();
-    };
-    let entries = match std::fs::read_dir(&root) {
-        Ok(rd) => rd,
-        Err(e) => {
-            // ENOENT ⇒ EDS hasn't been provisioned (no GOA accounts).
-            // Surface as empty list, log at debug to avoid noise.
-            tracing::debug!(error = %e, dir = %root.display(), "calendar: cache dir read failed");
-            return Vec::new();
+    /// Re-scan every calendar source and emit a fresh `Vec` only if it
+    /// differs from the current snapshot (`PartialEq` dedup avoids
+    /// re-emitting an identical list every minute).
+    fn refresh(&mut self, writer: &Mutable<Vec<CalendarEvent>>) {
+        let snapshot = self.scan_all();
+        let changed = {
+            let cur = writer.lock_ref();
+            *cur != snapshot
+        };
+        if changed {
+            writer.set(snapshot);
         }
-    };
+    }
 
-    let now = Local::now();
-    let window_end = now + Duration::days(NEXT_DAYS);
-    let mut out: Vec<CalendarEvent> = Vec::new();
-
-    for entry in entries.flatten() {
-        let source_dir = entry.path();
-        if !source_dir.is_dir() {
-            continue;
-        }
-        let ics = source_dir.join("calendar.ics");
-        if !ics.is_file() {
-            continue;
-        }
-        let calendar_name = source_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("calendar")
-            .to_string();
-        match parse_ics_file(&ics, &calendar_name, now, window_end) {
-            Ok(mut evs) => out.append(&mut evs),
-            Err(e) => {
-                tracing::warn!(error = %e, file = %ics.display(), "calendar: parse failed");
+    fn scan_all(&mut self) -> Vec<CalendarEvent> {
+        let now = Local::now();
+        let window_end = now + Duration::days(NEXT_DAYS);
+        // Re-read the source list each pass so a calendar added/removed at
+        // runtime (e.g. a new Nextcloud calendar discovered under the
+        // collection source) is picked up without a restart.
+        let sources = self.registry.calendars();
+        let mut out: Vec<CalendarEvent> = Vec::new();
+        for src in sources {
+            let source_uid = src.uid();
+            let calendar_name = src.display_name();
+            let client = match self.client(&source_uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(source = %source_uid, error = %e, "calendar: client connect failed");
+                    continue;
+                }
+            };
+            // "#t" = match-all; the upcoming-window filter happens in Rust
+            // so behaviour matches the prior .ics path exactly. (Components
+            // come back master-only — recurrence instances are not
+            // expanded here; see the module-level limitations note.)
+            let objects = match client.get_object_strings("#t") {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(source = %source_uid, error = %e, "calendar: query failed");
+                    continue;
+                }
+            };
+            for body in objects {
+                out.extend(parse_ics_body(&body, &calendar_name, now, window_end));
             }
         }
+        out.sort_by_key(|e| e.start);
+        out
     }
-
-    out.sort_by_key(|e| e.start);
-    out
 }
 
-fn parse_ics_file(
-    path: &Path,
+fn run_worker(rx: &mpsc::Receiver<()>, writer: &Mutable<Vec<CalendarEvent>>) {
+    let mut worker = match Worker::new() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(error = %e, "calendar: EDS worker init failed; service inert");
+            // Drain the channel so the ticker's sends don't error out; we
+            // can't recover without a restart.
+            for () in rx {}
+            return;
+        }
+    };
+    while rx.recv().is_ok() {
+        worker.refresh(writer);
+    }
+}
+
+// ── iCalendar parsing ────────────────────────────────────────────────────────
+
+/// Parse one iCalendar body (a VCALENDAR, or a bare VEVENT that libecal
+/// sometimes hands back) into the [`CalendarEvent`]s it contains that fall
+/// inside the `[now, window_end]` upcoming window.
+fn parse_ics_body(
+    body: &str,
     calendar_name: &str,
     now: DateTime<Local>,
     window_end: DateTime<Local>,
-) -> anyhow::Result<Vec<CalendarEvent>> {
-    let body = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    // `Calendar::parse` is the high-level entry point and accepts a string.
-    let parsed: Calendar = body
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+) -> Vec<CalendarEvent> {
+    // libecal usually hands back a full VCALENDAR; some backends return a
+    // bare VEVENT, so fall back to wrapping it before parsing (same trick
+    // as `tasks::parse_one`).
+    let Some(parsed) = body.parse::<Calendar>().ok().or_else(|| {
+        let wrapped = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte//\r\n{body}\r\nEND:VCALENDAR\r\n"
+        );
+        wrapped.parse::<Calendar>().ok()
+    }) else {
+        tracing::warn!("calendar: iCal body failed to parse");
+        return Vec::new();
+    };
 
     let mut out = Vec::new();
     for event in parsed.components.iter().filter_map(|c| match c {
-        icalendar::CalendarComponent::Event(e) => Some(e),
+        CalendarComponent::Event(e) => Some(e),
         _ => None,
     }) {
-        if event.get_status() == Some(EventStatus::Cancelled) {
-            continue;
+        if let Some(ev) = event_to_calendar_event(event, calendar_name, now, window_end, out.len()) {
+            out.push(ev);
         }
-        let Some(start_dpt) = event.get_start() else {
-            continue;
-        };
-        let Some((start_local, all_day)) = dpt_to_local(start_dpt) else {
-            continue;
-        };
-        // RFC 5545 §3.6.1: a VEVENT carries DTEND xor DURATION (never
-        // both). Google Calendar and many recurring-instance emitters
-        // prefer DURATION, so we have to honour both.
-        let end_local = if let Some((dt, _)) = event.get_end().and_then(dpt_to_local) {
-            dt
-        } else if let Some(dur) = event
-            .property_value("DURATION")
-            .and_then(parse_iso8601_duration)
-        {
-            start_local + dur
-        } else if all_day {
-            // Per RFC 5545: if neither DTEND nor DURATION is present on a
-            // DATE-typed VEVENT, the event ends at the end of DTSTART's
-            // day (i.e. start + 1 day).
-            start_local + Duration::days(1)
-        } else {
-            // Missing DTEND/DURATION on a DATE-TIME means a zero-duration
-            // event in iCal, but for UI purposes we'd rather see a 1-hour
-            // bar than a coincident edge.
-            start_local + Duration::hours(1)
-        };
-
-        // Window filter: include if the event hasn't ended yet AND its
-        // start lies inside the next-N-days window. The "hasn't ended"
-        // half catches multi-day events that started in the past but
-        // are still ongoing — we want to surface those too.
-        if end_local < now {
-            continue;
-        }
-        if start_local > window_end {
-            continue;
-        }
-
-        let uid = event.get_uid().map_or_else(
-            || format!("anon:{calendar_name}:{}", out.len()),
-            str::to_string,
-        );
-        let summary = event
-            .get_summary()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "(no title)".to_string());
-        let location = event
-            .get_location()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        out.push(CalendarEvent {
-            uid,
-            summary,
-            start: start_local,
-            end: end_local,
-            location,
-            all_day,
-            calendar_name: calendar_name.to_string(),
-        });
     }
-    Ok(out)
+    out
+}
+
+/// Convert a single parsed VEVENT into a [`CalendarEvent`], or `None` if it
+/// is cancelled, undatable, already over, or starts past the window.
+/// `anon_index` disambiguates the synthesised UID when a VEVENT carries no
+/// UID of its own.
+fn event_to_calendar_event(
+    event: &icalendar::Event,
+    calendar_name: &str,
+    now: DateTime<Local>,
+    window_end: DateTime<Local>,
+    anon_index: usize,
+) -> Option<CalendarEvent> {
+    if event.get_status() == Some(EventStatus::Cancelled) {
+        return None;
+    }
+    let start_dpt = event.get_start()?;
+    let (start_local, all_day) = dpt_to_local(start_dpt)?;
+    // RFC 5545 §3.6.1: a VEVENT carries DTEND xor DURATION (never both).
+    // Google Calendar and many recurring-instance emitters prefer
+    // DURATION, so we have to honour both.
+    let end_local = if let Some((dt, _)) = event.get_end().and_then(dpt_to_local) {
+        dt
+    } else if let Some(dur) = event
+        .property_value("DURATION")
+        .and_then(parse_iso8601_duration)
+    {
+        start_local + dur
+    } else if all_day {
+        // Per RFC 5545: if neither DTEND nor DURATION is present on a
+        // DATE-typed VEVENT, the event ends at the end of DTSTART's day.
+        start_local + Duration::days(1)
+    } else {
+        // Missing DTEND/DURATION on a DATE-TIME means a zero-duration event
+        // in iCal, but for UI purposes we'd rather show a 1-hour bar than a
+        // coincident edge.
+        start_local + Duration::hours(1)
+    };
+
+    // Window filter: include if the event hasn't ended yet AND its start
+    // lies inside the next-N-days window. The "hasn't ended" half catches
+    // multi-day events that started in the past but are still ongoing.
+    if end_local < now {
+        return None;
+    }
+    if start_local > window_end {
+        return None;
+    }
+
+    let uid = event.get_uid().map_or_else(
+        || format!("anon:{calendar_name}:{anon_index}"),
+        str::to_string,
+    );
+    let summary = event
+        .get_summary()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(no title)".to_string());
+    let location = event
+        .get_location()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(CalendarEvent {
+        uid,
+        summary,
+        start: start_local,
+        end: end_local,
+        location,
+        all_day,
+        calendar_name: calendar_name.to_string(),
+    })
 }
 
 /// Resolve a `DatePerhapsTime` to local time. Returns `(local_dt, all_day)`,
@@ -578,20 +647,17 @@ mod tests {
                 .naive_utc()
                 .format("%Y%m%dT%H%M%SZ"),
         );
-        let path = std::env::temp_dir().join("hytte-calendar-test.ics");
-        std::fs::write(&path, body).unwrap();
-        let evs = parse_ics_file(
-            &path,
+        let evs = parse_ics_body(
+            &body,
             "test-cal",
             now - Duration::hours(1),
             now + Duration::days(NEXT_DAYS),
-        )
-        .unwrap();
+        );
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].uid, "abc-123");
         assert_eq!(evs[0].summary, "Lunch");
         assert!(!evs[0].all_day);
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(evs[0].calendar_name, "test-cal");
     }
 
     #[test]
@@ -608,11 +674,29 @@ mod tests {
                 .naive_utc()
                 .format("%Y%m%dT%H%M%SZ"),
         );
-        let path = std::env::temp_dir().join("hytte-calendar-test2.ics");
-        std::fs::write(&path, body).unwrap();
-        let evs = parse_ics_file(&path, "test-cal", now, now + Duration::days(NEXT_DAYS)).unwrap();
+        let evs = parse_ics_body(&body, "test-cal", now, now + Duration::days(NEXT_DAYS));
         assert!(evs.is_empty());
-        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_bare_vevent_without_vcalendar_wrapper() {
+        // libecal sometimes returns a component with no VCALENDAR wrapper;
+        // parse_ics_body wraps + retries.
+        let now = Local::now();
+        let in_two_days = now + Duration::days(2);
+        let body = format!(
+            "BEGIN:VEVENT\r\nUID:bare-1\r\nSUMMARY:Standup\r\nDTSTART:{}\r\nEND:VEVENT\r\n",
+            in_two_days.naive_utc().format("%Y%m%dT%H%M%SZ"),
+        );
+        let evs = parse_ics_body(
+            &body,
+            "test-cal",
+            now - Duration::hours(1),
+            now + Duration::days(NEXT_DAYS),
+        );
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].uid, "bare-1");
+        assert_eq!(evs[0].summary, "Standup");
     }
 
     #[test]
@@ -687,18 +771,14 @@ mod tests {
              END:VEVENT\r\nEND:VCALENDAR\r\n",
             start.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
-        let path = std::env::temp_dir().join("hytte-calendar-test-pt4h.ics");
-        std::fs::write(&path, body).unwrap();
-        let evs = parse_ics_file(
-            &path,
+        let evs = parse_ics_body(
+            &body,
             "test-cal",
             now - Duration::hours(1),
             now + Duration::days(NEXT_DAYS),
-        )
-        .unwrap();
+        );
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].end - evs[0].start, Duration::hours(4));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -713,19 +793,15 @@ mod tests {
              DTSTART;VALUE=DATE:{date}\r\nDURATION:P3D\r\n\
              END:VEVENT\r\nEND:VCALENDAR\r\n",
         );
-        let path = std::env::temp_dir().join("hytte-calendar-test-p3d.ics");
-        std::fs::write(&path, body).unwrap();
-        let evs = parse_ics_file(
-            &path,
+        let evs = parse_ics_body(
+            &body,
             "test-cal",
             now - Duration::hours(1),
             now + Duration::days(NEXT_DAYS),
-        )
-        .unwrap();
+        );
         assert_eq!(evs.len(), 1);
         assert!(evs[0].all_day);
         assert_eq!(evs[0].end - evs[0].start, Duration::days(3));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

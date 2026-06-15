@@ -58,6 +58,17 @@ impl Registry {
         self.sources_by_extension(c"Task List")
     }
 
+    /// Enumerate every configured calendar (Events) source — the sibling
+    /// of [`task_lists`](Self::task_lists) for the `"Calendar"` extension.
+    /// Backend-agnostic: local `.ics`, `CalDAV` (Nextcloud / generic),
+    /// Google (via GOA), EWS — libecal does the per-backend translation, so
+    /// the caller opens each with `CalClient::connect(.., Events, ..)` and
+    /// queries VEVENTs regardless of where they actually live. As with
+    /// task lists, disabled sources are still returned; caller filters.
+    pub fn calendars(&self) -> Vec<Source> {
+        self.sources_by_extension(c"Calendar")
+    }
+
     /// Look up a single source by UID. Returns `None` if EDS doesn't
     /// know about that UID. The returned [`Source`] holds its own ref.
     pub fn ref_source(&self, uid: &str) -> Result<Option<Source>> {

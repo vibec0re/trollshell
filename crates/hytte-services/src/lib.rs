@@ -1,5 +1,6 @@
 //! Async clients to system daemons exposed as hytte services.
 
+pub mod app_usage;
 pub mod audio_native;
 pub mod bluetooth;
 pub mod bluetooth_audio;

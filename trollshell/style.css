@@ -366,6 +366,12 @@
 .ts-drawer-content {
     background: transparent;
 }
+/* The drawn-background drawing area exposes its CSS `color` as the silhouette
+ * fill (read via `color()` in `draw_drawer_silhouette`), so the drawer always
+ * matches the live theme `@window_bg_color` instead of a hardcoded value (#44). */
+.ts-drawer-bg {
+    color: @window_bg_color;
+}
 /* Sidebar window surface is transparent; the visible content is the
    inner card with class `.ts-sidebar`. Without this rule, the default
    @window_bg_color paints in the area outside the card (margin gaps),

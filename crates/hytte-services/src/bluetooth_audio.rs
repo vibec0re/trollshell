@@ -307,7 +307,9 @@ fn react(state: &Mutex<ReactorState>, devices: &[Device], sinks: &[Sink], enable
     // lock. This runs in a `spawn_local` future on the GTK main thread, so a
     // poisoned-mutex panic here would take down the whole shell; `ReactorState`
     // is plain data, so reading through the poison is safe.
-    let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut st = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Always track the current default's identity so we can restore on
     // disconnect even if auto-switch was toggled off and on again.

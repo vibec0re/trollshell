@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use hytte::adw;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, graphene, prelude::*};
 use hytte::prelude::*;
@@ -12,6 +13,16 @@ use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 /// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
 /// Used to clamp the per-trigger margin so the card never falls off-screen left.
 const DRAWER_MAX_WIDTH: i32 = 680;
+
+/// Concave flare radius for the drawer's two top corners — where the card
+/// sweeps *outward* to meet the bar so it "grows out of the bar" instead of
+/// floating below it (#34). The card body is inset by this much from its top
+/// (widest) extent, so the page content carries a matching left/right margin.
+/// Tunable: bigger = more pronounced flare. Drawn by [`draw_drawer_silhouette`].
+const DRAWER_FLARE_RADIUS: i32 = 20;
+
+/// Convex corner radius for the drawer's two bottom corners.
+const DRAWER_CORNER_RADIUS: f64 = 16.0;
 
 /// Chrome between the layer-shell surface edge and the visible `.ts-drawer`
 /// card, on the *leading* side of the bar's main axis. Derived from
@@ -205,10 +216,11 @@ struct ModalPanel {
     window: gtk::Window,
     revealer: gtk::Revealer,
     stack: gtk::Stack,
-    /// The visible `.ts-drawer` card. Measured (post-map) for its real
-    /// allocated size so the *card*, not the transparent surface, centers
-    /// under the trigger chip.
-    card: gtk::Box,
+    /// The visible `.ts-drawer` card — a `gtk::Overlay` whose custom-drawn
+    /// background paints the concave-flare silhouette (#34) behind the page
+    /// content. Measured (post-map) for its real allocated size so the *card*,
+    /// not the transparent surface, centers under the trigger chip.
+    card: gtk::Overlay,
     current: RefCell<Option<Page>>,
     catcher: gtk::Window,
     /// The bar this drawer hangs off — its edge/offset/thickness drive the
@@ -276,10 +288,10 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     wire_escape(&window, key.clone());
 
     let revealer = build_revealer(&geometry);
-    let card = build_drawer_card(&geometry);
+    let (card, content) = build_drawer_card(&geometry);
     let stack = build_pages_stack();
 
-    card.append(&stack);
+    content.append(&stack);
     revealer.set_child(Some(&card));
     window.set_child(Some(&revealer));
 
@@ -368,8 +380,20 @@ fn build_revealer(geometry: &BarGeometry) -> gtk::Revealer {
     revealer
 }
 
-fn build_drawer_card(geometry: &BarGeometry) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+/// Build the drawer card: a custom-drawn silhouette that grows out of the bar
+/// with a concave flare at its top corners (#34), with the page content
+/// overlaid on top. Returns the `gtk::Overlay` (the measured "card") and the
+/// content `gtk::Box` the pages stack mounts into.
+///
+/// Why custom-draw and not CSS: the flare is a *concave* curve (the corners
+/// sweep outward to meet the bar). CSS `border-radius` only rounds corners
+/// *inward* (convex), so the shape is painted in cairo here — mirroring the
+/// [`crate::overlays::frame`] precedent. The content box is inset by
+/// `DRAWER_FLARE_RADIUS` (its start/end margin) so the wings extend beyond it,
+/// up to the bar; the overlay is measured from that content so the drawn
+/// background tracks the page's natural size.
+fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
+    let card = gtk::Overlay::new();
     card.add_css_class("ts-drawer");
     if geometry.horizontal() {
         card.set_valign(geometry.perpendicular_align());
@@ -378,7 +402,102 @@ fn build_drawer_card(geometry: &BarGeometry) -> gtk::Box {
         card.set_halign(geometry.perpendicular_align());
         card.set_hexpand(false);
     }
-    card
+
+    let bg = gtk::DrawingArea::new();
+    bg.set_hexpand(true);
+    bg.set_vexpand(true);
+    bg.set_draw_func(|_area, cr: &gtk::cairo::Context, width: i32, height: i32| {
+        draw_drawer_silhouette(cr, f64::from(width), f64::from(height));
+    });
+    card.set_child(Some(&bg));
+
+    // Repaint when the system light/dark preference flips (the fill is
+    // theme-derived but drawn in cairo, so CSS won't re-trigger it).
+    let bg_weak = bg.downgrade();
+    adw::StyleManager::default().connect_dark_notify(move |_| {
+        if let Some(bg) = bg_weak.upgrade() {
+            bg.queue_draw();
+        }
+    });
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.add_css_class("ts-drawer-content");
+    content.set_margin_start(DRAWER_FLARE_RADIUS);
+    content.set_margin_end(DRAWER_FLARE_RADIUS);
+    card.add_overlay(&content);
+    // Size the overlay (and thus the drawn background) to the content + its
+    // flare-inset margins, not the zero-natural-size DrawingArea.
+    card.set_measure_overlay(&content, true);
+
+    (card, content)
+}
+
+/// Paint the drawer card silhouette into `cr` for a `w`×`h` allocation: a card
+/// flush to the bar along its top edge, its two top corners flaring *outward*
+/// (concave, `DRAWER_FLARE_RADIUS`) to meet the bar, and ordinary convex
+/// (`DRAWER_CORNER_RADIUS`) bottom corners. Mirrors the cairo approach in
+/// [`crate::overlays::frame`]; the fill + hairline border mirror the previous
+/// `.ts-drawer` CSS gradient (`shade(@window_bg_color, 0.82)` → base for dark,
+/// the lifted variant for light).
+fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    let rf = f64::from(DRAWER_FLARE_RADIUS);
+    let rc = DRAWER_CORNER_RADIUS;
+    // Degenerate allocation (pre-map / collapsed) — nothing sensible to draw.
+    if w <= 2.0 * rf || h <= rf + rc {
+        return;
+    }
+
+    // Outline, clockwise from the top-left wing tip. The top edge runs flush
+    // along the bar's bottom; the two top corners curve outward (`arc_negative`)
+    // up into the bar; the bottom two are ordinary convex corners (`arc`).
+    cr.new_path();
+    cr.move_to(0.0, 0.0);
+    cr.line_to(w, 0.0);
+    cr.arc_negative(w, rf, rf, -FRAC_PI_2, -PI); // top-right concave flare
+    cr.line_to(w - rf, h - rc);
+    cr.arc(w - rf - rc, h - rc, rc, 0.0, FRAC_PI_2); // bottom-right convex
+    cr.line_to(rf + rc, h);
+    cr.arc(rf + rc, h - rc, rc, FRAC_PI_2, PI); // bottom-left convex
+    cr.line_to(rf, rf);
+    cr.arc_negative(0.0, rf, rf, 0.0, -FRAC_PI_2); // top-left concave flare
+    cr.close_path();
+
+    // Theme-derived fill + edge (mirrors the old CSS, which themed light/dark).
+    let dark = adw::StyleManager::default().is_dark();
+    let (top, bottom, edge) = if dark {
+        (
+            [0.116, 0.116, 0.122],
+            [0.141, 0.141, 0.149],
+            [1.0, 1.0, 1.0, 0.08],
+        )
+    } else {
+        (
+            [0.992, 0.992, 0.996],
+            [0.980, 0.980, 0.984],
+            [0.0, 0.0, 0.0, 0.12],
+        )
+    };
+
+    let fill = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
+    fill.add_color_stop_rgba(0.0, top[0], top[1], top[2], 1.0);
+    fill.add_color_stop_rgba(1.0, bottom[0], bottom[1], bottom[2], 1.0);
+    if let Err(e) = cr.set_source(&fill) {
+        tracing::warn!(error = %e, "drawer: failed to set gradient source");
+        return;
+    }
+    if let Err(e) = cr.fill_preserve() {
+        tracing::warn!(error = %e, "drawer: cairo fill failed");
+        return;
+    }
+
+    // Faint hairline edge (was `border: 1px solid @borders`).
+    cr.set_source_rgba(edge[0], edge[1], edge[2], edge[3]);
+    cr.set_line_width(1.0);
+    if let Err(e) = cr.stroke() {
+        tracing::warn!(error = %e, "drawer: cairo stroke failed");
+    }
 }
 
 /// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible*

@@ -54,3 +54,19 @@ fn missing_service_panics_with_helpful_message() {
         .unwrap_or_default();
     assert!(msg.contains("ClockService not registered"), "got: {msg}");
 }
+
+#[test]
+fn registry_keys_by_type_with_absent_and_overwrite() {
+    use hytte_reactive::registry::Registry;
+
+    let mut r = Registry::default();
+    r.insert(7u32);
+    r.insert(String::from("hi")); // a distinct type coexists under its own key
+
+    assert_eq!(r.get::<u32>(), Some(&7));
+    assert_eq!(r.get::<String>().map(String::as_str), Some("hi"));
+    assert_eq!(r.get::<i64>(), None, "an unregistered type reads back None");
+
+    r.insert(9u32); // same type overwrites the previous value
+    assert_eq!(r.get::<u32>(), Some(&9));
+}

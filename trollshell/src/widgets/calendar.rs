@@ -12,7 +12,7 @@
 //! original (`gtk::Calendar`) design — this is the v2 redesign.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
@@ -285,17 +285,28 @@ fn wire_events_bind(
     let rows_track = rows_track.clone();
     let placeholder_track = placeholder_track.clone();
     bind(calendar::events(), group, move |group, evs| {
-        rebuild_upcoming_list(group, &rows_track, &placeholder_track, &evs);
+        rebuild_upcoming_list(
+            group,
+            &rows_track,
+            &placeholder_track,
+            &evs,
+            state.today.get(),
+        );
         state.events.borrow_mut().clone_from(&evs);
         render(&state);
     });
 }
 
+/// Rebuild the upcoming list grouped into day sections, iOS-calendar style
+/// (#46): a slim header per day ("Today" / "Tomorrow" / "Wed 18 Jun") with
+/// that day's events under it. The Today section always leads — when nothing
+/// remains scheduled today it shows a "No more events today" placeholder.
 fn rebuild_upcoming_list(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     evs: &[CalendarEvent],
+    today: NaiveDate,
 ) {
     for (_d, row) in rows_track.borrow_mut().drain(..) {
         group.remove(&row);
@@ -315,13 +326,75 @@ fn rebuild_upcoming_list(
         return;
     }
 
-    let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len());
+    // Group by calendar day. A multi-day event still running from a past start
+    // buckets under Today via `.max(today)`; the `BTreeMap` keeps days ordered.
+    let mut by_day: BTreeMap<NaiveDate, Vec<&CalendarEvent>> = BTreeMap::new();
     for ev in evs {
-        let row = build_calendar_row(ev);
-        group.add(&row);
-        new_rows.push((ev.start.date_naive(), row));
+        by_day
+            .entry(ev.start.date_naive().max(today))
+            .or_default()
+            .push(ev);
+    }
+
+    // Lead with Today even when it has no events (keys are all >= today, so
+    // inserting today at the front keeps the list date-ordered).
+    let mut days: Vec<NaiveDate> = by_day.keys().copied().collect();
+    if !by_day.contains_key(&today) {
+        days.insert(0, today);
+    }
+
+    let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len() + days.len());
+    for day in days {
+        let header = build_day_header(day, today);
+        group.add(&header);
+        new_rows.push((day, header));
+
+        if let Some(day_evs) = by_day.get(&day) {
+            for ev in day_evs {
+                let row = build_calendar_row(ev);
+                group.add(&row);
+                new_rows.push((day, row));
+            }
+        } else {
+            // Only the Today section reaches here (every other shown day has
+            // at least one event).
+            let none = build_none_today_row();
+            group.add(&none);
+            new_rows.push((day, none));
+        }
     }
     *rows_track.borrow_mut() = new_rows;
+}
+
+/// iOS-style day-section label: "Today" / "Tomorrow" / "Wed 18 Jun".
+fn day_header_label(day: NaiveDate, today: NaiveDate) -> String {
+    match day.signed_duration_since(today).num_days() {
+        0 => "Today".to_string(),
+        1 => "Tomorrow".to_string(),
+        // Code-generated (no user data) so it needs no markup escaping.
+        _ => day.format("%a %-d %b").to_string(),
+    }
+}
+
+/// A slim, muted day-section header row.
+fn build_day_header(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(day_header_label(day, today).as_str())
+        .activatable(false)
+        .selectable(false)
+        .build();
+    row.add_css_class("ts-cal-day-header");
+    row
+}
+
+/// Placeholder shown under the Today header when nothing remains today.
+fn build_none_today_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("No more events today")
+        .activatable(false)
+        .build();
+    row.add_css_class("ts-cal-day-empty");
+    row
 }
 
 // ── Today rollover (re-render on date change) ────────────────────────────────

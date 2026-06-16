@@ -835,9 +835,12 @@ window:not(.dark) .ts-drawer {
 .ts-sidebar-cal-list {
     margin-top: 0;
 }
+/* Fill + round the list *container* only, not each row: per-row background
+ * + border-radius turned every row into a free-floating pill with gaps
+ * between them (#32). Rows now sit flush inside the one container fill, with
+ * the boxed-list's own thin separators. */
 .ts-sidebar-cal-list listview,
-.ts-sidebar-cal-list list.boxed-list,
-.ts-sidebar-cal-list list.boxed-list > row {
+.ts-sidebar-cal-list list.boxed-list {
     background: alpha(white, 0.04);
     color: white;
     border-radius: 8px;
@@ -970,10 +973,10 @@ window:not(.dark) .ts-drawer {
     color: white;
 }
 
-/* Same dark-sidebar palette swap we use for the calendar's UPCOMING list. */
+/* Same dark-sidebar palette swap we use for the calendar's UPCOMING list —
+ * container-only fill so rows sit flush instead of as separate pills (#32). */
 .ts-sidebar-tasks-list listview,
-.ts-sidebar-tasks-list list.boxed-list,
-.ts-sidebar-tasks-list list.boxed-list > row {
+.ts-sidebar-tasks-list list.boxed-list {
     background: alpha(white, 0.04);
     color: white;
     border-radius: 8px;

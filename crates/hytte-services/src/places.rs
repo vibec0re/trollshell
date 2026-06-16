@@ -215,10 +215,18 @@ fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
         .collect())
 }
 
-/// Load places, writing the documented default on first run. Always returns a
-/// non-empty list: a missing/empty/malformed config falls back to the default.
+/// Load places, writing the documented default on first run. Returns the
+/// default for a missing/empty/malformed user config. (The built-in default is
+/// parse-tested, so in practice this is non-empty; if a malformed
+/// `DEFAULT_CONFIG` ever shipped it degrades to an empty list — logged loudly —
+/// rather than crashing the whole shell on cold start.)
 fn load_places() -> Vec<Place> {
-    let default = || parse_places(DEFAULT_CONFIG).expect("built-in default config parses");
+    let default = || {
+        parse_places(DEFAULT_CONFIG).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "built-in default places config failed to parse");
+            Vec::new()
+        })
+    };
     let Some(path) = config_path() else {
         return default();
     };

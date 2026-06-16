@@ -56,7 +56,10 @@ fn bind_class_toggles_css_class() {
 
     bind_class(m.signal(), &label, "active");
     run_briefly(50);
-    assert!(!label.has_css_class("active"), "absent while signal is false");
+    assert!(
+        !label.has_css_class("active"),
+        "absent while signal is false"
+    );
 
     m.set(true);
     run_briefly(50);

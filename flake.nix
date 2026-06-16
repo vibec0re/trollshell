@@ -67,7 +67,7 @@
       formatter = forAllSystems ({ treefmt-eval, ... }: treefmt-eval.config.build.wrapper);
 
       checks = forAllSystems (
-        { pkgs, treefmt-eval, ... }:
+        { pkgs, treefmt-eval, craneLib, ... }:
         let
           system = pkgs.stdenv.hostPlatform.system;
 
@@ -76,6 +76,18 @@
           # config bodies. It carries meta.mainProgram so `lib.getExe cfg.package`
           # (used by the systemd ExecStart) still resolves.
           stubPackage = pkgs.writeShellScriptBin "trollshell" "";
+
+          # The hytte-ecal `probe` example binary + a fixture task-list source,
+          # for the eds-nixos-test below.
+          probe = pkgs.callPackage ./nix/probe.nix { inherit craneLib; };
+          taskSource = pkgs.writeText "test-tasks.source" ''
+            [Data Source]
+            DisplayName=Test Tasks
+            Enabled=true
+
+            [Task List]
+            BackendName=local
+          '';
         in
         {
           formatting = treefmt-eval.config.build.check self;
@@ -186,6 +198,63 @@
               echo "$probe" >/dev/null
               touch $out
             '';
+
+          # The "lean heavy on nix" counterpart to the Rust ephemeral-EDS
+          # harness (#49): boot a real NixOS VM with evolution-data-server
+          # configured declaratively, seed a fixture task list, and run the
+          # hytte-ecal probe against it end-to-end. Verified to run under TCG
+          # (no KVM needed); GitHub's Linux runners have /dev/kvm for speed.
+          eds-nixos-test = pkgs.testers.runNixOSTest {
+            name = "eds-nixos-test";
+            nodes.machine =
+              { ... }:
+              {
+                users.users.alice = {
+                  isNormalUser = true;
+                  uid = 1000;
+                };
+                # Three-line EDS module: installs the package, wires its D-Bus
+                # session activation service files, and its systemd user units.
+                services.gnome.evolution-data-server.enable = true;
+                programs.dconf.enable = true; # EDS GSettings backend
+                services.gnome.gnome-keyring.enable = true; # EDS credential store
+                environment.systemPackages = [ probe ];
+                virtualisation.graphics = false;
+              };
+            testScript = ''
+              machine.wait_for_unit("multi-user.target")
+
+              # Seed the fixture task-list source into alice's home.
+              machine.succeed("mkdir -p /home/alice/.config/evolution/sources")
+              machine.copy_from_host(
+                  "${taskSource}",
+                  "/home/alice/.config/evolution/sources/test-tasks.source",
+              )
+              machine.succeed("chown -R alice:users /home/alice/.config")
+
+              # Bring up alice's user session (creates /run/user/1000/bus).
+              machine.succeed("loginctl enable-linger alice")
+              machine.wait_for_unit("user@1000.service")
+              machine.wait_for_file("/run/user/1000/bus")
+
+              # Run the probe as alice; EDS D-Bus-activates on first connect.
+              schemas = "${pkgs.evolution-data-server}/share/gsettings-schemas"
+              output = machine.wait_until_succeeds(
+                  "su -s /bin/sh alice -c '"
+                  + "export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; "
+                  + "export HOME=/home/alice XDG_RUNTIME_DIR=/run/user/1000; "
+                  + "export GSETTINGS_SCHEMA_DIR=$(ls -d " + schemas + "/*/glib-2.0/schemas | head -1); "
+                  + "probe'",
+                  timeout=180,
+              )
+              # EDS auto-provisions a default "Personal" list, so the count
+              # isn't 1 — assert our seeded fixture is enumerated and the FFI
+              # create/remove roundtrip actually worked.
+              assert "Test Tasks" in output, output
+              assert "created uid: hytte-ecal-probe-1" in output, output
+              assert "removed hytte-ecal-probe-1" in output, output
+            '';
+          };
         }
       );
 

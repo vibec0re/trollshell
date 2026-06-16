@@ -9,7 +9,7 @@
 use futures_signals::signal::Mutable;
 use gtk::glib;
 use gtk::prelude::*;
-use hytte_reactive::bind::{bind_text, bind_visible};
+use hytte_reactive::bind::{bind_class, bind_text, bind_visible};
 use std::time::Duration;
 
 fn run_briefly(ms: u64) {
@@ -47,4 +47,28 @@ fn bind_visible_toggles_widget() {
     m.set(true);
     run_briefly(50);
     assert!(label.is_visible());
+}
+
+#[gtk::test]
+fn bind_class_toggles_css_class() {
+    let label = gtk::Label::new(None);
+    let m = Mutable::new(false);
+
+    bind_class(m.signal(), &label, "active");
+    run_briefly(50);
+    assert!(
+        !label.has_css_class("active"),
+        "absent while signal is false"
+    );
+
+    m.set(true);
+    run_briefly(50);
+    assert!(label.has_css_class("active"), "added when signal goes true");
+
+    m.set(false);
+    run_briefly(50);
+    assert!(
+        !label.has_css_class("active"),
+        "removed again when signal goes false"
+    );
 }

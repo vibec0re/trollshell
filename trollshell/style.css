@@ -346,36 +346,25 @@
     padding-right: 5px;
     padding-left: 20px;
 }
-/* Drawer card — floats 10 px below the bar's bottom edge as an
- * independent card; all four corners rounded; drop shadow surrounds the
- * card. Colors inherit the Adwaita theme. */
+/* Drawer card — a custom-drawn silhouette (see `draw_drawer_silhouette` in
+ * modal.rs) that grows out of the bar with a concave flare at its top corners
+ * (#34). The fill + border are painted in cairo — a concave curve can't be
+ * expressed with CSS `border-radius` — so this rule only positions the card
+ * within the surface (its margins stay in sync with `CARD_CHROME_*` in
+ * modal.rs) and stays transparent so the drawn shape shows through. */
 .ts-drawer {
-    background: @window_bg_color;
-    background-image: linear-gradient(
-        180deg,
-        shade(@window_bg_color, 0.82) 0%,
-        @window_bg_color 100%
-    );
-
+    background: transparent;
     color: @window_fg_color;
-    border-radius: 14px;
-    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
-    border: 1px solid @borders;
     padding-top: 0px;
     margin-bottom: 20px;
     margin-right: 10px;
     margin-top: 0px;
 }
-/* Light mode: shade() darkens, but dark-on-light gradients read as a
- * dirty smudge. Lift the top slightly instead so the drawer reads as a
- * subtle highlight feathering down into the surface. */
-window:not(.dark) .ts-drawer {
-    background-image: linear-gradient(
-        180deg,
-        shade(@window_bg_color, 1.04) 0%,
-        @window_bg_color 100%
-    );
-    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+/* The page content overlaid on the drawn silhouette; transparent so the
+ * cairo fill behind it shows. Inset from the card's wings by
+ * `DRAWER_FLARE_RADIUS` (set as a margin in modal.rs). */
+.ts-drawer-content {
+    background: transparent;
 }
 /* Sidebar window surface is transparent; the visible content is the
    inner card with class `.ts-sidebar`. Without this rule, the default

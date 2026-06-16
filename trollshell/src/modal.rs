@@ -19,10 +19,12 @@ const DRAWER_MAX_WIDTH: i32 = 680;
 /// floating below it (#34). The card body is inset by this much from its top
 /// (widest) extent, so the page content carries a matching left/right margin.
 /// Tunable: bigger = more pronounced flare. Drawn by [`draw_drawer_silhouette`].
-const DRAWER_FLARE_RADIUS: i32 = 20;
+/// Kept close to the shell's other corner radii (frame cutout/panels ~10–14)
+/// so the drawer junction matches the rest of the UI (#44).
+const DRAWER_FLARE_RADIUS: i32 = 12;
 
 /// Convex corner radius for the drawer's two bottom corners.
-const DRAWER_CORNER_RADIUS: f64 = 16.0;
+const DRAWER_CORNER_RADIUS: f64 = 14.0;
 
 /// Chrome between the layer-shell surface edge and the visible `.ts-drawer`
 /// card, on the *leading* side of the bar's main axis. Derived from
@@ -403,11 +405,16 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
         card.set_hexpand(false);
     }
 
+    // No hexpand/vexpand: a gtk::Overlay always allocates its main child the
+    // overlay's full size, so the DrawingArea fills the card regardless —
+    // and setting expand here would propagate up and inflate the card past
+    // its natural width, shifting it off-centre (#44). The `.ts-drawer-bg`
+    // class carries `color: @window_bg_color` so the draw func can read the
+    // live theme fill via `color()` instead of hardcoding it.
     let bg = gtk::DrawingArea::new();
-    bg.set_hexpand(true);
-    bg.set_vexpand(true);
-    bg.set_draw_func(|_area, cr: &gtk::cairo::Context, width: i32, height: i32| {
-        draw_drawer_silhouette(cr, f64::from(width), f64::from(height));
+    bg.add_css_class("ts-drawer-bg");
+    bg.set_draw_func(|area, cr: &gtk::cairo::Context, width: i32, height: i32| {
+        draw_drawer_silhouette(cr, f64::from(width), f64::from(height), area.color());
     });
     card.set_child(Some(&bg));
 
@@ -436,10 +443,14 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
 /// flush to the bar along its top edge, its two top corners flaring *outward*
 /// (concave, `DRAWER_FLARE_RADIUS`) to meet the bar, and ordinary convex
 /// (`DRAWER_CORNER_RADIUS`) bottom corners. Mirrors the cairo approach in
-/// [`crate::overlays::frame`]; the fill + hairline border mirror the previous
-/// `.ts-drawer` CSS gradient (`shade(@window_bg_color, 0.82)` → base for dark,
-/// the lifted variant for light).
-fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64) {
+/// [`crate::overlays::frame`].
+///
+/// `base` is the live `@window_bg_color` (read from the drawing area's
+/// `.ts-drawer-bg` CSS `color`), so the fill tracks the theme exactly instead
+/// of a hardcoded grey (#44). The gradient reproduces the previous CSS
+/// (`shade(@window_bg_color, 0.82)` → base for dark; the lifted `1.04` variant
+/// for light); the hairline edge was `border: 1px solid @borders`.
+fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::RGBA) {
     use std::f64::consts::{FRAC_PI_2, PI};
 
     let rf = f64::from(DRAWER_FLARE_RADIUS);
@@ -464,25 +475,30 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64) {
     cr.arc_negative(0.0, rf, rf, 0.0, -FRAC_PI_2); // top-left concave flare
     cr.close_path();
 
-    // Theme-derived fill + edge (mirrors the old CSS, which themed light/dark).
+    // Fill: a vertical gradient from a shaded `@window_bg_color` to the base,
+    // reproducing the old `.ts-drawer` CSS. `shade` darkens for dark mode
+    // (0.82) and lifts for light (1.04), matching the two CSS variants.
     let dark = adw::StyleManager::default().is_dark();
-    let (top, bottom, edge) = if dark {
-        (
-            [0.116, 0.116, 0.122],
-            [0.141, 0.141, 0.149],
-            [1.0, 1.0, 1.0, 0.08],
-        )
+    let shade = if dark { 0.82 } else { 1.04 };
+    let base_rgb = [
+        f64::from(base.red()),
+        f64::from(base.green()),
+        f64::from(base.blue()),
+    ];
+    let top = [
+        (base_rgb[0] * shade).clamp(0.0, 1.0),
+        (base_rgb[1] * shade).clamp(0.0, 1.0),
+        (base_rgb[2] * shade).clamp(0.0, 1.0),
+    ];
+    let edge = if dark {
+        [1.0, 1.0, 1.0, 0.08]
     } else {
-        (
-            [0.992, 0.992, 0.996],
-            [0.980, 0.980, 0.984],
-            [0.0, 0.0, 0.0, 0.12],
-        )
+        [0.0, 0.0, 0.0, 0.12]
     };
 
     let fill = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
     fill.add_color_stop_rgba(0.0, top[0], top[1], top[2], 1.0);
-    fill.add_color_stop_rgba(1.0, bottom[0], bottom[1], bottom[2], 1.0);
+    fill.add_color_stop_rgba(1.0, base_rgb[0], base_rgb[1], base_rgb[2], 1.0);
     if let Err(e) = cr.set_source(&fill) {
         tracing::warn!(error = %e, "drawer: failed to set gradient source");
         return;

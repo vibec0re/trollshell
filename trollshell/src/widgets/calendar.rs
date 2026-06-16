@@ -518,9 +518,12 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
         None => when,
     };
 
+    // AdwActionRow renders title/subtitle as Pango markup, so an unescaped
+    // `&`/`<`/`>` in a summary or location silently blanks the field (#30).
+    // Escape both, mirroring `widgets/tasks.rs`.
     let row = adw::ActionRow::builder()
-        .title(&ev.summary)
-        .subtitle(&subtitle)
+        .title(glib::markup_escape_text(&ev.summary).as_str())
+        .subtitle(glib::markup_escape_text(&subtitle).as_str())
         .activatable(false)
         .build();
     row.set_subtitle_lines(0);

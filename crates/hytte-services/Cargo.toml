@@ -65,6 +65,7 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 [dev-dependencies]
 futures-executor = "0.3.32"
 futures-util = "0.3.32"
+tempfile = "3"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tokio = { version = "1.52.1", features = ["macros", "rt", "time"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

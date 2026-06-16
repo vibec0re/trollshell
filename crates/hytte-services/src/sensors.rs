@@ -21,6 +21,7 @@
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -301,6 +302,10 @@ struct PollState {
     cpu_prev: Vec<(u64, u64)>,
     /// name → `(rx_bytes, tx_bytes, sample_instant)`
     net_prev: HashMap<String, (u64, u64, Instant)>,
+    /// Resolved `/sys/class/hwmon/hwmonN` dir of the CPU sensor chip, cached
+    /// after the first scan so each tick re-reads only its `temp*_input`
+    /// instead of re-walking all of `/sys/class/hwmon`.
+    cpu_temp_chip: Option<PathBuf>,
     /// Tick counter for rate-limiting slower polls.
     tick: u64,
 }
@@ -310,6 +315,7 @@ impl PollState {
         Self {
             cpu_prev: Vec::new(),
             net_prev: HashMap::new(),
+            cpu_temp_chip: None,
             tick: 0,
         }
     }
@@ -403,8 +409,8 @@ async fn poll_loop(w: PollWriters) {
             }
         }
 
-        // ── CPU temp (every tick — cheap sysfs reads) ─────────────────────
-        cpu_temp_writer.set(read_cpu_temp());
+        // ── CPU temp (every tick; the hwmon chip dir is resolved once) ────
+        cpu_temp_writer.set(read_cpu_temp(&mut state.cpu_temp_chip));
 
         // ── GPU (every 2 ticks) ───────────────────────────────────────────
         if state.tick.is_multiple_of(2) {
@@ -667,49 +673,66 @@ fn read_proc_net_dev() -> Result<Vec<(String, u64, u64)>, std::io::Error> {
 
 // ── CPU temperature ───────────────────────────────────────────────────────────
 
-fn read_cpu_temp() -> CpuTemp {
-    use std::fs;
-    let Ok(hwmon) = fs::read_dir("/sys/class/hwmon") else {
+/// Read the package CPU temperature. The `/sys/class/hwmon` chip directory is
+/// resolved once (a `read_dir` walk + a `name` read per hwmon entry) and
+/// cached in `chip`; subsequent ticks re-read only the cached chip's
+/// `temp*_input` files. If the cached chip stops yielding a reading (module
+/// reload / hotplug) the cache is dropped and re-resolved next call.
+fn read_cpu_temp(chip: &mut Option<PathBuf>) -> CpuTemp {
+    // Fast path: the chip directory is already known.
+    if let Some(dir) = chip.as_deref() {
+        if let Some(celsius) = read_chip_temp(dir) {
+            return CpuTemp {
+                package_celsius: Some(celsius),
+            };
+        }
+        *chip = None; // chip vanished — fall through and re-resolve
+    }
+
+    // Slow path: find a preferred CPU sensor chip and cache its directory.
+    let Ok(hwmon) = std::fs::read_dir("/sys/class/hwmon") else {
         return CpuTemp::default();
     };
-
     let preferred_names: &[&str] = &["coretemp", "k10temp", "zenpower", "asusec"];
-
     for entry in hwmon.flatten() {
-        let name_path = entry.path().join("name");
-        let Ok(name) = fs::read_to_string(&name_path) else {
+        let dir = entry.path();
+        let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
             continue;
         };
-        let name = name.trim();
-        if !preferred_names.contains(&name) {
+        if !preferred_names.contains(&name.trim()) {
             continue;
         }
-        // Found a CPU sensor chip. Read every temp*_input file, take the max.
-        let mut max_milli: Option<u64> = None;
-        if let Ok(rd) = fs::read_dir(entry.path()) {
-            for f in rd.flatten() {
-                let fname = f.file_name();
-                let Some(name_str) = fname.to_str() else {
-                    continue;
-                };
-                if !name_str.starts_with("temp") || !name_str.ends_with("_input") {
-                    continue;
-                }
-                if let Ok(s) = fs::read_to_string(f.path())
-                    && let Ok(v) = s.trim().parse::<u64>()
-                {
-                    max_milli = Some(max_milli.map_or(v, |cur| cur.max(v)));
-                }
-            }
-        }
-        if let Some(m) = max_milli {
-            #[allow(clippy::cast_precision_loss)]
+        if let Some(celsius) = read_chip_temp(&dir) {
+            *chip = Some(dir);
             return CpuTemp {
-                package_celsius: Some(m as f64 / 1000.0),
+                package_celsius: Some(celsius),
             };
         }
     }
     CpuTemp::default()
+}
+
+/// Highest `temp*_input` value (milli-°C) under a resolved hwmon chip
+/// directory, converted to °C. `None` if the directory is unreadable or has
+/// no `temp*_input` sensors.
+fn read_chip_temp(dir: &Path) -> Option<f64> {
+    let mut max_milli: Option<u64> = None;
+    for f in std::fs::read_dir(dir).ok()?.flatten() {
+        let fname = f.file_name();
+        let Some(name) = fname.to_str() else {
+            continue;
+        };
+        if !name.starts_with("temp") || !name.ends_with("_input") {
+            continue;
+        }
+        if let Ok(s) = std::fs::read_to_string(f.path())
+            && let Ok(v) = s.trim().parse::<u64>()
+        {
+            max_milli = Some(max_milli.map_or(v, |cur| cur.max(v)));
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    max_milli.map(|m| m as f64 / 1000.0)
 }
 
 // ── GPU ───────────────────────────────────────────────────────────────────────
@@ -1038,6 +1061,24 @@ fn read_process_count() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn read_chip_temp_takes_max_input_in_celsius() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("temp1_input"), "45000\n").unwrap();
+        std::fs::write(dir.path().join("temp2_input"), "52000\n").unwrap();
+        std::fs::write(dir.path().join("temp1_label"), "Package\n").unwrap(); // not *_input
+        std::fs::write(dir.path().join("name"), "coretemp\n").unwrap(); // ignored here
+        assert_eq!(read_chip_temp(dir.path()), Some(52.0));
+    }
+
+    #[test]
+    fn read_chip_temp_missing_or_sensorless_is_none() {
+        assert_eq!(read_chip_temp(Path::new("/nonexistent/hwmon-x")), None);
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_chip_temp(empty.path()), None);
+    }
 
     #[test]
     fn parse_meminfo_extracts_swap_fields() {

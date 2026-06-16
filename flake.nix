@@ -67,7 +67,12 @@
       formatter = forAllSystems ({ treefmt-eval, ... }: treefmt-eval.config.build.wrapper);
 
       checks = forAllSystems (
-        { pkgs, treefmt-eval, craneLib, ... }:
+        {
+          pkgs,
+          treefmt-eval,
+          craneLib,
+          ...
+        }:
         let
           system = pkgs.stdenv.hostPlatform.system;
 

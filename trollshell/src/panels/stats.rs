@@ -6,8 +6,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self};
 use hytte::prelude::*;
+use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
 
@@ -37,8 +39,67 @@ fn build_stats_live_group_v2() -> adw::PreferencesGroup {
     group.add(&build_live_processes_row());
     group.add(&build_live_gpu_row());
     group.add(&build_live_disk_expander());
+    group.add(&build_top_apps_expander(
+        "Top apps \u{00b7} CPU",
+        app_usage::top_by_cpu(),
+        |s| format!("{:.0}%", s.cpu_frac * 100.0),
+    ));
+    group.add(&build_top_apps_expander(
+        "Top apps \u{00b7} RAM",
+        app_usage::top_by_mem(),
+        |s| fmt_bytes(s.mem_bytes),
+    ));
 
     group
+}
+
+/// A collapsible "Top apps" list (CPU or RAM) bound to an [`app_usage`] signal.
+/// `value` formats each row's right-hand value. Mirrors
+/// [`build_live_disk_expander`]'s drain-and-rebuild pattern. The `comm` is
+/// rendered with markup off, so an adversarial process name can't inject Pango
+/// markup (cf. #30).
+fn build_top_apps_expander(
+    title: &str,
+    signal: impl Signal<Item = Vec<ProcSample>> + 'static,
+    value: fn(&ProcSample) -> String,
+) -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder().title(title).build();
+    expander.set_expanded(true);
+
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let expander_for_bind = expander.clone();
+    let rows_for_bind = rows_track.clone();
+    bind(signal, &expander, move |_, list| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            expander_for_bind.remove(&row);
+        }
+        // Collapsed summary: the heaviest entry, or an em-dash when empty.
+        let subtitle = list.first().map_or_else(
+            || "\u{2014}".to_string(),
+            |s| format!("{} \u{00b7} {}", s.name, value(s)),
+        );
+        expander_for_bind.set_subtitle(&subtitle);
+
+        let mut new_rows = Vec::with_capacity(list.len());
+        for s in &list {
+            let row = adw::ActionRow::builder().activatable(false).build();
+            // Markup off: a process `comm` is untrusted and could otherwise
+            // inject Pango markup into the title (cf. #30).
+            row.set_use_markup(false);
+            row.set_title(&s.name);
+            if s.procs > 1 {
+                row.set_subtitle(&format!("{} processes", s.procs));
+            }
+            let label = gtk::Label::new(Some(&value(s)));
+            label.set_valign(gtk::Align::Center);
+            row.add_suffix(&label);
+            expander_for_bind.add_row(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    expander
 }
 
 fn build_live_cpu_row() -> adw::ActionRow {

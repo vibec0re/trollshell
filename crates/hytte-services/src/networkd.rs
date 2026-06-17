@@ -215,15 +215,27 @@ async fn refresh(
 
 async fn read_links() -> Result<Vec<Link>> {
     // ListLinks returns array of (idx: i32, name: String, path: ObjectPath).
-    let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> = call(NETWORKD_NAME)
-        .bus(BusKind::System)
-        .at_path(MANAGER_PATH)
-        .iface(MANAGER_IFACE)
-        .method("ListLinks")
-        .args(())
-        .send()
-        .await
-        .context("ListLinks")?;
+    // On systems without systemd-networkd the call errors with
+    // `org.freedesktop.DBus.Error.ServiceUnknown` / `NameHasNoOwner`; treat
+    // that the same as an empty list and fall back to /sys/class/net.
+    let list_result: Result<Vec<(i32, String, zbus::zvariant::OwnedObjectPath)>> =
+        call(NETWORKD_NAME)
+            .bus(BusKind::System)
+            .at_path(MANAGER_PATH)
+            .iface(MANAGER_IFACE)
+            .method("ListLinks")
+            .args(())
+            .send()
+            .await
+            .context("ListLinks");
+
+    let list = match list_result {
+        Err(e) => {
+            tracing::debug!(error = ?e, "networkd ListLinks failed; falling back to /sys/class/net");
+            return Ok(read_links_from_sys());
+        }
+        Ok(l) => l,
+    };
 
     // When networkd returns no links (e.g. interfaces are managed by
     // NetworkManager / iwd / plain kernel), fall back to /sys/class/net so
@@ -561,6 +573,32 @@ mod tests {
         assert_eq!(
             parsed.gateway_v4,
             Some(std::net::Ipv4Addr::new(192, 168, 0, 1))
+        );
+    }
+
+    // --- read_links_from_sys ---
+
+    /// Every Linux host has /sys/class/net with at least `lo`.  The function
+    /// filters out loopback, so the returned list may be empty on a host with
+    /// only a loopback device, but it must never panic and each entry must be
+    /// well-formed.
+    #[test]
+    fn read_links_from_sys_returns_well_formed_entries() {
+        let links = read_links_from_sys();
+        for link in &links {
+            assert!(!link.name.is_empty(), "link name must not be empty");
+            assert_ne!(link.name, "lo", "loopback must be filtered out");
+        }
+    }
+
+    /// `read_links_from_sys` must not include the loopback interface even when
+    /// it is the only interface present (edge-case defensive check).
+    #[test]
+    fn read_links_from_sys_excludes_lo() {
+        let links = read_links_from_sys();
+        assert!(
+            links.iter().all(|l| l.name != "lo"),
+            "loopback `lo` must be excluded from the sysfs link list"
         );
     }
 }

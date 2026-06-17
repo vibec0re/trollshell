@@ -830,13 +830,12 @@ fn write_default(state: &Rc<RefCell<AudioState>>, key: &str, name: &str) {
 /// yet — silently skip rather than publishing a mono array that would
 /// clobber a stereo sink's layout.
 // `linear` gain is in [0,1]; f32 is PipeWire's channelVolumes element type.
-#[allow(clippy::cast_possible_truncation)]
 fn send_volume(node: &pw::node::Node, channels: usize, linear: f64) {
     if channels == 0 {
         tracing::debug!("audio_native: skip set_volume — channel count unknown");
         return;
     }
-    let channel_volumes: Vec<f32> = vec![linear as f32; channels];
+    let channel_volumes: Vec<f32> = vec![crate::cast::f64_to_f32_gain(linear); channels];
     let pod = build_props_pod(Some(channel_volumes), None);
     let Some(pod) = pod else {
         tracing::warn!("audio_native: failed to build volume pod");
@@ -1060,14 +1059,12 @@ fn resolve_link_source(links: &HashMap<u32, LinkEdge>, stream_id: u32) -> u32 {
 /// the first channel's value. Averaging is friendlier when the UI shows
 /// a single slider for a stereo sink: a 100%/0% pair reads 50% instead of
 /// 100%, matching what the user perceives. Empty array → 0.0.
-// Channel count is a handful of elements; usize→f64 loses no precision here.
-#[allow(clippy::cast_precision_loss)]
 fn avg_volume(channels: &[f32]) -> f64 {
     if channels.is_empty() {
         return 0.0;
     }
     let sum: f64 = channels.iter().map(|v| f64::from(*v)).sum();
-    sum / channels.len() as f64
+    sum / crate::cast::usize_to_f64(channels.len())
 }
 
 /// Returns the audio service to register with the hytte runtime.
@@ -1266,12 +1263,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // exact 0.0 sentinel for the empty-input case
     fn avg_volume_empty_is_zero() {
         // A node we haven't received Props for yet has an empty
         // channelVolumes Vec. The UI reads `volume` and divides by
         // implicit ranges; producing 0.0 keeps it safely off the rails.
-        assert_eq!(avg_volume(&[]), 0.0);
+        // The empty-input path returns the literal constant 0.0 — use an
+        // epsilon comparison to stay consistent with float-comparison style.
+        assert!(avg_volume(&[]).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -8,6 +8,16 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
+/// `time_t` — POSIX calendar seconds since the Unix epoch. On every target
+/// we build for (Linux x86_64/aarch64, glibc/musl) this is a signed 64-bit
+/// integer; we model it as `i64` to match. Used by libical's
+/// [`i_cal_time_as_timet_with_zone`] / [`i_cal_time_new_from_timet_with_zone`].
+pub type TimeT = i64;
+
+/// `gboolean` — GLib's C-int boolean (`0` = FALSE, non-zero = TRUE). Used
+/// for the recurrence callback's return value.
+pub type GBoolean = c_int;
+
 // ── Opaque GObject types ─────────────────────────────────────────────────────
 
 /// `ESourceRegistry *` — central source lookup. Created via
@@ -27,6 +37,33 @@ pub type ECalClient = c_void;
 /// VEVENT…). Some accessors return borrows, others must be unref'd via
 /// [`g_object_unref`] — see each function's note.
 pub type ICalComponent = c_void;
+
+/// `ICalTime *` — a libical broken-down time value: a component's DTSTART /
+/// DTEND, or one occurrence from the recurrence iterator. Released with
+/// [`g_object_unref`] for the ones the accessors/iterator hand us (they
+/// return new refs).
+pub type ICalTime = c_void;
+
+/// `ICalTimezone *` — a libical timezone. We only ever use the process-wide
+/// UTC singleton ([`i_cal_timezone_get_utc_timezone`]), which is owned by
+/// libical and must never be unref'd.
+pub type ICalTimezone = c_void;
+
+/// `ICalProperty *` — one property of a component (e.g. an RRULE). Returned
+/// borrowed-or-owned per accessor; we `g_object_unref` the ones we own.
+pub type ICalProperty = c_void;
+
+/// `ICalRecurrence *` — a parsed RRULE value. Released with [`g_object_unref`].
+pub type ICalRecurrence = c_void;
+
+/// `ICalRecurIterator *` — libical's core recurrence iterator. Created via
+/// [`i_cal_recur_iterator_new`]; freed with [`i_cal_recur_iterator_free`].
+pub type ICalRecurIterator = c_void;
+
+/// `ICAL_RRULE_PROPERTY` — the `ICalPropertyKind` discriminant for an RRULE
+/// property (value 73 in `icalderivedproperty.h`). Passed to
+/// [`i_cal_component_get_first_property`].
+pub const I_CAL_RRULE_PROPERTY: c_int = 73;
 
 /// `GError *` — out-param for fallible operations. We always init it to
 /// `null` and free it via [`g_error_free`] if a call sets it.
@@ -222,6 +259,75 @@ unsafe extern "C" {
     /// `#[repr(C)]` enum is undefined behaviour. Callers match the int
     /// against [`I_CAL_VEVENT_COMPONENT`] / [`I_CAL_VTODO_COMPONENT`].
     pub fn i_cal_component_isa(comp: *mut ICalComponent) -> c_int;
+
+    /// Convert a broken-down [`ICalTime`] to POSIX `time_t` (UTC seconds),
+    /// interpreting the value as being in `zone`. We always pass the UTC
+    /// singleton so DATE-TIME instances normalise to absolute UTC; for
+    /// floating/DATE values libical anchors them to that zone. Borrows
+    /// `tt`/`zone`; allocates nothing.
+    pub fn i_cal_time_as_timet_with_zone(tt: *const ICalTime, zone: *const ICalTimezone) -> TimeT;
+
+    /// True iff the [`ICalTime`] is a DATE (no time-of-day) — i.e. the
+    /// instance is all-day. Returns a [`GBoolean`].
+    pub fn i_cal_time_is_date(tt: *const ICalTime) -> GBoolean;
+
+    /// True iff the [`ICalTime`] is the libical "null time" sentinel — a
+    /// guard before trusting the start/end the callback hands us.
+    pub fn i_cal_time_is_null_time(tt: *const ICalTime) -> GBoolean;
+
+    /// Construct a new [`ICalTime`] from POSIX `time_t` (UTC seconds) in
+    /// `zone`. `is_date` non-zero makes it a DATE (no time-of-day). The
+    /// returned object is owned by the caller — release with
+    /// [`g_object_unref`].
+    pub fn i_cal_time_new_from_timet_with_zone(
+        v: TimeT,
+        is_date: c_int,
+        zone: *mut ICalTimezone,
+    ) -> *mut ICalTime;
+
+    /// The component's DTSTART as a new [`ICalTime`] (owned — unref). For a
+    /// recurring master this is the series origin; we feed it to the
+    /// recurrence iterator.
+    pub fn i_cal_component_get_dtstart(comp: *mut ICalComponent) -> *mut ICalTime;
+
+    /// The component's DTEND as a new [`ICalTime`] (owned — unref), or a
+    /// null-time if absent. Used to derive per-occurrence duration.
+    pub fn i_cal_component_get_dtend(comp: *mut ICalComponent) -> *mut ICalTime;
+
+    /// First property of `kind` on the component (e.g.
+    /// [`I_CAL_RRULE_PROPERTY`]) as a new [`ICalProperty`] (owned — unref),
+    /// or null if the component has none.
+    pub fn i_cal_component_get_first_property(
+        comp: *mut ICalComponent,
+        kind: c_int,
+    ) -> *mut ICalProperty;
+
+    /// The RRULE value of an RRULE [`ICalProperty`] as a new
+    /// [`ICalRecurrence`] (owned — unref).
+    pub fn i_cal_property_get_rrule(prop: *mut ICalProperty) -> *mut ICalRecurrence;
+
+    /// Create a libical recurrence iterator for `rule` anchored at
+    /// `dtstart`. Owned — release with [`i_cal_recur_iterator_free`].
+    /// Borrows `rule`/`dtstart`.
+    pub fn i_cal_recur_iterator_new(
+        rule: *mut ICalRecurrence,
+        dtstart: *mut ICalTime,
+    ) -> *mut ICalRecurIterator;
+
+    /// Advance the iterator and return the next occurrence as a new
+    /// [`ICalTime`] (owned — unref). Returns a null-time
+    /// ([`i_cal_time_is_null_time`]) when the series is exhausted.
+    pub fn i_cal_recur_iterator_next(iter: *mut ICalRecurIterator) -> *mut ICalTime;
+
+    /// Free a recurrence iterator created by [`i_cal_recur_iterator_new`].
+    pub fn i_cal_recur_iterator_free(iter: *mut ICalRecurIterator);
+}
+
+#[link(name = "ical-glib")]
+unsafe extern "C" {
+    /// The process-wide UTC [`ICalTimezone`] singleton. Owned by libical —
+    /// never unref it. Passed to [`i_cal_time_as_timet_with_zone`].
+    pub fn i_cal_timezone_get_utc_timezone() -> *mut ICalTimezone;
 }
 
 // ── glib / gobject ──────────────────────────────────────────────────────────

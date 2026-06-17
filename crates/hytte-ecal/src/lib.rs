@@ -29,6 +29,29 @@ use std::ptr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
+// ── EventInstance ────────────────────────────────────────────────────────────
+
+/// One concrete occurrence of a (possibly recurring) calendar component,
+/// materialised by [`CalClient::generate_instances`]. Carries the
+/// **authoritative per-instance** start/end as POSIX `time_t` (UTC seconds)
+/// — computed by applying the component's RRULE via libical's recurrence
+/// iterator, so a daily meeting yields one `EventInstance` per day in the
+/// window. `ical` is the component's iCalendar serialisation, from which the
+/// caller extracts SUMMARY / LOCATION / UID etc. (the embedded DTSTART still
+/// reflects the series origin — trust `start_unix`/`end_unix`, not it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventInstance {
+    /// iCalendar serialisation of the component this occurrence belongs to.
+    pub ical: String,
+    /// Occurrence start, POSIX seconds since the Unix epoch (UTC).
+    pub start_unix: i64,
+    /// Occurrence end, POSIX seconds since the Unix epoch (UTC).
+    pub end_unix: i64,
+    /// True when the occurrence's start is a DATE (no time-of-day) — i.e.
+    /// an all-day event.
+    pub all_day: bool,
+}
+
 // ── ESourceRegistry ──────────────────────────────────────────────────────────
 
 /// Central source database. Construct once via [`Registry::new`] and share
@@ -411,6 +434,236 @@ impl CalClient {
         unsafe { sys::g_slist_free_full(out_list, sys::g_object_unref_destroy_notify) }
         Ok(out)
     }
+
+    /// Expand every component in `[start_unix, end_unix)` (POSIX seconds,
+    /// UTC) into its concrete occurrences by applying each one's RRULE.
+    /// Unlike [`get_object_strings`](Self::get_object_strings) — which only
+    /// ever returns master components — a recurring event yields **one
+    /// [`EventInstance`] per occurrence** inside the window (so a daily
+    /// meeting over a 30-day window returns ~30 instances). Non-recurring
+    /// events in the window come back as a single instance.
+    ///
+    /// The window is the only bound on expansion: a `FREQ=DAILY` series with
+    /// no `UNTIL`/`COUNT` is naturally capped by the range you pass, never
+    /// expanded unboundedly.
+    ///
+    /// Implementation: we fetch every master component (`#t`) and expand
+    /// each one with libical's **core recurrence iterator**
+    /// (`i_cal_recur_iterator_new` / `_next`) over the window — the engine
+    /// the higher-level `e_cal_*_generate_instances_*` helpers wrap. Driving
+    /// the iterator directly keeps expansion a pure function of the component
+    /// we already hold, independent of EDS backend state. `RDATE`/`EXDATE`
+    /// (additional / excluded instances) are not yet applied — RRULE is the
+    /// dominant case for issue #29; honouring those is a follow-up.
+    pub fn generate_instances(&self, start_unix: i64, end_unix: i64) -> Result<Vec<EventInstance>> {
+        // Fetch every master component. We need the live `ICalComponent*`
+        // (not the iCal string) to expand, so we walk the GSList ourselves
+        // rather than going through `get_object_strings`.
+        let s = CString::new("#t").expect("static sexp has no interior NUL");
+        let mut out_list: *mut sys::GSList = ptr::null_mut();
+        let mut err: *mut sys::GError = ptr::null_mut();
+        let ok = unsafe {
+            sys::e_cal_client_get_object_list_sync(
+                self.raw,
+                s.as_ptr(),
+                &mut out_list,
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        if ok == 0 {
+            return Err(take_error(err).unwrap_or_else(|| anyhow!("get_object_list_sync failed")));
+        }
+
+        let mut out: Vec<EventInstance> = Vec::new();
+        let mut node = out_list;
+        while !node.is_null() {
+            let comp = unsafe { (*node).data }.cast::<sys::ICalComponent>();
+            if !comp.is_null() {
+                unsafe { expand_component(comp, start_unix, end_unix, &mut out) }
+            }
+            node = unsafe { (*node).next };
+        }
+
+        // Free the list AND each ICalComponent — list_sync transferred
+        // ownership of every element to us.
+        if !out_list.is_null() {
+            unsafe { sys::g_slist_free_full(out_list, sys::g_object_unref_destroy_notify) }
+        }
+        Ok(out)
+    }
+}
+
+/// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
+/// seconds), pushing each occurrence into `out`.
+///
+/// - **Non-recurring** (no RRULE): emit a single [`EventInstance`] if its
+///   DTSTART falls before `end_unix` (the calendar service does the
+///   has-it-ended filtering).
+/// - **Recurring** (RRULE present): drive libical's core recurrence iterator
+///   (`i_cal_recur_iterator_new` / `_next`) from DTSTART, emitting one
+///   instance per occurrence inside `[start_unix, end_unix)` and stopping
+///   once occurrences pass `end_unix` (so an unbounded series is window-
+///   capped). Per-occurrence duration is `DTEND − DTSTART` (or 0 if absent;
+///   the service fabricates a UI duration).
+///
+/// EXDATE/RDATE are not yet honoured — RRULE is the dominant recurring case
+/// for #29; refining detached/excluded instances is a follow-up.
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*` (a VEVENT). Borrowed — never freed
+/// here. All owned libical objects created within are released.
+unsafe fn expand_component(
+    comp: *mut sys::ICalComponent,
+    start_unix: i64,
+    end_unix: i64,
+    out: &mut Vec<EventInstance>,
+) {
+    // DTSTART (owned). No DTSTART ⇒ undatable ⇒ skip.
+    let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp) };
+    let Some(dtstart_unix) = (unsafe { ical_time_to_unix(dtstart) }) else {
+        if !dtstart.is_null() {
+            unsafe { sys::g_object_unref(dtstart) }
+        }
+        return;
+    };
+    let all_day = unsafe { ical_time_is_date(dtstart) };
+
+    // Duration = DTEND − DTSTART when DTEND is present; else 0.
+    let dtend = unsafe { sys::i_cal_component_get_dtend(comp) };
+    let duration = match unsafe { ical_time_to_unix(dtend) } {
+        Some(e) if e >= dtstart_unix => e - dtstart_unix,
+        _ => 0,
+    };
+    if !dtend.is_null() {
+        unsafe { sys::g_object_unref(dtend) }
+    }
+
+    // The component's iCal serialisation (metadata: UID/SUMMARY/LOCATION/…),
+    // identical across a series' occurrences.
+    let ical = unsafe { component_ical_string(comp) };
+
+    // RRULE present?
+    let rrule_prop =
+        unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RRULE_PROPERTY) };
+    if rrule_prop.is_null() {
+        // Non-recurring: a single occurrence at DTSTART.
+        if dtstart_unix < end_unix {
+            out.push(EventInstance {
+                ical,
+                start_unix: dtstart_unix,
+                end_unix: dtstart_unix + duration,
+                all_day,
+            });
+        }
+        unsafe { sys::g_object_unref(dtstart) }
+        return;
+    }
+
+    // Recurring: iterate occurrences from DTSTART.
+    let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
+    if !rule.is_null() {
+        let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+        if !iter.is_null() {
+            // A defensive cap: even with the time-window stop condition, a
+            // pathological rule shouldn't loop forever.
+            let mut guard = 0u32;
+            loop {
+                guard += 1;
+                if guard > 100_000 {
+                    break;
+                }
+                let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+                let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
+                    // null-time ⇒ series exhausted.
+                    if !occ.is_null() {
+                        unsafe { sys::g_object_unref(occ) }
+                    }
+                    break;
+                };
+                if !occ.is_null() {
+                    unsafe { sys::g_object_unref(occ) }
+                }
+                if occ_unix >= end_unix {
+                    break; // past the window ⇒ done
+                }
+                if occ_unix + duration >= start_unix {
+                    // Occurrence overlaps the window (its end is at/after the
+                    // window start) ⇒ keep it.
+                    out.push(EventInstance {
+                        ical: ical.clone(),
+                        start_unix: occ_unix,
+                        end_unix: occ_unix + duration,
+                        all_day,
+                    });
+                }
+            }
+            unsafe { sys::i_cal_recur_iterator_free(iter) }
+        }
+        unsafe { sys::g_object_unref(rule) }
+    }
+    unsafe { sys::g_object_unref(rrule_prop) }
+    unsafe { sys::g_object_unref(dtstart) }
+}
+
+/// Pure-libical recurrence expansion of an iCalendar VEVENT string over a
+/// UTC window, with **no EDS backend** — exposed so the recurrence path can
+/// be exercised hermetically (the crate's unit tests use it). Parses `ical`,
+/// expands the first VEVENT it finds, and returns the occurrences.
+pub fn expand_ical_for_test(
+    ical: &str,
+    start_unix: i64,
+    end_unix: i64,
+) -> Result<Vec<EventInstance>> {
+    let comp = parse_vevent(ical)?;
+    let mut out = Vec::new();
+    unsafe { expand_component(comp.raw, start_unix, end_unix, &mut out) }
+    drop(comp);
+    Ok(out)
+}
+
+/// Serialise an `ICalComponent` to its iCal string (empty on failure).
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*`.
+unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
+    let s_ptr = unsafe { sys::i_cal_component_as_ical_string(comp) };
+    if s_ptr.is_null() {
+        return String::new();
+    }
+    let s = unsafe { CStr::from_ptr(s_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
+    s
+}
+
+/// Convert a borrowed `ICalTime*` to POSIX UTC seconds, or `None` if the
+/// pointer is null or libical reports it as the null-time sentinel.
+///
+/// # Safety
+///
+/// `tt` must be null or a valid `ICalTime*` borrowed from libical.
+unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
+    if tt.is_null() {
+        return None;
+    }
+    if unsafe { sys::i_cal_time_is_null_time(tt.cast_const()) } != 0 {
+        return None;
+    }
+    let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+    Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt.cast_const(), utc.cast_const()) })
+}
+
+/// True iff the borrowed `ICalTime*` is a DATE (all-day, no time-of-day).
+///
+/// # Safety
+///
+/// `tt` must be null or a valid `ICalTime*` borrowed from libical.
+unsafe fn ical_time_is_date(tt: *mut sys::ICalTime) -> bool {
+    !tt.is_null() && unsafe { sys::i_cal_time_is_date(tt.cast_const()) } != 0
 }
 
 impl Drop for CalClient {
@@ -481,6 +734,27 @@ fn parse_component(ical: &str) -> Result<Component> {
     bail!("libical: parsed body had no VTODO or VEVENT child");
 }
 
+/// Like [`parse_component`] but VEVENT-only — used by [`expand_ical_for_test`]
+/// to materialise a recurring event from a string for hermetic expansion.
+fn parse_vevent(ical: &str) -> Result<Component> {
+    let c = CString::new(ical).context("ical body contained an interior NUL")?;
+    let raw = unsafe { sys::i_cal_parser_parse_string(c.as_ptr()) };
+    if raw.is_null() {
+        bail!("libical: failed to parse iCalendar body");
+    }
+    let parsed = Component { raw };
+    if unsafe { sys::i_cal_component_isa(parsed.raw) } == sys::I_CAL_VEVENT_COMPONENT {
+        return Ok(parsed);
+    }
+    let inner = unsafe {
+        sys::i_cal_component_get_first_component(parsed.raw, sys::ICalComponentKind::Vevent)
+    };
+    if !inner.is_null() {
+        return Ok(Component { raw: inner });
+    }
+    bail!("libical: parsed body had no VEVENT child");
+}
+
 // ── GError helpers ───────────────────────────────────────────────────────────
 
 /// Consume a `GError*` (which may be null) into an `anyhow::Error`,
@@ -544,5 +818,85 @@ mod tests {
         };
         // Round-trips through a u32 without truncation.
         assert_eq!(err.domain, u32::MAX);
+    }
+
+    // ── Recurrence expansion (issue #29) ──────────────────────────────────
+    //
+    // These drive the pure-libical path in [`expand_ical_for_test`] — no EDS
+    // backend, so they're hermetic and run under the default `cargo test
+    // -p hytte-ecal` (the crate links libical-glib).
+
+    // 2026-06-01T00:00:00Z .. 2026-07-01T00:00:00Z (the whole of June 2026).
+    const JUN_START: i64 = 1_780_272_000;
+    const JUL_START: i64 = 1_782_864_000;
+    // 2026-06-01T09:00:00Z — the anchor used by the fixtures below.
+    const ANCHOR_0900: i64 = 1_780_304_400;
+
+    #[test]
+    fn rrule_daily_count_5_yields_5_instances() {
+        let ical = "BEGIN:VEVENT\r\nUID:d5\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=5\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 5, "FREQ=DAILY;COUNT=5 must expand to 5");
+        // Consecutive daily starts, 30-minute duration each.
+        for (i, e) in inst.iter().enumerate() {
+            let day = i64::try_from(i).unwrap();
+            assert_eq!(e.start_unix, ANCHOR_0900 + day * 86_400);
+            assert_eq!(e.end_unix - e.start_unix, 1_800);
+            assert!(!e.all_day);
+        }
+    }
+
+    #[test]
+    fn rrule_unbounded_daily_is_window_capped() {
+        // No COUNT/UNTIL ⇒ infinite series; the 30-day-ish window must bound
+        // it (here: June has 30 days, so exactly 30 occurrences from Jun 1).
+        let ical = "BEGIN:VEVENT\r\nUID:dinf\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Forever\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 30, "unbounded daily over June ⇒ 30 in-window");
+    }
+
+    #[test]
+    fn rrule_weekly_count_3() {
+        let ical = "BEGIN:VEVENT\r\nUID:w3\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T100000Z\r\n\
+                     SUMMARY:Weekly\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3);
+        assert_eq!(inst[1].start_unix - inst[0].start_unix, 7 * 86_400);
+    }
+
+    #[test]
+    fn non_recurring_event_yields_single_instance() {
+        let ical = "BEGIN:VEVENT\r\nUID:one\r\nDTSTAMP:20260615T120000Z\r\n\
+                     DTSTART:20260615T120000Z\r\nDTEND:20260615T130000Z\r\n\
+                     SUMMARY:Once\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].end_unix - inst[0].start_unix, 3_600);
+    }
+
+    #[test]
+    fn occurrences_outside_window_are_excluded() {
+        // COUNT=5 daily from Jun 1, but query only Jun 3 onward ⇒ 3 left.
+        let ical = "BEGIN:VEVENT\r\nUID:cut\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Cut\r\nRRULE:FREQ=DAILY;COUNT=5\r\nEND:VEVENT\r\n";
+        let jun3 = ANCHOR_0900 + 2 * 86_400; // 2026-06-03T09:00:00Z
+        let inst = super::expand_ical_for_test(ical, jun3, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3, "Jun 3,4,5 fall in the trimmed window");
+    }
+
+    #[test]
+    fn all_day_recurring_sets_all_day_flag() {
+        let ical = "BEGIN:VEVENT\r\nUID:ad\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART;VALUE=DATE:20260601\r\n\
+                     SUMMARY:Holiday\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3);
+        assert!(inst.iter().all(|e| e.all_day));
     }
 }

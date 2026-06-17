@@ -20,22 +20,36 @@
 //! opened lazily on first use).
 //!
 //! The service exposes [`events()`] — `Signal<Vec<CalendarEvent>>`, sorted
-//! by start time, filtered to events that haven't ended and start within
-//! [`NEXT_DAYS`] days. [`refresh()`] enqueues an out-of-cycle re-scan onto
+//! by start time, covering events that haven't ended and start within
+//! [`WINDOW_DAYS`] days. [`refresh()`] enqueues an out-of-cycle re-scan onto
 //! the worker. The public surface is read-only and identical to the prior
 //! file-poller, so the bar widget + drawer page need no changes.
 //!
-//! # Limitations
+//! ## Recurrence expansion (issue #29)
 //!
-//! - Recurring events: only the master entry's DTSTART is surfaced, and
-//!   only if it falls in the upcoming window. `get_object_strings` returns
-//!   master components, not expanded instances. Full RRULE expansion now
-//!   becomes *feasible* (`e_cal_client_generate_instances_sync` expands a
-//!   range server-side) but needs a new hytte-ecal binding — a follow-up.
-//! - Timezones: `WithTimezone` DTSTARTs are converted via
-//!   `try_into_utc()` (which uses chrono-tz when available); when that
-//!   fails we treat the inner naive datetime as local time. Floating
-//!   datetimes are interpreted as local time.
+//! The scan asks libecal to **expand** every component over the
+//! `[now, now + WINDOW_DAYS]` window via
+//! [`CalClient::generate_instances`][hytte_ecal::CalClient::generate_instances]
+//! (which drives libical's recurrence iterator). Recurring events (RRULE)
+//! come back as **one occurrence per instance** inside the window — a daily
+//! standup yields ~`WINDOW_DAYS` rows, matching GNOME Calendar — and
+//! non-recurring events as a single instance.
+//!
+//! Previously the scan used `get_object_strings("#t")`, which returns only
+//! the **master** component: a recurring event surfaced at most one row (on
+//! its original DTSTART, frequently outside the then-7-day window → nothing
+//! at all). That was the empty-month-grid half of #29.
+//!
+//! The window is the **only** bound on expansion, so an unbounded
+//! `FREQ=DAILY` series is naturally capped by the range rather than expanded
+//! years out. (RDATE/EXDATE refinement is a `hytte-ecal` follow-up.)
+//!
+//! # Limitations / notes
+//!
+//! - Timezones: instance bounds come back as absolute UTC seconds (libical
+//!   anchors the recurrence to UTC during expansion), so the old per-field
+//!   `WithTimezone`/chrono-tz fallback no longer gates recurring events.
+//!   All-day instances anchor to local midnight.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -43,15 +57,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
-use hytte_ecal::{CalClient, Registry, Source};
+use hytte_ecal::{CalClient, EventInstance, Registry, Source};
 use hytte_reactive::{Service, registry};
-use icalendar::{
-    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
-    EventStatus,
-};
+use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -81,9 +92,16 @@ pub struct CalendarEvent {
     pub calendar_name: String,
 }
 
-/// How far ahead to surface events. Anything starting after `now + NEXT_DAYS`
-/// is dropped from the signal.
-const NEXT_DAYS: i64 = 7;
+/// How far ahead to expand + surface events, as a rolling window from now.
+///
+/// **Scope default (issue #29):** 30 days. This decouples the data window
+/// from the old hard 7-day cap, so events further out — and recurrences
+/// expanded across the next month — actually show. The recurrence
+/// expansion is bounded by this same window (a daily event yields ~30
+/// instances, never an unbounded series), so widening it is the only knob.
+/// Tune here if the upcoming list should reach further (e.g. the full
+/// visible month-grid) or shorter.
+const WINDOW_DAYS: i64 = 30;
 
 /// Background refresh cadence. EDS syncs upstream on its own schedule
 /// (typically minutes); 60 s catches changes within a minute without
@@ -166,9 +184,9 @@ pub fn service() -> CalendarService {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Signal of the next [`NEXT_DAYS`] days of events, sorted ascending by
-/// start. Empty until the first refresh completes (or if EDS has no
-/// calendar sources configured).
+/// Signal of the next [`WINDOW_DAYS`] days of events (recurrences expanded
+/// into their occurrences), sorted ascending by start. Empty until the
+/// first refresh completes (or if EDS has no calendar sources configured).
 pub fn events() -> impl Signal<Item = Vec<CalendarEvent>> {
     registry::with(|r| {
         r.get::<CalendarHandles>()
@@ -239,7 +257,9 @@ impl Worker {
 
     fn scan_all(&mut self) -> Vec<CalendarEvent> {
         let now = Local::now();
-        let window_end = now + Duration::days(NEXT_DAYS);
+        let window_end = now + Duration::days(WINDOW_DAYS);
+        let start_unix = now.timestamp();
+        let end_unix = window_end.timestamp();
         // Re-read the source list each pass so a calendar added/removed at
         // runtime (e.g. a new Nextcloud calendar discovered under the
         // collection source) is picked up without a restart.
@@ -255,23 +275,162 @@ impl Worker {
                     continue;
                 }
             };
-            // "#t" = match-all; the upcoming-window filter happens in Rust
-            // so behaviour matches the prior .ics path exactly. (Components
-            // come back master-only — recurrence instances are not
-            // expanded here; see the module-level limitations note.)
-            let objects = match client.get_object_strings("#t") {
+            // Ask libecal to EXPAND every component over the window: each
+            // recurring event yields one instance per occurrence inside
+            // [start_unix, end_unix), with authoritative per-instance
+            // start/end (RRULE/RDATE applied, EXDATE removed). Non-recurring
+            // events come back as a single instance. This replaces the old
+            // `get_object_strings("#t")` master-only path — see the
+            // module-level "Recurrence expansion" note (#29).
+            let instances = match client.generate_instances(start_unix, end_unix) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(source = %source_uid, error = %e, "calendar: query failed");
+                    tracing::warn!(source = %source_uid, error = %e, "calendar: instance expansion failed");
                     continue;
                 }
             };
-            for body in objects {
-                out.extend(parse_ics_body(&body, &calendar_name, now, window_end));
+            for inst in instances {
+                if let Some(ev) = instance_to_calendar_event(&inst, &calendar_name, now, out.len())
+                {
+                    out.push(ev);
+                }
             }
         }
         out.sort_by_key(|e| e.start);
         out
+    }
+}
+
+/// Build a [`CalendarEvent`] from one libecal-expanded [`EventInstance`].
+///
+/// The **timing** (`start`/`end`/`all_day`) comes from the instance, which
+/// libecal computed by applying the recurrence rule + timezone — so a
+/// recurring event's third occurrence lands on the right day, not its
+/// series origin. The **metadata** (UID, SUMMARY, LOCATION, cancelled
+/// status) is parsed out of the component's iCal serialisation, which is
+/// identical across a series' instances.
+///
+/// Returns `None` if the component is cancelled, undatable, or already over
+/// (a multi-day occurrence that started before `now` but is still running
+/// is kept). `anon_index` disambiguates a synthesised UID for components
+/// with no UID of their own.
+fn instance_to_calendar_event(
+    inst: &EventInstance,
+    calendar_name: &str,
+    now: DateTime<Local>,
+    anon_index: usize,
+) -> Option<CalendarEvent> {
+    let start = unix_to_local(inst.start_unix, inst.all_day)?;
+    // A zero/negative-length instance (libecal can hand back end == start
+    // for a DATE-TIME with no DTEND) gets a UI-friendly fabricated end so
+    // the row isn't a coincident edge — same spirit as the raw-parse path.
+    let raw_end = unix_to_local(inst.end_unix, inst.all_day)?;
+    let end = if raw_end > start {
+        raw_end
+    } else if inst.all_day {
+        start + Duration::days(1)
+    } else {
+        start + Duration::hours(1)
+    };
+
+    // Already over? Drop it. (The "hasn't ended" check keeps an ongoing
+    // multi-day occurrence visible even though it started in the past.)
+    if end < now {
+        return None;
+    }
+
+    let meta = parse_event_meta(&inst.ical);
+    if meta.cancelled {
+        return None;
+    }
+
+    let uid = meta
+        .uid
+        .unwrap_or_else(|| format!("anon:{calendar_name}:{anon_index}"));
+    // Disambiguate a recurring series' occurrences (which all share one UID)
+    // by appending the instance start — keeps PartialEq dedup + per-row
+    // identity correct when several instances are in the window.
+    let uid = format!("{uid}@{}", inst.start_unix);
+    let summary = meta.summary.unwrap_or_else(|| "(no title)".to_string());
+
+    Some(CalendarEvent {
+        uid,
+        summary,
+        start,
+        end,
+        location: meta.location,
+        all_day: inst.all_day,
+        calendar_name: calendar_name.to_string(),
+    })
+}
+
+/// Convert a POSIX UTC timestamp to local time. For all-day instances we
+/// anchor to local midnight on the same calendar date (libecal hands back a
+/// midnight-UTC `time_t` for DATE values; reinterpreting it as a local date
+/// keeps the dot on the intended day regardless of the viewer's offset).
+fn unix_to_local(unix: i64, all_day: bool) -> Option<DateTime<Local>> {
+    let utc = DateTime::<Utc>::from_timestamp(unix, 0)?;
+    if all_day {
+        let date = utc.date_naive();
+        let naive = date.and_time(NaiveTime::from_hms_opt(0, 0, 0)?);
+        Local.from_local_datetime(&naive).single()
+    } else {
+        Some(utc.with_timezone(&Local))
+    }
+}
+
+/// Per-component metadata pulled out of an instance's iCal serialisation —
+/// the fields that are constant across a recurring series' occurrences.
+struct EventMeta {
+    uid: Option<String>,
+    summary: Option<String>,
+    location: Option<String>,
+    cancelled: bool,
+}
+
+/// Parse UID / SUMMARY / LOCATION / cancelled-status out of an iCal body.
+/// Times are deliberately ignored here — the authoritative per-instance
+/// bounds come from the [`EventInstance`], not the embedded (series-origin)
+/// DTSTART.
+fn parse_event_meta(ical: &str) -> EventMeta {
+    let parsed = ical.parse::<Calendar>().ok().or_else(|| {
+        let wrapped = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte//\r\n{ical}\r\nEND:VCALENDAR\r\n"
+        );
+        wrapped.parse::<Calendar>().ok()
+    });
+    let Some(parsed) = parsed else {
+        tracing::warn!("calendar: instance iCal failed to parse; using fallbacks");
+        return EventMeta {
+            uid: None,
+            summary: None,
+            location: None,
+            cancelled: false,
+        };
+    };
+    let event = parsed.components.iter().find_map(|c| match c {
+        CalendarComponent::Event(e) => Some(e),
+        _ => None,
+    });
+    let Some(event) = event else {
+        return EventMeta {
+            uid: None,
+            summary: None,
+            location: None,
+            cancelled: false,
+        };
+    };
+    EventMeta {
+        uid: event.get_uid().map(str::to_string),
+        summary: event
+            .get_summary()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        location: event
+            .get_location()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        cancelled: event.get_status() == Some(EventStatus::Cancelled),
     }
 }
 
@@ -289,244 +448,6 @@ fn run_worker(rx: &mpsc::Receiver<()>, writer: &Mutable<Vec<CalendarEvent>>) {
     while rx.recv().is_ok() {
         worker.refresh(writer);
     }
-}
-
-// ── iCalendar parsing ────────────────────────────────────────────────────────
-
-/// Parse one iCalendar body (a VCALENDAR, or a bare VEVENT that libecal
-/// sometimes hands back) into the [`CalendarEvent`]s it contains that fall
-/// inside the `[now, window_end]` upcoming window.
-fn parse_ics_body(
-    body: &str,
-    calendar_name: &str,
-    now: DateTime<Local>,
-    window_end: DateTime<Local>,
-) -> Vec<CalendarEvent> {
-    // libecal usually hands back a full VCALENDAR; some backends return a
-    // bare VEVENT, so fall back to wrapping it before parsing (same trick
-    // as `tasks::parse_one`).
-    let Some(parsed) = body.parse::<Calendar>().ok().or_else(|| {
-        let wrapped = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte//\r\n{body}\r\nEND:VCALENDAR\r\n"
-        );
-        wrapped.parse::<Calendar>().ok()
-    }) else {
-        tracing::warn!("calendar: iCal body failed to parse");
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for event in parsed.components.iter().filter_map(|c| match c {
-        CalendarComponent::Event(e) => Some(e),
-        _ => None,
-    }) {
-        if let Some(ev) = event_to_calendar_event(event, calendar_name, now, window_end, out.len())
-        {
-            out.push(ev);
-        }
-    }
-    out
-}
-
-/// Convert a single parsed VEVENT into a [`CalendarEvent`], or `None` if it
-/// is cancelled, undatable, already over, or starts past the window.
-/// `anon_index` disambiguates the synthesised UID when a VEVENT carries no
-/// UID of its own.
-fn event_to_calendar_event(
-    event: &icalendar::Event,
-    calendar_name: &str,
-    now: DateTime<Local>,
-    window_end: DateTime<Local>,
-    anon_index: usize,
-) -> Option<CalendarEvent> {
-    if event.get_status() == Some(EventStatus::Cancelled) {
-        return None;
-    }
-    let start_dpt = event.get_start()?;
-    let (start_local, all_day) = dpt_to_local(start_dpt)?;
-    // RFC 5545 §3.6.1: a VEVENT carries DTEND xor DURATION (never both).
-    // Google Calendar and many recurring-instance emitters prefer
-    // DURATION, so we have to honour both.
-    let end_local = if let Some((dt, _)) = event.get_end().and_then(dpt_to_local) {
-        dt
-    } else if let Some(dur) = event
-        .property_value("DURATION")
-        .and_then(parse_iso8601_duration)
-    {
-        start_local + dur
-    } else if all_day {
-        // Per RFC 5545: if neither DTEND nor DURATION is present on a
-        // DATE-typed VEVENT, the event ends at the end of DTSTART's day.
-        start_local + Duration::days(1)
-    } else {
-        // Missing DTEND/DURATION on a DATE-TIME means a zero-duration event
-        // in iCal, but for UI purposes we'd rather show a 1-hour bar than a
-        // coincident edge.
-        start_local + Duration::hours(1)
-    };
-
-    // Window filter: include if the event hasn't ended yet AND its start
-    // lies inside the next-N-days window. The "hasn't ended" half catches
-    // multi-day events that started in the past but are still ongoing.
-    if end_local < now {
-        return None;
-    }
-    if start_local > window_end {
-        return None;
-    }
-
-    let uid = event.get_uid().map_or_else(
-        || format!("anon:{calendar_name}:{anon_index}"),
-        str::to_string,
-    );
-    let summary = event
-        .get_summary()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "(no title)".to_string());
-    let location = event
-        .get_location()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    Some(CalendarEvent {
-        uid,
-        summary,
-        start: start_local,
-        end: end_local,
-        location,
-        all_day,
-        calendar_name: calendar_name.to_string(),
-    })
-}
-
-/// Resolve a `DatePerhapsTime` to local time. Returns `(local_dt, all_day)`,
-/// or `None` if the date couldn't be normalised (e.g. `WithTimezone` with an
-/// unknown TZID and chrono-tz disabled).
-fn dpt_to_local(dpt: DatePerhapsTime) -> Option<(DateTime<Local>, bool)> {
-    match dpt {
-        DatePerhapsTime::Date(d) => {
-            // All-day: anchor to midnight in local time. Calendars that
-            // treat DATEs as floating across timezones still get a stable
-            // local representation this way.
-            let naive = d.and_time(NaiveTime::from_hms_opt(0, 0, 0)?);
-            Some((Local.from_local_datetime(&naive).single()?, true))
-        }
-        DatePerhapsTime::DateTime(cdt) => match cdt {
-            CalendarDateTime::Utc(dt) => Some((dt.with_timezone(&Local), false)),
-            CalendarDateTime::Floating(naive) => {
-                Some((Local.from_local_datetime(&naive).single()?, false))
-            }
-            ref other @ CalendarDateTime::WithTimezone {
-                ref date_time,
-                ref tzid,
-            } => {
-                // WithTimezone: chrono-tz-backed conversion when the TZID
-                // is one chrono-tz knows; otherwise interpret the wall-
-                // clock time as local. The fallback is wrong for events
-                // authored in another zone but at least keeps them
-                // visible in the upcoming list.
-                if let Some(utc) = other.try_into_utc() {
-                    Some((utc.with_timezone(&Local), false))
-                } else {
-                    tracing::debug!(
-                        tzid = %tzid,
-                        "calendar: unknown TZID; falling back to local interpretation",
-                    );
-                    Some((Local.from_local_datetime(date_time).single()?, false))
-                }
-            }
-        },
-    }
-}
-
-/// Parse an ISO 8601 / RFC 5545 duration string into a `chrono::Duration`.
-///
-/// Coverage: `PT0S`, `PT15M`, `PT1H`, `PT1H30M`, `PT4H`, `P1D`, `P3D`,
-/// `P1W`, and combined forms like `P1DT2H`. A leading `-` flips sign.
-/// Anything that doesn't tokenise cleanly returns `None` rather than
-/// crashing; the caller falls back to the prior heuristic.
-fn parse_iso8601_duration(raw: &str) -> Option<Duration> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (negative, rest) = match s.as_bytes()[0] {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
-    };
-    // Must start with a literal `P`.
-    let rest = rest.strip_prefix('P')?;
-
-    // Split into the date-part (before any `T`) and the time-part (after).
-    let (date_part, time_part) = match rest.find('T') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, ""),
-    };
-
-    // Both halves can be empty individually — `PT1H` has no date part,
-    // `P1D` has no time part — but the *combined* result must contain at
-    // least one segment. Reject `P` and `PT` outright.
-    if date_part.is_empty() && time_part.is_empty() {
-        return None;
-    }
-
-    let mut total = Duration::zero();
-
-    // Date-part legal designators: D, W. (Y/M omitted: variable length,
-    // not meaningful for a UI offset against an instant.)
-    let mut num = String::new();
-    for c in date_part.chars() {
-        if c.is_ascii_digit() {
-            num.push(c);
-            continue;
-        }
-        if num.is_empty() {
-            return None;
-        }
-        let n: i64 = num.parse().ok()?;
-        num.clear();
-        match c {
-            'D' => total += Duration::days(n),
-            'W' => total += Duration::weeks(n),
-            // Y and M would need a calendar anchor to be meaningful;
-            // we deliberately don't support them.
-            _ => return None,
-        }
-    }
-    if !num.is_empty() {
-        // Trailing digits with no designator — malformed.
-        return None;
-    }
-
-    // Time-part legal designators: H, M, S.
-    let mut num = String::new();
-    for c in time_part.chars() {
-        if c.is_ascii_digit() {
-            num.push(c);
-            continue;
-        }
-        if num.is_empty() {
-            return None;
-        }
-        let n: i64 = num.parse().ok()?;
-        num.clear();
-        match c {
-            'H' => total += Duration::hours(n),
-            'M' => total += Duration::minutes(n),
-            'S' => total += Duration::seconds(n),
-            _ => return None,
-        }
-    }
-    if !num.is_empty() {
-        return None;
-    }
-
-    if negative {
-        total = -total;
-    }
-    Some(total)
 }
 
 // ── Helpers used by the page (formatting) ────────────────────────────────────
@@ -633,71 +554,181 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_minimal_ics() {
-        // A timed event in the next 7 days is surfaced.
-        let now = Local::now();
-        let in_two_days = now + Duration::days(2);
-        let body = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
-             BEGIN:VEVENT\r\nUID:abc-123\r\nSUMMARY:Lunch\r\n\
-             DTSTART:{}\r\nDTEND:{}\r\n\
-             END:VEVENT\r\nEND:VCALENDAR\r\n",
-            in_two_days.naive_utc().format("%Y%m%dT%H%M%SZ"),
-            (in_two_days + Duration::hours(1))
-                .naive_utc()
-                .format("%Y%m%dT%H%M%SZ"),
+    /// Build an `EventInstance` from a UID/summary plus explicit instance
+    /// bounds — mirrors what libecal's expansion hands the worker.
+    fn inst(
+        uid: &str,
+        summary: &str,
+        start: DateTime<Local>,
+        end: DateTime<Local>,
+    ) -> EventInstance {
+        let ical = format!(
+            "BEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{summary}\r\nDTSTART:{}\r\nEND:VEVENT\r\n",
+            start.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
-        let evs = parse_ics_body(
-            &body,
-            "test-cal",
-            now - Duration::hours(1),
-            now + Duration::days(NEXT_DAYS),
-        );
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].uid, "abc-123");
-        assert_eq!(evs[0].summary, "Lunch");
-        assert!(!evs[0].all_day);
-        assert_eq!(evs[0].calendar_name, "test-cal");
+        EventInstance {
+            ical,
+            start_unix: start.timestamp(),
+            end_unix: end.timestamp(),
+            all_day: false,
+        }
     }
 
     #[test]
-    fn skips_cancelled_and_out_of_window() {
+    fn instance_uses_authoritative_times_not_embedded_dtstart() {
+        // The instance's embedded DTSTART is the SERIES ORIGIN (2 days ago);
+        // the authoritative occurrence is in two days. The CalendarEvent must
+        // follow the instance bounds, not the embedded master DTSTART.
         let now = Local::now();
-        let body = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
-             BEGIN:VEVENT\r\nUID:cx\r\nSUMMARY:Cancelled\r\nSTATUS:CANCELLED\r\n\
-             DTSTART:{}\r\nEND:VEVENT\r\n\
-             BEGIN:VEVENT\r\nUID:fx\r\nSUMMARY:Far future\r\n\
-             DTSTART:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-            now.naive_utc().format("%Y%m%dT%H%M%SZ"),
-            (now + Duration::days(NEXT_DAYS + 30))
-                .naive_utc()
-                .format("%Y%m%dT%H%M%SZ"),
+        let series_origin = now - Duration::days(2);
+        let occurrence = now + Duration::days(2);
+        let ical = format!(
+            "BEGIN:VEVENT\r\nUID:daily-1\r\nSUMMARY:Standup\r\nDTSTART:{}\r\n\
+             RRULE:FREQ=DAILY\r\nEND:VEVENT\r\n",
+            series_origin.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
-        let evs = parse_ics_body(&body, "test-cal", now, now + Duration::days(NEXT_DAYS));
-        assert!(evs.is_empty());
+        let instance = EventInstance {
+            ical,
+            start_unix: occurrence.timestamp(),
+            end_unix: (occurrence + Duration::hours(1)).timestamp(),
+            all_day: false,
+        };
+        let ev = instance_to_calendar_event(&instance, "test-cal", now - Duration::hours(1), 0)
+            .expect("occurrence is in-window");
+        assert_eq!(ev.summary, "Standup");
+        assert!(ev.uid.starts_with("daily-1@"), "uid was {}", ev.uid);
+        // Within a second of the occurrence start, not the series origin.
+        assert!((ev.start - occurrence).num_seconds().abs() <= 1);
+        assert_eq!(ev.calendar_name, "test-cal");
     }
 
     #[test]
-    fn parses_bare_vevent_without_vcalendar_wrapper() {
-        // libecal sometimes returns a component with no VCALENDAR wrapper;
-        // parse_ics_body wraps + retries.
+    fn instance_recurring_distinct_uids_per_occurrence() {
+        // Two occurrences of one series (same UID) must produce DISTINCT
+        // CalendarEvent uids so PartialEq dedup + per-row identity hold.
         let now = Local::now();
-        let in_two_days = now + Duration::days(2);
-        let body = format!(
-            "BEGIN:VEVENT\r\nUID:bare-1\r\nSUMMARY:Standup\r\nDTSTART:{}\r\nEND:VEVENT\r\n",
-            in_two_days.naive_utc().format("%Y%m%dT%H%M%SZ"),
+        let day1 = now + Duration::days(1);
+        let day2 = now + Duration::days(2);
+        let a = instance_to_calendar_event(
+            &inst("series", "Daily", day1, day1 + Duration::hours(1)),
+            "cal",
+            now,
+            0,
+        )
+        .unwrap();
+        let b = instance_to_calendar_event(
+            &inst("series", "Daily", day2, day2 + Duration::hours(1)),
+            "cal",
+            now,
+            1,
+        )
+        .unwrap();
+        assert_ne!(a.uid, b.uid);
+    }
+
+    #[test]
+    fn instance_skips_cancelled() {
+        let now = Local::now();
+        let start = now + Duration::days(1);
+        let ical = format!(
+            "BEGIN:VEVENT\r\nUID:cx\r\nSUMMARY:Off\r\nSTATUS:CANCELLED\r\nDTSTART:{}\r\nEND:VEVENT\r\n",
+            start.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
-        let evs = parse_ics_body(
-            &body,
-            "test-cal",
-            now - Duration::hours(1),
-            now + Duration::days(NEXT_DAYS),
+        let instance = EventInstance {
+            ical,
+            start_unix: start.timestamp(),
+            end_unix: (start + Duration::hours(1)).timestamp(),
+            all_day: false,
+        };
+        assert!(instance_to_calendar_event(&instance, "cal", now, 0).is_none());
+    }
+
+    #[test]
+    fn instance_skips_already_ended() {
+        // An occurrence that ended before `now` is dropped.
+        let now = Local::now();
+        let start = now - Duration::days(2);
+        let end = now - Duration::days(2) + Duration::hours(1);
+        assert!(
+            instance_to_calendar_event(&inst("past", "Old", start, end), "cal", now, 0).is_none()
         );
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].uid, "bare-1");
-        assert_eq!(evs[0].summary, "Standup");
+    }
+
+    #[test]
+    fn instance_keeps_ongoing_multiday() {
+        // Started in the past but still running ⇒ kept (the "hasn't ended"
+        // half of the window check).
+        let now = Local::now();
+        let start = now - Duration::days(1);
+        let end = now + Duration::days(1);
+        let ev = instance_to_calendar_event(&inst("ongoing", "Trip", start, end), "cal", now, 0)
+            .expect("still running");
+        assert_eq!(ev.summary, "Trip");
+    }
+
+    #[test]
+    fn instance_zero_length_gets_fabricated_end() {
+        // libecal can hand back end == start for a DATE-TIME with no DTEND.
+        let now = Local::now();
+        let start = now + Duration::days(1);
+        let ev = instance_to_calendar_event(&inst("z", "Ping", start, start), "cal", now, 0)
+            .expect("in-window");
+        assert_eq!(ev.end - ev.start, Duration::hours(1));
+    }
+
+    #[test]
+    fn instance_all_day_anchors_local_midnight() {
+        let now = Local::now();
+        let date = (now + Duration::days(1)).date_naive();
+        let midnight_utc = date
+            .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+            .and_utc();
+        let instance = EventInstance {
+            ical: format!(
+                "BEGIN:VEVENT\r\nUID:ad\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:{}\r\nEND:VEVENT\r\n",
+                date.format("%Y%m%d"),
+            ),
+            start_unix: midnight_utc.timestamp(),
+            end_unix: midnight_utc.timestamp(),
+            all_day: true,
+        };
+        let ev = instance_to_calendar_event(&instance, "cal", now, 0).expect("in-window");
+        assert!(ev.all_day);
+        assert_eq!(ev.start.time(), NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(ev.start.date_naive(), date);
+    }
+
+    #[test]
+    fn parse_event_meta_extracts_fields() {
+        let ical = "BEGIN:VEVENT\r\nUID:m1\r\nSUMMARY: Lunch \r\nLOCATION: Cafe \r\nEND:VEVENT\r\n";
+        let meta = parse_event_meta(ical);
+        assert_eq!(meta.uid.as_deref(), Some("m1"));
+        assert_eq!(meta.summary.as_deref(), Some("Lunch"));
+        assert_eq!(meta.location.as_deref(), Some("Cafe"));
+        assert!(!meta.cancelled);
+    }
+
+    #[test]
+    fn parse_event_meta_handles_bare_vevent_and_missing_fields() {
+        // Bare VEVENT (no VCALENDAR wrapper) with no SUMMARY/LOCATION.
+        let meta = parse_event_meta("BEGIN:VEVENT\r\nUID:bare\r\nEND:VEVENT\r\n");
+        assert_eq!(meta.uid.as_deref(), Some("bare"));
+        assert!(meta.summary.is_none());
+        assert!(meta.location.is_none());
+    }
+
+    #[test]
+    fn instance_missing_summary_falls_back_to_no_title() {
+        let now = Local::now();
+        let start = now + Duration::days(1);
+        let instance = EventInstance {
+            ical: "BEGIN:VEVENT\r\nUID:nt\r\nEND:VEVENT\r\n".to_string(),
+            start_unix: start.timestamp(),
+            end_unix: (start + Duration::hours(1)).timestamp(),
+            all_day: false,
+        };
+        let ev = instance_to_calendar_event(&instance, "cal", now, 0).unwrap();
+        assert_eq!(ev.summary, "(no title)");
     }
 
     #[test]
@@ -725,84 +756,6 @@ mod tests {
         let end = start + Duration::days(1);
         let s = format_when(&ev_at(start, end, true));
         assert_eq!(s, "All day, Tomorrow");
-    }
-
-    #[test]
-    fn iso8601_duration_pt_forms() {
-        assert_eq!(parse_iso8601_duration("PT0S"), Some(Duration::zero()));
-        assert_eq!(parse_iso8601_duration("PT15M"), Some(Duration::minutes(15)));
-        assert_eq!(parse_iso8601_duration("PT1H"), Some(Duration::hours(1)));
-        assert_eq!(
-            parse_iso8601_duration("PT1H30M"),
-            Some(Duration::hours(1) + Duration::minutes(30)),
-        );
-        assert_eq!(parse_iso8601_duration("PT4H"), Some(Duration::hours(4)));
-    }
-
-    #[test]
-    fn iso8601_duration_p_forms() {
-        assert_eq!(parse_iso8601_duration("P1D"), Some(Duration::days(1)));
-        assert_eq!(parse_iso8601_duration("P3D"), Some(Duration::days(3)));
-        assert_eq!(parse_iso8601_duration("P1W"), Some(Duration::weeks(1)));
-        assert_eq!(
-            parse_iso8601_duration("P1DT2H"),
-            Some(Duration::days(1) + Duration::hours(2)),
-        );
-    }
-
-    #[test]
-    fn iso8601_duration_rejects_garbage() {
-        assert_eq!(parse_iso8601_duration(""), None);
-        assert_eq!(parse_iso8601_duration("P"), None);
-        assert_eq!(parse_iso8601_duration("PT"), None);
-        assert_eq!(parse_iso8601_duration("1H"), None);
-        assert_eq!(parse_iso8601_duration("PT1X"), None);
-    }
-
-    #[test]
-    fn duration_pt4h_overrides_dtend_fabrication() {
-        // VEVENT with DURATION:PT4H and no DTEND must end 4h after start,
-        // not 1h (the previous default).
-        let now = Local::now();
-        let start = now + Duration::hours(2);
-        let body = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
-             BEGIN:VEVENT\r\nUID:dur-pt4h\r\nSUMMARY:Workshop\r\n\
-             DTSTART:{}\r\nDURATION:PT4H\r\n\
-             END:VEVENT\r\nEND:VCALENDAR\r\n",
-            start.naive_utc().format("%Y%m%dT%H%M%SZ"),
-        );
-        let evs = parse_ics_body(
-            &body,
-            "test-cal",
-            now - Duration::hours(1),
-            now + Duration::days(NEXT_DAYS),
-        );
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].end - evs[0].start, Duration::hours(4));
-    }
-
-    #[test]
-    fn duration_p3d_overrides_for_all_day() {
-        // All-day VEVENT (DTSTART;VALUE=DATE) with DURATION:P3D should
-        // span 3 days, not 1 (the all-day fallback).
-        let now = Local::now();
-        let date = (now + Duration::days(1)).format("%Y%m%d");
-        let body = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//\r\n\
-             BEGIN:VEVENT\r\nUID:dur-p3d\r\nSUMMARY:Long weekend\r\n\
-             DTSTART;VALUE=DATE:{date}\r\nDURATION:P3D\r\n\
-             END:VEVENT\r\nEND:VCALENDAR\r\n",
-        );
-        let evs = parse_ics_body(
-            &body,
-            "test-cal",
-            now - Duration::hours(1),
-            now + Duration::days(NEXT_DAYS),
-        );
-        assert_eq!(evs.len(), 1);
-        assert!(evs[0].all_day);
-        assert_eq!(evs[0].end - evs[0].start, Duration::days(3));
     }
 
     #[test]

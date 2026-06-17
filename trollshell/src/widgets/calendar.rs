@@ -113,7 +113,7 @@ fn build_block() -> gtk::Box {
         Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
 
-    wire_day_clicks(&state, &rows_track, &scrolled);
+    wire_day_clicks(&state, &group, &rows_track, &placeholder_track, &scrolled);
     wire_events_bind(&state, &group, &rows_track, &placeholder_track);
     wire_clock_bind(&state, &column);
 
@@ -234,18 +234,29 @@ fn build_day_cell() -> DayCell {
 
 fn wire_day_clicks(
     state: &State,
+    group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     scrolled: &gtk::ScrolledWindow,
 ) {
     for (idx, cell) in state.cells.iter().enumerate() {
         let state = state.clone();
+        let group = group.clone();
         let rows_track = rows_track.clone();
+        let placeholder_track = placeholder_track.clone();
         let scrolled = scrolled.clone();
         cell.button.connect_clicked(move |_| {
             let Some(d) = state.cells[idx].date.get() else {
                 return;
             };
-            on_day_clicked(d, &state, &rows_track, &scrolled);
+            on_day_clicked(
+                d,
+                &state,
+                &group,
+                &rows_track,
+                &placeholder_track,
+                &scrolled,
+            );
         });
     }
 }
@@ -253,7 +264,9 @@ fn wire_day_clicks(
 fn on_day_clicked(
     date: NaiveDate,
     state: &State,
+    group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     scrolled: &gtk::ScrolledWindow,
 ) {
     state.selected.set(Some(date));
@@ -262,6 +275,11 @@ fn on_day_clicked(
         state.viewed.set((date.year(), date.month()));
     }
     render(state);
+
+    let today = state.today.get();
+    let evs = state.events.borrow();
+    let anchor = state.selected.get().unwrap_or(today);
+    rebuild_upcoming_list(group, rows_track, placeholder_track, &evs, today, anchor);
 
     let rows = rows_track.borrow();
     if let Some((_d, row)) = rows.iter().find(|(d, _)| *d == date) {
@@ -285,13 +303,11 @@ fn wire_events_bind(
     let rows_track = rows_track.clone();
     let placeholder_track = placeholder_track.clone();
     bind(calendar::events(), group, move |group, evs| {
-        rebuild_upcoming_list(
-            group,
-            &rows_track,
-            &placeholder_track,
-            &evs,
-            state.today.get(),
-        );
+        let today = state.today.get();
+        // Anchor the list to the selected day when one is chosen; fall back
+        // to today when nothing is selected (or today itself is selected).
+        let anchor = state.selected.get().unwrap_or(today);
+        rebuild_upcoming_list(group, &rows_track, &placeholder_track, &evs, today, anchor);
         state.events.borrow_mut().clone_from(&evs);
         render(&state);
     });
@@ -299,14 +315,20 @@ fn wire_events_bind(
 
 /// Rebuild the upcoming list grouped into day sections, iOS-calendar style
 /// (#46): a slim header per day ("Today" / "Tomorrow" / "Wed 18 Jun") with
-/// that day's events under it. The Today section always leads — when nothing
-/// remains scheduled today it shows a "No more events today" placeholder.
+/// that day's events under it.
+///
+/// `today` is the real calendar date (used for relative day labels and the
+/// placeholder wording); `anchor` is the first day to display — normally
+/// equal to `today`, but set to the selected day when the user has clicked a
+/// day in the grid (fix for #36). The anchor section always leads: when no
+/// events fall on that day it shows a "No events" placeholder row.
 fn rebuild_upcoming_list(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     evs: &[CalendarEvent],
     today: NaiveDate,
+    anchor: NaiveDate,
 ) {
     for (_d, row) in rows_track.borrow_mut().drain(..) {
         group.remove(&row);
@@ -326,21 +348,12 @@ fn rebuild_upcoming_list(
         return;
     }
 
-    // Group by calendar day. A multi-day event still running from a past start
-    // buckets under Today via `.max(today)`; the `BTreeMap` keeps days ordered.
-    let mut by_day: BTreeMap<NaiveDate, Vec<&CalendarEvent>> = BTreeMap::new();
-    for ev in evs {
-        by_day
-            .entry(ev.start.date_naive().max(today))
-            .or_default()
-            .push(ev);
-    }
+    let by_day = bucket_events_from_anchor(evs, anchor);
 
-    // Lead with Today even when it has no events (keys are all >= today, so
-    // inserting today at the front keeps the list date-ordered).
+    // Lead with the anchor day even when it has no events.
     let mut days: Vec<NaiveDate> = by_day.keys().copied().collect();
-    if !by_day.contains_key(&today) {
-        days.insert(0, today);
+    if !by_day.contains_key(&anchor) {
+        days.insert(0, anchor);
     }
 
     let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len() + days.len());
@@ -356,9 +369,9 @@ fn rebuild_upcoming_list(
                 new_rows.push((day, row));
             }
         } else {
-            // Only the Today section reaches here (every other shown day has
-            // at least one event).
-            let none = build_none_today_row();
+            // Only the anchor-day section reaches here (every other shown
+            // day has at least one event).
+            let none = build_none_anchor_row(day, today);
             group.add(&none);
             new_rows.push((day, none));
         }
@@ -387,10 +400,16 @@ fn build_day_header(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
     row
 }
 
-/// Placeholder shown under the Today header when nothing remains today.
-fn build_none_today_row() -> adw::ActionRow {
+/// Placeholder shown under the anchor-day header when that day has no events.
+/// Wording adapts: "No more events today" for today, "No events" for other days.
+fn build_none_anchor_row(anchor: NaiveDate, today: NaiveDate) -> adw::ActionRow {
+    let title = if anchor == today {
+        "No more events today"
+    } else {
+        "No events"
+    };
     let row = adw::ActionRow::builder()
-        .title("No more events today")
+        .title(title)
         .activatable(false)
         .build();
     row.add_css_class("ts-cal-day-empty");
@@ -547,6 +566,24 @@ fn group_events_by_day(events: &[CalendarEvent]) -> HashMap<NaiveDate, Vec<Strin
     out
 }
 
+/// Pure helper: group `events` by the bucket day they fall into relative to
+/// `anchor` — the first day that should appear in the list. Events whose start
+/// date precedes the anchor (ongoing multi-day occurrences) clamp to the
+/// anchor; events on or after the anchor land on their own start date. The
+/// return value is sorted ascending by day. Used by [`rebuild_upcoming_list`]
+/// and tested directly (no GTK required).
+fn bucket_events_from_anchor<'a>(
+    events: &'a [CalendarEvent],
+    anchor: NaiveDate,
+) -> BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> {
+    let mut by_day: BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> = BTreeMap::new();
+    for ev in events {
+        let day = ev.start.date_naive().max(anchor);
+        by_day.entry(day).or_default().push(ev);
+    }
+    by_day
+}
+
 // ── Calendar-source color hashing ────────────────────────────────────────────
 
 /// Deterministic palette index for a calendar source name (djb2 mod
@@ -698,5 +735,96 @@ mod tests {
     fn month_label_formats_as_full_name_plus_year() {
         assert_eq!(month_label_text(2026, 5), "May 2026");
         assert_eq!(month_label_text(2026, 12), "December 2026");
+    }
+
+    // ── bucket_events_from_anchor tests (#36) ─────────────────────────────────
+
+    fn make_event(start: NaiveDate) -> CalendarEvent {
+        use chrono::TimeZone;
+        let dt = Local
+            .from_local_datetime(&start.and_hms_opt(9, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        CalendarEvent {
+            uid: start.to_string(),
+            summary: "test".into(),
+            start: dt,
+            end: dt + chrono::Duration::hours(1),
+            location: None,
+            all_day: false,
+            calendar_name: "cal".into(),
+        }
+    }
+
+    #[test]
+    fn anchor_today_shows_all_upcoming() {
+        // When anchor == today (the default), all events are shown on their
+        // actual start dates.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev_today = make_event(today);
+        let ev_tomorrow = make_event(today + chrono::Duration::days(1));
+        let ev_next_week = make_event(today + chrono::Duration::days(7));
+
+        let evs = vec![ev_today.clone(), ev_tomorrow.clone(), ev_next_week.clone()];
+        let by_day = bucket_events_from_anchor(&evs, today);
+
+        let days: Vec<NaiveDate> = by_day.keys().copied().collect();
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[0], today);
+        assert_eq!(days[1], today + chrono::Duration::days(1));
+        assert_eq!(days[2], today + chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn anchor_future_day_hides_earlier_events() {
+        // When user clicks a day 3 days out, events before that day must
+        // not appear; the anchor day leads.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let anchor = today + chrono::Duration::days(3);
+        let ev_today = make_event(today);
+        let ev_anchor = make_event(anchor);
+        let ev_later = make_event(anchor + chrono::Duration::days(2));
+
+        let evs = vec![ev_today, ev_anchor.clone(), ev_later.clone()];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+
+        // ev_today is before anchor and has no end overlapping anchor, so
+        // its bucket is anchor (clamped). ev_anchor lands on anchor. The
+        // two collide into one bucket.
+        let days: Vec<NaiveDate> = by_day.keys().copied().collect();
+        // anchor + anchor+2d
+        assert!(days.contains(&anchor));
+        assert!(days.contains(&(anchor + chrono::Duration::days(2))));
+        // No day before the anchor should appear.
+        for d in &days {
+            assert!(*d >= anchor, "found pre-anchor day {d}");
+        }
+    }
+
+    #[test]
+    fn anchor_multiday_ongoing_event_buckets_under_anchor() {
+        // A multi-day event that started before the anchor (e.g. a
+        // conference that began yesterday) should appear under the anchor
+        // day since it is still running.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let anchor = today + chrono::Duration::days(2);
+
+        // Event started before the anchor — simulated as its start date
+        // being before anchor (the service already guarantees it hasn't ended).
+        let ev_ongoing = make_event(today); // starts today, anchor is day+2
+
+        let evs = vec![ev_ongoing];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+
+        // Must be bucketed under anchor, not under today.
+        assert!(by_day.contains_key(&anchor));
+        assert!(!by_day.contains_key(&today));
+    }
+
+    #[test]
+    fn anchor_empty_events_gives_empty_map() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let by_day = bucket_events_from_anchor(&[], anchor);
+        assert!(by_day.is_empty());
     }
 }

@@ -32,12 +32,4 @@ fn main() {
     }
     // glib + gobject come transitively via libecal's pkg-config Requires
     // line, so probing them explicitly here would just duplicate -l flags.
-
-    // Bake the EDS libexec dir (evolution-source-registry +
-    // evolution-calendar-factory) so the opt-in `system-tests` harness can
-    // spawn an ephemeral EDS. `exec_prefix` is empty under nix, so derive it
-    // from `prefix`. Non-fatal: only the system tests read EDS_LIBEXEC_DIR.
-    if let Ok(prefix) = pkg_config::get_variable("libecal-2.0", "prefix") {
-        println!("cargo:rustc-env=EDS_LIBEXEC_DIR={prefix}/libexec");
-    }
 }

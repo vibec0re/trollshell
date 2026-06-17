@@ -24,6 +24,41 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// ── Blocking-read bundle ───────────────────────────────────────────────────────
+
+/// All data collected by a single blocking-I/O sweep.
+///
+/// Constructed inside `tokio::task::spawn_blocking` and returned to the async
+/// poll loop so that no blocking syscall runs directly on a tokio worker thread.
+struct TickData {
+    /// Parsed `/proc/stat` entries, or `None` on read error.
+    cpu_stat: Option<Vec<(u64, u64)>>,
+    /// Parsed `/proc/meminfo`, or `None` on read error.
+    mem: Option<Memory>,
+    /// Parsed `/proc/net/dev`, or `None` on read error.
+    net_dev: Option<Vec<(String, u64, u64)>>,
+    /// CPU package temp from the cached hwmon chip dir (fast path) or a fresh
+    /// scan (slow path on first call / after chip disappears).
+    cpu_temp: CpuTemp,
+    /// Updated chip-dir cache to thread back into `PollState`.
+    cpu_temp_chip: Option<PathBuf>,
+    /// GPU state snapshot when this is a GPU tick.
+    ///
+    /// `None` means "not a GPU tick" (the GPU field should not be updated).
+    /// Use the `gpu_tick` flag to distinguish a GPU tick that found no hardware
+    /// from a non-GPU tick.
+    gpu_state: Option<GpuState>,
+    /// `true` if the GPU was polled this tick (regardless of whether hardware
+    /// was found). When `false`, `gpu_state` should be ignored.
+    gpu_tick: bool,
+    /// TCP socket counts (read every 2 ticks; `None` on non-TCP ticks).
+    net_conn: Option<NetConnections>,
+    /// Process count from `/proc`.
+    proc_count: u32,
+    /// Disk usage (read every 5 ticks; `None` on non-disk ticks).
+    disk: Option<DiskUsage>,
+}
+
 // ── Public data shapes ────────────────────────────────────────────────────────
 
 /// Per-CPU load snapshot.
@@ -306,6 +341,10 @@ struct PollState {
     /// after the first scan so each tick re-reads only its `temp*_input`
     /// instead of re-walking all of `/sys/class/hwmon`.
     cpu_temp_chip: Option<PathBuf>,
+    /// Whether `nvidia-smi` is available. `None` = not yet probed (happens on
+    /// the first GPU tick); `Some(false)` = absent / probing failed; `Some(true)`
+    /// = present. Probed once and cached so we never fork-exec a missing binary.
+    nvidia_available: Option<bool>,
     /// Tick counter for rate-limiting slower polls.
     tick: u64,
 }
@@ -316,6 +355,7 @@ impl PollState {
             cpu_prev: Vec::new(),
             net_prev: HashMap::new(),
             cpu_temp_chip: None,
+            nvidia_available: None,
             tick: 0,
         }
     }
@@ -336,6 +376,7 @@ struct PollWriters {
     mount_list: Mutable<Vec<MountSpec>>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn poll_loop(w: PollWriters) {
     let cpu_writer = w.cpu;
     let mem_writer = w.mem;
@@ -351,31 +392,117 @@ async fn poll_loop(w: PollWriters) {
     loop {
         let now = Instant::now();
 
+        // Snapshot tick-local flags before moving `state` fields into the closure.
+        let tick = state.tick;
+        let do_gpu = tick.is_multiple_of(2);
+        let do_net_conn = tick.is_multiple_of(2);
+        let do_disk = tick.is_multiple_of(5);
+
+        // Take the chip-dir cache out of state so the closure can own it.
+        let chip = state.cpu_temp_chip.take();
+        // Snapshot current nvidia availability.
+        let nvidia_available = state.nvidia_available;
+
+        // Mount list is cloned here (cheap — it's rarely non-empty).
+        let specs = if do_disk {
+            mount_list_reader.get_cloned()
+        } else {
+            Vec::new()
+        };
+
+        // ── All blocking I/O runs on a dedicated blocking thread ──────────
+        let data = tokio::task::spawn_blocking(move || {
+            // CPU
+            let cpu_stat = read_proc_stat().ok();
+            // Memory
+            let mem = read_proc_meminfo().ok();
+            // Network I/O
+            let net_dev = read_proc_net_dev().ok();
+            // CPU temp (with cached chip dir)
+            let (cpu_temp, cpu_temp_chip) = {
+                let mut ch = chip;
+                let temp = read_cpu_temp(&mut ch);
+                (temp, ch)
+            };
+            // GPU (every 2 ticks)
+            let (gpu_state, gpu_tick, new_nvidia_available) = if do_gpu {
+                let (state, nv) = read_gpu_with_cache(nvidia_available);
+                (state, true, Some(nv))
+            } else {
+                (None, false, None)
+            };
+            // TCP socket counts (every 2 ticks)
+            let net_conn = if do_net_conn {
+                Some(read_net_connections())
+            } else {
+                None
+            };
+            // Process count
+            let proc_count = read_process_count();
+            // Disk (every 5 ticks)
+            let disk = if do_disk {
+                Some(read_disk_for_specs(&specs))
+            } else {
+                None
+            };
+            (
+                TickData {
+                    cpu_stat,
+                    mem,
+                    net_dev,
+                    cpu_temp,
+                    cpu_temp_chip,
+                    gpu_state,
+                    gpu_tick,
+                    net_conn,
+                    proc_count,
+                    disk,
+                },
+                new_nvidia_available,
+            )
+        })
+        .await;
+
+        let Ok((data, new_nvidia_available)) = data else {
+            tracing::warn!("sensors: blocking I/O task panicked; skipping tick");
+            state.tick = state.tick.wrapping_add(1);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+
+        // Thread the chip cache back.
+        state.cpu_temp_chip = data.cpu_temp_chip;
+
+        // Thread the nvidia availability back (only set on GPU ticks).
+        if let Some(nv) = new_nvidia_available {
+            state.nvidia_available = Some(nv);
+        }
+
         // ── CPU ───────────────────────────────────────────────────────────────
-        match read_proc_stat() {
-            Ok(cpu_now) => {
+        match data.cpu_stat {
+            Some(cpu_now) => {
                 let load = compute_cpu_load(&state.cpu_prev, &cpu_now);
                 state.cpu_prev = cpu_now;
                 cpu_writer.set(load);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "sensors: failed to read /proc/stat");
+            None => {
+                tracing::warn!("sensors: failed to read /proc/stat");
             }
         }
 
         // ── Memory ────────────────────────────────────────────────────────────
-        match read_proc_meminfo() {
-            Ok(mem) => {
+        match data.mem {
+            Some(mem) => {
                 mem_writer.set(mem);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "sensors: failed to read /proc/meminfo");
+            None => {
+                tracing::warn!("sensors: failed to read /proc/meminfo");
             }
         }
 
         // ── Network ───────────────────────────────────────────────────────────
-        match read_proc_net_dev() {
-            Ok(net_now) => {
+        match data.net_dev {
+            Some(net_now) => {
                 let mut interfaces = Vec::new();
                 let mut next_net_prev = HashMap::new();
 
@@ -404,32 +531,31 @@ async fn poll_loop(w: PollWriters) {
                 state.net_prev = next_net_prev;
                 net_writer.set(NetIo { interfaces });
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "sensors: failed to read /proc/net/dev");
+            None => {
+                tracing::warn!("sensors: failed to read /proc/net/dev");
             }
         }
 
-        // ── CPU temp (every tick; the hwmon chip dir is resolved once) ────
-        cpu_temp_writer.set(read_cpu_temp(&mut state.cpu_temp_chip));
+        // ── CPU temp (every tick; chip dir resolved once via cache) ───────
+        cpu_temp_writer.set(data.cpu_temp);
 
         // ── GPU (every 2 ticks) ───────────────────────────────────────────
-        if state.tick.is_multiple_of(2) {
-            gpu_writer.set(read_gpu());
+        if data.gpu_tick {
+            gpu_writer.set(data.gpu_state);
         }
 
         // ── Disk (every 5 ticks) ──────────────────────────────────────────
-        if state.tick.is_multiple_of(5) {
-            let specs = mount_list_reader.get_cloned();
-            disk_writer.set(read_disk_for_specs(&specs));
+        if let Some(disk) = data.disk {
+            disk_writer.set(disk);
         }
 
         // ── TCP socket counts (every 2 ticks) ─────────────────────────────
-        if state.tick.is_multiple_of(2) {
-            net_conn_writer.set(read_net_connections());
+        if let Some(nc) = data.net_conn {
+            net_conn_writer.set(nc);
         }
 
         // ── Process count (every tick) ────────────────────────────────────
-        proc_count_writer.set(read_process_count());
+        proc_count_writer.set(data.proc_count);
 
         state.tick = state.tick.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -456,7 +582,13 @@ async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
     // Seed once before we even attempt to register for events. This way a
     // POLLPRI registration failure still leaves us with a correct list as
     // of startup.
-    mount_list.set(read_mountlist());
+    //
+    // `read_mountlist` does blocking file I/O; run it on a blocking thread.
+    mount_list.set(
+        tokio::task::spawn_blocking(read_mountlist)
+            .await
+            .unwrap_or_default(),
+    );
 
     let file = match std::fs::File::open("/proc/self/mountinfo") {
         Ok(f) => f,
@@ -478,7 +610,11 @@ async fn mount_watch_loop(mount_list: Mutable<Vec<MountSpec>>) {
         match async_fd.ready(Interest::PRIORITY).await {
             Ok(mut guard) => {
                 guard.clear_ready();
-                mount_list.set(read_mountlist());
+                // `read_mountlist` does blocking file I/O; run it on a blocking thread.
+                let new_list = tokio::task::spawn_blocking(read_mountlist)
+                    .await
+                    .unwrap_or_default();
+                mount_list.set(new_list);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "sensors: mountinfo poll error, exiting watcher");
@@ -842,8 +978,32 @@ fn read_nvidia_gpu() -> Option<GpuState> {
     })
 }
 
-fn read_gpu() -> Option<GpuState> {
-    read_amd_gpu().or_else(read_nvidia_gpu)
+/// Read GPU state, caching whether `nvidia-smi` is available.
+///
+/// `nvidia_available` is the cached probe result from the previous GPU tick:
+/// - `None`  — not yet probed; probe now and remember the outcome.
+/// - `Some(false)` — previously found absent; skip `nvidia-smi` entirely.
+/// - `Some(true)`  — previously found present; call `nvidia-smi` directly.
+///
+/// Returns `(gpu_state, updated_nvidia_available)`.  The caller stores the
+/// returned `bool` back into `PollState::nvidia_available`.
+fn read_gpu_with_cache(nvidia_available: Option<bool>) -> (Option<GpuState>, bool) {
+    // AMD sysfs reads don't need caching — `read_amd_gpu` only walks
+    // `/sys/class/drm` and exits on the first AMD card it finds.
+    if let Some(state) = read_amd_gpu() {
+        // AMD present — preserve whatever nvidia_available was (no need to probe).
+        return (Some(state), nvidia_available.unwrap_or(false));
+    }
+
+    // No AMD GPU. Try nvidia if we know (or suspect) it might be present.
+    let nv_available = nvidia_available.unwrap_or(true); // unknown → optimistically try once
+    if !nv_available {
+        return (None, false);
+    }
+    match read_nvidia_gpu() {
+        Some(state) => (Some(state), true),
+        None => (None, false),
+    }
 }
 
 // ── /proc/self/mountinfo parsing ─────────────────────────────────────────────

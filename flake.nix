@@ -75,6 +75,7 @@
         }:
         let
           system = pkgs.stdenv.hostPlatform.system;
+          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
 
           # A cheap stand-in for the real trollshell package so the module-eval
           # checks don't force a full Rust crate build just to type-check the
@@ -107,6 +108,18 @@
         in
         {
           formatting = treefmt-eval.config.build.check self;
+
+          # Lint the entire workspace with pedantic-clean Clippy. Reuses
+          # cargoArtifacts from the package build so dependencies aren't
+          # recompiled from scratch. Must stay green because the workspace
+          # denies clippy::all + clippy::pedantic and forbids unsafe.
+          clippy = craneLib.cargoClippy (
+            trollshell.passthru.commonArgs
+            // {
+              cargoArtifacts = trollshell.passthru.cargoArtifacts;
+              cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
+            }
+          );
 
           # Evaluate homeModules.default against a real home-manager module set so
           # the config bodies (systemd user units, session vars, the swaybg gate,

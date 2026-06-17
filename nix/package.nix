@@ -128,6 +128,8 @@ craneLib.buildPackage (
 
     # Raw input lists for the dev shell to reuse without crane's build hooks.
     passthru.devInputs = { inherit nativeBuildInputs buildInputs; };
+    passthru.commonArgs = commonArgs;
+    passthru.cargoArtifacts = cargoArtifacts;
 
     postInstall = ''
       mkdir -p $out/share/trollshell

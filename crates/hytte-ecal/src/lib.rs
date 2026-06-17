@@ -93,20 +93,23 @@ impl Registry {
         if list.is_null() {
             return Vec::new();
         }
-        let len = unsafe { sys::g_list_length(list) };
-        let mut out = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let data = unsafe { sys::g_list_nth_data(list, i) };
-            if data.is_null() {
-                continue;
+        let mut out = Vec::new();
+        // Walk the list spine once (O(n)) via `node.next`, rather than
+        // calling `g_list_nth_data(list, i)` in a loop — each of those
+        // re-walks from the head, making the whole thing O(n²).
+        let mut node = list;
+        while !node.is_null() {
+            let data = unsafe { (*node).data };
+            if !data.is_null() {
+                // `list_sources` returns refs we own — but `g_list_free_full`
+                // with `g_object_unref` would release them. Instead we
+                // adopt each ref into a `Source` (which will unref on drop)
+                // and free only the list spine (without touching elements).
+                out.push(Source {
+                    raw: data.cast::<sys::ESource>(),
+                });
             }
-            // `list_sources` returns refs we own — but `g_list_free_full`
-            // with `g_object_unref` would release them. Instead we
-            // adopt each ref into a `Source` (which will unref on drop)
-            // and free only the list spine (without touching elements).
-            out.push(Source {
-                raw: data.cast::<sys::ESource>(),
-            });
+            node = unsafe { (*node).next };
         }
         // Free the spine only — calling `g_list_free` here is the standard
         // pattern when ownership of the elements is transferred elsewhere.
@@ -293,20 +296,19 @@ impl CalClient {
             )
         };
         if ok == 0 {
-            // Distinguish "not found" from other errors. EDS uses
-            // E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND (code 1 in the
-            // E_CAL_CLIENT_ERROR domain). We don't have the domain quark
-            // imported, so match on the message substring as a fallback —
-            // good enough to avoid false-positives on real transport
-            // errors.
+            // Distinguish "not found" from other errors by matching the
+            // GError's domain quark + code, not the (localisable) message:
+            // EDS sets E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND in the
+            // E_CAL_CLIENT_ERROR domain. The domain quark is resolved at
+            // runtime via `e_cal_client_error_quark()` (stable for the
+            // process lifetime); `GError.domain` is itself a GQuark.
             if !err.is_null() {
-                let msg = unsafe { (*err).message };
-                if !msg.is_null() {
-                    let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
-                    if s.contains("not found") || s.contains("Object not found") {
-                        unsafe { sys::g_error_free(err) }
-                        return Ok(None);
-                    }
+                let domain = unsafe { (*err).domain };
+                let code = unsafe { (*err).code };
+                let not_found_domain = unsafe { sys::e_cal_client_error_quark() };
+                if domain == not_found_domain && code == sys::E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND {
+                    unsafe { sys::g_error_free(err) }
+                    return Ok(None);
                 }
             }
             return Err(take_error(err).unwrap_or_else(|| anyhow!("get_object_sync failed")));
@@ -385,21 +387,24 @@ impl CalClient {
         if out_list.is_null() {
             return Ok(Vec::new());
         }
-        let len = unsafe { sys::g_slist_length(out_list) };
-        let mut out = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let data = unsafe { sys::g_slist_nth_data(out_list, i).cast::<sys::ICalComponent>() };
-            if data.is_null() {
-                continue;
+        let mut out = Vec::new();
+        // Single O(n) walk of the GSList spine via `node.next`, instead of
+        // the O(n²) `g_slist_nth_data(list, i)` loop (each call re-walks
+        // from the head).
+        let mut node = out_list;
+        while !node.is_null() {
+            let data = unsafe { (*node).data }.cast::<sys::ICalComponent>();
+            if !data.is_null() {
+                let s_ptr = unsafe { sys::i_cal_component_as_ical_string(data) };
+                if !s_ptr.is_null() {
+                    let s = unsafe { CStr::from_ptr(s_ptr) }
+                        .to_string_lossy()
+                        .into_owned();
+                    unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
+                    out.push(s);
+                }
             }
-            let s_ptr = unsafe { sys::i_cal_component_as_ical_string(data) };
-            if !s_ptr.is_null() {
-                let s = unsafe { CStr::from_ptr(s_ptr) }
-                    .to_string_lossy()
-                    .into_owned();
-                unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
-                out.push(s);
-            }
+            node = unsafe { (*node).next };
         }
         // Free the list AND each ICalComponent — list_sync passes
         // ownership of every element to the caller.
@@ -448,10 +453,14 @@ fn parse_component(ical: &str) -> Result<Component> {
         bail!("libical: failed to parse iCalendar body");
     }
     let parsed = Component { raw };
+    // `isa` returns a raw `c_int`; match it against the libical component
+    // constants rather than transmuting into the 8-variant Rust enum
+    // (libical may return any of ~28 kinds — an unlisted value read as a
+    // `#[repr(C)]` enum would be UB).
     let kind = unsafe { sys::i_cal_component_isa(parsed.raw) };
     if matches!(
         kind,
-        sys::ICalComponentKind::Vtodo | sys::ICalComponentKind::Vevent
+        sys::I_CAL_VTODO_COMPONENT | sys::I_CAL_VEVENT_COMPONENT
     ) {
         return Ok(parsed);
     }
@@ -502,4 +511,38 @@ unsafe fn borrowed_cstr(p: *const c_char) -> Option<String> {
         return None;
     }
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sys;
+
+    /// The integer constants we match `i_cal_component_isa` against must
+    /// stay numerically identical to the corresponding `ICalComponentKind`
+    /// enum discriminants — they describe the same libical values, just in
+    /// the int form that's sound to receive from FFI.
+    #[test]
+    fn component_kind_constants_match_enum() {
+        assert_eq!(
+            sys::I_CAL_VEVENT_COMPONENT,
+            sys::ICalComponentKind::Vevent as i32
+        );
+        assert_eq!(
+            sys::I_CAL_VTODO_COMPONENT,
+            sys::ICalComponentKind::Vtodo as i32
+        );
+    }
+
+    /// `GError.domain` is a `GQuark` (`guint32`); the struct must mirror
+    /// that so the domain comparison in `get_object_as_string` is valid.
+    #[test]
+    fn gerror_domain_is_u32_quark() {
+        let err = sys::GError {
+            domain: u32::MAX,
+            code: 0,
+            message: std::ptr::null_mut(),
+        };
+        // Round-trips through a u32 without truncation.
+        assert_eq!(err.domain, u32::MAX);
+    }
 }

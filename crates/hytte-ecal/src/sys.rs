@@ -37,13 +37,30 @@ pub struct GError {
     pub message: *mut c_char,
 }
 
-/// `GList *` of `ESource *`. We iterate via [`g_list_next`] and free the
-/// list (NOT its elements — those have their own refcount) with
-/// [`g_list_free_full`] passing [`g_object_unref`] as the destroyer.
-pub type GList = c_void;
+/// Doubly-linked `GList` node. Modelled as `#[repr(C)]` (matching glib's
+/// `struct _GList { gpointer data; GList *next; GList *prev; }`) so we can
+/// walk `node.next` once per element — O(n) — instead of repeatedly
+/// re-walking from the head via `g_list_nth_data` (which is O(n²)).
+/// `g_list_next` is a C macro, not an exported symbol, so it can't be
+/// bound directly; the node struct is the supported alternative.
+///
+/// We only ever read `data`/`next` and never construct one ourselves, so
+/// the `prev` field is faithfully mirrored for layout but otherwise unused.
+#[repr(C)]
+pub struct GList {
+    pub data: *mut c_void,
+    pub next: *mut GList,
+    pub prev: *mut GList,
+}
 
-/// `GSList *` of `ICalComponent *`. Same iteration pattern as `GList`.
-pub type GSList = c_void;
+/// Singly-linked `GSList` node. Mirror of glib's
+/// `struct _GSList { gpointer data; GSList *next; }` — same O(n) walk
+/// rationale as [`GList`].
+#[repr(C)]
+pub struct GSList {
+    pub data: *mut c_void,
+    pub next: *mut GSList,
+}
 
 /// `GCancellable *` — pass null for "uncancellable". We don't expose
 /// cancellation yet.
@@ -159,6 +176,15 @@ unsafe extern "C" {
 /// Component-kind enum values from `icalenums.h`. Listed in source order
 /// so the numeric values match the C definitions — DO NOT reorder. We
 /// only carry the kinds we actually use.
+///
+/// This enum is only ever **passed into** libical (e.g.
+/// [`i_cal_component_get_first_component`]) with values we construct
+/// ourselves, so the `#[repr(C)]` enum is sound there. It must NOT be
+/// used to *receive* a kind from libical: `i_cal_component_isa` can
+/// return any of ~28 libical kinds, and materialising an out-of-range
+/// value as this 8-variant enum is undefined behaviour. For that path,
+/// [`i_cal_component_isa`] returns a raw `c_int` matched against the
+/// [`I_CAL_*_COMPONENT`] constants below.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ICalComponentKind {
@@ -172,6 +198,14 @@ pub enum ICalComponentKind {
     Vcalendar = 7,
 }
 
+/// `ICAL_VEVENT_COMPONENT` — the integer discriminant `i_cal_component_isa`
+/// returns for a VEVENT. Kept in sync with [`ICalComponentKind::Vevent`].
+pub const I_CAL_VEVENT_COMPONENT: c_int = 4;
+
+/// `ICAL_VTODO_COMPONENT` — the integer discriminant for a VTODO. Kept in
+/// sync with [`ICalComponentKind::Vtodo`].
+pub const I_CAL_VTODO_COMPONENT: c_int = 5;
+
 #[link(name = "ical-glib")]
 unsafe extern "C" {
     pub fn i_cal_parser_parse_string(s: *const c_char) -> *mut ICalComponent;
@@ -181,7 +215,13 @@ unsafe extern "C" {
         parent: *mut ICalComponent,
         kind: ICalComponentKind,
     ) -> *mut ICalComponent;
-    pub fn i_cal_component_isa(comp: *mut ICalComponent) -> ICalComponentKind;
+    /// Returns the component's kind as a raw `ICalComponentKind` C enum
+    /// value. Declared as `c_int` (not the [`ICalComponentKind`] Rust
+    /// enum) because libical may return any of ~28 kinds — only a subset
+    /// of which we model — and reading an unlisted value as a too-small
+    /// `#[repr(C)]` enum is undefined behaviour. Callers match the int
+    /// against [`I_CAL_VEVENT_COMPONENT`] / [`I_CAL_VTODO_COMPONENT`].
+    pub fn i_cal_component_isa(comp: *mut ICalComponent) -> c_int;
 }
 
 // ── glib / gobject ──────────────────────────────────────────────────────────
@@ -196,14 +236,28 @@ unsafe extern "C" {
     pub fn g_error_free(err: *mut GError);
     pub fn g_free(mem: *mut c_void);
 
-    pub fn g_list_length(list: *mut GList) -> c_uint;
-    pub fn g_list_nth_data(list: *mut GList, n: c_uint) -> *mut c_void;
+    // Iteration is done by walking `node.next` on the `#[repr(C)]`
+    // [`GList`]/[`GSList`] structs (O(n)); only the spine-free helpers are
+    // bound. `g_list_next`/`g_slist_next` are C macros, not symbols.
     pub fn g_list_free_full(list: *mut GList, free_func: unsafe extern "C" fn(*mut c_void));
-
-    pub fn g_slist_length(list: *mut GSList) -> c_uint;
-    pub fn g_slist_nth_data(list: *mut GSList, n: c_uint) -> *mut c_void;
     pub fn g_slist_free_full(list: *mut GSList, free_func: unsafe extern "C" fn(*mut c_void));
 }
+
+#[link(name = "ecal-2.0")]
+unsafe extern "C" {
+    /// `e_cal_client_error_quark()` — the runtime `GQuark` identifying the
+    /// `E_CAL_CLIENT_ERROR` GError domain. Compared against `GError.domain`
+    /// (a `GQuark`, i.e. `guint32`) to classify errors by domain+code
+    /// instead of i18n-fragile message substrings. `G_GNUC_CONST`: the
+    /// returned quark is stable for the process lifetime.
+    pub fn e_cal_client_error_quark() -> u32;
+}
+
+/// `E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND` — the `ECalClientError` code (in
+/// the [`e_cal_client_error_quark`] domain) EDS sets when a requested
+/// object UID doesn't exist. Second variant of the C enum, which starts
+/// at 0, so the value is 1.
+pub const E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND: c_int = 1;
 
 /// Trampoline so we can pass `g_object_unref` as a `GDestroyNotify`
 /// (which `g_list_free_full` expects). The signature `extern "C" fn(*mut

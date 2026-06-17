@@ -2,7 +2,7 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 
-use crate::components::focus::yield_to_niri_focus;
+use crate::components::focus::{FocusTarget, yield_to_niri_focus};
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -39,7 +39,10 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
                 niri::focus_workspace(id);
                 // Same on-demand-keyboard tie-break as the window pills — the
                 // bar would otherwise keep keyboard focus after the switch.
-                yield_to_niri_focus(btn);
+                // A workspace switch has no single target window id, so we
+                // re-arm when the focused window simply changes (or on the
+                // safety-net timeout).
+                yield_to_niri_focus(btn, FocusTarget::WorkspaceSwitch);
             });
             container_for_signal.append(&btn);
         }

@@ -122,9 +122,13 @@ struct IfaceRow {
 
 fn build_iface_traffic_row(iface: &sensors::NetInterface) -> IfaceRow {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    outer.set_hexpand(true);
 
     let (top_row, spark, top_value) = build_history_row(&iface.name);
-    top_value.set_text("B/s");
+    // Hide the right-hand label slot — units are shown in the detail row
+    // below the graph, so the "B/s" label here is redundant (#83).
+    top_value.set_visible(false);
+    top_row.set_hexpand(true);
     outer.append(&top_row);
 
     let detail = gtk::Label::new(None);

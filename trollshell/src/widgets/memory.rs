@@ -2,6 +2,8 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::sensors;
 
+use crate::components::cast;
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
@@ -27,8 +29,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             w.set_fraction(0.0);
             w.set_tooltip_text(Some("Memory: unknown"));
         } else {
-            #[allow(clippy::cast_precision_loss)]
-            let frac = (m.used as f64 / m.total as f64).clamp(0.0, 1.0);
+            let frac = (cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total)).clamp(0.0, 1.0);
             w.set_fraction(frac);
             w.set_tooltip_text(Some(&format!("Memory {:.0}%", frac * 100.0)));
         }

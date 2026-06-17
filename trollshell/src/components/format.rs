@@ -3,10 +3,11 @@
 
 use std::time::SystemTime;
 
+use crate::components::cast;
+
 /// Format a byte count as a human-readable string (e.g. `"7.4 GiB"`).
 pub(crate) fn fmt_bytes(b: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let f = b as f64;
+    let f = cast::u64_to_f64(b);
     if f >= 1_073_741_824.0 {
         format!("{:.1} GiB", f / 1_073_741_824.0)
     } else if f >= 1_048_576.0 {

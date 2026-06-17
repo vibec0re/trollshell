@@ -2,6 +2,8 @@ use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
 
+use crate::components::cast;
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-tray");
@@ -34,8 +36,7 @@ fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
         // Build a MemoryTexture from the ARGB32 pixmap data.
         // SNI uses ARGB32 in network byte order (big-endian), which maps to
         // gdk::MemoryFormat::A8r8g8b8.
-        #[allow(clippy::cast_sign_loss)]
-        let stride = (w as usize) * 4;
+        let stride = cast::i32_to_usize(w) * 4;
         let gbytes = glib::Bytes::from(bytes.as_slice());
         let texture = gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::A8r8g8b8, &gbytes, stride);
         icon.set_paintable(Some(&texture));

@@ -123,8 +123,7 @@ fn draw_sparkline(
             .max(f64::EPSILON),
     };
 
-    #[allow(clippy::cast_precision_loss)]
-    let count = samples.len() as f64;
+    let count = crate::cast::usize_to_f64(samples.len());
     let step_x = if count <= 1.0 { 0.0 } else { w / (count - 1.0) };
 
     // Resolve theme color via widget.color() — driven by
@@ -138,8 +137,7 @@ fn draw_sparkline(
     // Build path through samples.
     cr.new_path();
     for (i, sample) in samples.iter().enumerate() {
-        #[allow(clippy::cast_precision_loss)]
-        let x = (i as f64) * step_x;
+        let x = crate::cast::usize_to_f64(i) * step_x;
         let norm = (*sample / denom).clamp(0.0, 1.0);
         let y = h - norm * h;
         if i == 0 {

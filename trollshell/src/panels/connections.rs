@@ -117,7 +117,17 @@ pub fn panel_connections() -> gtk::Widget {
         other_for_bind.set_visible(total_other > 0);
     });
     conn_group.add(&other_expander);
-    column.append(&conn_group);
+
+    // Wrap the connections list in a ScrolledWindow so that when many
+    // sockets are open the panel scrolls instead of growing past the
+    // screen height and clipping (#84).
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(480);
+    scrolled.set_child(Some(&conn_group));
+    column.append(&scrolled);
 
     finish_page(&column)
 }

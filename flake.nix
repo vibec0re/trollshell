@@ -82,8 +82,8 @@
           # (used by the systemd ExecStart) still resolves.
           stubPackage = pkgs.writeShellScriptBin "trollshell" "";
 
-          # The hytte-ecal `probe` example binary + a fixture task-list source,
-          # for the eds-nixos-test below.
+          # The hytte-ecal `probe` example binary + fixture sources (a
+          # task-list and a calendar), for the eds-nixos-test below.
           probe = pkgs.callPackage ./nix/probe.nix { inherit craneLib; };
           taskSource = pkgs.writeText "test-tasks.source" ''
             [Data Source]
@@ -91,6 +91,17 @@
             Enabled=true
 
             [Task List]
+            BackendName=local
+          '';
+          # A writable local calendar the probe seeds a FREQ=DAILY;COUNT=5
+          # VEVENT into, then expands via generate_instances — exercising the
+          # RRULE-expansion path (#29).
+          calSource = pkgs.writeText "test-calendar.source" ''
+            [Data Source]
+            DisplayName=Test Calendar
+            Enabled=true
+
+            [Calendar]
             BackendName=local
           '';
         in
@@ -206,9 +217,11 @@
 
           # The "lean heavy on nix" counterpart to the Rust ephemeral-EDS
           # harness (#49): boot a real NixOS VM with evolution-data-server
-          # configured declaratively, seed a fixture task list, and run the
-          # hytte-ecal probe against it end-to-end. Verified to run under TCG
-          # (no KVM needed); GitHub's Linux runners have /dev/kvm for speed.
+          # configured declaratively, seed a fixture task list + calendar, and
+          # run the hytte-ecal probe against it end-to-end. The probe also
+          # creates a FREQ=DAILY;COUNT=5 VEVENT and expands it, so this gates
+          # the RRULE-expansion fix for #29. Verified to run under TCG (no KVM
+          # needed); GitHub's Linux runners have /dev/kvm for speed.
           eds-nixos-test = pkgs.testers.runNixOSTest {
             name = "eds-nixos-test";
             nodes.machine =
@@ -229,13 +242,24 @@
             testScript = ''
               machine.wait_for_unit("multi-user.target")
 
-              # Seed the fixture task-list source into alice's home.
+              # Seed the fixture task-list + calendar sources into alice's home.
               machine.succeed("mkdir -p /home/alice/.config/evolution/sources")
               machine.copy_from_host(
                   "${taskSource}",
                   "/home/alice/.config/evolution/sources/test-tasks.source",
               )
+              machine.copy_from_host(
+                  "${calSource}",
+                  "/home/alice/.config/evolution/sources/test-calendar.source",
+              )
               machine.succeed("chown -R alice:users /home/alice/.config")
+              # Store-copied files land read-only (0444); EDS's source
+              # registry rewrites .source files on first open to add runtime
+              # keys, which fails ("Permission denied") on a read-only file —
+              # benign for the auto-provisioned lists but it left the seeded
+              # *calendar* unwritable, so creating an event on it failed. Make
+              # the fixtures writable.
+              machine.succeed("chmod -R u+w /home/alice/.config/evolution")
 
               # Bring up alice's user session (creates /run/user/1000/bus).
               machine.succeed("loginctl enable-linger alice")
@@ -258,6 +282,15 @@
               assert "Test Tasks" in output, output
               assert "created uid: hytte-ecal-probe-1" in output, output
               assert "removed hytte-ecal-probe-1" in output, output
+
+              # Recurrence expansion (#29): the probe seeds a
+              # FREQ=DAILY;COUNT=5 VEVENT and expands it over a one-month
+              # window. All 5 occurrences must materialise — the whole point
+              # of the fix (the old master-only path would surface just 1).
+              assert "Test Calendar" in output, output
+              assert "created recurring uid:" in output, output
+              assert "recurring instance count: 5" in output, output
+              assert "removed recurring" in output, output
             '';
           };
         }

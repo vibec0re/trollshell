@@ -65,7 +65,7 @@ fn build_top_apps_expander(
     value: fn(&ProcSample) -> String,
 ) -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title(title).build();
-    expander.set_expanded(true);
+    expander.set_expanded(false);
 
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let expander_for_bind = expander.clone();
@@ -337,11 +337,12 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
                 .title(&m.path)
                 .activatable(false)
                 .build();
-            let pct = if m.total_bytes > 0 {
-                (cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)) * 100.0
+            let frac = if m.total_bytes > 0 {
+                cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
             } else {
                 0.0
             };
+            let pct = frac * 100.0;
             let label = gtk::Label::new(Some(&format!(
                 "{} / {} ({pct:.0}%)",
                 fmt_bytes(m.used_bytes),
@@ -349,6 +350,11 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
             )));
             label.set_valign(gtk::Align::Center);
             row.add_suffix(&label);
+            let bar = gtk::ProgressBar::new();
+            bar.add_css_class("ts-stat-progress");
+            bar.set_valign(gtk::Align::Center);
+            bar.set_fraction(frac.clamp(0.0, 1.0));
+            row.add_suffix(&bar);
             expander_for_bind.add_row(&row);
             new_rows.push(row);
         }

@@ -283,6 +283,32 @@
               assert "created uid: hytte-ecal-probe-1" in output, output
               assert "removed hytte-ecal-probe-1" in output, output
 
+              # Live view push (#33): the probe opens a CalClientView over the
+              # task list, then from a *second* client connection (standing in
+              # for Endeavour) creates + modifies a task. EDS must push the
+              # objects-added/-modified notifications to the view — exercising
+              # get_view_sync → view_start → the GObject signal trampoline →
+              # the boxed Rust callback, pumped via a private GMainContext. A
+              # missing push would bail the probe (so wait_until_succeeds would
+              # fail); the explicit count line is the positive signal. The probe
+              # watches whichever task list EDS lists first (ordering isn't
+              # guaranteed — could be the auto-provisioned "Personal" or our
+              # "Test Tasks"), so don't pin the name here.
+              assert "watching '" in output, output
+              assert "editor created uid: hytte-ecal-live-1" in output, output
+              assert "editor modified uid: hytte-ecal-live-1" in output, output
+              assert "live view push count:" in output, output
+              # At least the create + modify pushes landed (initial population +
+              # 2). Parse the final count and assert it advanced past the
+              # initial-population baseline. (The match can't be None here — the
+              # assert above already required the line — but guard it so the
+              # test driver's type checker is satisfied.)
+              import re
+              m = re.search(r"live view push count: (\d+)", output)
+              assert m is not None, output
+              push_count = int(m.group(1))
+              assert push_count >= 2, f"expected >=2 view pushes, got {push_count}: {output}"
+
               # Recurrence expansion (#29): the probe seeds a
               # FREQ=DAILY;COUNT=5 VEVENT and expands it over a one-month
               # window. All 5 occurrences must materialise — the whole point

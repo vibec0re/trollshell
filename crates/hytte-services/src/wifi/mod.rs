@@ -1,9 +1,9 @@
-//! iwd Wi-Fi station tracking + network list via the system D-Bus.
+//! Wi-Fi station tracking + network list, backed by either iwd or
+//! `NetworkManager` depending on which daemon is running on the host.
 //!
-//! Discovers the first object exposing `net.connman.iwd.Station` via
-//! `ObjectManager.GetManagedObjects` on `net.connman.iwd`, then watches
-//! `PropertiesChanged` on the Station interface and `InterfacesAdded` /
-//! `InterfacesRemoved` for network visibility changes.
+//! The backend is probed at startup via [`crate::wifi_backend::probe_backend`].
+//! Widgets are backend-agnostic — they only see the public types and signal
+//! accessors exported from this module.
 //!
 //! # Public API
 //!
@@ -37,7 +37,9 @@ use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
+
+use crate::wifi_backend::BackendChoice;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -88,6 +90,25 @@ fn waiters() -> Option<&'static WaitersMap> {
 
 pub(super) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+// ── Backend discriminant (stored in WifiHandles) ──────────────────────────────
+
+/// Which daemon is backing the Wi-Fi service on this host.
+///
+/// Cloneable so command functions can read it from the registry (GTK thread)
+/// and then use it inside a spawned tokio task.
+#[derive(Clone)]
+pub(crate) enum WifiBackend {
+    /// iwd is managing the radio. Commands use iwd D-Bus paths.
+    Iwd,
+    /// `NetworkManager` is managing the radio.
+    /// The inner `Arc<RwLock<String>>` stores the current NM Wi-Fi device path
+    /// (e.g. `/org/freedesktop/NetworkManager/Devices/3`), written by the
+    /// watcher task once the device is discovered and updated if it changes.
+    NetworkManager(Arc<RwLock<String>>),
+    /// Neither backend was detected; commands are no-ops.
+    None,
+}
+
 // ── Service handle ────────────────────────────────────────────────────────────
 
 /// Shared mutable state held in the service registry.
@@ -97,7 +118,9 @@ pub struct WifiHandles {
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
     pub(crate) prompts: Mutable<Option<PromptRequest>>,
     pub(crate) adapter: Mutable<Option<Adapter>>,
-    _ownership: hytte_bus::OwnNameSignal,
+    /// iwd name-ownership signal; `None` when the NM backend is active.
+    _ownership: Option<hytte_bus::OwnNameSignal>,
+    pub(crate) backend: WifiBackend,
 }
 
 impl Default for WifiHandles {
@@ -121,6 +144,10 @@ impl Service for WifiService {
     type Handles = WifiHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+        // Probe which backend is available on this host.
+        let backend_choice = rt.block_on(crate::wifi_backend::probe_backend());
+        tracing::info!(?backend_choice, "wifi: selected backend");
+
         // Initialise the WAITERS map once so public API functions can reach it.
         let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let _ = WAITERS.set(waiters_arc.clone());
@@ -130,26 +157,46 @@ impl Service for WifiService {
         let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
         let adapter_mutable = Mutable::new(None);
 
-        // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
-        // iwd records our system-bus unique name when we call RegisterAgent,
-        // then issues RequestPassphrase callbacks on the system bus.
-        let agent = agent::IwdAgent {
-            prompts: prompts_mutable.clone(),
-            waiters: waiters_arc,
+        let (ownership, backend) = match backend_choice {
+            BackendChoice::Iwd => {
+                // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
+                // iwd records our system-bus unique name when we call RegisterAgent,
+                // then issues RequestPassphrase callbacks on the system bus.
+                let agent = agent::IwdAgent {
+                    prompts: prompts_mutable.clone(),
+                    waiters: waiters_arc,
+                };
+                let own = hytte_bus::own_name(ANCHOR_NAME)
+                    .bus(BusKind::System)
+                    .at_path(AGENT_PATH, agent)
+                    .start();
+
+                let station_m = station_mutable.clone();
+                let networks_m = networks_mutable.clone();
+                let prompts_m = prompts_mutable.clone();
+                let adapter_m = adapter_mutable.clone();
+                rt.spawn(watcher::run_wifi_watcher(
+                    station_m, networks_m, prompts_m, adapter_m,
+                ));
+
+                (Some(own), WifiBackend::Iwd)
+            }
+            BackendChoice::NetworkManager => {
+                let device_path_store: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+                let station_m = station_mutable.clone();
+                let networks_m = networks_mutable.clone();
+                let adapter_m = adapter_mutable.clone();
+                let store = Arc::clone(&device_path_store);
+                rt.spawn(crate::wifi_nm::run_nm_wifi_watcher(
+                    station_m, networks_m, adapter_m, store,
+                ));
+                (None, WifiBackend::NetworkManager(device_path_store))
+            }
+            BackendChoice::None => {
+                tracing::warn!("wifi: no Wi-Fi backend detected — service is inactive");
+                (None, WifiBackend::None)
+            }
         };
-        let ownership = hytte_bus::own_name(ANCHOR_NAME)
-            .bus(BusKind::System)
-            .at_path(AGENT_PATH, agent)
-            .start();
-
-        let station_m = station_mutable.clone();
-        let networks_m = networks_mutable.clone();
-        let prompts_m = prompts_mutable.clone();
-        let adapter_m = adapter_mutable.clone();
-
-        rt.spawn(watcher::run_wifi_watcher(
-            station_m, networks_m, prompts_m, adapter_m,
-        ));
 
         WifiHandles {
             station: station_mutable,
@@ -157,6 +204,7 @@ impl Service for WifiService {
             prompts: prompts_mutable,
             adapter: adapter_mutable,
             _ownership: ownership,
+            backend,
         }
     }
 }
@@ -202,67 +250,166 @@ pub fn networks() -> impl Signal<Item = Vec<WifiNetwork>> {
     })
 }
 
+/// Read the active [`WifiBackend`] from the registry.
+fn get_backend() -> WifiBackend {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .backend
+            .clone()
+    })
+}
+
 /// Fire-and-forget: trigger a Wi-Fi scan on the station.
 pub fn scan() {
-    runtime::handle().spawn(async move {
-        let path = get_station_path().await;
-        if path.is_empty() {
-            tracing::warn!("wifi::scan: no station path known");
-            return;
+    match get_backend() {
+        WifiBackend::Iwd => {
+            runtime::handle().spawn(async move {
+                let path = get_station_path().await;
+                if path.is_empty() {
+                    tracing::warn!("wifi::scan: no station path known");
+                    return;
+                }
+                if let Err(e) = do_station_call(&path, "Scan").await {
+                    tracing::warn!(error = %e, "wifi scan failed");
+                }
+            });
         }
-        if let Err(e) = do_station_call(&path, "Scan").await {
-            tracing::warn!(error = %e, "wifi scan failed");
+        WifiBackend::NetworkManager(store) => {
+            runtime::handle().spawn(async move {
+                let path = store.read().await.clone();
+                if path.is_empty() {
+                    tracing::warn!("wifi::scan: NM device path not yet known");
+                    return;
+                }
+                if let Err(e) = crate::wifi_nm::nm_scan(&path).await {
+                    tracing::warn!(error = %e, "wifi scan (NM) failed");
+                }
+            });
         }
-    });
+        WifiBackend::None => {
+            tracing::warn!("wifi::scan: no backend available");
+        }
+    }
 }
 
 /// Fire-and-forget: connect to the network at `network_path`.
+///
+/// For the iwd backend, `network_path` is an iwd `Network` object path.
+/// For the `NetworkManager` backend, `network_path` is an NM `AccessPoint` object path.
 pub fn connect_network(network_path: &str) {
     let path = network_path.to_string();
-    runtime::handle().spawn(async move {
-        if let Err(e) = do_network_call(&path, "Connect").await {
-            tracing::warn!(error = %e, path, "wifi connect_network failed (may need agent)");
+    match get_backend() {
+        WifiBackend::Iwd => {
+            runtime::handle().spawn(async move {
+                if let Err(e) = do_network_call(&path, "Connect").await {
+                    tracing::warn!(error = %e, path, "wifi connect_network failed (may need agent)");
+                }
+            });
         }
-    });
+        WifiBackend::NetworkManager(store) => {
+            runtime::handle().spawn(async move {
+                let device_path = store.read().await.clone();
+                if device_path.is_empty() {
+                    tracing::warn!("wifi::connect_network: NM device path not yet known");
+                    return;
+                }
+                if let Err(e) = crate::wifi_nm::nm_connect(&device_path, &path).await {
+                    tracing::warn!(error = %e, path, "wifi connect_network (NM) failed");
+                }
+            });
+        }
+        WifiBackend::None => {
+            tracing::warn!("wifi::connect_network: no backend available");
+        }
+    }
 }
 
 /// Fire-and-forget: disconnect from the current network.
 pub fn disconnect() {
-    runtime::handle().spawn(async move {
-        let path = get_station_path().await;
-        if path.is_empty() {
-            tracing::warn!("wifi::disconnect: no station path known");
-            return;
+    match get_backend() {
+        WifiBackend::Iwd => {
+            runtime::handle().spawn(async move {
+                let path = get_station_path().await;
+                if path.is_empty() {
+                    tracing::warn!("wifi::disconnect: no station path known");
+                    return;
+                }
+                if let Err(e) = do_station_call(&path, "Disconnect").await {
+                    tracing::warn!(error = %e, "wifi disconnect failed");
+                }
+            });
         }
-        if let Err(e) = do_station_call(&path, "Disconnect").await {
-            tracing::warn!(error = %e, "wifi disconnect failed");
+        WifiBackend::NetworkManager(store) => {
+            runtime::handle().spawn(async move {
+                let path = store.read().await.clone();
+                if path.is_empty() {
+                    tracing::warn!("wifi::disconnect: NM device path not yet known");
+                    return;
+                }
+                if let Err(e) = crate::wifi_nm::nm_disconnect(&path).await {
+                    tracing::warn!(error = %e, "wifi disconnect (NM) failed");
+                }
+            });
         }
-    });
+        WifiBackend::None => {
+            tracing::warn!("wifi::disconnect: no backend available");
+        }
+    }
 }
 
-/// Fire-and-forget: set `Powered` on the iwd Adapter1.
+/// Fire-and-forget: set the radio powered state.
+///
+/// For iwd, sets `Powered` on the `Adapter1` object.
+/// For `NetworkManager`, sets `WirelessEnabled` on the manager.
 pub fn set_powered(on: bool) {
-    runtime::handle().spawn(async move {
-        let path = current_adapter_path().await;
-        if path.is_empty() {
-            tracing::warn!("wifi::set_powered: no adapter path known");
-            return;
+    match get_backend() {
+        WifiBackend::Iwd => {
+            runtime::handle().spawn(async move {
+                let path = current_adapter_path().await;
+                if path.is_empty() {
+                    tracing::warn!("wifi::set_powered: no adapter path known");
+                    return;
+                }
+                if let Err(e) = do_set_powered(&path, on).await {
+                    tracing::warn!(error = %e, on, "wifi set_powered failed");
+                }
+            });
         }
-        if let Err(e) = do_set_powered(&path, on).await {
-            tracing::warn!(error = %e, on, "wifi set_powered failed");
+        WifiBackend::NetworkManager(_) => {
+            runtime::handle().spawn(async move {
+                if let Err(e) = crate::wifi_nm::nm_set_powered(on).await {
+                    tracing::warn!(error = %e, on, "wifi set_powered (NM) failed");
+                }
+            });
         }
-    });
+        WifiBackend::None => {
+            tracing::warn!("wifi::set_powered: no backend available");
+        }
+    }
 }
 
-/// Fire-and-forget: call `Forget` on the given iwd `KnownNetwork` object.
-/// iwd handles cascading disconnect when forgetting the active network.
+/// Fire-and-forget: forget the network with the given path.
+///
+/// For iwd, calls `Forget` on the `KnownNetwork` object at `known_network_path`.
+/// For `NetworkManager`, this operation is not yet implemented (deferred to a follow-up).
 pub fn forget(known_network_path: &str) {
     let path = known_network_path.to_string();
-    runtime::handle().spawn(async move {
-        if let Err(e) = do_known_network_call(&path, "Forget").await {
-            tracing::warn!(error = %e, path, "wifi forget failed");
+    match get_backend() {
+        WifiBackend::Iwd => {
+            runtime::handle().spawn(async move {
+                if let Err(e) = do_known_network_call(&path, "Forget").await {
+                    tracing::warn!(error = %e, path, "wifi forget failed");
+                }
+            });
         }
-    });
+        WifiBackend::NetworkManager(_) => {
+            tracing::warn!("wifi::forget: not yet supported for NetworkManager backend");
+        }
+        WifiBackend::None => {
+            tracing::warn!("wifi::forget: no backend available");
+        }
+    }
 }
 
 /// Signal emitting `Some(PromptRequest)` when iwd needs a passphrase, `None`

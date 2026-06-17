@@ -494,8 +494,9 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
     // overlay's full size, so the DrawingArea fills the card regardless —
     // and setting expand here would propagate up and inflate the card past
     // its natural width, shifting it off-centre (#44). The `.ts-drawer-bg`
-    // class carries `color: @window_bg_color` so the draw func can read the
-    // live theme fill via `color()` instead of hardcoding it.
+    // class carries `color: @shell_background` so the draw func can read the
+    // fill color via `color()` — fixed to the always-dark shell surface color
+    // so the drawer matches the bar regardless of the system theme (#90).
     let bg = gtk::DrawingArea::new();
     bg.add_css_class("ts-drawer-bg");
     bg.set_draw_func(|area, cr: &gtk::cairo::Context, width: i32, height: i32| {
@@ -503,8 +504,10 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
     });
     card.set_child(Some(&bg));
 
-    // Repaint when the system light/dark preference flips (the fill is
-    // theme-derived but drawn in cairo, so CSS won't re-trigger it).
+    // Repaint when the system light/dark preference flips.  The fill color
+    // (`@shell_background`) is fixed and not theme-derived, so this is
+    // technically a no-op, but retained as a cheap safety net in case the
+    // variable is ever tied back to an Adwaita token.
     let bg_weak = bg.downgrade();
     adw::StyleManager::default().connect_dark_notify(move |_| {
         if let Some(bg) = bg_weak.upgrade() {
@@ -530,11 +533,11 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
 /// (`DRAWER_CORNER_RADIUS`) bottom corners. Mirrors the cairo approach in
 /// [`crate::overlays::frame`].
 ///
-/// `base` is the live `@window_bg_color` (read from the drawing area's
-/// `.ts-drawer-bg` CSS `color`), so the fill tracks the theme exactly instead
-/// of a hardcoded grey (#44). The gradient reproduces the previous CSS
-/// (`shade(@window_bg_color, 0.82)` → base for dark; the lifted `1.04` variant
-/// for light); the hairline edge was `border: 1px solid @borders`.
+/// `base` is read from the drawing area's `.ts-drawer-bg` CSS `color`, which
+/// is now `@shell_background` — a fixed dark color that matches the bar
+/// regardless of the system theme (fixes the light-mode regression from #44
+/// where `@window_bg_color` painted the drawer near-white). The gradient
+/// shades `base` by 0.82 at the top and fades to `base` at the bottom.
 fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::RGBA) {
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -560,26 +563,21 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
     cr.arc_negative(0.0, rf, rf, 0.0, -FRAC_PI_2); // top-left concave flare
     cr.close_path();
 
-    // Fill: a vertical gradient from a shaded `@window_bg_color` to the base,
-    // reproducing the old `.ts-drawer` CSS. `shade` darkens for dark mode
-    // (0.82) and lifts for light (1.04), matching the two CSS variants.
-    let dark = adw::StyleManager::default().is_dark();
-    let shade = if dark { 0.82 } else { 1.04 };
+    // Fill: a vertical gradient from a slightly-shaded `@shell_background` at
+    // the top to the base at the bottom. The fill is always dark (the drawer
+    // always matches the always-dark bar via `@shell_background`), so the
+    // old light-mode 1.04 lift branch is gone — only the 0.82 dark shade
+    // remains. Edge is a faint white hairline, matching the dark surface.
     let base_rgb = [
         f64::from(base.red()),
         f64::from(base.green()),
         f64::from(base.blue()),
     ];
     let top = [
-        (base_rgb[0] * shade).clamp(0.0, 1.0),
-        (base_rgb[1] * shade).clamp(0.0, 1.0),
-        (base_rgb[2] * shade).clamp(0.0, 1.0),
+        (base_rgb[0] * 0.82).clamp(0.0, 1.0),
+        (base_rgb[1] * 0.82).clamp(0.0, 1.0),
+        (base_rgb[2] * 0.82).clamp(0.0, 1.0),
     ];
-    let edge = if dark {
-        [1.0, 1.0, 1.0, 0.08]
-    } else {
-        [0.0, 0.0, 0.0, 0.12]
-    };
 
     let fill = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
     fill.add_color_stop_rgba(0.0, top[0], top[1], top[2], 1.0);
@@ -593,8 +591,8 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
         return;
     }
 
-    // Faint hairline edge (was `border: 1px solid @borders`).
-    cr.set_source_rgba(edge[0], edge[1], edge[2], edge[3]);
+    // Faint hairline edge (was `border: 1px solid @borders`): white at 8% alpha.
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.08);
     cr.set_line_width(1.0);
     if let Err(e) = cr.stroke() {
         tracing::warn!(error = %e, "drawer: cairo stroke failed");

@@ -6,6 +6,11 @@
 //!
 //! All D-Bus I/O goes through [`hytte_bus::call`] and [`hytte_bus::signals`]
 //! so the shared connection supervisor handles reconnects automatically.
+//!
+//! When `ListLinks` returns an empty list (e.g. systemd-networkd is not
+//! managing any interfaces), a fallback reads `/sys/class/net` to enumerate
+//! kernel interfaces.  The fallback provides name, ifindex, and operational
+//! state only — addresses/routes/gateways are not available from sysfs alone.
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -49,6 +54,22 @@ impl OperationalState {
             "degraded" => Self::Degraded,
             "enslaved" => Self::EnslavedRouting,
             "routable" => Self::Routable,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Map a sysfs `operstate` string (from `/sys/class/net/<if>/operstate`)
+    /// to an [`OperationalState`].
+    ///
+    /// The kernel values (`up`, `down`, `dormant`, `unknown`, …) are a subset
+    /// of networkd's richer set; unmapped values fall through to `Unknown`.
+    #[must_use]
+    pub(crate) fn from_sysfs_operstate(s: &str) -> Self {
+        match s.trim() {
+            "up" => Self::Routable,
+            "down" => Self::Off,
+            "dormant" => Self::Dormant,
+            "lowerlayerdown" => Self::NoCarrier,
             _ => Self::Unknown,
         }
     }
@@ -204,6 +225,14 @@ async fn read_links() -> Result<Vec<Link>> {
         .await
         .context("ListLinks")?;
 
+    // When networkd returns no links (e.g. interfaces are managed by
+    // NetworkManager / iwd / plain kernel), fall back to /sys/class/net so
+    // the panel shows *something* rather than an empty list.
+    if list.is_empty() {
+        tracing::debug!("networkd returned no links; falling back to /sys/class/net");
+        return Ok(read_links_from_sys());
+    }
+
     let mut out = Vec::with_capacity(list.len());
     for (idx, name, path) in list {
         let path_str = path.as_str().to_string();
@@ -246,6 +275,53 @@ async fn read_links() -> Result<Vec<Link>> {
         });
     }
     Ok(out)
+}
+
+/// Enumerate kernel interfaces from `/sys/class/net`.
+///
+/// Only name, ifindex, and operational state are available here.
+/// Addresses/routes/gateways are left at their defaults (empty / `None`).
+/// Loopback (`lo`) is skipped.
+fn read_links_from_sys() -> Vec<Link> {
+    let dir = match std::fs::read_dir("/sys/class/net") {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = ?e, "cannot read /sys/class/net");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "lo" {
+            continue;
+        }
+
+        let idx = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+
+        let operational = std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
+            .map_or(OperationalState::Unknown, |s| {
+                OperationalState::from_sysfs_operstate(&s)
+            });
+
+        out.push(Link {
+            idx,
+            name,
+            operational,
+            addresses: Vec::new(),
+            gateway_v4: None,
+            gateway_v6: None,
+            routes: Vec::new(),
+        });
+    }
+
+    // Stable ordering by ifindex so the list doesn't change between refreshes.
+    out.sort_by_key(|l| l.idx);
+    out
 }
 
 #[must_use]
@@ -361,6 +437,67 @@ fn bytes_to_ip(family: i32, bytes: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- sysfs operstate mapping ---
+
+    #[test]
+    fn sysfs_operstate_up_maps_to_routable() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("up"),
+            OperationalState::Routable
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_down_maps_to_off() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("down"),
+            OperationalState::Off
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_dormant_maps_to_dormant() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("dormant"),
+            OperationalState::Dormant
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_lowerlayerdown_maps_to_no_carrier() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("lowerlayerdown"),
+            OperationalState::NoCarrier
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_unknown_maps_to_unknown() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("unknown"),
+            OperationalState::Unknown
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_trims_trailing_newline() {
+        // /sys/class/net/<if>/operstate typically ends with '\n'
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("up\n"),
+            OperationalState::Routable
+        );
+    }
+
+    #[test]
+    fn sysfs_operstate_unrecognised_is_unknown() {
+        assert_eq!(
+            OperationalState::from_sysfs_operstate("notanything"),
+            OperationalState::Unknown
+        );
+    }
+
+    // --- parse_describe ---
 
     const SAMPLE_DESCRIBE: &str = r#"{
         "Index": 3,

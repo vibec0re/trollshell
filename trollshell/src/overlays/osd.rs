@@ -41,6 +41,8 @@ use std::time::Duration;
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
+
+use crate::components::cast;
 use hytte::services::brightness::{self, Brightness};
 use hytte::services::niri;
 use hytte::services::pipewire::{self, Source, Volume};
@@ -367,8 +369,7 @@ fn volume_icon(v: &Volume) -> &'static str {
     if v.muted {
         return "audio-volume-muted-symbolic";
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pct = (clamp01(v.linear) * 100.0).round() as u32;
+    let pct = pct(v.linear);
     match pct {
         0..=33 => "audio-volume-low-symbolic",
         34..=66 => "audio-volume-medium-symbolic",
@@ -380,8 +381,7 @@ fn mic_icon(s: &Source) -> &'static str {
     if s.muted {
         return "microphone-sensitivity-muted-symbolic";
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pct = (clamp01(s.volume) * 100.0).round() as u32;
+    let pct = pct(s.volume);
     if pct >= 50 {
         "microphone-sensitivity-high-symbolic"
     } else {
@@ -435,8 +435,7 @@ fn render_volume(v: Volume) -> State {
     let icon = volume_icon(&v);
     // Boosted volume can exceed 100%; show the true value in the label
     // while still clamping the progress bar to [0.0, 1.0].
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pct = (v.linear * 100.0).round() as u32;
+    let pct = cast::f64_to_u32_trunc((v.linear * 100.0).round());
     let value = if v.muted {
         "Muted".to_string()
     } else {
@@ -591,9 +590,8 @@ fn show(view: &Rc<OsdView>, state: &State) {
     view.timeout.set(Some(id));
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn pct(linear: f64) -> u32 {
-    (clamp01(linear) * 100.0).round() as u32
+    cast::f64_to_u32_trunc((clamp01(linear) * 100.0).round())
 }
 
 fn clamp01(v: f64) -> f64 {

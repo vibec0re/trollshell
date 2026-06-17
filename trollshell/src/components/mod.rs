@@ -3,6 +3,7 @@
 //! helpers. Visibility is `pub(crate)` throughout — these are
 //! implementation details of the trollshell binary.
 
+pub mod cast;
 pub mod connection_row;
 pub mod deep_link_row;
 pub mod focus;

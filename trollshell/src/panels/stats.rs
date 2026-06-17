@@ -13,6 +13,7 @@ use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
 
+use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
@@ -184,8 +185,7 @@ fn build_live_memory_row() -> adw::ActionRow {
             if m.total == 0 {
                 "—".to_string()
             } else {
-                #[allow(clippy::cast_precision_loss)]
-                let pct = (m.used as f64 / m.total as f64) * 100.0;
+                let pct = (cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total)) * 100.0;
                 format!("{} / {} ({pct:.0}%)", fmt_bytes(m.used), fmt_bytes(m.total))
             }
         }),
@@ -201,8 +201,7 @@ fn build_live_memory_row() -> adw::ActionRow {
             if m.total == 0 {
                 0.0
             } else {
-                #[allow(clippy::cast_precision_loss)]
-                let frac = m.used as f64 / m.total as f64;
+                let frac = cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total);
                 frac.clamp(0.0, 1.0)
             }
         }),
@@ -229,8 +228,7 @@ fn build_live_swap_row() -> adw::ActionRow {
             if m.swap_total == 0 {
                 String::new()
             } else {
-                #[allow(clippy::cast_precision_loss)]
-                let pct = (m.swap_used as f64 / m.swap_total as f64) * 100.0;
+                let pct = (cast::u64_to_f64(m.swap_used) / cast::u64_to_f64(m.swap_total)) * 100.0;
                 format!(
                     "{} / {} ({pct:.0}%)",
                     fmt_bytes(m.swap_used),
@@ -250,8 +248,7 @@ fn build_live_swap_row() -> adw::ActionRow {
             if m.swap_total == 0 {
                 0.0
             } else {
-                #[allow(clippy::cast_precision_loss)]
-                let frac = m.swap_used as f64 / m.swap_total as f64;
+                let frac = cast::u64_to_f64(m.swap_used) / cast::u64_to_f64(m.swap_total);
                 frac.clamp(0.0, 1.0)
             }
         }),
@@ -340,9 +337,8 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
                 .title(&m.path)
                 .activatable(false)
                 .build();
-            #[allow(clippy::cast_precision_loss)]
             let pct = if m.total_bytes > 0 {
-                (m.used_bytes as f64 / m.total_bytes as f64) * 100.0
+                (cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)) * 100.0
             } else {
                 0.0
             };
@@ -398,8 +394,7 @@ fn build_history_memory_row() -> gtk::Box {
             spark_clone.push(0.0);
             value_clone.set_text("\u{2014}");
         } else {
-            #[allow(clippy::cast_precision_loss)]
-            let frac = (m.used as f64 / m.total as f64).clamp(0.0, 1.0);
+            let frac = (cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total)).clamp(0.0, 1.0);
             spark_clone.push(frac);
             value_clone.set_text(&format!("{:.0}%", frac * 100.0));
         }

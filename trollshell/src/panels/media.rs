@@ -9,6 +9,7 @@ use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::mpris;
 
+use crate::components::cast;
 use crate::components::format::fmt_us;
 use crate::components::layout::{finish_page, page_grid, section};
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
@@ -230,8 +231,7 @@ fn player_seek_fraction(maybe: Option<mpris::Player>) -> f64 {
     if p.length_us == 0 {
         return 0.0;
     }
-    #[allow(clippy::cast_precision_loss)]
-    ((p.position_us as f64) / (p.length_us as f64)).clamp(0.0, 1.0)
+    (cast::u64_to_f64(p.position_us) / cast::u64_to_f64(p.length_us)).clamp(0.0, 1.0)
 }
 
 fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
@@ -245,11 +245,6 @@ fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
         return;
     }
     let pos_fraction = scale.value().clamp(0.0, 1.0);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let pos_us = (pos_fraction * length as f64) as i64;
+    let pos_us = cast::f64_to_i64_trunc(pos_fraction * cast::u64_to_f64(length));
     mpris::set_position(b, t, pos_us);
 }

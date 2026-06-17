@@ -3,11 +3,12 @@
 //! bottom.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::Signal;
-use hytte::gtk::{self};
+use hytte::gtk::{self, gio};
 use hytte::prelude::*;
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuLoad};
@@ -54,11 +55,64 @@ fn build_stats_live_group_v2() -> adw::PreferencesGroup {
     group
 }
 
+/// Cached desktop app metadata resolved from `gio::AppInfo`.
+///
+/// Note: `gio::DesktopAppInfo` is not available in gio 0.22 bindings, so we
+/// use the `gio::AppInfo` interface (the abstract interface) via
+/// `gio::AppInfo::all()`, which returns all installed applications with their
+/// ids, display names, and icons. We scan this list lazily (once per new
+/// app-id) and cache the result for the lifetime of the expander widget.
+#[derive(Clone)]
+struct AppMeta {
+    display_name: String,
+    icon: Option<gio::Icon>,
+}
+
+/// Resolve display name and icon for an app-id via `gio::AppInfo::all()`.
+///
+/// Scans all installed applications looking for one whose id matches
+/// `<app_id>.desktop` (exact) or `<app_id>.desktop` (lowercased). This is
+/// heuristic — the scope leaf id isn't always exactly the `.desktop` stem —
+/// so misses are common and handled gracefully (falls back to a generic icon
+/// and the raw app-id as display name).
+///
+/// Results are cached so the scan runs at most once per unique app-id per
+/// expander lifetime.
+fn resolve_app_meta(
+    app_id: &str,
+    meta_cache: &mut HashMap<String, Option<AppMeta>>,
+) -> Option<AppMeta> {
+    if let Some(cached) = meta_cache.get(app_id) {
+        return cached.clone();
+    }
+    // Build candidate desktop ids: exact and lowercase variant.
+    let exact = format!("{app_id}.desktop");
+    let lower = format!("{}.desktop", app_id.to_lowercase());
+
+    let meta = gio::AppInfo::all()
+        .into_iter()
+        .find(|info| {
+            info.id()
+                .is_some_and(|id| id == exact.as_str() || id == lower.as_str())
+        })
+        .map(|info| AppMeta {
+            display_name: info.display_name().to_string(),
+            icon: info.icon(),
+        });
+    meta_cache.insert(app_id.to_string(), meta.clone());
+    meta
+}
+
 /// A collapsible "Top apps" list (CPU or RAM) bound to an [`app_usage`] signal.
 /// `value` formats each row's right-hand value. Mirrors
-/// [`build_live_disk_expander`]'s drain-and-rebuild pattern. The `comm` is
-/// rendered with markup off, so an adversarial process name can't inject Pango
-/// markup (cf. #30).
+/// [`build_live_disk_expander`]'s drain-and-rebuild pattern.
+///
+/// Each row gets a leading icon resolved from the app-id via `gio::AppInfo`.
+/// Icons and display names are cached per app-id (one `AppInfo::all()` scan per
+/// unique app-id per expander lifetime). The name field is rendered with markup
+/// off so an adversarial scope id can't inject Pango markup (cf. #30).
+///
+/// The "System" bucket (all non-app-scope PIDs) gets a `computer-symbolic` icon.
 fn build_top_apps_expander(
     title: &str,
     signal: impl Signal<Item = Vec<ProcSample>> + 'static,
@@ -67,6 +121,11 @@ fn build_top_apps_expander(
     let expander = adw::ExpanderRow::builder().title(title).build();
     expander.set_expanded(false);
 
+    // Metadata cache: app-id → AppMeta (None = no desktop file found).
+    // Lives for the lifetime of this expander's bind closure.
+    let meta_cache: Rc<RefCell<HashMap<String, Option<AppMeta>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
@@ -74,23 +133,47 @@ fn build_top_apps_expander(
         for row in rows_for_bind.borrow_mut().drain(..) {
             expander_for_bind.remove(&row);
         }
-        // Collapsed summary: the heaviest entry, or an em-dash when empty.
+        // Collapsed summary: the heaviest entry's display name, or an em-dash.
         let subtitle = list.first().map_or_else(
             || "\u{2014}".to_string(),
-            |s| format!("{} \u{00b7} {}", s.name, value(s)),
+            |s| {
+                format!(
+                    "{} \u{00b7} {}",
+                    sample_display_name(s, &mut meta_cache.borrow_mut()),
+                    value(s)
+                )
+            },
         );
         expander_for_bind.set_subtitle(&subtitle);
 
         let mut new_rows = Vec::with_capacity(list.len());
         for s in &list {
             let row = adw::ActionRow::builder().activatable(false).build();
-            // Markup off: a process `comm` is untrusted and could otherwise
-            // inject Pango markup into the title (cf. #30).
+            // Markup off: scope ids are untrusted — adversarial names could
+            // otherwise inject Pango markup into the title (cf. #30).
             row.set_use_markup(false);
-            row.set_title(&s.name);
+            row.set_title(&sample_display_name(s, &mut meta_cache.borrow_mut()));
             if s.procs > 1 {
                 row.set_subtitle(&format!("{} processes", s.procs));
             }
+
+            // Prefix icon: cached from the app-id, or sensible fallbacks.
+            let icon: gio::Icon = if let Some(app_id) = s.app_id.as_deref() {
+                resolve_app_meta(app_id, &mut meta_cache.borrow_mut())
+                    .and_then(|m| m.icon)
+                    .unwrap_or_else(|| {
+                        gio::ThemedIcon::new("application-x-executable-symbolic")
+                            .upcast::<gio::Icon>()
+                    })
+            } else {
+                // System bucket: generic computer icon.
+                gio::ThemedIcon::new("computer-symbolic").upcast::<gio::Icon>()
+            };
+            let img = gtk::Image::from_gicon(&icon);
+            img.set_icon_size(gtk::IconSize::Normal);
+            img.set_valign(gtk::Align::Center);
+            row.add_prefix(&img);
+
             let label = gtk::Label::new(Some(&value(s)));
             label.set_valign(gtk::Align::Center);
             row.add_suffix(&label);
@@ -101,6 +184,19 @@ fn build_top_apps_expander(
     });
 
     expander
+}
+
+/// Human-readable display name for a sample. If an app-id is set, looks up
+/// the display name via the `AppMeta` cache (falling back to the raw app-id
+/// on a cache miss). Returns `s.name` for the "System" bucket.
+fn sample_display_name(
+    s: &ProcSample,
+    meta_cache: &mut HashMap<String, Option<AppMeta>>,
+) -> String {
+    s.app_id.as_deref().map_or_else(
+        || s.name.clone(),
+        |id| resolve_app_meta(id, meta_cache).map_or_else(|| id.to_string(), |m| m.display_name),
+    )
 }
 
 fn build_live_cpu_row() -> adw::ActionRow {

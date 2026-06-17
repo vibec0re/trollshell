@@ -24,7 +24,7 @@
 
 pub mod sys;
 
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -452,9 +452,10 @@ impl CalClient {
     /// (`i_cal_recur_iterator_new` / `_next`) over the window — the engine
     /// the higher-level `e_cal_*_generate_instances_*` helpers wrap. Driving
     /// the iterator directly keeps expansion a pure function of the component
-    /// we already hold, independent of EDS backend state. `RDATE`/`EXDATE`
-    /// (additional / excluded instances) are not yet applied — RRULE is the
-    /// dominant case for issue #29; honouring those is a follow-up.
+    /// we already hold, independent of EDS backend state. The component's
+    /// `EXDATE` properties (cancelled occurrences) are excluded and its
+    /// `RDATE` properties (extra one-off occurrences) added — see
+    /// [`expand_component`].
     pub fn generate_instances(&self, start_unix: i64, end_unix: i64) -> Result<Vec<EventInstance>> {
         // Fetch every master component. We need the live `ICalComponent*`
         // (not the iCal string) to expand, so we walk the GSList ourselves
@@ -497,8 +498,8 @@ impl CalClient {
 /// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
 /// seconds), pushing each occurrence into `out`.
 ///
-/// - **Non-recurring** (no RRULE): emit a single [`EventInstance`] if its
-///   DTSTART falls before `end_unix` (the calendar service does the
+/// - **Non-recurring** (no RRULE, no RDATE): emit a single [`EventInstance`]
+///   if its DTSTART falls before `end_unix` (the calendar service does the
 ///   has-it-ended filtering).
 /// - **Recurring** (RRULE present): drive libical's core recurrence iterator
 ///   (`i_cal_recur_iterator_new` / `_next`) from DTSTART, emitting one
@@ -507,8 +508,21 @@ impl CalClient {
 ///   capped). Per-occurrence duration is `DTEND − DTSTART` (or 0 if absent;
 ///   the service fabricates a UI duration).
 ///
-/// EXDATE/RDATE are not yet honoured — RRULE is the dominant recurring case
-/// for #29; refining detached/excluded instances is a follow-up.
+/// On top of the RRULE/DTSTART occurrences, the component's recurrence-set
+/// modifiers are applied (RFC 5545 §3.8.5):
+///
+/// - **EXDATE** (cancelled occurrences): each `EXDATE` value — there may be
+///   several `EXDATE` properties, since libical splits a comma-separated list
+///   into one property apiece — is normalised to UTC seconds and any matching
+///   occurrence is dropped. DATE and DATE-TIME forms both normalise through
+///   the same [`ical_time_to_unix`] the iterator output uses, so an all-day
+///   `EXDATE;VALUE=DATE` matches an all-day occurrence and a timed one matches
+///   a timed occurrence. An `EXDATE` that matches no occurrence is a harmless
+///   no-op.
+/// - **RDATE** (extra one-off occurrences): each in-window `RDATE` is added,
+///   deduped against the RRULE-expanded starts and skipped if it coincides
+///   with an `EXDATE` (per RFC, EXDATE wins). RDATE can stand alone (no
+///   RRULE), adding occurrences alongside DTSTART.
 ///
 /// # Safety
 ///
@@ -544,67 +558,162 @@ unsafe fn expand_component(
     // identical across a series' occurrences.
     let ical = unsafe { component_ical_string(comp) };
 
+    // Recurrence-set modifiers, normalised to UTC seconds the same way every
+    // occurrence is, so comparisons are apples-to-apples regardless of DATE
+    // vs DATE-TIME / TZID. EXDATE is a membership set; RDATE a list of extra
+    // starts.
+    let exdates = unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) };
+    let rdates = unsafe { collect_property_times(comp, sys::I_CAL_RDATE_PROPERTY, true) };
+
+    // `emitted` tracks occurrence starts we've already pushed, so RDATE
+    // doesn't double up one the RRULE (or DTSTART) already produced.
+    let mut emitted: Vec<i64> = Vec::new();
+    let mut emit = |out: &mut Vec<EventInstance>, occ_unix: i64| {
+        // EXDATE excludes; the window bounds the rest. An occurrence is kept
+        // when it starts before the window end and its end is at/after the
+        // window start (so it overlaps the window).
+        if exdates.contains(&occ_unix) {
+            return;
+        }
+        if occ_unix >= end_unix || occ_unix + duration < start_unix {
+            return;
+        }
+        if emitted.contains(&occ_unix) {
+            return;
+        }
+        emitted.push(occ_unix);
+        out.push(EventInstance {
+            ical: ical.clone(),
+            start_unix: occ_unix,
+            end_unix: occ_unix + duration,
+            all_day,
+        });
+    };
+
     // RRULE present?
     let rrule_prop =
         unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RRULE_PROPERTY) };
     if rrule_prop.is_null() {
-        // Non-recurring: a single occurrence at DTSTART.
-        if dtstart_unix < end_unix {
-            out.push(EventInstance {
-                ical,
-                start_unix: dtstart_unix,
-                end_unix: dtstart_unix + duration,
-                all_day,
-            });
-        }
-        unsafe { sys::g_object_unref(dtstart) }
-        return;
-    }
-
-    // Recurring: iterate occurrences from DTSTART.
-    let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
-    if !rule.is_null() {
-        let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
-        if !iter.is_null() {
-            // A defensive cap: even with the time-window stop condition, a
-            // pathological rule shouldn't loop forever.
-            let mut guard = 0u32;
-            loop {
-                guard += 1;
-                if guard > 100_000 {
-                    break;
-                }
-                let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
-                let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
-                    // null-time ⇒ series exhausted.
+        // No RRULE: DTSTART is the (sole) base occurrence; RDATE may add more.
+        emit(out, dtstart_unix);
+    } else {
+        // Recurring: iterate occurrences from DTSTART.
+        let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
+        if !rule.is_null() {
+            let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+            if !iter.is_null() {
+                // A defensive cap: even with the time-window stop condition, a
+                // pathological rule shouldn't loop forever.
+                let mut guard = 0u32;
+                loop {
+                    guard += 1;
+                    if guard > 100_000 {
+                        break;
+                    }
+                    let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+                    let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
+                        // null-time ⇒ series exhausted.
+                        if !occ.is_null() {
+                            unsafe { sys::g_object_unref(occ) }
+                        }
+                        break;
+                    };
                     if !occ.is_null() {
                         unsafe { sys::g_object_unref(occ) }
                     }
-                    break;
-                };
-                if !occ.is_null() {
-                    unsafe { sys::g_object_unref(occ) }
+                    if occ_unix >= end_unix {
+                        break; // past the window ⇒ done
+                    }
+                    emit(out, occ_unix);
                 }
-                if occ_unix >= end_unix {
-                    break; // past the window ⇒ done
-                }
-                if occ_unix + duration >= start_unix {
-                    // Occurrence overlaps the window (its end is at/after the
-                    // window start) ⇒ keep it.
-                    out.push(EventInstance {
-                        ical: ical.clone(),
-                        start_unix: occ_unix,
-                        end_unix: occ_unix + duration,
-                        all_day,
-                    });
-                }
+                unsafe { sys::i_cal_recur_iterator_free(iter) }
             }
-            unsafe { sys::i_cal_recur_iterator_free(iter) }
+            unsafe { sys::g_object_unref(rule) }
         }
-        unsafe { sys::g_object_unref(rule) }
+        unsafe { sys::g_object_unref(rrule_prop) }
     }
-    unsafe { sys::g_object_unref(rrule_prop) }
+
+    // RDATE: extra one-off occurrences within the window, deduped against the
+    // RRULE-expanded set and subject to the same EXDATE exclusion.
+    for rd in rdates {
+        emit(out, rd);
+    }
+
     unsafe { sys::g_object_unref(dtstart) }
+}
+
+/// Collect every value of the repeated date-valued property `kind` on `comp`
+/// (EXDATE or RDATE) as UTC POSIX seconds. libical exposes one property per
+/// value (it splits a comma-separated list), so we walk first/next.
+///
+/// `is_rdate` selects the value accessor: EXDATE carries a plain `ICalTime`,
+/// while RDATE carries an `ICalDatetimeperiod` (a date-time *or* a period,
+/// whose start we take). Null-times / unparseable values are skipped. Every
+/// owned libical object on each path is released.
+///
+/// # Safety
+///
+/// `comp` must be a live `ICalComponent*`. Borrowed — never freed here.
+unsafe fn collect_property_times(
+    comp: *mut sys::ICalComponent,
+    kind: c_int,
+    is_rdate: bool,
+) -> Vec<i64> {
+    let mut times = Vec::new();
+    let mut prop = unsafe { sys::i_cal_component_get_first_property(comp, kind) };
+    while !prop.is_null() {
+        let unix = if is_rdate {
+            unsafe { rdate_property_to_unix(prop) }
+        } else {
+            let tt = unsafe { sys::i_cal_property_get_exdate(prop) };
+            let u = unsafe { ical_time_to_unix(tt) };
+            if !tt.is_null() {
+                unsafe { sys::g_object_unref(tt) }
+            }
+            u
+        };
+        if let Some(u) = unix {
+            times.push(u);
+        }
+        unsafe { sys::g_object_unref(prop) }
+        prop = unsafe { sys::i_cal_component_get_next_property(comp, kind) };
+    }
+    times
+}
+
+/// Extract an RDATE property's start as UTC POSIX seconds. RDATE values come
+/// as an `ICalDatetimeperiod`: prefer its plain date-time; fall back to the
+/// start of its period form. Returns `None` for an unusable value. Frees every
+/// owned libical object it touches.
+///
+/// # Safety
+///
+/// `prop` must be a live RDATE `ICalProperty*`. Borrowed — never freed here.
+unsafe fn rdate_property_to_unix(prop: *mut sys::ICalProperty) -> Option<i64> {
+    let dtp = unsafe { sys::i_cal_property_get_rdate(prop) };
+    if dtp.is_null() {
+        return None;
+    }
+    // Date-time form first.
+    let tt = unsafe { sys::i_cal_datetimeperiod_get_time(dtp) };
+    let mut result = unsafe { ical_time_to_unix(tt) };
+    if !tt.is_null() {
+        unsafe { sys::g_object_unref(tt) }
+    }
+    // Period form: take its start.
+    if result.is_none() {
+        let period = unsafe { sys::i_cal_datetimeperiod_get_period(dtp) };
+        if !period.is_null() {
+            let start = unsafe { sys::i_cal_period_get_start(period) };
+            result = unsafe { ical_time_to_unix(start) };
+            if !start.is_null() {
+                unsafe { sys::g_object_unref(start) }
+            }
+            unsafe { sys::g_object_unref(period) }
+        }
+    }
+    unsafe { sys::g_object_unref(dtp) }
+    result
 }
 
 /// Pure-libical recurrence expansion of an iCalendar VEVENT string over a
@@ -1133,6 +1242,170 @@ mod tests {
         let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
         assert_eq!(inst.len(), 3);
         assert!(inst.iter().all(|e| e.all_day));
+    }
+
+    // ── EXDATE / RDATE (issue #29 follow-up) ──────────────────────────────
+    //
+    // The recurrence-set modifiers layered on top of RRULE expansion: EXDATE
+    // cancels a single occurrence (the common "skipped one standup" case) and
+    // RDATE bolts an extra one-off onto the series. Same hermetic path as the
+    // RRULE tests above.
+
+    #[test]
+    fn exdate_excludes_one_occurrence() {
+        // FREQ=DAILY;COUNT=5 from Jun 1 09:00, with Jun 3 cancelled.
+        let ical = "BEGIN:VEVENT\r\nUID:ex1\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=5\r\n\
+                     EXDATE:20260603T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(
+            inst.len(),
+            4,
+            "the excluded Jun 3 occurrence must be absent"
+        );
+        let jun3 = ANCHOR_0900 + 2 * 86_400;
+        assert!(
+            inst.iter().all(|e| e.start_unix != jun3),
+            "no instance may start at the EXDATE'd Jun 3 09:00",
+        );
+        // The other four are intact and contiguous (Jun 1,2,4,5).
+        assert_eq!(inst[0].start_unix, ANCHOR_0900);
+        assert_eq!(inst[1].start_unix, ANCHOR_0900 + 86_400);
+        assert_eq!(inst[2].start_unix, ANCHOR_0900 + 3 * 86_400);
+        assert_eq!(inst[3].start_unix, ANCHOR_0900 + 4 * 86_400);
+    }
+
+    #[test]
+    fn multiple_exdate_properties_all_apply() {
+        // Two separate EXDATE properties (Jun 2 and Jun 4) each cancel one.
+        let ical = "BEGIN:VEVENT\r\nUID:ex2\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=5\r\n\
+                     EXDATE:20260602T090000Z\r\nEXDATE:20260604T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3, "two EXDATEs ⇒ 5 − 2 = 3 occurrences");
+        let starts: Vec<i64> = inst.iter().map(|e| e.start_unix).collect();
+        assert_eq!(
+            starts,
+            vec![
+                ANCHOR_0900,              // Jun 1
+                ANCHOR_0900 + 2 * 86_400, // Jun 3
+                ANCHOR_0900 + 4 * 86_400, // Jun 5
+            ],
+        );
+    }
+
+    #[test]
+    fn exdate_listing_multiple_datetimes_in_one_property() {
+        // A single EXDATE property carrying a comma-separated list — libical
+        // splits it into multiple properties internally, which our first/next
+        // walk must pick up in full.
+        let ical = "BEGIN:VEVENT\r\nUID:ex3\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=5\r\n\
+                     EXDATE:20260602T090000Z,20260603T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3, "comma-listed EXDATE excludes both Jun 2 & 3");
+    }
+
+    #[test]
+    fn exdate_not_matching_any_occurrence_is_noop() {
+        // EXDATE points at a time no occurrence falls on (08:00, not 09:00) ⇒
+        // nothing is excluded.
+        let ical = "BEGIN:VEVENT\r\nUID:exn\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=5\r\n\
+                     EXDATE:20260603T080000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 5, "a non-matching EXDATE is a no-op");
+    }
+
+    #[test]
+    fn exdate_all_day_date_value_excludes_all_day_occurrence() {
+        // All-day series with an all-day (VALUE=DATE) EXDATE: the DATE-form
+        // exclusion must match the DATE-form occurrence (both normalise to
+        // UTC midnight).
+        let ical = "BEGIN:VEVENT\r\nUID:exad\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART;VALUE=DATE:20260601\r\n\
+                     SUMMARY:Holiday\r\nRRULE:FREQ=DAILY;COUNT=3\r\n\
+                     EXDATE;VALUE=DATE:20260602\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 2, "the all-day Jun 2 occurrence is excluded");
+        assert!(inst.iter().all(|e| e.all_day));
+    }
+
+    #[test]
+    fn rdate_adds_one_off_occurrence() {
+        // FREQ=DAILY;COUNT=3 (Jun 1,2,3) plus an RDATE on Jun 10 ⇒ 4 total,
+        // with the extra outside the RRULE span.
+        let ical = "BEGIN:VEVENT\r\nUID:rd1\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=3\r\n\
+                     RDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 4, "3 RRULE occurrences + 1 RDATE");
+        let jun10 = ANCHOR_0900 + 9 * 86_400;
+        assert!(
+            inst.iter().any(|e| e.start_unix == jun10),
+            "the RDATE-added Jun 10 occurrence must be present",
+        );
+        // Duration carries over from DTEND − DTSTART (30 min) for the RDATE.
+        let added = inst.iter().find(|e| e.start_unix == jun10).unwrap();
+        assert_eq!(added.end_unix - added.start_unix, 1_800);
+    }
+
+    #[test]
+    fn rdate_duplicate_of_rrule_occurrence_is_deduped() {
+        // An RDATE coinciding with an existing RRULE occurrence (Jun 2) must
+        // not produce a second instance.
+        let ical = "BEGIN:VEVENT\r\nUID:rd2\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=3\r\n\
+                     RDATE:20260602T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(
+            inst.len(),
+            3,
+            "RDATE duplicating an RRULE occurrence is deduped"
+        );
+    }
+
+    #[test]
+    fn exdate_beats_rdate_on_same_instant() {
+        // RFC 5545: if EXDATE and RDATE name the same instant, EXDATE wins.
+        let ical = "BEGIN:VEVENT\r\nUID:rdex\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=3\r\n\
+                     RDATE:20260610T090000Z\r\nEXDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3, "EXDATE cancels the same-instant RDATE");
+        let jun10 = ANCHOR_0900 + 9 * 86_400;
+        assert!(inst.iter().all(|e| e.start_unix != jun10));
+    }
+
+    #[test]
+    fn rdate_outside_window_is_excluded() {
+        // An RDATE in July, queried over June only ⇒ not emitted.
+        let ical = "BEGIN:VEVENT\r\nUID:rdw\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=3\r\n\
+                     RDATE:20260710T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 3, "out-of-window RDATE is dropped");
+    }
+
+    #[test]
+    fn rdate_without_rrule_adds_to_dtstart() {
+        // No RRULE: DTSTART is the base occurrence, RDATE adds another.
+        let ical = "BEGIN:VEVENT\r\nUID:rdo\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                     SUMMARY:Pair\r\nRDATE:20260605T090000Z\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+        assert_eq!(inst.len(), 2, "DTSTART + 1 RDATE, no RRULE");
+        let mut starts: Vec<i64> = inst.iter().map(|e| e.start_unix).collect();
+        starts.sort_unstable();
+        assert_eq!(starts, vec![ANCHOR_0900, ANCHOR_0900 + 4 * 86_400]);
     }
 
     // ── MainContext + Waker (issue #33) ───────────────────────────────────

@@ -74,6 +74,16 @@ pub type ICalProperty = c_void;
 /// `ICalRecurrence *` — a parsed RRULE value. Released with [`g_object_unref`].
 pub type ICalRecurrence = c_void;
 
+/// `ICalDatetimeperiod *` — the value of an RDATE property: either a plain
+/// date-time (extract via [`i_cal_datetimeperiod_get_time`]) or a period
+/// (extract via [`i_cal_datetimeperiod_get_period`]). Released with
+/// [`g_object_unref`].
+pub type ICalDatetimeperiod = c_void;
+
+/// `ICalPeriod *` — a time period (start + end/duration), the period form an
+/// RDATE may take. We only read its start. Released with [`g_object_unref`].
+pub type ICalPeriod = c_void;
+
 /// `ICalRecurIterator *` — libical's core recurrence iterator. Created via
 /// [`i_cal_recur_iterator_new`]; freed with [`i_cal_recur_iterator_free`].
 pub type ICalRecurIterator = c_void;
@@ -97,6 +107,18 @@ pub type GClosure = c_void;
 /// property (value 73 in `icalderivedproperty.h`). Passed to
 /// [`i_cal_component_get_first_property`].
 pub const I_CAL_RRULE_PROPERTY: c_int = 73;
+
+/// `ICAL_EXDATE_PROPERTY` — the `ICalPropertyKind` discriminant for an EXDATE
+/// property (value 35 in `icalderivedproperty.h`). A component may carry
+/// several EXDATE properties — libical splits a comma-separated EXDATE value
+/// into one property per date-time — so we iterate them via
+/// [`i_cal_component_get_first_property`] / [`i_cal_component_get_next_property`].
+pub const I_CAL_EXDATE_PROPERTY: c_int = 35;
+
+/// `ICAL_RDATE_PROPERTY` — the `ICalPropertyKind` discriminant for an RDATE
+/// property (value 62 in `icalderivedproperty.h`). As with EXDATE, libical
+/// surfaces one property per RDATE value, iterated the same way.
+pub const I_CAL_RDATE_PROPERTY: c_int = 62;
 
 /// `GError *` — out-param for fallible operations. We always init it to
 /// `null` and free it via [`g_error_free`] if a call sets it.
@@ -361,9 +383,43 @@ unsafe extern "C" {
         kind: c_int,
     ) -> *mut ICalProperty;
 
+    /// Next property of `kind` on the component, continuing the iteration
+    /// begun by [`i_cal_component_get_first_property`]. New ref (owned —
+    /// unref), or null once exhausted. Used to walk the multiple
+    /// EXDATE/RDATE properties libical splits a comma-separated value into.
+    pub fn i_cal_component_get_next_property(
+        comp: *mut ICalComponent,
+        kind: c_int,
+    ) -> *mut ICalProperty;
+
     /// The RRULE value of an RRULE [`ICalProperty`] as a new
     /// [`ICalRecurrence`] (owned — unref).
     pub fn i_cal_property_get_rrule(prop: *mut ICalProperty) -> *mut ICalRecurrence;
+
+    /// The EXDATE value of an EXDATE [`ICalProperty`] as a new [`ICalTime`]
+    /// (owned — unref). DATE vs DATE-TIME is reflected by
+    /// [`i_cal_time_is_date`] on the result, matching the component's
+    /// DTSTART form for a well-formed event.
+    pub fn i_cal_property_get_exdate(prop: *mut ICalProperty) -> *mut ICalTime;
+
+    /// The RDATE value of an RDATE [`ICalProperty`] as a new
+    /// [`ICalDatetimeperiod`] (owned — unref). It carries either a plain
+    /// date-time ([`i_cal_datetimeperiod_get_time`]) or a period
+    /// ([`i_cal_datetimeperiod_get_period`], whose start we take).
+    pub fn i_cal_property_get_rdate(prop: *mut ICalProperty) -> *mut ICalDatetimeperiod;
+
+    /// The date-time of an [`ICalDatetimeperiod`] as a new [`ICalTime`]
+    /// (owned — unref). Returns a null-time when the value is a period
+    /// rather than a bare date-time.
+    pub fn i_cal_datetimeperiod_get_time(dtp: *mut ICalDatetimeperiod) -> *mut ICalTime;
+
+    /// The period of an [`ICalDatetimeperiod`] as a new [`ICalPeriod`]
+    /// (owned — unref). Valid when [`i_cal_datetimeperiod_get_time`] is a
+    /// null-time.
+    pub fn i_cal_datetimeperiod_get_period(dtp: *mut ICalDatetimeperiod) -> *mut ICalPeriod;
+
+    /// The start of an [`ICalPeriod`] as a new [`ICalTime`] (owned — unref).
+    pub fn i_cal_period_get_start(period: *mut ICalPeriod) -> *mut ICalTime;
 
     /// Create a libical recurrence iterator for `rule` anchored at
     /// `dtstart`. Owned — release with [`i_cal_recur_iterator_free`].

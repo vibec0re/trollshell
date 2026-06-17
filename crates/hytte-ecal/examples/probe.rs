@@ -9,11 +9,14 @@
 //!   Endeavour — create and modify a task, pumping the [`MainContext`] and
 //!   asserting EDS pushes the `objects-added`/`-modified` notifications to the
 //!   view (issue #33). Prints `live view push count: N`.
-//! - **Calendar (RRULE expansion):** list every calendar source, then on
-//!   the first one, create a `FREQ=DAILY;COUNT=5` VEVENT and expand it via
-//!   [`CalClient::generate_instances`] over a one-month window — verifying
+//! - **Calendar (RRULE expansion + EXDATE):** list every calendar source,
+//!   then on the first one, create a `FREQ=DAILY;COUNT=5` VEVENT and expand it
+//!   via [`CalClient::generate_instances`] over a one-month window — verifying
 //!   the recurrence-expansion path (issue #29). Prints
-//!   `recurring instance count: N` so the nixosTest can assert it.
+//!   `recurring instance count: N`. It also seeds a second `COUNT=5` series
+//!   with an `EXDATE` cancelling one day and prints `exdate instance count: N`
+//!   plus `exdate cancelled occurrence present: <bool>`, so the nixosTest can
+//!   assert the cancelled occurrence is excluded (the #29 follow-up).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -178,9 +181,11 @@ fn probe_tasks(registry: &Registry) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seed a daily-recurring VEVENT on the first calendar source and expand it
+/// Seed daily-recurring VEVENTs on the first calendar source and expand them
 /// into instances over a one-month window, exercising the RRULE-expansion
-/// binding (`e_cal_client_generate_instances_sync`) — the fix for #29.
+/// binding — the fix for #29 — plus the EXDATE recurrence-set modifier (the
+/// #29 follow-up): a second series cancels one occurrence via EXDATE, and the
+/// expansion must surface it as one fewer instance.
 fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
     let cals = registry.calendars();
     println!("\nfound {} calendar(s)", cals.len());
@@ -206,6 +211,23 @@ fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
         DTEND:20260601T093000Z\r\n\
         SUMMARY:Daily recurring probe\r\n\
         RRULE:FREQ=DAILY;COUNT=5\r\n\
+        END:VEVENT\r\n\
+        END:VCALENDAR\r\n";
+
+    // The EXDATE companion: the same 5-occurrence daily shape, but with Jun 3
+    // cancelled via EXDATE. Correct expansion drops that one occurrence ⇒ 4.
+    let ical_exdate = "\
+        BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//hytte-ecal-probe//\r\n\
+        BEGIN:VEVENT\r\n\
+        UID:hytte-ecal-exdate-1\r\n\
+        DTSTAMP:20260601T090000Z\r\n\
+        DTSTART:20260601T090000Z\r\n\
+        DTEND:20260601T093000Z\r\n\
+        SUMMARY:Daily recurring probe with a cancelled day\r\n\
+        RRULE:FREQ=DAILY;COUNT=5\r\n\
+        EXDATE:20260603T090000Z\r\n\
         END:VEVENT\r\n\
         END:VCALENDAR\r\n";
 
@@ -237,6 +259,10 @@ fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
     };
     println!("created recurring uid: {uid}");
 
+    // Seed the EXDATE series on the same (writable) calendar.
+    let exdate_uid = client.create_from_ical(ical_exdate)?;
+    println!("created exdate uid: {exdate_uid}");
+
     // Window: the whole of June 2026 (UTC). All 5 daily occurrences fall
     // inside it.
     let start_unix = 1_780_272_000; // 2026-06-01T00:00:00Z
@@ -254,7 +280,27 @@ fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
         );
     }
 
+    // The EXDATE series: Jun 1,2,4,5 — the cancelled Jun 3 (09:00Z) absent.
+    let cancelled_unix = 1_780_304_400 + 2 * 86_400; // 2026-06-03T09:00:00Z
+    let exdate_recurring: Vec<_> = instances
+        .iter()
+        .filter(|i| i.ical.contains("hytte-ecal-exdate-1"))
+        .collect();
+    println!("exdate instance count: {}", exdate_recurring.len());
+    let cancelled_present = exdate_recurring
+        .iter()
+        .any(|i| i.start_unix == cancelled_unix);
+    println!("exdate cancelled occurrence present: {cancelled_present}");
+    for inst in &exdate_recurring {
+        println!(
+            "  exdate instance start_unix={} end_unix={}",
+            inst.start_unix, inst.end_unix
+        );
+    }
+
     client.remove(&uid, None)?;
     println!("removed recurring {uid}");
+    client.remove(&exdate_uid, None)?;
+    println!("removed exdate {exdate_uid}");
     Ok(())
 }

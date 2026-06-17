@@ -23,10 +23,19 @@
 //!
 //! ## Refresh cadence
 //!
-//! [`POLL_INTERVAL`] (60 s) refreshes from the tokio runtime — same
-//! shape as the calendar service. Writes also enqueue an immediate
-//! refresh so subscribers see the result in seconds rather than
-//! minutes.
+//! Refreshes are **event-driven**: the worker opens a live
+//! [`hytte_ecal::CalClientView`] over each task list (`watch`) and EDS
+//! pushes `objects-added/modified/removed` notifications the moment *any*
+//! client — Endeavour, Evolution, a `CalDAV` sync — touches a task. The
+//! worker re-reads and updates the signal on each push, so external edits
+//! surface in ~instantly rather than on a poll boundary (issue #33).
+//!
+//! [`POLL_INTERVAL`] (5 min) remains only as a cheap safety net — a backend
+//! whose view stalls (transient D-Bus hiccup, a source added at runtime
+//! before its watch is wired) still reconciles within five minutes. It's
+//! deliberately long so the idle path stays quiet (no per-minute wakeups);
+//! the live view, not the poll, is what makes the list feel live. Writes
+//! also enqueue an immediate refresh.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -37,7 +46,7 @@ use std::time::Duration as StdDuration;
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
-use hytte_ecal::{CalClient, Registry, Source};
+use hytte_ecal::{CalClient, CalClientView, MainContext, Registry, Source, Waker};
 use hytte_reactive::{Service, registry};
 use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
@@ -83,7 +92,11 @@ pub struct TaskList {
     pub display_name: String,
 }
 
-const POLL_INTERVAL: StdDuration = StdDuration::from_mins(1);
+/// Safety-net reconciliation interval. The live [`hytte_ecal::CalClientView`]
+/// is the primary refresh path (see the module docs); this long poll only
+/// catches the rare case where a view never delivers (e.g. a source added at
+/// runtime before its watch is wired). Kept long so the idle path stays quiet.
+const POLL_INTERVAL: StdDuration = StdDuration::from_mins(5);
 
 // ── Worker channel ───────────────────────────────────────────────────────────
 
@@ -126,6 +139,11 @@ enum Op {
 /// nothing.
 static SENDER: OnceLock<mpsc::Sender<Op>> = OnceLock::new();
 
+/// Wakes the worker out of its blocking [`MainContext`] iteration once an op
+/// has been queued, so commands are picked up promptly instead of waiting for
+/// the next EDS push or poll tick. Set once the worker's context exists.
+static WAKER: OnceLock<Waker> = OnceLock::new();
+
 fn send_op(op: Op) {
     let Some(tx) = SENDER.get() else {
         tracing::warn!("tasks: worker not started; op dropped");
@@ -133,6 +151,13 @@ fn send_op(op: Op) {
     };
     if let Err(e) = tx.send(op) {
         tracing::warn!(error = %e, "tasks: worker channel closed");
+        return;
+    }
+    // Break the worker out of `MainContext::iterate(block=true)` so it drains
+    // the queue now rather than on the next push/poll. No-op until the worker
+    // has published its waker.
+    if let Some(w) = WAKER.get() {
+        w.wake();
     }
 }
 
@@ -280,6 +305,11 @@ struct Worker {
     registry: Registry,
     clients: HashMap<String, CalClient>,
     list_names: HashMap<String, String>,
+    /// Live push subscriptions, one per task list, keyed by source UID. Kept
+    /// alive here so EDS keeps delivering `objects-{added,modified,removed}`
+    /// for that list; opened lazily in [`Worker::ensure_watch`] right after the
+    /// list's [`CalClient`]. Dropping an entry stops its view.
+    views: HashMap<String, CalClientView>,
 }
 
 impl Worker {
@@ -309,6 +339,7 @@ impl Worker {
                         registry,
                         clients: HashMap::new(),
                         list_names,
+                        views: HashMap::new(),
                     });
                 }
                 Err(e) => {
@@ -320,6 +351,7 @@ impl Worker {
             registry,
             clients: HashMap::new(),
             list_names,
+            views: HashMap::new(),
         })
     }
 
@@ -336,6 +368,36 @@ impl Worker {
             .clients
             .get(list_uid)
             .expect("just inserted; lookup can't miss"))
+    }
+
+    /// Open a live [`CalClientView`] over `list_uid`'s client (once) so EDS
+    /// pushes change notifications for it. The view's callback enqueues an
+    /// `Op::Refresh` — coalesced by the channel + the content-diff in
+    /// [`Worker::refresh`] — so any external edit re-reads the list. Idempotent:
+    /// a list already watched is a no-op. Best-effort — a watch that fails to
+    /// open just leaves that list on the safety-net poll.
+    fn ensure_watch(&mut self, list_uid: &str) {
+        if self.views.contains_key(list_uid) {
+            return;
+        }
+        let client = match self.client(list_uid) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(list = %list_uid, error = %e, "tasks: watch client connect failed");
+                return;
+            }
+        };
+        // The callback runs on this worker thread (inside MainContext::iterate),
+        // so it just queues a refresh; the loop drains it on the next turn.
+        match client.watch("#t", || send_op(Op::Refresh)) {
+            Ok(view) => {
+                tracing::debug!(list = %list_uid, "tasks: live view watching");
+                self.views.insert(list_uid.to_string(), view);
+            }
+            Err(e) => {
+                tracing::warn!(list = %list_uid, error = %e, "tasks: get_view failed; poll only");
+            }
+        }
     }
 
     fn lookup_source(&self, list_uid: &str) -> anyhow::Result<Source> {
@@ -383,6 +445,9 @@ impl Worker {
                 uid: list_uid.clone(),
                 display_name: list_name.clone(),
             });
+            // Establish the live push subscription before reading (idempotent),
+            // so newly-appeared lists start delivering change notifications.
+            self.ensure_watch(&list_uid);
             let client = match self.client(&list_uid) {
                 Ok(c) => c,
                 Err(e) => {
@@ -474,6 +539,18 @@ fn run_worker(
     tasks_writer: &Mutable<Vec<Task>>,
     lists_writer: &Mutable<Vec<TaskList>>,
 ) {
+    // Create the worker thread's private GMainContext *before* anything opens a
+    // view: EDS attaches each `CalClientView`'s signal sources to whatever
+    // context is thread-default at `get_view` time, and iterating this context
+    // is what dispatches their callbacks (on this thread). Publish its waker so
+    // `send_op` can break the blocking iteration to deliver commands promptly.
+    let Some(ctx) = MainContext::new() else {
+        tracing::error!("tasks: GMainContext alloc failed; service inert");
+        for _ in rx {}
+        return;
+    };
+    let _ = WAKER.set(ctx.waker());
+
     let mut worker = match Worker::new() {
         Ok(w) => w,
         Err(e) => {
@@ -484,8 +561,23 @@ fn run_worker(
             return;
         }
     };
-    while let Ok(op) = rx.recv() {
-        handle(&mut worker, op, tasks_writer, lists_writer);
+
+    // Event loop. Each turn: drain every queued op (so a burst of commands or
+    // view-pushed refreshes coalesces), then block in one GMainContext
+    // iteration until EDS pushes a change notification or `send_op` wakes us.
+    // No polling, no busy spin — fully idle when nothing is happening.
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(op) => handle(&mut worker, op, tasks_writer, lists_writer),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        // Blocks until a view signal is ready or a wakeup fires. View callbacks
+        // run *inside* this call (on this thread) and queue `Op::Refresh`s,
+        // which the next `try_recv` drain above picks up.
+        ctx.iterate(true);
     }
 }
 

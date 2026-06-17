@@ -1,22 +1,140 @@
 //! End-to-end smoke test against whatever EDS sources this machine has
 //! configured. Run with `cargo run -p hytte-ecal --example probe`.
 //!
-//! Two halves:
+//! Three halves:
 //! - **Tasks:** list every task source, then create / query / remove one
 //!   VTODO on the first task source found.
+//! - **Tasks (live view push):** open a [`CalClient::watch`] over the first
+//!   task list, then — from a *separate* client connection, standing in for
+//!   Endeavour — create and modify a task, pumping the [`MainContext`] and
+//!   asserting EDS pushes the `objects-added`/`-modified` notifications to the
+//!   view (issue #33). Prints `live view push count: N`.
 //! - **Calendar (RRULE expansion):** list every calendar source, then on
 //!   the first one, create a `FREQ=DAILY;COUNT=5` VEVENT and expand it via
 //!   [`CalClient::generate_instances`] over a one-month window — verifying
 //!   the recurrence-expansion path (issue #29). Prints
 //!   `recurring instance count: N` so the nixosTest can assert it.
 
-use hytte_ecal::{CalClient, Registry, sys::ECalClientSourceType};
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use hytte_ecal::{CalClient, MainContext, Registry, sys::ECalClientSourceType};
 
 fn main() -> anyhow::Result<()> {
     let registry = Registry::new()?;
     probe_tasks(&registry)?;
+    probe_tasks_live_view(&registry)?;
     probe_calendar_recurrence(&registry)?;
     Ok(())
+}
+
+/// The push-refresh path (issue #33). Open a live view on the first task list,
+/// then mutate it from a second client connection — simulating an external app
+/// like Endeavour — and assert the view's callback fires for each change. This
+/// exercises the whole FFI chain end-to-end against a real EDS: `get_view_sync`
+/// → `view_start` → the GObject signal trampoline → the boxed Rust callback,
+/// pumped via a private [`MainContext`].
+fn probe_tasks_live_view(registry: &Registry) -> anyhow::Result<()> {
+    println!("\n-- live view push (#33) --");
+    let lists = registry.task_lists();
+    let Some(first) = lists.first() else {
+        eprintln!("no task lists configured — skipping live-view probe");
+        return Ok(());
+    };
+
+    // The worker-thread model: a private context, pushed thread-default, that
+    // the view's signals dispatch onto. Created before the view, as in the
+    // tasks service.
+    let ctx = MainContext::new().ok_or_else(|| anyhow::anyhow!("GMainContext alloc failed"))?;
+
+    // Client A holds the view. The callback just counts pushes (coalesced —
+    // exactly what the service does). `Rc<Cell>` is fine: the callback only
+    // ever runs on this thread, inside `ctx.iterate`.
+    let watcher = CalClient::connect(first, ECalClientSourceType::Tasks, 5)?;
+    let pushes = Rc::new(Cell::new(0_usize));
+    let pushes_cb = Rc::clone(&pushes);
+    let _view = watcher.watch("#t", move || pushes_cb.set(pushes_cb.get() + 1))?;
+    println!("watching '{}'", first.display_name());
+
+    // `view-start` replays current contents via one `objects-added`; drain it
+    // so the count below reflects only our subsequent writes.
+    pump_until(&ctx, Duration::from_secs(5), &|| pushes.get() >= 1);
+    let after_initial = pushes.get();
+    println!("initial population pushes: {after_initial}");
+
+    // Client B = the "external editor". A distinct connection, so EDS routes
+    // its writes back to A's view over the real notification path.
+    let editor = CalClient::connect(first, ECalClientSourceType::Tasks, 5)?;
+    let ical = "\
+        BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//hytte-ecal-probe//\r\n\
+        BEGIN:VTODO\r\n\
+        UID:hytte-ecal-live-1\r\n\
+        DTSTAMP:20260521T160000Z\r\n\
+        SUMMARY:Live push probe\r\n\
+        STATUS:NEEDS-ACTION\r\n\
+        END:VTODO\r\n\
+        END:VCALENDAR\r\n";
+    let uid = editor.create_from_ical(ical)?;
+    println!("editor created uid: {uid}");
+
+    let target = after_initial + 1;
+    let got_add = pump_until(&ctx, Duration::from_secs(10), &|| pushes.get() >= target);
+    println!("after external create, push count: {}", pushes.get());
+    if !got_add {
+        anyhow::bail!("view did not receive a push after external create");
+    }
+
+    // Now modify it (the exact #33 scenario: an external app un/checks a todo).
+    let modified = "\
+        BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//hytte-ecal-probe//\r\n\
+        BEGIN:VTODO\r\n\
+        UID:hytte-ecal-live-1\r\n\
+        DTSTAMP:20260521T160500Z\r\n\
+        LAST-MODIFIED:20260521T160500Z\r\n\
+        SUMMARY:Live push probe (edited externally)\r\n\
+        STATUS:COMPLETED\r\n\
+        PERCENT-COMPLETE:100\r\n\
+        END:VTODO\r\n\
+        END:VCALENDAR\r\n";
+    editor.modify_from_ical(modified)?;
+    println!("editor modified uid: {uid}");
+
+    let target = pushes.get() + 1;
+    let got_mod = pump_until(&ctx, Duration::from_secs(10), &|| pushes.get() >= target);
+    println!("live view push count: {}", pushes.get());
+    if !got_mod {
+        anyhow::bail!("view did not receive a push after external modify");
+    }
+
+    editor.remove(&uid, None)?;
+    // Drain the removal push too (best-effort — not asserted).
+    pump_until(&ctx, Duration::from_secs(3), &|| false);
+    println!("removed {uid}");
+    Ok(())
+}
+
+/// Pump `ctx` until `done()` is true or `budget` elapses; returns whether
+/// `done()` became true. Blocks per-iteration with a short safety timeout so a
+/// missing push can't hang the probe forever — we just rely on EDS waking the
+/// context when a notification arrives.
+fn pump_until(ctx: &MainContext, budget: Duration, done: &dyn Fn() -> bool) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        // A non-blocking iteration dispatches any ready signal; sleep briefly
+        // between turns so we don't spin while waiting on the D-Bus round-trip.
+        if !ctx.iterate(false) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    done()
 }
 
 /// The original task-list roundtrip (create → query → remove a VTODO).

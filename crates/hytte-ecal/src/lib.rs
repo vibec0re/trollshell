@@ -666,9 +666,244 @@ unsafe fn ical_time_is_date(tt: *mut sys::ICalTime) -> bool {
     !tt.is_null() && unsafe { sys::i_cal_time_is_date(tt.cast_const()) } != 0
 }
 
+impl CalClient {
+    /// Open a **live, push-based** [`CalClientView`] over this client for the
+    /// S-expression `sexp` (use `"#t"` for "every object"). `on_change` is
+    /// invoked — coalesced to a bare "something changed, re-read" ping —
+    /// whenever EDS reports objects added, modified, or removed (including the
+    /// one-shot initial population that `view-start` triggers). It replaces the
+    /// poll lag for issue #33: an external client (Endeavour, Evolution, …)
+    /// editing a task surfaces in trollshell as soon as the owning thread next
+    /// pumps its [`MainContext`].
+    ///
+    /// The returned [`CalClientView`] must be kept alive for notifications to
+    /// keep flowing; dropping it stops the view and disconnects the handlers.
+    /// Signals are delivered on the **thread-default `GMainContext` in effect
+    /// when this is called** — so call it on a thread that owns a
+    /// [`MainContext`] (pushed thread-default) and pump that context. `on_change`
+    /// therefore always runs on that same thread, never concurrently with it.
+    pub fn watch<F>(&self, sexp: &str, on_change: F) -> Result<CalClientView>
+    where
+        F: Fn() + 'static,
+    {
+        let sexp_c = CString::new(sexp).context("sexp contained an interior NUL")?;
+        let mut view: *mut sys::ECalClientView = ptr::null_mut();
+        let mut err: *mut sys::GError = ptr::null_mut();
+        let ok = unsafe {
+            sys::e_cal_client_get_view_sync(
+                self.raw,
+                sexp_c.as_ptr(),
+                &mut view,
+                ptr::null_mut(),
+                &mut err,
+            )
+        };
+        if ok == 0 || view.is_null() {
+            return Err(take_error(err).unwrap_or_else(|| anyhow!("get_view_sync failed")));
+        }
+
+        // The callback lives in a double-box so we can hand GLib a *thin*
+        // `*mut c_void` (the inner `Box<dyn Fn()>`) as each handler's
+        // user_data. We own this box on the Rust side and free it in Drop —
+        // strictly after the view is stopped + unref'd, so no in-flight
+        // trampoline can read a freed pointer. Hence the connections use a
+        // no-op destroy-notify; ownership is ours, not the closures'.
+        let boxed: Box<Box<dyn Fn()>> = Box::new(Box::new(on_change));
+        let user_data = (&raw const *boxed).cast::<c_void>().cast_mut();
+
+        // Connect all three change signals to one trampoline. We don't track
+        // the returned handler ids: teardown is `g_object_unref(view)` in
+        // `CalClientView::drop`, which disconnects every handler on the object
+        // automatically. A `0` id means a connect failed — log but continue,
+        // since a partial subscription still beats none (and the safety-net
+        // poll backstops anything missed).
+        for sig in [c"objects-added", c"objects-modified", c"objects-removed"] {
+            let id = unsafe {
+                sys::g_signal_connect_data(
+                    view,
+                    sig.as_ptr(),
+                    // The concrete trampoline has a fixed
+                    // `(view, GSList*, user_data)` C signature; GLib stores it
+                    // signature-erased as a `GCallback`, so transmute to that.
+                    std::mem::transmute::<
+                        unsafe extern "C" fn(*mut c_void, *mut sys::GSList, *mut c_void),
+                        sys::GCallback,
+                    >(view_changed_trampoline),
+                    user_data,
+                    no_op_closure_notify,
+                    0, // G_CONNECT_DEFAULT
+                )
+            };
+            debug_assert!(id != 0, "g_signal_connect_data returned 0 for {sig:?}");
+        }
+
+        // Begin notifications. `view-start` also replays the current contents
+        // via `objects-added`, so the first refresh fires promptly without an
+        // extra manual poll.
+        let mut start_err: *mut sys::GError = ptr::null_mut();
+        unsafe { sys::e_cal_client_view_start(view, &mut start_err) }
+        if let Some(e) = take_error(start_err) {
+            // Couldn't start — disconnect/free everything we just set up and
+            // surface the error rather than returning a dead view.
+            unsafe { sys::g_object_unref(view) }
+            drop(boxed);
+            return Err(e);
+        }
+
+        Ok(CalClientView {
+            raw: view,
+            _callback: boxed,
+        })
+    }
+}
+
 impl Drop for CalClient {
     fn drop(&mut self) {
         unsafe { sys::g_object_unref(self.raw) }
+    }
+}
+
+// ── ECalClientView ───────────────────────────────────────────────────────────
+
+/// A live push subscription to a [`CalClient`]'s objects (see
+/// [`CalClient::watch`]). Holds the EDS view plus the boxed Rust callback the
+/// signal handlers fire into. Notifications flow only while this is alive **and**
+/// the owning thread keeps pumping the [`MainContext`] the view was created
+/// under; dropping it stops the view, releases EDS's proxy, and finally frees
+/// the callback.
+pub struct CalClientView {
+    raw: *mut sys::ECalClientView,
+    // Kept alive (and dropped last, after the view is torn down) so the raw
+    // user_data pointer the handlers hold stays valid for their whole life.
+    _callback: Box<Box<dyn Fn()>>,
+}
+
+impl Drop for CalClientView {
+    fn drop(&mut self) {
+        // Stop first so EDS quits emitting, then unref. Both run on the view's
+        // owning thread (the only place a `CalClientView` lives), so no
+        // trampoline can be mid-flight against the callback we're about to
+        // free when `_callback` drops right after this.
+        let mut err: *mut sys::GError = ptr::null_mut();
+        unsafe { sys::e_cal_client_view_stop(self.raw, &mut err) }
+        if !err.is_null() {
+            unsafe { sys::g_error_free(err) }
+        }
+        unsafe { sys::g_object_unref(self.raw) }
+    }
+}
+
+/// The `objects-{added,modified,removed}` C handler. All three share this one
+/// trampoline: the *kind* of change doesn't matter to us (the service re-reads
+/// the whole list either way), so we coalesce to a bare ping. `user_data` is
+/// the inner `Box<dyn Fn()>` from [`CalClient::watch`].
+///
+/// # Safety
+///
+/// GLib calls this with `user_data` equal to the pointer we passed to
+/// `g_signal_connect_data` — a live `*const Box<dyn Fn()>` owned by the
+/// [`CalClientView`] that is, by construction, still alive (it's torn down
+/// strictly before that box is freed). `_view`/`_objects` are borrowed and not
+/// touched.
+unsafe extern "C" fn view_changed_trampoline(
+    _view: *mut c_void,
+    _objects: *mut sys::GSList,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let cb = unsafe { &*user_data.cast::<Box<dyn Fn()>>() };
+    cb();
+}
+
+/// No-op `GClosureNotify`: the boxed callback's lifetime is owned by the
+/// [`CalClientView`], not by GLib's closures, so there is nothing to free when
+/// a closure finalises.
+///
+/// # Safety
+///
+/// Trivially safe — the body never dereferences either argument.
+unsafe extern "C" fn no_op_closure_notify(_data: *mut c_void, _closure: *mut sys::GClosure) {}
+
+// ── MainContext ──────────────────────────────────────────────────────────────
+
+/// A private GLib [`GMainContext`], pushed thread-default on construction so
+/// EDS views created on this thread deliver their signals here (not to the
+/// global default context, which trollshell's GTK thread owns). Iterate it with
+/// [`MainContext::iterate`] to dispatch pending view signals.
+///
+/// **Thread-bound:** create and iterate it on one thread only (it pushes itself
+/// thread-default for *that* thread). [`MainContext::waker`] hands out a
+/// `Send`-able handle for waking the iteration from elsewhere.
+pub struct MainContext {
+    raw: *mut sys::GMainContext,
+}
+
+impl MainContext {
+    /// Create a fresh private context and push it thread-default for the
+    /// calling thread. Returns `None` if GLib couldn't allocate one.
+    #[must_use]
+    pub fn new() -> Option<Self> {
+        let raw = unsafe { sys::g_main_context_new() };
+        if raw.is_null() {
+            return None;
+        }
+        unsafe { sys::g_main_context_push_thread_default(raw) }
+        Some(Self { raw })
+    }
+
+    /// Run one iteration. With `block` true, sleeps until a source is ready
+    /// (a view signal arrived) or a [`Waker::wake`] fires — fully event-driven,
+    /// no busy spin. Returns true if a source was dispatched.
+    pub fn iterate(&self, block: bool) -> bool {
+        unsafe { sys::g_main_context_iteration(self.raw, sys::GBoolean::from(block)) != 0 }
+    }
+
+    /// A `Send`-able handle that can [`Waker::wake`] this context's blocking
+    /// iteration from another thread (the only cross-thread `GMainContext`
+    /// operation GLib sanctions). Holds its own ref, so it stays valid even if
+    /// the `MainContext` is dropped first.
+    #[must_use]
+    pub fn waker(&self) -> Waker {
+        let raw = unsafe { sys::g_main_context_ref(self.raw) };
+        Waker { raw }
+    }
+}
+
+impl Drop for MainContext {
+    fn drop(&mut self) {
+        unsafe { sys::g_main_context_pop_thread_default(self.raw) }
+        unsafe { sys::g_main_context_unref(self.raw) }
+    }
+}
+
+/// A `Send + Sync` handle for waking a [`MainContext`]'s blocking iteration
+/// from another thread. Every wrapped call (`wakeup`/`ref`/`unref`) is on
+/// GLib's documented thread-safe `GMainContext` surface, so sharing this across
+/// threads is sound.
+pub struct Waker {
+    raw: *mut sys::GMainContext,
+}
+
+// SAFETY: `g_main_context_wakeup`/`_ref`/`_unref` are explicitly thread-safe in
+// GLib; this handle only ever calls those. It never touches the
+// thread-default-stack or iterates, so it carries no thread affinity.
+unsafe impl Send for Waker {}
+// SAFETY: as above — all operations are thread-safe and take `&self`.
+unsafe impl Sync for Waker {}
+
+impl Waker {
+    /// Break a [`MainContext::iterate(true)`] out of its block so the owning
+    /// thread loops promptly (e.g. to pick up a newly-queued command).
+    pub fn wake(&self) {
+        unsafe { sys::g_main_context_wakeup(self.raw) }
+    }
+}
+
+impl Drop for Waker {
+    fn drop(&mut self) {
+        unsafe { sys::g_main_context_unref(self.raw) }
     }
 }
 
@@ -898,5 +1133,49 @@ mod tests {
         let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
         assert_eq!(inst.len(), 3);
         assert!(inst.iter().all(|e| e.all_day));
+    }
+
+    // ── MainContext + Waker (issue #33) ───────────────────────────────────
+    //
+    // The push-refresh path's loop machinery — a private GMainContext the
+    // worker iterates, woken cross-thread. These are hermetic: pure GLib, no
+    // EDS backend. The view + signal trampoline themselves need a live EDS
+    // session, so those are exercised by the nixosTest (checks.eds-nixos-test).
+
+    #[test]
+    fn main_context_non_blocking_iteration_returns() {
+        // A fresh context has no ready sources, so a non-blocking iteration
+        // must return promptly (false = nothing dispatched) and not hang.
+        let ctx = super::MainContext::new().expect("alloc GMainContext");
+        assert!(!ctx.iterate(false), "empty context dispatched nothing");
+    }
+
+    #[test]
+    fn waker_unblocks_a_blocking_iteration() {
+        use std::time::{Duration, Instant};
+
+        // Prove the event-driven contract: `iterate(true)` on a context with
+        // no ready sources blocks until a waker fires from another thread —
+        // exactly how `send_op` nudges the EDS worker out of its block.
+        // The context is created and iterated on this one thread (so its
+        // thread-default push/pop stay balanced here); only the waker — which
+        // is `Send` by design — crosses to the helper thread.
+        let ctx = super::MainContext::new().expect("alloc GMainContext");
+        let waker = ctx.waker();
+
+        // Wake after a short delay; until then `iterate(true)` must stay
+        // blocked. The delay is the lower bound we assert the block lasted.
+        let _firer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            waker.wake();
+        });
+
+        let start = Instant::now();
+        ctx.iterate(true); // blocks until the wake above
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "iteration returned in {elapsed:?} — it didn't actually block on the waker"
+        );
     }
 }

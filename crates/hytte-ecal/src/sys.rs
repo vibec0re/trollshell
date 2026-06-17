@@ -6,7 +6,7 @@
 //! aliases use opaque `c_void` for GObject pointers — we don't need
 //! field access, only pointer identity + the methods listed here.
 
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 
 /// `time_t` — POSIX calendar seconds since the Unix epoch. On every target
 /// we build for (Linux x86_64/aarch64, glibc/musl) this is a signed 64-bit
@@ -17,6 +17,24 @@ pub type TimeT = i64;
 /// `gboolean` — GLib's C-int boolean (`0` = FALSE, non-zero = TRUE). Used
 /// for the recurrence callback's return value.
 pub type GBoolean = c_int;
+
+/// `gulong` — the handler id [`g_signal_connect_data`] returns. GLib defines
+/// `gulong` as the C `unsigned long`; on every target we build for (LP64
+/// Linux) that is 64-bit, modelled here as [`c_ulong`].
+pub type GULong = c_ulong;
+
+/// `GCallback` — the generic, signature-erased function pointer GLib's signal
+/// machinery stores. [`g_signal_connect_data`] takes a `GCallback`; the real
+/// per-signal trampoline is cast to this at the call site. Modelled as an
+/// `extern "C"` fn so transmuting a concrete trampoline into it is sound.
+pub type GCallback = unsafe extern "C" fn();
+
+/// `GClosureNotify` — invoked by GLib when the closure backing a connected
+/// handler is finalised (i.e. once the handler is disconnected / the emitting
+/// object is destroyed). We use it to drop the boxed Rust callback that backed
+/// the trampoline's `user_data`, so the closure owns its callback for exactly
+/// its lifetime. `closure` is opaque to us.
+pub type GClosureNotify = unsafe extern "C" fn(data: *mut c_void, closure: *mut GClosure);
 
 // ── Opaque GObject types ─────────────────────────────────────────────────────
 
@@ -59,6 +77,21 @@ pub type ICalRecurrence = c_void;
 /// `ICalRecurIterator *` — libical's core recurrence iterator. Created via
 /// [`i_cal_recur_iterator_new`]; freed with [`i_cal_recur_iterator_free`].
 pub type ICalRecurIterator = c_void;
+
+/// `ECalClientView *` — a live, push-based query result. Created via
+/// [`e_cal_client_get_view_sync`]; emits the `objects-added` /
+/// `objects-modified` / `objects-removed` GObject signals as the backend
+/// changes. Release with [`g_object_unref`].
+pub type ECalClientView = c_void;
+
+/// `GMainContext *` — a GLib event-loop context. We create a private one per
+/// EDS worker thread, push it thread-default, and iterate it so the view's
+/// signals dispatch on that thread. Released with [`g_main_context_unref`].
+pub type GMainContext = c_void;
+
+/// `GClosure *` — opaque; only ever received (never read) by a
+/// [`GClosureNotify`] callback. We never touch its fields.
+pub type GClosure = c_void;
 
 /// `ICAL_RRULE_PROPERTY` — the `ICalPropertyKind` discriminant for an RRULE
 /// property (value 73 in `icalderivedproperty.h`). Passed to
@@ -206,6 +239,32 @@ unsafe extern "C" {
         cancellable: *mut GCancellable,
         error: *mut *mut GError,
     ) -> c_int;
+
+    /// Synchronously create a live [`ECalClientView`] for the S-expression
+    /// `sexp` (e.g. `"#t"` for "everything"). The view is created in the
+    /// stopped state; call [`e_cal_client_view_start`] to begin receiving the
+    /// `objects-added`/`-modified`/`-removed` signals. The signals are
+    /// delivered on the thread-default [`GMainContext`] in effect *at the time
+    /// of this call*, so we push a private context thread-default first. On
+    /// success the out-param holds a new ref (release with [`g_object_unref`]).
+    pub fn e_cal_client_get_view_sync(
+        client: *mut ECalClient,
+        sexp: *const c_char,
+        out_view: *mut *mut ECalClientView,
+        cancellable: *mut GCancellable,
+        error: *mut *mut GError,
+    ) -> c_int;
+
+    /// Start delivering change notifications on a view returned (stopped) by
+    /// [`e_cal_client_get_view_sync`]. Also triggers the initial population:
+    /// `objects-added` fires once with every object currently matching the
+    /// query.
+    pub fn e_cal_client_view_start(view: *mut ECalClientView, error: *mut *mut GError);
+
+    /// Stop delivering notifications on a view. Best-effort on teardown — we
+    /// call it before unref'ing the view so EDS drops its D-Bus-side proxy
+    /// promptly.
+    pub fn e_cal_client_view_stop(view: *mut ECalClientView, error: *mut *mut GError);
 }
 
 // ── libical-glib: ICalComponent + parser ─────────────────────────────────────
@@ -335,6 +394,23 @@ unsafe extern "C" {
 #[link(name = "gobject-2.0")]
 unsafe extern "C" {
     pub fn g_object_unref(obj: *mut c_void);
+
+    /// `g_signal_connect_data` — connect `c_handler` to the named signal on
+    /// `instance`, threading `data` (our boxed Rust callback) through to every
+    /// invocation and to `destroy_data` (called once, when the closure is
+    /// finalised, so we can free `data`). Returns the handler id (a
+    /// [`GULong`]); `0` means the connection failed. `connect_flags` of `0`
+    /// (`G_CONNECT_DEFAULT`) is the "call before the default handler, no swap"
+    /// behaviour we want. The real per-signal handler is cast to the
+    /// signature-erased [`GCallback`] at the call site.
+    pub fn g_signal_connect_data(
+        instance: *mut c_void,
+        detailed_signal: *const c_char,
+        c_handler: GCallback,
+        data: *mut c_void,
+        destroy_data: GClosureNotify,
+        connect_flags: c_uint,
+    ) -> GULong;
 }
 
 #[link(name = "glib-2.0")]
@@ -347,6 +423,36 @@ unsafe extern "C" {
     // bound. `g_list_next`/`g_slist_next` are C macros, not symbols.
     pub fn g_list_free_full(list: *mut GList, free_func: unsafe extern "C" fn(*mut c_void));
     pub fn g_slist_free_full(list: *mut GSList, free_func: unsafe extern "C" fn(*mut c_void));
+
+    /// Create a fresh, private [`GMainContext`]. Owned — release with
+    /// [`g_main_context_unref`].
+    pub fn g_main_context_new() -> *mut GMainContext;
+
+    /// Take an additional ref on a [`GMainContext`]. Thread-safe — used by the
+    /// `Send`-able waker so it can outlive the owning `MainContext`.
+    pub fn g_main_context_ref(context: *mut GMainContext) -> *mut GMainContext;
+
+    /// Drop a ref taken via [`g_main_context_new`] / [`g_main_context_ref`].
+    pub fn g_main_context_unref(context: *mut GMainContext);
+
+    /// Make `context` the thread-default for the calling thread, so GObject
+    /// signal sources (like the EDS view's) attach to it rather than the
+    /// global default. Balanced by [`g_main_context_pop_thread_default`].
+    pub fn g_main_context_push_thread_default(context: *mut GMainContext);
+
+    /// Undo a [`g_main_context_push_thread_default`].
+    pub fn g_main_context_pop_thread_default(context: *mut GMainContext);
+
+    /// Run a single iteration of `context`. With `may_block` non-zero this
+    /// blocks until a source is ready (a view signal arrives) or
+    /// [`g_main_context_wakeup`] is called from another thread. Returns
+    /// non-zero if any source was dispatched.
+    pub fn g_main_context_iteration(context: *mut GMainContext, may_block: GBoolean) -> GBoolean;
+
+    /// Wake a [`g_main_context_iteration`] that is blocking on `context`.
+    /// Thread-safe — this is the one GMainContext call we make from *other*
+    /// threads (the public API senders) to break the worker out of its block.
+    pub fn g_main_context_wakeup(context: *mut GMainContext);
 }
 
 #[link(name = "ecal-2.0")]

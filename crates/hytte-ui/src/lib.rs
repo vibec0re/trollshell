@@ -2,6 +2,7 @@
 
 mod app;
 mod bar;
+pub(crate) mod cast;
 mod error;
 mod layer_window;
 mod monitor;

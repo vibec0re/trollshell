@@ -173,8 +173,7 @@ fn read_monitors() -> Vec<Monitor> {
         return Vec::new();
     };
     let model = display.monitors();
-    #[allow(clippy::cast_possible_wrap)]
-    let mut out = Vec::with_capacity(model.n_items() as usize);
+    let mut out = Vec::with_capacity(crate::cast::u32_to_usize(model.n_items()));
     for i in 0..model.n_items() {
         if let Some(obj) = model.item(i)
             && let Ok(monitor) = obj.downcast::<gdk::Monitor>()

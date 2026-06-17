@@ -13,6 +13,13 @@ tracing = "0.1.44"
 [build-dependencies]
 pkg-config = "0.3"
 
+[features]
+# Opt-in tests that spawn a real, ephemeral evolution-data-server (a private
+# dbus-daemon + isolated XDG dirs + the EDS registry/calendar factories from
+# the nix store). Mirrors hytte-bus's `system-tests`. Run in the devShell:
+#   cargo test -p hytte-ecal --features system-tests -- --test-threads=1
+system-tests = []
+
 [dev-dependencies]
 tempfile = "3"
 

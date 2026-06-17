@@ -6,6 +6,7 @@ pub mod bluetooth;
 pub mod bluetooth_audio;
 pub mod brightness;
 pub mod calendar;
+mod cast;
 pub mod clipboard;
 pub mod clock;
 pub mod departures;

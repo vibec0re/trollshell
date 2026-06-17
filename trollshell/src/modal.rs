@@ -199,7 +199,7 @@ impl Page {
     }
 
     /// Pages whose content is backed by the `app_usage` service (the
-    /// most-expensive-apps top-N CPU/RAM lists). Used to gate app_usage's
+    /// most-expensive-apps top-N CPU/RAM lists). Used to gate `app_usage`'s
     /// always-on `/proc` poller on whether one of these is actually visible
     /// (#50, item 5 of #42): only the Stats panel reads those lists.
     fn uses_app_usage(self) -> bool {

@@ -189,6 +189,15 @@ pub enum Page {
 }
 
 impl Page {
+    /// Pages whose content is backed by the `netconn` service (the active-
+    /// connections list / counters). Used to gate netconn's always-on `ss`
+    /// poller on whether one of these is actually visible (#50): the
+    /// Connections drill-down page and the Network panel (which shows a
+    /// netconn-derived "N sockets" subtitle + live group).
+    fn uses_netconn(self) -> bool {
+        matches!(self, Self::Connections | Self::Network)
+    }
+
     fn stack_name(self) -> &'static str {
         match self {
             Self::Media => "media",
@@ -245,6 +254,39 @@ thread_local! {
     /// so subscribers (OSD, bar CSS) can wire up before `install` runs and
     /// survive bar rebuilds on hot-plug.
     static DRAWER_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
+    /// `true` while a [`Page::uses_netconn`] page is the visible drawer page on
+    /// *any* monitor. Drives [`netconn_visible_signal`] so the netconn `ss`
+    /// poller can park while no one's looking (#50). Global (not per-monitor)
+    /// because the netconn service is global; recomputed by
+    /// [`recompute_netconn_visible`] on every page show/swap/retract.
+    static NETCONN_VISIBLE: Mutable<bool> = Mutable::new(false);
+}
+
+/// Recompute [`NETCONN_VISIBLE`] from the live panel set: `true` iff some
+/// monitor's drawer is currently showing a [`Page::uses_netconn`] page. Called
+/// after every transition that changes a panel's `current` page (open, in-place
+/// page swap, deep-link switch, retract-finish). `Mutable::set` is a no-op-free
+/// notify so we recompute unconditionally and let it dedupe.
+fn recompute_netconn_visible() {
+    let visible = PANELS.with(|panels| {
+        panels
+            .borrow()
+            .values()
+            .any(|p| p.current.borrow().is_some_and(Page::uses_netconn))
+    });
+    NETCONN_VISIBLE.with(|m| {
+        if m.get() != visible {
+            m.set(visible);
+        }
+    });
+}
+
+/// Signal that emits `true` while a netconn-backed drawer page
+/// ([`Page::uses_netconn`]: Connections / Network) is visible on any monitor.
+/// Wired in `main.rs` to `netconn::set_active` so the always-on `ss` poller
+/// parks when those panels are hidden (#50).
+pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
+    NETCONN_VISIBLE.with(|m| m.signal())
 }
 
 fn drawer_open_state(key: &str) -> Mutable<bool> {
@@ -570,6 +612,7 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
         });
+        recompute_netconn_visible();
     });
 }
 
@@ -581,6 +624,8 @@ pub fn close_all() {
             panel.window.close();
         }
     });
+    // No panels left → no netconn page visible; park the poller.
+    recompute_netconn_visible();
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -604,6 +649,7 @@ pub fn switch_active(target: Page) {
             }
         }
     });
+    recompute_netconn_visible();
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content
@@ -639,6 +685,7 @@ pub fn open(monitor: &Monitor, page: Page) {
         *panel.pending_center.borrow_mut() = None;
         show_panel(panel, page, 0);
     });
+    recompute_netconn_visible();
 }
 
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer
@@ -679,6 +726,9 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
             }
         }
     });
+    // Swap/open may have changed which page is visible; the same-page retract
+    // branch is recomputed later by `wire_retract_finish`. Idempotent.
+    recompute_netconn_visible();
 }
 
 /// Present the drawer on `page` at `main_margin` pixels from the bar's

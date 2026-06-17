@@ -9,7 +9,7 @@
 //! Failures (`ss` missing, parse error) log once and the signal stays
 //! at its last known value.
 
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -148,12 +148,22 @@ pub(crate) fn parse_ss_output(output: &str) -> Vec<Connection> {
 #[doc(hidden)]
 pub struct NetconnHandles {
     pub(crate) connections: Mutable<Vec<Connection>>,
+    /// Gate for the `ss` poller. While `false`, the poll loop parks and forks
+    /// nothing; flipping it back to `true` resumes sampling immediately (the
+    /// loop `select!`s on this so reactivation isn't delayed a full tick).
+    ///
+    /// Defaults to `true` so the first sample is taken eagerly at startup —
+    /// the list is then already populated the instant the drawer opens, and
+    /// `set_active(false)` parks it once the binary reports the relevant
+    /// panels are hidden. See `set_active`.
+    pub(crate) active: Mutable<bool>,
 }
 
 impl Default for NetconnHandles {
     fn default() -> Self {
         Self {
             connections: Mutable::new(Vec::new()),
+            active: Mutable::new(true),
         }
     }
 }
@@ -166,15 +176,24 @@ impl Service for NetconnService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NetconnHandles::default();
         let writer = handles.connections.clone();
+        let active = handles.active.clone();
         rt.spawn(async move {
-            poll_loop(writer).await;
+            poll_loop(writer, active).await;
         });
         handles
     }
 }
 
-async fn poll_loop(writer: Mutable<Vec<Connection>>) {
+async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
     loop {
+        // Park (forking nothing) while gated inactive. `wait_for(true)` resolves
+        // as soon as `set_active(true)` lands — `Mutable::signal()` replays the
+        // current value on first poll, so if we've already been reactivated by
+        // the time we get here it returns immediately, with no lost wakeup.
+        // Reactivation is thus instant rather than waiting out a sleep tick.
+        if !active.get() {
+            let _ = active.signal().wait_for(true).await;
+        }
         if let Some(out) = run_ss().await {
             let next = parse_ss_output(&out);
             // Avoid no-op re-emissions: the signal would still emit because
@@ -183,7 +202,13 @@ async fn poll_loop(writer: Mutable<Vec<Connection>>) {
                 writer.set(next);
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Sleep the inter-sample interval, but bail out early if we get gated
+        // inactive mid-wait — no point holding the timer when parked. The
+        // top-of-loop park then handles the resume edge.
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = active.signal().wait_for(false) => {}
+        }
     }
 }
 
@@ -216,6 +241,25 @@ pub fn connections() -> impl Signal<Item = Vec<Connection>> {
             .connections
             .signal_cloned()
     })
+}
+
+/// Gate the `ss` poller: `true` resumes 2 s sampling (immediately taking a
+/// fresh sample), `false` parks it so it forks nothing while the
+/// Connections/Network drawer panels are hidden.
+///
+/// Fire-and-forget command: the binary wires the drawer-visibility signal to
+/// this so the always-on poller idles when no one's looking (#50). A no-op
+/// `set` to the same value is skipped to avoid spurious loop wakeups.
+pub fn set_active(active: bool) {
+    registry::with(|r| {
+        let handle = &r
+            .get::<NetconnHandles>()
+            .expect("netconn::service() not registered")
+            .active;
+        if handle.get() != active {
+            handle.set(active);
+        }
+    });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

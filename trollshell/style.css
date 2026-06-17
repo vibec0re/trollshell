@@ -1007,6 +1007,34 @@
     margin-right: 4px;
 }
 
+/* Bold task title on the header line. */
+.ts-task-title {
+    font-weight: 700;
+}
+
+/* Small muted due-date chip on the header line, before the badge. */
+.ts-task-due {
+    font-size: 0.78em;
+    opacity: 0.55;
+    margin-right: 2px;
+}
+
+/* Source / list-name badge pill — top-right of the header line. */
+.ts-task-badge {
+    font-size: 0.72em;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 9999px;
+    background: alpha(currentColor, 0.12);
+    opacity: 0.75;
+}
+
+/* Second-line note / description — muted, smaller, single line. */
+.ts-task-note {
+    font-size: 0.82em;
+    opacity: 0.55;
+}
+
 /* The "+" popover and edit popover share this. */
 .ts-task-popover contents {
     background: #1b1b2a;

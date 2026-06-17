@@ -50,7 +50,7 @@ fn build_block(monitor: &Monitor) -> gtk::Box {
     group.add_css_class("ts-sidebar-tasks-list");
     column.append(&group);
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let rows_track: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     let overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     wire_tasks_bind(
@@ -104,7 +104,7 @@ fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>, monitor: &Monitor) -> 
 
 fn wire_tasks_bind(
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    rows_track: &Rc<RefCell<Vec<gtk::ListBoxRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     monitor: &Monitor,
@@ -127,7 +127,7 @@ fn wire_tasks_bind(
 
 fn rebuild_list(
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    rows_track: &Rc<RefCell<Vec<gtk::ListBoxRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     ts: &[Task],
@@ -155,7 +155,7 @@ fn rebuild_list(
     }
 
     let visible = ts.len().min(MAX_VISIBLE_TASKS);
-    let mut new_rows: Vec<adw::ActionRow> = Vec::with_capacity(visible);
+    let mut new_rows: Vec<gtk::ListBoxRow> = Vec::with_capacity(visible);
     for t in ts.iter().take(visible) {
         let row = build_task_row(t, monitor);
         group.add(&row);
@@ -178,52 +178,102 @@ fn rebuild_list(
 
 // ── One row ──────────────────────────────────────────────────────────────────
 
-fn build_task_row(task: &Task, monitor: &Monitor) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(&task.summary).as_str())
-        .activatable(true)
-        .build();
+/// Build a custom two-line task row as a plain `gtk::ListBoxRow`.
+///
+/// Layout:
+/// ```text
+/// ┌─────────────────────────────────────────────────────┐
+/// │ [✓] Bold title            [due chip]  [list badge]  │
+/// │     Note / description line (ellipsized, muted)     │
+/// └─────────────────────────────────────────────────────┘
+/// ```
+///
+/// The row is `activatable`; clicking its body (anywhere except the
+/// checkbox) opens the edit popover. The checkbox fires `set_completed`
+/// directly.
+fn build_task_row(task: &Task, monitor: &Monitor) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
     row.add_css_class("ts-task-row");
-    let subtitle = subtitle_text(task);
-    if !subtitle.is_empty() {
-        row.set_subtitle(&glib::markup_escape_text(&subtitle));
-    }
+    row.set_activatable(true);
 
-    // Checkbox prefix — wired to set_completed. NeedsAction + InProcess
-    // both render unchecked (those are the only states the service
-    // surfaces; Completed/Cancelled never reach the widget).
+    // Outer padding box — gives the row the same inset as adw::ActionRow.
+    let outer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    outer.set_margin_top(8);
+    outer.set_margin_bottom(8);
+    outer.set_margin_start(12);
+    outer.set_margin_end(12);
+    outer.set_valign(gtk::Align::Center);
+
+    // Checkbox — wired to set_completed. NeedsAction + InProcess both
+    // render unchecked (those are the only states the service surfaces).
     let check = gtk::CheckButton::new();
     check.set_valign(gtk::Align::Center);
     check.set_active(false);
-    let list_uid = task.list_uid.clone();
-    let uid = task.uid.clone();
+    let list_uid_cb = task.list_uid.clone();
+    let uid_cb = task.uid.clone();
     check.connect_toggled(move |c| {
-        tasks::set_completed(&list_uid, &uid, c.is_active());
+        tasks::set_completed(&list_uid_cb, &uid_cb, c.is_active());
     });
-    row.add_prefix(&check);
+    outer.append(&check);
 
-    // Tap-to-edit on the row body. AdwActionRow's own `activated`
-    // signal fires when the body (not the checkbox) is clicked.
+    // Content: vertical box holding header line + optional note line.
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    content.set_hexpand(true);
+    content.set_valign(gtk::Align::Center);
+
+    // ── Header line: bold title | spacer | optional due chip | list badge ──
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    header.set_hexpand(true);
+
+    let title_lbl = gtk::Label::new(Some(&task.summary));
+    title_lbl.add_css_class("ts-task-title");
+    title_lbl.set_halign(gtk::Align::Start);
+    title_lbl.set_hexpand(true);
+    title_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title_lbl.set_xalign(0.0);
+    header.append(&title_lbl);
+
+    // Optional due chip — small muted label before the badge.
+    let due_text = tasks::format_due(task);
+    if !due_text.is_empty() {
+        let due_lbl = gtk::Label::new(Some(&due_text));
+        due_lbl.add_css_class("ts-task-due");
+        due_lbl.set_halign(gtk::Align::End);
+        due_lbl.set_valign(gtk::Align::Center);
+        header.append(&due_lbl);
+    }
+
+    // List-name badge pill — top-right, identifies which task list.
+    let badge = gtk::Label::new(Some(&task.list_name));
+    badge.add_css_class("ts-task-badge");
+    badge.set_halign(gtk::Align::End);
+    badge.set_valign(gtk::Align::Center);
+    header.append(&badge);
+
+    content.append(&header);
+
+    // ── Note line — hidden when description is None/empty ──────────────
+    if let Some(ref desc) = task.description {
+        let note_lbl = gtk::Label::new(Some(desc));
+        note_lbl.add_css_class("ts-task-note");
+        note_lbl.set_halign(gtk::Align::Start);
+        note_lbl.set_xalign(0.0);
+        note_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        note_lbl.set_wrap(false);
+        content.append(&note_lbl);
+    }
+
+    outer.append(&content);
+    row.set_child(Some(&outer));
+
+    // Tap-to-edit: `row-activated` fires when the body (not checkbox) is clicked.
     let task_for_edit = task.clone();
     let monitor_for_edit = monitor.clone();
-    row.connect_activated(move |r| {
-        open_edit_popover(r, &task_for_edit, &monitor_for_edit);
+    row.connect_activate(move |r| {
+        open_edit_popover(r.upcast_ref(), &task_for_edit, &monitor_for_edit);
     });
 
     row
-}
-
-/// Subtitle: due label, followed by `· <list name>` so the user can
-/// see at a glance which backend the task lives on (helpful when
-/// multiple accounts are configured). Skipped entirely when the task
-/// has no due AND there's only one list to show.
-fn subtitle_text(task: &Task) -> String {
-    let due = tasks::format_due(task);
-    if due.is_empty() {
-        task.list_name.clone()
-    } else {
-        format!("{due} \u{00b7} {}", task.list_name)
-    }
 }
 
 // ── Create popover (add button) ──────────────────────────────────────────────
@@ -359,7 +409,7 @@ fn sync_list_picker(picker: &gtk::DropDown, lists: &[TaskList]) {
 
 // ── Edit popover (row body click) ────────────────────────────────────────────
 
-fn open_edit_popover(parent: &adw::ActionRow, task: &Task, monitor: &Monitor) {
+fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
     let popover = gtk::Popover::new();
     popover.add_css_class("ts-task-popover");
     popover.set_parent(parent);

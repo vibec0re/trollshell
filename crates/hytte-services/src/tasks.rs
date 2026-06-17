@@ -62,6 +62,8 @@ pub struct Task {
     pub uid: String,
     /// SUMMARY field, trimmed. Empty SUMMARYs become `"(no title)"`.
     pub summary: String,
+    /// DESCRIPTION field, trimmed. `None` when absent or whitespace-only.
+    pub description: Option<String>,
     /// Local-time due, if DUE was present on the VTODO.
     pub due: Option<DateTime<Local>>,
     /// True when DUE was a DATE (no time-of-day).
@@ -688,10 +690,15 @@ fn parse_one(body: &str, list_uid: &str, list_name: &str) -> Option<Task> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "(no title)".to_string());
+    let description = todo
+        .property_value("DESCRIPTION")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     Some(Task {
         uid,
         summary,
+        description,
         due,
         due_all_day,
         status,
@@ -889,6 +896,7 @@ mod tests {
         Task {
             uid: "u".into(),
             summary: "s".into(),
+            description: None,
             due,
             due_all_day: false,
             status: TaskStatus::NeedsAction,
@@ -935,6 +943,33 @@ mod tests {
                     BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Hidden\r\nPERCENT-COMPLETE:100\r\nEND:VTODO\r\n\
                     END:VCALENDAR\r\n";
         assert!(parse_one(body, "l", "L").is_none());
+    }
+
+    #[test]
+    fn parse_description_present() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Task\r\nDESCRIPTION:Some note\r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        let t = parse_one(body, "l", "L").unwrap();
+        assert_eq!(t.description, Some("Some note".to_string()));
+    }
+
+    #[test]
+    fn parse_description_absent_is_none() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Task\r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        let t = parse_one(body, "l", "L").unwrap();
+        assert_eq!(t.description, None);
+    }
+
+    #[test]
+    fn parse_description_whitespace_only_is_none() {
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//\r\n\
+                    BEGIN:VTODO\r\nUID:a\r\nSUMMARY:Task\r\nDESCRIPTION:   \r\nEND:VTODO\r\n\
+                    END:VCALENDAR\r\n";
+        let t = parse_one(body, "l", "L").unwrap();
+        assert_eq!(t.description, None);
     }
 
     #[test]

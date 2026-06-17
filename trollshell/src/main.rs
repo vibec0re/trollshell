@@ -110,6 +110,19 @@ fn main() -> hytte::ui::Result<()> {
             // bluetooth + pipewire signals out of the registry.
             bluetooth_audio::init();
 
+            // Gate netconn's always-on `ss -tunpH` poller on drawer
+            // visibility (#50): it only feeds the Connections/Network drawer
+            // pages, so park it whenever none of those is on-screen. The modal
+            // signal is global (true iff a netconn-backed page is visible on
+            // *any* monitor) and survives bar rebuilds, so a single
+            // subscription on the main loop suffices — no per-monitor wiring.
+            glib::MainContext::default().spawn_local(modal::netconn_visible_signal().for_each(
+                |visible| {
+                    netconn::set_active(visible);
+                    std::future::ready(())
+                },
+            ));
+
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             if let Some(primary) = app.monitors().first() {
                 overlays::prompt::install(primary);

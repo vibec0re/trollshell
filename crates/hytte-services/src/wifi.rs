@@ -1025,17 +1025,12 @@ fn apply_station_props_delta(
     for (key, value) in changed {
         match key.as_str() {
             "State" => {
-                if let Ok(s) = String::try_from(value.try_clone().unwrap_or_else(|_| {
-                    OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
-                })) {
-                    st.state = parse_state(&s);
-                } else if let Ok(s) =
-                    zbus::zvariant::Str::try_from(value.try_clone().unwrap_or_else(|_| {
-                        OwnedValue::try_from(zbus::zvariant::Value::from("")).unwrap()
-                    }))
-                {
-                    st.state = parse_state(s.as_str());
-                }
+                // `prop_str` handles both `String` and `zvariant::Str`
+                // variants gracefully via `try_clone().ok()`, so a
+                // malformed or uncloneable value from iwd just leaves the
+                // station state unchanged rather than aborting the shell.
+                let s = prop_str(changed, "State");
+                st.state = parse_state(&s);
             }
             "Scanning" => {
                 st.scanning = property::<bool>(changed, "Scanning").unwrap_or(false);
@@ -1086,6 +1081,53 @@ fn station_removed_from_event(msg: &zbus::Message, station_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A `PropertiesChanged` delta carrying an unknown `State` value must not
+    /// panic — it should fall through `parse_state`'s wildcard arm and leave
+    /// the station in `Disconnected`.
+    #[test]
+    fn apply_station_props_delta_unknown_state_is_graceful() {
+        let station = Mutable::new(Some(Station {
+            path: "/test/path".to_string(),
+            state: StationState::Connected,
+            scanning: false,
+            connected_network: None,
+            connected_ssid: None,
+        }));
+        let mut changed: HashMap<String, OwnedValue> = HashMap::new();
+        // A value that cannot be decoded as a station state string: insert a
+        // raw bool instead of the expected string type.
+        changed.insert(
+            "State".to_string(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(true)).unwrap(),
+        );
+        // Must not panic; the unrecognised state falls back to Disconnected.
+        apply_station_props_delta(&changed, &station);
+        assert_eq!(
+            station.lock_ref().as_ref().unwrap().state,
+            StationState::Disconnected,
+        );
+    }
+
+    #[test]
+    fn adapter_path_from_station_standard() {
+        assert_eq!(
+            adapter_path_from_station("/net/connman/iwd/0/3/6"),
+            "/net/connman/iwd/0",
+        );
+    }
+
+    #[test]
+    fn adapter_path_from_station_rejects_short_paths() {
+        assert_eq!(adapter_path_from_station("/net/connman/iwd"), String::new());
+        assert_eq!(adapter_path_from_station(""), String::new());
+        assert_eq!(
+            adapter_path_from_station("/other/prefix/0/3"),
+            String::new()
+        );
+    }
+
     #[test]
     fn known_network_path_round_trips() {
         // Smoke-test the Option<String> derivation logic as a pure function.

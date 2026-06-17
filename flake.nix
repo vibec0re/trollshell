@@ -93,9 +93,10 @@
             [Task List]
             BackendName=local
           '';
-          # A writable local calendar the probe seeds a FREQ=DAILY;COUNT=5
-          # VEVENT into, then expands via generate_instances — exercising the
-          # RRULE-expansion path (#29).
+          # A writable local calendar the probe seeds FREQ=DAILY;COUNT=5
+          # VEVENTs into, then expands via generate_instances — exercising the
+          # RRULE-expansion path (#29) and the EXDATE recurrence-set modifier
+          # (the #29 follow-up: one series cancels a day via EXDATE).
           calSource = pkgs.writeText "test-calendar.source" ''
             [Data Source]
             DisplayName=Test Calendar
@@ -219,9 +220,10 @@
           # harness (#49): boot a real NixOS VM with evolution-data-server
           # configured declaratively, seed a fixture task list + calendar, and
           # run the hytte-ecal probe against it end-to-end. The probe also
-          # creates a FREQ=DAILY;COUNT=5 VEVENT and expands it, so this gates
-          # the RRULE-expansion fix for #29. Verified to run under TCG (no KVM
-          # needed); GitHub's Linux runners have /dev/kvm for speed.
+          # creates FREQ=DAILY;COUNT=5 VEVENTs (one with an EXDATE) and expands
+          # them, so this gates the RRULE-expansion fix for #29 and its
+          # EXDATE/RDATE follow-up. Verified to run under TCG (no KVM needed);
+          # GitHub's Linux runners have /dev/kvm for speed.
           eds-nixos-test = pkgs.testers.runNixOSTest {
             name = "eds-nixos-test";
             nodes.machine =
@@ -317,6 +319,16 @@
               assert "created recurring uid:" in output, output
               assert "recurring instance count: 5" in output, output
               assert "removed recurring" in output, output
+
+              # EXDATE exclusion (#29 follow-up): the probe seeds a second
+              # FREQ=DAILY;COUNT=5 series with an EXDATE cancelling Jun 3.
+              # Correct expansion drops that one occurrence (4, not 5) and the
+              # cancelled instant must be absent — exactly the user-visible bug
+              # this fix closes (a cancelled standup still showing up).
+              assert "created exdate uid:" in output, output
+              assert "exdate instance count: 4" in output, output
+              assert "exdate cancelled occurrence present: false" in output, output
+              assert "removed exdate" in output, output
             '';
           };
         }

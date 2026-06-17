@@ -198,6 +198,14 @@ impl Page {
         matches!(self, Self::Connections | Self::Network)
     }
 
+    /// Pages whose content is backed by the `app_usage` service (the
+    /// most-expensive-apps top-N CPU/RAM lists). Used to gate app_usage's
+    /// always-on `/proc` poller on whether one of these is actually visible
+    /// (#50, item 5 of #42): only the Stats panel reads those lists.
+    fn uses_app_usage(self) -> bool {
+        matches!(self, Self::Stats)
+    }
+
     fn stack_name(self) -> &'static str {
         match self {
             Self::Media => "media",
@@ -260,6 +268,13 @@ thread_local! {
     /// because the netconn service is global; recomputed by
     /// [`recompute_netconn_visible`] on every page show/swap/retract.
     static NETCONN_VISIBLE: Mutable<bool> = Mutable::new(false);
+    /// `true` while a [`Page::uses_app_usage`] page (the Stats panel) is the
+    /// visible drawer page on *any* monitor. Drives [`stats_visible_signal`] so
+    /// the app_usage `/proc` poller can park while no one's looking (#50, item 5
+    /// of #42). Global (not per-monitor) because the app_usage service is
+    /// global; recomputed by [`recompute_stats_visible`] on every page
+    /// show/swap/retract.
+    static STATS_VISIBLE: Mutable<bool> = Mutable::new(false);
 }
 
 /// Recompute [`NETCONN_VISIBLE`] from the live panel set: `true` iff some
@@ -287,6 +302,34 @@ fn recompute_netconn_visible() {
 /// parks when those panels are hidden (#50).
 pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
     NETCONN_VISIBLE.with(|m| m.signal())
+}
+
+/// Recompute [`STATS_VISIBLE`] from the live panel set: `true` iff some
+/// monitor's drawer is currently showing a [`Page::uses_app_usage`] page (the
+/// Stats panel). Called after every transition that changes a panel's `current`
+/// page (open, in-place page swap, deep-link switch, retract-finish).
+/// `Mutable::set` is a no-op-free notify so we recompute unconditionally and let
+/// it dedupe.
+fn recompute_stats_visible() {
+    let visible = PANELS.with(|panels| {
+        panels
+            .borrow()
+            .values()
+            .any(|p| p.current.borrow().is_some_and(Page::uses_app_usage))
+    });
+    STATS_VISIBLE.with(|m| {
+        if m.get() != visible {
+            m.set(visible);
+        }
+    });
+}
+
+/// Signal that emits `true` while the Stats drawer page
+/// ([`Page::uses_app_usage`]) is visible on any monitor. Wired in `main.rs` to
+/// `app_usage::set_active` so the always-on `/proc` poller parks when that panel
+/// is hidden (#50, item 5 of #42).
+pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
+    STATS_VISIBLE.with(|m| m.signal())
 }
 
 fn drawer_open_state(key: &str) -> Mutable<bool> {
@@ -613,6 +656,7 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             panel.open_state.set(false);
         });
         recompute_netconn_visible();
+        recompute_stats_visible();
     });
 }
 
@@ -624,8 +668,9 @@ pub fn close_all() {
             panel.window.close();
         }
     });
-    // No panels left → no netconn page visible; park the poller.
+    // No panels left → no netconn/stats page visible; park the pollers.
     recompute_netconn_visible();
+    recompute_stats_visible();
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -650,6 +695,7 @@ pub fn switch_active(target: Page) {
         }
     });
     recompute_netconn_visible();
+    recompute_stats_visible();
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content
@@ -686,6 +732,7 @@ pub fn open(monitor: &Monitor, page: Page) {
         show_panel(panel, page, 0);
     });
     recompute_netconn_visible();
+    recompute_stats_visible();
 }
 
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer
@@ -729,6 +776,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
     // Swap/open may have changed which page is visible; the same-page retract
     // branch is recomputed later by `wire_retract_finish`. Idempotent.
     recompute_netconn_visible();
+    recompute_stats_visible();
 }
 
 /// Present the drawer on `page` at `main_margin` pixels from the bar's

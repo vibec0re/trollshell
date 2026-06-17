@@ -123,6 +123,18 @@ fn main() -> hytte::ui::Result<()> {
                 },
             ));
 
+            // Gate app_usage's always-on `/proc` walk on Stats-drawer
+            // visibility (#50, item 5 of #42): it only feeds the Stats panel's
+            // most-expensive-apps lists, so park it whenever that page isn't
+            // on-screen. Same global-signal / single-subscription shape as the
+            // netconn gate above.
+            glib::MainContext::default().spawn_local(modal::stats_visible_signal().for_each(
+                |visible| {
+                    app_usage::set_active(visible);
+                    std::future::ready(())
+                },
+            ));
+
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             if let Some(primary) = app.monitors().first() {
                 overlays::prompt::install(primary);

@@ -8,10 +8,13 @@
 //! fraction of *total* CPU capacity (all cores), `0.0..=1.0`. No
 //! `clk_tck`/`sysconf`, hence no `unsafe`.
 //!
+//! The poller is gated on Stats-drawer visibility via [`set_active`]: it parks
+//! (walking nothing) while the panel is hidden and resumes — taking a fresh
+//! sample immediately — when it reappears (#50, item 5 of #42).
+//!
 //! Out of scope here (tracked as follow-ups): cgroup/app grouping so a
 //! browser's many PIDs collapse into one *app* row, plus app icons (#38); and
-//! the design knobs — CPU scale, layout, a "system" bucket, panel-visibility
-//! gating (#42).
+//! the remaining design knobs — CPU scale, layout, a "system" bucket (#42).
 //!
 //! # Public API
 //!
@@ -25,7 +28,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry};
 
 /// Resident page size assumed when converting `/proc/<pid>/statm` pages to
@@ -37,8 +40,8 @@ const PAGE_SIZE: u64 = 4096;
 const TOP_N: usize = 6;
 
 /// Poll period. Heavier than the aggregate `sensors` reads (2 files per PID),
-/// so it runs at half that cadence; gating it to "panel visible" is a tracked
-/// follow-up (#42).
+/// so it runs at half that cadence; it's additionally gated to "Stats panel
+/// visible" via [`set_active`] so it idles entirely when no one's looking.
 const POLL: Duration = Duration::from_secs(2);
 
 /// One aggregated process group — all PIDs sharing a `comm`.
@@ -58,6 +61,15 @@ pub struct ProcSample {
 pub struct AppUsageHandles {
     pub(crate) by_cpu: Mutable<Vec<ProcSample>>,
     pub(crate) by_mem: Mutable<Vec<ProcSample>>,
+    /// Gate for the `/proc` poller. While `false`, the poll loop parks and
+    /// walks nothing; flipping it back to `true` resumes sampling immediately
+    /// (the loop `select!`s on this so reactivation isn't delayed a full tick).
+    ///
+    /// Defaults to `true` so the first sample is taken eagerly at startup —
+    /// the top-apps lists are then already populated the instant the Stats
+    /// drawer opens, and `set_active(false)` parks the poller once the binary
+    /// reports that panel is hidden. See [`set_active`].
+    pub(crate) active: Mutable<bool>,
 }
 
 pub struct AppUsageService;
@@ -69,10 +81,12 @@ impl Service for AppUsageService {
         let handles = AppUsageHandles {
             by_cpu: Mutable::new(Vec::new()),
             by_mem: Mutable::new(Vec::new()),
+            active: Mutable::new(true),
         };
         let by_cpu = handles.by_cpu.clone();
         let by_mem = handles.by_mem.clone();
-        rt.spawn(poll_loop(by_cpu, by_mem));
+        let active = handles.active.clone();
+        rt.spawn(poll_loop(by_cpu, by_mem, active));
         handles
     }
 }
@@ -102,6 +116,26 @@ pub fn top_by_mem() -> impl Signal<Item = Vec<ProcSample>> {
     })
 }
 
+/// Gate the `/proc` poller: `true` resumes ~2 s sampling (immediately taking a
+/// fresh sample), `false` parks it so it walks nothing while the Stats drawer
+/// panel — the only consumer of these lists — is hidden.
+///
+/// Fire-and-forget command: the binary wires the Stats-drawer-visibility signal
+/// to this so the always-on poller idles when no one's looking (#50, realizing
+/// item 5 of #42). A no-op `set` to the same value is skipped to avoid spurious
+/// loop wakeups.
+pub fn set_active(active: bool) {
+    registry::with(|r| {
+        let handle = &r
+            .get::<AppUsageHandles>()
+            .expect("app_usage::service() not registered")
+            .active;
+        if handle.get() != active {
+            handle.set(active);
+        }
+    });
+}
+
 /// Accumulator while folding PIDs into their `comm` group within one sample.
 #[derive(Default)]
 struct Agg {
@@ -110,13 +144,31 @@ struct Agg {
     procs: u32,
 }
 
-async fn poll_loop(by_cpu: Mutable<Vec<ProcSample>>, by_mem: Mutable<Vec<ProcSample>>) {
+async fn poll_loop(
+    by_cpu: Mutable<Vec<ProcSample>>,
+    by_mem: Mutable<Vec<ProcSample>>,
+    active: Mutable<bool>,
+) {
     // Per-PID cumulative CPU jiffies from the previous sample, and the previous
     // aggregate total CPU jiffies — the two halves of the delta ratio.
     let mut prev_pid: HashMap<u32, u64> = HashMap::new();
     let mut prev_total: u64 = 0;
 
     loop {
+        // Park (walking nothing) while gated inactive. `wait_for(true)` resolves
+        // as soon as `set_active(true)` lands — `Mutable::signal()` replays the
+        // current value on first poll, so if we've already been reactivated by
+        // the time we get here it returns immediately, with no lost wakeup.
+        // Reactivation is thus instant rather than waiting out a sleep tick.
+        //
+        // The CPU fractions are jiffy *deltas* over the inter-sample interval,
+        // so the resume sample's delta spans the whole parked gap. That's
+        // fine: `prev_total` grows by the same wall-clock span as the per-PID
+        // jiffies, so the ratio stays a valid "share of total capacity" — a
+        // process that was idle the whole time still reads ~0.
+        if !active.get() {
+            let _ = active.signal().wait_for(true).await;
+        }
         let total_now = read_total_cpu_jiffies();
         let d_total = total_now.saturating_sub(prev_total);
 
@@ -143,7 +195,13 @@ async fn poll_loop(by_cpu: Mutable<Vec<ProcSample>>, by_mem: Mutable<Vec<ProcSam
 
         prev_pid = cur_pid;
         prev_total = total_now;
-        tokio::time::sleep(POLL).await;
+        // Sleep the inter-sample interval, but bail out early if we get gated
+        // inactive mid-wait — no point holding the timer when parked. The
+        // top-of-loop park then handles the resume edge.
+        tokio::select! {
+            () = tokio::time::sleep(POLL) => {}
+            _ = active.signal().wait_for(false) => {}
+        }
     }
 }
 

@@ -5,6 +5,11 @@
  *                mint #06ffa5, magenta #aa00ef, teal #3a86af.
  */
 
+/* Shell surface color — shared by the bar background, the slide-out drawer
+ * fill, and the sidebar.  One variable to keep them visually unified.
+ * Always dark regardless of the system theme (the bar is always dark). */
+@define-color shell_background rgb(15, 15, 35);
+
 * {
     font-family: "Cantarell", system-ui, sans-serif;
     font-size: 13px;
@@ -22,7 +27,7 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    background: transparent;
+    background: @shell_background;
     color: #ffffff;
     border: none;
     box-shadow: none;
@@ -367,10 +372,11 @@
     background: transparent;
 }
 /* The drawn-background drawing area exposes its CSS `color` as the silhouette
- * fill (read via `color()` in `draw_drawer_silhouette`), so the drawer always
- * matches the live theme `@window_bg_color` instead of a hardcoded value (#44). */
+ * fill (read via `color()` in `draw_drawer_silhouette`).  Fixed to
+ * `@shell_background` so the drawer always matches the bar regardless of the
+ * system light/dark theme (fixes the regression introduced in #44). */
 .ts-drawer-bg {
-    color: @window_bg_color;
+    color: @shell_background;
 }
 /* Sidebar window surface is transparent; the visible content is the
    inner card with class `.ts-sidebar`. Without this rule, the default
@@ -381,12 +387,12 @@
 }
 
 /* Sidebar card — matches the bar's leftmost edge color so the sidebar
-   reads as a vertical extension of the bar's left side. Always dark
-   (no light-mode override) for the same reason — the bar is always dark.
+   reads as a vertical extension of the bar's left side. Always dark via
+   @shell_background (no light-mode override) — the bar is always dark.
    No border-radius: the frame's cutout paints its own rounded corners
    against the sidebar's right edge; rounding here causes a visual seam. */
 .ts-sidebar {
-    background: rgb(15, 15, 35);
+    background: @shell_background;
     padding: 12px;
     color: white;
 }

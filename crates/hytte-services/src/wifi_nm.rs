@@ -561,6 +561,80 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
         .await
 }
 
+// ── Integration-test probe ─────────────────────────────────────────────────────
+
+/// Machine-readable snapshot returned by [`probe_snapshot`].
+pub struct ProbeSnapshot {
+    /// NM device object path (e.g. `/org/freedesktop/NetworkManager/Devices/2`).
+    pub device_path: String,
+    /// Whether the Wi-Fi radio is enabled (`WirelessEnabled` on the NM manager).
+    pub powered: bool,
+    /// Station state as a debug string (e.g. `"Disconnected"`).
+    pub station_state: String,
+    /// Whether the scan call succeeded.
+    pub scan_ok: bool,
+    /// Number of visible networks after the scan.
+    pub network_count: usize,
+}
+
+/// Probe snapshot for the `NixOS` integration test (`checks.wifi-nm-nixos-test`).
+///
+/// Confirms the NM backend is reachable, finds the Wi-Fi device, reads
+/// initial state, triggers a scan, waits briefly, refreshes state, and
+/// returns a machine-readable snapshot. Drives the real `wifi_nm` code
+/// paths against a live `NetworkManager` end-to-end.
+///
+/// # Errors
+///
+/// Returns a string describing the failure if NM is unreachable or no
+/// Wi-Fi device is found.
+pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
+    use crate::wifi_backend::{BackendChoice, probe_backend};
+
+    // Verify NM is the chosen backend on the bus.
+    let backend = probe_backend().await;
+    if backend != BackendChoice::NetworkManager {
+        return Err(format!("backend is not NetworkManager: {backend:?}"));
+    }
+
+    // Find the Wi-Fi device.
+    let device_path = find_wifi_device()
+        .await
+        .ok_or_else(|| "no Wi-Fi device found".to_string())?;
+
+    // Temporary mutables standing in for the service handles.
+    let station_m: Mutable<Option<Station>> = Mutable::new(None);
+    let networks_m: Mutable<Vec<WifiNetwork>> = Mutable::new(Vec::new());
+    let adapter_m: Mutable<Option<Adapter>> = Mutable::new(None);
+
+    // Initial refresh.
+    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m).await;
+
+    let powered = adapter_m.get_cloned().is_some_and(|a: Adapter| a.powered);
+    let station_state = station_m
+        .get_cloned()
+        .map_or_else(|| "None".to_string(), |s: Station| format!("{:?}", s.state));
+
+    // Trigger a scan.
+    let scan_ok = nm_scan(&device_path).await.is_ok();
+
+    // Wait for scan results to populate (NM takes a couple of seconds minimum).
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    // Refresh after the scan.
+    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m).await;
+
+    let network_count = networks_m.lock_ref().len();
+
+    Ok(ProbeSnapshot {
+        device_path,
+        powered,
+        station_state,
+        scan_ok,
+        network_count,
+    })
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

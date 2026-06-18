@@ -56,6 +56,21 @@ pub(crate) fn f64_to_i64_trunc(v: f64) -> i64 {
     v as i64
 }
 
+/// Round an `f64` to the nearest integer and return it as `i32`.
+///
+/// Used by [`crate::scale`] to turn a font-scaled pixel value back into the
+/// `i32` that GTK setters (`set_pixel_size`, `set_size_request`) expect.
+///
+/// **Truncation:** `v.round()` has a zero fractional part, so the `as i32`
+/// truncation is exact for any `v` whose rounded magnitude is `< 2^31`.
+/// Callers feed design-baseline pixel sizes (tens to low hundreds) times a
+/// small scaling factor, which never approaches that bound; a non-finite `v`
+/// saturates to `0` / `i32::MAX` / `i32::MIN` rather than wrapping.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn f64_to_i32_round(v: f64) -> i32 {
+    v.round() as i32
+}
+
 /// Convert a non-negative `i32` pixel width to `usize` for stride calculation.
 ///
 /// SNI icon widths come from the D-Bus pixmap tuple `(w: i32, h: i32, …)`.
@@ -96,6 +111,14 @@ mod tests {
         assert_eq!(f64_to_i64_trunc(0.0), 0_i64);
         assert_eq!(f64_to_i64_trunc(1_500_000.7), 1_500_000_i64);
         assert_eq!(f64_to_i64_trunc(1.0e12), 1_000_000_000_000_i64);
+    }
+
+    #[test]
+    fn f64_to_i32_round_nearest() {
+        assert_eq!(f64_to_i32_round(0.0), 0_i32);
+        assert_eq!(f64_to_i32_round(15.6), 16_i32);
+        assert_eq!(f64_to_i32_round(15.4), 15_i32);
+        assert_eq!(f64_to_i32_round(-2.5), -3_i32);
     }
 
     #[test]

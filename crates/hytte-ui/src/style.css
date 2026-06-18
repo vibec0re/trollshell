@@ -1,6 +1,19 @@
 /* hytte default shell stylesheet. Override per-shell via
  * App::with_user_style(path). */
 
+/* Sizing convention (#114): sizes that should track text — padding, margins,
+ * border-radius, -gtk-icon-size, min/max dimensions — are expressed in `em`
+ * (relative to the element's font-size). GTK4 supports `em` but NOT `rem`.
+ * `em` + `-gtk-icon-size` honor the text-scaling-factor automatically, so
+ * density / large-font scaling comes largely for free. Raw `px` only for
+ * things that must stay physically fixed. Rust-set sizes (set_pixel_size /
+ * set_size_request / cairo) can't use CSS units — shells derive them with
+ * their own font-aware scale helper (e.g. trollshell's `crate::scale::scale`).
+ * `em` resolves against the inherited GTK root font (Cantarell 11 by default),
+ * which is what we want — do NOT force a root `font-size` here, as that would
+ * override the user's font preference. Phases #116-#119 convert the existing
+ * px sites; this phase only documents the convention (no visual change). */
+
 .hytte-bar {
     background: rgba(20, 20, 22, 0.86);
     color: #f5f5f7;

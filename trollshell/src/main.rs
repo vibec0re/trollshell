@@ -3,6 +3,7 @@ mod components;
 mod modal;
 mod overlays;
 mod panels;
+mod scale;
 mod widgets;
 
 use std::cell::RefCell;

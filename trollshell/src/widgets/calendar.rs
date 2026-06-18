@@ -349,11 +349,13 @@ fn rebuild_upcoming_list(
         if event_count >= UPCOMING_LIMIT {
             break;
         }
-        let header = build_day_header(day, today);
-        group.add(&header);
-        new_rows.push((day, header));
 
         if let Some(day_evs) = by_day.get(&day) {
+            // Day has events: emit the slim section header first, then each
+            // event row.
+            let header = build_day_header(day, today);
+            group.add(&header);
+            new_rows.push((day, header));
             for ev in day_evs {
                 if event_count >= UPCOMING_LIMIT {
                     break;
@@ -365,11 +367,12 @@ fn rebuild_upcoming_list(
             }
         } else {
             // Only the anchor-day section reaches here (every other shown
-            // day has at least one event). The "No events" placeholder counts
-            // as occupying zero event slots — it is purely decorative.
-            let none = build_none_anchor_row(day, today);
-            group.add(&none);
-            new_rows.push((day, none));
+            // day has at least one event). Collapse the header + "No events"
+            // placeholder into a single combined row so there is no dead
+            // double-row when today/the selected day is empty.
+            let combined = build_empty_day_row(day, today);
+            group.add(&combined);
+            new_rows.push((day, combined));
         }
     }
     *rows_track.borrow_mut() = new_rows;
@@ -396,17 +399,22 @@ fn build_day_header(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
     row
 }
 
-/// Placeholder shown under the anchor-day header when that day has no events.
-/// Wording adapts: "No more events today" for today, "No events" for other days.
-fn build_none_anchor_row(anchor: NaiveDate, today: NaiveDate) -> adw::ActionRow {
-    let title = if anchor == today {
+/// Combined row for an anchor day with no events. Using a single
+/// `adw::ActionRow` with title = the day label and subtitle = the empty
+/// message collapses what was previously two stacked rows (a day-section
+/// header + a separate placeholder) into one, eliminating dead space when
+/// today / the selected day has nothing scheduled.
+fn build_empty_day_row(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
+    let subtitle = if day == today {
         "No more events today"
     } else {
         "No events"
     };
     let row = adw::ActionRow::builder()
-        .title(title)
+        .title(day_header_label(day, today).as_str())
+        .subtitle(subtitle)
         .activatable(false)
+        .selectable(false)
         .build();
     row.add_css_class("ts-cal-day-empty");
     row

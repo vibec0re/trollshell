@@ -884,10 +884,32 @@
     padding-top: 0;
     padding-bottom: 1px;
 }
-/* "No more events today" placeholder under the Today section. */
+/* Combined header+empty row: the anchor day has no events so the section
+ * header and placeholder are merged into one AdwActionRow (title = day
+ * label, subtitle = "No more events today" / "No events"). The title
+ * inherits the same muted caps-y look as .ts-cal-day-header; the subtitle
+ * is italic and further dimmed. */
+.ts-sidebar-cal-list .ts-cal-day-empty {
+    background: transparent;
+    min-height: 0;
+    margin-top: 2px;
+    padding-top: 0;
+    padding-bottom: 0;
+}
 .ts-sidebar-cal-list .ts-cal-day-empty .title {
-    color: alpha(white, 0.4);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: alpha(white, 0.55);
+    padding-top: 2px;
+    padding-bottom: 0;
+}
+.ts-sidebar-cal-list .ts-cal-day-empty .subtitle {
+    color: alpha(white, 0.35);
     font-style: italic;
+    font-size: 11px;
+    padding-top: 0;
+    padding-bottom: 2px;
 }
 
 /* Source-color dot at the start of each upcoming-list row — mirrors the

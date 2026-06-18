@@ -20,16 +20,23 @@
 //! opened lazily on first use).
 //!
 //! The service exposes [`events()`] — `Signal<Vec<CalendarEvent>>`, sorted
-//! by start time, covering events that haven't ended and start within
-//! [`WINDOW_DAYS`] days. [`refresh()`] enqueues an out-of-cycle re-scan onto
-//! the worker. The public surface is read-only and identical to the prior
-//! file-poller, so the bar widget + drawer page need no changes.
+//! by start time. It covers the **union** of:
+//!
+//! 1. The currently-viewed calendar month (set by the widget via
+//!    [`set_viewed_month`]) — so past-day dots + past-day click-to-list work
+//!    for the visible month grid (issue #100).
+//! 2. The forward upcoming window `[now, now + WINDOW_DAYS]` — keeps the
+//!    Upcoming list data intact.
+//!
+//! [`refresh()`] enqueues an out-of-cycle re-scan onto the worker. The
+//! public surface is read-only and identical to the prior file-poller, so
+//! the bar widget + drawer page need no changes beyond calling
+//! `set_viewed_month`.
 //!
 //! ## Recurrence expansion (issue #29)
 //!
-//! The scan asks libecal to **expand** every component over the
-//! `[now, now + WINDOW_DAYS]` window via
-//! [`CalClient::generate_instances`][hytte_ecal::CalClient::generate_instances]
+//! The scan asks libecal to **expand** every component over the query window
+//! via [`CalClient::generate_instances`][hytte_ecal::CalClient::generate_instances]
 //! (which drives libical's recurrence iterator). Recurring events (RRULE)
 //! come back as **one occurrence per instance** inside the window — a daily
 //! standup yields ~`WINDOW_DAYS` rows, matching GNOME Calendar — and
@@ -52,8 +59,7 @@
 //!   All-day instances anchor to local midnight.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -125,6 +131,32 @@ fn send_refresh() {
     }
 }
 
+// ── Viewed-month state (issue #100) ─────────────────────────────────────────
+
+/// The (year, month) the grid is currently displaying, as set by the widget
+/// via [`set_viewed_month`]. `None` means "not yet set" — the scan falls
+/// back to the current month. Stored as a pair of `i32`/`u32` wrapped in a
+/// `Mutex` so the GTK-main-thread widget can write without a tokio context.
+static VIEWED_MONTH: Mutex<Option<(i32, u32)>> = Mutex::new(None);
+
+/// Tell the service which month the calendar grid is currently showing.
+///
+/// Call this from the widget whenever `viewed` changes — in `prev_btn` /
+/// `next_btn` handlers, in `on_day_clicked` if the month changes, and once
+/// at init. The service will compute a query window that is the **union** of
+/// the viewed month's full 6-week grid range and the forward upcoming window,
+/// then trigger a re-scan so the grid can show past-day dots and click-to-list
+/// events.
+pub fn set_viewed_month(year: i32, month: u32) {
+    {
+        let mut guard = VIEWED_MONTH
+            .lock()
+            .expect("calendar VIEWED_MONTH lock poisoned");
+        *guard = Some((year, month));
+    }
+    send_refresh();
+}
+
 // ── Service handle ───────────────────────────────────────────────────────────
 
 #[doc(hidden)]
@@ -184,9 +216,10 @@ pub fn service() -> CalendarService {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Signal of the next [`WINDOW_DAYS`] days of events (recurrences expanded
-/// into their occurrences), sorted ascending by start. Empty until the
-/// first refresh completes (or if EDS has no calendar sources configured).
+/// Signal of events covering the union of the viewed month's grid range and
+/// the forward upcoming window (`now … now + WINDOW_DAYS`), sorted ascending
+/// by start. Empty until the first refresh completes (or if EDS has no
+/// calendar sources configured).
 pub fn events() -> impl Signal<Item = Vec<CalendarEvent>> {
     registry::with(|r| {
         r.get::<CalendarHandles>()
@@ -257,9 +290,49 @@ impl Worker {
 
     fn scan_all(&mut self) -> Vec<CalendarEvent> {
         let now = Local::now();
-        let window_end = now + Duration::days(WINDOW_DAYS);
-        let start_unix = now.timestamp();
-        let end_unix = window_end.timestamp();
+        let today = now.date_naive();
+
+        // ── Compute query window = union(viewed-month grid, forward window) ───
+        //
+        // Forward upcoming window: [now, now + WINDOW_DAYS].
+        let forward_end = now + Duration::days(WINDOW_DAYS);
+
+        // Viewed-month window: the full 6-week grid that the calendar widget
+        // shows. The grid starts at the Monday on/before the first of the month
+        // and spans 42 days (6 weeks). We extend one extra day on each side as
+        // a buffer for timezone rounding at the edges.
+        let viewed_ym = VIEWED_MONTH
+            .lock()
+            .expect("calendar VIEWED_MONTH lock poisoned")
+            .unwrap_or_else(|| (today.year(), today.month()));
+        let (vy, vm) = viewed_ym;
+        let month_first = NaiveDate::from_ymd_opt(vy, vm, 1).unwrap_or(today);
+        let dow_offset = i64::from(month_first.weekday().num_days_from_monday());
+        // Grid origin = Monday on/before month_first
+        let grid_origin = month_first - Duration::days(dow_offset);
+        // Grid covers 42 cells (6 weeks); end is exclusive (+1 day buffer).
+        let grid_end_date = grid_origin + Duration::days(42 + 1);
+
+        // Union: earliest start = min(grid_origin, now); latest end = max(grid_end_date, forward_end).
+        // We want to include past events in the viewed month, so the scan start
+        // can be before now (as far back as the grid origin of the viewed month).
+        let scan_start_date = grid_origin.min(today);
+        let scan_start = Local
+            .from_local_datetime(&scan_start_date.and_hms_opt(0, 0, 0).unwrap_or_default())
+            .earliest()
+            .unwrap_or(now);
+
+        // Scan end = max(forward window, grid end). Convert grid_end_date to a
+        // DateTime for comparison.
+        let grid_end_dt = Local
+            .from_local_datetime(&grid_end_date.and_hms_opt(0, 0, 0).unwrap_or_default())
+            .earliest()
+            .unwrap_or(forward_end);
+        let scan_end = forward_end.max(grid_end_dt);
+
+        let start_unix = scan_start.timestamp();
+        let end_unix = scan_end.timestamp();
+
         // Re-read the source list each pass so a calendar added/removed at
         // runtime (e.g. a new Nextcloud calendar discovered under the
         // collection source) is picked up without a restart.
@@ -290,7 +363,8 @@ impl Worker {
                 }
             };
             for inst in instances {
-                if let Some(ev) = instance_to_calendar_event(&inst, &calendar_name, now, out.len())
+                if let Some(ev) =
+                    instance_to_calendar_event(&inst, &calendar_name, scan_start, out.len())
                 {
                     out.push(ev);
                 }
@@ -310,14 +384,17 @@ impl Worker {
 /// status) is parsed out of the component's iCal serialisation, which is
 /// identical across a series' instances.
 ///
-/// Returns `None` if the component is cancelled, undatable, or already over
-/// (a multi-day occurrence that started before `now` but is still running
-/// is kept). `anon_index` disambiguates a synthesised UID for components
-/// with no UID of their own.
+/// Returns `None` if the component is cancelled, undatable, or entirely
+/// before the scan window start. `window_start` is the beginning of the
+/// query window (which can be in the past for the viewed-month range); an
+/// event whose `end` is before `window_start` is dropped. An ongoing
+/// multi-day event that started before `window_start` but ends after it is
+/// kept. `anon_index` disambiguates a synthesised UID for components with
+/// no UID of their own.
 fn instance_to_calendar_event(
     inst: &EventInstance,
     calendar_name: &str,
-    now: DateTime<Local>,
+    window_start: DateTime<Local>,
     anon_index: usize,
 ) -> Option<CalendarEvent> {
     let start = unix_to_local(inst.start_unix, inst.all_day)?;
@@ -333,9 +410,14 @@ fn instance_to_calendar_event(
         start + Duration::hours(1)
     };
 
-    // Already over? Drop it. (The "hasn't ended" check keeps an ongoing
-    // multi-day occurrence visible even though it started in the past.)
-    if end < now {
+    // Drop only if the event ended before the scan window start.
+    // This is always a no-op for a forward-only window (window_start == now,
+    // generate_instances won't return events that end before the window
+    // start), so the eds-nixos-test probe path is unaffected.
+    // For a past-covering window (viewed month), past events within the
+    // grid are kept; events before the grid start are already excluded by
+    // the generate_instances call itself.
+    if end < window_start {
         return None;
     }
 
@@ -593,6 +675,7 @@ mod tests {
             end_unix: (occurrence + Duration::hours(1)).timestamp(),
             all_day: false,
         };
+        // window_start is now - 1h (simulates a past-covering window)
         let ev = instance_to_calendar_event(&instance, "test-cal", now - Duration::hours(1), 0)
             .expect("occurrence is in-window");
         assert_eq!(ev.summary, "Standup");
@@ -644,13 +727,39 @@ mod tests {
     }
 
     #[test]
-    fn instance_skips_already_ended() {
-        // An occurrence that ended before `now` is dropped.
+    fn instance_past_event_kept_when_window_covers_it() {
+        // An occurrence that ended before `now` is KEPT when window_start is
+        // set to a past time (i.e. the viewed-month window covers the past).
+        // This is the #100 fix: past events in the viewed month must be kept.
         let now = Local::now();
         let start = now - Duration::days(2);
         let end = now - Duration::days(2) + Duration::hours(1);
+        // window_start is 3 days ago — the event falls inside the window.
+        let window_start = now - Duration::days(3);
+        let ev = instance_to_calendar_event(
+            &inst("past-visible", "Old", start, end),
+            "cal",
+            window_start,
+            0,
+        );
         assert!(
-            instance_to_calendar_event(&inst("past", "Old", start, end), "cal", now, 0).is_none()
+            ev.is_some(),
+            "past event inside viewed-month window must be kept"
+        );
+    }
+
+    #[test]
+    fn instance_past_event_dropped_when_before_window() {
+        // An event that ended before window_start is always dropped.
+        // In a forward-only window (window_start == now), this is the same
+        // behaviour as before — the eds-nixos-test probe path is unaffected.
+        let now = Local::now();
+        let start = now - Duration::days(5);
+        let end = now - Duration::days(5) + Duration::hours(1);
+        // window_start == now: event ended 5 days before the window start.
+        assert!(
+            instance_to_calendar_event(&inst("past", "Old", start, end), "cal", now, 0).is_none(),
+            "event before window_start must be dropped"
         );
     }
 

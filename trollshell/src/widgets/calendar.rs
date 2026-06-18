@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone as _};
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, glib};
 use hytte::prelude::*;
@@ -111,6 +111,11 @@ fn build_block() -> gtk::Box {
     wire_events_bind(&state, &group, &rows_track, &placeholder_track);
     wire_clock_bind(&state, &column);
 
+    // Inform the service of the initial viewed month so the first scan
+    // covers the current month's past days (issue #100).
+    let (iy, im) = state.viewed.get();
+    calendar::set_viewed_month(iy, im);
+
     render(&state);
     column
 }
@@ -135,13 +140,18 @@ fn build_grid_header(state: &State) -> gtk::Box {
     let state_prev = state.clone();
     prev_btn.connect_clicked(move |_| {
         let (y, m) = state_prev.viewed.get();
-        state_prev.viewed.set(prev_month(y, m));
+        let (ny, nm) = prev_month(y, m);
+        state_prev.viewed.set((ny, nm));
+        // Notify the service so it re-scans to cover this month's past days.
+        calendar::set_viewed_month(ny, nm);
         render(&state_prev);
     });
     let state_next = state.clone();
     next_btn.connect_clicked(move |_| {
         let (y, m) = state_next.viewed.get();
-        state_next.viewed.set(next_month(y, m));
+        let (ny, nm) = next_month(y, m);
+        state_next.viewed.set((ny, nm));
+        calendar::set_viewed_month(ny, nm);
         render(&state_next);
     });
 
@@ -256,7 +266,10 @@ fn on_day_clicked(
     state.selected.set(Some(date));
     let (vy, vm) = state.viewed.get();
     if date.year() != vy || date.month() != vm {
-        state.viewed.set((date.year(), date.month()));
+        let (ny, nm) = (date.year(), date.month());
+        state.viewed.set((ny, nm));
+        // Month changed — re-scan so the new month's events are loaded.
+        calendar::set_viewed_month(ny, nm);
     }
     render(state);
 
@@ -570,18 +583,39 @@ fn group_events_by_day(events: &[CalendarEvent]) -> HashMap<NaiveDate, Vec<Strin
     out
 }
 
-/// Pure helper: group `events` by the bucket day they fall into relative to
-/// `anchor` — the first day that should appear in the list. Events whose start
-/// date precedes the anchor (ongoing multi-day occurrences) clamp to the
-/// anchor; events on or after the anchor land on their own start date. The
-/// return value is sorted ascending by day. Used by [`rebuild_upcoming_list`]
-/// and tested directly (no GTK required).
+/// Pure helper: group `events` into the day buckets that should appear in the
+/// Upcoming list, relative to `anchor` — the first day the list should show.
+///
+/// Rules (issue #100 fix — keeps the Upcoming list future-focused):
+/// - Events that **fully ended** before the anchor day (i.e. `end` is before
+///   the start of the anchor day) are **excluded entirely** — they are past
+///   events that exist in the feed only for the month-grid dots, not the list.
+/// - Events that started before the anchor but are **still running** on the
+///   anchor day (end ≥ start-of-anchor-day) are **clamped** to the anchor —
+///   shown as ongoing under today/the anchor section.
+/// - Events on or after the anchor land on their own start date.
+///
+/// The return value is sorted ascending by day. Used by
+/// [`rebuild_upcoming_list`] and tested directly (no GTK required).
 fn bucket_events_from_anchor<'a>(
     events: &'a [CalendarEvent],
     anchor: NaiveDate,
 ) -> BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> {
+    // Start-of-anchor-day in local time for end-before comparisons.
+    let anchor_day_start = Local
+        .from_local_datetime(&anchor.and_hms_opt(0, 0, 0).unwrap_or_default())
+        .earliest()
+        .unwrap_or_else(Local::now);
+
     let mut by_day: BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> = BTreeMap::new();
     for ev in events {
+        // Skip events that fully ended before or exactly at the anchor midnight.
+        // Using <= so an all-day event ending exactly at 00:00 of the anchor
+        // day (e.g. a 1-day all-day event on the day before) is excluded.
+        if ev.end <= anchor_day_start {
+            continue;
+        }
+        // Clamp ongoing events (started before anchor, still running) to anchor.
         let day = ev.start.date_naive().max(anchor);
         by_day.entry(day).or_default().push(ev);
     }
@@ -699,7 +733,7 @@ fn flash_row_highlight(row: &adw::ActionRow) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Weekday;
+    use chrono::{TimeZone, Weekday};
 
     #[test]
     fn grid_origin_lands_on_monday_at_or_before_first_of_month() {
@@ -759,10 +793,9 @@ mod tests {
         assert_eq!(month_label_text(2026, 12), "December 2026");
     }
 
-    // ── bucket_events_from_anchor tests (#36) ─────────────────────────────────
+    // ── bucket_events_from_anchor tests (#36, #100) ───────────────────────────
 
     fn make_event(start: NaiveDate) -> CalendarEvent {
-        use chrono::TimeZone;
         let dt = Local
             .from_local_datetime(&start.and_hms_opt(9, 0, 0).unwrap())
             .single()
@@ -774,6 +807,53 @@ mod tests {
             end: dt + chrono::Duration::hours(1),
             location: None,
             all_day: false,
+            calendar_name: "cal".into(),
+        }
+    }
+
+    fn make_event_spanning(start: NaiveDate, end: NaiveDate) -> CalendarEvent {
+        let start_dt = Local
+            .from_local_datetime(&start.and_hms_opt(9, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        let end_dt = Local
+            .from_local_datetime(&end.and_hms_opt(17, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        CalendarEvent {
+            uid: format!("{start}-{end}"),
+            summary: "spanning".into(),
+            start: start_dt,
+            end: end_dt,
+            location: None,
+            all_day: false,
+            calendar_name: "cal".into(),
+        }
+    }
+
+    /// Build a 1-day all-day event for `day`. The iCalendar convention for
+    /// all-day events is `DTEND = day + 1` at 00:00 (exclusive upper bound).
+    fn make_allday_event(day: NaiveDate) -> CalendarEvent {
+        let start_dt = Local
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap();
+        // iCal DTEND for a 1-day all-day event is the *next* day at 00:00.
+        let end_dt = Local
+            .from_local_datetime(
+                &(day + chrono::Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap();
+        CalendarEvent {
+            uid: format!("allday-{day}"),
+            summary: "all-day".into(),
+            start: start_dt,
+            end: end_dt,
+            location: None,
+            all_day: true,
             calendar_name: "cal".into(),
         }
     }
@@ -798,11 +878,12 @@ mod tests {
     }
 
     #[test]
-    fn anchor_future_day_hides_earlier_events() {
-        // When user clicks a day 3 days out, events before that day must
-        // not appear; the anchor day leads.
+    fn anchor_future_day_excludes_fully_past_short_events() {
+        // When user clicks a day 3 days out, a short event (1h) that started
+        // and ended on today must be fully excluded — NOT clamped to anchor.
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let anchor = today + chrono::Duration::days(3);
+        // ev_today: 1h event today; fully ends before anchor.
         let ev_today = make_event(today);
         let ev_anchor = make_event(anchor);
         let ev_later = make_event(anchor + chrono::Duration::days(2));
@@ -810,37 +891,97 @@ mod tests {
         let evs = vec![ev_today, ev_anchor.clone(), ev_later.clone()];
         let by_day = bucket_events_from_anchor(&evs, anchor);
 
-        // ev_today is before anchor and has no end overlapping anchor, so
-        // its bucket is anchor (clamped). ev_anchor lands on anchor. The
-        // two collide into one bucket.
-        let days: Vec<NaiveDate> = by_day.keys().copied().collect();
-        // anchor + anchor+2d
-        assert!(days.contains(&anchor));
-        assert!(days.contains(&(anchor + chrono::Duration::days(2))));
-        // No day before the anchor should appear.
-        for d in &days {
+        // ev_today fully ended before anchor → excluded entirely.
+        assert!(
+            !by_day.contains_key(&today),
+            "fully-past event must be excluded from upcoming list"
+        );
+        // anchor and anchor+2d should be present.
+        assert!(by_day.contains_key(&anchor));
+        assert!(by_day.contains_key(&(anchor + chrono::Duration::days(2))));
+        // No day before the anchor.
+        for d in by_day.keys() {
             assert!(*d >= anchor, "found pre-anchor day {d}");
         }
     }
 
     #[test]
     fn anchor_multiday_ongoing_event_buckets_under_anchor() {
-        // A multi-day event that started before the anchor (e.g. a
-        // conference that began yesterday) should appear under the anchor
-        // day since it is still running.
+        // A multi-day event that started before the anchor but ends on/after
+        // it (e.g. a conference that began yesterday) should appear under the
+        // anchor day — it is still ongoing.
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let anchor = today + chrono::Duration::days(2);
 
-        // Event started before the anchor — simulated as its start date
-        // being before anchor (the service already guarantees it hasn't ended).
-        let ev_ongoing = make_event(today); // starts today, anchor is day+2
+        // Event spans today → anchor+1: it is still running at the anchor.
+        let ev_ongoing = make_event_spanning(today, anchor + chrono::Duration::days(1));
 
         let evs = vec![ev_ongoing];
         let by_day = bucket_events_from_anchor(&evs, anchor);
 
         // Must be bucketed under anchor, not under today.
-        assert!(by_day.contains_key(&anchor));
-        assert!(!by_day.contains_key(&today));
+        assert!(
+            by_day.contains_key(&anchor),
+            "ongoing event must appear under anchor"
+        );
+        assert!(
+            !by_day.contains_key(&today),
+            "ongoing event must not appear under pre-anchor day"
+        );
+    }
+
+    #[test]
+    fn anchor_fully_past_multiday_event_excluded() {
+        // A multi-day event that ended before the anchor is fully past and
+        // must be excluded from the list (issue #100: past events in the feed
+        // must not pollute the Upcoming list).
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let anchor = today + chrono::Duration::days(3);
+
+        // Event ended yesterday (before anchor).
+        let ev_past = make_event_spanning(
+            today - chrono::Duration::days(2),
+            today - chrono::Duration::days(1),
+        );
+
+        let evs = vec![ev_past];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+
+        assert!(
+            by_day.is_empty(),
+            "fully-past multi-day event must be excluded"
+        );
+    }
+
+    /// Regression for the strict-`<` bug: a 1-day all-day event on the day
+    /// before the anchor has `end == anchor 00:00 == anchor_day_start`.  With
+    /// the old `<` it leaked into the anchor section; with `<=` it is excluded.
+    #[test]
+    fn allday_event_ending_exactly_at_anchor_midnight_is_excluded() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let yesterday = anchor - chrono::Duration::days(1);
+        // 1-day all-day event for yesterday: end = anchor 00:00.
+        let ev_yesterday = make_allday_event(yesterday);
+        let evs = [ev_yesterday];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+        assert!(
+            by_day.is_empty(),
+            "all-day event ending exactly at anchor midnight must be excluded"
+        );
+    }
+
+    /// Complement: a 1-day all-day event *on* the anchor day has
+    /// `end == anchor+1 00:00 > anchor_day_start` — it must be kept.
+    #[test]
+    fn allday_event_on_anchor_day_is_kept() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev_anchor = make_allday_event(anchor);
+        let evs = [ev_anchor];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+        assert!(
+            by_day.contains_key(&anchor),
+            "all-day event on the anchor day must appear in the list"
+        );
     }
 
     #[test]

@@ -146,8 +146,27 @@ fn show_context_menu(
             if let Some(m) = menu {
                 if !m.items.is_empty() {
                     let popover = build_menu_popover(&bus_name, &mp, &m.items, &monitor);
+                    // Nudge the popover to drop below the tray button (bar sits
+                    // at the top edge). GTK falls back gracefully if the geometry
+                    // doesn't fit.
+                    popover.set_position(gtk::PositionType::Bottom);
                     popover.set_parent(&btn);
+                    tracing::debug!(
+                        tray_popover = "pre-popup",
+                        bus = %bus_name,
+                        path = %mp,
+                        btn_has_root = btn.root().is_some(),
+                        btn_width = btn.width(),
+                        btn_height = btn.height(),
+                    );
                     popover.popup();
+                    tracing::debug!(
+                        tray_popover = "post-popup",
+                        bus = %bus_name,
+                        path = %mp,
+                        popover_visible = popover.is_visible(),
+                        popover_has_parent = popover.parent().is_some(),
+                    );
                     return;
                 }
                 tracing::debug!(bus = %bus_name, path = %mp, "DBusMenu empty, falling back to ContextMenu");
@@ -234,6 +253,8 @@ fn build_menu_item_widget(
             let Some(b) = btn_weak.upgrade() else { return };
             let sub_popover =
                 build_menu_popover(&bus_name, &menu_path, &sub_items_cloned, &monitor);
+            // Same positioning nudge as the top-level menu popover.
+            sub_popover.set_position(gtk::PositionType::Bottom);
             sub_popover.set_parent(&b);
             sub_popover.popup();
         });

@@ -5,6 +5,19 @@
  *                mint #06ffa5, magenta #aa00ef, teal #3a86af.
  */
 
+/* Sizing convention (#114): sizes that should track text — padding, margins,
+ * border-radius, -gtk-icon-size, min/max dimensions — are expressed in `em`
+ * (relative to the element's font-size). GTK4 supports `em` but NOT `rem`.
+ * `em` + `-gtk-icon-size` honor the text-scaling-factor automatically, so
+ * density / large-font scaling comes largely for free. Raw `px` only for
+ * things that must stay physically fixed. Rust-set sizes (set_pixel_size /
+ * set_size_request / cairo) can't use CSS units — derive them with
+ * `crate::scale::scale()`. Phases #116-#119 convert the existing px sites; this
+ * phase only documents the convention and adds the Rust helper (no px site is
+ * converted yet, so there is no visual change). NB: this stylesheet sets a
+ * `font-size` on `*` below, so for shell widgets `1em` resolves against that;
+ * authoring in `em` still keeps a single knob for density scaling. */
+
 /* Shell surface color — a flat lilac shared by every shell surface: bar,
  * slide-out drawer, and sidebar.  One variable keeps them visually unified.
  * Always dark regardless of the system theme (the bar is always dark).

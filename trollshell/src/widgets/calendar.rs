@@ -601,8 +601,10 @@ fn bucket_events_from_anchor<'a>(
 
     let mut by_day: BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> = BTreeMap::new();
     for ev in events {
-        // Skip events that fully ended before the anchor day.
-        if ev.end < anchor_day_start {
+        // Skip events that fully ended before or exactly at the anchor midnight.
+        // Using <= so an all-day event ending exactly at 00:00 of the anchor
+        // day (e.g. a 1-day all-day event on the day before) is excluded.
+        if ev.end <= anchor_day_start {
             continue;
         }
         // Clamp ongoing events (started before anchor, still running) to anchor.
@@ -821,6 +823,33 @@ mod tests {
         }
     }
 
+    /// Build a 1-day all-day event for `day`. The iCalendar convention for
+    /// all-day events is `DTEND = day + 1` at 00:00 (exclusive upper bound).
+    fn make_allday_event(day: NaiveDate) -> CalendarEvent {
+        let start_dt = Local
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap();
+        // iCal DTEND for a 1-day all-day event is the *next* day at 00:00.
+        let end_dt = Local
+            .from_local_datetime(
+                &(day + chrono::Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap();
+        CalendarEvent {
+            uid: format!("allday-{day}"),
+            summary: "all-day".into(),
+            start: start_dt,
+            end: end_dt,
+            location: None,
+            all_day: true,
+            calendar_name: "cal".into(),
+        }
+    }
+
     #[test]
     fn anchor_today_shows_all_upcoming() {
         // When anchor == today (the default), all events are shown on their
@@ -913,6 +942,37 @@ mod tests {
         assert!(
             by_day.is_empty(),
             "fully-past multi-day event must be excluded"
+        );
+    }
+
+    /// Regression for the strict-`<` bug: a 1-day all-day event on the day
+    /// before the anchor has `end == anchor 00:00 == anchor_day_start`.  With
+    /// the old `<` it leaked into the anchor section; with `<=` it is excluded.
+    #[test]
+    fn allday_event_ending_exactly_at_anchor_midnight_is_excluded() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let yesterday = anchor - chrono::Duration::days(1);
+        // 1-day all-day event for yesterday: end = anchor 00:00.
+        let ev_yesterday = make_allday_event(yesterday);
+        let evs = [ev_yesterday];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+        assert!(
+            by_day.is_empty(),
+            "all-day event ending exactly at anchor midnight must be excluded"
+        );
+    }
+
+    /// Complement: a 1-day all-day event *on* the anchor day has
+    /// `end == anchor+1 00:00 > anchor_day_start` — it must be kept.
+    #[test]
+    fn allday_event_on_anchor_day_is_kept() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev_anchor = make_allday_event(anchor);
+        let evs = [ev_anchor];
+        let by_day = bucket_events_from_anchor(&evs, anchor);
+        assert!(
+            by_day.contains_key(&anchor),
+            "all-day event on the anchor day must appear in the list"
         );
     }
 

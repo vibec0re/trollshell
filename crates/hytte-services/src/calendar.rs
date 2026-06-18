@@ -315,7 +315,7 @@ impl Worker {
 
         // Union: earliest start = min(grid_origin, now); latest end = max(grid_end_date, forward_end).
         // We want to include past events in the viewed month, so the scan start
-        // can be before now. We never go more than ~6 weeks back.
+        // can be before now (as far back as the grid origin of the viewed month).
         let scan_start_date = grid_origin.min(today);
         let scan_start = Local
             .from_local_datetime(&scan_start_date.and_hms_opt(0, 0, 0).unwrap_or_default())

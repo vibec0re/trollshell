@@ -9,7 +9,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
     let overlay = gtk::Overlay::new();
     let icon = gtk::Image::from_file(crate::assets::path("icons/notification.svg"));
-    icon.set_pixel_size(16);
+    icon.set_pixel_size(crate::scale::scale(16));
     overlay.set_child(Some(&icon));
 
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);

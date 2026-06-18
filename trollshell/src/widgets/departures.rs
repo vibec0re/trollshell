@@ -149,7 +149,7 @@ fn row(d: &Departure) -> (gtk::Widget, TimeRowRef) {
     let time_cell = gtk::Box::new(gtk::Orientation::Horizontal, 3);
     if d.walk_minutes > 0 {
         let walk = gtk::Image::from_file(crate::assets::path("icons/walk.svg"));
-        walk.set_pixel_size(14);
+        walk.set_pixel_size(crate::scale::scale(14));
         walk.set_valign(gtk::Align::Center);
         walk.add_css_class("ts-departure-walk-icon");
         time_cell.append(&walk);

@@ -10,7 +10,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
     let icon = gtk::Image::from_file(crate::assets::path("icons/disk.svg"));
-    icon.set_pixel_size(16);
+    icon.set_pixel_size(crate::scale::scale(16));
     row.append(&icon);
 
     // One tiny vertical bar per mount.

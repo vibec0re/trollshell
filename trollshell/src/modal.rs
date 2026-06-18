@@ -534,10 +534,11 @@ fn build_drawer_card(geometry: &BarGeometry) -> (gtk::Overlay, gtk::Box) {
 /// [`crate::overlays::frame`].
 ///
 /// `base` is read from the drawing area's `.ts-drawer-bg` CSS `color`, which
-/// is now `@shell_background` — a fixed dark color that matches the bar
-/// regardless of the system theme (fixes the light-mode regression from #44
-/// where `@window_bg_color` painted the drawer near-white). The gradient
-/// shades `base` by 0.82 at the top and fades to `base` at the bottom.
+/// is `@shell_background` — a fixed dark color that matches the bar and the
+/// sidebar (fixes the light-mode regression from #44 where `@window_bg_color`
+/// painted the drawer near-white). The fill is a flat `@shell_background`,
+/// matching `.ts-sidebar` exactly (#106 — removed the 0.82× top-darkening
+/// gradient that made the drawer's top edge read darker than the bar).
 fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::RGBA) {
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -563,29 +564,16 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
     cr.arc_negative(0.0, rf, rf, 0.0, -FRAC_PI_2); // top-left concave flare
     cr.close_path();
 
-    // Fill: a vertical gradient from a slightly-shaded `@shell_background` at
-    // the top to the base at the bottom. The fill is always dark (the drawer
-    // always matches the always-dark bar via `@shell_background`), so the
-    // old light-mode 1.04 lift branch is gone — only the 0.82 dark shade
-    // remains. Edge is a faint white hairline, matching the dark surface.
+    // Fill: flat `@shell_background` so the drawer matches the sidebar
+    // (`.ts-sidebar`, flat `@shell_background`) and the bar's base color.
+    // Previously a vertical gradient darkened the top to 0.82×, making the
+    // top edge — flush against the bar — read noticeably darker (#106).
     let base_rgb = [
         f64::from(base.red()),
         f64::from(base.green()),
         f64::from(base.blue()),
     ];
-    let top = [
-        (base_rgb[0] * 0.82).clamp(0.0, 1.0),
-        (base_rgb[1] * 0.82).clamp(0.0, 1.0),
-        (base_rgb[2] * 0.82).clamp(0.0, 1.0),
-    ];
-
-    let fill = gtk::cairo::LinearGradient::new(0.0, 0.0, 0.0, h);
-    fill.add_color_stop_rgba(0.0, top[0], top[1], top[2], 1.0);
-    fill.add_color_stop_rgba(1.0, base_rgb[0], base_rgb[1], base_rgb[2], 1.0);
-    if let Err(e) = cr.set_source(&fill) {
-        tracing::warn!(error = %e, "drawer: failed to set gradient source");
-        return;
-    }
+    cr.set_source_rgba(base_rgb[0], base_rgb[1], base_rgb[2], 1.0);
     if let Err(e) = cr.fill_preserve() {
         tracing::warn!(error = %e, "drawer: cairo fill failed");
         return;

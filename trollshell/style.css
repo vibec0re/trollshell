@@ -1161,12 +1161,12 @@
     margin-top: 0px;
     transition:
         opacity 200ms ease-out,
-        margin-top 200ms ease-out;
+        margin-top 280ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .ts-osd-card.shown {
     opacity: 1;
-    margin-top: 8px;
+    margin-top: 40px;
 }
 
 .ts-osd-icon {

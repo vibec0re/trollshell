@@ -53,9 +53,11 @@ use hytte::ui::layer_window;
 /// new event resets the timer.
 const HIDE_AFTER_MS: u32 = 1500;
 
-/// Distance from top of screen so the OSD doesn't sit flush against
-/// the bar.
-const TOP_MARGIN: i32 = 80;
+/// Distance from top of screen to the OSD window's top edge.
+/// `TOP_MARGIN` (48) + the CSS `.shown` `margin-top` (40) = **88 px** from the
+/// screen top, keeping the resting card position unchanged while the larger
+/// CSS travel makes it fly in from above.
+const TOP_MARGIN: i32 = 48;
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -578,10 +580,10 @@ fn show(view: &Rc<OsdView>, state: &State) {
         glib::timeout_add_local_once(Duration::from_millis(u64::from(HIDE_AFTER_MS)), move || {
             view_for_timeout.timeout.set(None);
             view_for_timeout.card.remove_css_class("shown");
-            // Wait for the 200ms CSS transition + 20ms safety buffer
+            // Wait for the 280ms CSS transition + 20ms safety buffer
             // before actually hiding the layer-shell window.
             let view_for_fade = view_for_timeout.clone();
-            let fade_id = glib::timeout_add_local_once(Duration::from_millis(220), move || {
+            let fade_id = glib::timeout_add_local_once(Duration::from_millis(300), move || {
                 view_for_fade.fade_out_timeout.set(None);
                 view_for_fade.window.set_visible(false);
             });

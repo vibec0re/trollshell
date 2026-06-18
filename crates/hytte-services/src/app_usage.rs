@@ -208,6 +208,9 @@ async fn poll_loop(
                 cpu_jiffies.saturating_sub(prev_pid.get(&pid).copied().unwrap_or(cpu_jiffies));
 
             // Determine the group key from the cgroup leaf; fall back to System.
+            // A pid that exits between the stat read and the cgroup read returns
+            // None here and is harmlessly misattributed to System for that tick
+            // (no panic, no double-count).
             let app_id = read_pid_app_id(pid);
             let group_key = app_id.as_deref().unwrap_or(SYSTEM_BUCKET).to_string();
 
@@ -325,7 +328,11 @@ fn read_pid_app_id(pid: u32) -> Option<String> {
 pub(crate) fn parse_app_id_from_cgroup(text: &str) -> Option<String> {
     for line in text.lines() {
         // Each line: `<hierarchy>:<controllers>:<path>`
-        let path = line.splitn(3, ':').nth(2)?;
+        // Use `else { continue }` rather than `?` so a single malformed or
+        // empty line is skipped instead of returning `None` for the whole file.
+        let Some(path) = line.splitn(3, ':').nth(2) else {
+            continue;
+        };
         // Find the last path segment that ends in `.scope` (case-insensitive
         // per clippy::case_sensitive_file_extension_comparisons). Use `rfind`
         // (= `filter` + `next_back` in one call, per clippy::filter_next).
@@ -365,7 +372,8 @@ pub(crate) fn parse_scope_leaf(leaf: &str) -> Option<String> {
 
     // Plain and instantiated form: "<id>" or "<id>-<random>"
     // Heuristic: if the last hyphen-separated component looks like a random
-    // suffix (all hex chars, 6+ chars, or all digits), strip it.
+    // suffix (all hex chars, 8+ chars, with at least one digit; or all digits),
+    // strip it.
     Some(strip_trailing_random_component(inner).to_string())
 }
 
@@ -381,7 +389,14 @@ fn strip_trailing_numeric_component(s: &str) -> &str {
 }
 
 /// Strip a trailing `-<random>` from `s` where `<random>` looks like a
-/// generated suffix (all hex, 6+ chars) or a PID-like suffix (all digits).
+/// generated suffix (all hex, 8+ chars with at least one digit) or a
+/// PID-like suffix (all digits).
+///
+/// The hex branch requires **8+ chars and at least one digit** to avoid
+/// false positives on short hex-looking words that are part of a real app-id
+/// (e.g. `decade`, `facade`, `gnome-decade` — 6-char pure-alpha words with
+/// all-hex letters are NOT stripped). Real systemd random suffixes are long
+/// blobs that virtually always contain a digit.
 ///
 /// This keeps the app-id intact for names like `app-org.x.Y-1234.scope`
 /// where the trailing part is an instance number, while leaving alone names
@@ -390,7 +405,9 @@ fn strip_trailing_random_component(s: &str) -> &str {
     if let Some(pos) = s.rfind('-') {
         let suffix = &s[pos + 1..];
         let is_numeric = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
-        let is_hex_random = suffix.len() >= 6 && suffix.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex_random = suffix.len() >= 8
+            && suffix.chars().all(|c| c.is_ascii_hexdigit())
+            && suffix.chars().any(|c| c.is_ascii_digit());
         if is_numeric || is_hex_random {
             return &s[..pos];
         }
@@ -455,9 +472,9 @@ mod tests {
 
     #[test]
     fn scope_leaf_instantiated_hex() {
-        // app-Alacritty-abc123.scope → Alacritty (hex suffix stripped)
+        // app-Alacritty-a1b2c3d4.scope → Alacritty (8-char hex suffix with digit stripped)
         assert_eq!(
-            parse_scope_leaf("app-Alacritty-abc123.scope"),
+            parse_scope_leaf("app-Alacritty-a1b2c3d4.scope"),
             Some("Alacritty".to_string())
         );
     }
@@ -530,10 +547,49 @@ mod tests {
 
     #[test]
     fn cgroup_instantiated_app() {
-        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-Alacritty-abc123.scope\n";
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-Alacritty-a1b2c3d4.scope\n";
         assert_eq!(
             parse_app_id_from_cgroup(cgroup),
             Some("Alacritty".to_string())
+        );
+    }
+
+    // Fix 1: malformed / short cgroup lines are skipped, not fatal.
+
+    #[test]
+    fn cgroup_empty_line_skipped_not_fatal() {
+        // A leading empty line (e.g. from "\n\n") must be skipped; the valid
+        // second line should still resolve the app-id.
+        let cgroup = "\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.scope\n";
+        assert_eq!(parse_app_id_from_cgroup(cgroup), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn cgroup_one_colon_line_skipped() {
+        // A line with only one colon has no third field; it must be skipped.
+        let cgroup = "malformed:line\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-bar.scope\n";
+        assert_eq!(parse_app_id_from_cgroup(cgroup), Some("bar".to_string()));
+    }
+
+    // Fix 2: short / pure-alpha hex-looking suffixes are NOT stripped.
+
+    #[test]
+    fn scope_leaf_short_hex_word_not_stripped() {
+        // "decade" is 6 chars and all-hex letters — must NOT be stripped.
+        // app-gnome-decade.scope → gnome-decade (not "gnome")
+        assert_eq!(
+            parse_scope_leaf("app-gnome-decade.scope"),
+            Some("gnome-decade".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_leaf_genuine_hex_random_stripped() {
+        // "a1b2c3d4" is 8 chars, all-hex, contains digits — IS stripped.
+        // app-foo-a1b2c3d4.scope → foo
+        assert_eq!(
+            parse_scope_leaf("app-foo-a1b2c3d4.scope"),
+            Some("foo".to_string())
         );
     }
 

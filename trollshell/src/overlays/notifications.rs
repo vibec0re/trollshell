@@ -356,7 +356,7 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     if notif.image.is_none() && !notif.app_icon.is_empty() {
         // Only show the small header icon when there is no thumbnail.
         let icon = gtk::Image::from_icon_name(&notif.app_icon);
-        icon.set_pixel_size(16);
+        icon.set_pixel_size(crate::scale::scale(16));
         header.append(&icon);
     }
 
@@ -436,7 +436,7 @@ fn build_overflow_card(monitor: &Monitor, count: usize) -> gtk::Widget {
     card.add_css_class("ts-toast-overflow");
 
     let icon = gtk::Image::from_icon_name("preferences-system-notifications-symbolic");
-    icon.set_pixel_size(24);
+    icon.set_pixel_size(crate::scale::scale(24));
     icon.add_css_class("ts-toast-image");
     card.append(&icon);
 
@@ -472,7 +472,7 @@ fn build_overflow_card(monitor: &Monitor, count: usize) -> gtk::Widget {
 
 fn build_image(image: &NotificationImage) -> gtk::Image {
     let img = gtk::Image::new();
-    img.set_pixel_size(48);
+    img.set_pixel_size(crate::scale::scale(48));
     match image {
         NotificationImage::Raw {
             width,

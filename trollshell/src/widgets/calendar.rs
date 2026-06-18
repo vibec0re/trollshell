@@ -342,7 +342,13 @@ fn rebuild_upcoming_list(
     let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len() + days.len());
     // Count only event rows (not day-section headers) against the cap.
     let mut event_count: usize = 0;
-    'outer: for day in days {
+    for day in days {
+        // Check the cap before emitting the day header so a day that exactly
+        // fills the cap doesn't leave the next day's header dangling with no
+        // event rows under it.
+        if event_count >= UPCOMING_LIMIT {
+            break;
+        }
         let header = build_day_header(day, today);
         group.add(&header);
         new_rows.push((day, header));
@@ -350,7 +356,7 @@ fn rebuild_upcoming_list(
         if let Some(day_evs) = by_day.get(&day) {
             for ev in day_evs {
                 if event_count >= UPCOMING_LIMIT {
-                    break 'outer;
+                    break;
                 }
                 let row = build_calendar_row(ev);
                 group.add(&row);
@@ -657,10 +663,16 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
 }
 
 /// Launch `gnome-calendar`. Logs a warning if the binary is not found or
-/// the spawn otherwise fails — never panics.
+/// the spawn otherwise fails — never panics. The child is reaped in a
+/// detached thread so no zombie accumulates in the long-running shell
+/// process.
 fn launch_gnome_calendar() {
     match std::process::Command::new("gnome-calendar").spawn() {
-        Ok(_) => {}
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         Err(e) => {
             tracing::warn!(error = %e, "could not launch gnome-calendar");
         }

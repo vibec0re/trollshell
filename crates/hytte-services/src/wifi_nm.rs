@@ -401,10 +401,21 @@ pub(crate) async fn run_nm_wifi_watcher(
             .signal("AccessPointRemoved")
             .start();
 
+        // Watch the manager's DeviceRemoved signal so we can re-discover when
+        // the Wi-Fi device is unplugged (USB dongle) or otherwise unregistered
+        // by NM.  The signal carries a single object-path argument.
+        let device_removed_sub = hytte_bus::signals(NM_NAME)
+            .bus(BusKind::System)
+            .at_path(NM_PATH)
+            .iface(NM_IFACE)
+            .signal("DeviceRemoved")
+            .start();
+
         let mut device_events = device_sub.events();
         let mut manager_events = manager_sub.events();
         let mut ap_added_events = ap_added_sub.events();
         let mut ap_removed_events = ap_removed_sub.events();
+        let mut device_removed_events = device_removed_sub.events();
 
         tracing::info!(path = %device_path, "wifi_nm: watching device");
 
@@ -421,6 +432,30 @@ pub(crate) async fn run_nm_wifi_watcher(
                 }
                 Some(_) = ap_removed_events.next() => {
                     refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+                }
+                Some(evt) = device_removed_events.next() => {
+                    // The DeviceRemoved signal body is a single object path `o`.
+                    // Accept any decode failure gracefully and always re-discover —
+                    // re-discovery is cheap and idempotent.
+                    let removed_path = evt
+                        .body
+                        .body()
+                        .deserialize::<zbus::zvariant::OwnedObjectPath>()
+                        .ok()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_default();
+                    let matches = removed_path.is_empty() || removed_path == device_path;
+                    if matches {
+                        tracing::warn!(
+                            path = %device_path,
+                            "wifi_nm: device removed — clearing state and re-discovering"
+                        );
+                        station.set(None);
+                        networks.set(Vec::new());
+                        adapter.set(None);
+                        *device_path_store.write().await = String::new();
+                        break;
+                    }
                 }
             }
         }

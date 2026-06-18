@@ -50,7 +50,7 @@ fn build_block(monitor: &Monitor) -> gtk::Box {
     group.add_css_class("ts-sidebar-tasks-list");
     column.append(&group);
 
-    let rows_track: Rc<RefCell<Vec<gtk::ListBoxRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let rows_track: Rc<RefCell<Vec<adw::PreferencesRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     let overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     wire_tasks_bind(
@@ -104,7 +104,7 @@ fn build_header(lists_track: &Rc<RefCell<Vec<TaskList>>>, monitor: &Monitor) -> 
 
 fn wire_tasks_bind(
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<gtk::ListBoxRow>>>,
+    rows_track: &Rc<RefCell<Vec<adw::PreferencesRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     monitor: &Monitor,
@@ -127,7 +127,7 @@ fn wire_tasks_bind(
 
 fn rebuild_list(
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<gtk::ListBoxRow>>>,
+    rows_track: &Rc<RefCell<Vec<adw::PreferencesRow>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     overflow_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     ts: &[Task],
@@ -155,7 +155,7 @@ fn rebuild_list(
     }
 
     let visible = ts.len().min(MAX_VISIBLE_TASKS);
-    let mut new_rows: Vec<gtk::ListBoxRow> = Vec::with_capacity(visible);
+    let mut new_rows: Vec<adw::PreferencesRow> = Vec::with_capacity(visible);
     for t in ts.iter().take(visible) {
         let row = build_task_row(t, monitor);
         group.add(&row);
@@ -178,7 +178,7 @@ fn rebuild_list(
 
 // ── One row ──────────────────────────────────────────────────────────────────
 
-/// Build a custom two-line task row as a plain `gtk::ListBoxRow`.
+/// Build a custom two-line task row as an `adw::PreferencesRow`.
 ///
 /// Layout:
 /// ```text
@@ -188,11 +188,14 @@ fn rebuild_list(
 /// └─────────────────────────────────────────────────────┘
 /// ```
 ///
-/// The row is `activatable`; clicking its body (anywhere except the
-/// checkbox) opens the edit popover. The checkbox fires `set_completed`
-/// directly.
-fn build_task_row(task: &Task, monitor: &Monitor) -> gtk::ListBoxRow {
-    let row = gtk::ListBoxRow::new();
+/// Using `adw::PreferencesRow` (an `AdwPreferencesRow` subclass of
+/// `GtkListBoxRow`) ensures `adw::PreferencesGroup::add` inserts the row
+/// directly rather than double-wrapping it in an anonymous
+/// `GtkListBoxRow`. The row is `activatable`; clicking its body (anywhere
+/// except the checkbox) opens the edit popover. The checkbox fires
+/// `set_completed` directly.
+fn build_task_row(task: &Task, monitor: &Monitor) -> adw::PreferencesRow {
+    let row = adw::PreferencesRow::new();
     row.add_css_class("ts-task-row");
     row.set_activatable(true);
 

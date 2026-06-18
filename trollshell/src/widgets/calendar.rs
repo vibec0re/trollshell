@@ -30,6 +30,12 @@ const PALETTE_SIZE: usize = 8;
 /// enough to convey "busy" without crowding the 36 px cell.
 const MAX_DOTS_PER_DAY: usize = 3;
 
+/// Maximum number of event rows shown in the upcoming list (day-section
+/// headers do not count toward this cap). Five rows keeps the list compact
+/// without a scrollbar while still covering a typical busy day + a peek at
+/// the next.
+const UPCOMING_LIMIT: usize = 5;
+
 /// Shared state used by every wired handler — render reads from here, the
 /// nav/click handlers write to it and trigger a re-render.
 #[derive(Clone)]
@@ -95,25 +101,13 @@ fn build_block() -> gtk::Box {
 
     let group = adw::PreferencesGroup::new();
     group.add_css_class("ts-sidebar-cal-list");
-
-    let scrolled = gtk::ScrolledWindow::new();
-    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
-    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-    // No min_content_height: the previous 220 px floor reserved a slab
-    // of empty space when the upcoming list had 0–2 entries, leaving a
-    // visible gap before the next sibling widget. The SW now shrinks
-    // to natural content height; max caps it at 280 so a packed list
-    // doesn't squeeze tasks + departures.
-    scrolled.set_max_content_height(280);
-    scrolled.set_propagate_natural_height(true);
-    scrolled.set_child(Some(&group));
-    column.append(&scrolled);
+    column.append(&group);
 
     let rows_track: Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
 
-    wire_day_clicks(&state, &group, &rows_track, &placeholder_track, &scrolled);
+    wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
     wire_events_bind(&state, &group, &rows_track, &placeholder_track);
     wire_clock_bind(&state, &column);
 
@@ -237,26 +231,17 @@ fn wire_day_clicks(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
-    scrolled: &gtk::ScrolledWindow,
 ) {
     for (idx, cell) in state.cells.iter().enumerate() {
         let state = state.clone();
         let group = group.clone();
         let rows_track = rows_track.clone();
         let placeholder_track = placeholder_track.clone();
-        let scrolled = scrolled.clone();
         cell.button.connect_clicked(move |_| {
             let Some(d) = state.cells[idx].date.get() else {
                 return;
             };
-            on_day_clicked(
-                d,
-                &state,
-                &group,
-                &rows_track,
-                &placeholder_track,
-                &scrolled,
-            );
+            on_day_clicked(d, &state, &group, &rows_track, &placeholder_track);
         });
     }
 }
@@ -267,7 +252,6 @@ fn on_day_clicked(
     group: &adw::PreferencesGroup,
     rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
-    scrolled: &gtk::ScrolledWindow,
 ) {
     state.selected.set(Some(date));
     let (vy, vm) = state.viewed.get();
@@ -283,7 +267,6 @@ fn on_day_clicked(
 
     let rows = rows_track.borrow();
     if let Some((_d, row)) = rows.iter().find(|(d, _)| *d == date) {
-        scroll_row_into_view(scrolled, row);
         flash_row_highlight(row);
     }
 }
@@ -357,20 +340,33 @@ fn rebuild_upcoming_list(
     }
 
     let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len() + days.len());
+    // Count only event rows (not day-section headers) against the cap.
+    let mut event_count: usize = 0;
     for day in days {
+        // Check the cap before emitting the day header so a day that exactly
+        // fills the cap doesn't leave the next day's header dangling with no
+        // event rows under it.
+        if event_count >= UPCOMING_LIMIT {
+            break;
+        }
         let header = build_day_header(day, today);
         group.add(&header);
         new_rows.push((day, header));
 
         if let Some(day_evs) = by_day.get(&day) {
             for ev in day_evs {
+                if event_count >= UPCOMING_LIMIT {
+                    break;
+                }
                 let row = build_calendar_row(ev);
                 group.add(&row);
                 new_rows.push((day, row));
+                event_count += 1;
             }
         } else {
             // Only the anchor-day section reaches here (every other shown
-            // day has at least one event).
+            // day has at least one event). The "No events" placeholder counts
+            // as occupying zero event slots — it is purely decorative.
             let none = build_none_anchor_row(day, today);
             group.add(&none);
             new_rows.push((day, none));
@@ -616,28 +612,45 @@ fn color_class_for_index(idx: usize) -> &'static str {
 
 // ── Upcoming-list row builder + helpers ──────────────────────────────────────
 
-/// Build an `adw::ActionRow` for a single calendar event. The prefix is a
-/// colored dot keyed by `calendar_name`, the subtitle shows the when-string
-/// and, if present, the location on a separate line.
-fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
-    use hytte::services::calendar::format_when;
+/// Format just the time portion of an event for the upcoming-list subtitle:
+/// all-day → `"All day"`, timed same-day → `"HH:MM – HH:MM"` (en-dash),
+/// timed same start==end → `"HH:MM"`. Location is intentionally excluded
+/// (meeting join-URLs cause too much noise in the compact list — issue #101).
+fn format_time_subtitle(ev: &CalendarEvent) -> String {
+    if ev.all_day {
+        return "All day".to_string();
+    }
+    let start_hm = ev.start.format("%H:%M");
+    let end_hm = ev.end.format("%H:%M");
+    let start_str = start_hm.to_string();
+    let end_str = end_hm.to_string();
+    if start_str == end_str {
+        start_str
+    } else {
+        format!("{start_str}\u{2013}{end_str}")
+    }
+}
 
-    let when = format_when(ev);
-    let subtitle = match &ev.location {
-        Some(loc) => format!("{when}\n{loc}"),
-        None => when,
-    };
+/// Build an `adw::ActionRow` for a single calendar event. The prefix is a
+/// colored dot keyed by `calendar_name`; the subtitle shows the time only
+/// (no location — join-URLs are too noisy in this compact list). The row is
+/// activatable: clicking it launches `gnome-calendar` (graceful if absent).
+fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
+    let subtitle = format_time_subtitle(ev);
 
     // AdwActionRow renders title/subtitle as Pango markup, so an unescaped
-    // `&`/`<`/`>` in a summary or location silently blanks the field (#30).
-    // Escape both, mirroring `widgets/tasks.rs`.
+    // `&`/`<`/`>` in a summary silently blanks the field (#30).
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&ev.summary).as_str())
         .subtitle(glib::markup_escape_text(&subtitle).as_str())
-        .activatable(false)
+        .activatable(true)
         .build();
-    row.set_subtitle_lines(0);
+    row.set_subtitle_lines(1);
     row.set_title_lines(1);
+
+    row.connect_activated(|_row| {
+        launch_gnome_calendar();
+    });
 
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("ts-cal-source-dot");
@@ -649,20 +662,21 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
     row
 }
 
-fn scroll_row_into_view(scrolled: &gtk::ScrolledWindow, row: &adw::ActionRow) {
-    use hytte::gtk::prelude::{AdjustmentExt, WidgetExt};
-    let Some(child) = scrolled.child() else {
-        return;
-    };
-    let origin = gtk::graphene::Point::new(0.0, 0.0);
-    let Some(point) = row.compute_point(&child, &origin) else {
-        return;
-    };
-    let y = f64::from(point.y());
-    let adj = scrolled.vadjustment();
-    let target = (y - 8.0).max(adj.lower());
-    let max = (adj.upper() - adj.page_size()).max(adj.lower());
-    adj.set_value(target.min(max));
+/// Launch `gnome-calendar`. Logs a warning if the binary is not found or
+/// the spawn otherwise fails — never panics. The child is reaped in a
+/// detached thread so no zombie accumulates in the long-running shell
+/// process.
+fn launch_gnome_calendar() {
+    match std::process::Command::new("gnome-calendar").spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not launch gnome-calendar");
+        }
+    }
 }
 
 fn flash_row_highlight(row: &adw::ActionRow) {

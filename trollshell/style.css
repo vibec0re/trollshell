@@ -858,13 +858,31 @@
 .ts-sidebar-cal-list .ts-cal-day-header {
     background: transparent;
     min-height: 0;
-    margin-top: 4px;
+    margin-top: 2px;
+    padding-top: 0;
+    padding-bottom: 0;
 }
 .ts-sidebar-cal-list .ts-cal-day-header .title {
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 1px;
     color: alpha(white, 0.55);
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+/* Event rows: tighter vertical rhythm so N=5 rows sit without wasted space. */
+.ts-sidebar-cal-list row {
+    min-height: 0;
+    padding-top: 2px;
+    padding-bottom: 2px;
+}
+.ts-sidebar-cal-list .title {
+    padding-top: 1px;
+    padding-bottom: 0;
+}
+.ts-sidebar-cal-list .subtitle {
+    padding-top: 0;
+    padding-bottom: 1px;
 }
 /* "No more events today" placeholder under the Today section. */
 .ts-sidebar-cal-list .ts-cal-day-empty .title {

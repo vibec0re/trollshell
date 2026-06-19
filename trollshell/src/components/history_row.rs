@@ -16,7 +16,7 @@ pub(crate) fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label)
     let name_label = gtk::Label::new(Some(name));
     name_label.add_css_class("ts-stat-name");
     name_label.set_xalign(0.0);
-    name_label.set_size_request(80, -1);
+    name_label.set_size_request(crate::scale::scale(80), -1);
     row.append(&name_label);
 
     let spark = Sparkline::new(60);
@@ -26,7 +26,7 @@ pub(crate) fn build_history_row(name: &str) -> (gtk::Box, Sparkline, gtk::Label)
     let value_label = gtk::Label::new(None);
     value_label.add_css_class("ts-stat-value");
     value_label.set_xalign(1.0);
-    value_label.set_size_request(80, -1);
+    value_label.set_size_request(crate::scale::scale(80), -1);
     row.append(&value_label);
 
     (row, spark, value_label)

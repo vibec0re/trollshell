@@ -13,6 +13,7 @@ use crate::components::cast;
 use crate::components::format::fmt_us;
 use crate::components::layout::{finish_page, page_grid, section};
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
+use crate::scale::scale;
 
 /// Labels + buttons that the bind closure updates on every emission.
 #[derive(Clone)]
@@ -58,11 +59,11 @@ pub fn panel_media() -> gtk::Widget {
 
 fn build_art_panel(grid: &gtk::Grid) -> gtk::Image {
     let art_box = section("");
-    art_box.set_size_request(220, 220);
+    art_box.set_size_request(scale(220), scale(220));
     art_box.add_css_class("ts-media-art");
     let art_image = gtk::Image::new();
     art_image.set_icon_name(Some("audio-x-generic-symbolic"));
-    art_image.set_pixel_size(200);
+    art_image.set_pixel_size(scale(200));
     art_box.append(&art_image);
     grid.attach(&art_box, 0, 0, 1, 1);
     art_image
@@ -167,7 +168,7 @@ fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
     w.len.set_text("0:00");
     art.set_paintable(None::<&gdk::Paintable>);
     art.set_icon_name(Some("audio-x-generic-symbolic"));
-    art.set_pixel_size(200);
+    art.set_pixel_size(scale(200));
     w.prev_btn.set_sensitive(false);
     w.play_pause_btn.set_sensitive(false);
     w.next_btn.set_sensitive(false);
@@ -209,7 +210,7 @@ fn spawn_art_fetch(art: gtk::Image, url: String) {
         };
         art.set_pixel_size(-1);
         art.set_paintable(Some(&texture));
-        art.set_size_request(200, 200);
+        art.set_size_request(scale(200), scale(200));
     });
 }
 

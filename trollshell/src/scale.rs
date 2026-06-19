@@ -32,9 +32,9 @@
 //!
 //! # Usage
 //!
-//! The first call sites land in the later #114 phases (#116–#119), which
-//! convert the existing hardcoded `set_pixel_size` / `set_size_request` /
-//! cairo-dimension sites:
+//! Phase 2 (#116) wires the first call sites (bar widget icons). Remaining
+//! phases (#117–#119) will convert `set_size_request` and cairo-dimension
+//! sites:
 //!
 //! ```rust,ignore
 //! use crate::scale::scale;
@@ -123,8 +123,8 @@ fn scale_with_factor(px: i32, factor: f64) -> i32 {
 /// separately by GTK and is intentionally *not* included here (see the module
 /// docs).
 ///
-/// First call sites land in #114 phases 2-5 (#116-#119).
-#[allow(dead_code)] // First call sites land in #114 phases 2-5 (#116-#119).
+/// Phase 2 (#116) wires bar-chip icon sizes; phases 3–5 (#117–#119) cover
+/// the remaining `set_size_request` and cairo-dimension sites.
 #[must_use]
 pub(crate) fn scale(px: i32) -> i32 {
     scale_with_factor(px, effective_font_px() / BASE_EM_PX)

@@ -15,7 +15,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // (it lives at `sidebar-show-symbolic` now, but Material's view_sidebar
     // matches the rest of the bar's icon style — see icons/cpu.svg etc.).
     let icon = gtk::Image::from_file(crate::assets::path("icons/view-sidebar.svg"));
-    icon.set_pixel_size(16);
+    icon.set_pixel_size(crate::scale::scale(16));
     btn.set_child(Some(&icon));
 
     let monitor_for_click = monitor.clone();

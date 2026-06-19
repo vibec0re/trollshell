@@ -12,9 +12,9 @@
  * density / large-font scaling comes largely for free. Raw `px` only for
  * things that must stay physically fixed. Rust-set sizes (set_pixel_size /
  * set_size_request / cairo) can't use CSS units — derive them with
- * `crate::scale::scale()`. Phases #116-#119 convert the existing px sites; this
- * phase only documents the convention and adds the Rust helper (no px site is
- * converted yet, so there is no visual change). NB: this stylesheet sets a
+ * `crate::scale::scale()`. Phase 2 (#116) converted bar + chip px → em and
+ * wired bar icon set_pixel_size through scale(). Phases #117-#119 cover the
+ * remaining sites. NB: this stylesheet sets a
  * `font-size` on `*` below, so for shell widgets `1em` resolves against that;
  * authoring in `em` still keeps a single knob for density scaling. */
 
@@ -74,8 +74,8 @@
 .hytte-bar-group-center button {
     background: transparent;
     border: none;
-    border-radius: 10px;
-    padding: 2px 10px;
+    border-radius: 0.769em;
+    padding: 0.154em 0.769em;
     color: inherit;
     box-shadow: none;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -83,7 +83,7 @@
 .hytte-bar-group-right button {
     background: transparent;
     border: none;
-    padding: 2px 6px;
+    padding: 0.154em 0.462em;
     color: inherit;
     box-shadow: none;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -92,12 +92,12 @@
 /* ─── Workspaces ─────────────────────────────────────────────────── */
 
 .ts-workspaces button {
-    min-width: 22px;
-    margin: 0 3px 0 0;
-    padding: 2px 8px;
+    min-width: 1.692em;
+    margin: 0 0.231em 0 0;
+    padding: 0.154em 0.615em;
     background: rgba(255, 255, 255, 0.05);
     color: #ffffff;
-    border-radius: 10px;
+    border-radius: 0.769em;
     opacity: 1;
     transition: all 0.3s ease;
 }
@@ -128,11 +128,11 @@
 /* ─── Window list ────────────────────────────────────────────────── */
 
 .ts-windows {
-    margin-left: 8px;
+    margin-left: 0.615em;
 }
 .ts-windows button {
-    padding: 2px 10px;
-    border-radius: 10px;
+    padding: 0.154em 0.769em;
+    border-radius: 0.769em;
     background: rgba(255, 255, 255, 0.03);
     opacity: 0.75;
     transition: all 0.3s ease;
@@ -161,9 +161,9 @@
 
 .hytte-bar-group-right {
     background: linear-gradient(90deg, #ff006e, #3a86ff, #aa00ef, #3a86af);
-    border-radius: 10px;
-    padding: 2px;
-    margin: 0 2px;
+    border-radius: 0.769em;
+    padding: 0.154em;
+    margin: 0 0.154em;
     box-shadow: 0 0 14px rgba(131, 56, 236, 0.35);
 }
 /* Sub-groups inside the right rainbow pill — dark pills wrapping a set
@@ -171,7 +171,7 @@
  * through the gap between groups, giving the cluster a segmented look. */
 .ts-bar-group {
     background: rgba(0, 0, 0, 0.25);
-    border-radius: 8px;
+    border-radius: 0.615em;
     padding: 0px;
 }
 /* Chips sit inside the rainbow pill with minimal padding + no inter-chip
@@ -184,8 +184,8 @@
         rgba(40, 20, 55, 0.88)
     );
     border: none;
-    border-radius: 8px;
-    padding: 2px 6px;
+    border-radius: 0.615em;
+    padding: 0.154em 0.462em;
     margin: 0;
     min-width: 0;
     box-shadow: none;
@@ -200,7 +200,7 @@
     box-shadow: 0 0 18px rgba(131, 56, 236, 0.55);
 }
 .ts-indicator image {
-    -gtk-icon-size: 16px;
+    -gtk-icon-size: 1.231em;
 }
 .ts-volume:hover {
     background: linear-gradient(135deg, #ff006e, #8338ec);
@@ -252,7 +252,7 @@
     opacity: 0.85;
 }
 .ts-clock {
-    padding: 2px 14px 2px 10px;
+    padding: 0.154em 1.077em 0.154em 0.769em;
 }
 .ts-indicator-bar {
     min-width: 4px;
@@ -308,11 +308,11 @@
 }
 .ts-tray-item {
     background: transparent;
-    padding: 0 3px;
-    min-width: 18px;
+    padding: 0 0.231em;
+    min-width: 1.385em;
 }
 .ts-tray-item image {
-    -gtk-icon-size: 16px;
+    -gtk-icon-size: 1.231em;
 }
 .ts-notif-indicator .ts-notif-dot {
     min-width: 6px;
@@ -323,12 +323,12 @@
     box-shadow: 0 0 4px rgba(255, 0, 110, 0.7);
 }
 .ts-mpris {
-    padding: 0 6px;
+    padding: 0 0.462em;
 }
 .ts-mpris button {
-    padding: 0 6px;
-    min-width: 22px;
-    border-radius: 10px;
+    padding: 0 0.462em;
+    min-width: 1.692em;
+    border-radius: 0.769em;
     transition: all 0.3s ease;
 }
 .ts-mpris button:hover {
@@ -340,7 +340,7 @@
     box-shadow: 0 0 10px rgba(6, 255, 165, 0.4);
 }
 .ts-mpris label {
-    padding: 0 8px;
+    padding: 0 0.615em;
     color: rgba(255, 255, 255, 0.9);
 }
 

@@ -171,7 +171,7 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
 
     let icon = gtk::Image::new();
     icon.add_css_class("ts-osd-icon");
-    icon.set_pixel_size(32);
+    icon.set_pixel_size(crate::scale::scale(32));
     header.append(&icon);
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);

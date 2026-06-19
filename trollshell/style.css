@@ -488,16 +488,16 @@
 /* ─── Notification toasts — use card background ─────────────────── */
 
 .ts-toasts {
-    padding: 4px;
+    padding: 0.308em;
 }
 .ts-toast {
     background: @card_bg_color;
     color: @card_fg_color;
     border: 1px solid @card_shade_color;
-    border-radius: 10px;
-    padding: 10px 12px;
-    min-width: 280px;
-    max-width: 380px;
+    border-radius: 0.769em;
+    padding: 0.769em 0.923em;
+    min-width: 21.538em;
+    max-width: 29.231em;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 .ts-toast-critical {
@@ -516,16 +516,16 @@
     font-size: 12px;
 }
 .ts-toast-image {
-    min-width: 48px;
-    min-height: 48px;
-    border-radius: 6px;
+    min-width: 3.692em;
+    min-height: 3.692em;
+    border-radius: 0.462em;
 }
 .ts-toast-actions {
-    margin-top: 6px;
+    margin-top: 0.462em;
 }
 .ts-toast-action {
-    padding: 2px 12px;
-    border-radius: 8px;
+    padding: 0.154em 0.923em;
+    border-radius: 0.615em;
     font-size: 12px;
 }
 
@@ -1163,10 +1163,10 @@
 }
 
 .ts-osd-card {
-    min-width: 280px;
-    max-width: 320px;
-    padding: 16px;
-    border-radius: 14px;
+    min-width: 21.538em;
+    max-width: 24.615em;
+    padding: 1.231em;
+    border-radius: 1.077em;
     background: alpha(@window_bg_color, 0.92);
     box-shadow: 0 4px 16px alpha(black, 0.25);
 
@@ -1196,7 +1196,7 @@
 }
 
 .ts-osd-progress trough {
-    min-height: 6px;
+    min-height: 0.462em;
     background: alpha(@accent_color, 0.15);
     border-radius: 9999px;
 }

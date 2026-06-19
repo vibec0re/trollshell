@@ -403,26 +403,26 @@
    against the sidebar's right edge; rounding here causes a visual seam. */
 .ts-sidebar {
     background: @shell_background;
-    padding: 12px;
+    padding: 0.923em;
     color: white;
 }
 
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {
-    padding: 4px;
+    padding: 0.308em;
 }
 .ts-weather-location {
     font-size: 11px;
     letter-spacing: 1.5px;
     color: alpha(currentColor, 0.6);
-    margin-bottom: 8px;
+    margin-bottom: 0.615em;
 }
 .ts-weather-headline {
-    margin-bottom: 2px;
+    margin-bottom: 0.154em;
 }
 .ts-weather-icon {
-    -gtk-icon-size: 28px;
+    -gtk-icon-size: 2.154em;
 }
 .ts-weather-temp {
     font-size: 32px;
@@ -432,12 +432,12 @@
     color: alpha(currentColor, 0.85);
 }
 .ts-weather-columns {
-    margin-top: 2px;
+    margin-top: 0.154em;
 }
 .ts-weather-minmax {
     font-size: 12px;
     color: alpha(currentColor, 0.7);
-    margin-top: 2px;
+    margin-top: 0.154em;
 }
 .ts-weather-details {
     font-size: 12px;
@@ -453,7 +453,7 @@
 }
 
 .ts-modal-page {
-    padding: 12px;
+    padding: 0.923em;
 }
 .ts-modal-catcher,
 .ts-modal-catcher > box {
@@ -462,23 +462,23 @@
 
 /* Card panels inside pages. */
 .ts-page-grid {
-    padding: 12px;
+    padding: 0.923em;
 }
 .ts-panel {
     background: @card_bg_color;
     color: @card_fg_color;
     border: 1px solid @card_shade_color;
-    border-radius: 10px;
-    padding: 10px 12px;
+    border-radius: 0.769em;
+    padding: 0.769em 0.923em;
 }
 .ts-panel-title {
     font-weight: 600;
     font-size: 13px;
     color: @accent_color;
-    margin-bottom: 6px;
+    margin-bottom: 0.462em;
 }
 .ts-popup-column {
-    min-width: 180px;
+    min-width: 13.846em;
 }
 .ts-popup-headline {
     font-weight: 600;
@@ -554,8 +554,8 @@
 /* ─── Bluetooth / Wi-Fi rows ────────────────────────────────────── */
 
 .ts-bluetooth-device {
-    padding: 4px 8px;
-    border-radius: 6px;
+    padding: 0.308em 0.615em;
+    border-radius: 0.462em;
     text-align: left;
 }
 .ts-bluetooth-device.connected {
@@ -563,15 +563,15 @@
 }
 .ts-wifi-headline {
     font-weight: 600;
-    margin-top: 4px;
+    margin-top: 0.308em;
 }
 .ts-wifi-list {
     border: 1px solid @card_shade_color;
-    border-radius: 6px;
+    border-radius: 0.462em;
     background: alpha(@view_bg_color, 0.6);
 }
 .ts-wifi-row {
-    padding: 4px 8px;
+    padding: 0.308em 0.615em;
     background: transparent;
     text-align: left;
 }
@@ -581,23 +581,23 @@
 .ts-wifi-suffix {
     opacity: 0.55;
     font-size: 11px;
-    margin-left: 8px;
+    margin-left: 0.615em;
 }
 
 /* ─── Notification history page ─────────────────────────────────── */
 
 .ts-notif-clear-btn {
-    padding: 2px 10px;
-    border-radius: 8px;
+    padding: 0.154em 0.769em;
+    border-radius: 0.615em;
     font-size: 12px;
 }
 .ts-notif-history {
     border: 1px solid @card_shade_color;
-    border-radius: 8px;
+    border-radius: 0.615em;
     background: alpha(@view_bg_color, 0.6);
 }
 .ts-notif-row {
-    padding: 8px 10px;
+    padding: 0.615em 0.769em;
     border-bottom: 1px solid @card_shade_color;
 }
 .ts-notif-row.critical {
@@ -622,40 +622,40 @@
 }
 .ts-notif-empty {
     opacity: 0.55;
-    padding: 16px;
+    padding: 1.231em;
     font-size: 13px;
 }
 
 /* ─── Audio mixer (pavucontrol-style) ───────────────────────────── */
 
 .ts-audio-row {
-    padding: 4px 4px;
+    padding: 0.308em 0.308em;
 }
 .ts-audio-row-name {
-    min-width: 180px;
+    min-width: 13.846em;
 }
 .ts-audio-row-name.dim {
     opacity: 0.6;
 }
 .ts-audio-default-btn {
-    padding: 0 4px;
-    min-width: 16px;
+    padding: 0 0.308em;
+    min-width: 1.231em;
     background: transparent;
 }
 .ts-audio-default-btn.active {
     color: @accent_color;
 }
 .ts-audio-mute-btn {
-    padding: 2px 6px;
-    border-radius: 6px;
+    padding: 0.154em 0.462em;
+    border-radius: 0.462em;
 }
 .ts-audio-mute-btn.muted {
     background: alpha(@destructive_color, 0.3);
 }
 
 .ts-mute-btn {
-    padding: 2px 6px;
-    border-radius: 6px;
+    padding: 0.154em 0.462em;
+    border-radius: 0.462em;
 }
 .ts-mute-btn.active {
     background: alpha(@destructive_color, 0.3);
@@ -664,9 +664,9 @@
 /* ─── Media (MPRIS) page ────────────────────────────────────────── */
 
 .ts-media-art {
-    min-width: 220px;
-    min-height: 220px;
-    border-radius: 10px;
+    min-width: 16.923em;
+    min-height: 16.923em;
+    border-radius: 0.769em;
 }
 .ts-media-title {
     font-weight: 700;
@@ -934,20 +934,20 @@
 /* ─── Sidebar — departures widget ─────────────────────────────── */
 
 .ts-departures {
-    padding: 12px;
+    padding: 0.923em;
 }
 
 .ts-departure-row {
-    padding: 6px 4px;
+    padding: 0.462em 0.308em;
 }
 
 .ts-line-badge {
-    min-width: 36px;
-    padding: 2px 6px;
-    border-radius: 6px;
+    min-width: 2.769em;
+    padding: 0.154em 0.462em;
+    border-radius: 0.462em;
     font-weight: 700;
     color: white;
-    margin-right: 8px;
+    margin-right: 0.615em;
 }
 .ts-line-S8 {
     background: #5dab46;
@@ -981,7 +981,7 @@
 }
 .ts-departure-delay {
     color: #ff6b6b;
-    margin-left: 6px;
+    margin-left: 0.462em;
     font-variant-numeric: tabular-nums;
 }
 
@@ -1010,32 +1010,32 @@
 .ts-departures-stale-footer {
     color: alpha(white, 0.45);
     font-style: italic;
-    padding: 12px;
+    padding: 0.923em;
 }
 
 .ts-departures-error {
     color: #ff6b6b;
-    padding: 12px;
+    padding: 0.923em;
 }
 
 /* ─── Sidebar — tasks widget ──────────────────────────────────── */
 
 .ts-sidebar-tasks {
-    padding: 0 12px;
-    margin-top: 10px;
+    padding: 0 0.923em;
+    margin-top: 0.769em;
 }
 
 .ts-sidebar-tasks-header {
     /* Row carries the "TASKS" label + the add button. .ts-sidebar-cal-header
      * (reused on the label) supplies its own margin; we just align here. */
-    margin-bottom: 4px;
+    margin-bottom: 0.308em;
 }
 
 .ts-sidebar-tasks-add-btn {
-    min-width: 22px;
-    min-height: 22px;
+    min-width: 1.692em;
+    min-height: 1.692em;
     padding: 0;
-    border-radius: 6px;
+    border-radius: 0.462em;
     color: alpha(white, 0.65);
 }
 .ts-sidebar-tasks-add-btn:hover {
@@ -1049,7 +1049,7 @@
 .ts-sidebar-tasks-list list.boxed-list {
     background: alpha(white, 0.04);
     color: white;
-    border-radius: 8px;
+    border-radius: 0.615em;
 }
 .ts-sidebar-tasks-list .title {
     color: white;
@@ -1060,7 +1060,7 @@
 }
 
 .ts-task-row checkbutton {
-    margin-right: 4px;
+    margin-right: 0.308em;
 }
 
 /* Bold task title on the header line. */
@@ -1072,14 +1072,14 @@
 .ts-task-due {
     font-size: 0.78em;
     opacity: 0.55;
-    margin-right: 2px;
+    margin-right: 0.154em;
 }
 
 /* Source / list-name badge pill — top-right of the header line. */
 .ts-task-badge {
     font-size: 0.72em;
     font-weight: 600;
-    padding: 1px 6px;
+    padding: 0.077em 0.462em;
     border-radius: 9999px;
     background: alpha(currentColor, 0.12);
     opacity: 0.75;
@@ -1095,14 +1095,14 @@
 .ts-task-popover contents {
     background: #1b1b2a;
     color: white;
-    border-radius: 10px;
+    border-radius: 0.769em;
 }
 
 .ts-task-entry {
     background: alpha(white, 0.08);
     color: white;
-    border-radius: 6px;
-    padding: 6px 8px;
+    border-radius: 0.462em;
+    padding: 0.462em 0.615em;
 }
 .ts-task-entry:focus {
     background: alpha(white, 0.12);
@@ -1110,16 +1110,16 @@
 
 .ts-task-due-picker {
     /* Tight vertical rhythm between the chip row, summary, and calendar. */
-    margin-top: 2px;
+    margin-top: 0.154em;
 }
 .ts-task-due-chip {
-    padding: 2px 8px;
+    padding: 0.154em 0.615em;
     font-size: 0.85em;
 }
 .ts-task-due-summary {
     font-size: 0.85em;
     color: alpha(white, 0.6);
-    padding: 0 4px;
+    padding: 0 0.308em;
 }
 
 /* ─── Calendar — transient highlight when click-day matches a row ─ */
@@ -1130,7 +1130,7 @@
 }
 
 .ts-net-pill {
-    padding: 1px 8px;
+    padding: 0.077em 0.615em;
     border-radius: 9999px;
     font-size: 0.72em;
     font-weight: 600;
@@ -1218,12 +1218,12 @@
 /* ── Stats: live progress (memory + swap suffix bars) ──────────────────── */
 
 .ts-stat-progress {
-    min-height: 6px;
-    min-width: 100px;
+    min-height: 0.462em;
+    min-width: 7.692em;
 }
 
 .ts-stat-progress > trough {
-    min-height: 6px;
+    min-height: 0.462em;
     background: alpha(@accent_color, 0.15);
     border-radius: 9999px;
 }
@@ -1236,7 +1236,7 @@
 /* ── Stats: history sparkline rows ─────────────────────────────────────── */
 
 .ts-history-row {
-    padding: 8px 12px;
+    padding: 0.615em 0.923em;
 }
 
 .ts-stat-name {
@@ -1250,13 +1250,13 @@
 
 .ts-sparkline {
     color: @accent_color;
-    min-height: 24px;
+    min-height: 1.846em;
 }
 
 /* ── Stats: failed-unit pill ───────────────────────────────────────────── */
 
 .ts-pill-error {
-    padding: 2px 10px;
+    padding: 0.154em 0.769em;
     border-radius: 9999px;
     font-size: 0.8em;
     font-weight: 600;

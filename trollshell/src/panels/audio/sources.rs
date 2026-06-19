@@ -51,7 +51,7 @@ impl SourceRow {
         let slider = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
         slider.set_draw_value(false);
         slider.set_hexpand(true);
-        slider.set_size_request(110, -1);
+        slider.set_size_request(crate::scale::scale(110), -1);
         slider.set_value(s.volume);
 
         let pending_volume: Rc<Cell<Option<(f64, Instant)>>> = Rc::new(Cell::new(None));

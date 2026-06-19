@@ -698,12 +698,12 @@
 /* ─── Calendar widget — sidebar surface ─────────────────────────── */
 
 .ts-sidebar-calendar {
-    padding: 8px 8px 0 8px;
+    padding: 0.615em 0.615em 0 0.615em;
 }
 
 /* Header row: < | "Month YYYY" | > */
 .ts-cal-header {
-    margin: 0 0 6px 0;
+    margin: 0 0 0.462em 0;
 }
 .ts-cal-month-label {
     color: white;
@@ -714,11 +714,11 @@
 .ts-cal-nav-btn {
     background: transparent;
     color: alpha(white, 0.7);
-    min-width: 28px;
-    min-height: 28px;
+    min-width: 2.154em;
+    min-height: 2.154em;
     padding: 0;
-    border-radius: 14px;
-    -gtk-icon-size: 14px;
+    border-radius: 1.077em;
+    -gtk-icon-size: 1.077em;
 }
 .ts-cal-nav-btn:hover {
     background: alpha(white, 0.08);
@@ -727,7 +727,7 @@
 
 /* MO TU WE TH FR SA SU header row */
 .ts-cal-daynames {
-    margin: 4px 0 2px 0;
+    margin: 0.308em 0 0.154em 0;
 }
 .ts-cal-dayname {
     color: alpha(white, 0.4);
@@ -738,7 +738,7 @@
 
 /* 6×7 day grid */
 .ts-cal-grid {
-    margin-bottom: 6px;
+    margin-bottom: 0.462em;
 }
 
 /* Each day cell — Adwaita-style flat button with a circular hover/selected
@@ -747,10 +747,10 @@
 .ts-cal-day {
     background: transparent;
     color: alpha(white, 0.85);
-    min-width: 36px;
-    min-height: 36px;
+    min-width: 2.769em;
+    min-height: 2.769em;
     padding: 0;
-    border-radius: 18px;
+    border-radius: 1.385em;
     box-shadow: none;
     border: none;
     font-size: 13px;
@@ -791,13 +791,13 @@
 
 /* Event dots — a row of small colored squares under the day number. */
 .ts-cal-event-dots {
-    min-height: 4px;
-    margin-top: 2px;
+    min-height: 0.308em;
+    margin-top: 0.154em;
 }
 .ts-cal-event-dot {
-    min-width: 4px;
-    min-height: 4px;
-    border-radius: 2px;
+    min-width: 0.308em;
+    min-height: 0.308em;
+    border-radius: 0.154em;
     margin: 0 1px;
 }
 /* On the selected day, dots invert to white so they read against the
@@ -839,7 +839,7 @@
     color: alpha(white, 0.5);
     font-size: 11px;
     letter-spacing: 1.5px;
-    margin: 10px 4px 6px 4px;
+    margin: 0.769em 0.308em 0.462em 0.308em;
 }
 
 /* adw::PreferencesGroup palette swap for the dark sidebar. */
@@ -854,7 +854,7 @@
 .ts-sidebar-cal-list list.boxed-list {
     background: alpha(white, 0.04);
     color: white;
-    border-radius: 8px;
+    border-radius: 0.615em;
 }
 .ts-sidebar-cal-list .title {
     color: white;
@@ -868,7 +868,7 @@
 .ts-sidebar-cal-list .ts-cal-day-header {
     background: transparent;
     min-height: 0;
-    margin-top: 2px;
+    margin-top: 0.154em;
     padding-top: 0;
     padding-bottom: 0;
 }
@@ -877,22 +877,22 @@
     font-weight: 700;
     letter-spacing: 1px;
     color: alpha(white, 0.55);
-    padding-top: 2px;
-    padding-bottom: 2px;
+    padding-top: 0.154em;
+    padding-bottom: 0.154em;
 }
 /* Event rows: tighter vertical rhythm so N=5 rows sit without wasted space. */
 .ts-sidebar-cal-list row {
     min-height: 0;
-    padding-top: 2px;
-    padding-bottom: 2px;
+    padding-top: 0.154em;
+    padding-bottom: 0.154em;
 }
 .ts-sidebar-cal-list .title {
-    padding-top: 1px;
+    padding-top: 0.077em;
     padding-bottom: 0;
 }
 .ts-sidebar-cal-list .subtitle {
     padding-top: 0;
-    padding-bottom: 1px;
+    padding-bottom: 0.077em;
 }
 /* Combined header+empty row: the anchor day has no events so the section
  * header and placeholder are merged into one AdwActionRow (title = day
@@ -902,7 +902,7 @@
 .ts-sidebar-cal-list .ts-cal-day-empty {
     background: transparent;
     min-height: 0;
-    margin-top: 2px;
+    margin-top: 0.154em;
     padding-top: 0;
     padding-bottom: 0;
 }
@@ -911,7 +911,7 @@
     font-weight: 700;
     letter-spacing: 1px;
     color: alpha(white, 0.55);
-    padding-top: 2px;
+    padding-top: 0.154em;
     padding-bottom: 0;
 }
 .ts-sidebar-cal-list .ts-cal-day-empty .subtitle {
@@ -919,16 +919,16 @@
     font-style: italic;
     font-size: 11px;
     padding-top: 0;
-    padding-bottom: 2px;
+    padding-bottom: 0.154em;
 }
 
 /* Source-color dot at the start of each upcoming-list row — mirrors the
  * grid dots so users can scan colors → calendar at a glance. */
 .ts-cal-source-dot {
-    min-width: 10px;
-    min-height: 10px;
-    border-radius: 5px;
-    margin: 0 8px 0 4px;
+    min-width: 0.769em;
+    min-height: 0.769em;
+    border-radius: 0.385em;
+    margin: 0 0.615em 0 0.308em;
 }
 
 /* ─── Sidebar — departures widget ─────────────────────────────── */

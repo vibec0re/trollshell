@@ -62,68 +62,99 @@ fn build_primary_expander() -> adw::ExpanderRow {
         gtk::prelude::WidgetExt::set_visible,
     );
 
-    expander.add_row(&primary_addr_row("IPv4 address", |p| match p {
-        Some(link) => link
-            .addresses
-            .iter()
-            .filter_map(|a| match a.addr {
-                std::net::IpAddr::V4(v) => Some(format!("{v}/{}", a.prefix_len)),
-                std::net::IpAddr::V6(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        None => String::new(),
+    // Each row reactively re-derives its value from `primary()`.
+    expander.add_row(&addr_row("IPv4 address", ipv4_addresses));
+    expander.add_row(&addr_row("IPv4 gateway", |link| {
+        link.gateway_v4.map(|g| g.to_string()).unwrap_or_default()
     }));
-    expander.add_row(&primary_addr_row("IPv4 gateway", |p| {
-        p.and_then(|l| l.gateway_v4.map(|g| g.to_string()))
-            .unwrap_or_default()
-    }));
-    expander.add_row(&primary_addr_row("IPv6 address", |p| match p {
-        Some(link) => {
-            let v6: Vec<String> = link
-                .addresses
-                .iter()
-                .filter_map(|a| match a.addr {
-                    std::net::IpAddr::V6(v) if !v.is_unicast_link_local() => {
-                        Some(format!("{v}/{}", a.prefix_len))
-                    }
-                    _ => None,
-                })
-                .collect();
-            if v6.is_empty() {
-                String::new()
-            } else if v6.len() == 1 {
-                v6[0].clone()
-            } else {
-                format!("{} (+{} more)", v6[0], v6.len() - 1)
-            }
-        }
-        None => String::new(),
-    }));
-    expander.add_row(&primary_addr_row("IPv6 gateway", |p| {
-        p.and_then(|l| l.gateway_v6.map(|g| g.to_string()))
-            .unwrap_or_default()
+    expander.add_row(&addr_row("IPv6 address", ipv6_addresses));
+    expander.add_row(&addr_row("IPv6 gateway", |link| {
+        link.gateway_v6.map(|g| g.to_string()).unwrap_or_default()
     }));
 
     expander
 }
 
-/// Build one of the four address/gateway rows under the Primary expander.
-/// Each row shows a mono-styled value derived from the primary link, and
-/// auto-hides when the derived text is empty.
-fn primary_addr_row(
-    title: &str,
-    derive: impl Fn(Option<Link>) -> String + 'static,
-) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(title).build();
-    let value = gtk::Label::new(None);
-    value.add_css_class("ts-mono");
-    row.add_suffix(&value);
-    bind(networkd::primary().map(derive), &row, move |row, txt| {
-        value.set_text(&txt);
-        row.set_visible(!txt.is_empty());
-    });
+/// All IPv4 addresses of `link`, one per line, as `addr/prefix`.
+fn ipv4_addresses(link: &Link) -> String {
+    link.addresses
+        .iter()
+        .filter_map(|a| match a.addr {
+            std::net::IpAddr::V4(v) => Some(format!("{v}/{}", a.prefix_len)),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// All routable IPv6 addresses of `link` (link-local excluded), one per line,
+/// as `addr/prefix`.
+fn ipv6_addresses(link: &Link) -> String {
+    link.addresses
+        .iter()
+        .filter_map(|a| match a.addr {
+            std::net::IpAddr::V6(v) if !v.is_unicast_link_local() => {
+                Some(format!("{v}/{}", a.prefix_len))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build one address/gateway row bound to the primary link. The value is
+/// rendered as the row *subtitle* (full width, wraps freely) so long IPv6
+/// values can never collapse the title into one char per line. The row
+/// auto-hides when the derived value is empty.
+fn addr_row(title: &str, derive: impl Fn(&Link) -> String + 'static) -> adw::ActionRow {
+    let row = build_addr_row(title);
+    bind(
+        networkd::primary().map(move |p| p.as_ref().map(&derive).unwrap_or_default()),
+        &row,
+        |row, txt| apply_addr_row(row, &txt),
+    );
     row
+}
+
+/// Build an empty address/gateway row with the wrapping-subtitle layout shared
+/// by the primary block and the per-link expanders.
+fn build_addr_row(title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).build();
+    // Keep the title on a single line; let the subtitle (the value) wrap.
+    row.set_title_lines(1);
+    row.set_subtitle_lines(0);
+    row.add_css_class("ts-mono");
+    row
+}
+
+/// Apply a derived value to an address/gateway row: set it as the subtitle and
+/// hide the row when empty.
+fn apply_addr_row(row: &adw::ActionRow, value: &str) {
+    row.set_subtitle(value);
+    row.set_visible(!value.is_empty());
+}
+
+/// Build the four (IPv4/IPv6 address + gateway) detail rows for a *specific*
+/// link — the same layout the primary block uses — and append them to
+/// `parent`. Empty rows hide themselves.
+fn add_link_detail_rows(parent: &adw::ExpanderRow, link: &Link) {
+    let rows = [
+        ("IPv4 address", ipv4_addresses(link)),
+        (
+            "IPv4 gateway",
+            link.gateway_v4.map(|g| g.to_string()).unwrap_or_default(),
+        ),
+        ("IPv6 address", ipv6_addresses(link)),
+        (
+            "IPv6 gateway",
+            link.gateway_v6.map(|g| g.to_string()).unwrap_or_default(),
+        ),
+    ];
+    for (title, value) in rows {
+        let row = build_addr_row(title);
+        apply_addr_row(&row, &value);
+        parent.add_row(&row);
+    }
 }
 
 fn build_no_connection_placeholder_row() -> adw::ActionRow {
@@ -152,8 +183,11 @@ fn build_all_links_expander() -> adw::ExpanderRow {
         |w, sub| w.set_subtitle(&sub),
     );
 
-    // Track child rows so we can drain & rebuild on each emission.
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // Track child rows so we can drain & rebuild on each emission. Each link is
+    // itself an expander (name + state pill) revealing that link's own
+    // address/gateway rows — so the still-up Wi-Fi config stays reachable even
+    // when ethernet becomes the primary/default route (#144).
+    let rows_track: Rc<RefCell<Vec<adw::ExpanderRow>>> = Rc::new(RefCell::new(Vec::new()));
     let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
     bind(networkd::links(), &expander, move |_, links| {
@@ -162,11 +196,12 @@ fn build_all_links_expander() -> adw::ExpanderRow {
         }
         let mut new_rows = Vec::new();
         for link in links.iter().filter(|l| l.name != "lo") {
-            let row = adw::ActionRow::builder().title(&link.name).build();
+            let row = adw::ExpanderRow::builder().title(&link.name).build();
             row.add_suffix(&pill_label(
                 state_pill_text(link.operational),
                 state_pill_class(link.operational),
             ));
+            add_link_detail_rows(&row, link);
             expander_for_bind.add_row(&row);
             new_rows.push(row);
         }

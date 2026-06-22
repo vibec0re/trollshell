@@ -68,16 +68,31 @@ struct AppMeta {
     icon: Option<gio::Icon>,
 }
 
-/// Resolve display name and icon for an app-id via `gio::AppInfo::all()`.
+/// Resolve display name and icon for an app-id via a layered `gio::AppInfo`
+/// lookup.
 ///
-/// Scans all installed applications looking for one whose id matches
-/// `<app_id>.desktop` (exact) or `<app_id>.desktop` (lowercased). This is
-/// heuristic — the scope leaf id isn't always exactly the `.desktop` stem —
-/// so misses are common and handled gracefully (falls back to a generic icon
-/// and the raw app-id as display name).
+/// Tries the following strategies in order, stopping at the first hit:
 ///
-/// Results are cached so the scan runs at most once per unique app-id per
+/// 1. **Exact id match** — `AppInfo::all()` entry whose id equals
+///    `<app_id>.desktop` (or its lowercase variant). Fast for well-behaved
+///    desktop files.
+/// 2. **Case-insensitive id containment** — scans for an entry whose desktop
+///    file id (without the `.desktop` suffix) case-insensitively contains, or
+///    is contained by, the app-id. Catches reverse-DNS mismatches such as
+///    `org.gnome.Nautilus.desktop` for app-id `org.gnome.Nautilus`, and
+///    NixOS wrapper names like `firefox-unwrapped` matching `firefox.desktop`.
+/// 3. **Executable basename match** — entry whose executable file stem
+///    case-insensitively equals the app-id. Catches cgroup scope leaves like
+///    `app-firefox.scope`→`firefox` when the desktop file is `Firefox.desktop`
+///    with executable `/usr/bin/firefox`.
+///
+/// All three layers scan `AppInfo::all()` (or share the same pre-fetched list)
+/// and cache the result so the work happens at most once per unique app-id per
 /// expander lifetime.
+///
+/// Note: `gio::DesktopAppInfo::search` and `startup_wm_class` are not
+/// available in the gio 0.22 bindings used here, so the above heuristics
+/// approximate their behaviour using the `AppInfo` abstract interface.
 fn resolve_app_meta(
     app_id: &str,
     meta_cache: &mut HashMap<String, Option<AppMeta>>,
@@ -85,20 +100,53 @@ fn resolve_app_meta(
     if let Some(cached) = meta_cache.get(app_id) {
         return cached.clone();
     }
-    // Build candidate desktop ids: exact and lowercase variant.
-    let exact = format!("{app_id}.desktop");
-    let lower = format!("{}.desktop", app_id.to_lowercase());
 
-    let meta = gio::AppInfo::all()
-        .into_iter()
-        .find(|info| {
-            info.id()
-                .is_some_and(|id| id == exact.as_str() || id == lower.as_str())
+    let app_id_lower = app_id.to_lowercase();
+
+    // Fetch all installed apps once for this lookup.
+    let all = gio::AppInfo::all();
+
+    // Layer 1: exact id match (fast path).
+    let exact = format!("{app_id}.desktop");
+    let exact_lower = format!("{app_id_lower}.desktop");
+    let hit = all.iter().find(|info| {
+        info.id()
+            .is_some_and(|id| id == exact.as_str() || id == exact_lower.as_str())
+    });
+
+    // Layer 2: case-insensitive id containment.
+    // Strips the `.desktop` suffix and checks if the stem contains the app-id
+    // or vice-versa (handles reverse-DNS and wrapper-name mismatches).
+    let hit = hit.or_else(|| {
+        all.iter().find(|info| {
+            info.id().is_some_and(|id| {
+                let stem = id
+                    .as_str()
+                    .strip_suffix(".desktop")
+                    .unwrap_or(id.as_str())
+                    .to_lowercase();
+                stem.contains(app_id_lower.as_str())
+                    || app_id_lower.as_str().contains(stem.as_str())
+            })
         })
-        .map(|info| AppMeta {
-            display_name: info.display_name().to_string(),
-            icon: info.icon(),
-        });
+    });
+
+    // Layer 3: executable basename match.
+    // Catches cases where the desktop file uses a different name but the
+    // binary matches (e.g. `firefox` binary → `Firefox.desktop`).
+    let hit = hit.or_else(|| {
+        all.iter().find(|info| {
+            let exe = info.executable();
+            exe.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.to_lowercase() == app_id_lower.as_str())
+        })
+    });
+
+    let meta = hit.map(|info| AppMeta {
+        display_name: info.display_name().to_string(),
+        icon: info.icon(),
+    });
     meta_cache.insert(app_id.to_string(), meta.clone());
     meta
 }

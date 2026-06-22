@@ -882,13 +882,16 @@
     color: alpha(white, 0.6);
 }
 /* Day-section headers in the upcoming list — a slim plain label (not an
- * AdwActionRow), so it collapses to text height with no intrinsic floor (#127). */
+ * AdwActionRow), so it collapses to text height with no intrinsic floor (#127).
+ * padding-left matches the AdwActionRow content inset (12px) so the date label
+ * aligns with the event-row content edge rather than the list's left edge (#151). */
 .ts-sidebar-cal-list .ts-cal-day-header {
     background: transparent;
     min-height: 0;
     margin-top: 0.231em;
     padding-top: 0;
     padding-bottom: 0;
+    padding-left: 12px;
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 1px;

@@ -680,6 +680,21 @@
     font-size: 12px;
 }
 
+/* Source switcher: a row of selectable chips, one per live MPRIS player
+ * plus "Auto". Shown only with >=2 players. */
+.ts-media-switcher {
+    margin-bottom: 0.308em;
+}
+.ts-media-source {
+    padding: 0.154em 0.615em;
+    border-radius: 0.692em;
+    min-height: 0;
+}
+.ts-media-source:checked {
+    background: alpha(@accent_bg_color, 0.85);
+    color: @accent_fg_color;
+}
+
 /* ─── Tray DBusMenu popovers ────────────────────────────────────── */
 
 .ts-tray-menu {

@@ -190,8 +190,9 @@ fn install_default_css() {
     // in — so editing it cannot recompile the binary. Resolution mirrors
     // trollshell's `assets.rs`: the runtime `HYTTE_UI_DATA_DIR` override (set
     // by the Nix wrapper → the assets derivation) wins; otherwise the
-    // compile-time `CARGO_MANIFEST_DIR/src` path points at the in-repo source
-    // (the dev `cargo run` case). Only the *path* is ever baked, never the CSS.
+    // compile-time `CARGO_MANIFEST_DIR/../../assets/hytte-ui` path points at
+    // the in-repo source (the dev `cargo run` case). Only the *path* is ever
+    // baked, never the CSS.
     provider.load_from_path(default_stylesheet_path());
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -204,12 +205,13 @@ fn install_default_css() {
 
 /// Resolve the default stylesheet path: the runtime `HYTTE_UI_DATA_DIR`
 /// override (the Nix wrapper points it at the assets derivation) if set, else
-/// the compile-time `CARGO_MANIFEST_DIR/src` path — the in-repo source, for the
-/// dev `cargo run` case. Baking only the path (not the contents) keeps the file
-/// fully decoupled from the build.
+/// the compile-time `CARGO_MANIFEST_DIR/../../assets/hytte-ui` path — the
+/// in-repo source under the top-level `assets/` dir, for the dev `cargo run`
+/// case. Baking only the path (not the contents) keeps the file fully
+/// decoupled from the build.
 fn default_stylesheet_path() -> PathBuf {
     let base = std::env::var_os("HYTTE_UI_DATA_DIR")
-        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/src").into());
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/hytte-ui").into());
     PathBuf::from(base).join("style.css")
 }
 

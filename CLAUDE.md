@@ -144,11 +144,11 @@ Source layout (each module has a consistent shape — match it when adding):
 - `overlays/` — per-monitor layer-shell overlays (lock_screen, osd, notifications, frame, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
 - `modal.rs` — the slide-out drawer system (`Page` enum, per-monitor drawer window/revealer).
 - `components/` — cross-cutting `pub(crate)` building blocks reused across panels.
-- `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Assets live in `trollshell/{icons,style.css}`.
+- `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Asset sources live in the top-level `assets/` dir mirroring the runtime `share/` layout: `assets/trollshell/{style.css,icons/}` and `assets/hytte-ui/style.css`.
 
 ### Conventions
 
-- CSS classes: `hytte-*` come from the library default stylesheet (`hytte-ui/src/style.css`); `ts-*` come from the binary's `trollshell/style.css` (loaded as user style at higher priority).
+- CSS classes: `hytte-*` come from the library default stylesheet (`assets/hytte-ui/style.css`); `ts-*` come from the binary's `assets/trollshell/style.css` (loaded as user style at higher priority).
 - App ID `cc.hannig.trollshell`; D-Bus agent names `cc.hannig.trollshell.{bluez,iwd}-agent` (polkit is now a standalone external agent, not in-process).
 - Logging via `tracing`.
 

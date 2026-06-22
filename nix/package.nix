@@ -24,14 +24,15 @@ let
   # we keep ONLY the assets the *compile* genuinely reads:
   #   - tests/fixtures — include_str!'d by the internals suite (doCheck runs
   #     `cargo test` in the sandbox).
-  # NO stylesheets are kept: NONE are include_str!'d anymore. Both
-  # trollshell/{style.css,icons} and crates/hytte-ui/src/style.css are loaded
-  # from disk at runtime — the binary resolves them via the makeWrapper env
-  # (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets` derivation below),
-  # and dev falls back to the compile-time CARGO_MANIFEST_DIR path. Excluding
-  # every asset means editing an icon or *any* stylesheet no longer invalidates
-  # the expensive Rust build — only the trivial `assets` derivation + the
-  # wrapper rebuild (#133).
+  # NO stylesheets are kept: NONE are include_str!'d anymore. The asset
+  # sources live in the top-level `assets/` dir (assets/trollshell/{style.css,
+  # icons} and assets/hytte-ui/style.css) and are loaded from disk at runtime —
+  # the binary resolves them via the makeWrapper env (TROLLSHELL_DATA_DIR /
+  # HYTTE_UI_DATA_DIR → the `assets` derivation below), and dev falls back to
+  # the compile-time CARGO_MANIFEST_DIR path. `assets/` is not cargo sources nor
+  # a test fixture, so the crane src filter already excludes it: editing an icon
+  # or *any* stylesheet no longer invalidates the expensive Rust build — only
+  # the trivial `assets` derivation + the wrapper rebuild (#133).
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
@@ -46,9 +47,9 @@ let
   #   $out/share/hytte-ui/style.css             → HYTTE_UI_DATA_DIR
   assets = runCommand "trollshell-assets" { } ''
     mkdir -p $out/share/trollshell $out/share/hytte-ui
-    cp -r ${../trollshell/icons} $out/share/trollshell/icons
-    cp ${../trollshell/style.css} $out/share/trollshell/style.css
-    cp ${../crates/hytte-ui/src/style.css} $out/share/hytte-ui/style.css
+    cp -r ${../assets/trollshell/icons} $out/share/trollshell/icons
+    cp ${../assets/trollshell/style.css} $out/share/trollshell/style.css
+    cp ${../assets/hytte-ui/style.css} $out/share/hytte-ui/style.css
   '';
 
   # Pulled out of commonArgs so the dev shell can reuse the exact same deps via

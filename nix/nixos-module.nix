@@ -68,7 +68,7 @@ in
         environment.systemPackages = [ cfg.package ];
 
         # Fonts the stylesheets name explicitly: Inter + Cantarell for the bar
-        # UI (hytte-ui/src/style.css, trollshell/style.css), JetBrains Mono /
+        # UI (assets/hytte-ui/style.css, assets/trollshell/style.css), JetBrains Mono /
         # Fira Code for the clock + workspace chips. Without them fontconfig
         # silently falls back and the bar renders in the wrong typeface.
         fonts.packages = [

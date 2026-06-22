@@ -43,11 +43,17 @@ pub fn panel_network() -> gtk::Widget {
     grid.remove_css_class("ts-modal-page");
 
     // Left column: Connection card, then Wi-Fi card — each its own top-level
-    // card (no parent "Configuration" wrapper).
+    // card (no parent "Configuration" wrapper). `.ts-net-card` makes the whole
+    // PreferencesGroup one card with its header (title/description/suffix)
+    // INSIDE the card surface, rather than libadwaita's default floating title
+    // above a separately-carded boxed-list.
     let left = card_column();
-    left.append(&connection::build_connection_group());
+    let conn = connection::build_connection_group();
+    conn.add_css_class("ts-net-card");
+    left.append(&conn);
 
     let wifi_group = wifi::build_wifi_group();
+    wifi_group.add_css_class("ts-net-card");
     // Hide the Wi-Fi card entirely when no adapter is present (e.g. a
     // desktop machine with no wireless hardware).
     bind(
@@ -63,6 +69,11 @@ pub fn panel_network() -> gtk::Widget {
     // wrapper).
     let right = card_column();
     let (iface_group, totals_group) = traffic::build_traffic_groups();
+    // Same uniform card surface as the left column. These two stay header-less
+    // (no "Traffic" title — rejected earlier); they only inherit the card
+    // background/border so all four cards read consistently.
+    iface_group.add_css_class("ts-net-card");
+    totals_group.add_css_class("ts-net-card");
     right.append(&totals_group);
     right.append(&iface_group);
     grid.attach(&right, 1, 0, 1, 1);

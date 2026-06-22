@@ -15,20 +15,23 @@
 //! .with(mpris::service())
 //!
 //! // Subscribe in widgets:
-//! mpris::active_player() -> impl Signal<Item = Option<Player>>
-//! mpris::players()       -> impl Signal<Item = Vec<Player>>
+//! mpris::active_player()   -> impl Signal<Item = Option<Player>>
+//! mpris::players()         -> impl Signal<Item = Vec<Player>>
+//! mpris::selected_player() -> impl Signal<Item = Option<String>>
 //!
 //! // Fire-and-forget commands:
 //! mpris::play_pause(bus_name);
 //! mpris::next(bus_name);
 //! mpris::previous(bus_name);
 //! mpris::set_position(bus_name, track_id, position_us);
+//! mpris::select_player(Some(bus_name)); // pin; None reverts to automatic
 //!
 //! // Art fetch (async, cached):
 //! mpris::art_for_url(url).await -> Option<Vec<u8>>
 //! ```
 
 use anyhow::{Context, Result};
+use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
@@ -102,14 +105,17 @@ pub struct Player {
 #[doc(hidden)]
 pub struct MprisHandles {
     pub(crate) players: Mutable<Vec<Player>>,
-    pub(crate) active: Mutable<Option<Player>>,
+    /// Manual override: the `bus_name` of the player the user explicitly
+    /// pinned. `None` means "automatic" (follow the [`pick_active`]
+    /// heuristic). Consumed read-side by [`active_player`].
+    pub(crate) selected: Mutable<Option<String>>,
 }
 
 impl Default for MprisHandles {
     fn default() -> Self {
         Self {
             players: Mutable::new(Vec::new()),
-            active: Mutable::new(None),
+            selected: Mutable::new(None),
         }
     }
 }
@@ -125,11 +131,10 @@ impl Service for MprisService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = MprisHandles::default();
         let players_mutable = handles.players.clone();
-        let active_mutable = handles.active.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&players_mutable, &active_mutable).await {
+                match listen(&players_mutable).await {
                     Ok(()) => {
                         tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
                     }
@@ -163,16 +168,67 @@ pub fn players() -> impl Signal<Item = Vec<Player>> {
     })
 }
 
-/// Signal that emits the currently "active" player (best according to
-/// the Playing > Paused > first heuristic), or `None` when no player is
-/// tracked.
+/// Signal that emits the currently "active" player.
+///
+/// When a player has been pinned via [`select_player`] *and* it is still
+/// present in [`players`], that player (with fresh metadata cloned from the
+/// live list) wins. Otherwise we fall back to the Playing > Paused > first
+/// heuristic ([`pick_active`]). This means a pinned player that closes
+/// (vanishes from `players`) automatically reverts to the heuristic — the
+/// user is never stuck on a dead player.
+///
+/// Both the Media panel and the bar chip consume this accessor, so the
+/// manual selection is honoured everywhere for free.
 pub fn active_player() -> impl Signal<Item = Option<Player>> {
+    registry::with(|r| {
+        let handles = r
+            .get::<MprisHandles>()
+            .expect("mpris::service() not registered");
+        let players = handles.players.signal_cloned();
+        let selected = handles.selected.signal_cloned();
+        map_ref! {
+            let players = players,
+            let selected = selected => {
+                resolve_active(players, selected.as_deref())
+            }
+        }
+    })
+}
+
+/// Signal that emits the `bus_name` of the manually pinned player, or `None`
+/// when in automatic mode. Useful for a panel to flag which entry is pinned
+/// versus merely heuristically active.
+pub fn selected_player() -> impl Signal<Item = Option<String>> {
     registry::with(|r| {
         r.get::<MprisHandles>()
             .expect("mpris::service() not registered")
-            .active
+            .selected
             .signal_cloned()
     })
+}
+
+/// Resolve the active player from the live list plus an optional manual
+/// override. A `Some(bus)` that matches a live player pins it (fresh
+/// metadata from the list); anything else falls back to [`pick_active`].
+fn resolve_active(players: &[Player], selected: Option<&str>) -> Option<Player> {
+    if let Some(bus) = selected
+        && let Some(p) = players.iter().find(|p| p.bus_name == bus)
+    {
+        return Some(p.clone());
+    }
+    pick_active(players)
+}
+
+/// Fire-and-forget: pin a specific player by `bus_name`, or revert to
+/// automatic (heuristic) selection with `None`. Just a `Mutable` set on the
+/// GTK main thread — no async needed.
+pub fn select_player(bus_name: Option<String>) {
+    registry::with(|r| {
+        r.get::<MprisHandles>()
+            .expect("mpris::service() not registered")
+            .selected
+            .set(bus_name);
+    });
 }
 
 /// Fire-and-forget: send `PlayPause` to the given bus name.
@@ -326,19 +382,18 @@ struct State {
     map: Arc<AsyncMutex<HashMap<String, Player>>>,
     /// Stable discovery order (bus names in registration order).
     order: Arc<AsyncMutex<Vec<String>>>,
-    /// Published signal for the full player list.
+    /// Published signal for the full player list. The "active" player is
+    /// derived read-side in [`active_player`] from this list plus the
+    /// `selected` override, so the watcher only needs to publish the list.
     players: Mutable<Vec<Player>>,
-    /// Published signal for the active player.
-    active: Mutable<Option<Player>>,
 }
 
 impl State {
-    fn new(players: Mutable<Vec<Player>>, active: Mutable<Option<Player>>) -> Self {
+    fn new(players: Mutable<Vec<Player>>) -> Self {
         Self {
             map: Arc::new(AsyncMutex::new(HashMap::new())),
             order: Arc::new(AsyncMutex::new(Vec::new())),
             players,
-            active,
         }
     }
 
@@ -367,16 +422,15 @@ impl State {
         }
     }
 
-    /// Rebuild and publish the players + active signals.
+    /// Rebuild and publish the player list. The active player is derived
+    /// from this (plus the `selected` override) on the read side.
     async fn publish(&self) {
         let map = self.map.lock().await;
         let order = self.order.lock().await;
         let list: Vec<Player> = order.iter().filter_map(|k| map.get(k).cloned()).collect();
         drop(map);
         drop(order);
-        let active = pick_active(&list);
         self.players.set(list);
-        self.active.set(active);
     }
 
     /// Register a new bus name in the tracking order.
@@ -563,8 +617,8 @@ async fn poll_position(state: State, bus_name: String) {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<Option<Player>>) -> Result<()> {
-    let state = State::new(players.clone(), active.clone());
+async fn listen(players: &Mutable<Vec<Player>>) -> Result<()> {
+    let state = State::new(players.clone());
 
     // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
     // names, so we don't miss any registrations during the startup window.

@@ -45,9 +45,14 @@ pub fn panel_media() -> gtk::Widget {
     let grid = page_grid();
     grid.set_column_homogeneous(false);
 
+    // Source switcher spans both columns at the top; shown only with >=2
+    // players (it wires its own reactive visibility).
+    let switcher = build_switcher();
+    grid.attach(&switcher, 0, 0, 2, 1);
+
     let art_image = build_art_panel(&grid);
     let info = build_info_panel();
-    grid.attach(&info.section, 1, 0, 1, 1);
+    grid.attach(&info.section, 1, 1, 1, 1);
 
     let state = Rc::new(PlayerState::default());
     wire_transport_buttons(&info.widgets, &state);
@@ -55,6 +60,119 @@ pub fn panel_media() -> gtk::Widget {
     wire_seek(&info.widgets.seek, &state);
 
     finish_page(&grid)
+}
+
+/// Per-render switcher chips: `bus_name` (`None` = the "Auto" chip) paired
+/// with its toggle button, so the active-marking bind can restyle without a
+/// full rebuild.
+type SwitcherChips = Rc<RefCell<Vec<(Option<String>, gtk::ToggleButton)>>>;
+
+/// A horizontal row of selectable source chips: one per live MPRIS player
+/// plus an "Auto" chip to revert to the heuristic. Rebuilt reactively from
+/// `mpris::players()`; the whole row hides unless >=2 players are present.
+/// The chip matching `mpris::active_player()` is marked active.
+fn build_switcher() -> gtk::Widget {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("ts-media-switcher");
+
+    let chips: SwitcherChips = Rc::new(RefCell::new(Vec::new()));
+
+    // Rebuild the chip set only when the ROSTER (each player's bus_name +
+    // display label) actually changes. `mpris::players()` re-emits ~4Hz from
+    // the position poller, so binding the rebuild straight to it would tear
+    // down and recreate every chip 4x/second. Project to the roster + dedupe
+    // so a rebuild fires only on add/remove/relabel.
+    let chips_for_build = chips.clone();
+    bind(
+        mpris::players()
+            .map(|players| {
+                players
+                    .iter()
+                    .map(|p| (p.bus_name.clone(), player_label(p)))
+                    .collect::<Vec<(String, String)>>()
+            })
+            .dedupe_cloned(),
+        &row,
+        move |row, roster| {
+            rebuild_switcher(row, &roster, &chips_for_build);
+        },
+    );
+
+    // Mark whichever chip is currently active (pinned or heuristic).
+    let chips_for_active = chips.clone();
+    bind(
+        mpris::active_player().map(|p| p.map(|p| p.bus_name)),
+        &row,
+        move |_, active_bus| {
+            for (bus, btn) in chips_for_active.borrow().iter() {
+                // The "Auto" chip (bus == None) is never the active *source*;
+                // it only reflects whether we're in automatic mode, which we
+                // can't tell from active_player alone, so leave it unset and
+                // let the matching player chip light up instead.
+                let is_active = bus.as_deref() == active_bus.as_deref();
+                set_toggle_silently(btn, is_active);
+            }
+        },
+    );
+
+    row.upcast()
+}
+
+/// Tear down and rebuild the switcher chips for the current roster (one
+/// `(bus_name, label)` per live player).
+fn rebuild_switcher(row: &gtk::Box, roster: &[(String, String)], chips: &SwitcherChips) {
+    // Hidden unless there is an actual choice to make.
+    row.set_visible(roster.len() >= 2);
+
+    while let Some(child) = row.first_child() {
+        row.remove(&child);
+    }
+    let mut new_chips = Vec::with_capacity(roster.len() + 1);
+
+    // "Auto" chip — revert to the heuristic.
+    let auto = source_chip("Auto");
+    auto.connect_clicked(|_| mpris::select_player(None));
+    row.append(&auto);
+    new_chips.push((None, auto));
+
+    // One chip per player, labelled by identity (fallbacks below).
+    for (bus, label) in roster {
+        let chip = source_chip(label);
+        let bus_for_click = bus.clone();
+        chip.connect_clicked(move |_| mpris::select_player(Some(bus_for_click.clone())));
+        row.append(&chip);
+        new_chips.push((Some(bus.clone()), chip));
+    }
+
+    *chips.borrow_mut() = new_chips;
+}
+
+/// Label for a source chip: `identity`, falling back to `title`, then
+/// `bus_name`.
+fn player_label(player: &mpris::Player) -> String {
+    if !player.identity.is_empty() {
+        player.identity.clone()
+    } else if !player.title.is_empty() {
+        player.title.clone()
+    } else {
+        player.bus_name.clone()
+    }
+}
+
+fn source_chip(label: &str) -> gtk::ToggleButton {
+    let btn = gtk::ToggleButton::with_label(label);
+    btn.add_css_class("ts-media-source");
+    btn
+}
+
+/// Set a chip's active (pressed) state. `set_active` only emits `toggled`,
+/// not `clicked` (our selection handler is on `clicked`), so this purely
+/// restyles the chip and never re-fires selection. Guarded to a no-op when
+/// already in the desired state.
+fn set_toggle_silently(btn: &gtk::ToggleButton, active: bool) {
+    if btn.is_active() != active {
+        btn.set_active(active);
+    }
 }
 
 fn build_art_panel(grid: &gtk::Grid) -> gtk::Image {
@@ -65,7 +183,7 @@ fn build_art_panel(grid: &gtk::Grid) -> gtk::Image {
     art_image.set_icon_name(Some("audio-x-generic-symbolic"));
     art_image.set_pixel_size(scale(200));
     art_box.append(&art_image);
-    grid.attach(&art_box, 0, 0, 1, 1);
+    grid.attach(&art_box, 0, 1, 1, 1);
     art_image
 }
 

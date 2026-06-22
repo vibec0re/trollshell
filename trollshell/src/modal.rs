@@ -10,6 +10,8 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 
+use crate::scale::scale;
+
 /// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
 /// Used to clamp the per-trigger margin so the card never falls off-screen left.
 const DRAWER_MAX_WIDTH: i32 = 680;
@@ -428,10 +430,12 @@ fn build_drawer_window(monitor: &Monitor, key: &str, geometry: &BarGeometry) -> 
     // pages from collapsing. niri honors live surface-size commits so the
     // drawer grows/shrinks as pages switch. The floor applies on the bar's
     // main axis (width for horizontal bars, height for vertical).
+    // Scaled with the font (#114) so the floor grows consistently with the cap.
+    let floor = scale(360);
     if geometry.horizontal() {
-        window.set_size_request(360, -1);
+        window.set_size_request(floor, -1);
     } else {
-        window.set_size_request(-1, 360);
+        window.set_size_request(-1, floor);
     }
     window
 }
@@ -892,7 +896,7 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
         let (_, nat, _, _) = panel.card.measure(orientation, -1);
         nat
     };
-    let card_extent = card_extent.clamp(360, DRAWER_MAX_WIDTH);
+    let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH));
 
     let chrome_end = geometry.chrome_main_end();
     let chrome_start = geometry.chrome_main_start();

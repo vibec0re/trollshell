@@ -339,3 +339,426 @@ mod tests {
         );
     }
 }
+
+// ── System tests: dbus-daemon-backed GetSecrets round-trip ───────────────────
+//
+// The unit tests above cover the pure-logic helpers. These tests cover the part
+// that *can't* be exercised in-process: the real `GetSecrets` D-Bus round trip.
+// We spawn an ephemeral `dbus-daemon` (one fresh broker per test, mirroring
+// `hytte-bus/tests/common/mod.rs`), mount the real `NmAgent` `#[zbus::interface]`
+// on it, then call it from a second connection acting as `NetworkManager`. This
+// exercises the actual `a{sa{sv}}` marshalling, method dispatch, error-name
+// mapping (`org.freedesktop.NetworkManager.SecretAgent.Error.*`), and the
+// prompt/waiter handshake over the wire — the closest-to-end-to-end the agent
+// can be tested without a live `NetworkManager` + a real Wi-Fi radio + the GTK
+// prompt overlay. That true hardware path stays live-verified on Annika's NM
+// host.
+//
+// Gated behind the `system-tests` cargo feature (whole-module `cfg`) so the
+// default `cargo test` doesn't even compile it, keeping the default run
+// hermetic (no `dbus-daemon` dependency). Run with:
+//   cargo test -p hytte-services --features system-tests --lib nm_agent
+//
+// Every await that could hang on a wrong wire signature is wrapped in
+// `tokio::time::timeout`, so a marshalling regression fails fast instead of
+// hanging the suite. `#[tokio::test(flavor = "multi_thread")]` is mandatory:
+// the bus guard's Drop calls `block_in_place`, which panics on a current-thread
+// runtime.
+#[cfg(all(test, feature = "system-tests"))]
+mod system_tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, Command};
+    use tokio::sync::Mutex as AsyncMutex;
+    use zbus::Connection;
+    use zbus::connection::Builder;
+
+    /// Path the agent is mounted at on the ephemeral bus. NM uses a fixed
+    /// well-known path in production; any valid object path works for the test.
+    const AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
+    const AGENT_IFACE: &str = "org.freedesktop.NetworkManager.SecretAgent";
+
+    /// Kills the spawned `dbus-daemon` on drop. Mirrors `hytte-bus`'s `BusGuard`:
+    /// SIGKILL + a `block_in_place` wait so the socket `TempDir` outlives the
+    /// process (hence the multi-thread runtime requirement).
+    struct BusGuard {
+        child: Option<Child>,
+        _tmp: TempDir,
+        address: String,
+    }
+
+    impl Drop for BusGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.start_kill();
+                tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    let _ = handle.block_on(child.wait());
+                });
+            }
+        }
+    }
+
+    /// Spawn a fresh `dbus-daemon`, return a connected `zbus::Connection` plus a
+    /// guard that kills the daemon on drop. Replicates
+    /// `hytte-bus/tests/common/mod.rs::ephemeral_bus` (we can't import that
+    /// crate's test-only module across crate boundaries).
+    async fn ephemeral_bus() -> (Connection, BusGuard) {
+        let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+        let socket: PathBuf = tmp.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+
+        let config = tmp.path().join("session.conf");
+        std::fs::write(
+            &config,
+            format!(
+                r#"<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>{address}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#
+            ),
+        )
+        .expect("write dbus-daemon config");
+
+        let mut child = Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .arg("--print-address=1")
+            .arg("--nofork")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dbus-daemon — install package `dbus` if missing");
+
+        // Read the printed address from stdout to confirm the daemon is up.
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let printed = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+            .await
+            .expect("dbus-daemon address timeout")
+            .expect("dbus-daemon read address")
+            .expect("dbus-daemon closed stdout");
+        assert!(
+            printed.contains("unix:path="),
+            "unexpected dbus-daemon address: {printed}"
+        );
+
+        let conn = Builder::address(address.as_str())
+            .expect("parse bus address")
+            .build()
+            .await
+            .expect("connect to ephemeral bus");
+
+        (
+            conn,
+            BusGuard {
+                child: Some(child),
+                _tmp: tmp,
+                address,
+            },
+        )
+    }
+
+    /// Build a fresh `NmAgent` with empty handles; return it plus clones of its
+    /// `prompts`/`waiters` so the test can drive the handshake after the agent
+    /// is moved into the object server.
+    fn fresh_agent() -> (NmAgent, Mutable<Option<PromptRequest>>, WaitersMap) {
+        let waiters: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
+        let prompts: Mutable<Option<PromptRequest>> = Mutable::new(None);
+        let agent = NmAgent {
+            prompts: prompts.clone(),
+            waiters: waiters.clone(),
+        };
+        (agent, prompts, waiters)
+    }
+
+    /// Mount `agent` on `server`, open a second connection to the same bus
+    /// acting as "`NetworkManager`", and return a proxy targeting the agent by the
+    /// server's unique name. Uses `Builder::address` (NOT the clippy-banned
+    /// `Connection::session`/`::system`).
+    async fn mount_and_proxy(
+        server: &Connection,
+        guard: &BusGuard,
+        agent: NmAgent,
+    ) -> zbus::Proxy<'static> {
+        server
+            .object_server()
+            .at(AGENT_PATH, agent)
+            .await
+            .expect("mount NmAgent on object server");
+
+        let dest = server
+            .unique_name()
+            .expect("server has a unique name")
+            .to_string();
+
+        let client = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .build()
+            .await
+            .expect("connect client (NetworkManager) to ephemeral bus");
+
+        zbus::Proxy::new(&client, dest, AGENT_PATH, AGENT_IFACE)
+            .await
+            .expect("build SecretAgent proxy")
+    }
+
+    /// A realistic `a{sa{sv}}` connection dict for a WPA-PSK network, with the
+    /// SSID stored as `ay` bytes the way NM marshals it.
+    fn wpa_connection(ssid: &[u8], key_mgmt: &str) -> ConnectionDict {
+        let to_owned = |v: Value<'static>| v.try_to_owned().expect("to OwnedValue");
+        let mut wireless: HashMap<String, OwnedValue> = HashMap::new();
+        wireless.insert("ssid".to_string(), to_owned(Value::from(ssid.to_vec())));
+        let mut security: HashMap<String, OwnedValue> = HashMap::new();
+        security.insert(
+            "key-mgmt".to_string(),
+            to_owned(Value::from(key_mgmt.to_string())),
+        );
+        let mut conn: ConnectionDict = HashMap::new();
+        conn.insert("802-11-wireless".to_string(), wireless);
+        conn.insert(WIRELESS_SECURITY_SETTING.to_string(), security);
+        conn
+    }
+
+    /// Poll `prompts` until it holds `Some`, up to `deadline`. Returns the
+    /// surfaced [`PromptRequest`] or panics on timeout.
+    async fn await_prompt(
+        prompts: &Mutable<Option<PromptRequest>>,
+        deadline: Duration,
+    ) -> PromptRequest {
+        let end = tokio::time::Instant::now() + deadline;
+        while tokio::time::Instant::now() < end {
+            if let Some(req) = prompts.get_cloned() {
+                return req;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("prompt was never surfaced within {deadline:?}");
+    }
+
+    // -- 1. happy path --------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn happy_path_returns_psk_over_the_bus() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        // Fire the GetSecrets call as a task — it blocks inside the agent
+        // awaiting the oneshot, so we must drive the handshake concurrently.
+        let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(
+                                "/org/freedesktop/NetworkManager/Connection/1",
+                            )
+                            .unwrap(),
+                            "802-11-wireless-security".to_string(),
+                            vec!["psk".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            });
+
+        // The agent should surface a prompt carrying the SSID + security.
+        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        assert_eq!(req.ssid, "FRITZ!Box");
+        assert_eq!(req.security, "psk");
+
+        // Resolve the waiter as the prompt overlay would on submit.
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("waiter registered")
+            .send(Ok("hunter2".to_string()))
+            .expect("send passphrase to waiter");
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+            .await
+            .expect("GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("GetSecrets returned a D-Bus error");
+
+        let psk = reply
+            .get("802-11-wireless-security")
+            .expect("security setting present in reply")
+            .get("psk")
+            .expect("psk present in reply");
+        assert_eq!(
+            String::try_from(psk.try_clone().unwrap()).unwrap(),
+            "hunter2"
+        );
+
+        // The agent clears the prompt once resolved.
+        assert!(
+            prompts.get_cloned().is_none(),
+            "prompt should be cleared after the passphrase is returned"
+        );
+    }
+
+    // -- 2. no-interaction flag → NoSecrets -----------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_interaction_flag_is_rejected() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, _prompts, _waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
+        let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
+            Duration::from_secs(3),
+            proxy.call(
+                "GetSecrets",
+                &(
+                    conn,
+                    OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Connection/1")
+                        .unwrap(),
+                    "802-11-wireless-security".to_string(),
+                    Vec::<String>::new(),
+                    0u32, // no ALLOW_INTERACTION
+                ),
+            ),
+        )
+        .await
+        .expect("GetSecrets did not return in time");
+
+        assert_error_name_contains(&result, "NoSecrets");
+    }
+
+    // -- 3. non-wireless setting → NoSecrets ----------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_wireless_setting_is_rejected() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, _prompts, _waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
+        let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
+            Duration::from_secs(3),
+            proxy.call(
+                "GetSecrets",
+                &(
+                    conn,
+                    OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Connection/1")
+                        .unwrap(),
+                    "ipv4".to_string(),
+                    Vec::<String>::new(),
+                    FLAG_ALLOW_INTERACTION,
+                ),
+            ),
+        )
+        .await
+        .expect("GetSecrets did not return in time");
+
+        assert_error_name_contains(&result, "NoSecrets");
+    }
+
+    // -- 4. CancelGetSecrets → UserCanceled -----------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_resolves_with_user_canceled() {
+        // This drives the *real* `CancelGetSecrets` D-Bus method (not the
+        // waiter-drop shortcut): we start an interactive GetSecrets, wait for
+        // the prompt, then call CancelGetSecrets over the wire. The agent drains
+        // its waiters with Err, so the in-flight GetSecrets resolves to the
+        // UserCanceled error name.
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, prompts, _waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let proxy_for_call = proxy.clone();
+
+        let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                proxy_for_call
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(
+                                "/org/freedesktop/NetworkManager/Connection/1",
+                            )
+                            .unwrap(),
+                            "802-11-wireless-security".to_string(),
+                            vec!["psk".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            });
+
+        // Wait until the agent is parked on the oneshot.
+        let _req = await_prompt(&prompts, Duration::from_secs(3)).await;
+
+        // Cancel over the wire.
+        let cancel: Result<(), zbus::Error> = tokio::time::timeout(
+            Duration::from_secs(3),
+            proxy.call(
+                "CancelGetSecrets",
+                &(
+                    OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Connection/1")
+                        .unwrap(),
+                    "802-11-wireless-security".to_string(),
+                ),
+            ),
+        )
+        .await
+        .expect("CancelGetSecrets did not return in time");
+        cancel.expect("CancelGetSecrets returned a D-Bus error");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), call)
+            .await
+            .expect("GetSecrets did not resolve after cancel")
+            .expect("GetSecrets task panicked");
+
+        assert_error_name_contains(&result, "UserCanceled");
+        assert!(
+            prompts.get_cloned().is_none(),
+            "prompt should be cleared after cancel"
+        );
+    }
+
+    // -- helpers --------------------------------------------------------------
+
+    /// Assert the result is a `MethodError` whose error name contains `needle`
+    /// (e.g. `"NoSecrets"` / `"UserCanceled"`). The full name is
+    /// `org.freedesktop.NetworkManager.SecretAgent.Error.<variant>`.
+    fn assert_error_name_contains(result: &Result<ConnectionDict, zbus::Error>, needle: &str) {
+        match result {
+            Err(zbus::Error::MethodError(name, _detail, _reply)) => {
+                let name = name.as_str();
+                assert!(
+                    name.contains(needle),
+                    "expected error name containing {needle:?}, got {name:?}"
+                );
+            }
+            Err(other) => panic!("expected MethodError containing {needle:?}, got {other:?}"),
+            Ok(dict) => panic!("expected MethodError containing {needle:?}, got Ok({dict:?})"),
+        }
+    }
+}

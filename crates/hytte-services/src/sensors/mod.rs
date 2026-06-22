@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use crate::cast::u64_to_f64_bytes;
 
 use disk::{read_disk_for_specs, read_mountlist, read_process_count};
-use gpu::read_gpu_with_cache;
+use gpu::{GpuCache, read_gpu_with_cache};
 use hwmon::read_cpu_temp;
 use meminfo::read_proc_meminfo;
 use net::{read_net_connections, read_proc_net_dev};
@@ -129,6 +129,7 @@ pub enum GpuVendor {
     #[default]
     Unknown,
     Amd,
+    Intel,
     Nvidia,
 }
 
@@ -357,10 +358,8 @@ struct PollState {
     /// after the first scan so each tick re-reads only its `temp*_input`
     /// instead of re-walking all of `/sys/class/hwmon`.
     cpu_temp_chip: Option<PathBuf>,
-    /// Whether `nvidia-smi` is available. `None` = not yet probed (happens on
-    /// the first GPU tick); `Some(false)` = absent / probing failed; `Some(true)`
-    /// = present. Probed once and cached so we never fork-exec a missing binary.
-    nvidia_available: Option<bool>,
+    /// Per-tick GPU probe cache: nvidia availability flag + Intel RC6 prev sample.
+    gpu_cache: GpuCache,
     /// Tick counter for rate-limiting slower polls.
     tick: u64,
 }
@@ -371,7 +370,7 @@ impl PollState {
             cpu_prev: Vec::new(),
             net_prev: HashMap::new(),
             cpu_temp_chip: None,
-            nvidia_available: None,
+            gpu_cache: GpuCache::default(),
             tick: 0,
         }
     }
@@ -416,8 +415,10 @@ async fn poll_loop(w: PollWriters) {
 
         // Take the chip-dir cache out of state so the closure can own it.
         let chip = state.cpu_temp_chip.take();
-        // Snapshot current nvidia availability.
-        let nvidia_available = state.nvidia_available;
+        // Move the GPU cache out of state so the closure can own it.
+        // On non-GPU ticks we put it back unchanged; on GPU ticks we replace it
+        // with the updated cache returned by `read_gpu_with_cache`.
+        let gpu_cache = std::mem::take(&mut state.gpu_cache);
 
         // Mount list is cloned here (cheap — it's rarely non-empty).
         let specs = if do_disk {
@@ -441,11 +442,11 @@ async fn poll_loop(w: PollWriters) {
                 (temp, ch)
             };
             // GPU (every 2 ticks)
-            let (gpu_state, gpu_tick, new_nvidia_available) = if do_gpu {
-                let (state, nv) = read_gpu_with_cache(nvidia_available);
-                (state, true, Some(nv))
+            let (gpu_state, gpu_tick, new_gpu_cache) = if do_gpu {
+                let (state, cache) = read_gpu_with_cache(gpu_cache);
+                (state, true, Some(cache))
             } else {
-                (None, false, None)
+                (None, false, Some(gpu_cache))
             };
             // TCP socket counts (every 2 ticks)
             let net_conn = if do_net_conn {
@@ -474,12 +475,12 @@ async fn poll_loop(w: PollWriters) {
                     proc_count,
                     disk,
                 },
-                new_nvidia_available,
+                new_gpu_cache,
             )
         })
         .await;
 
-        let Ok((data, new_nvidia_available)) = data else {
+        let Ok((data, new_gpu_cache)) = data else {
             tracing::warn!("sensors: blocking I/O task panicked; skipping tick");
             state.tick = state.tick.wrapping_add(1);
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -489,9 +490,9 @@ async fn poll_loop(w: PollWriters) {
         // Thread the chip cache back.
         state.cpu_temp_chip = data.cpu_temp_chip;
 
-        // Thread the nvidia availability back (only set on GPU ticks).
-        if let Some(nv) = new_nvidia_available {
-            state.nvidia_available = Some(nv);
+        // Thread the GPU cache back (always returned, even on non-GPU ticks).
+        if let Some(cache) = new_gpu_cache {
+            state.gpu_cache = cache;
         }
 
         // ── CPU ───────────────────────────────────────────────────────────────

@@ -257,13 +257,34 @@ fn build_task_row(task: &Task, monitor: &Monitor) -> adw::PreferencesRow {
 
     // ── Note line — hidden when description is None/empty ──────────────
     if let Some(ref desc) = task.description {
-        let note_lbl = gtk::Label::new(Some(desc));
+        // The VTODO DESCRIPTION is stored verbatim (only trimmed) in the
+        // service layer, so it can carry embedded hard `\n` newlines. Pango
+        // treats each `\n` as a separate paragraph, and `set_lines(n)` only
+        // caps wrapping *within* a paragraph — it does NOT limit the number of
+        // hard-newline paragraphs. That's why PR #129's `set_lines(2)` still
+        // rendered every line of a multi-line body (issue #126). We must
+        // pre-clamp the text ourselves before handing it to the label.
+        let logical: Vec<&str> = desc.lines().take(2).collect();
+        let note_lbl = if logical.len() == 2 {
+            // ≥2 logical lines: keep the first two, one physical line each
+            // (wrap OFF so a long line can't spill onto a 3rd line), and let
+            // ellipsize trim any over-wide line. Guaranteed ≤2 visual lines.
+            let clamped = logical[..2].join("\n");
+            let lbl = gtk::Label::new(Some(&clamped));
+            lbl.set_wrap(false);
+            lbl
+        } else {
+            // Exactly one logical line: allow wrapping so a long single line
+            // flows onto a 2nd line, then `set_lines(2)` + ellipsize cap it.
+            let lbl = gtk::Label::new(Some(desc));
+            lbl.set_wrap(true);
+            lbl.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            lbl.set_lines(2);
+            lbl
+        };
         note_lbl.add_css_class("ts-task-note");
         note_lbl.set_halign(gtk::Align::Start);
         note_lbl.set_xalign(0.0);
-        note_lbl.set_wrap(true);
-        note_lbl.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        note_lbl.set_lines(2);
         note_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
         content.append(&note_lbl);
     }

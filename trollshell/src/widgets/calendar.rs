@@ -103,8 +103,7 @@ fn build_block() -> gtk::Box {
     group.add_css_class("ts-sidebar-cal-list");
     column.append(&group);
 
-    let rows_track: Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>> =
-        Rc::new(RefCell::new(Vec::new()));
+    let rows_track: Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
 
     wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
@@ -239,7 +238,7 @@ fn build_day_cell() -> DayCell {
 fn wire_day_clicks(
     state: &State,
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     for (idx, cell) in state.cells.iter().enumerate() {
@@ -260,7 +259,7 @@ fn on_day_clicked(
     date: NaiveDate,
     state: &State,
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     state.selected.set(Some(date));
@@ -292,7 +291,7 @@ fn on_day_clicked(
 fn wire_events_bind(
     state: &State,
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     let state = state.clone();
@@ -320,7 +319,7 @@ fn wire_events_bind(
 /// events fall on that day it shows a "No events" placeholder row.
 fn rebuild_upcoming_list(
     group: &adw::PreferencesGroup,
-    rows_track: &Rc<RefCell<Vec<(NaiveDate, adw::ActionRow)>>>,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
     evs: &[CalendarEvent],
     today: NaiveDate,
@@ -352,7 +351,7 @@ fn rebuild_upcoming_list(
         days.insert(0, anchor);
     }
 
-    let mut new_rows: Vec<(NaiveDate, adw::ActionRow)> = Vec::with_capacity(evs.len() + days.len());
+    let mut new_rows: Vec<(NaiveDate, gtk::Widget)> = Vec::with_capacity(evs.len() + days.len());
     // Count only event rows (not day-section headers) against the cap.
     let mut event_count: usize = 0;
     for day in days {
@@ -368,14 +367,14 @@ fn rebuild_upcoming_list(
             // event row.
             let header = build_day_header(day, today);
             group.add(&header);
-            new_rows.push((day, header));
+            new_rows.push((day, header.upcast()));
             for ev in day_evs {
                 if event_count >= UPCOMING_LIMIT {
                     break;
                 }
                 let row = build_calendar_row(ev);
                 group.add(&row);
-                new_rows.push((day, row));
+                new_rows.push((day, row.upcast()));
                 event_count += 1;
             }
         } else {
@@ -385,7 +384,7 @@ fn rebuild_upcoming_list(
             // double-row when today/the selected day is empty.
             let combined = build_empty_day_row(day, today);
             group.add(&combined);
-            new_rows.push((day, combined));
+            new_rows.push((day, combined.upcast()));
         }
     }
     *rows_track.borrow_mut() = new_rows;
@@ -401,13 +400,23 @@ fn day_header_label(day: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
-/// A slim, muted day-section header row.
-fn build_day_header(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(day_header_label(day, today).as_str())
-        .activatable(false)
-        .selectable(false)
-        .build();
+/// A slim, muted day-section header — a bare `GtkListBoxRow` wrapping a
+/// label, NOT an `AdwActionRow` (whose intrinsic header-box min-height can't
+/// be collapsed below a floor, making a 1-line header almost as tall as a
+/// 2-line event row — #127). It must be a `GtkListBoxRow`, not a plain
+/// `gtk::Label`: `adw_preferences_group_add` routes non-`GtkListBoxRow`
+/// children to a box *below* the list, so a bare label would detach the
+/// headers from their events instead of interleaving above each day. The
+/// `ts-cal-day-header` class sits on the row (font props inherit to the
+/// label) so styling and the day-click highlight flash cover the full row.
+fn build_day_header(day: NaiveDate, today: NaiveDate) -> gtk::ListBoxRow {
+    let label = gtk::Label::new(Some(day_header_label(day, today).as_str()));
+    label.set_halign(gtk::Align::Start);
+    label.set_xalign(0.0);
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&label));
+    row.set_activatable(false);
+    row.set_selectable(false);
     row.add_css_class("ts-cal-day-header");
     row
 }
@@ -721,7 +730,7 @@ fn launch_gnome_calendar() {
     }
 }
 
-fn flash_row_highlight(row: &adw::ActionRow) {
+fn flash_row_highlight(row: &gtk::Widget) {
     use hytte::gtk::prelude::WidgetExt;
     row.add_css_class("ts-cal-day-hit");
     let row_for_clear = row.clone();

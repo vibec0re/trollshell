@@ -862,23 +862,18 @@
 .ts-sidebar-cal-list .subtitle {
     color: alpha(white, 0.6);
 }
-/* Day-section headers in the upcoming list — slim, muted, caps-y, echoing
- * the "UPCOMING" label (#46). Higher-specificity selectors override the
- * generic `.title`/row rules above. */
+/* Day-section headers in the upcoming list — a slim plain label (not an
+ * AdwActionRow), so it collapses to text height with no intrinsic floor (#127). */
 .ts-sidebar-cal-list .ts-cal-day-header {
     background: transparent;
     min-height: 0;
-    margin-top: 0.154em;
+    margin-top: 0.231em;
     padding-top: 0;
     padding-bottom: 0;
-}
-.ts-sidebar-cal-list .ts-cal-day-header .title {
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 1px;
     color: alpha(white, 0.55);
-    padding-top: 0.154em;
-    padding-bottom: 0.154em;
 }
 /* Event rows: tighter vertical rhythm so N=5 rows sit without wasted space. */
 .ts-sidebar-cal-list row {

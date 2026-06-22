@@ -9,6 +9,8 @@
 use hytte::adw;
 use hytte::gtk::{self, prelude::*};
 
+use crate::scale::scale;
+
 pub(crate) fn page_box() -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
     b.add_css_class("ts-modal-page");
@@ -23,9 +25,19 @@ pub(crate) fn page_box() -> gtk::Box {
 /// themselves (multi-line subtitles, `subtitle_lines(0)`, etc.) but this
 /// catches the ones that don't.
 pub(crate) fn finish_page(content: &impl IsA<gtk::Widget>) -> gtk::Widget {
+    // `maximum_size` caps the child allocation; `tightening_threshold` is
+    // intentionally set equal to it so `AdwClamp` never over-requests beyond
+    // the cap. When threshold < maximum_size, the clamp's natural-width
+    // request is `threshold + 3×(maximum_size − threshold)`, which balloons
+    // the surface past the card and creates wide lilac side-margins on panels
+    // whose content natural width crosses the threshold (network, vpn — #134).
+    // With threshold == maximum_size that formula collapses to exactly
+    // `maximum_size` and the overshoot disappears. Both values are scaled with
+    // the font so the cap grows consistently with the rest of the shell (#114).
+    let cap = scale(680);
     let clamp = adw::Clamp::builder()
-        .maximum_size(680)
-        .tightening_threshold(560)
+        .maximum_size(cap)
+        .tightening_threshold(cap)
         .child(content)
         .build();
     clamp.upcast()

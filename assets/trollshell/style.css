@@ -570,9 +570,15 @@
     margin-top: 0.308em;
 }
 .ts-wifi-list {
-    border: 1px solid @card_shade_color;
+    /* No distinct background/border — the scroller is part of the Wi-Fi
+       card's boxed-list, so it should read as the same surface. Only round
+       the corners so a scrolled list doesn't square off the card edge. */
     border-radius: 0.462em;
-    background: alpha(@view_bg_color, 0.6);
+    background: transparent;
+}
+.ts-wifi-list,
+.ts-wifi-list > viewport {
+    background: transparent;
 }
 .ts-wifi-row {
     padding: 0.308em 0.615em;

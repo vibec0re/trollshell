@@ -1,5 +1,7 @@
 {
   lib,
+  runCommand,
+  makeWrapper,
   craneLib,
   rustPlatform,
   pkg-config,
@@ -18,21 +20,37 @@
   pipewire,
 }:
 let
-  # crane's default cleanCargoSource keeps only .rs/.toml/.lock; also keep the
-  # stylesheets (hytte-ui/src/style.css is include_str!'d at compile time;
-  # trollshell/style.css is copied into the output by postInstall), the
-  # trollshell icons that postInstall ships, and the test fixtures the
-  # internals suite include_str!'s (doCheck runs `cargo test` in the sandbox).
+  # crane's default cleanCargoSource keeps only .rs/.toml/.lock; on top of that
+  # we keep ONLY the assets the *compile* genuinely reads:
+  #   - tests/fixtures — include_str!'d by the internals suite (doCheck runs
+  #     `cargo test` in the sandbox).
+  # NO stylesheets are kept: NONE are include_str!'d anymore. The asset
+  # sources live in the top-level `assets/` dir (assets/trollshell/{style.css,
+  # icons} and assets/hytte-ui/style.css) and are loaded from disk at runtime —
+  # the binary resolves them via the makeWrapper env (TROLLSHELL_DATA_DIR /
+  # HYTTE_UI_DATA_DIR → the `assets` derivation below), and dev falls back to
+  # the compile-time CARGO_MANIFEST_DIR path. `assets/` is not cargo sources nor
+  # a test fixture, so the crane src filter already excludes it: editing an icon
+  # or *any* stylesheet no longer invalidates the expensive Rust build — only
+  # the trivial `assets` derivation + the wrapper rebuild (#133).
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
     filter =
-      path: type:
-      (craneLib.filterCargoSources path type)
-      || (lib.hasSuffix ".css" path)
-      || (lib.hasInfix "/trollshell/icons/" path)
-      || (lib.hasInfix "/tests/fixtures/" path);
+      path: type: (craneLib.filterCargoSources path type) || (lib.hasInfix "/tests/fixtures/" path);
   };
+
+  # Standalone assets derivation: depends ONLY on the asset files, so editing a
+  # stylesheet or icon rebuilds just this (cheap) derivation + the wrapper, not
+  # the binary. Mara's call: an env wrapper over this, not a symlinkJoin.
+  #   $out/share/trollshell/{style.css,icons/}  → TROLLSHELL_DATA_DIR
+  #   $out/share/hytte-ui/style.css             → HYTTE_UI_DATA_DIR
+  assets = runCommand "trollshell-assets" { } ''
+    mkdir -p $out/share/trollshell $out/share/hytte-ui
+    cp -r ${../assets/trollshell/icons} $out/share/trollshell/icons
+    cp ${../assets/trollshell/style.css} $out/share/trollshell/style.css
+    cp ${../assets/hytte-ui/style.css} $out/share/hytte-ui/style.css
+  '';
 
   # Pulled out of commonArgs so the dev shell can reuse the exact same deps via
   # passthru.devInputs — crane appends its own build-orchestration hooks to the
@@ -92,10 +110,13 @@ let
     doCheck = true;
     cargoTestExtraArgs = "--workspace";
 
-    # Baked into the binary at compile time; trollshell::assets reads
-    # this with option_env! and falls back to CARGO_MANIFEST_DIR when
-    # unset (the dev `cargo run` case).
-    TROLLSHELL_DATA_DIR = "${placeholder "out"}/share/trollshell";
+    # No compile-time TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR here: both are
+    # injected at *runtime* by the makeWrapper wrapping below, pointing at the
+    # standalone `assets` derivation. Keeping them out of the build env is what
+    # decouples the assets from the (expensive) Rust compile (#133). The dev
+    # `cargo run` path stays covered by the in-crate compile-time fallbacks —
+    # both assets.rs (trollshell) and app.rs (hytte-ui) fall back to their
+    # crate's CARGO_MANIFEST_DIR when the runtime env is unset.
 
     # libspa-sys' bindgen uses clang_macro_fallback to constify cast macros like
     # SPA_ID_INVALID (`((uint32_t)0xffffffff)` in pipewire ≥ 1.6). The fallback
@@ -120,29 +141,63 @@ let
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # The actual Rust binary. Crucially it does NOT reference `assets`: nothing
+  # about its inputs or build env mentions an asset path, so its drvPath is
+  # invariant under asset edits. wrapGAppsHook4 still wraps it for GTK/GSettings
+  # env. The asset env is layered on *outside* this derivation (see below) so
+  # the expensive compile stays decoupled from the cheap assets (#133).
+  unwrapped = craneLib.buildPackage (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+
+      # Raw input lists for the dev shell to reuse without crane's build hooks.
+      passthru.devInputs = { inherit nativeBuildInputs buildInputs; };
+      passthru.commonArgs = commonArgs;
+      passthru.cargoArtifacts = cargoArtifacts;
+
+      meta = {
+        description = "hytte-based Wayland desktop shell (unwrapped — no asset env)";
+        homepage = "https://github.com/vibec0re/trollshell/";
+        license = lib.licenses.mpl20;
+        platforms = lib.platforms.linux;
+        mainProgram = "trollshell";
+      };
+    }
+  );
 in
-craneLib.buildPackage (
-  commonArgs
-  // {
-    inherit cargoArtifacts;
+# Final package = a thin wrapper that injects the runtime asset paths via
+# makeWrapper (Mara: env wrapper, NOT symlinkJoin). It depends on `unwrapped`
+# and `assets`; an asset edit rebuilds `assets` + re-runs this trivial wrapper,
+# but `unwrapped.drvPath` is unchanged, so the Rust binary is NOT recompiled.
+# We copy/symlink the rest of `unwrapped`'s outputs through and re-wrap only the
+# binary, so consumers (mainProgram, share/) keep working.
+runCommand "trollshell-0.1.0"
+  {
+    nativeBuildInputs = [ makeWrapper ];
 
-    # Raw input lists for the dev shell to reuse without crane's build hooks.
-    passthru.devInputs = { inherit nativeBuildInputs buildInputs; };
-    passthru.commonArgs = commonArgs;
-    passthru.cargoArtifacts = cargoArtifacts;
-
-    postInstall = ''
-      mkdir -p $out/share/trollshell
-      cp -r trollshell/icons $out/share/trollshell/
-      cp trollshell/style.css $out/share/trollshell/
-    '';
-
-    meta = {
+    # Preserve the consumed passthru/meta from the inner build so flake.nix
+    # (commonArgs/cargoArtifacts) and the dev shell (devInputs) keep resolving,
+    # and `nix run` still finds the main program.
+    passthru = unwrapped.passthru // {
+      inherit unwrapped assets;
+    };
+    meta = unwrapped.meta // {
       description = "hytte-based Wayland desktop shell";
-      homepage = "https://github.com/vibec0re/trollshell/";
-      license = lib.licenses.mpl20;
-      platforms = lib.platforms.linux;
-      mainProgram = "trollshell";
     };
   }
-)
+  ''
+    mkdir -p $out/bin
+    # Re-link everything except bin/ from the inner output so e.g. share/ stays
+    # reachable, then wrap the binary with the runtime asset env. The asset
+    # paths come from `assets`, so editing an asset never touches `unwrapped`.
+    for d in ${unwrapped}/*; do
+      name="$(basename "$d")"
+      [ "$name" = "bin" ] && continue
+      ln -s "$d" "$out/$name"
+    done
+    makeWrapper ${unwrapped}/bin/trollshell $out/bin/trollshell \
+      --set TROLLSHELL_DATA_DIR "${assets}/share/trollshell" \
+      --set HYTTE_UI_DATA_DIR "${assets}/share/hytte-ui"
+  ''

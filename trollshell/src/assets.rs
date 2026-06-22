@@ -5,13 +5,15 @@
 //! 1. `TROLLSHELL_DATA_DIR` env at runtime (override, e.g. for testing).
 //! 2. `TROLLSHELL_DATA_DIR` env at compile time (set by the Nix derivation
 //!    to `$out/share/trollshell`).
-//! 3. `CARGO_MANIFEST_DIR` (dev fallback — assets sit next to `Cargo.toml`).
+//! 3. `CARGO_MANIFEST_DIR` (dev fallback — the asset sources live in the
+//!    top-level `assets/trollshell/` dir, i.e. `../assets/trollshell`
+//!    relative to this crate's `Cargo.toml`).
 
 use std::path::PathBuf;
 
 const COMPILED_BASE: &str = match option_env!("TROLLSHELL_DATA_DIR") {
     Some(s) => s,
-    None => env!("CARGO_MANIFEST_DIR"),
+    None => concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/trollshell"),
 };
 
 #[must_use]

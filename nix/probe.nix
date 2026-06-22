@@ -30,7 +30,7 @@ let
       path: type:
       (craneLib.filterCargoSources path type)
       || (lib.hasSuffix ".css" path)
-      || (lib.hasInfix "/trollshell/icons/" path)
+      || (lib.hasInfix "/assets/trollshell/icons/" path)
       || (lib.hasInfix "/tests/fixtures/" path);
   };
 

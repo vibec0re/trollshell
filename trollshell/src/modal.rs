@@ -30,7 +30,7 @@ const DRAWER_CORNER_RADIUS: f64 = 14.0;
 
 /// Chrome between the layer-shell surface edge and the visible `.ts-drawer`
 /// card, on the *leading* side of the bar's main axis. Derived from
-/// `trollshell/style.css`:
+/// `assets/trollshell/style.css`:
 /// - Top/Bottom bars (horizontal axis): `.ts-modal` `padding-left: 20px`
 ///   plus `.ts-drawer` `margin-left: 0`.
 /// - Left/Right bars (vertical axis): `.ts-drawer` `margin-top: 0`

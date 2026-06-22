@@ -14,21 +14,49 @@ use super::pill_label;
 pub(super) fn build_connection_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Connection").build();
 
-    // Live description on the group itself.
+    // Online/offline state as a card row (replaces the old floating group
+    // description). The pill suffix updates in-place; CSS classes are
+    // toggled rather than recreating a new label each emission.
+    let state_row = adw::ActionRow::builder()
+        .title("Status")
+        .activatable(false)
+        .selectable(false)
+        .build();
+    let state_pill = pill_label("Offline", "ts-pill-known");
+    state_row.add_suffix(&state_pill);
+
     bind(
-        networkd::primary().map(|p| match p {
-            Some(link) => match link.operational {
-                OperationalState::Routable => format!("Online via {}", link.name),
-                OperationalState::Carrier | OperationalState::DegradedCarrier => {
-                    format!("Limited connectivity via {}", link.name)
-                }
-                other => format!("{} via {}", describe_state(other), link.name),
-            },
-            None => "Offline".to_string(),
+        networkd::primary().map(|p| {
+            let subtitle = match p {
+                Some(ref link) => match link.operational {
+                    OperationalState::Routable => format!("Online via {}", link.name),
+                    OperationalState::Carrier | OperationalState::DegradedCarrier => {
+                        format!("Limited connectivity via {}", link.name)
+                    }
+                    other => format!("{} via {}", describe_state(other), link.name),
+                },
+                None => "Offline".to_string(),
+            };
+            let online = p.is_some_and(|l| l.operational == OperationalState::Routable);
+            (subtitle, online)
         }),
-        &group,
-        |g, text| g.set_description(Some(&text)),
+        &state_row,
+        {
+            let pill = state_pill.clone();
+            move |row, (subtitle, online)| {
+                row.set_subtitle(&subtitle);
+                pill.set_text(if online { "Online" } else { "Offline" });
+                if online {
+                    pill.remove_css_class("ts-pill-known");
+                    pill.add_css_class("ts-pill-connected");
+                } else {
+                    pill.remove_css_class("ts-pill-connected");
+                    pill.add_css_class("ts-pill-known");
+                }
+            }
+        },
     );
+    group.add(&state_row);
 
     // Three expanders in vertical order; placeholder row replaces
     // Primary when no connection is active.

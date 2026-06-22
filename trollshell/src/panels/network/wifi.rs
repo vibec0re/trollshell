@@ -30,11 +30,16 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     let header = build_wifi_header_suffix();
     group.set_header_suffix(Some(&header));
 
-    // Network list inside a bounded ScrolledWindow.
+    // Network list inside a bounded ScrolledWindow. No forced min height
+    // (so a short list sizes to its content rather than showing a tall empty
+    // block) but a max cap so a long list stays scroll-bounded inside the
+    // card. The `.ts-wifi-list` class only rounds the scroll corners now —
+    // the distinct background was dropped so the list reads as part of the
+    // same card.
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-    scrolled.set_min_content_height(160);
+    scrolled.set_propagate_natural_height(true);
     scrolled.set_max_content_height(240);
     scrolled.add_css_class("ts-wifi-list");
     let networks_group = adw::PreferencesGroup::new();

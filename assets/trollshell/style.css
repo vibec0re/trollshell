@@ -481,6 +481,38 @@
     color: @accent_color;
     margin-bottom: 0.462em;
 }
+/* Network panel: make each PreferencesGroup a single card with its header
+   INSIDE the card surface (not libadwaita's floating title above the list).
+   libadwaita renders an AdwPreferencesGroup as a `.header` box (title +
+   description + header-suffix) followed by a separately-carded
+   `list.boxed-list`; the title therefore floats ABOVE the card. We make the
+   whole group the card (matching the `.ts-panel` idiom) and flatten the inner
+   boxed-list so it sits ON the card rather than painting its own nested card. */
+.ts-net-card {
+    background: @card_bg_color;
+    color: @card_fg_color;
+    border: 1px solid @card_shade_color;
+    border-radius: 0.769em;
+    padding: 0.769em 0.923em;
+}
+/* Keep the in-card header (title/description/scan-suffix) snug above the rows
+   without libadwaita's default gap that visually detaches it from the list. */
+.ts-net-card .header {
+    margin-bottom: 0.308em;
+    padding: 0;
+}
+/* Flatten the inner boxed-list so it sits ON the card surface rather than
+   painting its own nested card; keep the row separators. The default
+   boxed-list adds a top margin + its own background/border/shadow + rounded
+   corners — neutralize all of those so it's ONE card, not a card-in-card. */
+.ts-net-card list.boxed-list {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+    margin: 0;
+    min-height: 0;
+}
 .ts-popup-column {
     min-width: 13.846em;
 }
@@ -570,9 +602,15 @@
     margin-top: 0.308em;
 }
 .ts-wifi-list {
-    border: 1px solid @card_shade_color;
+    /* No distinct background/border — the scroller is part of the Wi-Fi
+       card's boxed-list, so it should read as the same surface. Only round
+       the corners so a scrolled list doesn't square off the card edge. */
     border-radius: 0.462em;
-    background: alpha(@view_bg_color, 0.6);
+    background: transparent;
+}
+.ts-wifi-list,
+.ts-wifi-list > viewport {
+    background: transparent;
 }
 .ts-wifi-row {
     padding: 0.308em 0.615em;

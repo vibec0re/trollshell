@@ -1,5 +1,6 @@
-//! Network drawer panel — two-column layout (Configuration left, Live right)
-//! plus an "Active connections" drill-down. Backed by `networkd`,
+//! Network drawer panel — two-column layout of flat per-card sections
+//! (left: Connection + Wi-Fi cards; right: Total/TCP + per-interface graph
+//! cards) plus an "Active connections" drill-down. Backed by `networkd`,
 //! `resolved`, `sensors`, `wifi`, and `netconn` services.
 
 mod connection;
@@ -13,35 +14,68 @@ use hytte::services::netconn;
 use hytte::services::wifi as wifi_svc;
 
 use crate::components::deep_link_row::deep_link_row;
-use crate::components::layout::{finish_page, page_box, page_grid, section};
+use crate::components::layout::{finish_page, page_box, page_grid};
+
+/// Inter-card spacing within a column; matches the grid's 12px row/column
+/// spacing so both columns and the page padding read as one uniform rhythm.
+const CARD_SPACING: i32 = 12;
+
+/// Build a plain vertical column box that hosts top-level cards directly
+/// (no parent `section()` wrapper). Each `AdwPreferencesGroup` added to it
+/// renders as its own boxed-list card.
+fn card_column() -> gtk::Box {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, CARD_SPACING);
+    column.set_hexpand(true);
+    column
+}
 
 pub fn panel_network() -> gtk::Widget {
     // Outer container holds the two-column grid up top, then a drill-down
     // row to the Connections page.
     let outer = page_box();
     outer.add_css_class("ts-popup-column");
-    outer.set_spacing(16);
+    outer.set_spacing(CARD_SPACING);
 
     let grid = page_grid();
+    // The outer `page_box` already contributes `ts-modal-page` padding; strip
+    // the duplicate from the grid so the columns align with the cards outside
+    // the grid (e.g. the "Active connections" row below it).
+    grid.remove_css_class("ts-modal-page");
 
-    // Left column: configuration.
-    let left = section("Configuration");
-    left.append(&connection::build_connection_group());
-    grid.attach(&left, 0, 0, 1, 1);
-
-    // Right column: live stats.
-    let right = section("Live");
-    right.append(&traffic::build_traffic_group());
+    // Left column: Connection card, then Wi-Fi card — each its own top-level
+    // card (no parent "Configuration" wrapper). `.ts-net-card` makes the whole
+    // PreferencesGroup one card with its header (title/description/suffix)
+    // INSIDE the card surface, rather than libadwaita's default floating title
+    // above a separately-carded boxed-list.
+    let left = card_column();
+    let conn = connection::build_connection_group();
+    conn.add_css_class("ts-net-card");
+    left.append(&conn);
 
     let wifi_group = wifi::build_wifi_group();
-    // Hide the Wi-Fi section entirely when no adapter is present (e.g. a
+    wifi_group.add_css_class("ts-net-card");
+    // Hide the Wi-Fi card entirely when no adapter is present (e.g. a
     // desktop machine with no wireless hardware).
     bind(
         wifi_svc::adapter().map(|a| a.is_some()),
         &wifi_group,
         gtk::prelude::WidgetExt::set_visible,
     );
-    right.append(&wifi_group);
+    left.append(&wifi_group);
+    grid.attach(&left, 0, 0, 1, 1);
+
+    // Right column: live traffic — Total/TCP card on TOP, per-interface
+    // graph card below. Each its own top-level card (no parent "Live"
+    // wrapper).
+    let right = card_column();
+    let (iface_group, totals_group) = traffic::build_traffic_groups();
+    // Same uniform card surface as the left column. These two stay header-less
+    // (no "Traffic" title — rejected earlier); they only inherit the card
+    // background/border so all four cards read consistently.
+    iface_group.add_css_class("ts-net-card");
+    totals_group.add_css_class("ts-net-card");
+    right.append(&totals_group);
+    right.append(&iface_group);
     grid.attach(&right, 1, 0, 1, 1);
 
     outer.append(&grid);

@@ -7,6 +7,15 @@
 //!
 //! Clicking the label (not the transport buttons) toggles the Media page in
 //! the modal panel.
+//!
+//! ## Three visual states
+//!
+//! - **No player** — container hidden entirely.
+//! - **Player + busy workspace (≥ `HIDE_WHEN_WINDOWS_GTE` windows)** — *narrow
+//!   mode*: show only the `mini` icon button; all transport controls and the
+//!   title label are hidden. Clicking `mini` opens the Media panel.
+//! - **Player + uncrowded workspace** — *full mode*: show transport controls
+//!   and title label; `mini` is hidden.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,35 +34,41 @@ use crate::widgets::window_list;
 /// capacity), so we yield early.
 const HIDE_WHEN_WINDOWS_GTE: usize = 2;
 
+/// All child widgets of the MPRIS container, bundled so they can be passed
+/// around without hitting the `too_many_arguments` clippy limit.
+struct Chips {
+    prev_btn: gtk::Button,
+    play_pause_btn: gtk::Button,
+    next_btn: gtk::Button,
+    label: gtk::Label,
+    mini: gtk::Button,
+}
+
 /// Build the MPRIS center-cluster widget.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     container.add_css_class("ts-mpris");
 
-    let prev_btn = icon_button("media-skip-backward-symbolic");
-    let play_pause_btn = icon_button("media-playback-start-symbolic");
-    let next_btn = icon_button("media-skip-forward-symbolic");
-    let label = build_clickable_label(monitor);
+    let chips = Chips {
+        prev_btn: icon_button("media-skip-backward-symbolic"),
+        play_pause_btn: icon_button("media-playback-start-symbolic"),
+        next_btn: icon_button("media-skip-forward-symbolic"),
+        label: build_clickable_label(monitor),
+        mini: build_mini_button(monitor),
+    };
 
-    container.append(&prev_btn);
-    container.append(&play_pause_btn);
-    container.append(&next_btn);
-    container.append(&label);
+    container.append(&chips.prev_btn);
+    container.append(&chips.play_pause_btn);
+    container.append(&chips.next_btn);
+    container.append(&chips.label);
+    container.append(&chips.mini);
 
     let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    bind_transport_button(&prev_btn, &current_bus, mpris::previous);
-    bind_transport_button(&play_pause_btn, &current_bus, mpris::play_pause);
-    bind_transport_button(&next_btn, &current_bus, mpris::next);
+    bind_transport_button(&chips.prev_btn, &current_bus, mpris::previous);
+    bind_transport_button(&chips.play_pause_btn, &current_bus, mpris::play_pause);
+    bind_transport_button(&chips.next_btn, &current_bus, mpris::next);
 
-    wire_visibility_and_state(
-        &container,
-        &label,
-        &prev_btn,
-        &play_pause_btn,
-        &next_btn,
-        &current_bus,
-        monitor,
-    );
+    wire_visibility_and_state(&container, chips, &current_bus, monitor);
 
     container.set_visible(false);
     container.upcast()
@@ -62,6 +77,18 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 fn icon_button(icon: &str) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.set_child(Some(&gtk::Image::from_icon_name(icon)));
+    btn
+}
+
+/// A compact single-icon button shown in *narrow* mode (busy workspace).
+/// Clicking it opens the Media panel — same destination as the full-mode label.
+fn build_mini_button(monitor: &Monitor) -> gtk::Button {
+    let btn = icon_button("audio-x-generic-symbolic");
+    btn.add_css_class("ts-mpris-mini");
+    let monitor = monitor.clone();
+    btn.connect_clicked(move |btn| {
+        crate::modal::toggle(&monitor, crate::modal::Page::Media, btn);
+    });
     btn
 }
 
@@ -82,15 +109,18 @@ fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
     label
 }
 
-/// MPRIS hides when there's no active player OR when the left cluster is
-/// crowded enough that keeping it visible would risk pushing the right
-/// cluster off-screen.
+/// Drives the three-state MPRIS presentation:
+///
+/// - **No player** → container hidden; `current_bus` cleared.
+/// - **Player + busy workspace** (narrow) → container visible; only `mini`
+///   shown; transport controls and label hidden. `current_bus` and player
+///   state are still kept current so the full-mode controls work immediately
+///   when the workspace becomes uncrowded again.
+/// - **Player + uncrowded workspace** (full) → container visible; transport
+///   controls and label shown; `mini` hidden.
 fn wire_visibility_and_state(
     container: &gtk::Box,
-    label: &gtk::Label,
-    prev_btn: &gtk::Button,
-    play_pause_btn: &gtk::Button,
-    next_btn: &gtk::Button,
+    chips: Chips,
     current_bus: &Rc<RefCell<Option<String>>>,
     monitor: &Monitor,
 ) {
@@ -101,10 +131,13 @@ fn wire_visibility_and_state(
         }
     };
 
-    let label = label.clone();
-    let prev_btn = prev_btn.clone();
-    let play_pause_btn = play_pause_btn.clone();
-    let next_btn = next_btn.clone();
+    let Chips {
+        prev_btn,
+        play_pause_btn,
+        next_btn,
+        label,
+        mini,
+    } = chips;
     let current_bus = current_bus.clone();
 
     bind(
@@ -115,12 +148,26 @@ fn wire_visibility_and_state(
                 container.set_visible(false);
                 *current_bus.borrow_mut() = None;
             }
-            Some(_) if win_count >= HIDE_WHEN_WINDOWS_GTE => {
-                container.set_visible(false);
+            Some(player) if win_count >= HIDE_WHEN_WINDOWS_GTE => {
+                // Narrow mode: keep bus + state current so full mode works on
+                // transition back, but show only the mini icon affordance.
+                *current_bus.borrow_mut() = Some(player.bus_name.clone());
+                apply_player_to_widgets(&player, &label, &prev_btn, &play_pause_btn, &next_btn);
+                prev_btn.set_visible(false);
+                play_pause_btn.set_visible(false);
+                next_btn.set_visible(false);
+                label.set_visible(false);
+                mini.set_visible(true);
+                container.set_visible(true);
             }
             Some(player) => {
                 *current_bus.borrow_mut() = Some(player.bus_name.clone());
                 apply_player_to_widgets(&player, &label, &prev_btn, &play_pause_btn, &next_btn);
+                prev_btn.set_visible(true);
+                play_pause_btn.set_visible(true);
+                next_btn.set_visible(true);
+                label.set_visible(true);
+                mini.set_visible(false);
                 container.set_visible(true);
             }
         },

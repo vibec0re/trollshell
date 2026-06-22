@@ -186,15 +186,13 @@ fn read_monitors() -> Vec<Monitor> {
 
 fn install_default_css() {
     let provider = gtk::CssProvider::new();
-    // Prefer the runtime-overridable stylesheet on disk (set by the Nix
-    // wrapper via HYTTE_UI_DATA_DIR → an assets derivation, so editing the
-    // CSS doesn't recompile the binary). Fall back to the compiled-in copy
-    // when the env is unset or the file is missing, which keeps a plain
-    // `cargo run`/`cargo build` working with no env at all.
-    match runtime_default_stylesheet() {
-        Some(path) => provider.load_from_path(&path),
-        None => provider.load_from_string(crate::DEFAULT_STYLESHEET),
-    }
+    // The default stylesheet is loaded from disk at runtime — never compiled
+    // in — so editing it cannot recompile the binary. Resolution mirrors
+    // trollshell's `assets.rs`: the runtime `HYTTE_UI_DATA_DIR` override (set
+    // by the Nix wrapper → the assets derivation) wins; otherwise the
+    // compile-time `CARGO_MANIFEST_DIR/src` path points at the in-repo source
+    // (the dev `cargo run` case). Only the *path* is ever baked, never the CSS.
+    provider.load_from_path(default_stylesheet_path());
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -204,17 +202,15 @@ fn install_default_css() {
     }
 }
 
-/// Locate the on-disk default stylesheet via `HYTTE_UI_DATA_DIR`.
-///
-/// Returns `Some(path)` only when the env var is set *and* the resolved
-/// `style.css` exists; otherwise `None`, signalling the caller to use the
-/// compiled-in [`crate::DEFAULT_STYLESHEET`] fallback. The Nix wrapper points
-/// this at the assets derivation; dev builds leave it unset and rely on the
-/// fallback.
-fn runtime_default_stylesheet() -> Option<PathBuf> {
-    let base = std::env::var_os("HYTTE_UI_DATA_DIR")?;
-    let path = PathBuf::from(base).join("style.css");
-    path.is_file().then_some(path)
+/// Resolve the default stylesheet path: the runtime `HYTTE_UI_DATA_DIR`
+/// override (the Nix wrapper points it at the assets derivation) if set, else
+/// the compile-time `CARGO_MANIFEST_DIR/src` path — the in-repo source, for the
+/// dev `cargo run` case. Baking only the path (not the contents) keeps the file
+/// fully decoupled from the build.
+fn default_stylesheet_path() -> PathBuf {
+    let base = std::env::var_os("HYTTE_UI_DATA_DIR")
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/src").into());
+    PathBuf::from(base).join("style.css")
 }
 
 fn install_user_css(path: &Path) {

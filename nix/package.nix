@@ -22,25 +22,21 @@
 let
   # crane's default cleanCargoSource keeps only .rs/.toml/.lock; on top of that
   # we keep ONLY the assets the *compile* genuinely reads:
-  #   - crates/hytte-ui/src/style.css — include_str!'d at compile time as the
-  #     runtime-load fallback (see hytte-ui app.rs install_default_css), so it
-  #     MUST stay in the build src.
   #   - tests/fixtures — include_str!'d by the internals suite (doCheck runs
   #     `cargo test` in the sandbox).
-  # The runtime-loaded, postInstall-shipped assets (trollshell/style.css +
-  # trollshell/icons) are deliberately EXCLUDED: the binary resolves them at
-  # runtime via the makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR →
-  # the `assets` derivation below). Excluding them means editing an icon or
-  # trollshell's stylesheet no longer invalidates the expensive Rust build —
-  # only the trivial `assets` derivation + the wrapper rebuild (#133).
+  # NO stylesheets are kept: NONE are include_str!'d anymore. Both
+  # trollshell/{style.css,icons} and crates/hytte-ui/src/style.css are loaded
+  # from disk at runtime — the binary resolves them via the makeWrapper env
+  # (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets` derivation below),
+  # and dev falls back to the compile-time CARGO_MANIFEST_DIR path. Excluding
+  # every asset means editing an icon or *any* stylesheet no longer invalidates
+  # the expensive Rust build — only the trivial `assets` derivation + the
+  # wrapper rebuild (#133).
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
     filter =
-      path: type:
-      (craneLib.filterCargoSources path type)
-      || (lib.hasInfix "/crates/hytte-ui/src/style.css" path)
-      || (lib.hasInfix "/tests/fixtures/" path);
+      path: type: (craneLib.filterCargoSources path type) || (lib.hasInfix "/tests/fixtures/" path);
   };
 
   # Standalone assets derivation: depends ONLY on the asset files, so editing a
@@ -117,8 +113,9 @@ let
     # injected at *runtime* by the makeWrapper wrapping below, pointing at the
     # standalone `assets` derivation. Keeping them out of the build env is what
     # decouples the assets from the (expensive) Rust compile (#133). The dev
-    # `cargo run` path stays covered by the in-crate fallbacks (assets.rs'
-    # CARGO_MANIFEST_DIR and hytte-ui's include_str! default).
+    # `cargo run` path stays covered by the in-crate compile-time fallbacks —
+    # both assets.rs (trollshell) and app.rs (hytte-ui) fall back to their
+    # crate's CARGO_MANIFEST_DIR when the runtime env is unset.
 
     # libspa-sys' bindgen uses clang_macro_fallback to constify cast macros like
     # SPA_ID_INVALID (`((uint32_t)0xffffffff)` in pipewire ≥ 1.6). The fallback

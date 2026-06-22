@@ -23,5 +23,3 @@ pub use gtk4_layer_shell::{Edge as LayerEdge, KeyboardMode, Layer, LayerShell};
 // Re-export so consumers don't need their own gtk/adw deps.
 pub use ::adw;
 pub use ::gtk;
-
-pub(crate) const DEFAULT_STYLESHEET: &str = include_str!("style.css");

@@ -16,11 +16,10 @@
 //! surface, so clicking outside the popover does nothing — the popover
 //! sticks until Escape or a second trigger-click.
 //!
-//! [`attach_dismiss_catcher`] works around this by mirroring the modal
-//! drawer's proven mechanism: while the popover is up it shows a
-//! full-screen transparent `Layer::Top` "catcher" window underneath it;
-//! a click anywhere on the catcher pops the popover down. This is
-//! independent of the compositor's grab routing, so outside-click
+//! [`attach_dismiss_catcher`] works around this: while the popover is up
+//! it shows a full-screen transparent `Layer::Top` "catcher" window
+//! underneath it; a click anywhere on the catcher pops the popover down.
+//! This is independent of the compositor's grab routing, so outside-click
 //! dismissal works regardless. `set_autohide(true)` stays on — where the
 //! grab *does* route (e.g. nested popovers, or other compositors) it
 //! still dismisses; both paths funnel through `popdown`, so there is no
@@ -160,13 +159,19 @@ impl Popup {
 /// routed by the compositor (see the module docs).
 ///
 /// While the popover is up, a full-screen transparent `Layer::Top` window
-/// (the "catcher") is shown on `monitor`, mirroring the modal drawer's
-/// proven mechanism (`trollshell::modal::build_catcher`). A press anywhere
-/// on the catcher pops the popover down; the popover renders above the
-/// catcher because the catcher is presented first, then the popover's
-/// surface commits last (most compositors stack last-mapped on top within a
-/// layer). The catcher is created on each show and destroyed when the
-/// popover closes, so nothing lingers between opens.
+/// (the "catcher") is shown on `monitor`. A press anywhere on the catcher
+/// pops the popover down. Because `gtk::Popover` renders as an xdg-popup
+/// it stacks reliably above its parent layer-shell surface regardless of
+/// present order — so the catcher sits below the popover without relying
+/// on compositor-specific sibling-surface ordering. The catcher is created
+/// on each show and destroyed when the popover closes, so nothing lingers
+/// between opens.
+///
+/// Note: the modal drawer used a similar two-surface approach before #109,
+/// but switched to a single fullscreen surface because niri does not
+/// reliably restack two sibling `Layer::Top` surfaces by present order.
+/// The popover case is unaffected — xdg-popup vs. layer-shell is a
+/// different surface hierarchy.
 ///
 /// `set_autohide` is intentionally left untouched: if the compositor *does*
 /// route the grab, that path still dismisses, and because it funnels through

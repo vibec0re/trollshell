@@ -1085,7 +1085,7 @@
     opacity: 0.75;
 }
 
-/* Second-line note / description — muted, smaller, single line. */
+/* Second-line note / description — muted, smaller, two lines max. */
 .ts-task-note {
     font-size: 0.82em;
     opacity: 0.55;

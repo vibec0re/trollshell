@@ -261,8 +261,10 @@ fn build_task_row(task: &Task, monitor: &Monitor) -> adw::PreferencesRow {
         note_lbl.add_css_class("ts-task-note");
         note_lbl.set_halign(gtk::Align::Start);
         note_lbl.set_xalign(0.0);
+        note_lbl.set_wrap(true);
+        note_lbl.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        note_lbl.set_lines(2);
         note_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        note_lbl.set_wrap(false);
         content.append(&note_lbl);
     }
 

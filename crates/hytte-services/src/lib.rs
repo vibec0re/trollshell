@@ -18,6 +18,7 @@ pub mod logind;
 pub mod mpris;
 pub mod netconn;
 pub mod networkd;
+mod networkd_nm;
 pub mod niri;
 pub mod notifications;
 pub mod notifications_mute;

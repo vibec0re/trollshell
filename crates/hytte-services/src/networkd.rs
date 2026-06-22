@@ -7,10 +7,17 @@
 //! All D-Bus I/O goes through [`hytte_bus::call`] and [`hytte_bus::signals`]
 //! so the shared connection supervisor handles reconnects automatically.
 //!
-//! When `ListLinks` returns an empty list (e.g. systemd-networkd is not
-//! managing any interfaces), a fallback reads `/sys/class/net` to enumerate
-//! kernel interfaces.  The fallback provides name, ifindex, and operational
-//! state only — addresses/routes/gateways are not available from sysfs alone.
+//! # Backend selection (issue #80)
+//!
+//! systemd-networkd is **not** the link manager on every host — a
+//! `NetworkManager`-managed desktop runs no networkd at all, so `ListLinks`
+//! errors with `ServiceUnknown` and the panel's "All links" list stays empty.
+//! At startup we probe (via [`crate::wifi_backend::probe_backend`]-style
+//! `ListNames`/`ListActivatableNames`) whether networkd is actually present and
+//! produces links; if it isn't and **`NetworkManager` is**, the link list is
+//! sourced from NM over D-Bus instead (see [`crate::networkd_nm`]), feeding the
+//! *same* [`Link`] list the panel already renders. This mirrors the #96 Wi-Fi
+//! `NetworkManager` backend. No `/sys` scraping (rejected on #80/#91).
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -19,6 +26,8 @@ use hytte_bus::{BusKind, call, signals};
 use hytte_reactive::{Service, registry};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+
+use crate::wifi_backend::BackendChoice;
 
 const NETWORKD_NAME: &str = "org.freedesktop.network1";
 const MANAGER_PATH: &str = "/org/freedesktop/network1";
@@ -58,24 +67,8 @@ impl OperationalState {
         }
     }
 
-    /// Map a sysfs `operstate` string (from `/sys/class/net/<if>/operstate`)
-    /// to an [`OperationalState`].
-    ///
-    /// The kernel values (`up`, `down`, `dormant`, `unknown`, …) are a subset
-    /// of networkd's richer set; unmapped values fall through to `Unknown`.
-    #[must_use]
-    pub(crate) fn from_sysfs_operstate(s: &str) -> Self {
-        match s.trim() {
-            "up" => Self::Routable,
-            "down" => Self::Off,
-            "dormant" => Self::Dormant,
-            "lowerlayerdown" => Self::NoCarrier,
-            _ => Self::Unknown,
-        }
-    }
-
     /// Coarse priority used to pick a "primary" link (highest wins).
-    fn priority(self) -> u8 {
+    pub(crate) fn priority(self) -> u8 {
         match self {
             Self::Routable => 5,
             Self::Degraded => 4,
@@ -127,6 +120,60 @@ impl Default for NetworkdHandles {
     }
 }
 
+/// Which daemon should source the interface/link list on this host.
+///
+/// Probed once at startup. systemd-networkd is preferred when it is actually
+/// managing links (its `ListLinks` returns a non-empty list); otherwise, if
+/// `NetworkManager` is present, NM provides the list (issue #80).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkBackend {
+    /// systemd-networkd (`org.freedesktop.network1`) is the active manager.
+    Networkd,
+    /// `NetworkManager` (`org.freedesktop.NetworkManager`) sources the links.
+    NetworkManager,
+    /// Neither is usable; the link list stays empty (panel shows nothing, as
+    /// it does today).
+    None,
+}
+
+/// Decide which backend should source the link list.
+///
+/// Prefers networkd **only when it actually has links** — on a
+/// `NetworkManager`-managed host `ListLinks` either errors (`ServiceUnknown`)
+/// or returns an empty list, in which case we fall through to `NetworkManager` if
+/// the `org.freedesktop.NetworkManager` bus name is present (mirroring
+/// [`crate::wifi_backend::probe_backend`]). When neither is available we return
+/// [`LinkBackend::None`] and the service stays inert.
+async fn probe_link_backend() -> LinkBackend {
+    // Does networkd have any links to show? `read_networkd_links` errors when
+    // the network1 name isn't on the bus; an Ok-but-empty result means networkd
+    // is running but not managing anything (e.g. NM-managed box where networkd
+    // is installed-but-idle). Either way, prefer NM if it can fill the list.
+    let networkd_has_links = match read_networkd_links().await {
+        Ok(links) if !links.is_empty() => return LinkBackend::Networkd,
+        Ok(_) => {
+            tracing::info!("networkd present but no links; checking NetworkManager");
+            true
+        }
+        Err(e) => {
+            tracing::info!(error = ?e, "networkd unreachable; checking NetworkManager");
+            false
+        }
+    };
+
+    if crate::wifi_backend::probe_backend().await == BackendChoice::NetworkManager {
+        LinkBackend::NetworkManager
+    } else if networkd_has_links {
+        // networkd answered (just with no links yet) and NM isn't present —
+        // keep networkd as the source so its listen loop's periodic refresh
+        // picks up interfaces as they enrol.
+        LinkBackend::Networkd
+    } else {
+        // Neither networkd nor NetworkManager is usable.
+        LinkBackend::None
+    }
+}
+
 impl Service for NetworkdService {
     type Handles = NetworkdHandles;
 
@@ -136,20 +183,33 @@ impl Service for NetworkdService {
         let primary_writer = handles.primary.clone();
 
         rt.spawn(async move {
-            // Startup probe: if the initial refresh fails, networkd isn't
-            // running on this host (e.g. NetworkManager-only setups). Log
-            // once at info and stay inert rather than entering a 2s retry
-            // loop that hammers dbus for the rest of the process lifetime.
-            if let Err(e) = refresh(&links_writer, &primary_writer).await {
-                tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
-                return;
-            }
-            loop {
-                match listen(&links_writer, &primary_writer).await {
-                    Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
-                    Err(e) => tracing::warn!(error = ?e, "networkd error, retrying in 2s"),
+            match probe_link_backend().await {
+                LinkBackend::NetworkManager => {
+                    tracing::info!(
+                        "networkd: sourcing link list from NetworkManager (networkd not managing)"
+                    );
+                    crate::networkd_nm::run_nm_links_watcher(links_writer, primary_writer).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                LinkBackend::Networkd => {
+                    // Seed once; if the initial refresh fails outright, networkd
+                    // isn't running on this host and no NM is present either —
+                    // log once at info and stay inert rather than hammering dbus
+                    // in a 2s retry loop for the rest of the process lifetime.
+                    if let Err(e) = refresh(&links_writer, &primary_writer).await {
+                        tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
+                        return;
+                    }
+                    loop {
+                        match listen(&links_writer, &primary_writer).await {
+                            Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
+                            Err(e) => tracing::warn!(error = ?e, "networkd error, retrying in 2s"),
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                LinkBackend::None => {
+                    tracing::info!("networkd: no link backend available; service inert");
+                }
             }
         });
 
@@ -201,7 +261,7 @@ async fn refresh(
     links_out: &Mutable<Vec<Link>>,
     primary_out: &Mutable<Option<Link>>,
 ) -> Result<()> {
-    let links = read_links().await?;
+    let links = read_networkd_links().await?;
     let primary = links
         .iter()
         .max_by_key(|l| l.operational.priority())
@@ -213,7 +273,13 @@ async fn refresh(
     Ok(())
 }
 
-async fn read_links() -> Result<Vec<Link>> {
+/// Read the link list from systemd-networkd's `ListLinks` + per-link
+/// `Describe`.
+///
+/// Returns an error when the `org.freedesktop.network1` name is not on the bus
+/// (e.g. networkd isn't running) — callers use that to fall back to the
+/// `NetworkManager` source. There is no `/sys` fallback (rejected on #80/#91).
+async fn read_networkd_links() -> Result<Vec<Link>> {
     // ListLinks returns array of (idx: i32, name: String, path: ObjectPath).
     let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> = call(NETWORKD_NAME)
         .bus(BusKind::System)
@@ -224,14 +290,6 @@ async fn read_links() -> Result<Vec<Link>> {
         .send()
         .await
         .context("ListLinks")?;
-
-    // When networkd returns no links (e.g. interfaces are managed by
-    // NetworkManager / iwd / plain kernel), fall back to /sys/class/net so
-    // the panel shows *something* rather than an empty list.
-    if list.is_empty() {
-        tracing::debug!("networkd returned no links; falling back to /sys/class/net");
-        return Ok(read_links_from_sys());
-    }
 
     let mut out = Vec::with_capacity(list.len());
     for (idx, name, path) in list {
@@ -275,53 +333,6 @@ async fn read_links() -> Result<Vec<Link>> {
         });
     }
     Ok(out)
-}
-
-/// Enumerate kernel interfaces from `/sys/class/net`.
-///
-/// Only name, ifindex, and operational state are available here.
-/// Addresses/routes/gateways are left at their defaults (empty / `None`).
-/// Loopback (`lo`) is skipped.
-fn read_links_from_sys() -> Vec<Link> {
-    let dir = match std::fs::read_dir("/sys/class/net") {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = ?e, "cannot read /sys/class/net");
-            return Vec::new();
-        }
-    };
-
-    let mut out = Vec::new();
-    for entry in dir.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "lo" {
-            continue;
-        }
-
-        let idx = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .unwrap_or(0);
-
-        let operational = std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
-            .map_or(OperationalState::Unknown, |s| {
-                OperationalState::from_sysfs_operstate(&s)
-            });
-
-        out.push(Link {
-            idx,
-            name,
-            operational,
-            addresses: Vec::new(),
-            gateway_v4: None,
-            gateway_v6: None,
-            routes: Vec::new(),
-        });
-    }
-
-    // Stable ordering by ifindex so the list doesn't change between refreshes.
-    out.sort_by_key(|l| l.idx);
-    out
 }
 
 #[must_use]
@@ -437,65 +448,6 @@ fn bytes_to_ip(family: i32, bytes: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- sysfs operstate mapping ---
-
-    #[test]
-    fn sysfs_operstate_up_maps_to_routable() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("up"),
-            OperationalState::Routable
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_down_maps_to_off() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("down"),
-            OperationalState::Off
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_dormant_maps_to_dormant() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("dormant"),
-            OperationalState::Dormant
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_lowerlayerdown_maps_to_no_carrier() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("lowerlayerdown"),
-            OperationalState::NoCarrier
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_unknown_maps_to_unknown() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("unknown"),
-            OperationalState::Unknown
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_trims_trailing_newline() {
-        // /sys/class/net/<if>/operstate typically ends with '\n'
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("up\n"),
-            OperationalState::Routable
-        );
-    }
-
-    #[test]
-    fn sysfs_operstate_unrecognised_is_unknown() {
-        assert_eq!(
-            OperationalState::from_sysfs_operstate("notanything"),
-            OperationalState::Unknown
-        );
-    }
 
     // --- parse_describe ---
 

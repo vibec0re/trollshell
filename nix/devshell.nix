@@ -34,6 +34,14 @@ pkgs.mkShell {
   # (BINDGEN_EXTRA_CLANG_ARGS is left to bindgenHook, inherited via the package's
   # nativeBuildInputs — it sets a more complete value than we could here.)
   env = {
+    # Asset path env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR) is deliberately
+    # NOT set here. The packaged build injects both at runtime via makeWrapper
+    # (pointing at the `assets` derivation); the dev `cargo run` relies on the
+    # in-crate fallbacks instead — trollshell/assets.rs falls back to
+    # CARGO_MANIFEST_DIR, and hytte-ui falls back to its include_str! default
+    # stylesheet when HYTTE_UI_DATA_DIR is unset. So dev styling/icons resolve
+    # to the live in-repo sources with no extra wiring.
+
     # Kept explicit so the shellHook's LD_LIBRARY_PATH line below sees it
     # regardless of when bindgenHook's hook fires.
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";

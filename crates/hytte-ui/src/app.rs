@@ -185,9 +185,16 @@ fn read_monitors() -> Vec<Monitor> {
 }
 
 fn install_default_css() {
-    // Filled in by Task 8; placeholder here keeps the symbol present.
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(crate::DEFAULT_STYLESHEET);
+    // Prefer the runtime-overridable stylesheet on disk (set by the Nix
+    // wrapper via HYTTE_UI_DATA_DIR → an assets derivation, so editing the
+    // CSS doesn't recompile the binary). Fall back to the compiled-in copy
+    // when the env is unset or the file is missing, which keeps a plain
+    // `cargo run`/`cargo build` working with no env at all.
+    match runtime_default_stylesheet() {
+        Some(path) => provider.load_from_path(&path),
+        None => provider.load_from_string(crate::DEFAULT_STYLESHEET),
+    }
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -195,6 +202,19 @@ fn install_default_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+}
+
+/// Locate the on-disk default stylesheet via `HYTTE_UI_DATA_DIR`.
+///
+/// Returns `Some(path)` only when the env var is set *and* the resolved
+/// `style.css` exists; otherwise `None`, signalling the caller to use the
+/// compiled-in [`crate::DEFAULT_STYLESHEET`] fallback. The Nix wrapper points
+/// this at the assets derivation; dev builds leave it unset and rely on the
+/// fallback.
+fn runtime_default_stylesheet() -> Option<PathBuf> {
+    let base = std::env::var_os("HYTTE_UI_DATA_DIR")?;
+    let path = PathBuf::from(base).join("style.css");
+    path.is_file().then_some(path)
 }
 
 fn install_user_css(path: &Path) {

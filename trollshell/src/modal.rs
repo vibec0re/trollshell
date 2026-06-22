@@ -117,19 +117,6 @@ impl BarGeometry {
         }
     }
 
-    /// The perpendicular anchor + main-axis anchor the drawer surface uses.
-    /// The main-axis anchor is the *trailing* edge so the under-the-chip
-    /// margin is uniformly measured from there: horizontal bars hug the right
-    /// and slide along X; vertical bars hug the bottom and slide along Y.
-    fn anchors(&self) -> (Anchor, Anchor) {
-        match self.edge {
-            Edge::Top => (Anchor::Top, Anchor::Right),
-            Edge::Bottom => (Anchor::Bottom, Anchor::Right),
-            Edge::Left => (Anchor::Left, Anchor::Bottom),
-            Edge::Right => (Anchor::Right, Anchor::Bottom),
-        }
-    }
-
     /// Layer-shell edge carrying the perpendicular (bar-thickness) margin.
     fn perpendicular_layer_edge(&self) -> LayerEdge {
         match self.edge {
@@ -229,10 +216,11 @@ impl Page {
     }
 }
 
-/// Per-monitor drawer handle. Internally owns the layer-shell window, a
-/// `GtkRevealer` that slides the card out of the bar's far edge (direction
-/// chosen per `BarGeometry`), and a persistent fullscreen click-catcher
-/// that's toggled alongside the drawer.
+/// Per-monitor drawer handle. Internally owns a single fullscreen layer-shell
+/// window (a transparent click-catching background plus the card overlaid on
+/// top — one surface, no cross-surface restacking for niri to mishandle, #109)
+/// and a `GtkRevealer` that slides the card out of the bar's far edge
+/// (direction chosen per `BarGeometry`).
 struct ModalPanel {
     window: gtk::Window,
     revealer: gtk::Revealer,
@@ -243,7 +231,13 @@ struct ModalPanel {
     /// not the transparent surface, centers under the trigger chip.
     card: gtk::Overlay,
     current: RefCell<Option<Page>>,
-    catcher: gtk::Window,
+    /// The `.ts-modal` positioner box overlaid on the fullscreen window. It
+    /// carries the chrome padding and is aligned to the bar's perp+trailing
+    /// corner; its GTK margins (set per-open) place the card the same distance
+    /// from the screen edge the old content-sized drawer surface did — so the
+    /// centering math is unchanged, only the margin *sink* moved here from the
+    /// window. The `revealer` lives inside it.
+    positioner: gtk::Box,
     /// The bar this drawer hangs off — its edge/offset/thickness drive the
     /// drawer's anchoring and perpendicular margin.
     geometry: BarGeometry,
@@ -366,13 +360,14 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
         bar_window: bar.window().clone(),
     };
 
-    // Build the catcher FIRST so that within `Layer::Top` the catcher's
-    // surface is committed before the drawer's. Within the same layer,
-    // most Wayland compositors stack the most-recently-mapped surface on
-    // top, so `show_panel` re-maps catcher → drawer on every open to keep
-    // the drawer above its catcher.
-    let catcher = build_catcher(monitor, key.clone());
-
+    // One fullscreen `Layer::Top` surface (#109): an `Overlay` whose MAIN child
+    // is a transparent click-catcher box and whose OVERLAY child is the
+    // positioner carrying the card. Z-order is handled INSIDE GTK (overlay
+    // children paint above the main child), so there's no cross-surface
+    // restacking within `Layer::Top` for niri to mishandle — the previous
+    // two-surface design (separate catcher + drawer windows) relied on niri
+    // honoring present-order restacking within a layer, which it does not, so
+    // outside clicks never reached the catcher's gesture.
     let window = build_drawer_window(monitor, &key, &geometry);
     wire_escape(&window, key.clone());
 
@@ -382,7 +377,33 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
 
     content.append(&stack);
     revealer.set_child(Some(&card));
-    window.set_child(Some(&revealer));
+
+    // Transparent click-catching background: any press retracts the drawer.
+    let catcher_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    catcher_box.add_css_class("ts-modal-catcher");
+    catcher_box.set_hexpand(true);
+    catcher_box.set_vexpand(true);
+    let catcher_gesture = gtk::GestureClick::new();
+    catcher_gesture.set_button(0);
+    let catcher_key = key.clone();
+    catcher_gesture.connect_pressed(move |_, _, _, _| {
+        retract_by_key(&catcher_key);
+    });
+    catcher_box.add_controller(catcher_gesture);
+
+    // Positioner: the `.ts-modal` chrome-bearing box, aligned to the bar's
+    // perpendicular + trailing-main corner. Because the overlay is fullscreen,
+    // a GTK margin on this box (with the trailing-edge alignment) lands the
+    // card the same distance from the screen edge the old layer-shell
+    // `set_margin` did — so the centering math is byte-identical (only the
+    // margin sink moved window → positioner). Holds the revealer → card.
+    let positioner = build_positioner(&geometry);
+    positioner.append(&revealer);
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&catcher_box));
+    overlay.add_overlay(&positioner);
+    window.set_child(Some(&overlay));
 
     wire_retract_finish(&revealer, key.clone());
     wire_recenter_on_map(&window, key.clone());
@@ -397,7 +418,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 stack,
                 card,
                 current: RefCell::new(None),
-                catcher,
+                positioner,
                 geometry,
                 pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
@@ -406,38 +427,57 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     });
 }
 
-/// Drawer surface, anchored to the bar's *actual* edge. Content-driven
-/// natural size; ignores other layer-shell exclusive zones (sets
-/// `exclusive_zone(-1)`) so its perpendicular margin is measured from the
-/// true screen edge — the bar's own exclusive reservation would otherwise
-/// stack with our margin and push the drawer off the bar. The perpendicular
-/// margin is set live in `show_panel` from `geometry.perpendicular_margin()`
-/// (bar offset + measured thickness), not a hardcoded constant; the
-/// main-axis margin (under the chip) is set per-open.
-fn build_drawer_window(monitor: &Monitor, key: &str, geometry: &BarGeometry) -> gtk::Window {
-    let (anchor_perp, anchor_main) = geometry.anchors();
+/// The single fullscreen drawer surface (#109): anchored to all four screen
+/// edges so the inner `Overlay` fills the screen, holding both the transparent
+/// click-catcher and the card. Transparent (`.ts-modal-catcher`, not
+/// `.ts-modal` — the chrome padding lives on the positioner inside). Ignores
+/// other layer-shell exclusive zones (`exclusive_zone(-1)`) so the positioner's
+/// perpendicular margin is measured from the true screen edge — the bar's own
+/// exclusive reservation would otherwise stack with our margin and push the
+/// drawer off the bar. Card positioning is done with GTK margins on the
+/// positioner box (set live in `show_panel`), since this surface no longer
+/// moves.
+fn build_drawer_window(monitor: &Monitor, key: &str, _geometry: &BarGeometry) -> gtk::Window {
     let window = layer_window(monitor)
         .layer(Layer::Top)
-        .anchor(anchor_perp)
-        .anchor(anchor_main)
+        .anchor(Anchor::Top)
+        .anchor(Anchor::Bottom)
+        .anchor(Anchor::Left)
+        .anchor(Anchor::Right)
         .exclusive(false)
         .keyboard_mode(KeyboardMode::OnDemand)
         .namespace(format!("hytte-modal-{key}"))
         .build();
-    window.add_css_class("ts-modal");
+    window.add_css_class("ts-modal-catcher");
     window.set_exclusive_zone(-1);
-    // AdwClamp inside each page caps width at 680; 360 floor keeps sparse
-    // pages from collapsing. niri honors live surface-size commits so the
-    // drawer grows/shrinks as pages switch. The floor applies on the bar's
-    // main axis (width for horizontal bars, height for vertical).
-    // Scaled with the font (#114) so the floor grows consistently with the cap.
+    window
+}
+
+/// Build the `.ts-modal` positioner box overlaid on the fullscreen window.
+/// It carries the chrome padding and is aligned to the bar's perpendicular +
+/// *trailing*-main corner so a GTK margin places the card the same distance
+/// from the screen edge the old content-sized drawer surface did. The main-axis
+/// floor (was on the drawer window) lives here now: `AdwClamp` inside each page
+/// caps width at 680; the 360 floor keeps sparse pages from collapsing. Scaled
+/// with the font (#114) so the floor grows consistently with the cap. The
+/// `revealer` is appended into it by the caller.
+fn build_positioner(geometry: &BarGeometry) -> gtk::Box {
+    let positioner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    positioner.add_css_class("ts-modal");
     let floor = scale(360);
     if geometry.horizontal() {
-        window.set_size_request(floor, -1);
+        // Horizontal bar: hug the trailing (right) main edge, align
+        // perpendicularly to the bar's near/far side.
+        positioner.set_halign(gtk::Align::End);
+        positioner.set_valign(geometry.perpendicular_align());
+        positioner.set_size_request(floor, -1);
     } else {
-        window.set_size_request(-1, floor);
+        // Vertical bar: hug the trailing (bottom) main edge.
+        positioner.set_valign(gtk::Align::End);
+        positioner.set_halign(geometry.perpendicular_align());
+        positioner.set_size_request(-1, floor);
     }
-    window
+    positioner
 }
 
 fn wire_escape(window: &gtk::Window, key: String) {
@@ -628,8 +668,9 @@ fn build_pages_stack() -> gtk::Stack {
     stack
 }
 
-/// When the retract animation finishes, hide the drawer + catcher and clear
-/// the open state for downstream subscribers.
+/// When the retract animation finishes, hide the drawer surface and clear the
+/// open state for downstream subscribers. The click-catcher is part of the same
+/// surface now, so hiding the window hides both.
 fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
     revealer.connect_child_revealed_notify(move |r| {
         if r.is_child_revealed() {
@@ -641,7 +682,6 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
                 return;
             };
             panel.window.set_visible(false);
-            panel.catcher.set_visible(false);
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
         });
@@ -654,7 +694,6 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
 pub fn close_all() {
     PANELS.with(|panels| {
         for (_, panel) in panels.borrow_mut().drain() {
-            panel.catcher.close();
             panel.window.close();
         }
     });
@@ -700,7 +739,8 @@ pub fn dismiss_all() {
 }
 
 /// Begin the retract animation. The notify-child-revealed handler finishes
-/// the teardown (hiding the surface + closing the catcher) when it ends.
+/// the teardown (hiding the single surface, catcher and card together) when it
+/// ends.
 fn retract_by_key(key: &str) {
     PANELS.with(|panels| {
         if let Some(panel) = panels.borrow().get(key) {
@@ -772,9 +812,10 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
 /// Present the drawer on `page` at `main_margin` pixels from the bar's
 /// trailing main-axis edge (screen right for horizontal bars, screen top for
 /// vertical). Also sets the perpendicular margin live from the bar's real
-/// offset + thickness. Show the catcher before the drawer so that within
-/// `Layer::Top` the drawer's surface commits most recently and stacks above
-/// the catcher.
+/// offset + thickness. The margins now sink onto the `positioner` box (the
+/// fullscreen surface no longer moves) — because the overlay is fullscreen, a
+/// GTK margin on the trailing-aligned positioner is equivalent to the old
+/// layer-shell `set_margin` on the content-sized drawer surface.
 fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
     panel.stack.set_visible_child_name(page.stack_name());
     *panel.current.borrow_mut() = Some(page);
@@ -783,20 +824,36 @@ fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
 
     // Perpendicular margin: bar offset + live-measured thickness, replacing
     // the old hardcoded 59. The bar window is mapped by open time.
-    panel.window.set_margin(
+    set_widget_margin(
+        &panel.positioner,
         panel.geometry.perpendicular_layer_edge(),
         panel.geometry.perpendicular_margin(),
     );
-    panel
-        .window
-        .set_margin(panel.geometry.main_layer_edge(), main_margin);
-
-    panel.catcher.set_visible(true);
-    panel.catcher.present();
+    set_widget_margin(
+        &panel.positioner,
+        panel.geometry.main_layer_edge(),
+        main_margin,
+    );
 
     panel.window.set_visible(true);
     panel.window.present();
     panel.revealer.set_reveal_child(true);
+}
+
+/// Set a GTK margin on `widget` corresponding to a layer-shell [`LayerEdge`].
+/// The shell runs LTR, so `Left`→`margin_start` and `Right`→`margin_end`. Used
+/// to position the `.ts-modal` positioner within the fullscreen overlay the
+/// same way `set_margin` positioned the old content-sized drawer surface.
+fn set_widget_margin(widget: &impl IsA<gtk::Widget>, edge: LayerEdge, margin: i32) {
+    // `LayerEdge` (gtk4_layer_shell's `Edge`) is `#[non_exhaustive]`, so a
+    // wildcard arm is required even though the four screen edges are the only
+    // meaningful values. `Right` maps to `margin_end` (LTR) via that wildcard.
+    match edge {
+        LayerEdge::Top => widget.set_margin_top(margin),
+        LayerEdge::Bottom => widget.set_margin_bottom(margin),
+        LayerEdge::Left => widget.set_margin_start(margin),
+        _ => widget.set_margin_end(margin),
+    }
 }
 
 /// Recompute the main-axis margin from the *real* card allocation once the
@@ -819,9 +876,7 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
                     return;
                 };
                 let margin = main_margin_for_center(panel, center);
-                panel
-                    .window
-                    .set_margin(panel.geometry.main_layer_edge(), margin);
+                set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
             });
         });
     });
@@ -915,40 +970,6 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
 /// `monitors_changed` task.
 pub fn drawer_open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'static {
     drawer_open_state(&monitor_key(monitor)).signal()
-}
-
-/// Full-screen transparent layer-shell window that closes the drawer on any
-/// press. Built once at install time and kept alive for the panel's
-/// lifetime; visibility tracks the drawer.
-fn build_catcher(monitor: &Monitor, modal_key: String) -> gtk::Window {
-    let win = layer_window(monitor)
-        .layer(Layer::Top)
-        .anchor(Anchor::Top)
-        .anchor(Anchor::Bottom)
-        .anchor(Anchor::Left)
-        .anchor(Anchor::Right)
-        .exclusive(false)
-        .keyboard_mode(KeyboardMode::None)
-        .namespace("hytte-modal-catcher")
-        .build();
-    win.add_css_class("ts-modal-catcher");
-
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    content.set_hexpand(true);
-    content.set_vexpand(true);
-    win.set_child(Some(&content));
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(0);
-    let modal_key_for_press = modal_key;
-    gesture.connect_pressed(move |_, _, _, _| {
-        retract_by_key(&modal_key_for_press);
-    });
-    content.add_controller(gesture);
-
-    // Start hidden; `show_panel` toggles visibility alongside the drawer.
-    win.set_visible(false);
-    win
 }
 
 /// Per-page side-effects that should run whenever a page becomes visible

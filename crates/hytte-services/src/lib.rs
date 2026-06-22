@@ -36,4 +36,6 @@ pub mod vpn;
 pub mod wallpaper;
 pub mod weather;
 pub mod wifi;
+pub mod wifi_backend;
+pub mod wifi_nm;
 pub mod wifiscan;

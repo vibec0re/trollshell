@@ -2,7 +2,7 @@
 //! rows on top, history sparklines middle, failed-services expander
 //! bottom.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -127,8 +127,14 @@ fn build_top_apps_expander(
         Rc::new(RefCell::new(HashMap::new()));
 
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // One-shot guard: collapse the expander the first time rows actually arrive.
+    // We must not call set_expanded(false) on every tick — that would fight the
+    // user's manual expand/collapse.  The build-time set_expanded(false) above
+    // covers the empty-expander case; this guard fires once on first population.
+    let collapsed_once: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
+    let collapsed_once_for_bind = collapsed_once.clone();
     bind(signal, &expander, move |_, list| {
         for row in rows_for_bind.borrow_mut().drain(..) {
             expander_for_bind.remove(&row);
@@ -181,6 +187,16 @@ fn build_top_apps_expander(
             new_rows.push(row);
         }
         *rows_for_bind.borrow_mut() = new_rows;
+
+        // Re-assert collapsed state once on first non-empty population.
+        // libadwaita can render the expander open when rows arrive after the
+        // initial set_expanded(false) on an empty widget (async row-population
+        // race — #131).  We fire exactly once so the user's subsequent
+        // manual expand/collapse is never overridden.
+        if !collapsed_once_for_bind.get() && !list.is_empty() {
+            expander_for_bind.set_expanded(false);
+            collapsed_once_for_bind.set(true);
+        }
     });
 
     expander

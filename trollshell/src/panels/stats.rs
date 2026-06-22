@@ -1,6 +1,6 @@
-//! System stats drawer panel — live CPU/memory/swap/processes/GPU/disk
-//! rows on top, history sparklines middle, failed-services expander
-//! bottom.
+//! System stats drawer panel — one card per monitored resource
+//! (CPU / Memory / Disks / GPU / Services). Each card groups that
+//! resource's live rows, history sparkline, and top-consumers list.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
 
 use crate::components::cast;
-use crate::components::format::{fmt_bytes, fmt_rate};
+use crate::components::format::fmt_bytes;
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 
@@ -24,33 +24,88 @@ pub fn panel_stats() -> gtk::Widget {
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
 
-    column.append(build_stats_live_group_v2().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_history_group().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_cpu_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_memory_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_disks_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_gpu_card().upcast_ref::<gtk::Widget>());
     column.append(build_stats_services_group().upcast_ref::<gtk::Widget>());
 
     finish_page(&column)
 }
 
-fn build_stats_live_group_v2() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
+/// Wrap a bare history-sparkline `gtk::Box` in a `gtk::ListBoxRow` so it joins
+/// an `AdwPreferencesGroup`'s boxed-list in source order with the standard
+/// separators. A non-`GtkListBoxRow` child added to a group otherwise renders
+/// *below* the boxed-list and out of order (cf. the adw-routing gotcha; the
+/// same fix PR #149 used for the per-interface network rows).
+fn history_row_wrapper(child: &gtk::Box) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+    row.set_hexpand(true);
+    row.set_child(Some(child));
+    row
+}
+
+/// CPU card — live CPU + per-core + processes, CPU history sparkline, and the
+/// CPU top-apps expander. Processes (a system-load metric) lives here; this is
+/// the one placement Mara didn't pin (flagged in the PR for relocation).
+fn build_stats_cpu_card() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("CPU").build();
 
     group.add(&build_live_cpu_row());
     group.add(&build_live_per_core_row());
-    group.add(&build_live_memory_row());
-    group.add(&build_live_swap_row());
     group.add(&build_live_processes_row());
-    group.add(&build_live_gpu_row());
-    group.add(&build_live_disk_expander());
+    group.add(&history_row_wrapper(&build_history_cpu_row()));
     group.add(&build_top_apps_expander(
         "Top apps \u{00b7} CPU",
         app_usage::top_by_cpu(),
         |s| format!("{:.0}%", s.cpu_frac * 100.0),
     ));
+
+    group
+}
+
+/// Memory card — live memory + swap, memory history sparkline, and the RAM
+/// top-apps expander. The swap row self-hides when no swap is configured.
+fn build_stats_memory_card() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Memory").build();
+
+    group.add(&build_live_memory_row());
+    group.add(&build_live_swap_row());
+    group.add(&history_row_wrapper(&build_history_memory_row()));
     group.add(&build_top_apps_expander(
         "Top apps \u{00b7} RAM",
         app_usage::top_by_mem(),
         |s| fmt_bytes(s.mem_bytes),
     ));
+
+    group
+}
+
+/// Disks card — the per-mount disk expander.
+fn build_stats_disks_card() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Disks").build();
+    group.add(&build_live_disk_expander());
+    group
+}
+
+/// GPU card — live GPU row + GPU-temp history sparkline. The whole card hides
+/// when no GPU is detected (bound to the same `sensors::gpu()` presence signal
+/// the live GPU row uses to self-hide). Intel GPUs are supported as of #150, so
+/// this card shows on Arc/iGPU hardware.
+fn build_stats_gpu_card() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("GPU").build();
+
+    // Hide the entire card when no GPU is present.
+    bind(
+        sensors::gpu().map(|g| g.is_some()),
+        &group,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    group.add(&build_live_gpu_row());
+    group.add(&history_row_wrapper(&build_history_gpu_temp_row()));
 
     group
 }
@@ -524,17 +579,6 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
     expander
 }
 
-fn build_stats_history_group() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("History").build();
-
-    group.add(&build_history_cpu_row());
-    group.add(&build_history_memory_row());
-    group.add(&build_history_network_row());
-    group.add(&build_history_gpu_temp_row());
-
-    group
-}
-
 fn build_history_cpu_row() -> gtk::Box {
     let (row, spark, value) = build_history_row("CPU");
     spark.set_domain_max(Some(1.0));
@@ -567,46 +611,6 @@ fn build_history_memory_row() -> gtk::Box {
     });
 
     row
-}
-
-fn build_history_network_row() -> gtk::Box {
-    // Vertical container: [main row | detail line]
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
-
-    let (top_row, spark, value) = build_history_row("Network");
-    spark.set_domain_max(None);
-    value.set_text("B/s");
-    outer.append(&top_row);
-
-    // Detail line: indented to align under the sparkline column.
-    // 80px (name col) + 8px (Box spacing) = 88px left margin.
-    let detail = gtk::Label::new(None);
-    detail.add_css_class("ts-stat-value");
-    detail.set_xalign(0.0);
-    detail.set_margin_start(88);
-    detail.set_margin_bottom(4);
-    outer.append(&detail);
-
-    let spark_clone = spark.clone();
-    let detail_clone = detail.clone();
-    bind(sensors::network(), &outer, move |_, net| {
-        let (rx_total, tx_total) = net
-            .interfaces
-            .iter()
-            .filter(|i| i.name != "lo")
-            .fold((0.0_f64, 0.0_f64), |(rx, tx), i| {
-                (rx + i.rx_rate_bps, tx + i.tx_rate_bps)
-            });
-        let combined = rx_total + tx_total;
-        spark_clone.push(combined);
-        detail_clone.set_text(&format!(
-            "\u{2193} {} \u{2191} {}",
-            fmt_rate(rx_total),
-            fmt_rate(tx_total)
-        ));
-    });
-
-    outer
 }
 
 fn build_history_gpu_temp_row() -> gtk::Box {

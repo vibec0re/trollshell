@@ -1,13 +1,13 @@
 //! Network drawer panel — two-column layout of flat per-card sections
-//! (left: Connection + Wi-Fi cards; right: Total/TCP + per-interface graph
-//! cards) plus an "Active connections" drill-down. Backed by `networkd`,
-//! `resolved`, `sensors`, `wifi`, and `netconn` services.
+//! (left: Connection + Wi-Fi cards; right: Total/TCP card — which ends with
+//! an "Active connections" drill-down row — plus a per-interface graph card).
+//! Backed by `networkd`, `resolved`, `sensors`, `wifi`, and `netconn` services.
 
 mod connection;
 mod traffic;
 mod wifi;
 
-use hytte::adw::{self, prelude::*};
+use hytte::adw::prelude::*;
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::netconn;
@@ -74,13 +74,14 @@ pub fn panel_network() -> gtk::Widget {
     // background/border so all four cards read consistently.
     iface_group.add_css_class("ts-net-card");
     totals_group.add_css_class("ts-net-card");
-    right.append(&totals_group);
-    right.append(&iface_group);
-    grid.attach(&right, 1, 0, 1, 1);
 
-    outer.append(&grid);
-
-    // Active connections drill-down — opens Page::Connections for the full list.
+    // "Active connections" drill-down now lives as the last row of the
+    // Total/TCP card rather than its own separate card below the grid
+    // (Mara, #161 item 3: "active connections could go into the total / tcp
+    // card"). It opens Page::Connections for the full socket list; the
+    // subtitle tracks the live socket / PID counts. `deep_link_row` returns
+    // an `AdwActionRow` (a `GtkListBoxRow`), so it joins the card's boxed-list
+    // with separators rather than rendering below it.
     let drill = deep_link_row(
         "Active connections",
         None,
@@ -96,17 +97,13 @@ pub fn panel_network() -> gtk::Widget {
         &drill,
         |row, txt| row.set_subtitle(&txt),
     );
-    let drill_group = adw::PreferencesGroup::new();
-    // Same uniform card surface as the four grid cards (conn / Wi-Fi /
-    // totals / per-iface). Without `.ts-net-card` this group rendered as
-    // libadwaita's default boxed-list — its own nested card background plus
-    // the default top margin on `list.boxed-list` — giving it a different
-    // outer rhythm than the cards above it (Mara's "inconsistent margins").
-    // Adding the class flattens it onto one card surface so all five share
-    // the same padding and the same flattened-list margins.
-    drill_group.add_css_class("ts-net-card");
-    drill_group.add(&drill);
-    outer.append(&drill_group);
+    totals_group.add(&drill);
+
+    right.append(&totals_group);
+    right.append(&iface_group);
+    grid.attach(&right, 1, 0, 1, 1);
+
+    outer.append(&grid);
 
     finish_page(&outer)
 }

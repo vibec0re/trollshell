@@ -430,7 +430,9 @@ pub fn set_powered(on: bool) {
 /// Fire-and-forget: forget the network with the given path.
 ///
 /// For iwd, calls `Forget` on the `KnownNetwork` object at `known_network_path`.
-/// For `NetworkManager`, this operation is not yet implemented (deferred to a follow-up).
+/// For `NetworkManager`, calls `Settings.Connection.Delete` on the saved
+/// connection profile at `known_network_path` (the path the watcher records in
+/// [`WifiNetwork::known_network_path`] from the saved-connection enumeration).
 pub fn forget(known_network_path: &str) {
     let path = known_network_path.to_string();
     match get_backend() {
@@ -442,7 +444,15 @@ pub fn forget(known_network_path: &str) {
             });
         }
         WifiBackend::NetworkManager(_) => {
-            tracing::warn!("wifi::forget: not yet supported for NetworkManager backend");
+            runtime::handle().spawn(async move {
+                if path.is_empty() {
+                    tracing::warn!("wifi::forget: NM connection path is empty");
+                    return;
+                }
+                if let Err(e) = crate::wifi_nm::nm_forget(&path).await {
+                    tracing::warn!(error = %e, path, "wifi forget (NM) failed");
+                }
+            });
         }
         WifiBackend::None => {
             tracing::warn!("wifi::forget: no backend available");

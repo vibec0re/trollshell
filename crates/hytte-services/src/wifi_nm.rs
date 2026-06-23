@@ -4,11 +4,16 @@
 //! fills — widgets are backend-agnostic. All D-Bus calls use
 //! [`hytte_bus::call`] / [`hytte_bus::signals`] on the **system bus**.
 //!
+//! # Saved connections & forget
+//!
+//! NM has no per-network "known" flag; instead it stores connection *profiles*
+//! under `Settings`. Each refresh tick enumerates them once
+//! ([`nm_saved_connections`]) and matches by SSID, so visible networks report
+//! `known: true` with their connection object path. `forget`
+//! ([`nm_forget`]) deletes that profile via `Settings.Connection.Delete`.
+//!
 //! # Limitations (MVP)
 //!
-//! * `forget` is not yet implemented (NM uses connection profiles, which is
-//!   more complex than iwd's `KnownNetwork.Forget`). A follow-up ticket covers
-//!   this.
 //! * `connect_network` uses `ActivateConnection` with `"/"` for the connection
 //!   path (NM auto-selects the best stored connection). For secured networks
 //!   without stored credentials, NM asks the registered secret agent (see
@@ -35,6 +40,13 @@ const NM_AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const NM_AGENT_MANAGER_PATH: &str = "/org/freedesktop/NetworkManager/AgentManager";
 const NM_AGENT_MANAGER_IFACE: &str = "org.freedesktop.NetworkManager.AgentManager";
+const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
+const NM_SETTINGS_IFACE: &str = "org.freedesktop.NetworkManager.Settings";
+const NM_SETTINGS_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
+
+/// A connection settings dict: `a{sa{sv}}` — setting name → (key → value).
+/// This is exactly the shape `Settings.Connection.GetSettings()` returns.
+type ConnectionSettings = HashMap<String, HashMap<String, OwnedValue>>;
 
 /// Stable identifier for our secret agent. NM keys registered agents by this
 /// reverse-DNS string; reusing it across restarts lets NM replace a stale
@@ -51,6 +63,23 @@ pub(crate) const NM_AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAg
 /// Decode an NM `Ssid` byte array to a UTF-8 string, lossily.
 fn ssid_bytes_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Extract the Wi-Fi SSID from a saved connection's settings dict
+/// (`Settings.Connection.GetSettings() -> a{sa{sv}}`).
+///
+/// The SSID lives at `settings["802-11-wireless"]["ssid"]` as a byte array
+/// (`ay`). Returns `None` for connections that aren't Wi-Fi (no
+/// `802-11-wireless` setting), or whose SSID is missing/empty after trimming —
+/// callers skip those, so they never end up keyed in the saved-connection map.
+fn saved_connection_ssid(settings: &ConnectionSettings) -> Option<String> {
+    let bytes = settings
+        .get("802-11-wireless")?
+        .get("ssid")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <Vec<u8>>::try_from(v).ok())?;
+    let ssid = ssid_bytes_to_string(&bytes).trim().to_string();
+    if ssid.is_empty() { None } else { Some(ssid) }
 }
 
 /// Map an NM device state `u32` to a [`StationState`].
@@ -183,6 +212,73 @@ async fn get_all_access_points(device: &str) -> Result<Vec<OwnedObjectPath>, hyt
         .await
 }
 
+// ── Saved-connection enumeration ───────────────────────────────────────────────
+
+/// List all saved connection profiles (`Settings.ListConnections() -> ao`).
+async fn list_connections() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(NM_SETTINGS_PATH)
+        .iface(NM_SETTINGS_IFACE)
+        .method("ListConnections")
+        .args(())
+        .send::<Vec<OwnedObjectPath>>()
+        .await
+}
+
+/// Read one saved connection's settings (`Settings.Connection.GetSettings() ->
+/// a{sa{sv}}`).
+async fn get_connection_settings(
+    connection_path: &str,
+) -> Result<ConnectionSettings, hytte_bus::BusError> {
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(connection_path.to_string())
+        .iface(NM_SETTINGS_CONNECTION_IFACE)
+        .method("GetSettings")
+        .args(())
+        .send::<ConnectionSettings>()
+        .await
+}
+
+/// Build a map **SSID → connection object path** over all saved Wi-Fi
+/// connections.
+///
+/// Enumerates `Settings.ListConnections`, then `GetSettings` per profile,
+/// keeping only `802-11-wireless` profiles with a non-empty SSID. Non-Wi-Fi
+/// profiles (Ethernet, VPN, …) and SSID-less ones are skipped. A failure on a
+/// single connection is logged and skipped so it can't abort the whole map.
+///
+/// If two saved profiles share an SSID (rare), the last one wins — `forget`
+/// then removes that profile; any duplicate is left, which is acceptable for
+/// this control. Failure of the top-level `ListConnections` yields an empty map
+/// (every network reports `known: false`), which is the safe degraded state.
+async fn nm_saved_connections() -> HashMap<String, String> {
+    let connections = match list_connections().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: Settings.ListConnections failed");
+            return HashMap::new();
+        }
+    };
+
+    let mut by_ssid = HashMap::new();
+    for conn in connections {
+        let conn_str = conn.as_str();
+        match get_connection_settings(conn_str).await {
+            Ok(settings) => {
+                if let Some(ssid) = saved_connection_ssid(&settings) {
+                    by_ssid.insert(ssid, conn_str.to_string());
+                }
+            }
+            Err(e) => {
+                tracing::debug!(path = conn_str, error = %e, "wifi_nm: GetSettings failed");
+            }
+        }
+    }
+    by_ssid
+}
+
 // ── Device discovery ──────────────────────────────────────────────────────────
 
 /// Find the first Wi-Fi device path from NM. Returns `None` on failure.
@@ -218,10 +314,15 @@ async fn find_wifi_device() -> Option<String> {
 // ── State refresh ─────────────────────────────────────────────────────────────
 
 /// Build a [`WifiNetwork`] from a single NM AP's properties.
+///
+/// `saved` maps SSID → saved-connection object path (see
+/// [`nm_saved_connections`]); a hit marks the network `known` and records the
+/// connection path so [`crate::wifi::forget`] can `Delete` it.
 fn wifi_network_from_ap_props(
     ap_path: &str,
     props: &HashMap<String, OwnedValue>,
     active_ap_path: &str,
+    saved: &HashMap<String, String>,
 ) -> Option<WifiNetwork> {
     let ssid_bytes = prop_bytes(props, "Ssid").unwrap_or_default();
     let ssid = ssid_bytes_to_string(&ssid_bytes);
@@ -236,20 +337,30 @@ fn wifi_network_from_ap_props(
     let security = security_from_flags(flags, wpa_flags, rsn_flags);
     let connected = ap_path == active_ap_path;
     let signal_dbm = strength_to_dbm(strength);
+    // A saved connection for this SSID makes it a "known" network; its object
+    // path is what `forget()` deletes.
+    let known_network_path = saved.get(&ssid).cloned();
 
     Some(WifiNetwork {
         path: ap_path.to_string(),
         ssid,
         security,
-        known: false, // NM: deferred — needs saved connections enumeration
+        known: known_network_path.is_some(),
         connected,
         signal_dbm,
-        known_network_path: None,
+        known_network_path,
     })
 }
 
 /// Read all APs for `device_path` and return the network list.
-async fn read_nm_networks(device_path: &str, active_ap_path: &str) -> Vec<WifiNetwork> {
+///
+/// `saved` (SSID → connection path) is computed once per refresh tick and
+/// passed in so we don't `GetSettings` per AP per second.
+async fn read_nm_networks(
+    device_path: &str,
+    active_ap_path: &str,
+    saved: &HashMap<String, String>,
+) -> Vec<WifiNetwork> {
     let ap_paths = match get_all_access_points(device_path).await {
         Ok(p) => p,
         Err(e) => {
@@ -263,7 +374,8 @@ async fn read_nm_networks(device_path: &str, active_ap_path: &str) -> Vec<WifiNe
         let ap_str = ap.as_str();
         match get_ap_props(ap_str).await {
             Ok(props) => {
-                if let Some(net) = wifi_network_from_ap_props(ap_str, &props, active_ap_path) {
+                if let Some(net) = wifi_network_from_ap_props(ap_str, &props, active_ap_path, saved)
+                {
                     networks.push(net);
                 }
             }
@@ -331,8 +443,13 @@ async fn refresh_nm_state(
         active_ap_path
     };
 
+    // --- saved connections (once per tick) → mark known networks ---
+    // Saved connections change rarely; computing this map once per refresh and
+    // reusing it for every AP avoids a GetSettings storm (one per AP per second).
+    let saved = nm_saved_connections().await;
+
     // --- network list ---
-    let nets = read_nm_networks(device_path, &active_ap_path).await;
+    let nets = read_nm_networks(device_path, &active_ap_path, &saved).await;
 
     let connected_ssid = if active_ap_path.is_empty() {
         None
@@ -547,6 +664,30 @@ pub(crate) async fn nm_disconnect(device_path: &str) -> Result<(), hytte_bus::Bu
         .at_path(device_path.to_string())
         .iface(NM_DEVICE_IFACE)
         .method("Disconnect")
+        .args(())
+        .send::<()>()
+        .await
+}
+
+/// Forget (delete) a saved connection profile via
+/// `Settings.Connection.Delete()`.
+///
+/// `connection_path` is a saved-connection object path (e.g.
+/// `/org/freedesktop/NetworkManager/Settings/3`), as recorded in
+/// [`WifiNetwork::known_network_path`] by [`nm_saved_connections`]. NM removes
+/// the profile and emits `Settings.Connection.Removed`, after which the next
+/// refresh tick reports the network as no longer `known`.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. the profile
+/// was already removed, or policy denies the delete).
+pub(crate) async fn nm_forget(connection_path: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(connection_path.to_string())
+        .iface(NM_SETTINGS_CONNECTION_IFACE)
+        .method("Delete")
         .args(())
         .send::<()>()
         .await
@@ -832,5 +973,132 @@ mod tests {
     #[test]
     fn strength_50_is_midpoint() {
         assert_eq!(strength_to_dbm(50), -75);
+    }
+
+    // -- saved_connection_ssid -----------------------------------------------
+    //
+    // Builds `a{sa{sv}}` connection-settings dicts (the GetSettings shape) and
+    // checks the SSID-extraction / known-network-matching logic the watcher
+    // relies on. Mirrors the OwnedValue-dict construction in nm_agent.rs tests.
+
+    /// Wrap a value into an `OwnedValue`.
+    fn val(v: impl Into<Value<'static>>) -> OwnedValue {
+        v.into().try_to_owned().expect("to OwnedValue")
+    }
+
+    /// Build one setting sub-dict from `(key, value)` pairs.
+    fn setting(pairs: Vec<(&str, OwnedValue)>) -> HashMap<String, OwnedValue> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn ssid_from_wireless_ssid_bytes() {
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(b"FRITZ!Box".to_vec()))]),
+        );
+        assert_eq!(saved_connection_ssid(&conn).as_deref(), Some("FRITZ!Box"));
+    }
+
+    #[test]
+    fn ssid_trims_surrounding_whitespace() {
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(b"  My Home Net  ".to_vec()))]),
+        );
+        assert_eq!(saved_connection_ssid(&conn).as_deref(), Some("My Home Net"));
+    }
+
+    #[test]
+    fn ssid_none_for_non_wifi_connection() {
+        // Ethernet / VPN profiles have no `802-11-wireless` setting → skipped.
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "connection".to_string(),
+            setting(vec![("id", val("Wired connection 1"))]),
+        );
+        conn.insert("802-3-ethernet".to_string(), HashMap::new());
+        assert_eq!(saved_connection_ssid(&conn), None);
+    }
+
+    #[test]
+    fn ssid_none_when_wireless_setting_lacks_ssid() {
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert("802-11-wireless".to_string(), HashMap::new());
+        assert_eq!(saved_connection_ssid(&conn), None);
+    }
+
+    #[test]
+    fn ssid_none_for_empty_ssid_bytes() {
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(Vec::<u8>::new()))]),
+        );
+        assert_eq!(saved_connection_ssid(&conn), None);
+    }
+
+    #[test]
+    fn ssid_none_for_whitespace_only_ssid() {
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(b"   ".to_vec()))]),
+        );
+        assert_eq!(saved_connection_ssid(&conn), None);
+    }
+
+    // -- wifi_network_from_ap_props: known-network matching -------------------
+
+    /// Minimal AP props dict with just an SSID; enough to exercise the
+    /// saved-connection lookup that decides `known` / `known_network_path`.
+    fn ap_props_with_ssid(ssid: &[u8]) -> HashMap<String, OwnedValue> {
+        let mut props = HashMap::new();
+        props.insert("Ssid".to_string(), val(ssid.to_vec()));
+        props
+    }
+
+    #[test]
+    fn ap_marked_known_when_saved_connection_matches() {
+        let props = ap_props_with_ssid(b"FRITZ!Box");
+        let mut saved = HashMap::new();
+        saved.insert(
+            "FRITZ!Box".to_string(),
+            "/org/freedesktop/NetworkManager/Settings/3".to_string(),
+        );
+        let net = wifi_network_from_ap_props("/ap/0", &props, "", &saved)
+            .expect("non-empty SSID yields a network");
+        assert!(net.known);
+        assert_eq!(
+            net.known_network_path.as_deref(),
+            Some("/org/freedesktop/NetworkManager/Settings/3"),
+        );
+    }
+
+    #[test]
+    fn ap_not_known_when_no_saved_connection() {
+        let props = ap_props_with_ssid(b"FRITZ!Box");
+        let saved: HashMap<String, String> = HashMap::new();
+        let net = wifi_network_from_ap_props("/ap/0", &props, "", &saved)
+            .expect("non-empty SSID yields a network");
+        assert!(!net.known);
+        assert_eq!(net.known_network_path, None);
+    }
+
+    #[test]
+    fn ap_known_match_is_exact_on_ssid() {
+        // A saved connection for a *different* SSID must not mark this AP known.
+        let props = ap_props_with_ssid(b"FRITZ!Box");
+        let mut saved = HashMap::new();
+        saved.insert(
+            "Other Net".to_string(),
+            "/org/freedesktop/NetworkManager/Settings/9".to_string(),
+        );
+        let net = wifi_network_from_ap_props("/ap/0", &props, "", &saved)
+            .expect("non-empty SSID yields a network");
+        assert!(!net.known);
+        assert_eq!(net.known_network_path, None);
     }
 }

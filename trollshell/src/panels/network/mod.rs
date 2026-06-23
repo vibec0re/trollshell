@@ -97,6 +97,14 @@ pub fn panel_network() -> gtk::Widget {
         |row, txt| row.set_subtitle(&txt),
     );
     let drill_group = adw::PreferencesGroup::new();
+    // Same uniform card surface as the four grid cards (conn / Wi-Fi /
+    // totals / per-iface). Without `.ts-net-card` this group rendered as
+    // libadwaita's default boxed-list — its own nested card background plus
+    // the default top margin on `list.boxed-list` — giving it a different
+    // outer rhythm than the cards above it (Mara's "inconsistent margins").
+    // Adding the class flattens it onto one card surface so all five share
+    // the same padding and the same flattened-list margins.
+    drill_group.add_css_class("ts-net-card");
     drill_group.add(&drill);
     outer.append(&drill_group);
 

@@ -4,6 +4,7 @@
 //! implementation details of the trollshell binary.
 
 pub mod cast;
+pub mod chip;
 pub mod connection_row;
 pub mod deep_link_row;
 pub mod focus;

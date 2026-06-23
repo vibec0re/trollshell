@@ -3,9 +3,11 @@ use hytte::prelude::*;
 use hytte::services::notifications;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-notif-indicator");
+    let btn = crate::components::chip::indicator(
+        "ts-notif-indicator",
+        crate::modal::Page::Notifications,
+        monitor,
+    );
 
     let overlay = gtk::Overlay::new();
     let icon = gtk::Image::from_file(crate::assets::path("icons/notification.svg"));
@@ -27,11 +29,6 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         } else {
             w.set_tooltip_text(None);
         }
-    });
-
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Notifications, b);
     });
 
     btn.upcast()

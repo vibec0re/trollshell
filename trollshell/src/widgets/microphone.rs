@@ -4,9 +4,8 @@ use hytte::prelude::*;
 use hytte::services::pipewire::{self, Source};
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-microphone");
+    let btn =
+        crate::components::chip::indicator("ts-microphone", crate::modal::Page::Audio, monitor);
 
     let icon = gtk::Image::new();
     btn.set_child(Some(&icon));
@@ -37,10 +36,6 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         },
     );
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Audio, b);
-    });
     btn.upcast()
 }
 

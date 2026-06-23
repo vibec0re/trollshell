@@ -73,6 +73,32 @@ pub struct WiredProfile {
     pub active: bool,
 }
 
+/// A saved `NetworkManager` VPN connection profile, surfaced to the VPN panel
+/// so it can be activated / deactivated.
+///
+/// Built once per refresh tick by [`nm_vpn_profiles`] from the `vpn` saved
+/// connections, joined against NM's active connections. Unlike a wired profile,
+/// a VPN does **not** bind to a device — it rides the primary connection — so
+/// activation passes `"/"` for both the device and specific-object. Deactivation
+/// targets the *active-connection* object path (not a device), captured here in
+/// [`VpnProfile::active_connection_path`] when the profile is up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VpnProfile {
+    /// Display name (the `connection.id` field of the saved profile).
+    pub name: String,
+    /// The saved-connection object path
+    /// (e.g. `/org/freedesktop/NetworkManager/Settings/5`). `activate` passes
+    /// this to `ActivateConnection`.
+    pub connection_path: String,
+    /// Whether this profile is currently active (an active connection references
+    /// its settings path).
+    pub active: bool,
+    /// When [`VpnProfile::active`], the NM *active-connection* object path
+    /// (e.g. `/org/freedesktop/NetworkManager/ActiveConnection/7`) that
+    /// `DeactivateConnection` targets. `None` when inactive.
+    pub active_connection_path: Option<String>,
+}
+
 /// Stable identifier for our secret agent. NM keys registered agents by this
 /// reverse-DNS string; reusing it across restarts lets NM replace a stale
 /// registration cleanly.
@@ -135,6 +161,28 @@ fn wired_profile_name(settings: &ConnectionSettings) -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Wired connection".to_string());
+    Some(name)
+}
+
+/// Extract the VPN-profile display name from a saved connection's settings
+/// dict, or `None` if it isn't a VPN profile.
+///
+/// A profile is a VPN iff it carries a top-level `vpn` setting **or** its
+/// `connection.type` is `"vpn"` (NM always writes both for a real VPN, but we
+/// accept either so a sparse dict still matches). The display name is
+/// `connection.id`; if that's missing or blank we fall back to `"VPN
+/// connection"` so the row is never nameless. Non-VPN profiles return `None`
+/// and are skipped by [`nm_vpn_profiles`].
+fn vpn_profile_name(settings: &ConnectionSettings) -> Option<String> {
+    let has_vpn_setting = settings.contains_key("vpn");
+    let is_vpn_type = connection_string_field(settings, "type").as_deref() == Some("vpn");
+    if !has_vpn_setting && !is_vpn_type {
+        return None;
+    }
+    let name = connection_string_field(settings, "id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "VPN connection".to_string());
     Some(name)
 }
 
@@ -331,6 +379,51 @@ async fn active_connection_settings_paths() -> std::collections::HashSet<String>
     paths
 }
 
+/// Build a map **settings path → active-connection object path** over all
+/// currently-active connections (manager `ActiveConnections` → each active
+/// connection's `Connection` property).
+///
+/// Used to mark VPN profiles active *and* capture the active-connection object
+/// path that `DeactivateConnection` needs. (Wired uses
+/// [`active_connection_settings_paths`], which only needs the set of settings
+/// paths; VPN additionally needs the active-connection path to deactivate, since
+/// VPNs deactivate via `DeactivateConnection(active)`, not `Device.Disconnect`.)
+///
+/// A failure on any single active connection is logged and skipped; a failure to
+/// read the manager's `ActiveConnections` yields an empty map (every profile
+/// reports inactive — the safe degraded state).
+async fn active_connection_map() -> HashMap<String, String> {
+    let manager_props = match get_manager_props().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: manager GetAll (ActiveConnections, vpn) failed");
+            return HashMap::new();
+        }
+    };
+    let actives: Vec<OwnedObjectPath> = manager_props
+        .get("ActiveConnections")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <Vec<OwnedObjectPath>>::try_from(v).ok())
+        .unwrap_or_default();
+
+    let mut map = HashMap::new();
+    for active in actives {
+        let active_path = active.as_str().to_string();
+        match get_active_connection_props(&active_path).await {
+            Ok(props) => {
+                if let Some(conn) = prop_object_path(&props, "Connection") {
+                    // Last active wins on the rare duplicate; fine for this control.
+                    map.insert(conn, active_path);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(path = %active_path, error = %e, "wifi_nm: active connection props read failed (vpn)");
+            }
+        }
+    }
+    map
+}
+
 /// One discovered NM ethernet device: its object path and the interface name
 /// (`Interface` property), used to bind saved profiles to a device.
 struct EthernetDevice {
@@ -462,6 +555,52 @@ async fn nm_wired_profiles() -> Vec<WiredProfile> {
             connection_path: conn_str.to_string(),
             device_path,
             active,
+        });
+    }
+
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
+}
+
+/// Build the list of saved VPN profiles for the panel.
+///
+/// Enumerates `Settings.ListConnections`, keeps `vpn` profiles (see
+/// [`vpn_profile_name`]), and marks each active if its settings path is in the
+/// active-connection map — capturing the *active-connection object path* for the
+/// active ones so [`crate::wifi::vpn_deactivate`] can `DeactivateConnection` it.
+/// A failure on a single connection is logged and skipped; a `ListConnections`
+/// failure yields an empty list. Profiles are sorted by name for a stable order.
+async fn nm_vpn_profiles() -> Vec<VpnProfile> {
+    let connections = match list_connections().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: Settings.ListConnections (vpn) failed");
+            return Vec::new();
+        }
+    };
+
+    let active_map = active_connection_map().await;
+
+    let mut profiles = Vec::new();
+    for conn in connections {
+        let conn_str = conn.as_str();
+        let settings = match get_connection_settings(conn_str).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(path = conn_str, error = %e, "wifi_nm: GetSettings (vpn) failed");
+                continue;
+            }
+        };
+        let Some(name) = vpn_profile_name(&settings) else {
+            continue;
+        };
+        let active_connection_path = active_map.get(conn_str).cloned();
+        let active = active_connection_path.is_some();
+        profiles.push(VpnProfile {
+            name,
+            connection_path: conn_str.to_string(),
+            active,
+            active_connection_path,
         });
     }
 
@@ -649,15 +788,16 @@ async fn read_nm_networks(
 
 /// Snapshot the full device state and push it to the mutables.
 ///
-/// Also re-enumerates saved wired (ethernet) profiles into `wired` on the same
-/// tick (one extra `ListConnections`/`GetSettings` pass) so the network panel's
-/// "Wired" card stays in sync without a second NM watcher.
+/// Also re-enumerates saved wired (ethernet) and VPN profiles into `wired` /
+/// `vpn` on the same tick (one extra `ListConnections`/`GetSettings` pass each)
+/// so the network/VPN panels stay in sync without a second NM watcher.
 async fn refresh_nm_state(
     device_path: &str,
     station: &Mutable<Option<Station>>,
     networks: &Mutable<Vec<WifiNetwork>>,
     adapter: &Mutable<Option<Adapter>>,
     wired: &Mutable<Vec<WiredProfile>>,
+    vpn: &Mutable<Vec<VpnProfile>>,
 ) {
     // --- adapter (powered = WirelessEnabled on the manager) ---
     let manager_props = match get_manager_props().await {
@@ -737,8 +877,9 @@ async fn refresh_nm_state(
 
     networks.set(nets);
 
-    // --- saved wired (ethernet) profiles (same tick) ---
+    // --- saved wired (ethernet) + VPN profiles (same tick) ---
     refresh_wired_profiles(wired).await;
+    refresh_vpn_profiles(vpn).await;
 }
 
 /// Re-enumerate saved wired (ethernet) profiles and publish them, but only set
@@ -748,6 +889,15 @@ async fn refresh_wired_profiles(wired: &Mutable<Vec<WiredProfile>>) {
     let profiles = nm_wired_profiles().await;
     if *wired.lock_ref() != profiles {
         wired.set(profiles);
+    }
+}
+
+/// Re-enumerate saved VPN profiles and publish them, diffed-before-set (same
+/// rationale as [`refresh_wired_profiles`]).
+async fn refresh_vpn_profiles(vpn: &Mutable<Vec<VpnProfile>>) {
+    let profiles = nm_vpn_profiles().await;
+    if *vpn.lock_ref() != profiles {
+        vpn.set(profiles);
     }
 }
 
@@ -762,15 +912,17 @@ pub(crate) async fn run_nm_wifi_watcher(
     networks: Mutable<Vec<WifiNetwork>>,
     adapter: Mutable<Option<Adapter>>,
     wired: Mutable<Vec<WiredProfile>>,
+    vpn: Mutable<Vec<VpnProfile>>,
     device_path_store: Arc<RwLock<String>>,
 ) {
     loop {
-        // Retry discovery every 5 s if NM isn't ready yet. Wired profiles are
-        // independent of the Wi-Fi device (a desktop may have ethernet but no
+        // Retry discovery every 5 s if NM isn't ready yet. Wired/VPN profiles are
+        // independent of the Wi-Fi device (a desktop may have ethernet/VPN but no
         // radio), so keep them refreshed even while no Wi-Fi device exists —
-        // otherwise the "Wired" card would never populate on such machines.
+        // otherwise those cards would never populate on such machines.
         let Some(device_path) = find_wifi_device().await else {
             refresh_wired_profiles(&wired).await;
+            refresh_vpn_profiles(&vpn).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         };
@@ -779,7 +931,7 @@ pub(crate) async fn run_nm_wifi_watcher(
         *device_path_store.write().await = device_path.clone();
 
         // Initial full refresh.
-        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
+        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
 
         // Subscribe to PropertiesChanged on the device and on the manager.
         let device_sub = hytte_bus::signals(NM_NAME)
@@ -832,16 +984,16 @@ pub(crate) async fn run_nm_wifi_watcher(
         loop {
             tokio::select! {
                 Some(_) = device_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
                 }
                 Some(_) = manager_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
                 }
                 Some(_) = ap_added_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
                 }
                 Some(_) = ap_removed_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
                 }
                 Some(evt) = device_removed_events.next() => {
                     // The DeviceRemoved signal body is a single object path `o`.
@@ -979,6 +1131,61 @@ pub(crate) async fn nm_activate_connection(
         .map(|_| ())
 }
 
+/// Activate a saved VPN connection profile via
+/// `ActivateConnection(connection, device="/", specific_object="/")`.
+///
+/// A VPN rides the primary (default) connection rather than binding to a
+/// specific device, so we pass NM's `"/"` no-object sentinel for **both** the
+/// device and the specific-object (unlike [`nm_activate_connection`], which
+/// targets a real ethernet device). NM resolves the base device itself and, if
+/// the profile is missing stored secrets, asks the registered secret agent
+/// (our [`crate::wifi::nm_agent`]) for them via the prompt overlay.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the connection path is malformed or the
+/// D-Bus call fails (e.g. policy denies activation).
+pub(crate) async fn nm_activate_vpn(connection_path: &str) -> Result<(), hytte_bus::BusError> {
+    let connection_obj_path = owned_object_path(connection_path, "connection path")?;
+    let device_obj_path = owned_object_path("/", "device")?;
+    let specific_object = owned_object_path("/", "specific object")?;
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(NM_PATH)
+        .iface(NM_IFACE)
+        .method("ActivateConnection")
+        .args((connection_obj_path, device_obj_path, specific_object))
+        .send::<OwnedObjectPath>()
+        .await
+        .map(|_| ())
+}
+
+/// Deactivate an active connection via `Manager.DeactivateConnection(active)`.
+///
+/// `active_conn_path` is an *active-connection* object path (e.g.
+/// `/org/freedesktop/NetworkManager/ActiveConnection/7`), as captured in
+/// [`VpnProfile::active_connection_path`]. This is the correct teardown for a
+/// VPN — VPNs are **not** disconnected via `Device.Disconnect` (they have no
+/// device of their own), so [`nm_disconnect`] would be wrong here.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the path is malformed or the D-Bus call
+/// fails (e.g. the connection was already torn down, or policy denies it).
+pub(crate) async fn nm_deactivate_connection(
+    active_conn_path: &str,
+) -> Result<(), hytte_bus::BusError> {
+    let active_obj_path = owned_object_path(active_conn_path, "active connection path")?;
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(NM_PATH)
+        .iface(NM_IFACE)
+        .method("DeactivateConnection")
+        .args((active_obj_path,))
+        .send::<()>()
+        .await
+}
+
 /// Disconnect the NM device.
 ///
 /// # Errors
@@ -1041,14 +1248,22 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
         .await
 }
 
+/// `NMSecretAgentCapabilities` bit 0 — `VPN_HINTS`. Advertises that the agent
+/// understands the VPN service-type / per-secret hints NM passes alongside a
+/// `vpn` `GetSecrets` request, so NM includes them. (An agent receives `vpn`
+/// `GetSecrets` callbacks regardless of this bit; setting it only enables the
+/// hints — we use the first usable hint to pick which secret key to prompt for.)
+const NM_SECRET_AGENT_CAPABILITY_VPN_HINTS: u32 = 0x1;
+
 /// Register our secret agent with NM's `AgentManager`.
 ///
 /// Uses `RegisterWithCapabilities(identifier, capabilities)` with
-/// `capabilities = 0` (`NM_SECRET_AGENT_CAPABILITY_NONE` — we don't support VPN
-/// hints). NM records the *unique* name of the connection this call arrives on
-/// and issues `GetSecrets` callbacks back on it, so the agent object must
-/// already be exported on the same shared system connection before calling
-/// this (it is — both go through `hytte_bus`'s pooled system connection).
+/// `capabilities = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS` so NM passes the VPN
+/// service-type / secret-name hints with `vpn` `GetSecrets` requests. NM records
+/// the *unique* name of the connection this call arrives on and issues
+/// `GetSecrets` callbacks back on it, so the agent object must already be
+/// exported on the same shared system connection before calling this (it is —
+/// both go through `hytte_bus`'s pooled system connection).
 ///
 /// Idempotent: NM lets the same connection re-register; a stale registration
 /// from a prior epoch is replaced.
@@ -1058,8 +1273,7 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
 /// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. NM is not
 /// running, or policy refuses agent registration).
 pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
-    // capabilities = 0 (NONE)
-    let capabilities: u32 = 0;
+    let capabilities: u32 = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS;
     hytte_bus::call(NM_NAME)
         .bus(BusKind::System)
         .at_path(NM_AGENT_MANAGER_PATH)
@@ -1116,9 +1330,18 @@ pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
     let networks_m: Mutable<Vec<WifiNetwork>> = Mutable::new(Vec::new());
     let adapter_m: Mutable<Option<Adapter>> = Mutable::new(None);
     let wired_m: Mutable<Vec<WiredProfile>> = Mutable::new(Vec::new());
+    let vpn_m: Mutable<Vec<VpnProfile>> = Mutable::new(Vec::new());
 
     // Initial refresh.
-    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m, &wired_m).await;
+    refresh_nm_state(
+        &device_path,
+        &station_m,
+        &networks_m,
+        &adapter_m,
+        &wired_m,
+        &vpn_m,
+    )
+    .await;
 
     let powered = adapter_m.get_cloned().is_some_and(|a: Adapter| a.powered);
     let station_state = station_m
@@ -1132,7 +1355,15 @@ pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
     // Refresh after the scan.
-    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m, &wired_m).await;
+    refresh_nm_state(
+        &device_path,
+        &station_m,
+        &networks_m,
+        &adapter_m,
+        &wired_m,
+        &vpn_m,
+    )
+    .await;
 
     let network_count = networks_m.lock_ref().len();
 
@@ -1510,6 +1741,96 @@ mod tests {
         );
         conn.insert("vpn".to_string(), HashMap::new());
         assert_eq!(wired_profile_name(&conn), None);
+    }
+
+    // -- vpn_profile_name -----------------------------------------------------
+    //
+    // Same `a{sa{sv}}` GetSettings shape, exercising the VPN-profile recogniser
+    // the VPN panel relies on.
+
+    /// Build a minimal VPN `connection`-settings dict. `with_vpn_setting`
+    /// controls whether a top-level `vpn` setting is present; `kind` sets
+    /// `connection.type`.
+    fn vpn_conn(
+        id: Option<&str>,
+        kind: Option<&str>,
+        with_vpn_setting: bool,
+    ) -> ConnectionSettings {
+        let mut conn: ConnectionSettings = HashMap::new();
+        let mut connection = Vec::new();
+        if let Some(id) = id {
+            connection.push(("id", val(id.to_string())));
+        }
+        if let Some(kind) = kind {
+            connection.push(("type", val(kind.to_string())));
+        }
+        conn.insert("connection".to_string(), setting(connection));
+        if with_vpn_setting {
+            conn.insert("vpn".to_string(), HashMap::new());
+        }
+        conn
+    }
+
+    #[test]
+    fn vpn_name_from_connection_id() {
+        let conn = vpn_conn(Some("Work VPN"), Some("vpn"), true);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("Work VPN"));
+    }
+
+    #[test]
+    fn vpn_name_matches_on_type_without_vpn_setting() {
+        // `connection.type == "vpn"` alone is enough to recognise a VPN.
+        let conn = vpn_conn(Some("Sparse VPN"), Some("vpn"), false);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("Sparse VPN"));
+    }
+
+    #[test]
+    fn vpn_name_matches_on_vpn_setting_without_type() {
+        // A top-level `vpn` setting alone is enough, even with no type.
+        let conn = vpn_conn(Some("Settingful VPN"), None, true);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("Settingful VPN"));
+    }
+
+    #[test]
+    fn vpn_name_trims_whitespace() {
+        let conn = vpn_conn(Some("  Office VPN  "), Some("vpn"), true);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("Office VPN"));
+    }
+
+    #[test]
+    fn vpn_name_falls_back_when_id_missing() {
+        let conn = vpn_conn(None, Some("vpn"), true);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("VPN connection"));
+    }
+
+    #[test]
+    fn vpn_name_falls_back_when_id_blank() {
+        let conn = vpn_conn(Some("   "), None, true);
+        assert_eq!(vpn_profile_name(&conn).as_deref(), Some("VPN connection"));
+    }
+
+    #[test]
+    fn vpn_name_none_for_ethernet() {
+        let conn = ethernet_conn(Some("Wired connection 1"), Some("enp3s0"));
+        assert_eq!(vpn_profile_name(&conn), None);
+    }
+
+    #[test]
+    fn vpn_name_none_for_wifi() {
+        // A Wi-Fi profile (no `vpn` setting, type != "vpn") is not a VPN.
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "connection".to_string(),
+            setting(vec![
+                ("id", val("FRITZ!Box")),
+                ("type", val("802-11-wireless")),
+            ]),
+        );
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(b"FRITZ!Box".to_vec()))]),
+        );
+        assert_eq!(vpn_profile_name(&conn), None);
     }
 
     // -- connection_string_field ----------------------------------------------

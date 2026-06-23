@@ -1,12 +1,18 @@
-//! Drawer panel for the active VPN tunnels.
+//! Drawer panel for VPN connections.
 //!
-//! Layout: header description shows live tunnel count. Each tunnel
-//! becomes one `adw::PreferencesGroup` titled by name ("wg0"),
-//! subtitle by kind (e.g. `WireGuard`), with rx/tx rows and (for
-//! `WireGuard`) a nested peers expander. Empty state when no tunnel up.
+//! Two stacked sections:
+//!  1. **Saved profiles** (NM `vpn` connection profiles) — an activate /
+//!     deactivate control group at the top, sourced from
+//!     [`wifi::vpn_profiles`]. Hidden entirely when there are none (and on the
+//!     iwd / no-backend host, which surfaces no NM VPN profiles).
+//!  2. **Live tunnels** — the read-only live-tunnel view sourced from
+//!     [`vpn::tunnels`]: header description shows the live count, each tunnel
+//!     becomes one `adw::PreferencesGroup` titled by name ("wg0"), subtitle by
+//!     kind (e.g. `WireGuard`), with rx/tx rows and (for `WireGuard`) a nested
+//!     peers expander. Empty state when no tunnel up.
 //!
-//! Backed by `hytte::services::vpn`. The page consumes the `tunnels()`
-//! signal — UI layer never spawns processes.
+//! Backed by `hytte::services::{vpn, wifi}`. The page consumes signals only —
+//! the UI layer never spawns processes or talks D-Bus directly.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,6 +21,7 @@ use hytte::adw::{self, prelude::*};
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::vpn;
+use hytte::services::wifi;
 
 use crate::components::format::{fmt_bytes, humanize_since};
 use crate::components::layout::{finish_page, page_box};
@@ -24,7 +31,19 @@ pub fn panel_vpn() -> gtk::Widget {
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
 
-    let header = adw::PreferencesGroup::builder().title("VPN").build();
+    // Saved NM VPN profiles (activate / deactivate) above the live view.
+    // Hidden when there are no saved profiles, exactly like the wired card.
+    let profiles_group = build_vpn_profiles_group();
+    bind(
+        wifi::vpn_profiles().map(|p| !p.is_empty()),
+        &profiles_group,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+    column.append(&profiles_group);
+
+    let header = adw::PreferencesGroup::builder()
+        .title("Active tunnels")
+        .build();
     bind(
         vpn::tunnels().map(|ts| match ts.len() {
             0 => "No VPN active".to_string(),
@@ -69,6 +88,128 @@ pub fn panel_vpn() -> gtk::Widget {
     });
 
     finish_page(&column)
+}
+
+// ── Saved NM VPN profiles ──────────────────────────────────────────────────────
+
+/// Pill-styled state label, mirroring `panels::network::pill_label` (which is
+/// `pub(super)` to the network module). Always vertically centered for use as an
+/// `ActionRow` suffix.
+fn pill_label(text: &str, variant_class: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_valign(gtk::Align::Center);
+    label.add_css_class("ts-net-pill");
+    label.add_css_class(variant_class);
+    label
+}
+
+/// Build the "Saved profiles" group of NM VPN connection profiles, each with an
+/// Activate / Deactivate control. Drain-rebuilds its rows on every emission,
+/// matching the wired card (cheap: VPN profiles are few and change rarely).
+fn build_vpn_profiles_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Saved profiles")
+        .build();
+
+    bind(
+        wifi::vpn_profiles().map(|p| match p.len() {
+            0 => "No saved profiles".to_string(),
+            1 => "1 saved profile".to_string(),
+            n => format!("{n} saved profiles"),
+        }),
+        &group,
+        |g, sub| g.set_description(Some(&sub)),
+    );
+
+    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let group_for_bind = group.clone();
+    let rows_for_bind = rows_track.clone();
+    bind(wifi::vpn_profiles(), &group, move |_, profiles| {
+        for row in rows_for_bind.borrow_mut().drain(..) {
+            group_for_bind.remove(&row);
+        }
+        let mut new_rows = Vec::with_capacity(profiles.len());
+        for profile in &profiles {
+            let row = build_vpn_profile_row(profile);
+            group_for_bind.add(&row);
+            new_rows.push(row);
+        }
+        *rows_for_bind.borrow_mut() = new_rows;
+    });
+
+    group
+}
+
+fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
+    let subtitle = if profile.active {
+        "Connected"
+    } else {
+        "Available"
+    };
+
+    let row = adw::ActionRow::builder()
+        .title(&profile.name)
+        .subtitle(subtitle)
+        .activatable(false)
+        .build();
+
+    let icon = gtk::Image::from_icon_name("network-vpn-symbolic");
+    row.add_prefix(&icon);
+
+    if profile.active {
+        row.add_suffix(&pill_label("Active", "ts-pill-connected"));
+    } else {
+        row.add_suffix(&pill_label("Inactive", "ts-pill-known"));
+    }
+
+    row.add_suffix(&build_vpn_row_menu(profile));
+    row
+}
+
+fn build_vpn_row_menu(profile: &wifi::VpnProfile) -> gtk::MenuButton {
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("view-more-symbolic");
+    menu_btn.set_valign(gtk::Align::Center);
+    menu_btn.add_css_class("flat");
+    menu_btn.set_tooltip_text(Some("More actions"));
+
+    let popover = gtk::Popover::new();
+    let popover_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    popover_box.set_margin_top(4);
+    popover_box.set_margin_bottom(4);
+    popover_box.set_margin_start(4);
+    popover_box.set_margin_end(4);
+
+    if profile.active {
+        // Deactivate targets the active-connection object path; only offered
+        // when the profile is up (and that path was captured).
+        if let Some(active) = profile.active_connection_path.clone() {
+            let pop = popover.clone();
+            let deactivate_btn = gtk::Button::with_label("Deactivate");
+            deactivate_btn.add_css_class("flat");
+            deactivate_btn.add_css_class("destructive-action");
+            deactivate_btn.connect_clicked(move |_| {
+                wifi::vpn_deactivate(&active);
+                pop.popdown();
+            });
+            popover_box.append(&deactivate_btn);
+        }
+    } else {
+        // Activate passes the saved-connection path (NM resolves the rest).
+        let pop = popover.clone();
+        let conn = profile.connection_path.clone();
+        let activate_btn = gtk::Button::with_label("Activate");
+        activate_btn.add_css_class("flat");
+        activate_btn.connect_clicked(move |_| {
+            wifi::vpn_activate(&conn);
+            pop.popdown();
+        });
+        popover_box.append(&activate_btn);
+    }
+
+    popover.set_child(Some(&popover_box));
+    menu_btn.set_popover(Some(&popover));
+    menu_btn
 }
 
 fn build_tunnel_group(tunnel: &vpn::Tunnel) -> adw::PreferencesGroup {

@@ -44,8 +44,8 @@ use crate::wifi_backend::BackendChoice;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
-pub use crate::wifi_nm::WiredProfile;
-pub use types::{Adapter, PromptRequest, Station, StationState, WifiNetwork};
+pub use crate::wifi_nm::{VpnProfile, WiredProfile};
+pub use types::{Adapter, PromptKind, PromptRequest, Station, StationState, WifiNetwork};
 
 // ── Station path cache ────────────────────────────────────────────────────────
 
@@ -123,6 +123,10 @@ pub struct WifiHandles {
     /// Saved wired (ethernet) profiles. Only populated by the NM backend;
     /// stays empty for iwd / no-backend (iwd doesn't manage ethernet).
     pub(crate) wired: Mutable<Vec<WiredProfile>>,
+    /// Saved VPN profiles. Only populated by the NM backend; stays empty for
+    /// iwd / no-backend (iwd doesn't manage VPNs). Distinct from the poll-only
+    /// `vpn::tunnels()` live-tunnel detection — these are NM connection profiles.
+    pub(crate) vpn: Mutable<Vec<VpnProfile>>,
     /// iwd name-ownership signal; `None` when the NM backend is active.
     _ownership: Option<hytte_bus::OwnNameSignal>,
     /// NM secret-agent export handle; `None` unless the NM backend is active.
@@ -166,6 +170,7 @@ impl Service for WifiService {
         let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
         let adapter_mutable = Mutable::new(None);
         let wired_mutable: Mutable<Vec<WiredProfile>> = Mutable::new(Vec::new());
+        let vpn_mutable: Mutable<Vec<VpnProfile>> = Mutable::new(Vec::new());
 
         let (ownership, nm_agent, backend) = match backend_choice {
             BackendChoice::Iwd => {
@@ -197,9 +202,10 @@ impl Service for WifiService {
                 let networks_m = networks_mutable.clone();
                 let adapter_m = adapter_mutable.clone();
                 let wired_m = wired_mutable.clone();
+                let vpn_m = vpn_mutable.clone();
                 let store = Arc::clone(&device_path_store);
                 rt.spawn(crate::wifi_nm::run_nm_wifi_watcher(
-                    station_m, networks_m, adapter_m, wired_m, store,
+                    station_m, networks_m, adapter_m, wired_m, vpn_m, store,
                 ));
 
                 // Mount the NM SecretAgent on the SYSTEM bus and register it
@@ -247,6 +253,7 @@ impl Service for WifiService {
             prompts: prompts_mutable,
             adapter: adapter_mutable,
             wired: wired_mutable,
+            vpn: vpn_mutable,
             _ownership: ownership,
             _nm_agent: nm_agent,
             backend,
@@ -302,6 +309,20 @@ pub fn wired_profiles() -> impl Signal<Item = Vec<WiredProfile>> {
         r.get::<WifiHandles>()
             .expect("wifi::service() not registered")
             .wired
+            .signal_cloned()
+    })
+}
+
+/// Signal emitting the saved VPN NM connection profiles, sorted by name. Empty
+/// on the iwd / no backend (only `NetworkManager` manages VPN profiles).
+///
+/// Distinct from [`crate::vpn::tunnels`], which polls the live tunnel
+/// interfaces — these are NM *connection profiles* the user can activate.
+pub fn vpn_profiles() -> impl Signal<Item = Vec<VpnProfile>> {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .vpn
             .signal_cloned()
     })
 }
@@ -537,6 +558,54 @@ pub fn wired_forget(connection_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = crate::wifi_nm::nm_forget(&conn).await {
             tracing::warn!(error = %e, conn, "wired forget (NM) failed");
+        }
+    });
+}
+
+/// Fire-and-forget: activate the saved VPN profile at `connection_path`
+/// (NM `ActivateConnection` with `"/"` for device + specific-object — a VPN
+/// rides the primary connection, see [`crate::wifi_nm::nm_activate_vpn`]).
+///
+/// NM-only: VPN profiles are surfaced solely by the `NetworkManager` backend, so
+/// this is a no-op on iwd / no backend. If the profile needs credentials NM
+/// doesn't hold, our secret agent surfaces an interactive prompt.
+pub fn vpn_activate(connection_path: &str) {
+    let conn = connection_path.to_string();
+    let WifiBackend::NetworkManager(_) = get_backend() else {
+        tracing::warn!("wifi::vpn_activate: NM backend not active");
+        return;
+    };
+    if conn.is_empty() {
+        tracing::warn!("wifi::vpn_activate: empty connection path");
+        return;
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = crate::wifi_nm::nm_activate_vpn(&conn).await {
+            tracing::warn!(error = %e, conn, "vpn activate (NM) failed");
+        }
+    });
+}
+
+/// Fire-and-forget: deactivate the active VPN connection at
+/// `active_connection_path` (NM `Manager.DeactivateConnection` — **not**
+/// `Device.Disconnect`, which is wrong for a device-less VPN).
+///
+/// `active_connection_path` is the *active-connection* object path captured in
+/// [`VpnProfile::active_connection_path`] while the profile is up. NM-only (see
+/// [`vpn_activate`]).
+pub fn vpn_deactivate(active_connection_path: &str) {
+    let active = active_connection_path.to_string();
+    let WifiBackend::NetworkManager(_) = get_backend() else {
+        tracing::warn!("wifi::vpn_deactivate: NM backend not active");
+        return;
+    };
+    if active.is_empty() {
+        tracing::warn!("wifi::vpn_deactivate: empty active-connection path");
+        return;
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = crate::wifi_nm::nm_deactivate_connection(&active).await {
+            tracing::warn!(error = %e, active, "vpn deactivate (NM) failed");
         }
     });
 }

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use super::types::PromptRequest;
+use super::types::{PromptKind, PromptRequest};
 use super::{NEXT_ID, WaitersMap};
 
 // ── Agent error ────────────────────────────────────────────────────────────────
@@ -44,6 +44,14 @@ enum NmAgentError {
 
 /// The 802-11 wireless-security setting NM asks us to fill for a PSK network.
 const WIRELESS_SECURITY_SETTING: &str = "802-11-wireless-security";
+
+/// The `vpn` setting NM asks us to fill for a VPN connection's credentials.
+const VPN_SETTING: &str = "vpn";
+
+/// Default VPN secret key when NM gives no usable hint. The overwhelmingly
+/// common single-secret VPN case (`OpenVPN` / PPTP / L2TP user auth, many
+/// plugins) keys the credential under `"password"`.
+const VPN_DEFAULT_SECRET_KEY: &str = "password";
 
 /// `NMSecretAgentGetSecretsFlags` bit 0 — `ALLOW_INTERACTION`. When unset, NM
 /// only wants secrets it can return without prompting the user, so we must not
@@ -117,6 +125,94 @@ fn build_secret_reply(setting_name: &str, passphrase: &str) -> ConnectionDict {
     out
 }
 
+// ── VPN secrets ────────────────────────────────────────────────────────────────
+
+/// The VPN connection name shown in the prompt: `connection.id`, falling back to
+/// the empty string. (VPN connections have no SSID; the id is the display name.)
+fn vpn_name_from_connection(connection: &ConnectionDict) -> String {
+    setting_str(connection, "connection", "id").unwrap_or_default()
+}
+
+/// Read the `vpn.secrets` sub-dict (`a{ss}` — already-known secret values) out
+/// of the connection. NM nests VPN secrets one level deeper than other settings:
+/// `connection["vpn"]["secrets"]` is itself a string→string map. Returns the
+/// keys already present (so we only prompt for the genuinely-missing ones).
+fn existing_vpn_secret_keys(connection: &ConnectionDict) -> std::collections::HashSet<String> {
+    connection
+        .get(VPN_SETTING)
+        .and_then(|vpn| vpn.get("secrets"))
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <HashMap<String, String>>::try_from(v).ok())
+        .map(|m| m.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Decide which VPN secret key to prompt for.
+///
+/// Preference: the first `hints` entry NM passed (NM names the wanted secret in
+/// the hints, e.g. `["password"]` or `["Gateway Password"]`) that isn't already
+/// present in the connection's stored `vpn.secrets`; otherwise
+/// [`VPN_DEFAULT_SECRET_KEY`] (`"password"`) — the common single-secret case.
+///
+/// **Limitation:** when NM asks for *several* missing VPN secrets at once we
+/// only prompt for one and return that single key. The common case (a single
+/// user password) is fully covered; multi-secret VPNs (e.g. password + OTP in
+/// one round) would need a multi-field dialog, which is out of scope here.
+fn vpn_secret_key_to_prompt(connection: &ConnectionDict, hints: &[String]) -> String {
+    let existing = existing_vpn_secret_keys(connection);
+    hints
+        .iter()
+        .map(|h| {
+            // NM sometimes qualifies a hint as "<setting>.<key>"; take the key.
+            h.rsplit_once('.').map_or(h.as_str(), |(_, k)| k)
+        })
+        .find(|key| !existing.contains(*key))
+        .map_or_else(|| VPN_DEFAULT_SECRET_KEY.to_string(), ToString::to_string)
+}
+
+/// Build the VPN reply dict `{ "vpn": { "secrets": { <key>: <value> } } }`.
+///
+/// This is the exact shape NM expects back from `GetSecrets` for the `vpn`
+/// setting: the `vpn` setting carries a single `"secrets"` key whose value is an
+/// `a{ss}` (string→string) sub-dict of the credential(s). It is **distinct**
+/// from the Wi-Fi PSK shape (`{ "802-11-wireless-security": { "psk": … } }`),
+/// where the secret sits directly under the setting.
+fn build_vpn_secret_reply(secret_key: &str, secret_value: &str) -> ConnectionDict {
+    // Inner a{ss}: the secret key → value map.
+    let mut secrets: HashMap<String, String> = HashMap::new();
+    secrets.insert(secret_key.to_string(), secret_value.to_string());
+
+    let mut vpn_setting: HashMap<String, OwnedValue> = HashMap::new();
+    if let Ok(v) = Value::from(secrets).try_to_owned() {
+        vpn_setting.insert("secrets".to_string(), v);
+    }
+
+    let mut out: ConnectionDict = HashMap::new();
+    out.insert(VPN_SETTING.to_string(), vpn_setting);
+    out
+}
+
+/// How to shape the `GetSecrets` reply once the user supplies the secret. The
+/// two kinds differ in the nested dict NM expects back (see
+/// [`build_secret_reply`] vs [`build_vpn_secret_reply`]).
+enum ReplyShape {
+    /// Wi-Fi: `{ <setting_name>: { "psk": <secret> } }`.
+    WirelessSecurity { setting_name: String },
+    /// VPN: `{ "vpn": { "secrets": { <secret_key>: <secret> } } }`.
+    Vpn { secret_key: String },
+}
+
+impl ReplyShape {
+    fn build(&self, secret: &str) -> ConnectionDict {
+        match self {
+            ReplyShape::WirelessSecurity { setting_name } => {
+                build_secret_reply(setting_name, secret)
+            }
+            ReplyShape::Vpn { secret_key } => build_vpn_secret_reply(secret_key, secret),
+        }
+    }
+}
+
 // ── Interface ───────────────────────────────────────────────────────────────
 
 // zbus's `#[interface]` macro requires every method to be `async fn`; the
@@ -128,11 +224,12 @@ impl NmAgent {
     /// Called by NM when it needs secrets it doesn't already hold.
     ///
     /// `connection` is the full `a{sa{sv}}` settings dict, `setting_name` the
-    /// setting whose secrets are wanted (e.g. `"802-11-wireless-security"`),
-    /// `hints` the specific keys (e.g. `["psk"]`), and `flags` the
-    /// `NMSecretAgentGetSecretsFlags`. We only handle the wireless-security PSK
-    /// case interactively; everything else returns the NM "no secrets" error so
-    /// NM can fall through to another agent or fail the activation cleanly.
+    /// setting whose secrets are wanted (e.g. `"802-11-wireless-security"` or
+    /// `"vpn"`), `hints` the specific keys (e.g. `["psk"]` / `["password"]`),
+    /// and `flags` the `NMSecretAgentGetSecretsFlags`. We handle the
+    /// wireless-security PSK case and the VPN-secret case interactively;
+    /// everything else returns the NM "no secrets" error so NM can fall through
+    /// to another agent or fail the activation cleanly.
     async fn get_secrets(
         &self,
         connection: ConnectionDict,
@@ -141,12 +238,13 @@ impl NmAgent {
         hints: Vec<String>,
         flags: u32,
     ) -> Result<ConnectionDict, NmAgentError> {
-        // Only wireless-security secrets are something we can prompt for.
+        // Classify the request: wireless-security PSK, VPN secret, or neither.
         let wants_wireless =
             setting_name == WIRELESS_SECURITY_SETTING || hints.iter().any(|h| h == "psk");
-        if !wants_wireless {
+        let wants_vpn = setting_name == VPN_SETTING;
+        if !wants_wireless && !wants_vpn {
             return Err(NmAgentError::NoSecrets(
-                "only 802-11-wireless-security supported".into(),
+                "only 802-11-wireless-security and vpn secrets supported".into(),
             ));
         }
 
@@ -158,16 +256,49 @@ impl NmAgent {
             ));
         }
 
-        let ssid = ssid_from_connection(&connection);
-        let security = security_from_connection(&connection);
         let conn_path = connection_path.as_str().to_string();
 
-        tracing::info!(
-            ssid = %ssid,
-            security = %security,
-            path = %conn_path,
-            "NM SecretAgent::GetSecrets — requesting passphrase",
-        );
+        // Build the prompt request and remember how to shape the reply, branching
+        // on the setting kind. Both kinds share the waiter/oneshot plumbing.
+        let (prompt, reply_key): (PromptRequest, ReplyShape) = if wants_vpn {
+            let name = vpn_name_from_connection(&connection);
+            let secret_key = vpn_secret_key_to_prompt(&connection, &hints);
+            tracing::info!(
+                name = %name,
+                secret_key = %secret_key,
+                path = %conn_path,
+                "NM SecretAgent::GetSecrets — requesting VPN secret",
+            );
+            (
+                PromptRequest {
+                    id: 0, // filled in below
+                    network_path: conn_path.clone(),
+                    ssid: name,
+                    security: String::new(),
+                    kind: PromptKind::VpnSecret,
+                },
+                ReplyShape::Vpn { secret_key },
+            )
+        } else {
+            let ssid = ssid_from_connection(&connection);
+            let security = security_from_connection(&connection);
+            tracing::info!(
+                ssid = %ssid,
+                security = %security,
+                path = %conn_path,
+                "NM SecretAgent::GetSecrets — requesting passphrase",
+            );
+            (
+                PromptRequest {
+                    id: 0, // filled in below
+                    network_path: conn_path,
+                    ssid,
+                    security,
+                    kind: PromptKind::WifiPassphrase,
+                },
+                ReplyShape::WirelessSecurity { setting_name },
+            )
+        };
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<Result<String, String>>();
@@ -175,16 +306,11 @@ impl NmAgent {
             let mut waiters = self.waiters.lock().await;
             waiters.insert(id, tx);
         }
-        self.prompts.set(Some(PromptRequest {
-            id,
-            network_path: conn_path,
-            ssid,
-            security,
-        }));
+        self.prompts.set(Some(PromptRequest { id, ..prompt }));
 
-        if let Ok(Ok(pass)) = rx.await {
+        if let Ok(Ok(secret)) = rx.await {
             self.prompts.set(None);
-            Ok(build_secret_reply(&setting_name, &pass))
+            Ok(reply_key.build(&secret))
         } else {
             self.prompts.set(None);
             Err(NmAgentError::UserCanceled("user dismissed prompt".into()))
@@ -337,6 +463,118 @@ mod tests {
             String::try_from(psk.try_clone().unwrap()).unwrap(),
             "hunter2"
         );
+    }
+
+    // -- VPN secrets ----------------------------------------------------------
+
+    /// Decode the `vpn.secrets` `a{ss}` sub-dict out of a reply dict and return
+    /// the value stored under `key` (panics if the nested shape is wrong — which
+    /// is exactly what we're asserting against).
+    fn vpn_reply_secret(reply: &ConnectionDict, key: &str) -> String {
+        let vpn = reply.get("vpn").expect("vpn setting present in reply");
+        let secrets_val = vpn
+            .get("secrets")
+            .expect("secrets sub-dict present")
+            .try_clone()
+            .expect("clone secrets value");
+        let secrets =
+            <HashMap<String, String>>::try_from(secrets_val).expect("secrets decodes as a{ss}");
+        secrets.get(key).cloned().expect("secret key present")
+    }
+
+    #[test]
+    fn vpn_reply_nests_secret_under_vpn_secrets() {
+        let reply = build_vpn_secret_reply("password", "s3cr3t");
+        // The top-level setting must be exactly "vpn" — not the bare key.
+        assert!(reply.contains_key("vpn"), "vpn setting present");
+        assert!(
+            !reply.contains_key("password"),
+            "secret must be nested, not top-level",
+        );
+        assert_eq!(vpn_reply_secret(&reply, "password"), "s3cr3t");
+    }
+
+    #[test]
+    fn vpn_reply_uses_requested_secret_key() {
+        // A non-default key (e.g. a per-gateway password) is preserved verbatim.
+        let reply = build_vpn_secret_reply("Gateway Password", "abc");
+        assert_eq!(vpn_reply_secret(&reply, "Gateway Password"), "abc");
+    }
+
+    /// Build a minimal VPN connection dict: a `connection.id` plus an optional
+    /// `vpn.secrets` `a{ss}` of already-stored secret keys.
+    fn vpn_connection(id: &str, existing_secrets: &[(&str, &str)]) -> ConnectionDict {
+        let mut conn: ConnectionDict = HashMap::new();
+        conn.insert(
+            "connection".to_string(),
+            setting(&[("id", val(id.to_string()))]),
+        );
+        let mut vpn: HashMap<String, OwnedValue> = HashMap::new();
+        if !existing_secrets.is_empty() {
+            let secrets: HashMap<String, String> = existing_secrets
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            vpn.insert("secrets".to_string(), val(secrets));
+        }
+        conn.insert("vpn".to_string(), vpn);
+        conn
+    }
+
+    #[test]
+    fn vpn_name_from_connection_id() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(vpn_name_from_connection(&conn), "Work VPN");
+    }
+
+    #[test]
+    fn vpn_name_empty_when_no_id() {
+        let conn: ConnectionDict = HashMap::new();
+        assert_eq!(vpn_name_from_connection(&conn), "");
+    }
+
+    #[test]
+    fn vpn_secret_key_defaults_to_password_without_hints() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(vpn_secret_key_to_prompt(&conn, &[]), "password");
+    }
+
+    #[test]
+    fn vpn_secret_key_uses_first_hint() {
+        let conn = vpn_connection("Work VPN", &[]);
+        let hints = vec!["Gateway Password".to_string()];
+        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "Gateway Password",);
+    }
+
+    #[test]
+    fn vpn_secret_key_strips_setting_prefix_from_hint() {
+        // NM sometimes qualifies the hint as "<setting>.<key>".
+        let conn = vpn_connection("Work VPN", &[]);
+        let hints = vec!["vpn.password".to_string()];
+        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "password");
+    }
+
+    #[test]
+    fn vpn_secret_key_skips_already_stored_secret() {
+        // The first hint is already present → prompt for the next missing one.
+        let conn = vpn_connection("Work VPN", &[("password", "stored")]);
+        let hints = vec!["password".to_string(), "otp".to_string()];
+        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "otp");
+    }
+
+    #[test]
+    fn existing_vpn_secret_keys_reads_stored_secrets() {
+        let conn = vpn_connection("Work VPN", &[("password", "stored"), ("otp", "123")]);
+        let keys = existing_vpn_secret_keys(&conn);
+        assert!(keys.contains("password"));
+        assert!(keys.contains("otp"));
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn existing_vpn_secret_keys_empty_when_none_stored() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert!(existing_vpn_secret_keys(&conn).is_empty());
     }
 }
 
@@ -537,6 +775,25 @@ mod system_tests {
         conn
     }
 
+    /// A realistic `a{sa{sv}}` VPN connection dict: a `connection.id` and a
+    /// `vpn` setting (with `service-type`), the way NM marshals one. No stored
+    /// `vpn.secrets`, so the agent must prompt.
+    fn vpn_connection_dict(id: &str, service_type: &str) -> ConnectionDict {
+        let to_owned = |v: Value<'static>| v.try_to_owned().expect("to OwnedValue");
+        let mut connection: HashMap<String, OwnedValue> = HashMap::new();
+        connection.insert("id".to_string(), to_owned(Value::from(id.to_string())));
+        connection.insert("type".to_string(), to_owned(Value::from("vpn".to_string())));
+        let mut vpn: HashMap<String, OwnedValue> = HashMap::new();
+        vpn.insert(
+            "service-type".to_string(),
+            to_owned(Value::from(service_type.to_string())),
+        );
+        let mut conn: ConnectionDict = HashMap::new();
+        conn.insert("connection".to_string(), connection);
+        conn.insert("vpn".to_string(), vpn);
+        conn
+    }
+
     /// Poll `prompts` until it holds `Some`, up to `deadline`. Returns the
     /// surfaced [`PromptRequest`] or panics on timeout.
     async fn await_prompt(
@@ -617,6 +874,71 @@ mod system_tests {
         assert!(
             prompts.get_cloned().is_none(),
             "prompt should be cleared after the passphrase is returned"
+        );
+    }
+
+    // -- 1b. VPN happy path: nested vpn.secrets reply over the bus -------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vpn_happy_path_returns_nested_secret_over_the_bus() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openvpn");
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(
+                                "/org/freedesktop/NetworkManager/Connection/2",
+                            )
+                            .unwrap(),
+                            "vpn".to_string(),
+                            vec!["password".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            });
+
+        // The prompt should carry the VPN name and be flagged as a VPN secret.
+        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        assert_eq!(req.ssid, "Work VPN");
+        assert_eq!(req.kind, PromptKind::VpnSecret);
+
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("waiter registered")
+            .send(Ok("vpnpass".to_string()))
+            .expect("send VPN secret to waiter");
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+            .await
+            .expect("GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("GetSecrets returned a D-Bus error");
+
+        // The reply must be `{ "vpn": { "secrets": { "password": "vpnpass" } } }`
+        // — assert the full nesting survives the round trip on the wire.
+        let vpn = reply.get("vpn").expect("vpn setting present in reply");
+        let secrets_val = vpn
+            .get("secrets")
+            .expect("secrets sub-dict present")
+            .try_clone()
+            .expect("clone secrets");
+        let secrets = <HashMap<String, String>>::try_from(secrets_val)
+            .expect("secrets decodes as a{ss} over the wire");
+        assert_eq!(secrets.get("password").map(String::as_str), Some("vpnpass"));
+
+        assert!(
+            prompts.get_cloned().is_none(),
+            "prompt should be cleared after the VPN secret is returned"
         );
     }
 

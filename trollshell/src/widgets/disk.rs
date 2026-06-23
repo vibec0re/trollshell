@@ -3,9 +3,7 @@ use hytte::prelude::*;
 use hytte::services::sensors;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-disk");
+    let btn = crate::components::chip::indicator("ts-disk", crate::modal::Page::Stats, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
@@ -27,20 +25,12 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
             mounts_for_signal.remove(&c);
         }
         for m in &disk.mounts {
-            let bar = gtk::ProgressBar::new();
-            bar.add_css_class("ts-indicator-bar");
-            bar.set_orientation(gtk::Orientation::Vertical);
-            bar.set_inverted(true);
-            bar.set_valign(gtk::Align::Center);
+            let bar = crate::components::chip::vertical_bar();
             bar.set_fraction(m.usage.clamp(0.0, 1.0));
             bar.set_tooltip_text(Some(&format!("{}: {:.0}%", m.path, m.usage * 100.0)));
             mounts_for_signal.append(&bar);
         }
     });
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Stats, b);
-    });
     btn.upcast()
 }

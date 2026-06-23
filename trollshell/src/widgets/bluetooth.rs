@@ -4,9 +4,8 @@ use hytte::prelude::*;
 use hytte::services::bluetooth;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-bluetooth");
+    let btn =
+        crate::components::chip::indicator("ts-bluetooth", crate::modal::Page::Bluetooth, monitor);
 
     let icon = gtk::Image::new();
     btn.set_child(Some(&icon));
@@ -46,9 +45,5 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     );
 
     let _ = icon; // moved into button child above; keep reference for bind
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Bluetooth, b);
-    });
     btn.upcast()
 }

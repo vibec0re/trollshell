@@ -9,18 +9,12 @@ use hytte::prelude::*;
 use hytte::services::vpn;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-vpn");
+    let btn = crate::components::chip::indicator("ts-vpn", crate::modal::Page::Vpn, monitor);
 
     let icon = gtk::Image::from_icon_name("network-vpn-symbolic");
     btn.set_child(Some(&icon));
 
     bind_visible(vpn::is_active(), &btn);
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Vpn, b);
-    });
     btn.upcast()
 }

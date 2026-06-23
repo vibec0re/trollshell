@@ -83,8 +83,11 @@ fn icon_button(icon: &str) -> gtk::Button {
 /// A compact single-icon button shown in *narrow* mode (busy workspace).
 /// Clicking it opens the Media panel — same destination as the full-mode label.
 fn build_mini_button(monitor: &Monitor) -> gtk::Button {
-    let btn = icon_button("audio-x-generic-symbolic");
+    let btn = gtk::Button::new();
     btn.add_css_class("ts-mpris-mini");
+    btn.set_child(Some(&gtk::Image::from_icon_name(
+        "audio-x-generic-symbolic",
+    )));
     let monitor = monitor.clone();
     btn.connect_clicked(move |btn| {
         crate::modal::toggle(&monitor, crate::modal::Page::Media, btn);

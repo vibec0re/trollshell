@@ -59,9 +59,7 @@ const TIER_CLASSES: [&str; 4] = [
 ];
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-battery");
+    let btn = crate::components::chip::indicator("ts-battery", crate::modal::Page::Power, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
@@ -111,10 +109,6 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         &btn,
     );
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Power, b);
-    });
     btn.upcast()
 }
 

@@ -3,9 +3,8 @@ use hytte::prelude::*;
 use hytte::services::networkd::{self, Link, OperationalState};
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-network");
+    let btn =
+        crate::components::chip::indicator("ts-network", crate::modal::Page::Network, monitor);
 
     let icon = gtk::Image::new();
     btn.set_child(Some(&icon));
@@ -14,10 +13,6 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         w.set_icon_name(Some(icon_name(primary.as_ref())));
     });
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Network, b);
-    });
     btn.upcast()
 }
 

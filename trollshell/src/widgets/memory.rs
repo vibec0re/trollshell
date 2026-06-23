@@ -5,9 +5,7 @@ use hytte::services::sensors;
 use crate::components::cast;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-memory");
+    let btn = crate::components::chip::indicator("ts-memory", crate::modal::Page::Stats, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
@@ -15,11 +13,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     icon.set_pixel_size(crate::scale::scale(16));
     row.append(&icon);
 
-    let bar = gtk::ProgressBar::new();
-    bar.add_css_class("ts-indicator-bar");
-    bar.set_orientation(gtk::Orientation::Vertical);
-    bar.set_inverted(true);
-    bar.set_valign(gtk::Align::Center);
+    let bar = crate::components::chip::vertical_bar();
     row.append(&bar);
 
     btn.set_child(Some(&row));
@@ -35,9 +29,5 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         }
     });
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Stats, b);
-    });
     btn.upcast()
 }

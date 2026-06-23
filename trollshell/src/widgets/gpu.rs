@@ -3,9 +3,7 @@ use hytte::prelude::*;
 use hytte::services::sensors;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = gtk::Button::new();
-    btn.add_css_class("ts-indicator");
-    btn.add_css_class("ts-gpu");
+    let btn = crate::components::chip::indicator("ts-gpu", crate::modal::Page::Stats, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 
@@ -17,11 +15,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     temp_label.add_css_class("ts-gpu-temp");
     row.append(&temp_label);
 
-    let bar = gtk::ProgressBar::new();
-    bar.add_css_class("ts-indicator-bar");
-    bar.set_orientation(gtk::Orientation::Vertical);
-    bar.set_inverted(true);
-    bar.set_valign(gtk::Align::Center);
+    let bar = crate::components::chip::vertical_bar();
     row.append(&bar);
 
     btn.set_child(Some(&row));
@@ -49,9 +43,5 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // Hide the widget when no GPU is detected.
     bind_visible(sensors::gpu().map(|g| g.is_some()), &btn);
 
-    let monitor_for_click = monitor.clone();
-    btn.connect_clicked(move |b| {
-        crate::modal::toggle(&monitor_for_click, crate::modal::Page::Stats, b);
-    });
     btn.upcast()
 }

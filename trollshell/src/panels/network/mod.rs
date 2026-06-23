@@ -1,11 +1,13 @@
 //! Network drawer panel — two-column layout of flat per-card sections
-//! (left: Connection + Wi-Fi cards; right: Total/TCP card — which ends with
-//! an "Active connections" drill-down row — plus a per-interface graph card).
-//! Backed by `networkd`, `resolved`, `sensors`, `wifi`, and `netconn` services.
+//! (left: Connection + Wi-Fi + Wired cards; right: Total/TCP card — which ends
+//! with an "Active connections" drill-down row — plus a per-interface graph
+//! card). Backed by `networkd`, `resolved`, `sensors`, `wifi`, and `netconn`
+//! services.
 
 mod connection;
 mod traffic;
 mod wifi;
+mod wired;
 
 use hytte::adw::prelude::*;
 use hytte::gtk;
@@ -62,6 +64,19 @@ pub fn panel_network() -> gtk::Widget {
         gtk::prelude::WidgetExt::set_visible,
     );
     left.append(&wifi_group);
+
+    // Wired (ethernet) card, after Wi-Fi. Hidden entirely when there are no
+    // saved ethernet profiles (the common laptop case) so it never shows an
+    // empty card.
+    let wired_group = wired::build_wired_group();
+    wired_group.add_css_class("ts-net-card");
+    bind(
+        wifi_svc::wired_profiles().map(|p| !p.is_empty()),
+        &wired_group,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+    left.append(&wired_group);
+
     grid.attach(&left, 0, 0, 1, 1);
 
     // Right column: live traffic — Total/TCP card on TOP, per-interface

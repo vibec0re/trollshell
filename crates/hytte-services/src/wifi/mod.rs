@@ -44,6 +44,7 @@ use crate::wifi_backend::BackendChoice;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
+pub use crate::wifi_nm::WiredProfile;
 pub use types::{Adapter, PromptRequest, Station, StationState, WifiNetwork};
 
 // ── Station path cache ────────────────────────────────────────────────────────
@@ -119,6 +120,9 @@ pub struct WifiHandles {
     pub(crate) networks: Mutable<Vec<WifiNetwork>>,
     pub(crate) prompts: Mutable<Option<PromptRequest>>,
     pub(crate) adapter: Mutable<Option<Adapter>>,
+    /// Saved wired (ethernet) profiles. Only populated by the NM backend;
+    /// stays empty for iwd / no-backend (iwd doesn't manage ethernet).
+    pub(crate) wired: Mutable<Vec<WiredProfile>>,
     /// iwd name-ownership signal; `None` when the NM backend is active.
     _ownership: Option<hytte_bus::OwnNameSignal>,
     /// NM secret-agent export handle; `None` unless the NM backend is active.
@@ -161,6 +165,7 @@ impl Service for WifiService {
         let networks_mutable = Mutable::new(Vec::new());
         let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
         let adapter_mutable = Mutable::new(None);
+        let wired_mutable: Mutable<Vec<WiredProfile>> = Mutable::new(Vec::new());
 
         let (ownership, nm_agent, backend) = match backend_choice {
             BackendChoice::Iwd => {
@@ -191,9 +196,10 @@ impl Service for WifiService {
                 let station_m = station_mutable.clone();
                 let networks_m = networks_mutable.clone();
                 let adapter_m = adapter_mutable.clone();
+                let wired_m = wired_mutable.clone();
                 let store = Arc::clone(&device_path_store);
                 rt.spawn(crate::wifi_nm::run_nm_wifi_watcher(
-                    station_m, networks_m, adapter_m, store,
+                    station_m, networks_m, adapter_m, wired_m, store,
                 ));
 
                 // Mount the NM SecretAgent on the SYSTEM bus and register it
@@ -240,6 +246,7 @@ impl Service for WifiService {
             networks: networks_mutable,
             prompts: prompts_mutable,
             adapter: adapter_mutable,
+            wired: wired_mutable,
             _ownership: ownership,
             _nm_agent: nm_agent,
             backend,
@@ -284,6 +291,17 @@ pub fn networks() -> impl Signal<Item = Vec<WifiNetwork>> {
         r.get::<WifiHandles>()
             .expect("wifi::service() not registered")
             .networks
+            .signal_cloned()
+    })
+}
+
+/// Signal emitting the saved wired (ethernet) NM connection profiles, sorted by
+/// name. Empty on the iwd / no backend (only `NetworkManager` manages ethernet).
+pub fn wired_profiles() -> impl Signal<Item = Vec<WiredProfile>> {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .wired
             .signal_cloned()
     })
 }
@@ -458,6 +476,69 @@ pub fn forget(known_network_path: &str) {
             tracing::warn!("wifi::forget: no backend available");
         }
     }
+}
+
+/// Fire-and-forget: activate the saved wired (ethernet) profile at
+/// `connection_path` on `device_path` (NM `ActivateConnection`).
+///
+/// NM-only: wired profiles are surfaced solely by the `NetworkManager` backend,
+/// so this is a no-op on iwd / no backend (there are never any wired profiles to
+/// act on there).
+pub fn wired_activate(connection_path: &str, device_path: &str) {
+    let conn = connection_path.to_string();
+    let dev = device_path.to_string();
+    let WifiBackend::NetworkManager(_) = get_backend() else {
+        tracing::warn!("wifi::wired_activate: NM backend not active");
+        return;
+    };
+    if conn.is_empty() || dev.is_empty() {
+        tracing::warn!("wifi::wired_activate: empty connection or device path");
+        return;
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = crate::wifi_nm::nm_activate_connection(&conn, &dev).await {
+            tracing::warn!(error = %e, conn, dev, "wired activate (NM) failed");
+        }
+    });
+}
+
+/// Fire-and-forget: deactivate the wired connection on `device_path`
+/// (NM `Device.Disconnect`). NM-only (see [`wired_activate`]).
+pub fn wired_deactivate(device_path: &str) {
+    let dev = device_path.to_string();
+    let WifiBackend::NetworkManager(_) = get_backend() else {
+        tracing::warn!("wifi::wired_deactivate: NM backend not active");
+        return;
+    };
+    if dev.is_empty() {
+        tracing::warn!("wifi::wired_deactivate: empty device path");
+        return;
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = crate::wifi_nm::nm_disconnect(&dev).await {
+            tracing::warn!(error = %e, dev, "wired deactivate (NM) failed");
+        }
+    });
+}
+
+/// Fire-and-forget: forget (delete) the saved wired profile at
+/// `connection_path` (NM `Settings.Connection.Delete`). NM-only (see
+/// [`wired_activate`]).
+pub fn wired_forget(connection_path: &str) {
+    let conn = connection_path.to_string();
+    let WifiBackend::NetworkManager(_) = get_backend() else {
+        tracing::warn!("wifi::wired_forget: NM backend not active");
+        return;
+    };
+    if conn.is_empty() {
+        tracing::warn!("wifi::wired_forget: empty connection path");
+        return;
+    }
+    runtime::handle().spawn(async move {
+        if let Err(e) = crate::wifi_nm::nm_forget(&conn).await {
+            tracing::warn!(error = %e, conn, "wired forget (NM) failed");
+        }
+    });
 }
 
 /// Signal emitting `Some(PromptRequest)` when iwd needs a passphrase, `None`

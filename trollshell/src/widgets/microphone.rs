@@ -3,6 +3,8 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::pipewire::{self, Source};
 
+use crate::components::layout::toggle_class;
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let btn =
         crate::components::chip::indicator("ts-microphone", crate::modal::Page::Audio, monitor);
@@ -28,11 +30,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
         move |w, (default, recording): (Option<Source>, bool)| {
             let (name, recording) = icon_state(default.as_ref(), recording);
             w.set_icon_name(Some(name));
-            if recording {
-                btn_for_bind.add_css_class("ts-microphone-recording");
-            } else {
-                btn_for_bind.remove_css_class("ts-microphone-recording");
-            }
+            toggle_class(&btn_for_bind, "ts-microphone-recording", recording);
         },
     );
 

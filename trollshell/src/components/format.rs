@@ -5,9 +5,10 @@ use std::time::SystemTime;
 
 use crate::components::cast;
 
-/// Format a byte count as a human-readable string (e.g. `"7.4 GiB"`).
-pub(crate) fn fmt_bytes(b: u64) -> String {
-    let f = cast::u64_to_f64(b);
+/// Inner formatter: given a non-negative float representing bytes, return the
+/// magnitude string without any suffix (e.g. `"7.4 GiB"`). Called by both
+/// [`fmt_bytes`] and [`fmt_rate`] so the threshold logic lives in one place.
+fn fmt_bytes_f64(f: f64) -> String {
     if f >= 1_073_741_824.0 {
         format!("{:.1} GiB", f / 1_073_741_824.0)
     } else if f >= 1_048_576.0 {
@@ -19,16 +20,26 @@ pub(crate) fn fmt_bytes(b: u64) -> String {
     }
 }
 
+/// Format a byte count as a human-readable string (e.g. `"7.4 GiB"`).
+pub(crate) fn fmt_bytes(b: u64) -> String {
+    fmt_bytes_f64(cast::u64_to_f64(b))
+}
+
 /// Format a byte-per-second rate as a human-readable string (e.g. `"7.4 GiB/s"`).
 pub(crate) fn fmt_rate(bps: f64) -> String {
-    if bps >= 1_073_741_824.0 {
-        format!("{:.1} GiB/s", bps / 1_073_741_824.0)
-    } else if bps >= 1_048_576.0 {
-        format!("{:.1} MiB/s", bps / 1_048_576.0)
-    } else if bps >= 1024.0 {
-        format!("{:.1} KiB/s", bps / 1024.0)
+    format!("{}/s", fmt_bytes_f64(bps))
+}
+
+/// Format a [`std::time::Duration`] as a human-readable string with a caller-
+/// supplied suffix (e.g. `"1h 30m until full"`).
+pub(crate) fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    if h > 0 {
+        format!("{h}h {m}m {suffix}")
     } else {
-        format!("{bps:.0} B/s")
+        format!("{m}m {suffix}")
     }
 }
 

@@ -105,6 +105,7 @@ fn build_stats_gpu_card() -> adw::PreferencesGroup {
     );
 
     group.add(&build_live_gpu_row());
+    group.add(&history_row_wrapper(&build_history_gpu_usage_row()));
     group.add(&history_row_wrapper(&build_history_gpu_temp_row()));
 
     group
@@ -607,6 +608,35 @@ fn build_history_memory_row() -> gtk::Box {
             let frac = (cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total)).clamp(0.0, 1.0);
             spark_clone.push(frac);
             value_clone.set_text(&format!("{:.0}%", frac * 100.0));
+        }
+    });
+
+    row
+}
+
+fn build_history_gpu_usage_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("GPU usage");
+    // Usage is a percentage — fix the scale to 0..=100 % (unlike temp, which
+    // auto-scales). We push raw percent (0..=100), so the domain max is 100.
+    spark.set_domain_max(Some(100.0));
+
+    // Hide unless GPU is present with a load reading. Intel iGPUs report load
+    // without a temperature, so this gate keys off `load` (not temp).
+    bind(
+        sensors::gpu().map(|g| g.and_then(|s| s.load).is_some()),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::gpu(), &row, move |_, g| {
+        if let Some(state) = g
+            && let Some(l) = state.load
+        {
+            let pct = l * 100.0;
+            spark_clone.push(pct);
+            value_clone.set_text(&format!("{pct:.0}%"));
         }
     });
 

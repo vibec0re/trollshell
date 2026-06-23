@@ -1,6 +1,7 @@
 //! Configuration column: primary link details, all-links overview, DNS.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
@@ -162,27 +163,25 @@ fn apply_addr_row(row: &adw::ActionRow, value: &str) {
     row.set_visible(!value.is_empty());
 }
 
-/// Build the four (IPv4/IPv6 address + gateway) detail rows for a *specific*
-/// link — the same layout the primary block uses — and append them to
-/// `parent`. Empty rows hide themselves.
-fn add_link_detail_rows(parent: &adw::ExpanderRow, link: &Link) {
-    let rows = [
-        ("IPv4 address", ipv4_addresses(link)),
-        (
-            "IPv4 gateway",
-            link.gateway_v4.map(|g| g.to_string()).unwrap_or_default(),
-        ),
-        ("IPv6 address", ipv6_addresses(link)),
-        (
-            "IPv6 gateway",
-            link.gateway_v6.map(|g| g.to_string()).unwrap_or_default(),
-        ),
-    ];
-    for (title, value) in rows {
-        let row = build_addr_row(title);
-        apply_addr_row(&row, &value);
-        parent.add_row(&row);
-    }
+/// The four address/gateway detail row titles for a per-link disclosure, in
+/// display order. Index-aligned with [`link_detail_values`].
+const LINK_DETAIL_TITLES: [&str; 4] = [
+    "IPv4 address",
+    "IPv4 gateway",
+    "IPv6 address",
+    "IPv6 gateway",
+];
+
+/// The four address/gateway detail values for `link`, index-aligned with
+/// [`LINK_DETAIL_TITLES`]. Empty strings mean the corresponding row hides
+/// itself.
+fn link_detail_values(link: &Link) -> [String; 4] {
+    [
+        ipv4_addresses(link),
+        link.gateway_v4.map(|g| g.to_string()).unwrap_or_default(),
+        ipv6_addresses(link),
+        link.gateway_v6.map(|g| g.to_string()).unwrap_or_default(),
+    ]
 }
 
 fn build_no_connection_placeholder_row() -> adw::ActionRow {
@@ -200,6 +199,28 @@ fn build_no_connection_placeholder_row() -> adw::ActionRow {
     row
 }
 
+/// The widgets making up one link's disclosure row inside "All links". Kept in
+/// a stable per-link cache (keyed by link name) so the bind handler can diff
+/// the list in place across `networkd::links()` emissions — rather than
+/// drain-rebuilding — and an expanded link survives carrier blips with its
+/// chevron and revealer state intact (#152).
+struct LinkRow {
+    /// The `AdwActionRow` shown in the "All links" expander (name + pill +
+    /// chevron). Added to / removed from the parent expander via `add_row` /
+    /// `remove`.
+    action: adw::ActionRow,
+    /// The boxed-list wrapper holding this link's detail rows, slid open/shut
+    /// by the chevron. A separate row in the parent expander, kept directly
+    /// beneath `action` by the diff's re-ordering pass.
+    detail_holder: gtk::ListBoxRow,
+    /// The connection-state pill suffix, updated in place each emission.
+    pill: gtk::Label,
+    /// The four address/gateway detail rows (index-aligned with
+    /// [`LINK_DETAIL_TITLES`]), updated in place — they hide themselves when
+    /// their value is empty.
+    detail_rows: [adw::ActionRow; 4],
+}
+
 fn build_all_links_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("All links").build();
     bind(
@@ -211,32 +232,154 @@ fn build_all_links_expander() -> adw::ExpanderRow {
         |w, sub| w.set_subtitle(&sub),
     );
 
-    // Track child rows so we can drain & rebuild on each emission. Each link is
-    // itself an expander (name + state pill) revealing that link's own
-    // address/gateway rows — so the still-up Wi-Fi config stays reachable even
-    // when ethernet becomes the primary/default route (#144).
-    let rows_track: Rc<RefCell<Vec<adw::ExpanderRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // Per-link rows keyed by link name, diffed in place on every
+    // `networkd::links()` emission. networkd emits on any link change (carrier
+    // flap, address renewal, a `vb-h-*` veth blinking); draining and rebuilding
+    // collapsed rows each time destroyed any link you had expanded (#152), so
+    // we instead remove only links that disappeared, add only new ones, and
+    // update survivors in place — leaving their chevron/revealer untouched.
+    let cache: Rc<RefCell<HashMap<String, LinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
     let expander_for_bind = expander.clone();
-    let rows_for_bind = rows_track.clone();
+    let cache_for_bind = cache.clone();
     bind(networkd::links(), &expander, move |_, links| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            expander_for_bind.remove(&row);
+        let mut named: Vec<&Link> = links.iter().filter(|l| l.name != "lo").collect();
+        named.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut cache_mut = cache_for_bind.borrow_mut();
+
+        // Remove links that disappeared.
+        let live: HashSet<String> = named.iter().map(|l| l.name.clone()).collect();
+        cache_mut.retain(|name, row| {
+            let keep = live.contains(name);
+            if !keep {
+                expander_for_bind.remove(&row.action);
+                expander_for_bind.remove(&row.detail_holder);
+            }
+            keep
+        });
+
+        // Update survivors in place; build rows for newly-seen links.
+        let mut added_new = false;
+        for link in &named {
+            if let Some(row) = cache_mut.get(&link.name) {
+                update_link_row(row, link);
+            } else {
+                let row = build_link_row(&expander_for_bind, link);
+                cache_mut.insert(link.name.clone(), row);
+                added_new = true;
+            }
         }
-        let mut new_rows = Vec::new();
-        for link in links.iter().filter(|l| l.name != "lo") {
-            let row = adw::ExpanderRow::builder().title(&link.name).build();
-            row.add_suffix(&pill_label(
-                state_pill_text(link.operational),
-                state_pill_class(link.operational),
-            ));
-            add_link_detail_rows(&row, link);
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
+
+        // Only re-order when the membership changed: detach every surviving
+        // row, then re-add in sorted name order so a new link lands in the
+        // right slot and each link's detail holder stays directly beneath its
+        // action row. Survivor updates never touch ordering, so an expanded
+        // link does not jump or re-collapse on a carrier blip.
+        if added_new {
+            for row in cache_mut.values() {
+                expander_for_bind.remove(&row.action);
+                expander_for_bind.remove(&row.detail_holder);
+            }
+            for link in &named {
+                if let Some(row) = cache_mut.get(&link.name) {
+                    expander_for_bind.add_row(&row.action);
+                    expander_for_bind.add_row(&row.detail_holder);
+                }
+            }
         }
-        *rows_for_bind.borrow_mut() = new_rows;
     });
 
     expander
+}
+
+/// Build one link's disclosure: an activatable `AdwActionRow` (name + state
+/// pill + chevron we drive ourselves) over a `gtk::Revealer` holding the
+/// link's address/gateway rows, added to `parent`. Activating the row toggles
+/// the revealer and flips the chevron between `pan-end` (collapsed) and
+/// `pan-down` (expanded) — so the disclosure state is ours, sidestepping
+/// libadwaita's stuck nested-expander arrow (#152).
+fn build_link_row(parent: &adw::ExpanderRow, link: &Link) -> LinkRow {
+    let action = adw::ActionRow::builder()
+        .title(&link.name)
+        .activatable(true)
+        .build();
+    action.set_title_lines(1);
+
+    let pill = pill_label(
+        state_pill_text(link.operational),
+        state_pill_class(link.operational),
+    );
+    action.add_suffix(&pill);
+
+    let chevron = gtk::Image::from_icon_name("pan-end-symbolic");
+    chevron.set_valign(gtk::Align::Center);
+    action.add_suffix(&chevron);
+
+    // Detail rows live in their own boxed-list inside the revealer, wrapped in a
+    // `gtk::ListBoxRow` so the parent expander renders them as a row rather than
+    // a separator-less child below the list (the adw routing gotcha).
+    let detail_list = gtk::ListBox::new();
+    detail_list.add_css_class("boxed-list");
+    detail_list.set_selection_mode(gtk::SelectionMode::None);
+
+    let values = link_detail_values(link);
+    let detail_rows = std::array::from_fn(|i| {
+        let row = build_addr_row(LINK_DETAIL_TITLES[i]);
+        row.set_activatable(false);
+        row.set_selectable(false);
+        apply_addr_row(&row, &values[i]);
+        detail_list.append(&row);
+        row
+    });
+
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_reveal_child(false);
+    revealer.set_child(Some(&detail_list));
+
+    let detail_holder = gtk::ListBoxRow::new();
+    detail_holder.set_activatable(false);
+    detail_holder.set_selectable(false);
+    detail_holder.set_child(Some(&revealer));
+
+    // Activation drives the disclosure: flip the revealer, swap the chevron.
+    let chevron_for_click = chevron.clone();
+    action.connect_activated(move |_| {
+        let now = !revealer.reveals_child();
+        revealer.set_reveal_child(now);
+        chevron_for_click.set_icon_name(Some(if now {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
+    });
+
+    parent.add_row(&action);
+    parent.add_row(&detail_holder);
+
+    LinkRow {
+        action,
+        detail_holder,
+        pill,
+        detail_rows,
+    }
+}
+
+/// Update a surviving link's row in place: refresh the state pill and the four
+/// detail values. Never touches the chevron or revealer, so the link's
+/// expanded/collapsed disclosure state persists across refreshes.
+fn update_link_row(row: &LinkRow, link: &Link) {
+    row.pill.set_text(state_pill_text(link.operational));
+    // Reset to the two pill variants and re-apply the current one so the class
+    // set doesn't accumulate across state changes.
+    row.pill.remove_css_class("ts-pill-connected");
+    row.pill.remove_css_class("ts-pill-known");
+    row.pill.add_css_class(state_pill_class(link.operational));
+
+    let values = link_detail_values(link);
+    for (detail, value) in row.detail_rows.iter().zip(values.iter()) {
+        apply_addr_row(detail, value);
+    }
 }
 
 fn state_pill_text(state: OperationalState) -> &'static str {

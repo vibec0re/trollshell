@@ -91,10 +91,12 @@ fn build_stats_disks_card() -> adw::PreferencesGroup {
     group
 }
 
-/// GPU card — live GPU row + GPU-temp history sparkline. The whole card hides
-/// when no GPU is detected (bound to the same `sensors::gpu()` presence signal
-/// the live GPU row uses to self-hide). Intel GPUs are supported as of #150, so
-/// this card shows on Arc/iGPU hardware.
+/// GPU card — live GPU row + usage / VRAM / temp history sparklines. The whole
+/// card hides when no GPU is detected (bound to the same `sensors::gpu()`
+/// presence signal the live GPU row uses to self-hide); each history row
+/// additionally self-hides if its specific metric (load / VRAM / temperature)
+/// isn't reported. Intel GPUs are supported as of #150, so this card shows on
+/// Arc/iGPU hardware.
 fn build_stats_gpu_card() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("GPU").build();
 
@@ -107,6 +109,7 @@ fn build_stats_gpu_card() -> adw::PreferencesGroup {
 
     group.add(&build_live_gpu_row());
     group.add(&history_row_wrapper(&build_history_gpu_usage_row()));
+    group.add(&history_row_wrapper(&build_history_gpu_vram_row()));
     group.add(&history_row_wrapper(&build_history_gpu_temp_row()));
 
     group
@@ -630,6 +633,39 @@ fn build_history_gpu_usage_row() -> gtk::Box {
             && let Some(l) = state.load
         {
             let pct = l * 100.0;
+            spark_clone.push(pct);
+            value_clone.set_text(&format!("{pct:.0}%"));
+        }
+    });
+
+    row
+}
+
+fn build_history_gpu_vram_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("GPU VRAM");
+    // VRAM is a percentage of total memory — fix the scale to 0..=100 % like
+    // GPU usage (we push raw percent, so the domain max is 100).
+    spark.set_domain_max(Some(100.0));
+
+    // Hide unless GPU is present with both used + total VRAM readings (some
+    // GPUs report load/temp but not memory).
+    bind(
+        sensors::gpu().map(|g| {
+            g.and_then(|s| s.memory_used_bytes.zip(s.memory_total_bytes))
+                .is_some()
+        }),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::gpu(), &row, move |_, g| {
+        if let Some(state) = g
+            && let Some((used, total)) = state.memory_used_bytes.zip(state.memory_total_bytes)
+            && total > 0
+        {
+            let pct = (cast::u64_to_f64(used) / cast::u64_to_f64(total) * 100.0).clamp(0.0, 100.0);
             spark_clone.push(pct);
             value_clone.set_text(&format!("{pct:.0}%"));
         }

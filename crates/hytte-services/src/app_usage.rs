@@ -367,14 +367,55 @@ pub(crate) fn parse_scope_leaf(leaf: &str) -> Option<String> {
         // Strip trailing `-<digits>` (the instance number).
         // The app-id may also contain hyphens, so we only strip when the last
         // component is purely numeric.
-        return Some(strip_trailing_numeric_component(flatpak_rest).to_string());
+        return Some(unescape_systemd_hex(strip_trailing_numeric_component(
+            flatpak_rest,
+        )));
     }
 
     // Plain and instantiated form: "<id>" or "<id>-<random>"
     // Heuristic: if the last hyphen-separated component looks like a random
     // suffix (all hex chars, 8+ chars, with at least one digit; or all digits),
-    // strip it.
-    Some(strip_trailing_random_component(inner).to_string())
+    // strip it. Decode systemd \xNN escapes after stripping so the suffix
+    // logic operates on the escaped form (escapes don't match suffix patterns).
+    Some(unescape_systemd_hex(strip_trailing_random_component(inner)))
+}
+
+/// Decode systemd `\xNN` hex escapes (e.g. `\x2d` → `-`) in a cgroup/scope
+/// leaf id. Bytes are reassembled and lossily decoded as UTF-8 so a
+/// multi-byte escape sequence round-trips. Non-escape text is preserved.
+///
+/// Does NOT apply systemd's `-`↔`/` path-unit swap — these app-scope ids use
+/// `-` as a real separator, so only the explicit `\xNN` forms are decoded.
+///
+/// Malformed escapes (`\x` with fewer than two hex digits following, or `\x`
+/// followed by non-hex chars) are left LITERAL — no panic, no dropped chars.
+fn unescape_systemd_hex(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for the two-character escape introducer `\x`.
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'x') {
+            // Require exactly two ASCII hex digits following `\x`.
+            let hi = bytes.get(i + 2).copied();
+            let lo = bytes.get(i + 3).copied();
+            if let (Some(hi), Some(lo)) = (hi, lo)
+                && hi.is_ascii_hexdigit()
+                && lo.is_ascii_hexdigit()
+            {
+                // SAFETY: both bytes are ASCII hex digits, so this parse
+                // can't fail.
+                let decoded =
+                    u8::from_str_radix(std::str::from_utf8(&[hi, lo]).unwrap(), 16).unwrap();
+                out.push(decoded);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Strip a trailing `-<digits>` from `s` (used for Flatpak instance numbers).
@@ -551,6 +592,69 @@ mod tests {
         assert_eq!(
             parse_app_id_from_cgroup(cgroup),
             Some("Alacritty".to_string())
+        );
+    }
+
+    // ── unescape_systemd_hex unit tests ─────────────────────────────────────
+
+    #[test]
+    fn unescape_hyphen() {
+        // `\x2d` is systemd's encoding of `-`.
+        assert_eq!(unescape_systemd_hex(r"a\x2db"), "a-b");
+    }
+
+    #[test]
+    fn unescape_space() {
+        // `\x20` is systemd's encoding of ` `.
+        assert_eq!(unescape_systemd_hex(r"x\x20y"), "x y");
+    }
+
+    #[test]
+    fn unescape_preserves_non_hex_escape() {
+        // `\xzz` — the two chars after `\x` are not hex digits, so it must
+        // be left literal.
+        assert_eq!(unescape_systemd_hex(r"a\xzzb"), r"a\xzzb");
+    }
+
+    #[test]
+    fn unescape_preserves_truncated_escape() {
+        // `\x2` — only one hex digit following `\x`, must be left literal.
+        assert_eq!(unescape_systemd_hex(r"a\x2"), r"a\x2");
+    }
+
+    #[test]
+    fn unescape_empty_string() {
+        assert_eq!(unescape_systemd_hex(""), "");
+    }
+
+    // ── \xNN cgroup escape decoding via parse_scope_leaf ────────────────────
+
+    #[test]
+    fn scope_leaf_cgroup_escape_niri_gnome_system_monitor() {
+        // Scope name as systemd emits: hyphens escaped to \x2d.
+        // Raw string: `app-niri-gnome\x2dsystem\x2dmonitor.scope`
+        // (backslash + x + 2 + d, not a control char)
+        assert_eq!(
+            parse_scope_leaf(r"app-niri-gnome\x2dsystem\x2dmonitor.scope"),
+            Some("niri-gnome-system-monitor".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_leaf_cgroup_escape_niri_element_desktop() {
+        // `app-niri-element\x2ddesktop.scope` → `niri-element-desktop`
+        assert_eq!(
+            parse_scope_leaf(r"app-niri-element\x2ddesktop.scope"),
+            Some("niri-element-desktop".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_leaf_no_escapes_unchanged() {
+        // An id without any escapes must be returned verbatim (idempotent).
+        assert_eq!(
+            parse_scope_leaf("app-firefox.scope"),
+            Some("firefox".to_string())
         );
     }
 

@@ -57,15 +57,32 @@ pub struct WifiNetwork {
 
 // ── Prompt request ────────────────────────────────────────────────────────────
 
-/// A pending passphrase prompt request from iwd.
+/// What kind of secret the overlay is asking the user for. Lets the overlay
+/// title/label the dialog correctly without changing the existing Wi-Fi fields.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PromptKind {
+    /// A Wi-Fi passphrase (iwd `RequestPassphrase` or NM `GetSecrets` for
+    /// `802-11-wireless-security`). The overlay reads [`PromptRequest::ssid`] /
+    /// [`PromptRequest::security`].
+    #[default]
+    WifiPassphrase,
+    /// A VPN secret (NM `GetSecrets` for the `vpn` setting). The overlay reads
+    /// [`PromptRequest::ssid`] as the VPN connection name.
+    VpnSecret,
+}
+
+/// A pending passphrase / secret prompt request.
 #[derive(Clone, Debug)]
 pub struct PromptRequest {
     /// Unique per request; echo back into `submit_prompt` or `cancel_prompt`.
     pub id: u64,
-    /// iwd network object path.
+    /// iwd / NM connection object path.
     pub network_path: String,
-    /// SSID from Network.Name (best-effort, falls back to last path segment).
+    /// SSID from Network.Name (best-effort, falls back to last path segment) for
+    /// a Wi-Fi prompt, or the VPN connection name for a [`PromptKind::VpnSecret`].
     pub ssid: String,
-    /// Network security type ("psk", "8021x", etc.).
+    /// Network security type ("psk", "8021x", etc.). Empty for a VPN prompt.
     pub security: String,
+    /// Which kind of secret is being requested — drives the overlay's wording.
+    pub kind: PromptKind,
 }

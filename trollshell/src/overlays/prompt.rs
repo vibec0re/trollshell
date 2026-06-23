@@ -70,13 +70,27 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     vbox.set_margin_top(18);
     vbox.set_margin_bottom(18);
 
-    let title = gtk::Label::new(Some(&format!("Connect to {}", req.ssid)));
+    // Title + subtitle vary by prompt kind: a Wi-Fi passphrase ("Connect to
+    // <SSID>" / "Security: psk") vs a VPN secret ("VPN password" / the
+    // connection name). The VPN case has no security field.
+    let title_text = match req.kind {
+        wifi::PromptKind::VpnSecret => "VPN password".to_string(),
+        wifi::PromptKind::WifiPassphrase => format!("Connect to {}", req.ssid),
+    };
+    let title = gtk::Label::new(Some(&title_text));
     title.add_css_class("ts-prompt-title");
     title.set_xalign(0.0);
     vbox.append(&title);
 
-    if !req.security.is_empty() {
-        let subtitle = gtk::Label::new(Some(&format!("Security: {}", req.security)));
+    let subtitle_text = match req.kind {
+        // For a VPN the `ssid` field carries the connection name.
+        wifi::PromptKind::VpnSecret => Some(req.ssid.clone()).filter(|s| !s.is_empty()),
+        wifi::PromptKind::WifiPassphrase => {
+            Some(format!("Security: {}", req.security)).filter(|_| !req.security.is_empty())
+        }
+    };
+    if let Some(subtitle_text) = subtitle_text {
+        let subtitle = gtk::Label::new(Some(&subtitle_text));
         subtitle.add_css_class("ts-prompt-subtitle");
         subtitle.set_xalign(0.0);
         vbox.append(&subtitle);

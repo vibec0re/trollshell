@@ -45,6 +45,7 @@ impl IwdAgent {
             network_path: path,
             ssid,
             security,
+            kind: super::types::PromptKind::WifiPassphrase,
         }));
 
         if let Ok(Ok(pass)) = rx.await {

@@ -11,6 +11,7 @@ use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
 
 use super::pill_label;
+use crate::components::layout::boxed_list;
 use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_connection_group() -> adw::PreferencesGroup {
@@ -319,9 +320,7 @@ fn build_link_row(parent: &adw::ExpanderRow, link: &Link) -> LinkRow {
     // Detail rows live in their own boxed-list inside the revealer, wrapped in a
     // `gtk::ListBoxRow` so the parent expander renders them as a row rather than
     // a separator-less child below the list (the adw routing gotcha).
-    let detail_list = gtk::ListBox::new();
-    detail_list.add_css_class("boxed-list");
-    detail_list.set_selection_mode(gtk::SelectionMode::None);
+    let detail_list = boxed_list();
 
     let values = link_detail_values(link);
     let detail_rows = std::array::from_fn(|i| {

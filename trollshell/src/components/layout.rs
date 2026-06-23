@@ -4,7 +4,9 @@
 //! drawer styling and an `AdwClamp` width cap. `page_grid` is the
 //! two-column grid container. `section` (renamed from `panel` to avoid
 //! clashing with the `panels/` module name) is the titled card you
-//! attach into a grid cell.
+//! attach into a grid cell. `boxed_list` builds a selection-free
+//! `gtk::ListBox` with the Adwaita `boxed-list` style. `toggle_class`
+//! adds or removes a single CSS class based on a boolean.
 
 use hytte::adw;
 use hytte::gtk::{self, prelude::*};
@@ -53,6 +55,24 @@ pub(crate) fn page_grid() -> gtk::Grid {
     g.set_column_spacing(12);
     g.set_column_homogeneous(true);
     g
+}
+
+/// Selection-free `gtk::ListBox` styled with Adwaita's `boxed-list` look.
+/// Use `list.append(&row)` to populate it.
+pub(crate) fn boxed_list() -> gtk::ListBox {
+    let list = gtk::ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list
+}
+
+/// Add `class` to `widget` when `on` is `true`; remove it otherwise.
+pub(crate) fn toggle_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
+    if on {
+        widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
+    }
 }
 
 /// Card-style section with a title header. Caller appends content by

@@ -25,6 +25,9 @@ use hytte::gtk::{self, prelude::*};
 
 use crate::components::layout::{finish_page, page_box};
 
+// Re-export shared helpers so submodules can access them via `super::`.
+pub(super) use crate::components::layout::{boxed_list, toggle_class};
+
 /// Snapshot considered to match our pending write when within this much
 /// of the value we sent. `pactl` rounds to integer percent so 0.005 is a
 /// comfortable margin below the 0.01 step.
@@ -56,13 +59,6 @@ fn audio_section(title: &str, list: &gtk::ListBox) -> gtk::Box {
     section
 }
 
-pub(super) fn boxed_list() -> gtk::ListBox {
-    let list = gtk::ListBox::new();
-    list.add_css_class("boxed-list");
-    list.set_selection_mode(gtk::SelectionMode::None);
-    list
-}
-
 pub(super) fn truncate_desc(s: &str) -> String {
     if s.len() > 40 {
         format!("{}…", &s[..39])
@@ -73,14 +69,6 @@ pub(super) fn truncate_desc(s: &str) -> String {
 
 pub(super) fn default_radio_glyph(is_default: bool) -> &'static str {
     if is_default { "\u{25cf}" } else { "\u{25cb}" }
-}
-
-pub(super) fn toggle_class<W: IsA<gtk::Widget>>(widget: &W, class: &str, on: bool) {
-    if on {
-        widget.add_css_class(class);
-    } else {
-        widget.remove_css_class(class);
-    }
 }
 
 /// Should the snapshot value be applied to the UI? Returns `true` when

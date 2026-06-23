@@ -7,7 +7,8 @@ use hytte::prelude::*;
 use hytte::services::brightness;
 use hytte::services::upower::{self, Battery, BatteryState};
 
-use crate::components::layout::{finish_page, page_box, section};
+use crate::components::format::fmt_dur;
+use crate::components::layout::{boxed_list, finish_page, page_box, section};
 use crate::components::power_profile::build_power_profile_expander;
 
 pub fn panel_power() -> gtk::Widget {
@@ -39,14 +40,6 @@ pub fn panel_power() -> gtk::Widget {
     column.append(&bright);
 
     finish_page(&column)
-}
-
-/// Boxed `gtk::ListBox` matching Adwaita's `boxed-list` style.
-fn boxed_list() -> gtk::ListBox {
-    let list = gtk::ListBox::new();
-    list.add_css_class("boxed-list");
-    list.set_selection_mode(gtk::SelectionMode::None);
-    list
 }
 
 /// Adwaita-flavoured brightness control: icon + slider + live percentage,
@@ -121,16 +114,5 @@ fn describe_battery(b: &Battery) -> String {
     match remaining {
         Some(r) => format!("{state} \u{2014} {r}"),
         None => state.to_string(),
-    }
-}
-
-fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {
-    let total = d.as_secs();
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    if h > 0 {
-        format!("{h}h {m}m {suffix}")
-    } else {
-        format!("{m}m {suffix}")
     }
 }

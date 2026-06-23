@@ -26,6 +26,7 @@
 
 mod agent;
 mod client;
+mod nm_agent;
 mod parse;
 mod types;
 mod watcher;
@@ -120,6 +121,10 @@ pub struct WifiHandles {
     pub(crate) adapter: Mutable<Option<Adapter>>,
     /// iwd name-ownership signal; `None` when the NM backend is active.
     _ownership: Option<hytte_bus::OwnNameSignal>,
+    /// NM secret-agent export handle; `None` unless the NM backend is active.
+    /// Held only to keep the exported agent object (and its re-mount task) alive
+    /// for the service's lifetime.
+    _nm_agent: Option<hytte_bus::ExportHandle>,
     pub(crate) backend: WifiBackend,
 }
 
@@ -157,7 +162,7 @@ impl Service for WifiService {
         let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
         let adapter_mutable = Mutable::new(None);
 
-        let (ownership, backend) = match backend_choice {
+        let (ownership, nm_agent, backend) = match backend_choice {
             BackendChoice::Iwd => {
                 // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
                 // iwd records our system-bus unique name when we call RegisterAgent,
@@ -179,7 +184,7 @@ impl Service for WifiService {
                     station_m, networks_m, prompts_m, adapter_m,
                 ));
 
-                (Some(own), WifiBackend::Iwd)
+                (Some(own), None, WifiBackend::Iwd)
             }
             BackendChoice::NetworkManager => {
                 let device_path_store: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
@@ -190,11 +195,43 @@ impl Service for WifiService {
                 rt.spawn(crate::wifi_nm::run_nm_wifi_watcher(
                     station_m, networks_m, adapter_m, store,
                 ));
-                (None, WifiBackend::NetworkManager(device_path_store))
+
+                // Mount the NM SecretAgent on the SYSTEM bus and register it
+                // with NM's AgentManager. Unlike the iwd agent, NM secret
+                // agents do NOT own a well-known name — NM records our system
+                // connection's unique name and calls GetSecrets back on it, so
+                // we export the object name-lessly (no system-bus policy entry
+                // needed). Export first, then register, so the object is
+                // present before NM can call back.
+                let nm_agent = nm_agent::NmAgent {
+                    prompts: prompts_mutable.clone(),
+                    waiters: waiters_arc,
+                };
+                let export = hytte_bus::export_object(crate::wifi_nm::NM_AGENT_PATH)
+                    .bus(BusKind::System)
+                    .start(nm_agent);
+                rt.spawn(async {
+                    // Give the export a moment to mount on the live connection
+                    // before registering, so NM never calls back before the
+                    // object exists.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    match crate::wifi_nm::register_nm_agent().await {
+                        Ok(()) => tracing::info!("wifi_nm: secret agent registered with NM"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "wifi_nm: secret agent registration failed");
+                        }
+                    }
+                });
+
+                (
+                    None,
+                    Some(export),
+                    WifiBackend::NetworkManager(device_path_store),
+                )
             }
             BackendChoice::None => {
                 tracing::warn!("wifi: no Wi-Fi backend detected — service is inactive");
-                (None, WifiBackend::None)
+                (None, None, WifiBackend::None)
             }
         };
 
@@ -204,6 +241,7 @@ impl Service for WifiService {
             prompts: prompts_mutable,
             adapter: adapter_mutable,
             _ownership: ownership,
+            _nm_agent: nm_agent,
             backend,
         }
     }

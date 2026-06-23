@@ -10,9 +10,10 @@
 //!   more complex than iwd's `KnownNetwork.Forget`). A follow-up ticket covers
 //!   this.
 //! * `connect_network` uses `ActivateConnection` with `"/"` for the connection
-//!   path (NM auto-selects the best stored connection). New WPA networks where
-//!   NM has no stored credentials will fail silently — a passphrase agent is a
-//!   follow-up.
+//!   path (NM auto-selects the best stored connection). For secured networks
+//!   without stored credentials, NM asks the registered secret agent (see
+//!   [`register_nm_agent`] and the `wifi::nm_agent` module) for the passphrase
+//!   via the same prompt overlay the iwd backend uses.
 
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
@@ -32,6 +33,18 @@ const NM_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device";
 const NM_WIRELESS_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const NM_AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
+const NM_AGENT_MANAGER_PATH: &str = "/org/freedesktop/NetworkManager/AgentManager";
+const NM_AGENT_MANAGER_IFACE: &str = "org.freedesktop.NetworkManager.AgentManager";
+
+/// Stable identifier for our secret agent. NM keys registered agents by this
+/// reverse-DNS string; reusing it across restarts lets NM replace a stale
+/// registration cleanly.
+pub(crate) const NM_AGENT_IDENTIFIER: &str = "cc.hannig.trollshell";
+
+/// Standard object path NM secret agents export their interface at.
+/// (NM itself does not require a specific path — it records our unique name —
+///  but a stable, conventional path keeps introspection tidy.)
+pub(crate) const NM_AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
 
 // ── Pure conversion helpers ───────────────────────────────────────────────────
 
@@ -557,6 +570,35 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
         .iface(PROPS_IFACE)
         .method("Set")
         .args((NM_IFACE, "WirelessEnabled", value))
+        .send::<()>()
+        .await
+}
+
+/// Register our secret agent with NM's `AgentManager`.
+///
+/// Uses `RegisterWithCapabilities(identifier, capabilities)` with
+/// `capabilities = 0` (`NM_SECRET_AGENT_CAPABILITY_NONE` — we don't support VPN
+/// hints). NM records the *unique* name of the connection this call arrives on
+/// and issues `GetSecrets` callbacks back on it, so the agent object must
+/// already be exported on the same shared system connection before calling
+/// this (it is — both go through `hytte_bus`'s pooled system connection).
+///
+/// Idempotent: NM lets the same connection re-register; a stale registration
+/// from a prior epoch is replaced.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. NM is not
+/// running, or policy refuses agent registration).
+pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
+    // capabilities = 0 (NONE)
+    let capabilities: u32 = 0;
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(NM_AGENT_MANAGER_PATH)
+        .iface(NM_AGENT_MANAGER_IFACE)
+        .method("RegisterWithCapabilities")
+        .args((NM_AGENT_IDENTIFIER, capabilities))
         .send::<()>()
         .await
 }

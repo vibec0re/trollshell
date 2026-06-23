@@ -214,6 +214,14 @@ in
         # hits AccessDenied at the broker and parks the agent inert with one
         # info-level log (own.rs) — the bluetooth/wifi pairing agents just go
         # quiet, nothing crashes.
+        #
+        # NB: the NetworkManager secret agent (issue #99) is deliberately NOT
+        # listed here. NM secret agents do not own a well-known name — NM
+        # records the registering connection's *unique* name and calls
+        # GetSecrets back on it (hytte_bus::export_object mounts the object
+        # name-lessly on the shared system connection). NM's own bundled
+        # system-bus policy already lets a console user register a secret agent,
+        # so no extra <allow own=...> entry is required.
         services.dbus.packages = [
           (pkgs.writeTextDir "share/dbus-1/system.d/cc.hannig.trollshell.conf" ''
             <!DOCTYPE busconfig PUBLIC

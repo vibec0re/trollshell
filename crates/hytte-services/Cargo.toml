@@ -9,6 +9,13 @@ description = "Async clients to system daemons, exposed as hytte services"
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the integration tests that spawn a real dbus-daemon
+# (e.g. the NM SecretAgent GetSecrets round-trip in `wifi::nm_agent`). Off by
+# default so `cargo test` stays hermetic; enable with `--features system-tests`
+# to run them. Mirrors hytte-bus / hytte-reactive / hytte-ui.
+system-tests = []
+
 [dependencies]
 anyhow = "1.0.102"
 nix = { version = "0.29", default-features = false, features = [
@@ -67,7 +74,18 @@ futures-executor = "0.3.32"
 futures-util = "0.3.32"
 tempfile = "3"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
-tokio = { version = "1.52.1", features = ["macros", "rt", "time"] }
+# `rt-multi-thread` + `process` + `io-util` are needed by the system-tests'
+# ephemeral-bus harness (BusGuard::drop calls block_in_place, which requires a
+# multi-thread runtime; the daemon is spawned via tokio::process and its address
+# read with io-util). They're inert for the default (hermetic) test run.
+tokio = { version = "1.52.1", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "process",
+  "io-util",
+  "time",
+] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
   "registry",
 ] }

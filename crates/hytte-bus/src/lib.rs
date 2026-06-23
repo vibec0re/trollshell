@@ -8,6 +8,7 @@
 mod call;
 mod connection;
 mod error;
+mod export;
 mod own;
 mod property;
 mod proxy;
@@ -16,6 +17,7 @@ mod signals;
 pub use call::{CallBuilder, RetryPolicy, call_with};
 pub use connection::BusKind;
 pub use error::BusError;
+pub use export::{ExportBuilder, ExportHandle, export_object_with};
 pub use own::{OwnNameBuilder, OwnNameSignal, OwnState, own_name_with};
 pub use property::{PropState, PropertyBuilder, PropertySignal, property_with};
 pub use proxy::{BusProxy, ProxyBuilder, ProxyState, proxy_with};
@@ -35,6 +37,18 @@ pub use connection::test_support;
 #[must_use]
 pub fn own_name(name: impl Into<String>) -> OwnNameBuilder {
     own::own_name_with(connection::session(), name)
+}
+
+/// Build an [`ExportBuilder`] against the **system** bus by default — exports a
+/// D-Bus interface at an object path *without* owning a well-known name. Use
+/// `.bus(BusKind::Session)` to switch.
+///
+/// For agents whose host daemon calls back on the registering connection's
+/// unique name (e.g. `NetworkManager`'s secret agent), this avoids needing a
+/// well-known name (and the system-bus policy that would require).
+#[must_use]
+pub fn export_object(path: impl Into<String>) -> ExportBuilder {
+    export::export_object_with(connection::system(), path)
 }
 
 /// Build a [`SignalsBuilder`] against the **system** bus by default. Use

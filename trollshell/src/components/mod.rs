@@ -13,3 +13,4 @@ pub mod history_row;
 pub mod layout;
 pub mod mpris_controls;
 pub mod power_profile;
+pub mod reactive_list;

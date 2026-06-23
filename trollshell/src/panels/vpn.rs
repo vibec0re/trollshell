@@ -25,6 +25,7 @@ use hytte::services::wifi;
 
 use crate::components::format::{fmt_bytes, humanize_since};
 use crate::components::layout::{finish_page, page_box};
+use crate::components::reactive_list::reactive_list;
 
 pub fn panel_vpn() -> gtk::Widget {
     let column = page_box();
@@ -121,21 +122,12 @@ fn build_vpn_profiles_group() -> adw::PreferencesGroup {
         |g, sub| g.set_description(Some(&sub)),
     );
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let group_for_bind = group.clone();
-    let rows_for_bind = rows_track.clone();
-    bind(wifi::vpn_profiles(), &group, move |_, profiles| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            group_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::with_capacity(profiles.len());
-        for profile in &profiles {
-            let row = build_vpn_profile_row(profile);
-            group_for_bind.add(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+    reactive_list(
+        &group,
+        wifi::vpn_profiles(),
+        |profile: &wifi::VpnProfile| build_vpn_profile_row(profile),
+        None::<fn() -> adw::ActionRow>,
+    );
 
     group
 }

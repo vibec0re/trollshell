@@ -5,15 +5,13 @@
 //! refresh tick as the Wi-Fi state). The whole card hides when there are no
 //! saved ethernet profiles — see the visibility bind in [`super::mod`].
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::wifi;
 
 use super::pill_label;
+use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_wired_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Wired").build();
@@ -31,21 +29,12 @@ pub(super) fn build_wired_group() -> adw::PreferencesGroup {
 
     // Drain-rebuild the profile rows on each update — same approach the Wi-Fi
     // network list uses (cheap: ethernet profiles are few and change rarely).
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let group_for_bind = group.clone();
-    let rows_for_bind = rows_track.clone();
-    bind(wifi::wired_profiles(), &group, move |_, profiles| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            group_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::with_capacity(profiles.len());
-        for profile in &profiles {
-            let row = build_wired_row(profile);
-            group_for_bind.add(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+    reactive_list(
+        &group,
+        wifi::wired_profiles(),
+        |profile: &wifi::WiredProfile| build_wired_row(profile),
+        None::<fn() -> adw::ActionRow>,
+    );
 
     group
 }

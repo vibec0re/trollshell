@@ -185,7 +185,11 @@ fn config_subdir(name: &str) -> std::io::Result<PathBuf> {
 /// verbatim — this is critical for `qt[56]ct.conf` which the user may have
 /// hand-edited or which may carry palette paths set by `qt[56]ct` itself.
 fn update_ini_keys(path: &Path, section: &str, kvs: &[(&str, &str)]) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let header = format!("[{section}]");
     let mut out = String::new();
     let mut in_target = false;
@@ -340,5 +344,35 @@ mod tests {
             out,
             "# my conf\n[Other]\nx=y\n\n[Settings]\ngtk-theme-name=Adwaita\n",
         );
+    }
+
+    #[test]
+    fn absent_file_treated_as_empty() {
+        // A path that does not exist should be treated as empty (NotFound is
+        // not an error — the file simply hasn't been created yet).
+        let path = std::env::temp_dir().join(format!(
+            "hytte-theme-ini-test-absent-{}.ini",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path); // ensure absent
+        update_ini_keys(&path, "Settings", &[("gtk-theme-name", "Adwaita")]).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(out, "[Settings]\ngtk-theme-name=Adwaita\n");
+    }
+
+    #[test]
+    fn unreadable_file_propagates_error() {
+        // A non-NotFound IO error (e.g. IsADirectory) must propagate rather
+        // than being silently swallowed as empty content.
+        let dir = std::env::temp_dir().join(format!(
+            "hytte-theme-ini-test-dir-{}.ini",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Passing a directory path triggers ErrorKind::IsADirectory on Linux.
+        let result = update_ini_keys(&dir, "Settings", &[("k", "v")]);
+        let _ = std::fs::remove_dir(&dir);
+        assert!(result.is_err(), "expected Err for unreadable path, got Ok");
     }
 }

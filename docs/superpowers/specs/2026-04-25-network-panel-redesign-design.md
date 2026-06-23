@@ -1,6 +1,14 @@
 # Network panel redesign — v0.2.2
 
-**Status:** design
+> **⚠️ SUPERSEDED (2026-06-23).** This spec predates the NetworkManager work and
+> targets `trollshell/src/widgets/pages.rs::page_network`, a file that no longer
+> exists — the network UI now lives under `trollshell/src/panels/network/`
+> (`mod.rs`, `connection.rs`, `wifi.rs`, `wired.rs`, `traffic.rs`). For current
+> intent see `2026-04-29-network-panel-and-vpn-design.md` and
+> `2026-04-29-network-panel-tightening-design.md`, plus the NM backend
+> (`networkd_nm.rs`, `wifi_nm.rs`, `wifi/nm_agent.rs`). Kept for history only.
+
+**Status:** superseded (was: design)
 **Date:** 2026-04-25
 **Author:** Claude (with annika)
 **Predecessors:** `2026-04-24-hytte-trollshell-design.md` (v0.1 architecture), `2026-04-25-trollshell-v0.2.1-polish-design.md`.

@@ -248,7 +248,7 @@
 }
 .ts-cpu-temp,
 .ts-gpu-temp {
-    font-size: 11px;
+    font-size: 0.846em;
     opacity: 0.85;
 }
 .ts-clock {
@@ -417,8 +417,8 @@
     padding: 0.308em;
 }
 .ts-weather-location {
-    font-size: 11px;
-    letter-spacing: 1.5px;
+    font-size: 0.846em;
+    letter-spacing: 0.115em;
     color: alpha(currentColor, 0.6);
     margin-bottom: 0.615em;
 }
@@ -429,7 +429,7 @@
     -gtk-icon-size: 2.154em;
 }
 .ts-weather-temp {
-    font-size: 32px;
+    font-size: 2.462em;
     font-weight: 300;
 }
 .ts-weather-condition {
@@ -439,12 +439,12 @@
     margin-top: 0.154em;
 }
 .ts-weather-minmax {
-    font-size: 12px;
+    font-size: 0.923em;
     color: alpha(currentColor, 0.7);
     margin-top: 0.154em;
 }
 .ts-weather-details {
-    font-size: 12px;
+    font-size: 0.923em;
 }
 .ts-weather-detail-label {
     color: alpha(currentColor, 0.55);
@@ -477,7 +477,7 @@
 }
 .ts-panel-title {
     font-weight: 600;
-    font-size: 13px;
+    font-size: 1em;
     color: @accent_color;
     margin-bottom: 0.462em;
 }
@@ -518,7 +518,7 @@
 }
 .ts-popup-headline {
     font-weight: 600;
-    font-size: 14px;
+    font-size: 1.077em;
 }
 
 /* ─── Notification toasts — use card background ─────────────────── */
@@ -541,15 +541,15 @@
 }
 .ts-toast-app {
     opacity: 0.65;
-    font-size: 11px;
+    font-size: 0.846em;
 }
 .ts-toast-summary {
     font-weight: 600;
-    font-size: 14px;
+    font-size: 1.077em;
 }
 .ts-toast-body {
     opacity: 0.85;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 .ts-toast-image {
     min-width: 3.692em;
@@ -562,7 +562,7 @@
 .ts-toast-action {
     padding: 0.154em 0.923em;
     border-radius: 0.615em;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 
 /* ─── Password prompt ───────────────────────────────────────────── */
@@ -580,11 +580,11 @@
 }
 .ts-prompt-title {
     font-weight: 600;
-    font-size: 15px;
+    font-size: 1.154em;
 }
 .ts-prompt-subtitle {
     opacity: 0.65;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 
 /* ─── Bluetooth / Wi-Fi rows ────────────────────────────────────── */
@@ -622,7 +622,7 @@
 }
 .ts-wifi-suffix {
     opacity: 0.55;
-    font-size: 11px;
+    font-size: 0.846em;
     margin-left: 0.615em;
 }
 
@@ -631,7 +631,7 @@
 .ts-notif-clear-btn {
     padding: 0.154em 0.769em;
     border-radius: 0.615em;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 .ts-notif-history {
     border: 1px solid @card_shade_color;
@@ -647,25 +647,25 @@
 }
 .ts-notif-row-app {
     color: @accent_color;
-    font-size: 11px;
+    font-size: 0.846em;
     font-weight: 600;
 }
 .ts-notif-row-time {
     opacity: 0.45;
-    font-size: 11px;
+    font-size: 0.846em;
 }
 .ts-notif-row-summary {
     font-weight: 600;
-    font-size: 13px;
+    font-size: 1em;
 }
 .ts-notif-row-body {
     opacity: 0.8;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 .ts-notif-empty {
     opacity: 0.55;
     padding: 1.231em;
-    font-size: 13px;
+    font-size: 1em;
 }
 
 /* ─── Audio mixer (pavucontrol-style) ───────────────────────────── */
@@ -712,14 +712,14 @@
 }
 .ts-media-title {
     font-weight: 700;
-    font-size: 15px;
+    font-size: 1.154em;
 }
 .ts-media-artist {
     opacity: 0.78;
 }
 .ts-media-album {
     opacity: 0.55;
-    font-size: 12px;
+    font-size: 0.923em;
 }
 
 /* Source switcher: a row of selectable chips, one per live MPRIS player
@@ -765,8 +765,8 @@
 .ts-cal-month-label {
     color: white;
     font-weight: 600;
-    font-size: 14px;
-    letter-spacing: 0.2px;
+    font-size: 1.077em;
+    letter-spacing: 0.015em;
 }
 .ts-cal-nav-btn {
     background: transparent;
@@ -788,9 +788,9 @@
 }
 .ts-cal-dayname {
     color: alpha(white, 0.4);
-    font-size: 10px;
+    font-size: 0.769em;
     font-weight: 600;
-    letter-spacing: 0.8px;
+    letter-spacing: 0.062em;
 }
 
 /* 6×7 day grid */
@@ -810,14 +810,14 @@
     border-radius: 1.385em;
     box-shadow: none;
     border: none;
-    font-size: 13px;
+    font-size: 1em;
 }
 .ts-cal-day:hover {
     background: alpha(white, 0.08);
     color: white;
 }
 .ts-cal-day-number {
-    font-size: 13px;
+    font-size: 1em;
     line-height: 1;
 }
 /* "Other month" days appear faded but stay clickable so users can jump
@@ -894,8 +894,8 @@
 /* "UPCOMING" header above the events list */
 .ts-sidebar-cal-header {
     color: alpha(white, 0.5);
-    font-size: 11px;
-    letter-spacing: 1.5px;
+    font-size: 0.846em;
+    letter-spacing: 0.115em;
     margin: 0.769em 0.308em 0.462em 0.308em;
 }
 
@@ -930,9 +930,9 @@
     padding-top: 0;
     padding-bottom: 0;
     padding-left: 12px;
-    font-size: 11px;
+    font-size: 0.846em;
     font-weight: 700;
-    letter-spacing: 1px;
+    letter-spacing: 0.077em;
     color: alpha(white, 0.55);
 }
 /* Event rows: tighter vertical rhythm so N=5 rows sit without wasted space. */
@@ -962,9 +962,9 @@
     padding-bottom: 0;
 }
 .ts-sidebar-cal-list .ts-cal-day-empty .title {
-    font-size: 11px;
+    font-size: 0.846em;
     font-weight: 700;
-    letter-spacing: 1px;
+    letter-spacing: 0.077em;
     color: alpha(white, 0.55);
     padding-top: 0.154em;
     padding-bottom: 0;
@@ -972,7 +972,7 @@
 .ts-sidebar-cal-list .ts-cal-day-empty .subtitle {
     color: alpha(white, 0.35);
     font-style: italic;
-    font-size: 11px;
+    font-size: 0.846em;
     padding-top: 0;
     padding-bottom: 0.154em;
 }

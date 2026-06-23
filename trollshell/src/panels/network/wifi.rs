@@ -41,12 +41,41 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_height(true);
     scrolled.set_max_content_height(240);
+    scrolled.set_hexpand(true);
     scrolled.add_css_class("ts-wifi-list");
     let networks_group = adw::PreferencesGroup::new();
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     scrolled.set_child(Some(&networks_group));
-    group.add(&scrolled);
+
+    // Fold the scan list into a dedicated collapsible expander so it no longer
+    // always fills the Wi-Fi card. The station/status info (header suffix +
+    // description) stays inline; only the scanned-network list lives here. The
+    // ScrolledWindow is a plain widget (not a GtkListBoxRow), so wrap it in a
+    // non-interactive ListBoxRow — otherwise libadwaita renders it BELOW the
+    // expander's boxed-list with no separators.
+    let networks_expander = adw::ExpanderRow::builder()
+        .title("Available networks")
+        .build();
+    let list_row = gtk::ListBoxRow::new();
+    list_row.set_activatable(false);
+    list_row.set_selectable(false);
+    list_row.set_hexpand(true);
+    list_row.set_child(Some(&scrolled));
+    networks_expander.add_row(&list_row);
+    group.add(&networks_expander);
+
+    // Subtitle tracks the scanned-network count, matching the sibling
+    // expanders (All links / DNS) in the Connection card.
+    bind(
+        wifi::networks().map(|nets| match nets.len() {
+            0 => "No networks".to_string(),
+            1 => "1 network".to_string(),
+            n => format!("{n} networks"),
+        }),
+        &networks_expander,
+        |w, sub| w.set_subtitle(&sub),
+    );
 
     // Power-off greying for the network list (Switch stays sensitive).
     bind(

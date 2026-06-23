@@ -79,7 +79,9 @@ impl Service for ResolvedService {
                     // useful.
                     if servers.is_empty() {
                         servers = parse_resolv_conf(
-                            &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
+                            &std::fs::read_to_string("/etc/resolv.conf")
+                                .inspect_err(|e| tracing::warn!(error = %e, "resolved: /etc/resolv.conf read failed; DNS list will be empty"))
+                                .unwrap_or_default(),
                         );
                         if !servers.is_empty() {
                             tracing::debug!(

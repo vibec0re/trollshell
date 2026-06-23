@@ -303,6 +303,7 @@ async fn read_networkd_links() -> Result<Vec<Link>> {
             .args(())
             .send()
             .await
+            .inspect_err(|e| tracing::warn!(error = ?e, link = %name, "networkd Describe failed; treating link as address-less"))
             .unwrap_or_default();
 
         // OperationalState is also in the Describe JSON, but older networkd
@@ -320,7 +321,9 @@ async fn read_networkd_links() -> Result<Vec<Link>> {
             .unwrap_or_default();
 
         // The `Describe` method returns a JSON blob; parse addresses & routes.
-        let parsed = parse_describe(&describe_json).unwrap_or_default();
+        let parsed = parse_describe(&describe_json)
+            .inspect_err(|e| tracing::warn!(error = ?e, link = %name, "networkd Describe JSON parse failed; treating link as address-less"))
+            .unwrap_or_default();
 
         out.push(Link {
             idx,

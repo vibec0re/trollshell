@@ -43,10 +43,35 @@ const NM_AGENT_MANAGER_IFACE: &str = "org.freedesktop.NetworkManager.AgentManage
 const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
 const NM_SETTINGS_IFACE: &str = "org.freedesktop.NetworkManager.Settings";
 const NM_SETTINGS_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
+const NM_ACTIVE_CONNECTION_IFACE: &str = "org.freedesktop.NetworkManager.Connection.Active";
 
 /// A connection settings dict: `a{sa{sv}}` — setting name → (key → value).
 /// This is exactly the shape `Settings.Connection.GetSettings()` returns.
 type ConnectionSettings = HashMap<String, HashMap<String, OwnedValue>>;
+
+/// A saved `NetworkManager` wired (ethernet) connection profile, surfaced to the
+/// network panel so it can be activated / deactivated / forgotten.
+///
+/// Built once per refresh tick by [`nm_wired_profiles`] from the
+/// `802-3-ethernet` saved connections, joined against NM's active connections
+/// (for [`WiredProfile::active`]) and the ethernet devices (for
+/// [`WiredProfile::device_path`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiredProfile {
+    /// Display name (the `connection.id` field of the saved profile).
+    pub name: String,
+    /// The saved-connection object path
+    /// (e.g. `/org/freedesktop/NetworkManager/Settings/3`). `forget` deletes
+    /// this; `activate` passes it to `ActivateConnection`.
+    pub connection_path: String,
+    /// The NM ethernet device this profile binds to, when one can be resolved
+    /// (by `connection.interface-name` match, or by the device whose active
+    /// connection references this profile). `activate`/`deactivate` need it.
+    pub device_path: Option<String>,
+    /// Whether this profile is currently active (an active connection references
+    /// its settings path).
+    pub active: bool,
+}
 
 /// Stable identifier for our secret agent. NM keys registered agents by this
 /// reverse-DNS string; reusing it across restarts lets NM replace a stale
@@ -80,6 +105,37 @@ fn saved_connection_ssid(settings: &ConnectionSettings) -> Option<String> {
         .and_then(|v| <Vec<u8>>::try_from(v).ok())?;
     let ssid = ssid_bytes_to_string(&bytes).trim().to_string();
     if ssid.is_empty() { None } else { Some(ssid) }
+}
+
+/// Read a string field from the `connection` setting sub-dict
+/// (e.g. `connection.id`, `connection.interface-name`).
+///
+/// Returns `None` if the `connection` setting or the key is absent, or the
+/// value isn't a string.
+fn connection_string_field(settings: &ConnectionSettings, key: &str) -> Option<String> {
+    settings
+        .get("connection")?
+        .get(key)
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| String::try_from(v).ok())
+}
+
+/// Extract the wired-profile display name from a saved connection's settings
+/// dict, or `None` if it isn't an ethernet (`802-3-ethernet`) profile.
+///
+/// A profile is wired iff it carries an `802-3-ethernet` setting. The display
+/// name is `connection.id`; if that's missing or blank we fall back to
+/// `"Wired connection"` so the row is never nameless. Wi-Fi / VPN / other
+/// profiles return `None` and are skipped by [`nm_wired_profiles`].
+fn wired_profile_name(settings: &ConnectionSettings) -> Option<String> {
+    if !settings.contains_key("802-3-ethernet") {
+        return None;
+    }
+    let name = connection_string_field(settings, "id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Wired connection".to_string());
+    Some(name)
 }
 
 /// Map an NM device state `u32` to a [`StationState`].
@@ -210,6 +266,207 @@ async fn get_all_access_points(device: &str) -> Result<Vec<OwnedObjectPath>, hyt
         .args(())
         .send::<Vec<OwnedObjectPath>>()
         .await
+}
+
+async fn get_active_connection_props(
+    active: &str,
+) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(active.to_string())
+        .iface(PROPS_IFACE)
+        .method("GetAll")
+        .args((NM_ACTIVE_CONNECTION_IFACE,))
+        .send::<HashMap<String, OwnedValue>>()
+        .await
+}
+
+// ── Wired (ethernet) enumeration ───────────────────────────────────────────────
+
+/// Read an object-path property out of a props dict, normalising NM's `"/"`
+/// (no-object) sentinel to `None`.
+fn prop_object_path(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    let path = props
+        .get(key)
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| OwnedObjectPath::try_from(v).ok())?;
+    let s = path.as_str();
+    if s == "/" { None } else { Some(s.to_string()) }
+}
+
+/// Collect the saved-connection settings paths of all *currently active*
+/// connections (manager `ActiveConnections` → each active connection's
+/// `Connection` property). Used to mark wired profiles active.
+///
+/// A failure on any single active connection is logged and skipped; a failure
+/// to read the manager's `ActiveConnections` yields an empty set (every profile
+/// reports inactive — the safe degraded state).
+async fn active_connection_settings_paths() -> std::collections::HashSet<String> {
+    let manager_props = match get_manager_props().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: manager GetAll (ActiveConnections) failed");
+            return std::collections::HashSet::new();
+        }
+    };
+    let actives: Vec<OwnedObjectPath> = manager_props
+        .get("ActiveConnections")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <Vec<OwnedObjectPath>>::try_from(v).ok())
+        .unwrap_or_default();
+
+    let mut paths = std::collections::HashSet::new();
+    for active in actives {
+        match get_active_connection_props(active.as_str()).await {
+            Ok(props) => {
+                if let Some(conn) = prop_object_path(&props, "Connection") {
+                    paths.insert(conn);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(path = active.as_str(), error = %e, "wifi_nm: active connection props read failed");
+            }
+        }
+    }
+    paths
+}
+
+/// One discovered NM ethernet device: its object path and the interface name
+/// (`Interface` property), used to bind saved profiles to a device.
+struct EthernetDevice {
+    path: String,
+    interface: String,
+    /// The settings path this device's active connection references, if any.
+    active_connection_settings: Option<String>,
+}
+
+/// Enumerate all NM ethernet devices (`DeviceType == 1`), reading each one's
+/// interface name and active-connection settings path. Returns an empty vec on
+/// `GetDevices` failure (every wired profile then reports no device — degraded
+/// but non-fatal).
+async fn find_ethernet_devices() -> Vec<EthernetDevice> {
+    let devices = match get_devices().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: GetDevices (ethernet) failed");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for dev in devices {
+        let dev_str = dev.as_str();
+        let props = match get_device_props(dev_str).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(path = dev_str, error = %e, "wifi_nm: ethernet device props read failed");
+                continue;
+            }
+        };
+        // DeviceType: 1 = Ethernet.
+        if property::<u32>(&props, "DeviceType") != Some(1) {
+            continue;
+        }
+        let interface = property::<String>(&props, "Interface").unwrap_or_default();
+        // The device's ActiveConnection points at an active-connection object,
+        // whose `Connection` property is the saved-settings path that's up.
+        let active_connection_settings = match prop_object_path(&props, "ActiveConnection") {
+            Some(active_path) => match get_active_connection_props(&active_path).await {
+                Ok(ac_props) => prop_object_path(&ac_props, "Connection"),
+                Err(e) => {
+                    tracing::debug!(path = %active_path, error = %e, "wifi_nm: ethernet ActiveConnection read failed");
+                    None
+                }
+            },
+            None => None,
+        };
+        out.push(EthernetDevice {
+            path: dev_str.to_string(),
+            interface,
+            active_connection_settings,
+        });
+    }
+    out
+}
+
+/// Choose the device path a wired profile binds to.
+///
+/// Preference order: (1) the device whose active connection already references
+/// this profile's settings path (so deactivate targets the right NIC even with
+/// no interface-name pin); (2) a device whose `Interface` matches the profile's
+/// `connection.interface-name`; (3) the sole ethernet device if there's exactly
+/// one (the common single-NIC case, where unpinned profiles are ambiguous but
+/// in practice apply to that one NIC); else `None`.
+fn device_for_wired_profile<'a>(
+    settings: &ConnectionSettings,
+    connection_path: &str,
+    devices: &'a [EthernetDevice],
+) -> Option<&'a EthernetDevice> {
+    if let Some(dev) = devices
+        .iter()
+        .find(|d| d.active_connection_settings.as_deref() == Some(connection_path))
+    {
+        return Some(dev);
+    }
+    if let Some(iface) = connection_string_field(settings, "interface-name") {
+        let iface = iface.trim();
+        if !iface.is_empty()
+            && let Some(dev) = devices.iter().find(|d| d.interface == iface)
+        {
+            return Some(dev);
+        }
+    }
+    if devices.len() == 1 {
+        return devices.first();
+    }
+    None
+}
+
+/// Build the list of saved wired (ethernet) profiles for the panel.
+///
+/// Enumerates `Settings.ListConnections`, keeps `802-3-ethernet` profiles,
+/// resolves each to a device (see [`device_for_wired_profile`]) and marks it
+/// active if its settings path is in the active-connection set. A failure on a
+/// single connection is logged and skipped; a `ListConnections` failure yields
+/// an empty list. Profiles are sorted by name for a stable display order.
+async fn nm_wired_profiles() -> Vec<WiredProfile> {
+    let connections = match list_connections().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "wifi_nm: Settings.ListConnections (wired) failed");
+            return Vec::new();
+        }
+    };
+
+    let devices = find_ethernet_devices().await;
+    let active_paths = active_connection_settings_paths().await;
+
+    let mut profiles = Vec::new();
+    for conn in connections {
+        let conn_str = conn.as_str();
+        let settings = match get_connection_settings(conn_str).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(path = conn_str, error = %e, "wifi_nm: GetSettings (wired) failed");
+                continue;
+            }
+        };
+        let Some(name) = wired_profile_name(&settings) else {
+            continue;
+        };
+        let device_path =
+            device_for_wired_profile(&settings, conn_str, &devices).map(|d| d.path.clone());
+        let active = active_paths.contains(conn_str);
+        profiles.push(WiredProfile {
+            name,
+            connection_path: conn_str.to_string(),
+            device_path,
+            active,
+        });
+    }
+
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    profiles
 }
 
 // ── Saved-connection enumeration ───────────────────────────────────────────────
@@ -391,11 +648,16 @@ async fn read_nm_networks(
 }
 
 /// Snapshot the full device state and push it to the mutables.
+///
+/// Also re-enumerates saved wired (ethernet) profiles into `wired` on the same
+/// tick (one extra `ListConnections`/`GetSettings` pass) so the network panel's
+/// "Wired" card stays in sync without a second NM watcher.
 async fn refresh_nm_state(
     device_path: &str,
     station: &Mutable<Option<Station>>,
     networks: &Mutable<Vec<WifiNetwork>>,
     adapter: &Mutable<Option<Adapter>>,
+    wired: &Mutable<Vec<WiredProfile>>,
 ) {
     // --- adapter (powered = WirelessEnabled on the manager) ---
     let manager_props = match get_manager_props().await {
@@ -474,6 +736,19 @@ async fn refresh_nm_state(
     }));
 
     networks.set(nets);
+
+    // --- saved wired (ethernet) profiles (same tick) ---
+    refresh_wired_profiles(wired).await;
+}
+
+/// Re-enumerate saved wired (ethernet) profiles and publish them, but only set
+/// the mutable when the list actually changed — so a per-tick refresh on an
+/// unchanged set doesn't churn the panel's bind (drain-rebuild) needlessly.
+async fn refresh_wired_profiles(wired: &Mutable<Vec<WiredProfile>>) {
+    let profiles = nm_wired_profiles().await;
+    if *wired.lock_ref() != profiles {
+        wired.set(profiles);
+    }
 }
 
 // ── Main watcher task ─────────────────────────────────────────────────────────
@@ -486,11 +761,16 @@ pub(crate) async fn run_nm_wifi_watcher(
     station: Mutable<Option<Station>>,
     networks: Mutable<Vec<WifiNetwork>>,
     adapter: Mutable<Option<Adapter>>,
+    wired: Mutable<Vec<WiredProfile>>,
     device_path_store: Arc<RwLock<String>>,
 ) {
     loop {
-        // Retry discovery every 5 s if NM isn't ready yet.
+        // Retry discovery every 5 s if NM isn't ready yet. Wired profiles are
+        // independent of the Wi-Fi device (a desktop may have ethernet but no
+        // radio), so keep them refreshed even while no Wi-Fi device exists —
+        // otherwise the "Wired" card would never populate on such machines.
         let Some(device_path) = find_wifi_device().await else {
+            refresh_wired_profiles(&wired).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             continue;
         };
@@ -499,7 +779,7 @@ pub(crate) async fn run_nm_wifi_watcher(
         *device_path_store.write().await = device_path.clone();
 
         // Initial full refresh.
-        refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
 
         // Subscribe to PropertiesChanged on the device and on the manager.
         let device_sub = hytte_bus::signals(NM_NAME)
@@ -552,16 +832,16 @@ pub(crate) async fn run_nm_wifi_watcher(
         loop {
             tokio::select! {
                 Some(_) = device_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
                 }
                 Some(_) = manager_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
                 }
                 Some(_) = ap_added_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
                 }
                 Some(_) = ap_removed_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter).await;
+                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired).await;
                 }
                 Some(evt) = device_removed_events.next() => {
                     // The DeviceRemoved signal body is a single object path `o`.
@@ -648,6 +928,52 @@ pub(crate) async fn nm_connect(
         .iface(NM_IFACE)
         .method("ActivateConnection")
         .args((connection_path, device_obj_path, ap_obj_path))
+        .send::<OwnedObjectPath>()
+        .await
+        .map(|_| ())
+}
+
+/// Parse a string into an owned D-Bus `ObjectPath`, mapping a bad path to a
+/// permanent [`hytte_bus::BusError`] (so callers `?`-propagate it).
+fn owned_object_path(
+    path: &str,
+    what: &str,
+) -> Result<zbus::zvariant::OwnedObjectPath, hytte_bus::BusError> {
+    Ok(zbus::zvariant::ObjectPath::try_from(path)
+        .map_err(|e| hytte_bus::BusError::Permanent {
+            reason: format!("invalid {what}: {e}"),
+            dbus_name: None,
+        })?
+        .to_owned()
+        .into())
+}
+
+/// Activate a saved connection profile on a specific device via
+/// `ActivateConnection(connection, device, specific_object="/")`.
+///
+/// Unlike [`nm_connect`] (which passes `"/"` for the connection so NM
+/// auto-selects), this passes the *real* saved-connection object path and a
+/// `"/"` specific-object — exactly the call needed to bring up a wired
+/// (ethernet) profile on its NIC. NM consults the secret agent only if the
+/// profile is missing stored secrets (ethernet profiles normally aren't).
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if either path is malformed or the D-Bus
+/// call fails (e.g. policy denies activation).
+pub(crate) async fn nm_activate_connection(
+    connection_path: &str,
+    device_path: &str,
+) -> Result<(), hytte_bus::BusError> {
+    let connection_obj_path = owned_object_path(connection_path, "connection path")?;
+    let device_obj_path = owned_object_path(device_path, "device path")?;
+    let specific_object = owned_object_path("/", "specific object")?;
+    hytte_bus::call(NM_NAME)
+        .bus(BusKind::System)
+        .at_path(NM_PATH)
+        .iface(NM_IFACE)
+        .method("ActivateConnection")
+        .args((connection_obj_path, device_obj_path, specific_object))
         .send::<OwnedObjectPath>()
         .await
         .map(|_| ())
@@ -789,9 +1115,10 @@ pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
     let station_m: Mutable<Option<Station>> = Mutable::new(None);
     let networks_m: Mutable<Vec<WifiNetwork>> = Mutable::new(Vec::new());
     let adapter_m: Mutable<Option<Adapter>> = Mutable::new(None);
+    let wired_m: Mutable<Vec<WiredProfile>> = Mutable::new(Vec::new());
 
     // Initial refresh.
-    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m).await;
+    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m, &wired_m).await;
 
     let powered = adapter_m.get_cloned().is_some_and(|a: Adapter| a.powered);
     let station_state = station_m
@@ -805,7 +1132,7 @@ pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
     // Refresh after the scan.
-    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m).await;
+    refresh_nm_state(&device_path, &station_m, &networks_m, &adapter_m, &wired_m).await;
 
     let network_count = networks_m.lock_ref().len();
 
@@ -1100,5 +1427,188 @@ mod tests {
             .expect("non-empty SSID yields a network");
         assert!(!net.known);
         assert_eq!(net.known_network_path, None);
+    }
+
+    // -- wired_profile_name ---------------------------------------------------
+    //
+    // Same `a{sa{sv}}` GetSettings shape, exercising the ethernet-profile
+    // recogniser the wired card relies on.
+
+    /// Build a minimal ethernet `connection`-settings dict.
+    fn ethernet_conn(id: Option<&str>, iface: Option<&str>) -> ConnectionSettings {
+        let mut conn: ConnectionSettings = HashMap::new();
+        let mut connection = vec![("type", val("802-3-ethernet".to_string()))];
+        if let Some(id) = id {
+            connection.push(("id", val(id.to_string())));
+        }
+        if let Some(iface) = iface {
+            connection.push(("interface-name", val(iface.to_string())));
+        }
+        conn.insert("connection".to_string(), setting(connection));
+        conn.insert("802-3-ethernet".to_string(), HashMap::new());
+        conn
+    }
+
+    #[test]
+    fn ethernet_name_from_connection_id() {
+        let conn = ethernet_conn(Some("Wired connection 1"), Some("enp3s0"));
+        assert_eq!(
+            wired_profile_name(&conn).as_deref(),
+            Some("Wired connection 1"),
+        );
+    }
+
+    #[test]
+    fn ethernet_name_trims_whitespace() {
+        let conn = ethernet_conn(Some("  Office LAN  "), None);
+        assert_eq!(wired_profile_name(&conn).as_deref(), Some("Office LAN"));
+    }
+
+    #[test]
+    fn ethernet_name_falls_back_when_id_missing() {
+        let conn = ethernet_conn(None, Some("enp3s0"));
+        assert_eq!(
+            wired_profile_name(&conn).as_deref(),
+            Some("Wired connection")
+        );
+    }
+
+    #[test]
+    fn ethernet_name_falls_back_when_id_blank() {
+        let conn = ethernet_conn(Some("   "), None);
+        assert_eq!(
+            wired_profile_name(&conn).as_deref(),
+            Some("Wired connection")
+        );
+    }
+
+    #[test]
+    fn none_for_wifi_connection() {
+        // A Wi-Fi profile (no `802-3-ethernet` setting) is not a wired profile.
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "connection".to_string(),
+            setting(vec![
+                ("id", val("FRITZ!Box")),
+                ("type", val("802-11-wireless")),
+            ]),
+        );
+        conn.insert(
+            "802-11-wireless".to_string(),
+            setting(vec![("ssid", val(b"FRITZ!Box".to_vec()))]),
+        );
+        assert_eq!(wired_profile_name(&conn), None);
+    }
+
+    #[test]
+    fn none_for_vpn_connection() {
+        // A VPN profile (no `802-3-ethernet` setting) is not a wired profile.
+        let mut conn: ConnectionSettings = HashMap::new();
+        conn.insert(
+            "connection".to_string(),
+            setting(vec![("id", val("Work VPN")), ("type", val("vpn"))]),
+        );
+        conn.insert("vpn".to_string(), HashMap::new());
+        assert_eq!(wired_profile_name(&conn), None);
+    }
+
+    // -- connection_string_field ----------------------------------------------
+
+    #[test]
+    fn interface_name_read_from_connection_setting() {
+        let conn = ethernet_conn(Some("LAN"), Some("enp3s0"));
+        assert_eq!(
+            connection_string_field(&conn, "interface-name").as_deref(),
+            Some("enp3s0"),
+        );
+    }
+
+    #[test]
+    fn connection_field_none_when_absent() {
+        let conn = ethernet_conn(Some("LAN"), None);
+        assert_eq!(connection_string_field(&conn, "interface-name"), None);
+    }
+
+    // -- device_for_wired_profile ---------------------------------------------
+
+    fn eth_device(path: &str, iface: &str, active_for: Option<&str>) -> EthernetDevice {
+        EthernetDevice {
+            path: path.to_string(),
+            interface: iface.to_string(),
+            active_connection_settings: active_for.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn device_match_prefers_active_connection() {
+        // The device already running this profile wins, even if another device's
+        // interface name would also match.
+        let conn = ethernet_conn(Some("LAN"), Some("enp3s0"));
+        let devices = vec![
+            eth_device("/dev/0", "enp3s0", None),
+            eth_device("/dev/1", "enp4s0", Some("/settings/7")),
+        ];
+        let dev = device_for_wired_profile(&conn, "/settings/7", &devices)
+            .expect("active-connection match");
+        assert_eq!(dev.path, "/dev/1");
+    }
+
+    #[test]
+    fn device_match_by_interface_name() {
+        let conn = ethernet_conn(Some("LAN"), Some("enp4s0"));
+        let devices = vec![
+            eth_device("/dev/0", "enp3s0", None),
+            eth_device("/dev/1", "enp4s0", None),
+        ];
+        let dev =
+            device_for_wired_profile(&conn, "/settings/7", &devices).expect("interface-name match");
+        assert_eq!(dev.path, "/dev/1");
+    }
+
+    #[test]
+    fn device_match_falls_back_to_sole_device() {
+        // Unpinned profile (no interface-name) on a single-NIC machine binds to
+        // that one ethernet device.
+        let conn = ethernet_conn(Some("LAN"), None);
+        let devices = vec![eth_device("/dev/0", "enp3s0", None)];
+        let dev =
+            device_for_wired_profile(&conn, "/settings/7", &devices).expect("sole-device fallback");
+        assert_eq!(dev.path, "/dev/0");
+    }
+
+    #[test]
+    fn device_match_none_when_ambiguous() {
+        // Unpinned profile with multiple NICs and no active match → ambiguous.
+        let conn = ethernet_conn(Some("LAN"), None);
+        let devices = vec![
+            eth_device("/dev/0", "enp3s0", None),
+            eth_device("/dev/1", "enp4s0", None),
+        ];
+        assert!(device_for_wired_profile(&conn, "/settings/7", &devices).is_none());
+    }
+
+    // -- prop_object_path -----------------------------------------------------
+
+    #[test]
+    fn object_path_slash_sentinel_is_none() {
+        let mut props = HashMap::new();
+        props.insert(
+            "Connection".to_string(),
+            val(OwnedObjectPath::try_from("/").expect("valid path")),
+        );
+        assert_eq!(prop_object_path(&props, "Connection"), None);
+    }
+
+    #[test]
+    fn object_path_real_path_read() {
+        let mut props = HashMap::new();
+        props.insert(
+            "Connection".to_string(),
+            val(OwnedObjectPath::try_from("/org/fd/NM/Settings/3").expect("valid path")),
+        );
+        assert_eq!(
+            prop_object_path(&props, "Connection").as_deref(),
+            Some("/org/fd/NM/Settings/3"),
+        );
     }
 }

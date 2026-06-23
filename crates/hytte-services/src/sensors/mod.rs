@@ -391,7 +391,6 @@ struct PollWriters {
     mount_list: Mutable<Vec<MountSpec>>,
 }
 
-#[allow(clippy::too_many_lines)]
 async fn poll_loop(w: PollWriters) {
     let cpu_writer = w.cpu;
     let mem_writer = w.mem;
@@ -495,85 +494,117 @@ async fn poll_loop(w: PollWriters) {
             state.gpu_cache = cache;
         }
 
-        // ── CPU ───────────────────────────────────────────────────────────────
-        match data.cpu_stat {
-            Some(cpu_now) => {
-                let load = compute_cpu_load(&state.cpu_prev, &cpu_now);
-                state.cpu_prev = cpu_now;
-                cpu_writer.set(load);
-            }
-            None => {
-                tracing::warn!("sensors: failed to read /proc/stat");
-            }
-        }
-
-        // ── Memory ────────────────────────────────────────────────────────────
-        match data.mem {
-            Some(mem) => {
-                mem_writer.set(mem);
-            }
-            None => {
-                tracing::warn!("sensors: failed to read /proc/meminfo");
-            }
-        }
-
-        // ── Network ───────────────────────────────────────────────────────────
-        match data.net_dev {
-            Some(net_now) => {
-                let mut interfaces = Vec::new();
-                let mut next_net_prev = HashMap::new();
-
-                for (name, rx, tx) in net_now {
-                    let (rx_rate, tx_rate) = match state.net_prev.get(&name) {
-                        Some((prev_rx, prev_tx, prev_when)) => {
-                            let dt = now.duration_since(*prev_when).as_secs_f64().max(0.1);
-                            let rx_r = u64_to_f64_bytes(rx.saturating_sub(*prev_rx)) / dt;
-                            let tx_r = u64_to_f64_bytes(tx.saturating_sub(*prev_tx)) / dt;
-                            (rx_r, tx_r)
-                        }
-                        None => (0.0, 0.0),
-                    };
-                    interfaces.push(NetInterface {
-                        name: name.clone(),
-                        rx_bytes_total: rx,
-                        tx_bytes_total: tx,
-                        rx_rate_bps: rx_rate,
-                        tx_rate_bps: tx_rate,
-                    });
-                    next_net_prev.insert(name, (rx, tx, now));
-                }
-
-                state.net_prev = next_net_prev;
-                net_writer.set(NetIo { interfaces });
-            }
-            None => {
-                tracing::warn!("sensors: failed to read /proc/net/dev");
-            }
-        }
-
-        // ── CPU temp (every tick; chip dir resolved once via cache) ───────
-        cpu_temp_writer.set(data.cpu_temp);
-
-        // ── GPU (every 2 ticks) ───────────────────────────────────────────
-        if data.gpu_tick {
-            gpu_writer.set(data.gpu_state);
-        }
-
-        // ── Disk (every 5 ticks) ──────────────────────────────────────────
-        if let Some(disk) = data.disk {
-            disk_writer.set(disk);
-        }
-
-        // ── TCP socket counts (every 2 ticks) ─────────────────────────────
-        if let Some(nc) = data.net_conn {
-            net_conn_writer.set(nc);
-        }
-
-        // ── Process count (every tick) ────────────────────────────────────
+        apply_cpu_load(&mut state.cpu_prev, data.cpu_stat, &cpu_writer);
+        apply_memory(data.mem, &mem_writer);
+        apply_network(&mut state.net_prev, data.net_dev, now, &net_writer);
+        apply_cpu_temp(data.cpu_temp, &cpu_temp_writer);
+        apply_gpu(data.gpu_tick, data.gpu_state, &gpu_writer);
+        apply_disk(data.disk, &disk_writer);
+        apply_conn_counts(data.net_conn, &net_conn_writer);
         proc_count_writer.set(data.proc_count);
 
         state.tick = state.tick.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+// ── Per-concern publish helpers ───────────────────────────────────────────────
+
+/// Compute and publish CPU load; update the rolling `cpu_prev` cache.
+fn apply_cpu_load(
+    cpu_prev: &mut Vec<(u64, u64)>,
+    cpu_stat: Option<Vec<(u64, u64)>>,
+    writer: &Mutable<CpuLoad>,
+) {
+    match cpu_stat {
+        Some(cpu_now) => {
+            let load = compute_cpu_load(cpu_prev, &cpu_now);
+            *cpu_prev = cpu_now;
+            writer.set(load);
+        }
+        None => {
+            tracing::warn!("sensors: failed to read /proc/stat");
+        }
+    }
+}
+
+/// Publish memory usage, or warn on read failure.
+fn apply_memory(mem: Option<Memory>, writer: &Mutable<Memory>) {
+    match mem {
+        Some(mem) => {
+            writer.set(mem);
+        }
+        None => {
+            tracing::warn!("sensors: failed to read /proc/meminfo");
+        }
+    }
+}
+
+/// Compute per-interface byte rates from the new `/proc/net/dev` snapshot,
+/// update the rolling `net_prev` cache, and publish the `NetIo` snapshot.
+fn apply_network(
+    net_prev: &mut HashMap<String, (u64, u64, Instant)>,
+    net_dev: Option<Vec<(String, u64, u64)>>,
+    now: Instant,
+    writer: &Mutable<NetIo>,
+) {
+    match net_dev {
+        Some(net_now) => {
+            let mut interfaces = Vec::new();
+            let mut next_net_prev = HashMap::new();
+
+            for (name, rx, tx) in net_now {
+                let (rx_rate, tx_rate) = match net_prev.get(&name) {
+                    Some((prev_rx, prev_tx, prev_when)) => {
+                        let dt = now.duration_since(*prev_when).as_secs_f64().max(0.1);
+                        let rx_r = u64_to_f64_bytes(rx.saturating_sub(*prev_rx)) / dt;
+                        let tx_r = u64_to_f64_bytes(tx.saturating_sub(*prev_tx)) / dt;
+                        (rx_r, tx_r)
+                    }
+                    None => (0.0, 0.0),
+                };
+                interfaces.push(NetInterface {
+                    name: name.clone(),
+                    rx_bytes_total: rx,
+                    tx_bytes_total: tx,
+                    rx_rate_bps: rx_rate,
+                    tx_rate_bps: tx_rate,
+                });
+                next_net_prev.insert(name, (rx, tx, now));
+            }
+
+            *net_prev = next_net_prev;
+            writer.set(NetIo { interfaces });
+        }
+        None => {
+            tracing::warn!("sensors: failed to read /proc/net/dev");
+        }
+    }
+}
+
+/// Publish the CPU package temperature (every tick).
+fn apply_cpu_temp(cpu_temp: CpuTemp, writer: &Mutable<CpuTemp>) {
+    writer.set(cpu_temp);
+}
+
+/// Publish the GPU state snapshot (only on GPU ticks).
+fn apply_gpu(gpu_tick: bool, gpu_state: Option<GpuState>, writer: &Mutable<Option<GpuState>>) {
+    if gpu_tick {
+        writer.set(gpu_state);
+    }
+}
+
+/// Publish disk usage (only on disk ticks).
+fn apply_disk(disk: Option<DiskUsage>, writer: &Mutable<DiskUsage>) {
+    if let Some(disk) = disk {
+        writer.set(disk);
+    }
+}
+
+/// Publish TCP socket-state counts (only on net-conn ticks).
+fn apply_conn_counts(net_conn: Option<NetConnections>, writer: &Mutable<NetConnections>) {
+    if let Some(nc) = net_conn {
+        writer.set(nc);
     }
 }
 

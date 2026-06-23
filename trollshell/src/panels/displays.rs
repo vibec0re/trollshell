@@ -16,17 +16,16 @@ use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, glib};
-use hytte::prelude::*;
 use hytte::services::displays::{self, Output};
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::reactive_list::reactive_list;
 
 pub fn panel_displays() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
 
     let group = adw::PreferencesGroup::builder().title("Displays").build();
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     // In-flight set_output_enabled calls. The displays service polls niri
     // every 2 s; if niri's ack lags the next poll, the rebuilt row would
     // briefly flip the Switch back to the stale state. While a name is in
@@ -37,36 +36,20 @@ pub fn panel_displays() -> gtk::Widget {
 
     column.append(&group);
 
-    let group_for_bind = group.clone();
-    let rows_track_for_bind = rows_track.clone();
-    let pending_for_bind = pending.clone();
-    bind(displays::outputs(), &group, move |_, list| {
-        // PreferencesGroup has no row-traversal API, so we track the rows
-        // we've added and remove them explicitly before each rebuild.
-        for row in rows_track_for_bind.borrow_mut().drain(..) {
-            group_for_bind.remove(&row);
-        }
-        if list.is_empty() {
-            // Show a single placeholder row when niri reports nothing yet
-            // — typically the first poll hasn't completed, or niri's IPC
-            // socket isn't reachable.
-            let placeholder = adw::ActionRow::builder()
+    reactive_list(
+        &group,
+        displays::outputs(),
+        move |output: &Output| build_display_row(output, &pending),
+        // Show a single placeholder row when niri reports nothing yet — typically
+        // the first poll hasn't completed, or niri's IPC socket isn't reachable.
+        Some(|| {
+            adw::ActionRow::builder()
                 .title("No displays detected")
                 .subtitle("Waiting for niri\u{2026}")
                 .activatable(false)
-                .build();
-            group_for_bind.add(&placeholder);
-            rows_track_for_bind.borrow_mut().push(placeholder);
-            return;
-        }
-        let mut new_rows = Vec::with_capacity(list.len());
-        for output in &list {
-            let row = build_display_row(output, &pending_for_bind);
-            group_for_bind.add(&row);
-            new_rows.push(row);
-        }
-        *rows_track_for_bind.borrow_mut() = new_rows;
-    });
+                .build()
+        }),
+    );
 
     finish_page(&column)
 }

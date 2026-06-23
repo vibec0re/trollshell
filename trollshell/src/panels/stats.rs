@@ -18,6 +18,7 @@ use crate::components::cast;
 use crate::components::format::fmt_bytes;
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
+use crate::components::reactive_list::reactive_list;
 
 pub fn panel_stats() -> gtk::Widget {
     let column = page_box();
@@ -540,15 +541,10 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
         |r, t| r.set_subtitle(&t),
     );
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let expander_for_bind = expander.clone();
-    let rows_for_bind = rows_track.clone();
-    bind(sensors::disk(), &expander, move |_, d| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            expander_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::with_capacity(d.mounts.len());
-        for m in &d.mounts {
+    reactive_list(
+        &expander,
+        sensors::disk().map(|d| d.mounts),
+        |m: &sensors::DiskMount| {
             let row = adw::ActionRow::builder()
                 .title(&m.path)
                 .activatable(false)
@@ -571,11 +567,10 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
             bar.set_valign(gtk::Align::Center);
             bar.set_fraction(frac.clamp(0.0, 1.0));
             row.add_suffix(&bar);
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+            row
+        },
+        None::<fn() -> adw::ActionRow>,
+    );
 
     expander
 }
@@ -706,15 +701,10 @@ fn build_failed_units_expander() -> adw::ExpanderRow {
         |r, t| r.set_subtitle(&t),
     );
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let expander_for_bind = expander.clone();
-    let rows_for_bind = rows_track.clone();
-    bind(systemd::failed_units(), &expander, move |_, units| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            expander_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::with_capacity(units.len());
-        for unit in &units {
+    reactive_list(
+        &expander,
+        systemd::failed_units(),
+        |unit: &systemd::FailedUnit| {
             let row = adw::ActionRow::builder()
                 .title(&unit.name)
                 .activatable(false)
@@ -731,11 +721,10 @@ fn build_failed_units_expander() -> adw::ExpanderRow {
             pill.add_css_class("ts-pill-error");
             row.add_suffix(&pill);
 
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+            row
+        },
+        None::<fn() -> adw::ActionRow>,
+    );
 
     expander
 }

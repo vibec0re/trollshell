@@ -1,8 +1,5 @@
 //! Live column bottom: Wi-Fi adapter, scan controls, and network list.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self};
@@ -10,6 +7,7 @@ use hytte::prelude::*;
 use hytte::services::wifi;
 
 use super::pill_label;
+use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Wi-Fi").build();
@@ -44,8 +42,6 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     scrolled.set_hexpand(true);
     scrolled.add_css_class("ts-wifi-list");
     let networks_group = adw::PreferencesGroup::new();
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
     scrolled.set_child(Some(&networks_group));
 
     // Fold the scan list into a dedicated collapsible expander so it no longer
@@ -84,34 +80,18 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
         gtk::prelude::WidgetExt::set_sensitive,
     );
 
-    let group_for_bind = networks_group.clone();
-    let rows_for_bind = rows_track.clone();
-    let placeholder_for_bind = placeholder_track.clone();
-    bind(wifi::networks(), &networks_group, move |_, nets| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            group_for_bind.remove(&row);
-        }
-        if let Some(p) = placeholder_for_bind.borrow_mut().take() {
-            group_for_bind.remove(&p);
-        }
-        if nets.is_empty() {
-            let placeholder = adw::ActionRow::builder()
+    reactive_list(
+        &networks_group,
+        wifi::networks(),
+        |net: &wifi::WifiNetwork| build_network_row(net),
+        Some(|| {
+            adw::ActionRow::builder()
                 .title("No networks found")
                 .subtitle("Tap Scan to refresh")
                 .activatable(false)
-                .build();
-            group_for_bind.add(&placeholder);
-            *placeholder_for_bind.borrow_mut() = Some(placeholder);
-        } else {
-            let mut new_rows = Vec::with_capacity(nets.len());
-            for net in &nets {
-                let row = build_network_row(net);
-                group_for_bind.add(&row);
-                new_rows.push(row);
-            }
-            *rows_for_bind.borrow_mut() = new_rows;
-        }
-    });
+                .build()
+        }),
+    );
 
     group
 }

@@ -11,6 +11,7 @@ use hytte::services::networkd::{self, Link, OperationalState};
 use hytte::services::resolved;
 
 use super::pill_label;
+use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_connection_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Connection").build();
@@ -417,26 +418,20 @@ fn build_dns_expander() -> adw::ExpanderRow {
         |w, sub| w.set_subtitle(&sub),
     );
 
-    let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let expander_for_bind = expander.clone();
-    let rows_for_bind = rows_track.clone();
-    bind(resolved::dns(), &expander, move |_, state| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
-            expander_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::new();
-        for ip in &state.servers {
+    reactive_list(
+        &expander,
+        resolved::dns().map(|state| state.servers),
+        |ip: &std::net::IpAddr| {
             let row = adw::ActionRow::builder()
                 .title(ip.to_string())
                 .activatable(false)
                 .build();
             row.set_title_lines(1);
             row.add_css_class("ts-mono");
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+            row
+        },
+        None::<fn() -> adw::ActionRow>,
+    );
 
     expander
 }

@@ -9,7 +9,7 @@ A Rust workspace with two layers:
 - **`hytte`** — a library-first toolkit for composing GTK4 + libadwaita + `gtk4-layer-shell` Wayland desktop shells. Split across `crates/hytte-*`.
 - **`trollshell`** — the personal shell binary built on `hytte`, targeting the **Niri** compositor.
 
-"Composable, not configurable": there is no config DSL. The shell is wired up in plain Rust in `trollshell/src/main.rs`. The canonical design is `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md`; every subsequent feature has a paired `docs/superpowers/specs/<date>-<feature>-design.md` (the why) and `docs/superpowers/plans/<date>-<feature>.md` (the how). Consult these before changing a subsystem — they are the source of truth for intent.
+"Composable, not configurable": there is no config DSL. The shell is wired up in plain Rust in `trollshell/src/main.rs`. The canonical design is `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md`; most subsequent features have a design spec under `docs/superpowers/specs/` (the why) and a plan under `docs/superpowers/plans/` (the how), named by feature or version — the literal same-stem `<date>-<feature>` pairing doesn't hold for all of them. Consult these before changing a subsystem — they are the source of truth for intent.
 
 ## Build / run / test
 
@@ -108,7 +108,7 @@ pub fn do_thing(arg: …) { … }                                 // fire-and-fo
 
 ### system-daemon-as-state-store
 
-Services are **thin async clients to persistent system daemons** (systemd-networkd, BlueZ, PipeWire, UPower, logind, niri-ipc, iwd, evolution-data-server, …). Persistent state lives in the daemon, not in `hytte`, so restarting `trollshell` during dev reconnects **without losing system state**. This is a core design constraint — keep new state in the daemon where possible.
+Services are **thin async clients to persistent system daemons** (systemd-networkd, NetworkManager, BlueZ, PipeWire, UPower, logind, niri-ipc, iwd, evolution-data-server, …). Persistent state lives in the daemon, not in `hytte`, so restarting `trollshell` during dev reconnects **without losing system state**. This is a core design constraint — keep new state in the daemon where possible. The network stack sources from **both** networkd (link/route state, `networkd.rs`) and NetworkManager (`networkd_nm.rs`, `wifi_nm.rs`), with an NM secret agent (`wifi/nm_agent.rs`) answering Wi-Fi/VPN `GetSecrets`.
 
 **Exception:** `notifications` registers itself as the `org.freedesktop.Notifications` daemon (a session singleton), so any other notification daemon (mako/dunst) must be disabled.
 
@@ -135,7 +135,7 @@ All D-Bus goes through here, never raw zbus. Connections are pooled singletons (
 
 ## The `trollshell` binary
 
-`main.rs` builds the `App`, registers ~28 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
+`main.rs` builds the `App`, registers ~31 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
 
 Source layout (each module has a consistent shape — match it when adding):
 
@@ -149,7 +149,7 @@ Source layout (each module has a consistent shape — match it when adding):
 ### Conventions
 
 - CSS classes: `hytte-*` come from the library default stylesheet (`assets/hytte-ui/style.css`); `ts-*` come from the binary's `assets/trollshell/style.css` (loaded as user style at higher priority).
-- App ID `cc.hannig.trollshell`; D-Bus agent names `cc.hannig.trollshell.{bluez,iwd}-agent` (polkit is now a standalone external agent, not in-process).
+- App ID `cc.hannig.trollshell`; D-Bus agent names `cc.hannig.trollshell.{bluez,iwd}-agent` (polkit is now a standalone external agent, not in-process). The NetworkManager secret agent (`wifi/nm_agent.rs`) registers with NM's `AgentManager` (no extra bus-name; `RegisterWithCapabilities`) rather than owning a `cc.hannig.*` name.
 - Logging via `tracing`.
 
 ## Deployment & session integration

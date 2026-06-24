@@ -36,19 +36,22 @@ layer-rule {
 layer-rule {
     match namespace="hytte-sidebar"
     // Flush left panel; the frame overlay paints the rounded inner corner.
+    // xray false: it's an overlay over the window stack, so frost the real
+    // content behind it — not just the wallpaper.
     geometry-corner-radius 0
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }
 
 layer-rule {
     match namespace="hytte-modal"
     // Slide-out drawer card. Tune to match the drawer's drawn corner radius.
+    // xray false: same overlay reasoning as the sidebar.
     geometry-corner-radius 14
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }

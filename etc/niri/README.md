@@ -216,9 +216,11 @@ won't frost until their card backgrounds gain an alpha — a follow-up.
 
 - **Frost strength:** the `@shell_background` alpha in `style.css` (lower =
   more wallpaper shows through, less readable; higher = subtler frost).
-- **`xray true`:** blurs the wallpaper only (cheap, static). Drop it on the
-  `hytte-sidebar` / `hytte-modal` rules for a pricier blur that frosts the
-  *window* sitting behind them, not just the wallpaper.
+- **`xray`:** `xray true` (the bar) blurs the wallpaper only — cheap and
+  static, right for a surface that only has wallpaper behind it. The overlay
+  surfaces (`hytte-sidebar` / `hytte-modal`) ship with `xray false` so the
+  blur frosts the *window* sitting behind them too; flip them to `xray true`
+  for the cheaper wallpaper-only blur.
 - **`geometry-corner-radius`:** rounds the blur clip. `0` for the flush
   bar/sidebar; bump the `hytte-modal` value to match the drawer's drawn
   corner radius if it shows a square halo.

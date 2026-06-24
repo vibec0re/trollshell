@@ -22,8 +22,14 @@
  * slide-out drawer, and sidebar.  One variable keeps them visually unified.
  * Always dark regardless of the system theme (the bar is always dark).
  * Note: frame.rs hardcodes this value as a cairo flat fill (cairo can't
- * read CSS vars) — update frame.rs too whenever this changes. */
-@define-color shell_background rgb(25, 15, 45);
+ * read CSS vars) — update frame.rs too whenever this changes COLOR.
+ *
+ * The alpha below is deliberately NOT mirrored into frame.rs: the chrome
+ * surfaces backed by this colour (bar, sidebar, drawer) are translucent so
+ * niri's layer-rule blur can frost the wallpaper behind them (see
+ * etc/niri/blur.kdl), while the frame border stays fully opaque. Set the
+ * alpha back to 1.0 (or use a plain rgb()) to disable the frosted look. */
+@define-color shell_background rgba(25, 15, 45, 0.65);
 
 * {
     font-family: "Cantarell", system-ui, sans-serif;

@@ -191,7 +191,7 @@ needs **niri ≥ 26.04** (the `ext-background-effect` protocol / `layer-rule`
 
 1. **Translucency (already in the shell):** `@shell_background` in
    `assets/trollshell/style.css` carries an alpha < 1
-   (`rgba(25, 15, 45, 0.65)`). Blur is only visible *through* a translucent
+   (`rgba(25, 15, 45, 0.65)`). Blur is only visible _through_ a translucent
    surface — set the alpha back to `1.0` to turn the frost off entirely.
 2. **The blur rules:** `etc/niri/blur.kdl` holds the `layer-rule { }` blocks
    that tell niri to blur trollshell's surfaces, matched by their
@@ -219,7 +219,7 @@ won't frost until their card backgrounds gain an alpha — a follow-up.
 - **`xray`:** `xray true` (the bar) blurs the wallpaper only — cheap and
   static, right for a surface that only has wallpaper behind it. The overlay
   surfaces (`hytte-sidebar` / `hytte-modal`) ship with `xray false` so the
-  blur frosts the *window* sitting behind them too; flip them to `xray true`
+  blur frosts the _window_ sitting behind them too; flip them to `xray true`
   for the cheaper wallpaper-only blur.
 - **`geometry-corner-radius`:** rounds the blur clip. `0` for the flush
   bar/sidebar; bump the `hytte-modal` value to match the drawer's drawn

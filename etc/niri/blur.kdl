@@ -19,9 +19,11 @@
 //   hytte-frame         -> fullscreen click-through frame overlay
 //   hytte-popup-catcher -> invisible fullscreen dismiss catcher
 //
-// `xray true` blurs the wallpaper only (cheap, computed once). Remove it for
-// a pricier blur that also frosts windows sitting behind the surface — nicer
-// for the drawer/sidebar when they overlap a window, heavier on the GPU.
+// `xray true` blurs the wallpaper only (cheap, computed once) — used on ALL
+// these surfaces so the bar/sidebar/drawer share one consistent dark frost.
+// (Frosting the bright window behind an overlay, via `xray false`, makes it
+// read brighter and off-colour next to the bar.) Drop `xray true` on a rule
+// for a pricier blur that frosts the actual window behind that surface.
 
 layer-rule {
     match namespace="hytte-bar"
@@ -36,22 +38,23 @@ layer-rule {
 layer-rule {
     match namespace="hytte-sidebar"
     // Flush left panel; the frame overlay paints the rounded inner corner.
-    // xray false: it's an overlay over the window stack, so frost the real
-    // content behind it — not just the wallpaper.
+    // xray true to match the bar: frost the wallpaper (not the bright window
+    // behind it) so the sidebar reads as a consistent dark extension of the
+    // bar rather than a brighter, differently-tinted panel.
     geometry-corner-radius 0
     background-effect {
         blur true
-        xray false
+        xray true
     }
 }
 
 layer-rule {
     match namespace="hytte-modal"
     // Slide-out drawer card. Tune to match the drawer's drawn corner radius.
-    // xray false: same overlay reasoning as the sidebar.
+    // xray true: match the bar/sidebar for one consistent dark frost.
     geometry-corner-radius 14
     background-effect {
         blur true
-        xray false
+        xray true
     }
 }

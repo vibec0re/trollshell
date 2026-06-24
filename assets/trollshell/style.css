@@ -29,7 +29,7 @@
  * niri's layer-rule blur can frost the wallpaper behind them (see
  * etc/niri/blur.kdl), while the frame border stays fully opaque. Set the
  * alpha back to 1.0 (or use a plain rgb()) to disable the frosted look. */
-@define-color shell_background rgba(25, 15, 45, 0.65);
+@define-color shell_background rgba(25, 15, 45, 0.85);
 
 * {
     font-family: "Cantarell", system-ui, sans-serif;

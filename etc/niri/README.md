@@ -191,8 +191,10 @@ needs **niri ≥ 26.04** (the `ext-background-effect` protocol / `layer-rule`
 
 1. **Translucency (already in the shell):** `@shell_background` in
    `assets/trollshell/style.css` carries an alpha < 1
-   (`rgba(25, 15, 45, 0.65)`). Blur is only visible _through_ a translucent
-   surface — set the alpha back to `1.0` to turn the frost off entirely.
+   (`rgba(25, 15, 45, 0.85)` — mostly opaque, so the frost reads as a subtle
+   dark vibrancy rather than a washed-out panel). Blur is only visible
+   _through_ a translucent surface — set the alpha back to `1.0` to turn the
+   frost off entirely, or lower it for a stronger (lighter) frost.
 2. **The blur rules:** `etc/niri/blur.kdl` holds the `layer-rule { }` blocks
    that tell niri to blur trollshell's surfaces, matched by their
    layer-shell namespace (`hytte-bar*`, `hytte-sidebar*`, `hytte-modal*`).
@@ -216,11 +218,12 @@ won't frost until their card backgrounds gain an alpha — a follow-up.
 
 - **Frost strength:** the `@shell_background` alpha in `style.css` (lower =
   more wallpaper shows through, less readable; higher = subtler frost).
-- **`xray`:** `xray true` (the bar) blurs the wallpaper only — cheap and
-  static, right for a surface that only has wallpaper behind it. The overlay
-  surfaces (`hytte-sidebar` / `hytte-modal`) ship with `xray false` so the
-  blur frosts the _window_ sitting behind them too; flip them to `xray true`
-  for the cheaper wallpaper-only blur.
+- **`xray`:** all three surfaces ship with `xray true` (blur the wallpaper
+  only — cheap, and consistent). This is deliberate: an overlay frosting the
+  bright _window_ behind it (`xray false`) reads brighter and off-colour next
+  to the bar, breaking the "sidebar is a dark extension of the bar" look. Set
+  a rule to `xray false` if you specifically want it to frost the window
+  behind it (pricier; niri recomputes on movement).
 - **`geometry-corner-radius`:** rounds the blur clip. `0` for the flush
   bar/sidebar; bump the `hytte-modal` value to match the drawer's drawn
   corner radius if it shows a square halo.

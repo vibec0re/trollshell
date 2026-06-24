@@ -29,8 +29,16 @@ fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
 
     let icon = gtk::Image::new();
 
-    if !item.icon_name.is_empty() {
-        // Prefer named icon from the icon theme.
+    // Robust fallback chain:
+    //   1. Named icon if the current theme actually has it.
+    //   2. Raw ARGB32 pixmap from IconPixmap (app-supplied bitmap).
+    //   3. Named icon as best-effort (theme might resolve it at render time).
+    //   4. Generic symbolic fallback.
+    let icon_name_in_theme = !item.icon_name.is_empty()
+        && gdk::Display::default()
+            .is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(&item.icon_name));
+
+    if icon_name_in_theme {
         icon.set_icon_name(Some(&item.icon_name));
     } else if let Some((w, h, ref bytes)) = item.icon_pixmap {
         // Build a MemoryTexture from the ARGB32 pixmap data.
@@ -40,6 +48,10 @@ fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
         let gbytes = glib::Bytes::from(bytes.as_slice());
         let texture = gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::A8r8g8b8, &gbytes, stride);
         icon.set_paintable(Some(&texture));
+    } else if !item.icon_name.is_empty() {
+        // Best-effort: try the named icon even though the theme lookup did not
+        // confirm it (no default display yet, or the icon may resolve later).
+        icon.set_icon_name(Some(&item.icon_name));
     } else {
         // Generic fallback.
         icon.set_icon_name(Some("application-x-executable-symbolic"));

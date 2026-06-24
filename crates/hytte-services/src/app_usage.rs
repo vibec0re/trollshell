@@ -1,12 +1,18 @@
 //! App-usage service — walks `/proc` every ~2 s and exposes the top processes
 //! by CPU share and by resident memory, aggregated by **systemd app-scope**
 //! (`/proc/<pid>/cgroup`). PIDs that don't live inside a recognised app scope
-//! collapse into a single "System" bucket.
+//! but do belong to a named systemd **service** collapse into a per-service row;
+//! everything else folds into a single "System" bucket.
 //!
 //! v2 of #38 ("most expensive apps: group by systemd slice + app icons").
 //! v1 aggregated by `comm` (kernel process name); this cut re-keys by the
 //! app-id parsed from the cgroup leaf, which makes browsers, Electron apps,
 //! Flatpaks, and multi-process apps all collapse into one row.
+//!
+//! v3 of #107 extends the cgroup parser so **systemd services**
+//! (`NetworkManager`, `pipewire`, …) each get their own row rather than piling
+//! into "System". The priority is: app-scope first (unchanged) → deepest
+//! `.service` segment → System fallback.
 //!
 //! # Cgroup leaf parsing
 //!
@@ -52,8 +58,26 @@ const TOP_N: usize = 6;
 /// visible" via [`set_active`] so it idles entirely when no one's looking.
 const POLL: Duration = Duration::from_secs(2);
 
-/// Synthetic group key for all pids that don't belong to a recognised app scope.
+/// Synthetic group key for all pids that don't belong to a recognised app scope
+/// or systemd service.
 const SYSTEM_BUCKET: &str = "System";
+
+/// The resolved identity of a PID derived from its cgroup path.
+///
+/// Used internally to carry both the group key and the `app_id` in one pass,
+/// avoiding a second parse of the cgroup text.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CgroupGroup {
+    /// A user app tracked by a systemd app-scope (e.g. `app-firefox.scope`).
+    /// The inner `String` is the app-id, used both as the group key and as the
+    /// `app_id` on [`ProcSample`] (for desktop-file / icon lookups by the UI).
+    App(String),
+    /// A systemd service unit (e.g. `NetworkManager.service`).
+    /// The inner `String` is the unit name with `.service` stripped and
+    /// `\xNN` escapes decoded, used as the group key and display name.
+    /// `app_id` is `None` — services have no `.desktop` file.
+    Service(String),
+}
 
 /// One aggregated process group — all PIDs sharing an app-scope id (v2) or
 /// process name fallback. The `app_id` is `None` for the "System" bucket and
@@ -211,11 +235,14 @@ async fn poll_loop(
             // A pid that exits between the stat read and the cgroup read returns
             // None here and is harmlessly misattributed to System for that tick
             // (no panic, no double-count).
-            let app_id = read_pid_app_id(pid);
-            let group_key = app_id.as_deref().unwrap_or(SYSTEM_BUCKET).to_string();
+            let (group_key, app_id) = match read_pid_app_id(pid) {
+                Some(CgroupGroup::App(id)) => (id.clone(), Some(id)),
+                Some(CgroupGroup::Service(name)) => (name, None),
+                None => (SYSTEM_BUCKET.to_string(), None),
+            };
 
             let g = groups.entry(group_key).or_insert_with(|| Agg {
-                app_id: app_id.clone(),
+                app_id,
                 ..Agg::default()
             });
             g.cpu_jiffies = g.cpu_jiffies.saturating_add(delta);
@@ -305,27 +332,47 @@ fn read_pid_stats(pid: u32) -> Option<(u64, u64)> {
     Some((jiffies, rss))
 }
 
-/// Read `/proc/<pid>/cgroup` and extract the app-id from a systemd app scope.
-/// Returns `None` for kernel threads, pids outside an app scope, or read errors.
-fn read_pid_app_id(pid: u32) -> Option<String> {
+/// Read `/proc/<pid>/cgroup` and resolve the group for this PID.
+///
+/// Returns:
+/// - `Some(CgroupGroup::App(id))` — PID lives in a systemd app-scope.
+/// - `Some(CgroupGroup::Service(name))` — PID lives in a named `.service` unit.
+/// - `None` — kernel thread, unrecognised path, or read error (→ System bucket).
+fn read_pid_app_id(pid: u32) -> Option<CgroupGroup> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    parse_app_id_from_cgroup(&text)
+    parse_cgroup_group(&text)
 }
 
-/// Parse the app-id from a `/proc/<pid>/cgroup` file.
+/// Parse the cgroup path from a `/proc/<pid>/cgroup` file and resolve the
+/// group this PID belongs to.
 ///
-/// The relevant line looks like:
-/// ```text
-/// 0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox.scope
-/// ```
-/// or for Flatpak:
-/// ```text
-/// 0::/user.slice/.../app.slice/app-flatpak-org.gnome.Nautilus-1234.scope
-/// ```
+/// Priority (first match wins):
+/// 1. **App-scope** — any path segment ending `.scope` that starts with `app-`
+///    → [`CgroupGroup::App`]. This handles plain apps, Flatpaks, and
+///    instantiated app-scopes. An intermediate `user@<n>.service` segment in
+///    the same path is intentionally ignored.
+/// 2. **Systemd service** — the *deepest* (last / most-specific) segment
+///    ending `.service` → [`CgroupGroup::Service`]. Taking the deepest segment
+///    means e.g. `user@1000.service/pipewire.service` resolves to `pipewire`,
+///    not the user manager.
+/// 3. **None** — unrecognised path (kernel thread, bare `/`, …) → System
+///    bucket.
 ///
-/// We scan all lines for a segment ending in `.scope` that starts with `app-`,
-/// and extract the id from the leaf segment.
-pub(crate) fn parse_app_id_from_cgroup(text: &str) -> Option<String> {
+/// Edge case: if the deepest `.service` segment IS `user@<n>.service` (the
+/// process sits directly under the user manager with nothing deeper), we fold
+/// it into System (`None`) — the user manager itself is not a useful display
+/// row, and real processes are virtually always nested one level deeper.
+///
+/// Example paths and their resolution:
+/// ```text
+/// 0::/system.slice/NetworkManager.service                               → Service("NetworkManager")
+/// 0::/user.slice/user-1000.slice/user@1000.service/pipewire.service     → Service("pipewire")
+/// 0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox.scope → App("firefox")
+/// 0::/system.slice/system-getty.slice/getty@tty1.service                → Service("getty@tty1")
+/// 0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.gnome.Nautilus-1234.scope → App("org.gnome.Nautilus")
+/// 0::/                                                                   → None
+/// ```
+pub(crate) fn parse_cgroup_group(text: &str) -> Option<CgroupGroup> {
     for line in text.lines() {
         // Each line: `<hierarchy>:<controllers>:<path>`
         // Use `else { continue }` rather than `?` so a single malformed or
@@ -333,19 +380,50 @@ pub(crate) fn parse_app_id_from_cgroup(text: &str) -> Option<String> {
         let Some(path) = line.splitn(3, ':').nth(2) else {
             continue;
         };
-        // Find the last path segment that ends in `.scope` (case-insensitive
-        // per clippy::case_sensitive_file_extension_comparisons). Use `rfind`
-        // (= `filter` + `next_back` in one call, per clippy::filter_next).
+
+        // Priority 1: app-scope wins (deepest segment ending `.scope` that also
+        // starts with `app-`). Use `rfind` (= `filter` + `next_back` per
+        // clippy::filter_next).
         if let Some(leaf) = path.split('/').rfind(|s| {
             std::path::Path::new(s)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("scope"))
         }) && let Some(id) = parse_scope_leaf(leaf)
         {
-            return Some(id);
+            return Some(CgroupGroup::App(id));
+        }
+
+        // Priority 2: deepest `.service` segment in this path.
+        if let Some(leaf) = path.split('/').rfind(|s| {
+            std::path::Path::new(s)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("service"))
+        }) && let Some(name) = parse_service_leaf(leaf)
+        {
+            // Edge case: the deepest service IS the user-manager itself
+            // (`user@<n>.service`). Fold into System — it's not a useful row.
+            // A real process always has something deeper (a sub-service or scope),
+            // so if we get here with user@<n> it means the process is sitting
+            // directly in the user-manager transient scope with no sub-unit —
+            // too noisy to show separately.
+            let is_user_manager =
+                name.starts_with("user@") && name[5..].chars().all(|c| c.is_ascii_digit());
+            if !is_user_manager {
+                return Some(CgroupGroup::Service(name));
+            }
         }
     }
     None
+}
+
+/// Keep `parse_app_id_from_cgroup` as a compatibility shim used by existing
+/// tests — it extracts only the App id, ignoring Service rows.
+#[cfg(test)]
+pub(crate) fn parse_app_id_from_cgroup(text: &str) -> Option<String> {
+    match parse_cgroup_group(text) {
+        Some(CgroupGroup::App(id)) => Some(id),
+        _ => None,
+    }
 }
 
 /// Extract the app-id from a systemd scope leaf name.
@@ -378,6 +456,24 @@ pub(crate) fn parse_scope_leaf(leaf: &str) -> Option<String> {
     // strip it. Decode systemd \xNN escapes after stripping so the suffix
     // logic operates on the escaped form (escapes don't match suffix patterns).
     Some(unescape_systemd_hex(strip_trailing_random_component(inner)))
+}
+
+/// Extract the service name from a systemd service unit leaf name.
+///
+/// Strips the `.service` suffix and decodes any `\xNN` systemd hex escapes.
+/// Instance identifiers are preserved: `getty@tty1.service` → `getty@tty1`.
+///
+/// Returns `None` if `leaf` does not end with `.service`.
+///
+/// Examples:
+/// - `"NetworkManager.service"` → `Some("NetworkManager")`
+/// - `"getty@tty1.service"` → `Some("getty@tty1")`
+/// - `"user@1000.service"` → `Some("user@1000")`
+/// - `r"my\x2dservice.service"` → `Some("my-service")`
+/// - `"app.slice"` → `None`
+pub(crate) fn parse_service_leaf(leaf: &str) -> Option<String> {
+    let inner = leaf.strip_suffix(".service")?;
+    Some(unescape_systemd_hex(inner))
 }
 
 /// Decode systemd `\xNN` hex escapes (e.g. `\x2d` → `-`) in a cgroup/scope
@@ -554,8 +650,119 @@ mod tests {
         assert_eq!(parse_scope_leaf("init.scope"), None);
     }
 
+    // ── parse_service_leaf ───────────────────────────────────────────────────
+
+    #[test]
+    fn service_leaf_system_service() {
+        assert_eq!(
+            parse_service_leaf("NetworkManager.service"),
+            Some("NetworkManager".to_string())
+        );
+    }
+
+    #[test]
+    fn service_leaf_user_service() {
+        assert_eq!(
+            parse_service_leaf("pipewire.service"),
+            Some("pipewire".to_string())
+        );
+    }
+
+    #[test]
+    fn service_leaf_instanced() {
+        // Instance part preserved verbatim.
+        assert_eq!(
+            parse_service_leaf("getty@tty1.service"),
+            Some("getty@tty1".to_string())
+        );
+    }
+
+    #[test]
+    fn service_leaf_escaped_name() {
+        // `\x2d` is systemd's hex encoding of `-`.
+        assert_eq!(
+            parse_service_leaf(r"my\x2dservice.service"),
+            Some("my-service".to_string())
+        );
+    }
+
+    #[test]
+    fn service_leaf_non_service_returns_none() {
+        assert_eq!(parse_service_leaf("app.slice"), None);
+        assert_eq!(parse_service_leaf("app-firefox.scope"), None);
+        assert_eq!(parse_service_leaf("init.scope"), None);
+    }
+
+    // ── parse_cgroup_group ───────────────────────────────────────────────────
+
+    #[test]
+    fn cgroup_group_system_service() {
+        let cgroup = "0::/system.slice/NetworkManager.service\n";
+        assert_eq!(
+            parse_cgroup_group(cgroup),
+            Some(CgroupGroup::Service("NetworkManager".to_string()))
+        );
+    }
+
+    #[test]
+    fn cgroup_group_deepest_user_service() {
+        // user@1000.service/pipewire.service → Service("pipewire"), not user@1000.
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/pipewire.service\n";
+        assert_eq!(
+            parse_cgroup_group(cgroup),
+            Some(CgroupGroup::Service("pipewire".to_string()))
+        );
+    }
+
+    #[test]
+    fn cgroup_group_app_scope_wins_over_service() {
+        // Even though user@1000.service is in the path, the app-scope wins.
+        let cgroup =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox.scope\n";
+        assert_eq!(
+            parse_cgroup_group(cgroup),
+            Some(CgroupGroup::App("firefox".to_string()))
+        );
+    }
+
+    #[test]
+    fn cgroup_group_flatpak_app_scope_wins() {
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.gnome.Nautilus-1234.scope\n";
+        assert_eq!(
+            parse_cgroup_group(cgroup),
+            Some(CgroupGroup::App("org.gnome.Nautilus".to_string()))
+        );
+    }
+
+    #[test]
+    fn cgroup_group_instanced_service() {
+        let cgroup = "0::/system.slice/system-getty.slice/getty@tty1.service\n";
+        assert_eq!(
+            parse_cgroup_group(cgroup),
+            Some(CgroupGroup::Service("getty@tty1".to_string()))
+        );
+    }
+
+    #[test]
+    fn cgroup_group_user_manager_itself_folds_to_system() {
+        // A process sitting directly in user@1000.service with nothing deeper
+        // should fold into System (None), not get its own user-manager row.
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service\n";
+        assert_eq!(parse_cgroup_group(cgroup), None);
+    }
+
+    #[test]
+    fn cgroup_group_kernel_thread_returns_none() {
+        let cgroup = "0::/\n";
+        assert_eq!(parse_cgroup_group(cgroup), None);
+    }
+
+    // ── legacy tests kept via parse_app_id_from_cgroup shim ─────────────────
+
     #[test]
     fn cgroup_system_slice_returns_none() {
+        // dbus.service is now a Service row, not an App — the compat shim
+        // returns None (only App variants propagate through it).
         let cgroup = "0::/system.slice/dbus.service\n";
         assert_eq!(parse_app_id_from_cgroup(cgroup), None);
     }

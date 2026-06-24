@@ -1,0 +1,57 @@
+// Frosted-glass blur for trollshell's translucent chrome surfaces.
+//
+// Requires niri >= 26.04 (the `ext-background-effect` protocol / layer-rule
+// `background-effect` block). niri does NOT support `include`, so merge each
+// `layer-rule { }` block below into ~/.config/niri/config.kdl by hand
+// (see the "Frosted-glass blur" section in etc/niri/README.md).
+//
+// IMPORTANT: blur only shows THROUGH a translucent surface. These rules are
+// paired with `@shell_background` carrying an alpha < 1 in
+// assets/trollshell/style.css — over an opaque surface the blur is invisible.
+//
+// `match namespace=` is a regex matched anywhere in the surface namespace:
+//   hytte-bar-{edge}    -> the bar              (crates/hytte-ui/src/bar.rs:106)
+//   hytte-sidebar-{id}  -> the pushable sidebar (overlays/sidebar.rs:218)
+//   hytte-modal-{id}    -> the slide-out drawer (modal.rs:449)
+//
+// DELIBERATELY NOT BLURRED (fullscreen surfaces — blurring them frosts the
+// WHOLE screen):
+//   hytte-frame         -> fullscreen click-through frame overlay
+//   hytte-popup-catcher -> invisible fullscreen dismiss catcher
+//
+// `xray true` blurs the wallpaper only (cheap, computed once). Remove it for
+// a pricier blur that also frosts windows sitting behind the surface — nicer
+// for the drawer/sidebar when they overlap a window, heavier on the GPU.
+
+layer-rule {
+    match namespace="hytte-bar"
+    // Full-width flush strip — no rounding.
+    geometry-corner-radius 0
+    background-effect {
+        blur true
+        xray true
+    }
+}
+
+layer-rule {
+    match namespace="hytte-sidebar"
+    // Flush left panel; the frame overlay paints the rounded inner corner.
+    // xray false: it's an overlay over the window stack, so frost the real
+    // content behind it — not just the wallpaper.
+    geometry-corner-radius 0
+    background-effect {
+        blur true
+        xray false
+    }
+}
+
+layer-rule {
+    match namespace="hytte-modal"
+    // Slide-out drawer card. Tune to match the drawer's drawn corner radius.
+    // xray false: same overlay reasoning as the sidebar.
+    geometry-corner-radius 14
+    background-effect {
+        blur true
+        xray false
+    }
+}

@@ -181,3 +181,56 @@ If you change one, change the other:
 
 - niri: `etc/niri/frame.kdl` → `struts { left N; right N; bottom N }`
 - trollshell: `trollshell/src/overlays/frame.rs::FRAME_THICKNESS`
+
+## Frosted-glass blur
+
+trollshell's chrome surfaces (bar, sidebar, drawer) are translucent so the
+compositor can blur the wallpaper behind them for a frosted-glass look. This
+needs **niri ≥ 26.04** (the `ext-background-effect` protocol / `layer-rule`
+`background-effect` block) and **two coupled pieces**:
+
+1. **Translucency (already in the shell):** `@shell_background` in
+   `assets/trollshell/style.css` carries an alpha < 1
+   (`rgba(25, 15, 45, 0.65)`). Blur is only visible _through_ a translucent
+   surface — set the alpha back to `1.0` to turn the frost off entirely.
+2. **The blur rules:** `etc/niri/blur.kdl` holds the `layer-rule { }` blocks
+   that tell niri to blur trollshell's surfaces, matched by their
+   layer-shell namespace (`hytte-bar*`, `hytte-sidebar*`, `hytte-modal*`).
+
+niri does **not** support `include`, so — as with `binds.kdl` and
+`frame.kdl` — merge the blocks by hand. Paste every `layer-rule { }` block
+from `etc/niri/blur.kdl` at the **top level** of `~/.config/niri/config.kdl`
+(not nested inside another block), then reload (auto, or
+`niri msg action reload-config`).
+
+### Why only those three namespaces
+
+The `hytte-frame` (fullscreen frame overlay) and `hytte-popup-catcher`
+(invisible dismiss catcher) surfaces span the whole output — blurring them
+would frost the **entire screen**, so they're deliberately excluded. The
+`hytte-osd` / `hytte-toasts` / `hytte-prompt` surfaces aren't backed by
+`@shell_background` yet (transparent wrappers / `@card_bg_color`), so they
+won't frost until their card backgrounds gain an alpha — a follow-up.
+
+### Tuning
+
+- **Frost strength:** the `@shell_background` alpha in `style.css` (lower =
+  more wallpaper shows through, less readable; higher = subtler frost).
+- **`xray`:** `xray true` (the bar) blurs the wallpaper only — cheap and
+  static, right for a surface that only has wallpaper behind it. The overlay
+  surfaces (`hytte-sidebar` / `hytte-modal`) ship with `xray false` so the
+  blur frosts the _window_ sitting behind them too; flip them to `xray true`
+  for the cheaper wallpaper-only blur.
+- **`geometry-corner-radius`:** rounds the blur clip. `0` for the flush
+  bar/sidebar; bump the `hytte-modal` value to match the drawer's drawn
+  corner radius if it shows a square halo.
+- `noise` and `saturation` keys are also accepted inside `background-effect`
+  if you want grain or a colour boost.
+
+### Verification
+
+1. On niri ≥ 26.04, merge the blocks and reload. The bar should show the
+   wallpaper softly blurred through it instead of flat dark purple.
+2. Toggle the sidebar / open the drawer — same frost.
+3. No frost? Check (a) niri version, (b) the blocks landed at top level, and
+   (c) `@shell_background` still has its alpha (a rebuild reverts CSS edits).

@@ -69,8 +69,10 @@ pub struct TrayItem {
     /// Current item status.
     pub status: ItemStatus,
     /// Raw ARGB32 pixmap — `(width, height, bytes)` — picked from the largest
-    /// entry of the `IconPixmap` array. `None` when no pixmap is available or
-    /// when `icon_name` is non-empty (prefer icon themes).
+    /// entry of the `IconPixmap` array. `None` when no pixmap is available.
+    /// Always populated when the app provides one, even when `icon_name` is
+    /// also set — the widget layer decides which to use based on theme
+    /// availability.
     pub icon_pixmap: Option<(i32, i32, Vec<u8>)>,
     /// Tooltip title (may be empty).
     pub tooltip_title: String,
@@ -792,12 +794,9 @@ async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> 
         .await
         .unwrap_or_default();
 
-    // IconPixmap: a(iiay) — pick the largest entry (by area).
-    let icon_pixmap = if icon_name.is_empty() {
-        read_icon_pixmap(bus_name, object_path).await
-    } else {
-        None
-    };
+    // IconPixmap: a(iiay) — always read; the widget layer decides whether to use
+    // it (e.g. when `icon_name` is non-empty but not present in the icon theme).
+    let icon_pixmap = read_icon_pixmap(bus_name, object_path).await;
 
     // Tooltip: (s, a(iiay), s, s) — (icon_name, icon_pixmap, title, description).
     let (tooltip_title, tooltip_description) = read_tooltip(bus_name, object_path).await;

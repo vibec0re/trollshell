@@ -337,28 +337,35 @@ impl SurfaceBlur {
     /// Scope the surface's blur to `rect` (surface-local, logical px), or clear
     /// it with `None`.
     ///
-    /// `Some(rect)` builds a one-shot `wl_region` covering `rect` and sets it as
-    /// the blur region; `None` passes a NULL region, which removes the effect.
-    /// The change is double-buffered and applies on the surface's **next
-    /// commit** — we `flush()` the request and `queue_draw()` the window so GTK
-    /// commits on its next frame.
+    /// Both cases hand niri an explicit `wl_region`: `Some(rect)` covers `rect`;
+    /// `None` sends an **empty** region. We deliberately never send a NULL region.
+    /// niri distinguishes the two (`src/render_helpers/background_effect.rs`):
+    /// a non-NULL but empty region short-circuits to "blur nothing"
+    /// (`if rects.is_empty() { return None }`), whereas a NULL region leaves
+    /// `has_blur_region` false so niri **reverts to the layer-rule**
+    /// `background-effect { blur true }` and frosts the *entire* surface geometry.
+    /// On an always-mapped surface (the sidebar) the NULL path therefore re-frosts
+    /// the whole still-mapped surface once its content collapses — the lingering
+    /// grey strip (#192/#194). Clearing with an empty region suppresses the frost
+    /// instead of falling back to it.
+    ///
+    /// The change is double-buffered and applies on the surface's **next commit**
+    /// — we `flush()` the request and `queue_draw()` the window so GTK commits on
+    /// its next frame.
     ///
     /// Coordinate note: niri clips the region to the surface size, so an
-    /// over-large rect is harmless; a zero/empty rect blurs nothing (the
-    /// closed-state case).
+    /// over-large rect is harmless; an empty/zero rect blurs nothing (the
+    /// closed-state case) without reverting to the layer-rule frost.
     pub fn set_region(&self, rect: Option<Rect>) {
-        match rect {
-            Some(r) => {
-                let region = self.compositor.create_region(&self.qh, ());
-                region.add(r.x(), r.y(), r.width(), r.height());
-                self.effect.set_blur_region(Some(&region));
-                // `set_blur_region` has copy semantics; the region can go now.
-                region.destroy();
-            }
-            None => {
-                self.effect.set_blur_region(None);
-            }
+        // Always build a region object and set it — never NULL (see doc above).
+        // An empty region (no `add`) is the deliberate "clear" path.
+        let region = self.compositor.create_region(&self.qh, ());
+        if let Some(r) = rect {
+            region.add(r.x(), r.y(), r.width(), r.height());
         }
+        self.effect.set_blur_region(Some(&region));
+        // `set_blur_region` has copy semantics; the region can go now.
+        region.destroy();
         // Push the request to the compositor, then nudge GTK to commit the
         // surface (when the double-buffered region actually applies).
         let _ = self.conn.flush();

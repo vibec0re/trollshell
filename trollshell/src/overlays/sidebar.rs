@@ -29,17 +29,30 @@
 //! re-asserts the zone once the revealer settles and forces a GTK frame so the
 //! final committed surface state carries it (#194).
 //!
-//! Committing `exclusive_zone = 0` is necessary but **not sufficient**: a live
-//! capture showed the persistent surface itself staying at `SIDEBAR_WIDTH` once
-//! opened (`win_width=320 / surface_width=320` closed-after-open, vs. `0 / 1`
-//! never-opened) because `build_card`'s 320px `set_size_request` floor pinned
-//! the toplevel's minimum width, so the collapsed revealer never let it
-//! re-measure smaller — a full-width `Layer::Top` surface kept covering the left
-//! edge (the grey strip). `drive_exclusive_zone_on_settle` therefore also
-//! **relaxes that floor to `0` on settled-close** (restored to `SIDEBAR_WIDTH`
-//! on open by `wire_open_subscription`) and `queue_resize()`s, so the closed
-//! surface deflates to ~0 width and niri reflows the tile back over the strip
-//! (#194).
+//! Committing `exclusive_zone = 0` makes niri stop *reserving* the strip (tiles
+//! reflow to full width), but the persistent surface still overlays on top. That
+//! overlay is transparent (`.ts-sidebar-surface { background: transparent }`) and
+//! the collapsed card paints nothing, so it should be invisible — yet a grey
+//! strip lingered once opened. **Root cause (confirmed against niri's source,
+//! #194):** the `hytte-sidebar` *layer-rule* `background-effect { blur true }`
+//! frosts the **entire** surface geometry, and `hytte-blur` was clearing the
+//! frost on close by sending a **NULL** `wl_region`. niri reads a NULL blur
+//! region as "no client scoping" and reverts to that whole-surface layer-rule
+//! frost (`src/render_helpers/background_effect.rs`: a NULL region leaves
+//! `has_blur_region` false, so `blur = effect.blur == Some(true)`), so the whole
+//! still-mapped surface stayed frosted — a frosted-wallpaper grey strip. The fix
+//! lives in [`hytte::blur::SurfaceBlur::set_region`]: clear by sending an
+//! **empty** region (which niri short-circuits to "blur nothing") rather than
+//! NULL.
+//!
+//! The surface does **not** shrink back below `SIDEBAR_WIDTH` once opened — a GTK
+//! toplevel won't re-measure under a prior allocation (`win_width=320 /
+//! surface_width=320` closed-after-open, vs. `0 / 1` never-opened). That is
+//! harmless now that the frost is suppressed: a transparent, click-through,
+//! zone-0 overlay of any width is invisible. `drive_exclusive_zone_on_settle`
+//! still re-asserts `exclusive_zone = 0` + flushes on settle so niri reliably
+//! reclaims the strut; its card-floor relax is now a belt-and-braces no-op (the
+//! toplevel won't actually deflate, and it no longer needs to).
 //!
 //! ## Frame integration
 //!
@@ -548,35 +561,34 @@ fn drive_blur_during_slide(
 /// revealer's slide and the now-visible card keep GTK drawing, so the
 /// `SIDEBAR_WIDTH` zone commits naturally.
 ///
-/// The harder half is the **surface geometry**. The sidebar is a persistent,
-/// always-mapped `Layer::Top` surface; a live `RUST_LOG` capture showed that
-/// once it had been opened, the closed toplevel + `wl_surface` stayed at
-/// `win_width=320 / surface_width=320` (vs. `0 / 1` on a never-opened, fresh
-/// start) even with the revealer collapsed and `exclusive_zone=0` committed.
-/// That full-width Top surface kept covering the left edge → the grey strip /
-/// non-reflowing tile. Root cause: `build_card`'s `set_size_request(SIDEBAR_WIDTH,
-/// -1)` pins a 320px **minimum** width that the collapsed `GtkRevealer` doesn't
-/// release, so the toplevel never re-measures below 320. We therefore relax the
-/// card's floor to `0` once it has settled **closed** (and keep it at
-/// `SIDEBAR_WIDTH` open — the `AdwClamp` still caps the open ceiling), then
-/// `queue_resize()` so the toplevel re-measures down and the surface deflates;
-/// niri reclaims the strip and reflows the tile back over it.
+/// The card-floor relax is a vestige of an earlier (disproven) hypothesis. A
+/// live `RUST_LOG` capture showed the closed toplevel + `wl_surface` staying at
+/// `win_width=320 / surface_width=320` once opened (vs. `0 / 1` never-opened),
+/// and the theory was that `build_card`'s `set_size_request(SIDEBAR_WIDTH, -1)`
+/// floor pinned the surface full-width so it covered the strip. Relaxing that
+/// floor to `0` on settled-close did **not** shrink the surface (a GTK toplevel
+/// won't re-measure under a prior allocation), and the grey strip turned out to
+/// be the niri layer-rule frost of the whole still-mapped surface — fixed in
+/// [`hytte::blur::SurfaceBlur::set_region`] (clear with an empty region, not a
+/// NULL one). The floor relax is kept as harmless belt-and-braces; it no longer
+/// matters, since a transparent, zone-0, unfrosted overlay is invisible at any
+/// width.
 ///
 /// We tick at frame cadence until the revealer settles at the `open` target,
 /// then re-set the zone + floor and `queue_resize()` / `queue_draw()` the window.
 /// `queue_draw` schedules a GTK frame whose commit carries the pending
 /// layer-shell state (mirrors how [`SurfaceBlur::set_region`] nudges the region
-/// to commit); `queue_resize` forces the re-measure that shrinks the toplevel.
-/// Re-asserting at the *settled* moment guarantees the final committed state
-/// matches the final open-state, even if the last mid-slide commit predated it.
+/// to commit). Re-asserting at the *settled* moment guarantees the final
+/// committed zone matches the final open-state, even if the last mid-slide commit
+/// predated it.
 ///
 /// Like [`drive_blur_during_slide`], a mid-animation re-toggle is detected via
 /// `open_state` and the stale timer bails so two timers don't fight; the timer
 /// id is parked in `tick_slot` so [`close_all`] can cancel it on teardown.
 ///
-/// NEEDS LIVE NIRI RE-TEST: the pinned-floor / uncommitted-pending-zone
-/// hypothesis is the most defensible explanation for the non-reflow, but it can
-/// only be confirmed against a real niri session.
+/// NEEDS LIVE NIRI RE-TEST: the empty-vs-NULL blur-region fix is confirmed
+/// against niri's source, but the visible result can only be confirmed against a
+/// real niri session.
 fn drive_exclusive_zone_on_settle(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
@@ -605,15 +617,16 @@ fn drive_exclusive_zone_on_settle(
         // The `zone` value and the floor coincide (SIDEBAR_WIDTH open / 0 closed),
         // so reuse it. (#194)
         card.set_size_request(zone, -1);
-        // DIAGNOSTIC (#194): a live RUST_LOG capture showed the closed surface
-        // staying at win_width=320 / surface_width=320 once it had been opened —
-        // the 320px card floor (`build_card`'s set_size_request) kept the toplevel
-        // from re-measuring below SIDEBAR_WIDTH, so the persistent Top surface
-        // still covered the left edge (grey strip) even with exclusive_zone=0
-        // committed. With the floor now relaxed to 0 on settled-close (above),
-        // this log should show win_width / surface_width dropping to ~0 on close
-        // (was 320). Fires once per settle (the re-assert), not per animation
-        // frame. NEEDS LIVE NIRI RE-TEST.
+        // DIAGNOSTIC (#194): logs the settled surface geometry once per settle
+        // (the re-assert), not per animation frame. NOTE the success criterion
+        // CHANGED: the persistent toplevel stays at win_width=320 /
+        // surface_width=320 once opened (a GTK toplevel won't re-measure below a
+        // prior allocation, even with the card floor relaxed) — that is EXPECTED
+        // and fine. The grey strip was the niri layer-rule frost of this whole
+        // still-mapped surface, now suppressed in `hytte::blur::set_region`
+        // (empty region instead of a NULL one). So the fix is confirmed by the
+        // grey strip being GONE, NOT by surface_width dropping to 0. NEEDS LIVE
+        // NIRI RE-TEST.
         tracing::debug!(
             open,
             set_exclusive_zone = zone,

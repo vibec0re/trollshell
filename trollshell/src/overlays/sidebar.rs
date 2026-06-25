@@ -29,6 +29,18 @@
 //! re-asserts the zone once the revealer settles and forces a GTK frame so the
 //! final committed surface state carries it (#194).
 //!
+//! Committing `exclusive_zone = 0` is necessary but **not sufficient**: a live
+//! capture showed the persistent surface itself staying at `SIDEBAR_WIDTH` once
+//! opened (`win_width=320 / surface_width=320` closed-after-open, vs. `0 / 1`
+//! never-opened) because `build_card`'s 320px `set_size_request` floor pinned
+//! the toplevel's minimum width, so the collapsed revealer never let it
+//! re-measure smaller — a full-width `Layer::Top` surface kept covering the left
+//! edge (the grey strip). `drive_exclusive_zone_on_settle` therefore also
+//! **relaxes that floor to `0` on settled-close** (restored to `SIDEBAR_WIDTH`
+//! on open by `wire_open_subscription`) and `queue_resize()`s, so the closed
+//! surface deflates to ~0 width and niri reflows the tile back over the strip
+//! (#194).
+//!
 //! ## Frame integration
 //!
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
@@ -215,6 +227,7 @@ pub fn install(monitor: &Monitor) {
     let subscription = wire_open_subscription(
         &window,
         &revealer,
+        &card,
         &open_state,
         &blur,
         &blur_tick,
@@ -298,6 +311,13 @@ fn build_revealer() -> gtk::Revealer {
 /// `AdwClamp` wrapping this card in `install` caps the natural width at
 /// `SIDEBAR_WIDTH`; see also `components::layout::finish_page` for the
 /// same belt-and-suspenders pattern in the drawer.
+///
+/// This `SIDEBAR_WIDTH` floor is the **open-state** floor and is set here only
+/// as the initial value: [`drive_exclusive_zone_on_settle`] relaxes it to `0`
+/// once the sidebar settles closed (and [`wire_open_subscription`] restores it
+/// on open). Without that, the 320px minimum pins the *persistent* layer-shell
+/// surface at full width even when the revealer is collapsed, so the closed
+/// surface keeps covering the left edge and niri never reflows the tile (#194).
 fn build_card(monitor: &Monitor) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");
@@ -337,6 +357,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
 fn wire_open_subscription(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
+    card: &gtk::Box,
     open_state: &Mutable<bool>,
     blur: &Rc<RefCell<Option<SurfaceBlur>>>,
     blur_tick: &Rc<RefCell<Option<glib::SourceId>>>,
@@ -344,6 +365,7 @@ fn wire_open_subscription(
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
+    let card = card.clone();
     let blur = blur.clone();
     let blur_tick = blur_tick.clone();
     let zone_tick = zone_tick.clone();
@@ -351,6 +373,15 @@ fn wire_open_subscription(
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
+        // Restore the card's full-width floor the moment we start opening, so the
+        // revealer slides a SIDEBAR_WIDTH card in. The floor is relaxed to 0 on
+        // each settled-close (see `drive_exclusive_zone_on_settle`) so the closed
+        // toplevel can re-measure below SIDEBAR_WIDTH and the wl_surface deflates;
+        // we only relax on *settle*, so the close slide still shows a full-width
+        // card sliding out. (#194)
+        if open {
+            card.set_size_request(SIDEBAR_WIDTH, -1);
+        }
         // Push the layer-shell request to niri NOW. gtk4-layer-shell enqueues the
         // `set_exclusive_zone` request on GTK's wayland connection but the bytes
         // only leave the process on GTK's next flush; a sidebar settling closed
@@ -370,7 +401,14 @@ fn wire_open_subscription(
         // shows. We tick until settle, then re-set the zone + force a GTK frame
         // (queue_draw) so the FINAL committed surface state carries the right
         // zone. NEEDS LIVE NIRI RE-TEST.
-        drive_exclusive_zone_on_settle(&window, &revealer, &open_state_for_zone, &zone_tick, open);
+        drive_exclusive_zone_on_settle(
+            &window,
+            &revealer,
+            &card,
+            &open_state_for_zone,
+            &zone_tick,
+            open,
+        );
         // Scope niri's frost to the card as it slides: tick the region off the
         // revealer's animating width until it settles, then clear it on close
         // so no strip lingers (#192). No-op when `blur` is None (niri < 26.04).
@@ -500,84 +538,115 @@ fn drive_blur_during_slide(
     });
 }
 
-/// Re-assert the layer-shell exclusive zone after the revealer settles, then
-/// force a GTK frame so the final surface state actually commits (#194).
+/// Re-assert the layer-shell exclusive zone — and **deflate the card's width
+/// floor** — after the revealer settles, then force a GTK frame so the final
+/// surface state actually commits (#194).
 ///
 /// `set_exclusive_zone` (called once in [`wire_open_subscription`]) only mutates
 /// gtk4-layer-shell's *pending* state — it applies on the surface's next
 /// `wl_surface.commit`, which GTK only issues when it draws a frame. On OPEN the
 /// revealer's slide and the now-visible card keep GTK drawing, so the
-/// `SIDEBAR_WIDTH` zone commits naturally. On CLOSE the card slides back to 0
-/// width and goes transparent; once it settles GTK has no further reason to
-/// draw, so the `exclusive_zone = 0` can sit uncommitted — niri never sees the
-/// new zone, keeps the tile pushed ~`SIDEBAR_WIDTH` right, and leaves a
-/// wallpaper gap on the left.
+/// `SIDEBAR_WIDTH` zone commits naturally.
+///
+/// The harder half is the **surface geometry**. The sidebar is a persistent,
+/// always-mapped `Layer::Top` surface; a live `RUST_LOG` capture showed that
+/// once it had been opened, the closed toplevel + `wl_surface` stayed at
+/// `win_width=320 / surface_width=320` (vs. `0 / 1` on a never-opened, fresh
+/// start) even with the revealer collapsed and `exclusive_zone=0` committed.
+/// That full-width Top surface kept covering the left edge → the grey strip /
+/// non-reflowing tile. Root cause: `build_card`'s `set_size_request(SIDEBAR_WIDTH,
+/// -1)` pins a 320px **minimum** width that the collapsed `GtkRevealer` doesn't
+/// release, so the toplevel never re-measures below 320. We therefore relax the
+/// card's floor to `0` once it has settled **closed** (and keep it at
+/// `SIDEBAR_WIDTH` open — the `AdwClamp` still caps the open ceiling), then
+/// `queue_resize()` so the toplevel re-measures down and the surface deflates;
+/// niri reclaims the strip and reflows the tile back over it.
 ///
 /// We tick at frame cadence until the revealer settles at the `open` target,
-/// then re-set the zone to the authoritative value and `queue_draw()` the
-/// window. `queue_draw` schedules a GTK frame whose commit carries the pending
+/// then re-set the zone + floor and `queue_resize()` / `queue_draw()` the window.
+/// `queue_draw` schedules a GTK frame whose commit carries the pending
 /// layer-shell state (mirrors how [`SurfaceBlur::set_region`] nudges the region
-/// to commit). Re-asserting at the *settled* moment guarantees the final
-/// committed state matches the final open-state, even if the last mid-slide
-/// commit predated it.
+/// to commit); `queue_resize` forces the re-measure that shrinks the toplevel.
+/// Re-asserting at the *settled* moment guarantees the final committed state
+/// matches the final open-state, even if the last mid-slide commit predated it.
 ///
 /// Like [`drive_blur_during_slide`], a mid-animation re-toggle is detected via
 /// `open_state` and the stale timer bails so two timers don't fight; the timer
 /// id is parked in `tick_slot` so [`close_all`] can cancel it on teardown.
 ///
-/// NEEDS LIVE NIRI RE-TEST: the uncommitted-pending-zone hypothesis is the most
-/// defensible explanation for the non-reflow, but it can only be confirmed
-/// against a real niri session.
+/// NEEDS LIVE NIRI RE-TEST: the pinned-floor / uncommitted-pending-zone
+/// hypothesis is the most defensible explanation for the non-reflow, but it can
+/// only be confirmed against a real niri session.
 fn drive_exclusive_zone_on_settle(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
+    card: &gtk::Box,
     open_state: &Mutable<bool>,
     tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
     open: bool,
 ) {
-    // Helper: when the revealer has reached the target, lock in the zone and
-    // force a commit. Returns whether it settled (i.e. the caller can stop).
-    fn reassert_if_settled(window: &gtk::Window, revealer: &gtk::Revealer, open: bool) -> bool {
+    // Helper: when the revealer has reached the target, deflate/restore the card
+    // floor, lock in the zone, and force a commit. Returns whether it settled
+    // (i.e. the caller can stop).
+    fn reassert_if_settled(
+        window: &gtk::Window,
+        revealer: &gtk::Revealer,
+        card: &gtk::Box,
+        open: bool,
+    ) -> bool {
         if revealer.is_child_revealed() != open {
             return false;
         }
         let zone = if open { SIDEBAR_WIDTH } else { 0 };
-        // DIAGNOSTIC (#194): the close-path reflow is still unverified — the blur
-        // clears on close (so commits ARE firing) yet the tile can stay pushed
-        // with a grey gap. Log the SETTLED surface geometry + the zone we hand
-        // niri, so a `RUST_LOG=trollshell=debug` capture distinguishes the two
-        // hypotheses: on close, does the surface collapse to ~0 width (zone=0
-        // should let niri reflow → cause is downstream in niri) or stay
-        // ~SIDEBAR_WIDTH (the closed surface still covers the reflowed tile)?
-        // Fires once per settle (the re-assert), not per animation frame.
+        // Relax the card's min-width floor to 0 when settled-closed so the
+        // collapsed revealer can let the toplevel re-measure below SIDEBAR_WIDTH
+        // and the persistent Top surface deflates to ~0 width; restore the
+        // SIDEBAR_WIDTH floor when open (the AdwClamp still caps the ceiling).
+        // The `zone` value and the floor coincide (SIDEBAR_WIDTH open / 0 closed),
+        // so reuse it. (#194)
+        card.set_size_request(zone, -1);
+        // DIAGNOSTIC (#194): a live RUST_LOG capture showed the closed surface
+        // staying at win_width=320 / surface_width=320 once it had been opened —
+        // the 320px card floor (`build_card`'s set_size_request) kept the toplevel
+        // from re-measuring below SIDEBAR_WIDTH, so the persistent Top surface
+        // still covered the left edge (grey strip) even with exclusive_zone=0
+        // committed. With the floor now relaxed to 0 on settled-close (above),
+        // this log should show win_width / surface_width dropping to ~0 on close
+        // (was 320). Fires once per settle (the re-assert), not per animation
+        // frame. NEEDS LIVE NIRI RE-TEST.
         tracing::debug!(
             open,
             set_exclusive_zone = zone,
             revealed = revealer.is_child_revealed(),
             win_width = window.width(),
             surface_width = ?window.surface().map(|s| s.width()),
-            "sidebar: exclusive-zone re-assert on settle",
+            "sidebar: exclusive-zone re-assert + card-floor deflate on settle",
         );
         window.set_exclusive_zone(zone);
-        // Force a GTK frame so the pending layer-shell state commits even when
-        // the settled surface would otherwise draw nothing further.
+        // Force a re-measure so the relaxed floor shrinks the toplevel, then a
+        // GTK frame so the pending layer-shell state commits even when the
+        // settled surface would otherwise draw nothing further, then flush so the
+        // zone-release bytes actually leave the process (a settled-closed surface
+        // may not produce another frame on its own).
+        window.queue_resize();
         window.queue_draw();
         hytte::blur::flush(window);
         true
     }
 
-    if reassert_if_settled(window, revealer, open) {
+    if reassert_if_settled(window, revealer, card, open) {
         return;
     }
     let window = window.clone();
     let revealer = revealer.clone();
+    let card = card.clone();
     let open_state = open_state.clone();
     rearm_slide_tick(tick_slot, move || {
         // A re-toggle started a fresh tick for the new target; bail out.
         if open_state.get() != open {
             return glib::ControlFlow::Break;
         }
-        if reassert_if_settled(&window, &revealer, open) {
+        if reassert_if_settled(&window, &revealer, &card, open) {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue

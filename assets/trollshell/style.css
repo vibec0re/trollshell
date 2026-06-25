@@ -586,7 +586,9 @@
     border-radius: 0.769em;
     padding: 0.769em 0.923em;
     min-width: 21.538em;
-    max-width: 29.231em;
+    /* GTK4 CSS has no `max-width` property (parser: "No property named
+     * max-width"); it was silently dropped. The toast width is content-driven
+     * off `min-width`. */
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 .ts-toast-critical {
@@ -911,9 +913,12 @@
     margin: 0 1px;
 }
 /* On the selected day, dots invert to white so they read against the
- * accent pill. */
+ * accent pill. The descendant selector (specificity 0,2,0) already outranks
+ * the single-class `.ts-cal-color-N` palette rule (0,1,0), so no `!important`
+ * is needed — and GTK's CSS parser rejects `!important` on `background`
+ * ("Junk at end of value"). */
 .ts-cal-day-selected .ts-cal-event-dot {
-    background: alpha(white, 0.85) !important;
+    background: alpha(white, 0.85);
 }
 
 /* Calendar-source palette — `color_index_for_calendar` maps the source
@@ -1273,7 +1278,9 @@
 
 .ts-osd-card {
     min-width: 21.538em;
-    max-width: 24.615em;
+    /* GTK4 CSS has no `max-width` property (parser: "No property named
+     * max-width"); it was silently dropped. The OSD card width is content- and
+     * `min-width`-driven. */
     padding: 1.231em;
     border-radius: 1.077em;
     background: alpha(@window_bg_color, 0.92);

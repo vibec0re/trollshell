@@ -351,6 +351,14 @@ fn wire_open_subscription(
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
+        // Push the layer-shell request to niri NOW. gtk4-layer-shell enqueues the
+        // `set_exclusive_zone` request on GTK's wayland connection but the bytes
+        // only leave the process on GTK's next flush; a sidebar settling closed
+        // may not produce another frame, so the zero zone could sit unflushed and
+        // niri would keep the tile pushed (grey wallpaper gap). Flushing here is
+        // the analogue of the explicit `conn.flush()` that makes the blur region
+        // clear on close — without it the zone release is unreliable (#194).
+        hytte::blur::flush(&window);
         revealer.set_reveal_child(open);
         apply_input_passthrough(&window, !open);
         // Re-assert the exclusive zone once the revealer settles so niri reliably
@@ -554,6 +562,7 @@ fn drive_exclusive_zone_on_settle(
         // Force a GTK frame so the pending layer-shell state commits even when
         // the settled surface would otherwise draw nothing further.
         window.queue_draw();
+        hytte::blur::flush(window);
         true
     }
 

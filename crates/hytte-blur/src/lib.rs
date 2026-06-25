@@ -300,6 +300,39 @@ pub fn attach(window: &gtk::Window) -> Option<SurfaceBlur> {
     })
 }
 
+/// Flush GTK's Wayland connection so freshly-issued layer-shell requests reach
+/// the compositor *now*, instead of waiting for GTK's own next flush.
+///
+/// gtk4-layer-shell enqueues requests like `zwlr_layer_surface_v1.set_exclusive_zone`
+/// on GTK's libwayland connection and forces a commit, but the bytes only leave
+/// the process when that connection is flushed — which GTK normally does on its
+/// frame cycle. A surface that has just gone idle (e.g. a sidebar settling
+/// closed: revealer collapsed, nothing left to paint) may not produce another
+/// frame promptly, so the request can sit unflushed and the compositor never
+/// reflows tiles. Pushing the connection explicitly is the same `conn.flush()`
+/// that makes [`SurfaceBlur::set_region`] land on close; callers driving the
+/// exclusive zone should call this right after `set_exclusive_zone`.
+///
+/// Works regardless of niri version (it only needs GTK's `wl_display`, not the
+/// `ext-background-effect` manager). Safe no-op if `window` isn't realized on a
+/// Wayland display yet.
+pub fn flush(window: &gtk::Window) {
+    if let Some(conn) = gtk_connection(window) {
+        let _ = conn.flush();
+    }
+}
+
+/// Wrap GTK's own libwayland backend into a `Connection` so a `flush()` here
+/// pushes the very socket GTK uses (same fd → it carries GTK's queued
+/// requests). `None` until the window is realized on a Wayland display.
+fn gtk_connection(window: &gtk::Window) -> Option<Connection> {
+    let display = WidgetExt::display(window);
+    let wl_display = display.downcast_ref::<WaylandDisplay>()?;
+    let wl_display_obj = wl_display.wl_display()?;
+    let backend = wl_display_obj.backend().upgrade()?;
+    Some(Connection::from_backend(backend))
+}
+
 impl SurfaceBlur {
     /// Scope the surface's blur to `rect` (surface-local, logical px), or clear
     /// it with `None`.

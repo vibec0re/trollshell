@@ -1,0 +1,47 @@
+[package]
+name = "hytte-blur"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client-side ext-background-effect-v1 (set_blur_region) so niri's frosted-glass blur hugs the visible content of a GTK layer-shell surface, not its whole geometry."
+
+[dependencies]
+tracing = "0.1.44"
+# GTK's own wayland connection + the raw wl_surface / wl_display / wl_compositor.
+# `wayland_crate` exposes the wayland-client objects (gated behind this feature
+# in gdk4-wayland 0.11); without it the getters below don't exist. The version
+# tracks gtk4 0.11.2 used in hytte-ui.
+gdk4-wayland = { version = "0.11.0", features = ["wayland_crate"] }
+# Must match the wayland-client gdk4-wayland 0.11 re-exports/uses (`^0.31.10`),
+# or the proxies (the WlSurface we get from GTK) won't interoperate with the
+# ones we create. Cargo unifies these to one build since both want 0.31.x.
+wayland-client = "0.31.10"
+# The ext-background-effect-v1 staging protocol bindings. 0.32 tracks
+# wayland-client 0.31. We use the maintained crate's generated client bindings
+# rather than vendoring + `wayland-scanner` ourselves: the protocol's XML is
+# also vendored at `protocol/ext-background-effect-v1.xml` for reference, but
+# the build consumes the crate. `staging` gates the in-testing protocols;
+# `client` selects the client side.
+wayland-protocols = { version = "0.32.13", features = ["staging", "client"] }
+gtk = { version = "0.11.2", package = "gtk4", features = ["v4_14"] }
+
+[lints.rust]
+# Wayland protocol plumbing + GTK's wayland objects; the generated protocol
+# code path can need `unsafe`. This is the only crate besides `hytte-ecal`
+# overriding the workspace `forbid`. Safe wrappers in `lib.rs` confine any
+# unsafety; downstream crates (sidebar/modal) stay `unsafe`-free.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# This crate wraps a generated wayland protocol + GTK's wayland objects. The
+# allows below tame clippy::pedantic noise intrinsic to that:
+# - doc_markdown:       wayland/GTK type names read as "missing backticks"
+# - must_use_candidate: the safe wrappers' return values ARE the API
+doc_markdown = "allow"
+must_use_candidate = "allow"

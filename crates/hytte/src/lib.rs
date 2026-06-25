@@ -2,6 +2,7 @@
 //! crate just re-exports `hytte_ui`, `hytte_reactive`, `hytte_services`,
 //! and `hytte_bus` under shorter module paths.
 
+pub use hytte_blur as blur;
 pub use hytte_bus as bus;
 pub use hytte_reactive as reactive;
 pub use hytte_services as services;

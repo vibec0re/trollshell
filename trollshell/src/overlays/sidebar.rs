@@ -35,9 +35,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
+use hytte::blur::SurfaceBlur;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
@@ -81,6 +83,11 @@ struct SidebarPanel {
     /// Periodic departures-refresh timer (fires only while open). Removed in
     /// [`close_all`] so it doesn't outlive the surface across a hot-plug.
     refresh_source: glib::SourceId,
+    /// Client-side `ext-background-effect` blur scope for this surface (#192/
+    /// #193). `None` when niri < 26.04 (or the effect couldn't attach); the
+    /// niri layer-rule blur (`etc/niri/blur.kdl`) is the fallback there. Shared
+    /// with the open subscription + map handler so they drive the region.
+    blur: Rc<RefCell<Option<SurfaceBlur>>>,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -175,7 +182,15 @@ pub fn install(monitor: &Monitor) {
     // so without this the closed sidebar's region still swallows clicks.
     apply_input_passthrough(&window, false);
 
-    let subscription = wire_open_subscription(&window, &revealer, &open_state);
+    // Client-side blur-region scope (#192/#193). The wl_surface only exists
+    // once the surface maps, so attach on first `map` and seed the region to
+    // the current open-state. `None` on niri < 26.04 → the layer-rule blur in
+    // etc/niri/blur.kdl stays as the fallback. Stored shared so the open
+    // subscription can drive the region as the card slides.
+    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
+    wire_blur_attach(&window, &blur, &open_state);
+
+    let subscription = wire_open_subscription(&window, &revealer, &open_state, &blur);
     wire_escape(&window, monitor.clone());
 
     // Keep the board live while open: re-poll departures on a fixed cadence
@@ -198,6 +213,7 @@ pub fn install(monitor: &Monitor) {
                 open_state,
                 subscription,
                 refresh_source,
+                blur,
             },
         );
     });
@@ -291,19 +307,133 @@ fn wire_open_subscription(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
     open_state: &Mutable<bool>,
+    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
+    let blur = blur.clone();
+    let open_state_for_tick = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
         revealer.set_reveal_child(open);
         apply_input_passthrough(&window, !open);
+        // Scope niri's frost to the card as it slides: tick the region off the
+        // revealer's animating width until it settles, then clear it on close
+        // so no strip lingers (#192). No-op when `blur` is None (niri < 26.04).
+        drive_blur_during_slide(&window, &revealer, &blur, &open_state_for_tick, open);
         if open {
             hytte::services::departures::refresh();
             hytte::services::weather::refresh();
         }
         async {}
     }))
+}
+
+/// Surface-local height to blur: the mapped surface's height (full screen, since
+/// the sidebar anchors Top+Bottom). Falls back to the window's allocated height
+/// before the surface reports a size.
+fn surface_height(window: &gtk::Window) -> i32 {
+    window
+        .surface()
+        .map_or_else(|| window.height(), |s| s.height())
+}
+
+/// Apply the blur region for the revealer's *current* state, returning whether
+/// the slide animation has settled at the `open` target. When settled the
+/// region locks to the authoritative `SIDEBAR_WIDTH` (open) / clears (closed);
+/// mid-slide it follows the revealer's allocated width so the frost tracks the
+/// card. No-op when `blur` is `None` (niri < 26.04).
+fn apply_slide_region(
+    window: &gtk::Window,
+    revealer: &gtk::Revealer,
+    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
+    open: bool,
+) -> bool {
+    let settled = revealer.is_child_revealed() == open;
+    let visible = if settled {
+        if open { SIDEBAR_WIDTH } else { 0 }
+    } else {
+        // `revealer.width()` is the allocated child width mid-slide.
+        revealer.width().clamp(0, SIDEBAR_WIDTH)
+    };
+    if let Some(sb) = blur.borrow().as_ref() {
+        sb.set_region(hytte::blur::left_panel_region(
+            visible,
+            surface_height(window),
+        ));
+    }
+    settled
+}
+
+/// Drive the blur region across the slide: apply once now, then re-arm a frame
+/// tick (~60 Hz) until the revealer settles, so the frost slides in/out with the
+/// card and clears on close (no lingering strip, #192).
+///
+/// `open_state` is checked each tick: if the user re-toggles mid-animation, the
+/// live target diverges from this timer's captured `open` and the stale timer
+/// stops (the fresh subscription firing started its own).
+fn drive_blur_during_slide(
+    window: &gtk::Window,
+    revealer: &gtk::Revealer,
+    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
+    open_state: &Mutable<bool>,
+    open: bool,
+) {
+    if apply_slide_region(window, revealer, blur, open) {
+        return;
+    }
+    let window = window.clone();
+    let revealer = revealer.clone();
+    let blur = blur.clone();
+    let open_state = open_state.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        // A re-toggle started a fresh tick for the new target; bail out so two
+        // timers don't fight over the region.
+        if open_state.get() != open {
+            return glib::ControlFlow::Break;
+        }
+        if apply_slide_region(&window, &revealer, &blur, open) {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// Attach the [`SurfaceBlur`] once the layer surface is mapped (its `wl_surface`
+/// exists). Seeds the region to the current open-state so the closed sidebar
+/// starts with no frost. The sidebar surface is persistent (mapped once at
+/// install), so this attaches a single time — the `is_some` guard makes a
+/// stray re-map idempotent.
+fn wire_blur_attach(
+    window: &gtk::Window,
+    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
+    open_state: &Mutable<bool>,
+) {
+    let blur = blur.clone();
+    let open_state = open_state.clone();
+    window.connect_map(move |w| {
+        // Defer to idle so the wl_surface is fully realized before we bind.
+        let w = w.clone();
+        let blur = blur.clone();
+        let open_state = open_state.clone();
+        glib::idle_add_local_once(move || {
+            if blur.borrow().is_some() {
+                return;
+            }
+            if let Some(sb) = hytte::blur::attach(&w) {
+                let open = open_state.get();
+                let visible = if open { SIDEBAR_WIDTH } else { 0 };
+                sb.set_region(hytte::blur::left_panel_region(visible, surface_height(&w)));
+                *blur.borrow_mut() = Some(sb);
+                tracing::debug!("sidebar: attached client blur-region scope");
+            } else {
+                tracing::debug!(
+                    "sidebar: client blur-region unavailable (niri < 26.04?); using layer-rule fallback"
+                );
+            }
+        });
+    });
 }
 
 /// Toggle the surface's input region so the closed sidebar's persistent
@@ -350,6 +480,10 @@ pub fn close_all() {
             panel.subscription.abort();
             panel.refresh_source.remove();
             panel.open_state.set(false);
+            // Drop the blur effect explicitly before closing the surface so the
+            // `ext-background-effect` object is destroyed against a live
+            // wl_surface (its Drop issues `destroy` + a final commit nudge).
+            panel.blur.borrow_mut().take();
             panel.window.close();
         }
     });

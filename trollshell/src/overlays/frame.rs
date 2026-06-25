@@ -5,7 +5,7 @@
 //! interactive because the frame's input region is empty — every click
 //! falls through to the layer below.
 //!
-//! The frame paints a flat dark purple (`rgb(18, 10, 36)`, matching
+//! The frame paints a flat dark purple (`rgb(14, 8, 28)`, matching
 //! `@shell_background` in `style.css`) into the L/R/bottom border regions
 //! and carves four rounded inner corners around the workspace cutout.
 //! Top inset is the bar's exclusive zone.
@@ -169,10 +169,10 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
 
         // Source: flat dark purple matching `@shell_background` in style.css —
-        // `rgb(18, 10, 36)`. The bar is now a flat fill too, so the frame's
-        // L/R/bottom borders match it exactly. Cairo can't read CSS vars, so
-        // this value must be kept in sync with @shell_background manually.
-        cr.set_source_rgba(18.0 / 255.0, 10.0 / 255.0, 36.0 / 255.0, 1.0);
+        // `rgb(14, 8, 28)`. The bar paints the opaque `@shell_background_opaque`
+        // (same RGB), so the frame's L/R/bottom borders match it exactly. Cairo
+        // can't read CSS vars, so keep this in sync with @shell_background.
+        cr.set_source_rgba(14.0 / 255.0, 8.0 / 255.0, 28.0 / 255.0, 1.0);
         if let Err(e) = cr.fill() {
             tracing::warn!(error = %e, "frame: cairo fill failed");
         }

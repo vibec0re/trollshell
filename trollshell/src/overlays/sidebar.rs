@@ -533,7 +533,24 @@ fn drive_exclusive_zone_on_settle(
         if revealer.is_child_revealed() != open {
             return false;
         }
-        window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
+        let zone = if open { SIDEBAR_WIDTH } else { 0 };
+        // DIAGNOSTIC (#194): the close-path reflow is still unverified — the blur
+        // clears on close (so commits ARE firing) yet the tile can stay pushed
+        // with a grey gap. Log the SETTLED surface geometry + the zone we hand
+        // niri, so a `RUST_LOG=trollshell=debug` capture distinguishes the two
+        // hypotheses: on close, does the surface collapse to ~0 width (zone=0
+        // should let niri reflow → cause is downstream in niri) or stay
+        // ~SIDEBAR_WIDTH (the closed surface still covers the reflowed tile)?
+        // Fires once per settle (the re-assert), not per animation frame.
+        tracing::debug!(
+            open,
+            set_exclusive_zone = zone,
+            revealed = revealer.is_child_revealed(),
+            win_width = window.width(),
+            surface_width = ?window.surface().map(|s| s.width()),
+            "sidebar: exclusive-zone re-assert on settle",
+        );
+        window.set_exclusive_zone(zone);
         // Force a GTK frame so the pending layer-shell state commits even when
         // the settled surface would otherwise draw nothing further.
         window.queue_draw();

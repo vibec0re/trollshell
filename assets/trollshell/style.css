@@ -18,18 +18,25 @@
  * `font-size` on `*` below, so for shell widgets `1em` resolves against that;
  * authoring in `em` still keeps a single knob for density scaling. */
 
-/* Shell surface color — a flat lilac shared by every shell surface: bar,
- * slide-out drawer, and sidebar.  One variable keeps them visually unified.
- * Always dark regardless of the system theme (the bar is always dark).
- * Note: frame.rs hardcodes this value as a cairo flat fill (cairo can't
- * read CSS vars) — update frame.rs too whenever this changes COLOR.
+/* Shell surface colour — a flat deep purple shared by the shell surfaces.
+ * One variable keeps them visually unified. Always dark regardless of the
+ * system theme (the shell chrome is always dark). Note: frame.rs hardcodes
+ * this RGB as a cairo flat fill (cairo can't read CSS vars) — update frame.rs
+ * too whenever this changes COLOUR.
  *
- * The alpha below is deliberately NOT mirrored into frame.rs: the chrome
- * surfaces backed by this colour (bar, sidebar, drawer) are translucent so
- * niri's layer-rule blur can frost the wallpaper behind them (see
- * etc/niri/blur.kdl), while the frame border stays fully opaque. Set the
- * alpha back to 1.0 (or use a plain rgb()) to disable the frosted look. */
-@define-color shell_background rgba(18, 10, 36, 0.85);
+ * The alpha here keeps the SIDEBAR and DRAWER translucent so niri's layer-rule
+ * blur can frost the wallpaper behind them (see etc/niri/blur.kdl), while the
+ * frame border stays fully opaque. The BAR does NOT use this translucent token:
+ * it paints @shell_background_opaque (below) so it reads as one flat colour with
+ * the opaque frame border — no seam where the bar's bottom edge meets the
+ * frame's top edge (the trade-off: the bar shows no wallpaper frost). Set the
+ * alpha back to 1.0 to flatten the sidebar/drawer too. */
+@define-color shell_background rgba(14, 8, 28, 0.85);
+/* Opaque sibling of @shell_background — same RGB, alpha forced to 1.0. Painted
+ * by the bar so it matches the frame's fully-opaque cairo fill (frame.rs)
+ * exactly, killing the bar↔frame seam. Keep its RGB in sync with
+ * @shell_background above AND with frame.rs. */
+@define-color shell_background_opaque rgb(14, 8, 28);
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
  * than @shell_background so the weather/calendar/tasks/departures cards read as
@@ -57,7 +64,13 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    background: @shell_background;
+    /* Flat OPAQUE fill matching the frame border (frame.rs) exactly, so the
+     * bar's bottom edge meets the frame's top edge with no visible seam. Paint
+     * the surface here ONCE — .hytte-bar-content stays transparent (painting
+     * @shell_background there too stacked a second translucent 0.85 layer → a
+     * ~0.98 effective alpha that read slightly off-colour against the opaque
+     * frame: the seam). */
+    background: @shell_background_opaque;
     color: #ffffff;
     border: none;
     box-shadow: none;
@@ -83,7 +96,10 @@
     margin: 0;
     min-height: 32px;
     border-radius: 0;
-    background: @shell_background;
+    /* Transparent: the opaque .hytte-bar window behind it supplies the single
+     * flat fill. Double-painting @shell_background here was the seam Annika
+     * saw — two translucent layers ≈ 0.98 alpha vs the opaque frame's 1.0. */
+    background: transparent;
 }
 .hytte-bar-group-left button,
 .hytte-bar-group-center button {

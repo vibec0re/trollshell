@@ -29,7 +29,16 @@
  * niri's layer-rule blur can frost the wallpaper behind them (see
  * etc/niri/blur.kdl), while the frame border stays fully opaque. Set the
  * alpha back to 1.0 (or use a plain rgb()) to disable the frosted look. */
-@define-color shell_background rgba(25, 15, 45, 0.85);
+@define-color shell_background rgba(18, 10, 36, 0.85);
+
+/* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
+ * than @shell_background so the weather/calendar/tasks/departures cards read as
+ * raised over the translucent (frosted) sidebar panel. Deliberately opaque: the
+ * panel is translucent so niri's blur frosts the wallpaper behind it, which
+ * makes text sitting straight on the panel unreadable. Each widget gets its own
+ * opaque card so its text reads against a stable dark surface, not the blurred
+ * wallpaper. Same purple hue as the shell colour; tune freely. */
+@define-color sidebar_card_background rgb(32, 22, 54);
 
 * {
     font-family: "Cantarell", system-ui, sans-serif;
@@ -417,10 +426,24 @@
     color: white;
 }
 
+/* Sidebar widget cards — each top-level widget is a SOLID opaque dark card so
+ * its text reads against a stable surface instead of straight on the blurred
+ * wallpaper behind the translucent panel (#194). Background/radius/margin live
+ * here; per-widget padding is kept in each widget's own rule below so their
+ * internal rhythm is untouched. */
+.ts-weather,
+.ts-sidebar-calendar,
+.ts-sidebar-tasks,
+.ts-departures {
+    background: @sidebar_card_background;
+    border-radius: 0.769em;
+    margin-bottom: 0.615em;
+}
+
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {
-    padding: 0.308em;
+    padding: 0.615em 0.769em;
 }
 .ts-weather-location {
     font-size: 0.846em;
@@ -761,7 +784,7 @@
 /* ─── Calendar widget — sidebar surface ─────────────────────────── */
 
 .ts-sidebar-calendar {
-    padding: 0.615em 0.615em 0 0.615em;
+    padding: 0.615em 0.769em 0.462em 0.769em;
 }
 
 /* Header row: < | "Month YYYY" | > */
@@ -1082,8 +1105,9 @@
 /* ─── Sidebar — tasks widget ──────────────────────────────────── */
 
 .ts-sidebar-tasks {
-    padding: 0 0.923em;
-    margin-top: 0.769em;
+    /* Inter-card spacing comes from the shared .ts-weather/... margin-bottom
+     * above; padding gives the tasks list room inside its own card (#194). */
+    padding: 0.462em 0.769em 0.615em 0.769em;
 }
 
 .ts-sidebar-tasks-header {

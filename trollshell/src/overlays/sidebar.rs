@@ -21,6 +21,14 @@
 //! revealer settled at 0 width), so we drive it directly. Niri snaps tiles +
 //! the bar to the new value immediately; the revealer's slide is cosmetic.
 //!
+//! `set_exclusive_zone` only mutates gtk4-layer-shell's *pending* state — it
+//! applies on the surface's next `wl_surface.commit`, which GTK only issues
+//! when it draws. On close the settled card draws nothing, so the
+//! `exclusive_zone = 0` could sit uncommitted and niri would keep the tile
+//! pushed (a wallpaper gap on the left). `drive_exclusive_zone_on_settle`
+//! re-asserts the zone once the revealer settles and forces a GTK frame so the
+//! final committed surface state carries it (#194).
+//!
 //! ## Frame integration
 //!
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
@@ -313,10 +321,21 @@ fn wire_open_subscription(
     let revealer = revealer.clone();
     let blur = blur.clone();
     let open_state_for_tick = open_state.clone();
+    let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
         revealer.set_reveal_child(open);
         apply_input_passthrough(&window, !open);
+        // Re-assert the exclusive zone once the revealer settles so niri reliably
+        // reclaims the strip on close (#194). `set_exclusive_zone` only mutates
+        // gtk4-layer-shell's PENDING state; it commits on GTK's next frame. When
+        // the sidebar settles closed (transparent card, revealer collapsed to 0)
+        // GTK has no reason to draw again, so the `exclusive_zone = 0` can sit
+        // uncommitted — the compositor keeps the tile pushed and a wallpaper gap
+        // shows. We tick until settle, then re-set the zone + force a GTK frame
+        // (queue_draw) so the FINAL committed surface state carries the right
+        // zone. NEEDS LIVE NIRI RE-TEST.
+        drive_exclusive_zone_on_settle(&window, &revealer, &open_state_for_zone, open);
         // Scope niri's frost to the card as it slides: tick the region off the
         // revealer's animating width until it settles, then clear it on close
         // so no strip lingers (#192). No-op when `blur` is None (niri < 26.04).
@@ -393,6 +412,71 @@ fn drive_blur_during_slide(
             return glib::ControlFlow::Break;
         }
         if apply_slide_region(&window, &revealer, &blur, open) {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// Re-assert the layer-shell exclusive zone after the revealer settles, then
+/// force a GTK frame so the final surface state actually commits (#194).
+///
+/// `set_exclusive_zone` (called once in [`wire_open_subscription`]) only mutates
+/// gtk4-layer-shell's *pending* state — it applies on the surface's next
+/// `wl_surface.commit`, which GTK only issues when it draws a frame. On OPEN the
+/// revealer's slide and the now-visible card keep GTK drawing, so the
+/// `SIDEBAR_WIDTH` zone commits naturally. On CLOSE the card slides back to 0
+/// width and goes transparent; once it settles GTK has no further reason to
+/// draw, so the `exclusive_zone = 0` can sit uncommitted — niri never sees the
+/// new zone, keeps the tile pushed ~`SIDEBAR_WIDTH` right, and leaves a
+/// wallpaper gap on the left.
+///
+/// We tick at frame cadence until the revealer settles at the `open` target,
+/// then re-set the zone to the authoritative value and `queue_draw()` the
+/// window. `queue_draw` schedules a GTK frame whose commit carries the pending
+/// layer-shell state (mirrors how [`SurfaceBlur::set_region`] nudges the region
+/// to commit). Re-asserting at the *settled* moment guarantees the final
+/// committed state matches the final open-state, even if the last mid-slide
+/// commit predated it.
+///
+/// Like [`drive_blur_during_slide`], a mid-animation re-toggle is detected via
+/// `open_state` and the stale timer bails so two timers don't fight.
+///
+/// NEEDS LIVE NIRI RE-TEST: the uncommitted-pending-zone hypothesis is the most
+/// defensible explanation for the non-reflow, but it can only be confirmed
+/// against a real niri session.
+fn drive_exclusive_zone_on_settle(
+    window: &gtk::Window,
+    revealer: &gtk::Revealer,
+    open_state: &Mutable<bool>,
+    open: bool,
+) {
+    // Helper: when the revealer has reached the target, lock in the zone and
+    // force a commit. Returns whether it settled (i.e. the caller can stop).
+    fn reassert_if_settled(window: &gtk::Window, revealer: &gtk::Revealer, open: bool) -> bool {
+        if revealer.is_child_revealed() != open {
+            return false;
+        }
+        window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
+        // Force a GTK frame so the pending layer-shell state commits even when
+        // the settled surface would otherwise draw nothing further.
+        window.queue_draw();
+        true
+    }
+
+    if reassert_if_settled(window, revealer, open) {
+        return;
+    }
+    let window = window.clone();
+    let revealer = revealer.clone();
+    let open_state = open_state.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        // A re-toggle started a fresh tick for the new target; bail out.
+        if open_state.get() != open {
+            return glib::ControlFlow::Break;
+        }
+        if reassert_if_settled(&window, &revealer, open) {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue

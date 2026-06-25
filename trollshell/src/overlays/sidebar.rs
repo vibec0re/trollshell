@@ -96,6 +96,15 @@ struct SidebarPanel {
     /// niri layer-rule blur (`etc/niri/blur.kdl`) is the fallback there. Shared
     /// with the open subscription + map handler so they drive the region.
     blur: Rc<RefCell<Option<SurfaceBlur>>>,
+    /// Live blur-region slide timer ([`drive_blur_during_slide`]), if one is
+    /// armed. Cancelled in [`close_all`]: a tick armed for a close that gets
+    /// interrupted by `close_all` (window closed mid-slide → the revealer can
+    /// never settle, its frame clock having stopped) would otherwise loop on the
+    /// main context forever, keeping the window/revealer/blur clones alive.
+    blur_tick: Rc<RefCell<Option<glib::SourceId>>>,
+    /// Live exclusive-zone settle timer ([`drive_exclusive_zone_on_settle`]),
+    /// if one is armed. Same leak + teardown as [`Self::blur_tick`].
+    zone_tick: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
 fn monitor_key(m: &Monitor) -> String {
@@ -198,7 +207,19 @@ pub fn install(monitor: &Monitor) {
     let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
     wire_blur_attach(&window, &blur, &open_state);
 
-    let subscription = wire_open_subscription(&window, &revealer, &open_state, &blur);
+    // Slots holding the currently-armed slide timers so `close_all` can cancel
+    // them before tearing the surface down (see field docs on SidebarPanel).
+    let blur_tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let zone_tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    let subscription = wire_open_subscription(
+        &window,
+        &revealer,
+        &open_state,
+        &blur,
+        &blur_tick,
+        &zone_tick,
+    );
     wire_escape(&window, monitor.clone());
 
     // Keep the board live while open: re-poll departures on a fixed cadence
@@ -222,6 +243,8 @@ pub fn install(monitor: &Monitor) {
                 subscription,
                 refresh_source,
                 blur,
+                blur_tick,
+                zone_tick,
             },
         );
     });
@@ -316,10 +339,14 @@ fn wire_open_subscription(
     revealer: &gtk::Revealer,
     open_state: &Mutable<bool>,
     blur: &Rc<RefCell<Option<SurfaceBlur>>>,
+    blur_tick: &Rc<RefCell<Option<glib::SourceId>>>,
+    zone_tick: &Rc<RefCell<Option<glib::SourceId>>>,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
     let blur = blur.clone();
+    let blur_tick = blur_tick.clone();
+    let zone_tick = zone_tick.clone();
     let open_state_for_tick = open_state.clone();
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
@@ -335,11 +362,18 @@ fn wire_open_subscription(
         // shows. We tick until settle, then re-set the zone + force a GTK frame
         // (queue_draw) so the FINAL committed surface state carries the right
         // zone. NEEDS LIVE NIRI RE-TEST.
-        drive_exclusive_zone_on_settle(&window, &revealer, &open_state_for_zone, open);
+        drive_exclusive_zone_on_settle(&window, &revealer, &open_state_for_zone, &zone_tick, open);
         // Scope niri's frost to the card as it slides: tick the region off the
         // revealer's animating width until it settles, then clear it on close
         // so no strip lingers (#192). No-op when `blur` is None (niri < 26.04).
-        drive_blur_during_slide(&window, &revealer, &blur, &open_state_for_tick, open);
+        drive_blur_during_slide(
+            &window,
+            &revealer,
+            &blur,
+            &open_state_for_tick,
+            &blur_tick,
+            open,
+        );
         if open {
             hytte::services::departures::refresh();
             hytte::services::weather::refresh();
@@ -384,18 +418,57 @@ fn apply_slide_region(
     settled
 }
 
+/// Re-arm a frame-cadence (~60 Hz) slide timer in `slot`, first cancelling
+/// whatever timer `slot` currently holds. `step` runs each tick and returns the
+/// next [`glib::ControlFlow`]; when it yields `Break` the timer clears `slot`.
+///
+/// Because re-arming removes the slot's previous timer, at most one timer per
+/// slot is ever live, and `slot` only ever holds a *live* id (the owner clears
+/// it on `Break`). That invariant is what lets [`close_all`] cancel an in-flight
+/// slide tick by removing the stored id — without it, a tick armed for a close
+/// that is then interrupted by `close_all` (window closed mid-slide → the
+/// revealer's frame clock stops, so it can never settle and the tick's own
+/// settle/bail conditions never trip) would loop on the main context forever,
+/// holding the window/revealer/blur clones alive (a zombie surface per
+/// hot-plug). It also means `close_all` never removes a stale (already-finished,
+/// possibly reused) source id.
+fn rearm_slide_tick<F>(slot: &Rc<RefCell<Option<glib::SourceId>>>, mut step: F)
+where
+    F: FnMut() -> glib::ControlFlow + 'static,
+{
+    // The slot only holds a live timer (the owner clears it on Break), so a
+    // present id is safe to remove here.
+    let previous = slot.borrow_mut().take();
+    if let Some(previous) = previous {
+        previous.remove();
+    }
+    let slot_for_clear = slot.clone();
+    let id = glib::timeout_add_local(Duration::from_millis(16), move || {
+        let flow = step();
+        if matches!(flow, glib::ControlFlow::Break) {
+            // We are the slot's only live timer (re-arm removes predecessors),
+            // so clearing unconditionally can't drop a successor's id.
+            slot_for_clear.borrow_mut().take();
+        }
+        flow
+    });
+    *slot.borrow_mut() = Some(id);
+}
+
 /// Drive the blur region across the slide: apply once now, then re-arm a frame
 /// tick (~60 Hz) until the revealer settles, so the frost slides in/out with the
 /// card and clears on close (no lingering strip, #192).
 ///
 /// `open_state` is checked each tick: if the user re-toggles mid-animation, the
 /// live target diverges from this timer's captured `open` and the stale timer
-/// stops (the fresh subscription firing started its own).
+/// stops (the fresh subscription firing started its own). The timer id is parked
+/// in `tick_slot` so [`close_all`] can cancel it on teardown.
 fn drive_blur_during_slide(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
     blur: &Rc<RefCell<Option<SurfaceBlur>>>,
     open_state: &Mutable<bool>,
+    tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
     open: bool,
 ) {
     if apply_slide_region(window, revealer, blur, open) {
@@ -405,7 +478,7 @@ fn drive_blur_during_slide(
     let revealer = revealer.clone();
     let blur = blur.clone();
     let open_state = open_state.clone();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
+    rearm_slide_tick(tick_slot, move || {
         // A re-toggle started a fresh tick for the new target; bail out so two
         // timers don't fight over the region.
         if open_state.get() != open {
@@ -441,7 +514,8 @@ fn drive_blur_during_slide(
 /// commit predated it.
 ///
 /// Like [`drive_blur_during_slide`], a mid-animation re-toggle is detected via
-/// `open_state` and the stale timer bails so two timers don't fight.
+/// `open_state` and the stale timer bails so two timers don't fight; the timer
+/// id is parked in `tick_slot` so [`close_all`] can cancel it on teardown.
 ///
 /// NEEDS LIVE NIRI RE-TEST: the uncommitted-pending-zone hypothesis is the most
 /// defensible explanation for the non-reflow, but it can only be confirmed
@@ -450,6 +524,7 @@ fn drive_exclusive_zone_on_settle(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
     open_state: &Mutable<bool>,
+    tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
     open: bool,
 ) {
     // Helper: when the revealer has reached the target, lock in the zone and
@@ -471,7 +546,7 @@ fn drive_exclusive_zone_on_settle(
     let window = window.clone();
     let revealer = revealer.clone();
     let open_state = open_state.clone();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
+    rearm_slide_tick(tick_slot, move || {
         // A re-toggle started a fresh tick for the new target; bail out.
         if open_state.get() != open {
             return glib::ControlFlow::Break;
@@ -569,6 +644,16 @@ pub fn close_all() {
             // tear down the surface.
             panel.subscription.abort();
             panel.refresh_source.remove();
+            // Cancel any in-flight slide timers. With the subscription aborted
+            // these can't be re-armed, and without this an interrupted close
+            // tick would loop forever (the closed window's revealer can never
+            // settle) holding the surface alive across the hot-plug.
+            if let Some(id) = panel.blur_tick.borrow_mut().take() {
+                id.remove();
+            }
+            if let Some(id) = panel.zone_tick.borrow_mut().take() {
+                id.remove();
+            }
             panel.open_state.set(false);
             // Drop the blur effect explicitly before closing the surface so the
             // `ext-background-effect` object is destroyed against a live

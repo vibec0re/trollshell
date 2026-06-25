@@ -430,11 +430,19 @@
  * its text reads against a stable surface instead of straight on the blurred
  * wallpaper behind the translucent panel (#194). Background/radius/margin live
  * here; per-widget padding is kept in each widget's own rule below so their
- * internal rhythm is untouched. */
+ * internal rhythm is untouched.
+ *
+ * `.ts-sidebar-calendar` is the lone shared class: `calendar::build_block`
+ * feeds BOTH the sidebar `widget` and the drawer `widget_for_drawer`, so it is
+ * scoped under the sidebar card's `.ts-sidebar` ancestor (added only in
+ * `sidebar::build_card`) — otherwise the opaque card would also paint over the
+ * drawer Calendar page, which must keep its transparent silhouette. The other
+ * three classes are sidebar-only (their `widget()` is appended only in the
+ * sidebar card), so they need no scoping. */
 .ts-weather,
-.ts-sidebar-calendar,
 .ts-sidebar-tasks,
-.ts-departures {
+.ts-departures,
+.ts-sidebar .ts-sidebar-calendar {
     background: @sidebar_card_background;
     border-radius: 0.769em;
     margin-bottom: 0.615em;

@@ -402,9 +402,15 @@ fn drive_blur_during_slide(
 
 /// Attach the [`SurfaceBlur`] once the layer surface is mapped (its `wl_surface`
 /// exists). Seeds the region to the current open-state so the closed sidebar
-/// starts with no frost. The sidebar surface is persistent (mapped once at
-/// install), so this attaches a single time — the `is_some` guard makes a
-/// stray re-map idempotent.
+/// starts with no frost.
+///
+/// The sidebar surface is persistent (mapped once at install), so in the common
+/// case this attaches a single time. But if the surface is ever unmapped +
+/// remapped (hot-plug / compositor remap), the previous handle is bound to a
+/// now-destroyed `wl_surface` (inert). We therefore **drop the stale handle on
+/// each map, then re-attach + re-seed** — mirroring the drawer's take-then-
+/// reattach — instead of guarding with `is_some` (which would keep the dead
+/// handle forever). Idempotent on a single map.
 fn wire_blur_attach(
     window: &gtk::Window,
     blur: &Rc<RefCell<Option<SurfaceBlur>>>,
@@ -418,9 +424,9 @@ fn wire_blur_attach(
         let blur = blur.clone();
         let open_state = open_state.clone();
         glib::idle_add_local_once(move || {
-            if blur.borrow().is_some() {
-                return;
-            }
+            // Drop any handle bound to a previous (now-destroyed) surface so a
+            // remap rebinds against the live wl_surface.
+            blur.borrow_mut().take();
             if let Some(sb) = hytte::blur::attach(&w) {
                 let open = open_state.get();
                 let visible = if open { SIDEBAR_WIDTH } else { 0 };

@@ -26,13 +26,6 @@ wayland-client = "0.31.10"
 wayland-protocols = { version = "0.32.13", features = ["staging", "client"] }
 gtk = { version = "0.11.2", package = "gtk4", features = ["v4_14"] }
 
-[lints.rust]
-# Wayland protocol plumbing + GTK's wayland objects; the generated protocol
-# code path can need `unsafe`. This is the only crate besides `hytte-ecal`
-# overriding the workspace `forbid`. Safe wrappers in `lib.rs` confine any
-# unsafety; downstream crates (sidebar/modal) stay `unsafe`-free.
-unsafe_code = "allow"
-
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }

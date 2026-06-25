@@ -974,8 +974,15 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
 /// every close (`set_visible(false)`) and recreated on open, so the `wl_surface`
 /// — and thus the effect binding — is fresh each time. We therefore **re-attach
 /// on every map**, replacing any stale handle. `None` on niri < 26.04 leaves the
-/// layer-rule blur as the fallback. The card rect is then driven by
-/// [`drive_drawer_blur`] from `show_panel`.
+/// layer-rule blur as the fallback.
+///
+/// This `connect_map` idle can land *after* [`drive_drawer_blur`]'s tick has
+/// already `Break`'d (the tick stops once the revealer settles, ~180 ms, whether
+/// or not it ever saw a non-`None` handle). If the drawer is open at attach time
+/// we therefore **seed the card rect right here**, mirroring the sidebar's
+/// post-attach seed — otherwise the region would never be set and the fullscreen
+/// surface would frost the whole screen for the session. If the drawer is closed
+/// at attach time we leave the region clear.
 fn wire_blur_attach(window: &gtk::Window, blur: &Rc<RefCell<Option<SurfaceBlur>>>, key: String) {
     let blur = blur.clone();
     window.connect_map(move |w| {
@@ -986,6 +993,20 @@ fn wire_blur_attach(window: &gtk::Window, blur: &Rc<RefCell<Option<SurfaceBlur>>
             // Drop any handle bound to the previous (now-destroyed) surface.
             blur.borrow_mut().take();
             if let Some(sb) = hytte::blur::attach(&w) {
+                // Seed the region now if the drawer is already open: the tick
+                // that normally drives it may have stopped before this late
+                // attach (see fn docs). Compute the rect while holding only the
+                // PANELS borrow, then release it before touching `blur`.
+                let seed = PANELS.with(|panels| {
+                    let panels = panels.borrow();
+                    panels
+                        .get(&key)
+                        .filter(|panel| panel.open_state.get())
+                        .and_then(card_surface_rect)
+                });
+                if let Some(rect) = seed {
+                    sb.set_region(Some(rect));
+                }
                 *blur.borrow_mut() = Some(sb);
                 tracing::debug!(monitor = %key, "drawer: attached client blur-region scope");
             } else {

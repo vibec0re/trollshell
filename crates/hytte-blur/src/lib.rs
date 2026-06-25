@@ -7,18 +7,21 @@
 //! niri a *sub-rectangle* — "blur only here" — via the surface's own
 //! `set_blur_region` request, scoping the frost to the visible card.
 //!
-//! ## Why a confined-`unsafe` crate
+//! ## GTK ↔ Wayland interop (no `unsafe` needed)
 //!
 //! We call the protocol on **GTK's own `wl_surface`**, over **GTK's own
 //! libwayland connection** — not a separate one — or the proxies wouldn't
 //! interoperate. `gdk4-wayland` (feature `wayland_crate`) hands us the raw
-//! `wayland-client` objects: `WaylandSurface::wl_surface()`,
+//! `wayland-client` objects via safe getters: `WaylandSurface::wl_surface()`,
 //! `WaylandDisplay::wl_display()`, `WaylandDisplay::wl_compositor()`. We wrap
 //! GTK's display backend into a `wayland_client::Connection`, bind the
-//! `ext_background_effect_manager_v1` global on a throwaway event queue, and
-//! issue requests on the **same backend** so they flush over GTK's socket.
-//! All of that lives behind the safe [`attach`] / [`SurfaceBlur::set_region`]
-//! API; downstream (sidebar/modal) stays `unsafe`-free.
+//! `ext_background_effect_manager_v1` global once (cached per thread), and issue
+//! requests on the **same backend** so they flush over GTK's socket. The
+//! generated protocol code lives in the dependency crates (`wayland-client` /
+//! `wayland-protocols`), so this crate touches only their safe APIs — it needs
+//! no `unsafe` and inherits the workspace `unsafe_code = "forbid"`. All of it
+//! lives behind the safe [`attach`] / [`SurfaceBlur::set_region`] API;
+//! downstream (sidebar/modal) stays `unsafe`-free too.
 //!
 //! ## Commit timing
 //!
@@ -149,11 +152,96 @@ impl Dispatch<WlCompositor, ()> for BlurState {
     }
 }
 
+/// Process-wide (per-thread, GTK main thread) bound `ext-background-effect`
+/// manager. The manager is a compositor singleton: binding it once and reusing
+/// it across every [`attach`] avoids leaking a fresh `wl_registry` (no
+/// destructor) plus an `ext_background_effect_manager_v1` (wayland-rs proxies
+/// don't auto-send their destructors on drop) on every drawer open, and avoids
+/// re-paying the two blocking round-trips. The wayland objects are `!Send`, so
+/// a `thread_local` on the GTK main thread is the correct home; the bound
+/// manager intentionally lives for the process lifetime.
+struct BlurManager {
+    conn: Connection,
+    qh: QueueHandle<BlurState>,
+    manager: ExtBackgroundEffectManagerV1,
+}
+
+thread_local! {
+    /// `Some(BlurManager)` once the manager has been bound and advertised the
+    /// `blur` capability; `None` if the compositor doesn't expose the global or
+    /// the capability (niri < 26.04 / non-niri) — cached either way so an
+    /// unsupported compositor isn't re-probed on every [`attach`].
+    static MANAGER: std::cell::OnceCell<Option<BlurManager>> = const { std::cell::OnceCell::new() };
+}
+
+/// Bind the `ext-background-effect` manager once (first call) and return a
+/// reference-friendly view of the cached result. The bind + `capabilities`
+/// round-trip happens exactly once per thread; subsequent calls reuse the
+/// cache (including the unsupported `None` case). Returns the bits a
+/// [`SurfaceBlur`] needs cloned out of the cache so the borrow doesn't escape
+/// the `with` closure.
+///
+/// `wl_display_obj` is GTK's own `wl_display` (so our requests ride GTK's
+/// socket and the proxies interoperate with GTK's `wl_surface`).
+fn cached_manager(
+    wl_display_obj: &wayland_client::protocol::wl_display::WlDisplay,
+) -> Option<(
+    Connection,
+    QueueHandle<BlurState>,
+    ExtBackgroundEffectManagerV1,
+)> {
+    MANAGER.with(|cell| {
+        let bound = cell.get_or_init(|| bind_manager(wl_display_obj));
+        bound
+            .as_ref()
+            .map(|m| (m.conn.clone(), m.qh.clone(), m.manager.clone()))
+    })
+}
+
+/// First-time bind of the `ext-background-effect` manager on GTK's connection.
+/// Returns `None` when the global is absent or the `blur` capability isn't
+/// advertised — the graceful niri < 26.04 / non-niri no-op.
+fn bind_manager(
+    wl_display_obj: &wayland_client::protocol::wl_display::WlDisplay,
+) -> Option<BlurManager> {
+    // Wrap GTK's backend into a Connection so our requests flush over GTK's
+    // socket (same fd → the proxies interoperate with GTK's wl_surface).
+    let backend = wl_display_obj.backend().upgrade()?;
+    let conn = Connection::from_backend(backend);
+
+    // Registry queue used to bind the manager + drain its initial
+    // `capabilities` event. Created exactly once and kept alive in the cache;
+    // the effect/region objects we later create on `qh` ride the same
+    // connection. GTK's own queue drives the surface's frame commits.
+    let (globals, mut queue) = registry_queue_init::<BlurState>(&conn).ok()?;
+    let qh = queue.handle();
+
+    // v1 only; bind exactly version 1.
+    let manager: ExtBackgroundEffectManagerV1 = globals.bind(&qh, 1..=1, ()).ok()?;
+
+    // Round-trip so the `capabilities` event lands in BlurState before we
+    // decide whether blur is supported.
+    let mut state = BlurState::default();
+    queue.roundtrip(&mut state).ok()?;
+    if !state.blur_supported() {
+        tracing::debug!("ext-background-effect manager bound but blur capability absent");
+        return None;
+    }
+
+    tracing::debug!("bound ext-background-effect manager (blur capability present)");
+    Some(BlurManager { conn, qh, manager })
+}
+
 /// A live blur-region handle for one GTK window's surface.
 ///
 /// Holds the `ext_background_effect_surface_v1` plus the bits needed to build
 /// `wl_region`s on GTK's connection. Dropping it issues `destroy`, which (per
 /// the protocol) removes the effect on the surface's next commit.
+///
+/// The `conn`/`qh` are clones of the process-wide cached [`BlurManager`]'s; the
+/// `compositor`/`surface`/`effect`/`window` are this surface's own. Only the
+/// per-surface `effect` is destroyed on drop — the cached manager outlives every
+/// `SurfaceBlur`.
 pub struct SurfaceBlur {
     conn: Connection,
     qh: QueueHandle<BlurState>,
@@ -177,6 +265,10 @@ pub struct SurfaceBlur {
 /// Must be called **after** the window is mapped/realized (its `wl_surface`
 /// exists). Callers that build the window then `set_visible(true)` should
 /// attach right after, or on the window's first `map`.
+///
+/// The `ext-background-effect` manager is bound once per thread and cached (see
+/// [`cached_manager`]); this call only creates the per-surface effect object, so
+/// the per-open drawer churn no longer leaks a registry + manager.
 pub fn attach(window: &gtk::Window) -> Option<SurfaceBlur> {
     let surface_widget = window.surface()?;
     // GTK is Wayland-only here; downcast the GdkSurface / GdkDisplay to the
@@ -188,30 +280,12 @@ pub fn attach(window: &gtk::Window) -> Option<SurfaceBlur> {
     let display = WidgetExt::display(window);
     let wl_display = display.downcast_ref::<WaylandDisplay>()?;
     let wl_display_obj = wl_display.wl_display()?;
+    // GTK's existing `wl_compositor` (not a fresh bind → no leak).
     let compositor = wl_display.wl_compositor()?;
 
-    // Wrap GTK's backend into a Connection so our requests flush over GTK's
-    // socket (same fd → the proxies interoperate with GTK's wl_surface).
-    let backend = wl_display_obj.backend().upgrade()?;
-    let conn = Connection::from_backend(backend);
-
-    // Throwaway queue used only to bind the manager + drain its initial
-    // `capabilities` event. The effect/region objects we create on `qh` ride
-    // the same connection; GTK's own queue drives the surface's frame commits.
-    let (globals, mut queue) = registry_queue_init::<BlurState>(&conn).ok()?;
-    let qh = queue.handle();
-
-    // v1 only; bind exactly version 1.
-    let manager: ExtBackgroundEffectManagerV1 = globals.bind(&qh, 1..=1, ()).ok()?;
-
-    // Round-trip so the `capabilities` event lands in BlurState before we
-    // decide whether blur is supported.
-    let mut state = BlurState::default();
-    queue.roundtrip(&mut state).ok()?;
-    if !state.blur_supported() {
-        tracing::debug!("ext-background-effect manager bound but blur capability absent");
-        return None;
-    }
+    // Reuse the cached, process-wide manager (binds + probes on first call).
+    // `None` here preserves the graceful niri < 26.04 no-op.
+    let (conn, qh, manager) = cached_manager(&wl_display_obj)?;
 
     let effect = manager.get_background_effect(&wl_surface, &qh, ());
 

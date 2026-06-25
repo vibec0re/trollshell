@@ -1314,6 +1314,13 @@
     min-height: 1.846em;
 }
 
+/* Per-core CPU history graph (#196): N colored lines, so taller than the
+   single-line sparkline to keep the cores legible. Colors are generated
+   per-series in Rust (HSL spread), not from the theme color. */
+.ts-multi-sparkline {
+    min-height: 4em;
+}
+
 /* ── Stats: failed-unit pill ───────────────────────────────────────────── */
 
 .ts-pill-error {

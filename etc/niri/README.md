@@ -214,6 +214,28 @@ would frost the **entire screen**, so they're deliberately excluded. The
 `@shell_background` yet (transparent wrappers / `@card_bg_color`), so they
 won't frost until their card backgrounds gain an alpha — a follow-up.
 
+### Client-side region scoping (the frost hugs the content)
+
+The `layer-rule` blur frosts the **whole layer-shell surface geometry**, not the
+painted content. That's fine for the bar (the surface _is_ the content), but it
+bit the sidebar and drawer (#192/#193):
+
+- the sidebar surface is **always mapped** (it stays below the bar in z-order),
+  so an `xray` strip lingered where the sidebar was even when closed; and
+- the drawer is **one fullscreen surface** (the card + an invisible dismiss
+  catcher in one window, #109), so opening it frosted the entire screen.
+
+trollshell now also scopes the frost from the **client** side via niri 26.04's
+`ext-background-effect-v1` `set_blur_region` (the `hytte-blur` crate). The shell
+hands niri the visible card's rectangle — "blur only here" — driven off the same
+slide animation, so the frost tracks the sidebar as it slides in/out and hugs the
+drawer card instead of the whole surface. Closed → empty region → no strip.
+
+**The `layer-rule` blocks above stay.** They are still what _enables_ blur for
+those namespaces; the client region only _narrows_ it. On **niri < 26.04** (no
+`ext-background-effect` global), the client scoping is a graceful no-op and the
+layer-rule blur is the (un-scoped) fallback — so keep the blocks merged.
+
 ### Tuning
 
 - **Frost strength:** the `@shell_background` alpha in `style.css` (lower =

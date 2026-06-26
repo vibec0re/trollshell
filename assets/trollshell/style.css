@@ -18,18 +18,34 @@
  * `font-size` on `*` below, so for shell widgets `1em` resolves against that;
  * authoring in `em` still keeps a single knob for density scaling. */
 
-/* Shell surface color — a flat lilac shared by every shell surface: bar,
- * slide-out drawer, and sidebar.  One variable keeps them visually unified.
- * Always dark regardless of the system theme (the bar is always dark).
- * Note: frame.rs hardcodes this value as a cairo flat fill (cairo can't
- * read CSS vars) — update frame.rs too whenever this changes COLOR.
+/* Shell surface colour -- a flat deep purple shared by the shell surfaces.
+ * One variable keeps them visually unified. Always dark regardless of the
+ * system theme (the shell chrome is always dark). Note: frame.rs hardcodes
+ * this RGB as a cairo flat fill (cairo can't read CSS vars) -- update frame.rs
+ * too whenever this changes COLOUR.
  *
- * The alpha below is deliberately NOT mirrored into frame.rs: the chrome
- * surfaces backed by this colour (bar, sidebar, drawer) are translucent so
- * niri's layer-rule blur can frost the wallpaper behind them (see
- * etc/niri/blur.kdl), while the frame border stays fully opaque. Set the
- * alpha back to 1.0 (or use a plain rgb()) to disable the frosted look. */
-@define-color shell_background rgba(25, 15, 45, 0.85);
+ * The alpha here keeps the SIDEBAR and DRAWER translucent so niri's layer-rule
+ * blur can frost the wallpaper behind them (see etc/niri/blur.kdl), while the
+ * frame border stays fully opaque. The BAR does NOT use this translucent token:
+ * it paints @shell_background_opaque (below) so it reads as one flat colour with
+ * the opaque frame border -- no seam where the bar's bottom edge meets the
+ * frame's top edge (the trade-off: the bar shows no wallpaper frost). Set the
+ * alpha back to 1.0 to flatten the sidebar/drawer too. */
+@define-color shell_background rgba(14, 8, 28, 0.85);
+/* Opaque sibling of @shell_background -- same RGB, alpha forced to 1.0. Painted
+ * by the bar so it matches the frame's fully-opaque cairo fill (frame.rs)
+ * exactly, killing the bar<->frame seam. Keep its RGB in sync with
+ * @shell_background above AND with frame.rs. */
+@define-color shell_background_opaque rgb(14, 8, 28);
+
+/* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
+ * than @shell_background so the weather/calendar/tasks/departures cards read as
+ * raised over the translucent (frosted) sidebar panel. Deliberately opaque: the
+ * panel is translucent so niri's blur frosts the wallpaper behind it, which
+ * makes text sitting straight on the panel unreadable. Each widget gets its own
+ * opaque card so its text reads against a stable dark surface, not the blurred
+ * wallpaper. Same purple hue as the shell colour; tune freely. */
+@define-color sidebar_card_background rgb(32, 22, 54);
 
 * {
     font-family: "Cantarell", system-ui, sans-serif;
@@ -48,7 +64,13 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    background: @shell_background;
+    /* Flat OPAQUE fill matching the frame border (frame.rs) exactly, so the
+     * bar's bottom edge meets the frame's top edge with no visible seam. Paint
+     * the surface here ONCE — .hytte-bar-content stays transparent (painting
+     * @shell_background there too stacked a second translucent 0.85 layer → a
+     * ~0.98 effective alpha that read slightly off-colour against the opaque
+     * frame: the seam). */
+    background: @shell_background_opaque;
     color: #ffffff;
     border: none;
     box-shadow: none;
@@ -74,7 +96,10 @@
     margin: 0;
     min-height: 32px;
     border-radius: 0;
-    background: @shell_background;
+    /* Transparent: the opaque .hytte-bar window behind it supplies the single
+     * flat fill. Double-painting @shell_background here was the seam Annika
+     * saw — two translucent layers ≈ 0.98 alpha vs the opaque frame's 1.0. */
+    background: transparent;
 }
 .hytte-bar-group-left button,
 .hytte-bar-group-center button {
@@ -417,10 +442,32 @@
     color: white;
 }
 
+/* Sidebar widget cards — each top-level widget is a SOLID opaque dark card so
+ * its text reads against a stable surface instead of straight on the blurred
+ * wallpaper behind the translucent panel (#194). Background/radius/margin live
+ * here; per-widget padding is kept in each widget's own rule below so their
+ * internal rhythm is untouched.
+ *
+ * `.ts-sidebar-calendar` is the lone shared class: `calendar::build_block`
+ * feeds BOTH the sidebar `widget` and the drawer `widget_for_drawer`, so it is
+ * scoped under the sidebar card's `.ts-sidebar` ancestor (added only in
+ * `sidebar::build_card`) — otherwise the opaque card would also paint over the
+ * drawer Calendar page, which must keep its transparent silhouette. The other
+ * three classes are sidebar-only (their `widget()` is appended only in the
+ * sidebar card), so they need no scoping. */
+.ts-weather,
+.ts-sidebar-tasks,
+.ts-departures,
+.ts-sidebar .ts-sidebar-calendar {
+    background: @sidebar_card_background;
+    border-radius: 0.769em;
+    margin-bottom: 0.615em;
+}
+
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {
-    padding: 0.308em;
+    padding: 0.615em 0.769em;
 }
 .ts-weather-location {
     font-size: 0.846em;
@@ -539,7 +586,9 @@
     border-radius: 0.769em;
     padding: 0.769em 0.923em;
     min-width: 21.538em;
-    max-width: 29.231em;
+    /* GTK4 CSS has no `max-width` property (parser: "No property named
+     * max-width"); it was silently dropped. The toast width is content-driven
+     * off `min-width`. */
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 .ts-toast-critical {
@@ -598,7 +647,6 @@
 .ts-bluetooth-device {
     padding: 0.308em 0.615em;
     border-radius: 0.462em;
-    text-align: left;
 }
 .ts-bluetooth-device.connected {
     background: alpha(@accent_color, 0.2);
@@ -621,7 +669,6 @@
 .ts-wifi-row {
     padding: 0.308em 0.615em;
     background: transparent;
-    text-align: left;
 }
 .ts-wifi-row.connected {
     background: alpha(@accent_color, 0.25);
@@ -752,7 +799,6 @@
     padding: 4px 12px;
     border-radius: 6px;
     background: transparent;
-    text-align: left;
 }
 .ts-tray-menu separator {
     margin: 2px 0;
@@ -761,7 +807,7 @@
 /* ─── Calendar widget — sidebar surface ─────────────────────────── */
 
 .ts-sidebar-calendar {
-    padding: 0.615em 0.615em 0 0.615em;
+    padding: 0.615em 0.769em 0.462em 0.769em;
 }
 
 /* Header row: < | "Month YYYY" | > */
@@ -864,9 +910,12 @@
     margin: 0 1px;
 }
 /* On the selected day, dots invert to white so they read against the
- * accent pill. */
+ * accent pill. The descendant selector (specificity 0,2,0) already outranks
+ * the single-class `.ts-cal-color-N` palette rule (0,1,0), so no `!important`
+ * is needed — and GTK's CSS parser rejects `!important` on `background`
+ * ("Junk at end of value"). */
 .ts-cal-day-selected .ts-cal-event-dot {
-    background: alpha(white, 0.85) !important;
+    background: alpha(white, 0.85);
 }
 
 /* Calendar-source palette — `color_index_for_calendar` maps the source
@@ -1082,8 +1131,9 @@
 /* ─── Sidebar — tasks widget ──────────────────────────────────── */
 
 .ts-sidebar-tasks {
-    padding: 0 0.923em;
-    margin-top: 0.769em;
+    /* Inter-card spacing comes from the shared .ts-weather/... margin-bottom
+     * above; padding gives the tasks list room inside its own card (#194). */
+    padding: 0.462em 0.769em 0.615em 0.769em;
 }
 
 .ts-sidebar-tasks-header {
@@ -1225,7 +1275,9 @@
 
 .ts-osd-card {
     min-width: 21.538em;
-    max-width: 24.615em;
+    /* GTK4 CSS has no `max-width` property (parser: "No property named
+     * max-width"); it was silently dropped. The OSD card width is content- and
+     * `min-width`-driven. */
     padding: 1.231em;
     border-radius: 1.077em;
     background: alpha(@window_bg_color, 0.92);

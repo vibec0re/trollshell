@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use hytte::adw;
+use hytte::blur::SurfaceBlur;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, graphene, prelude::*};
 use hytte::prelude::*;
@@ -250,6 +252,12 @@ struct ModalPanel {
     /// retract animation finishing). Consumers — e.g. the bar — bind CSS
     /// classes to this so the seam between bar and drawer can restyle.
     open_state: Mutable<bool>,
+    /// Client-side `ext-background-effect` blur scope for this fullscreen
+    /// surface (#192/#193). Without it, niri's layer-rule blur frosts the WHOLE
+    /// screen while the drawer is open; with it we scope the frost to the card's
+    /// rect (cleared when hidden). `None` on niri < 26.04 → the layer-rule blur
+    /// in etc/niri/blur.kdl is the fallback. Shared with the map handler.
+    blur: Rc<RefCell<Option<SurfaceBlur>>>,
 }
 
 thread_local! {
@@ -407,6 +415,15 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
 
     wire_retract_finish(&revealer, key.clone());
     wire_recenter_on_map(&window, key.clone());
+
+    // Client-side blur-region scope (#192/#193). The drawer is a fullscreen
+    // surface, so niri's layer-rule blur frosts the whole screen while it's
+    // open; scope the frost to the card instead. The wl_surface only exists
+    // once the surface maps (the drawer maps on each open), so attach + set the
+    // card rect on map. `None` on niri < 26.04 → the layer-rule blur stays.
+    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
+    wire_blur_attach(&window, &blur, key.clone());
+
     window.set_visible(false);
 
     PANELS.with(|panels| {
@@ -422,6 +439,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 geometry,
                 pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
+                blur,
             },
         );
     });
@@ -681,6 +699,13 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             let Some(panel) = panels.get(&key) else {
                 return;
             };
+            // Clear the blur region before hiding so no frost lingers if the
+            // surface is reused, then drop the (now-defunct) effect handle —
+            // hiding the surface destroys the wl_surface it was bound to.
+            if let Some(sb) = panel.blur.borrow().as_ref() {
+                sb.set_region(None);
+            }
+            panel.blur.borrow_mut().take();
             panel.window.set_visible(false);
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
@@ -759,7 +784,7 @@ pub fn open(monitor: &Monitor, page: Page) {
         // No bar chip context here (called from a notification toast click);
         // anchor the drawer flush with the bar's trailing main-axis edge.
         *panel.pending_center.borrow_mut() = None;
-        show_panel(panel, page, 0);
+        show_panel(panel, &key, page, 0);
     });
     recompute_netconn_visible();
     recompute_stats_visible();
@@ -799,7 +824,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
                 // underestimates); the window-map handler recomputes from the
                 // real card allocation once the surface is mapped.
                 let margin = chip_center.map_or(0, |c| main_margin_for_center(panel, c));
-                show_panel(panel, page, margin);
+                show_panel(panel, &key, page, margin);
             }
         }
     });
@@ -816,7 +841,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
 /// fullscreen surface no longer moves) — because the overlay is fullscreen, a
 /// GTK margin on the trailing-aligned positioner is equivalent to the old
 /// layer-shell `set_margin` on the content-sized drawer surface.
-fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
+fn show_panel(panel: &ModalPanel, key: &str, page: Page, main_margin: i32) {
     panel.stack.set_visible_child_name(page.stack_name());
     *panel.current.borrow_mut() = Some(page);
     panel.open_state.set(true);
@@ -838,6 +863,67 @@ fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
     panel.window.set_visible(true);
     panel.window.present();
     panel.revealer.set_reveal_child(true);
+
+    // Scope niri's frost to the card (#192/#193): drive the blur region off the
+    // card's surface-local bounds across the reveal slide, instead of letting
+    // the fullscreen surface frost the whole screen. No-op when blur is None.
+    drive_drawer_blur(key.to_string());
+}
+
+/// The drawer card's bounds in surface-local (window) coordinates, as an
+/// `ext-background-effect` blur rect. `None` until the card has a real,
+/// non-degenerate allocation (pre-map) or if it can't be projected onto the
+/// window — callers treat `None` as "leave the region unchanged this tick".
+fn card_surface_rect(panel: &ModalPanel) -> Option<hytte::blur::Rect> {
+    let window: gtk::Widget = panel.window.clone().upcast();
+    let bounds = panel.card.compute_bounds(&window)?;
+    #[allow(clippy::cast_possible_truncation)]
+    let (x, y, w, h) = (
+        bounds.x() as i32,
+        bounds.y() as i32,
+        bounds.width() as i32,
+        bounds.height() as i32,
+    );
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(hytte::blur::Rect::new(x, y, w, h))
+}
+
+/// Drive the drawer's blur region across the reveal slide: tick the card's
+/// surface-local rect (~60 Hz) until the revealer settles open, so the frost
+/// hugs the growing card instead of the fullscreen surface. The retract path
+/// clears the region in [`wire_retract_finish`].
+///
+/// The tick does **not** early-return when `blur` is still `None`: the surface
+/// (re)attaches on a deferred `map` idle that may land after `show_panel` starts
+/// this tick, so we keep ticking while open and apply the region as soon as the
+/// handle appears. No-op forever when niri < 26.04 (the handle stays `None`).
+fn drive_drawer_blur(key: String) {
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        PANELS.with(|panels| {
+            let panels = panels.borrow();
+            let Some(panel) = panels.get(&key) else {
+                return glib::ControlFlow::Break;
+            };
+            // Stop once retracted/closed; the retract-finish handler clears it.
+            if !panel.open_state.get() {
+                return glib::ControlFlow::Break;
+            }
+            if let Some(rect) = card_surface_rect(panel)
+                && let Some(sb) = panel.blur.borrow().as_ref()
+            {
+                sb.set_region(Some(rect));
+            }
+            // Settled open → the card rect is stable; one more region push above
+            // locked it in, so stop ticking.
+            if panel.revealer.is_child_revealed() {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        })
+    });
 }
 
 /// Set a GTK margin on `widget` corresponding to a layer-shell [`LayerEdge`].
@@ -878,6 +964,57 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
                 let margin = main_margin_for_center(panel, center);
                 set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
             });
+        });
+    });
+}
+
+/// Attach (or re-attach) the [`SurfaceBlur`] when the drawer surface maps.
+///
+/// Unlike the sidebar's persistent surface, the drawer surface is destroyed on
+/// every close (`set_visible(false)`) and recreated on open, so the `wl_surface`
+/// — and thus the effect binding — is fresh each time. We therefore **re-attach
+/// on every map**, replacing any stale handle. `None` on niri < 26.04 leaves the
+/// layer-rule blur as the fallback.
+///
+/// This `connect_map` idle can land *after* [`drive_drawer_blur`]'s tick has
+/// already `Break`'d (the tick stops once the revealer settles, ~180 ms, whether
+/// or not it ever saw a non-`None` handle). If the drawer is open at attach time
+/// we therefore **seed the card rect right here**, mirroring the sidebar's
+/// post-attach seed — otherwise the region would never be set and the fullscreen
+/// surface would frost the whole screen for the session. If the drawer is closed
+/// at attach time we leave the region clear.
+fn wire_blur_attach(window: &gtk::Window, blur: &Rc<RefCell<Option<SurfaceBlur>>>, key: String) {
+    let blur = blur.clone();
+    window.connect_map(move |w| {
+        let w = w.clone();
+        let blur = blur.clone();
+        let key = key.clone();
+        glib::idle_add_local_once(move || {
+            // Drop any handle bound to the previous (now-destroyed) surface.
+            blur.borrow_mut().take();
+            if let Some(sb) = hytte::blur::attach(&w) {
+                // Seed the region now if the drawer is already open: the tick
+                // that normally drives it may have stopped before this late
+                // attach (see fn docs). Compute the rect while holding only the
+                // PANELS borrow, then release it before touching `blur`.
+                let seed = PANELS.with(|panels| {
+                    let panels = panels.borrow();
+                    panels
+                        .get(&key)
+                        .filter(|panel| panel.open_state.get())
+                        .and_then(card_surface_rect)
+                });
+                if let Some(rect) = seed {
+                    sb.set_region(Some(rect));
+                }
+                *blur.borrow_mut() = Some(sb);
+                tracing::debug!(monitor = %key, "drawer: attached client blur-region scope");
+            } else {
+                tracing::debug!(
+                    monitor = %key,
+                    "drawer: client blur-region unavailable (niri < 26.04?); layer-rule fallback"
+                );
+            }
         });
     });
 }

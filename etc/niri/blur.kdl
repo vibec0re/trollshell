@@ -9,6 +9,14 @@
 // paired with `@shell_background` carrying an alpha < 1 in
 // assets/trollshell/style.css — over an opaque surface the blur is invisible.
 //
+// CLIENT-SIDE REGION SCOPING (niri >= 26.04): these layer-rules frost the WHOLE
+// surface geometry, not the painted content. trollshell additionally scopes the
+// frost to the visible card via ext-background-effect-v1 `set_blur_region` (the
+// `hytte-blur` crate, #192/#193) — so the sidebar/drawer frost hugs the card and
+// no strip lingers when closed. KEEP these blocks: they ENABLE blur per
+// namespace (the client region only NARROWS it), and they're the un-scoped
+// fallback on niri < 26.04 where the client scoping is a graceful no-op.
+//
 // `match namespace=` is a regex matched anywhere in the surface namespace:
 //   hytte-bar-{edge}    -> the bar              (crates/hytte-ui/src/bar.rs:106)
 //   hytte-sidebar-{id}  -> the pushable sidebar (overlays/sidebar.rs:218)

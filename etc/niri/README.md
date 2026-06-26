@@ -205,6 +205,16 @@ from `etc/niri/blur.kdl` at the **top level** of `~/.config/niri/config.kdl`
 (not nested inside another block), then reload (auto, or
 `niri msg action reload-config`).
 
+**On NixOS / home-manager** you can deploy these rules without hand-merging
+via `config.programs.trollshell.niri.blurRules` — splice it into your niri
+`config.kdl` `.text` (niri has no include). For example in your
+home-manager config:
+
+```nix
+xdg.configFile."niri/config.kdl".text =
+  myNiriConfigKdl + config.programs.trollshell.niri.blurRules;
+```
+
 ### Why only those three namespaces
 
 The `hytte-frame` (fullscreen frame overlay) and `hytte-popup-catcher`

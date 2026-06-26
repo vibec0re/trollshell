@@ -231,21 +231,30 @@ hands niri the visible card's rectangle — "blur only here" — driven off the 
 slide animation, so the frost tracks the sidebar as it slides in/out and hugs the
 drawer card instead of the whole surface. Closed → empty region → no strip.
 
-**The `layer-rule` blocks above stay.** They are still what _enables_ blur for
-those namespaces; the client region only _narrows_ it. On **niri < 26.04** (no
-`ext-background-effect` global), the client scoping is a graceful no-op and the
-layer-rule blur is the (un-scoped) fallback — so keep the blocks merged.
+**The `layer-rule` blocks above stay — they are required, not just a fallback.**
+They are what _enables_ blur for those namespaces (the client region only
+_narrows_ it). Critically, `xray false` on the sidebar and drawer can only be
+set via a layer-rule — the client `set_blur_region` protocol forces `xray true`,
+so "use the client protocol only and drop blur.kdl" is NOT viable for the
+overlays. On **niri < 26.04** (no `ext-background-effect` global), the client
+scoping is a graceful no-op and the layer-rule blur is the (un-scoped) fallback
+— an additional reason to keep the blocks merged.
 
 ### Tuning
 
 - **Frost strength:** the `@shell_background` alpha in `style.css` (lower =
   more wallpaper shows through, less readable; higher = subtler frost).
-- **`xray`:** all three surfaces ship with `xray true` (blur the wallpaper
-  only — cheap, and consistent). This is deliberate: an overlay frosting the
-  bright _window_ behind it (`xray false`) reads brighter and off-colour next
-  to the bar, breaking the "sidebar is a dark extension of the bar" look. Set
-  a rule to `xray false` if you specifically want it to frost the window
-  behind it (pricier; niri recomputes on movement).
+- **`xray`:** the bar ships `xray true` (frosts the wallpaper only — cheap,
+  computed once; the bar sits over wallpaper so nothing occludes it). The
+  sidebar and drawer ship `xray false` (frost the actual window content behind
+  them — they overlay the window stack, so `xray true` would frost only the
+  occluded wallpaper and leave windows sharp, giving no visible frost).
+  Trade-off: `xray false` reads a touch brighter/off-colour next to the bar
+  and is pricier (niri recomputes on movement), but it is the only way the
+  overlay frost is visible over windows. **Note:** the client
+  `set_blur_region` protocol forces `xray true` — `xray false` can only be
+  set via a layer-rule, so the blur.kdl rules for the sidebar and drawer
+  cannot be dropped in favour of the client protocol alone.
 - **`geometry-corner-radius`:** rounds the blur clip. `0` for the flush
   bar/sidebar; bump the `hytte-modal` value to match the drawer's drawn
   corner radius if it shows a square halo.

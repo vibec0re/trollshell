@@ -13,9 +13,13 @@
 // surface geometry, not the painted content. trollshell additionally scopes the
 // frost to the visible card via ext-background-effect-v1 `set_blur_region` (the
 // `hytte-blur` crate, #192/#193) — so the sidebar/drawer frost hugs the card and
-// no strip lingers when closed. KEEP these blocks: they ENABLE blur per
-// namespace (the client region only NARROWS it), and they're the un-scoped
-// fallback on niri < 26.04 where the client scoping is a graceful no-op.
+// no strip lingers when closed. KEEP these blocks — they are REQUIRED, not just
+// a niri < 26.04 fallback: (1) they ENABLE blur per namespace (the client region
+// only NARROWS it); (2) `xray false` on the sidebar/drawer is layer-rule-only —
+// the client `set_blur_region` protocol forces `xray true`, so "protocol-only /
+// drop blur.kdl" is NOT viable for the overlays. On niri < 26.04 the client
+// scoping is a graceful no-op and the layer-rule blur is the (un-scoped)
+// fallback — keep the blocks merged.
 //
 // `match namespace=` is a regex matched anywhere in the surface namespace:
 //   hytte-bar-{edge}    -> the bar              (crates/hytte-ui/src/bar.rs:106)
@@ -27,11 +31,14 @@
 //   hytte-frame         -> fullscreen click-through frame overlay
 //   hytte-popup-catcher -> invisible fullscreen dismiss catcher
 //
-// `xray true` blurs the wallpaper only (cheap, computed once) — used on ALL
-// these surfaces so the bar/sidebar/drawer share one consistent dark frost.
-// (Frosting the bright window behind an overlay, via `xray false`, makes it
-// read brighter and off-colour next to the bar.) Drop `xray true` on a rule
-// for a pricier blur that frosts the actual window behind that surface.
+// `xray true` frosts the wallpaper only (cheap, computed once); `xray false`
+// frosts the actual content behind the surface (pricier; niri recomputes on
+// movement). The BAR sits over wallpaper — `xray true` is correct and cheap,
+// nothing occludes it. The SIDEBAR and DRAWER overlay the window stack:
+// `xray true` would frost only the occluded wallpaper and leave windows sharp
+// — no visible frost. `xray false` frosts the actual window content behind
+// them. Trade-off: a touch brighter/off-colour next to the bar, but it's the
+// only way the overlay frost shows over windows.
 
 layer-rule {
     match namespace="hytte-bar"
@@ -46,23 +53,24 @@ layer-rule {
 layer-rule {
     match namespace="hytte-sidebar"
     // Flush left panel; the frame overlay paints the rounded inner corner.
-    // xray true to match the bar: frost the wallpaper (not the bright window
-    // behind it) so the sidebar reads as a consistent dark extension of the
-    // bar rather than a brighter, differently-tinted panel.
+    // xray false: the sidebar overlays the window stack, so xray true would
+    // frost only the occluded wallpaper and leave windows sharp — no visible
+    // frost. xray false frosts the actual window content behind the sidebar.
     geometry-corner-radius 0
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }
 
 layer-rule {
     match namespace="hytte-modal"
     // Slide-out drawer card. Tune to match the drawer's drawn corner radius.
-    // xray true: match the bar/sidebar for one consistent dark frost.
+    // xray false: the drawer overlays the window stack (same reason as the
+    // sidebar — xray true would frost only occluded wallpaper, not windows).
     geometry-corner-radius 14
     background-effect {
         blur true
-        xray true
+        xray false
     }
 }

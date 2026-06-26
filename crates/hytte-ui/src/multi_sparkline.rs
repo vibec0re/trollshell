@@ -1,8 +1,9 @@
 //! Multi-series time-series visualization (GNOME-System-Monitor-style).
 //! Owns N fixed-capacity ring buffers of `f64` samples and renders each
-//! as its own anti-aliased polyline via cairo, one evenly-spread HSL hue
-//! per series. The sibling of [`Sparkline`](crate::Sparkline): same ring
-//! buffer + cairo draw shape, but N polylines instead of one.
+//! as its own anti-aliased smooth (Catmull-Rom) curve via cairo, one
+//! evenly-spread HSL hue per series. The sibling of
+//! [`Sparkline`](crate::Sparkline): same ring buffer + cairo draw shape, but
+//! N smoothed curves instead of one.
 //!
 //! Unlike `Sparkline` (whose single line resolves through the widget's GTK4
 //! theme color), the per-series colors are **generated** — `hue = i / count`
@@ -160,21 +161,69 @@ fn draw_multi_sparkline(
         let n = crate::cast::usize_to_f64(samples.len());
         let step_x = if n <= 1.0 { 0.0 } else { w / (n - 1.0) };
 
+        // Project samples to pixel coordinates inside the plot box. Both axes
+        // are already bounded: x ∈ [0, w] (i·step_x) and y ∈ [0, h] (norm
+        // clamped to 0..=1), so every *data* point sits inside [0,w]×[0,h].
+        let points: Vec<(f64, f64)> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, sample)| {
+                let x = crate::cast::usize_to_f64(i) * step_x;
+                let norm = (*sample / denom).clamp(0.0, 1.0);
+                let y = h - norm * h;
+                (x, y)
+            })
+            .collect();
+
+        // Smooth the top edge with a Catmull-Rom spline expressed as cubic
+        // beziers (GNOME-System-Monitor look). A lone point (or empty series)
+        // can't form a segment: the single `move_to` strokes nothing, matching
+        // the prior 1-sample render.
         cr.new_path();
-        for (i, sample) in samples.iter().enumerate() {
-            let x = crate::cast::usize_to_f64(i) * step_x;
-            let norm = (*sample / denom).clamp(0.0, 1.0);
-            let y = h - norm * h;
-            if i == 0 {
-                cr.move_to(x, y);
-            } else {
-                cr.line_to(x, y);
-            }
+        cr.move_to(points[0].0, points[0].1);
+        for i in 0..points.len() - 1 {
+            // Neighbours clamp to the endpoints at the boundaries (p0=p1 for the
+            // first segment, p3=p2 for the last) — standard Catmull-Rom edges.
+            let p0 = points[i.saturating_sub(1)];
+            let p1 = points[i];
+            let p2 = points[i + 1];
+            let p3 = points[(i + 2).min(points.len() - 1)];
+            let (c1, c2) = catmull_rom_control_points(p0, p1, p2, p3, w, h);
+            cr.curve_to(c1.0, c1.1, c2.0, c2.1, p2.0, p2.1);
         }
         let (r, g, b) = series_color(idx, count);
         cr.set_source_rgba(r, g, b, STROKE_ALPHA);
         let _ = cr.stroke();
     }
+}
+
+/// Catmull-Rom → cubic-bezier control points for the segment `p1`→`p2`, given
+/// its neighbours `p0` and `p3` (clamp `p0=p1` / `p3=p2` at the curve ends).
+///
+/// Returns the two bezier control points
+/// `C1 = p1 + (p2 - p0)/6` and `C2 = p2 - (p3 - p1)/6`, each **clamped into the
+/// plot box** `[0,w]×[0,h]`. Catmull-Rom can overshoot on sharp peaks; clamping
+/// only the control points (never the data points) holds the smoothed curve
+/// tight against the top edge and baseline without a visible bulge, while
+/// keeping it smooth.
+#[allow(clippy::many_single_char_names)]
+fn catmull_rom_control_points(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    w: f64,
+    h: f64,
+) -> ((f64, f64), (f64, f64)) {
+    let c1 = (
+        (p2.0 - p0.0).mul_add(1.0 / 6.0, p1.0).clamp(0.0, w),
+        (p2.1 - p0.1).mul_add(1.0 / 6.0, p1.1).clamp(0.0, h),
+    );
+    let c2 = (
+        (p3.0 - p1.0).mul_add(-1.0 / 6.0, p2.0).clamp(0.0, w),
+        (p3.1 - p1.1).mul_add(-1.0 / 6.0, p2.1).clamp(0.0, h),
+    );
+    (c1, c2)
 }
 
 // ── Color palette ─────────────────────────────────────────────────────────────
@@ -281,6 +330,79 @@ mod color_tests {
         let (r, g, b) = series_color(0, 0);
         for c in [r, g, b] {
             assert!(c.is_finite());
+        }
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::catmull_rom_control_points;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn flat_line_control_points_stay_flat() {
+        // Evenly spaced points all at the same height → both control points
+        // keep that exact y (a flat segment smooths to a flat curve).
+        let y = 5.0;
+        let (c1, c2) =
+            catmull_rom_control_points((0.0, y), (1.0, y), (2.0, y), (3.0, y), 100.0, 10.0);
+        assert!(approx(c1.1, y), "c1.y drifted: {}", c1.1);
+        assert!(approx(c2.1, y), "c2.y drifted: {}", c2.1);
+    }
+
+    #[test]
+    fn control_points_clamped_into_box() {
+        let w = 100.0;
+        let h = 10.0;
+        // Raw C1.y = p1.y + (p2.y - p0.y)/6 = 0.5 + (0 - 10)/6 ≈ -1.17 → clamp 0.
+        let (c1, _c2) =
+            catmull_rom_control_points((0.0, 10.0), (1.0, 0.5), (2.0, 0.0), (3.0, 0.0), w, h);
+        assert!((0.0..=h).contains(&c1.1), "c1.y not clamped: {}", c1.1);
+        assert!(approx(c1.1, 0.0), "c1.y should clamp to 0: {}", c1.1);
+
+        // Raw C2.y = p2.y - (p3.y - p1.y)/6 = 9.5 - (0 - 10)/6 ≈ 11.17 → clamp h.
+        let (_c1, c2) =
+            catmull_rom_control_points((0.0, 10.0), (1.0, 10.0), (2.0, 9.5), (3.0, 0.0), w, h);
+        assert!((0.0..=h).contains(&c2.1), "c2.y not clamped: {}", c2.1);
+        assert!(approx(c2.1, h), "c2.y should clamp to h: {}", c2.1);
+    }
+
+    #[test]
+    fn control_points_always_inside_box() {
+        // Sweep a grid of inputs: control points never leave the plot box.
+        let w = 60.0;
+        let h = 24.0;
+        for a in 0..5 {
+            for b in 0..5 {
+                let p0 = (0.0, f64::from(a) * h / 4.0);
+                let p1 = (15.0, f64::from(b) * h / 4.0);
+                let p2 = (30.0, f64::from((a + b) % 5) * h / 4.0);
+                let p3 = (45.0, f64::from((a * b) % 5) * h / 4.0);
+                let (c1, c2) = catmull_rom_control_points(p0, p1, p2, p3, w, h);
+                for (cx, cy) in [c1, c2] {
+                    assert!((0.0..=w).contains(&cx), "x {cx} outside [0,{w}]");
+                    assert!((0.0..=h).contains(&cy), "y {cy} outside [0,{h}]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_neighbour_clamp_is_finite() {
+        // First-segment boundary uses p0=p1; result stays finite and in-box.
+        let (c1, c2) = catmull_rom_control_points(
+            (0.0, 3.0),
+            (0.0, 3.0),
+            (10.0, 7.0),
+            (20.0, 2.0),
+            100.0,
+            10.0,
+        );
+        for (cx, cy) in [c1, c2] {
+            assert!(cx.is_finite() && cy.is_finite());
         }
     }
 }

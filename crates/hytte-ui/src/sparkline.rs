@@ -159,22 +159,17 @@ fn draw_sparkline(
     let _ = cr.fill();
 }
 
-// These call gtk::init() / build widgets, so they need a display server —
-// gated into the `system-tests` bucket rather than run by default.
+// These build GTK widgets, so they need a display server — gated into the
+// `system-tests` bucket rather than run by default. `#[gtk::test]` runs them
+// on GTK's single main thread (a plain `#[test]` lands on a libtest worker
+// thread and trips "GTK may only be used from the main thread", and can't
+// coexist with the other `#[gtk::test]`s in this crate).
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;
 
-    fn ensure_gtk_init() {
-        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        ONCE.get_or_init(|| {
-            gtk::init().ok();
-        });
-    }
-
-    #[test]
+    #[gtk::test]
     fn push_caps_at_capacity() {
-        ensure_gtk_init();
         let s = Sparkline::new(3);
         for i in 0..5 {
             s.push(f64::from(i));
@@ -184,9 +179,8 @@ mod tests {
         assert_eq!(v, vec![2.0, 3.0, 4.0]);
     }
 
-    #[test]
+    #[gtk::test]
     fn clear_empties() {
-        ensure_gtk_init();
         let s = Sparkline::new(10);
         s.push(1.0);
         s.push(2.0);
@@ -194,9 +188,8 @@ mod tests {
         assert!(s.samples.borrow().is_empty());
     }
 
-    #[test]
+    #[gtk::test]
     fn set_domain_max_round_trips() {
-        ensure_gtk_init();
         let s = Sparkline::new(5);
         s.set_domain_max(Some(2.0));
         assert_eq!(s.domain_max.get(), Some(2.0));

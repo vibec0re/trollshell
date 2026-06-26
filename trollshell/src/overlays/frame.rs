@@ -5,10 +5,13 @@
 //! interactive because the frame's input region is empty — every click
 //! falls through to the layer below.
 //!
-//! The frame paints a flat dark purple (`rgb(14, 8, 28)`, matching
-//! `@shell_background` in `style.css`) into the L/R/bottom border regions
-//! and carves four rounded inner corners around the workspace cutout.
-//! Top inset is the bar's exclusive zone.
+//! The frame paints a translucent dark purple (`rgba(14, 8, 28, 0.85)`,
+//! matching `@shell_background` in `style.css`) into the L/R/bottom border
+//! regions and carves four rounded inner corners around the workspace cutout.
+//! Top inset is the bar's exclusive zone. Using the same 0.85 alpha as the
+//! bar means the bar↔frame boundary is seamless (uniform frost). Note: the
+//! frame surface is translucent but not yet *blurred* — frosting just its
+//! narrow border via the client `set_blur_region` protocol is a planned follow-up.
 //!
 //! Visual constants — match `etc/niri/frame.kdl` struts and the
 //! post-restyle bar geometry from `style.css`. If any of these change,
@@ -168,11 +171,11 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
 
-        // Source: flat dark purple matching `@shell_background` in style.css —
-        // `rgb(14, 8, 28)`. The bar paints the opaque `@shell_background_opaque`
-        // (same RGB), so the frame's L/R/bottom borders match it exactly. Cairo
-        // can't read CSS vars, so keep this in sync with @shell_background.
-        cr.set_source_rgba(14.0 / 255.0, 8.0 / 255.0, 28.0 / 255.0, 1.0);
+        // Source: translucent dark purple matching `@shell_background` in
+        // style.css — `rgba(14, 8, 28, 0.85)`. The bar also uses 0.85 alpha,
+        // so the bar↔frame boundary has no opacity seam. Cairo can't read CSS
+        // vars, so keep this RGB + alpha in sync with @shell_background.
+        cr.set_source_rgba(14.0 / 255.0, 8.0 / 255.0, 28.0 / 255.0, 0.85);
         if let Err(e) = cr.fill() {
             tracing::warn!(error = %e, "frame: cairo fill failed");
         }

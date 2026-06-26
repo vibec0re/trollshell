@@ -24,19 +24,12 @@
  * this RGB as a cairo flat fill (cairo can't read CSS vars) -- update frame.rs
  * too whenever this changes COLOUR.
  *
- * The alpha here keeps the SIDEBAR and DRAWER translucent so niri's layer-rule
- * blur can frost the wallpaper behind them (see etc/niri/blur.kdl), while the
- * frame border stays fully opaque. The BAR does NOT use this translucent token:
- * it paints @shell_background_opaque (below) so it reads as one flat colour with
- * the opaque frame border -- no seam where the bar's bottom edge meets the
- * frame's top edge (the trade-off: the bar shows no wallpaper frost). Set the
- * alpha back to 1.0 to flatten the sidebar/drawer too. */
+ * Alpha 0.85 makes ALL shell chrome (bar, sidebar, drawer, frame) translucent
+ * so niri's layer-rule blur (see etc/niri/blur.kdl) frosts the wallpaper behind
+ * them uniformly. The bar uses this token directly (no more opaque override) and
+ * frame.rs uses the same 0.85 alpha, so the bar↔frame boundary is seamless.
+ * Set the alpha back to 1.0 to flatten everything to opaque. */
 @define-color shell_background rgba(14, 8, 28, 0.85);
-/* Opaque sibling of @shell_background -- same RGB, alpha forced to 1.0. Painted
- * by the bar so it matches the frame's fully-opaque cairo fill (frame.rs)
- * exactly, killing the bar<->frame seam. Keep its RGB in sync with
- * @shell_background above AND with frame.rs. */
-@define-color shell_background_opaque rgb(14, 8, 28);
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
  * than @shell_background so the weather/calendar/tasks/departures cards read as
@@ -64,13 +57,14 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    /* Flat OPAQUE fill matching the frame border (frame.rs) exactly, so the
-     * bar's bottom edge meets the frame's top edge with no visible seam. Paint
-     * the surface here ONCE — .hytte-bar-content stays transparent (painting
-     * @shell_background there too stacked a second translucent 0.85 layer → a
-     * ~0.98 effective alpha that read slightly off-colour against the opaque
-     * frame: the seam). */
-    background: @shell_background_opaque;
+    /* Translucent fill matching @shell_background (alpha 0.85) so niri's
+     * hytte-bar blur layer-rule frosts the wallpaper behind the bar, matching
+     * the sidebar and drawer. frame.rs uses the same 0.85 alpha, so the bar's
+     * bottom edge meets the frame's top edge with no opacity seam. Paint the
+     * surface here ONCE — .hytte-bar-content stays transparent (double-painting
+     * @shell_background there would stack two 0.85 layers → ~0.98 effective
+     * alpha: a visible seam). */
+    background: @shell_background;
     color: #ffffff;
     border: none;
     box-shadow: none;
@@ -96,9 +90,9 @@
     margin: 0;
     min-height: 32px;
     border-radius: 0;
-    /* Transparent: the opaque .hytte-bar window behind it supplies the single
-     * flat fill. Double-painting @shell_background here was the seam Annika
-     * saw — two translucent layers ≈ 0.98 alpha vs the opaque frame's 1.0. */
+    /* Transparent: the translucent .hytte-bar window behind it supplies the
+     * single flat fill. Double-painting @shell_background here would stack two
+     * 0.85 layers → ~0.98 effective alpha: a visible seam vs the frame's 0.85. */
     background: transparent;
 }
 .hytte-bar-group-left button,

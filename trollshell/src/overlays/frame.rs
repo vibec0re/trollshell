@@ -9,18 +9,35 @@
 //! matching `@shell_background` in `style.css`) into the L/R/bottom border
 //! regions and carves four rounded inner corners around the workspace cutout.
 //! Top inset is the bar's exclusive zone. Using the same 0.90 alpha as the
-//! bar means the bar↔frame boundary is seamless (uniform frost). Note: the
-//! frame surface is translucent but not yet *blurred* — frosting just its
-//! narrow border via the client `set_blur_region` protocol is a planned follow-up.
+//! bar means the bar↔frame boundary is seamless (uniform frost).
+//!
+//! ## Border frost (client protocol)
+//!
+//! The frame surface is translucent *and* frosted — but only along its three
+//! border strips (left / right / bottom), never the workspace cutout (frosting
+//! the cutout would frost the whole screen). We hand niri a three-rectangle
+//! blur region via the client `ext-background-effect` `set_blur_region` request
+//! ([`hytte::blur`]), so the frost hugs the painted border. The region tracks
+//! the sidebar slide: the left strip's width follows the cutout's left edge
+//! ([`sidebar::current_visible_width`]). `None` on niri < 26.04 — the frame
+//! stays translucent-but-unblurred there (the bar/sidebar layer-rule fallback
+//! in `etc/niri/blur.kdl` does not cover the frame). See #189 / #194.
 //!
 //! Visual constants — match `etc/niri/frame.kdl` struts and the
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use hytte::blur::SurfaceBlur;
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 use hytte::ui::{LayerShell, layer_window};
+
+use crate::components::cast;
+use crate::overlays::sidebar;
 
 /// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
 /// Top inset of the frame (= top of the workspace cutout).
@@ -69,6 +86,25 @@ pub fn install(monitor: &Monitor) {
     // the surface exists.
     install_click_through(&window);
 
+    // Client-side blur-region scope (#189): frost only the frame's three border
+    // strips, not the cutout. The wl_surface exists only once mapped, so attach
+    // on first `map` and seed the border region. `None` on niri < 26.04 → the
+    // frame stays translucent-but-unblurred (no layer-rule fallback covers it).
+    // Shared so the resize handler and the sidebar-slide tick can re-send it.
+    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
+    wire_blur_attach(&window, &blur, monitor);
+
+    // Re-send the border region whenever the surface is resized (e.g. monitor
+    // mode change), since the right/bottom strips are anchored to (w, h).
+    let blur_for_resize = blur.clone();
+    let window_for_resize = window.clone();
+    let monitor_for_resize = monitor.clone();
+    area.connect_resize(move |_area, _w, _h| {
+        if let Some(sb) = blur_for_resize.borrow().as_ref() {
+            send_frame_blur(sb, &window_for_resize, &monitor_for_resize);
+        }
+    });
+
     // Reactively hide the frame whenever this monitor's active workspace
     // has an edge-spanning window — fullscreen, maximize-to-edges, or a
     // floating window stretched to the output's width. `Layer::Overlay`
@@ -79,15 +115,24 @@ pub fn install(monitor: &Monitor) {
 
     // Redraw the frame's cutout each animation frame while the sidebar's
     // revealer is in transition, so the cutout's left edge stays in sync
-    // with the slide. Stop ticking once the revealer settles.
+    // with the slide — and re-send the border blur region each tick so the
+    // left strip's frost tracks the cutout's moving left edge. Stop ticking
+    // once the revealer settles.
     let area_for_sidebar = area.clone();
     let monitor_for_sidebar = monitor.clone();
+    let window_for_sidebar = window.clone();
+    let blur_for_sidebar = blur.clone();
     glib::MainContext::default().spawn_local(
         crate::overlays::sidebar::open_signal(monitor).for_each(move |_open| {
             let area = area_for_sidebar.clone();
             let monitor = monitor_for_sidebar.clone();
+            let window = window_for_sidebar.clone();
+            let blur = blur_for_sidebar.clone();
             area.add_tick_callback(move |a, _clock| {
                 a.queue_draw();
+                if let Some(sb) = blur.borrow().as_ref() {
+                    send_frame_blur(sb, &window, &monitor);
+                }
                 if crate::overlays::sidebar::is_settled(&monitor) {
                     glib::ControlFlow::Break
                 } else {
@@ -117,6 +162,66 @@ fn install_click_through(window: &gtk::Window) {
             tracing::warn!("frame: window has no surface at realize");
         }
     });
+}
+
+/// Attach the [`SurfaceBlur`] once the layer surface is mapped (its `wl_surface`
+/// exists) and seed the border region. Mirrors the sidebar's `wire_blur_attach`:
+/// the frame surface is persistent (mapped once at install) but is *hidden* (not
+/// destroyed) on a fullscreen window, so on a remap the previous handle is bound
+/// to a now-dead `wl_surface`. We therefore **drop the stale handle on each map,
+/// then re-attach + re-seed** rather than guarding with `is_some` (which would
+/// keep the dead handle forever). Idempotent on a single map.
+fn wire_blur_attach(
+    window: &gtk::Window,
+    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
+    monitor: &Monitor,
+) {
+    let blur = blur.clone();
+    let monitor = monitor.clone();
+    window.connect_map(move |w| {
+        // Defer to idle so the wl_surface is fully realized before we bind.
+        let w = w.clone();
+        let blur = blur.clone();
+        let monitor = monitor.clone();
+        glib::idle_add_local_once(move || {
+            // Drop any handle bound to a previous (now-destroyed) surface so a
+            // remap rebinds against the live wl_surface.
+            blur.borrow_mut().take();
+            if let Some(sb) = hytte::blur::attach(&w) {
+                send_frame_blur(&sb, &w, &monitor);
+                *blur.borrow_mut() = Some(sb);
+                tracing::debug!("frame: attached client blur-region scope (border strips)");
+            } else {
+                tracing::debug!(
+                    "frame: client blur-region unavailable (niri < 26.04?); border not frosted"
+                );
+            }
+        });
+    });
+}
+
+/// Send the current border blur region to niri: read the surface size, take the
+/// sidebar's current visible width as the cutout's left edge, and frost the
+/// three border strips ([`hytte::blur::frame_border_rects`]). No-op-friendly —
+/// callers only invoke it when `blur` is `Some` (niri >= 26.04).
+fn send_frame_blur(sb: &SurfaceBlur, window: &gtk::Window, monitor: &Monitor) {
+    let (w, h) = surface_size(window);
+    let left_inset = sidebar::current_visible_width(monitor);
+    // BAR_HEIGHT / FRAME_THICKNESS are integral f64 design constants (44.0 / 8.0);
+    // round to the i32 the region rects use. No raw `as` (pedantic gate).
+    let bar_height = cast::f64_to_i32_round(BAR_HEIGHT);
+    let thickness = cast::f64_to_i32_round(FRAME_THICKNESS);
+    let rects = hytte::blur::frame_border_rects(w, h, left_inset, bar_height, thickness);
+    sb.set_region_rects(&rects);
+}
+
+/// The frame surface's size in logical px (full output). Falls back to the
+/// window's allocated size before the surface reports one.
+fn surface_size(window: &gtk::Window) -> (i32, i32) {
+    window.surface().map_or_else(
+        || (window.width(), window.height()),
+        |s| (s.width(), s.height()),
+    )
 }
 
 fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {

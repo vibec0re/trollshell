@@ -371,6 +371,33 @@ impl SurfaceBlur {
         let _ = self.conn.flush();
         self.window.queue_draw();
     }
+
+    /// Scope the surface's blur to the union of `rects` (surface-local, logical
+    /// px). The multi-rectangle counterpart of [`Self::set_region`]: it builds a
+    /// single `wl_region`, `add`s every rect, and hands it to niri. An **empty
+    /// slice** sends an empty (but non-NULL) region — suppressing the frost,
+    /// exactly like `set_region(None)` — and never a NULL region (see
+    /// [`Self::set_region`]'s note on why NULL would revert to the whole-surface
+    /// layer-rule frost).
+    ///
+    /// Used by the fullscreen frame overlay to frost only its three border
+    /// strips ([`frame_border_rects`]), not the workspace cutout (which would
+    /// frost the whole screen). Same commit timing as [`Self::set_region`]: the
+    /// region is double-buffered, so we `flush()` then `queue_draw()` to land it
+    /// on GTK's next frame.
+    pub fn set_region_rects(&self, rects: &[Rect]) {
+        // Mirror `set_region`'s sequence exactly: one region built on GTK's
+        // queue, every rect added, set, destroyed (copy semantics), flushed,
+        // then a draw nudge so the double-buffered region commits.
+        let region = self.compositor.create_region(&self.qh, ());
+        for r in rects {
+            region.add(r.x(), r.y(), r.width(), r.height());
+        }
+        self.effect.set_blur_region(Some(&region));
+        region.destroy();
+        let _ = self.conn.flush();
+        self.window.queue_draw();
+    }
 }
 
 impl Drop for SurfaceBlur {
@@ -395,6 +422,51 @@ pub fn left_panel_region(visible_width: i32, surface_height: i32) -> Option<Rect
         return None;
     }
     Some(Rect::new(0, 0, visible_width, surface_height))
+}
+
+/// The three border strips of the fullscreen frame overlay — left, right, and
+/// bottom — as surface-local rectangles (logical px), for [`SurfaceBlur::set_region_rects`].
+///
+/// Frosts only the frame's painted border, never the workspace cutout (frosting
+/// the cutout would frost the whole screen). The layout mirrors `frame.rs`'s
+/// cairo paint: `bar_height` is the top inset (the bar's exclusive zone),
+/// `thickness` is the frame strut width, and `left_inset` is the cutout's left
+/// edge (the sidebar's current visible width — `thickness` when closed, the
+/// sidebar width when open):
+///
+/// - **left:**   `(0, bar_height, left_inset, height - bar_height)`
+/// - **right:**  `(width - thickness, bar_height, thickness, height - bar_height)`
+/// - **bottom:** `(left_inset, height - thickness, width - left_inset - thickness, thickness)`
+///
+/// All dimensions are clamped to `>= 0`, so a degenerate (pre-map / tiny)
+/// surface yields empty rects rather than negative ones (niri also clips an
+/// over-large rect to the surface, so an empty rect simply blurs nothing).
+#[must_use]
+pub fn frame_border_rects(
+    width: i32,
+    height: i32,
+    left_inset: i32,
+    bar_height: i32,
+    thickness: i32,
+) -> [Rect; 3] {
+    let left_inset = left_inset.max(0);
+    let bar_height = bar_height.max(0);
+    let thickness = thickness.max(0);
+    // Height of the body region below the bar — shared by the L/R strips.
+    let body_h = (height - bar_height).max(0);
+    [
+        // Left strip: screen's left edge → cutout's left edge.
+        Rect::new(0, bar_height, left_inset, body_h),
+        // Right strip: the fixed-thickness strut on the right edge.
+        Rect::new((width - thickness).max(0), bar_height, thickness, body_h),
+        // Bottom strip: between the L/R struts, below the cutout.
+        Rect::new(
+            left_inset,
+            (height - thickness).max(0),
+            (width - left_inset - thickness).max(0),
+            thickness,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -426,5 +498,43 @@ mod tests {
         // frost slides in with the card rather than snapping.
         let r = left_panel_region(140, 1080).expect("animating → Some(rect)");
         assert_eq!(r.width(), 140);
+    }
+
+    fn xywh(r: Rect) -> (i32, i32, i32, i32) {
+        (r.x(), r.y(), r.width(), r.height())
+    }
+
+    #[test]
+    fn frame_border_rects_closed_sidebar() {
+        // 1920x1080, bar 44, strut 8, sidebar closed (left_inset == strut).
+        let [left, right, bottom] = frame_border_rects(1920, 1080, 8, 44, 8);
+        // Left strip is the 8px L-strut below the bar.
+        assert_eq!(xywh(left), (0, 44, 8, 1080 - 44));
+        // Right strip is the 8px R-strut, flush to the right edge.
+        assert_eq!(xywh(right), (1920 - 8, 44, 8, 1080 - 44));
+        // Bottom strip spans between the struts, 8px tall, at the bottom edge.
+        assert_eq!(xywh(bottom), (8, 1080 - 8, 1920 - 8 - 8, 8));
+    }
+
+    #[test]
+    fn frame_border_rects_open_sidebar_widens_left_strip() {
+        // Sidebar open at 320: the left strip widens to the cutout's left edge
+        // and the bottom strip shifts/shrinks to start at it.
+        let [left, _right, bottom] = frame_border_rects(1920, 1080, 320, 44, 8);
+        assert_eq!(xywh(left), (0, 44, 320, 1080 - 44));
+        assert_eq!(xywh(bottom), (320, 1080 - 8, 1920 - 320 - 8, 8));
+    }
+
+    #[test]
+    fn frame_border_rects_tiny_surface_clamps_to_zero() {
+        // Degenerate surface smaller than the insets → no negative dimensions.
+        let [left, right, bottom] = frame_border_rects(4, 10, 8, 44, 8);
+        // body_h = (10 - 44).max(0) = 0; left_inset clamped to its value but
+        // widths/offsets that would go negative clamp to 0.
+        assert_eq!(left.height(), 0);
+        assert_eq!(right.height(), 0);
+        assert_eq!(right.x(), 0); // (4 - 8).max(0)
+        assert_eq!(bottom.y(), 2); // (10 - 8).max(0)
+        assert_eq!(bottom.width(), 0); // (4 - 8 - 8).max(0)
     }
 }

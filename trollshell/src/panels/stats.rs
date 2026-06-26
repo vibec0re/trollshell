@@ -58,8 +58,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
     group.add(&build_live_cpu_row());
     group.add(&build_live_per_core_row());
     group.add(&build_live_processes_row());
-    group.add(&history_row_wrapper(&build_history_cpu_row()));
-    group.add(&history_row_wrapper(&build_history_per_core_row()));
+    group.add(&build_expandable_cpu_history_row());
     group.add(&build_top_apps_expander(
         "Top apps \u{00b7} CPU",
         app_usage::top_by_cpu(),
@@ -594,48 +593,79 @@ fn build_history_cpu_row() -> gtk::Box {
     row
 }
 
-/// Per-core CPU history graph (GNOME-System-Monitor style): one colored,
-/// anti-aliased line per logical core over the same 60-sample window the other
-/// history rows keep, 0..=100 %. Additive to the overall CPU sparkline above —
-/// this adds the missing per-core × history quadrant (#196).
+/// Expandable CPU history row: collapsed shows the overall `Sparkline`;
+/// expanded switches to the per-core [`MultiSparkline`] (overall is hidden).
 ///
-/// Laid out as a vertical box: a `[name | value]` header line over a
-/// full-width [`MultiSparkline`], so the multi-line graph gets the vertical
-/// room a single-line sparkline doesn't need.
-fn build_history_per_core_row() -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    row.add_css_class("ts-history-row");
-    row.set_hexpand(true);
+/// A [`gtk::Stack`] with `vhomogeneous(false)` and a crossfade transition
+/// lets the card grow in height when the user expands. The collapsed page is
+/// produced by [`build_history_cpu_row`]; the expanded page inlines the former
+/// `build_history_per_core_row` content so both graphs share one row slot.
+///
+/// Activating the row (clicking) toggles between states. Expanded state is
+/// **not** persisted across drawer open/close — each rebuild starts collapsed.
+///
+/// Returns a [`gtk::ListBoxRow`] so it slots into the [`adw::PreferencesGroup`]
+/// boxed-list in source order (same routing fix as [`history_row_wrapper`]).
+fn build_expandable_cpu_history_row() -> gtk::ListBoxRow {
+    // ── Collapsed page: overall CPU sparkline ──────────────────────────────
+    let overall_box = build_history_cpu_row();
 
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name_label = gtk::Label::new(Some("Per-core history"));
-    name_label.add_css_class("ts-stat-name");
-    name_label.set_xalign(0.0);
-    name_label.set_hexpand(true);
-    header.append(&name_label);
+    // ── Expanded page: per-core MultiSparkline ─────────────────────────────
+    // Per-core load is a fraction in 0..=1, so the domain is fixed (same as
+    // the overall sparkline) rather than auto-scaled.
+    let percore_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    percore_box.add_css_class("ts-history-row");
+    percore_box.set_hexpand(true);
 
-    let value_label = gtk::Label::new(None);
-    value_label.add_css_class("ts-stat-value");
-    value_label.set_xalign(1.0);
-    header.append(&value_label);
-    row.append(&header);
+    let percore_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let percore_name = gtk::Label::new(Some("Per-core history"));
+    percore_name.add_css_class("ts-stat-name");
+    percore_name.set_xalign(0.0);
+    percore_name.set_hexpand(true);
+    percore_header.append(&percore_name);
 
-    // Per-core load is a fraction in 0..=1, so the domain is fixed (like the
-    // overall CPU sparkline) rather than auto-scaled.
-    let graph = MultiSparkline::new(60);
-    graph.set_domain_max(Some(1.0));
-    graph.widget().set_hexpand(true);
-    row.append(graph.widget());
+    let percore_value = gtk::Label::new(None);
+    percore_value.add_css_class("ts-stat-value");
+    percore_value.set_xalign(1.0);
+    percore_header.append(&percore_value);
+    percore_box.append(&percore_header);
 
-    let graph_clone = graph.clone();
-    let value_clone = value_label.clone();
-    bind(sensors::cpu(), &row, move |_, c: CpuLoad| {
-        graph_clone.push_frame(&c.per_core);
-        value_clone.set_text(&format!(
+    let percore_graph = MultiSparkline::new(60);
+    percore_graph.set_domain_max(Some(1.0));
+    percore_graph.widget().set_hexpand(true);
+    percore_box.append(percore_graph.widget());
+
+    let percore_graph_c = percore_graph.clone();
+    let percore_value_c = percore_value.clone();
+    bind(sensors::cpu(), &percore_box, move |_, c: CpuLoad| {
+        percore_graph_c.push_frame(&c.per_core);
+        percore_value_c.set_text(&format!(
             "{} cores \u{00b7} {:.0}%",
             c.per_core.len(),
             c.overall * 100.0
         ));
+    });
+
+    // ── Stack: vhomogeneous(false) so the card grows on expand ───────────
+    let stack = gtk::Stack::new();
+    stack.set_vhomogeneous(false);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_hexpand(true);
+    stack.add_named(&overall_box, Some("overall"));
+    stack.add_named(&percore_box, Some("percore"));
+    // Default to collapsed; not persisted across rebuilds.
+    stack.set_visible_child_name("overall");
+
+    // ── Row wrapper: activatable so a click toggles collapsed ↔ expanded ──
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(true);
+    row.set_selectable(false);
+    row.set_hexpand(true);
+    row.set_child(Some(&stack));
+
+    row.connect_activate(move |_| {
+        let expanded = stack.visible_child_name().as_deref() == Some("percore");
+        stack.set_visible_child_name(if expanded { "overall" } else { "percore" });
     });
 
     row

@@ -6,6 +6,7 @@ pub(crate) mod cast;
 mod error;
 mod layer_window;
 mod monitor;
+pub mod multi_sparkline;
 mod popup;
 pub mod sparkline;
 
@@ -14,6 +15,7 @@ pub use bar::{Bar, BarHandle, Edge};
 pub use error::{Error, Result};
 pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window};
 pub use monitor::Monitor;
+pub use multi_sparkline::MultiSparkline;
 pub use popup::{Popup, PopupBuilder, Position as PopupPosition, attach_dismiss_catcher};
 pub use sparkline::Sparkline;
 

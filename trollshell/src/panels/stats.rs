@@ -13,6 +13,7 @@ use hytte::prelude::*;
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuLoad};
 use hytte::services::systemd;
+use hytte::ui::MultiSparkline;
 
 use crate::components::cast;
 use crate::components::format::fmt_bytes;
@@ -58,6 +59,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
     group.add(&build_live_per_core_row());
     group.add(&build_live_processes_row());
     group.add(&history_row_wrapper(&build_history_cpu_row()));
+    group.add(&history_row_wrapper(&build_history_per_core_row()));
     group.add(&build_top_apps_expander(
         "Top apps \u{00b7} CPU",
         app_usage::top_by_cpu(),
@@ -587,6 +589,53 @@ fn build_history_cpu_row() -> gtk::Box {
     bind(sensors::cpu(), &row, move |_, c: CpuLoad| {
         spark_clone.push(c.overall);
         value_clone.set_text(&format!("{:.0}%", c.overall * 100.0));
+    });
+
+    row
+}
+
+/// Per-core CPU history graph (GNOME-System-Monitor style): one colored,
+/// anti-aliased line per logical core over the same 60-sample window the other
+/// history rows keep, 0..=100 %. Additive to the overall CPU sparkline above —
+/// this adds the missing per-core × history quadrant (#196).
+///
+/// Laid out as a vertical box: a `[name | value]` header line over a
+/// full-width [`MultiSparkline`], so the multi-line graph gets the vertical
+/// room a single-line sparkline doesn't need.
+fn build_history_per_core_row() -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    row.add_css_class("ts-history-row");
+    row.set_hexpand(true);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let name_label = gtk::Label::new(Some("Per-core history"));
+    name_label.add_css_class("ts-stat-name");
+    name_label.set_xalign(0.0);
+    name_label.set_hexpand(true);
+    header.append(&name_label);
+
+    let value_label = gtk::Label::new(None);
+    value_label.add_css_class("ts-stat-value");
+    value_label.set_xalign(1.0);
+    header.append(&value_label);
+    row.append(&header);
+
+    // Per-core load is a fraction in 0..=1, so the domain is fixed (like the
+    // overall CPU sparkline) rather than auto-scaled.
+    let graph = MultiSparkline::new(60);
+    graph.set_domain_max(Some(1.0));
+    graph.widget().set_hexpand(true);
+    row.append(graph.widget());
+
+    let graph_clone = graph.clone();
+    let value_clone = value_label.clone();
+    bind(sensors::cpu(), &row, move |_, c: CpuLoad| {
+        graph_clone.push_frame(&c.per_core);
+        value_clone.set_text(&format!(
+            "{} cores \u{00b7} {:.0}%",
+            c.per_core.len(),
+            c.overall * 100.0
+        ));
     });
 
     row

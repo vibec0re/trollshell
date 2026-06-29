@@ -656,17 +656,43 @@ fn build_expandable_cpu_history_row() -> gtk::ListBoxRow {
     // Default to collapsed; not persisted across rebuilds.
     stack.set_visible_child_name("overall");
 
-    // ── Row wrapper: activatable so a click toggles collapsed ↔ expanded ──
+    // ── Chevron: trailing affordance showing collapsed/expanded state ─────
+    let chevron = gtk::Image::from_icon_name("pan-end-symbolic");
+    chevron.set_valign(gtk::Align::Center);
+    chevron.set_icon_size(gtk::IconSize::Normal);
+
+    // ── Outer box: hosts stack + chevron, receives the GestureClick ───────
+    // adw::PreferencesGroup's internal GtkListBox does NOT activate plain
+    // GtkListBoxRows on click (only its own Adw row types), so we cannot rely
+    // on connect_activate.  A GestureClick on the content widget fires directly
+    // on pointer release, independent of list activation.
+    let outer_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    outer_box.set_hexpand(true);
+    outer_box.append(&stack);
+    outer_box.append(&chevron);
+
+    let gesture = gtk::GestureClick::new();
+    let stack_for_gesture = stack.clone();
+    let chevron_for_gesture = chevron.clone();
+    gesture.connect_released(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let expanded = stack_for_gesture.visible_child_name().as_deref() == Some("percore");
+        if expanded {
+            stack_for_gesture.set_visible_child_name("overall");
+            chevron_for_gesture.set_icon_name(Some("pan-end-symbolic"));
+        } else {
+            stack_for_gesture.set_visible_child_name("percore");
+            chevron_for_gesture.set_icon_name(Some("pan-down-symbolic"));
+        }
+    });
+    outer_box.add_controller(gesture);
+
+    // ── Row wrapper: NOT activatable (gesture handles click) ──────────────
     let row = gtk::ListBoxRow::new();
-    row.set_activatable(true);
+    row.set_activatable(false);
     row.set_selectable(false);
     row.set_hexpand(true);
-    row.set_child(Some(&stack));
-
-    row.connect_activate(move |_| {
-        let expanded = stack.visible_child_name().as_deref() == Some("percore");
-        stack.set_visible_child_name(if expanded { "overall" } else { "percore" });
-    });
+    row.set_child(Some(&outer_box));
 
     row
 }

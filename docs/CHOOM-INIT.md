@@ -1,13 +1,13 @@
 # Choom init — working `vibec0re/trollshell`
 
 Hi choom <3 You're joining work on **`vibec0re/trollshell`** (GitHub is the forge). This is the
-onboarding "init": everything we've learned working this repo that *isn't* obvious from the tree.
+onboarding "init": everything we've learned working this repo that _isn't_ obvious from the tree.
 Read the repo's own [`CLAUDE.md`](../CLAUDE.md) first — it's the source of truth for architecture and
 build. This doc is the **how we work + the landmines**. When the two disagree, the code wins; verify
 before asserting.
 
 > Before anything else, **orient yourself live**: `gh pr list` and `gh issue list`, then read the
-> *full* latest thread on whatever you're about to touch. Threads move fast and several chooms work
+> _full_ latest thread on whatever you're about to touch. Threads move fast and several chooms work
 > this repo at once (§4) — a snapshot in this doc would be stale by the time you read it.
 
 ---
@@ -15,7 +15,7 @@ before asserting.
 ## 0. The one rule that gates everything
 
 **You must build inside the Nix devShell.** `.envrc` is `use flake` (direnv). If direnv isn't
-active, run `nix develop` first. Outside it the build *panics* ("a libclang shared library is not
+active, run `nix develop` first. Outside it the build _panics_ ("a libclang shared library is not
 loaded") and icons render as `image-missing`. `nix` needs flakes per-invocation:
 `--extra-experimental-features 'nix-command flakes'`.
 
@@ -34,10 +34,11 @@ NixOS box, not Arch. `nix` only — no `pacman`. Rust/Python aren't on PATH exce
   `nix fmt <paths>` is the safe superset; run it on every changed file before committing.
 - **CI does NOT run clippy.** CI (`nix flake check`) = treefmt + module-eval + the EDS nixosTest +
   `cargo test`. A PR can be CI-green and clippy-dirty. The local
-  `cargo clippy --workspace --all-targets` is the *only* clippy enforcement — always run it.
+  `cargo clippy --workspace --all-targets` is the _only_ clippy enforcement — always run it.
   (For fast iteration `cargo clippy -p <crate> --lib` beats the full workspace gate.)
 
 Quickref:
+
 ```sh
 cargo build --release -p trollshell
 cargo run -p trollshell                 # needs a LIVE Niri session ($NIRI_SOCKET)
@@ -46,6 +47,7 @@ cargo test --workspace --features system-tests   # + dbus-daemon/display tests (
 cargo clippy --workspace --all-targets  # THE clippy gate
 nix fmt                                 # THE format gate
 ```
+
 `trollshell` is a real Wayland shell — running it meaningfully needs a live Niri session + system
 daemons. Most of what we build (UI, sensors, D-Bus clients) **cannot be verified in CI or even
 headlessly** — that shapes the whole workflow below.
@@ -62,16 +64,16 @@ headlessly** — that shapes the whole workflow below.
   triage comments and **follow-up/breakdown issues is pre-authorized** — no need to ask first (be
   judicious; only break down genuinely large work; reference the parent; `gh issue list` first to
   avoid duplicating one a concurrent choom just filed).
-- **Self-triaged issues:** an issue the *bot* authored with full root-cause analysis in its body is
+- **Self-triaged issues:** an issue the _bot_ authored with full root-cause analysis in its body is
   already triaged — don't post a redundant `## Triage` restating it. Only human-filed issues
   (annikahannig / kaesaecracker) need one.
 - **Never auto-merge to `main`.** That's Annika's call. Open the PR, flag what needs live-verify,
   let the PO test and report.
 - **Fan out WIDE.** Annika actively wants aggressive parallelism ("why not more than two agents?").
   When genuinely-independent work exists, don't run a serial queue. Read-only research/review/
-  scoping agents are *free* (no worktree, no build) — spawn them liberally in parallel.
+  scoping agents are _free_ (no worktree, no build) — spawn them liberally in parallel.
 - **Sweep for unanswered questions every idle pass.** Check EVERY issue + recently-closed, by
-  *latest-comment author* (never by timestamp — a reviewer question can predate your wake). If the
+  _latest-comment author_ (never by timestamp — a reviewer question can predate your wake). If the
   last comment is from `annikahannig` or `kaesaecracker` and it's a question / request / live-test
   result, it's unanswered → replying is top priority, even on issues you weren't tracking. A
   PO/reporter question left hanging is the highest-cost miss.
@@ -88,18 +90,18 @@ non-blocking clarifying question is open but a robust fix covers the likely case
 **The LIMIT — genuinely HOLD when the design is an active dispute.** A `## Triage` comment existing
 does **not** make an issue build-ready. Right before you start building a freshly-triaged issue,
 **re-read the FULL latest thread** (not just the triage + your own claim). HOLD if the reporter/PO
-has (a) pushed back on the *approach*, (b) said "no impl yet" / "didn't get feedback", (c) escalated
+has (a) pushed back on the _approach_, (b) said "no impl yet" / "didn't get feedback", (c) escalated
 to Annika for a decision, or (d) a concurrent choom already agreed to hold. A brand-new issue with
-the reporter mid-conversation is *more* likely contested, not less. Building into a live design
+the reporter mid-conversation is _more_ likely contested, not less. Building into a live design
 dispute reads as incoherent ("you said hold, then you shipped") and gets parked. Also genuinely hold
-when untriaged, or when a fix would be *wrong* without the answer.
+when untriaged, or when a fix would be _wrong_ without the answer.
 
 **Idle wake with a blocked/drained backlog?** Don't just grow backoff — **adversarially self-review
 the open PRs whose correctness CI can't catch** (D-Bus clients, GTK/Wayland layout, anything flagged
 "needs live verify"). Fan out one read-only reviewer per high-risk PR; feed it the diff + full new
 files; ask for HIGH-CONFIDENCE correctness bugs only (logic, wrong API sig, panics on real data,
 broken incremental-update) with `file:line` + a minimal fix — not style/clippy nits. Push confirmed
-fixes as one commit to the *same* branch (never a new PR, never merge). This has caught a CRITICAL +
+fixes as one commit to the _same_ branch (never a new PR, never merge). This has caught a CRITICAL +
 multiple HIGH bugs in code that was clippy-clean, unit-green, and already pushed — before the PO
 wasted a live-test round-trip.
 
@@ -113,7 +115,7 @@ work is indistinguishable by author. This bites in specific ways — guard again
   already landed after the human's comment, it's handled — don't double-handle.
 - **`gh issue list` immediately before `gh issue create`.** Another context may have just filed the
   same follow-up. Duplicates fragment discussion; the senior issue wins. When closing-as-dup,
-  re-fetch the *other* issue's state right before acting and verify exactly one of the pair stays
+  re-fetch the _other_ issue's state right before acting and verify exactly one of the pair stays
   open (two contexts can close BOTH in opposite directions).
 - **Check the working tree before ANY edit/checkout/commit.** The primary worktree is **not always
   clean `main`** — a concurrent context can be mid-build there (dirty files, HEAD on a stray feature
@@ -122,14 +124,14 @@ work is indistinguishable by author. This bites in specific ways — guard again
   concurrent choom owns it → hands off; don't build that issue or touch those files. A reflexive
   `git checkout` / `worktree remove --force` **silently discards** their uncommitted work.
 - **Stay in your lane.** Triage context owns `## Triage` comments + untriaged issues; the implementer
-  owns building *triaged* issues + replying on its *own* PRs. Don't act on an untriaged issue.
+  owns building _triaged_ issues + replying on its _own_ PRs. Don't act on an untriaged issue.
 - **`origin/main` moves mid-session.** Re-`git fetch` during a wake — a concurrent PR (or Annika)
   can merge while you work.
 
 ## 5. Fan-out / worktree hygiene (if you spawn build worktrees)
 
 - **ff local `main` FIRST, before any fan-out:** `git fetch origin -q && git merge --ff-only
-  origin/main`. Agent worktrees fork the *primary repo's LOCAL main*, not `origin/main` — stale
+origin/main`. Agent worktrees fork the _primary repo's LOCAL main_, not `origin/main` — stale
   local main makes agents branch off old code and "re-fix" already-merged work, or silently
   conflict/revert.
 - **Cap parallel build worktrees ~3.** Each carries a multi-GB `target` (the shared-`CARGO_TARGET_DIR`
@@ -145,7 +147,7 @@ work is indistinguishable by author. This bites in specific ways — guard again
 ## 6. PR etiquette with an active PO
 
 If you EXTEND an already-open, green+mergeable PR with more commits while Annika is in an active
-session, she can hit merge *between* your commits and land a PARTIAL PR (this happened — the
+session, she can hit merge _between_ your commits and land a PARTIAL PR (this happened — the
 load-bearing commit got orphaned, cost a confusing round-trip). When adding load-bearing scope to a
 mergeable PR: prefer a **separate PR**, or mark the PR **draft** before pushing and flip to ready
 when complete, or post a one-line "hold the merge — one more commit coming". After a PO merges a
@@ -155,21 +157,21 @@ before telling them it's done.
 ## 7. Technical landmines (type-check clean, render/run wrong — CI can't catch these)
 
 - **niri blurs the FULL layer-shell surface geometry**, not the painted content. A fullscreen
-  surface holding a small card frosts the *whole screen*; a persistent never-unmapped surface leaves
+  surface holding a small card frosts the _whole screen_; a persistent never-unmapped surface leaves
   a lingering frosted strip. This is the root cause behind every frosted-glass regression. Don't
   chase CSS alpha — start from surface geometry. niri 26.04 ships `ext-background-effect-v1` with
   `set_blur_region(wl_region)` to scope blur to a sub-rect. `etc/niri/blur.kdl` is **docs, not
   loaded** (niri has no `include`) — the live rules are hand-merged into Annika's nixos `config.kdl`.
 - **`adw::PreferencesGroup::add` routes by widget type:** a `GtkListBoxRow`/`AdwActionRow`/etc. goes
-  *into* the boxed list (interleaved, in order); **any non-row child (bare `gtk::Label`/`gtk::Box`)
+  _into_ the boxed list (interleaved, in order); **any non-row child (bare `gtk::Label`/`gtk::Box`)
   renders BELOW the entire list.** It compiles fine; the bug is render-only. To interleave, the child
   MUST be a `GtkListBoxRow` subclass. For a slim row without the `AdwActionRow` header-box floor, use
   a bare `gtk::ListBoxRow` + `set_child`. trollshell uses `PreferencesGroup` heavily (calendar,
   tasks, network).
-- **`gtk::Label::set_lines(n)` does NOT cap hard `\n` paragraphs** — only wrapping *within* one
+- **`gtk::Label::set_lines(n)` does NOT cap hard `\n` paragraphs** — only wrapping _within_ one
   paragraph. Text with embedded newlines (descriptions, notes) renders every line regardless.
   Pre-clamp in Rust: `text.lines().take(n)` before handing it to the label.
-- General rule: any change only the *renderer* (not the type system / clippy / CI) can validate →
+- General rule: any change only the _renderer_ (not the type system / clippy / CI) can validate →
   adversarially self-review against the actual library behavior before un-drafting.
 
 ## 8. How a change reaches Annika's machine (deployment)
@@ -199,5 +201,5 @@ see `etc/README.md`.
 
 ---
 
-*Welcome aboard, choom. Build inside the devShell, `nix fmt` + workspace clippy before every push,
-read the full thread before you act, fan out wide, never auto-merge, and flag the live-verify.* <3
+_Welcome aboard, choom. Build inside the devShell, `nix fmt` + workspace clippy before every push,
+read the full thread before you act, fan out wide, never auto-merge, and flag the live-verify._ <3

@@ -215,6 +215,23 @@ pub fn install(monitor: &Monitor) {
         .build();
     revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
+    // Client-side blur-region scope (#192/#193). The wl_surface only exists
+    // once the surface maps, so attach on first `map` and seed the region to
+    // the current open-state. `None` on niri < 26.04 → the layer-rule blur in
+    // etc/niri/blur.kdl stays as the fallback. Stored shared so the open
+    // subscription can drive the region as the card slides.
+    //
+    // MUST be wired BEFORE `set_visible(true)`: gtk4-layer-shell maps this
+    // persistent surface *synchronously* inside `set_visible`, and the surface
+    // is created once and never remaps — so a `connect_map` handler installed
+    // afterwards misses the only `map` it will ever see, `attach()` never runs,
+    // no client region is set, and niri frosts the WHOLE surface geometry
+    // (the #192 lingering strip / #193 whole-screen frost). The drawer
+    // (`modal.rs`) is immune only because it wires its handler before any
+    // `set_visible`.
+    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
+    wire_blur_attach(&window, &blur, &open_state);
+
     // Present the surface ONCE, here at install. Stays alive for the
     // process lifetime — toggle goes through the revealer + open_state,
     // never through set_visible/present. See module-level note on z-order.
@@ -223,14 +240,6 @@ pub fn install(monitor: &Monitor) {
     // region by default even after the revealer collapses to 0 width,
     // so without this the closed sidebar's region still swallows clicks.
     apply_input_passthrough(&window, false);
-
-    // Client-side blur-region scope (#192/#193). The wl_surface only exists
-    // once the surface maps, so attach on first `map` and seed the region to
-    // the current open-state. `None` on niri < 26.04 → the layer-rule blur in
-    // etc/niri/blur.kdl stays as the fallback. Stored shared so the open
-    // subscription can drive the region as the card slides.
-    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
-    wire_blur_attach(&window, &blur, &open_state);
 
     // Slots holding the currently-armed slide timers so `close_all` can cancel
     // them before tearing the surface down (see field docs on SidebarPanel).
@@ -685,8 +694,8 @@ fn wire_blur_attach(
 ) {
     let blur = blur.clone();
     let open_state = open_state.clone();
-    window.connect_map(move |w| {
-        // Defer to idle so the wl_surface is fully realized before we bind.
+    // Run the bind on the next idle so the wl_surface is fully realized.
+    let schedule_attach = move |w: &gtk::Window| {
         let w = w.clone();
         let blur = blur.clone();
         let open_state = open_state.clone();
@@ -706,7 +715,17 @@ fn wire_blur_attach(
                 );
             }
         });
+    };
+    window.connect_map({
+        let schedule_attach = schedule_attach.clone();
+        move |w| schedule_attach(w)
     });
+    // Belt-and-suspenders: if the surface already mapped before we connected
+    // (gtk4-layer-shell can map synchronously inside `set_visible`), `connect_map`
+    // would never fire for this once-mapped, never-remapped surface — so bind now.
+    if window.is_mapped() {
+        schedule_attach(window);
+    }
 }
 
 /// Toggle the surface's input region so the closed sidebar's persistent

@@ -877,11 +877,22 @@ fn show_panel(panel: &ModalPanel, key: &str, page: Page, main_margin: i32) {
 fn card_surface_rect(panel: &ModalPanel) -> Option<hytte::blur::Rect> {
     let window: gtk::Widget = panel.window.clone().upcast();
     let bounds = panel.card.compute_bounds(&window)?;
+    // The card's *bounding box* is wider than its drawn silhouette: the body is
+    // inset by `DRAWER_FLARE_RADIUS` on each side (the content's start/end
+    // margins in `build_drawer_card`; the top corners flare *outward* to the bar
+    // — see `draw_drawer_silhouette`). A `wl_region` is rectangles-only, so a
+    // full bounding-box rect would frost a `DRAWER_FLARE_RADIUS`-wide strip of
+    // bare wallpaper/window down each side — the "blur border" around the card.
+    // Inset the rect to the body so the frost hugs the silhouette. The thin top
+    // wings (≤ rf tall) and the convex bottom corners (`DRAWER_CORNER_RADIUS`)
+    // can't be expressed as rectangles; they're left slightly un-/over-frosted by
+    // at most a corner sliver — far less visible than the full-height side halo.
+    let inset = DRAWER_FLARE_RADIUS;
     #[allow(clippy::cast_possible_truncation)]
     let (x, y, w, h) = (
-        bounds.x() as i32,
+        bounds.x() as i32 + inset,
         bounds.y() as i32,
-        bounds.width() as i32,
+        bounds.width() as i32 - 2 * inset,
         bounds.height() as i32,
     );
     if w <= 0 || h <= 0 {

@@ -24,13 +24,15 @@
  * this RGB as a cairo flat fill (cairo can't read CSS vars) -- update frame.rs
  * too whenever this changes COLOUR.
  *
- * Alpha 0.80 makes ALL shell chrome (bar, sidebar, drawer, frame) translucent
- * so niri's layer-rule blur (see etc/niri/blur.kdl) frosts the wallpaper behind
- * them uniformly. The bar uses this token directly (no more opaque override) and
- * frame.rs uses the same 0.80 alpha, so the bar↔frame boundary is seamless.
- * Raise toward 1.0 for a more solid shell (less frost); lower for more frost.
- * Set the alpha to 1.0 to flatten everything to opaque. */
-@define-color shell_background rgba(28, 6, 44, 0.80);
+ * OPAQUE (alpha 1.0): all shell chrome (bar, sidebar, drawer, frame) is a solid
+ * flat purple. The frosted-glass / translucency experiment is parked — niri's
+ * layer-rule blur (etc/niri/blur.kdl) is now inert, since blur only shows
+ * through a translucent surface and is invisible over this opaque fill. The
+ * full frosted state lives on the `experiment/frosted-glass-blur` branch.
+ * To bring the frost back, give this an alpha < 1 (e.g. `rgba(28, 6, 44, 0.80)`)
+ * and match it in frame.rs (it hardcodes the same RGB(A) — cairo can't read CSS
+ * vars). */
+@define-color shell_background rgb(28, 6, 44);
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
  * than @shell_background so the weather/calendar/tasks/departures cards read as

@@ -24,12 +24,13 @@
  * this RGB as a cairo flat fill (cairo can't read CSS vars) -- update frame.rs
  * too whenever this changes COLOUR.
  *
- * Alpha 0.90 makes ALL shell chrome (bar, sidebar, drawer, frame) translucent
+ * Alpha 0.80 makes ALL shell chrome (bar, sidebar, drawer, frame) translucent
  * so niri's layer-rule blur (see etc/niri/blur.kdl) frosts the wallpaper behind
  * them uniformly. The bar uses this token directly (no more opaque override) and
- * frame.rs uses the same 0.90 alpha, so the bar↔frame boundary is seamless.
- * Set the alpha back to 1.0 to flatten everything to opaque. */
-@define-color shell_background rgba(28, 6, 44, 0.90);
+ * frame.rs uses the same 0.80 alpha, so the bar↔frame boundary is seamless.
+ * Raise toward 1.0 for a more solid shell (less frost); lower for more frost.
+ * Set the alpha to 1.0 to flatten everything to opaque. */
+@define-color shell_background rgba(28, 6, 44, 0.80);
 
 /* Sidebar widget card fill — a SOLID (alpha 1.0) dark purple, a touch lighter
  * than @shell_background so the weather/calendar/tasks/departures cards read as
@@ -57,12 +58,12 @@
  *     inside. ─────────────────────────────────────────────────────── */
 
 .hytte-bar {
-    /* Translucent fill matching @shell_background (alpha 0.90) so niri's
+    /* Translucent fill matching @shell_background (alpha 0.80) so niri's
      * hytte-bar blur layer-rule frosts the wallpaper behind the bar, matching
-     * the sidebar and drawer. frame.rs uses the same 0.90 alpha, so the bar's
+     * the sidebar and drawer. frame.rs uses the same 0.80 alpha, so the bar's
      * bottom edge meets the frame's top edge with no opacity seam. Paint the
      * surface here ONCE — .hytte-bar-content stays transparent (double-painting
-     * @shell_background there would stack two 0.90 layers → ~0.99 effective
+     * @shell_background there would stack two 0.80 layers → ~0.96 effective
      * alpha: a visible seam). */
     background: @shell_background;
     color: #ffffff;
@@ -92,7 +93,7 @@
     border-radius: 0;
     /* Transparent: the translucent .hytte-bar window behind it supplies the
      * single flat fill. Double-painting @shell_background here would stack two
-     * 0.90 layers → ~0.99 effective alpha: a visible seam vs the frame's 0.90. */
+     * 0.80 layers → ~0.96 effective alpha: a visible seam vs the frame's 0.80. */
     background: transparent;
 }
 .hytte-bar-group-left button,

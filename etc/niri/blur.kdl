@@ -30,6 +30,9 @@
 // WHOLE screen):
 //   hytte-frame         -> fullscreen click-through frame overlay
 //   hytte-popup-catcher -> invisible fullscreen dismiss catcher
+//   hytte-modal         -> the slide-out drawer (DROPPED FOR NOW — curved card
+//                          edges shimmer under a rectangles-only blur region;
+//                          see the commented-out rule below)
 //
 // `xray true` frosts the wallpaper only (cheap, computed once); `xray false`
 // frosts the actual content behind the surface (pricier; niri recomputes on
@@ -63,14 +66,22 @@ layer-rule {
     }
 }
 
-layer-rule {
-    match namespace="hytte-modal"
-    // Slide-out drawer card. Tune to match the drawer's drawn corner radius.
-    // xray false: the drawer overlays the window stack (same reason as the
-    // sidebar — xray true would frost only occluded wallpaper, not windows).
-    geometry-corner-radius 14
-    background-effect {
-        blur true
-        xray false
-    }
-}
+// DROPPED FOR NOW (hytte-modal / the slide-out drawer): the drawer card is a
+// *curved* silhouette — concave top wings sweeping up to the bar + convex bottom
+// corners — and a client `set_blur_region` is rectangles-only, so the frost
+// can't hug those edges (it shimmers along them and during the reveal slide).
+// Until the curved-edge frost is solved, the drawer is unblurred. The shell now
+// hands niri an EMPTY blur region on each drawer map (modal.rs `wire_blur_attach`),
+// which suppresses this rule even while it stays merged — so removing it from the
+// live config is optional. To drop the frost the clean way, also delete this block
+// from ~/.config/niri/config.kdl and reload niri. Re-enable: un-comment below and
+// restore the card-scoping in modal.rs (git revert the drop commit).
+//
+// layer-rule {
+//     match namespace="hytte-modal"
+//     geometry-corner-radius 14
+//     background-effect {
+//         blur true
+//         xray false
+//     }
+// }

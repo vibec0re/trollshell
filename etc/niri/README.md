@@ -197,7 +197,16 @@ needs **niri ≥ 26.04** (the `ext-background-effect` protocol / `layer-rule`
    frost off entirely, or lower it for a stronger (lighter) frost.
 2. **The blur rules:** `etc/niri/blur.kdl` holds the `layer-rule { }` blocks
    that tell niri to blur trollshell's surfaces, matched by their
-   layer-shell namespace (`hytte-bar*`, `hytte-sidebar*`, `hytte-modal*`).
+   layer-shell namespace (`hytte-bar*`, `hytte-sidebar*`).
+
+> **Drawer frost is dropped for now.** The `hytte-modal` rule is commented out
+> in `blur.kdl`: the drawer card's curved silhouette can't be hugged by a
+> rectangles-only blur region, so the frost shimmered along its edges. The shell
+> hands niri an empty region on each drawer map, so the frost is suppressed even
+> if you still have the old `hytte-modal` block merged in your live config (drop
+> it + reload for the clean state). The bar and sidebar frost is unaffected. The
+> drawer-specific notes below describe the prior behaviour, kept for when the
+> curved-edge frost is solved.
 
 niri does **not** support `include`, so — as with `binds.kdl` and
 `frame.kdl` — merge the blocks by hand. Paste every `layer-rule { }` block

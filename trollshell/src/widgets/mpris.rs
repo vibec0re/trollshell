@@ -36,10 +36,16 @@
 //! ```
 //!
 //! `available` deliberately excludes *this* widget's own width: it subtracts
-//! only the left and right clusters, whose widths don't depend on whether we
-//! are currently full or narrow. That independence is what keeps the decision
-//! from feeding back into itself — toggling the mpris mode changes only the
-//! center child's width, which we never read here.
+//! only the left and right clusters. Crucially it measures each cluster's
+//! **natural** width, never its current *allocated* width — `GtkCenterBox`
+//! shrinks the start child (the window-button cluster) toward its minimum when
+//! the end pair, which holds this widget, is wide, so the left cluster's
+//! *allocation* depends on whether mpris is currently full. Reading that
+//! allocation would feed our own mode back into the decision and oscillate (the
+//! flicker as the full row tries to overlap the window buttons). Natural widths
+//! are mode-independent — the window-button labels are width-capped
+//! (`window_list`'s `max_width_chars`), so the left natural is bounded — and
+//! that independence is what actually keeps the decision from feeding back.
 //!
 //! `full_natural` is summed from the individual full-mode chips' own
 //! `measure()` results, which are independent of the chip's current `visible`
@@ -270,6 +276,14 @@ fn decide_mode(container: &gtk::Box, chips: &Chips, currently_full: bool) -> boo
 /// Horizontal space (px) the mpris widget may occupy: bar width minus the left
 /// and right clusters minus a small gap. `None` if the bar geometry isn't
 /// realised yet.
+///
+/// The clusters are measured by their **natural** width, never their current
+/// *allocated* width: `GtkCenterBox` squeezes the start (window-button) cluster
+/// toward its minimum when the end pair — which holds this widget — is wide, so
+/// the left cluster's allocation depends on whether mpris is full. Reading it
+/// would feed our own mode back into the decision and flicker. The `bar_width`
+/// is read from the `CenterBox` allocation because that tracks the monitor, not
+/// our mode.
 fn available_width(container: &gtk::Box) -> Option<i32> {
     // Parent chain: container → middle(Box) → end_pair(Box) → CenterBox → win.
     let middle = container.parent()?;
@@ -282,30 +296,24 @@ fn available_width(container: &gtk::Box) -> Option<i32> {
     }
 
     // Left cluster = the CenterBox start widget (window-title list etc.).
-    let left_width = center_box
-        .start_widget()
-        .map_or(0, |w| natural_or_allocated(&w));
+    let left_width = center_box.start_widget().map_or(0, |w| natural_width(&w));
 
     // Right cluster = the sibling of `middle` inside `end_pair` (the status
     // groups). Its width is independent of our mode.
     let right_width = end_pair
         .last_child()
         .filter(|w| *w != middle)
-        .map_or(0, |w| natural_or_allocated(&w));
+        .map_or(0, |w| natural_width(&w));
 
     Some((bar_width - left_width - right_width - GAP).max(0))
 }
 
-/// A widget's allocated width if it has one, else its natural width. The left
-/// and right clusters are usually allocated by the time we measure; the
-/// fallback covers the first pass before allocation has settled.
-fn natural_or_allocated(w: &gtk::Widget) -> i32 {
-    let alloc = w.width();
-    if alloc > 0 {
-        alloc
-    } else {
-        w.measure(gtk::Orientation::Horizontal, -1).1
-    }
+/// A widget's natural width — mode-independent, unlike its allocated width
+/// (which `GtkCenterBox` perturbs in response to the mpris mode; see
+/// [`available_width`]). Used for the neighbour clusters so the fit decision
+/// never reads an allocation our own toggle feeds back into.
+fn natural_width(w: &gtk::Widget) -> i32 {
+    w.measure(gtk::Orientation::Horizontal, -1).1
 }
 
 /// Summed natural width of the full-mode chips (prev/play/next/label),

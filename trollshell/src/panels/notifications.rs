@@ -14,6 +14,7 @@ use hytte::prelude::*;
 use hytte::services::{dnd, notifications, notifications_mute};
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::notif_actions;
 
 pub fn panel_notifications() -> gtk::Widget {
     let column = page_box();
@@ -188,11 +189,14 @@ fn build_history_action_row(entry: &notifications::HistoryEntry) -> adw::ActionR
     time_label.set_valign(gtk::Align::Center);
     row.add_prefix(&time_label);
 
-    // Action buttons (cap at 3 — same as toasts).
-    if !entry.actions.is_empty() {
+    // Action buttons (cap at 3 — same as toasts). The reserved `default`
+    // action is excluded — it's not meant to render as a button (see
+    // `notif_actions`).
+    let mut visible = notif_actions::visible_actions(&entry.actions).peekable();
+    if visible.peek().is_some() {
         let actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions_box.set_valign(gtk::Align::Center);
-        for action in entry.actions.iter().take(3) {
+        for action in visible.take(3) {
             let btn = gtk::Button::with_label(&action.label);
             btn.add_css_class("flat");
             let id = entry.id;

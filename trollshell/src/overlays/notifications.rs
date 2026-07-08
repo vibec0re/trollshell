@@ -43,6 +43,8 @@ use hytte::services::notifications::{self, Notification, NotificationImage, Urge
 use hytte::services::notifications_mute;
 use hytte::ui::{Anchor, Margin, layer_window};
 
+use crate::components::notif_actions;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Maximum number of non-critical toasts rendered as individual cards.
@@ -367,6 +369,21 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     app_label.set_hexpand(true);
     header.append(&app_label);
 
+    // Explicit dismiss button. Load-bearing (not just symmetry): once
+    // body-click is wired to invoke a `default` action instead of
+    // dismissing (below), a default-carrying toast would otherwise have no
+    // way to close it without waiting out the timeout.
+    let dismiss_btn = gtk::Button::from_icon_name("window-close-symbolic");
+    dismiss_btn.add_css_class("flat");
+    dismiss_btn.add_css_class("ts-toast-dismiss");
+    dismiss_btn.set_valign(gtk::Align::Center);
+    dismiss_btn.set_tooltip_text(Some("Dismiss"));
+    let dismiss_id = notif.id;
+    dismiss_btn.connect_clicked(move |_| {
+        notifications::dismiss(dismiss_id, 2);
+    });
+    header.append(&dismiss_btn);
+
     column.append(&header);
 
     // Summary.
@@ -389,14 +406,16 @@ fn build_card(notif: &Notification) -> gtk::Widget {
         column.append(&body);
     }
 
-    // Action buttons (rendered only when actions are present). Cap at 3
-    // visible buttons so a chatty app (e.g. an "snooze 1m / 5m / 15m / 1h"
-    // calendar reminder) can't blow out the toast width — the rest stay
-    // accessible from the drawer history page.
-    if !notif.actions.is_empty() {
+    // Action buttons (rendered only when visible actions are present —
+    // the reserved `default` action is excluded, see `notif_actions`).
+    // Cap at 3 visible buttons so a chatty app (e.g. an "snooze 1m / 5m /
+    // 15m / 1h" calendar reminder) can't blow out the toast width — the
+    // rest stay accessible from the drawer history page.
+    let mut visible = notif_actions::visible_actions(&notif.actions).peekable();
+    if visible.peek().is_some() {
         let actions_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions_row.add_css_class("ts-toast-actions");
-        for action in notif.actions.iter().take(3) {
+        for action in visible.take(3) {
             let btn = gtk::Button::with_label(&action.label);
             btn.add_css_class("ts-toast-action");
             let id = notif.id;
@@ -412,12 +431,19 @@ fn build_card(notif: &Notification) -> gtk::Widget {
 
     card.append(&column);
 
-    // Click anywhere on the card → dismiss (reason 2 = dismissed by user).
-    // Action buttons consume their own click events before it bubbles here.
+    // Click anywhere on the card → invoke the reserved `default` action
+    // (if the notification carries one) then dismiss (reason 2 =
+    // dismissed by user); with no `default` action this is a plain
+    // dismiss, same as before. Action/dismiss buttons consume their own
+    // click events before it bubbles here.
     let id = notif.id;
+    let default_key = notif_actions::default_action(&notif.actions).map(|a| a.key.clone());
     let gesture = gtk::GestureClick::new();
     gesture.connect_pressed(move |gesture, _, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(key) = &default_key {
+            notifications::invoke_action(id, key);
+        }
         notifications::dismiss(id, 2);
     });
     card.add_controller(gesture);

@@ -596,6 +596,9 @@
      * off `min-width`. */
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
+.ts-toast:hover {
+    cursor: pointer;
+}
 .ts-toast-critical {
     border-color: @destructive_color;
 }
@@ -623,6 +626,14 @@
     padding: 0.154em 0.923em;
     border-radius: 0.615em;
     font-size: 0.923em;
+}
+.ts-toast-dismiss {
+    padding: 0.154em 0.308em;
+    border-radius: 0.462em;
+    opacity: 0.55;
+}
+.ts-toast-dismiss:hover {
+    opacity: 1;
 }
 
 /* ─── Password prompt ───────────────────────────────────────────── */

@@ -14,9 +14,9 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     app_usage, bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures,
-    displays, dnd, geoclue, mpris, netconn, networkd, niri, notifications, notifications_mute,
-    pipewire, places, power_profiles, resolved, screensaver, sensors, systemd, tasks, tray, upower,
-    vpn, wallpaper, weather, wifi, wifiscan,
+    displays, dnd, geoclue, idle_notify, mpris, netconn, networkd, niri, notifications,
+    notifications_mute, pipewire, places, power_profiles, resolved, screensaver, sensors, systemd,
+    tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
 };
 
 fn main() -> hytte::ui::Result<()> {
@@ -68,6 +68,9 @@ fn main() -> hytte::ui::Result<()> {
         .with(wifi::service())
         .with(power_profiles::service())
         .with(screensaver::service())
+        // Native ext-idle-notify-v1 observer (#204 Phase 2, observe-only): runs
+        // alongside swayidle to validate idle-timing parity. Takes no action.
+        .with(idle_notify::service())
         .with(systemd::service())
         .with(wallpaper::service())
         .with(displays::service())

@@ -1004,6 +1004,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "wayland-client",
+ "wayland-protocols",
  "zbus",
  "zeroize",
 ]

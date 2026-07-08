@@ -14,6 +14,7 @@ pub mod displays;
 pub mod dnd;
 pub mod geoclue;
 pub mod hooks;
+pub mod idle_notify;
 pub mod logind;
 pub mod mpris;
 pub mod netconn;

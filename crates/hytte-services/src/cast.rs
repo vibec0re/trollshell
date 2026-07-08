@@ -83,6 +83,20 @@ pub(crate) fn millicelsius_to_celsius(milli: u64) -> f64 {
     milli as f64 / 1_000.0
 }
 
+/// Convert a kHz frequency reading from sysfs (`u64`, e.g. from
+/// `/sys/devices/system/cpu/cpuN/cpufreq/scaling_cur_freq`) to Hz (`f64`).
+///
+/// # Precision contract
+///
+/// sysfs reports CPU frequencies in kHz. A realistic current or ceiling
+/// frequency is ~800 000 – 6 000 000 kHz; multiplying by 1 000.0 gives a value
+/// of order 10^9 — far below `f64`'s 2^53 exact-integer range, so the `u64 →
+/// f64` cast is exact and no precision is lost for this use case.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn khz_to_hz(khz: u64) -> f64 {
+    khz as f64 * 1_000.0
+}
+
 /// Convert a whole-number percent in `u64` (e.g. GPU busy percent from
 /// `/sys/class/drm/.../gpu_busy_percent`) to a `0.0..=1.0` ratio.
 ///
@@ -223,6 +237,19 @@ mod tests {
     fn millicelsius_to_celsius_precision() {
         // 52 125 milli-°C = 52.125 °C (exactly representable in f64).
         assert!((millicelsius_to_celsius(52_125) - 52.125).abs() < f64::EPSILON);
+    }
+
+    // ── khz_to_hz ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn khz_to_hz_zero() {
+        assert!(khz_to_hz(0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn khz_to_hz_typical() {
+        // 2 400 000 kHz = 2.4 GHz exactly.
+        assert!((khz_to_hz(2_400_000) - 2.4e9).abs() < f64::EPSILON);
     }
 
     // ── percent_u64_to_ratio ──────────────────────────────────────────────────

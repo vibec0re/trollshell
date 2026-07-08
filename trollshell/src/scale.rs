@@ -52,6 +52,23 @@ use crate::components::cast;
 /// the denominator of the scaling factor (so the factor is `1.0` at default).
 const BASE_EM_PX: f64 = 11.0 * 96.0 / 72.0;
 
+/// The CSS base `font-size`, in pixels at the 1× baseline.
+///
+/// Every CSS `em` in the shell resolves against the root `font-size`, so this
+/// is the single literal the whole CSS `em` convention (`#114`) scales from.
+/// It is injected from Rust as `* { font-size: CSS_BASE_FONT_PX * `
+/// [`scale_factor`]`() px }` (see [`css_base_font_px`] and
+/// `main.rs::install_scaled_base_font`) rather than hard-coded in `style.css`,
+/// so it rides the *same* factor [`scale`] uses — CSS text and Rust-set sizes
+/// grow together instead of drifting (`#135` part 2).
+///
+/// Kept as its own literal, distinct from [`BASE_EM_PX`] (14.667): the two
+/// baselines are deliberately *not* merged, because folding them into one
+/// number would force re-authoring either every CSS `em` divisor or every
+/// [`scale`] call site and risk breaking 1× identity on that side. Both ride
+/// the same [`scale_factor`], which is what keeps them from drifting.
+pub(crate) const CSS_BASE_FONT_PX: f64 = 13.0;
+
 /// The point size GTK falls back to when `gtk-font-name` is missing or can't be
 /// parsed as a point size.
 const DEFAULT_FONT_PT: f64 = 11.0;
@@ -115,6 +132,19 @@ fn scale_with_factor(px: i32, factor: f64) -> i32 {
     cast::f64_to_i32_round(f64::from(px) * factor)
 }
 
+/// The dimensionless font-scaling factor shared by CSS and Rust sizing.
+///
+/// `effective_font_px() / `[`BASE_EM_PX`], i.e. how much larger the effective
+/// font is than the 1× baseline. Exactly `1.0` at the Adwaita/GNOME default,
+/// growing with a larger `gtk-font-name` point size or a text-scaling-factor /
+/// DPI bump carried via `gtk-xft-dpi`. Both [`scale`] (Rust-set pixel sizes)
+/// and [`css_base_font_px`] (the CSS base `font-size`) multiply through this
+/// one factor, so CSS `em` and Rust `scale()` sizes track together (`#135`).
+#[must_use]
+pub(crate) fn scale_factor() -> f64 {
+    effective_font_px() / BASE_EM_PX
+}
+
 /// Scale a design-baseline pixel value by the effective font size.
 ///
 /// `px` is authored at the [`BASE_EM_PX`] baseline (font 11pt @ 96 DPI), where
@@ -127,7 +157,19 @@ fn scale_with_factor(px: i32, factor: f64) -> i32 {
 /// the remaining `set_size_request` and cairo-dimension sites.
 #[must_use]
 pub(crate) fn scale(px: i32) -> i32 {
-    scale_with_factor(px, effective_font_px() / BASE_EM_PX)
+    scale_with_factor(px, scale_factor())
+}
+
+/// The CSS base `font-size` in pixels for the *current* effective font.
+///
+/// [`CSS_BASE_FONT_PX`] (13 at 1×) times the shared [`scale_factor`]. Injected
+/// from `main.rs` as `* { font-size: <this>px }` so every CSS `em` in the shell
+/// rides the same factor as [`scale`]. At the default font the factor is `1.0`,
+/// so this is exactly `13.0` → 1× is pixel-identical to the old static
+/// `* { font-size: 13px }` (`#135` part 2).
+#[must_use]
+pub(crate) fn css_base_font_px() -> f64 {
+    CSS_BASE_FONT_PX * scale_factor()
 }
 
 #[cfg(test)]
@@ -167,5 +209,39 @@ mod tests {
     fn baseline_em_is_default() {
         // Sanity-check the documented baseline arithmetic.
         assert!((BASE_EM_PX - 14.666_666).abs() < 1e-3, "{BASE_EM_PX}");
+    }
+
+    /// Pure-math counterpart to [`css_base_font_px`], so the CSS-base scaling
+    /// is unit-testable without a live `gtk::Settings` (mirrors
+    /// [`scale_with_factor`]). `css_base_font_px()` == `this(scale_factor())`.
+    fn css_base_font_px_with_factor(factor: f64) -> f64 {
+        CSS_BASE_FONT_PX * factor
+    }
+
+    #[test]
+    fn css_base_scales_linearly() {
+        // 1× is pixel-identical to the old static `* { font-size: 13px }`.
+        assert!((css_base_font_px_with_factor(1.0) - 13.0).abs() < 1e-9);
+        // A larger effective font grows the base proportionally…
+        assert!((css_base_font_px_with_factor(2.0) - 26.0).abs() < 1e-9);
+        // …and a smaller one shrinks it.
+        assert!((css_base_font_px_with_factor(0.5) - 6.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn css_base_no_op_at_default() {
+        // Headless: GTK isn't initialized, so `scale_factor()` is exactly 1.0
+        // and the CSS base is exactly the 1× literal — the same no-op guarantee
+        // `scale()` gives, keeping 1× pixel-identical. If GTK *is* up with a
+        // non-baseline font, allow a little slack.
+        if gtk::is_initialized_main_thread() {
+            assert!(
+                (css_base_font_px() - CSS_BASE_FONT_PX).abs() <= 1.0,
+                "css_base_font_px() = {}",
+                css_base_font_px()
+            );
+        } else {
+            assert!((css_base_font_px() - CSS_BASE_FONT_PX).abs() < 1e-9);
+        }
     }
 }

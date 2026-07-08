@@ -14,9 +14,11 @@
  * set_size_request / cairo) can't use CSS units — derive them with
  * `crate::scale::scale()`. Phase 2 (#116) converted bar + chip px → em and
  * wired bar icon set_pixel_size through scale(). Phases #117-#119 cover the
- * remaining sites. NB: this stylesheet sets a
- * `font-size` on `*` below, so for shell widgets `1em` resolves against that;
- * authoring in `em` still keeps a single knob for density scaling. */
+ * remaining sites. NB: the base `font-size` on `*` is injected from Rust
+ * (main.rs::install_scaled_base_font) as `13px * scale::scale_factor()`, so
+ * `1em` resolves against a base that tracks the font / GNOME text-scaling —
+ * the same factor `scale()` uses. Authoring in `em` keeps one knob for the
+ * whole shell, CSS and Rust sizes now scaling together (#135 part 2). */
 
 /* Shell surface colour -- a flat deep purple shared by the shell surfaces.
  * One variable keeps them visually unified. Always dark regardless of the
@@ -45,7 +47,13 @@
 
 * {
     font-family: "Cantarell", system-ui, sans-serif;
-    font-size: 13px;
+    /* Base `font-size` is injected from Rust (main.rs::install_scaled_base_font)
+     * as `13px * scale::scale_factor()`, NOT hard-coded here — so every `em`
+     * below rides the same factor `scale::scale()` uses and CSS text tracks
+     * the font / GNOME text-scaling instead of staying fixed (#135 part 2).
+     * At the default font the factor is 1.0 → an exact `13px`, so 1× is
+     * pixel-identical to the former static rule. Do NOT re-add a `font-size`
+     * literal here; it would pin the base and reintroduce the drift. */
     font-weight: 500;
 }
 

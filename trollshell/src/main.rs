@@ -88,6 +88,13 @@ fn main() -> hytte::ui::Result<()> {
                 s.set_gtk_icon_theme_name(Some("Adwaita"));
             }
 
+            // Inject the CSS base `font-size` from Rust so every CSS `em`
+            // rides the same scale factor as `scale::scale()` — one knob
+            // rescales the whole shell, CSS text and Rust-set sizes together
+            // (#135 part 2). Must run after GTK is initialized (a display +
+            // gtk::Settings exist here).
+            install_scaled_base_font();
+
             // Spawn a task on the GTK main loop that owns the live set of
             // bars. Each emission of monitors_changed (initial + every
             // hot-plug) tears down the old bars and rebuilds for the
@@ -211,6 +218,56 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
     );
 
     bar
+}
+
+/// Install the shell's base `font-size` on `*`, computed in Rust as
+/// `scale::css_base_font_px()` (`13px * scale::scale_factor()`).
+///
+/// This is the single source of truth for the CSS `em` base (#135 part 2): the
+/// static `* { font-size: 13px }` was removed from `style.css` in favour of
+/// this so the base rides the *same* factor `scale::scale()` uses. At the
+/// default font the factor is `1.0` → an exact `13px`, so **1× is
+/// pixel-identical**; as the GTK font / GNOME text-scaling (carried via
+/// `gtk-xft-dpi`) grows, CSS text and Rust-set sizes grow together with no
+/// drift.
+///
+/// Added at `STYLE_PROVIDER_PRIORITY_USER` — the authority the user stylesheet
+/// held when it carried the base rule — and *after* that provider is installed,
+/// so it wins ties over the user sheet and, by priority, over the library
+/// default's `.hytte-bar` font-size. Re-applied on `gtk-xft-dpi` /
+/// `gtk-font-name` changes so a live text-scaling change rescales the shell
+/// without a restart.
+fn install_scaled_base_font() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    apply_scaled_base_font(&provider);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER,
+    );
+
+    // Live text-scaling: re-derive the base when the effective font changes.
+    // `gtk-font-name` covers a point-size change; `gtk-xft-dpi` carries the
+    // text-scaling-factor / DPI. The display keeps its own ref to the provider,
+    // so loading fresh CSS into it here updates the whole shell in place.
+    if let Some(settings) = gtk::Settings::default() {
+        let p = provider.clone();
+        settings.connect_gtk_xft_dpi_notify(move |_| apply_scaled_base_font(&p));
+        settings.connect_gtk_font_name_notify(move |_| apply_scaled_base_font(&provider));
+    }
+}
+
+/// Load `* { font-size: <css_base_font_px>px }` into `provider`. Shared by the
+/// initial install and the settings-change handlers in
+/// [`install_scaled_base_font`].
+fn apply_scaled_base_font(provider: &gtk::CssProvider) {
+    provider.load_from_string(&format!(
+        "* {{ font-size: {:.4}px; }}",
+        scale::css_base_font_px()
+    ));
 }
 
 /// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from

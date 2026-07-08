@@ -10,6 +10,49 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use zbus::zvariant::Type;
 
+/// A leased file descriptor returned by a D-Bus method whose reply carries a
+/// `UNIX_FD` (`h`), wrapping an owned [`std::os::fd::OwnedFd`].
+///
+/// The fd stays open for exactly as long as this guard is alive; dropping it
+/// closes the fd. For resources whose lifetime *is* an open fd — most notably a
+/// logind inhibitor from `org.freedesktop.login1.Manager.Inhibit` — that drop
+/// **releases** the resource. Store the lease wherever the hold should persist
+/// (e.g. a service's `Handles`) and drop it to release.
+///
+/// Obtained from [`CallBuilder::call_fd`]. The fd is `dup`'d out of the reply
+/// message, so it is fully independent of the D-Bus call machinery and remains
+/// valid after that call resolves.
+#[derive(Debug)]
+#[must_use = "dropping the FdLease closes the fd, releasing the underlying \
+              resource (e.g. a logind inhibitor)"]
+pub struct FdLease {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl FdLease {
+    /// Consume the lease and hand back the raw [`std::os::fd::OwnedFd`].
+    ///
+    /// The fd remains open; the caller takes over responsibility for keeping it
+    /// alive (and, eventually, closing it). The lease's `drop`-releases-the-fd
+    /// contract no longer applies once the fd has been extracted.
+    #[must_use]
+    pub fn into_inner(self) -> std::os::fd::OwnedFd {
+        self.fd
+    }
+}
+
+impl std::os::fd::AsFd for FdLease {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+}
+
+impl std::os::fd::AsRawFd for FdLease {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+    }
+}
+
 /// Retry behavior on transient bus failure (the bus was mid-reconnect when
 /// the call landed).
 #[derive(Clone, Copy, Debug)]
@@ -246,6 +289,32 @@ where
         R: DeserializeOwned + Type + 'static,
     {
         self.into_owned().execute::<R>().await
+    }
+
+    /// Execute a method whose reply carries a single `UNIX_FD` (`h`) and take
+    /// **ownership** of that fd, returning it as an [`FdLease`].
+    ///
+    /// The canonical use is a logind inhibitor:
+    /// `org.freedesktop.login1.Manager.Inhibit(what, who, why, mode)` returns an
+    /// fd whose open-ness *is* the lock — the inhibition lasts exactly as long
+    /// as the returned [`FdLease`] is alive. Hold the lease (e.g. in a service's
+    /// `Handles`) for as long as the inhibition should last; drop it to release.
+    ///
+    /// The fd is `dup`'d out of the reply message during deserialization, so it
+    /// is fully independent of the D-Bus call machinery and stays valid after
+    /// this future resolves (the reply message — and the fd it carried — is
+    /// dropped while our independent dup lives on in the [`FdLease`]).
+    ///
+    /// `login1` lives on the **system** bus, so remember `.bus(BusKind::System)`
+    /// — this builder defaults to the session bus. Retry/timeout behaviour is
+    /// identical to [`send`](Self::send).
+    ///
+    /// # Errors
+    /// Returns a [`BusError`] if the call fails: a transient bus error (subject
+    /// to the configured [`RetryPolicy`]), a timeout, or a D-Bus error reply.
+    pub async fn call_fd(self) -> Result<FdLease, BusError> {
+        let fd: zbus::zvariant::OwnedFd = self.into_owned().execute().await?;
+        Ok(FdLease { fd: fd.into() })
     }
 
     /// Spawn the call onto the runtime and ignore the reply. Errors are

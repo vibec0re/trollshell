@@ -14,7 +14,7 @@ mod property;
 mod proxy;
 mod signals;
 
-pub use call::{CallBuilder, RetryPolicy, call_with};
+pub use call::{CallBuilder, FdLease, RetryPolicy, call_with};
 pub use connection::BusKind;
 pub use error::BusError;
 pub use export::{ExportBuilder, ExportHandle, export_object_with};

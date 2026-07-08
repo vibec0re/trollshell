@@ -1,7 +1,7 @@
-//! Sensors service — polls `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`,
-//! `/sys/class/hwmon`, `/sys/class/drm`, and optional `nvidia-smi` every
-//! second and exposes CPU load/temp, memory usage, network I/O rates, GPU
-//! stats, and disk usage as `futures-signals` signals.
+//! Sensors service — polls `/proc/stat`, `/sys/.../cpufreq`, `/proc/meminfo`,
+//! `/proc/net/dev`, `/sys/class/hwmon`, `/sys/class/drm`, and optional
+//! `nvidia-smi` every second and exposes CPU load/clock/temp, memory usage,
+//! network I/O rates, GPU stats, and disk usage as `futures-signals` signals.
 //!
 //! # Public API
 //!
@@ -11,6 +11,7 @@
 //!
 //! // Subscribe in widgets:
 //! sensors::cpu()      -> impl Signal<Item = CpuLoad>
+//! sensors::cpu_freq() -> impl Signal<Item = CpuFreq>
 //! sensors::memory()   -> impl Signal<Item = Memory>
 //! sensors::network()  -> impl Signal<Item = NetIo>
 //! sensors::cpu_temp() -> impl Signal<Item = CpuTemp>
@@ -18,6 +19,7 @@
 //! sensors::disk()     -> impl Signal<Item = DiskUsage>
 //! ```
 
+mod cpufreq;
 mod disk;
 mod gpu;
 mod hwmon;
@@ -33,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::cast::u64_to_f64_bytes;
 
+use cpufreq::read_cpu_freq;
 use disk::{read_disk_for_specs, read_mountlist, read_process_count};
 use gpu::{GpuCache, read_gpu_with_cache};
 use hwmon::read_cpu_temp;
@@ -49,6 +52,9 @@ use proc_stat::{compute_cpu_load, read_proc_stat};
 struct TickData {
     /// Parsed `/proc/stat` entries, or `None` on read error.
     cpu_stat: Option<Vec<(u64, u64)>>,
+    /// Per-core CPU clock snapshot from `/sys/.../cpufreq`. Empty/default when
+    /// no cpufreq governor is present (e.g. VMs).
+    cpu_freq: CpuFreq,
     /// Parsed `/proc/meminfo`, or `None` on read error.
     mem: Option<Memory>,
     /// Parsed `/proc/net/dev`, or `None` on read error.
@@ -84,6 +90,24 @@ pub struct CpuLoad {
     pub overall: f64,
     /// Per-logical-core load. Length matches the kernel's CPU count.
     pub per_core: Vec<f64>,
+}
+
+/// Per-core CPU clock (cpufreq) snapshot, all frequencies in **Hz**.
+///
+/// Sourced from `/sys/devices/system/cpu/cpu*/cpufreq`. When no cpufreq
+/// governor is present (many VMs), all fields are default (empty `per_core`,
+/// zeroed frequencies) so a consumer can self-hide.
+#[derive(Clone, Debug, Default)]
+pub struct CpuFreq {
+    /// Aggregate current frequency = the **maximum** current frequency across
+    /// cores, in Hz.
+    pub max_hz: f64,
+    /// Per-logical-core current frequency, in Hz. Length matches the number of
+    /// cores exposing a `cpufreq` node.
+    pub per_core: Vec<f64>,
+    /// Highest `cpuinfo_max_freq` across cores, in Hz — the fixed normalization
+    /// ceiling for a 0→max axis.
+    pub max_ceiling_hz: f64,
 }
 
 /// Memory usage snapshot.
@@ -190,6 +214,7 @@ impl NetConnections {
 #[doc(hidden)]
 pub struct SensorsHandles {
     pub(crate) cpu: Mutable<CpuLoad>,
+    pub(crate) cpu_freq: Mutable<CpuFreq>,
     pub(crate) memory: Mutable<Memory>,
     pub(crate) network: Mutable<NetIo>,
     pub(crate) cpu_temp: Mutable<CpuTemp>,
@@ -206,6 +231,7 @@ impl Default for SensorsHandles {
     fn default() -> Self {
         Self {
             cpu: Mutable::new(CpuLoad::default()),
+            cpu_freq: Mutable::new(CpuFreq::default()),
             memory: Mutable::new(Memory::default()),
             network: Mutable::new(NetIo::default()),
             cpu_temp: Mutable::new(CpuTemp::default()),
@@ -229,6 +255,7 @@ impl Service for SensorsService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = SensorsHandles::default();
         let cpu_writer = handles.cpu.clone();
+        let cpu_freq_writer = handles.cpu_freq.clone();
         let mem_writer = handles.memory.clone();
         let net_writer = handles.network.clone();
         let cpu_temp_writer = handles.cpu_temp.clone();
@@ -242,6 +269,7 @@ impl Service for SensorsService {
         rt.spawn(async move {
             poll_loop(PollWriters {
                 cpu: cpu_writer,
+                cpu_freq: cpu_freq_writer,
                 mem: mem_writer,
                 net: net_writer,
                 cpu_temp: cpu_temp_writer,
@@ -273,6 +301,16 @@ pub fn cpu() -> impl Signal<Item = CpuLoad> {
         r.get::<SensorsHandles>()
             .expect("sensors::service() not registered")
             .cpu
+            .signal_cloned()
+    })
+}
+
+/// Signal that emits the current per-core CPU clock (cpufreq) snapshot.
+pub fn cpu_freq() -> impl Signal<Item = CpuFreq> {
+    registry::with(|r| {
+        r.get::<SensorsHandles>()
+            .expect("sensors::service() not registered")
+            .cpu_freq
             .signal_cloned()
     })
 }
@@ -380,6 +418,7 @@ impl PollState {
 /// Constructed in `SensorsService::start` from the `SensorsHandles` clones.
 struct PollWriters {
     cpu: Mutable<CpuLoad>,
+    cpu_freq: Mutable<CpuFreq>,
     mem: Mutable<Memory>,
     net: Mutable<NetIo>,
     cpu_temp: Mutable<CpuTemp>,
@@ -393,6 +432,7 @@ struct PollWriters {
 
 async fn poll_loop(w: PollWriters) {
     let cpu_writer = w.cpu;
+    let cpu_freq_writer = w.cpu_freq;
     let mem_writer = w.mem;
     let net_writer = w.net;
     let cpu_temp_writer = w.cpu_temp;
@@ -430,6 +470,8 @@ async fn poll_loop(w: PollWriters) {
         let data = tokio::task::spawn_blocking(move || {
             // CPU
             let cpu_stat = read_proc_stat().ok();
+            // CPU clock (per-core cpufreq)
+            let cpu_freq = read_cpu_freq();
             // Memory
             let mem = read_proc_meminfo().ok();
             // Network I/O
@@ -464,6 +506,7 @@ async fn poll_loop(w: PollWriters) {
             (
                 TickData {
                     cpu_stat,
+                    cpu_freq,
                     mem,
                     net_dev,
                     cpu_temp,
@@ -495,6 +538,7 @@ async fn poll_loop(w: PollWriters) {
         }
 
         apply_cpu_load(&mut state.cpu_prev, data.cpu_stat, &cpu_writer);
+        apply_cpu_freq(data.cpu_freq, &cpu_freq_writer);
         apply_memory(data.mem, &mem_writer);
         apply_network(&mut state.net_prev, data.net_dev, now, &net_writer);
         apply_cpu_temp(data.cpu_temp, &cpu_temp_writer);
@@ -526,6 +570,14 @@ fn apply_cpu_load(
             tracing::warn!("sensors: failed to read /proc/stat");
         }
     }
+}
+
+/// Publish the per-core CPU clock snapshot (every tick).
+///
+/// The reader already degrades to a default `CpuFreq` when no cpufreq governor
+/// is present, so there is no error variant to warn about here.
+fn apply_cpu_freq(cpu_freq: CpuFreq, writer: &Mutable<CpuFreq>) {
+    writer.set(cpu_freq);
 }
 
 /// Publish memory usage, or warn on read failure.

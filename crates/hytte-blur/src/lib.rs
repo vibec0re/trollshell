@@ -1,5 +1,11 @@
 //! Client-side `ext-background-effect-v1` blur-region scoping.
 //!
+//! **Status:** wired-but-inert, not dead code. `modal.rs`/`sidebar.rs` still
+//! attach and `set_region` on every map (610a499), but the chrome went back
+//! to opaque, so niri's blur layer-rules go inert automatically — nothing to
+//! blur through. Physically excising this crate is a deferred follow-up, not
+//! done. Don't remove it as "unused."
+//!
 //! niri's `ext-background-effect` layer-rule (`blur true`) frosts the **entire**
 //! layer-shell surface geometry, not the painted content. trollshell's always-
 //! mapped sidebar surface and its fullscreen drawer surface therefore frost a

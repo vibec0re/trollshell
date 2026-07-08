@@ -60,7 +60,7 @@ let
     pkg-config
     wrapGAppsHook4
     # Sets LIBCLANG_PATH + a complete BINDGEN_EXTRA_CLANG_ARGS so the bindgen
-    # consumers (pam-sys, pipewire-sys/libspa-sys) find libclang and the libc /
+    # consumer (pipewire-sys/libspa-sys) finds libclang and the libc /
     # clang resource headers in the sandbox.
     rustPlatform.bindgenHook
   ];
@@ -88,9 +88,9 @@ let
   ];
 
   # Args shared between the deps-only build (cached on Cargo.lock changes only)
-  # and the final crate build. The bindgen consumers (hytte-pam via pam-sys,
-  # pipewire-sys/libspa-sys) run during the deps build, so bindgenHook (which
-  # populates LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS) has to apply there too.
+  # and the final crate build. The bindgen consumer (pipewire-sys/libspa-sys)
+  # runs during the deps build, so bindgenHook (which populates
+  # LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS) has to apply there too.
   commonArgs = {
     pname = "trollshell";
     version = "0.1.0";

@@ -1,18 +1,26 @@
 //! Helpers that spawn a per-binding future on `glib::MainContext`, drive
-//! a `Signal` to completion, and apply each emitted value to a GTK widget
-//! on the main thread.
+//! a `Signal`, and apply each emitted value to a GTK widget on the main
+//! thread — holding the widget only weakly so a torn-down widget frees.
 
-use futures_signals::signal::{Signal, SignalExt};
+use futures_signals::signal::Signal;
 use gtk::glib;
 use gtk::prelude::*;
 
 /// Spawn a future on the GTK main loop that drives `signal` and applies
 /// each emitted value to `widget` via `apply`.
 ///
-/// The widget is cloned (cheap — GTK widgets are reference-counted). The
-/// future lives as long as the underlying signal source; widget cleanup
-/// drops the closure when the widget is collected and the next emission
-/// observes a no-op.
+/// The apply-loop holds only a [`glib::WeakRef`] to `widget`, so the binding
+/// never keeps the widget alive by itself. While the widget is in use its
+/// parent chain (window → boxes → chips) holds it strong, so every emission
+/// upgrades the weak ref and applies exactly as before. Once the last strong
+/// ref is dropped — e.g. a bar or drawer is torn down on monitor hot-plug —
+/// the next emission upgrades to `None`, the loop `break`s, and both the task
+/// and its underlying signal subscription are released.
+///
+/// (A loop whose widget vanished while it was parked lingers until the next
+/// emission wakes it to break; meanwhile it pins no widget subtree — only the
+/// signal subscription — so the residual is negligible versus the old
+/// strong-clone, which pinned the whole detached subtree forever.)
 pub fn bind<S, W, F>(signal: S, widget: &W, apply: F)
 where
     S: Signal + 'static,
@@ -20,14 +28,13 @@ where
     W: IsA<gtk::Widget> + Clone + 'static,
     F: Fn(&W, S::Item) + 'static,
 {
-    let widget = widget.clone();
+    let weak = widget.downgrade();
     glib::MainContext::default().spawn_local(async move {
-        signal
-            .for_each(move |value| {
-                apply(&widget, value);
-                std::future::ready(())
-            })
-            .await;
+        let mut signal = std::pin::pin!(signal);
+        while let Some(value) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
+            let Some(widget) = weak.upgrade() else { break };
+            apply(&widget, value);
+        }
     });
 }
 
@@ -76,8 +83,9 @@ where
 /// future blocks that handler around every `apply` call and unblocks it
 /// after.
 ///
-/// Lifetime is tied to the widget the same way `bind` is: a cheap clone
-/// keeps the future alive for as long as the widget is referenced.
+/// Lifetime is tied to the widget the same way [`bind`] is: the apply-loop
+/// holds only a [`glib::WeakRef`], so it applies while the widget is alive and
+/// frees itself (breaking the loop) once the widget's last strong ref drops.
 pub fn bind_two_way<S, W, V, Apply, Connect>(
     signal: S,
     widget: &W,
@@ -90,17 +98,16 @@ pub fn bind_two_way<S, W, V, Apply, Connect>(
     Apply: Fn(&W, V) + 'static,
     Connect: FnOnce(&W) -> glib::SignalHandlerId,
 {
-    let widget = widget.clone();
-    let handler_id = connect_user(&widget);
+    let handler_id = connect_user(widget);
+    let weak = widget.downgrade();
     glib::MainContext::default().spawn_local(async move {
-        signal
-            .for_each(move |value| {
-                widget.block_signal(&handler_id);
-                apply(&widget, value);
-                widget.unblock_signal(&handler_id);
-                std::future::ready(())
-            })
-            .await;
+        let mut signal = std::pin::pin!(signal);
+        while let Some(value) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
+            let Some(widget) = weak.upgrade() else { break };
+            widget.block_signal(&handler_id);
+            apply(&widget, value);
+            widget.unblock_signal(&handler_id);
+        }
     });
 }
 
@@ -144,6 +151,42 @@ mod tests {
             "user handler must not fire during signal-driven apply"
         );
         assert!(switch.is_active(), "apply did set the property");
+    }
+
+    /// Dropping the last strong ref to a bound widget frees it: the next
+    /// signal emission wakes the parked apply-loop, its `WeakRef` upgrade
+    /// returns `None`, and the loop breaks. On the old strong-clone/`for_each`
+    /// code the future pinned the widget forever, so `weak.upgrade()` would
+    /// still be `Some` — this is the #224 regression test.
+    #[gtk::test]
+    fn dropping_bound_widget_frees_it_on_next_emission() {
+        let ctx = glib::MainContext::default();
+
+        let label = gtk::Label::new(None);
+        let weak = label.downgrade();
+        let state = Mutable::new(String::from("a"));
+
+        bind_text(state.signal_cloned(), &label);
+        while ctx.iteration(false) {}
+        assert_eq!(
+            weak.upgrade().map(|l| l.text().to_string()),
+            Some(String::from("a")),
+            "bound label applied the initial value"
+        );
+
+        // Drop the only strong ref we hold. A weakly-held bind future must not
+        // keep the widget alive.
+        drop(label);
+
+        // Emit again: this wakes the parked apply-loop, which upgrades the
+        // (now-dangling) weak ref, gets `None`, and breaks — releasing it.
+        state.set(String::from("b"));
+        while ctx.iteration(false) {}
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bound widget must be freed once its last strong ref is dropped"
+        );
     }
 
     /// A genuine user action still fires the user handler — the block is

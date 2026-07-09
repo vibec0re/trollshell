@@ -38,6 +38,40 @@ pub(crate) fn indicator(class: &str, page: Page, monitor: &Monitor) -> gtk::Butt
     btn
 }
 
+/// Attach a vertical-scroll controller to `widget` that accumulates
+/// smooth-scroll deltas into whole "notches" before firing `on_step`.
+///
+/// Trackpads and high-resolution mice report `scroll` events as fractional
+/// pixel deltas (libinput smooth scrolling) rather than a wheel's integral
+/// clicks, so a naive `dy.round()` per event either fires on every
+/// sub-pixel tick or misses slow scrolls entirely. Accumulating the raw
+/// deltas in a `Cell<f64>` and only firing once the running total crosses a
+/// whole unit reproduces the one-notch-per-click feel of a physical wheel
+/// for both input types, and lets a fast flick fire `on_step` more than
+/// once per event.
+///
+/// `on_step` is called with `1.0` for a scroll down and `-1.0` for a scroll
+/// up (matching raw GDK `dy` sign — down is positive); callers map that to
+/// "increase"/"decrease" as appropriate for the chip.
+pub(crate) fn wire_scroll<W: IsA<gtk::Widget>>(widget: &W, on_step: impl Fn(f64) + 'static) {
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    let accumulated = std::cell::Cell::new(0.0_f64);
+    controller.connect_scroll(move |_, _dx, dy| {
+        let mut total = accumulated.get() + dy;
+        while total >= 1.0 {
+            on_step(1.0);
+            total -= 1.0;
+        }
+        while total <= -1.0 {
+            on_step(-1.0);
+            total += 1.0;
+        }
+        accumulated.set(total);
+        gtk::glib::Propagation::Stop
+    });
+    widget.add_controller(controller);
+}
+
 /// Build the standard vertical fill bar used in the cpu / memory / gpu / disk
 /// chips.
 ///

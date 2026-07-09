@@ -13,10 +13,14 @@
 
 - Hook scripts live at `$HOME/.config/trollshell/hooks/<event>` — one file per event, no `.d/` directory, no extension required.
 - The file must be a regular file with the executable bit set (`mode & 0o111 != 0`). It is invoked directly (no `sh -c` wrapping); the user's shebang decides the interpreter.
-- v1 fires exactly one event: `theme-changed`. Future events (`network-up`, `power-state`, etc.) drop into the same directory under different names.
+- v1 shipped one event, `theme-changed`; more slot into the same directory under different names as callers are added (the API itself is unchanged). Fired events so far:
+  - `theme-changed` (`theme::set`) — the desktop theme flipped.
+  - `place-changed` (`places::resolve_loop`) — the resolved current place transitioned (Wi-Fi fingerprint / GeoClue presence). Deduped on the place **name**, and the first resolution after startup is silent, so login stays quiet and GeoClue jitter within one place doesn't re-fire (#235).
 - Inputs are passed as environment variables, never as positional args:
   - `TROLLSHELL_EVENT=<event-name>` — always present
-  - Event-specific vars set by the caller. For `theme-changed`: `TROLLSHELL_THEME=light` or `TROLLSHELL_THEME=dark`.
+  - Event-specific vars set by the caller:
+    - `theme-changed`: `TROLLSHELL_THEME=light` or `TROLLSHELL_THEME=dark`.
+    - `place-changed`: `TROLLSHELL_PLACE=<place name>` and `TROLLSHELL_PLACE_STATION=<station id>` (empty when the place has no configured station, e.g. "away").
 - `$HOME` resolution mirrors `theme.rs::config_subdir`: `$HOME/.config/...` directly, no `$XDG_CONFIG_HOME`. If both files later need XDG support, both get upgraded together.
 
 ### `hooks::run` API
@@ -112,4 +116,4 @@ No integration test for `theme::set` → `hooks::run`. The wire-up is a single l
 - Positional args / arg-parsing.
 - OSD or settings-panel surfacing of hook failures.
 - `$XDG_CONFIG_HOME` resolution (would be a one-shot upgrade across `theme.rs` and `hooks.rs` together).
-- Other events: `network-up`, `power-state`, `lock`, etc. The contract is designed so they slot in by adding a new caller; `hooks::run` itself does not need to change.
+- Further events: `network-up`, `power-state`, `lock`, etc. The contract is designed so they slot in by adding a new caller; `hooks::run` itself does not need to change. (`place-changed` was the first such addition — see the event list above.)

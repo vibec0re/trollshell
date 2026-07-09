@@ -25,7 +25,7 @@ use std::time::Duration;
 
 // Re-export the niri-ipc data types consumers need so trollshell etc.
 // don't have to depend on niri-ipc directly.
-pub use niri_ipc::{Window, WindowLayout, Workspace};
+pub use niri_ipc::{Cast, CastKind, CastTarget, Window, WindowLayout, Workspace};
 
 /// The niri IPC service handle.
 pub struct NiriService;
@@ -36,6 +36,7 @@ pub struct NiriHandles {
     pub(crate) workspaces: Mutable<Vec<Workspace>>,
     pub(crate) windows: Mutable<Vec<Window>>,
     pub(crate) focused_window: Mutable<Option<Window>>,
+    pub(crate) casts: Mutable<Vec<Cast>>,
 }
 
 impl Default for NiriHandles {
@@ -44,6 +45,7 @@ impl Default for NiriHandles {
             workspaces: Mutable::new(Vec::new()),
             windows: Mutable::new(Vec::new()),
             focused_window: Mutable::new(None),
+            casts: Mutable::new(Vec::new()),
         }
     }
 }
@@ -56,10 +58,16 @@ impl Service for NiriService {
         let ws_writer = handles.workspaces.clone();
         let win_list_writer = handles.windows.clone();
         let win_focus_writer = handles.focused_window.clone();
+        let casts_writer = handles.casts.clone();
 
         rt.spawn_blocking(move || {
             loop {
-                match listen_once(&ws_writer, &win_list_writer, &win_focus_writer) {
+                match listen_once(
+                    &ws_writer,
+                    &win_list_writer,
+                    &win_focus_writer,
+                    &casts_writer,
+                ) {
                     Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
                     Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
                 }
@@ -75,6 +83,7 @@ fn listen_once(
     workspaces: &Mutable<Vec<Workspace>>,
     windows: &Mutable<Vec<Window>>,
     focused_window: &Mutable<Option<Window>>,
+    casts: &Mutable<Vec<Cast>>,
 ) -> Result<()> {
     let mut socket = Socket::connect().context("connect to NIRI_SOCKET")?;
 
@@ -92,7 +101,7 @@ fn listen_once(
 
     loop {
         let event = read_event().map_err(|e| anyhow!("read niri event: {e}"))?;
-        apply_event(event, workspaces, windows, focused_window);
+        apply_event(event, workspaces, windows, focused_window, casts);
     }
 }
 
@@ -101,6 +110,7 @@ fn apply_event(
     workspaces: &Mutable<Vec<Workspace>>,
     windows: &Mutable<Vec<Window>>,
     focused_window: &Mutable<Option<Window>>,
+    casts: &Mutable<Vec<Cast>>,
 ) {
     match event {
         Event::WorkspacesChanged { workspaces: ws } => {
@@ -193,6 +203,27 @@ fn apply_event(
                 focused_window.set(Some(updated));
             }
         }
+        // Screencast session state. Mirrors niri's own `CastsState::apply`
+        // (niri-ipc 26.4.0 `state.rs`): `CastsChanged` is a full replace,
+        // `CastStartedOrChanged` upserts by `stream_id`, and `CastStopped`
+        // removes by `stream_id`. Dropping the `CastStopped` arm would leave
+        // the privacy indicator stuck on forever once a stream ends without
+        // a fresh full `CastsChanged` — it's the one arm that's
+        // non-negotiable here.
+        Event::CastsChanged { casts: list } => {
+            casts.set(list);
+        }
+        Event::CastStartedOrChanged { cast } => {
+            let mut list = casts.lock_mut();
+            if let Some(existing) = list.iter_mut().find(|c| c.stream_id == cast.stream_id) {
+                *existing = cast;
+            } else {
+                list.push(cast);
+            }
+        }
+        Event::CastStopped { stream_id } => {
+            casts.lock_mut().retain(|c| c.stream_id != stream_id);
+        }
         _ => {}
     }
 }
@@ -243,6 +274,22 @@ pub fn focused_window() -> impl Signal<Item = Option<Window>> {
         r.get::<NiriHandles>()
             .expect("niri::service() not registered")
             .focused_window
+            .signal_cloned()
+    })
+}
+
+/// Signal of the currently active niri screencast sessions.
+///
+/// Non-empty whenever niri reports at least one live cast session — this is
+/// the "session exists" gate (the safe default for a privacy affordance),
+/// not "actively streaming frames": a paused cast (`Cast::is_active ==
+/// false`, e.g. an OBS scene switch) still counts, since the compositor is
+/// still capturing on the consumer's behalf.
+pub fn active_casts() -> impl Signal<Item = Vec<Cast>> {
+    registry::with(|r| {
+        r.get::<NiriHandles>()
+            .expect("niri::service() not registered")
+            .casts
             .signal_cloned()
     })
 }
@@ -458,6 +505,7 @@ mod tests {
         let small = mk_window(10, 1, (MON_W - 200.0, MON_H - BAR_H - 8.0));
         let windows = Mutable::new(vec![small]);
         let focused_window = Mutable::new(None);
+        let casts = Mutable::new(Vec::new());
 
         // Pre-condition: not edge-spanning.
         assert!(!has_edge_window(
@@ -475,6 +523,7 @@ mod tests {
             &workspaces,
             &windows,
             &focused_window,
+            &casts,
         );
 
         assert!(has_edge_window(
@@ -495,6 +544,7 @@ mod tests {
         w.is_focused = true;
         let windows = Mutable::new(vec![w.clone()]);
         let focused_window = Mutable::new(Some(w));
+        let casts = Mutable::new(Vec::new());
 
         apply_event(
             Event::WindowLayoutsChanged {
@@ -503,6 +553,7 @@ mod tests {
             &workspaces,
             &windows,
             &focused_window,
+            &casts,
         );
 
         let focused = focused_window.lock_ref().clone().expect("focused set");
@@ -518,6 +569,7 @@ mod tests {
         let workspaces = Mutable::new(vec![mk_workspace(1, CONNECTOR, true)]);
         let windows: Mutable<Vec<Window>> = Mutable::new(Vec::new());
         let focused_window = Mutable::new(None);
+        let casts = Mutable::new(Vec::new());
 
         apply_event(
             Event::WindowLayoutsChanged {
@@ -526,9 +578,125 @@ mod tests {
             &workspaces,
             &windows,
             &focused_window,
+            &casts,
         );
 
         assert!(windows.lock_ref().is_empty());
         assert!(focused_window.lock_ref().is_none());
+    }
+
+    fn mk_cast(stream_id: u64, target: CastTarget) -> Cast {
+        Cast {
+            stream_id,
+            session_id: stream_id,
+            kind: CastKind::PipeWire,
+            target,
+            is_dynamic_target: false,
+            is_active: true,
+            pid: None,
+            pw_node_id: None,
+        }
+    }
+
+    /// `CastsChanged` is a full replace (mirrors niri's own
+    /// `CastsState::apply`), not a merge.
+    #[test]
+    fn casts_changed_replaces_list() {
+        let workspaces = Mutable::new(Vec::new());
+        let windows = Mutable::new(Vec::new());
+        let focused_window = Mutable::new(None);
+        let casts = Mutable::new(vec![mk_cast(1, CastTarget::Nothing {})]);
+
+        apply_event(
+            Event::CastsChanged {
+                casts: vec![mk_cast(
+                    2,
+                    CastTarget::Output {
+                        name: "DP-1".into(),
+                    },
+                )],
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+            &casts,
+        );
+
+        let list = casts.lock_ref();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].stream_id, 2);
+    }
+
+    /// `CastStartedOrChanged` upserts by `stream_id`: a fresh id is
+    /// appended, a known id is replaced in place.
+    #[test]
+    fn cast_started_or_changed_upserts_by_stream_id() {
+        let workspaces = Mutable::new(Vec::new());
+        let windows = Mutable::new(Vec::new());
+        let focused_window = Mutable::new(None);
+        let casts = Mutable::new(Vec::new());
+
+        apply_event(
+            Event::CastStartedOrChanged {
+                cast: mk_cast(1, CastTarget::Nothing {}),
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+            &casts,
+        );
+        assert_eq!(casts.lock_ref().len(), 1);
+
+        // Same stream_id, target resolved: replace in place, not append.
+        apply_event(
+            Event::CastStartedOrChanged {
+                cast: mk_cast(
+                    1,
+                    CastTarget::Output {
+                        name: "DP-1".into(),
+                    },
+                ),
+            },
+            &workspaces,
+            &windows,
+            &focused_window,
+            &casts,
+        );
+
+        let list = casts.lock_ref();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].target,
+            CastTarget::Output {
+                name: "DP-1".into(),
+            }
+        );
+    }
+
+    /// `CastStopped` removes only the matching `stream_id`. This is the
+    /// non-negotiable arm — without it a cast announced via
+    /// `CastStartedOrChanged` and later torn down never leaves the list,
+    /// so the privacy indicator would stay lit forever.
+    #[test]
+    fn cast_stopped_removes_by_stream_id() {
+        let workspaces = Mutable::new(Vec::new());
+        let windows = Mutable::new(Vec::new());
+        let focused_window = Mutable::new(None);
+        let casts = Mutable::new(vec![
+            mk_cast(1, CastTarget::Nothing {}),
+            mk_cast(2, CastTarget::Nothing {}),
+        ]);
+
+        apply_event(
+            Event::CastStopped { stream_id: 1 },
+            &workspaces,
+            &windows,
+            &focused_window,
+            &casts,
+        );
+
+        let list = casts.lock_ref();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].stream_id, 2);
     }
 }

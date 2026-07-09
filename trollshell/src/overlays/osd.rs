@@ -161,6 +161,7 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
         .keyboard_mode(KeyboardMode::None)
         .build();
     window.add_css_class("ts-osd");
+    install_click_through(&window);
     window.set_visible(false);
 
     let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -207,6 +208,35 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
         current_muted: Cell::new(false),
         drawer_open: Cell::new(false),
     })
+}
+
+/// Set an empty input region on the OSD's surface so pointer events fall
+/// through to whatever's underneath — the card is display-only (an
+/// `Image`, two `Label`s, a `ProgressBar`) and takes no keyboard, so
+/// nothing inside it ever needs a click. Without this, the card's
+/// top-center footprint is a pointer black-hole for the ~1.8s it's shown.
+///
+/// The OSD is shown/hidden repeatedly via `set_visible` (see [`show`]),
+/// so its surface remaps on every show and `connect_map` re-fires each
+/// time. Mirrors the surface-timing shape of
+/// `sidebar::wire_blur_attach` — `connect_map` plus an `is_mapped`
+/// fallback for the (here moot, since we wire before the first show)
+/// case where the surface is already mapped.
+fn install_click_through(window: &gtk::Window) {
+    use hytte::gtk::cairo;
+
+    fn apply(w: &gtk::Window) {
+        if let Some(surface) = w.surface() {
+            surface.set_input_region(Some(&cairo::Region::create()));
+        } else {
+            tracing::warn!("osd: window has no surface at map");
+        }
+    }
+
+    window.connect_map(apply);
+    if window.is_mapped() {
+        apply(window);
+    }
 }
 
 /// Wire the four module-level signal subscriptions exactly once on the

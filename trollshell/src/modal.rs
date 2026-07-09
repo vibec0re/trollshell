@@ -197,6 +197,15 @@ impl Page {
         matches!(self, Self::Stats)
     }
 
+    /// Pages whose content is backed by the `mpris` service's position
+    /// poller (the seek bar's `position_us`, sampled at 4 Hz while a player
+    /// is Playing). Used to gate that poller on whether the Media panel is
+    /// actually visible (#228): it's the only consumer of `position_us`
+    /// (`panels/media.rs`'s position label + seek fraction).
+    fn uses_mpris_position(self) -> bool {
+        matches!(self, Self::Media)
+    }
+
     fn stack_name(self) -> &'static str {
         match self {
             Self::Media => "media",
@@ -279,6 +288,16 @@ thread_local! {
     /// global; recomputed by [`recompute_stats_visible`] on every page
     /// show/swap/retract.
     static STATS_VISIBLE: Mutable<bool> = Mutable::new(false);
+    /// `true` while a [`Page::uses_mpris_position`] page (the Media panel) is
+    /// the visible drawer page on *any* monitor. Drives [`media_visible_signal`]
+    /// so the mpris per-player `Position` pollers can park while no one's
+    /// looking (#228). Global (not per-monitor) because the mpris service is
+    /// global; recomputed by [`recompute_media_visible`] on every page
+    /// show/swap/retract. This is the third copy of the `netconn`/`app_usage`
+    /// `*_VISIBLE`/`recompute_*`/`set_active` gate shape — see #228's PR body
+    /// for a noted follow-up to generalize all three into a single
+    /// `page_visible_signal(Page)` map.
+    static MEDIA_VISIBLE: Mutable<bool> = Mutable::new(false);
 }
 
 /// Recompute [`NETCONN_VISIBLE`] from the live panel set: `true` iff some
@@ -334,6 +353,34 @@ fn recompute_stats_visible() {
 /// is hidden (#50, item 5 of #42).
 pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
     STATS_VISIBLE.with(|m| m.signal())
+}
+
+/// Recompute [`MEDIA_VISIBLE`] from the live panel set: `true` iff some
+/// monitor's drawer is currently showing a [`Page::uses_mpris_position`] page
+/// (the Media panel). Called after every transition that changes a panel's
+/// `current` page (open, in-place page swap, deep-link switch, retract-finish).
+/// `Mutable::set` is a no-op-free notify so we recompute unconditionally and
+/// let it dedupe.
+fn recompute_media_visible() {
+    let visible = PANELS.with(|panels| {
+        panels
+            .borrow()
+            .values()
+            .any(|p| p.current.borrow().is_some_and(Page::uses_mpris_position))
+    });
+    MEDIA_VISIBLE.with(|m| {
+        if m.get() != visible {
+            m.set(visible);
+        }
+    });
+}
+
+/// Signal that emits `true` while the Media drawer page
+/// ([`Page::uses_mpris_position`]) is visible on any monitor. Wired in
+/// `main.rs` to `mpris::set_active` so the always-on per-player `Position`
+/// pollers park when that panel is hidden (#228).
+pub fn media_visible_signal() -> impl Signal<Item = bool> + 'static {
+    MEDIA_VISIBLE.with(|m| m.signal())
 }
 
 fn drawer_open_state(key: &str) -> Mutable<bool> {
@@ -711,6 +758,7 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         });
         recompute_netconn_visible();
         recompute_stats_visible();
+        recompute_media_visible();
     });
 }
 
@@ -724,6 +772,7 @@ pub fn close_all() {
     // No panels left → no netconn/stats page visible; park the pollers.
     recompute_netconn_visible();
     recompute_stats_visible();
+    recompute_media_visible();
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -749,6 +798,7 @@ pub fn switch_active(target: Page) {
     });
     recompute_netconn_visible();
     recompute_stats_visible();
+    recompute_media_visible();
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content
@@ -787,6 +837,7 @@ pub fn open(monitor: &Monitor, page: Page) {
     });
     recompute_netconn_visible();
     recompute_stats_visible();
+    recompute_media_visible();
 }
 
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer
@@ -831,6 +882,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
     // branch is recomputed later by `wire_retract_finish`. Idempotent.
     recompute_netconn_visible();
     recompute_stats_visible();
+    recompute_media_visible();
 }
 
 /// Present the drawer on `page` at `main_margin` pixels from the bar's

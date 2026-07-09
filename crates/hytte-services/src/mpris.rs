@@ -25,6 +25,7 @@
 //! mpris::previous(bus_name);
 //! mpris::set_position(bus_name, track_id, position_us);
 //! mpris::select_player(Some(bus_name)); // pin; None reverts to automatic
+//! mpris::set_active(bool);              // gate the position poller (#228)
 //!
 //! // Art fetch (async, cached):
 //! mpris::art_for_url(url).await -> Option<Vec<u8>>
@@ -109,6 +110,20 @@ pub struct MprisHandles {
     /// pinned. `None` means "automatic" (follow the [`pick_active`]
     /// heuristic). Consumed read-side by [`active_player`].
     pub(crate) selected: Mutable<Option<String>>,
+    /// Gate for the per-player `Position` pollers (#228). While `false`, every
+    /// `poll_position` task parks and forks no D-Bus calls; flipping it back
+    /// to `true` resumes 250 ms sampling immediately (the loop `select!`s on
+    /// this so reactivation isn't delayed a full tick) and takes one eager
+    /// poll on resume so the seek bar snaps fresh the instant a media panel
+    /// opens.
+    ///
+    /// Defaults to `true` so position sampling runs eagerly at startup —
+    /// `set_active(false)` parks it once the binary reports no
+    /// `Page::uses_mpris_position` panel is visible. See [`set_active`].
+    /// This single gate is shared across *all* per-player pollers (cloned
+    /// into [`State`], which is where the pollers actually live — see
+    /// `State::active`).
+    pub(crate) active: Mutable<bool>,
 }
 
 impl Default for MprisHandles {
@@ -116,6 +131,7 @@ impl Default for MprisHandles {
         Self {
             players: Mutable::new(Vec::new()),
             selected: Mutable::new(None),
+            active: Mutable::new(true),
         }
     }
 }
@@ -131,10 +147,11 @@ impl Service for MprisService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = MprisHandles::default();
         let players_mutable = handles.players.clone();
+        let active_mutable = handles.active.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&players_mutable).await {
+                match listen(&players_mutable, &active_mutable).await {
                     Ok(()) => {
                         tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
                     }
@@ -228,6 +245,28 @@ pub fn select_player(bus_name: Option<String>) {
             .expect("mpris::service() not registered")
             .selected
             .set(bus_name);
+    });
+}
+
+/// Gate the per-player `Position` pollers (#228): `true` resumes 250 ms
+/// sampling (taking one poll immediately so the seek bar snaps fresh),
+/// `false` parks every `poll_position` task so they fork no D-Bus calls
+/// while no media drawer page — the only consumer of `position_us` — is
+/// visible.
+///
+/// Fire-and-forget command: the binary wires the media-drawer-visibility
+/// signal to this so the always-on pollers idle when no one's looking (#228,
+/// mirroring the #50 `netconn`/`app_usage` gates). A no-op `set` to the same
+/// value is skipped to avoid spurious loop wakeups.
+pub fn set_active(active: bool) {
+    registry::with(|r| {
+        let handle = &r
+            .get::<MprisHandles>()
+            .expect("mpris::service() not registered")
+            .active;
+        if handle.get() != active {
+            handle.set(active);
+        }
     });
 }
 
@@ -386,14 +425,21 @@ struct State {
     /// derived read-side in [`active_player`] from this list plus the
     /// `selected` override, so the watcher only needs to publish the list.
     players: Mutable<Vec<Player>>,
+    /// Gate for the per-player `Position` pollers (#228), cloned from
+    /// [`MprisHandles::active`]. `poll_position` is spawned once per player
+    /// (unlike netconn's single global loop), so the gate lives here — the
+    /// shared `State` — rather than being threaded straight into each
+    /// poller task individually.
+    active: Mutable<bool>,
 }
 
 impl State {
-    fn new(players: Mutable<Vec<Player>>) -> Self {
+    fn new(players: Mutable<Vec<Player>>, active: Mutable<bool>) -> Self {
         Self {
             map: Arc::new(AsyncMutex::new(HashMap::new())),
             order: Arc::new(AsyncMutex::new(Vec::new())),
             players,
+            active,
         }
     }
 
@@ -564,12 +610,38 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
 /// notified via `PropertiesChanged` in the MPRIS spec), updates `position_us`
 /// in state, and re-publishes. Self-exits when the bus name disappears from
 /// state.
+///
+/// Gated on `state.active` (#228): while inactive (no media drawer page
+/// visible on any monitor), the loop parks and forks no D-Bus calls at all —
+/// not even the "is it Playing" state-map check. Reactivation is instant
+/// (`select!`s on the gate rather than sleeping through a stale tick) and
+/// takes one eager poll immediately on resume, via `reset_immediately`, so
+/// the seek bar snaps to the true position the instant the panel opens
+/// rather than waiting up to 250 ms for the next tick.
 async fn poll_position(state: State, bus_name: String) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        interval.tick().await;
+        // Park (forking nothing) while gated inactive. `wait_for(true)`
+        // resolves immediately if we're already active by the time we get
+        // here (no lost wakeup, mirrors netconn.rs/app_usage.rs). Once
+        // reactivated, reset the interval so the following tick fires right
+        // away instead of waiting out whatever was left of the last 250 ms
+        // window before we parked.
+        if !state.active.get() {
+            let _ = state.active.signal().wait_for(true).await;
+            interval.reset_immediately();
+        }
+
+        // Wait for the next tick, but bail out early if we get gated
+        // inactive mid-wait — no point holding the timer while parked.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.active.signal().wait_for(false) => {
+                continue;
+            }
+        }
 
         // Check whether the player still exists and is Playing.
         let is_playing = {
@@ -617,8 +689,8 @@ async fn poll_position(state: State, bus_name: String) {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-async fn listen(players: &Mutable<Vec<Player>>) -> Result<()> {
-    let state = State::new(players.clone());
+async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Result<()> {
+    let state = State::new(players.clone(), active.clone());
 
     // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
     // names, so we don't miss any registrations during the startup window.

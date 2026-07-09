@@ -146,6 +146,18 @@ fn main() -> hytte::ui::Result<()> {
                 },
             ));
 
+            // Gate mpris's per-player 250ms `Position` pollers on Media-drawer
+            // visibility (#228): it's the only consumer of `position_us`, so
+            // park all the pollers whenever that page isn't on-screen. Same
+            // global-signal / single-subscription shape as the netconn/
+            // app_usage gates above.
+            glib::MainContext::default().spawn_local(modal::media_visible_signal().for_each(
+                |visible| {
+                    mpris::set_active(visible);
+                    std::future::ready(())
+                },
+            ));
+
             // Password prompt overlay — reacts to wifi::active_prompt() signal.
             if let Some(primary) = app.monitors().first() {
                 overlays::prompt::install(primary);

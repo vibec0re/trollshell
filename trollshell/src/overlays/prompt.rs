@@ -18,21 +18,54 @@ use hytte::ui::{Layer, layer_window};
 
 thread_local! {
     static PROMPT_WINDOW: RefCell<Option<gtk::Window>> = const { RefCell::new(None) };
+
+    /// The `active_prompt` subscription handle. Stored so [`close_all`] (and a
+    /// re-`install`) can abort the prior subscription before wiring a new one —
+    /// otherwise each monitor hot-plug would leak a subscription, and several
+    /// would fight over the single `PROMPT_WINDOW`.
+    static PROMPT_SUB: RefCell<Option<glib::JoinHandle<()>>> = const { RefCell::new(None) };
 }
 
 // ── Public entry-point ────────────────────────────────────────────────────────
 
-/// Build and subscribe the prompt overlay for the given monitor.  Idempotent
-/// in practice — called once from `main.rs` before the GTK loop starts.
+/// Build and subscribe the prompt overlay for the given monitor. Called from
+/// `main.rs` inside the `monitors_changed` loop, targeting the current primary
+/// output. Aborts any prior subscription first, so re-installing on a new
+/// monitor set re-homes the prompt cleanly. `wifi::active_prompt()` replays its
+/// current value on subscribe, so a prompt that was live when the previous
+/// primary vanished re-presents on the new one.
 pub fn install(monitor: &Monitor) {
+    // Drop any prior subscription so we never run two against the shared
+    // PROMPT_WINDOW. (main.rs calls close_all before the install loop; this
+    // keeps install idempotent on its own too.)
+    abort_subscription();
+
     let monitor = monitor.clone();
-    glib::MainContext::default().spawn_local(wifi::active_prompt().for_each(move |prompt| {
-        match prompt {
-            Some(req) => show_prompt(&monitor, req),
-            None => close_prompt(),
+    let handle =
+        glib::MainContext::default().spawn_local(wifi::active_prompt().for_each(move |prompt| {
+            match prompt {
+                Some(req) => show_prompt(&monitor, req),
+                None => close_prompt(),
+            }
+            std::future::ready(())
+        }));
+    PROMPT_SUB.with(|s| *s.borrow_mut() = Some(handle));
+}
+
+/// Abort the `active_prompt` subscription and close any open prompt window.
+/// Called before rebuilding on monitor hot-plug so the prompt doesn't route
+/// into a dead surface and its subscription doesn't leak.
+pub fn close_all() {
+    abort_subscription();
+    close_prompt();
+}
+
+fn abort_subscription() {
+    PROMPT_SUB.with(|s| {
+        if let Some(handle) = s.borrow_mut().take() {
+            handle.abort();
         }
-        std::future::ready(())
-    }));
+    });
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

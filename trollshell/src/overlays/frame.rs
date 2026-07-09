@@ -16,10 +16,35 @@
 //! post-restyle bar geometry from `style.css`. If any of these change,
 //! update both sides.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 use hytte::ui::{LayerShell, layer_window};
+
+/// A mounted frame overlay for one output.
+struct FrameView {
+    /// The layer-shell frame window. Closed in [`close_all`]. Its
+    /// `bind_visible` apply-loop holds only a `WeakRef` (the #224/#243 fix),
+    /// so it frees itself on the next `edge_window_on` emission once the
+    /// window drops — no explicit abort needed for it.
+    window: gtk::Window,
+    /// The sidebar `open_signal` tick loop (spawned raw below — *not* a
+    /// `bind`, so no `WeakRef` safety net). Its `JoinHandle` is stored so
+    /// [`close_all`] can `.abort()` it on hot-plug; otherwise it would keep
+    /// firing (and pinning its `DrawingArea` + `Monitor` clones) against a
+    /// torn-down surface, leaking one subscription per rebuild. Mirrors
+    /// `sidebar.rs`'s stored-`JoinHandle` teardown.
+    sidebar_sub: glib::JoinHandle<()>,
+}
+
+thread_local! {
+    /// Mounted frame overlays keyed by `Monitor.connector()`. Each entry owns
+    /// its layer-shell window and the sidebar tick-loop subscription handle.
+    static FRAMES: RefCell<HashMap<String, FrameView>> = RefCell::new(HashMap::new());
+}
 
 /// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
 /// Top inset of the frame (= top of the workspace cutout).
@@ -34,7 +59,13 @@ const CUTOUT_RADIUS: f64 = 10.0;
 
 /// Mount one frame overlay on `monitor`.
 pub fn install(monitor: &Monitor) {
-    let connector = monitor.connector().unwrap_or_default();
+    let connector = match monitor.connector() {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            tracing::debug!("frame::install: monitor has no connector; skipping");
+            return;
+        }
+    };
     let (mon_w, _mon_h) = monitor.size();
     let mon_w = f64::from(mon_w);
 
@@ -73,15 +104,19 @@ pub fn install(monitor: &Monitor) {
     // floating window stretched to the output's width. `Layer::Overlay`
     // sits above niri's apps by spec, so without this toggle the frame
     // would paint over those windows.
-    let visible = niri::edge_window_on(connector, mon_w).map(|edge| !edge);
+    let visible = niri::edge_window_on(connector.clone(), mon_w).map(|edge| !edge);
     bind_visible(visible, &window);
 
     // Redraw the frame's cutout each animation frame while the sidebar's
     // revealer is in transition, so the cutout's left edge stays in sync
     // with the slide. Stop ticking once the revealer settles.
+    //
+    // Spawned raw (not a `bind`), so it has no WeakRef safety net and won't
+    // stop when the window drops — the `JoinHandle` is stored in `FrameView`
+    // and aborted in `close_all` on hot-plug.
     let area_for_sidebar = area.clone();
     let monitor_for_sidebar = monitor.clone();
-    glib::MainContext::default().spawn_local(
+    let sidebar_sub = glib::MainContext::default().spawn_local(
         crate::overlays::sidebar::open_signal(monitor).for_each(move |_open| {
             let area = area_for_sidebar.clone();
             let monitor = monitor_for_sidebar.clone();
@@ -98,6 +133,36 @@ pub fn install(monitor: &Monitor) {
     );
 
     window.set_visible(true);
+
+    // Register the surface + its raw subscription so `close_all` can tear
+    // both down on the next monitor hot-plug (re-keys cleanly by connector).
+    FRAMES.with(|map| {
+        map.borrow_mut().insert(
+            connector,
+            FrameView {
+                window,
+                sidebar_sub,
+            },
+        );
+    });
+}
+
+/// Close every frame overlay and abort its sidebar tick-loop subscription,
+/// dropping the per-monitor entries. Called before rebuilding on hot-plug so
+/// a vanished output's frame window + raw subscription don't linger (the
+/// subscription has no `WeakRef` safety net, so it must be aborted explicitly —
+/// mirrors `sidebar::close_all`).
+pub fn close_all() {
+    FRAMES.with(|map| {
+        for (_, view) in map.borrow_mut().drain() {
+            // Abort the raw tick-loop first so it can't queue another draw
+            // into the surface we're about to close, then close the window.
+            // The `bind_visible` apply-loop rides on the #224/#243 WeakRef
+            // fix: it frees itself on its next emission once the window drops.
+            view.sidebar_sub.abort();
+            view.window.close();
+        }
+    });
 }
 
 /// Set an empty input region on the window's surface so every pointer

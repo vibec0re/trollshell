@@ -102,6 +102,11 @@ struct OsdView {
     /// When true, `route_show` skips the OSD to avoid redundant noise
     /// while the user is interacting with the live slider.
     drawer_open: Cell<bool>,
+    /// Per-monitor `drawer_open_signal` subscription handle. Unlike the
+    /// module-level singletons this is one-per-install, so it MUST be aborted
+    /// on teardown — parked here and `.abort()`ed in [`close_all`], else it
+    /// accumulates a dangling subscription per monitor rebuild.
+    drawer_sub: RefCell<Option<glib::JoinHandle<()>>>,
 }
 
 /// Mount one OSD on `monitor` and lazily wire the module-level signal
@@ -118,31 +123,67 @@ pub fn install(monitor: &Monitor) {
     };
 
     let view = build_osd_view(monitor);
-    OSDS.with(|map| {
-        map.borrow_mut().insert(connector.clone(), view);
-    });
 
     // Subscribe to the drawer-open state for this monitor so route_show
     // can suppress the OSD while the user is looking at the live slider.
     // The signal is backed by a lazily-allocated `Mutable` keyed by
     // connector, so this works even though `osd::install` runs before
     // `modal::install` during boot.
+    //
+    // Park the JoinHandle in the view: this is a PER-MONITOR subscription
+    // (unlike the module-level singletons), so `close_all` must abort it on
+    // teardown or it accumulates one per rebuild.
     let connector_for_sub = connector.clone();
-    glib::MainContext::default().spawn_local(crate::modal::drawer_open_signal(monitor).for_each(
-        move |open| {
+    let drawer_sub = glib::MainContext::default().spawn_local(
+        crate::modal::drawer_open_signal(monitor).for_each(move |open| {
             OSDS.with(|map| {
                 if let Some(view) = map.borrow().get(&connector_for_sub) {
                     view.drawer_open.set(open);
                 }
             });
             std::future::ready(())
-        },
-    ));
+        }),
+    );
+    view.drawer_sub.replace(Some(drawer_sub));
+
+    OSDS.with(|map| {
+        map.borrow_mut().insert(connector.clone(), view);
+    });
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));
         install_subscriptions();
     }
+}
+
+/// Close every OSD surface, abort its per-monitor `drawer_open_signal`
+/// subscription, cancel any pending hide/fade timers, and drop the
+/// per-monitor entries. Called before rebuilding on monitor hot-plug so a
+/// vanished output's `OsdView` doesn't linger in [`OSDS`] — otherwise
+/// `route_show`'s `map.values().next()` fallback could pop an OSD on a dead
+/// surface, and the un-aborted drawer subscription would leak per rebuild.
+///
+/// The module-level singletons (volume / mic / brightness / battery /
+/// focused-output) keep running: they route by connector each emission, so a
+/// fresh `install` re-keys the map and they self-heal. `SUBS_INSTALLED` stays
+/// set so they wire exactly once for the process lifetime.
+pub fn close_all() {
+    OSDS.with(|map| {
+        for (_, view) in map.borrow_mut().drain() {
+            if let Some(sub) = view.drawer_sub.borrow_mut().take() {
+                sub.abort();
+            }
+            // Cancel pending timers so they can't fire (holding a live `Rc`
+            // clone of the view) into a closed window after teardown.
+            if let Some(id) = view.timeout.take() {
+                id.remove();
+            }
+            if let Some(id) = view.fade_out_timeout.take() {
+                id.remove();
+            }
+            view.window.close();
+        }
+    });
 }
 
 /// Construct one `OsdView` for `monitor`. Pure widget construction —
@@ -207,6 +248,7 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
         current_kind: Cell::new(None),
         current_muted: Cell::new(false),
         drawer_open: Cell::new(false),
+        drawer_sub: RefCell::new(None),
     })
 }
 

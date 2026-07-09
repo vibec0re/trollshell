@@ -99,18 +99,53 @@ fn main() -> hytte::ui::Result<()> {
             install_scaled_base_font();
 
             // Spawn a task on the GTK main loop that owns the live set of
-            // bars. Each emission of monitors_changed (initial + every
-            // hot-plug) tears down the old bars and rebuilds for the
-            // current monitor set. Dropping a BarHandle closes its window.
+            // bars AND every per-monitor overlay. Each emission of
+            // monitors_changed (initial + every hot-plug) tears down the old
+            // surfaces and rebuilds for the current monitor set. Dropping a
+            // BarHandle closes its window; the overlays are re-keyed by
+            // connector via their `close_all` + `install` pair. Folding the
+            // frame/toast/OSD/prompt overlays in here (rather than installing
+            // them once at startup) is what makes a hot-plugged output get
+            // toasts/OSD/frame and a vanished boot-time output stop swallowing
+            // them into a dead surface (#225).
             let monitors_signal = app.monitors_changed();
             glib::MainContext::default().spawn_local(async move {
                 let bars: RefCell<Vec<BarHandle>> = RefCell::new(Vec::new());
                 monitors_signal
                     .for_each(move |monitors| {
-                        // Close all existing modals before rebuilding.
+                        // Tear down every per-monitor surface before rebuilding.
+                        // Order mirrors install: bars/drawers/sidebar first, then
+                        // the overlays. Each `close_all` drains its per-connector
+                        // map (and aborts the raw per-monitor subscriptions the
+                        // frame/OSD spawn), so nothing lingers when an output
+                        // vanishes and the re-install below re-keys cleanly.
                         modal::close_all();
                         overlays::sidebar::close_all();
+                        overlays::frame::close_all();
+                        overlays::notifications::close_all();
+                        overlays::osd::close_all();
+                        overlays::prompt::close_all();
+
                         *bars.borrow_mut() = monitors.iter().map(build_bar).collect();
+
+                        // Notifications + OSD + frame mount on every monitor;
+                        // routing picks niri's focused output each emission.
+                        for monitor in &monitors {
+                            overlays::frame::install(monitor);
+                            overlays::notifications::install(monitor);
+                            overlays::osd::install(monitor);
+                        }
+
+                        // Password prompt overlay on the current primary output.
+                        // Guard the zero-monitor / dead-first-output case — never
+                        // index `.first()` unguarded. `wifi::active_prompt()`
+                        // replays its current value on subscribe, so a prompt that
+                        // was live when the previous primary vanished re-presents
+                        // on the new one.
+                        if let Some(primary) = monitors.first() {
+                            overlays::prompt::install(primary);
+                        }
+
                         std::future::ready(())
                     })
                     .await;
@@ -146,17 +181,9 @@ fn main() -> hytte::ui::Result<()> {
                 },
             ));
 
-            // Password prompt overlay — reacts to wifi::active_prompt() signal.
-            if let Some(primary) = app.monitors().first() {
-                overlays::prompt::install(primary);
-            }
-
-            // Notifications + OSD mount on every monitor; routing picks the focused one.
-            for monitor in &app.monitors() {
-                overlays::frame::install(monitor);
-                overlays::notifications::install(monitor);
-                overlays::osd::install(monitor);
-            }
+            // The frame / notifications / OSD / prompt overlays are installed
+            // (and re-installed on hot-plug) inside the monitors_changed loop
+            // above, alongside the bars — see #225.
         })
 }
 

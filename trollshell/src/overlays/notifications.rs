@@ -107,6 +107,23 @@ pub fn install(monitor: &Monitor) {
     }
 }
 
+/// Close every toast surface and drop the per-monitor entries. Called before
+/// rebuilding on monitor hot-plug so a vanished output's `ToastView` doesn't
+/// linger in [`TOAST_WINDOWS`] — otherwise `route_emission`'s
+/// `map.values().next()` fallback could route every toast into a dead surface.
+///
+/// The module-level subscriptions (focused-output + the combined toast signal)
+/// are left running: they route by connector on each emission, so a fresh
+/// `install` re-keys the map and they self-heal. `SUBS_INSTALLED` therefore
+/// stays set — subscriptions wire exactly once for the process lifetime.
+pub fn close_all() {
+    TOAST_WINDOWS.with(|map| {
+        for (_, view) in map.borrow_mut().drain() {
+            view.window.close();
+        }
+    });
+}
+
 // ── Subscriptions + routing ───────────────────────────────────────────────────
 
 /// Wires the focused-output cell and the combined notification signal.

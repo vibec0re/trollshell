@@ -22,6 +22,12 @@
 //! [`current`] (for weather: place coords + name when matched, else the raw
 //! `GeoClue` passthrough), each with a cross-thread shared handle. Requires
 //! `wifiscan::service()` and `geoclue::service()` registered first.
+//!
+//! Also fires the `place-changed` hook (see [`crate::hooks`]) on a genuine
+//! place *transition* — deduped on the place name, not the raw resolution
+//! (`GeoClue` re-resolves jitter coordinates without changing the matched
+//! place). The very first resolution after startup is recorded but never
+//! fires, so login stays quiet.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -33,6 +39,7 @@ use hytte_reactive::{Service, registry};
 use tokio::sync::Notify;
 
 use crate::geoclue::{self, LocationSnapshot, LocationSource, LocationState};
+use crate::hooks;
 use crate::wifiscan::{self, AccessPoint};
 
 // ── Config ────────────────────────────────────────────────────────────────--
@@ -63,6 +70,13 @@ const DEFAULT_CONFIG: &str = r#"# trollshell places — where you frequent, how 
 #      used as home.
 #
 # Station ids: https://v6.bvg.transport.rest/locations?query=Schöneweide
+#
+# Moving between named places fires the `place-changed` hook — drop a script
+# at ~/.config/trollshell/hooks/place-changed and it runs with
+# $TROLLSHELL_PLACE (the place name) and $TROLLSHELL_PLACE_STATION (its
+# station id, empty when unset). Transitions are deduped by name, and the
+# very first resolution after login/startup never fires — only actual
+# changes do. See docs/superpowers/specs/2026-05-05-settings-hooks-design.md.
 
 [[place]]
 name = "Schöneweide"
@@ -549,6 +563,33 @@ async fn watch_config(places: Mutable<Arc<Vec<Place>>>) {
     }
 }
 
+/// Decide whether a freshly resolved `place` should fire the `place-changed`
+/// hook, given whether we've resolved at least once before (`resolved_once`)
+/// and the name last fired for (`last_fired`). Both are updated in place.
+///
+/// Dedups on the place **name** (identity), not the full [`ResolvedPlace`] —
+/// `GeoClue` re-resolves emit a fresh struct (coordinates move) on every
+/// jitter even when the matched place hasn't changed, which would otherwise
+/// spam the hook on every sensor tick (#235). The very first resolution
+/// (e.g. at login) seeds the bookkeeping but never fires, so a freshly
+/// started shell stays quiet until an actual transition happens.
+///
+/// Returns the place to fire the hook for on a genuine transition, else
+/// `None` (first resolution, no change, or the transition is *into* "no
+/// place" — there's no name to report).
+fn place_transition<'a>(
+    place: Option<&'a ResolvedPlace>,
+    resolved_once: &mut bool,
+    last_fired: &mut Option<String>,
+) -> Option<&'a ResolvedPlace> {
+    let name = place.map(|p| p.name.clone());
+    let is_first = !*resolved_once;
+    *resolved_once = true;
+    let transitioned = !is_first && name != *last_fired;
+    *last_fired = name;
+    if transitioned { place } else { None }
+}
+
 async fn resolve_loop(
     place_out: Mutable<Option<ResolvedPlace>>,
     location_out: Mutable<LocationState>,
@@ -600,6 +641,9 @@ async fn resolve_loop(
         });
     }
 
+    let mut place_hook_resolved_once = false;
+    let mut place_hook_last_fired: Option<String> = None;
+
     loop {
         let current = places.get_cloned();
         let ap_list = match &aps {
@@ -611,6 +655,23 @@ async fn resolve_loop(
             None => LocationState::Unavailable,
         };
         let (place, location) = resolve(&current, &ap_list, &geoloc);
+
+        if let Some(p) = place_transition(
+            place.as_ref(),
+            &mut place_hook_resolved_once,
+            &mut place_hook_last_fired,
+        ) {
+            hooks::run(
+                "place-changed",
+                &[
+                    ("TROLLSHELL_PLACE", p.name.as_str()),
+                    (
+                        "TROLLSHELL_PLACE_STATION",
+                        p.station.as_deref().unwrap_or(""),
+                    ),
+                ],
+            );
+        }
 
         if place_out.get_cloned() != place {
             if let Some(p) = &place {
@@ -810,6 +871,89 @@ mod tests {
             assert_eq!(place.as_ref().map(|p| p.name.as_str()), Some("Home"));
             assert_eq!(loc, geoloc);
         }
+    }
+
+    // ── place-changed hook dedup ────────────────────────────────────────────
+
+    fn resolved(name: &str, station: Option<&str>) -> ResolvedPlace {
+        ResolvedPlace {
+            name: name.to_string(),
+            lat: 0.0,
+            lon: 0.0,
+            station: station.map(str::to_string),
+            walk_minutes: 0,
+            lines: Vec::new(),
+            directions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn place_transition_silent_on_first_resolution() {
+        let mut resolved_once = false;
+        let mut last_fired = None;
+        let home = Some(resolved("Home", Some("900180001")));
+
+        assert!(place_transition(home.as_ref(), &mut resolved_once, &mut last_fired).is_none());
+        assert!(resolved_once);
+        assert_eq!(last_fired.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn place_transition_dedups_on_name_not_full_struct() {
+        // Same name, different coords each call (GeoClue jitter) — must not
+        // re-fire after the first (silent) resolution.
+        let mut resolved_once = false;
+        let mut last_fired = None;
+        let away_1 = Some(ResolvedPlace {
+            lat: 52.1,
+            ..resolved("Nearby", None)
+        });
+        let away_2 = Some(ResolvedPlace {
+            lat: 52.2,
+            ..resolved("Nearby", None)
+        });
+
+        assert!(place_transition(away_1.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // first: silent
+        assert!(place_transition(away_2.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // same name: no fire
+        assert!(place_transition(away_1.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // still no fire
+    }
+
+    #[test]
+    fn place_transition_fires_on_genuine_name_change() {
+        let mut resolved_once = false;
+        let mut last_fired = None;
+        let home = Some(resolved("Home", Some("900180001")));
+        let office = Some(resolved("Office", Some("900008888")));
+
+        assert!(place_transition(home.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // first: silent
+        let fired = place_transition(office.as_ref(), &mut resolved_once, &mut last_fired)
+            .expect("name changed → fires");
+        assert_eq!(fired.name, "Office");
+        assert_eq!(fired.station.as_deref(), Some("900008888"));
+        assert_eq!(last_fired.as_deref(), Some("Office"));
+
+        // Back to Home is itself a transition.
+        let fired_again = place_transition(home.as_ref(), &mut resolved_once, &mut last_fired)
+            .expect("transition back also fires");
+        assert_eq!(fired_again.name, "Home");
+    }
+
+    #[test]
+    fn place_transition_into_no_place_updates_state_but_reports_nothing() {
+        let mut resolved_once = false;
+        let mut last_fired = None;
+        let home = Some(resolved("Home", None));
+        let none: Option<ResolvedPlace> = None;
+
+        assert!(place_transition(home.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // first: silent
+        // Transitioning to "no place" has no name to report, even though it's
+        // a real transition in the bookkeeping.
+        assert!(place_transition(none.as_ref(), &mut resolved_once, &mut last_fired).is_none());
+        assert_eq!(last_fired, None);
+        // Coming back to Home is a transition again (last_fired was cleared).
+        let fired = place_transition(home.as_ref(), &mut resolved_once, &mut last_fired)
+            .expect("re-arriving fires again");
+        assert_eq!(fired.name, "Home");
     }
 
     // ── Live reload ──────────────────────────────────────────────────────────

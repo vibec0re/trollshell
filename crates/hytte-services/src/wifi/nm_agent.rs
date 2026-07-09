@@ -58,6 +58,13 @@ const VPN_DEFAULT_SECRET_KEY: &str = "password";
 /// pop a passphrase dialog.
 const FLAG_ALLOW_INTERACTION: u32 = 0x1;
 
+/// `NMSecretAgentGetSecretsFlags` bit 1 — `REQUEST_NEW`. NM sets this when it
+/// is re-asking because the secret we (or another agent) last supplied was
+/// rejected — a stateless, per-call, authoritative "the last secret was
+/// wrong" bit. Mapped into [`PromptRequest::prior_failure`] so the overlay can
+/// render error feedback on the reopened prompt.
+const FLAG_REQUEST_NEW: u32 = 0x2;
+
 /// A connection settings dict: `a{sa{sv}}` — setting name → (key → value).
 type ConnectionDict = HashMap<String, HashMap<String, OwnedValue>>;
 
@@ -257,6 +264,7 @@ impl NmAgent {
         }
 
         let conn_path = connection_path.as_str().to_string();
+        let prior_failure = flags & FLAG_REQUEST_NEW != 0;
 
         // Build the prompt request and remember how to shape the reply, branching
         // on the setting kind. Both kinds share the waiter/oneshot plumbing.
@@ -267,6 +275,7 @@ impl NmAgent {
                 name = %name,
                 secret_key = %secret_key,
                 path = %conn_path,
+                prior_failure,
                 "NM SecretAgent::GetSecrets — requesting VPN secret",
             );
             (
@@ -276,6 +285,7 @@ impl NmAgent {
                     ssid: name,
                     security: String::new(),
                     kind: PromptKind::VpnSecret,
+                    prior_failure,
                 },
                 ReplyShape::Vpn { secret_key },
             )
@@ -286,6 +296,7 @@ impl NmAgent {
                 ssid = %ssid,
                 security = %security,
                 path = %conn_path,
+                prior_failure,
                 "NM SecretAgent::GetSecrets — requesting passphrase",
             );
             (
@@ -295,6 +306,7 @@ impl NmAgent {
                     ssid,
                     security,
                     kind: PromptKind::WifiPassphrase,
+                    prior_failure,
                 },
                 ReplyShape::WirelessSecurity { setting_name },
             )

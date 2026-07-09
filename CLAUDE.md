@@ -15,7 +15,7 @@ A Rust workspace with two layers:
 
 **You must work inside the Nix devShell.** `.envrc` is `use flake` (direnv); if direnv isn't active, run `nix develop` first. The devShell sets env that the build and runtime both require:
 
-- `LD_LIBRARY_PATH`/`LIBCLANG_PATH` so the two bindgen consumers (`hytte-pam` via pam-sys, and pipewire-sys/libspa-sys) can load libclang. Outside the shell, the build panics with _"a libclang shared library is not loaded on this thread."_
+- `LD_LIBRARY_PATH`/`LIBCLANG_PATH` so the bindgen consumer (pipewire-sys/libspa-sys) can load libclang. Outside the shell, the build panics with _"a libclang shared library is not loaded on this thread."_
 - `XDG_DATA_DIRS` + `GSETTINGS_SCHEMA_DIR` so GTK finds Adwaita symbolic icons and GSettings schemas. Outside the shell, most bar icons render as `image-missing`.
 
 ```sh
@@ -25,7 +25,7 @@ RUST_LOG=hytte_services=debug,trollshell=debug cargo run -p trollshell   # with 
 nix build                                     # build the packaged binary (.#trollshell)
 ```
 
-`trollshell` is a real Wayland shell — running it meaningfully requires being **inside a Niri session**. Layer-shell surfaces, the lock screen, and most services need live system daemons.
+`trollshell` is a real Wayland shell — running it meaningfully requires being **inside a Niri session**. Layer-shell surfaces and most services need live system daemons. (Locking is delegated to `swaylock`/logind, not an in-shell lock screen — see "Deployment & session integration" below.)
 
 ### Faster inner loop (devShell only)
 
@@ -118,13 +118,13 @@ Services are **thin async clients to persistent system daemons** (systemd-networ
 hytte-reactive   ← base: Service trait, Registry, tokio runtime, bind() helpers
   ↑   ↑   ↑
 hytte-ui  hytte-services  hytte-bus
-hytte-ui          → App/AppBuilder (wraps adw::Application), Bar, LayerWindow, Popup, Monitor; layer-shell + ext-session-lock-v1; default stylesheet
+hytte-ui          → App/AppBuilder (wraps adw::Application), Bar, LayerWindow, Popup, Monitor; layer-shell; default stylesheet
 hytte-bus         → shared D-Bus layer: call / property / proxy / signals / own_name builders over pooled session+system connections
 hytte-services    → the service modules (clients to daemons)
 hytte-ecal        → hand-written FFI to evolution-data-server (libecal); the ONLY crate allowed `unsafe`
-hytte-pam         → synchronous PAM auth for the lock screen
-hytte             → umbrella: re-exports {bus, reactive, services, ui} + a `prelude`
-trollshell        → the binary; depends on `hytte` + `hytte-pam`
+hytte-blur        → client-side ext-background-effect-v1 blur-region scoping (niri frosted-glass). Wired-but-inert: still attached live in `modal.rs`/`sidebar.rs` (attach-on-map + `set_region`), but 610a499 flattened the chrome to opaque, so niri's blur layer-rules go inert automatically — physically excising the wiring is a deferred follow-up, not done yet
+hytte             → umbrella: re-exports {bus, reactive, services, ui, blur} + a `prelude`
+trollshell        → the binary; depends on `hytte`
 ```
 
 Shell code uses `use hytte::prelude::*;` (App, Bar, Edge, Monitor, bind*, Service, …) plus `hytte::gtk` / `hytte::adw` / `hytte::services::*`. Don't add direct deps on gtk/adw/futures-signals in the binary — go through the re-exports.
@@ -135,13 +135,13 @@ All D-Bus goes through here, never raw zbus. Connections are pooled singletons (
 
 ## The `trollshell` binary
 
-`main.rs` builds the `App`, registers ~31 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
+`main.rs` builds the `App`, registers 33 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
 
 Source layout (each module has a consistent shape — match it when adding):
 
 - `widgets/` — bar chips. Each `pub fn widget(monitor) -> gtk::Widget`, binds to service signals, and on click calls `modal::toggle(monitor, Page::…, &btn)`.
 - `panels/` — drawer pages mounted into `modal.rs`'s per-monitor `gtk::Stack`. Each `pub fn panel_<name>() -> gtk::Widget`.
-- `overlays/` — per-monitor layer-shell overlays (lock_screen, osd, notifications, frame, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
+- `overlays/` — per-monitor layer-shell overlays (frame, notifications, osd, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
 - `modal.rs` — the slide-out drawer system (`Page` enum, per-monitor drawer window/revealer).
 - `components/` — cross-cutting `pub(crate)` building blocks reused across panels.
 - `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Asset sources live in the top-level `assets/` dir mirroring the runtime `share/` layout: `assets/trollshell/{style.css,icons/}` and `assets/hytte-ui/style.css`.
@@ -154,10 +154,9 @@ Source layout (each module has a consistent shape — match it when adding):
 
 ## Deployment & session integration
 
-`etc/` holds the full Niri-session config the shell expects (systemd user units incl. `trollshell.service` and `niri-session.target`, niri keybinds, swayidle idle/lock pipeline, kanshi display profiles, cliphist, the PAM service file) — see `etc/README.md`. The flake exposes `nixosModules.default` (`programs.trollshell.enable`) which, beyond installing the package, declares the `trollshell` PAM service. Everything else it pulls in — the system-bus policy permitting the two agent names (`bluez`/`iwd`), the polkit-gnome user service, UPower, power-profiles-daemon, and geoclue2 — sits behind `programs.trollshell.enableRecommendedServices` (default `true`); each is `mkDefault` so an explicit `enable = false;` still wins. With the switch off, the chips that back onto a missing daemon hide themselves (battery on `BatteryState::Unknown`, the power-profile group on empty `available`, weather falls back to `TROLLSHELL_WEATHER_CITY`) and the bluez/iwd agents park inert on `AccessDenied`. A `homeModules.default` (home-manager) runs the shell as a user service and shares the same option base (`nix/module-common.nix`).
+`etc/` holds the full Niri-session config the shell expects (systemd user units incl. `trollshell.service` and `niri-session.target`, niri keybinds, swayidle idle/lock pipeline, kanshi display profiles, cliphist) — see `etc/README.md`. trollshell ships no in-shell lock screen; locking is delegated to `swaylock` (driven by `swayidle`), wired through logind's `Lock` signal — see `etc/README.md`'s "Screen locking" section for wiring `swaylock`'s own PAM stack. The flake exposes `nixosModules.default` (`programs.trollshell.enable`), which installs the package. Everything else it pulls in — the system-bus policy permitting the two agent names (`bluez`/`iwd`), the polkit-gnome user service, UPower, power-profiles-daemon, and geoclue2 — sits behind `programs.trollshell.enableRecommendedServices` (default `true`); each is `mkDefault` so an explicit `enable = false;` still wins. With the switch off, the chips that back onto a missing daemon hide themselves (battery on `BatteryState::Unknown`, the power-profile group on empty `available`, weather falls back to `TROLLSHELL_WEATHER_CITY`) and the bluez/iwd agents park inert on `AccessDenied`. A `homeModules.default` (home-manager) runs the shell as a user service and shares the same option base (`nix/module-common.nix`).
 
 ## Known gotchas
 
 - **Niri fullscreen detection:** `WindowLayoutsChanged` is the _only_ niri-ipc event that fires on a fullscreen toggle (`WindowsChanged`/`WindowOpenedOrChanged` do not). The frame overlay relies on this.
 - **Icons render as `image-missing`** if you run outside the devShell, or if the icon theme isn't forced — `main.rs` calls `set_gtk_icon_theme_name("Adwaita")` to work around GSettings schemas not being visible under `cargo run`.
-- **bindgen 0.69 vs 0.72:** `hytte-pam` force-enables bindgen 0.69's `runtime` feature in its build-deps because the pipewire crates pull bindgen 0.72 and flip clang-sys to runtime linking workspace-wide; the two majors don't share features. Don't remove that otherwise-unused build-dep.

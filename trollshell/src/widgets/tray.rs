@@ -277,11 +277,11 @@ fn apply_item_button_visuals(btn: &gtk::Button, item: &TrayItem) {
         String::new()
     };
 
-    if !tooltip_markup.is_empty() {
-        btn.set_tooltip_markup(Some(&tooltip_markup));
-    } else {
+    if tooltip_markup.is_empty() {
         // Clear any tooltip that was set on a previous emit.
         btn.set_tooltip_markup(None);
+    } else {
+        btn.set_tooltip_markup(Some(&tooltip_markup));
     }
 }
 

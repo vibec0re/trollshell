@@ -3,7 +3,7 @@
 //! resource's live rows, history sparkline, and top-consumers list.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
@@ -16,7 +16,7 @@ use hytte::services::systemd;
 use hytte::ui::MultiSparkline;
 
 use crate::components::cast;
-use crate::components::format::fmt_bytes;
+use crate::components::format::{fmt_bytes, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
@@ -86,10 +86,12 @@ fn build_stats_memory_card() -> adw::PreferencesGroup {
     group
 }
 
-/// Disks card — the per-mount disk expander.
+/// Disks card — the per-mount capacity expander plus a live disk-I/O
+/// throughput history row (aggregate read+write rate across physical disks).
 fn build_stats_disks_card() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Disks").build();
     group.add(&build_live_disk_expander());
+    group.add(&history_row_wrapper(&build_history_disk_io_row()));
     group
 }
 
@@ -578,6 +580,101 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
     );
 
     expander
+}
+
+/// Disk I/O throughput history row, mirroring the network traffic row
+/// ([`crate::panels::network::traffic`]): a full-width auto-scaling
+/// [`Sparkline`] of the aggregate `read + write` rate, a `↓ read ↑ write`
+/// current-rate line, a `min … · max …` line over the graph window, and a
+/// `total ↓ … ↑ …` cumulative-since-boot line.
+///
+/// Soft defaults (flagged for review, both mirroring the network row):
+/// - **aggregate** across physical disks, not per-device;
+/// - **one combined series** (read + write summed into the graph), with the
+///   read/write split shown in the value labels rather than as two lines.
+fn build_history_disk_io_row() -> gtk::Box {
+    // Same window the Sparkline keeps (see `build_history_row`), so the min/max
+    // labels describe exactly the samples on screen.
+    const WINDOW: usize = 60;
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    outer.set_hexpand(true);
+
+    let (top_row, spark, top_value) = build_history_row("Disk I/O");
+    // Throughput has no fixed ceiling — auto-scale to the window max.
+    spark.set_domain_max(None);
+    // Units live in the detail rows below, so the right-hand slot is redundant
+    // (mirrors the network per-interface row).
+    top_value.set_visible(false);
+    top_row.set_hexpand(true);
+    outer.append(&top_row);
+
+    // Current ↓ read ↑ write rate.
+    let rate_label = gtk::Label::new(None);
+    rate_label.add_css_class("ts-stat-value");
+    rate_label.set_xalign(0.0);
+    rate_label.set_margin_start(crate::scale::scale(88));
+    outer.append(&rate_label);
+
+    // min / max of the combined rate over the graph window.
+    let minmax_label = gtk::Label::new(None);
+    minmax_label.add_css_class("ts-stat-value");
+    minmax_label.set_xalign(0.0);
+    minmax_label.set_margin_start(crate::scale::scale(88));
+    outer.append(&minmax_label);
+
+    // Cumulative read / write since boot.
+    let total_label = gtk::Label::new(None);
+    total_label.add_css_class("ts-stat-value");
+    total_label.set_xalign(0.0);
+    total_label.set_margin_start(crate::scale::scale(88));
+    total_label.set_margin_bottom(4);
+    outer.append(&total_label);
+
+    // Our own ring of the combined-rate samples, so we can label min/max over
+    // the window (the Sparkline doesn't expose its buffer).
+    let window: Rc<RefCell<VecDeque<f64>>> = Rc::new(RefCell::new(VecDeque::with_capacity(WINDOW)));
+
+    let spark_clone = spark.clone();
+    bind(sensors::disk_io(), &outer, move |_, io| {
+        let combined = io.read_bps + io.write_bps;
+        spark_clone.push(combined);
+        {
+            let mut w = window.borrow_mut();
+            if w.len() == WINDOW {
+                w.pop_front();
+            }
+            w.push_back(combined);
+        }
+
+        rate_label.set_text(&format!(
+            "\u{2193} {} \u{2191} {}",
+            fmt_rate(io.read_bps),
+            fmt_rate(io.write_bps),
+        ));
+
+        let (mut min, mut max) = (f64::INFINITY, 0.0_f64);
+        for &v in window.borrow().iter() {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if !min.is_finite() {
+            min = 0.0;
+        }
+        minmax_label.set_text(&format!(
+            "min {} \u{00b7} max {}",
+            fmt_rate(min),
+            fmt_rate(max),
+        ));
+
+        total_label.set_text(&format!(
+            "total \u{2193} {} \u{2191} {}",
+            fmt_bytes(io.total_read_bytes),
+            fmt_bytes(io.total_write_bytes),
+        ));
+    });
+
+    outer
 }
 
 fn build_history_cpu_row() -> gtk::Box {

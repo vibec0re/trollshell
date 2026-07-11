@@ -117,11 +117,76 @@
           # cargoArtifacts from the package build so dependencies aren't
           # recompiled from scratch. Must stay green because the workspace
           # denies clippy::all + clippy::pedantic and forbids unsafe.
+          #
+          # `--features system-tests` pulls the whole-file-gated integration
+          # tests (crates/hytte-{bus,reactive,ui}/tests/*.rs) and the gated
+          # `mod` blocks (hytte-ui's widget_tests/gtk_tests) into the lint
+          # pass too — without it they're invisible to clippy, the same gap
+          # #232 found for `cargo test` itself. Verified clean locally
+          # (`cargo clippy --workspace --all-targets --features system-tests
+          # -- -D warnings`) before wiring this in.
           clippy = craneLib.cargoClippy (
             trollshell.passthru.commonArgs
             // {
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
-              cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
+              cargoClippyExtraArgs = "--workspace --all-targets --features system-tests -- -D warnings";
+            }
+          );
+
+          # Run the `system-tests` cargo-feature bucket (#232): the
+          # whole-file-`#![cfg(feature = "system-tests")]` integration tests
+          # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,
+          # feature = "system-tests"))]` GTK unit-test modules in hytte-ui.
+          # These never compile anywhere else — the package build (doCheck
+          # above) deliberately omits the feature to stay hermetic — so this
+          # is their only home. Built via `mkCargoDerivation` directly
+          # (rather than `craneLib.cargoTest`) because `cargoTest.nix`
+          # hardcodes `checkPhaseCargoCommand`, silently discarding any
+          # override — we need that command to wrap `cargo test` in
+          # `xvfb-run` for the GTK tests (hytte-ui's `app_smoke`/`bind`/
+          # widget-tree & multi-sparkline tests) to have a display.
+          # hytte-bus's tests spawn their own ephemeral `dbus-daemon`
+          # (crates/hytte-bus/tests/common/mod.rs), so that binary needs to
+          # be on PATH too — neither it nor `xvfb-run` are in the devShell or
+          # the package's buildInputs, so both are supplied explicitly here.
+          # Reuses the same cargoArtifacts as the package build/clippy: the
+          # `system-tests` feature is `[]` (no extra deps), so the cached
+          # dependency graph is unaffected — only the workspace members
+          # themselves (not covered by cargoArtifacts, which only caches
+          # true external deps) need recompiling against the extra feature.
+          system-tests = craneLib.mkCargoDerivation (
+            trollshell.passthru.commonArgs
+            // {
+              pnameSuffix = "-system-tests";
+              cargoArtifacts = trollshell.passthru.cargoArtifacts;
+              nativeCheckInputs = [
+                pkgs.dbus
+                pkgs.xvfb-run
+              ];
+              doCheck = true;
+              # No separate build step: `cargo test` compiles as part of the
+              # check phase. `commonArgs.preBuild` (the libspa-sys writable-
+              # vendor-dir workaround) still runs first via the standard
+              # (now-empty) buildPhase, same as it does for the `clippy` and
+              # `cargoTest`-shaped checks — so the check phase's compile
+              # inherits a writable vendor dir.
+              buildPhaseCargoCommand = "";
+              # A fresh writable $HOME: GTK/glib want to write font/icon
+              # caches, and default stdenv HOME is deliberately unwritable.
+              # xvfb-run allocates its own virtual display, so no manual
+              # Xvfb/DISPLAY wiring is needed. Call the real `cargo` binary
+              # directly (not the `cargoWithProfile` shell helper) because
+              # xvfb-run execs its argv directly rather than through a
+              # shell, so a bash *function* wouldn't resolve — the plain
+              # `cargo` binary is on PATH via mkCargoDerivation's own
+              # nativeBuildInputs and env vars (CARGO_HOME, vendoring) are
+              # inherited by the child process either way.
+              preCheck = ''
+                export HOME="$(mktemp -d)"
+              '';
+              checkPhaseCargoCommand = ''
+                xvfb-run -a cargo test --workspace --locked --features system-tests
+              '';
             }
           );
 

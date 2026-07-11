@@ -5,11 +5,17 @@
 //! one entry covering all batteries on the system).
 //!
 //! Each tracked field (`Percentage`, `State`, `IconName`, `TimeToEmpty`,
-//! `TimeToFull`) gets its own [`hytte_bus::property`] subscription.  Changes
-//! are coalesced into the shared [`Battery`] via parallel `for_each` tasks
-//! that each update only their slice of the state (same pattern as
-//! `power_profiles`).
+//! `TimeToFull`, `WarningLevel`) gets its own [`hytte_bus::property`]
+//! subscription.  Changes are coalesced into the shared [`Battery`] via
+//! parallel `for_each` tasks that each update only their slice of the state
+//! (same pattern as `power_profiles`).
+//!
+//! `WarningLevel` additionally drives a self-toast: [`spawn_warning_level_watcher`]
+//! watches for a rising severity edge (entering `Low` or `Critical`/`Action`)
+//! and posts via [`crate::notifications::post_local`] — see [`warning_toast`]
+//! for the crossing/dedup rules (#237).
 
+use crate::notifications::Urgency;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, PropertySignal, property};
 use hytte_reactive::{Service, registry};
@@ -46,6 +52,31 @@ impl BatteryState {
     }
 }
 
+/// `UPower`'s `WarningLevel` enum (`org.freedesktop.UPower.Device.WarningLevel`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarningLevel {
+    Unknown,
+    None,
+    /// UPS-only: discharging but not yet at a warning threshold.
+    Discharging,
+    Low,
+    Critical,
+    Action,
+}
+
+impl WarningLevel {
+    fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::None,
+            2 => Self::Discharging,
+            3 => Self::Low,
+            4 => Self::Critical,
+            5 => Self::Action,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Battery {
     /// Charge percentage, `0.0..=100.0`.
@@ -58,6 +89,8 @@ pub struct Battery {
     pub time_to_full: Option<Duration>,
     /// Free-form icon name from `UPower` (e.g. `"battery-good-symbolic"`).
     pub icon_name: String,
+    /// `UPower`'s own low-battery severity, independent of `percentage`.
+    pub warning_level: WarningLevel,
 }
 
 impl Default for Battery {
@@ -68,6 +101,7 @@ impl Default for Battery {
             time_to_empty: None,
             time_to_full: None,
             icon_name: String::new(),
+            warning_level: WarningLevel::Unknown,
         }
     }
 }
@@ -124,9 +158,18 @@ impl Service for UpowerService {
             rt,
             display_device_prop::<String>("IconName"),
             String::new(),
-            writer,
+            writer.clone(),
             |b, v| b.icon_name = v,
         );
+        bind_prop_field(
+            rt,
+            display_device_prop::<u32>("WarningLevel"),
+            0,
+            writer.clone(),
+            |b, v| b.warning_level = WarningLevel::from_u32(v),
+        );
+
+        spawn_warning_level_watcher(rt, writer);
 
         handles
     }
@@ -184,6 +227,76 @@ fn bind_prop_field<T>(
     });
 }
 
+/// Coarse severity used to detect a genuine *rising* `WarningLevel` edge.
+/// `Unknown`, `None`, and `Discharging` (UPS-only, not a warning by itself)
+/// all collapse to "not warning" — only `Low` and `Critical`/`Action` are
+/// toast-worthy tiers.
+fn warning_tier(level: WarningLevel) -> u8 {
+    match level {
+        WarningLevel::Unknown | WarningLevel::None | WarningLevel::Discharging => 0,
+        WarningLevel::Low => 1,
+        WarningLevel::Critical | WarningLevel::Action => 2,
+    }
+}
+
+/// Decide whether moving from `baseline` (the last-observed level, or `None`
+/// if `next` is the very first observation) to `next` should post a toast,
+/// and at what urgency.
+///
+/// `baseline = None` never toasts — it only seeds the baseline, so a shell
+/// restart while the battery is already `Low`/`Critical` doesn't re-announce
+/// a state the user is already living with (see #237 triage: naively
+/// toasting on "any transition into Low/Critical" would re-fire on every
+/// restart, since the property emits its current value as the first
+/// `Loaded`). Otherwise only a **rising** edge — climbing to a higher
+/// severity tier — toasts; falling back (charger plugged in) or sitting at
+/// the same tier stays silent. A fast drain that skips a tier (jumping
+/// straight from "fine" to `Critical`/`Action`) still fires the
+/// higher-severity toast once.
+fn warning_toast(baseline: Option<WarningLevel>, next: WarningLevel) -> Option<Urgency> {
+    let prev_tier = warning_tier(baseline?);
+    let next_tier = warning_tier(next);
+    if next_tier <= prev_tier {
+        return None;
+    }
+    match next_tier {
+        1 => Some(Urgency::Normal),
+        2 => Some(Urgency::Critical),
+        _ => None,
+    }
+}
+
+/// Watch `battery`'s `warning_level` for rising edges and self-post a toast
+/// via [`crate::notifications::post_local`] (normal-urgency entering `Low`,
+/// critical-urgency entering `Critical`/`Action`) — see [`warning_toast`] for
+/// the dedup/baseline rules.
+///
+/// Runs on the hytte-tokio runtime, not the GTK thread; `post_local` is
+/// cross-thread-safe (reaches the notifications daemon's `SHARED` handle),
+/// so this is safe regardless of service registration order.
+fn spawn_warning_level_watcher(rt: &tokio::runtime::Handle, battery: Mutable<Battery>) {
+    rt.spawn(async move {
+        let mut baseline: Option<WarningLevel> = None;
+        battery
+            .signal_ref(|b| b.warning_level)
+            .dedupe()
+            .for_each(move |level| {
+                if let Some(urgency) = warning_toast(baseline, level) {
+                    let percentage = battery.lock_ref().percentage;
+                    let summary = match level {
+                        WarningLevel::Critical | WarningLevel::Action => "Battery critical",
+                        _ => "Battery low",
+                    };
+                    let body = format!("{percentage:.0}% remaining");
+                    crate::notifications::post_local("Battery", summary, &body, urgency);
+                }
+                baseline = Some(level);
+                std::future::ready(())
+            })
+            .await;
+    });
+}
+
 #[must_use]
 pub fn service() -> UpowerService {
     UpowerService
@@ -196,4 +309,94 @@ pub fn battery() -> impl Signal<Item = Battery> {
             .battery
             .signal_cloned()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Urgency, WarningLevel, warning_toast};
+
+    #[test]
+    fn first_observation_never_toasts() {
+        // The baseline seed (shell startup) must stay silent even if the
+        // battery is already Low/Critical — see #237 triage.
+        assert_eq!(warning_toast(None, WarningLevel::Low), None);
+        assert_eq!(warning_toast(None, WarningLevel::Critical), None);
+        assert_eq!(warning_toast(None, WarningLevel::Action), None);
+        assert_eq!(warning_toast(None, WarningLevel::None), None);
+    }
+
+    #[test]
+    fn rising_edge_into_low_toasts_normal() {
+        assert_eq!(
+            warning_toast(Some(WarningLevel::None), WarningLevel::Low),
+            Some(Urgency::Normal)
+        );
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Discharging), WarningLevel::Low),
+            Some(Urgency::Normal)
+        );
+    }
+
+    #[test]
+    fn rising_edge_into_critical_or_action_toasts_critical() {
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Low), WarningLevel::Critical),
+            Some(Urgency::Critical)
+        );
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Critical), WarningLevel::Action),
+            None // same tier — no re-toast
+        );
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Low), WarningLevel::Action),
+            Some(Urgency::Critical)
+        );
+    }
+
+    #[test]
+    fn fast_drain_skipping_low_still_toasts_critical() {
+        // A quick drain can jump straight from "fine" to Critical/Action
+        // without UPower ever reporting Low in between.
+        assert_eq!(
+            warning_toast(Some(WarningLevel::None), WarningLevel::Critical),
+            Some(Urgency::Critical)
+        );
+    }
+
+    #[test]
+    fn sitting_at_the_same_level_does_not_retoast() {
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Low), WarningLevel::Low),
+            None
+        );
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Critical), WarningLevel::Critical),
+            None
+        );
+    }
+
+    #[test]
+    fn falling_back_is_silent() {
+        // Charger plugged in: level improves, no toast, but it does become
+        // the new baseline for the next rising edge.
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Critical), WarningLevel::Low),
+            None
+        );
+        assert_eq!(
+            warning_toast(Some(WarningLevel::Low), WarningLevel::None),
+            None
+        );
+    }
+
+    #[test]
+    fn re_arming_after_a_fall_toasts_again() {
+        // Low -> None (charger) -> Low again should toast the second time:
+        // it's a fresh rising edge from the new baseline.
+        let after_charge = WarningLevel::None;
+        assert_eq!(
+            warning_toast(Some(after_charge), WarningLevel::Low),
+            Some(Urgency::Normal)
+        );
+    }
 }

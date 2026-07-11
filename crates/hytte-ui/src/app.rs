@@ -162,6 +162,23 @@ impl App {
         &self.inner
     }
 
+    /// Register `gio::ActionEntry`s on the underlying `adw::Application` (a
+    /// `gio::ActionMap`).
+    ///
+    /// A `GApplication` auto-exports its own action group over
+    /// `org.gtk.Actions` at the app's object path once it owns its bus name,
+    /// so this is how a hytte shell exposes a keyboard/D-Bus command surface
+    /// (e.g. niri keybinds driving the shell) **without** claiming a second
+    /// bus name and **without** a thread hop — the handlers fire on the GTK
+    /// main thread. Call from the body closure (post-activate); the actions
+    /// are live for the process lifetime.
+    pub fn add_action_entries(
+        &self,
+        entries: impl IntoIterator<Item = gio::ActionEntry<adw::Application>>,
+    ) {
+        self.inner.add_action_entries(entries);
+    }
+
     /// Quit the main loop. Useful from tests.
     pub fn quit(&self) {
         self.inner.quit();

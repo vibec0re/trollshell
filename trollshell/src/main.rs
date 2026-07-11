@@ -1,4 +1,5 @@
 mod assets;
+mod commands;
 mod components;
 mod modal;
 mod overlays;
@@ -97,6 +98,11 @@ fn main() -> hytte::ui::Result<()> {
             // (#135 part 2). Must run after GTK is initialized (a display +
             // gtk::Settings exist here).
             install_scaled_base_font();
+
+            // Register the command surface (GActions on the app's already-owned
+            // bus name) so niri keybinds can drive the drawer / power menu /
+            // sidebar over org.gtk.Actions — see commands.rs and #219.
+            commands::install(app);
 
             // Spawn a task on the GTK main loop that owns the live set of
             // bars AND every per-monitor overlay. Each emission of

@@ -14,8 +14,21 @@
 //!
 //! `IconPixmap` fallback, rich `Tooltip`, and `DBusMenu` via
 //! `com.canonical.dbusmenu`.
+//!
+//! # Module layout
+//!
+//! The untrusted-input parsers (the `com.canonical.dbusmenu` layout tree and
+//! the `RegisterStatusNotifierItem` argument) live in [`parse`], which is
+//! pure and hermetically unit-tested; the menu data shapes live in [`types`].
+//! This file keeps the service, D-Bus, and signal-emit logic.
 
-use anyhow::{Context, Result, anyhow};
+mod parse;
+mod types;
+
+pub use parse::strip_accel;
+pub use types::{Menu, MenuEntry, MenuItem, ToggleType};
+
+use anyhow::{Context, Result};
 use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
@@ -84,45 +97,6 @@ pub struct TrayItem {
     /// primary click as "show menu" rather than `Activate`. Common for Qt/KDE
     /// status icons that have no separate primary action.
     pub item_is_menu: bool,
-}
-
-// ── DBusMenu public types ─────────────────────────────────────────────────────
-
-/// A `DBusMenu` tree fetched from one `com.canonical.dbusmenu` endpoint.
-#[derive(Clone, Debug)]
-pub struct Menu {
-    pub id: i32,
-    pub items: Vec<MenuEntry>,
-}
-
-/// A single entry in a [`Menu`].
-#[derive(Clone, Debug)]
-pub enum MenuEntry {
-    Item(MenuItem),
-    Separator,
-}
-
-/// Toggle style for a [`MenuItem`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToggleType {
-    None,
-    Checkmark,
-    Radio,
-}
-
-/// A menu item fetched from `com.canonical.dbusmenu`.
-#[derive(Clone, Debug)]
-pub struct MenuItem {
-    pub id: i32,
-    /// Display label with accelerator markers stripped.
-    pub label: String,
-    pub enabled: bool,
-    pub icon_name: String,
-    pub toggle_type: ToggleType,
-    /// 0 = unchecked, 1 = checked, -1 = indeterminate.
-    pub toggle_state: i32,
-    /// Sub-items when `children-display == "submenu"`.
-    pub submenu: Option<Vec<MenuEntry>>,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -296,137 +270,8 @@ async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
         .await
         .context("call GetLayout")?;
 
-    let root = parse_layout_node(layout)?;
+    let root = parse::parse_layout_node(layout)?;
     Ok(root)
-}
-
-/// Recursively parse a single layout node `(i, a{sv}, av)` from an
-/// `OwnedValue`.
-fn parse_layout_node(val: OwnedValue) -> Result<Menu> {
-    let structure = Structure::try_from(val).context("layout node not a structure")?;
-    let mut fields = structure.into_fields();
-    if fields.len() < 3 {
-        return Err(anyhow!("layout node has fewer than 3 fields"));
-    }
-
-    let id = i32::try_from(fields.remove(0)).context("node id")?;
-
-    // Properties: a{sv}
-    let props_val = fields.remove(0);
-    let props: HashMap<String, OwnedValue> =
-        HashMap::try_from(OwnedValue::try_from(props_val).context("props to owned")?)
-            .context("node props")?;
-
-    // Children: av
-    let children_val = fields.remove(0);
-    let children_arr = zbus::zvariant::Array::try_from(
-        OwnedValue::try_from(children_val).context("children to owned")?,
-    )
-    .context("node children")?;
-
-    let visible = bool_prop(&props, "visible", true);
-    if !visible {
-        // Return a menu with no items for invisible root (unlikely but safe).
-        return Ok(Menu { id, items: vec![] });
-    }
-
-    let item_type = str_prop(&props, "type", "standard");
-    if item_type == "separator" {
-        // A root node that is a separator — return empty.
-        return Ok(Menu { id, items: vec![] });
-    }
-
-    // Collect children into MenuEntry list.
-    let mut items = Vec::new();
-    for child_val in children_arr.iter() {
-        let owned: OwnedValue = child_val
-            .try_clone()
-            .context("clone child value")?
-            .try_into_owned()
-            .context("child to owned")?;
-        match parse_menu_entry(owned) {
-            Ok(Some(entry)) => items.push(entry),
-            Ok(None) => {} // invisible / skipped
-            Err(e) => tracing::debug!(error = %e, "skipping malformed menu entry"),
-        }
-    }
-
-    Ok(Menu { id, items })
-}
-
-/// Parse one child value from the `av` children list into a `MenuEntry`.
-/// Returns `Ok(None)` for invisible items.
-fn parse_menu_entry(val: OwnedValue) -> Result<Option<MenuEntry>> {
-    let structure = Structure::try_from(val).context("menu entry not a structure")?;
-    let mut fields = structure.into_fields();
-    if fields.len() < 3 {
-        return Err(anyhow!("menu entry has fewer than 3 fields"));
-    }
-
-    let id = i32::try_from(fields.remove(0)).context("entry id")?;
-
-    let props_val = fields.remove(0);
-    let props: HashMap<String, OwnedValue> =
-        HashMap::try_from(OwnedValue::try_from(props_val).context("entry props to owned")?)
-            .context("entry props")?;
-
-    let children_val = fields.remove(0);
-    let children_arr = zbus::zvariant::Array::try_from(
-        OwnedValue::try_from(children_val).context("entry children to owned")?,
-    )
-    .context("entry children")?;
-
-    let visible = bool_prop(&props, "visible", true);
-    if !visible {
-        return Ok(None);
-    }
-
-    let item_type = str_prop(&props, "type", "standard");
-    if item_type == "separator" {
-        return Ok(Some(MenuEntry::Separator));
-    }
-
-    let label = strip_accel(&str_prop(&props, "label", ""));
-    let enabled = bool_prop(&props, "enabled", true);
-    let icon_name = str_prop(&props, "icon-name", "");
-    let toggle_type_str = str_prop(&props, "toggle-type", "");
-    let toggle_type = match toggle_type_str.as_str() {
-        "checkmark" => ToggleType::Checkmark,
-        "radio" => ToggleType::Radio,
-        _ => ToggleType::None,
-    };
-    let toggle_state = i32_prop(&props, "toggle-state", -1);
-    let children_display = str_prop(&props, "children-display", "");
-
-    // Recurse into children when this is a submenu entry.
-    let submenu = if children_display == "submenu" && !children_arr.is_empty() {
-        let mut sub_items = Vec::new();
-        for child_val in children_arr.iter() {
-            let owned: OwnedValue = child_val
-                .try_clone()
-                .context("clone sub-child")?
-                .try_into_owned()
-                .context("sub-child to owned")?;
-            match parse_menu_entry(owned) {
-                Ok(Some(entry)) => sub_items.push(entry),
-                Ok(None) => {}
-                Err(e) => tracing::debug!(error = %e, "skipping malformed sub-menu entry"),
-            }
-        }
-        Some(sub_items)
-    } else {
-        None
-    };
-
-    Ok(Some(MenuEntry::Item(MenuItem {
-        id,
-        label,
-        enabled,
-        icon_name,
-        toggle_type,
-        toggle_state,
-        submenu,
-    })))
 }
 
 /// Fire-and-forget: send `Event(id, "clicked", null, timestamp)` on the
@@ -572,7 +417,7 @@ impl Watcher {
             .sender()
             .map_or("", zbus::names::UniqueName::as_str)
             .to_string();
-        let (bus_name, object_path) = parse_service(service, &sender);
+        let (bus_name, object_path) = parse::parse_service(service, &sender);
 
         tracing::debug!(bus_name, object_path, "RegisterStatusNotifierItem");
 
@@ -908,69 +753,4 @@ async fn read_menu_path(bus_name: &str, object_path: &str) -> Option<String> {
     } else {
         Some(s)
     }
-}
-
-// ── Helper: parse service argument ───────────────────────────────────────────
-
-fn parse_service(service: &str, sender: &str) -> (String, String) {
-    if service.starts_with('/') {
-        (sender.to_string(), service.to_string())
-    } else {
-        (service.to_string(), "/StatusNotifierItem".to_string())
-    }
-}
-
-// ── DBusMenu property helpers ─────────────────────────────────────────────────
-
-fn str_prop(props: &HashMap<String, OwnedValue>, key: &str, default: &str) -> String {
-    props
-        .get(key)
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn bool_prop(props: &HashMap<String, OwnedValue>, key: &str, default: bool) -> bool {
-    props
-        .get(key)
-        .and_then(|v| bool::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or(default)
-}
-
-fn i32_prop(props: &HashMap<String, OwnedValue>, key: &str, default: i32) -> i32 {
-    props
-        .get(key)
-        .and_then(|v| i32::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or(default)
-}
-
-/// Strip GTK/Qt accelerator markers from a menu label.
-#[must_use]
-///
-/// Rules:
-/// - `__` → `_` (escaped underscore)
-/// - `_X` → `X` (accelerator shortcut, drop the `_`)
-pub fn strip_accel(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '_' {
-            match chars.peek() {
-                Some('_') => {
-                    out.push('_');
-                    chars.next();
-                }
-                Some(_) => {
-                    // Drop the underscore; next char is the accelerator letter.
-                    // It will be pushed naturally in the next iteration.
-                }
-                None => {
-                    // Trailing underscore — keep it.
-                    out.push('_');
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }

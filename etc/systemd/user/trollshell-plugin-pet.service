@@ -1,0 +1,22 @@
+[Unit]
+Description=trollshell kaomoji pet plugin (out-of-process, #276)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# NOTE: the pet mounts SidebarTop — the same slot as the reference clock
+# demo. The v1 host has one plugin per slot; enable one or the other.
+Conflicts=trollshell-plugin-clock-demo.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-pet
+# The pet's persona name and its brain (a local llama-server; leave the URL
+# empty — Environment=PET_LLM_URL= — for a fully canned-line pet).
+Environment=PET_NAME=nisse
+Environment=PET_LLM_URL=http://127.0.0.1:8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

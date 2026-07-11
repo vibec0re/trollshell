@@ -1,0 +1,24 @@
+# The pet's brain: a local llama-server (from nixpkgs' `llama-cpp`) holding a
+# small chat model resident. The pet plugin is a thin HTTP client to this —
+# the shell's daemon-as-state-store stance applied to a cat.
+#
+# Fetch the model once (≈0.8 GB, Q4):
+#   mkdir -p ~/.local/share/trollshell-pet
+#   curl -L -o ~/.local/share/trollshell-pet/brain.gguf \
+#     'https://huggingface.co/openbmb/MiniCPM5-1B-GGUF/resolve/main/MiniCPM5-1B-Q4_K_M.gguf'
+# (Any chat-tuned GGUF works; the pet only sends /v1/chat/completions.)
+[Unit]
+Description=llama-server brain for the trollshell pet plugin
+PartOf=niri-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# On NixOS, `llama-server` comes from the llama-cpp package (add it to your
+# user packages, or point ExecStart at a nix store path / wrapper).
+ExecStart=llama-server --model %h/.local/share/trollshell-pet/brain.gguf --port 8080 --ctx-size 1024 --threads 4 --reasoning-budget 0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=niri-session.target

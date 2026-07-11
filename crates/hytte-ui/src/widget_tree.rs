@@ -40,6 +40,7 @@
 //!     id: None,
 //!     dir: Dir::Horizontal,
 //!     spacing: 4,
+//!     scroll: false,
 //!     classes: vec!["ts-plugin".into()],
 //!     children: vec![Node::Label {
 //!         id: Some("title".into()),
@@ -72,8 +73,8 @@ pub enum Dir {
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
     Click,
-    /// A scrollable node (currently an id-bearing [`Node::Box`]) was
-    /// scrolled. `dx`/`dy` are the raw GTK scroll deltas.
+    /// A [`Node::Box`] with `scroll: true` was scrolled. `dx`/`dy` are the
+    /// raw GTK scroll deltas.
     Scroll { dx: f64, dy: f64 },
 }
 
@@ -83,12 +84,15 @@ pub enum EventKind {
 /// plugin is expected to use the existing `ts-*` / `hytte-*` token contract.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
-    /// A `gtk::Box`. `id` (optional) keys the node *and*, when present, makes
-    /// it a scroll event target.
+    /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
+    /// `scroll` independently controls whether it becomes a scroll event
+    /// target (an `EventControllerScroll` forwarding raw deltas via
+    /// [`EventKind::Scroll`]).
     Box {
         id: Option<NodeId>,
         dir: Dir,
         spacing: i32,
+        scroll: bool,
         classes: Vec<String>,
         children: Vec<Node>,
     },
@@ -146,7 +150,8 @@ impl Reconciler {
     /// Build a reconciler that mounts its tree as a child of `root`.
     ///
     /// `on_event` is invoked on the GTK main thread when a [`Node::Button`]
-    /// is clicked or an id-bearing [`Node::Box`] is scrolled.
+    /// is clicked or a scroll-enabled (`scroll: true`) [`Node::Box`] is
+    /// scrolled.
     #[must_use]
     pub fn new(root: &gtk::Box, on_event: impl Fn(NodeId, EventKind) + 'static) -> Self {
         Self {
@@ -194,6 +199,11 @@ struct RetainedNode {
     /// Realized children, in render order. `Box` holds its full child list;
     /// `Button`/`Revealer` hold exactly one; leaf nodes hold none.
     children: Vec<RetainedNode>,
+    /// A [`Node::Box`]'s scroll controller, present iff it was last rendered
+    /// with `scroll: true`. Retained so [`update_in_place`] can attach or
+    /// detach it as the flag flips across renders without rebuilding the
+    /// rest of the subtree. Always `None` for every other node kind.
+    scroll_controller: Option<gtk::EventControllerScroll>,
 }
 
 /// Shallow per-node snapshot used for keying and class diffing.
@@ -328,20 +338,22 @@ fn plan_diff(prev: &[ChildKey], next: &[ChildKey]) -> DiffPlan {
 /// (this is the only place `connect_clicked` / the scroll controller is
 /// attached, so reuse across renders can never stack duplicate handlers).
 fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
+    let mut scroll_controller = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
             dir,
             spacing,
+            scroll,
             classes,
             children,
         } => {
             let boxw = gtk::Box::new(orientation(*dir), *spacing);
             apply_classes(&boxw, classes);
-            // A scroll target needs an id to address; only id-bearing boxes
-            // get a scroll controller.
-            if let Some(id) = id {
-                attach_scroll(&boxw, id, on_event);
+            // Scroll behaviour is driven purely by `scroll`; `id` (if any)
+            // is only along for the ride as the fired event's target.
+            if *scroll {
+                scroll_controller = Some(attach_scroll(&boxw, id.as_deref(), on_event));
             }
             let mut kids = Vec::with_capacity(children.len());
             for child in children {
@@ -399,6 +411,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         widget,
         desc: desc_of(node),
         children,
+        scroll_controller,
     }
 }
 
@@ -409,16 +422,28 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
 fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) {
     match new {
         Node::Box {
+            id,
             dir,
             spacing,
+            scroll,
             classes,
             children,
-            ..
         } => {
             let boxw = downcast::<gtk::Box>(&retained.widget);
             boxw.set_orientation(orientation(*dir));
             boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
+            // `scroll` is a plain mutable property (like `classes`), not
+            // part of this node's identity, so a flip attaches/detaches the
+            // controller in place rather than forcing a subtree rebuild.
+            match (retained.scroll_controller.take(), *scroll) {
+                (Some(ctrl), true) => retained.scroll_controller = Some(ctrl),
+                (Some(ctrl), false) => boxw.remove_controller(&ctrl),
+                (None, true) => {
+                    retained.scroll_controller = Some(attach_scroll(boxw, id.as_deref(), on_event));
+                }
+                (None, false) => {}
+            }
             diff_children(boxw, &mut retained.children, children, on_event);
         }
         Node::Label { text, classes, .. } => {
@@ -558,17 +583,27 @@ fn orientation(dir: Dir) -> gtk::Orientation {
     }
 }
 
-fn attach_scroll(boxw: &gtk::Box, id: &NodeId, on_event: &EventFn) {
+/// Attach a scroll controller to `boxw`, firing [`EventKind::Scroll`]
+/// through `on_event` addressed at `id` (or an empty [`NodeId`] if the box
+/// carries none — `id` is optional and only a diff key, never required for
+/// scroll behaviour). Returns the controller so the caller can retain it and
+/// `remove_controller` it later if `scroll` flips back to `false`.
+fn attach_scroll(
+    boxw: &gtk::Box,
+    id: Option<&str>,
+    on_event: &EventFn,
+) -> gtk::EventControllerScroll {
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     let on_event = on_event.clone();
-    let id = id.clone();
+    let id = id.map(ToOwned::to_owned).unwrap_or_default();
     scroll.connect_scroll(move |_, dx, dy| {
         on_event(id.clone(), EventKind::Scroll { dx, dy });
-        // Don't consume: an id is also just a diff key, so swallowing every
-        // scroll over an id-bearing box would be surprising.
+        // Don't consume: scrolling over a scroll-enabled box shouldn't
+        // swallow the event from ancestor controllers.
         glib::Propagation::Proceed
     });
-    boxw.add_controller(scroll);
+    boxw.add_controller(scroll.clone());
+    scroll
 }
 
 fn apply_classes(widget: &impl IsA<gtk::Widget>, classes: &[String]) {
@@ -872,6 +907,7 @@ mod gtk_tests {
             id: None,
             dir: Dir::Horizontal,
             spacing: 0,
+            scroll: false,
             classes: vec![],
             children,
         }
@@ -1058,5 +1094,58 @@ mod gtk_tests {
                 .as_str(),
             "b"
         );
+    }
+
+    #[gtk::test]
+    fn scroll_flag_attaches_and_detaches_independent_of_id() {
+        use gtk::gio::prelude::ListModelExt;
+
+        fn hbox_scroll(scroll: bool) -> Node {
+            Node::Box {
+                id: None,
+                dir: Dir::Horizontal,
+                spacing: 0,
+                scroll,
+                classes: vec![],
+                children: vec![],
+            }
+        }
+
+        // Baseline controller count for a plain `gtk::Box`, so the assertions
+        // below don't assume this GTK version attaches zero controllers by
+        // default.
+        let base = gtk::Box::new(gtk::Orientation::Horizontal, 0)
+            .observe_controllers()
+            .n_items();
+
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        // First render, no id at all, scroll: true → controller attached at
+        // build time. Proves scroll no longer needs an id to activate.
+        rec.render(&hbox_scroll(true));
+        let inner = root.first_child().unwrap();
+        assert_eq!(
+            inner.observe_controllers().n_items(),
+            base + 1,
+            "scroll controller attached on first build, no id required"
+        );
+
+        // Same kind/id (both keyless) → reused in place; toggling `scroll`
+        // off detaches the controller without rebuilding the widget.
+        rec.render(&hbox_scroll(false));
+        let inner2 = root.first_child().unwrap();
+        assert_eq!(inner, inner2, "box reused across a scroll-flag flip");
+        assert_eq!(
+            inner2.observe_controllers().n_items(),
+            base,
+            "scroll controller detached in place"
+        );
+
+        // Toggling back on reattaches, still the same widget identity.
+        rec.render(&hbox_scroll(true));
+        let inner3 = root.first_child().unwrap();
+        assert_eq!(inner, inner3, "box still reused");
+        assert_eq!(inner3.observe_controllers().n_items(), base + 1);
     }
 }

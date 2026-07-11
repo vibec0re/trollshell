@@ -14,14 +14,8 @@ name = "hytte-plugin-clock-demo"
 path = "src/main.rs"
 
 [dependencies]
-# The ONLY hytte dependency: the GTK-free wire protocol. `tokio` feature pulls
-# in the framed `read_frame`/`write_frame` helpers. No gtk / adw / hytte-ui /
-# futures-signals — a plugin never links the shell.
-hytte-plugin-proto = { path = "../hytte-plugin-proto", features = ["tokio"] }
-tokio = { version = "1.52.1", default-features = false, features = [
-  "rt",
-  "macros",
-  "net",
-  "io-util",
-  "time",
-] }
+# The ONLY dependency: the plugin runtime SDK (#275), which re-exports the
+# GTK-free wire protocol as `hytte_plugin::proto` and owns all transport
+# (dial/backoff, handshake, session loop). No gtk / adw / hytte-ui /
+# futures-signals — and no direct tokio — a plugin never links the shell.
+hytte-plugin = { path = "../hytte-plugin" }

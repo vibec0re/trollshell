@@ -21,8 +21,10 @@
 //! # Transport & topology
 //!
 //! The host **listens** on one same-user-only socket,
-//! `$XDG_RUNTIME_DIR/trollshell/plugin.sock`; plugins are systemd user units
-//! that **dial in** and self-identify with [`Register`](PluginMsg::Register).
+//! `$XDG_RUNTIME_DIR/trollshell/plugin.sock` (construct it with
+//! [`socket_path`] — both ends share the one definition); plugins are systemd
+//! user units that **dial in** and self-identify with
+//! [`Register`](PluginMsg::Register).
 //! A crash is just a disconnect (`Restart=on-failure` reconnects). "Enable a
 //! plugin" = enable its unit. Encoding is `MessagePack` (`rmp-serde`) in
 //! length-prefixed frames — see [`codec`].
@@ -66,6 +68,7 @@ pub mod effect;
 pub mod manifest;
 pub mod msg;
 pub mod state;
+pub mod topology;
 pub mod wire;
 
 /// The wire protocol version. Exact-matched on [`Register`](msg::PluginMsg::Register)
@@ -77,6 +80,7 @@ pub use effect::{AudioAction, Effect, EffectOutcome, MediaAction, NiriAction, Pa
 pub use manifest::{Capability, Manifest, Mount, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use state::{ClockState, StateSnapshot};
+pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{Cls, Dir, EventKind, Node, NodeId};
 
 #[cfg(feature = "tokio")]

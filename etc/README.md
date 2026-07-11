@@ -16,7 +16,10 @@ into your user config directory per the per-feature README.
 | [systemd/user](systemd/user/README.md)             | The umbrella `niri-session.target` and unit topology | symlink units + enable target |
 
 For the entire stack: see [systemd/user/README.md](systemd/user/README.md) for the
-full install sequence.
+full install sequence. That directory also ships
+`trollshell-plugin-clock-demo.service`, the reference out-of-process widget
+plugin (#35) — a separate, GTK-free binary that dials the shell over a Unix
+socket; see its "Out-of-process widget plugins" section.
 
 ## Screen locking
 

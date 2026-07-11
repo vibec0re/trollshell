@@ -409,20 +409,20 @@ mod curve_tests {
 
 // These call gtk::init() / build widgets, so they need a display server —
 // gated into the `system-tests` bucket rather than run by default.
+//
+// `#[gtk::test]` (not a manual `gtk::init()` OnceLock) runs every test on one
+// shared GTK main thread, so these run serially but correctly under the
+// default multithreaded `cargo test` harness — mirrors widget_tree.rs's
+// gtk_tests. A hand-rolled OnceLock only initializes GTK on whichever thread
+// happens to run first; libtest's worker pool dispatches other tests to
+// different OS threads, and gtk4-rs panics ("GTK may only be used from the
+// main thread") the moment one of those touches a widget.
 #[cfg(all(test, feature = "system-tests"))]
 mod widget_tests {
     use super::*;
 
-    fn ensure_gtk_init() {
-        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        ONCE.get_or_init(|| {
-            gtk::init().ok();
-        });
-    }
-
-    #[test]
+    #[gtk::test]
     fn push_frame_caps_each_series_at_capacity() {
-        ensure_gtk_init();
         let g = MultiSparkline::new(3);
         for i in 0..5 {
             g.push_frame(&[f64::from(i), f64::from(i) * 10.0]);
@@ -435,9 +435,8 @@ mod widget_tests {
         assert_eq!(s1, vec![20.0, 30.0, 40.0]);
     }
 
-    #[test]
+    #[gtk::test]
     fn changing_width_resets_series() {
-        ensure_gtk_init();
         let g = MultiSparkline::new(10);
         g.push_frame(&[1.0, 2.0]);
         g.push_frame(&[3.0, 4.0]);
@@ -451,26 +450,23 @@ mod widget_tests {
         }
     }
 
-    #[test]
+    #[gtk::test]
     fn empty_frame_is_noop_shape() {
-        ensure_gtk_init();
         let g = MultiSparkline::new(5);
         g.push_frame(&[]);
         assert!(g.series.borrow().is_empty());
     }
 
-    #[test]
+    #[gtk::test]
     fn clear_empties() {
-        ensure_gtk_init();
         let g = MultiSparkline::new(10);
         g.push_frame(&[1.0, 2.0]);
         g.clear();
         assert!(g.series.borrow().is_empty());
     }
 
-    #[test]
+    #[gtk::test]
     fn set_domain_max_round_trips() {
-        ensure_gtk_init();
         let g = MultiSparkline::new(5);
         g.set_domain_max(Some(1.0));
         assert_eq!(g.domain_max.get(), Some(1.0));

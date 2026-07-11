@@ -9,15 +9,36 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
-use zbus::zvariant::{OwnedValue, Structure};
+use zbus::zvariant::{OwnedValue, Structure, Value};
 
 use super::types::{Menu, MenuEntry, MenuItem, ToggleType};
 
 // ── DBusMenu layout parsing ───────────────────────────────────────────────────
 
+/// Peel a `Value::Value` variant wrapper down to the value it carries.
+///
+/// `com.canonical.dbusmenu`'s `GetLayout` types each node's children as `av`
+/// (array of variant). `zvariant::Array::from(Vec<Value>)` marks every
+/// element whose *own* signature is `"v"` by boxing it in an extra
+/// `Value::Value(inner)` layer (see `Value::new`) — which is exactly what a
+/// real `av` deserializes to off the wire too. `Structure::try_from` only
+/// matches `Value::Structure` directly, so without peeling this wrapper
+/// first, every child structure fails to convert and is silently dropped
+/// (issue #8: tray menus decode with zero children). Peel any (possibly
+/// repeated) wrapping here; a value that arrives already unwrapped passes
+/// through untouched.
+fn unwrap_variant(value: OwnedValue) -> Result<OwnedValue> {
+    let mut inner: Value<'static> = value.into();
+    while let Value::Value(boxed) = inner {
+        inner = *boxed;
+    }
+    OwnedValue::try_from(inner).context("re-owning unwrapped variant")
+}
+
 /// Recursively parse a single layout node `(i, a{sv}, av)` from an
 /// `OwnedValue`.
 pub(super) fn parse_layout_node(val: OwnedValue) -> Result<Menu> {
+    let val = unwrap_variant(val)?;
     let structure = Structure::try_from(val).context("layout node not a structure")?;
     let mut fields = structure.into_fields();
     if fields.len() < 3 {
@@ -72,6 +93,7 @@ pub(super) fn parse_layout_node(val: OwnedValue) -> Result<Menu> {
 /// Parse one child value from the `av` children list into a `MenuEntry`.
 /// Returns `Ok(None)` for invisible items.
 fn parse_menu_entry(val: OwnedValue) -> Result<Option<MenuEntry>> {
+    let val = unwrap_variant(val)?;
     let structure = Structure::try_from(val).context("menu entry not a structure")?;
     let mut fields = structure.into_fields();
     if fields.len() < 3 {
@@ -421,17 +443,14 @@ mod tests {
     // ── parse_menu_entry: deep submenu nesting ────────────────────────────────
 
     /// Deep `children-display == submenu` nesting must terminate without
-    /// panicking. This also *characterises* (pins) a pre-existing behaviour
-    /// gap: `av` children arrive as `Value::Value`-wrapped structures — both
-    /// off the wire and in these fixtures — and `Structure::try_from` does not
-    /// peel that variant, so `parse_menu_entry` currently drops every child.
-    /// The submenu is therefore `Some(vec![])`, not the nested tree, and a
-    /// root's item list is likewise empty. This is almost certainly behind
-    /// issue #8 ("tray icon menus weird"); the split deliberately preserves it
-    /// (behaviour-preserving move) and locks it here so a later fix flips this
-    /// assertion intentionally.
+    /// panicking, and — since the `unwrap_variant` fix (#8) — must actually
+    /// retain the nested tree. `av` children arrive as `Value::Value`-wrapped
+    /// structures, both off the wire and in these fixtures (see the fixture
+    /// builder doc comment above); `parse_menu_entry` now peels that wrapper
+    /// before `Structure::try_from`, so the grandchild survives two levels of
+    /// submenu nesting instead of being silently dropped.
     #[test]
-    fn menu_entry_deep_submenu_nesting_currently_drops_children() {
+    fn menu_entry_deep_submenu_nesting_preserves_children() {
         let grandchild = node_value(30, vec![("label", Value::from("Grandchild"))], vec![]);
         let child = node_value(
             20,
@@ -454,26 +473,77 @@ mod tests {
         match entry {
             Some(MenuEntry::Item(item)) => {
                 assert_eq!(item.label, "Parent");
-                // `children-display == submenu` + non-empty `av` → `Some(_)`,
-                // but the variant-wrapped child fails to decode and is skipped,
-                // leaving an empty list. (See the doc comment above — #8.)
-                assert_eq!(item.submenu.as_ref().map(Vec::len), Some(0));
+                let submenu = item.submenu.expect("parent has a submenu");
+                assert_eq!(submenu.len(), 1, "child was dropped: {submenu:?}");
+                match &submenu[0] {
+                    MenuEntry::Item(child_item) => {
+                        assert_eq!(child_item.label, "Child");
+                        let grandchildren =
+                            child_item.submenu.as_ref().expect("child has a submenu");
+                        assert_eq!(
+                            grandchildren.len(),
+                            1,
+                            "grandchild was dropped: {grandchildren:?}"
+                        );
+                        match &grandchildren[0] {
+                            MenuEntry::Item(grandchild_item) => {
+                                assert_eq!(grandchild_item.label, "Grandchild");
+                            }
+                            other @ MenuEntry::Separator => {
+                                panic!("expected grandchild item, got {other:?}")
+                            }
+                        }
+                    }
+                    other @ MenuEntry::Separator => panic!("expected child item, got {other:?}"),
+                }
             }
             other => panic!("expected item, got {other:?}"),
         }
     }
 
     /// Companion to the nesting test at the root level: a root node with a
-    /// visible standard child likewise yields an empty item list today,
-    /// because the `av` child is variant-wrapped and dropped. Pins current
-    /// behaviour (see #8).
+    /// visible standard child now retains that child, since `unwrap_variant`
+    /// peels the `Value::Value` wrapping before `Structure::try_from` (#8).
     #[test]
-    fn layout_node_children_currently_drop() {
+    fn layout_node_children_preserves_children() {
         let child = node_value(2, vec![("label", Value::from("Child"))], vec![]);
         let root = node_owned(1, vec![("label", Value::from("Root"))], vec![child]);
         let menu = parse_layout_node(root).expect("root parses");
         assert_eq!(menu.id, 1);
-        assert!(menu.items.is_empty());
+        assert_eq!(menu.items.len(), 1);
+        match &menu.items[0] {
+            MenuEntry::Item(item) => assert_eq!(item.label, "Child"),
+            other @ MenuEntry::Separator => panic!("expected item, got {other:?}"),
+        }
+    }
+
+    /// A menu with N visible children must parse exactly N entries in order
+    /// — the general case behind the single-child regression tests above.
+    #[test]
+    fn layout_node_parses_all_n_children() {
+        let children: Vec<Value<'static>> = (0..5)
+            .map(|i| {
+                node_value(
+                    100 + i,
+                    vec![("label", Value::from(format!("Item {i}")))],
+                    vec![],
+                )
+            })
+            .collect();
+        let root = node_owned(1, vec![("label", Value::from("Root"))], children);
+        let menu = parse_layout_node(root).expect("root parses");
+        assert_eq!(menu.items.len(), 5);
+        for (i, entry) in menu.items.iter().enumerate() {
+            match entry {
+                MenuEntry::Item(item) => {
+                    assert_eq!(item.id, 100 + i32::try_from(i).unwrap());
+                    assert_eq!(item.label, format!("Item {i}"));
+                }
+                other @ MenuEntry::Separator => {
+                    panic!("expected item at index {i}, got {other:?}")
+                }
+            }
+        }
     }
 
     // ── parse_service ─────────────────────────────────────────────────────────

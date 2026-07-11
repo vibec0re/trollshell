@@ -46,6 +46,9 @@ impl IwdAgent {
             ssid,
             security,
             kind: super::types::PromptKind::WifiPassphrase,
+            // iwd's RequestPassphrase carries no retry/failure signal (unlike
+            // NM's REQUEST_NEW flag) — see the field doc on PromptRequest.
+            prior_failure: false,
         }));
 
         if let Ok(Ok(pass)) = rx.await {

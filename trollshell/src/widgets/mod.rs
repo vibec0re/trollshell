@@ -13,6 +13,7 @@ pub mod mpris;
 pub mod network;
 pub mod notif_indicator;
 pub mod power_chip;
+pub mod screencast;
 pub mod settings_chip;
 pub mod sidebar_toggle;
 pub mod tasks;

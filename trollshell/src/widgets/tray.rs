@@ -3,30 +3,231 @@ use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+/// Per-button live item data.  Click handlers capture this `Rc<RefCell<…>>`
+/// and read it at activation time, so reused buttons always dispatch against
+/// the most recent item state — even after many signal emits have updated the
+/// cell since the button was first created.
+type ItemCell = Rc<RefCell<TrayItem>>;
+
+/// key → (button widget, live item cell).
+type ButtonMap = HashMap<String, (gtk::Button, ItemCell)>;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-tray");
 
+    // The map persists across signal emits on the GTK main thread.
+    // Rc is fine here — bind() drives the closure via spawn_local.
+    let button_map: Rc<RefCell<ButtonMap>> = Rc::new(RefCell::new(HashMap::new()));
+
     let container_for_signal = container.clone();
     let monitor = monitor.clone();
     bind(tray::items(), &container, move |_, items| {
-        while let Some(child) = container_for_signal.first_child() {
-            container_for_signal.remove(&child);
-        }
-        for item in items {
-            let btn = build_item_button(&item, &monitor);
-            container_for_signal.append(&btn);
-        }
+        update_tray(&container_for_signal, &button_map, &items, &monitor);
     });
 
     container.upcast()
 }
 
-fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
+/// Keyed-diff update of the tray container.
+///
+/// `tray::items()` fires on every `NewIcon`/`NewTitle`/`NewStatus`/`NewToolTip`
+/// from any tray app.  This function avoids tearing down stable buttons on each
+/// emit by keying on `TrayItem::key` (`"{bus_name}{object_path}"`):
+///
+/// 1. Remove buttons whose key is no longer present.
+/// 2. For each item in service order: reuse the existing button (update cell +
+///    visuals) or create a new one.
+/// 3. Reorder the container children to match the service-published order.
+///
+/// Click handlers are wired once at creation via [`create_item_button`].
+/// They capture an `Rc<RefCell<TrayItem>>` and read it at activation time, so
+/// they act on current data without stale captures.  Handlers are never
+/// reconnected on reuse — the double-connect bug cannot occur here.
+fn update_tray(
+    container: &gtk::Box,
+    button_map: &Rc<RefCell<ButtonMap>>,
+    items: &[TrayItem],
+    monitor: &Monitor,
+) {
+    let mut map = button_map.borrow_mut();
+
+    let prev_keys: Vec<String> = map.keys().cloned().collect();
+    let new_keys: Vec<String> = items.iter().map(|i| i.key.clone()).collect();
+    let (ops, removed_keys) = plan_diff(&prev_keys, &new_keys);
+
+    // ── 1. Remove obsolete buttons ────────────────────────────────────────
+    for key in &removed_keys {
+        if let Some((btn, _)) = map.remove(key) {
+            container.remove(&btn);
+        }
+    }
+
+    // ── 2. Reuse stable buttons; create new ones ──────────────────────────
+    for (item, &op) in items.iter().zip(ops.iter()) {
+        match op {
+            DiffOp::Reuse => {
+                if let Some((btn, item_cell)) = map.get(&item.key) {
+                    // Update live cell — handlers read this at click time.
+                    *item_cell.borrow_mut() = item.clone();
+                    // Re-apply visual properties (icon, tooltip).
+                    apply_item_button_visuals(btn, item);
+                }
+            }
+            DiffOp::Create => {
+                let item_cell: ItemCell = Rc::new(RefCell::new(item.clone()));
+                let btn = create_item_button(&item_cell, monitor);
+                container.append(&btn); // position corrected in step 3
+                map.insert(item.key.clone(), (btn, item_cell));
+            }
+        }
+    }
+
+    // ── 3. Reorder to match service order ─────────────────────────────────
+    // gtk_widget_insert_after() repositions an already-parented child without
+    // destroying it.  None as previous_sibling → place as first child.
+    let mut prev: Option<gtk::Button> = None;
+    for item in items {
+        if let Some((btn, _)) = map.get(&item.key) {
+            btn.insert_after(container, prev.as_ref());
+            prev = Some(btn.clone());
+        }
+    }
+}
+
+/// Classification of an incoming key in a keyed-diff pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffOp {
+    /// The key is new — build a fresh button.
+    Create,
+    /// The key was already present — reuse the existing button.
+    Reuse,
+}
+
+/// Classify each key in `next` as [`DiffOp::Create`] or [`DiffOp::Reuse`].
+///
+/// Returns one op per entry in `next` (same order) and the set of keys present
+/// in `prev` but absent from `next` (to be removed from the container).
+///
+/// Pure function — no GTK state; unit-testable without a display.
+fn plan_diff(prev: &[String], next: &[String]) -> (Vec<DiffOp>, Vec<String>) {
+    let prev_set: HashSet<&str> = prev.iter().map(String::as_str).collect();
+    let next_set: HashSet<&str> = next.iter().map(String::as_str).collect();
+
+    let ops = next
+        .iter()
+        .map(|k| {
+            if prev_set.contains(k.as_str()) {
+                DiffOp::Reuse
+            } else {
+                DiffOp::Create
+            }
+        })
+        .collect();
+
+    let removed = prev
+        .iter()
+        .filter(|k| !next_set.contains(k.as_str()))
+        .cloned()
+        .collect();
+
+    (ops, removed)
+}
+
+/// Create a tray button for `item_cell` and wire up click handlers.
+///
+/// Handlers are connected exactly once here and capture a clone of
+/// `item_cell`.  They read the current item at activation time rather than
+/// closing over snapshot values, so they remain correct across any number of
+/// subsequent signal emits that update the cell.
+///
+/// Because handlers are never reconnected on reuse, there is no way for them
+/// to stack up across emits — the double-connect bug cannot occur.
+fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-tray-item");
 
+    {
+        let item = item_cell.borrow();
+        apply_item_button_visuals(&btn, &item);
+    }
+
+    // Primary click: Activate or show-menu depending on ItemIsMenu.
+    {
+        let item_cell = item_cell.clone();
+        let btn_weak = btn.downgrade();
+        let monitor = monitor.clone();
+        btn.connect_clicked(move |_| {
+            let item = item_cell.borrow();
+            let item_is_menu = item.item_is_menu;
+            let bus_name = item.bus_name.clone();
+            let object_path = item.object_path.clone();
+            let menu_path = item.menu_path.clone();
+            drop(item); // release borrow before any async dispatch
+            if item_is_menu {
+                show_context_menu(
+                    btn_weak.clone(),
+                    bus_name,
+                    object_path,
+                    menu_path,
+                    monitor.clone(),
+                );
+            } else {
+                tray::activate(&bus_name, &object_path);
+            }
+        });
+    }
+
+    // Secondary click → DBusMenu popover if available, otherwise fall back to
+    // the SNI's own `ContextMenu(x, y)` method (apps without a DBusMenu still
+    // expect right-click to do *something*).
+    {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gdk::BUTTON_SECONDARY);
+        // Capture phase so we see the event before gtk::Button's built-in
+        // click gesture has a chance to swallow it.
+        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let item_cell = item_cell.clone();
+        let btn_weak = btn.downgrade();
+        let monitor = monitor.clone();
+        gesture.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let item = item_cell.borrow();
+            let bus_name = item.bus_name.clone();
+            let object_path = item.object_path.clone();
+            let menu_path = item.menu_path.clone();
+            drop(item);
+            show_context_menu(
+                btn_weak.clone(),
+                bus_name,
+                object_path,
+                menu_path,
+                monitor.clone(),
+            );
+        });
+        btn.add_controller(gesture);
+    }
+
+    btn
+}
+
+/// Apply (or re-apply) the icon and tooltip from `item` to `btn`.
+///
+/// Safe to call on both freshly-created and reused buttons.  When reusing,
+/// the old child widget is replaced and any previous tooltip is cleared if
+/// the item no longer carries one.
+///
+/// # Icon fallback chain
+///
+/// 1. Named icon confirmed present in the current theme.
+/// 2. Raw ARGB32 pixmap from `IconPixmap` (app-supplied bitmap).
+/// 3. Named icon best-effort (theme may resolve it later).
+/// 4. Generic symbolic fallback.
+fn apply_item_button_visuals(btn: &gtk::Button, item: &TrayItem) {
     let icon = gtk::Image::new();
 
     // Robust fallback chain:
@@ -76,66 +277,12 @@ fn build_item_button(item: &TrayItem, monitor: &Monitor) -> gtk::Button {
         String::new()
     };
 
-    if !tooltip_markup.is_empty() {
+    if tooltip_markup.is_empty() {
+        // Clear any tooltip that was set on a previous emit.
+        btn.set_tooltip_markup(None);
+    } else {
         btn.set_tooltip_markup(Some(&tooltip_markup));
     }
-
-    let bus_name = item.bus_name.clone();
-    let object_path = item.object_path.clone();
-    let menu_path = item.menu_path.clone();
-    let item_is_menu = item.item_is_menu;
-
-    // Primary click. Per SNI spec, when `ItemIsMenu` is true the app has no
-    // separate primary action — left-click should show the menu instead.
-    {
-        let bus_name = bus_name.clone();
-        let object_path = object_path.clone();
-        let menu_path = menu_path.clone();
-        let btn_weak = btn.downgrade();
-        let monitor = monitor.clone();
-        btn.connect_clicked(move |_| {
-            if item_is_menu {
-                show_context_menu(
-                    btn_weak.clone(),
-                    bus_name.clone(),
-                    object_path.clone(),
-                    menu_path.clone(),
-                    monitor.clone(),
-                );
-            } else {
-                tray::activate(&bus_name, &object_path);
-            }
-        });
-    }
-
-    // Secondary click → DBusMenu popover if available, otherwise fall back to
-    // the SNI's own `ContextMenu(x, y)` method (apps without a DBusMenu still
-    // expect right-click to do *something*).
-    {
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(gdk::BUTTON_SECONDARY);
-        // Capture phase so we see the event before gtk::Button's built-in
-        // click gesture has a chance to swallow it.
-        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let btn_weak = btn.downgrade();
-        let bus_name = bus_name.clone();
-        let object_path = object_path.clone();
-        let menu_path = menu_path.clone();
-        let monitor = monitor.clone();
-        gesture.connect_pressed(move |gesture, _, _, _| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            show_context_menu(
-                btn_weak.clone(),
-                bus_name.clone(),
-                object_path.clone(),
-                menu_path.clone(),
-                monitor.clone(),
-            );
-        });
-        btn.add_controller(gesture);
-    }
-
-    btn
 }
 
 /// Display the context menu for a tray item. Prefers the `com.canonical.dbusmenu`
@@ -294,5 +441,76 @@ fn build_menu_item_widget(
         });
 
         btn.upcast()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiffOp, plan_diff};
+
+    #[test]
+    fn diff_no_change() {
+        let prev = vec!["a".to_string(), "b".to_string()];
+        let next = prev.clone();
+        let (ops, removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_insert() {
+        let prev = vec!["a".to_string(), "b".to_string()];
+        let next = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (ops, removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse, DiffOp::Create]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_remove() {
+        let prev = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let next = vec!["a".to_string(), "c".to_string()];
+        let (ops, mut removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse]);
+        removed.sort();
+        assert_eq!(removed, ["b"]);
+    }
+
+    #[test]
+    fn diff_reorder() {
+        let prev = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let next = vec!["c".to_string(), "b".to_string(), "a".to_string()];
+        let (ops, removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse, DiffOp::Reuse]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_full_replace() {
+        let prev = vec!["a".to_string(), "b".to_string()];
+        let next = vec!["c".to_string(), "d".to_string()];
+        let (ops, mut removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Create, DiffOp::Create]);
+        removed.sort();
+        assert_eq!(removed, ["a", "b"]);
+    }
+
+    #[test]
+    fn diff_empty_prev() {
+        let prev: Vec<String> = vec![];
+        let next = vec!["a".to_string()];
+        let (ops, removed) = plan_diff(&prev, &next);
+        assert_eq!(ops, [DiffOp::Create]);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_empty_next() {
+        let prev = vec!["a".to_string(), "b".to_string()];
+        let next: Vec<String> = vec![];
+        let (ops, mut removed) = plan_diff(&prev, &next);
+        assert!(ops.is_empty());
+        removed.sort();
+        assert_eq!(removed, ["a", "b"]);
     }
 }

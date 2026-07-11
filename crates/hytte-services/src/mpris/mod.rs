@@ -30,6 +30,17 @@
 //! // Art fetch (async, cached):
 //! mpris::art_for_url(url).await -> Option<Vec<u8>>
 //! ```
+//!
+//! # Module layout
+//!
+//! The untrusted-input metadata parsers (the pure functions that pull fields
+//! out of an arbitrary player's `a{sv}` `Metadata` map) live in [`parse`],
+//! which is free of I/O and hermetically unit-tested. This file keeps the
+//! service, D-Bus, per-player-task, and signal-emit logic — including the
+//! bus-touching `read_metadata` orchestrator that fetches the map and hands
+//! it to [`parse::parse_metadata`].
+
+mod parse;
 
 use anyhow::{Context, Result};
 use futures_signals::map_ref;
@@ -834,118 +845,19 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
 /// Extract track metadata from the `Metadata` property. Returns
 /// `(title, artists, album, art_url, length_us, track_id)` — all default
 /// to empty / zero / None on missing/malformed values.
+///
+/// The (I/O-touching) bus fetch lives here; the pure field extraction is
+/// delegated to [`parse::parse_metadata`].
 async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, Option<String>) {
-    let raw: OwnedValue = match get_property(bus_name, PLAYER_IFACE, "Metadata").await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                0,
-                None,
-            );
-        }
-    };
-
-    let map: HashMap<String, OwnedValue> = match HashMap::try_from(raw) {
-        Ok(m) => m,
-        Err(_) => {
-            return (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                0,
-                None,
-            );
-        }
-    };
-
-    let title = map
-        .get("xesam:title")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    let album = map
-        .get("xesam:album")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    // xesam:artist is a string array (as); handle gracefully if absent or malformed.
-    let artists = parse_artist_array(map.get("xesam:artist"));
-
-    // xesam:artUrl — a plain string in most players.
-    let art_url = map
-        .get("xesam:artUrl")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    // mpris:length — u64 or i64 microseconds.
-    let length_us = parse_length(map.get("mpris:length"));
-
-    // mpris:trackid — ObjectPath or String.
-    let track_id = parse_track_id(map.get("mpris:trackid"));
-
-    (title, artists, album, art_url, length_us, track_id)
-}
-
-/// Parse `xesam:artist` from an `OwnedValue` that should be `as` (array of strings).
-fn parse_artist_array(val: Option<&OwnedValue>) -> String {
-    let Some(v) = val else { return String::new() };
-    let Ok(owned) = v.try_clone() else {
-        return String::new();
-    };
-
-    let Ok(arr) = zbus::zvariant::Array::try_from(owned) else {
-        return String::new();
-    };
-
-    let parts: Vec<String> = arr
-        .iter()
-        .filter_map(|item| {
-            let cloned = item.try_clone().ok()?;
-            String::try_from(OwnedValue::try_from(cloned).ok()?).ok()
-        })
-        .collect();
-
-    parts.join(", ")
-}
-
-/// Parse `mpris:length` from an `OwnedValue`. The spec says u64 but some
-/// players send i64. Saturate negatives to 0.
-fn parse_length(val: Option<&OwnedValue>) -> u64 {
-    let Some(v) = val else { return 0 };
-    let Ok(owned) = v.try_clone() else { return 0 };
-
-    // Try u64 first (spec-compliant).
-    if let Ok(n) = u64::try_from(owned.clone()) {
-        return n;
+    match get_property::<OwnedValue>(bus_name, PLAYER_IFACE, "Metadata").await {
+        Ok(raw) => parse::parse_metadata(raw),
+        Err(_) => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+            None,
+        ),
     }
-    // Fall back to i64, saturate negatives.
-    if let Ok(n) = i64::try_from(owned) {
-        return u64::try_from(n).unwrap_or(0);
-    }
-    0
-}
-
-/// Parse `mpris:trackid` from an `OwnedValue`. May be an `ObjectPath`, a plain
-/// String, or a Variant wrapping one of those. Returns the underlying path/
-/// string as a `String`, or `None` if absent or unparseable.
-fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
-    let v = val?;
-    let Ok(owned) = v.try_clone() else {
-        return None;
-    };
-
-    // Try ObjectPath first (most common).
-    if let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(owned.clone()) {
-        return Some(path.as_str().to_string());
-    }
-    // Try plain String.
-    if let Ok(s) = String::try_from(owned) {
-        return Some(s);
-    }
-    None
 }

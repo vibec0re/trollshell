@@ -9,6 +9,7 @@ mod monitor;
 pub mod multi_sparkline;
 mod popup;
 pub mod sparkline;
+pub mod widget_tree;
 
 pub use app::{App, AppBuilder};
 pub use bar::{Bar, BarHandle, Edge};
@@ -18,6 +19,7 @@ pub use monitor::Monitor;
 pub use multi_sparkline::MultiSparkline;
 pub use popup::{Popup, PopupBuilder, Position as PopupPosition, attach_dismiss_catcher};
 pub use sparkline::Sparkline;
+pub use widget_tree::{Dir, EventKind, Node, NodeId, Reconciler};
 
 // `Edge` re-exported as `LayerEdge` to avoid colliding with `bar::Edge`.
 pub use gtk4_layer_shell::{Edge as LayerEdge, KeyboardMode, Layer, LayerShell};

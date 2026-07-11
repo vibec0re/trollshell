@@ -372,6 +372,11 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // what anchors the departures widget to the bottom edge.
     card.set_vexpand(true);
 
+    // Plugin mount: `Mount::SidebarTop` — an out-of-process widget plugin's
+    // view reconciled above the built-in widgets (#35 PR 2). Empty (renders
+    // nothing) until a plugin dials in and pushes a tree.
+    card.append(&crate::plugins::sidebar_top_slot());
+
     card.append(&crate::widgets::weather::widget());
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
@@ -384,6 +389,9 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.append(&spacer);
 
     card.append(&crate::widgets::departures::widget());
+
+    // Plugin mount: `Mount::SidebarBottom` — reconciled below everything.
+    card.append(&crate::plugins::sidebar_bottom_slot());
     card
 }
 

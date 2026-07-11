@@ -11,12 +11,12 @@ use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gio};
 use hytte::prelude::*;
 use hytte::services::app_usage::{self, ProcSample};
-use hytte::services::sensors::{self, CpuLoad};
+use hytte::services::sensors::{self, CpuFreq, CpuLoad};
 use hytte::services::systemd;
 use hytte::ui::MultiSparkline;
 
 use crate::components::cast;
-use crate::components::format::{fmt_bytes, fmt_rate};
+use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
@@ -59,6 +59,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
     group.add(&build_live_per_core_row());
     group.add(&build_live_processes_row());
     group.add(&build_expandable_cpu_history_row());
+    group.add(&build_expandable_cpu_clock_row());
     group.add(&build_top_apps_expander(
         "Top apps \u{00b7} CPU",
         app_usage::top_by_cpu(),
@@ -790,6 +791,161 @@ fn build_expandable_cpu_history_row() -> gtk::ListBoxRow {
     row.set_selectable(false);
     row.set_hexpand(true);
     row.set_child(Some(&outer_box));
+
+    row
+}
+
+/// Collapsed page for [`build_expandable_cpu_clock_row`]: aggregate CPU clock
+/// `Sparkline`. Per #214's locked design, the aggregate is the **maximum**
+/// current frequency across cores (`CpuFreq::max_hz`), and the graph is
+/// normalized against `max_ceiling_hz` (the highest `cpuinfo_max_freq`) so the
+/// axis is a fixed 0→max-clock domain that shows headroom rather than
+/// auto-scaling to the live window.
+fn build_history_cpu_clock_row() -> gtk::Box {
+    let (row, spark, value) = build_history_row("Clock");
+    spark.set_domain_max(Some(1.0));
+
+    let spark_clone = spark.clone();
+    let value_clone = value.clone();
+    bind(sensors::cpu_freq(), &row, move |_, f: CpuFreq| {
+        let ceiling = f.max_ceiling_hz;
+        let normalized = if ceiling > 0.0 {
+            f.max_hz / ceiling
+        } else {
+            0.0
+        };
+        spark_clone.push(normalized);
+        value_clone.set_text(&fmt_hz(f.max_hz));
+    });
+
+    row
+}
+
+/// Expandable CPU-clock history row: collapsed shows the aggregate (max
+/// across cores) clock `Sparkline`; expanded switches to the per-core
+/// [`MultiSparkline`], each series normalized to the shared `max_ceiling_hz`.
+///
+/// This is #214, the UI half completing the cpufreq work merged in #241 —
+/// same locked design as #210's CPU-usage row (Mara: reusable expand
+/// mechanism, new row in the existing CPU card, not a separate card). The
+/// Stack/chevron/`GestureClick` toggle here is a deliberate **parallel** of
+/// [`build_expandable_cpu_history_row`] rather than a shared helper: the two
+/// rows' collapsed/expanded content (sources, normalization, value
+/// formatting) differ enough that factoring out just the toggle shell would
+/// leave two near-identical stubs calling into it, without shrinking the
+/// per-row bind logic that's the actual bulk of each function. If a third
+/// expandable metric shows up, that's the point to extract the shared shell.
+///
+/// Graceful-degrade: when there's no cpufreq governor (VMs, missing
+/// `/sys/.../cpufreq`), `sensors::cpu_freq()` publishes an empty `CpuFreq`
+/// (`max_ceiling_hz == 0.0`); this row hides entirely rather than showing a
+/// flat/meaningless graph, mirroring the GPU card's and swap row's self-hide.
+///
+/// Returns a [`gtk::ListBoxRow`] so it slots into the [`adw::PreferencesGroup`]
+/// boxed-list in source order (same routing fix as [`history_row_wrapper`]).
+fn build_expandable_cpu_clock_row() -> gtk::ListBoxRow {
+    // ── Collapsed page: aggregate (max) clock sparkline ────────────────────
+    let overall_box = build_history_cpu_clock_row();
+
+    // ── Expanded page: per-core MultiSparkline ─────────────────────────────
+    // Each core's current frequency normalized against the shared
+    // max_ceiling_hz, so the domain stays a fixed 0..=1 (same axis as the
+    // collapsed page) rather than auto-scaling.
+    let percore_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    percore_box.add_css_class("ts-history-row");
+    percore_box.set_hexpand(true);
+
+    let percore_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let percore_name = gtk::Label::new(Some("Per-core clock"));
+    percore_name.add_css_class("ts-stat-name");
+    percore_name.set_xalign(0.0);
+    percore_name.set_hexpand(true);
+    percore_header.append(&percore_name);
+
+    let percore_value = gtk::Label::new(None);
+    percore_value.add_css_class("ts-stat-value");
+    percore_value.set_xalign(1.0);
+    percore_header.append(&percore_value);
+    percore_box.append(&percore_header);
+
+    let percore_graph = MultiSparkline::new(60);
+    percore_graph.set_domain_max(Some(1.0));
+    percore_graph.widget().set_hexpand(true);
+    percore_box.append(percore_graph.widget());
+
+    let percore_graph_c = percore_graph.clone();
+    let percore_value_c = percore_value.clone();
+    bind(sensors::cpu_freq(), &percore_box, move |_, f: CpuFreq| {
+        let ceiling = f.max_ceiling_hz;
+        let normalized: Vec<f64> = if ceiling > 0.0 {
+            f.per_core.iter().map(|&hz| hz / ceiling).collect()
+        } else {
+            vec![0.0; f.per_core.len()]
+        };
+        percore_graph_c.push_frame(&normalized);
+        percore_value_c.set_text(&format!(
+            "{} cores \u{00b7} {}",
+            f.per_core.len(),
+            fmt_hz(f.max_hz)
+        ));
+    });
+
+    // ── Stack: vhomogeneous(false) so the card grows on expand ───────────
+    let stack = gtk::Stack::new();
+    stack.set_vhomogeneous(false);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_hexpand(true);
+    stack.add_named(&overall_box, Some("overall"));
+    stack.add_named(&percore_box, Some("percore"));
+    // Default to collapsed; not persisted across rebuilds.
+    stack.set_visible_child_name("overall");
+
+    // ── Chevron: trailing affordance showing collapsed/expanded state ─────
+    let chevron = gtk::Image::from_icon_name("pan-end-symbolic");
+    chevron.set_valign(gtk::Align::Center);
+    chevron.set_icon_size(gtk::IconSize::Normal);
+
+    // ── Outer box: hosts stack + chevron, receives the GestureClick ───────
+    // adw::PreferencesGroup's internal GtkListBox does NOT activate plain
+    // GtkListBoxRows on click (only its own Adw row types), so we cannot rely
+    // on connect_activate.  A GestureClick on the content widget fires directly
+    // on pointer release, independent of list activation.
+    let outer_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    outer_box.set_hexpand(true);
+    outer_box.append(&stack);
+    outer_box.append(&chevron);
+
+    let gesture = gtk::GestureClick::new();
+    let stack_for_gesture = stack.clone();
+    let chevron_for_gesture = chevron.clone();
+    gesture.connect_released(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let expanded = stack_for_gesture.visible_child_name().as_deref() == Some("percore");
+        if expanded {
+            stack_for_gesture.set_visible_child_name("overall");
+            chevron_for_gesture.set_icon_name(Some("pan-end-symbolic"));
+        } else {
+            stack_for_gesture.set_visible_child_name("percore");
+            chevron_for_gesture.set_icon_name(Some("pan-down-symbolic"));
+        }
+    });
+    outer_box.add_controller(gesture);
+
+    // ── Row wrapper: NOT activatable (gesture handles click) ──────────────
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+    row.set_hexpand(true);
+    row.set_child(Some(&outer_box));
+
+    // Graceful-degrade: hide the whole row when no cpufreq governor is
+    // present (empty CpuFreq → max_ceiling_hz == 0.0), same convention as the
+    // GPU card / swap row self-hides above.
+    bind(
+        sensors::cpu_freq().map(|f| f.max_ceiling_hz > 0.0),
+        &row,
+        gtk::prelude::WidgetExt::set_visible,
+    );
 
     row
 }

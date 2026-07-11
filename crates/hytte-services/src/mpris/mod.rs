@@ -47,7 +47,7 @@ use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -155,22 +155,31 @@ pub struct MprisService;
 impl Service for MprisService {
     type Handles = MprisHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = MprisHandles::default();
         let players_mutable = handles.players.clone();
         let active_mutable = handles.active.clone();
 
-        rt.spawn(async move {
-            loop {
-                match listen(&players_mutable, &active_mutable).await {
-                    Ok(()) => {
-                        tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
+        // Supervised so a panic inside the listener (e.g. in a future parser
+        // regression) restarts the reconnect loop instead of freezing the
+        // `players` signal forever. The inner `loop` still handles the ordinary
+        // stream-closed / error reconnect; the supervisor only re-runs the
+        // whole factory on an actual panic.
+        spawn_supervised("mpris", move || {
+            let players = players_mutable.clone();
+            let active = active_mutable.clone();
+            async move {
+                loop {
+                    match listen(&players, &active).await {
+                        Ok(()) => {
+                            tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "mpris watcher error, reconnecting in 2s");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "mpris watcher error, reconnecting in 2s");
-                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
@@ -728,8 +737,15 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
             tracing::debug!(name, "found existing mpris player");
             let state2 = state.clone();
             let bus_name = name.clone();
-            tokio::spawn(async move {
-                spawn_player_tasks(state2, bus_name).await;
+            // Supervised: `spawn_player_tasks` reads + parses this player's
+            // (untrusted) metadata, so it's the real panic surface. A clean
+            // completion (player closed / stream ended) does not restart.
+            spawn_supervised("mpris-player", move || {
+                let state = state2.clone();
+                let bus_name = bus_name.clone();
+                async move {
+                    spawn_player_tasks(state, bus_name).await;
+                }
             });
         }
     }
@@ -760,8 +776,13 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
             tracing::debug!(name, "mpris player appeared");
             let state2 = state.clone();
             let bus_name = name.clone();
-            tokio::spawn(async move {
-                spawn_player_tasks(state2, bus_name).await;
+            // Supervised — same rationale as the startup-discovery spawn above.
+            spawn_supervised("mpris-player", move || {
+                let state = state2.clone();
+                let bus_name = bus_name.clone();
+                async move {
+                    spawn_player_tasks(state, bus_name).await;
+                }
             });
         }
     }

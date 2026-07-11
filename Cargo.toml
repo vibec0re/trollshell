@@ -8,6 +8,7 @@ members = [
   "crates/hytte-bus",
   "crates/hytte-ecal",
   "crates/hytte-blur",
+  "crates/hytte-plugin-proto",
   "trollshell",
 ]
 

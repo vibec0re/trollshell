@@ -1,6 +1,6 @@
 //! Shared scaffold for bar-chip indicator buttons.
 //!
-//! Every bar chip follows the same two-step pattern:
+//! Every clickable bar chip follows the same two-step pattern:
 //!
 //! 1. **Open** — create a `gtk::Button` with `"ts-indicator"` + a per-chip
 //!    class, then attach the chip-specific child widget.
@@ -8,11 +8,16 @@
 //!    [`crate::modal::toggle`]`(monitor, page, btn)`.
 //!
 //! [`indicator`] covers both steps; chips call it instead of repeating the
-//! boilerplate inline. For the bar chips that display a small vertical fill
-//! bar (cpu / memory / gpu / disk), [`vertical_bar`] builds the
-//! `gtk::ProgressBar` with the standard orientation, inversion and alignment.
-//! The disk chip creates its bars dynamically inside a bind closure and calls
-//! [`vertical_bar`] there.
+//! boilerplate inline. [`indicator`] *always* wires a click-through to some
+//! drawer `Page` — there's no click-less variant of it. A chip that's a pure
+//! status light with no page to open (e.g. the screencast privacy indicator)
+//! uses [`static_indicator`] instead, which shares the same CSS scaffold but
+//! wires no click at all.
+//!
+//! For the bar chips that display a small vertical fill bar (cpu / memory /
+//! gpu / disk), [`vertical_bar`] builds the `gtk::ProgressBar` with the
+//! standard orientation, inversion and alignment. The disk chip creates its
+//! bars dynamically inside a bind closure and calls [`vertical_bar`] there.
 
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
@@ -35,6 +40,23 @@ pub(crate) fn indicator(class: &str, page: Page, monitor: &Monitor) -> gtk::Butt
         crate::modal::toggle(&monitor_for_click, page, b);
     });
 
+    btn
+}
+
+/// Build a non-interactive chip button: same `"ts-indicator"` + `class`
+/// scaffold as [`indicator`], but with no `connect_clicked` wiring and no
+/// `Page` to open — for chips that are pure status lights (nothing to drill
+/// into today). `can_target`/`focusable` are turned off so it doesn't eat
+/// pointer/keyboard focus it has no use for.
+///
+/// The caller is responsible for attaching a child widget (icon, label, …)
+/// via `btn.set_child(…)` after this call.
+pub(crate) fn static_indicator(class: &str) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.add_css_class("ts-indicator");
+    btn.add_css_class(class);
+    btn.set_can_target(false);
+    btn.set_focusable(false);
     btn
 }
 

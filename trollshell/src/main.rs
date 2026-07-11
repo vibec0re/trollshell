@@ -232,6 +232,9 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
                 widgets::settings_chip::widget(monitor),
                 widgets::power_chip::widget(monitor),
             ]),
+            // Privacy indicator, kept in its own group so it doesn't shift
+            // when other chips hide/show — see #221.
+            group([widgets::screencast::widget(monitor)]),
         ])
         .show();
 

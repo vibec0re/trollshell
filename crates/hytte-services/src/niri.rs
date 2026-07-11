@@ -30,6 +30,16 @@ pub use niri_ipc::{Cast, CastKind, CastTarget, Window, WindowLayout, Workspace};
 /// The niri IPC service handle.
 pub struct NiriService;
 
+/// A completed niri screenshot capture (`Event::ScreenshotCaptured`).
+///
+/// `path` mirrors the event's own field: `Some(path)` when niri wrote the
+/// screenshot to disk, `None` when it was only copied to the clipboard (or
+/// the path wasn't valid UTF-8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedShot {
+    pub path: Option<String>,
+}
+
 /// Internal handles holding the reactive state.
 #[doc(hidden)]
 pub struct NiriHandles {
@@ -37,6 +47,7 @@ pub struct NiriHandles {
     pub(crate) windows: Mutable<Vec<Window>>,
     pub(crate) focused_window: Mutable<Option<Window>>,
     pub(crate) casts: Mutable<Vec<Cast>>,
+    pub(crate) screenshot_captured: Mutable<Option<CapturedShot>>,
 }
 
 impl Default for NiriHandles {
@@ -46,6 +57,7 @@ impl Default for NiriHandles {
             windows: Mutable::new(Vec::new()),
             focused_window: Mutable::new(None),
             casts: Mutable::new(Vec::new()),
+            screenshot_captured: Mutable::new(None),
         }
     }
 }
@@ -59,6 +71,7 @@ impl Service for NiriService {
         let win_list_writer = handles.windows.clone();
         let win_focus_writer = handles.focused_window.clone();
         let casts_writer = handles.casts.clone();
+        let screenshot_writer = handles.screenshot_captured.clone();
 
         rt.spawn_blocking(move || {
             loop {
@@ -67,6 +80,7 @@ impl Service for NiriService {
                     &win_list_writer,
                     &win_focus_writer,
                     &casts_writer,
+                    &screenshot_writer,
                 ) {
                     Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
                     Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
@@ -84,6 +98,7 @@ fn listen_once(
     windows: &Mutable<Vec<Window>>,
     focused_window: &Mutable<Option<Window>>,
     casts: &Mutable<Vec<Cast>>,
+    screenshot_captured: &Mutable<Option<CapturedShot>>,
 ) -> Result<()> {
     let mut socket = Socket::connect().context("connect to NIRI_SOCKET")?;
 
@@ -101,7 +116,14 @@ fn listen_once(
 
     loop {
         let event = read_event().map_err(|e| anyhow!("read niri event: {e}"))?;
-        apply_event(event, workspaces, windows, focused_window, casts);
+        apply_event(
+            event,
+            workspaces,
+            windows,
+            focused_window,
+            casts,
+            screenshot_captured,
+        );
     }
 }
 
@@ -111,6 +133,7 @@ fn apply_event(
     windows: &Mutable<Vec<Window>>,
     focused_window: &Mutable<Option<Window>>,
     casts: &Mutable<Vec<Cast>>,
+    screenshot_captured: &Mutable<Option<CapturedShot>>,
 ) {
     match event {
         Event::WorkspacesChanged { workspaces: ws } => {
@@ -224,6 +247,13 @@ fn apply_event(
         Event::CastStopped { stream_id } => {
             casts.lock_mut().retain(|c| c.stream_id != stream_id);
         }
+        // Fired once niri's own screenshot UI (opened via `screenshot()`)
+        // completes a capture. `path` is `Some` when niri wrote the image to
+        // disk, `None` when it only went to the clipboard. Every emission is
+        // a fresh capture, so this always `set`s rather than merging.
+        Event::ScreenshotCaptured { path } => {
+            screenshot_captured.set(Some(CapturedShot { path }));
+        }
         _ => {}
     }
 }
@@ -294,6 +324,21 @@ pub fn active_casts() -> impl Signal<Item = Vec<Cast>> {
     })
 }
 
+/// Signal of the most recent completed screenshot capture, if any.
+///
+/// `None` until the first capture of this process's lifetime; thereafter
+/// `Some` and updated on every subsequent `Event::ScreenshotCaptured` (never
+/// reset back to `None` between captures — subscribers should treat every
+/// emission of `Some` as "a fresh capture just happened", not react to level.
+pub fn screenshot_captured() -> impl Signal<Item = Option<CapturedShot>> {
+    registry::with(|r| {
+        r.get::<NiriHandles>()
+            .expect("niri::service() not registered")
+            .screenshot_captured
+            .signal_cloned()
+    })
+}
+
 /// Tolerance (logical pixels) when comparing a window's tile width to a
 /// monitor's logical width to detect an edge-spanning window. niri
 /// reports sizes in logical pixels; a few pixels of slack cover
@@ -358,6 +403,21 @@ pub fn focus_workspace(id: u64) {
 /// Focus the window with the given id (fire-and-forget).
 pub fn focus_window(id: u64) {
     send_action(Action::FocusWindow { id });
+}
+
+/// Open niri's own interactive screenshot UI (region/window selection is
+/// niri's UI, not trollshell's) — fire-and-forget.
+///
+/// `show_pointer: true` matches niri's own CLI default. `path: None` lets
+/// niri save according to its configured `screenshot-path` rather than
+/// trollshell dictating a location. The eventual capture (or cancellation —
+/// niri simply never emits the event) surfaces via
+/// [`Event::ScreenshotCaptured`] → [`screenshot_captured()`].
+pub fn screenshot() {
+    send_action(Action::Screenshot {
+        show_pointer: true,
+        path: None,
+    });
 }
 
 /// Ask niri to exit the session (fire-and-forget).
@@ -506,6 +566,7 @@ mod tests {
         let windows = Mutable::new(vec![small]);
         let focused_window = Mutable::new(None);
         let casts = Mutable::new(Vec::new());
+        let screenshot_captured = Mutable::new(None);
 
         // Pre-condition: not edge-spanning.
         assert!(!has_edge_window(
@@ -524,6 +585,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         assert!(has_edge_window(
@@ -545,6 +607,7 @@ mod tests {
         let windows = Mutable::new(vec![w.clone()]);
         let focused_window = Mutable::new(Some(w));
         let casts = Mutable::new(Vec::new());
+        let screenshot_captured = Mutable::new(None);
 
         apply_event(
             Event::WindowLayoutsChanged {
@@ -554,6 +617,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         let focused = focused_window.lock_ref().clone().expect("focused set");
@@ -570,6 +634,7 @@ mod tests {
         let windows: Mutable<Vec<Window>> = Mutable::new(Vec::new());
         let focused_window = Mutable::new(None);
         let casts = Mutable::new(Vec::new());
+        let screenshot_captured = Mutable::new(None);
 
         apply_event(
             Event::WindowLayoutsChanged {
@@ -579,6 +644,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         assert!(windows.lock_ref().is_empty());
@@ -606,6 +672,7 @@ mod tests {
         let windows = Mutable::new(Vec::new());
         let focused_window = Mutable::new(None);
         let casts = Mutable::new(vec![mk_cast(1, CastTarget::Nothing {})]);
+        let screenshot_captured = Mutable::new(None);
 
         apply_event(
             Event::CastsChanged {
@@ -620,6 +687,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         let list = casts.lock_ref();
@@ -635,6 +703,7 @@ mod tests {
         let windows = Mutable::new(Vec::new());
         let focused_window = Mutable::new(None);
         let casts = Mutable::new(Vec::new());
+        let screenshot_captured = Mutable::new(None);
 
         apply_event(
             Event::CastStartedOrChanged {
@@ -644,6 +713,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
         assert_eq!(casts.lock_ref().len(), 1);
 
@@ -661,6 +731,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         let list = casts.lock_ref();
@@ -686,6 +757,7 @@ mod tests {
             mk_cast(1, CastTarget::Nothing {}),
             mk_cast(2, CastTarget::Nothing {}),
         ]);
+        let screenshot_captured = Mutable::new(None);
 
         apply_event(
             Event::CastStopped { stream_id: 1 },
@@ -693,6 +765,7 @@ mod tests {
             &windows,
             &focused_window,
             &casts,
+            &screenshot_captured,
         );
 
         let list = casts.lock_ref();

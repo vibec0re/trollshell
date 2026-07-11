@@ -181,6 +181,11 @@ fn main() -> hytte::ui::Result<()> {
                 },
             ));
 
+            // Post a plain "Screenshot saved" toast whenever niri reports a
+            // completed capture. Single global subscription — see
+            // `install_screenshot_toast` for why.
+            install_screenshot_toast();
+
             // The frame / notifications / OSD / prompt overlays are installed
             // (and re-installed on hot-plug) inside the monitors_changed loop
             // above, alongside the bars — see #225.
@@ -229,6 +234,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             group([widgets::clock::widget(monitor)]),
             group([
                 widgets::notif_indicator::widget(monitor),
+                widgets::screenshot::widget(monitor),
                 widgets::settings_chip::widget(monitor),
                 widgets::power_chip::widget(monitor),
             ]),
@@ -301,6 +307,31 @@ fn apply_scaled_base_font(provider: &gtk::CssProvider) {
         "* {{ font-size: {:.4}px; }}",
         scale::css_base_font_px()
     ));
+}
+
+/// Post a plain "Screenshot saved" toast whenever niri reports a completed
+/// capture (`Event::ScreenshotCaptured` → `niri::screenshot_captured()`).
+///
+/// A single global subscription — not one per monitor/bar — so an
+/// N-monitor setup doesn't fire N toasts for one screenshot; mirrors the
+/// `netconn`/`app_usage` single-subscription shape in [`main`].
+///
+/// Deliberately no action buttons: Open/Copy need the local-action-dispatch
+/// design call the #220 triage flagged as unresolved (`post_local` toasts
+/// carry no actions today).
+fn install_screenshot_toast() {
+    glib::MainContext::default().spawn_local(niri::screenshot_captured().for_each(|shot| {
+        if let Some(shot) = shot {
+            let path = shot.path.as_deref().unwrap_or("clipboard only");
+            notifications::post_local(
+                "Screenshot",
+                "Screenshot saved",
+                path,
+                notifications::Urgency::Normal,
+            );
+        }
+        std::future::ready(())
+    }));
 }
 
 /// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from

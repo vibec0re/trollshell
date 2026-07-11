@@ -30,6 +30,21 @@ pub(crate) fn fmt_rate(bps: f64) -> String {
     format!("{}/s", fmt_bytes_f64(bps))
 }
 
+/// Format a clock frequency in Hz as a human-readable string (e.g. `"3.8 GHz"`).
+/// Used by the CPU-clock history row (`sensors::cpu_freq()`); modern CPU
+/// clocks land in the GHz range, but lower magnitudes degrade gracefully.
+pub(crate) fn fmt_hz(hz: f64) -> String {
+    if hz >= 1_000_000_000.0 {
+        format!("{:.1} GHz", hz / 1_000_000_000.0)
+    } else if hz >= 1_000_000.0 {
+        format!("{:.0} MHz", hz / 1_000_000.0)
+    } else if hz >= 1_000.0 {
+        format!("{:.0} kHz", hz / 1_000.0)
+    } else {
+        format!("{hz:.0} Hz")
+    }
+}
+
 /// Format a [`std::time::Duration`] as a human-readable string with a caller-
 /// supplied suffix (e.g. `"1h 30m until full"`).
 pub(crate) fn fmt_dur(d: std::time::Duration, suffix: &str) -> String {

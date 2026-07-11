@@ -4,6 +4,7 @@ mod components;
 mod modal;
 mod overlays;
 mod panels;
+mod plugins;
 mod scale;
 mod widgets;
 
@@ -78,6 +79,11 @@ fn main() -> hytte::ui::Result<()> {
         .with(clipboard::service())
         .with(calendar::service())
         .with(tasks::service())
+        // Out-of-process widget-plugin host transport (#35 PR 2). Listens on a
+        // per-user socket; plugins dial in as systemd user units. The GTK-side
+        // halves (clock pump, effect broker) are wired via `plugins::install()`
+        // below; the sidebar reconciler slots mount in `build_card`.
+        .with(plugins::service())
         .with_user_style(assets::path("style.css"))
         .run(|app| {
             // GSettings schemas often aren't visible to `cargo run` from the
@@ -161,6 +167,13 @@ fn main() -> hytte::ui::Result<()> {
             // loop. Must run after services are registered so it can pull
             // bluetooth + pipewire signals out of the registry.
             bluetooth_audio::init();
+
+            // Wire the GTK-thread halves of the plugin host transport: the
+            // clock→wire state pump and the (global) effect broker. Must run
+            // after services are registered — it pulls the plugins + clock
+            // handles out of the registry. The per-monitor reconciler slots
+            // mount separately in `overlays::sidebar::build_card`.
+            plugins::install();
 
             // Gate netconn's always-on `ss -tunpH` poller on drawer
             // visibility (#50): it only feeds the Connections/Network drawer

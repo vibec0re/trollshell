@@ -15,5 +15,12 @@ chrono = { version = "0.4.44", default-features = false, features = [
   "std",
 ] }
 hytte = { path = "../crates/hytte" }
+# Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
+# framing helpers. GTK/adw/futures-signals still go through `hytte`'s
+# re-exports; tokio + the proto crate aren't re-exported, so they're direct.
+hytte-plugin-proto = { path = "../crates/hytte-plugin-proto", features = [
+  "tokio",
+] }
+tokio = { version = "1.52.1", features = ["net", "rt", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }

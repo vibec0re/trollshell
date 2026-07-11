@@ -129,8 +129,21 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
         vbox.append(&subtitle);
     }
 
+    // A reopened prompt whose previously-submitted secret was rejected gets an
+    // error-styled subtitle, so a retry doesn't read as a byte-identical,
+    // indistinguishable re-ask.
+    if req.prior_failure {
+        let error_label = gtk::Label::new(Some("Authentication failed — check the passphrase"));
+        error_label.add_css_class("ts-prompt-error");
+        error_label.set_xalign(0.0);
+        vbox.append(&error_label);
+    }
+
     let entry = gtk::PasswordEntry::new();
     entry.set_show_peek_icon(true);
+    if req.prior_failure {
+        entry.add_css_class("error");
+    }
     vbox.append(&entry);
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -139,6 +152,9 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     let cancel_btn = gtk::Button::with_label("Cancel");
     let connect_btn = gtk::Button::with_label("Connect");
     connect_btn.add_css_class("suggested-action");
+    // Disabled until the entry holds text — an empty submit is otherwise a
+    // silent no-op the agent just re-prompts for.
+    connect_btn.set_sensitive(false);
     buttons.append(&cancel_btn);
     buttons.append(&connect_btn);
     vbox.append(&buttons);
@@ -158,12 +174,25 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     });
     window.add_controller(key_ctrl);
 
+    // ── Entry text → Connect sensitivity ─────────────────────────────────────
+    //
+    // An empty submit is a silent no-op the agent just re-prompts for, so keep
+    // Connect disabled (and Enter inert) until the entry holds text.
+
+    let connect_btn_for_guard = connect_btn.clone();
+    entry.connect_changed(move |e| {
+        connect_btn_for_guard.set_sensitive(!e.text().is_empty());
+    });
+
     // ── Enter in entry → submit ───────────────────────────────────────────────
 
     let entry_for_activate = entry.clone();
     let id_for_activate = req.id;
     entry.connect_activate(move |_| {
         let text = entry_for_activate.text().to_string();
+        if text.is_empty() {
+            return;
+        }
         wifi::submit_prompt(id_for_activate, &text);
     });
 
@@ -180,6 +209,9 @@ fn show_prompt(monitor: &Monitor, req: wifi::PromptRequest) {
     let id_for_connect = req.id;
     connect_btn.connect_clicked(move |_| {
         let text = entry_for_connect.text().to_string();
+        if text.is_empty() {
+            return;
+        }
         wifi::submit_prompt(id_for_connect, &text);
     });
 

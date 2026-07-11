@@ -85,4 +85,12 @@ pub struct PromptRequest {
     pub security: String,
     /// Which kind of secret is being requested — drives the overlay's wording.
     pub kind: PromptKind,
+    /// `true` when this prompt is a reopen after a previously-submitted secret
+    /// was rejected. Only the NM backend can populate this reliably — it maps
+    /// `NM_SECRET_AGENT_GET_SECRETS_FLAG_REQUEST_NEW` on `GetSecrets` (a
+    /// stateless, per-call, authoritative "the last secret was rejected" bit).
+    /// The iwd backend has no equivalent signal on `RequestPassphrase`, so it
+    /// always sets this `false`. Deliberately a bool, not an attempt count —
+    /// NM cannot produce a count, only this one bit.
+    pub prior_failure: bool,
 }

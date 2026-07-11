@@ -27,5 +27,12 @@ tokio = { version = "1.52.1", default-features = false, features = [
 tokio-stream = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-# `io::duplex` gives the session loop a hermetic in-memory "socket".
-tokio = { version = "1.52.1", features = ["rt", "macros", "io-util", "time"] }
+# `io::duplex` gives the session loop a hermetic in-memory "socket";
+# `test-util` lets the reconnect-loop test auto-advance the backoff sleeps.
+tokio = { version = "1.52.1", features = [
+  "rt",
+  "macros",
+  "io-util",
+  "time",
+  "test-util",
+] }

@@ -40,7 +40,11 @@ pub enum HostMsg {
     EffectResult { id: u64, outcome: EffectOutcome },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
-    /// The host is going away; the plugin should exit cleanly.
+    /// The host is going away; no further frames follow and the connection is
+    /// about to close. Treat it as end-of-session — reconnect policy is the
+    /// plugin's. (The `hytte-plugin` runtime redials with backoff rather than
+    /// exiting: plugin units run `Restart=on-failure`, so a clean exit would
+    /// strand the plugin across a host restart.)
     Shutdown,
 }
 

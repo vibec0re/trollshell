@@ -18,6 +18,10 @@
 //!
 //! - **Liveness**: a host [`Ping`](proto::HostMsg::Ping) is answered with
 //!   [`Pong`](proto::PluginMsg::Pong) internally — it is not an [`Input`].
+//! - **The greeting**: right after `Register`, the runtime sends one
+//!   `Log { Info, "<id> connected" }` frame. That is the wire `Log` path's
+//!   only SDK surface in v1 — plugin diagnostics go to stderr, which systemd
+//!   routes to the journal.
 //! - **Shutdown ≡ disconnect**: on [`Shutdown`](proto::HostMsg::Shutdown) (or
 //!   socket EOF) the session ends and the runtime redials with backoff. It
 //!   deliberately does **not** exit: plugin units run `Restart=on-failure`, so
@@ -56,10 +60,16 @@ pub use runtime::run;
 /// the codec/framing helpers matter only if you bypass [`run`].)
 pub use hytte_plugin_proto as proto;
 
+/// Stream constructors/combinators for building [`Plugin::sources`] values
+/// (`iter`, `wrappers::*`, `StreamExt`, …) — re-exported wholesale so a
+/// source-driven plugin still needs no dependency beyond this crate.
+pub use tokio_stream;
+
 /// A boxed message stream returned by [`Plugin::sources`]. Any well-behaved
-/// [`Stream`](tokio_stream::Stream) qualifies (`tokio_stream` wrappers,
-/// channel receivers, …); the runtime polls it inside a `select!`, so it must
-/// tolerate being polled incrementally, as all standard combinators do.
+/// [`Stream`](tokio_stream::Stream) qualifies (build one from the
+/// re-exported [`tokio_stream`]: its wrappers, `iter`, channel receivers, …);
+/// the runtime polls it inside a `select!`, so it must tolerate being polled
+/// incrementally, as all standard combinators do.
 pub type MsgStream<M> = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = M>>>;
 
 /// One app-level input folded into the plugin's model by

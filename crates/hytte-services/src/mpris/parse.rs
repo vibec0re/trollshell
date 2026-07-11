@@ -105,13 +105,16 @@ fn parse_length(val: Option<&OwnedValue>) -> u64 {
 }
 
 /// Parse `mpris:trackid` from an `OwnedValue`. May be an `ObjectPath`, a plain
-/// String, or a Variant wrapping one of those. Returns the underlying path/
-/// string as a `String`, or `None` if absent or unparseable.
+/// String, or a Variant wrapping one of those (some players double-wrap the
+/// entry in a nested `Value::Value` rather than sending a bare
+/// `ObjectPath`/`String`). Returns the underlying path/string as a `String`,
+/// or `None` if absent or unparseable.
 fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
     let v = val?;
     let Ok(owned) = v.try_clone() else {
         return None;
     };
+    let owned = unwrap_variant(owned)?;
 
     // Try ObjectPath first (most common).
     if let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(owned.clone()) {
@@ -122,6 +125,21 @@ fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
         return Some(s);
     }
     None
+}
+
+/// Peel any `Value::Value` variant wrapping around `value`. Some MPRIS
+/// players deliver `mpris:trackid` doubly-wrapped in a Variant rather than as
+/// a bare `ObjectPath`/`String`; without peeling, `OwnedObjectPath::try_from`
+/// / `String::try_from` see the wrapper type and fail. Mirrors tray parse's
+/// `unwrap_variant` (#259 / `crates/hytte-services/src/tray/parse.rs`), and
+/// loops to handle repeated wrapping. Returns `None` (rather than panicking)
+/// if re-owning the peeled value fails.
+fn unwrap_variant(value: OwnedValue) -> Option<OwnedValue> {
+    let mut inner: zbus::zvariant::Value<'static> = value.into();
+    while let zbus::zvariant::Value::Value(boxed) = inner {
+        inner = *boxed;
+    }
+    OwnedValue::try_from(inner).ok()
 }
 
 #[cfg(test)]
@@ -228,18 +246,34 @@ mod tests {
         assert_eq!(id.as_deref(), Some("/players/track/7"));
     }
 
-    /// The doc comment promises a "Variant wrapping one of those" is handled,
-    /// but `OwnedObjectPath::try_from` / `String::try_from` do not peel a
-    /// nested `Value::Value`, so a variant-wrapped trackid currently resolves
-    /// to `None`. Pinned here (behaviour-preserving) so a later fix that peels
-    /// the variant flips this assertion deliberately — the doc-vs-code gap the
-    /// #233 triage flagged.
+    /// The doc comment promises a "Variant wrapping one of those" is handled;
+    /// `parse_track_id` now peels a nested `Value::Value` via `unwrap_variant`
+    /// (mirroring tray parse's #259 fix) before trying `OwnedObjectPath`/
+    /// `String`, so a variant-wrapped trackid resolves to the wrapped path —
+    /// closing the doc-vs-code gap the #233 triage flagged.
     #[test]
-    fn track_id_variant_wrapped_object_path_currently_none() {
+    fn track_id_variant_wrapped_object_path_peeled() {
         let op = ObjectPath::try_from("/nested/track/1").expect("valid path");
         let wrapped = Value::Value(Box::new(Value::from(op)));
         let owned_wrapped = wrapped.try_to_owned().expect("variant serialises");
-        assert_eq!(parse_track_id(Some(&owned_wrapped)), None);
+        assert_eq!(
+            parse_track_id(Some(&owned_wrapped)).as_deref(),
+            Some("/nested/track/1")
+        );
+    }
+
+    /// `unwrap_variant` loops rather than peeling a single layer, so a
+    /// doubly-wrapped trackid (`Value::Value(Value::Value(ObjectPath))`) also
+    /// resolves — some players/proxies nest the wrapper more than once.
+    #[test]
+    fn track_id_double_variant_wrapped_object_path_peeled() {
+        let op = ObjectPath::try_from("/nested/track/2").expect("valid path");
+        let wrapped = Value::Value(Box::new(Value::Value(Box::new(Value::from(op)))));
+        let owned_wrapped = wrapped.try_to_owned().expect("variant serialises");
+        assert_eq!(
+            parse_track_id(Some(&owned_wrapped)).as_deref(),
+            Some("/nested/track/2")
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod cast;
 pub mod chip;
 pub mod connection_row;
 pub mod deep_link_row;
+pub mod diff;
 pub mod focus;
 pub mod format;
 pub mod history_row;

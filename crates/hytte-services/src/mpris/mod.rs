@@ -25,10 +25,22 @@
 //! mpris::previous(bus_name);
 //! mpris::set_position(bus_name, track_id, position_us);
 //! mpris::select_player(Some(bus_name)); // pin; None reverts to automatic
+//! mpris::set_active(bool);              // gate the position poller (#228)
 //!
 //! // Art fetch (async, cached):
 //! mpris::art_for_url(url).await -> Option<Vec<u8>>
 //! ```
+//!
+//! # Module layout
+//!
+//! The untrusted-input metadata parsers (the pure functions that pull fields
+//! out of an arbitrary player's `a{sv}` `Metadata` map) live in [`parse`],
+//! which is free of I/O and hermetically unit-tested. This file keeps the
+//! service, D-Bus, per-player-task, and signal-emit logic — including the
+//! bus-touching `read_metadata` orchestrator that fetches the map and hands
+//! it to [`parse::parse_metadata`].
+
+mod parse;
 
 use anyhow::{Context, Result};
 use futures_signals::map_ref;
@@ -109,6 +121,20 @@ pub struct MprisHandles {
     /// pinned. `None` means "automatic" (follow the [`pick_active`]
     /// heuristic). Consumed read-side by [`active_player`].
     pub(crate) selected: Mutable<Option<String>>,
+    /// Gate for the per-player `Position` pollers (#228). While `false`, every
+    /// `poll_position` task parks and forks no D-Bus calls; flipping it back
+    /// to `true` resumes 250 ms sampling immediately (the loop `select!`s on
+    /// this so reactivation isn't delayed a full tick) and takes one eager
+    /// poll on resume so the seek bar snaps fresh the instant a media panel
+    /// opens.
+    ///
+    /// Defaults to `true` so position sampling runs eagerly at startup —
+    /// `set_active(false)` parks it once the binary reports no
+    /// `Page::uses_mpris_position` panel is visible. See [`set_active`].
+    /// This single gate is shared across *all* per-player pollers (cloned
+    /// into [`State`], which is where the pollers actually live — see
+    /// `State::active`).
+    pub(crate) active: Mutable<bool>,
 }
 
 impl Default for MprisHandles {
@@ -116,6 +142,7 @@ impl Default for MprisHandles {
         Self {
             players: Mutable::new(Vec::new()),
             selected: Mutable::new(None),
+            active: Mutable::new(true),
         }
     }
 }
@@ -131,10 +158,11 @@ impl Service for MprisService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = MprisHandles::default();
         let players_mutable = handles.players.clone();
+        let active_mutable = handles.active.clone();
 
         rt.spawn(async move {
             loop {
-                match listen(&players_mutable).await {
+                match listen(&players_mutable, &active_mutable).await {
                     Ok(()) => {
                         tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
                     }
@@ -228,6 +256,28 @@ pub fn select_player(bus_name: Option<String>) {
             .expect("mpris::service() not registered")
             .selected
             .set(bus_name);
+    });
+}
+
+/// Gate the per-player `Position` pollers (#228): `true` resumes 250 ms
+/// sampling (taking one poll immediately so the seek bar snaps fresh),
+/// `false` parks every `poll_position` task so they fork no D-Bus calls
+/// while no media drawer page — the only consumer of `position_us` — is
+/// visible.
+///
+/// Fire-and-forget command: the binary wires the media-drawer-visibility
+/// signal to this so the always-on pollers idle when no one's looking (#228,
+/// mirroring the #50 `netconn`/`app_usage` gates). A no-op `set` to the same
+/// value is skipped to avoid spurious loop wakeups.
+pub fn set_active(active: bool) {
+    registry::with(|r| {
+        let handle = &r
+            .get::<MprisHandles>()
+            .expect("mpris::service() not registered")
+            .active;
+        if handle.get() != active {
+            handle.set(active);
+        }
     });
 }
 
@@ -386,14 +436,21 @@ struct State {
     /// derived read-side in [`active_player`] from this list plus the
     /// `selected` override, so the watcher only needs to publish the list.
     players: Mutable<Vec<Player>>,
+    /// Gate for the per-player `Position` pollers (#228), cloned from
+    /// [`MprisHandles::active`]. `poll_position` is spawned once per player
+    /// (unlike netconn's single global loop), so the gate lives here — the
+    /// shared `State` — rather than being threaded straight into each
+    /// poller task individually.
+    active: Mutable<bool>,
 }
 
 impl State {
-    fn new(players: Mutable<Vec<Player>>) -> Self {
+    fn new(players: Mutable<Vec<Player>>, active: Mutable<bool>) -> Self {
         Self {
             map: Arc::new(AsyncMutex::new(HashMap::new())),
             order: Arc::new(AsyncMutex::new(Vec::new())),
             players,
+            active,
         }
     }
 
@@ -564,12 +621,38 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
 /// notified via `PropertiesChanged` in the MPRIS spec), updates `position_us`
 /// in state, and re-publishes. Self-exits when the bus name disappears from
 /// state.
+///
+/// Gated on `state.active` (#228): while inactive (no media drawer page
+/// visible on any monitor), the loop parks and forks no D-Bus calls at all —
+/// not even the "is it Playing" state-map check. Reactivation is instant
+/// (`select!`s on the gate rather than sleeping through a stale tick) and
+/// takes one eager poll immediately on resume, via `reset_immediately`, so
+/// the seek bar snaps to the true position the instant the panel opens
+/// rather than waiting up to 250 ms for the next tick.
 async fn poll_position(state: State, bus_name: String) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        interval.tick().await;
+        // Park (forking nothing) while gated inactive. `wait_for(true)`
+        // resolves immediately if we're already active by the time we get
+        // here (no lost wakeup, mirrors netconn.rs/app_usage.rs). Once
+        // reactivated, reset the interval so the following tick fires right
+        // away instead of waiting out whatever was left of the last 250 ms
+        // window before we parked.
+        if !state.active.get() {
+            let _ = state.active.signal().wait_for(true).await;
+            interval.reset_immediately();
+        }
+
+        // Wait for the next tick, but bail out early if we get gated
+        // inactive mid-wait — no point holding the timer while parked.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = state.active.signal().wait_for(false) => {
+                continue;
+            }
+        }
 
         // Check whether the player still exists and is Playing.
         let is_playing = {
@@ -617,8 +700,8 @@ async fn poll_position(state: State, bus_name: String) {
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
 
-async fn listen(players: &Mutable<Vec<Player>>) -> Result<()> {
-    let state = State::new(players.clone());
+async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Result<()> {
+    let state = State::new(players.clone(), active.clone());
 
     // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
     // names, so we don't miss any registrations during the startup window.
@@ -762,118 +845,19 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
 /// Extract track metadata from the `Metadata` property. Returns
 /// `(title, artists, album, art_url, length_us, track_id)` — all default
 /// to empty / zero / None on missing/malformed values.
+///
+/// The (I/O-touching) bus fetch lives here; the pure field extraction is
+/// delegated to [`parse::parse_metadata`].
 async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, Option<String>) {
-    let raw: OwnedValue = match get_property(bus_name, PLAYER_IFACE, "Metadata").await {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                0,
-                None,
-            );
-        }
-    };
-
-    let map: HashMap<String, OwnedValue> = match HashMap::try_from(raw) {
-        Ok(m) => m,
-        Err(_) => {
-            return (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                0,
-                None,
-            );
-        }
-    };
-
-    let title = map
-        .get("xesam:title")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    let album = map
-        .get("xesam:album")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    // xesam:artist is a string array (as); handle gracefully if absent or malformed.
-    let artists = parse_artist_array(map.get("xesam:artist"));
-
-    // xesam:artUrl — a plain string in most players.
-    let art_url = map
-        .get("xesam:artUrl")
-        .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default();
-
-    // mpris:length — u64 or i64 microseconds.
-    let length_us = parse_length(map.get("mpris:length"));
-
-    // mpris:trackid — ObjectPath or String.
-    let track_id = parse_track_id(map.get("mpris:trackid"));
-
-    (title, artists, album, art_url, length_us, track_id)
-}
-
-/// Parse `xesam:artist` from an `OwnedValue` that should be `as` (array of strings).
-fn parse_artist_array(val: Option<&OwnedValue>) -> String {
-    let Some(v) = val else { return String::new() };
-    let Ok(owned) = v.try_clone() else {
-        return String::new();
-    };
-
-    let Ok(arr) = zbus::zvariant::Array::try_from(owned) else {
-        return String::new();
-    };
-
-    let parts: Vec<String> = arr
-        .iter()
-        .filter_map(|item| {
-            let cloned = item.try_clone().ok()?;
-            String::try_from(OwnedValue::try_from(cloned).ok()?).ok()
-        })
-        .collect();
-
-    parts.join(", ")
-}
-
-/// Parse `mpris:length` from an `OwnedValue`. The spec says u64 but some
-/// players send i64. Saturate negatives to 0.
-fn parse_length(val: Option<&OwnedValue>) -> u64 {
-    let Some(v) = val else { return 0 };
-    let Ok(owned) = v.try_clone() else { return 0 };
-
-    // Try u64 first (spec-compliant).
-    if let Ok(n) = u64::try_from(owned.clone()) {
-        return n;
+    match get_property::<OwnedValue>(bus_name, PLAYER_IFACE, "Metadata").await {
+        Ok(raw) => parse::parse_metadata(raw),
+        Err(_) => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+            None,
+        ),
     }
-    // Fall back to i64, saturate negatives.
-    if let Ok(n) = i64::try_from(owned) {
-        return u64::try_from(n).unwrap_or(0);
-    }
-    0
-}
-
-/// Parse `mpris:trackid` from an `OwnedValue`. May be an `ObjectPath`, a plain
-/// String, or a Variant wrapping one of those. Returns the underlying path/
-/// string as a `String`, or `None` if absent or unparseable.
-fn parse_track_id(val: Option<&OwnedValue>) -> Option<String> {
-    let v = val?;
-    let Ok(owned) = v.try_clone() else {
-        return None;
-    };
-
-    // Try ObjectPath first (most common).
-    if let Ok(path) = zbus::zvariant::OwnedObjectPath::try_from(owned.clone()) {
-        return Some(path.as_str().to_string());
-    }
-    // Try plain String.
-    if let Ok(s) = String::try_from(owned) {
-        return Some(s);
-    }
-    None
 }

@@ -1,0 +1,15 @@
+[Unit]
+Description=trollshell reference clock widget plugin (out-of-process, #35)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-clock-demo
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

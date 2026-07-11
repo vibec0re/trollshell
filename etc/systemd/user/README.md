@@ -22,6 +22,7 @@ niri-session.target                   (this directory's umbrella target)
         │ pulls in (WantedBy)
         ├── trollshell.service        (bar + drawer + screensaver
         │                              + bluetooth-audio + … all in-process)
+        ├── trollshell-plugin-clock-demo.service  (out-of-process widget plugin)
         ├── swayidle.service          (dim → lock → suspend)
         ├── swaybg.service            (wallpaper)
         └── polkit-gnome-authentication-agent-1.service  (polkit prompts)
@@ -51,6 +52,25 @@ complexity for no gain.
 The exceptions (swayidle, swaybg) are external binaries that already run
 fine as their own units; wrapping them in trollshell would just add a
 supervisor we don't need.
+
+## Out-of-process widget plugins
+
+`trollshell-plugin-clock-demo.service` is the **reference plugin** for the
+"frontend B" plugin architecture (#35). Unlike everything above, a plugin is a
+_separate_ process that links **no GTK** — it speaks a small MessagePack wire
+protocol (`hytte-plugin-proto`) to trollshell over the same-user socket
+`$XDG_RUNTIME_DIR/trollshell/plugin.sock`. trollshell is the host: it renders
+the plugin's declarative widget tree, brokers its effects, and pushes back a
+subscribed subset of shell state. The demo mounts a clock in the sidebar's top
+slot and opens the power menu when its button is clicked.
+
+"Enable a plugin" is just "enable its unit" — the host discovers plugins by who
+connects, not by scanning a directory. The unit is ordered `After=`
+`trollshell.service` so the host socket is usually up first, but the plugin
+also dials with a bounded backoff, so a host that isn't up yet (or a host
+restart) is ridden out in-process rather than crash-looping; systemd's
+`Restart=on-failure` is the outer supervisor. Run more plugins by shipping one
+unit per plugin binary on the same pattern.
 
 ## Required packages
 
@@ -92,11 +112,19 @@ ln -sf "$PWD/etc/systemd/user/swaybg.service"     \
        ~/.config/systemd/user/swaybg.service
 ln -sf "$PWD/etc/systemd/user/polkit-gnome-authentication-agent-1.service" \
        ~/.config/systemd/user/polkit-gnome-authentication-agent-1.service
+ln -sf "$PWD/etc/systemd/user/trollshell-plugin-clock-demo.service" \
+       ~/.config/systemd/user/trollshell-plugin-clock-demo.service
 
 systemctl --user daemon-reload
 systemctl --user enable trollshell.service swayidle.service swaybg.service \
-                        polkit-gnome-authentication-agent-1.service
+                        polkit-gnome-authentication-agent-1.service \
+                        trollshell-plugin-clock-demo.service
 ```
+
+The `trollshell-plugin-clock-demo.service` unit's `ExecStart` hardcodes
+`/usr/local/bin/hytte-plugin-clock-demo` (what `cargo install --root
+/usr/local --path crates/hytte-plugin-clock-demo` produces); override it the
+same way as `trollshell.service` (below) to run a dev build.
 
 `enable` (no `--now`) is correct here — these units start when
 `niri-session.target` is started by niri at session login. Starting them

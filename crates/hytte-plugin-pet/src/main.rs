@@ -46,8 +46,8 @@ use tokio_stream::wrappers::IntervalStream;
 const TICK: Duration = Duration::from_secs(4);
 /// How many ticks a speech bubble lingers (~20 s).
 const BUBBLE_TTL: u32 = 5;
-/// Recent pokes at which the cat has HAD IT.
-const GRUMPY_AT: u32 = 5;
+/// Recent pokes at which the cat has HAD IT (voice and face agree).
+pub(crate) const GRUMPY_AT: u32 = 5;
 /// Idle-thought odds: 1 in this many ticks (~every 5 minutes).
 const IDLE_ODDS: u64 = 75;
 /// The face button's node id — the poke target.
@@ -183,10 +183,15 @@ impl Pet {
         }
     }
 
-    /// A click on the face.
+    /// A click on the face. While a thought is already in flight the poke
+    /// still registers on the mood, but no new request queues up — stale
+    /// replies would only clobber the fresh line (and it's a cat: when it's
+    /// busy, it ignores you).
     fn poke(&mut self) {
         self.recent_pokes = self.recent_pokes.saturating_add(1);
-        self.think(ThinkKind::Poke);
+        if !self.thinking {
+            self.think(ThinkKind::Poke);
+        }
     }
 
     /// The 4-second heartbeat: animate, decay, expire, occasionally muse.
@@ -370,13 +375,17 @@ mod tests {
     #[test]
     fn poke_spam_turns_grumpy() {
         let (mut p, mut rx) = pet();
+        let mut last = None;
         for _ in 0..GRUMPY_AT {
             p.poke();
+            // The brain answers between pokes, so the next poke may ask again.
+            if let Ok(req) = rx.try_recv() {
+                last = Some(req);
+                let _ = p.update(Input::App(PetMsg::Thought("!".to_owned())));
+            }
         }
-        let last = std::iter::from_fn(|| rx.try_recv().ok())
-            .last()
-            .expect("requests were sent");
-        assert_eq!(last.mood, "grumpy");
+        let last = last.expect("requests were sent");
+        assert_eq!(last.mood, "grumpy", "the final ask carries the spam mood");
         assert_eq!(last.pokes, GRUMPY_AT);
         p.thinking = false;
         assert_eq!(p.mood(), Mood::Grumpy);
@@ -463,6 +472,20 @@ mod tests {
             matches!(&children[1], Node::Label { text, .. } if text == "hej"),
             "the bubble label carries the thought"
         );
+    }
+
+    #[test]
+    fn pokes_while_thinking_register_but_do_not_queue_requests() {
+        let (mut p, mut rx) = pet();
+        p.poke();
+        assert!(rx.try_recv().is_ok(), "first poke asks the brain");
+        p.poke();
+        p.poke();
+        assert!(
+            rx.try_recv().is_err(),
+            "further pokes while thinking queue nothing"
+        );
+        assert_eq!(p.recent_pokes, 3, "but they still count for the mood");
     }
 
     #[test]

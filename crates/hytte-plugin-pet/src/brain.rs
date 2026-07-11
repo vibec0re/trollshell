@@ -17,14 +17,17 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::PetMsg;
+use crate::{GRUMPY_AT, PetMsg};
 
 /// Minimum gap between two real model calls; requests inside the gap get a
 /// canned line instead. Keeps a poke-happy user from melting the CPU.
 const MIN_LLM_GAP: Duration = Duration::from_secs(15);
 
-/// Bubble budget: one line, at most this many characters.
-const MAX_LINE: usize = 48;
+/// Bubble budget: one line, at most this many characters. Kept at the
+/// canned-pool width: the sidebar card is 320px and the Node vocabulary has
+/// no wrap/ellipsize yet, so a long label's *minimum* width would push the
+/// whole layer surface past the sidebar (overlapping niri tiles).
+const MAX_LINE: usize = 30;
 
 /// What the reducer wants a line about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,14 +79,25 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
     let mut last_llm: Option<Instant> = None;
     let mut canned_step: u64 = 0;
 
-    while let Some(req) = rx.recv().await {
+    while let Some(mut req) = rx.recv().await {
+        // Coalesce: anything that queued up while we were busy is stale
+        // context — answer only the newest request (the reducer also gates
+        // requests on `thinking`, so this is a backstop).
+        while let Ok(newer) = rx.try_recv() {
+            req = newer;
+        }
+        if tx.is_closed() {
+            return; // session gone; don't start work nobody will read
+        }
         canned_step = canned_step.wrapping_add(1);
         let line = match &cfg.llm_base {
             Some(base) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
-                let url = format!("{base}/v1/chat/completions");
+                let url = llm_url(base);
                 let name = cfg.name.clone();
-                last_llm = Some(Instant::now());
                 let asked = tokio::task::spawn_blocking(move || ask_llm(&url, &name, req)).await;
+                // Stamp at completion: the gap is between calls, so a slow
+                // call must not immediately qualify the next one.
+                last_llm = Some(Instant::now());
                 match asked {
                     Ok(Ok(line)) => line,
                     Ok(Err(e)) => {
@@ -102,6 +116,12 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
             return;
         }
     }
+}
+
+/// The chat endpoint for a configured base URL (tolerates a trailing slash —
+/// llama-server 404s on `//v1/...`).
+fn llm_url(base: &str) -> String {
+    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
 }
 
 // ── The model path ───────────────────────────────────────────────────────────
@@ -149,7 +169,7 @@ struct ChatChoiceMessage {
 fn ask_llm(url: &str, name: &str, req: ThinkReq) -> Result<String, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_global(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
     let body = ChatRequest {
@@ -207,7 +227,7 @@ fn persona(name: &str, req: ThinkReq) -> String {
 /// with the format re-anchored at the end (1B models follow the tail best).
 fn event(name: &str, req: ThinkReq) -> String {
     let stim = match req.kind {
-        ThinkKind::Poke if req.pokes >= 4 => format!("*poke #{} in a row*", req.pokes),
+        ThinkKind::Poke if req.pokes >= GRUMPY_AT => format!("*poke #{} in a row*", req.pokes),
         ThinkKind::Poke => "*Annika pokes you*".to_owned(),
         ThinkKind::Idle if req.mood == "sleepy" => {
             "(late night, everything is quiet, you are sleepy)".to_owned()
@@ -229,18 +249,28 @@ fn sanitize(raw: &str, name: &str) -> String {
         .unwrap_or("")
         .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”')
         .trim();
-    let line = line
-        .strip_prefix(&format!("{name}:"))
-        .or_else(|| line.strip_prefix(&format!("{name} :")))
-        .unwrap_or(line)
-        .trim();
+    // "Nisse: ..." self-naming tic, any casing.
+    let line = match line.split_once(':') {
+        Some((head, tail)) if head.trim().to_lowercase() == name.to_lowercase() => tail.trim(),
+        _ => line,
+    };
     let cleaned: String = line.chars().filter(|&c| !is_dropped(c)).collect();
     let cleaned = cleaned.trim();
     let mut out: String = cleaned.chars().take(MAX_LINE).collect();
     if cleaned.chars().count() > MAX_LINE {
+        // Don't strand combining marks on the cut edge.
+        while out.chars().last().is_some_and(is_combining) {
+            out.pop();
+        }
         out.push('…');
     }
     out
+}
+
+/// Common combining-mark ranges (a full grapheme segmenter would be a dep;
+/// this covers what a chat model realistically emits).
+fn is_combining(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}')
 }
 
 /// Codepoints to drop from bubbles: emoji blocks (kaomoji glyphs sit far
@@ -299,7 +329,7 @@ const CANNED_SLEEPY: &[&str] = &[
 /// requests cycle the pool instead of repeating one entry.
 pub fn canned(req: ThinkReq, step: u64) -> String {
     let pool = match req.kind {
-        ThinkKind::Poke if req.pokes >= 4 => CANNED_POKE_GRUMPY,
+        ThinkKind::Poke if req.pokes >= GRUMPY_AT => CANNED_POKE_GRUMPY,
         ThinkKind::Poke => CANNED_POKE,
         ThinkKind::Idle if req.mood == "sleepy" => CANNED_SLEEPY,
         ThinkKind::Idle => CANNED_IDLE,
@@ -325,7 +355,29 @@ mod tests {
     }
 
     #[test]
+    fn llm_url_tolerates_trailing_slashes() {
+        assert_eq!(
+            llm_url("http://127.0.0.1:8080/"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+        assert_eq!(
+            llm_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn sanitize_strips_the_self_naming_tic_and_emoji() {
+        assert_eq!(
+            sanitize("Nisse: purring loudly", "nisse"),
+            "purring loudly",
+            "the tic strip is case-insensitive"
+        );
+        assert_eq!(
+            sanitize("warning: nap time", "nisse"),
+            "warning: nap time",
+            "legit colons survive"
+        );
         assert_eq!(
             sanitize("nisse: sleepy cat night quiet", "nisse"),
             "sleepy cat night quiet"

@@ -14,9 +14,12 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-# On NixOS, `llama-server` comes from the llama-cpp package (add it to your
-# user packages, or point ExecStart at a nix store path / wrapper).
-ExecStart=llama-server --model %h/.local/share/trollshell-pet/brain.gguf --port 8080 --ctx-size 1024 --threads 4 --reasoning-budget 0
+# `llama-server` comes from the llama-cpp package. systemd user units don't
+# see your shell's PATH: on NixOS, either install llama-cpp system-wide and
+# use the absolute /run/current-system/sw/bin/llama-server, or keep the
+# /usr/bin/env form below (env resolves via the user manager's PATH, which
+# NixOS points at the system + per-user profiles).
+ExecStart=/usr/bin/env llama-server --model %h/.local/share/trollshell-pet/brain.gguf --port 8080 --ctx-size 1024 --threads 4
 Restart=on-failure
 RestartSec=5
 

@@ -50,10 +50,16 @@
 //!
 //! // Subscribe in widgets (e.g. a "what's keeping me awake" drawer page):
 //! screensaver::inhibitors() -> impl Signal<Item = Vec<Inhibitor>>
+//!
+//! // Manual "Keep awake" (caffeine) toggle — hybrid logind fd + SIGSTOP (#270):
+//! screensaver::set_keep_awake(true);                       // engage / release
+//! screensaver::keep_awake() -> impl Signal<Item = bool>    // authoritative on/off
+//! screensaver::other_inhibitors() -> impl Signal<…>        // "Also awake: …" apps
 //! ```
 
 use anyhow::{Context, Result, anyhow};
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_bus::FdLease;
 use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -77,9 +83,56 @@ struct ScreenSaverShared {
     state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
     inhibitors: Mutable<Vec<Inhibitor>>,
     next_cookie: Arc<AtomicU32>,
+    /// Manual "Keep awake" (caffeine) coordination — the logind idle-inhibitor
+    /// lease plus the screensaver cookie it's mirrored to. A separate mutex
+    /// from `state`; lock ordering is always `manual` → `state`, never the
+    /// reverse, so the two can't deadlock.
+    manual: Arc<Mutex<ManualCaffeine>>,
 }
 
 static SHARED: OnceLock<ScreenSaverShared> = OnceLock::new();
+
+// ── Manual "Keep awake" (caffeine) ─────────────────────────────────────────────
+//
+// The Power drawer's "Keep awake" toggle is a *hybrid* (issue #270):
+//   - State: a real logind idle-inhibitor fd (`logind::inhibit_idle`) — honest,
+//     inspectable via `systemd-inhibit --list`, survives a shell restart.
+//   - Enforcement: a matching screensaver `Inhibitor` registered here, so the
+//     existing swayidle `SIGSTOP` bridge actually keeps the screen awake — the
+//     same path that already enforces external `org.freedesktop.ScreenSaver`
+//     apps (Firefox/mpv/screen-share) a pure-logind `BlockInhibited` watch
+//     would miss.
+// The toggle's authoritative on/off state is read back from `inhibitors()`
+// (via [`keep_awake`]), never from the acquire call's return — so any monitor's
+// drawer can flip it and a drawer rebuild re-derives it.
+
+/// Sentinel identity of the manual caffeine inhibitor in the shared inhibitor
+/// map, so it can be told apart from external app inhibitors when deriving the
+/// switch state ([`keep_awake`]) and the "Also awake" list ([`other_inhibitors`]).
+const CAFFEINE_APP: &str = "trollshell";
+const CAFFEINE_REASON: &str = "Keep awake";
+
+/// State of the manual caffeine toggle. Held behind `ScreenSaverShared::manual`.
+#[derive(Default)]
+struct ManualCaffeine {
+    /// The state the user last asked for. The async acquire task reconciles
+    /// against this so a fast on→off (before the logind fd lands) can't leave a
+    /// dangling inhibitor.
+    desired: bool,
+    /// An acquire task is in flight; suppresses spawning a second one.
+    acquiring: bool,
+    /// The live hold, present iff caffeine is currently engaged.
+    hold: Option<ManualHold>,
+}
+
+/// A live manual caffeine hold: the logind fd (drop = release) plus the
+/// screensaver cookie registered for `SIGSTOP` enforcement.
+struct ManualHold {
+    cookie: u32,
+    /// Dropping this fd closes it, releasing the logind idle inhibitor. Held,
+    /// not read — its lifetime is the whole point.
+    _lease: FdLease,
+}
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -143,6 +196,7 @@ impl Service for ScreenSaverService {
             state: state.clone(),
             inhibitors: inhibitors.clone(),
             next_cookie: next_cookie.clone(),
+            manual: Arc::new(Mutex::new(ManualCaffeine::default())),
         });
 
         ScreenSaverHandles {
@@ -171,6 +225,116 @@ pub fn inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
             .inhibitors
             .signal_cloned()
     })
+}
+
+/// Whether the manual "Keep awake" (caffeine) toggle is engaged, derived from
+/// the **authoritative** inhibitor list rather than any local widget state — so
+/// every monitor's Power drawer agrees and a drawer rebuild re-reads it. Bind a
+/// `Keep awake` switch's `active` to this. Multi-monitor safe (issue #270).
+pub fn keep_awake() -> impl Signal<Item = bool> {
+    inhibitors().map(|v| v.iter().any(is_caffeine))
+}
+
+/// Everything keeping the system awake **other than** the manual caffeine
+/// toggle — external `org.freedesktop.ScreenSaver` inhibitors (Firefox, mpv,
+/// screen-share, …). Feeds the "Also awake: …" subtitle so the user sees that
+/// turning the toggle off won't let the screen sleep while an app still holds
+/// it.
+pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
+    inhibitors().map(|v| v.into_iter().filter(|i| !is_caffeine(i)).collect())
+}
+
+/// Turn the manual "Keep awake" caffeine inhibitor on or off.
+///
+/// `on = true`: acquire a logind idle-inhibitor fd (honest, inspectable state)
+/// **and** register a matching screensaver inhibitor so the existing swayidle
+/// `SIGSTOP` bridge actually enforces keep-awake. `on = false`: drop the fd
+/// (releasing the logind inhibitor) and remove the screensaver inhibitor
+/// (`SIGCONT` if it was the last).
+///
+/// Idempotent — calling it with the state it's already in is a no-op, so the
+/// GTK switch's programmatic `set_active` (from the authoritative-state
+/// binding) can never thrash the logind fd. Safe to call from any thread; the
+/// async fd acquire runs on the shared runtime.
+pub fn set_keep_awake(on: bool) {
+    let Some(shared) = SHARED.get() else {
+        // Service not registered (test harness?) — nothing to hold.
+        return;
+    };
+    if on {
+        acquire_manual(shared);
+    } else {
+        release_manual(shared);
+    }
+}
+
+/// Does this inhibitor represent the manual caffeine toggle (vs. an external
+/// app)? Matched on the sentinel `(application, reason)` we register it with.
+fn is_caffeine(i: &Inhibitor) -> bool {
+    i.application == CAFFEINE_APP && i.reason == CAFFEINE_REASON
+}
+
+/// Engage manual caffeine: mark it desired and, unless a hold or an in-flight
+/// acquire already exists, spawn the async logind fd acquire. On success the
+/// task registers the screensaver inhibitor (which drives `SIGSTOP`) and stores
+/// the hold; if the user toggled back off while the fd was in flight it drops
+/// the fd instead, so a fast on→off never leaks an inhibitor.
+fn acquire_manual(shared: &'static ScreenSaverShared) {
+    {
+        let mut m = shared.manual.lock().expect("caffeine state poisoned");
+        m.desired = true;
+        if m.acquiring || m.hold.is_some() {
+            return; // already engaged or coming online
+        }
+        m.acquiring = true;
+    }
+    runtime::handle().spawn(async move {
+        let lease = match crate::logind::inhibit_idle().await {
+            Ok(lease) => lease,
+            Err(e) => {
+                tracing::warn!(error = %e, "keep-awake: logind Inhibit(idle) failed");
+                {
+                    let mut m = shared.manual.lock().expect("caffeine state poisoned");
+                    m.acquiring = false;
+                    m.desired = false;
+                }
+                // Re-publish so `keep_awake()` re-emits `false`: a switch the
+                // user optimistically flipped on snaps back, since the acquire
+                // didn't take (no inhibitor was registered).
+                publish_inhibitors(&shared.state, &shared.inhibitors);
+                return;
+            }
+        };
+        let mut m = shared.manual.lock().expect("caffeine state poisoned");
+        m.acquiring = false;
+        if !m.desired {
+            // Toggled back off before the fd landed — release it (drop closes
+            // the fd) and leave no inhibitor behind.
+            drop(lease);
+            return;
+        }
+        // Register the enforcement half: a screensaver inhibitor. This pauses
+        // swayidle (SIGSTOP) on the empty→non-empty transition and surfaces the
+        // hold in `inhibitors()` (which drives `keep_awake()`).
+        let cookie = inhibit(CAFFEINE_APP, CAFFEINE_REASON);
+        m.hold = Some(ManualHold {
+            cookie,
+            _lease: lease,
+        });
+    });
+}
+
+/// Release manual caffeine: clear the desired flag (so any in-flight acquire
+/// self-releases on completion) and, if a hold exists, drop the logind fd and
+/// remove the screensaver inhibitor (`SIGCONT` if it was the last).
+fn release_manual(shared: &ScreenSaverShared) {
+    let mut m = shared.manual.lock().expect("caffeine state poisoned");
+    m.desired = false;
+    if let Some(hold) = m.hold.take() {
+        // uninhibit removes the inhibitor + resumes swayidle if last; dropping
+        // `hold` (at end of scope) closes the logind fd, releasing that lock.
+        uninhibit(hold.cookie);
+    }
 }
 
 /// Ask the session to lock. trollshell no longer draws its own lock surface;

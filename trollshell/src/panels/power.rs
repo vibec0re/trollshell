@@ -5,6 +5,7 @@ use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::brightness;
+use hytte::services::screensaver::{self, Inhibitor};
 use hytte::services::upower::{self, Battery, BatteryState};
 
 use crate::components::format::fmt_dur;
@@ -39,7 +40,59 @@ pub fn panel_power() -> gtk::Widget {
     bright.append(&build_brightness_row());
     column.append(&bright);
 
+    let awake = section("Keep awake");
+    awake.append(&build_keep_awake_row());
+    column.append(&awake);
+
     finish_page(&column)
+}
+
+/// "Keep awake" caffeine toggle: an `adw::SwitchRow` whose state is derived
+/// from the daemon's authoritative inhibitor list (`screensaver::keep_awake()`),
+/// NOT local widget state — so any monitor's drawer reflects the same toggle
+/// and a drawer rebuild never loses track (issue #270). Flipping it acquires /
+/// releases a logind idle-inhibitor fd held in the screensaver service; the
+/// existing swayidle `SIGSTOP` bridge does the actual enforcement.
+fn build_keep_awake_row() -> gtk::ListBox {
+    let list = boxed_list();
+
+    let row = adw::SwitchRow::builder().title("Keep awake").build();
+
+    // Two-way: the authoritative signal drives `active` (block prevents the
+    // programmatic set_active from re-entering the handler); a user flip calls
+    // set_keep_awake, which is idempotent so mirrored state can't thrash the fd.
+    bind_two_way(
+        screensaver::keep_awake(),
+        &row,
+        adw::SwitchRow::set_active,
+        |r| r.connect_active_notify(|r| screensaver::set_keep_awake(r.is_active())),
+    );
+
+    // Subtitle: what else is holding the system awake (Firefox, mpv, screen
+    // share, …), so an off toggle doesn't imply the screen will sleep.
+    bind(screensaver::other_inhibitors(), &row, |r, others| {
+        r.set_subtitle(&keep_awake_subtitle(&others));
+    });
+
+    list.append(&row);
+    list
+}
+
+/// Build the "Keep awake" subtitle from the external inhibitors: a deduped
+/// "Also awake: …" app list, or default help text when nothing else holds it.
+fn keep_awake_subtitle(others: &[Inhibitor]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for i in others {
+        let name = i.application.as_str();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        "Prevent the screen from blanking or locking".to_string()
+    } else {
+        format!("Also awake: {}", names.join(", "))
+    }
 }
 
 /// Adwaita-flavoured brightness control: icon + slider + live percentage,

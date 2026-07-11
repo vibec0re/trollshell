@@ -14,6 +14,10 @@
 //! watches for a rising severity edge (entering `Low` or `Critical`/`Action`)
 //! and posts via [`crate::notifications::post_local`] — see [`warning_toast`]
 //! for the crossing/dedup rules (#237).
+//!
+//! [`on_battery`] tracks a separate property — `OnBattery` on the *manager*
+//! object (`/org/freedesktop/UPower`, `org.freedesktop.UPower`), not the
+//! device — since it's correct even on desktops with no battery (#230).
 
 use crate::notifications::Urgency;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
@@ -24,6 +28,7 @@ use std::time::Duration;
 const UPOWER_NAME: &str = "org.freedesktop.UPower";
 const DISPLAY_DEVICE_PATH: &str = "/org/freedesktop/UPower/devices/DisplayDevice";
 const DEVICE_IFACE: &str = "org.freedesktop.UPower.Device";
+const MANAGER_PATH: &str = "/org/freedesktop/UPower";
 
 pub struct UpowerService;
 
@@ -109,12 +114,14 @@ impl Default for Battery {
 #[doc(hidden)]
 pub struct UpowerHandles {
     pub(crate) battery: Mutable<Battery>,
+    pub(crate) on_battery: Mutable<bool>,
 }
 
 impl Default for UpowerHandles {
     fn default() -> Self {
         Self {
             battery: Mutable::new(Battery::default()),
+            on_battery: Mutable::new(false),
         }
     }
 }
@@ -171,6 +178,12 @@ impl Service for UpowerService {
 
         spawn_warning_level_watcher(rt, writer);
 
+        bind_on_battery(
+            rt,
+            manager_prop::<bool>("OnBattery"),
+            handles.on_battery.clone(),
+        );
+
         handles
     }
 }
@@ -190,6 +203,41 @@ where
         .iface(DEVICE_IFACE)
         .name(name)
         .start()
+}
+
+/// The manager object (`/org/freedesktop/UPower`, `org.freedesktop.UPower`)
+/// carries system-wide properties like `OnBattery` — distinct from the
+/// per-device iface `display_device_prop` targets.
+fn manager_prop<T>(name: &'static str) -> PropertySignal<T>
+where
+    T: Clone
+        + Send
+        + Sync
+        + 'static
+        + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
+{
+    property::<T>(UPOWER_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(UPOWER_NAME)
+        .name(name)
+        .start()
+}
+
+fn bind_on_battery(rt: &tokio::runtime::Handle, prop: PropertySignal<bool>, writer: Mutable<bool>) {
+    rt.spawn(async move {
+        prop.signal()
+            .for_each(move |s| {
+                let v = match s {
+                    PropState::Loaded(v) | PropState::Stale(v) => v,
+                    PropState::Loading => false,
+                };
+                writer.set(v);
+                std::future::ready(())
+            })
+            .await;
+    });
 }
 
 fn secs_to_duration(secs: i64) -> Option<Duration> {
@@ -308,6 +356,18 @@ pub fn battery() -> impl Signal<Item = Battery> {
             .expect("upower::service() not registered")
             .battery
             .signal_cloned()
+    })
+}
+
+/// Whether the system is currently running on battery power, per `UPower`'s
+/// manager-level `OnBattery` property. `false` until the first `Loaded`
+/// (covers both "on AC" and "not yet known").
+pub fn on_battery() -> impl Signal<Item = bool> {
+    registry::with(|r| {
+        r.get::<UpowerHandles>()
+            .expect("upower::service() not registered")
+            .on_battery
+            .signal()
     })
 }
 

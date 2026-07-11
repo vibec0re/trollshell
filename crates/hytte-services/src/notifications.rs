@@ -13,8 +13,8 @@ use hytte_bus::OwnNameSignal;
 use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
@@ -38,6 +38,13 @@ use zbus::zvariant::OwnedValue;
 struct NotificationsShared {
     active: Mutable<Vec<Notification>>,
     history: Mutable<Vec<HistoryEntry>>,
+    /// Shared id counter — the **same** `Arc<AtomicU32>` the D-Bus `Notify`
+    /// handler (`NotificationsIface::next_id`) allocates from. Stored here so
+    /// `post_local`, which runs on a hytte-tokio worker and can only reach
+    /// `SHARED` (the registry counter is GTK-thread-only), draws ids from that
+    /// one monotonic sequence — a locally-posted toast can therefore never
+    /// collide with a `Notify`-allocated id.
+    next_id: Arc<AtomicU32>,
     /// Ownership handle used to emit D-Bus signals directly on the owned
     /// connection without a round-trip method call.
     ownership: OwnNameSignal,
@@ -188,6 +195,7 @@ impl Service for NotificationsService {
         let _ = SHARED.set(NotificationsShared {
             active: active.clone(),
             history: history.clone(),
+            next_id: next_id.clone(),
             ownership: ownership.clone(),
         });
 
@@ -341,6 +349,127 @@ pub fn invoke_action(id: u32, action_key: &str) {
             }
         });
     }
+}
+
+// ── Local self-posting ────────────────────────────────────────────────────────
+
+/// Key for the [`post_local`] rate-limiter: `(app_name, summary, body)`.
+type RateLimitKey = (String, String, String);
+/// Last-emit instants keyed by [`RateLimitKey`].
+type RateLimitMap = HashMap<RateLimitKey, Instant>;
+
+/// Rate-limit window for repeated identical [`post_local`] toasts.
+///
+/// A user-triggered command that keeps failing (e.g. a Wi-Fi connect a
+/// flapping daemon retries) shouldn't stack up identical toasts — repeats of
+/// the same `(app_name, summary, body)` inside this window are dropped.
+const POST_LOCAL_RATE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Backing store for the [`post_local`] rate-limiter. A plain
+/// `std::sync::Mutex` (not the async one) is fine — the critical section is a
+/// map GC + lookup + insert with no `.await`.
+static POST_LOCAL_SEEN: OnceLock<Mutex<RateLimitMap>> = OnceLock::new();
+
+/// Pure rate-limit decision, factored out of [`rate_limit_allow`] so it can be
+/// unit-tested without the process-global map. Returns `true` (and records
+/// `now`) when `key` hasn't been seen within `window`; `false` for a repeat.
+/// Opportunistically drops entries older than `window` so the map can't grow
+/// unbounded.
+fn rate_limit_check(
+    seen: &mut RateLimitMap,
+    key: RateLimitKey,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    seen.retain(|_, ts| now.duration_since(*ts) < window);
+    if seen
+        .get(&key)
+        .is_some_and(|ts| now.duration_since(*ts) < window)
+    {
+        return false;
+    }
+    seen.insert(key, now);
+    true
+}
+
+/// Process-global wrapper over [`rate_limit_check`]. Fails open (allows the
+/// toast) if the lock is poisoned — a stray duplicate beats a swallowed error.
+fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
+    let map = POST_LOCAL_SEEN.get_or_init(|| Mutex::new(RateLimitMap::new()));
+    let Ok(mut guard) = map.lock() else {
+        return true;
+    };
+    let key = (app_name.to_string(), summary.to_string(), body.to_string());
+    rate_limit_check(&mut guard, key, Instant::now(), POST_LOCAL_RATE_LIMIT)
+}
+
+/// Inject a synthetic notification into the daemon's own active set, so the
+/// shell can surface its **own** failures — a failed fire-and-forget command
+/// (Wi-Fi/VPN connect, a screenshot save, …) — as a native toast with no D-Bus
+/// round-trip. The toast renders exactly like an external `Notify` and
+/// auto-expires after the server-default timeout via the same spawn/[`dismiss`]
+/// pattern the D-Bus handler uses.
+///
+/// Callable from **any** thread: it only touches the cross-thread `SHARED`
+/// handle (never the GTK-thread-local registry), so command helpers running on
+/// the hytte-tokio runtime can post directly.
+///
+/// # Urgency / Do-Not-Disturb
+///
+/// Pass [`Urgency::Critical`] for **error-scope** self-toasts. The toast
+/// overlay suppresses non-critical toasts while Do-Not-Disturb is on or the
+/// posting app is muted; only `Critical` bypasses both gates. A failure the
+/// user just triggered by clicking should not be silently eaten by DND, so the
+/// swept Wi-Fi/VPN error arms all pass `Critical`.
+///
+/// # Rate-limiting
+///
+/// Identical `(app_name, summary, body)` toasts within
+/// [`POST_LOCAL_RATE_LIMIT`] are dropped so a flapping daemon can't spam the
+/// surface.
+///
+/// No-op if the notifications service isn't registered (e.g. headless tests) —
+/// callers should keep their `tracing::warn!` as the durable record.
+pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
+    let Some(shared) = SHARED.get() else {
+        return;
+    };
+
+    if !rate_limit_allow(app_name, summary, body) {
+        return;
+    }
+
+    // Allocate from the SAME atomic the D-Bus `Notify` handler uses — one
+    // monotonic sequence, so this id can never collide with a `Notify`-issued
+    // one (see `NotificationsShared::next_id`).
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let notification = Notification {
+        id,
+        app_name: app_name.to_string(),
+        app_icon: String::new(),
+        summary: summary.to_string(),
+        body: strip_markup(body),
+        urgency,
+        timeout: Some(DEFAULT_TIMEOUT),
+        actions: Vec::new(),
+        image: None,
+        created_at,
+    };
+
+    shared.active.lock_mut().push(notification);
+    tracing::debug!(id, app_name, summary, "local notification posted");
+
+    // Auto-dismiss after the server-default timeout, mirroring `notify()`.
+    runtime::handle().spawn(async move {
+        tokio::time::sleep(DEFAULT_TIMEOUT).await;
+        dismiss(id, 1); // 1 = expired
+    });
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -646,8 +775,81 @@ fn strip_markup(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TIMEOUT, resolve_timeout};
-    use std::time::Duration;
+    use super::{DEFAULT_TIMEOUT, RateLimitMap, rate_limit_check, resolve_timeout};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn rate_limit_blocks_identical_repeats_within_window() {
+        let mut seen = RateLimitMap::new();
+        let window = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let key = (
+            "Wi-Fi".to_string(),
+            "Wi-Fi connection failed".to_string(),
+            "boom".to_string(),
+        );
+
+        // First occurrence: allowed.
+        assert!(rate_limit_check(&mut seen, key.clone(), t0, window));
+        // Immediate identical repeat: blocked.
+        assert!(!rate_limit_check(&mut seen, key.clone(), t0, window));
+        // Still inside the window: blocked.
+        assert!(!rate_limit_check(
+            &mut seen,
+            key.clone(),
+            t0 + Duration::from_secs(9),
+            window,
+        ));
+        // Past the window: allowed again.
+        assert!(rate_limit_check(
+            &mut seen,
+            key,
+            t0 + Duration::from_secs(11),
+            window,
+        ));
+    }
+
+    #[test]
+    fn rate_limit_is_per_key() {
+        let mut seen = RateLimitMap::new();
+        let window = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let wifi = (
+            "Wi-Fi".to_string(),
+            "Wi-Fi connection failed".to_string(),
+            String::new(),
+        );
+        let vpn = (
+            "VPN".to_string(),
+            "VPN connection failed".to_string(),
+            String::new(),
+        );
+
+        assert!(rate_limit_check(&mut seen, wifi.clone(), t0, window));
+        // A different key is independent and allowed at the same instant.
+        assert!(rate_limit_check(&mut seen, vpn, t0, window));
+        // The first key is still rate-limited.
+        assert!(!rate_limit_check(&mut seen, wifi, t0, window));
+    }
+
+    #[test]
+    fn shared_atomic_ids_never_collide_across_allocators() {
+        // post_local (via SHARED) and the D-Bus Notify handler (via
+        // NotificationsIface) both fetch_add on the SAME Arc<AtomicU32>, so
+        // their id streams interleave without ever overlapping — the
+        // collision-safety invariant this feature depends on.
+        let counter = Arc::new(AtomicU32::new(1));
+        let iface_side = counter.clone(); // NotificationsIface::next_id
+        let shared_side = counter.clone(); // NotificationsShared::next_id
+
+        let a = iface_side.fetch_add(1, Ordering::Relaxed); // a Notify
+        let b = shared_side.fetch_add(1, Ordering::Relaxed); // a post_local
+        let c = iface_side.fetch_add(1, Ordering::Relaxed); // another Notify
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert!(a != b && b != c && a != c);
+    }
 
     #[test]
     fn negative_timeout_uses_server_default() {

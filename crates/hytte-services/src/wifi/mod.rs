@@ -381,6 +381,12 @@ pub fn connect_network(network_path: &str) {
             runtime::handle().spawn(async move {
                 if let Err(e) = do_network_call(&path, "Connect").await {
                     tracing::warn!(error = %e, path, "wifi connect_network failed (may need agent)");
+                    crate::notifications::post_local(
+                        "Wi-Fi",
+                        "Wi-Fi connection failed",
+                        &e.to_string(),
+                        crate::notifications::Urgency::Critical,
+                    );
                 }
             });
         }
@@ -393,6 +399,12 @@ pub fn connect_network(network_path: &str) {
                 }
                 if let Err(e) = crate::wifi_nm::nm_connect(&device_path, &path).await {
                     tracing::warn!(error = %e, path, "wifi connect_network (NM) failed");
+                    crate::notifications::post_local(
+                        "Wi-Fi",
+                        "Wi-Fi connection failed",
+                        &e.to_string(),
+                        crate::notifications::Urgency::Critical,
+                    );
                 }
             });
         }
@@ -414,6 +426,12 @@ pub fn disconnect() {
                 }
                 if let Err(e) = do_station_call(&path, "Disconnect").await {
                     tracing::warn!(error = %e, "wifi disconnect failed");
+                    crate::notifications::post_local(
+                        "Wi-Fi",
+                        "Wi-Fi disconnect failed",
+                        &e.to_string(),
+                        crate::notifications::Urgency::Critical,
+                    );
                 }
             });
         }
@@ -426,6 +444,12 @@ pub fn disconnect() {
                 }
                 if let Err(e) = crate::wifi_nm::nm_disconnect(&path).await {
                     tracing::warn!(error = %e, "wifi disconnect (NM) failed");
+                    crate::notifications::post_local(
+                        "Wi-Fi",
+                        "Wi-Fi disconnect failed",
+                        &e.to_string(),
+                        crate::notifications::Urgency::Critical,
+                    );
                 }
             });
         }
@@ -582,6 +606,12 @@ pub fn vpn_activate(connection_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = crate::wifi_nm::nm_activate_vpn(&conn).await {
             tracing::warn!(error = %e, conn, "vpn activate (NM) failed");
+            crate::notifications::post_local(
+                "VPN",
+                "VPN connection failed",
+                &e.to_string(),
+                crate::notifications::Urgency::Critical,
+            );
         }
     });
 }
@@ -606,6 +636,12 @@ pub fn vpn_deactivate(active_connection_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = crate::wifi_nm::nm_deactivate_connection(&active).await {
             tracing::warn!(error = %e, active, "vpn deactivate (NM) failed");
+            crate::notifications::post_local(
+                "VPN",
+                "VPN disconnect failed",
+                &e.to_string(),
+                crate::notifications::Urgency::Critical,
+            );
         }
     });
 }

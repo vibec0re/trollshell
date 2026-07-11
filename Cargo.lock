@@ -974,6 +974,7 @@ dependencies = [
  "futures-util",
  "gtk4",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

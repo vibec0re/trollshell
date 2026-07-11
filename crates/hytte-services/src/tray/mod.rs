@@ -33,7 +33,7 @@ use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, OwnNameSignal, ProxyState, call, proxy, signals};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -147,19 +147,24 @@ impl Service for TrayService {
         let _ = ownership_slot.set(ownership.clone());
 
         // Spawn the NameOwnerChanged watcher to prune items when their bus
-        // name disappears.
+        // name disappears. Supervised so a panic in the watcher restarts the
+        // reconnect loop rather than leaving pruning dead for the process
+        // lifetime; the inner `loop` still drives the ordinary reconnect.
         let state2 = state;
-        runtime::handle().spawn(async move {
-            loop {
-                match watch_name_owner_changes(&state2).await {
-                    Ok(()) => {
-                        tracing::warn!("tray NOC stream closed, reconnecting in 2s");
+        spawn_supervised("tray", move || {
+            let state = state2.clone();
+            async move {
+                loop {
+                    match watch_name_owner_changes(&state).await {
+                        Ok(()) => {
+                            tracing::warn!("tray NOC stream closed, reconnecting in 2s");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "tray NOC watcher error, reconnecting in 2s");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "tray NOC watcher error, reconnecting in 2s");
-                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
@@ -435,10 +440,19 @@ impl Watcher {
                 .await;
 
                 // Spawn a per-item watcher using bus::proxy for PeerGone detection
-                // and bus::signals for property-update signals.
+                // and bus::signals for property-update signals. Supervised:
+                // `watch_item` re-reads + parses this item's (untrusted) tooltip
+                // / icon-pixmap / menu properties, so it's the real panic
+                // surface; a clean completion (item disconnected) does not
+                // restart.
                 let state = self.state.clone();
-                tokio::spawn(async move {
-                    watch_item(state, bus_name, object_path).await;
+                spawn_supervised("tray-item", move || {
+                    let state = state.clone();
+                    let bus_name = bus_name.clone();
+                    let object_path = object_path.clone();
+                    async move {
+                        watch_item(state, bus_name, object_path).await;
+                    }
                 });
             }
             Err(e) => {

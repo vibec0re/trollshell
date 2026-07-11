@@ -160,6 +160,26 @@ pub fn toggle(monitor: &Monitor) {
     state.set(!now);
 }
 
+/// Command-surface entry point (no `&Monitor` in hand): flip the sidebar on
+/// the `preferred` connector if one is installed there, else on any installed
+/// sidebar. Backs the `toggle-sidebar` `GAction` driven by a niri keybind —
+/// `preferred` is niri's focused output. Looks the connector up in the live
+/// [`PANELS`] map (not [`SIDEBAR_OPEN`]) so it targets a real installed surface
+/// and never conjures a dangling open-state entry for a nonexistent monitor.
+pub fn toggle_on_focused(preferred: Option<&str>) {
+    let key = PANELS.with(|panels| {
+        let panels = panels.borrow();
+        preferred
+            .filter(|k| panels.contains_key(*k))
+            .map(str::to_string)
+            .or_else(|| panels.keys().next().cloned())
+    });
+    if let Some(key) = key {
+        let state = sidebar_open_state(&key);
+        state.set(!state.get());
+    }
+}
+
 /// Currently visible width of the sidebar card on `monitor`, in CSS px.
 /// Returns `FRAME_THICKNESS_I32` when the sidebar is closed, hasn't been
 /// installed yet, or the per-monitor panel is missing. The frame uses

@@ -206,6 +206,27 @@ impl Page {
         matches!(self, Self::Media)
     }
 
+    /// Every drawer page. The single source for reverse lookups
+    /// ([`Page::from_stack_name`]); the string mapping still lives only in
+    /// [`Page::stack_name`], so a page's token is defined in exactly one place.
+    const ALL: [Self; 15] = [
+        Self::Media,
+        Self::Network,
+        Self::Vpn,
+        Self::Connections,
+        Self::Bluetooth,
+        Self::Stats,
+        Self::Audio,
+        Self::Power,
+        Self::PowerMenu,
+        Self::Notifications,
+        Self::Appearance,
+        Self::Displays,
+        Self::Clipboard,
+        Self::Calendar,
+        Self::Settings,
+    ];
+
     fn stack_name(self) -> &'static str {
         match self {
             Self::Media => "media",
@@ -224,6 +245,15 @@ impl Page {
             Self::Calendar => "calendar",
             Self::Settings => "settings",
         }
+    }
+
+    /// Reverse of [`Page::stack_name`]: resolve a `Page` from its stable
+    /// stack-name token (e.g. `"power-menu"`). The command surface's
+    /// `open-page` `GAction` uses this to turn a niri keybind's string argument
+    /// into a `Page`. Returns `None` for an unknown token.
+    #[must_use]
+    pub fn from_stack_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.stack_name() == name)
     }
 }
 
@@ -824,20 +854,45 @@ fn retract_by_key(key: &str) {
 }
 
 pub fn open(monitor: &Monitor, page: Page) {
-    let key = monitor_key(monitor);
+    open_by_key(&monitor_key(monitor), page);
+}
+
+/// Open the drawer to `page` on the monitor whose connector is `key`. Shared
+/// by [`open`] (the monitor-driven notification/toast path) and the
+/// command-surface helpers below. No bar-chip context here, so the drawer
+/// anchors flush with the bar's trailing main-axis edge (`pending_center` =
+/// `None`, `main_margin` = 0). No-op if no drawer is mounted for `key`.
+fn open_by_key(key: &str, page: Page) {
     PANELS.with(|panels| {
         let panels = panels.borrow();
-        let Some(panel) = panels.get(&key) else {
+        let Some(panel) = panels.get(key) else {
             return;
         };
-        // No bar chip context here (called from a notification toast click);
-        // anchor the drawer flush with the bar's trailing main-axis edge.
         *panel.pending_center.borrow_mut() = None;
         show_panel(panel, page, 0);
     });
     recompute_netconn_visible();
     recompute_stats_visible();
     recompute_media_visible();
+}
+
+/// Command-surface entry point (no `&Monitor` in hand): open `page` on the
+/// `preferred` connector if a drawer is mounted there, else on any mounted
+/// drawer. Backs the `open-page` / `power-menu` `GActions` driven by niri
+/// keybinds — `preferred` is niri's focused output. Falls back to any panel so
+/// an unknown/absent focused output still opens *a* drawer rather than
+/// silently no-op'ing. No-op only when no drawers are mounted at all.
+pub fn open_on_focused(preferred: Option<&str>, page: Page) {
+    let key = PANELS.with(|panels| {
+        let panels = panels.borrow();
+        preferred
+            .filter(|k| panels.contains_key(*k))
+            .map(str::to_string)
+            .or_else(|| panels.keys().next().cloned())
+    });
+    if let Some(key) = key {
+        open_by_key(&key, page);
+    }
 }
 
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer

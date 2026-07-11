@@ -1,7 +1,8 @@
 //! Sensors service — polls `/proc/stat`, `/sys/.../cpufreq`, `/proc/meminfo`,
-//! `/proc/net/dev`, `/sys/class/hwmon`, `/sys/class/drm`, and optional
-//! `nvidia-smi` every second and exposes CPU load/clock/temp, memory usage,
-//! network I/O rates, GPU stats, and disk usage as `futures-signals` signals.
+//! `/proc/net/dev`, `/proc/diskstats`, `/sys/class/hwmon`, `/sys/class/drm`,
+//! and optional `nvidia-smi` every second and exposes CPU load/clock/temp,
+//! memory usage, network I/O rates, disk I/O throughput, GPU stats, and disk
+//! usage as `futures-signals` signals.
 //!
 //! # Public API
 //!
@@ -17,10 +18,12 @@
 //! sensors::cpu_temp() -> impl Signal<Item = CpuTemp>
 //! sensors::gpu()      -> impl Signal<Item = Option<GpuState>>
 //! sensors::disk()     -> impl Signal<Item = DiskUsage>
+//! sensors::disk_io()  -> impl Signal<Item = DiskIo>
 //! ```
 
 mod cpufreq;
 mod disk;
+mod diskio;
 mod gpu;
 mod hwmon;
 mod meminfo;
@@ -37,6 +40,7 @@ use crate::cast::u64_to_f64_bytes;
 
 use cpufreq::read_cpu_freq;
 use disk::{read_disk_for_specs, read_mountlist, read_process_count};
+use diskio::{compute_disk_io, read_proc_diskstats};
 use gpu::{GpuCache, read_gpu_with_cache};
 use hwmon::read_cpu_temp;
 use meminfo::read_proc_meminfo;
@@ -59,6 +63,9 @@ struct TickData {
     mem: Option<Memory>,
     /// Parsed `/proc/net/dev`, or `None` on read error.
     net_dev: Option<Vec<(String, u64, u64)>>,
+    /// Cumulative `(name, read_bytes, write_bytes)` per physical disk from
+    /// `/proc/diskstats`, or `None` on read error.
+    disk_io: Option<Vec<(String, u64, u64)>>,
     /// CPU package temp from the cached hwmon chip dir (fast path) or a fresh
     /// scan (slow path on first call / after chip disappears).
     cpu_temp: CpuTemp,
@@ -140,6 +147,20 @@ pub struct NetInterface {
     pub tx_rate_bps: f64,
 }
 
+/// Disk I/O throughput snapshot — aggregate across all physical whole-disk
+/// block devices (the soft default; mirrors the network row's rx+tx aggregate).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiskIo {
+    /// Aggregate read rate across physical disks (bytes/sec).
+    pub read_bps: f64,
+    /// Aggregate write rate across physical disks (bytes/sec).
+    pub write_bps: f64,
+    /// Cumulative bytes **read since boot**, summed across physical disks.
+    pub total_read_bytes: u64,
+    /// Cumulative bytes **written since boot**, summed across physical disks.
+    pub total_write_bytes: u64,
+}
+
 /// CPU package temperature.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpuTemp {
@@ -217,6 +238,7 @@ pub struct SensorsHandles {
     pub(crate) cpu_freq: Mutable<CpuFreq>,
     pub(crate) memory: Mutable<Memory>,
     pub(crate) network: Mutable<NetIo>,
+    pub(crate) disk_io: Mutable<DiskIo>,
     pub(crate) cpu_temp: Mutable<CpuTemp>,
     pub(crate) gpu: Mutable<Option<GpuState>>,
     pub(crate) disk: Mutable<DiskUsage>,
@@ -234,6 +256,7 @@ impl Default for SensorsHandles {
             cpu_freq: Mutable::new(CpuFreq::default()),
             memory: Mutable::new(Memory::default()),
             network: Mutable::new(NetIo::default()),
+            disk_io: Mutable::new(DiskIo::default()),
             cpu_temp: Mutable::new(CpuTemp::default()),
             gpu: Mutable::new(None),
             disk: Mutable::new(DiskUsage::default()),
@@ -258,6 +281,7 @@ impl Service for SensorsService {
         let cpu_freq_writer = handles.cpu_freq.clone();
         let mem_writer = handles.memory.clone();
         let net_writer = handles.network.clone();
+        let disk_io_writer = handles.disk_io.clone();
         let cpu_temp_writer = handles.cpu_temp.clone();
         let gpu_writer = handles.gpu.clone();
         let disk_writer = handles.disk.clone();
@@ -272,6 +296,7 @@ impl Service for SensorsService {
                 cpu_freq: cpu_freq_writer,
                 mem: mem_writer,
                 net: net_writer,
+                disk_io: disk_io_writer,
                 cpu_temp: cpu_temp_writer,
                 gpu: gpu_writer,
                 disk: disk_writer,
@@ -335,6 +360,17 @@ pub fn network() -> impl Signal<Item = NetIo> {
     })
 }
 
+/// Signal that emits the current disk I/O throughput snapshot (aggregate
+/// read/write rate across physical disks + cumulative totals since boot).
+pub fn disk_io() -> impl Signal<Item = DiskIo> {
+    registry::with(|r| {
+        r.get::<SensorsHandles>()
+            .expect("sensors::service() not registered")
+            .disk_io
+            .signal()
+    })
+}
+
 /// Signal that emits the current CPU temperature.
 pub fn cpu_temp() -> impl Signal<Item = CpuTemp> {
     registry::with(|r| {
@@ -392,6 +428,9 @@ struct PollState {
     cpu_prev: Vec<(u64, u64)>,
     /// name → `(rx_bytes, tx_bytes, sample_instant)`
     net_prev: HashMap<String, (u64, u64, Instant)>,
+    /// disk name → `(read_bytes, write_bytes, sample_instant)` for the disk-I/O
+    /// rate diff (mirrors `net_prev`).
+    disk_io_prev: HashMap<String, (u64, u64, Instant)>,
     /// Resolved `/sys/class/hwmon/hwmonN` dir of the CPU sensor chip, cached
     /// after the first scan so each tick re-reads only its `temp*_input`
     /// instead of re-walking all of `/sys/class/hwmon`.
@@ -407,6 +446,7 @@ impl PollState {
         Self {
             cpu_prev: Vec::new(),
             net_prev: HashMap::new(),
+            disk_io_prev: HashMap::new(),
             cpu_temp_chip: None,
             gpu_cache: GpuCache::default(),
             tick: 0,
@@ -421,6 +461,7 @@ struct PollWriters {
     cpu_freq: Mutable<CpuFreq>,
     mem: Mutable<Memory>,
     net: Mutable<NetIo>,
+    disk_io: Mutable<DiskIo>,
     cpu_temp: Mutable<CpuTemp>,
     gpu: Mutable<Option<GpuState>>,
     disk: Mutable<DiskUsage>,
@@ -435,6 +476,7 @@ async fn poll_loop(w: PollWriters) {
     let cpu_freq_writer = w.cpu_freq;
     let mem_writer = w.mem;
     let net_writer = w.net;
+    let disk_io_writer = w.disk_io;
     let cpu_temp_writer = w.cpu_temp;
     let gpu_writer = w.gpu;
     let disk_writer = w.disk;
@@ -476,6 +518,8 @@ async fn poll_loop(w: PollWriters) {
             let mem = read_proc_meminfo().ok();
             // Network I/O
             let net_dev = read_proc_net_dev().ok();
+            // Disk I/O (physical-disk read/write byte counters)
+            let disk_io = read_proc_diskstats().ok();
             // CPU temp (with cached chip dir)
             let (cpu_temp, cpu_temp_chip) = {
                 let mut ch = chip;
@@ -509,6 +553,7 @@ async fn poll_loop(w: PollWriters) {
                     cpu_freq,
                     mem,
                     net_dev,
+                    disk_io,
                     cpu_temp,
                     cpu_temp_chip,
                     gpu_state,
@@ -541,6 +586,7 @@ async fn poll_loop(w: PollWriters) {
         apply_cpu_freq(data.cpu_freq, &cpu_freq_writer);
         apply_memory(data.mem, &mem_writer);
         apply_network(&mut state.net_prev, data.net_dev, now, &net_writer);
+        apply_disk_io(&mut state.disk_io_prev, data.disk_io, now, &disk_io_writer);
         apply_cpu_temp(data.cpu_temp, &cpu_temp_writer);
         apply_gpu(data.gpu_tick, data.gpu_state, &gpu_writer);
         apply_disk(data.disk, &disk_writer);
@@ -630,6 +676,27 @@ fn apply_network(
         }
         None => {
             tracing::warn!("sensors: failed to read /proc/net/dev");
+        }
+    }
+}
+
+/// Compute the aggregate disk I/O rate from the new `/proc/diskstats` snapshot,
+/// update the rolling `disk_io_prev` cache, and publish the `DiskIo` snapshot.
+/// Mirrors [`apply_network`], summed across physical disks.
+fn apply_disk_io(
+    disk_io_prev: &mut HashMap<String, (u64, u64, Instant)>,
+    disk_io: Option<Vec<(String, u64, u64)>>,
+    now: Instant,
+    writer: &Mutable<DiskIo>,
+) {
+    match disk_io {
+        Some(devices) => {
+            let (snapshot, next_prev) = compute_disk_io(disk_io_prev, devices, now);
+            *disk_io_prev = next_prev;
+            writer.set(snapshot);
+        }
+        None => {
+            tracing::warn!("sensors: failed to read /proc/diskstats");
         }
     }
 }

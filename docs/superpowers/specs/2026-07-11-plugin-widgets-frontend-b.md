@@ -262,6 +262,42 @@ behind the `tokio` feature. Inherits the workspace lints (`unsafe_code =
 - **systemd units + socket wiring in `etc/`** — the supervision surface.
 - **A reference `vibectl` plugin** — the end-to-end proof.
 
+## Plugin runtime SDK — `hytte-plugin` (#275, post-sprint)
+
+The reference plugin (PR 3) initially inlined ~150 lines of transport
+scaffolding; `crates/hytte-plugin` extracts it as the plugin-side **Rust
+runtime** so an author writes only the TEA core:
+
+```rust
+trait Plugin {
+    type Msg;                                  // own-source messages; Infallible if none
+    fn manifest() -> Manifest;
+    fn init() -> Self;                         // per-session: state re-derives after reconnect
+    fn sources() -> Option<MsgStream<Msg>>;    // self-driven re-renders (timer/fetch), default None
+    fn update(&mut self, Input<Msg>) -> Vec<Effect>;
+    fn view(&self) -> Node;
+}
+fn run<P: Plugin>() -> !                       // owns main: dial+backoff, handshake, session loop
+```
+
+Runtime decisions (deliberate, settled in #275):
+
+- **`Ping`/`Shutdown` never reach the author** — the runtime answers `Pong`
+  itself; `Shutdown` ≡ disconnect → redial with backoff (units run
+  `Restart=on-failure`, so a clean exit would strand the plugin across a host
+  restart; redialing rides it out).
+- **Render dedup replaces "should I re-render"**: after every `update`, a
+  `Render` frame goes out iff the tree changed since the last sent one or the
+  update returned effects (effects force a send even for an identical tree).
+- **Cancel-safety**: `read_frame` is cancel-safe only at frame boundaries, so
+  the runtime never races it in `select!` — a reader task owns the read half
+  and forwards whole frames over a channel (the host's reader/writer shape).
+- **`socket_path()` lives in `hytte-plugin-proto`** (`topology.rs`): the path
+  is part of the wire contract; host and SDK share the one definition.
+
+`hytte-plugin-proto` stays the language-neutral schema anchor — a non-Rust
+plugin still speaks the wire directly and reimplements this loop.
+
 ## Future
 
 - More `StateKey`s (battery, media, net, niri workspaces/window, cpu, weather,

@@ -1,0 +1,38 @@
+[package]
+name = "hytte-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust runtime SDK for hytte out-of-process widget plugins (frontend B, issue #35): the TEA session loop, dial/backoff transport, and render dedup around hytte-plugin-proto"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The wire protocol, with its framed tokio read/write helpers. This crate is
+# the *Rust runtime* over that language-neutral schema: a plugin binary
+# depends on `hytte-plugin` alone (the proto vocabulary is re-exported).
+hytte-plugin-proto = { path = "../hytte-plugin-proto", features = ["tokio"] }
+tokio = { version = "1.40", default-features = false, features = [
+  "rt",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+] }
+# `Stream` + `StreamExt::next` for the plugin's own `sources()` messages, and
+# `pending()` to normalize the no-sources case.
+tokio-stream = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+# `io::duplex` gives the session loop a hermetic in-memory "socket";
+# `test-util` lets the reconnect-loop test auto-advance the backoff sleeps.
+tokio = { version = "1.40", features = [
+  "rt",
+  "macros",
+  "io-util",
+  "time",
+  "test-util",
+] }

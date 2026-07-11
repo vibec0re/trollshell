@@ -48,7 +48,6 @@
 use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use chrono::{DateTime, Local};
@@ -60,16 +59,11 @@ use hytte::services::clock;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
     ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg, StateKey, StateSnapshot,
-    read_frame, wire, write_frame,
+    read_frame, socket_path, wire, write_frame,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
-
-/// The host-listens socket, under the same-user runtime dir (`0700`). Its
-/// parent (`trollshell/`) is created and the socket file tightened to `0600`.
-const SOCKET_DIR: &str = "trollshell";
-const SOCKET_FILE: &str = "plugin.sock";
 
 // ── Service ─────────────────────────────────────────────────────────────────
 
@@ -286,19 +280,11 @@ fn build_slot(signal: impl Signal<Item = Option<SlotRender>> + 'static) -> gtk::
 
 // ── tokio-side: listener + per-connection tasks ──────────────────────────────
 
-/// The socket path under `$XDG_RUNTIME_DIR`, or `None` if that env var is unset
-/// (per the spec the host is same-user-only and refuses to fall back elsewhere).
-fn socket_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let mut path = PathBuf::from(base);
-    path.push(SOCKET_DIR);
-    path.push(SOCKET_FILE);
-    Some(path)
-}
-
-/// Bind the host socket and accept plugin connections forever. Creates the
-/// parent dir (`0700`), unlinks any stale socket before bind, and tightens the
-/// socket to `0600`.
+/// Bind the host socket and accept plugin connections forever. The path comes
+/// from [`hytte_plugin_proto::socket_path`] (shared with the plugin-side
+/// runtime — the one definition both ends dial/bind; `None` = same-user-only
+/// by spec, no fallback). Creates the parent dir (`0700`), unlinks any stale
+/// socket before bind, and tightens the socket to `0600`.
 async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
     let Some(path) = socket_path() else {
         tracing::warn!("XDG_RUNTIME_DIR unset; plugin host socket not created");

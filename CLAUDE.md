@@ -125,6 +125,11 @@ hytte-ecal        → hand-written FFI to evolution-data-server (libecal); the O
 hytte-blur        → client-side ext-background-effect-v1 blur-region scoping (niri frosted-glass). Wired-but-inert: still attached live in `modal.rs`/`sidebar.rs` (attach-on-map + `set_region`), but 610a499 flattened the chrome to opaque, so niri's blur layer-rules go inert automatically — physically excising the wiring is a deferred follow-up, not done yet
 hytte             → umbrella: re-exports {bus, reactive, services, ui, blur} + a `prelude`
 trollshell        → the binary; depends on `hytte`
+
+— plugin side (#35 frontend B; out-of-process, NEVER links the shell):
+hytte-plugin-proto → GTK-free wire protocol (node vocab, manifest, MessagePack framing, socket_path); language-neutral schema anchor, tokio optional
+hytte-plugin       → the Rust plugin runtime SDK over the proto: TEA `Plugin` trait + `run()` (dial/backoff, Register handshake, session loop, render dedup). A plugin binary deps THIS crate alone
+hytte-plugin-clock-demo → the reference plugin: pure manifest/init/update/view + one-line main
 ```
 
 Shell code uses `use hytte::prelude::*;` (App, Bar, Edge, Monitor, bind*, Service, …) plus `hytte::gtk` / `hytte::adw` / `hytte::services::*`. Don't add direct deps on gtk/adw/futures-signals in the binary — go through the re-exports.

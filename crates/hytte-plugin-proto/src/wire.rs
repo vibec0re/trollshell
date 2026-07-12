@@ -66,6 +66,32 @@ pub enum Node {
         name: String,
         classes: Vec<Cls>,
     },
+    /// A raster image: a `width`×`height` block of **RGBA8** pixels.
+    ///
+    /// - **Layout:** `data` is row-major (row 0 first), 4 bytes per pixel in
+    ///   `[R, G, B, A]` order, **non-premultiplied** straight alpha. Its length
+    ///   MUST equal `width * height * 4` — the host validates this and renders
+    ///   nothing (with a warning) for a buffer that doesn't match, so a
+    ///   malformed plugin can never crash the shell.
+    /// - **Encoding:** `data` rides the wire as a single `MessagePack` `bin` blob
+    ///   (via `serde_bytes`), not a per-byte int array, so a 128×128 RGBA frame
+    ///   is ~64 KiB on the wire — well under [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN).
+    /// - **Rendering:** the host scales the buffer up with **nearest-neighbor**
+    ///   filtering (crisp, chunky pixels — the "LCD" look), never linear
+    ///   interpolation. The buffer's natural size is `width`×`height`, but
+    ///   CSS/layout may size the widget up; the small buffer is then drawn big.
+    /// - `data` is a **mutable** prop: the same `id` re-rendered with new bytes
+    ///   swaps the texture in place rather than rebuilding the widget.
+    Pixels {
+        id: Option<NodeId>,
+        width: u32,
+        height: u32,
+        /// The RGBA8 buffer, `width * height * 4` bytes. `serde_bytes` keeps it
+        /// a single binary blob on the wire (see the variant docs).
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        classes: Vec<Cls>,
+    },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
         id: NodeId,

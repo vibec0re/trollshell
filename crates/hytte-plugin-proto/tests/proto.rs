@@ -38,6 +38,13 @@ fn sample_tree() -> Node {
                 name: "weather-clear-symbolic".into(),
                 classes: vec!["ts-icon".into()],
             },
+            Node::Pixels {
+                id: Some("lcd".into()),
+                width: 2,
+                height: 2,
+                data: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                classes: vec!["ts-lcd".into()],
+            },
             Node::Button {
                 id: "go".into(),
                 classes: vec!["ts-btn".into()],
@@ -145,6 +152,76 @@ fn full_node_tree_round_trips() {
     let tree = sample_tree();
     let back: Node = decode(&encode(&tree)).expect("decode Node");
     assert_eq!(tree, back);
+}
+
+// ── Pixels node ──────────────────────────────────────────────────────────────
+
+#[test]
+fn pixels_node_round_trips() {
+    let node = Node::Pixels {
+        id: Some("lcd".into()),
+        width: 4,
+        height: 2,
+        data: (0u8..32).collect(), // 4*2*4
+        classes: vec!["ts-lcd".into()],
+    };
+    let back: Node = decode(&encode(&node)).expect("decode Pixels");
+    assert_eq!(node, back);
+}
+
+#[test]
+fn pixels_data_is_one_binary_blob() {
+    // Baseline: a bare `Vec<u8>` WITHOUT serde_bytes serializes as a per-byte
+    // int array (~2× for bytes >= 0x80) — the bloat serde_bytes exists to avoid.
+    #[derive(serde::Serialize)]
+    struct NaiveArray {
+        data: Vec<u8>,
+    }
+
+    // Bytes >= 0x80 cost 2 bytes each as a MessagePack int array but 1 byte each
+    // as a `bin` blob, so all-0xFF is the worst case for a bare `Vec<u8>`.
+    let data = vec![0xFFu8; 1024];
+    let naive = encode_body(&NaiveArray { data: data.clone() });
+
+    // The real node routes `data` through serde_bytes → one MessagePack `bin`.
+    let node = Node::Pixels {
+        id: None,
+        width: 16,
+        height: 16,
+        data: data.clone(),
+        classes: vec![],
+    };
+    let body = encode_body(&node);
+
+    assert!(
+        body.len() < data.len() + 128,
+        "Pixels body carries the buffer as one compact blob ({} B for a {} B buffer)",
+        body.len(),
+        data.len(),
+    );
+    assert!(
+        naive.len() > body.len() * 3 / 2,
+        "the int-array encoding ({} B) is far larger than the serde_bytes blob ({} B)",
+        naive.len(),
+        body.len(),
+    );
+}
+
+#[test]
+fn pixels_with_mismatched_len_still_round_trips() {
+    // The proto layer is deliberately permissive: it does NOT enforce the
+    // `width*height*4` invariant, so one malformed node decodes cleanly and can
+    // never drop the whole connection. Enforcement lives at the host trust
+    // boundary (`to_ui_node`), which degrades to rendering nothing + a warning.
+    let node = Node::Pixels {
+        id: None,
+        width: 10,
+        height: 10,
+        data: vec![0, 1, 2], // 3 bytes, not 400
+        classes: vec![],
+    };
+    let back: Node = decode(&encode(&node)).expect("permissive decode of a bad-size Pixels");
+    assert_eq!(node, back);
 }
 
 // ── Proto exact-match rule ───────────────────────────────────────────────────

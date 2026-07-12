@@ -833,11 +833,13 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             id,
             text,
             max_width_chars,
+            ellipsize,
             classes,
         } => UiNode::Text {
             id: id.clone(),
             text: text.clone(),
             max_width_chars: *max_width_chars,
+            ellipsize: *ellipsize,
             classes: classes.clone(),
         },
         wire::Node::Icon { id, name, classes } => UiNode::Icon {
@@ -903,6 +905,7 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
         wire::Node::Separator { classes } => UiNode::Separator {
             classes: classes.clone(),
         },
+        wire::Node::Spacer => UiNode::Spacer,
     }
 }
 
@@ -1024,6 +1027,7 @@ mod tests {
                     classes: vec![],
                     children: vec![],
                 },
+                wire::Node::Spacer,
             ],
         };
         let expected = UiNode::Box {
@@ -1079,13 +1083,16 @@ mod tests {
                     classes: vec![],
                     children: vec![],
                 },
+                UiNode::Spacer,
             ],
         };
         assert_eq!(to_ui_node(&tree), expected);
     }
 
-    /// The three additive `#274` nodes map field-for-field: `Row`/`ListBox`
-    /// recurse their children like `Box`, and `Text` carries `max_width_chars`.
+    /// The list nodes map field-for-field: `Row`/`ListBox` recurse their
+    /// children like `Box`, and `Text` carries `max_width_chars` **and** the
+    /// #297 `ellipsize` flag. A `Spacer` between the cluster and the value maps
+    /// 1:1 (the justification primitive).
     #[test]
     fn wire_row_listbox_text_map_to_ui() {
         let tree = wire::Node::ListBox {
@@ -1094,12 +1101,21 @@ mod tests {
             children: vec![wire::Node::Row {
                 id: Some("r0".into()),
                 classes: vec!["ts-row".into()],
-                children: vec![wire::Node::Text {
-                    id: None,
-                    text: "wraps".into(),
-                    max_width_chars: Some(20),
-                    classes: vec!["ts-dest".into()],
-                }],
+                children: vec![
+                    wire::Node::Text {
+                        id: None,
+                        text: "an ellipsized destination".into(),
+                        max_width_chars: Some(20),
+                        ellipsize: true,
+                        classes: vec!["ts-dest".into()],
+                    },
+                    wire::Node::Spacer,
+                    wire::Node::Label {
+                        id: None,
+                        text: "12:30".into(),
+                        classes: vec!["ts-time".into()],
+                    },
+                ],
             }],
         };
         let expected = UiNode::ListBox {
@@ -1108,12 +1124,21 @@ mod tests {
             children: vec![UiNode::Row {
                 id: Some("r0".into()),
                 classes: vec!["ts-row".into()],
-                children: vec![UiNode::Text {
-                    id: None,
-                    text: "wraps".into(),
-                    max_width_chars: Some(20),
-                    classes: vec!["ts-dest".into()],
-                }],
+                children: vec![
+                    UiNode::Text {
+                        id: None,
+                        text: "an ellipsized destination".into(),
+                        max_width_chars: Some(20),
+                        ellipsize: true,
+                        classes: vec!["ts-dest".into()],
+                    },
+                    UiNode::Spacer,
+                    UiNode::Label {
+                        id: None,
+                        text: "12:30".into(),
+                        classes: vec!["ts-time".into()],
+                    },
+                ],
             }],
         };
         assert_eq!(to_ui_node(&tree), expected);

@@ -41,16 +41,21 @@ fn sample_tree() -> Node {
                     id: Some("row-0".into()),
                     classes: vec!["ts-row".into()],
                     children: vec![
+                        // Ellipsizing destination + a Spacer + the value: the
+                        // real departures/weather row shape (#295/#296).
                         Node::Text {
                             id: None,
-                            text: "a long wrapping destination name".into(),
+                            text: "a long ellipsized destination name".into(),
                             max_width_chars: Some(24),
+                            ellipsize: true,
                             classes: vec!["ts-dest".into()],
                         },
+                        Node::Spacer,
                         Node::Text {
                             id: Some("plat".into()),
                             text: "spor 2".into(),
                             max_width_chars: None,
+                            ellipsize: false,
                             classes: vec![],
                         },
                     ],
@@ -177,6 +182,82 @@ fn full_node_tree_round_trips() {
     let tree = sample_tree();
     let back: Node = decode(&encode(&tree)).expect("decode Node");
     assert_eq!(tree, back);
+}
+
+// ── Spacer + Text ellipsize (#297) ───────────────────────────────────────────
+
+#[test]
+fn spacer_round_trips() {
+    let node = Node::Spacer;
+    let back: Node = decode(&encode(&node)).expect("decode Spacer");
+    assert_eq!(node, back);
+}
+
+#[test]
+fn spacer_is_name_tagged() {
+    // `Spacer` is a fieldless (unit) variant, so external tagging emits it as the
+    // bare variant *name* — the name is what keeps appending a variant additive
+    // (older code skips an unknown tag). Prove the name rides the wire.
+    let body = encode_body(&Node::Spacer);
+    assert!(contains(&body, b"Spacer"), "variant name 'Spacer' present");
+}
+
+#[test]
+fn text_ellipsize_round_trips() {
+    for ellipsize in [true, false] {
+        let node = Node::Text {
+            id: Some("dest".into()),
+            text: "long destination".into(),
+            max_width_chars: Some(22),
+            ellipsize,
+            classes: vec!["ts-dest".into()],
+        };
+        let back: Node = decode(&encode(&node)).expect("decode Text");
+        assert_eq!(node, back, "ellipsize={ellipsize} round-trips");
+    }
+}
+
+#[test]
+fn text_without_ellipsize_decodes_old_frame_compat() {
+    // A `Text` frame built before #297 has no `ellipsize` key. The current
+    // decoder must still accept it, defaulting `ellipsize` to `false`
+    // (`#[serde(default)]` + named-map encoding) — the backward-compat guarantee
+    // that keeps already-deployed plugins (departures/weather) rendering. Modeled
+    // as an externally-tagged enum mirroring the pre-#297 field set, so it
+    // serializes as `{"Text": { id, text, classes }}` exactly like an old plugin.
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Text {
+            id: Option<String>,
+            text: String,
+            classes: Vec<String>,
+        },
+    }
+
+    let old = NodeOld::Text {
+        id: Some("dest".into()),
+        text: "an old destination".into(),
+        classes: vec!["ts-dest".into()],
+    };
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"ellipsize"),
+        "an old frame carries no ellipsize key"
+    );
+    let decoded: Node = decode_body(&body).expect("decode pre-#297 Text frame");
+    assert_eq!(
+        decoded,
+        Node::Text {
+            id: Some("dest".into()),
+            text: "an old destination".into(),
+            // Both #274's `max_width_chars` and #297's `ellipsize` default when
+            // absent from an old frame.
+            max_width_chars: None,
+            ellipsize: false,
+            classes: vec!["ts-dest".into()],
+        },
+        "absent ellipsize (and max_width_chars) default",
+    );
 }
 
 // ── Pixels node ──────────────────────────────────────────────────────────────

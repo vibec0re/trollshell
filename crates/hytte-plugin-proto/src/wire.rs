@@ -85,15 +85,28 @@ pub enum Node {
     /// natural width at that many characters; when `None` the wrap is bounded by
     /// the container (e.g. the sidebar's 320 px clamp).
     ///
-    /// Additive: a brand-new variant, so existing `Label` frames decode
-    /// unchanged. (`Label` gains no fields — mutating it would break every
-    /// in-tree `Node::Label { .. }` literal; `Text` keeps the change additive at
-    /// the Rust-source level too.)
+    /// `ellipsize` (default `false`) flips the flow mode: when `true` the label
+    /// is **single-line** and truncates with a trailing ellipsis
+    /// (`EllipsizeMode::End`) instead of wrapping — matching how the native
+    /// departures row cuts a long destination at 22 chars (#296). Like
+    /// `text`/`max_width_chars`, it is a **mutable prop**: a same-id re-render
+    /// flipping it swaps the flow mode in place rather than rebuilding the label.
+    ///
+    /// Additive on two axes: `Text` is a brand-new variant vs `Label` (existing
+    /// `Label` frames decode unchanged), and `ellipsize` is a **`#[serde(default)]`
+    /// field**, so a `Text` frame built before #297 (no `ellipsize` key) still
+    /// decodes — defaulting to `false`, i.e. the wrapping behaviour is preserved.
+    /// (It carries no `skip_serializing_if`: serde has no by-value bool predicate
+    /// and a `fn(&bool) -> bool` helper would trip `clippy::trivially_copy_pass_by_ref`.
+    /// A `false` on the wire is a couple of bytes and costs nothing in compat —
+    /// the decoder defaults the absent key either way.)
     Text {
         id: Option<NodeId>,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_width_chars: Option<i32>,
+        #[serde(default)]
+        ellipsize: bool,
         classes: Vec<Cls>,
     },
     /// A `gtk::Image` set from a themed icon `name` (name only — never pixels).
@@ -148,4 +161,18 @@ pub enum Node {
     },
     /// A `gtk::Separator`.
     Separator { classes: Vec<Cls> },
+    /// An **expanding gap** — an empty, style-less box that eats a container's
+    /// slack so its siblings justify around it. The host materializes it as an
+    /// empty `gtk::Box` with `hexpand`/`vexpand` set (dir-agnostic; the cross-axis
+    /// expand is inert since the box has zero natural size), so a single `Spacer`
+    /// between a cluster and a value right-pins the value in a [`Row`](Node::Row)
+    /// (`Label + Spacer + Label`), and two spacers centre the meat between them.
+    ///
+    /// It carries **no id and no children** — purely structural, styled by its
+    /// neighbours, never itself. This is how the native rows achieve justification
+    /// (an expanding filler), mirrored as one additive, field-less variant so no
+    /// existing node grows a `hexpand` field (#295/#296). Consecutive spacers
+    /// reuse by kind in the reconciler (no id to key on) — which is fine, they're
+    /// interchangeable.
+    Spacer,
 }

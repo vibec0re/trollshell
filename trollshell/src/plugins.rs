@@ -56,6 +56,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Local};
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -77,14 +78,23 @@ use tokio::sync::{mpsc, watch};
 /// The plugin host transport service. Registered in `main.rs` via `App::with`.
 pub struct PluginsService;
 
+/// Monotonic per-connection token. Stamped on every [`SlotRender`] a connection
+/// parks so slot ownership is **connection-scoped, not plugin-id-scoped**: a
+/// fast-reconnecting plugin (the SDK backs off from 100 ms) can have its new
+/// connection claim the slot before the old connection's teardown runs, and a
+/// plugin-id compare would let the stale teardown blank the live successor
+/// (#278). The generation compare cannot — each connection has a unique token.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// One rendered plugin frame parked in a mount slot's coalescing mailbox: the
-/// declarative tree, the id of the plugin that produced it, and a handle to send
-/// frames **back** to it (event round-trip). Effects do **not** ride here — they
-/// are one-shot, so they go down the non-lossy effect channel instead (#277).
-/// `Clone` so it can ride a `Mutable` signal to the GTK reconcilers.
+/// declarative tree, the [`NEXT_GENERATION`] token of the connection that
+/// produced it, and a handle to send frames **back** to that connection (event
+/// round-trip). Effects do **not** ride here — they are one-shot, so they go
+/// down the non-lossy effect channel instead (#277). `Clone` so it can ride a
+/// `Mutable` signal to the GTK reconcilers.
 #[derive(Clone)]
 struct SlotRender {
-    plugin_id: String,
+    generation: u64,
     tree: wire::Node,
     outbound: mpsc::UnboundedSender<HostMsg>,
 }
@@ -371,6 +381,10 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     let plugin_id = manifest.id.clone();
     let mount = manifest.mount;
+    // Unique per-connection token stamped on every frame this connection parks,
+    // so teardown can distinguish "still my frame in the slot" from "a successor
+    // connection already claimed it" (#278).
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         plugin = %plugin_id,
         ?mount,
@@ -413,7 +427,7 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     }
                     // Latest-wins: `set` overwrites any superseded frame in place.
                     slot.set(Some(SlotRender {
-                        plugin_id: plugin_id.clone(),
+                        generation,
                         tree,
                         outbound: out_tx.clone(),
                     }));
@@ -431,10 +445,11 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         }
     }
 
-    // Teardown: release the mount slot if this plugin still owns it (blanks the
-    // reconciler on the GTK side), then stop the outbound + snapshot tasks.
-    clear_slot_if_owned(&ctx.sidebar_top, &plugin_id);
-    clear_slot_if_owned(&ctx.sidebar_bottom, &plugin_id);
+    // Teardown: release the mount slot only if THIS connection still owns it
+    // (blanks the reconciler on the GTK side), then stop the outbound + snapshot
+    // tasks. Connection-scoped so a fast-reconnect successor is never evicted.
+    clear_slot_if_owned(&ctx.sidebar_top, generation);
+    clear_slot_if_owned(&ctx.sidebar_bottom, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
@@ -481,17 +496,22 @@ async fn snapshot_task(
     }
 }
 
-/// Clear a mount slot iff the disconnecting plugin still owns it (a newer plugin
-/// may already have claimed the slot).
-fn clear_slot_if_owned(slot: &Mutable<Option<SlotRender>>, plugin_id: &str) {
-    let owned = {
-        slot.lock_ref()
-            .as_ref()
-            .is_some_and(|r| r.plugin_id == plugin_id)
-    };
+/// Clear a mount slot iff the disconnecting connection still owns it (a newer
+/// connection — even a fast reconnect of the same plugin — may already have
+/// claimed the slot; its render carries a higher generation, so we leave it).
+fn clear_slot_if_owned(slot: &Mutable<Option<SlotRender>>, generation: u64) {
+    let owned = owns_slot(slot.lock_ref().as_ref().map(|r| r.generation), generation);
     if owned {
         slot.set(None);
     }
+}
+
+/// Whether a teardown for `teardown_gen` should clear a slot currently holding
+/// `slot_gen`. Ownership is connection-scoped: the compare succeeds only for the
+/// exact connection that parked the frame, so a stale teardown can never evict a
+/// successor connection's live render (#278). An empty slot is owned by nobody.
+fn owns_slot(slot_gen: Option<u64>, teardown_gen: u64) -> bool {
+    slot_gen == Some(teardown_gen)
 }
 
 /// Surface a plugin's `Log` frame at the matching host `tracing` level.
@@ -628,7 +648,8 @@ fn empty_node() -> UiNode {
 mod tests {
     use super::{
         BrokeredEffect, Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir,
-        UiEventKind, UiNode, empty_node, map_page, mpsc, to_ui_node, to_wire_event, wire,
+        UiEventKind, UiNode, empty_node, map_page, mpsc, owns_slot, to_ui_node, to_wire_event,
+        wire,
     };
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
@@ -785,10 +806,10 @@ mod tests {
         }
     }
 
-    /// A label frame owned by `plugin_id`, for the mailbox tests below.
-    fn label_frame(text: &str, plugin_id: &str, tx: &mpsc::UnboundedSender<HostMsg>) -> SlotRender {
+    /// A label frame carrying a generation, for the mailbox tests below.
+    fn label_frame(text: &str, generation: u64, tx: &mpsc::UnboundedSender<HostMsg>) -> SlotRender {
         SlotRender {
-            plugin_id: plugin_id.to_owned(),
+            generation,
             tree: wire::Node::Label {
                 id: None,
                 text: text.to_owned(),
@@ -804,13 +825,12 @@ mod tests {
     fn render_mailbox_coalesces_latest_wins() {
         let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
         let mailbox: Mutable<Option<SlotRender>> = Mutable::new(None);
-        mailbox.set(Some(label_frame("first", "p", &tx)));
-        mailbox.set(Some(label_frame("second", "p", &tx)));
-        mailbox.set(Some(label_frame("third", "p", &tx)));
+        mailbox.set(Some(label_frame("first", 0, &tx)));
+        mailbox.set(Some(label_frame("second", 0, &tx)));
+        mailbox.set(Some(label_frame("third", 0, &tx)));
 
         let guard = mailbox.lock_ref();
         let latest = guard.as_ref().expect("mailbox holds the latest frame");
-        assert_eq!(latest.plugin_id, "p");
         match &latest.tree {
             wire::Node::Label { text, .. } => assert_eq!(text, "third"),
             other => panic!("expected a Label, got {other:?}"),
@@ -835,8 +855,8 @@ mod tests {
                 effect: Effect::OpenPage(Page::PowerMenu),
             })
             .expect("effect queued");
-        mailbox.set(Some(label_frame("A", "p", &tx)));
-        mailbox.set(Some(label_frame("B", "p", &tx)));
+        mailbox.set(Some(label_frame("A", 0, &tx)));
+        mailbox.set(Some(label_frame("B", 0, &tx)));
 
         // The mailbox observes only B (load-shedding by design)…
         match &mailbox.lock_ref().as_ref().expect("frame parked").tree {
@@ -848,6 +868,20 @@ mod tests {
         assert_eq!(got.plugin_id, "p");
         assert!(matches!(got.effect, Effect::OpenPage(Page::PowerMenu)));
         assert!(eff_rx.try_recv().is_err(), "effect must not be duplicated");
+    }
+
+    /// #278: connection-scoped slot ownership. A stale teardown (older
+    /// generation) must never evict a fast-reconnect successor that already
+    /// claimed the slot; only the owning generation's own teardown clears it.
+    #[test]
+    fn stale_teardown_never_evicts_successor() {
+        // Successor (gen 2) holds the slot; the old connection's teardown (gen 1)
+        // must NOT clear it.
+        assert!(!owns_slot(Some(2), 1));
+        // The owning connection's own teardown clears its live frame.
+        assert!(owns_slot(Some(2), 2));
+        // An already-empty slot is owned by nobody.
+        assert!(!owns_slot(None, 1));
     }
 
     /// A bar mount is a real wire variant the reader must handle; assert the two

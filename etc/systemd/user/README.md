@@ -82,6 +82,18 @@ Its optional brain is `trollshell-pet-brain.service`, a local `llama-server`
 fetching one; without it the pet falls back to canned lines and loses no
 function beyond variety.
 
+`trollshell-plugin-weather.service` is the third in-tree plugin (#290): the
+sidebar weather card, out of process. It mounts the same `SidebarTop` region
+with `order=-10`, so it renders **above** the pet (which leaves `order` unset →
+sorts as `0`). It geolocates via geoclue2 (system bus) and, when geoclue is
+unavailable/denied, forward-geocodes `$TROLLSHELL_WEATHER_CITY` — the same env
+var the in-shell card honors (see the unit's commented `Environment=` line).
+Being a separate process it links **no GTK**: it talks D-Bus over its own
+`zbus` connection and fetches open-meteo directly. **Click the card to refresh
+now.** During the migration transition it runs _alongside_ the built-in weather
+card (compare, then remove the native mount — see #290); once removed, the
+plugin card takes its place at the top of the sidebar.
+
 `trollshell-plugin-departures.service` is the migration of the built-in
 departures board out-of-process (#289): it mounts `SidebarBottom` — where the
 native board anchors — and renders the same S-Bahn list. It reads its station

@@ -12,6 +12,7 @@ members = [
   "crates/hytte-plugin",
   "crates/hytte-plugin-clock-demo",
   "crates/hytte-plugin-pet",
+  "crates/hytte-plugin-departures",
   "trollshell",
 ]
 

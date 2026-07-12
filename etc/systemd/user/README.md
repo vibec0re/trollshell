@@ -73,10 +73,11 @@ restart) is ridden out in-process rather than crash-looping; systemd's
 unit per plugin binary on the same pattern.
 
 `trollshell-plugin-pet.service` is the second in-tree plugin (#276): a
-kaomoji cat in the sidebar's top slot — poke it by clicking. **It shares the
-`SidebarTop` slot with the clock demo** (the v1 host mounts one plugin per
-slot), so the units carry `Conflicts=`: enable one or the other. Its
-optional brain is `trollshell-pet-brain.service`, a local `llama-server`
+kaomoji cat in the sidebar's top slot — poke it by clicking. It shares the
+`SidebarTop` mount with the clock demo, but since #274 that mount is a
+**region** holding N plugin cards (sorted by each plugin's manifest `order`),
+so the two **coexist** — the old `Conflicts=` is gone; enable either or both.
+Its optional brain is `trollshell-pet-brain.service`, a local `llama-server`
 (nixpkgs `llama-cpp`) holding a small chat model — the unit's comments cover
 fetching one; without it the pet falls back to canned lines and loses no
 function beyond variety.

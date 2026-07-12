@@ -514,6 +514,42 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             name: name.clone(),
             classes: classes.clone(),
         },
+        wire::Node::Pixels {
+            id,
+            width,
+            height,
+            data,
+            classes,
+        } => {
+            // Validation seam: a plugin's RGBA8 buffer is untrusted, so this is
+            // the one non-1:1 arm. `data.len()` MUST equal `width*height*4`; a
+            // mismatch degrades to an empty (nothing-rendered) surface — id and
+            // classes preserved so CSS chrome stays and a later valid frame
+            // updates in place — with a `tracing::warn!`. This is the single
+            // documented seam (the host is the trust boundary and the only layer
+            // with `tracing`); the `hytte_ui` widget stays a silent panic-safe
+            // backstop, and decode stays permissive so one bad node can't drop
+            // the whole connection.
+            let (width, height, data) = if pixels_len_ok(*width, *height, data.len()) {
+                (*width, *height, data.clone())
+            } else {
+                tracing::warn!(
+                    node = ?id,
+                    width = *width,
+                    height = *height,
+                    data_len = data.len(),
+                    "plugin Pixels buffer size != width*height*4; rendering nothing"
+                );
+                (0, 0, Vec::new())
+            };
+            UiNode::Pixels {
+                id: id.clone(),
+                width,
+                height,
+                data,
+                classes: classes.clone(),
+            }
+        }
         wire::Node::Button { id, classes, child } => UiNode::Button {
             id: id.clone(),
             classes: classes.clone(),
@@ -544,6 +580,16 @@ fn to_ui_dir(dir: wire::Dir) -> UiDir {
         wire::Dir::Horizontal => UiDir::Horizontal,
         wire::Dir::Vertical => UiDir::Vertical,
     }
+}
+
+/// Whether a [`wire::Node::Pixels`] buffer honors the RGBA8 size invariant:
+/// `data_len == width * height * 4`, computed in `u64` so the product can't
+/// overflow. `(0, 0, 0)` is consistent (a legitimate empty surface).
+fn pixels_len_ok(width: u32, height: u32, data_len: usize) -> bool {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|n| n.checked_mul(4));
+    expected == u64::try_from(data_len).ok()
 }
 
 /// Map a reconciler event back onto its wire form for the outbound `Event`
@@ -595,13 +641,14 @@ fn empty_node() -> UiNode {
 mod tests {
     use super::{
         Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir, UiEventKind, UiNode,
-        empty_node, map_page, mpsc, to_ui_node, to_wire_event, wire,
+        empty_node, map_page, mpsc, pixels_len_ok, to_ui_node, to_wire_event, wire,
     };
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
     /// (incl. `Box { scroll }` and nesting) and produces a field-for-field
     /// mirror.
     #[test]
+    #[allow(clippy::too_many_lines)] // one big paired tree literal; splitting hurts readability
     fn wire_node_maps_to_ui_node_exhaustively() {
         let tree = wire::Node::Box {
             id: Some("root".into()),
@@ -619,6 +666,13 @@ mod tests {
                     id: Some("i".into()),
                     name: "battery-symbolic".into(),
                     classes: vec![],
+                },
+                wire::Node::Pixels {
+                    id: Some("px".into()),
+                    width: 1,
+                    height: 1,
+                    data: vec![10, 20, 30, 255],
+                    classes: vec!["ts-lcd".into()],
                 },
                 wire::Node::Button {
                     id: "b".into(),
@@ -667,6 +721,13 @@ mod tests {
                     id: Some("i".into()),
                     name: "battery-symbolic".into(),
                     classes: vec![],
+                },
+                UiNode::Pixels {
+                    id: Some("px".into()),
+                    width: 1,
+                    height: 1,
+                    data: vec![10, 20, 30, 255],
+                    classes: vec!["ts-lcd".into()],
                 },
                 UiNode::Button {
                     id: "b".into(),
@@ -779,6 +840,56 @@ mod tests {
             wire::Node::Label { text, .. } => assert_eq!(text, "third"),
             other => panic!("expected a Label, got {other:?}"),
         }
+    }
+
+    /// A `Pixels` node whose buffer size violates `width*height*4` must not
+    /// reach the widget: the host validation seam degrades it to an empty
+    /// (0×0, no data) surface, preserving id + classes so a later valid frame
+    /// updates in place. A well-formed buffer passes through 1:1.
+    #[test]
+    fn pixels_bad_len_degrades_to_empty_surface() {
+        assert!(pixels_len_ok(2, 2, 16));
+        assert!(!pixels_len_ok(2, 2, 15));
+        // Overflow-safe: absurd dims against a small buffer just report false.
+        assert!(!pixels_len_ok(u32::MAX, u32::MAX, 4));
+
+        let bad = wire::Node::Pixels {
+            id: Some("lcd".into()),
+            width: 2,
+            height: 2,
+            data: vec![0, 1, 2], // 3 bytes, needs 16
+            classes: vec!["ts-lcd".into()],
+        };
+        assert_eq!(
+            to_ui_node(&bad),
+            UiNode::Pixels {
+                id: Some("lcd".into()),
+                width: 0,
+                height: 0,
+                data: vec![],
+                classes: vec!["ts-lcd".into()],
+            },
+            "malformed Pixels degrades to a nothing-rendered surface",
+        );
+
+        let good = wire::Node::Pixels {
+            id: None,
+            width: 1,
+            height: 2,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8], // 1*2*4
+            classes: vec![],
+        };
+        assert_eq!(
+            to_ui_node(&good),
+            UiNode::Pixels {
+                id: None,
+                width: 1,
+                height: 2,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                classes: vec![],
+            },
+            "well-formed Pixels passes through 1:1",
+        );
     }
 
     /// A bar mount is a real wire variant the reader must handle; assert the two

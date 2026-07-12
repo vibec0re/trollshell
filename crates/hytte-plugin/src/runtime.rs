@@ -76,9 +76,17 @@ where
     )
     .await?;
 
+    // The per-session command lane (#280): the runtime owns the channel, so
+    // its lifecycle is exactly this session. `init` gets the sender (the model
+    // sends on it from `update`), `sources` gets the receiver (its I/O task
+    // drains it). Both ends die when this session's model and sources drop, so
+    // a queued command never crosses a reconnect. Command-less plugins set
+    // `Cmd = Infallible` and ignore both ends.
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<P::Cmd>();
+
     // Seed render: the fresh model's view goes out immediately, so the slot
     // mounts before the first state snapshot lands.
-    let mut model = P::init();
+    let mut model = P::init(cmd_tx);
     let mut last_tree = model.view();
     write_frame(
         &mut wr,
@@ -108,8 +116,10 @@ where
 
     // The plugin's own message sources, normalized to one never-yielding
     // stream when it has none. `src_done` keeps a finished stream from being
-    // polled again (a `Stream` may panic after its final `None`).
-    let mut src = P::sources().unwrap_or_else(|| Box::pin(tokio_stream::pending()));
+    // polled again (a `Stream` may panic after its final `None`). This is also
+    // where the command receiver lands: a plugin's I/O task drains `cmd_rx`
+    // and re-emits results as the app messages this stream carries.
+    let mut src = P::sources(cmd_rx).unwrap_or_else(|| Box::pin(tokio_stream::pending()));
     let mut src_done = false;
 
     let result = loop {
@@ -236,7 +246,7 @@ pub fn run<P: Plugin>() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{BACKOFF_BASE, BACKOFF_CAP, Backoff, reconnect_loop, session};
-    use crate::{Input, MsgStream, Plugin};
+    use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
     use hytte_plugin_proto::{
         Capability, ClockState, Effect, EffectOutcome, EventKind, HostMsg, Manifest, Mount, Node,
         Page, PluginMsg, StateKey, StateSnapshot, read_frame, write_frame,
@@ -257,6 +267,7 @@ mod tests {
 
     impl Plugin for Echo {
         type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
 
         fn manifest() -> Manifest {
             let mut m = Manifest::new("echo-test", Mount::SidebarTop);
@@ -265,7 +276,7 @@ mod tests {
             m
         }
 
-        fn init() -> Self {
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
             Self {
                 iso: "seed".to_owned(),
             }
@@ -311,16 +322,17 @@ mod tests {
 
     impl Plugin for Ticker {
         type Msg = u32;
+        type Cmd = std::convert::Infallible;
 
         fn manifest() -> Manifest {
             Manifest::new("ticker-test", Mount::SidebarBottom)
         }
 
-        fn init() -> Self {
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
             Self { count: 0 }
         }
 
-        fn sources() -> Option<MsgStream<u32>> {
+        fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<u32>> {
             Some(Box::pin(tokio_stream::iter([1_u32, 2, 3])))
         }
 
@@ -375,16 +387,17 @@ mod tests {
 
     impl Plugin for FragileTicker {
         type Msg = u32;
+        type Cmd = std::convert::Infallible;
 
         fn manifest() -> Manifest {
             Manifest::new("fragile-test", Mount::SidebarBottom)
         }
 
-        fn init() -> Self {
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
             Self { count: 0 }
         }
 
-        fn sources() -> Option<MsgStream<u32>> {
+        fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<u32>> {
             Some(Box::pin(Fragile {
                 yielded: false,
                 ended: false,
@@ -402,6 +415,79 @@ mod tests {
             Node::Label {
                 id: None,
                 text: self.count.to_string(),
+                classes: Vec::new(),
+            }
+        }
+    }
+
+    /// A minimal I/O "task" for [`Commander`]: it *is* the sources stream —
+    /// each command drained from the [`CmdReceiver`] is turned into an app
+    /// message. Stands in for a real plugin's socket/HTTP task, which likewise
+    /// consumes commands and re-emits results as [`Input::App`]s. Hand-rolled
+    /// (over `poll_recv`) to keep the SDK's own tests off the `tokio-stream`
+    /// wrapper features.
+    struct CmdEcho {
+        rx: CmdReceiver<u32>,
+    }
+
+    impl tokio_stream::Stream for CmdEcho {
+        type Item = String;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<String>> {
+            self.get_mut()
+                .rx
+                .poll_recv(cx)
+                .map(|opt| opt.map(|n| format!("io:{n}")))
+        }
+    }
+
+    /// Command-driven: a click dispatches a [`Cmd`](Plugin::Cmd) down the
+    /// per-session lane; its own I/O side ([`CmdEcho`]) echoes it back as an
+    /// app message that folds into the view. Exercises the whole outbound
+    /// path — `update` → `Cmd` → I/O task → `Msg` → `update` → render (#280).
+    struct Commander {
+        cmd_tx: CmdSender<u32>,
+        last: String,
+    }
+
+    impl Plugin for Commander {
+        type Msg = String;
+        type Cmd = u32;
+
+        fn manifest() -> Manifest {
+            Manifest::new("commander-test", Mount::SidebarTop)
+        }
+
+        fn init(cmds: CmdSender<Self::Cmd>) -> Self {
+            Self {
+                cmd_tx: cmds,
+                last: "seed".to_owned(),
+            }
+        }
+
+        fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+            Some(Box::pin(CmdEcho { rx: cmds }))
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            match input {
+                Input::Event { node, kind } => {
+                    if node == "cmd-btn" && matches!(kind, EventKind::Click) {
+                        // Fire-and-forget onto the plugin's own I/O side; the
+                        // click alone changes neither the view nor the effects.
+                        let _ = self.cmd_tx.send(42);
+                    }
+                }
+                Input::App(done) => self.last = done,
+                Input::Snapshot(_) | Input::EffectResult { .. } => {}
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> Node {
+            Node::Label {
+                id: Some("cmd-lbl".to_owned()),
+                text: self.last.clone(),
                 classes: Vec::new(),
             }
         }
@@ -692,6 +778,84 @@ mod tests {
 
         let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_command_from_update_reaches_the_sources_io_side() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let seed = eat_handshake(&mut hrd, "commander-test").await;
+            assert!(matches!(seed, Node::Label { ref text, .. } if text == "seed"));
+
+            // A click emits neither a render nor an effect — it only dispatches
+            // command 42 down the lane. The sources I/O side echoes it as the
+            // app message "io:42", which folds in and re-renders. So the very
+            // next plugin frame is that echo's Render: the round-trip landed.
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "cmd-btn".to_owned(),
+                    kind: EventKind::Click,
+                },
+            )
+            .await;
+            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+                panic!("the echoed command must re-render");
+            };
+            assert!(
+                effects.is_empty(),
+                "the command is plugin I/O, not an effect"
+            );
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "io:42"),
+                "the command round-tripped through the plugin's own I/O side"
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// The command lane is per-session: [`session`] builds a fresh channel on
+    /// every connect and hands its ends to `init`/`sources`. Two back-to-back
+    /// sessions must each round-trip — a single global channel would be closed
+    /// once the first session's model (holding the sender) dropped, wedging the
+    /// second. Also pins that a command never leaks across a reconnect.
+    #[tokio::test]
+    async fn the_command_lane_is_recreated_each_session() {
+        for _ in 0..2 {
+            let (plugin_end, host_end) = duplex(64 * 1024);
+            let (prd, pwr) = tokio::io::split(plugin_end);
+            let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+            let host = async move {
+                eat_handshake(&mut hrd, "commander-test").await;
+                send(
+                    &mut hwr,
+                    &HostMsg::Event {
+                        node: "cmd-btn".to_owned(),
+                        kind: EventKind::Click,
+                    },
+                )
+                .await;
+                let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                    panic!("each session's fresh lane must round-trip");
+                };
+                assert!(matches!(tree, Node::Label { ref text, .. } if text == "io:42"));
+                send(&mut hwr, &HostMsg::Shutdown).await;
+            };
+
+            let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr), host);
+            assert!(
+                result.is_ok(),
+                "a fresh per-session command lane round-trips"
+            );
+        }
     }
 
     #[tokio::test]

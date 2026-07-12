@@ -48,6 +48,35 @@
 //! returns a message stream from [`sources`](Plugin::sources); each item
 //! arrives in [`update`](Plugin::update) as [`Input::App`]. Sources are
 //! created per session and dropped on disconnect — spawn nothing global.
+//!
+//! # Commands: the outbound I/O lane
+//!
+//! [`update`](Plugin::update) returns shell [`Effect`]s — actions the *host*
+//! brokers (open a page, drive niri/media, run a command). A plugin's **own**
+//! external I/O — send a frame on the WebSocket it holds, fire an HTTP call —
+//! is not a shell effect: the design does that in-process and never round-trips
+//! it through the host. But `update` is sync, so it cannot do the I/O itself;
+//! the sanctioned lane is a typed **command** channel (issue #280).
+//!
+//! The runtime creates one fresh channel per session and threads its two ends
+//! for you: [`init`](Plugin::init) receives the
+//! [`CmdSender<Self::Cmd>`](CmdSender) (store it in the model, then
+//! [`send`](CmdSender::send) from `update` to dispatch a command), and
+//! [`sources`](Plugin::sources) receives the matching
+//! [`CmdReceiver<Self::Cmd>`](CmdReceiver) (drain it in the I/O task the
+//! sources own — the same task that also feeds [`Input::App`] messages back
+//! in). This mirrors [`Input`]'s inbound direction with an explicit outbound
+//! one, so a plugin that *controls* something (not just displays it) needs no
+//! ad-hoc channel smuggling. A purely host-driven plugin sets `type Cmd =`
+//! [`Infallible`](std::convert::Infallible) and never touches either end.
+//!
+//! **Lifecycle.** The channel's life is exactly one session: created on
+//! (re)connect, destroyed on disconnect together with the model (its sender)
+//! and the sources task (its receiver). Commands therefore never cross a
+//! reconnect — a command still queued when the socket drops dies with the
+//! session, which is correct, since the very I/O task that would service it is
+//! being torn down and re-established anyway. The next session starts from a
+//! clean channel, just as it re-derives the model from the next snapshot.
 
 use hytte_plugin_proto::{Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot};
 
@@ -71,6 +100,48 @@ pub use tokio_stream;
 /// the runtime polls it inside a `select!`, so it must tolerate being polled
 /// incrementally, as all standard combinators do.
 pub type MsgStream<M> = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = M>>>;
+
+/// The sending half of a plugin's per-session **command lane** — the
+/// sanctioned outbound path from [`update`](Plugin::update) to the plugin's
+/// own external I/O (issue #280; see the crate-level *Commands* section).
+///
+/// The runtime hands this to [`init`](Plugin::init); store it in the model and
+/// call [`send`](CmdSender::send) from `update` to queue one command for the
+/// I/O task your [`sources`](Plugin::sources) built around the matching
+/// [`CmdReceiver`]. It is **unbounded**, so `update` (which is sync) never
+/// blocks; [`send`](CmdSender::send) returns `Err` only once the receiver is
+/// gone — i.e. the session is already tearing down — which callers can safely
+/// ignore. `Clone` it if more than one place needs to enqueue commands.
+///
+/// (An alias for tokio's [`UnboundedSender`](tokio::sync::mpsc::UnboundedSender)
+/// so a plugin needs no direct tokio dependency to name it.)
+pub type CmdSender<C> = tokio::sync::mpsc::UnboundedSender<C>;
+
+/// The receiving half of a plugin's per-session **command lane**, handed to
+/// [`sources`](Plugin::sources). Drain it in the plugin's own I/O task — e.g.
+/// `while let Some(cmd) = rx.recv().await { socket.send(cmd).await }` — which
+/// is also where the inbound [`Input::App`] messages are produced, so a single
+/// task owns both directions of the plugin's external connection.
+///
+/// Dropped on disconnect, so any command still queued when the session ends is
+/// discarded rather than replayed against the next connection (see the
+/// crate-level *Commands* section on lifecycle).
+///
+/// (An alias for tokio's
+/// [`UnboundedReceiver`](tokio::sync::mpsc::UnboundedReceiver).)
+pub type CmdReceiver<C> = tokio::sync::mpsc::UnboundedReceiver<C>;
+
+/// Construct a command-lane [`CmdSender`]/[`CmdReceiver`] pair.
+///
+/// In normal operation you do **not** call this — [`run`] creates the
+/// per-session channel and hands the ends to [`init`](Plugin::init) and
+/// [`sources`](Plugin::sources) for you. It is exposed so unit tests can build
+/// a plugin's model without a live runtime (e.g. `Model::init(cmd_channel().0)`),
+/// and for the rare plugin that needs an auxiliary channel of its own.
+#[must_use]
+pub fn cmd_channel<C>() -> (CmdSender<C>, CmdReceiver<C>) {
+    tokio::sync::mpsc::unbounded_channel()
+}
 
 /// One app-level input folded into the plugin's model by
 /// [`update`](Plugin::update). This is the [`HostMsg`](proto::HostMsg) surface
@@ -107,9 +178,18 @@ pub enum Input<M> {
 /// socket or a host.
 pub trait Plugin: Sized {
     /// Messages produced by this plugin's own [`sources`](Plugin::sources)
-    /// (timer ticks, fetch results). Use [`std::convert::Infallible`] for a
+    /// (timer ticks, fetch results) — the **inbound** side of its own I/O,
+    /// folded in as [`Input::App`]. Use [`std::convert::Infallible`] for a
     /// purely host-driven plugin.
     type Msg;
+
+    /// Commands this plugin dispatches from [`update`](Plugin::update) to its
+    /// own I/O task — the **outbound** side, symmetric to [`Msg`](Plugin::Msg)
+    /// (see the crate-level *Commands* section). The runtime carries them over
+    /// a per-session [`CmdSender`]/[`CmdReceiver`] pair. Use
+    /// [`std::convert::Infallible`] for a plugin that only *displays* state and
+    /// issues no I/O of its own (it then ignores both channel ends).
+    type Cmd;
 
     /// The plugin's self-description: id, subscriptions, capabilities, mount.
     /// Sent as the `Register` handshake frame on every (re)connect.
@@ -118,13 +198,25 @@ pub trait Plugin: Sized {
     /// The initial model, built fresh on every session (see the crate docs on
     /// per-session state). Its [`view`](Plugin::view) is the seed render, sent
     /// immediately so the slot mounts before the first snapshot lands.
-    fn init() -> Self;
+    ///
+    /// `cmds` is this session's command sender (see the crate-level *Commands*
+    /// section): a plugin that issues its own I/O stores it in the model and
+    /// [`send`](CmdSender::send)s on it from [`update`](Plugin::update); a
+    /// purely host-driven plugin (`Cmd = Infallible`) ignores it.
+    fn init(cmds: CmdSender<Self::Cmd>) -> Self;
 
     /// The plugin's own message stream (timers, fetches), or `None` for a
     /// purely host-driven plugin. Called once per session; the stream is
     /// dropped on disconnect.
+    ///
+    /// `cmds` is this session's command receiver, paired with the sender given
+    /// to [`init`](Plugin::init): a plugin that issues I/O drains it in the
+    /// task that also emits its [`Msg`](Plugin::Msg)s (returning that task's
+    /// stream here); the default drops it, which is what a source-less or
+    /// command-less plugin wants.
     #[must_use]
-    fn sources() -> Option<MsgStream<Self::Msg>> {
+    fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+        let _ = cmds;
         None
     }
 

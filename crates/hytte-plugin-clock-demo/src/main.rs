@@ -25,7 +25,7 @@
 use hytte_plugin::proto::{
     Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
 };
-use hytte_plugin::{Input, Plugin};
+use hytte_plugin::{CmdSender, Input, Plugin};
 
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
 const PLUGIN_ID: &str = "clock-demo";
@@ -49,6 +49,11 @@ impl Plugin for ClockDemo {
     /// Purely host-driven: no timers, no fetches, no self-generated messages.
     type Msg = std::convert::Infallible;
 
+    /// Purely display: it issues no I/O of its own, so it has no commands and
+    /// ignores the command lane entirely (see `hytte_plugin`'s *Commands*
+    /// docs). `Infallible` = "no command can ever be constructed".
+    type Cmd = std::convert::Infallible;
+
     /// Subscribes to `Clock`, mounts `SidebarTop`, requests the `OpenPage`
     /// capability. `Manifest::new` stamps `proto = PROTO_VERSION`, which the
     /// host exact-matches at the handshake.
@@ -60,8 +65,10 @@ impl Plugin for ClockDemo {
     }
 
     /// Placeholder time until the first snapshot lands (the runtime renders
-    /// this seed immediately, so the slot mounts right away).
-    fn init() -> Self {
+    /// this seed immediately, so the slot mounts right away). The command
+    /// sender goes unused — this plugin only reads state and asks the host to
+    /// open a page.
+    fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
         Self {
             iso: "—".to_owned(),
             unix: 0,
@@ -153,11 +160,18 @@ mod tests {
         })
     }
 
+    /// A fresh model with a throwaway command sender — the demo issues no
+    /// commands, so the lane goes unused (`cmd_channel` lets the test build a
+    /// sender without a direct tokio dependency).
+    fn fresh() -> ClockDemo {
+        ClockDemo::init(hytte_plugin::cmd_channel().0)
+    }
+
     /// The core signal: a snapshot with a clock updates the model and `view`
     /// renders the exact expected widget tree the host will reconcile.
     #[test]
     fn snapshot_updates_model_and_renders_expected_tree() {
-        let mut model = ClockDemo::init();
+        let mut model = fresh();
         let effects = model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1_752_241_740));
         assert!(effects.is_empty());
         assert_eq!(model.iso, "2026-07-11T15:49:00+02:00");
@@ -193,7 +207,7 @@ mod tests {
     /// the runtime's tree dedup then sends no frame for it.
     #[test]
     fn snapshot_without_clock_changes_nothing() {
-        let mut model = ClockDemo::init();
+        let mut model = fresh();
         let before = model.view();
         let effects = model.update(Input::Snapshot(StateSnapshot::default()));
         assert!(effects.is_empty());
@@ -203,7 +217,7 @@ mod tests {
     /// Clicking the clock button emits exactly one `OpenPage(PowerMenu)` effect.
     #[test]
     fn button_click_emits_open_power_menu_effect() {
-        let mut model = ClockDemo::init();
+        let mut model = fresh();
         let effects = model.update(Input::Event {
             node: CLOCK_BTN.to_owned(),
             kind: EventKind::Click,
@@ -214,7 +228,7 @@ mod tests {
     /// A click on a node we don't own is ignored (no spurious effect).
     #[test]
     fn click_on_unknown_node_is_ignored() {
-        let mut model = ClockDemo::init();
+        let mut model = fresh();
         let effects = model.update(Input::Event {
             node: "not-ours".to_owned(),
             kind: EventKind::Click,
@@ -232,7 +246,7 @@ mod tests {
         let back: PluginMsg = decode(&encode(&reg)).expect("register frame decodes");
         assert_eq!(reg, back);
 
-        let mut model = ClockDemo::init();
+        let mut model = fresh();
         let _ = model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1));
         let render = PluginMsg::Render {
             tree: model.view(),

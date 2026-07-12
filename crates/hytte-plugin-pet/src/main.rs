@@ -5,6 +5,15 @@
 //! TEA — the model below, a 4-second tick, and a view of exactly one face
 //! and (sometimes) one speech bubble. **Click the face to poke it.**
 //!
+//! # Face (`face.rs`)
+//!
+//! The face is a **procedural color LCD** (#284): each tick renders the mood's
+//! expression + a blink cycle into a 128×128 RGBA8 buffer, drawn as a
+//! [`Node::Pixels`] the host upscales nearest-neighbor for the chunky-pixel look
+//! (bezel in CSS, `.pet-face` / `.pet-lcd`). The speech bubble stays text — the
+//! kaomoji voice lives there. Set **`TROLLSHELL_PET_KAOMOJI=1`** to fall back to
+//! the original kaomoji `Label` face instead of the LCD.
+//!
 //! # Moods
 //!
 //! Derived, never stored: poking excites it, poke-spam makes it grumpy
@@ -30,6 +39,7 @@
 //! other.
 
 mod brain;
+mod face;
 
 use std::time::Duration;
 
@@ -81,6 +91,9 @@ struct Pet {
     /// [`ThinkReq`] here from `update`, and the task the pet's `sources` spawn
     /// drains it. The runtime owns the channel per session.
     cmd_tx: CmdSender<ThinkReq>,
+    /// Render the legacy kaomoji `Label` face instead of the LCD, when
+    /// `TROLLSHELL_PET_KAOMOJI=1`. Read once at init so `view` stays pure.
+    kaomoji_fallback: bool,
 }
 
 /// The pet's disposition — derived from state, never stored.
@@ -232,6 +245,8 @@ impl Plugin for Pet {
             ticks: 0,
             rng: (now.as_secs() ^ u64::from(now.subsec_nanos())).max(1),
             cmd_tx: cmds,
+            kaomoji_fallback: std::env::var("TROLLSHELL_PET_KAOMOJI")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         }
     }
 
@@ -272,16 +287,30 @@ impl Plugin for Pet {
 
     fn view(&self) -> Node {
         let mood = self.mood();
-        let loops = frames(mood);
-        let kao = loops[self.frame % loops.len()];
-        let mut children = vec![Node::Button {
-            id: FACE_ID.to_owned(),
-            classes: vec!["pet-face".to_owned(), format!("pet-mood-{}", mood.word())],
-            child: Box::new(Node::Label {
+        // The face: an LCD `Pixels` surface by default, or the legacy kaomoji
+        // `Label` under `TROLLSHELL_PET_KAOMOJI=1`. Either way it is the same
+        // `Button(FACE_ID)` poke target — clicks are unchanged.
+        let face_child = if self.kaomoji_fallback {
+            let loops = frames(mood);
+            let kao = loops[self.frame % loops.len()];
+            Node::Label {
                 id: None,
                 text: kao.to_owned(),
                 classes: vec!["pet-kao".to_owned()],
-            }),
+            }
+        } else {
+            Node::Pixels {
+                id: Some("pet-lcd".to_owned()),
+                width: face::SIZE_U32,
+                height: face::SIZE_U32,
+                data: face::render(mood, self.frame),
+                classes: vec!["pet-lcd".to_owned()],
+            }
+        };
+        let mut children = vec![Node::Button {
+            id: FACE_ID.to_owned(),
+            classes: vec!["pet-face".to_owned(), format!("pet-mood-{}", mood.word())],
+            child: Box::new(face_child),
         }];
         if let Some((line, _)) = &self.bubble {
             children.push(Node::Label {
@@ -467,6 +496,50 @@ mod tests {
         assert!(
             matches!(&children[1], Node::Label { text, .. } if text == "hej"),
             "the bubble label carries the thought"
+        );
+    }
+
+    #[test]
+    fn face_is_an_lcd_by_default_and_a_kaomoji_under_the_fallback() {
+        // Default: the face child is a 128×128 RGBA8 Pixels surface whose buffer
+        // honors the host's `len == w*h*4` invariant.
+        let (mut p, _rx) = pet();
+        p.kaomoji_fallback = false;
+        let Node::Box { children, .. } = p.view() else {
+            panic!("root is a box");
+        };
+        let Node::Button { id, child, .. } = &children[0] else {
+            panic!("face is a button");
+        };
+        assert_eq!(id, FACE_ID, "the LCD keeps the same poke target");
+        let Node::Pixels {
+            width,
+            height,
+            data,
+            ..
+        } = &**child
+        else {
+            panic!("default face child is a Pixels surface");
+        };
+        assert_eq!((*width, *height), (128, 128));
+        assert_eq!(
+            data.len(),
+            128 * 128 * 4,
+            "buffer must satisfy the host's len == w*h*4 seam"
+        );
+
+        // Fallback: the kaomoji Label returns, still inside Button(FACE_ID).
+        let (mut p, _rx2) = pet();
+        p.kaomoji_fallback = true;
+        let Node::Box { children, .. } = p.view() else {
+            panic!("root is a box");
+        };
+        let Node::Button { child, .. } = &children[0] else {
+            panic!("face is a button");
+        };
+        assert!(
+            matches!(&**child, Node::Label { .. }),
+            "fallback face is the kaomoji label"
         );
     }
 

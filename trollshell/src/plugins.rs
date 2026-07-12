@@ -18,21 +18,28 @@
 //!
 //! ```text
 //! plugin ──Register/Render/Log/Pong──▶ per-conn reader task ──▶ render mailbox (Mutable)
+//!                                                              ──▶ effect channel (mpsc)
 //!                                                              ──▶ tracing / liveness
 //! GTK reconciler ◀── render mailbox ── maps wire::Node → hytte_ui::Node
+//! GTK effect broker ◀── effect channel ── drained in arrival order (non-lossy)
 //! GTK reconciler ──on_event──▶ per-conn outbound (mpsc) ──▶ writer task ──▶ plugin (Event)
 //! GTK clock pump ──▶ watch ──▶ per-conn snapshot task ──▶ writer task ──▶ plugin (StateSnapshot)
 //! ```
 //!
-//! ## Coalescing (latest-wins)
+//! ## Coalescing (latest-wins) — trees only
 //!
-//! Both bridges coalesce, per the spec's "always accept new view state, no
+//! The view bridges coalesce, per the spec's "always accept new view state, no
 //! deltas, latest-wins":
 //! - The render mailbox is a `Mutable<Option<SlotRender>>`; a new frame
 //!   overwrites the previous in place, and a slow GTK consumer only ever sees
 //!   the newest tree (superseded frames are dropped).
 //! - The clock bridge is a `watch` channel; a per-conn task reads
 //!   `borrow_and_update()` so bursts collapse to the latest `ClockState`.
+//!
+//! Effects are the exception: they are **one-shot**, so coalescing could drop a
+//! click (#277). The reader task strips each frame's effects onto a dedicated
+//! `mpsc::unbounded` channel drained on the GTK thread — non-lossy, ordered per
+//! connection — instead of letting them ride the latest-wins mailbox.
 //!
 //! ## v1 scope (see the PR body for the full deferred list)
 //!
@@ -49,6 +56,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Local};
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -70,27 +78,48 @@ use tokio::sync::{mpsc, watch};
 /// The plugin host transport service. Registered in `main.rs` via `App::with`.
 pub struct PluginsService;
 
+/// Monotonic per-connection token. Stamped on every [`SlotRender`] a connection
+/// parks so slot ownership is **connection-scoped, not plugin-id-scoped**: a
+/// fast-reconnecting plugin (the SDK backs off from 100 ms) can have its new
+/// connection claim the slot before the old connection's teardown runs, and a
+/// plugin-id compare would let the stale teardown blank the live successor
+/// (#278). The generation compare cannot — each connection has a unique token.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// One rendered plugin frame parked in a mount slot's coalescing mailbox: the
-/// declarative tree, its bundled effects, and a handle to send frames **back**
-/// to the plugin that produced it (event round-trip). `Clone` so it can ride a
+/// declarative tree, the [`NEXT_GENERATION`] token of the connection that
+/// produced it, and a handle to send frames **back** to that connection (event
+/// round-trip). Effects do **not** ride here — they are one-shot, so they go
+/// down the non-lossy effect channel instead (#277). `Clone` so it can ride a
 /// `Mutable` signal to the GTK reconcilers.
 #[derive(Clone)]
 struct SlotRender {
-    plugin_id: String,
+    generation: u64,
     tree: wire::Node,
-    effects: Vec<Effect>,
     outbound: mpsc::UnboundedSender<HostMsg>,
+}
+
+/// One effect stripped off a render frame, queued on the non-lossy effect
+/// channel for the GTK-side broker. Carries the producing plugin's id purely
+/// for the audit log.
+struct BrokeredEffect {
+    plugin_id: String,
+    effect: Effect,
 }
 
 /// Registry handles for the plugin host. The two sidebar render mailboxes are
 /// written from tokio (a plugin's reader task) and read on the GTK thread (the
-/// reconcilers + the effect broker). `clock_tx` is written on the GTK thread
-/// (the clock pump) and subscribed from tokio (per-conn snapshot tasks).
+/// reconcilers). `clock_tx` is written on the GTK thread (the clock pump) and
+/// subscribed from tokio (per-conn snapshot tasks). `effects_rx` is the receive
+/// end of the non-lossy effect channel; [`install`] takes it once to drain the
+/// broker on the GTK thread (`RefCell<Option<…>>` because the registry is
+/// thread-local to that thread and the receiver is single-consumer).
 #[doc(hidden)]
 pub struct PluginHandles {
     sidebar_top: Mutable<Option<SlotRender>>,
     sidebar_bottom: Mutable<Option<SlotRender>>,
     clock_tx: watch::Sender<Option<ClockState>>,
+    effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
 
 /// Clones of the shared handles handed to the tokio listener + per-conn tasks.
@@ -99,6 +128,7 @@ struct ListenerCtx {
     sidebar_top: Mutable<Option<SlotRender>>,
     sidebar_bottom: Mutable<Option<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
+    effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
 
 impl Service for PluginsService {
@@ -106,15 +136,18 @@ impl Service for PluginsService {
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let (clock_tx, clock_rx) = watch::channel(None);
+        let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
             sidebar_top: Mutable::new(None),
             sidebar_bottom: Mutable::new(None),
             clock_tx,
+            effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
             sidebar_top: handles.sidebar_top.clone(),
             sidebar_bottom: handles.sidebar_bottom.clone(),
             clock_rx,
+            effects_tx,
         };
         rt.spawn(async move {
             if let Err(e) = listen(&ctx).await {
@@ -147,18 +180,27 @@ pub fn install() {
         std::future::ready(())
     }));
 
-    // Effect broker: one global subscription per sidebar mailbox so a bundled
-    // effect is brokered exactly once even when the same tree is mirrored onto
-    // several monitors' sidebars. Reconcilers (per monitor) render the tree but
-    // never touch effects.
-    glib::MainContext::default().spawn_local(top_render_signal().for_each(|opt| {
-        broker_render_effects(opt.as_ref());
-        std::future::ready(())
-    }));
-    glib::MainContext::default().spawn_local(bottom_render_signal().for_each(|opt| {
-        broker_render_effects(opt.as_ref());
-        std::future::ready(())
-    }));
+    // Effect broker: drain the non-lossy effect channel in arrival order.
+    // Effects are one-shot, so — unlike the idempotent trees on the render
+    // mailbox — they must never be coalesced away (#277); the reader tasks strip
+    // them off each frame and queue them here. Draining on the GTK main thread
+    // is exactly once per effect, regardless of how many monitors mirror the
+    // tree (the mailbox fan-out never sees effects). Reconcilers render the
+    // tree; they never touch effects.
+    let effects_rx = registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .effects_rx
+            .borrow_mut()
+            .take()
+    });
+    if let Some(mut effects_rx) = effects_rx {
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(brokered) = effects_rx.recv().await {
+                broker_effect(&brokered.plugin_id, &brokered.effect);
+            }
+        });
+    }
 }
 
 /// Publish the latest clock state to the per-conn snapshot tasks.
@@ -187,16 +229,6 @@ fn bottom_render_signal() -> impl Signal<Item = Option<SlotRender>> {
             .sidebar_bottom
             .signal_cloned()
     })
-}
-
-/// Broker every effect bundled on a render frame (v1: `OpenPage` only).
-fn broker_render_effects(render: Option<&SlotRender>) {
-    let Some(render) = render else {
-        return;
-    };
-    for effect in &render.effects {
-        broker_effect(&render.plugin_id, effect);
-    }
 }
 
 /// Map one wire [`Effect`] onto a real host command. v1 handles [`Effect::OpenPage`]
@@ -349,6 +381,10 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     let plugin_id = manifest.id.clone();
     let mount = manifest.mount;
+    // Unique per-connection token stamped on every frame this connection parks,
+    // so teardown can distinguish "still my frame in the slot" from "a successor
+    // connection already claimed it" (#278).
+    let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         plugin = %plugin_id,
         ?mount,
@@ -371,19 +407,30 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
             Ok(PluginMsg::Render { tree, effects }) => {
-                let render = SlotRender {
-                    plugin_id: plugin_id.clone(),
-                    tree,
-                    effects,
-                    outbound: out_tx.clone(),
-                };
-                // Latest-wins: `set` overwrites any superseded frame in place.
-                match mount {
-                    Mount::SidebarTop => ctx.sidebar_top.set(Some(render)),
-                    Mount::SidebarBottom => ctx.sidebar_bottom.set(Some(render)),
+                let slot = match mount {
+                    Mount::SidebarTop => Some(&ctx.sidebar_top),
+                    Mount::SidebarBottom => Some(&ctx.sidebar_bottom),
                     Mount::BarLeft | Mount::BarCenter | Mount::BarRight => {
                         tracing::debug!(plugin = %plugin_id, ?mount, "bar mount unsupported in v1; render dropped");
+                        None
                     }
+                };
+                if let Some(slot) = slot {
+                    // One-shot effects first, over the non-lossy channel, BEFORE
+                    // parking the idempotent tree — a superseding render frame
+                    // could otherwise coalesce this frame's click away (#277).
+                    for effect in effects {
+                        let _ = ctx.effects_tx.send(BrokeredEffect {
+                            plugin_id: plugin_id.clone(),
+                            effect,
+                        });
+                    }
+                    // Latest-wins: `set` overwrites any superseded frame in place.
+                    slot.set(Some(SlotRender {
+                        generation,
+                        tree,
+                        outbound: out_tx.clone(),
+                    }));
                 }
             }
             Ok(PluginMsg::Register { .. }) => {
@@ -398,10 +445,11 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         }
     }
 
-    // Teardown: release the mount slot if this plugin still owns it (blanks the
-    // reconciler on the GTK side), then stop the outbound + snapshot tasks.
-    clear_slot_if_owned(&ctx.sidebar_top, &plugin_id);
-    clear_slot_if_owned(&ctx.sidebar_bottom, &plugin_id);
+    // Teardown: release the mount slot only if THIS connection still owns it
+    // (blanks the reconciler on the GTK side), then stop the outbound + snapshot
+    // tasks. Connection-scoped so a fast-reconnect successor is never evicted.
+    clear_slot_if_owned(&ctx.sidebar_top, generation);
+    clear_slot_if_owned(&ctx.sidebar_bottom, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
@@ -448,17 +496,22 @@ async fn snapshot_task(
     }
 }
 
-/// Clear a mount slot iff the disconnecting plugin still owns it (a newer plugin
-/// may already have claimed the slot).
-fn clear_slot_if_owned(slot: &Mutable<Option<SlotRender>>, plugin_id: &str) {
-    let owned = {
-        slot.lock_ref()
-            .as_ref()
-            .is_some_and(|r| r.plugin_id == plugin_id)
-    };
+/// Clear a mount slot iff the disconnecting connection still owns it (a newer
+/// connection — even a fast reconnect of the same plugin — may already have
+/// claimed the slot; its render carries a higher generation, so we leave it).
+fn clear_slot_if_owned(slot: &Mutable<Option<SlotRender>>, generation: u64) {
+    let owned = owns_slot(slot.lock_ref().as_ref().map(|r| r.generation), generation);
     if owned {
         slot.set(None);
     }
+}
+
+/// Whether a teardown for `teardown_gen` should clear a slot currently holding
+/// `slot_gen`. Ownership is connection-scoped: the compare succeeds only for the
+/// exact connection that parked the frame, so a stale teardown can never evict a
+/// successor connection's live render (#278). An empty slot is owned by nobody.
+fn owns_slot(slot_gen: Option<u64>, teardown_gen: u64) -> bool {
+    slot_gen == Some(teardown_gen)
 }
 
 /// Surface a plugin's `Log` frame at the matching host `tracing` level.
@@ -594,8 +647,9 @@ fn empty_node() -> UiNode {
 #[cfg(test)]
 mod tests {
     use super::{
-        Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir, UiEventKind, UiNode,
-        empty_node, map_page, mpsc, to_ui_node, to_wire_event, wire,
+        BrokeredEffect, Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir,
+        UiEventKind, UiNode, empty_node, map_page, mpsc, owns_slot, to_ui_node, to_wire_event,
+        wire,
     };
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
@@ -752,33 +806,82 @@ mod tests {
         }
     }
 
-    /// The render mailbox coalesces latest-wins: rapid frames overwrite in place,
-    /// and a slow consumer reading once observes only the newest tree.
-    #[test]
-    fn render_mailbox_coalesces_latest_wins() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
-        let frame = |text: &str| SlotRender {
-            plugin_id: "p".into(),
+    /// A label frame carrying a generation, for the mailbox tests below.
+    fn label_frame(text: &str, generation: u64, tx: &mpsc::UnboundedSender<HostMsg>) -> SlotRender {
+        SlotRender {
+            generation,
             tree: wire::Node::Label {
                 id: None,
                 text: text.to_owned(),
                 classes: vec![],
             },
-            effects: vec![],
             outbound: tx.clone(),
-        };
+        }
+    }
+
+    /// The render mailbox coalesces latest-wins: rapid frames overwrite in place,
+    /// and a slow consumer reading once observes only the newest tree.
+    #[test]
+    fn render_mailbox_coalesces_latest_wins() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
         let mailbox: Mutable<Option<SlotRender>> = Mutable::new(None);
-        mailbox.set(Some(frame("first")));
-        mailbox.set(Some(frame("second")));
-        mailbox.set(Some(frame("third")));
+        mailbox.set(Some(label_frame("first", 0, &tx)));
+        mailbox.set(Some(label_frame("second", 0, &tx)));
+        mailbox.set(Some(label_frame("third", 0, &tx)));
 
         let guard = mailbox.lock_ref();
         let latest = guard.as_ref().expect("mailbox holds the latest frame");
-        assert_eq!(latest.plugin_id, "p");
         match &latest.tree {
             wire::Node::Label { text, .. } => assert_eq!(text, "third"),
             other => panic!("expected a Label, got {other:?}"),
         }
+    }
+
+    /// #277: two back-to-back frames coalesce in the latest-wins mailbox, but a
+    /// one-shot effect bundled on the superseded frame rides the dedicated
+    /// non-lossy channel and is delivered exactly once — not dropped, not
+    /// duplicated. This is the click-drop scenario the fix closes.
+    #[test]
+    fn effects_survive_render_coalescing() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (eff_tx, mut eff_rx) = mpsc::unbounded_channel::<BrokeredEffect>();
+        let mailbox: Mutable<Option<SlotRender>> = Mutable::new(None);
+
+        // Frame A: a click's effect goes on the effect channel, then the tree is
+        // parked. Frame B (a tick microseconds later) coalesces A's tree away.
+        eff_tx
+            .send(BrokeredEffect {
+                plugin_id: "p".into(),
+                effect: Effect::OpenPage(Page::PowerMenu),
+            })
+            .expect("effect queued");
+        mailbox.set(Some(label_frame("A", 0, &tx)));
+        mailbox.set(Some(label_frame("B", 0, &tx)));
+
+        // The mailbox observes only B (load-shedding by design)…
+        match &mailbox.lock_ref().as_ref().expect("frame parked").tree {
+            wire::Node::Label { text, .. } => assert_eq!(text, "B"),
+            other => panic!("expected a Label, got {other:?}"),
+        }
+        // …but the effect survived, exactly once, in order.
+        let got = eff_rx.try_recv().expect("effect not dropped by coalescing");
+        assert_eq!(got.plugin_id, "p");
+        assert!(matches!(got.effect, Effect::OpenPage(Page::PowerMenu)));
+        assert!(eff_rx.try_recv().is_err(), "effect must not be duplicated");
+    }
+
+    /// #278: connection-scoped slot ownership. A stale teardown (older
+    /// generation) must never evict a fast-reconnect successor that already
+    /// claimed the slot; only the owning generation's own teardown clears it.
+    #[test]
+    fn stale_teardown_never_evicts_successor() {
+        // Successor (gen 2) holds the slot; the old connection's teardown (gen 1)
+        // must NOT clear it.
+        assert!(!owns_slot(Some(2), 1));
+        // The owning connection's own teardown clears its live frame.
+        assert!(owns_slot(Some(2), 2));
+        // An already-empty slot is owned by nobody.
+        assert!(!owns_slot(None, 1));
     }
 
     /// A bar mount is a real wire variant the reader must handle; assert the two

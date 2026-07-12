@@ -280,7 +280,11 @@ impl Plugin for Pet {
                     self.poke();
                 }
             }
-            Input::EffectResult { .. } => {}
+            // EffectResult is unused (no RunCommand is issued), and the cat keeps
+            // purring whether or not you're looking (its ticks are cheap and its
+            // liveliness is the point) — so it ignores the sidebar-visibility push
+            // (#288) rather than napping while hidden. Both are no-ops.
+            Input::EffectResult { .. } | Input::SlotVisible(_) => {}
         }
         Vec::new()
     }

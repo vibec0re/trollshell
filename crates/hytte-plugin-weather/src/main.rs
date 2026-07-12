@@ -15,7 +15,9 @@
 //! open-meteo every [`fetch::POLL_INTERVAL`] and on demand. Each result
 //! re-enters the reducer as [`Input::App`]. **Click the card to refresh now**:
 //! the click dispatches a [`Cmd`](Plugin::Cmd) down the #280 command lane, which
-//! the worker turns into an immediate fetch.
+//! the worker turns into an immediate fetch. Slot-visibility gating
+//! ([`Input::SlotVisible`], #288) is available but deliberately unused: at a
+//! 15-minute cadence there is nothing worth parking while the sidebar is closed.
 //!
 //! # Location (`location.rs`)
 //!
@@ -209,10 +211,10 @@ impl Plugin for Weather {
                 let _ = self.cmd_tx.send(WeatherCmd::RefreshNow);
             }
             // Weather subscribes to no state and issues no effects, so `Snapshot`
-            // and `EffectResult` (and a foreign/scroll `Event`) are no-ops. A
-            // bare wildcard (rather than an exhaustive arm list) also absorbs any
-            // additive `Input` variant still in flight — e.g. the slot-visibility
-            // push (#288) — which weather simply ignores.
+            // and `EffectResult` (and a foreign/scroll `Event`) are no-ops.
+            // `SlotVisible` (#288) is deliberately unused too — see the crate
+            // docs — and the bare wildcard (rather than an exhaustive arm list)
+            // keeps any future additive `Input` variant a no-op as well.
             _ => {}
         }
         Vec::new()
@@ -620,8 +622,9 @@ mod tests {
 
     #[test]
     fn ignored_inputs_are_no_ops() {
-        // Snapshot / EffectResult (and any future additive Input variant) fold
-        // to nothing — no panic, no effect, no state change.
+        // Snapshot / EffectResult / SlotVisible (and any future additive Input
+        // variant) fold to nothing — no panic, no effect, no state change.
+        // Visibility gating is deliberately unused at this cadence (crate docs).
         let (mut m, _rx) = model();
         let before = m.view();
         let fx = m.update(Input::Snapshot(
@@ -635,6 +638,8 @@ mod tests {
                 output: None,
             },
         });
+        assert!(fx.is_empty());
+        let fx = m.update(Input::SlotVisible(false));
         assert!(fx.is_empty());
         assert_eq!(m.view(), before, "ignored inputs leave the card unchanged");
     }

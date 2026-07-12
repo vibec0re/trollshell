@@ -130,6 +130,7 @@ where
                 Some(Ok(HostMsg::EffectResult { id, outcome })) => {
                     Input::EffectResult { id, outcome }
                 }
+                Some(Ok(HostMsg::SlotVisibility { visible })) => Input::SlotVisible(visible),
                 Some(Ok(HostMsg::Ping { seq })) => {
                     // Liveness is runtime plumbing: answer, don't surface.
                     if let Err(e) = write_frame(&mut wr, &PluginMsg::Pong { seq }).await {
@@ -301,6 +302,7 @@ mod tests {
                     self.iso = format!("cmd{id} ok={}", outcome.ok);
                     Vec::new()
                 }
+                Input::SlotVisible(_) => Vec::new(),
                 Input::App(never) => match never {},
             }
         }
@@ -309,6 +311,41 @@ mod tests {
             Node::Label {
                 id: Some("echo-lbl".to_owned()),
                 text: self.iso.clone(),
+                classes: Vec::new(),
+            }
+        }
+    }
+
+    /// Reflects the latest slot-visibility push in its view, so a
+    /// [`HostMsg::SlotVisibility`] arriving as [`Input::SlotVisible`] is
+    /// observable as a re-render — the park-your-pollers signal in miniature.
+    struct Watcher {
+        visible: bool,
+    }
+
+    impl Plugin for Watcher {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("watcher-test", Mount::SidebarTop)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { visible: false }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::SlotVisible(visible) = input {
+                self.visible = visible;
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> Node {
+            Node::Label {
+                id: None,
+                text: if self.visible { "visible" } else { "hidden" }.to_owned(),
                 classes: Vec::new(),
             }
         }
@@ -479,7 +516,7 @@ mod tests {
                     }
                 }
                 Input::App(done) => self.last = done,
-                Input::Snapshot(_) | Input::EffectResult { .. } => {}
+                Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
             }
             Vec::new()
         }
@@ -777,6 +814,48 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::SlotVisibility`] push reaches `update` as
+    /// [`Input::SlotVisible`] and re-renders — the mechanism a migrated poller
+    /// gates on to park itself while hidden (#288). Latest-wins is exercised
+    /// implicitly: each push is folded independently and the tree tracks it.
+    #[tokio::test]
+    async fn slot_visibility_push_reaches_update_as_input() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let seed = eat_handshake(&mut hrd, "watcher-test").await;
+            assert!(
+                matches!(seed, Node::Label { ref text, .. } if text == "hidden"),
+                "the fresh model starts hidden",
+            );
+
+            // "sidebar opened" → the plugin folds SlotVisible(true) and re-renders.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+                panic!("a visibility push must reach update() and re-render");
+            };
+            assert!(effects.is_empty());
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "visible"),
+                "SlotVisibility(true) reached update as Input::SlotVisible(true)",
+            );
+
+            // "sidebar closed" flips it back — the park-your-pollers edge.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: false }).await;
+            let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("the close push must re-render");
+            };
+            assert!(matches!(tree, Node::Label { ref text, .. } if text == "hidden"));
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Watcher, _, _>(prd, pwr), host);
         assert!(result.is_ok());
     }
 

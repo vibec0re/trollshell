@@ -90,7 +90,7 @@ unavailable/denied, forward-geocodes `$TROLLSHELL_WEATHER_CITY` — the same env
 var the in-shell card honors (see the unit's commented `Environment=` line).
 Being a separate process it links **no GTK**: it talks D-Bus over its own
 `zbus` connection and fetches open-meteo directly. **Click the card to refresh
-now.** During the migration transition it runs *alongside* the built-in weather
+now.** During the migration transition it runs _alongside_ the built-in weather
 card (compare, then remove the native mount — see #290); once removed, the
 plugin card takes its place at the top of the sidebar.
 

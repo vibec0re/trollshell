@@ -166,6 +166,8 @@ fn host_msgs_round_trip() {
             output: Some("running".into()),
         },
     });
+    round_trip_host(&HostMsg::SlotVisibility { visible: true });
+    round_trip_host(&HostMsg::SlotVisibility { visible: false });
     round_trip_host(&HostMsg::Ping { seq: 1 });
     round_trip_host(&HostMsg::Shutdown);
 }

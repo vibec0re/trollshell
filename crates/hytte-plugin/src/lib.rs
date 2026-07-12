@@ -168,6 +168,21 @@ pub enum Input<M> {
         /// Whether it succeeded, and any captured output.
         outcome: EffectOutcome,
     },
+    /// The plugin's mount surface became visible (`true`) or hidden (`false`) —
+    /// its host [`SlotVisibility`](proto::HostMsg::SlotVisibility). The runtime
+    /// delivers one **at register** (seeded from the host so a (re)connecting
+    /// plugin starts in the right state), then one on every change.
+    ///
+    /// This is the hook for **parking your own pollers while nobody is looking**:
+    /// gate a `sources()` fetch/tick loop on the latest value (fetch while
+    /// visible, idle while hidden), the same energy behavior the shell already
+    /// applies to its built-in pollers. Ignoring it keeps today's always-on
+    /// behavior — nothing breaks.
+    ///
+    /// **Latest-wins delivery.** Visibility is state, not a one-shot event, so a
+    /// burst of toggles may coalesce to the newest value; act on the value you
+    /// receive, never assume you saw every intermediate edge.
+    SlotVisible(bool),
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
 }

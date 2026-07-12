@@ -7,6 +7,7 @@ mod error;
 mod layer_window;
 mod monitor;
 pub mod multi_sparkline;
+mod pixels;
 mod popup;
 pub mod sparkline;
 pub mod widget_tree;

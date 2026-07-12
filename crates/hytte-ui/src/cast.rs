@@ -37,6 +37,19 @@ pub(crate) fn u32_to_usize(n: u32) -> usize {
     n as usize
 }
 
+/// Convert a widget's `i32` pixel dimension to `f32` for
+/// [`graphene::Rect`](gtk::graphene::Rect) drawing bounds.
+///
+/// # Precision contract
+///
+/// `f32` has a 24-bit mantissa, so integers up to 2^24 (~16.7M) round-trip
+/// exactly. GTK widget allocations are at most a few thousand pixels per axis —
+/// orders of magnitude below that — so no precision is lost.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn i32_to_f32(n: i32) -> f32 {
+    n as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

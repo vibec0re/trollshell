@@ -48,6 +48,18 @@ struct NotificationsShared {
     /// Ownership handle used to emit D-Bus signals directly on the owned
     /// connection without a round-trip method call.
     ownership: OwnNameSignal,
+    /// Local-dispatch callbacks for locally-posted notification actions,
+    /// keyed by `(notification id, action key)`. Populated by
+    /// [`post_local_with_actions`], consumed (removed + run) by
+    /// [`invoke_action`] on a matching `(id, key)`, and swept for a whole
+    /// `id` by [`dismiss`] whenever that notification closes — by any path
+    /// (auto-expiry, user dismiss, or `CloseNotification`) — so a
+    /// never-clicked action doesn't linger forever. Externally-posted
+    /// (D-Bus `Notify`) notifications never populate this map, so this
+    /// field has zero effect on their behaviour. A plain `std::sync::Mutex`
+    /// is fine here for the same reason as `POST_LOCAL_SEEN`: every
+    /// critical section is non-async map surgery.
+    local_actions: Mutex<LocalActionMap>,
 }
 
 static SHARED: OnceLock<NotificationsShared> = OnceLock::new();
@@ -197,6 +209,7 @@ impl Service for NotificationsService {
             history: history.clone(),
             next_id: next_id.clone(),
             ownership: ownership.clone(),
+            local_actions: Mutex::new(HashMap::new()),
         });
 
         NotificationsHandles {
@@ -289,6 +302,15 @@ pub fn dismiss(id: u32, reason: u32) {
             hist.insert(0, entry);
             hist.truncate(100);
         }
+
+        // Drop any local-dispatch callback still registered for `id` — this
+        // close path (expiry, user dismiss, or `close_notification`'s call
+        // into `dismiss`) means the action can never be invoked again. A
+        // cheap no-op for externally-posted notifications, which never
+        // populate this map.
+        if let Ok(mut map) = shared.local_actions.lock() {
+            clear_local_actions(&mut map, id);
+        }
     }
 
     // Emit the NotificationClosed signal directly on the owned connection.
@@ -330,10 +352,37 @@ pub fn dismiss_all() {
 
 /// Invoke action `action_key` on notification `id`.
 ///
-/// Emits `ActionInvoked` on the session bus as a broadcast — the originating
-/// app filters by `id` and reacts (e.g. opens its window, posts a reply form).
+/// # Local dispatch (locally-posted notifications)
+///
+/// If `(id, action_key)` has a callback registered via
+/// [`post_local_with_actions`], that callback is run **instead of** the
+/// D-Bus broadcast below — not in addition to it. A locally-posted
+/// notification has no external subscriber that could react to
+/// `ActionInvoked` (the shell posted it to itself), so there is nothing for
+/// the broadcast to accomplish beyond a wasted round-trip; the callback IS
+/// the complete reaction. See [`LocalActionCallback`] for the thread
+/// contract the callback runs under.
+///
+/// # D-Bus broadcast (externally-posted notifications)
+///
+/// With no local callback registered — always true for notifications an
+/// external app posted via the `Notify` D-Bus method — this emits
+/// `ActionInvoked` on the session bus exactly as before: a broadcast the
+/// originating app filters by `id` and reacts to (e.g. opens its window,
+/// posts a reply form). This path, and therefore external notifications'
+/// behaviour, is unchanged by local dispatch.
+///
 /// Both the toast widget and the history page wire action buttons to this.
 pub fn invoke_action(id: u32, action_key: &str) {
+    if let Some(shared) = SHARED.get()
+        && let Ok(mut map) = shared.local_actions.lock()
+        && let Some(callback) = take_local_action(&mut map, id, action_key)
+    {
+        drop(map);
+        callback();
+        return;
+    }
+
     let action_key = action_key.to_string();
     if let Some(shared) = SHARED.get() {
         let ownership = shared.ownership.clone();
@@ -352,6 +401,94 @@ pub fn invoke_action(id: u32, action_key: &str) {
 }
 
 // ── Local self-posting ────────────────────────────────────────────────────────
+
+/// A locally-dispatched notification action: a button key/label pair (same
+/// shape as [`Action`]) plus the callback [`invoke_action`] runs when that
+/// button is clicked. Built with [`LocalAction::new`] and passed to
+/// [`post_local_with_actions`].
+pub struct LocalAction {
+    /// Action key. Must be unique among the actions passed to the same
+    /// [`post_local_with_actions`] call — it's the lookup key
+    /// [`invoke_action`] uses to find this callback.
+    key: String,
+    /// User-facing button label, rendered by the same toast/history action
+    /// buttons an externally-posted [`Action`] would use.
+    label: String,
+    /// Run once, on the thread that calls [`invoke_action`] for this
+    /// `(id, key)` — see [`LocalActionCallback`] for the full contract.
+    callback: LocalActionCallback,
+}
+
+impl LocalAction {
+    /// Build a local action. `callback` runs at most once — see
+    /// [`LocalActionCallback`]'s doc for the thread it runs on and why it
+    /// must be `Send`.
+    #[must_use]
+    pub fn new(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        callback: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            callback: Box::new(callback),
+        }
+    }
+}
+
+/// Callback type backing [`LocalAction`].
+///
+/// # Thread contract
+///
+/// The callback runs synchronously, **inline**, on whichever thread calls
+/// [`invoke_action`] for the `(id, key)` it was registered under — there is
+/// no dispatch/spawn in between. In practice that is always the GTK main
+/// thread today: the only two `invoke_action` call sites are button click
+/// handlers (`trollshell/src/overlays/notifications.rs`'s toast action row,
+/// and the drawer history page), and callbacks may therefore freely touch
+/// GTK/GDK/GIO (`gdk::Display::default()`, `gio::AppInfo::…`, …) — as the
+/// screenshot toast's Open/Copy callbacks do.
+///
+/// The `Send` bound exists for **storage**, not dispatch: registered
+/// callbacks live in [`NotificationsShared::local_actions`], a static also
+/// reached from hytte-tokio worker threads (the auto-expire timer, the
+/// D-Bus `close_notification` method), both of which only ever *drop* an
+/// unclicked callback via [`clear_local_actions`] — never call it. `Send`
+/// makes that cross-thread drop legal; it does not promise (and nothing
+/// requires) that the closure itself is safe to *run* off the GTK thread.
+/// A useful corollary: since GTK/GDK objects are not `Send`, a `Send`
+/// closure structurally cannot hold one across the boundary — it can only
+/// capture plain owned data (e.g. a screenshot's file path `String`) and
+/// resolve the GTK/GDK/GIO handle fresh when it actually runs.
+pub type LocalActionCallback = Box<dyn FnOnce() + Send + 'static>;
+
+/// Map backing [`NotificationsShared::local_actions`]; see that field's doc.
+type LocalActionMap = HashMap<(u32, String), LocalActionCallback>;
+
+/// Register `callback` for `(id, key)`. Pure map mutation, factored out of
+/// [`post_local_with_actions`] so registration can be unit-tested without
+/// the process-global `SHARED` state.
+fn register_local_action(
+    map: &mut LocalActionMap,
+    id: u32,
+    key: String,
+    callback: LocalActionCallback,
+) {
+    map.insert((id, key), callback);
+}
+
+/// Remove and return the callback registered for `(id, key)`, if any. Pure
+/// map mutation, factored out of [`invoke_action`] for unit-testing.
+fn take_local_action(map: &mut LocalActionMap, id: u32, key: &str) -> Option<LocalActionCallback> {
+    map.remove(&(id, key.to_string()))
+}
+
+/// Remove every callback registered for `id`, regardless of key. Pure map
+/// mutation, factored out of [`dismiss`] for unit-testing.
+fn clear_local_actions(map: &mut LocalActionMap, id: u32) {
+    map.retain(|(nid, _), _| *nid != id);
+}
 
 /// Key for the [`post_local`] rate-limiter: `(app_name, summary, body)`.
 type RateLimitKey = (String, String, String);
@@ -430,7 +567,36 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 ///
 /// No-op if the notifications service isn't registered (e.g. headless tests) —
 /// callers should keep their `tracing::warn!` as the durable record.
+///
+/// Plain-toast convenience wrapper over [`post_local_with_actions`] with no
+/// actions attached; see that function to attach Open/Copy-style action
+/// buttons with local callbacks.
 pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
+    post_local_with_actions(app_name, summary, body, urgency, Vec::new());
+}
+
+/// Like [`post_local`], but attaches `actions` as clickable buttons on the
+/// toast (same rendering path as an externally-posted notification's
+/// actions — the toast/history UI doesn't distinguish local from external).
+///
+/// Each [`LocalAction`]'s callback is registered under the freshly-allocated
+/// notification id and its key, so a click dispatches to that callback via
+/// [`invoke_action`] rather than the D-Bus `ActionInvoked` broadcast — see
+/// [`invoke_action`]'s "Local dispatch" doc section for why the broadcast is
+/// skipped entirely rather than also firing.
+///
+/// Registered callbacks are swept if the toast closes unclicked (expiry,
+/// dismiss, …) — see [`NotificationsShared::local_actions`].
+///
+/// No-op (actions dropped) if the notifications service isn't registered,
+/// mirroring [`post_local`].
+pub fn post_local_with_actions(
+    app_name: &str,
+    summary: &str,
+    body: &str,
+    urgency: Urgency,
+    actions: Vec<LocalAction>,
+) {
     let Some(shared) = SHARED.get() else {
         return;
     };
@@ -443,6 +609,31 @@ pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
     // monotonic sequence, so this id can never collide with a `Notify`-issued
     // one (see `NotificationsShared::next_id`).
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+
+    // Register each action's callback under (id, key) and build the plain
+    // Action list the Notification carries for rendering. If the mutex is
+    // poisoned, fail safe by posting the toast with no action buttons rather
+    // than buttons that would dispatch to nothing.
+    let mut ui_actions = Vec::with_capacity(actions.len());
+    if let Ok(mut map) = shared.local_actions.lock() {
+        for action in actions {
+            let LocalAction {
+                key,
+                label,
+                callback,
+            } = action;
+            ui_actions.push(Action {
+                key: key.clone(),
+                label,
+            });
+            register_local_action(&mut map, id, key, callback);
+        }
+    } else {
+        tracing::warn!(
+            id,
+            "notifications: local_actions mutex poisoned, posting without actions"
+        );
+    }
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,7 +648,7 @@ pub fn post_local(app_name: &str, summary: &str, body: &str, urgency: Urgency) {
         body: strip_markup(body),
         urgency,
         timeout: Some(DEFAULT_TIMEOUT),
-        actions: Vec::new(),
+        actions: ui_actions,
         image: None,
         created_at,
     };
@@ -775,9 +966,12 @@ fn strip_markup(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TIMEOUT, RateLimitMap, rate_limit_check, resolve_timeout};
+    use super::{
+        DEFAULT_TIMEOUT, LocalActionMap, RateLimitMap, clear_local_actions, rate_limit_check,
+        register_local_action, resolve_timeout, take_local_action,
+    };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -873,5 +1067,76 @@ mod tests {
             resolve_timeout(i32::MAX),
             Some(Duration::from_millis(i32::MAX as u64))
         );
+    }
+
+    // ── Local action registry: insert / dispatch / cleanup ──────────────────
+
+    #[test]
+    fn local_action_take_removes_and_runs_callback() {
+        let mut map = LocalActionMap::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_writer = ran.clone();
+        register_local_action(
+            &mut map,
+            1,
+            "open".to_string(),
+            Box::new(move || ran_writer.store(true, Ordering::SeqCst)),
+        );
+        assert_eq!(map.len(), 1);
+
+        // Taken exactly once: removed from the map, and running it fires
+        // the callback.
+        let callback = take_local_action(&mut map, 1, "open").expect("callback registered");
+        assert!(map.is_empty());
+        assert!(!ran.load(Ordering::SeqCst));
+        callback();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn local_action_take_is_scoped_by_id_and_key() {
+        let mut map = LocalActionMap::new();
+        register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 1, "copy".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 2, "open".to_string(), Box::new(|| {}));
+
+        // Wrong key: no match, nothing removed.
+        assert!(take_local_action(&mut map, 1, "close").is_none());
+        assert_eq!(map.len(), 3);
+
+        // Same key, different id: no match either — ids don't collide.
+        assert!(take_local_action(&mut map, 3, "open").is_none());
+        assert_eq!(map.len(), 3);
+
+        // Exact (id, key) match: removed, siblings untouched.
+        assert!(take_local_action(&mut map, 1, "open").is_some());
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&(1, "copy".to_string())));
+        assert!(map.contains_key(&(2, "open".to_string())));
+    }
+
+    #[test]
+    fn clear_local_actions_drops_only_the_given_id() {
+        let mut map = LocalActionMap::new();
+        register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 1, "copy".to_string(), Box::new(|| {}));
+        register_local_action(&mut map, 2, "open".to_string(), Box::new(|| {}));
+
+        // Simulates `dismiss(1, ..)`: both of id 1's callbacks go, id 2's
+        // stays registered.
+        clear_local_actions(&mut map, 1);
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&(2, "open".to_string())));
+    }
+
+    #[test]
+    fn clear_local_actions_on_unknown_id_is_a_no_op() {
+        let mut map = LocalActionMap::new();
+        register_local_action(&mut map, 1, "open".to_string(), Box::new(|| {}));
+
+        clear_local_actions(&mut map, 999);
+
+        assert_eq!(map.len(), 1);
     }
 }

@@ -54,10 +54,46 @@ pub enum Node {
         classes: Vec<Cls>,
         children: Vec<Node>,
     },
+    /// A horizontal list **row** — a semantic sibling of [`Box`](Node::Box) for
+    /// list-y cards (planned additive in the spec's node vocab, #199). Children
+    /// are modelled exactly like `Box`'s and laid out left-to-right; style via
+    /// `classes`. The host materializes it as a horizontal `gtk::Box`.
+    Row {
+        id: Option<NodeId>,
+        classes: Vec<Cls>,
+        children: Vec<Node>,
+    },
+    /// A vertical list **container** stacking its children (typically
+    /// [`Row`](Node::Row)s) top-to-bottom — the list-y counterpart to
+    /// [`Box`](Node::Box). The host materializes it as a selection-less list
+    /// surface; style the list chrome via `classes`.
+    ListBox {
+        id: Option<NodeId>,
+        classes: Vec<Cls>,
+        children: Vec<Node>,
+    },
     /// A `gtk::Label`.
     Label {
         id: Option<NodeId>,
         text: String,
+        classes: Vec<Cls>,
+    },
+    /// A **wrapping** `gtk::Label`. Where [`Label`](Node::Label) is a single-line
+    /// tag whose natural width forces its container wider (the pet's 320 px
+    /// blow-out, #281), `Text` wraps at word/char boundaries so a long string
+    /// stays within its container. `max_width_chars`, when set, caps the label's
+    /// natural width at that many characters; when `None` the wrap is bounded by
+    /// the container (e.g. the sidebar's 320 px clamp).
+    ///
+    /// Additive: a brand-new variant, so existing `Label` frames decode
+    /// unchanged. (`Label` gains no fields — mutating it would break every
+    /// in-tree `Node::Label { .. }` literal; `Text` keeps the change additive at
+    /// the Rust-source level too.)
+    Text {
+        id: Option<NodeId>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_width_chars: Option<i32>,
         classes: Vec<Cls>,
     },
     /// A `gtk::Image` set from a themed icon `name` (name only — never pixels).

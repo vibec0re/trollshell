@@ -17,6 +17,7 @@ fn sample_manifest() -> Manifest {
         subscribes: vec![StateKey::Clock],
         capabilities: vec![Capability::OpenPage, Capability::RunCommand],
         mount: Mount::SidebarTop,
+        order: None,
     }
 }
 
@@ -32,6 +33,28 @@ fn sample_tree() -> Node {
                 id: None,
                 text: "hi".into(),
                 classes: vec![],
+            },
+            Node::ListBox {
+                id: Some("list".into()),
+                classes: vec!["ts-list".into()],
+                children: vec![Node::Row {
+                    id: Some("row-0".into()),
+                    classes: vec!["ts-row".into()],
+                    children: vec![
+                        Node::Text {
+                            id: None,
+                            text: "a long wrapping destination name".into(),
+                            max_width_chars: Some(24),
+                            classes: vec!["ts-dest".into()],
+                        },
+                        Node::Text {
+                            id: Some("plat".into()),
+                            text: "spor 2".into(),
+                            max_width_chars: None,
+                            classes: vec![],
+                        },
+                    ],
+                }],
             },
             Node::Icon {
                 id: Some("ico".into()),
@@ -308,6 +331,52 @@ fn forward_compat_extra_field_is_skipped() {
 
     let decoded: Manifest = decode_body(&encode_body(&future)).expect("skip extra field");
     assert_eq!(decoded, sample_manifest());
+}
+
+#[test]
+fn manifest_without_order_decodes_old_plugin_compat() {
+    // An older plugin (built before `order` existed) sends a Register whose
+    // manifest map has NO `order` key. The current host must still decode it,
+    // defaulting `order` to `None` (relies on `#[serde(default)]` + named-map
+    // encoding). This is the backward-compat guarantee for the migration.
+    #[derive(serde::Serialize)]
+    struct ManifestNoOrder {
+        id: String,
+        proto: u16,
+        subscribes: Vec<StateKey>,
+        capabilities: Vec<Capability>,
+        mount: Mount,
+    }
+
+    let old = ManifestNoOrder {
+        id: "vibectl".into(),
+        proto: PROTO_VERSION,
+        subscribes: vec![StateKey::Clock],
+        capabilities: vec![Capability::OpenPage, Capability::RunCommand],
+        mount: Mount::SidebarTop,
+    };
+
+    let body = encode_body(&old);
+    // A field-less-`order` manifest must NOT put `order` on the wire (so old and
+    // new field-less frames are byte-identical): `skip_serializing_if` on `None`
+    // guarantees the same for a modern `order: None` manifest.
+    assert!(
+        !contains(&body, b"order"),
+        "absent order stays off the wire"
+    );
+    let decoded: Manifest = decode_body(&body).expect("decode old field-less manifest");
+    assert_eq!(decoded, sample_manifest(), "order defaults to None");
+    assert_eq!(decoded.order, None);
+}
+
+#[test]
+fn manifest_with_order_round_trips() {
+    let m = Manifest::new("departures", Mount::SidebarTop).with_order(-5);
+    assert_eq!(m.order, Some(-5));
+    let body = encode_body(&m);
+    assert!(contains(&body, b"order"), "a set order rides the wire");
+    let back: Manifest = decode_body(&body).expect("decode manifest with order");
+    assert_eq!(back, m);
 }
 
 #[test]

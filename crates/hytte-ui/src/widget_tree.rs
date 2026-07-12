@@ -96,10 +96,36 @@ pub enum Node {
         classes: Vec<String>,
         children: Vec<Node>,
     },
+    /// A list **row** — a horizontal `gtk::Box` sibling of [`Node::Box`] for
+    /// list-y cards. Children are diffed exactly like a `Box`'s.
+    Row {
+        id: Option<NodeId>,
+        classes: Vec<String>,
+        children: Vec<Node>,
+    },
+    /// A vertical list **container** stacking its children (typically
+    /// [`Node::Row`]s). Materialized as a vertical `gtk::Box`; children diff
+    /// like a `Box`'s.
+    ListBox {
+        id: Option<NodeId>,
+        classes: Vec<String>,
+        children: Vec<Node>,
+    },
     /// A `gtk::Label`.
     Label {
         id: Option<NodeId>,
         text: String,
+        classes: Vec<String>,
+    },
+    /// A **wrapping** `gtk::Label` (word/char wrap): unlike [`Node::Label`] its
+    /// natural width doesn't force its container wider — the fix for the pet's
+    /// 320 px blow-out. `max_width_chars`, when `Some`, caps the natural width
+    /// (`set_max_width_chars`); `None` leaves the wrap bounded by the container.
+    /// Both `text` and `max_width_chars` update in place.
+    Text {
+        id: Option<NodeId>,
+        text: String,
+        max_width_chars: Option<i32>,
         classes: Vec<String>,
     },
     /// A `gtk::Image` set from a themed icon `name`.
@@ -243,7 +269,10 @@ impl NodeDesc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeKind {
     Box,
+    Row,
+    ListBox,
     Label,
+    Text,
     Icon,
     Pixels,
     Button,
@@ -353,6 +382,9 @@ fn plan_diff(prev: &[ChildKey], next: &[ChildKey]) -> DiffPlan {
 /// Build a fresh widget subtree for `node`, wiring its event handlers **once**
 /// (this is the only place `connect_clicked` / the scroll controller is
 /// attached, so reuse across renders can never stack duplicate handlers).
+// One exhaustive arm per node variant — the length is the vocabulary size, not
+// complexity; splitting it hurts readability more than it helps.
+#[allow(clippy::too_many_lines)]
 fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut scroll_controller = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
@@ -371,16 +403,44 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             if *scroll {
                 scroll_controller = Some(attach_scroll(&boxw, id.as_deref(), on_event));
             }
-            let mut kids = Vec::with_capacity(children.len());
-            for child in children {
-                let realized = build_node(child, on_event);
-                boxw.append(&realized.widget);
-                kids.push(realized);
-            }
+            let kids = build_children(&boxw, children, on_event);
+            (boxw.upcast(), kids)
+        }
+        Node::Row {
+            classes, children, ..
+        } => {
+            let boxw = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            apply_classes(&boxw, classes);
+            let kids = build_children(&boxw, children, on_event);
+            (boxw.upcast(), kids)
+        }
+        Node::ListBox {
+            classes, children, ..
+        } => {
+            let boxw = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            apply_classes(&boxw, classes);
+            let kids = build_children(&boxw, children, on_event);
             (boxw.upcast(), kids)
         }
         Node::Label { text, classes, .. } => {
             let label = gtk::Label::new(Some(text));
+            apply_classes(&label, classes);
+            (label.upcast(), Vec::new())
+        }
+        Node::Text {
+            text,
+            max_width_chars,
+            classes,
+            ..
+        } => {
+            let label = gtk::Label::new(Some(text));
+            // A wrapping label: word-then-char boundaries so an unbroken long
+            // token still can't force its container wider (the #281 fix).
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            if let Some(n) = max_width_chars {
+                label.set_max_width_chars(*n);
+            }
             apply_classes(&label, classes);
             (label.upcast(), Vec::new())
         }
@@ -443,6 +503,23 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     }
 }
 
+/// Build and append each child into the `gtk::Box` container, returning the
+/// realized children in render order. Shared by the `Box` / `Row` / `ListBox`
+/// container arms of [`build_node`].
+fn build_children(
+    container: &gtk::Box,
+    children: &[Node],
+    on_event: &EventFn,
+) -> Vec<RetainedNode> {
+    let mut kids = Vec::with_capacity(children.len());
+    for child in children {
+        let realized = build_node(child, on_event);
+        container.append(&realized.widget);
+        kids.push(realized);
+    }
+    kids
+}
+
 /// Update an already-realized node in place. Precondition (guaranteed by the
 /// caller via [`reusable`] / [`plan_diff`]): `retained`'s kind and id match
 /// `new`, so the widget downcast always succeeds and event handlers stay
@@ -474,9 +551,34 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             }
             diff_children(boxw, &mut retained.children, children, on_event);
         }
+        Node::Row {
+            classes, children, ..
+        }
+        | Node::ListBox {
+            classes, children, ..
+        } => {
+            // Row/ListBox are gtk::Box containers with no scroll or orientation
+            // props to mutate (orientation is fixed by the kind, which reuse
+            // already matched on), so only classes + children reconcile.
+            let boxw = downcast::<gtk::Box>(&retained.widget);
+            reconcile_classes(boxw, &retained.desc.classes, classes);
+            diff_children(boxw, &mut retained.children, children, on_event);
+        }
         Node::Label { text, classes, .. } => {
             let label = downcast::<gtk::Label>(&retained.widget);
             label.set_text(text);
+            reconcile_classes(label, &retained.desc.classes, classes);
+        }
+        Node::Text {
+            text,
+            max_width_chars,
+            classes,
+            ..
+        } => {
+            let label = downcast::<gtk::Label>(&retained.widget);
+            label.set_text(text);
+            // `-1` is GTK's "no maximum", so a flip back to `None` resets it.
+            label.set_max_width_chars(max_width_chars.unwrap_or(-1));
             reconcile_classes(label, &retained.desc.classes, classes);
         }
         Node::Icon { name, classes, .. } => {
@@ -677,7 +779,10 @@ fn downcast<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> &T {
 fn node_kind(node: &Node) -> NodeKind {
     match node {
         Node::Box { .. } => NodeKind::Box,
+        Node::Row { .. } => NodeKind::Row,
+        Node::ListBox { .. } => NodeKind::ListBox,
         Node::Label { .. } => NodeKind::Label,
+        Node::Text { .. } => NodeKind::Text,
         Node::Icon { .. } => NodeKind::Icon,
         Node::Pixels { .. } => NodeKind::Pixels,
         Node::Button { .. } => NodeKind::Button,
@@ -690,7 +795,10 @@ fn node_kind(node: &Node) -> NodeKind {
 fn node_id(node: &Node) -> Option<&str> {
     match node {
         Node::Box { id, .. }
+        | Node::Row { id, .. }
+        | Node::ListBox { id, .. }
         | Node::Label { id, .. }
+        | Node::Text { id, .. }
         | Node::Icon { id, .. }
         | Node::Pixels { id, .. }
         | Node::Progress { id, .. }
@@ -703,7 +811,10 @@ fn node_id(node: &Node) -> Option<&str> {
 fn node_classes(node: &Node) -> &[String] {
     match node {
         Node::Box { classes, .. }
+        | Node::Row { classes, .. }
+        | Node::ListBox { classes, .. }
         | Node::Label { classes, .. }
+        | Node::Text { classes, .. }
         | Node::Icon { classes, .. }
         | Node::Pixels { classes, .. }
         | Node::Button { classes, .. }
@@ -1243,5 +1354,122 @@ mod gtk_tests {
         let inner3 = root.first_child().unwrap();
         assert_eq!(inner, inner3, "box still reused");
         assert_eq!(inner3.observe_controllers().n_items(), base + 1);
+    }
+
+    fn text(id: Option<&str>, s: &str, max: Option<i32>) -> Node {
+        Node::Text {
+            id: id.map(ToOwned::to_owned),
+            text: s.to_owned(),
+            max_width_chars: max,
+            classes: vec![],
+        }
+    }
+
+    fn listbox(id: Option<&str>, children: Vec<Node>) -> Node {
+        Node::ListBox {
+            id: id.map(ToOwned::to_owned),
+            classes: vec![],
+            children,
+        }
+    }
+
+    fn row(id: Option<&str>, children: Vec<Node>) -> Node {
+        Node::Row {
+            id: id.map(ToOwned::to_owned),
+            classes: vec![],
+            children,
+        }
+    }
+
+    #[gtk::test]
+    fn listbox_and_row_build_as_oriented_boxes() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&listbox(
+            Some("list"),
+            vec![row(Some("r0"), vec![text(None, "hi", None)])],
+        ));
+
+        let list = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .expect("ListBox → gtk::Box");
+        assert_eq!(list.orientation(), gtk::Orientation::Vertical);
+        let inner_row = list
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .expect("Row → gtk::Box");
+        assert_eq!(inner_row.orientation(), gtk::Orientation::Horizontal);
+        let label = inner_row
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(label.text().as_str(), "hi");
+        assert!(label.wraps(), "Text is a wrapping label");
+    }
+
+    #[gtk::test]
+    fn text_wrap_and_max_width_update_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&text(Some("t"), "one", Some(10)));
+        let label = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(label.wraps());
+        assert_eq!(label.max_width_chars(), 10);
+
+        // Same id → reused; text + max_width_chars are mutable props.
+        rec.render(&text(Some("t"), "two", None));
+        let after = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(after, label, "wrapping label reused, not rebuilt");
+        assert_eq!(after.text().as_str(), "two");
+        assert_eq!(
+            after.max_width_chars(),
+            -1,
+            "None resets the max to GTK's -1"
+        );
+    }
+
+    #[gtk::test]
+    fn listbox_rows_keyed_diff_insert_and_remove() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&listbox(
+            Some("list"),
+            vec![row(Some("a"), vec![]), row(Some("b"), vec![])],
+        ));
+        let list = root.first_child().unwrap();
+        let before = children(&list);
+        assert_eq!(before.len(), 2);
+
+        // Insert "z" between a and b; a and b keep their widget identities.
+        rec.render(&listbox(
+            Some("list"),
+            vec![
+                row(Some("a"), vec![]),
+                row(Some("z"), vec![]),
+                row(Some("b"), vec![]),
+            ],
+        ));
+        let after = children(&root.first_child().unwrap());
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[0], "row a reused in place");
+        assert_eq!(after[2], before[1], "row b reused, shifted right");
+
+        // Drop "a": b survives untouched.
+        rec.render(&listbox(Some("list"), vec![row(Some("b"), vec![])]));
+        let last = children(&root.first_child().unwrap());
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0], before[1], "row b is the surviving sibling");
     }
 }

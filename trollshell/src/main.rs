@@ -12,7 +12,7 @@ use std::cell::RefCell;
 
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk;
-use hytte::gtk::{glib, prelude::*};
+use hytte::gtk::{gdk, gio, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     app_usage, bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures,
@@ -340,29 +340,102 @@ fn apply_scaled_base_font(provider: &gtk::CssProvider) {
     ));
 }
 
-/// Post a plain "Screenshot saved" toast whenever niri reports a completed
-/// capture (`Event::ScreenshotCaptured` → `niri::screenshot_captured()`).
+/// Post a "Screenshot saved" toast whenever niri reports a completed capture
+/// (`Event::ScreenshotCaptured` → `niri::screenshot_captured()`), with
+/// **Open** / **Copy** action buttons when a file path came back.
 ///
 /// A single global subscription — not one per monitor/bar — so an
 /// N-monitor setup doesn't fire N toasts for one screenshot; mirrors the
 /// `netconn`/`app_usage` single-subscription shape in [`main`].
 ///
-/// Deliberately no action buttons: Open/Copy need the local-action-dispatch
-/// design call the #220 triage flagged as unresolved (`post_local` toasts
-/// carry no actions today).
+/// Actions dispatch locally via [`notifications::post_local_with_actions`]
+/// (#220's deferred half — see that function and `invoke_action`'s "Local
+/// dispatch" doc for the mechanism): clicking Open/Copy never touches
+/// D-Bus, it runs [`open_screenshot`]/[`copy_screenshot`] directly on the
+/// GTK main thread, same as the click that invoked it.
+///
+/// `shot.path` is `None` when niri only copied the capture to the
+/// clipboard (no `write_to_disk`, or non-UTF-8 path) — there's no file to
+/// Open or re-Copy in that case, so the toast carries no actions.
 fn install_screenshot_toast() {
     glib::MainContext::default().spawn_local(niri::screenshot_captured().for_each(|shot| {
         if let Some(shot) = shot {
-            let path = shot.path.as_deref().unwrap_or("clipboard only");
-            notifications::post_local(
-                "Screenshot",
-                "Screenshot saved",
-                path,
-                notifications::Urgency::Normal,
-            );
+            match shot.path {
+                Some(path) => {
+                    let open_path = path.clone();
+                    let copy_path = path.clone();
+                    notifications::post_local_with_actions(
+                        "Screenshot",
+                        "Screenshot saved",
+                        &path,
+                        notifications::Urgency::Normal,
+                        vec![
+                            notifications::LocalAction::new("open", "Open", move || {
+                                open_screenshot(&open_path);
+                            }),
+                            notifications::LocalAction::new("copy", "Copy", move || {
+                                copy_screenshot(&copy_path);
+                            }),
+                        ],
+                    );
+                }
+                None => {
+                    notifications::post_local(
+                        "Screenshot",
+                        "Screenshot saved",
+                        "clipboard only",
+                        notifications::Urgency::Normal,
+                    );
+                }
+            }
         }
         std::future::ready(())
     }));
+}
+
+/// Open a saved screenshot with the desktop's default handler for its file
+/// type (typically an image viewer). Runs on the GTK main thread — see
+/// [`notifications::LocalActionCallback`]'s thread contract; this is the
+/// Open action's callback in [`install_screenshot_toast`].
+///
+/// `gio::AppInfo::launch_default_for_uri` over shelling out to `xdg-open`:
+/// same desktop-portal-backed resolution, no subprocess. Failure (no
+/// handler registered, launch error) is logged at warn — mirrors
+/// `clipboard::paste_entry`'s fire-and-forget-with-warn idiom.
+fn open_screenshot(path: &str) {
+    let uri = gio::File::for_path(path).uri();
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
+        tracing::warn!(error = %e, path, "screenshot: failed to open with default handler");
+    }
+}
+
+/// Copy a saved screenshot's image *contents* (not its path) to the
+/// clipboard via `GdkClipboard::set_texture` — the same native-GTK
+/// mechanism `overlays::notifications::build_image` uses to decode a
+/// notification thumbnail, so no `wl-copy` subprocess is needed. Runs on
+/// the GTK main thread; this is the Copy action's callback in
+/// [`install_screenshot_toast`].
+///
+/// Niri may already have copied this same image to the clipboard as part
+/// of the capture itself (screen/window screenshots do this by default);
+/// re-copying identical image bytes here is a harmless no-op in that case,
+/// unlike the path-string copy the #220 triage flagged as a potential
+/// clobber — this copies the same content, not a different representation
+/// of it.
+fn copy_screenshot(path: &str) {
+    let Some(display) = gdk::Display::default() else {
+        tracing::warn!(
+            path,
+            "screenshot: no default GdkDisplay, cannot copy to clipboard"
+        );
+        return;
+    };
+    match gdk::Texture::from_filename(path) {
+        Ok(texture) => display.clipboard().set_texture(&texture),
+        Err(e) => {
+            tracing::warn!(error = %e, path, "screenshot: failed to load image for clipboard copy");
+        }
+    }
 }
 
 /// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from

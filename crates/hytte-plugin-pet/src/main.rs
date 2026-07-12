@@ -31,13 +31,12 @@
 
 mod brain;
 
-use std::cell::RefCell;
 use std::time::Duration;
 
 use brain::{ThinkKind, ThinkReq};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::IntervalStream;
@@ -62,15 +61,6 @@ pub(crate) enum PetMsg {
     Thought(String),
 }
 
-thread_local! {
-    /// Hand-off slot: `init()` parks the brain-request receiver here for
-    /// `sources()` to collect (the SDK calls `init` before `sources`, both
-    /// on the runtime thread — same pattern as `v1bectl_widget`; the
-    /// sanctioned SDK lane is #280).
-    static CMD_RX: RefCell<Option<mpsc::UnboundedReceiver<ThinkReq>>> =
-        const { RefCell::new(None) };
-}
-
 /// The pet's whole head.
 struct Pet {
     /// Local hour 0..=23, from clock snapshots.
@@ -87,7 +77,10 @@ struct Pet {
     ticks: u64,
     /// xorshift state for the idle-thought dice.
     rng: u64,
-    cmd_tx: mpsc::UnboundedSender<ThinkReq>,
+    /// The command lane to the brain task (#280): `poke`/`think` enqueue a
+    /// [`ThinkReq`] here from `update`, and the task the pet's `sources` spawn
+    /// drains it. The runtime owns the channel per session.
+    cmd_tx: CmdSender<ThinkReq>,
 }
 
 /// The pet's disposition — derived from state, never stored.
@@ -215,6 +208,10 @@ impl Pet {
 
 impl Plugin for Pet {
     type Msg = PetMsg;
+    /// Outbound: the pet asks its own brain for lines — that's plugin I/O, not
+    /// a shell effect, so it rides the command lane (#280), not `update`'s
+    /// return.
+    type Cmd = ThinkReq;
 
     fn manifest() -> Manifest {
         let mut m = Manifest::new("pet", Mount::SidebarTop);
@@ -222,9 +219,7 @@ impl Plugin for Pet {
         m
     }
 
-    fn init() -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        CMD_RX.with(|slot| *slot.borrow_mut() = Some(cmd_rx));
+    fn init(cmds: CmdSender<Self::Cmd>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -236,16 +231,16 @@ impl Plugin for Pet {
             recent_pokes: 0,
             ticks: 0,
             rng: (now.as_secs() ^ u64::from(now.subsec_nanos())).max(1),
-            cmd_tx,
+            cmd_tx: cmds,
         }
     }
 
-    fn sources() -> Option<MsgStream<Self::Msg>> {
-        let cmd_rx = CMD_RX
-            .with(|slot| slot.borrow_mut().take())
-            .expect("init() parks the brain receiver before sources() runs");
+    fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+        // The brain task owns both directions of the pet's own I/O: it drains
+        // `cmds` (the command lane, filled from `update`) and re-emits each
+        // reply as a `PetMsg::Thought` on the app-message stream below.
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        tokio::spawn(brain::brain(cmd_rx, msg_tx));
+        tokio::spawn(brain::brain(cmds, msg_tx));
         let ticks = IntervalStream::new(tokio::time::interval(TICK)).map(|_| PetMsg::Tick);
         let thoughts = UnboundedReceiverStream::new(msg_rx);
         Some(Box::pin(ticks.merge(thoughts)))
@@ -314,12 +309,13 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// A pet with a fixed seed + a probe on its brain-request channel.
-    fn pet() -> (Pet, mpsc::UnboundedReceiver<ThinkReq>) {
-        let mut p = Pet::init();
-        let rx = CMD_RX
-            .with(|slot| slot.borrow_mut().take())
-            .expect("init parks the receiver");
+    /// A pet with a fixed seed + a probe on its brain-request channel. The
+    /// command lane is normally the runtime's to build; here the test plays
+    /// that role with [`cmd_channel`](hytte_plugin::cmd_channel), keeping the
+    /// receiver to assert what `update` dispatched.
+    fn pet() -> (Pet, CmdReceiver<ThinkReq>) {
+        let (tx, rx) = hytte_plugin::cmd_channel();
+        let mut p = Pet::init(tx);
         p.rng = 42;
         p.hour = 12;
         (p, rx)

@@ -1084,6 +1084,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-weather"
+version = "0.1.0"
+dependencies = [
+ "hytte-plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "ureq",
+ "zbus",
+]
+
+[[package]]
 name = "hytte-reactive"
 version = "0.1.0"
 dependencies = [

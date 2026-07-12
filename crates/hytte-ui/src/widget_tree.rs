@@ -121,11 +121,15 @@ pub enum Node {
     /// natural width doesn't force its container wider — the fix for the pet's
     /// 320 px blow-out. `max_width_chars`, when `Some`, caps the natural width
     /// (`set_max_width_chars`); `None` leaves the wrap bounded by the container.
-    /// Both `text` and `max_width_chars` update in place.
+    /// When `ellipsize` is `true` the label instead runs **single-line** and
+    /// truncates with a trailing ellipsis (`EllipsizeMode::End`) — the native
+    /// departures-row look. `text`, `max_width_chars`, and `ellipsize` all update
+    /// in place (a same-id re-render flips the flow mode without a rebuild).
     Text {
         id: Option<NodeId>,
         text: String,
         max_width_chars: Option<i32>,
+        ellipsize: bool,
         classes: Vec<String>,
     },
     /// A `gtk::Image` set from a themed icon `name`.
@@ -169,6 +173,14 @@ pub enum Node {
     },
     /// A `gtk::Separator`.
     Separator { classes: Vec<String> },
+    /// An **expanding gap**: an empty, style-less `gtk::Box` with `hexpand` and
+    /// `vexpand` set, so it soaks up a container's slack and justifies its
+    /// siblings (`Label + Spacer + Label` right-pins the trailing label in a
+    /// [`Node::Row`]). Carries no id and no children — purely structural. Both
+    /// axes expand so the one node works in a horizontal *or* vertical parent
+    /// without knowing its orientation; the cross-axis expand is inert (an empty
+    /// box has zero natural size). Consecutive spacers reuse by kind.
+    Spacer,
 }
 
 /// Boxed event callback shared (`Rc`) into every widget's signal handler.
@@ -279,6 +291,7 @@ enum NodeKind {
     Progress,
     Revealer,
     Separator,
+    Spacer,
 }
 
 // ── The pure diff algorithm ─────────────────────────────────────────────────
@@ -430,14 +443,12 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         Node::Text {
             text,
             max_width_chars,
+            ellipsize,
             classes,
             ..
         } => {
             let label = gtk::Label::new(Some(text));
-            // A wrapping label: word-then-char boundaries so an unbroken long
-            // token still can't force its container wider (the #281 fix).
-            label.set_wrap(true);
-            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            apply_text_flow(&label, *ellipsize);
             if let Some(n) = max_width_chars {
                 label.set_max_width_chars(*n);
             }
@@ -492,6 +503,16 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
             apply_classes(&sep, classes);
             (sep.upcast(), Vec::new())
+        }
+        Node::Spacer => {
+            // An empty box that expands on both axes to eat the container's
+            // slack. Dir-agnostic: the along-axis expand justifies siblings; the
+            // cross-axis one is inert (zero natural size). No id, no children, no
+            // classes — it is styled by its neighbours, never itself.
+            let boxw = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            boxw.set_hexpand(true);
+            boxw.set_vexpand(true);
+            (boxw.upcast(), Vec::new())
         }
     };
 
@@ -572,6 +593,7 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
         Node::Text {
             text,
             max_width_chars,
+            ellipsize,
             classes,
             ..
         } => {
@@ -579,6 +601,9 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             label.set_text(text);
             // `-1` is GTK's "no maximum", so a flip back to `None` resets it.
             label.set_max_width_chars(max_width_chars.unwrap_or(-1));
+            // `ellipsize` is a mutable prop: flip the flow mode (wrap ⇄ single-line
+            // ellipsis) in place without rebuilding the label.
+            apply_text_flow(label, *ellipsize);
             reconcile_classes(label, &retained.desc.classes, classes);
         }
         Node::Icon { name, classes, .. } => {
@@ -623,6 +648,9 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
         Node::Separator { classes } => {
             reconcile_classes(&retained.widget, &retained.desc.classes, classes);
         }
+        // A `Spacer` has no mutable props (expand is fixed by the kind, which
+        // reuse already matched on) and no classes — nothing to reconcile.
+        Node::Spacer => {}
     }
 
     // Refresh the snapshot so the *next* diff compares against current state.
@@ -725,6 +753,26 @@ fn orientation(dir: Dir) -> gtk::Orientation {
     }
 }
 
+/// Set a [`Node::Text`] label's flow mode. Shared by build and update so the
+/// two never drift, and so an `ellipsize` flip toggles in place:
+/// - `ellipsize == true` → single-line, truncate with a trailing ellipsis
+///   (`EllipsizeMode::End`) — the native departures-row look.
+/// - `ellipsize == false` → wrap at word-then-char boundaries so an unbroken
+///   long token still can't force the container wider (the #281 fix).
+///
+/// Both directions reset the opposite mode (`set_ellipsize(None)` vs
+/// `set_wrap(false)`), so flipping the flag on a reused label is complete.
+fn apply_text_flow(label: &gtk::Label, ellipsize: bool) {
+    if ellipsize {
+        label.set_wrap(false);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    } else {
+        label.set_ellipsize(gtk::pango::EllipsizeMode::None);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    }
+}
+
 /// Attach a scroll controller to `boxw`, firing [`EventKind::Scroll`]
 /// through `on_event` addressed at `id` (or an empty [`NodeId`] if the box
 /// carries none — `id` is optional and only a diff key, never required for
@@ -789,6 +837,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Progress { .. } => NodeKind::Progress,
         Node::Revealer { .. } => NodeKind::Revealer,
         Node::Separator { .. } => NodeKind::Separator,
+        Node::Spacer => NodeKind::Spacer,
     }
 }
 
@@ -804,7 +853,7 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
         Node::Button { id, .. } => Some(id.as_str()),
-        Node::Separator { .. } => None,
+        Node::Separator { .. } | Node::Spacer => None,
     }
 }
 
@@ -822,7 +871,9 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Separator { classes } => classes,
         // `Revealer` carries no classes of its own (see the `Node` vocab); it
         // is a transparent open/close wrapper, so style its child instead.
-        Node::Revealer { .. } => &[],
+        // `Spacer` is style-less on purpose — a structural gap, never itself
+        // themed.
+        Node::Revealer { .. } | Node::Spacer => &[],
     }
 }
 
@@ -928,6 +979,22 @@ mod diff_tests {
         let plan = plan_diff(&prev, &next);
         assert_eq!(plan.ops, vec![SlotOp::Create]);
         assert_eq!(plan.removals, vec![0]);
+    }
+
+    #[test]
+    fn consecutive_id_less_spacers_reuse_by_kind() {
+        // A `Spacer` has no id, so a pair of them keys purely by kind — the
+        // positional keyless path must reuse both across an identical re-render
+        // (they're interchangeable), never churn them.
+        let sp = || key(None, NodeKind::Spacer);
+        let prev = vec![sp(), lbl(None), sp()];
+        let next = vec![sp(), lbl(None), sp()];
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(
+            plan.ops,
+            vec![SlotOp::Reuse(0), SlotOp::Reuse(1), SlotOp::Reuse(2)]
+        );
+        assert!(plan.removals.is_empty());
     }
 
     #[test]
@@ -1361,6 +1428,7 @@ mod gtk_tests {
             id: id.map(ToOwned::to_owned),
             text: s.to_owned(),
             max_width_chars: max,
+            ellipsize: false,
             classes: vec![],
         }
     }
@@ -1438,6 +1506,90 @@ mod gtk_tests {
             -1,
             "None resets the max to GTK's -1"
         );
+    }
+
+    #[gtk::test]
+    fn text_ellipsize_toggles_flow_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        // Start ellipsizing: single-line, End-truncation, no wrap.
+        rec.render(&Node::Text {
+            id: Some("dest".into()),
+            text: "a very long destination name".into(),
+            max_width_chars: None,
+            ellipsize: true,
+            classes: vec![],
+        });
+        let label = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(!label.wraps(), "ellipsize ⇒ single line (no wrap)");
+        assert_eq!(label.ellipsize(), gtk::pango::EllipsizeMode::End);
+
+        // Same id → reused; flipping `ellipsize` off restores the wrap flow
+        // in place (mutable prop), same widget identity.
+        rec.render(&Node::Text {
+            id: Some("dest".into()),
+            text: "a very long destination name".into(),
+            max_width_chars: None,
+            ellipsize: false,
+            classes: vec![],
+        });
+        let after = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(after, label, "wrapping label reused, not rebuilt");
+        assert!(after.wraps(), "wrap restored");
+        assert_eq!(
+            after.ellipsize(),
+            gtk::pango::EllipsizeMode::None,
+            "ellipsize mode cleared on the flip back"
+        );
+    }
+
+    #[gtk::test]
+    fn spacer_builds_expanding_empty_box() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // The weather-row shape: label + expanding gap + value.
+        rec.render(&hbox(vec![
+            lbl(None, "wind"),
+            Node::Spacer,
+            lbl(None, "12"),
+        ]));
+
+        let inner = root.first_child().unwrap();
+        let kids = children(&inner);
+        assert_eq!(kids.len(), 3, "label + spacer + label");
+        let spacer = kids[1]
+            .downcast_ref::<gtk::Box>()
+            .expect("Spacer → an empty gtk::Box");
+        assert!(spacer.hexpands(), "spacer expands horizontally");
+        assert!(spacer.vexpands(), "spacer expands both axes (dir-agnostic)");
+        assert!(spacer.first_child().is_none(), "spacer is empty");
+    }
+
+    #[gtk::test]
+    fn consecutive_spacers_reuse_by_kind() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // Two adjacent, id-less spacers (a centring pair).
+        rec.render(&hbox(vec![Node::Spacer, lbl(None, "x"), Node::Spacer]));
+        let before = children(&root.first_child().unwrap());
+        assert_eq!(before.len(), 3);
+
+        // Re-render the same shape: both spacers reuse by kind (positional,
+        // id-less), so every widget keeps its identity.
+        rec.render(&hbox(vec![Node::Spacer, lbl(None, "x"), Node::Spacer]));
+        let after = children(&root.first_child().unwrap());
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[0], "leading spacer reused");
+        assert_eq!(after[2], before[2], "trailing spacer reused");
     }
 
     #[gtk::test]

@@ -1,0 +1,23 @@
+[Unit]
+Description=trollshell weather widget plugin (out-of-process, #290)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# Mounts SidebarTop alongside the pet / clock demo. Since #274 that mount is a
+# *region* holding N plugin cards (sorted by manifest `order`), so they coexist
+# — no `Conflicts=` needed. Weather requests order=-10, so it renders above the
+# pet within the plugin region.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-weather
+# Geolocation is geoclue2 (system bus) with a fallback: if geoclue is
+# unavailable/denied, set the city here and it forward-geocodes it. This is the
+# same env var the in-shell weather card honors.
+# Environment=TROLLSHELL_WEATHER_CITY=Berlin
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

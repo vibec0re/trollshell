@@ -1485,3 +1485,69 @@
 .ts-lock-shake {
     animation: ts-lock-shake-keyframes 400ms ease-in-out;
 }
+
+/* ─── Pet plugin — procedural LCD face (#284) ───────────────────────────────
+ * The pet is an out-of-process widget plugin (hytte-plugin-pet) mounted in the
+ * sidebar top slot. Its face is a `Node::Pixels` LCD (128×128, upscaled
+ * nearest-neighbor by the host's PixelSurface). These `pet-*` classes are the
+ * chrome the plugin references by name — the plugin never ships raw CSS.
+ *
+ * NB: the PixelSurface overrides `snapshot` and does NOT chain CSS backgrounds,
+ * so `.pet-lcd` visuals (fill/shadow/scanlines) would not paint — only layout
+ * (min-size) is honored there. All the "screen module" chrome therefore lives
+ * on `.pet-face`, the real gtk::Button bezel around it; the screen's rounded
+ * corners are baked into the buffer in the same dark tone as the bezel. */
+
+.pet-root {
+    padding: 0.4em 0.2em;
+}
+
+/* The bezel — a dark rounded case around the LCD glass. The gradient bottoms
+ * out at the buffer's baked corner colour (#120a1e) so screen and case merge. */
+.pet-face {
+    background: linear-gradient(160deg, #241428, #120a1e);
+    border: 1px solid alpha(white, 0.06);
+    border-radius: 0.9em;
+    padding: 0.5em;
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 12px rgba(131, 56, 236, 0.25);
+    transition: box-shadow 0.2s ease;
+}
+.pet-face:hover {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 18px rgba(255, 0, 110, 0.45);
+}
+/* Poke feedback: press the case in. */
+.pet-face:active {
+    box-shadow:
+        inset 0 3px 9px rgba(0, 0, 0, 0.78),
+        0 0 10px rgba(255, 0, 110, 0.6);
+}
+
+/* The LCD glass. Only sizing is honored here (see the note above): the small
+ * 128px buffer is scaled up to this square, staying crisp via nearest-neighbor.
+ * border-radius is cosmetic-only — the visible rounding is baked in the buffer. */
+.pet-lcd {
+    min-width: 7em;
+    min-height: 7em;
+    border-radius: 0.45em;
+}
+
+/* Speech bubble — the kaomoji voice still speaks here (text, not pixels). */
+.pet-bubble {
+    background: @sidebar_card_background;
+    color: white;
+    border-radius: 0.7em;
+    padding: 0.35em 0.7em;
+    margin-top: 0.3em;
+    font-size: 0.9em;
+}
+
+/* Legacy kaomoji face (TROLLSHELL_PET_KAOMOJI=1 fallback). */
+.pet-kao {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 1.7em;
+    color: #e9c9f0;
+}

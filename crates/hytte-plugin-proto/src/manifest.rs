@@ -58,6 +58,19 @@ pub struct Manifest {
     pub capabilities: Vec<Capability>,
     /// Where the plugin's view mounts.
     pub mount: Mount,
+    /// The plugin's placement request **within** its [`mount`](Manifest::mount)
+    /// region. The host holds each region as N plugin cards and sorts them by
+    /// `(order, id)` ascending — a lower `order` renders earlier (higher in a
+    /// sidebar); ties break on the stable `id`. Advisory only: the host owns
+    /// final placement and may clamp or ignore it.
+    ///
+    /// `None` is the default and is the value an **older, pre-`order`** plugin's
+    /// `Register` frame decodes to (it omits the field entirely); it sorts as if
+    /// `0`. Additive under the crate's compat rules — same [`PROTO_VERSION`],
+    /// `#[serde(default)]` for backward decode, `skip_serializing_if` so a `None`
+    /// is byte-identical on the wire to an old field-less manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
 }
 
 impl Manifest {
@@ -71,7 +84,17 @@ impl Manifest {
             subscribes: Vec::new(),
             capabilities: Vec::new(),
             mount,
+            order: None,
         }
+    }
+
+    /// Request a placement [`order`](Manifest::order) within the mount region.
+    /// Advisory — the host sorts co-mounted plugins by `(order, id)` but owns
+    /// final placement. Chainable off [`Manifest::new`].
+    #[must_use]
+    pub fn with_order(mut self, order: i32) -> Self {
+        self.order = Some(order);
+        self
     }
 
     /// The exact-match proto rule the host applies on `Register`: a plugin

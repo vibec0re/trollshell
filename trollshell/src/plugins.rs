@@ -17,29 +17,43 @@
 //! `Arc<Mutex>` threaded through widgets.
 //!
 //! ```text
-//! plugin ──Register/Render/Log/Pong──▶ per-conn reader task ──▶ render mailbox (Mutable)
+//! plugin ──Register/Render/Log/Pong──▶ per-conn reader task ──▶ region mailbox (Mutable<Vec<..>>)
 //!                                                              ──▶ effect channel (mpsc)
 //!                                                              ──▶ tracing / liveness
-//! GTK reconciler ◀── render mailbox ── maps wire::Node → hytte_ui::Node
+//! GTK region ◀── region mailbox ── one reconciler per plugin card, maps wire::Node → hytte_ui::Node
 //! GTK effect broker ◀── effect channel ── drained in arrival order (non-lossy)
 //! GTK reconciler ──on_event──▶ per-conn outbound (mpsc) ──▶ writer task ──▶ plugin (Event)
 //! GTK clock pump ──▶ watch ──▶ per-conn snapshot task ──▶ writer task ──▶ plugin (StateSnapshot)
 //! ```
 //!
+//! ## Mount regions (#274)
+//!
+//! Each sidebar mount is a **region** holding N plugin cards, not one slot for a
+//! single plugin: the region mailbox is a `Mutable<Vec<SlotRender>>`, one entry
+//! per connected plugin id, kept sorted by `(manifest.order, plugin_id)`
+//! ascending (a manifest `order: Option<i32>`; `None` sorts as `0`, ties break
+//! on the stable id). The GTK side mounts **one reconciler per plugin card** in
+//! a vertical container, so plugins on the same mount coexist (pet + clock-demo
+//! no longer need `Conflicts=`) and each card joins / updates / reorders /
+//! leaves without disturbing its siblings.
+//!
 //! ## Coalescing (latest-wins) — trees only
 //!
 //! The view bridges coalesce, per the spec's "always accept new view state, no
 //! deltas, latest-wins":
-//! - The render mailbox is a `Mutable<Option<SlotRender>>`; a new frame
-//!   overwrites the previous in place, and a slow GTK consumer only ever sees
-//!   the newest tree (superseded frames are dropped).
+//! - The region mailbox is a `Mutable<Vec<SlotRender>>`; a plugin's new frame
+//!   overwrites *its own* entry in place (latest-wins per plugin id), and a slow
+//!   GTK consumer only ever observes the newest region snapshot (superseded
+//!   frames of any plugin are dropped).
 //! - The clock bridge is a `watch` channel; a per-conn task reads
 //!   `borrow_and_update()` so bursts collapse to the latest `ClockState`.
 //!
 //! Effects are the exception: they are **one-shot**, so coalescing could drop a
 //! click (#277). The reader task strips each frame's effects onto a dedicated
 //! `mpsc::unbounded` channel drained on the GTK thread — non-lossy, ordered per
-//! connection — instead of letting them ride the latest-wins mailbox.
+//! connection — instead of letting them ride the latest-wins mailbox. That
+//! channel is **global** (one per host, not per region/plugin), so the region
+//! change leaves the #277 exactly-once guarantee untouched.
 //!
 //! ## v1 scope (see the PR body for the full deferred list)
 //!
@@ -53,6 +67,7 @@
 //!   deferred.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
@@ -79,21 +94,26 @@ use tokio::sync::{mpsc, watch};
 pub struct PluginsService;
 
 /// Monotonic per-connection token. Stamped on every [`SlotRender`] a connection
-/// parks so slot ownership is **connection-scoped, not plugin-id-scoped**: a
+/// parks so a card's ownership is **connection-scoped, not plugin-id-scoped**: a
 /// fast-reconnecting plugin (the SDK backs off from 100 ms) can have its new
-/// connection claim the slot before the old connection's teardown runs, and a
-/// plugin-id compare would let the stale teardown blank the live successor
-/// (#278). The generation compare cannot — each connection has a unique token.
+/// connection replace its region entry before the old connection's teardown
+/// runs, and a plugin-id-only compare would let the stale teardown evict the
+/// live successor (#278). The generation compare cannot — each connection has a
+/// unique token, so teardown removes a card only when the *same connection*
+/// still owns it (see [`clear_region_if_owned`]).
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// One rendered plugin frame parked in a mount slot's coalescing mailbox: the
-/// declarative tree, the [`NEXT_GENERATION`] token of the connection that
+/// One plugin's rendered card parked in a mount region's coalescing mailbox: the
+/// producing plugin's `id` and requested `order` (region sort key), the
+/// declarative `tree`, the [`NEXT_GENERATION`] token of the connection that
 /// produced it, and a handle to send frames **back** to that connection (event
 /// round-trip). Effects do **not** ride here — they are one-shot, so they go
 /// down the non-lossy effect channel instead (#277). `Clone` so it can ride a
 /// `Mutable` signal to the GTK reconcilers.
 #[derive(Clone)]
 struct SlotRender {
+    plugin_id: String,
+    order: i32,
     generation: u64,
     tree: wire::Node,
     outbound: mpsc::UnboundedSender<HostMsg>,
@@ -116,8 +136,8 @@ struct BrokeredEffect {
 /// thread-local to that thread and the receiver is single-consumer).
 #[doc(hidden)]
 pub struct PluginHandles {
-    sidebar_top: Mutable<Option<SlotRender>>,
-    sidebar_bottom: Mutable<Option<SlotRender>>,
+    sidebar_top: Mutable<Vec<SlotRender>>,
+    sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_tx: watch::Sender<Option<ClockState>>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
@@ -125,8 +145,8 @@ pub struct PluginHandles {
 /// Clones of the shared handles handed to the tokio listener + per-conn tasks.
 #[derive(Clone)]
 struct ListenerCtx {
-    sidebar_top: Mutable<Option<SlotRender>>,
-    sidebar_bottom: Mutable<Option<SlotRender>>,
+    sidebar_top: Mutable<Vec<SlotRender>>,
+    sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
@@ -138,8 +158,8 @@ impl Service for PluginsService {
         let (clock_tx, clock_rx) = watch::channel(None);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
-            sidebar_top: Mutable::new(None),
-            sidebar_bottom: Mutable::new(None),
+            sidebar_top: Mutable::new(Vec::new()),
+            sidebar_bottom: Mutable::new(Vec::new()),
             clock_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
         };
@@ -213,7 +233,7 @@ fn set_clock(cs: ClockState) {
     });
 }
 
-fn top_render_signal() -> impl Signal<Item = Option<SlotRender>> {
+fn top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     registry::with(|r| {
         r.get::<PluginHandles>()
             .expect("plugins::service() not registered")
@@ -222,7 +242,7 @@ fn top_render_signal() -> impl Signal<Item = Option<SlotRender>> {
     })
 }
 
-fn bottom_render_signal() -> impl Signal<Item = Option<SlotRender>> {
+fn bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     registry::with(|r| {
         r.get::<PluginHandles>()
             .expect("plugins::service() not registered")
@@ -248,66 +268,124 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
     }
 }
 
-// ── GTK-side mount: reconciler-backed sidebar slots ──────────────────────────
+// ── GTK-side mount: reconciler-backed sidebar regions ────────────────────────
 
-/// A reconciler-backed [`Mount::SidebarTop`] slot. Built per monitor from
-/// `overlays::sidebar::build_card` and appended above the built-in widgets.
+/// The [`Mount::SidebarTop`] **region** — a vertical container of N plugin
+/// cards. Built per monitor from `overlays::sidebar::build_card` and appended
+/// above the built-in widgets.
 #[must_use]
 pub fn sidebar_top_slot() -> gtk::Widget {
-    build_slot(top_render_signal())
+    build_region(top_render_signal())
 }
 
-/// A reconciler-backed [`Mount::SidebarBottom`] slot, appended below the
-/// built-in sidebar widgets.
+/// The [`Mount::SidebarBottom`] **region**, appended below the built-in sidebar
+/// widgets.
 #[must_use]
 pub fn sidebar_bottom_slot() -> gtk::Widget {
-    build_slot(bottom_render_signal())
+    build_region(bottom_render_signal())
 }
 
-/// Build a `gtk::Box` driven by a [`Reconciler`] fed from `signal` (a mount's
-/// render mailbox). The reconciler's `on_event` routes user interactions back
-/// to whichever plugin currently owns the slot, via the outbound sender carried
-/// on the latest [`SlotRender`].
-fn build_slot(signal: impl Signal<Item = Option<SlotRender>> + 'static) -> gtk::Widget {
+/// One plugin's mounted card within a region: its dedicated reconciler root (a
+/// child of the region container), the [`Reconciler`] driving it, and the
+/// outbound sender its `on_event` routes user interactions to. Keyed per plugin
+/// id so a card can be updated, reordered, or removed without disturbing its
+/// siblings. GTK-main-thread-only.
+struct MountedCard {
+    plugin_id: String,
+    root: gtk::Box,
+    reconciler: Reconciler,
+    /// Outbound of the connection currently owning this plugin's card, swapped
+    /// on each render so events always reach the live connection.
+    outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>>,
+}
+
+/// Build the `gtk::Box` region driven by `signal` (a mount's sorted render
+/// list). Each connected plugin gets its own reconciler-backed card; the region
+/// reconciles cards in on join / update / reorder / leave, keyed by plugin id.
+fn build_region(signal: impl Signal<Item = Vec<SlotRender>> + 'static) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    container.add_css_class("ts-plugin-slot");
+    container.add_css_class("ts-plugin-region");
 
-    // Outbound sender of the plugin currently mounted here. GTK-thread only, so
-    // an `Rc<RefCell<…>>` is correct — this never crosses to tokio.
-    let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> = Rc::new(RefCell::new(None));
+    // GTK-thread-only per-plugin card state. Order here is just a lookup table;
+    // widget order is enforced against the region container directly.
+    let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let event_outbound = outbound.clone();
-    let reconciler = Reconciler::new(&container, move |id: NodeId, kind: UiEventKind| {
-        if let Some(tx) = event_outbound.borrow().as_ref() {
-            let _ = tx.send(HostMsg::Event {
-                node: id,
-                kind: to_wire_event(kind),
-            });
-        }
-    });
-    let reconciler = Rc::new(RefCell::new(reconciler));
-
-    let rec = reconciler.clone();
-    let out = outbound.clone();
-    let handle = glib::MainContext::default().spawn_local(signal.for_each(move |opt| {
-        if let Some(render) = opt {
-            *out.borrow_mut() = Some(render.outbound.clone());
-            rec.borrow_mut().render(&to_ui_node(&render.tree));
-        } else {
-            // Plugin disconnected / slot released: blank the slot and stop
-            // routing events to the dead sender.
-            *out.borrow_mut() = None;
-            rec.borrow_mut().render(&empty_node());
-        }
+    let cards_for_signal = cards.clone();
+    let container_for_signal = container.clone();
+    let handle = glib::MainContext::default().spawn_local(signal.for_each(move |renders| {
+        reconcile_region(&container_for_signal, &cards_for_signal, &renders);
         std::future::ready(())
     }));
 
-    // Best-effort teardown: abort the render subscription when the slot widget
+    // Best-effort teardown: abort the render subscription when the region widget
     // is destroyed (a sidebar rebuild on hot-plug), so it stops rendering into a
     // detached container and drops its captured handles.
     container.connect_destroy(move |_| handle.abort());
 
     container.upcast()
+}
+
+/// Reconcile a mount region's child cards against the latest sorted plugin
+/// render list. Adds a card + reconciler for a newly-joined plugin, updates &
+/// reorders existing cards, and removes cards whose plugin left — each keyed by
+/// plugin id, so one plugin's join/leave never disturbs a sibling's widget
+/// (the per-plugin removal semantics of #274).
+fn reconcile_region(
+    container: &gtk::Box,
+    cards: &Rc<RefCell<Vec<MountedCard>>>,
+    renders: &[SlotRender],
+) {
+    let mut cards = cards.borrow_mut();
+
+    // 1. Drop cards whose plugin vanished from the region (left / disconnected).
+    let present: HashSet<&str> = renders.iter().map(|r| r.plugin_id.as_str()).collect();
+    cards.retain(|card| {
+        let keep = present.contains(card.plugin_id.as_str());
+        if !keep {
+            container.remove(&card.root);
+        }
+        keep
+    });
+
+    // 2. Upsert each plugin's card in sorted (region) order, laying the roots out
+    //    to match. `prev` walks the intended sibling order.
+    let mut prev: Option<gtk::Widget> = None;
+    for render in renders {
+        let ui_tree = to_ui_node(&render.tree);
+        if let Some(idx) = cards.iter().position(|c| c.plugin_id == render.plugin_id) {
+            let card = &mut cards[idx];
+            // Swap in the live connection's outbound, then re-render its tree.
+            *card.outbound.borrow_mut() = Some(render.outbound.clone());
+            card.reconciler.render(&ui_tree);
+            container.reorder_child_after(&card.root, prev.as_ref());
+            prev = Some(card.root.clone().upcast());
+        } else {
+            // New plugin joined: its own root + reconciler, wired to its own
+            // outbound cell (so events reach the right connection).
+            let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            root.add_css_class("ts-plugin-card");
+            let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> =
+                Rc::new(RefCell::new(Some(render.outbound.clone())));
+            let ev_outbound = outbound.clone();
+            let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
+                if let Some(tx) = ev_outbound.borrow().as_ref() {
+                    let _ = tx.send(HostMsg::Event {
+                        node: id,
+                        kind: to_wire_event(kind),
+                    });
+                }
+            });
+            reconciler.render(&ui_tree);
+            container.insert_child_after(&root, prev.as_ref());
+            prev = Some(root.clone().upcast());
+            cards.push(MountedCard {
+                plugin_id: render.plugin_id.clone(),
+                root,
+                reconciler,
+                outbound,
+            });
+        }
+    }
 }
 
 // ── tokio-side: listener + per-connection tasks ──────────────────────────────
@@ -381,9 +459,11 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     let plugin_id = manifest.id.clone();
     let mount = manifest.mount;
-    // Unique per-connection token stamped on every frame this connection parks,
-    // so teardown can distinguish "still my frame in the slot" from "a successor
-    // connection already claimed it" (#278).
+    // Region sort key (advisory placement request); `None` sorts as `0` (#274).
+    let order = manifest.order.unwrap_or(0);
+    // Unique per-connection token stamped on every card this connection parks,
+    // so teardown can distinguish "still my card in the region" from "a successor
+    // connection already replaced it" (#278).
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         plugin = %plugin_id,
@@ -407,7 +487,7 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
             Ok(PluginMsg::Render { tree, effects }) => {
-                let slot = match mount {
+                let region = match mount {
                     Mount::SidebarTop => Some(&ctx.sidebar_top),
                     Mount::SidebarBottom => Some(&ctx.sidebar_bottom),
                     Mount::BarLeft | Mount::BarCenter | Mount::BarRight => {
@@ -415,22 +495,29 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                         None
                     }
                 };
-                if let Some(slot) = slot {
-                    // One-shot effects first, over the non-lossy channel, BEFORE
-                    // parking the idempotent tree — a superseding render frame
-                    // could otherwise coalesce this frame's click away (#277).
+                if let Some(region) = region {
+                    // One-shot effects first, over the (global) non-lossy channel,
+                    // BEFORE parking the idempotent tree — a superseding render
+                    // frame could otherwise coalesce this frame's click away
+                    // (#277). Unchanged by the region model.
                     for effect in effects {
                         let _ = ctx.effects_tx.send(BrokeredEffect {
                             plugin_id: plugin_id.clone(),
                             effect,
                         });
                     }
-                    // Latest-wins: `set` overwrites any superseded frame in place.
-                    slot.set(Some(SlotRender {
-                        generation,
-                        tree,
-                        outbound: out_tx.clone(),
-                    }));
+                    // Latest-wins per plugin id: upsert overwrites *this* plugin's
+                    // card in place, leaving siblings alone (#274).
+                    upsert_region(
+                        region,
+                        SlotRender {
+                            plugin_id: plugin_id.clone(),
+                            order,
+                            generation,
+                            tree,
+                            outbound: out_tx.clone(),
+                        },
+                    );
                 }
             }
             Ok(PluginMsg::Register { .. }) => {
@@ -445,11 +532,12 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         }
     }
 
-    // Teardown: release the mount slot only if THIS connection still owns it
-    // (blanks the reconciler on the GTK side), then stop the outbound + snapshot
-    // tasks. Connection-scoped so a fast-reconnect successor is never evicted.
-    clear_slot_if_owned(&ctx.sidebar_top, generation);
-    clear_slot_if_owned(&ctx.sidebar_bottom, generation);
+    // Teardown: remove THIS plugin's card from its region only if THIS connection
+    // still owns it (removes just that card on the GTK side), then stop the
+    // outbound + snapshot tasks. Connection-scoped + keyed per plugin id, so a
+    // fast-reconnect successor is never evicted and sibling plugins are untouched.
+    clear_region_if_owned(&ctx.sidebar_top, &plugin_id, generation);
+    clear_region_if_owned(&ctx.sidebar_bottom, &plugin_id, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
@@ -496,22 +584,47 @@ async fn snapshot_task(
     }
 }
 
-/// Clear a mount slot iff the disconnecting connection still owns it (a newer
-/// connection — even a fast reconnect of the same plugin — may already have
-/// claimed the slot; its render carries a higher generation, so we leave it).
-fn clear_slot_if_owned(slot: &Mutable<Option<SlotRender>>, generation: u64) {
-    let owned = owns_slot(slot.lock_ref().as_ref().map(|r| r.generation), generation);
-    if owned {
-        slot.set(None);
+/// Insert-or-replace `render`'s plugin card in its mount region, latest-wins per
+/// plugin id, keeping the region sorted by `(order, plugin_id)` ascending. A
+/// plugin's repeated renders overwrite its own card (coalescing — superseded
+/// trees dropped); distinct plugins get distinct cards, so they never fight
+/// (#274). Called from a connection's reader task on every `Render`.
+fn upsert_region(region: &Mutable<Vec<SlotRender>>, render: SlotRender) {
+    let mut cards = region.lock_mut();
+    if let Some(existing) = cards.iter_mut().find(|c| c.plugin_id == render.plugin_id) {
+        *existing = render;
+    } else {
+        cards.push(render);
     }
+    cards.sort_by(|a, b| (a.order, &a.plugin_id).cmp(&(b.order, &b.plugin_id)));
 }
 
-/// Whether a teardown for `teardown_gen` should clear a slot currently holding
-/// `slot_gen`. Ownership is connection-scoped: the compare succeeds only for the
-/// exact connection that parked the frame, so a stale teardown can never evict a
-/// successor connection's live render (#278). An empty slot is owned by nobody.
-fn owns_slot(slot_gen: Option<u64>, teardown_gen: u64) -> bool {
-    slot_gen == Some(teardown_gen)
+/// Remove a plugin's card from a mount region on connection teardown — but only
+/// if THIS connection still owns it (its `generation` matches the parked card's).
+/// A fast-reconnect successor (same plugin id, higher generation) has already
+/// replaced the card, so a stale teardown leaves it (the #278 guarantee, now
+/// applied per plugin-id entry). A different plugin's card is keyed by a
+/// different id and never matched, so siblings are undisturbed.
+///
+/// Probes with the read lock first so a teardown never spuriously notifies a
+/// region this plugin isn't even in (each teardown checks *both* sidebar
+/// regions); it re-finds under the write lock to stay correct against a
+/// concurrent mutation.
+fn clear_region_if_owned(region: &Mutable<Vec<SlotRender>>, plugin_id: &str, generation: u64) {
+    let owns = region
+        .lock_ref()
+        .iter()
+        .any(|c| c.plugin_id == plugin_id && c.generation == generation);
+    if !owns {
+        return;
+    }
+    let mut cards = region.lock_mut();
+    if let Some(pos) = cards
+        .iter()
+        .position(|c| c.plugin_id == plugin_id && c.generation == generation)
+    {
+        cards.remove(pos);
+    }
 }
 
 /// Surface a plugin's `Log` frame at the matching host `tracing` level.
@@ -540,6 +653,9 @@ fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
 /// is written exhaustively so adding a node variant to either side is a compile
 /// error here.
+// One exhaustive arm per node variant — the length is the vocabulary size, not
+// complexity.
+#[allow(clippy::too_many_lines)]
 fn to_ui_node(node: &wire::Node) -> UiNode {
     match node {
         wire::Node::Box {
@@ -557,9 +673,38 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             classes: classes.clone(),
             children: children.iter().map(to_ui_node).collect(),
         },
+        wire::Node::Row {
+            id,
+            classes,
+            children,
+        } => UiNode::Row {
+            id: id.clone(),
+            classes: classes.clone(),
+            children: children.iter().map(to_ui_node).collect(),
+        },
+        wire::Node::ListBox {
+            id,
+            classes,
+            children,
+        } => UiNode::ListBox {
+            id: id.clone(),
+            classes: classes.clone(),
+            children: children.iter().map(to_ui_node).collect(),
+        },
         wire::Node::Label { id, text, classes } => UiNode::Label {
             id: id.clone(),
             text: text.clone(),
+            classes: classes.clone(),
+        },
+        wire::Node::Text {
+            id,
+            text,
+            max_width_chars,
+            classes,
+        } => UiNode::Text {
+            id: id.clone(),
+            text: text.clone(),
+            max_width_chars: *max_width_chars,
             classes: classes.clone(),
         },
         wire::Node::Icon { id, name, classes } => UiNode::Icon {
@@ -678,24 +823,12 @@ fn map_page(page: Page) -> crate::modal::Page {
     }
 }
 
-/// An empty root node used to blank a slot when its plugin disconnects.
-fn empty_node() -> UiNode {
-    UiNode::Box {
-        id: None,
-        dir: UiDir::Vertical,
-        spacing: 0,
-        scroll: false,
-        classes: Vec::new(),
-        children: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         BrokeredEffect, Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir,
-        UiEventKind, UiNode, empty_node, map_page, mpsc, owns_slot, pixels_len_ok, to_ui_node,
-        to_wire_event, wire,
+        UiEventKind, UiNode, clear_region_if_owned, map_page, mpsc, pixels_len_ok, to_ui_node,
+        to_wire_event, upsert_region, wire,
     };
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
@@ -817,19 +950,39 @@ mod tests {
         assert_eq!(to_ui_node(&tree), expected);
     }
 
+    /// The three additive `#274` nodes map field-for-field: `Row`/`ListBox`
+    /// recurse their children like `Box`, and `Text` carries `max_width_chars`.
     #[test]
-    fn empty_node_is_an_empty_box() {
-        assert_eq!(
-            empty_node(),
-            UiNode::Box {
-                id: None,
-                dir: UiDir::Vertical,
-                spacing: 0,
-                scroll: false,
-                classes: vec![],
-                children: vec![],
-            }
-        );
+    fn wire_row_listbox_text_map_to_ui() {
+        let tree = wire::Node::ListBox {
+            id: Some("list".into()),
+            classes: vec!["ts-list".into()],
+            children: vec![wire::Node::Row {
+                id: Some("r0".into()),
+                classes: vec!["ts-row".into()],
+                children: vec![wire::Node::Text {
+                    id: None,
+                    text: "wraps".into(),
+                    max_width_chars: Some(20),
+                    classes: vec!["ts-dest".into()],
+                }],
+            }],
+        };
+        let expected = UiNode::ListBox {
+            id: Some("list".into()),
+            classes: vec!["ts-list".into()],
+            children: vec![UiNode::Row {
+                id: Some("r0".into()),
+                classes: vec!["ts-row".into()],
+                children: vec![UiNode::Text {
+                    id: None,
+                    text: "wraps".into(),
+                    max_width_chars: Some(20),
+                    classes: vec!["ts-dest".into()],
+                }],
+            }],
+        };
+        assert_eq!(to_ui_node(&tree), expected);
     }
 
     #[test]
@@ -867,9 +1020,18 @@ mod tests {
         }
     }
 
-    /// A label frame carrying a generation, for the mailbox tests below.
-    fn label_frame(text: &str, generation: u64, tx: &mpsc::UnboundedSender<HostMsg>) -> SlotRender {
+    /// One plugin card carrying an id/order/generation + a label tree, for the
+    /// region tests below.
+    fn render_of(
+        plugin_id: &str,
+        order: i32,
+        generation: u64,
+        text: &str,
+        tx: &mpsc::UnboundedSender<HostMsg>,
+    ) -> SlotRender {
         SlotRender {
+            plugin_id: plugin_id.to_owned(),
+            order,
             generation,
             tree: wire::Node::Label {
                 id: None,
@@ -880,22 +1042,49 @@ mod tests {
         }
     }
 
-    /// The render mailbox coalesces latest-wins: rapid frames overwrite in place,
-    /// and a slow consumer reading once observes only the newest tree.
-    #[test]
-    fn render_mailbox_coalesces_latest_wins() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
-        let mailbox: Mutable<Option<SlotRender>> = Mutable::new(None);
-        mailbox.set(Some(label_frame("first", 0, &tx)));
-        mailbox.set(Some(label_frame("second", 0, &tx)));
-        mailbox.set(Some(label_frame("third", 0, &tx)));
-
-        let guard = mailbox.lock_ref();
-        let latest = guard.as_ref().expect("mailbox holds the latest frame");
-        match &latest.tree {
-            wire::Node::Label { text, .. } => assert_eq!(text, "third"),
+    fn label_text(render: &SlotRender) -> &str {
+        match &render.tree {
+            wire::Node::Label { text, .. } => text,
             other => panic!("expected a Label, got {other:?}"),
         }
+    }
+
+    /// A region keeps **one card per plugin id** (a plugin's re-render coalesces
+    /// its own card, latest-wins) and stays sorted by `(order, plugin_id)`.
+    #[test]
+    fn upsert_region_coalesces_per_plugin_and_sorts() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        // Arrive out of order; "alpha" renders twice.
+        upsert_region(&region, render_of("bravo", 0, 0, "b1", &tx));
+        upsert_region(&region, render_of("alpha", 0, 0, "a1", &tx));
+        upsert_region(&region, render_of("alpha", 0, 0, "a2", &tx));
+
+        let cards = region.lock_ref();
+        assert_eq!(cards.len(), 2, "one card per plugin id (alpha coalesced)");
+        assert_eq!(cards[0].plugin_id, "alpha", "sorted by (order, id)");
+        assert_eq!(cards[1].plugin_id, "bravo");
+        assert_eq!(label_text(&cards[0]), "a2", "alpha's latest tree wins");
+    }
+
+    /// `(order, id)` ordering: lower `order` first; `None` (mapped to `0` by the
+    /// reader) ties with `order: 0` and breaks on the stable id.
+    #[test]
+    fn region_orders_by_order_then_id() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        // pet requests order 5 (renders later); clock had no order → 0; aaa → 0.
+        upsert_region(&region, render_of("pet", 5, 0, "", &tx));
+        upsert_region(&region, render_of("clock", 0, 1, "", &tx)); // None → 0
+        upsert_region(&region, render_of("aaa", 0, 2, "", &tx)); // ties clock on order
+
+        let ids: Vec<String> = region
+            .lock_ref()
+            .iter()
+            .map(|c| c.plugin_id.clone())
+            .collect();
+        // (0,"aaa") < (0,"clock") < (5,"pet")
+        assert_eq!(ids, vec!["aaa", "clock", "pet"]);
     }
 
     /// A `Pixels` node whose buffer size violates `width*height*4` must not
@@ -948,15 +1137,15 @@ mod tests {
         );
     }
 
-    /// #277: two back-to-back frames coalesce in the latest-wins mailbox, but a
-    /// one-shot effect bundled on the superseded frame rides the dedicated
-    /// non-lossy channel and is delivered exactly once — not dropped, not
-    /// duplicated. This is the click-drop scenario the fix closes.
+    /// #277 (preserved under the region model): a plugin's back-to-back frames
+    /// coalesce its region card latest-wins, but a one-shot effect bundled on the
+    /// superseded frame rides the dedicated **global** non-lossy channel and is
+    /// delivered exactly once — not dropped, not duplicated.
     #[test]
-    fn effects_survive_render_coalescing() {
+    fn effects_survive_region_coalescing() {
         let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
         let (eff_tx, mut eff_rx) = mpsc::unbounded_channel::<BrokeredEffect>();
-        let mailbox: Mutable<Option<SlotRender>> = Mutable::new(None);
+        let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
 
         // Frame A: a click's effect goes on the effect channel, then the tree is
         // parked. Frame B (a tick microseconds later) coalesces A's tree away.
@@ -966,13 +1155,14 @@ mod tests {
                 effect: Effect::OpenPage(Page::PowerMenu),
             })
             .expect("effect queued");
-        mailbox.set(Some(label_frame("A", 0, &tx)));
-        mailbox.set(Some(label_frame("B", 0, &tx)));
+        upsert_region(&region, render_of("p", 0, 0, "A", &tx));
+        upsert_region(&region, render_of("p", 0, 0, "B", &tx));
 
-        // The mailbox observes only B (load-shedding by design)…
-        match &mailbox.lock_ref().as_ref().expect("frame parked").tree {
-            wire::Node::Label { text, .. } => assert_eq!(text, "B"),
-            other => panic!("expected a Label, got {other:?}"),
+        // The region observes only B for plugin p (load-shedding by design)…
+        {
+            let cards = region.lock_ref();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(label_text(&cards[0]), "B");
         }
         // …but the effect survived, exactly once, in order.
         let got = eff_rx.try_recv().expect("effect not dropped by coalescing");
@@ -981,18 +1171,48 @@ mod tests {
         assert!(eff_rx.try_recv().is_err(), "effect must not be duplicated");
     }
 
-    /// #278: connection-scoped slot ownership. A stale teardown (older
-    /// generation) must never evict a fast-reconnect successor that already
-    /// claimed the slot; only the owning generation's own teardown clears it.
+    /// #274 removal semantics: a plugin's teardown removes only *its own* card;
+    /// a sibling plugin's card is keyed by a different id and stays put.
     #[test]
-    fn stale_teardown_never_evicts_successor() {
-        // Successor (gen 2) holds the slot; the old connection's teardown (gen 1)
-        // must NOT clear it.
-        assert!(!owns_slot(Some(2), 1));
-        // The owning connection's own teardown clears its live frame.
-        assert!(owns_slot(Some(2), 2));
-        // An already-empty slot is owned by nobody.
-        assert!(!owns_slot(None, 1));
+    fn per_plugin_teardown_leaves_siblings() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        upsert_region(&region, render_of("a", 0, 10, "", &tx));
+        upsert_region(&region, render_of("b", 0, 11, "", &tx));
+
+        clear_region_if_owned(&region, "a", 10);
+
+        let cards = region.lock_ref();
+        assert_eq!(cards.len(), 1, "only plugin a's card removed");
+        assert_eq!(cards[0].plugin_id, "b", "sibling b undisturbed");
+    }
+
+    /// #278 (preserved, now per plugin-id entry): a stale teardown (older
+    /// generation) must never evict a fast-reconnect successor of the SAME
+    /// plugin id; only the owning generation's own teardown clears the card.
+    #[test]
+    fn stale_teardown_never_evicts_same_id_successor() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        // conn gen 1 parks plugin p; a fast reconnect (gen 2) replaces its card.
+        upsert_region(&region, render_of("p", 0, 1, "v1", &tx));
+        upsert_region(&region, render_of("p", 0, 2, "v2", &tx));
+
+        // The old connection's teardown (gen 1) must NOT evict the gen-2 card.
+        clear_region_if_owned(&region, "p", 1);
+        {
+            let cards = region.lock_ref();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].generation, 2, "successor survives stale teardown");
+            assert_eq!(label_text(&cards[0]), "v2");
+        }
+
+        // The owning connection's own teardown (gen 2) does clear it.
+        clear_region_if_owned(&region, "p", 2);
+        assert!(
+            region.lock_ref().is_empty(),
+            "owning teardown clears the card"
+        );
     }
 
     /// A bar mount is a real wire variant the reader must handle; assert the two

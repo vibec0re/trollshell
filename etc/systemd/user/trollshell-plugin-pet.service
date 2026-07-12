@@ -4,9 +4,9 @@ Documentation=file://%h/.config/systemd/user/README.md
 PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target trollshell.service
-# NOTE: the pet mounts SidebarTop — the same slot as the reference clock
-# demo. The v1 host has one plugin per slot; enable one or the other.
-Conflicts=trollshell-plugin-clock-demo.service
+# The pet mounts SidebarTop alongside the reference clock demo. Since #274 that
+# mount is a *region* holding N plugin cards (sorted by manifest `order`), so
+# the two coexist — no `Conflicts=` needed. Enable both if you like.
 
 [Service]
 Type=simple

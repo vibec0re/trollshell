@@ -376,10 +376,10 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
 
-    // Plugin mount: `Mount::SidebarTop` — an out-of-process widget plugin's
-    // view (#35 PR 2), reconciled *after* the built-in cards but above the
-    // flex gap (#274: plugins must not shove weather/calendar/tasks down).
-    // Empty (renders nothing) until a plugin dials in and pushes a tree.
+    // Plugin mount: `Mount::SidebarTop` — a *region* holding N out-of-process
+    // widget-plugin cards (#274), sorted by each plugin's manifest `order`.
+    // Reconciled *after* the built-in cards but above the flex gap (plugins must
+    // not shove weather/calendar/tasks down). Empty until a plugin dials in.
     card.append(&crate::plugins::sidebar_top_slot());
 
     // Flex gap: eats whatever vertical space the calendar + tasks
@@ -391,7 +391,8 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
 
     card.append(&crate::widgets::departures::widget());
 
-    // Plugin mount: `Mount::SidebarBottom` — reconciled below everything.
+    // Plugin mount: `Mount::SidebarBottom` — the bottom plugin *region* (#274),
+    // reconciled below everything.
     card.append(&crate::plugins::sidebar_bottom_slot());
     card
 }

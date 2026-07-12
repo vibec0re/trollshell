@@ -1,0 +1,20 @@
+[Unit]
+Description=trollshell departures board plugin (out-of-process, #289)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# Mounts SidebarBottom, where the native departures board anchors. During the
+# migration (stage 2, #289) the native board stays until live-verified, so run
+# ONE of them at a time — enable this unit only once the native mount is gone
+# (its removal is the #289 follow-up). Station config is read from the same
+# ~/.config/trollshell/places.toml the shell already writes.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-departures
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

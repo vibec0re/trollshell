@@ -108,6 +108,21 @@ pub enum Node {
         name: String,
         classes: Vec<String>,
     },
+    /// A raster image: a `width`×`height` block of **RGBA8** pixels
+    /// (`data`, row-major, 4 bytes/pixel `[R, G, B, A]`, non-premultiplied,
+    /// length `width * height * 4`), materialized by a [`crate::pixels`]
+    /// `PixelSurface` and scaled up with **nearest-neighbor** filtering for
+    /// crisp "LCD"-style pixels. `data` is a **mutable** prop: a same-id
+    /// re-render swaps the texture in place (like [`Node::Label`]'s `text`).
+    /// An inconsistent buffer renders nothing (the widget is panic-safe); the
+    /// upstream host validates and warns.
+    Pixels {
+        id: Option<NodeId>,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        classes: Vec<String>,
+    },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
         id: NodeId,
@@ -230,6 +245,7 @@ enum NodeKind {
     Box,
     Label,
     Icon,
+    Pixels,
     Button,
     Progress,
     Revealer,
@@ -374,6 +390,18 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             apply_classes(&image, classes);
             (image.upcast(), Vec::new())
         }
+        Node::Pixels {
+            width,
+            height,
+            data,
+            classes,
+            ..
+        } => {
+            let surface = crate::pixels::PixelSurface::new();
+            surface.set_pixels(*width, *height, data);
+            apply_classes(&surface, classes);
+            (surface.upcast(), Vec::new())
+        }
         Node::Button { id, classes, child } => {
             let button = gtk::Button::new();
             apply_classes(&button, classes);
@@ -455,6 +483,18 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             let image = downcast::<gtk::Image>(&retained.widget);
             image.set_icon_name(Some(name));
             reconcile_classes(image, &retained.desc.classes, classes);
+        }
+        Node::Pixels {
+            width,
+            height,
+            data,
+            classes,
+            ..
+        } => {
+            let surface = downcast::<crate::pixels::PixelSurface>(&retained.widget);
+            // `data` is a mutable prop: swap the texture in place (no rebuild).
+            surface.set_pixels(*width, *height, data);
+            reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Button { classes, child, .. } => {
             let button = downcast::<gtk::Button>(&retained.widget);
@@ -639,6 +679,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Box { .. } => NodeKind::Box,
         Node::Label { .. } => NodeKind::Label,
         Node::Icon { .. } => NodeKind::Icon,
+        Node::Pixels { .. } => NodeKind::Pixels,
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
         Node::Revealer { .. } => NodeKind::Revealer,
@@ -651,6 +692,7 @@ fn node_id(node: &Node) -> Option<&str> {
         Node::Box { id, .. }
         | Node::Label { id, .. }
         | Node::Icon { id, .. }
+        | Node::Pixels { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
         Node::Button { id, .. } => Some(id.as_str()),
@@ -663,6 +705,7 @@ fn node_classes(node: &Node) -> &[String] {
         Node::Box { classes, .. }
         | Node::Label { classes, .. }
         | Node::Icon { classes, .. }
+        | Node::Pixels { classes, .. }
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
         | Node::Separator { classes } => classes,
@@ -1094,6 +1137,59 @@ mod gtk_tests {
                 .as_str(),
             "b"
         );
+    }
+
+    fn pix(id: Option<&str>, width: u32, height: u32, data: Vec<u8>) -> Node {
+        Node::Pixels {
+            id: id.map(ToOwned::to_owned),
+            width,
+            height,
+            data,
+            classes: vec![],
+        }
+    }
+
+    #[gtk::test]
+    fn pixels_builds_surface() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // 1×1 opaque red.
+        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        let w = root.first_child().expect("pixel surface mounted");
+        assert!(
+            w.downcast_ref::<crate::pixels::PixelSurface>().is_some(),
+            "Pixels maps to a PixelSurface"
+        );
+    }
+
+    #[gtk::test]
+    fn pixels_update_reuses_widget_on_same_id() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        let before = root.first_child().unwrap();
+
+        // Same id, new bytes: mutable-prop update, widget identity preserved.
+        rec.render(&pix(Some("lcd"), 1, 1, vec![0, 255, 0, 255]));
+        let after = root.first_child().unwrap();
+        assert_eq!(before, after, "same-id Pixels reuses the surface in place");
+    }
+
+    #[gtk::test]
+    fn pixels_bad_buffer_does_not_panic() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // data.len() (3) != 2*2*4: the widget must degrade to rendering nothing
+        // rather than hand MemoryTexture::new an under-sized buffer.
+        rec.render(&pix(Some("lcd"), 2, 2, vec![1, 2, 3]));
+        let w = root
+            .first_child()
+            .unwrap()
+            .downcast::<crate::pixels::PixelSurface>()
+            .unwrap();
+        // A subsequent valid frame still renders in place (kind/id unchanged).
+        rec.render(&pix(Some("lcd"), 1, 1, vec![9, 9, 9, 255]));
+        assert_eq!(root.first_child().unwrap(), w.upcast::<gtk::Widget>());
     }
 
     #[gtk::test]

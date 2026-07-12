@@ -1,0 +1,41 @@
+[package]
+name = "hytte-plugin-departures"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The S-Bahn departures board as an out-of-process trollshell widget plugin, visibility-gated so its poller parks while the sidebar is closed (issue #289)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-departures"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream
+# (including `wrappers::UnboundedReceiverStream`, which is un-feature-gated).
+hytte-plugin = { path = "../hytte-plugin" }
+# The poll task's interval + command-lane select loop and the blocking-fetch
+# offload. `macros` for `select!`, `rt` for `spawn`/`spawn_blocking`.
+tokio = { version = "1.40", default-features = false, features = [
+  "rt",
+  "macros",
+  "time",
+  "sync",
+] }
+# The HAFAS/transport.rest client — the same blocking `ureq` + `spawn_blocking`
+# idiom as the native `hytte-services::departures` fetcher; `rustls` for HTTPS.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Reads the station out of `~/.config/trollshell/places.toml` (the same config
+# file + schema the native board used, via `hytte-services::places`).
+toml = "1"
+# RFC 3339 departure timestamps → unix seconds + `HH:MM`. `clock` for the
+# fetch-time `Utc::now()` that prunes already-departed rows.
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }

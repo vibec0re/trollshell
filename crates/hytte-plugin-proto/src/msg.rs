@@ -38,6 +38,24 @@ pub enum HostMsg {
     /// The result of a brokered [`Effect::RunCommand`](crate::effect::Effect::RunCommand),
     /// keyed by the command's `id`.
     EffectResult { id: u64, outcome: EffectOutcome },
+    /// The plugin's mount surface became visible or hidden — e.g. the sidebar
+    /// its card lives in was opened / closed. Pushed on every open/close edge
+    /// and **once at register** (so a reconnecting plugin starts in the right
+    /// state), letting a plugin park its own pollers/timers while nobody is
+    /// looking (the shell already gates its built-in pollers this way).
+    ///
+    /// **Delivery is latest-wins.** Unlike an [`Event`](HostMsg::Event) (a
+    /// one-shot interaction), visibility is *state*: a burst of open/close
+    /// toggles may coalesce to the newest `visible` value, and that is correct —
+    /// the receiver only ever needs the current state, never the intermediate
+    /// edges. This is explicitly **not** a #277-style lossiness concern (which
+    /// is about dropping one-shot effects); dropping a superseded visibility
+    /// value loses nothing.
+    ///
+    /// With multiple monitors a card mirrors onto every monitor's sidebar, so
+    /// the host sends `visible: true` while **any** sidebar showing it is open
+    /// (OR across monitors) and `false` only once they are all closed.
+    SlotVisibility { visible: bool },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is

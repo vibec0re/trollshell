@@ -24,7 +24,26 @@
 //! GTK effect broker ◀── effect channel ── drained in arrival order (non-lossy)
 //! GTK reconciler ──on_event──▶ per-conn outbound (mpsc) ──▶ writer task ──▶ plugin (Event)
 //! GTK clock pump ──▶ watch ──▶ per-conn snapshot task ──▶ writer task ──▶ plugin (StateSnapshot)
+//! GTK sidebar open/close ──▶ watch ──▶ per-conn visibility task ──▶ writer task ──▶ plugin (SlotVisibility)
 //! ```
+//!
+//! ## Slot visibility (park pollers while hidden) (#288)
+//!
+//! A migrated poller (e.g. a departures/weather plugin) should idle while its
+//! card isn't on screen, the way the shell already gates its built-in pollers.
+//! The host pushes a [`HostMsg::SlotVisibility`] on every sidebar open/close and
+//! **once at register** (so a reconnecting plugin starts correct) — mirroring the
+//! clock pump's `watch` + seed-send shape. Delivery is latest-wins (it's state,
+//! not a one-shot event, so no #277 lossiness concern).
+//!
+//! Sidebars are **per-monitor** and a plugin's card mirrors onto every monitor's
+//! sidebar region, so `visible` is the **OR across monitors**: `true` while *any*
+//! sidebar is open, `false` only once all are closed. The GTK side keeps a
+//! per-monitor open flag ([`SLOT_VISIBILITY_BY_MONITOR`], fed by `sidebar.rs` via
+//! [`set_sidebar_visibility`] / [`forget_sidebar_visibility`] — the latter on
+//! monitor hot-unplug, so a disappearing monitor that held the only open sidebar
+//! drops `visible` to `false`) and publishes the aggregate ([`any_sidebar_open`])
+//! only when it actually changes.
 //!
 //! ## Mount regions (#274)
 //!
@@ -67,7 +86,7 @@
 //!   deferred.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
@@ -139,6 +158,11 @@ pub struct PluginHandles {
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_tx: watch::Sender<Option<ClockState>>,
+    /// Aggregate slot visibility (OR of every monitor's sidebar open flag),
+    /// written on the GTK thread ([`set_sidebar_visibility`]) and subscribed
+    /// from tokio (per-conn visibility tasks). Starts `false` (nothing open at
+    /// boot). See the module-level "Slot visibility" note (#288).
+    visibility_tx: watch::Sender<bool>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
 
@@ -148,6 +172,7 @@ struct ListenerCtx {
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
+    visibility_rx: watch::Receiver<bool>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
 
@@ -156,17 +181,22 @@ impl Service for PluginsService {
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let (clock_tx, clock_rx) = watch::channel(None);
+        // Slot visibility seeds `false`: no sidebar is open at boot, and each
+        // monitor's `install` re-asserts `false` as it wires up (#288).
+        let (visibility_tx, visibility_rx) = watch::channel(false);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
             sidebar_top: Mutable::new(Vec::new()),
             sidebar_bottom: Mutable::new(Vec::new()),
             clock_tx,
+            visibility_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
             sidebar_top: handles.sidebar_top.clone(),
             sidebar_bottom: handles.sidebar_bottom.clone(),
             clock_rx,
+            visibility_rx,
             effects_tx,
         };
         rt.spawn(async move {
@@ -230,6 +260,79 @@ fn set_clock(cs: ClockState) {
             .expect("plugins::service() not registered")
             .clock_tx
             .send_replace(Some(cs));
+    });
+}
+
+// ── Slot visibility (#288): OR of every monitor's sidebar open flag ───────────
+
+thread_local! {
+    /// GTK-thread-only per-monitor sidebar open flag, keyed by connector. The OR
+    /// across its values is the single `visible` bool pushed to every connected
+    /// plugin: a plugin's card mirrors onto **every** monitor's sidebar region,
+    /// so it is "visible" while any one sidebar is open. Fed by `sidebar.rs`
+    /// through [`set_sidebar_visibility`] (open/close) and
+    /// [`forget_sidebar_visibility`] (hot-unplug).
+    static SLOT_VISIBILITY_BY_MONITOR: RefCell<HashMap<String, bool>> =
+        RefCell::new(HashMap::new());
+}
+
+/// A plugin's card is visible iff **any** monitor's sidebar is open — the card
+/// mirrors onto every monitor's sidebar region, so one open sidebar shows it.
+/// (An empty map — no monitors tracked yet — is not visible.)
+fn any_sidebar_open(open_by_monitor: &HashMap<String, bool>) -> bool {
+    open_by_monitor.values().any(|&open| open)
+}
+
+/// Record `monitor_key`'s open flag in `map`, returning the new OR-aggregate.
+/// Pure so the hot-plug aggregation is unit-testable without the registry.
+fn apply_open(map: &mut HashMap<String, bool>, monitor_key: &str, open: bool) -> bool {
+    map.insert(monitor_key.to_owned(), open);
+    any_sidebar_open(map)
+}
+
+/// Drop `monitor_key` from `map` (hot-unplug), returning the new OR-aggregate —
+/// so a disappearing monitor that held the only open sidebar flips it to `false`.
+/// Pure, for the same reason as [`apply_open`].
+fn apply_forget(map: &mut HashMap<String, bool>, monitor_key: &str) -> bool {
+    map.remove(monitor_key);
+    any_sidebar_open(map)
+}
+
+/// Record a monitor's sidebar open-state and, if the OR-aggregate changed, push
+/// the new [`HostMsg::SlotVisibility`] to every connected plugin. Called from
+/// `sidebar.rs` on each open/close edge. GTK-thread-only.
+pub fn set_sidebar_visibility(monitor_key: &str, open: bool) {
+    let visible =
+        SLOT_VISIBILITY_BY_MONITOR.with(|m| apply_open(&mut m.borrow_mut(), monitor_key, open));
+    publish_visibility(visible);
+}
+
+/// Forget a monitor's sidebar on hot-unplug and push the recomputed aggregate.
+/// The disappearing monitor's flag leaves the OR, so if it held the only open
+/// sidebar `visible` correctly drops to `false`. GTK-thread-only.
+pub fn forget_sidebar_visibility(monitor_key: &str) {
+    let visible =
+        SLOT_VISIBILITY_BY_MONITOR.with(|m| apply_forget(&mut m.borrow_mut(), monitor_key));
+    publish_visibility(visible);
+}
+
+/// Push `visible` on the watch channel, but only when it differs from the last
+/// published value (`send_if_modified`) — so redundant open/close churn on one
+/// monitor while another stays open doesn't wake the per-conn tasks. Latest-wins
+/// is fine either way (it's state, not a one-shot event).
+fn publish_visibility(visible: bool) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .visibility_tx
+            .send_if_modified(|current| {
+                if *current == visible {
+                    false
+                } else {
+                    *current = visible;
+                    true
+                }
+            });
     });
 }
 
@@ -483,6 +586,11 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .contains(&StateKey::Clock)
         .then(|| tokio::spawn(snapshot_task(ctx.clock_rx.clone(), out_tx.clone())));
 
+    // Slot visibility (#288): seeded at register + pushed on every change. Sent
+    // to EVERY plugin — visibility is universal, not a `StateKey` subscription —
+    // so any plugin can park its own pollers/timers while its card is hidden.
+    let visibility = tokio::spawn(visibility_task(ctx.visibility_rx.clone(), out_tx.clone()));
+
     // Reader loop: dispatch inbound frames until the peer disconnects.
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -541,6 +649,7 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
+    visibility.abort();
     writer.abort();
 }
 
@@ -579,6 +688,30 @@ async fn snapshot_task(
             })
             .is_err()
         {
+            break;
+        }
+    }
+}
+
+/// Push the aggregate slot visibility on the initial subscribe (the register
+/// seed, so a reconnecting plugin starts in the right state) and on every
+/// change, coalescing bursts latest-wins via `borrow_and_update` (#288). Mirrors
+/// [`snapshot_task`]; runs for every connection since visibility is universal.
+async fn visibility_task(
+    mut visibility_rx: watch::Receiver<bool>,
+    out: mpsc::UnboundedSender<HostMsg>,
+) {
+    // Seed at register (the watch replays its current value).
+    let initial = *visibility_rx.borrow_and_update();
+    if out
+        .send(HostMsg::SlotVisibility { visible: initial })
+        .is_err()
+    {
+        return;
+    }
+    while visibility_rx.changed().await.is_ok() {
+        let visible = *visibility_rx.borrow_and_update();
+        if out.send(HostMsg::SlotVisibility { visible }).is_err() {
             break;
         }
     }
@@ -826,9 +959,10 @@ fn map_page(page: Page) -> crate::modal::Page {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokeredEffect, Effect, HostMsg, Mount, Mutable, Page, SlotRender, StateKey, UiDir,
-        UiEventKind, UiNode, clear_region_if_owned, map_page, mpsc, pixels_len_ok, to_ui_node,
-        to_wire_event, upsert_region, wire,
+        BrokeredEffect, Effect, HashMap, HostMsg, Mount, Mutable, Page, SlotRender, StateKey,
+        UiDir, UiEventKind, UiNode, any_sidebar_open, apply_forget, apply_open,
+        clear_region_if_owned, map_page, mpsc, pixels_len_ok, to_ui_node, to_wire_event,
+        upsert_region, wire,
     };
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
@@ -1213,6 +1347,47 @@ mod tests {
             region.lock_ref().is_empty(),
             "owning teardown clears the card"
         );
+    }
+
+    /// #288: slot visibility is the **OR across monitors** — a plugin's card
+    /// mirrors onto every monitor's sidebar, so it's visible while any one is
+    /// open. Walks the multi-monitor open/close lifecycle through the pure
+    /// aggregation helpers (`apply_open` returns the recomputed aggregate).
+    #[test]
+    fn slot_visibility_is_or_across_monitors() {
+        let mut map = HashMap::new();
+        // No monitors tracked yet → not visible.
+        assert!(!any_sidebar_open(&map));
+
+        // Two monitors install, both closed → not visible.
+        assert!(!apply_open(&mut map, "DP-1", false));
+        assert!(!apply_open(&mut map, "HDMI-A-1", false));
+
+        // Open one → visible (OR); the other opening too stays visible.
+        assert!(apply_open(&mut map, "DP-1", true));
+        assert!(apply_open(&mut map, "HDMI-A-1", true));
+
+        // Close one while the other stays open → still visible.
+        assert!(apply_open(&mut map, "DP-1", false));
+        // Close the last open sidebar → not visible.
+        assert!(!apply_open(&mut map, "HDMI-A-1", false));
+    }
+
+    /// #288: hot-unplug of the monitor holding the **only** open sidebar must
+    /// drop visibility to `false` — its flag leaves the OR entirely, it isn't
+    /// merely set closed.
+    #[test]
+    fn hot_unplug_of_only_open_monitor_drops_visibility() {
+        let mut map = HashMap::new();
+        apply_open(&mut map, "DP-1", true);
+        apply_open(&mut map, "HDMI-A-1", false);
+        assert!(any_sidebar_open(&map), "one open sidebar → visible");
+
+        // The monitor with the only open sidebar disappears → visibility drops.
+        assert!(!apply_forget(&mut map, "DP-1"));
+        // Forgetting the remaining (closed) monitor leaves it not visible + empty.
+        assert!(!apply_forget(&mut map, "HDMI-A-1"));
+        assert!(map.is_empty(), "forgotten monitors leave no stale entries");
     }
 
     /// A bar mount is a real wire variant the reader must handle; assert the two

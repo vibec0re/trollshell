@@ -113,6 +113,10 @@ struct SidebarPanel {
     revealer: gtk::Revealer,
     open_state: Mutable<bool>,
     subscription: glib::JoinHandle<()>,
+    /// Forwards this monitor's open/close edge to the plugin host's visibility
+    /// aggregate (#288). Aborted in [`close_all`] before the monitor is forgotten
+    /// so it can't re-add a hot-unplugged connector after teardown.
+    visibility_subscription: glib::JoinHandle<()>,
     /// Periodic departures-refresh timer (fires only while open). Removed in
     /// [`close_all`] so it doesn't outlive the surface across a hot-plug.
     refresh_source: glib::SourceId,
@@ -277,6 +281,21 @@ pub fn install(monitor: &Monitor) {
     );
     wire_escape(&window, monitor.clone());
 
+    // Forward this monitor's sidebar open/close edge to the plugin host so
+    // out-of-process plugin cards mounted here can park their pollers while the
+    // sidebar is hidden (#288) — the same energy story as the built-in departures
+    // poller below. Kept as its own lightweight subscription (rather than folded
+    // into the blur/zone-heavy `wire_open_subscription`) so that dense function
+    // keeps its argument budget; the host ORs this across monitors before pushing
+    // `SlotVisibility`. The initial `false` on subscribe seeds this monitor's flag.
+    let visibility_subscription = {
+        let key = key.clone();
+        glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
+            crate::plugins::set_sidebar_visibility(&key, open);
+            std::future::ready(())
+        }))
+    };
+
     // Keep the board live while open: re-poll departures on a fixed cadence
     // (a no-op while closed). The captured open-state clone is independent of
     // the one stored on the panel.
@@ -296,6 +315,7 @@ pub fn install(monitor: &Monitor) {
                 revealer,
                 open_state,
                 subscription,
+                visibility_subscription,
                 refresh_source,
                 blur,
                 blur_tick,
@@ -794,13 +814,22 @@ fn wire_escape(window: &gtk::Window, monitor: Monitor) {
 /// linger after a monitor disappears.
 pub fn close_all() {
     PANELS.with(|panels| {
-        for (_, panel) in panels.borrow_mut().drain() {
+        for (key, panel) in panels.borrow_mut().drain() {
             // Abort the subscription and drop the refresh timer first so neither
             // can dispatch into the (about to be closed) window. Then reset the
             // bool so any other subscribers see the closed state, and finally
             // tear down the surface.
             panel.subscription.abort();
+            // Abort the visibility subscription BEFORE forgetting the monitor, so
+            // the `open_state.set(false)` below can't fire it and re-add the
+            // connector we're about to forget (#288).
+            panel.visibility_subscription.abort();
             panel.refresh_source.remove();
+            // Drop this monitor from the plugin-host visibility aggregate (#288):
+            // the subscriptions are aborted (so the `false` edge below won't reach
+            // the host), and on a true hot-unplug this monitor is gone — so if it
+            // held the only open sidebar, `visible` must drop to false.
+            crate::plugins::forget_sidebar_visibility(&key);
             // Cancel any in-flight slide timers. With the subscription aborted
             // these can't be re-armed, and without this an interrupted close
             // tick would loop forever (the closed window's revealer can never

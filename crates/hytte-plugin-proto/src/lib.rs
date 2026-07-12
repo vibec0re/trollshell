@@ -12,7 +12,8 @@
 //!
 //! - host → plugin: [`HostMsg`] — a full subscribed-state snapshot on change, a
 //!   user [`Event`](HostMsg::Event), an [`EffectResult`](HostMsg::EffectResult),
-//!   liveness, or `Shutdown`.
+//!   a [`SlotVisibility`](HostMsg::SlotVisibility) push (park pollers while
+//!   hidden), liveness, or `Shutdown`.
 //! - plugin → host: [`PluginMsg`] — a one-time [`Register`](PluginMsg::Register),
 //!   then a [`Render { tree, effects }`](PluginMsg::Render) pushed on the
 //!   plugin's own schedule (host state change, timer, external fetch), plus logs

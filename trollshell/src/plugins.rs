@@ -950,6 +950,21 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             fraction: *fraction,
             classes: classes.clone(),
         },
+        wire::Node::Slider {
+            id,
+            min,
+            max,
+            value,
+            step,
+            classes,
+        } => UiNode::Slider {
+            id: id.clone(),
+            min: *min,
+            max: *max,
+            value: *value,
+            step: *step,
+            classes: classes.clone(),
+        },
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
             id: id.clone(),
             open: *open,
@@ -980,11 +995,14 @@ fn pixels_len_ok(width: u32, height: u32, data_len: usize) -> bool {
 }
 
 /// Map a reconciler event back onto its wire form for the outbound `Event`
-/// frame. Exhaustive over the v1 `EventKind` set (Click + Scroll).
+/// frame. Exhaustive over the `EventKind` set (Click + Scroll + `ValueChanged`),
+/// so adding a kind to either side breaks the build here rather than silently
+/// dropping an event.
 fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
     match kind {
         UiEventKind::Click => wire::EventKind::Click,
         UiEventKind::Scroll { dx, dy } => wire::EventKind::Scroll { dx, dy },
+        UiEventKind::ValueChanged { value } => wire::EventKind::ValueChanged { value },
     }
 }
 
@@ -1070,6 +1088,14 @@ mod tests {
                     fraction: 0.5,
                     classes: vec![],
                 },
+                wire::Node::Slider {
+                    id: "sld".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    value: 0.3,
+                    step: 0.1,
+                    classes: vec!["ts-slider".into()],
+                },
                 wire::Node::Revealer {
                     id: Some("r".into()),
                     open: true,
@@ -1125,6 +1151,14 @@ mod tests {
                     id: None,
                     fraction: 0.5,
                     classes: vec![],
+                },
+                UiNode::Slider {
+                    id: "sld".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    value: 0.3,
+                    step: 0.1,
+                    classes: vec!["ts-slider".into()],
                 },
                 UiNode::Revealer {
                     id: Some("r".into()),
@@ -1208,6 +1242,10 @@ mod tests {
         assert_eq!(
             to_wire_event(UiEventKind::Scroll { dx: 1.5, dy: -2.0 }),
             wire::EventKind::Scroll { dx: 1.5, dy: -2.0 }
+        );
+        assert_eq!(
+            to_wire_event(UiEventKind::ValueChanged { value: 0.42 }),
+            wire::EventKind::ValueChanged { value: 0.42 }
         );
     }
 

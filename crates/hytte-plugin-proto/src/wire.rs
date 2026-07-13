@@ -28,14 +28,41 @@ pub enum Dir {
 }
 
 /// A user interaction on a rendered node, addressed by [`NodeId`]. Mirrors
-/// `hytte_ui::EventKind` exactly (v1: `Click` + `Scroll`; the reconciler ships
-/// no `Hover`).
+/// `hytte_ui::EventKind` exactly (the reconciler ships no `Hover`).
+///
+/// # Wire compat — the `ValueChanged` push is opt-in *by vocabulary* (#305/#315)
+///
+/// [`Event`](crate::msg::HostMsg::Event) frames flow **host → plugin**, so
+/// appending a variant here is subject to the same "a new host→plugin push must
+/// be opt-in, never unconditional" rule as [`HostMsg`](crate::msg::HostMsg) (see
+/// the crate root). Appending [`ValueChanged`](EventKind::ValueChanged) satisfies
+/// that rule **structurally**, not by a manifest opt-in: the host only ever
+/// addresses an `Event` at a node the plugin itself rendered, and a plugin built
+/// against a pre-#315 proto can't emit a [`Node::Slider`] — so it can never be
+/// the target of a `ValueChanged`, and its `rmp-serde` never has to decode the
+/// unknown variant. A plugin only starts receiving `ValueChanged` once it opts
+/// in by rendering a `Slider`, i.e. once it was rebuilt against this proto and
+/// *can* decode it. (Contrast [`HostMsg::SlotVisibility`](crate::msg::HostMsg::SlotVisibility),
+/// which is state the host would otherwise push unconditionally, so that one
+/// needs an explicit [`StateKey`](crate::manifest::StateKey) subscription.)
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
     Click,
     /// A `scroll: true` [`Node::Box`] was scrolled; `dx`/`dy` are raw deltas.
     Scroll { dx: f64, dy: f64 },
+    /// A [`Node::Slider`] was moved by the user (drag, scroll, or keyboard);
+    /// `value` is the slider's new position, clamped to its `min..=max` range.
+    ///
+    /// The host emits these on a **trailing-edge throttle** (≈one per 50 ms plus
+    /// a final settle), never one per raw motion tick — but a plugin driving a
+    /// network round-trip per value (the vibectl per-light brightness case)
+    /// should still debounce its own side effects, since a drag is inherently a
+    /// stream. The value only ever reflects a user action: a programmatic
+    /// re-render that echoes a new `value` back into the slider does **not**
+    /// produce a `ValueChanged` (see `hytte_ui`'s `change-value` vs
+    /// `value-changed` note), so there is no echo/feedback loop.
+    ValueChanged { value: f64 },
 }
 
 /// The closed widget vocabulary. A plugin's view is a single root [`Node`].
@@ -151,6 +178,34 @@ pub enum Node {
     Progress {
         id: Option<NodeId>,
         fraction: f64,
+        classes: Vec<Cls>,
+    },
+    /// An interactive `gtk::Scale` (horizontal range control) — the writable
+    /// counterpart to [`Progress`](Node::Progress). The user drags/scrolls/keys
+    /// it to pick a `value` in `min..=max`; the host reports each user move as an
+    /// [`EventKind::ValueChanged`] addressed by `id` (throttled — see that
+    /// variant). `id` is **required**, exactly like [`Button`](Node::Button): it
+    /// is the event target.
+    ///
+    /// `value` is a **mutable prop**: a same-id re-render moves the thumb in
+    /// place — *except* while the user is actively dragging, when the host
+    /// suppresses the programmatic move so a stale echo can't rubber-band the
+    /// grab (the standard optimistic-state / reconcile-on-echo model; the
+    /// motivating vibectl per-light brightness slider relies on it). `min`,
+    /// `max`, and `step` are mutable too. `step` is the keyboard/scroll
+    /// increment. Style via `classes` (e.g. an `.osd`/`.flat` hook) — the host
+    /// draws no value label.
+    ///
+    /// Additive: a brand-new name-tagged variant, so every existing frame decodes
+    /// unchanged and `PROTO_VERSION` stays put. See [`EventKind`] for why the
+    /// paired host→plugin `ValueChanged` push is opt-in *by vocabulary* and needs
+    /// no manifest subscription.
+    Slider {
+        id: NodeId,
+        min: f64,
+        max: f64,
+        value: f64,
+        step: f64,
         classes: Vec<Cls>,
     },
     /// A `gtk::Revealer`; `open` drives `set_reveal_child`.

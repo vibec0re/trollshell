@@ -87,6 +87,14 @@ fn sample_tree() -> Node {
                 fraction: 0.42,
                 classes: vec![],
             },
+            Node::Slider {
+                id: "brightness".into(),
+                min: 0.0,
+                max: 1.0,
+                value: 0.7,
+                step: 0.05,
+                classes: vec!["ts-slider".into()],
+            },
             Node::Revealer {
                 id: None,
                 open: false,
@@ -163,6 +171,10 @@ fn host_msgs_round_trip() {
     round_trip_host(&HostMsg::Event {
         node: "scroller".into(),
         kind: EventKind::Scroll { dx: 0.0, dy: -1.5 },
+    });
+    round_trip_host(&HostMsg::Event {
+        node: "brightness".into(),
+        kind: EventKind::ValueChanged { value: 0.62 },
     });
     round_trip_host(&HostMsg::EffectResult {
         id: 7,
@@ -257,6 +269,60 @@ fn text_without_ellipsize_decodes_old_frame_compat() {
             classes: vec!["ts-dest".into()],
         },
         "absent ellipsize (and max_width_chars) default",
+    );
+}
+
+// ── Slider node + ValueChanged event (#315) ──────────────────────────────────
+
+#[test]
+fn slider_node_round_trips() {
+    let node = Node::Slider {
+        id: "brightness".into(),
+        min: 0.0,
+        max: 1.0,
+        value: 0.42,
+        step: 0.05,
+        classes: vec!["ts-slider".into(), "osd".into()],
+    };
+    let back: Node = decode(&encode(&node)).expect("decode Slider");
+    assert_eq!(node, back);
+}
+
+#[test]
+fn slider_is_name_tagged_and_additive() {
+    // `Slider` is a brand-new, externally-tagged variant, so it rides the wire
+    // as its bare variant *name* — the property that makes appending it additive
+    // (`PROTO_VERSION` stays 1): an older decoder skips an unknown tag rather
+    // than mis-decoding an existing variant, and every pre-#315 frame (which
+    // can't carry a `Slider`) decodes byte-for-byte unchanged.
+    let body = encode_body(&Node::Slider {
+        id: "vol".into(),
+        min: 0.0,
+        max: 100.0,
+        value: 30.0,
+        step: 1.0,
+        classes: vec![],
+    });
+    assert!(contains(&body, b"Slider"), "variant name 'Slider' present");
+}
+
+#[test]
+fn value_changed_event_round_trips() {
+    // The paired host→plugin event. It only reaches a plugin that rendered a
+    // `Slider` (the structural opt-in of #305/#315), but on the wire it is just
+    // another name-tagged `EventKind` variant carrying its `value`.
+    let msg = HostMsg::Event {
+        node: "brightness".into(),
+        kind: EventKind::ValueChanged { value: 0.375 },
+    };
+    let back: HostMsg = decode(&encode(&msg)).expect("decode ValueChanged event");
+    assert_eq!(msg, back);
+    assert!(
+        contains(
+            &encode_body(&EventKind::ValueChanged { value: 0.5 }),
+            b"ValueChanged"
+        ),
+        "variant name 'ValueChanged' rides the wire (appending it is additive)",
     );
 }
 

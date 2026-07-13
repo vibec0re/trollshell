@@ -52,8 +52,10 @@
 
 use gtk::glib;
 use gtk::prelude::*;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 /// Stable, plugin-meaningful node identity. Doubles as the diff key and the
 /// event target. A `Button` requires one; other nodes may omit it (and then
@@ -76,6 +78,13 @@ pub enum EventKind {
     /// A [`Node::Box`] with `scroll: true` was scrolled. `dx`/`dy` are the
     /// raw GTK scroll deltas.
     Scroll { dx: f64, dy: f64 },
+    /// A [`Node::Slider`] was moved by the user (drag / scroll / keyboard).
+    /// `value` is its new position, clamped to the slider's `min..=max`. Emitted
+    /// on a trailing-edge throttle (never one per raw motion tick) and **only**
+    /// for user-driven changes — a programmatic re-render that moves the thumb
+    /// does not fire it (the reconciler wires `change-value`, not
+    /// `value-changed`; see [`attach_slider`]).
+    ValueChanged { value: f64 },
 }
 
 /// The closed widget vocabulary. A plugin tree is a single root `Node`.
@@ -165,6 +174,26 @@ pub enum Node {
         fraction: f64,
         classes: Vec<String>,
     },
+    /// An interactive horizontal `gtk::Scale` — the writable counterpart to
+    /// [`Node::Progress`]. `id` is **required** (like [`Node::Button`]): it is
+    /// the [`EventKind::ValueChanged`] target. `min`/`max`/`step`/`value` set the
+    /// range, keyboard/scroll increment, and initial position; the host draws no
+    /// value label (style via `classes`) and makes it `hexpand`.
+    ///
+    /// `value` is a **mutable prop** updated in place — but suppressed while the
+    /// user is actively dragging, so a plugin echoing the value back can't fight
+    /// the grab (see [`update_in_place`]). Events are wired via the `change-value`
+    /// signal (user-only) rather than `value-changed`, so a programmatic
+    /// `set_value` never re-enters the event path — the `bind_two_way`
+    /// feedback-loop problem, avoided structurally.
+    Slider {
+        id: NodeId,
+        min: f64,
+        max: f64,
+        value: f64,
+        step: f64,
+        classes: Vec<String>,
+    },
     /// A `gtk::Revealer`; `open` drives `set_reveal_child`.
     Revealer {
         id: Option<NodeId>,
@@ -203,8 +232,8 @@ impl Reconciler {
     /// Build a reconciler that mounts its tree as a child of `root`.
     ///
     /// `on_event` is invoked on the GTK main thread when a [`Node::Button`]
-    /// is clicked or a scroll-enabled (`scroll: true`) [`Node::Box`] is
-    /// scrolled.
+    /// is clicked, a scroll-enabled (`scroll: true`) [`Node::Box`] is
+    /// scrolled, or a [`Node::Slider`] is moved by the user.
     #[must_use]
     pub fn new(root: &gtk::Box, on_event: impl Fn(NodeId, EventKind) + 'static) -> Self {
         Self {
@@ -257,6 +286,11 @@ struct RetainedNode {
     /// detach it as the flag flips across renders without rebuilding the
     /// rest of the subtree. Always `None` for every other node kind.
     scroll_controller: Option<gtk::EventControllerScroll>,
+    /// A [`Node::Slider`]'s outbound throttle + drag-suppression state, wired
+    /// once at build. Retained so [`update_in_place`] can read the last
+    /// user-interaction time and skip a programmatic `set_value` that would
+    /// fight an active drag. Always `None` for every other node kind.
+    slider: Option<Rc<SliderCtl>>,
 }
 
 /// Shallow per-node snapshot used for keying and class diffing.
@@ -289,6 +323,7 @@ enum NodeKind {
     Pixels,
     Button,
     Progress,
+    Slider,
     Revealer,
     Separator,
     Spacer,
@@ -400,6 +435,7 @@ fn plan_diff(prev: &[ChildKey], next: &[ChildKey]) -> DiffPlan {
 #[allow(clippy::too_many_lines)]
 fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut scroll_controller = None;
+    let mut slider = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -492,6 +528,29 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             apply_classes(&bar, classes);
             (bar.upcast(), Vec::new())
         }
+        Node::Slider {
+            id,
+            min,
+            max,
+            value,
+            step,
+            classes,
+        } => {
+            // Build via an explicit `Adjustment` (not `Scale::with_range`, which
+            // asserts `min < max` and `step != 0`) so an ill-formed plugin range
+            // can never trip a GTK critical / NULL return. `page_size = 0`: a
+            // scale is a point selector, so the whole `min..=max` is reachable.
+            let adj = gtk::Adjustment::new(*value, *min, *max, *step, *step, 0.0);
+            let scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&adj));
+            scale.set_draw_value(false);
+            scale.set_hexpand(true);
+            apply_classes(&scale, classes);
+            // The change-value handler (user-driven only) is bound once here, to
+            // this widget identity — like `Button`'s click — so reuse never stacks
+            // duplicate handlers.
+            slider = Some(attach_slider(&scale, id.clone(), on_event));
+            (scale.upcast(), Vec::new())
+        }
         Node::Revealer { open, child, .. } => {
             let revealer = gtk::Revealer::new();
             revealer.set_reveal_child(*open);
@@ -521,6 +580,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         desc: desc_of(node),
         children,
         scroll_controller,
+        slider,
     }
 }
 
@@ -545,6 +605,9 @@ fn build_children(
 /// caller via [`reusable`] / [`plan_diff`]): `retained`'s kind and id match
 /// `new`, so the widget downcast always succeeds and event handlers stay
 /// valid (a `Button`/`Box` never changes identity across an id change).
+// One exhaustive arm per node variant — the length is the vocabulary size, not
+// complexity; splitting it hurts readability more than it helps (as in `build_node`).
+#[allow(clippy::too_many_lines)]
 fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) {
     match new {
         Node::Box {
@@ -637,6 +700,37 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             let bar = downcast::<gtk::ProgressBar>(&retained.widget);
             bar.set_fraction(*fraction);
             reconcile_classes(bar, &retained.desc.classes, classes);
+        }
+        Node::Slider {
+            min,
+            max,
+            value,
+            step,
+            classes,
+            ..
+        } => {
+            let scale = downcast::<gtk::Scale>(&retained.widget);
+            // Range/step are plain mutable props: push them through the live
+            // adjustment (the same one built at `build_node`), then reconcile the
+            // value below.
+            let adj = scale.adjustment();
+            adj.set_lower(*min);
+            adj.set_upper(*max);
+            adj.set_step_increment(*step);
+            adj.set_page_increment(*step);
+            // `value` is a mutable prop — but suppress the programmatic move while
+            // the user is actively dragging, so a plugin echoing the value back
+            // can't rubber-band the grab. Once the drag settles (last user change
+            // older than the grab window) the echo applies and the thumb
+            // reconciles. `set_value` fires `value-changed` only — never
+            // `change-value` — so it never re-emits an event.
+            let dragging = retained.slider.as_ref().is_some_and(|ctl| {
+                slider_suppress_set(ctl.last_user.get(), Instant::now(), SLIDER_GRAB_WINDOW)
+            });
+            if !dragging {
+                scale.set_value(*value);
+            }
+            reconcile_classes(scale, &retained.desc.classes, classes);
         }
         Node::Revealer { open, child, .. } => {
             let revealer = downcast::<gtk::Revealer>(&retained.widget);
@@ -796,6 +890,149 @@ fn attach_scroll(
     scroll
 }
 
+// ── Slider: user-driven throttled emit + drag-fight suppression ───────────────
+
+/// Minimum spacing between emitted [`EventKind::ValueChanged`] frames: a drag
+/// fires `change-value` at the display refresh rate, so the raw stream is
+/// coalesced to a leading edge + one trailing emit per this window (plus a final
+/// settle). Keeps a network-bound consumer (vibectl per-light brightness) from
+/// being flooded while still feeling live.
+const SLIDER_CADENCE: Duration = Duration::from_millis(50);
+
+/// How long after the user's last move a programmatic `set_value` stays
+/// suppressed. A drag keeps refreshing the last-move time, so the slider ignores
+/// echoed values for the whole grab and briefly after; once movement stops, the
+/// plugin's echo applies and the thumb reconciles.
+const SLIDER_GRAB_WINDOW: Duration = Duration::from_millis(250);
+
+/// Per-[`Node::Slider`] outbound state: a trailing-edge throttle over the
+/// user-driven `change-value` stream, plus the last user-interaction time
+/// [`update_in_place`] reads to suppress a render-driven `set_value` that would
+/// fight an active drag. Held by an `Rc` shared between the `change-value`
+/// handler (strong, so it lives with the `gtk::Scale`) and the retained node.
+struct SliderCtl {
+    on_event: EventFn,
+    id: NodeId,
+    /// Instant of the most recent user-driven change (drag / scroll / key).
+    last_user: Cell<Option<Instant>>,
+    /// Instant of the last emitted `ValueChanged` (the leading-edge gate).
+    last_emit: Cell<Option<Instant>>,
+    /// Latest user value awaiting a trailing-edge flush (`None` once emitted).
+    pending: Cell<Option<f64>>,
+    /// Whether a trailing flush timer is currently armed (so we never stack more
+    /// than one; the armed timer always flushes the freshest `pending`).
+    armed: Cell<bool>,
+}
+
+/// The throttle verdict for one user move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThrottleAction {
+    /// Emit now (leading edge — first move, or the cadence window has elapsed).
+    Emit,
+    /// Too soon; schedule a trailing flush after this delay.
+    Defer(Duration),
+}
+
+/// Pure leading-edge decision: emit if we've never emitted or a full `cadence`
+/// has passed since the last emit, else defer by the remaining time. Split out
+/// so the throttle logic is unit-testable without GTK or a clock.
+fn throttle_decision(
+    last_emit: Option<Instant>,
+    now: Instant,
+    cadence: Duration,
+) -> ThrottleAction {
+    match last_emit {
+        None => ThrottleAction::Emit,
+        Some(prev) => {
+            let elapsed = now.saturating_duration_since(prev);
+            if elapsed >= cadence {
+                ThrottleAction::Emit
+            } else {
+                // `elapsed < cadence` here, so this is the exact remaining time;
+                // `saturating_sub` keeps clippy's unchecked-time-subtraction happy.
+                ThrottleAction::Defer(cadence.saturating_sub(elapsed))
+            }
+        }
+    }
+}
+
+/// Pure drag-suppression predicate: a render-driven `set_value` is suppressed
+/// while the user's last move is newer than `window`. Unit-testable, no GTK.
+fn slider_suppress_set(last_user: Option<Instant>, now: Instant, window: Duration) -> bool {
+    matches!(last_user, Some(t) if now.saturating_duration_since(t) < window)
+}
+
+impl SliderCtl {
+    /// Record a user move and emit it under the trailing-edge throttle.
+    fn on_user_change(self: &Rc<Self>, value: f64) {
+        let now = Instant::now();
+        self.last_user.set(Some(now));
+        match throttle_decision(self.last_emit.get(), now, SLIDER_CADENCE) {
+            ThrottleAction::Emit => self.emit(value, now),
+            ThrottleAction::Defer(delay) => {
+                self.pending.set(Some(value));
+                self.arm_trailing(delay);
+            }
+        }
+    }
+
+    /// Emit a `ValueChanged` now and record the emit time (clearing any pending).
+    fn emit(&self, value: f64, now: Instant) {
+        self.last_emit.set(Some(now));
+        self.pending.set(None);
+        (self.on_event)(self.id.clone(), EventKind::ValueChanged { value });
+    }
+
+    /// Arm a one-shot trailing flush (unless one is already pending). The timer
+    /// holds only a [`Weak`], so a torn-down slider's flush is a no-op — no post-
+    /// teardown emit, no leak.
+    fn arm_trailing(self: &Rc<Self>, delay: Duration) {
+        if self.armed.replace(true) {
+            return; // a flush is already scheduled; it picks up the latest pending
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(delay, move || {
+            if let Some(ctl) = weak.upgrade() {
+                ctl.armed.set(false);
+                if let Some(v) = ctl.pending.take() {
+                    ctl.emit(v, Instant::now());
+                }
+            }
+        });
+    }
+}
+
+/// Wire a [`Node::Slider`]'s user-driven value stream to `on_event`, addressed
+/// at `id`, and return the retained [`SliderCtl`].
+///
+/// Bound on `change-value` — **not** `value-changed`. That distinction is the
+/// whole re-entrancy story: `change-value` fires only for user actions (drag,
+/// scroll wheel, arrow keys), while `value-changed` also fires on a programmatic
+/// `set_value`. Listening on the former means a plugin re-render that echoes a
+/// value back can never re-enter this handler, so there is no feedback loop to
+/// break with `block_signal` (the `bind_two_way` problem — solved structurally
+/// here). The handler returns [`glib::Propagation::Proceed`] so GTK still moves
+/// the thumb to follow the cursor.
+fn attach_slider(scale: &gtk::Scale, id: NodeId, on_event: &EventFn) -> Rc<SliderCtl> {
+    let ctl = Rc::new(SliderCtl {
+        on_event: on_event.clone(),
+        id,
+        last_user: Cell::new(None),
+        last_emit: Cell::new(None),
+        pending: Cell::new(None),
+        armed: Cell::new(false),
+    });
+    let handler_ctl = ctl.clone();
+    scale.connect_change_value(move |scale, _scroll, value| {
+        // Clamp to the live adjustment bounds so the emitted value matches what
+        // the scale will settle on (a drag can overshoot the ends slightly).
+        let adj = scale.adjustment();
+        handler_ctl.on_user_change(value.clamp(adj.lower(), adj.upper()));
+        glib::Propagation::Proceed
+    });
+    ctl
+}
+
 fn apply_classes(widget: &impl IsA<gtk::Widget>, classes: &[String]) {
     for class in classes {
         widget.add_css_class(class);
@@ -835,6 +1072,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Pixels { .. } => NodeKind::Pixels,
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
+        Node::Slider { .. } => NodeKind::Slider,
         Node::Revealer { .. } => NodeKind::Revealer,
         Node::Separator { .. } => NodeKind::Separator,
         Node::Spacer => NodeKind::Spacer,
@@ -852,7 +1090,8 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Pixels { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
-        Node::Button { id, .. } => Some(id.as_str()),
+        // `Button` and `Slider` both require an id — it is their event target.
+        Node::Button { id, .. } | Node::Slider { id, .. } => Some(id.as_str()),
         Node::Separator { .. } | Node::Spacer => None,
     }
 }
@@ -868,6 +1107,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Pixels { classes, .. }
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
+        | Node::Slider { classes, .. }
         | Node::Separator { classes } => classes,
         // `Revealer` carries no classes of its own (see the `Node` vocab); it
         // is a transparent open/close wrapper, so style its child instead.
@@ -1078,6 +1318,69 @@ mod diff_tests {
             seen.iter().all(|&c| c == 1),
             "each prev index used exactly once: {seen:?}"
         );
+    }
+}
+
+// ── Slider throttle / drag-suppression (pure — hermetic) ─────────────────────
+
+#[cfg(test)]
+mod slider_tests {
+    use super::{ThrottleAction, slider_suppress_set, throttle_decision};
+    use std::time::{Duration, Instant};
+
+    const CADENCE: Duration = Duration::from_millis(50);
+    const WINDOW: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn first_move_emits_on_leading_edge() {
+        // Never emitted → emit immediately, whatever `now` is.
+        assert_eq!(
+            throttle_decision(None, Instant::now(), CADENCE),
+            ThrottleAction::Emit
+        );
+    }
+
+    #[test]
+    fn move_after_cadence_emits() {
+        let t0 = Instant::now();
+        // A full cadence (or more) since the last emit → emit again.
+        assert_eq!(
+            throttle_decision(Some(t0), t0 + CADENCE, CADENCE),
+            ThrottleAction::Emit
+        );
+        assert_eq!(
+            throttle_decision(Some(t0), t0 + CADENCE + Duration::from_millis(10), CADENCE),
+            ThrottleAction::Emit
+        );
+    }
+
+    #[test]
+    fn move_within_cadence_defers_by_remaining() {
+        let t0 = Instant::now();
+        // 20 ms into a 50 ms window → defer the remaining 30 ms (trailing flush).
+        assert_eq!(
+            throttle_decision(Some(t0), t0 + Duration::from_millis(20), CADENCE),
+            ThrottleAction::Defer(Duration::from_millis(30))
+        );
+    }
+
+    #[test]
+    fn set_value_suppressed_only_within_grab_window() {
+        let t0 = Instant::now();
+        // No user interaction yet → never suppress a render-driven set_value.
+        assert!(!slider_suppress_set(None, t0, WINDOW));
+        // A move 100 ms ago (< window) → still "dragging", suppress the echo.
+        assert!(slider_suppress_set(
+            Some(t0),
+            t0 + Duration::from_millis(100),
+            WINDOW
+        ));
+        // A move older than the window → the grab settled, apply the echo.
+        assert!(!slider_suppress_set(
+            Some(t0),
+            t0 + WINDOW + Duration::from_millis(1),
+            WINDOW
+        ));
     }
 }
 
@@ -1623,5 +1926,159 @@ mod gtk_tests {
         let last = children(&root.first_child().unwrap());
         assert_eq!(last.len(), 1);
         assert_eq!(last[0], before[1], "row b is the surviving sibling");
+    }
+
+    // ── Slider (#315) ────────────────────────────────────────────────────────
+
+    fn slider(id: &str, min: f64, max: f64, value: f64, step: f64) -> Node {
+        Node::Slider {
+            id: id.to_owned(),
+            min,
+            max,
+            value,
+            step,
+            classes: vec![],
+        }
+    }
+
+    fn scale_of(root: &gtk::Box) -> gtk::Scale {
+        root.first_child()
+            .expect("slider mounted")
+            .downcast::<gtk::Scale>()
+            .expect("Slider → gtk::Scale")
+    }
+
+    #[gtk::test]
+    fn slider_builds_with_range_value_step() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&slider("b", 0.0, 100.0, 40.0, 5.0));
+
+        let scale = scale_of(&root);
+        let adj = scale.adjustment();
+        assert!(
+            (adj.lower() - 0.0).abs() < f64::EPSILON,
+            "min → adjustment lower"
+        );
+        assert!(
+            (adj.upper() - 100.0).abs() < f64::EPSILON,
+            "max → adjustment upper"
+        );
+        assert!(
+            (adj.step_increment() - 5.0).abs() < f64::EPSILON,
+            "step → step increment"
+        );
+        assert!((scale.value() - 40.0).abs() < f64::EPSILON, "value set");
+        assert_eq!(
+            scale.orientation(),
+            gtk::Orientation::Horizontal,
+            "slider is horizontal"
+        );
+        assert!(!scale.draws_value(), "no value label (styled via classes)");
+    }
+
+    #[gtk::test]
+    fn slider_update_moves_value_when_not_dragging() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&slider("b", 0.0, 1.0, 0.2, 0.05));
+        let before = scale_of(&root);
+
+        // Same id, new value: with no user interaction the programmatic move
+        // applies and the widget is reused in place (mutable prop).
+        rec.render(&slider("b", 0.0, 1.0, 0.8, 0.05));
+        let after = scale_of(&root);
+        assert_eq!(before, after, "same-id Slider reused, not rebuilt");
+        assert!(
+            (after.value() - 0.8).abs() < f64::EPSILON,
+            "value moved in place"
+        );
+    }
+
+    #[gtk::test]
+    fn slider_update_reconciles_range_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&slider("vol", 0.0, 1.0, 0.5, 0.05));
+        let before = scale_of(&root);
+
+        // A same-id re-render widening the range + step reconciles the live
+        // adjustment without rebuilding the widget.
+        rec.render(&slider("vol", 0.0, 10.0, 7.0, 1.0));
+        let after = scale_of(&root);
+        assert_eq!(
+            before, after,
+            "widget identity preserved across a range change"
+        );
+        let adj = after.adjustment();
+        assert!((adj.upper() - 10.0).abs() < f64::EPSILON, "upper widened");
+        assert!(
+            (adj.step_increment() - 1.0).abs() < f64::EPSILON,
+            "step updated"
+        );
+        assert!((after.value() - 7.0).abs() < f64::EPSILON, "value updated");
+    }
+
+    #[gtk::test]
+    fn slider_kind_change_recreates_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&slider("x", 0.0, 1.0, 0.3, 0.1));
+        let before = root.first_child().unwrap();
+        // Same id "x" but Slider → Button: not reuse-compatible.
+        rec.render(&btn("x", "hi"));
+        let after = root.first_child().unwrap();
+        assert_ne!(
+            before, after,
+            "Slider→Button under same id is a fresh widget"
+        );
+        assert!(after.downcast::<gtk::Button>().is_ok());
+    }
+
+    #[gtk::test]
+    fn slider_user_change_emits_value_changed() {
+        let root = root();
+        let events: Rc<RefCell<Vec<(String, EventKind)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let mut rec = Reconciler::new(&root, move |id, kind| sink.borrow_mut().push((id, kind)));
+        rec.render(&slider("b", 0.0, 1.0, 0.0, 0.05));
+
+        // Drive a user move via the `change-value` signal (what a drag emits).
+        // The first move hits the throttle's leading edge → emits synchronously.
+        let scale = scale_of(&root);
+        let _: bool = scale.emit_by_name("change-value", &[&gtk::ScrollType::Jump, &0.7f64]);
+
+        let recorded = events.borrow();
+        assert_eq!(recorded.len(), 1, "one leading-edge ValueChanged");
+        assert_eq!(recorded[0].0, "b", "addressed by the slider id");
+        match recorded[0].1 {
+            EventKind::ValueChanged { value } => {
+                assert!((value - 0.7).abs() < 1e-9, "carries the moved-to value");
+            }
+            other => panic!("expected ValueChanged, got {other:?}"),
+        }
+    }
+
+    #[gtk::test]
+    fn slider_render_suppressed_during_active_drag() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&slider("b", 0.0, 1.0, 0.1, 0.05));
+        let scale = scale_of(&root);
+
+        // Simulate the user grabbing and dragging to 0.7 (records last_user = now).
+        let _: bool = scale.emit_by_name("change-value", &[&gtk::ScrollType::Jump, &0.7f64]);
+        assert!(
+            (scale.value() - 0.7).abs() < f64::EPSILON,
+            "drag moved the thumb"
+        );
+
+        // A plugin re-render echoes a stale 0.1 back mid-drag: the programmatic
+        // set_value must be suppressed so it can't rubber-band the grab.
+        rec.render(&slider("b", 0.0, 1.0, 0.1, 0.05));
+        assert!(
+            (scale.value() - 0.7).abs() < f64::EPSILON,
+            "echoed value suppressed during the active drag; thumb stays where the user put it",
+        );
     }
 }

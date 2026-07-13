@@ -279,11 +279,14 @@ impl Plugin for Board {
     type Cmd = Cmd;
 
     fn manifest() -> Manifest {
-        // SidebarBottom: where the native board anchored. Subscribes to Clock
-        // for the per-second leave-by relabel + departed prune. No caps (it
-        // brokers no shell effects); no `order` (sole card in the region today).
+        // SidebarBottom: where the native board anchored. Subscribes to Clock for
+        // the per-second leave-by relabel + departed prune, and to SlotVisible
+        // (#305) so the host actually pushes the visibility edges that park/resume
+        // the poll task (`Input::SlotVisible` below) — the push is opt-in via the
+        // manifest now, so a poller MUST subscribe to keep being gated. No caps
+        // (it brokers no shell effects); no `order` (sole card in the region today).
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom);
-        m.subscribes = vec![StateKey::Clock];
+        m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
         m
     }
 
@@ -751,6 +754,23 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Cmd::SetVisible(true))));
         board.update(Input::SlotVisible(false));
         assert!(matches!(rx.try_recv(), Ok(Cmd::SetVisible(false))));
+    }
+
+    #[test]
+    fn manifest_subscribes_clock_and_slot_visible() {
+        // The board gates its poll task on visibility, so it MUST subscribe
+        // `SlotVisible` — the push is opt-in via the manifest (#305), so without
+        // the subscription the host would never send the edges the gate needs.
+        let m = Board::manifest();
+        assert_eq!(m.mount, Mount::SidebarBottom);
+        assert!(
+            m.subscribes.contains(&StateKey::Clock),
+            "Clock drives the per-second relabel"
+        );
+        assert!(
+            m.subscribes.contains(&StateKey::SlotVisible),
+            "SlotVisible opts the board into the visibility push it gates on (#305)"
+        );
     }
 
     // ── view: every state renders the expected tree ──────────────────────────

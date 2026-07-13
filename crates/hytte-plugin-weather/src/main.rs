@@ -16,8 +16,12 @@
 //! re-enters the reducer as [`Input::App`]. **Click the card to refresh now**:
 //! the click dispatches a [`Cmd`](Plugin::Cmd) down the #280 command lane, which
 //! the worker turns into an immediate fetch. Slot-visibility gating
-//! ([`Input::SlotVisible`], #288) is available but deliberately unused: at a
-//! 15-minute cadence there is nothing worth parking while the sidebar is closed.
+//! ([`Input::SlotVisible`], #288) is deliberately unused: at a 15-minute cadence
+//! there is nothing worth parking while the sidebar is closed. The manifest
+//! therefore does **not** subscribe [`StateKey::SlotVisible`], so under the
+//! opt-in push rule (#305) the host never sends the visibility frame at all —
+//! the reducer still folds a stray `SlotVisible` to a no-op as a belt-and-braces
+//! guard.
 //!
 //! # Location (`location.rs`)
 //!
@@ -43,9 +47,10 @@ use tokio::sync::mpsc;
 
 /// Stable plugin id — the host's region key and audit-log subject.
 const PLUGIN_ID: &str = "weather";
-/// Placement within the `SidebarTop` region: a low `order` renders earlier
-/// (higher). `-10` keeps weather above the pet (`order` unset → sorts as `0`),
-/// matching the native card's top-of-sidebar spot.
+/// Placement request within the mount region: a low `order` renders earlier
+/// (higher). Weather now mounts in the **leading** region ([`Mount::SidebarLead`],
+/// #301) where it's the sole card today, so this is harmless — it's kept so that
+/// if a second lead-region plugin ever appears, weather still sorts to the top.
 const ORDER: i32 = -10;
 
 /// The whole card is a flat button; a click is the "refresh now" target.
@@ -180,9 +185,14 @@ impl Plugin for Weather {
     type Cmd = WeatherCmd;
 
     fn manifest() -> Manifest {
-        // No state subscriptions (weather sources its own data) and no shell
-        // capabilities (it renders + fetches; it asks nothing of the host).
-        Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(ORDER)
+        // `SidebarLead` (#301): the leading region, above the built-in cards —
+        // where the native weather card sits — so the plugin card actually leads
+        // the sidebar (the after-tasks `SidebarTop` region can't). No state
+        // subscriptions: weather sources its own data and doesn't gate on
+        // visibility (see the crate docs), so it opts into no host push — which
+        // also keeps it clear of the #305 hazard. No capabilities either (it
+        // renders + fetches; it asks nothing of the host).
+        Manifest::new(PLUGIN_ID, Mount::SidebarLead).with_order(ORDER)
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
@@ -300,7 +310,7 @@ fn resolved_content(s: &Snapshot) -> Node {
         Vec::new(),
         vec![
             headline,
-            label(
+            text_line(
                 COND_ID,
                 s.condition.label.to_owned(),
                 "ts-weather-condition",
@@ -333,15 +343,17 @@ fn resolved_content(s: &Snapshot) -> Node {
         0,
         Vec::new(),
         vec![
-            label(LOC_ID, s.location.to_uppercase(), "ts-weather-location"),
+            text_line(LOC_ID, s.location.to_uppercase(), "ts-weather-location"),
             columns,
         ],
     )
 }
 
-/// A "name … value" detail row (label + value). The wire vocab has no
-/// hexpand/align, so the value sits next to its label rather than pinned right
-/// (a cosmetic gap vs the native card — see the PR).
+/// A "name … value" detail row: `label + Spacer + value`, so the [`Node::Spacer`]
+/// eats the row's horizontal slack and the value **right-pins** — the #299
+/// justification primitive, mirroring the native card's `name.hexpand` +
+/// `value.halign(End)` two-column look (this is the #295 "no hexpand" gap, now
+/// closed).
 fn detail_row(name: &str, value_id: &str, value: String) -> Node {
     Node::Box {
         id: None,
@@ -355,6 +367,7 @@ fn detail_row(name: &str, value_id: &str, value: String) -> Node {
                 text: name.to_owned(),
                 classes: vec!["ts-weather-detail-label".to_owned()],
             },
+            Node::Spacer,
             label(value_id, value, "ts-weather-detail-value"),
         ],
     }
@@ -377,6 +390,22 @@ fn label(id: &str, text: String, class: &str) -> Node {
     Node::Label {
         id: Some(id.to_owned()),
         text,
+        classes: vec![class.to_owned()],
+    }
+}
+
+/// An id'd, single-class **single-line** `Text` that truncates with a trailing
+/// ellipsis instead of wrapping (`ellipsize: true`, #299). Used for the location
+/// and condition strings: the native card keeps them on one line (plain
+/// non-wrapping labels), and ellipsizing keeps a long location name from blowing
+/// the card wide rather than clipping it. (Values/labels in detail rows stay
+/// plain `Label`s — they're short and fixed.)
+fn text_line(id: &str, text: String, class: &str) -> Node {
+    Node::Text {
+        id: Some(id.to_owned()),
+        text,
+        max_width_chars: None,
+        ellipsize: true,
         classes: vec![class.to_owned()],
     }
 }
@@ -429,6 +458,38 @@ mod tests {
             } if nid == id => Some(text.clone()),
             Node::Box { children, .. } => children.iter().find_map(|c| find_text(c, id)),
             Node::Button { child, .. } => find_text(child, id),
+            _ => None,
+        }
+    }
+
+    /// Depth-first search for the `ellipsize` flag of a `Text` node with `id`.
+    fn find_text_ellipsize(node: &Node, id: &str) -> Option<bool> {
+        match node {
+            Node::Text {
+                id: Some(nid),
+                ellipsize,
+                ..
+            } if nid == id => Some(*ellipsize),
+            Node::Box { children, .. } => children.iter().find_map(|c| find_text_ellipsize(c, id)),
+            Node::Button { child, .. } => find_text_ellipsize(child, id),
+            _ => None,
+        }
+    }
+
+    /// Depth-first search for the first `Box` carrying `class` (returns its
+    /// children — the row shape we want to pin).
+    fn find_box_children<'a>(node: &'a Node, class: &str) -> Option<&'a [Node]> {
+        match node {
+            Node::Box {
+                classes, children, ..
+            } => {
+                if classes.iter().any(|c| c == class) {
+                    Some(children)
+                } else {
+                    children.iter().find_map(|c| find_box_children(c, class))
+                }
+            }
+            Node::Button { child, .. } => find_box_children(child, class),
             _ => None,
         }
     }
@@ -491,16 +552,19 @@ mod tests {
     // ── Manifest ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn manifest_mounts_sidebar_top_above_the_pet() {
+    fn manifest_leads_the_sidebar_and_subscribes_nothing() {
         let m: Manifest = Weather::manifest();
         assert_eq!(m.id, "weather");
-        assert_eq!(m.mount, Mount::SidebarTop);
         assert_eq!(
-            m.order,
-            Some(-10),
-            "renders above the pet (order unset → 0)"
+            m.mount,
+            Mount::SidebarLead,
+            "the leading region — above the built-in cards (#301)"
         );
-        assert!(m.subscribes.is_empty(), "weather sources its own data");
+        assert_eq!(m.order, Some(-10), "sole lead-region card; harmless order");
+        assert!(
+            m.subscribes.is_empty(),
+            "weather sources its own data and opts into no host push — no SlotVisible (#305)"
+        );
         assert!(
             m.capabilities.is_empty(),
             "weather asks nothing of the host"
@@ -553,6 +617,43 @@ mod tests {
         assert_eq!(find_text(&tree, "weather-feels").as_deref(), Some("16°"));
         assert_eq!(find_text(&tree, "weather-wind").as_deref(), Some("12 km/h"));
         assert_eq!(find_text(&tree, "weather-humid").as_deref(), Some("64%"));
+    }
+
+    /// The #301 layout adoption: detail rows are `label + Spacer + value` (so the
+    /// value right-pins, #299), and the single-line strings (location, condition)
+    /// ride ellipsizing `Text` so a long value truncates instead of blowing the
+    /// card wide.
+    #[test]
+    fn resolved_view_right_pins_details_and_ellipsizes_single_lines() {
+        let (mut m, _rx) = model();
+        let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
+        let tree = m.view();
+
+        // Location + condition stay single-line via ellipsizing Text.
+        assert_eq!(
+            find_text_ellipsize(&tree, LOC_ID),
+            Some(true),
+            "location ellipsizes"
+        );
+        assert_eq!(
+            find_text_ellipsize(&tree, COND_ID),
+            Some(true),
+            "condition ellipsizes"
+        );
+
+        // Each detail row is `label + Spacer + value`, so the value right-pins.
+        let row = find_box_children(&tree, "ts-weather-detail").expect("a detail row");
+        assert!(
+            matches!(
+                row,
+                [
+                    Node::Label { .. },
+                    Node::Spacer,
+                    Node::Label { id: Some(_), .. }
+                ]
+            ),
+            "detail row is label + Spacer + value, got {row:?}",
+        );
     }
 
     #[test]

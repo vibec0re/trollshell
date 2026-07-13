@@ -63,6 +63,22 @@
 //!   type / meaning** — anything that changes what an existing name decodes to.
 //! - **Reordering** a tuple variant's elements (positional, so order is
 //!   meaning).
+//!
+//! ### A new host→plugin push must be **opt-in**, never unconditional (#305)
+//!
+//! "Appending a name-tagged variant is additive" only holds while old code never
+//! *receives* the new variant. A host that pushes a freshly-added
+//! [`HostMsg`](msg::HostMsg) variant to **every** connection breaks exactly that:
+//! a plugin built against the older proto can't decode the unknown variant, its
+//! session dies, and (with an SDK that redials) it crash-loops — and the
+//! [`PROTO_VERSION`] exact-match can't catch it, since both sides are the same
+//! version. So a new push must be **gated on an opt-in the plugin declares in its
+//! [`Manifest`](manifest::Manifest)** — a [`StateKey`](manifest::StateKey)
+//! subscription or a [`Capability`](manifest::Capability). The host serializes
+//! only what a connection subscribed to, so an old binary that never declared the
+//! opt-in never receives the variable it can't decode. (Visibility, #288, was
+//! retrofitted onto [`StateKey::SlotVisible`](manifest::StateKey::SlotVisible)
+//! for this reason.)
 
 pub mod codec;
 pub mod effect;

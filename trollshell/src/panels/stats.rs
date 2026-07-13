@@ -1082,46 +1082,19 @@ fn build_history_gpu_temp_row() -> gtk::Box {
     row
 }
 
+/// Services group — flattened per #311: no group description and no
+/// `Failed units` expander wrapper (both duplicated the count already shown
+/// on the bar chip, and the expander hid the one thing this flyout is opened
+/// to see). The failed-unit `ActionRow`s render straight into the group, so
+/// the flyout *is* the list, matching the other stats panels' pattern of
+/// showing their primary content directly rather than behind a titled row.
+/// If every unit recovers while the panel is open, the list just goes empty
+/// (the chip that opens this panel self-hides at zero failed units anyway).
 fn build_stats_services_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
 
-    bind(
-        systemd::failed_units().map(|units| {
-            if units.is_empty() {
-                "All services running".to_string()
-            } else {
-                format!("{} failed unit(s)", units.len())
-            }
-        }),
-        &group,
-        |g, txt| g.set_description(Some(&txt)),
-    );
-
-    group.add(&build_failed_units_expander());
-    group
-}
-
-fn build_failed_units_expander() -> adw::ExpanderRow {
-    let expander = adw::ExpanderRow::builder().title("Failed units").build();
-    bind(
-        systemd::failed_units().map(|u| !u.is_empty()),
-        &expander,
-        gtk::prelude::WidgetExt::set_visible,
-    );
-    bind(
-        systemd::failed_units().map(|u| {
-            if u.is_empty() {
-                "None".to_string()
-            } else {
-                format!("{} unit(s)", u.len())
-            }
-        }),
-        &expander,
-        |r, t| r.set_subtitle(&t),
-    );
-
     reactive_list(
-        &expander,
+        &group,
         systemd::failed_units(),
         |unit: &systemd::FailedUnit| {
             let row = adw::ActionRow::builder()
@@ -1145,5 +1118,5 @@ fn build_failed_units_expander() -> adw::ExpanderRow {
         None::<fn() -> adw::ActionRow>,
     );
 
-    expander
+    group
 }

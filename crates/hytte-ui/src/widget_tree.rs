@@ -473,6 +473,13 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         }
         Node::Label { text, classes, .. } => {
             let label = gtk::Label::new(Some(text));
+            // Left-align the text: a GTK label defaults to `xalign 0.5`, so a
+            // label that fills its box centres — but card/list text should read
+            // from the leading edge (the native widgets set `halign(Start)`).
+            // `xalign` positions the text without shrinking the label, so
+            // `max_width_chars`/ellipsize still work. Per-node override tracked
+            // in #333.
+            label.set_xalign(0.0);
             apply_classes(&label, classes);
             (label.upcast(), Vec::new())
         }
@@ -485,6 +492,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let label = gtk::Label::new(Some(text));
             apply_text_flow(&label, *ellipsize);
+            label.set_xalign(0.0); // left-align by default — see Node::Label above (#333)
             if let Some(n) = max_width_chars {
                 label.set_max_width_chars(*n);
             }

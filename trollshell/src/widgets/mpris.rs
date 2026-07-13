@@ -117,7 +117,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     bind_transport_button(&chips.play_pause_btn, &current_bus, mpris::play_pause);
     bind_transport_button(&chips.next_btn, &current_bus, mpris::next);
 
-    wire_visibility_and_state(&container, chips, &current_bus);
+    wire_visibility_and_state(monitor, &container, chips, &current_bus);
 
     container.set_visible(false);
     container.upcast()
@@ -192,6 +192,7 @@ impl ModeState {
 /// - **Player, full row fits** (full) → container visible; transport controls
 ///   and label shown; `mini` hidden.
 fn wire_visibility_and_state(
+    monitor: &Monitor,
     container: &gtk::Box,
     chips: Chips,
     current_bus: &Rc<RefCell<Option<String>>>,
@@ -228,11 +229,12 @@ fn wire_visibility_and_state(
     // Re-evaluate the fit whenever the geometry that feeds the decision
     // changes. The bar window's width changes on monitor resize; the left
     // cluster's width changes as windows open/close or titles change; the
-    // container's own allocation changes when either neighbour moves. We watch
+    // container's own allocation changes when either neighbour moves; and the
+    // sidebar's exclusive zone shrinks the whole bar on open (#324). We watch
     // the `width` property on each — `connect_notify_local("width", …)` fires
     // post-allocate, so reads are settled, and we defer the actual decision to
     // an idle callback so we never toggle visibility from inside a layout pass.
-    install_geometry_watchers(container, &chips, &mode);
+    install_geometry_watchers(monitor, container, &chips, &mode);
 }
 
 /// Recompute the fit and apply the resulting mode. Cheap and idempotent: if
@@ -262,7 +264,17 @@ fn decide_mode(container: &gtk::Box, chips: &Chips, currently_full: bool) -> boo
         return currently_full;
     };
     let full_natural = full_mode_natural_width(chips);
+    fits(available, full_natural, currently_full)
+}
 
+/// The pure fit decision with hysteresis, split out from the GTK geometry reads
+/// so the asymmetric threshold band is unit-testable without a live widget tree.
+///
+/// `available` is the usable px (bar width minus the neighbour clusters and the
+/// gap); `full_natural` is the summed natural width of the full-mode chips;
+/// `currently_full` selects the threshold. Returns `true` for full, `false` for
+/// narrow.
+fn fits(available: i32, full_natural: i32, currently_full: bool) -> bool {
     if currently_full {
         // Collapse to narrow only once the full row no longer fits.
         full_natural <= available
@@ -284,6 +296,12 @@ fn decide_mode(container: &gtk::Box, chips: &Chips, currently_full: bool) -> boo
 /// would feed our own mode back into the decision and flicker. The `bar_width`
 /// is read from the `CenterBox` allocation because that tracks the monitor, not
 /// our mode.
+///
+/// The sidebar needs no special term here: it is a `Layer::Top` surface whose
+/// left exclusive zone shrinks this exclusive bar on open, so the `CenterBox`
+/// allocation already drops by the sidebar width and `bar_width` reflects it.
+/// We only have to *re-run* on the toggle (see [`install_geometry_watchers`]),
+/// not subtract — subtracting would double-count against the shrunk bar (#324).
 fn available_width(container: &gtk::Box) -> Option<i32> {
     // Parent chain: container → middle(Box) → end_pair(Box) → CenterBox → win.
     let middle = container.parent()?;
@@ -337,10 +355,15 @@ fn apply_mode(chips: &Chips, full: bool) {
 }
 
 /// Watch the geometry inputs and re-evaluate the fit when any changes. We hook
-/// the `width` notify on the bar window, the left cluster, and the container
-/// itself; the decision is deferred to idle so we never mutate visibility
-/// mid-allocate.
-fn install_geometry_watchers(container: &gtk::Box, chips: &Rc<Chips>, mode: &ModeState) {
+/// the `width` notify on the bar window, the `CenterBox`, the left cluster, and
+/// the container itself, plus the sidebar's open signal (#324); the decision is
+/// deferred to idle so we never mutate visibility mid-allocate.
+fn install_geometry_watchers(
+    monitor: &Monitor,
+    container: &gtk::Box,
+    chips: &Rc<Chips>,
+    mode: &ModeState,
+) {
     // A coalescing idle-scheduled re-evaluation: many width notifies can fire
     // in one frame; collapse them to a single deferred decision.
     let pending = Rc::new(Cell::new(false));
@@ -370,6 +393,26 @@ fn install_geometry_watchers(container: &gtk::Box, chips: &Rc<Chips>, mode: &Mod
         container.connect_notify_local(Some("width"), move |_, _| schedule());
     }
 
+    // Re-evaluate when the sidebar toggles (#324). The sidebar is a `Layer::Top`
+    // surface whose left exclusive zone (`SIDEBAR_WIDTH`) pushes/shrinks this
+    // exclusive, Top+Left+Right-anchored bar on open, so `center_box.width()`
+    // drops by that width — no subtraction here, the bar already shrank. That
+    // resize is an async compositor round-trip, and the width watchers alone can
+    // miss it: the bar window's `default-width` doesn't track a layer-shell
+    // configure, the container keeps its full-mode natural width, and the left
+    // cluster is often already squeezed to its minimum (the long-title case in
+    // the report). Hooking the open signal guarantees a re-eval on toggle; the
+    // `CenterBox` `width` watcher (installed on realise) then settles it once the
+    // resize lands.
+    {
+        let schedule = schedule.clone();
+        bind(
+            crate::overlays::sidebar::open_signal(monitor),
+            container,
+            move |_container, _open| schedule(),
+        );
+    }
+
     // Defer the bar-window / left-cluster hooks until the widget is realised
     // and its parent chain (and the bar root) exists. `connect_realize` fires
     // once the widget joins a mapped window.
@@ -395,15 +438,29 @@ fn watch_neighbours(container: &gtk::Box, schedule: &(impl Fn() + Clone + 'stati
         win.connect_notify_local(Some("default-width"), move |_, _| schedule());
     }
 
-    // Left cluster: its width grows/shrinks as windows open/close. Reach it
-    // via the CenterBox start widget.
+    // Reach the CenterBox (and, via it, the left cluster) through the parent
+    // chain, which exists once realised.
     if let Some(middle) = container.parent()
         && let Some(end_pair) = middle.parent()
         && let Some(center_box) = end_pair.parent().and_downcast::<gtk::CenterBox>()
-        && let Some(left) = center_box.start_widget()
     {
-        let schedule = schedule.clone();
-        left.connect_notify_local(Some("width"), move |_, _| schedule());
+        // The CenterBox's own allocated width == the bar content width, which
+        // shrinks when the sidebar's left exclusive zone pushes the bar (#324).
+        // This is the one geometry input that reliably changes on a sidebar push
+        // (unlike the window's `default-width`, or the left cluster's width when
+        // it is already at its minimum), and — being the bar width — it is
+        // independent of our own mode, so watching it can't feed back and
+        // oscillate.
+        {
+            let schedule = schedule.clone();
+            center_box.connect_notify_local(Some("width"), move |_, _| schedule());
+        }
+
+        // Left cluster: its width grows/shrinks as windows open/close.
+        if let Some(left) = center_box.start_widget() {
+            let schedule = schedule.clone();
+            left.connect_notify_local(Some("width"), move |_, _| schedule());
+        }
     }
 }
 
@@ -423,5 +480,43 @@ fn apply_player_to_widgets(player: &Player, chips: &Chips) {
     let icon_name = play_pause_icon(player.status);
     if let Some(img) = chips.play_pause_btn.child().and_downcast::<gtk::Image>() {
         img.set_icon_name(Some(icon_name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HYSTERESIS, fits};
+
+    #[test]
+    fn full_holds_until_the_row_no_longer_fits() {
+        // In full mode we collapse only once the row exceeds the available px.
+        assert!(fits(100, 100, true), "an exact fit stays full");
+        assert!(fits(100, 99, true), "room to spare stays full");
+        assert!(!fits(100, 101, true), "one px over collapses to narrow");
+    }
+
+    #[test]
+    fn narrow_expands_only_with_hysteresis_headroom() {
+        // From narrow we need HYSTERESIS px of headroom beyond the bare fit.
+        assert!(!fits(100, 100, false), "a bare fit is not enough to expand");
+        assert!(
+            !fits(100, 100 - HYSTERESIS + 1, false),
+            "one px short of the headroom stays narrow"
+        );
+        assert!(
+            fits(100, 100 - HYSTERESIS, false),
+            "exactly HYSTERESIS headroom expands to full"
+        );
+    }
+
+    #[test]
+    fn a_width_at_the_boundary_does_not_ping_pong() {
+        // With available == full_natural the asymmetric thresholds keep the
+        // current mode: full stays full, narrow stays narrow — no oscillation.
+        assert!(fits(200, 200, true), "full holds at the boundary");
+        assert!(
+            !fits(200, 200, false),
+            "narrow does not expand at the boundary"
+        );
     }
 }

@@ -40,19 +40,28 @@ const LINE_GAP: usize = 2;
 const PAD: usize = 3;
 /// Radius of the (chunky) rounded-corner cut on the baked bubble background.
 const CORNER: usize = 2;
-/// Target pixel width of the bubble's slot beside the face in the compact row
-/// (#313). The sidebar card is 320 px; inside its ~12 px padding (~296 px) the
-/// 128 px LCD face plus its bezel/border eats ~143 px, so this is roughly the
-/// width left for the bubble — which renders at **1× scale** in the row (a `Row`
-/// packs it at its natural buffer width), so the buffer must fit here directly.
+/// Integer pixel-scale baked into the bubble buffer (#323 — bigger pixel font,
+/// multiline). A `Row` packs the bubble at its **natural** buffer width (1×), so
+/// the host does no upscaling of its own — bigger chunky pixels have to come from
+/// the buffer itself. [`render`] draws the glyphs at 1× then nearest-neighbor
+/// upscales the whole buffer by this factor, so each `5×7` glyph paints as a
+/// crisp `5·SCALE × 7·SCALE` block.
+const SCALE: usize = 2;
+
+/// Target **on-screen** pixel width of the bubble's slot beside the face in the
+/// compact row (#313). The sidebar card is 320 px; inside its ~12 px padding
+/// (~296 px) the 128 px LCD face plus its bezel/border eats ~143 px, so this is
+/// roughly the width left for the bubble. The buffer is packed at 1× in the row,
+/// so the **pre-scale** buffer must fit `BUBBLE_SLOT_PX / SCALE` and the ×[`SCALE`]
+/// upscale lands it back near this on-screen width.
 const BUBBLE_SLOT_PX: usize = 126;
 
-/// Wrap width, in glyph cells: the widest line whose 1× buffer — text plus the
-/// two [`PAD`] borders — still fits [`BUBBLE_SLOT_PX`], so the bubble never
-/// overruns its slot beside the face. Derived from the slot rather than
-/// hand-tuned; still keeps the pet's ~30-char lines to at most [`MAX_LINES`]
-/// wrapped rows.
-const MAX_COLS: usize = max_cols_for(BUBBLE_SLOT_PX);
+/// Wrap width, in glyph cells: the widest line whose *pre-scale* buffer — text
+/// plus the two [`PAD`] borders — still fits `BUBBLE_SLOT_PX / SCALE`, so after
+/// the ×[`SCALE`] upscale the bubble stays within its slot beside the face. The
+/// narrower cell count (vs. an unscaled bubble) is deliberate: it wraps the pet's
+/// lines *down* into [`MAX_LINES`] chunky rows instead of growing sideways.
+const MAX_COLS: usize = max_cols_for(BUBBLE_SLOT_PX / SCALE);
 
 /// The largest column count whose rendered line width (both [`PAD`] borders
 /// included) fits `slot_px` — the inverse of [`line_px`] with the padding
@@ -79,8 +88,9 @@ const NOTDEF: [u8; 4] = [0x6c, 0x4e, 0x86, 0xff];
 const CLEAR: [u8; 4] = [0, 0, 0, 0];
 
 /// Render `line` into a chunky-pixel speech bubble [`Node::Pixels`]. The buffer
-/// hugs the wrapped text (background baked in, transparent rounded corners), so
-/// the host's nearest-neighbor upscale blows it up crisply — the 8-bit look.
+/// is a **fixed-width** slot (background baked in, transparent rounded corners),
+/// upscaled ×[`SCALE`] for the 8-bit look — so it no longer resizes as the
+/// message length changes (#323); longer text wraps down into more rows instead.
 pub(crate) fn bubble_node(line: &str, id: &str, classes: Vec<String>) -> Node {
     let (width, height, data) = render(line);
     Node::Pixels {
@@ -95,13 +105,17 @@ pub(crate) fn bubble_node(line: &str, id: &str, classes: Vec<String>) -> Node {
 /// Render `text` into a `(width, height, RGBA8)` bubble buffer. The buffer
 /// satisfies the host's `len == width * height * 4` invariant for every input
 /// (including the empty string).
+///
+/// The width is **fixed** at the full [`MAX_COLS`] slot regardless of the text,
+/// so the bubble stays a constant on-screen width per message (#323 — it used to
+/// hug the text and jump around on every poke). Only the height varies, with the
+/// wrapped line count. The whole thing is nearest-neighbor–upscaled ×[`SCALE`]
+/// last, since the row packs it at 1× (see [`SCALE`]).
 fn render(text: &str) -> (u32, u32, Vec<u8>) {
     let lines = wrap(text, MAX_COLS, MAX_LINES);
-    let content_w = lines
-        .iter()
-        .map(|l| line_px(l.chars().count()))
-        .max()
-        .unwrap_or(0);
+    // Fixed slot width — the full MAX_COLS line — so the bubble doesn't resize
+    // with the message. Every wrapped line is ≤ MAX_COLS, so text always fits.
+    let content_w = line_px(MAX_COLS);
     let n_lines = lines.len().max(1);
     let buf_w = (2 * PAD + content_w).max(1);
     let buf_h = 2 * PAD + n_lines * GLYPH_H + (n_lines - 1) * LINE_GAP;
@@ -115,11 +129,36 @@ fn render(text: &str) -> (u32, u32, Vec<u8>) {
             blit_glyph(&mut buf, buf_w, buf_h, ox, oy, ch);
         }
     }
+
+    let (buf_w, buf_h, buf) = upscale(&buf, buf_w, buf_h, SCALE);
     (
         u32::try_from(buf_w).unwrap_or(0),
         u32::try_from(buf_h).unwrap_or(0),
         buf,
     )
+}
+
+/// Nearest-neighbor–upscale an RGBA8 buffer by an integer `factor`, replicating
+/// each source pixel into a `factor × factor` block. `factor <= 1` is a copy.
+/// Preserves the `len == w * h * 4` invariant and every exact pixel value.
+fn upscale(src: &[u8], w: usize, h: usize, factor: usize) -> (usize, usize, Vec<u8>) {
+    if factor <= 1 {
+        return (w, h, src.to_vec());
+    }
+    let (dw, dh) = (w * factor, h * factor);
+    let mut dst = vec![0u8; dw * dh * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let src_px = &src[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            for sy in 0..factor {
+                for sx in 0..factor {
+                    let didx = ((y * factor + sy) * dw + (x * factor + sx)) * 4;
+                    dst[didx..didx + 4].copy_from_slice(src_px);
+                }
+            }
+        }
+    }
+    (dw, dh, dst)
 }
 
 /// Pixel width of a line of `cols` glyphs (`0` for an empty line).
@@ -179,6 +218,12 @@ fn wrap(text: &str, max_cols: usize, max_lines: usize) -> Vec<String> {
     if lines.len() > max_lines {
         lines.truncate(max_lines);
         if let Some(last) = lines.last_mut() {
+            // The `…` must fit within max_cols too: if the kept line is already
+            // full, drop a char to make room, so the marked line never overruns
+            // the (now fixed-width) slot.
+            if last.chars().count() >= max_cols {
+                *last = last.chars().take(max_cols.saturating_sub(1)).collect();
+            }
             last.push('…');
         }
     }

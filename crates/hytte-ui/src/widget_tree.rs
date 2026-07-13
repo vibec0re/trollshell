@@ -564,10 +564,12 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             (sep.upcast(), Vec::new())
         }
         Node::Spacer => {
-            // An empty box that expands on both axes to eat the container's
-            // slack. Dir-agnostic: the along-axis expand justifies siblings; the
-            // cross-axis one is inert (zero natural size). No id, no children, no
-            // classes — it is styled by its neighbours, never itself.
+            // An empty box that eats the container's slack to justify its
+            // siblings. Built expanding on both axes as a default; the real,
+            // container-aware axis is set by `constrain_spacer_axis` once the
+            // parent orientation is known (a cross-axis expand is NOT inert — it
+            // propagates up and stretches the box on that axis, #330). No id, no
+            // children, no classes — it is styled by its neighbours, never itself.
             let boxw = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             boxw.set_hexpand(true);
             boxw.set_vexpand(true);
@@ -596,9 +598,25 @@ fn build_children(
     for child in children {
         let realized = build_node(child, on_event);
         container.append(&realized.widget);
+        constrain_spacer_axis(container, child, &realized.widget);
         kids.push(realized);
     }
     kids
+}
+
+/// A [`Node::Spacer`] must expand only along its container's **main** axis.
+/// `build_node` builds the spacer widget with expand on *both* axes (there it
+/// can't see its parent); here — where the container orientation is known — we
+/// drop the cross-axis flag. Left in, GTK's `compute_expand` propagates that
+/// cross-axis expand up to the parent box: a spacer justifying `label … value`
+/// in a horizontal row would make the row — and, up the chain, the whole card —
+/// claim vertical expansion, splaying the rows down the sidebar (#330).
+fn constrain_spacer_axis(container: &gtk::Box, child: &Node, widget: &gtk::Widget) {
+    if matches!(child, Node::Spacer) {
+        let horizontal = container.orientation() == gtk::Orientation::Horizontal;
+        widget.set_hexpand(horizontal);
+        widget.set_vexpand(!horizontal);
+    }
 }
 
 /// Update an already-realized node in place. Precondition (guaranteed by the
@@ -823,6 +841,9 @@ fn diff_children(
             SlotOp::Create => container.insert_child_after(&widget, prev_sibling.as_ref()),
             SlotOp::Reuse(_) => container.reorder_child_after(&widget, prev_sibling.as_ref()),
         }
+        // Re-assert the spacer's axis: covers a fresh spacer and a reused one
+        // whose container flipped orientation since it was built.
+        constrain_spacer_axis(container, &new_children[slot], &widget);
         prev_sibling = Some(widget);
     }
 
@@ -1856,25 +1877,57 @@ mod gtk_tests {
     }
 
     #[gtk::test]
-    fn spacer_builds_expanding_empty_box() {
+    fn spacer_expands_only_along_its_container_axis() {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});
-        // The weather-row shape: label + expanding gap + value.
+        // The weather-row shape: label + expanding gap + value, in a HORIZONTAL
+        // box. The spacer must justify horizontally WITHOUT claiming vertical
+        // expand — a cross-axis expand propagates up and stretches the card (#330).
         rec.render(&hbox(vec![
             lbl(None, "wind"),
             Node::Spacer,
             lbl(None, "12"),
         ]));
-
         let inner = root.first_child().unwrap();
         let kids = children(&inner);
         assert_eq!(kids.len(), 3, "label + spacer + label");
         let spacer = kids[1]
             .downcast_ref::<gtk::Box>()
             .expect("Spacer → an empty gtk::Box");
-        assert!(spacer.hexpands(), "spacer expands horizontally");
-        assert!(spacer.vexpands(), "spacer expands both axes (dir-agnostic)");
+        assert!(
+            spacer.hexpands(),
+            "spacer expands along the row's main axis"
+        );
+        assert!(
+            !spacer.vexpands(),
+            "spacer must NOT expand on the cross axis (would stretch the row/card, #330)"
+        );
         assert!(spacer.first_child().is_none(), "spacer is empty");
+
+        // Same node in a VERTICAL box: now it must expand vertically, not
+        // horizontally — the axis follows the container.
+        let vbox = Node::Box {
+            id: None,
+            dir: Dir::Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![lbl(None, "a"), Node::Spacer, lbl(None, "b")],
+        };
+        rec.render(&vbox);
+        let inner = root.first_child().unwrap();
+        let vkids = children(&inner);
+        let vspacer = vkids[1]
+            .downcast_ref::<gtk::Box>()
+            .expect("Spacer → an empty gtk::Box");
+        assert!(
+            vspacer.vexpands(),
+            "spacer expands along the column's main axis"
+        );
+        assert!(
+            !vspacer.hexpands(),
+            "spacer must NOT expand on the cross axis in a column (#330)"
+        );
     }
 
     #[gtk::test]

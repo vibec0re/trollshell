@@ -7,7 +7,6 @@ members = [
   "crates/hytte",
   "crates/hytte-bus",
   "crates/hytte-ecal",
-  "crates/hytte-blur",
   "crates/hytte-plugin-proto",
   "crates/hytte-plugin",
   "crates/hytte-plugin-clock-demo",

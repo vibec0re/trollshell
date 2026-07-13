@@ -32,27 +32,20 @@
 //! Committing `exclusive_zone = 0` makes niri stop *reserving* the strip (tiles
 //! reflow to full width), but the persistent surface still overlays on top. That
 //! overlay is transparent (`.ts-sidebar-surface { background: transparent }`) and
-//! the collapsed card paints nothing, so it should be invisible — yet a grey
-//! strip lingered once opened. **Root cause (confirmed against niri's source,
-//! #194):** the `hytte-sidebar` *layer-rule* `background-effect { blur true }`
-//! frosts the **entire** surface geometry, and `hytte-blur` was clearing the
-//! frost on close by sending a **NULL** `wl_region`. niri reads a NULL blur
-//! region as "no client scoping" and reverts to that whole-surface layer-rule
-//! frost (`src/render_helpers/background_effect.rs`: a NULL region leaves
-//! `has_blur_region` false, so `blur = effect.blur == Some(true)`), so the whole
-//! still-mapped surface stayed frosted — a frosted-wallpaper grey strip. The fix
-//! lives in [`hytte::blur::SurfaceBlur::set_region`]: clear by sending an
-//! **empty** region (which niri short-circuits to "blur nothing") rather than
-//! NULL.
+//! the collapsed card paints nothing, so it's invisible. (Historically a grey
+//! strip lingered here: the shell scoped a niri `background-effect` frost to the
+//! card via the client-side `hytte-blur` protocol, and niri re-frosted the whole
+//! still-mapped surface whenever that scoping lapsed — #192/#194. The
+//! frosted-glass experiment was retired in #312, so there is no frost to leak.)
 //!
 //! The surface does **not** shrink back below `SIDEBAR_WIDTH` once opened — a GTK
 //! toplevel won't re-measure under a prior allocation (`win_width=320 /
 //! surface_width=320` closed-after-open, vs. `0 / 1` never-opened). That is
-//! harmless now that the frost is suppressed: a transparent, click-through,
-//! zone-0 overlay of any width is invisible. `drive_exclusive_zone_on_settle`
-//! still re-asserts `exclusive_zone = 0` + flushes on settle so niri reliably
-//! reclaims the strut; its card-floor relax is now a belt-and-braces no-op (the
-//! toplevel won't actually deflate, and it no longer needs to).
+//! harmless: a transparent, click-through, zone-0 overlay of any width is
+//! invisible. `drive_exclusive_zone_on_settle` still re-asserts `exclusive_zone
+//! = 0` + flushes on settle so niri reliably reclaims the strut; its card-floor
+//! relax is now a belt-and-braces no-op (the toplevel won't actually deflate, and
+//! it no longer needs to).
 //!
 //! ## Frame integration
 //!
@@ -72,7 +65,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
-use hytte::blur::SurfaceBlur;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
@@ -109,19 +101,11 @@ struct SidebarPanel {
     /// aggregate (#288). Aborted in [`close_all`] before the monitor is forgotten
     /// so it can't re-add a hot-unplugged connector after teardown.
     visibility_subscription: glib::JoinHandle<()>,
-    /// Client-side `ext-background-effect` blur scope for this surface (#192/
-    /// #193). `None` when niri < 26.04 (or the effect couldn't attach); the
-    /// niri layer-rule blur (`etc/niri/blur.kdl`) is the fallback there. Shared
-    /// with the open subscription + map handler so they drive the region.
-    blur: Rc<RefCell<Option<SurfaceBlur>>>,
-    /// Live blur-region slide timer ([`drive_blur_during_slide`]), if one is
-    /// armed. Cancelled in [`close_all`]: a tick armed for a close that gets
-    /// interrupted by `close_all` (window closed mid-slide → the revealer can
-    /// never settle, its frame clock having stopped) would otherwise loop on the
-    /// main context forever, keeping the window/revealer/blur clones alive.
-    blur_tick: Rc<RefCell<Option<glib::SourceId>>>,
-    /// Live exclusive-zone settle timer ([`drive_exclusive_zone_on_settle`]),
-    /// if one is armed. Same leak + teardown as [`Self::blur_tick`].
+    /// Live exclusive-zone settle timer ([`drive_exclusive_zone_on_settle`]), if
+    /// one is armed. Cancelled in [`close_all`]: a tick armed for a close that
+    /// gets interrupted by `close_all` (window closed mid-slide → the revealer
+    /// can never settle, its frame clock having stopped) would otherwise loop on
+    /// the main context forever, keeping the window/revealer clones alive.
     zone_tick: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
@@ -228,22 +212,6 @@ pub fn install(monitor: &Monitor) {
         .build();
     revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
-    // Client-side blur-region scope (#192/#193). The wl_surface only exists
-    // once the surface maps, so attach on first `map` and seed the region to
-    // the current open-state. `None` on niri < 26.04 → the layer-rule blur in
-    // etc/niri/blur.kdl stays as the fallback. Stored shared so the open
-    // subscription can drive the region as the card slides.
-    //
-    // MUST be wired BEFORE `set_visible(true)`: gtk4-layer-shell maps this
-    // persistent surface *synchronously* inside `set_visible`, and the surface
-    // is created once and never remaps — so a `connect_map` handler installed
-    // afterwards misses the only `map` it will ever see, `attach()` never runs,
-    // no client region is set, and niri frosts the WHOLE surface geometry
-    // (the #192 lingering strip / #193 whole-screen frost). The drawer
-    // (`modal.rs`) is immune only because it wires its handler before any
-    // `set_visible`.
-    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
-    wire_blur_attach(&window, &blur, &open_state);
 
     // Present the surface ONCE, here at install. Stays alive for the
     // process lifetime — toggle goes through the revealer + open_state,
@@ -254,27 +222,18 @@ pub fn install(monitor: &Monitor) {
     // so without this the closed sidebar's region still swallows clicks.
     apply_input_passthrough(&window, false);
 
-    // Slots holding the currently-armed slide timers so `close_all` can cancel
-    // them before tearing the surface down (see field docs on SidebarPanel).
-    let blur_tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    // Slot holding the currently-armed settle timer so `close_all` can cancel it
+    // before tearing the surface down (see field docs on SidebarPanel).
     let zone_tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    let subscription = wire_open_subscription(
-        &window,
-        &revealer,
-        &card,
-        &open_state,
-        &blur,
-        &blur_tick,
-        &zone_tick,
-    );
+    let subscription = wire_open_subscription(&window, &revealer, &card, &open_state, &zone_tick);
     wire_escape(&window, monitor.clone());
 
     // Forward this monitor's sidebar open/close edge to the plugin host so
     // out-of-process plugin cards mounted here can park their pollers while the
     // sidebar is hidden (#288) — e.g. the departures plugin's own poller.
     // Kept as its own lightweight subscription (rather than folded into the
-    // blur/zone-heavy `wire_open_subscription`) so that dense function keeps
+    // zone-driving `wire_open_subscription`) so that dense function keeps
     // its argument budget; the host ORs this across monitors before pushing
     // `SlotVisibility`. The initial `false` on subscribe seeds this monitor's flag.
     let visibility_subscription = {
@@ -294,8 +253,6 @@ pub fn install(monitor: &Monitor) {
                 open_state,
                 subscription,
                 visibility_subscription,
-                blur,
-                blur_tick,
                 zone_tick,
             },
         );
@@ -419,17 +376,12 @@ fn wire_open_subscription(
     revealer: &gtk::Revealer,
     card: &gtk::Box,
     open_state: &Mutable<bool>,
-    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
-    blur_tick: &Rc<RefCell<Option<glib::SourceId>>>,
     zone_tick: &Rc<RefCell<Option<glib::SourceId>>>,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
     let card = card.clone();
-    let blur = blur.clone();
-    let blur_tick = blur_tick.clone();
     let zone_tick = zone_tick.clone();
-    let open_state_for_tick = open_state.clone();
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
@@ -446,10 +398,9 @@ fn wire_open_subscription(
         // `set_exclusive_zone` request on GTK's wayland connection but the bytes
         // only leave the process on GTK's next flush; a sidebar settling closed
         // may not produce another frame, so the zero zone could sit unflushed and
-        // niri would keep the tile pushed (grey wallpaper gap). Flushing here is
-        // the analogue of the explicit `conn.flush()` that makes the blur region
-        // clear on close — without it the zone release is unreliable (#194).
-        hytte::blur::flush(&window);
+        // niri would keep the tile pushed (grey wallpaper gap). Flush GDK's
+        // display connection explicitly so the zone release lands (#194).
+        WidgetExt::display(&window).flush();
         revealer.set_reveal_child(open);
         apply_input_passthrough(&window, !open);
         // Re-assert the exclusive zone once the revealer settles so niri reliably
@@ -469,58 +420,11 @@ fn wire_open_subscription(
             &zone_tick,
             open,
         );
-        // Scope niri's frost to the card as it slides: tick the region off the
-        // revealer's animating width until it settles, then clear it on close
-        // so no strip lingers (#192). No-op when `blur` is None (niri < 26.04).
-        drive_blur_during_slide(
-            &window,
-            &revealer,
-            &blur,
-            &open_state_for_tick,
-            &blur_tick,
-            open,
-        );
         if open {
             hytte::services::weather::refresh();
         }
         async {}
     }))
-}
-
-/// Surface-local height to blur: the mapped surface's height (full screen, since
-/// the sidebar anchors Top+Bottom). Falls back to the window's allocated height
-/// before the surface reports a size.
-fn surface_height(window: &gtk::Window) -> i32 {
-    window
-        .surface()
-        .map_or_else(|| window.height(), |s| s.height())
-}
-
-/// Apply the blur region for the revealer's *current* state, returning whether
-/// the slide animation has settled at the `open` target. When settled the
-/// region locks to the authoritative `SIDEBAR_WIDTH` (open) / clears (closed);
-/// mid-slide it follows the revealer's allocated width so the frost tracks the
-/// card. No-op when `blur` is `None` (niri < 26.04).
-fn apply_slide_region(
-    window: &gtk::Window,
-    revealer: &gtk::Revealer,
-    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
-    open: bool,
-) -> bool {
-    let settled = revealer.is_child_revealed() == open;
-    let visible = if settled {
-        if open { SIDEBAR_WIDTH } else { 0 }
-    } else {
-        // `revealer.width()` is the allocated child width mid-slide.
-        revealer.width().clamp(0, SIDEBAR_WIDTH)
-    };
-    if let Some(sb) = blur.borrow().as_ref() {
-        sb.set_region(hytte::blur::left_panel_region(
-            visible,
-            surface_height(window),
-        ));
-    }
-    settled
 }
 
 /// Re-arm a frame-cadence (~60 Hz) slide timer in `slot`, first cancelling
@@ -530,13 +434,13 @@ fn apply_slide_region(
 /// Because re-arming removes the slot's previous timer, at most one timer per
 /// slot is ever live, and `slot` only ever holds a *live* id (the owner clears
 /// it on `Break`). That invariant is what lets [`close_all`] cancel an in-flight
-/// slide tick by removing the stored id — without it, a tick armed for a close
+/// settle tick by removing the stored id — without it, a tick armed for a close
 /// that is then interrupted by `close_all` (window closed mid-slide → the
 /// revealer's frame clock stops, so it can never settle and the tick's own
 /// settle/bail conditions never trip) would loop on the main context forever,
-/// holding the window/revealer/blur clones alive (a zombie surface per
-/// hot-plug). It also means `close_all` never removes a stale (already-finished,
-/// possibly reused) source id.
+/// holding the window/revealer clones alive (a zombie surface per hot-plug). It
+/// also means `close_all` never removes a stale (already-finished, possibly
+/// reused) source id.
 fn rearm_slide_tick<F>(slot: &Rc<RefCell<Option<glib::SourceId>>>, mut step: F)
 where
     F: FnMut() -> glib::ControlFlow + 'static,
@@ -560,43 +464,6 @@ where
     *slot.borrow_mut() = Some(id);
 }
 
-/// Drive the blur region across the slide: apply once now, then re-arm a frame
-/// tick (~60 Hz) until the revealer settles, so the frost slides in/out with the
-/// card and clears on close (no lingering strip, #192).
-///
-/// `open_state` is checked each tick: if the user re-toggles mid-animation, the
-/// live target diverges from this timer's captured `open` and the stale timer
-/// stops (the fresh subscription firing started its own). The timer id is parked
-/// in `tick_slot` so [`close_all`] can cancel it on teardown.
-fn drive_blur_during_slide(
-    window: &gtk::Window,
-    revealer: &gtk::Revealer,
-    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
-    open_state: &Mutable<bool>,
-    tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
-    open: bool,
-) {
-    if apply_slide_region(window, revealer, blur, open) {
-        return;
-    }
-    let window = window.clone();
-    let revealer = revealer.clone();
-    let blur = blur.clone();
-    let open_state = open_state.clone();
-    rearm_slide_tick(tick_slot, move || {
-        // A re-toggle started a fresh tick for the new target; bail out so two
-        // timers don't fight over the region.
-        if open_state.get() != open {
-            return glib::ControlFlow::Break;
-        }
-        if apply_slide_region(&window, &revealer, &blur, open) {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
-    });
-}
-
 /// Re-assert the layer-shell exclusive zone — and **deflate the card's width
 /// floor** — after the revealer settles, then force a GTK frame so the final
 /// surface state actually commits (#194).
@@ -611,30 +478,24 @@ fn drive_blur_during_slide(
 /// live `RUST_LOG` capture showed the closed toplevel + `wl_surface` staying at
 /// `win_width=320 / surface_width=320` once opened (vs. `0 / 1` never-opened),
 /// and the theory was that `build_card`'s `set_size_request(SIDEBAR_WIDTH, -1)`
-/// floor pinned the surface full-width so it covered the strip. Relaxing that
+/// floor pinned the surface full-width so it covered a grey strip. Relaxing that
 /// floor to `0` on settled-close did **not** shrink the surface (a GTK toplevel
-/// won't re-measure under a prior allocation), and the grey strip turned out to
-/// be the niri layer-rule frost of the whole still-mapped surface — fixed in
-/// [`hytte::blur::SurfaceBlur::set_region`] (clear with an empty region, not a
-/// NULL one). The floor relax is kept as harmless belt-and-braces; it no longer
-/// matters, since a transparent, zone-0, unfrosted overlay is invisible at any
-/// width.
+/// won't re-measure under a prior allocation); the strip was actually a niri
+/// `background-effect` frost of the whole still-mapped surface, since retired
+/// with the frosted-glass experiment (#312). The floor relax is kept as harmless
+/// belt-and-braces; it no longer matters, since a transparent, zone-0 overlay is
+/// invisible at any width.
 ///
 /// We tick at frame cadence until the revealer settles at the `open` target,
 /// then re-set the zone + floor and `queue_resize()` / `queue_draw()` the window.
 /// `queue_draw` schedules a GTK frame whose commit carries the pending
-/// layer-shell state (mirrors how [`SurfaceBlur::set_region`] nudges the region
-/// to commit). Re-asserting at the *settled* moment guarantees the final
+/// layer-shell state. Re-asserting at the *settled* moment guarantees the final
 /// committed zone matches the final open-state, even if the last mid-slide commit
 /// predated it.
 ///
-/// Like [`drive_blur_during_slide`], a mid-animation re-toggle is detected via
-/// `open_state` and the stale timer bails so two timers don't fight; the timer
-/// id is parked in `tick_slot` so [`close_all`] can cancel it on teardown.
-///
-/// NEEDS LIVE NIRI RE-TEST: the empty-vs-NULL blur-region fix is confirmed
-/// against niri's source, but the visible result can only be confirmed against a
-/// real niri session.
+/// A mid-animation re-toggle is detected via `open_state` and the stale timer
+/// bails so two timers don't fight; the timer id is parked in `tick_slot` so
+/// [`close_all`] can cancel it on teardown.
 fn drive_exclusive_zone_on_settle(
     window: &gtk::Window,
     revealer: &gtk::Revealer,
@@ -664,15 +525,12 @@ fn drive_exclusive_zone_on_settle(
         // so reuse it. (#194)
         card.set_size_request(zone, -1);
         // DIAGNOSTIC (#194): logs the settled surface geometry once per settle
-        // (the re-assert), not per animation frame. NOTE the success criterion
-        // CHANGED: the persistent toplevel stays at win_width=320 /
-        // surface_width=320 once opened (a GTK toplevel won't re-measure below a
-        // prior allocation, even with the card floor relaxed) — that is EXPECTED
-        // and fine. The grey strip was the niri layer-rule frost of this whole
-        // still-mapped surface, now suppressed in `hytte::blur::set_region`
-        // (empty region instead of a NULL one). So the fix is confirmed by the
-        // grey strip being GONE, NOT by surface_width dropping to 0. NEEDS LIVE
-        // NIRI RE-TEST.
+        // (the re-assert), not per animation frame. NOTE: the persistent toplevel
+        // stays at win_width=320 / surface_width=320 once opened (a GTK toplevel
+        // won't re-measure below a prior allocation, even with the card floor
+        // relaxed) — that is EXPECTED and fine. The historical grey strip was a
+        // niri `background-effect` frost of this whole still-mapped surface, gone
+        // now that the frosted-glass experiment is retired (#312).
         tracing::debug!(
             open,
             set_exclusive_zone = zone,
@@ -689,7 +547,7 @@ fn drive_exclusive_zone_on_settle(
         // may not produce another frame on its own).
         window.queue_resize();
         window.queue_draw();
-        hytte::blur::flush(window);
+        WidgetExt::display(window).flush();
         true
     }
 
@@ -711,58 +569,6 @@ fn drive_exclusive_zone_on_settle(
             glib::ControlFlow::Continue
         }
     });
-}
-
-/// Attach the [`SurfaceBlur`] once the layer surface is mapped (its `wl_surface`
-/// exists). Seeds the region to the current open-state so the closed sidebar
-/// starts with no frost.
-///
-/// The sidebar surface is persistent (mapped once at install), so in the common
-/// case this attaches a single time. But if the surface is ever unmapped +
-/// remapped (hot-plug / compositor remap), the previous handle is bound to a
-/// now-destroyed `wl_surface` (inert). We therefore **drop the stale handle on
-/// each map, then re-attach + re-seed** — mirroring the drawer's take-then-
-/// reattach — instead of guarding with `is_some` (which would keep the dead
-/// handle forever). Idempotent on a single map.
-fn wire_blur_attach(
-    window: &gtk::Window,
-    blur: &Rc<RefCell<Option<SurfaceBlur>>>,
-    open_state: &Mutable<bool>,
-) {
-    let blur = blur.clone();
-    let open_state = open_state.clone();
-    // Run the bind on the next idle so the wl_surface is fully realized.
-    let schedule_attach = move |w: &gtk::Window| {
-        let w = w.clone();
-        let blur = blur.clone();
-        let open_state = open_state.clone();
-        glib::idle_add_local_once(move || {
-            // Drop any handle bound to a previous (now-destroyed) surface so a
-            // remap rebinds against the live wl_surface.
-            blur.borrow_mut().take();
-            if let Some(sb) = hytte::blur::attach(&w) {
-                let open = open_state.get();
-                let visible = if open { SIDEBAR_WIDTH } else { 0 };
-                sb.set_region(hytte::blur::left_panel_region(visible, surface_height(&w)));
-                *blur.borrow_mut() = Some(sb);
-                tracing::debug!("sidebar: attached client blur-region scope");
-            } else {
-                tracing::debug!(
-                    "sidebar: client blur-region unavailable (niri < 26.04?); using layer-rule fallback"
-                );
-            }
-        });
-    };
-    window.connect_map({
-        let schedule_attach = schedule_attach.clone();
-        move |w| schedule_attach(w)
-    });
-    // Belt-and-suspenders: if the surface already mapped before we connected
-    // (gtk4-layer-shell can map synchronously inside `set_visible`), `connect_map`
-    // would never fire for this once-mapped, never-remapped surface — so bind now.
-    if window.is_mapped() {
-        schedule_attach(window);
-    }
 }
 
 /// Toggle the surface's input region so the closed sidebar's persistent
@@ -816,21 +622,14 @@ pub fn close_all() {
             // the host), and on a true hot-unplug this monitor is gone — so if it
             // held the only open sidebar, `visible` must drop to false.
             crate::plugins::forget_sidebar_visibility(&key);
-            // Cancel any in-flight slide timers. With the subscription aborted
-            // these can't be re-armed, and without this an interrupted close
-            // tick would loop forever (the closed window's revealer can never
-            // settle) holding the surface alive across the hot-plug.
-            if let Some(id) = panel.blur_tick.borrow_mut().take() {
-                id.remove();
-            }
+            // Cancel any in-flight settle timer. With the subscription aborted it
+            // can't be re-armed, and without this an interrupted close tick would
+            // loop forever (the closed window's revealer can never settle),
+            // holding the surface alive across the hot-plug.
             if let Some(id) = panel.zone_tick.borrow_mut().take() {
                 id.remove();
             }
             panel.open_state.set(false);
-            // Drop the blur effect explicitly before closing the surface so the
-            // `ext-background-effect` object is destroyed against a live
-            // wl_surface (its Drop issues `destroy` + a final commit nudge).
-            panel.blur.borrow_mut().take();
             panel.window.close();
         }
     });

@@ -210,6 +210,23 @@ pub enum Node {
     /// without knowing its orientation; the cross-axis expand is inert (an empty
     /// box has zero natural size). Consecutive spacers reuse by kind.
     Spacer,
+    /// A collapsible **expander row** — the analogue of `AdwExpanderRow` (#333).
+    /// Materialized as a flat, full-width header (`gtk::Button` wrapping `header`,
+    /// with a trailing, dimmed disclosure chevron) above a `gtk::Revealer` holding
+    /// `children` stacked vertically. Clicking the header fires
+    /// [`EventKind::Click`] addressed by `id` (like [`Node::Button`]); the plugin
+    /// flips its own `expanded` and re-renders — the host never self-toggles, so
+    /// there is no hidden host state to desync. `expanded` is a **mutable prop**: a
+    /// same-id re-render reveals/hides the body and swaps the chevron
+    /// (`pan-end` ⇄ `pan-down`) in place without a rebuild. `id` is **required** —
+    /// it is the click target.
+    Expander {
+        id: NodeId,
+        header: Box<Node>,
+        children: Vec<Node>,
+        expanded: bool,
+        classes: Vec<String>,
+    },
 }
 
 /// Boxed event callback shared (`Rc`) into every widget's signal handler.
@@ -291,6 +308,31 @@ struct RetainedNode {
     /// user-interaction time and skip a programmatic `set_value` that would
     /// fight an active drag. Always `None` for every other node kind.
     slider: Option<Rc<SliderCtl>>,
+    /// A [`Node::Expander`]'s realized sub-widgets (revealer, chevron, header
+    /// box, single header child, body container), wired once at build. Retained
+    /// so [`update_in_place`] can reveal/hide the body, swap the chevron, and
+    /// reconcile the header child without navigating the widget tree. The body
+    /// children live in [`RetainedNode::children`] (diffed into `body_box`).
+    /// Always `None` for every other node kind.
+    expander: Option<Box<ExpanderState>>,
+}
+
+/// A [`Node::Expander`]'s retained pieces (see [`RetainedNode::expander`]).
+struct ExpanderState {
+    /// The body wrapper; `expanded` drives `set_reveal_child`.
+    revealer: gtk::Revealer,
+    /// The trailing disclosure chevron; its icon is swapped on an `expanded` flip.
+    chevron: gtk::Image,
+    /// The horizontal header box — child 0 is the realized `header` node, child 1
+    /// the chevron. Held so a header rebuild can re-parent in place before the
+    /// chevron.
+    header_box: gtk::Box,
+    /// The realized `header` node, kept as a single-element vec so it reconciles
+    /// through the same reuse-or-rebuild path as a `Button`/`Revealer` child.
+    header: Vec<RetainedNode>,
+    /// The revealer's inner vertical box — the container the body children diff
+    /// into.
+    body_box: gtk::Box,
 }
 
 /// Shallow per-node snapshot used for keying and class diffing.
@@ -327,6 +369,7 @@ enum NodeKind {
     Revealer,
     Separator,
     Spacer,
+    Expander,
 }
 
 // ── The pure diff algorithm ─────────────────────────────────────────────────
@@ -425,6 +468,104 @@ fn plan_diff(prev: &[ChildKey], next: &[ChildKey]) -> DiffPlan {
     DiffPlan { ops, removals }
 }
 
+// ── Container abstraction (Box vs ListBox) ───────────────────────────────────
+
+/// The widget a set of diffed children mount into. Abstracts the two backing
+/// container kinds so the keyed [`diff_children`] machinery is shared:
+///
+/// - [`Container::Box`] backs [`Node::Box`]/[`Node::Row`] — a plain `gtk::Box`
+///   whose children sit directly in it, reordered by sibling position.
+/// - [`Container::List`] backs [`Node::ListBox`] — a real `gtk::ListBox`
+///   (`selection-mode: none`) so libadwaita's `.boxed-list` card styling, which
+///   selects `list.boxed-list` (the `GtkListBox` CSS node) and `> row`, actually
+///   paints. A `gtk::ListBox` **auto-wraps** each appended child in a
+///   `GtkListBoxRow`, so this variant transparently reaches a child's wrapper via
+///   `widget.parent()` for remove/reorder, and places by **absolute index**
+///   (`GtkListBox` has no sibling-relative reorder). The retained `widget` stays
+///   the plugin's own node widget, so [`update_in_place`]'s downcasts are
+///   unaffected by the wrapping.
+enum Container {
+    Box(gtk::Box),
+    List(gtk::ListBox),
+}
+
+impl Container {
+    /// The main-axis orientation, used to constrain a [`Node::Spacer`]. A list
+    /// always stacks vertically.
+    fn orientation(&self) -> gtk::Orientation {
+        match self {
+            Container::Box(b) => b.orientation(),
+            Container::List(_) => gtk::Orientation::Vertical,
+        }
+    }
+
+    /// Append `child` at the end (build path, in order). For a list, GTK wraps it
+    /// in a fresh `GtkListBoxRow`.
+    fn append(&self, child: &gtk::Widget) {
+        match self {
+            Container::Box(b) => b.append(child),
+            Container::List(l) => l.append(child),
+        }
+    }
+
+    /// Remove `child` (the plugin node widget). For a list this removes its
+    /// enclosing auto-created `GtkListBoxRow`.
+    fn remove(&self, child: &gtk::Widget) {
+        match self {
+            Container::Box(b) => b.remove(child),
+            Container::List(l) => {
+                if let Some(row) = list_row_of(child) {
+                    l.remove(&row);
+                } else {
+                    l.remove(child);
+                }
+            }
+        }
+    }
+
+    /// Place `child` at slot `index`, after `prev_sibling` in render order. A
+    /// freshly-built child is inserted; an existing one is reordered to that slot.
+    fn place(
+        &self,
+        child: &gtk::Widget,
+        index: usize,
+        prev_sibling: Option<&gtk::Widget>,
+        created: bool,
+    ) {
+        match self {
+            Container::Box(b) => {
+                if created {
+                    b.insert_child_after(child, prev_sibling);
+                } else {
+                    b.reorder_child_after(child, prev_sibling);
+                }
+            }
+            Container::List(l) => {
+                // GtkListBox has no sibling-relative reorder — place by absolute
+                // index. A freshly-built widget is inserted (GTK auto-wraps it in a
+                // row); an existing one is moved only if its wrapping row isn't
+                // already at `index`, by removing + re-inserting the *same* row
+                // (identity preserved; we hold a ref across the move).
+                let idx = i32::try_from(index).unwrap_or(-1);
+                if created {
+                    l.insert(child, idx);
+                } else if let Some(row) = list_row_of(child)
+                    && row.index() != idx
+                {
+                    l.remove(&row);
+                    l.insert(&row, idx);
+                }
+            }
+        }
+    }
+}
+
+/// The `GtkListBoxRow` auto-created to wrap a list child, i.e. the child's
+/// parent. `None` if the child isn't (yet) inside a list row.
+fn list_row_of(child: &gtk::Widget) -> Option<gtk::ListBoxRow> {
+    child.parent().and_downcast::<gtk::ListBoxRow>()
+}
+
 // ── Build / update ──────────────────────────────────────────────────────────
 
 /// Build a fresh widget subtree for `node`, wiring its event handlers **once**
@@ -436,6 +577,7 @@ fn plan_diff(prev: &[ChildKey], next: &[ChildKey]) -> DiffPlan {
 fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut scroll_controller = None;
     let mut slider = None;
+    let mut expander = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -452,7 +594,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             if *scroll {
                 scroll_controller = Some(attach_scroll(&boxw, id.as_deref(), on_event));
             }
-            let kids = build_children(&boxw, children, on_event);
+            let kids = build_children(&Container::Box(boxw.clone()), children, on_event);
             (boxw.upcast(), kids)
         }
         Node::Row {
@@ -460,16 +602,21 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         } => {
             let boxw = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             apply_classes(&boxw, classes);
-            let kids = build_children(&boxw, children, on_event);
+            let kids = build_children(&Container::Box(boxw.clone()), children, on_event);
             (boxw.upcast(), kids)
         }
         Node::ListBox {
             classes, children, ..
         } => {
-            let boxw = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            apply_classes(&boxw, classes);
-            let kids = build_children(&boxw, children, on_event);
-            (boxw.upcast(), kids)
+            // A **real** `gtk::ListBox` (not a plain vertical Box) so libadwaita's
+            // `.boxed-list` card styling — which selects `list.boxed-list` — can
+            // actually paint (see [`Container`]). Selection-less: a plugin list is
+            // a display/command surface, and the vocab carries no selection event.
+            let list = gtk::ListBox::new();
+            list.set_selection_mode(gtk::SelectionMode::None);
+            apply_classes(&list, classes);
+            let kids = build_children(&Container::List(list.clone()), children, on_event);
+            (list.upcast(), kids)
         }
         Node::Label { text, classes, .. } => {
             let label = gtk::Label::new(Some(text));
@@ -583,6 +730,53 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             boxw.set_vexpand(true);
             (boxw.upcast(), Vec::new())
         }
+        Node::Expander {
+            id,
+            header,
+            children,
+            expanded,
+            classes,
+        } => {
+            let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            apply_classes(&outer, classes);
+
+            // Header: a flat, full-width button — the whole header is the click
+            // target. Bound once here (like `Button`), so reuse never double-fires.
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            let on_click = on_event.clone();
+            let click_id = id.clone();
+            button.connect_clicked(move |_| on_click(click_id.clone(), EventKind::Click));
+
+            let header_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let header_realized = build_node(header, on_event);
+            // The header content fills so the chevron pins to the trailing edge —
+            // no Spacer dance needed by the plugin.
+            header_realized.widget.set_hexpand(true);
+            header_box.append(&header_realized.widget);
+            let chevron = gtk::Image::from_icon_name(chevron_icon(*expanded));
+            chevron.add_css_class("dim-label"); // subtle, like a native disclosure
+            header_box.append(&chevron);
+            button.set_child(Some(&header_box));
+            outer.append(&button);
+
+            // Body: a revealer over a vertical box of children.
+            let revealer = gtk::Revealer::new();
+            revealer.set_reveal_child(*expanded);
+            let body_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let body_kids = build_children(&Container::Box(body_box.clone()), children, on_event);
+            revealer.set_child(Some(&body_box));
+            outer.append(&revealer);
+
+            expander = Some(Box::new(ExpanderState {
+                revealer,
+                chevron,
+                header_box,
+                header: vec![header_realized],
+                body_box,
+            }));
+            (outer.upcast(), body_kids)
+        }
     };
 
     RetainedNode {
@@ -591,14 +785,15 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         children,
         scroll_controller,
         slider,
+        expander,
     }
 }
 
-/// Build and append each child into the `gtk::Box` container, returning the
-/// realized children in render order. Shared by the `Box` / `Row` / `ListBox`
+/// Build and append each child into the [`Container`], returning the realized
+/// children in render order. Shared by the `Box` / `Row` / `ListBox` / `Expander`
 /// container arms of [`build_node`].
 fn build_children(
-    container: &gtk::Box,
+    container: &Container,
     children: &[Node],
     on_event: &EventFn,
 ) -> Vec<RetainedNode> {
@@ -619,7 +814,7 @@ fn build_children(
 /// cross-axis expand up to the parent box: a spacer justifying `label … value`
 /// in a horizontal row would make the row — and, up the chain, the whole card —
 /// claim vertical expansion, splaying the rows down the sidebar (#330).
-fn constrain_spacer_axis(container: &gtk::Box, child: &Node, widget: &gtk::Widget) {
+fn constrain_spacer_axis(container: &Container, child: &Node, widget: &gtk::Widget) {
     if matches!(child, Node::Spacer) {
         let horizontal = container.orientation() == gtk::Orientation::Horizontal;
         widget.set_hexpand(horizontal);
@@ -659,20 +854,41 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
                 }
                 (None, false) => {}
             }
-            diff_children(boxw, &mut retained.children, children, on_event);
+            diff_children(
+                &Container::Box(boxw.clone()),
+                &mut retained.children,
+                children,
+                on_event,
+            );
         }
         Node::Row {
             classes, children, ..
-        }
-        | Node::ListBox {
-            classes, children, ..
         } => {
-            // Row/ListBox are gtk::Box containers with no scroll or orientation
-            // props to mutate (orientation is fixed by the kind, which reuse
-            // already matched on), so only classes + children reconcile.
+            // A Row is a horizontal gtk::Box with no scroll or orientation props
+            // to mutate (orientation is fixed by the kind, which reuse already
+            // matched on), so only classes + children reconcile.
             let boxw = downcast::<gtk::Box>(&retained.widget);
             reconcile_classes(boxw, &retained.desc.classes, classes);
-            diff_children(boxw, &mut retained.children, children, on_event);
+            diff_children(
+                &Container::Box(boxw.clone()),
+                &mut retained.children,
+                children,
+                on_event,
+            );
+        }
+        Node::ListBox {
+            classes, children, ..
+        } => {
+            // A ListBox is a real gtk::ListBox; children reconcile through the
+            // List container, which handles the GtkListBoxRow wrapping.
+            let list = downcast::<gtk::ListBox>(&retained.widget);
+            reconcile_classes(list, &retained.desc.classes, classes);
+            diff_children(
+                &Container::List(list.clone()),
+                &mut retained.children,
+                children,
+                on_event,
+            );
         }
         Node::Label { text, classes, .. } => {
             let label = downcast::<gtk::Label>(&retained.widget);
@@ -771,6 +987,50 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
         // A `Spacer` has no mutable props (expand is fixed by the kind, which
         // reuse already matched on) and no classes — nothing to reconcile.
         Node::Spacer => {}
+        Node::Expander {
+            header,
+            children,
+            expanded,
+            classes,
+            ..
+        } => {
+            let outer = downcast::<gtk::Box>(&retained.widget);
+            reconcile_classes(outer, &retained.desc.classes, classes);
+            let es = retained
+                .expander
+                .as_mut()
+                .expect("kind invariant: Expander retains its ExpanderState");
+            // `expanded` is a mutable prop: reveal/hide + swap the chevron in place.
+            // The click handler stays bound (from build time), so a toggle still
+            // fires exactly once.
+            es.revealer.set_reveal_child(*expanded);
+            es.chevron.set_icon_name(Some(chevron_icon(*expanded)));
+            // Reconcile the single header child, keeping it child 0 of the header
+            // box (the chevron stays pinned after it).
+            match es.header.pop() {
+                Some(mut existing) if reusable(&existing.desc, header) => {
+                    update_in_place(&mut existing, header, on_event);
+                    existing.widget.set_hexpand(true);
+                    es.header.push(existing);
+                }
+                other => {
+                    if let Some(old) = other {
+                        es.header_box.remove(&old.widget);
+                    }
+                    let realized = build_node(header, on_event);
+                    realized.widget.set_hexpand(true);
+                    es.header_box.prepend(&realized.widget); // before the chevron
+                    es.header.clear();
+                    es.header.push(realized);
+                }
+            }
+            diff_children(
+                &Container::Box(es.body_box.clone()),
+                &mut retained.children,
+                children,
+                on_event,
+            );
+        }
     }
 
     // Refresh the snapshot so the *next* diff compares against current state.
@@ -800,9 +1060,9 @@ fn reconcile_single(
     }
 }
 
-/// Reconcile a `gtk::Box`'s children using the keyed [`plan_diff`].
+/// Reconcile a [`Container`]'s children using the keyed [`plan_diff`].
 fn diff_children(
-    container: &gtk::Box,
+    container: &Container,
     retained: &mut Vec<RetainedNode>,
     new_children: &[Node],
     on_event: &EventFn,
@@ -841,14 +1101,18 @@ fn diff_children(
     );
 
     // Lay the children out in new-tree order. Reused widgets are already in
-    // the box (reorder); freshly created ones are not yet (insert).
+    // the container (reorder); freshly created ones are not yet (insert). The
+    // [`Container`] hides the Box-vs-ListBox placement difference (sibling-after
+    // vs absolute index + row wrapping).
     let mut prev_sibling: Option<gtk::Widget> = None;
     for (slot, op) in plan.ops.iter().enumerate() {
         let widget = next[slot].widget.clone();
-        match *op {
-            SlotOp::Create => container.insert_child_after(&widget, prev_sibling.as_ref()),
-            SlotOp::Reuse(_) => container.reorder_child_after(&widget, prev_sibling.as_ref()),
-        }
+        container.place(
+            &widget,
+            slot,
+            prev_sibling.as_ref(),
+            matches!(*op, SlotOp::Create),
+        );
         // Re-assert the spacer's axis: covers a fresh spacer and a reused one
         // whose container flipped orientation since it was built.
         constrain_spacer_axis(container, &new_children[slot], &widget);
@@ -873,6 +1137,17 @@ fn orientation(dir: Dir) -> gtk::Orientation {
     match dir {
         Dir::Horizontal => gtk::Orientation::Horizontal,
         Dir::Vertical => gtk::Orientation::Vertical,
+    }
+}
+
+/// The disclosure-chevron icon for a [`Node::Expander`]'s current state: pointing
+/// down when open, at the trailing edge (right, in LTR) when collapsed — matching
+/// the native `AdwExpanderRow` affordance.
+fn chevron_icon(expanded: bool) -> &'static str {
+    if expanded {
+        "pan-down-symbolic"
+    } else {
+        "pan-end-symbolic"
     }
 }
 
@@ -1105,6 +1380,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Revealer { .. } => NodeKind::Revealer,
         Node::Separator { .. } => NodeKind::Separator,
         Node::Spacer => NodeKind::Spacer,
+        Node::Expander { .. } => NodeKind::Expander,
     }
 }
 
@@ -1119,8 +1395,11 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Pixels { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
-        // `Button` and `Slider` both require an id — it is their event target.
-        Node::Button { id, .. } | Node::Slider { id, .. } => Some(id.as_str()),
+        // `Button`, `Slider`, and `Expander` all require an id — it is their
+        // event target (a click for Button/Expander, a value change for Slider).
+        Node::Button { id, .. } | Node::Slider { id, .. } | Node::Expander { id, .. } => {
+            Some(id.as_str())
+        }
         Node::Separator { .. } | Node::Spacer => None,
     }
 }
@@ -1137,6 +1416,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
         | Node::Slider { classes, .. }
+        | Node::Expander { classes, .. }
         | Node::Separator { classes } => classes,
         // `Revealer` carries no classes of its own (see the `Node` vocab); it
         // is a transparent open/close wrapper, so style its child instead.
@@ -1781,8 +2061,56 @@ mod gtk_tests {
         }
     }
 
+    fn listbox_classed(id: Option<&str>, classes: Vec<&str>, children: Vec<Node>) -> Node {
+        Node::ListBox {
+            id: id.map(ToOwned::to_owned),
+            classes: classes.into_iter().map(ToOwned::to_owned).collect(),
+            children,
+        }
+    }
+
+    fn list_of(root: &gtk::Box) -> gtk::ListBox {
+        root.first_child()
+            .expect("list mounted")
+            .downcast::<gtk::ListBox>()
+            .expect("ListBox → real gtk::ListBox")
+    }
+
+    /// The inner node widgets (unwrapped from their auto-created `GtkListBoxRow`s)
+    /// of a `gtk::ListBox`, in order.
+    fn list_rows(list: &gtk::ListBox) -> Vec<gtk::Widget> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(row) = list.row_at_index(i) {
+            out.push(row.child().expect("list row has a child"));
+            i += 1;
+        }
+        out
+    }
+
     #[gtk::test]
-    fn listbox_and_row_build_as_oriented_boxes() {
+    fn listbox_is_a_real_listbox_ready_for_boxed_list() {
+        // The crux of #333: a ListBox must materialize as a *real* `gtk::ListBox`
+        // (CSS node `list`) so libadwaita's `.boxed-list` rules (`list.boxed-list`)
+        // actually paint — a plain `gtk::Box` (CSS node `box`) never would.
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&listbox_classed("l".into(), vec!["boxed-list"], vec![]));
+
+        let list = list_of(&root);
+        assert_eq!(
+            list.selection_mode(),
+            gtk::SelectionMode::None,
+            "a plugin list is selection-less"
+        );
+        assert!(
+            list.has_css_class("boxed-list"),
+            "the .boxed-list blessing class applies to the real GtkListBox"
+        );
+    }
+
+    #[gtk::test]
+    fn listbox_wraps_rows_and_diffs_through_the_wrapper() {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});
         rec.render(&listbox(
@@ -1790,17 +2118,18 @@ mod gtk_tests {
             vec![row(Some("r0"), vec![text(None, "hi", None)])],
         ));
 
-        let list = root
-            .first_child()
+        let list = list_of(&root);
+        // GTK auto-wraps each child in a GtkListBoxRow.
+        let wrapper = list
+            .row_at_index(0)
+            .expect("row 0")
+            .downcast::<gtk::ListBoxRow>()
+            .expect("child auto-wrapped in a GtkListBoxRow");
+        let inner_row = wrapper
+            .child()
             .unwrap()
             .downcast::<gtk::Box>()
-            .expect("ListBox → gtk::Box");
-        assert_eq!(list.orientation(), gtk::Orientation::Vertical);
-        let inner_row = list
-            .first_child()
-            .unwrap()
-            .downcast::<gtk::Box>()
-            .expect("Row → gtk::Box");
+            .expect("Row → horizontal gtk::Box inside the wrapper");
         assert_eq!(inner_row.orientation(), gtk::Orientation::Horizontal);
         let label = inner_row
             .first_child()
@@ -1809,6 +2138,78 @@ mod gtk_tests {
             .unwrap();
         assert_eq!(label.text().as_str(), "hi");
         assert!(label.wraps(), "Text is a wrapping label");
+    }
+
+    #[gtk::test]
+    fn listbox_row_content_updates_through_the_wrapper() {
+        // A same-id Row's inner content must update in place, with BOTH the plugin
+        // Row widget and its auto-created wrapper row preserved across the render.
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&listbox(
+            Some("list"),
+            vec![row(Some("a"), vec![lbl(Some("t"), "x")])],
+        ));
+        let list = list_of(&root);
+        let row_before = list_rows(&list)[0].clone();
+        let wrapper_before = list.row_at_index(0).unwrap();
+        let label_before = row_before.first_child().unwrap();
+
+        rec.render(&listbox(
+            Some("list"),
+            vec![row(Some("a"), vec![lbl(Some("t"), "y")])],
+        ));
+        let after = list_rows(&list);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0], row_before, "Row box reused through the wrapper");
+        assert_eq!(
+            list.row_at_index(0).unwrap(),
+            wrapper_before,
+            "the GtkListBoxRow wrapper is preserved too"
+        );
+        let label_after = after[0].first_child().unwrap();
+        assert_eq!(label_after, label_before, "inner label reused, not rebuilt");
+        assert_eq!(
+            label_after
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .as_str(),
+            "y",
+            "text updated in place"
+        );
+    }
+
+    #[gtk::test]
+    fn listbox_rows_reorder_preserves_identity() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&listbox(
+            Some("list"),
+            vec![
+                row(Some("a"), vec![]),
+                row(Some("b"), vec![]),
+                row(Some("c"), vec![]),
+            ],
+        ));
+        let list = list_of(&root);
+        let before = list_rows(&list); // [a, b, c]
+        assert_eq!(before.len(), 3);
+
+        // Reorder to [c, a, b]: every row keeps its widget identity, no rebuild.
+        rec.render(&listbox(
+            Some("list"),
+            vec![
+                row(Some("c"), vec![]),
+                row(Some("a"), vec![]),
+                row(Some("b"), vec![]),
+            ],
+        ));
+        let after = list_rows(&list);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[2], "c moved to front, same widget");
+        assert_eq!(after[1], before[0], "a shifted back, same widget");
+        assert_eq!(after[2], before[1], "b shifted back, same widget");
     }
 
     #[gtk::test]
@@ -1964,11 +2365,12 @@ mod gtk_tests {
             Some("list"),
             vec![row(Some("a"), vec![]), row(Some("b"), vec![])],
         ));
-        let list = root.first_child().unwrap();
-        let before = children(&list);
+        let list = list_of(&root);
+        let before = list_rows(&list);
         assert_eq!(before.len(), 2);
 
-        // Insert "z" between a and b; a and b keep their widget identities.
+        // Insert "z" between a and b; a and b keep their widget identities (through
+        // the GtkListBoxRow wrapping).
         rec.render(&listbox(
             Some("list"),
             vec![
@@ -1977,16 +2379,171 @@ mod gtk_tests {
                 row(Some("b"), vec![]),
             ],
         ));
-        let after = children(&root.first_child().unwrap());
+        let after = list_rows(&list);
         assert_eq!(after.len(), 3);
         assert_eq!(after[0], before[0], "row a reused in place");
         assert_eq!(after[2], before[1], "row b reused, shifted right");
 
         // Drop "a": b survives untouched.
         rec.render(&listbox(Some("list"), vec![row(Some("b"), vec![])]));
-        let last = children(&root.first_child().unwrap());
+        let last = list_rows(&list);
         assert_eq!(last.len(), 1);
         assert_eq!(last[0], before[1], "row b is the surviving sibling");
+    }
+
+    // ── Expander (#333) ──────────────────────────────────────────────────────
+
+    fn expander(id: &str, header: Node, expanded: bool, children: Vec<Node>) -> Node {
+        Node::Expander {
+            id: id.to_owned(),
+            header: Box::new(header),
+            children,
+            expanded,
+            classes: vec![],
+        }
+    }
+
+    /// The (header button, chevron image, revealer) of a mounted Expander.
+    fn expander_parts(root: &gtk::Box) -> (gtk::Button, gtk::Image, gtk::Revealer) {
+        let outer = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .expect("Expander → vertical gtk::Box");
+        assert_eq!(outer.orientation(), gtk::Orientation::Vertical);
+        let button = outer
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .expect("header is a gtk::Button");
+        let header_box = button.child().unwrap().downcast::<gtk::Box>().unwrap();
+        let chevron = header_box
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Image>()
+            .expect("trailing chevron image");
+        let revealer = outer
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Revealer>()
+            .expect("body revealer");
+        (button, chevron, revealer)
+    }
+
+    #[gtk::test]
+    fn expander_builds_header_chevron_and_revealer() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&expander(
+            "e",
+            lbl(Some("h"), "Living Room"),
+            false,
+            vec![lbl(Some("d"), "Lamp")],
+        ));
+
+        let (_button, chevron, revealer) = expander_parts(&root);
+        assert!(!revealer.reveals_child(), "collapsed → body hidden");
+        assert_eq!(
+            chevron.icon_name().unwrap().as_str(),
+            "pan-end-symbolic",
+            "collapsed chevron points at the trailing edge"
+        );
+    }
+
+    #[gtk::test]
+    fn expander_expanded_prop_reveals_and_swaps_chevron_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&expander("e", lbl(Some("h"), "Room"), false, vec![]));
+        let (button_before, chevron, revealer) = expander_parts(&root);
+
+        // Same id, expanded now true: reveal + chevron swap, no rebuild.
+        rec.render(&expander("e", lbl(Some("h"), "Room"), true, vec![]));
+        let (button_after, chevron_after, revealer_after) = expander_parts(&root);
+        assert_eq!(button_after, button_before, "header button reused");
+        assert_eq!(chevron_after, chevron, "chevron reused");
+        assert_eq!(revealer_after, revealer, "revealer reused");
+        assert!(
+            revealer.reveals_child(),
+            "expanded → body revealed in place"
+        );
+        assert_eq!(
+            chevron.icon_name().unwrap().as_str(),
+            "pan-down-symbolic",
+            "expanded chevron points down"
+        );
+    }
+
+    #[gtk::test]
+    fn expander_header_updates_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&expander("e", lbl(Some("h"), "Old"), false, vec![]));
+        let (button, _chevron, _rev) = expander_parts(&root);
+        let header_box = button.child().unwrap().downcast::<gtk::Box>().unwrap();
+        let label_before = header_box.first_child().unwrap();
+
+        rec.render(&expander("e", lbl(Some("h"), "New"), false, vec![]));
+        let label_after = button
+            .child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .unwrap()
+            .first_child()
+            .unwrap();
+        assert_eq!(label_after, label_before, "same-id header label reused");
+        assert_eq!(
+            label_after
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .as_str(),
+            "New",
+            "header text updated in place"
+        );
+    }
+
+    #[gtk::test]
+    fn expander_body_children_diff_in_the_revealer() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&expander(
+            "e",
+            lbl(Some("h"), "Room"),
+            true,
+            vec![lbl(Some("a"), "a")],
+        ));
+        let (_b, _c, revealer) = expander_parts(&root);
+        let body = revealer.child().unwrap().downcast::<gtk::Box>().unwrap();
+        assert_eq!(children(&body).len(), 1);
+
+        rec.render(&expander(
+            "e",
+            lbl(Some("h"), "Room"),
+            true,
+            vec![lbl(Some("a"), "a"), lbl(Some("b"), "b")],
+        ));
+        assert_eq!(children(&body).len(), 2, "body child appended in place");
+    }
+
+    #[gtk::test]
+    fn expander_header_click_fires_click_once_even_after_reuse() {
+        let root = root();
+        let events: Rc<RefCell<Vec<(String, EventKind)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let mut rec = Reconciler::new(&root, move |id, kind| sink.borrow_mut().push((id, kind)));
+
+        rec.render(&expander("room", lbl(None, "h"), false, vec![]));
+        // Re-render (reuse): the click handler must not be re-connected.
+        rec.render(&expander("room", lbl(None, "h"), true, vec![]));
+
+        let (button, _c, _r) = expander_parts(&root);
+        button.emit_clicked();
+
+        let recorded = events.borrow();
+        assert_eq!(recorded.len(), 1, "exactly one Click, no double-fire");
+        assert_eq!(recorded[0].0, "room", "addressed by the expander id");
+        assert_eq!(recorded[0].1, EventKind::Click);
     }
 
     // ── Slider (#315) ────────────────────────────────────────────────────────

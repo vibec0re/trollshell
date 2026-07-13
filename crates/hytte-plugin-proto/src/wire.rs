@@ -234,4 +234,32 @@ pub enum Node {
     /// reuse by kind in the reconciler (no id to key on) — which is fine, they're
     /// interchangeable.
     Spacer,
+    /// A collapsible **expander row** — the plugin-facing analogue of
+    /// `AdwExpanderRow` (#333). The host materializes it as a flat, full-width
+    /// header (a `gtk::Button` wrapping `header`, with a trailing disclosure
+    /// chevron) above a `gtk::Revealer` that holds `children` stacked vertically.
+    /// It lets a plugin stop hand-rolling the button + chevron + revealer + the
+    /// right-pin dance (the motivating vibectl room panels) and get the chevron,
+    /// trailing layout, and reveal for free.
+    ///
+    /// **Toggling is plugin-driven, not host-local.** Clicking the header fires an
+    /// [`EventKind::Click`] addressed by `id` (exactly like [`Button`](Node::Button));
+    /// the plugin flips its own `expanded` in its model and re-renders. The host
+    /// never self-toggles, so the plugin's model stays the single source of truth
+    /// (no hidden host state to desync). `expanded` is a **mutable prop**: a same-id
+    /// re-render reveals/hides the body and swaps the chevron in place without a
+    /// rebuild. `id` is **required** — it is the click target.
+    ///
+    /// Additive: a brand-new name-tagged variant, so every existing frame decodes
+    /// unchanged and `PROTO_VERSION` stays put. Because the toggle round-trips as a
+    /// plain [`EventKind::Click`] — which a plugin opts into simply by rendering the
+    /// node — there is no new host→plugin push and so no #305 manifest opt-in is
+    /// needed (contrast [`EventKind::ValueChanged`]).
+    Expander {
+        id: NodeId,
+        header: Box<Node>,
+        children: Vec<Node>,
+        expanded: bool,
+        classes: Vec<Cls>,
+    },
 }

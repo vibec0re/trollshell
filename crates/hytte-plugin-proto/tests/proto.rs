@@ -215,6 +215,52 @@ fn spacer_is_name_tagged() {
 }
 
 #[test]
+fn expander_round_trips() {
+    // The #333 collapsible-row variant: nested header + body children + the
+    // `expanded` mutable prop must all survive a MessagePack round-trip.
+    for expanded in [true, false] {
+        let node = Node::Expander {
+            id: "living-room".into(),
+            header: Box::new(Node::Label {
+                id: None,
+                text: "Living Room".into(),
+                classes: vec!["heading".into()],
+            }),
+            children: vec![Node::Row {
+                id: Some("lamp".into()),
+                classes: vec![],
+                children: vec![Node::Label {
+                    id: None,
+                    text: "Lamp".into(),
+                    classes: vec![],
+                }],
+            }],
+            expanded,
+            classes: vec!["boxed-list".into()],
+        };
+        let back: Node = decode(&encode(&node)).expect("decode Expander");
+        assert_eq!(node, back, "expanded={expanded} round-trips");
+    }
+}
+
+#[test]
+fn expander_is_name_tagged() {
+    // Appended name-tagged variant → the name rides the wire (what keeps older
+    // code skipping it, and keeps PROTO_VERSION at 1).
+    let body = encode_body(&Node::Expander {
+        id: "e".into(),
+        header: Box::new(Node::Spacer),
+        children: vec![],
+        expanded: false,
+        classes: vec![],
+    });
+    assert!(
+        contains(&body, b"Expander"),
+        "variant name 'Expander' present"
+    );
+}
+
+#[test]
 fn text_ellipsize_round_trips() {
     for ellipsize in [true, false] {
         let node = Node::Text {

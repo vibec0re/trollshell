@@ -106,13 +106,69 @@
 //!   foreground to the semantic color, not a background fill), `accent`.
 //! - **Containers** — `flat` (drops a `Box`/`Button`'s frame — the standard
 //!   "no chrome" hook), `card` (libadwaita's own rounded, shadowed surface —
-//!   see the sidebar-mount caution below before reaching for this one).
+//!   see the sidebar-mount caution below before reaching for this one),
+//!   `boxed-list` on a [`Node::ListBox`] (the native carded, separated-rows list
+//!   — see *Native card lists* below).
 //!
 //! `hytte-plugin-weather` (this workspace's reference weather card) sets
 //! `flat` on its root today — proof the mechanism needs no shell change to
 //! land. The issue #316 motivating consumer, the out-of-tree vibectl sidebar
 //! widget, goes further: `heading` for titles, `dim-label` + `numeric` for
 //! secondary readouts, alongside its own private hooks.
+//!
+//! ## Native card lists (`.boxed-list`) and collapsible rows (#333)
+//!
+//! A [`Node::ListBox`] materializes as a **real `gtk::ListBox`** (selection-less),
+//! not a plain box, specifically so libadwaita's `.boxed-list` styling — which
+//! selects `list.boxed-list` and its `> row`s — actually paints. Put
+//! `"boxed-list"` in a `ListBox`'s `classes` and its [`Node::Row`] children
+//! (auto-wrapped in list rows by GTK) get the carded surface, rounded corners,
+//! and hairline row separators of a native Adwaita list — no shell change, no
+//! proto bump. So the recipe for a native card list is just:
+//!
+//! ```ignore
+//! Node::ListBox {
+//!     id: Some("devices".into()),
+//!     classes: vec!["boxed-list".into()],
+//!     children: vec![
+//!         Node::Row {
+//!             id: Some("lamp".into()),
+//!             classes: vec![],
+//!             children: vec![
+//!                 Node::Label { id: None, text: "Lamp".into(), classes: vec![] },
+//!                 Node::Spacer,
+//!                 Node::Label { id: None, text: "On".into(), classes: vec!["dim-label".into()] },
+//!             ],
+//!         },
+//!         // …one Row per device…
+//!     ],
+//! }
+//! ```
+//!
+//! For a **collapsible** section, reach for [`Node::Expander`] instead of
+//! hand-rolling a button + chevron + revealer. It renders a flat, full-width
+//! header (your `header` node, with a trailing disclosure chevron) over a
+//! revealer holding `children`. Clicking the header fires an
+//! [`EventKind::Click`](proto::EventKind::Click) addressed by the expander's `id`
+//! — fold that into your model, flip `expanded`, and re-render; the host reveals
+//! the body and rotates the chevron. Because the toggle round-trips as a plain
+//! click a plugin already opts into by rendering the node, `Expander` needs no
+//! new event kind and no manifest opt-in:
+//!
+//! ```ignore
+//! // In `view`, driven by `self.rooms[i].open` in your own model:
+//! Node::Expander {
+//!     id: format!("room:{}", room.id),
+//!     header: Box::new(Node::Label {
+//!         id: None, text: room.name.clone(), classes: vec!["heading".into()],
+//!     }),
+//!     children: room.devices.iter().map(device_row).collect(),
+//!     expanded: room.open,
+//!     classes: vec![],
+//! }
+//! // In `update`, on Input::Event { node, kind: Click } where node == "room:…":
+//! //     toggle that room's `open`, return the new model → the host re-renders.
+//! ```
 //!
 //! ## Shell-provided guarantees for sidebar mounts
 //!

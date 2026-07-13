@@ -974,6 +974,19 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             classes: classes.clone(),
         },
         wire::Node::Spacer => UiNode::Spacer,
+        wire::Node::Expander {
+            id,
+            header,
+            children,
+            expanded,
+            classes,
+        } => UiNode::Expander {
+            id: id.clone(),
+            header: Box::new(to_ui_node(header)),
+            children: children.iter().map(to_ui_node).collect(),
+            expanded: *expanded,
+            classes: classes.clone(),
+        },
     }
 }
 
@@ -1232,6 +1245,43 @@ mod tests {
                     },
                 ],
             }],
+        };
+        assert_eq!(to_ui_node(&tree), expected);
+    }
+
+    /// The #333 `Expander` maps 1:1: the boxed `header` and the body `children`
+    /// recurse, and the `expanded` mutable prop carries across.
+    #[test]
+    fn wire_expander_maps_to_ui() {
+        let tree = wire::Node::Expander {
+            id: "room".into(),
+            header: Box::new(wire::Node::Label {
+                id: None,
+                text: "Living Room".into(),
+                classes: vec!["heading".into()],
+            }),
+            children: vec![wire::Node::Label {
+                id: Some("d".into()),
+                text: "Lamp".into(),
+                classes: vec![],
+            }],
+            expanded: true,
+            classes: vec!["boxed-list".into()],
+        };
+        let expected = UiNode::Expander {
+            id: "room".into(),
+            header: Box::new(UiNode::Label {
+                id: None,
+                text: "Living Room".into(),
+                classes: vec!["heading".into()],
+            }),
+            children: vec![UiNode::Label {
+                id: Some("d".into()),
+                text: "Lamp".into(),
+                classes: vec![],
+            }],
+            expanded: true,
+            classes: vec!["boxed-list".into()],
         };
         assert_eq!(to_ui_node(&tree), expected);
     }

@@ -16,8 +16,12 @@ use serde::{Deserialize, Serialize};
 /// then fall back to positional matching in the host reconciler.
 pub type NodeId = String;
 
-/// A CSS class token, applied verbatim by the host (`ts-*` binary / `hytte-*`
-/// library contract). Plugins style via these tokens, never raw CSS.
+/// A CSS class token, applied verbatim by the host — one `add_css_class` call
+/// per token, no filtering or remapping. Plugins style through these tokens,
+/// never raw CSS: see the `hytte-plugin` SDK crate docs' `# Styling` section
+/// for the blessed libadwaita classes, the automatic `.ts-plugin-card`
+/// sidebar-mount guarantee, and which `ts-*`/`hytte-*` classes are
+/// shell-internal and not safe to copy.
 pub type Cls = String;
 
 /// Orientation for a [`Node::Box`]. Mirrors `hytte_ui::Dir`.

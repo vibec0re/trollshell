@@ -77,6 +77,133 @@
 //! session, which is correct, since the very I/O task that would service it is
 //! being torn down and re-established anyway. The next session starts from a
 //! clean channel, just as it re-derives the model from the next snapshot.
+//!
+//! # Styling
+//!
+//! A plugin's entire style surface is the `classes` field every [`Node`]
+//! variant carries (a `Vec<`[`Cls`](proto::Cls)`>`, a plain CSS class token) —
+//! there is no other hook, and a plugin cannot ship its own CSS (see
+//! *Scoped plugin stylesheets* below). Classes flow to GTK **verbatim**: the
+//! host's reconciler calls `add_css_class` once per token, with no
+//! filtering, renaming, or validation (`hytte-ui`'s
+//! `widget_tree::apply_classes`, which every [`Node`] kind's `classes` goes
+//! through). Whatever rule matches that class name in the shell's
+//! already-loaded stylesheets — libadwaita's own, or the shell's — paints;
+//! there is nothing plugin-specific about the mechanism itself.
+//!
+//! ## The blessed set: standard libadwaita style classes
+//!
+//! These are libadwaita's own documented style classes, not a hytte
+//! invention, so they theme identically in any libadwaita app — safe to put
+//! in any [`Node`]'s `classes` today, with no host change and no proto
+//! version bump:
+//!
+//! - **Typography** — `heading`, `caption-heading`, `title-1`..`title-4`
+//!   (`title-1` largest), `numeric` (tabular figures — a clock or a
+//!   temperature reads better with it), `monospace`, `dim-label` (dims text
+//!   to the secondary/muted opacity).
+//! - **State** — `success`, `warning`, `error` (recolor a `Label`/`Icon`'s
+//!   foreground to the semantic color, not a background fill), `accent`.
+//! - **Containers** — `flat` (drops a `Box`/`Button`'s frame — the standard
+//!   "no chrome" hook), `card` (libadwaita's own rounded, shadowed surface —
+//!   see the sidebar-mount caution below before reaching for this one).
+//!
+//! `hytte-plugin-weather` (this workspace's reference weather card) sets
+//! `flat` on its root today — proof the mechanism needs no shell change to
+//! land. The issue #316 motivating consumer, the out-of-tree vibectl sidebar
+//! widget, goes further: `heading` for titles, `dim-label` + `numeric` for
+//! secondary readouts, alongside its own private hooks.
+//!
+//! ## Shell-provided guarantees for sidebar mounts
+//!
+//! A plugin mounted at [`Mount::SidebarLead`](proto::Mount::SidebarLead),
+//! [`SidebarTop`](proto::Mount::SidebarTop), or
+//! [`SidebarBottom`](proto::Mount::SidebarBottom) renders as one card inside
+//! a host-managed region; the host wraps every plugin's card root in its own
+//! `gtk::Box` carrying `.ts-plugin-card` **automatically** (issue #319,
+//! `trollshell/src/plugins.rs`'s `reconcile_region`) — do not add that class
+//! yourself, and avoid stacking libadwaita's `card` on your own root either
+//! (two nested rounded/shadowed surfaces read as a card-in-a-card). That
+//! wrapper gives every plugin card the same `@sidebar_card_background`
+//! opaque fill, corner radius, and inter-card margin as the shell's own
+//! weather/tasks/departures cards (`assets/trollshell/style.css`) — a solid
+//! dark surface instead of the sidebar's frosted, semi-translucent panel
+//! showing straight through, so plugin text stays legible with no per-plugin
+//! contrast tuning. Text color (white) is inherited the same way, from the
+//! sidebar's own ancestor rule — nothing to set. The host's card adds **no
+//! padding** of its own: your root owns its inner spacing, same as the
+//! built-ins, so nobody double-pads.
+//!
+//! [`Mount::BarLeft`](proto::Mount::BarLeft),
+//! [`BarCenter`](proto::Mount::BarCenter), and
+//! [`BarRight`](proto::Mount::BarRight) renders are not wired up yet (v1
+//! drops them — see `trollshell/src/plugins.rs`), so this card guarantee is
+//! sidebar-only in practice today.
+//!
+//! ## `Node::Pixels` paints no CSS background
+//!
+//! `classes` still attach to a [`Node::Pixels`]'s widget the same way as
+//! every other kind, but the GTK widget behind it (`hytte-ui`'s
+//! `pixels::PixelSurface`) overrides GTK's `snapshot` vfunc to paint only its
+//! RGBA8 texture and never chains up to the default CSS background/border
+//! paint — so a `card`, `error`, or any other background-painting class is a
+//! silent no-op there. Wrap a raster node in a `Box` if it needs a themed
+//! backdrop.
+//!
+//! ## What NOT to rely on
+//!
+//! The shell's own sidebar and bar widgets carry internal classes —
+//! `ts-sidebar-*`, `hytte-bar-*`, and friends — styled in the binary's or
+//! library's own stylesheet for *their* layout, not offered as a plugin
+//! contract; they can be renamed or restyled without notice. If a class
+//! isn't in the blessed set above or the automatic `.ts-plugin-card`
+//! wrapper, don't copy it off a native widget just because it looks right in
+//! the shell's CSS today.
+//!
+//! Two of this workspace's reference plugins are the exception worth calling
+//! out rather than imitating: `hytte-plugin-weather` and
+//! `hytte-plugin-departures` are 1:1 ports of what used to be native sidebar
+//! chips, and their views still set the shell's own `ts-weather*` /
+//! `ts-departures*` classes to keep pixel parity with the pre-port look.
+//! That's a historical artifact of the port, not a supported third-party
+//! surface — a new plugin should reach for the blessed set and the
+//! `.ts-plugin-card` guarantee above, not grep these two for class names.
+//!
+//! ## Scoped plugin stylesheets: deferred (issue #316, gap 3)
+//!
+//! A plugin cannot register CSS of its own, scoped to its mount — `classes`
+//! only ever select into stylesheets the *host* loads. That is a deliberate
+//! v1 non-goal, not an oversight: GTK CSS selectors are unscoped by default,
+//! so letting an out-of-process, third-party plugin ship a stylesheet raises
+//! a scoping/security question (its rules reaching outside its own subtree,
+//! or clobbering shell chrome) that deserves its own design pass rather than
+//! a speculative answer bolted onto this doc. Revisit on demand.
+//!
+//! ## Example
+//!
+//! ```ignore
+//! Node::Box {
+//!     id: None,
+//!     dir: Dir::Vertical,
+//!     spacing: 4,
+//!     scroll: false,
+//!     // No `.ts-plugin-card` and no `.card` here — the host's region
+//!     // wrapper already supplies the card treatment (see above).
+//!     classes: vec!["flat".into()],
+//!     children: vec![
+//!         Node::Label {
+//!             id: None,
+//!             text: "Living Room".into(),
+//!             classes: vec!["heading".into()],
+//!         },
+//!         Node::Label {
+//!             id: None,
+//!             text: "21°C".into(),
+//!             classes: vec!["numeric".into(), "dim-label".into()],
+//!         },
+//!     ],
+//! }
+//! ```
 
 use hytte_plugin_proto::{Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot};
 

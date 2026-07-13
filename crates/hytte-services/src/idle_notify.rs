@@ -15,7 +15,7 @@
 //!
 //! ## Pure-safe Wayland path
 //!
-//! Like `hytte-blur`, this uses only the safe `wayland-client` /
+//! This uses only the safe `wayland-client` /
 //! `wayland-protocols` (`staging`) APIs — no `unsafe`, inheriting the
 //! workspace `unsafe_code = "forbid"`. It opens its **own** `wayland-client`
 //! connection via `Connection::connect_to_env()` (independent of GTK's own

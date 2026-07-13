@@ -122,8 +122,7 @@ hytte-ui          → App/AppBuilder (wraps adw::Application), Bar, LayerWindow,
 hytte-bus         → shared D-Bus layer: call / property / proxy / signals / own_name builders over pooled session+system connections
 hytte-services    → the service modules (clients to daemons)
 hytte-ecal        → hand-written FFI to evolution-data-server (libecal); the ONLY crate allowed `unsafe`
-hytte-blur        → client-side ext-background-effect-v1 blur-region scoping (niri frosted-glass). Wired-but-inert: still attached live in `modal.rs`/`sidebar.rs` (attach-on-map + `set_region`), but 610a499 flattened the chrome to opaque, so niri's blur layer-rules go inert automatically — physically excising the wiring is a deferred follow-up, not done yet
-hytte             → umbrella: re-exports {bus, reactive, services, ui, blur} + a `prelude`
+hytte             → umbrella: re-exports {bus, reactive, services, ui} + a `prelude`
 trollshell        → the binary; depends on `hytte`
 
 — plugin side (#35 frontend B; out-of-process, NEVER links the shell):

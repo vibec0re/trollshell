@@ -1,9 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use hytte::adw;
-use hytte::blur::SurfaceBlur;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, gdk, glib, graphene, prelude::*};
 use hytte::prelude::*;
@@ -305,12 +303,6 @@ struct ModalPanel {
     /// retract animation finishing). Consumers — e.g. the bar — bind CSS
     /// classes to this so the seam between bar and drawer can restyle.
     open_state: Mutable<bool>,
-    /// Client-side `ext-background-effect` blur scope for this fullscreen
-    /// surface (#192/#193). Without it, niri's layer-rule blur frosts the WHOLE
-    /// screen while the drawer is open; with it we scope the frost to the card's
-    /// rect (cleared when hidden). `None` on niri < 26.04 → the layer-rule blur
-    /// in etc/niri/blur.kdl is the fallback. Shared with the map handler.
-    blur: Rc<RefCell<Option<SurfaceBlur>>>,
 }
 
 thread_local! {
@@ -507,13 +499,6 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     wire_retract_finish(&revealer, key.clone());
     wire_recenter_on_map(&window, key.clone());
 
-    // The drawer frost is dropped for now (curved card edges shimmer under a
-    // rectangles-only blur region — see `wire_blur_attach`). We still attach a
-    // `SurfaceBlur` on map to hand niri an empty region, suppressing the
-    // still-merged `hytte-modal` layer-rule frost without a niri reload.
-    let blur: Rc<RefCell<Option<SurfaceBlur>>> = Rc::new(RefCell::new(None));
-    wire_blur_attach(&window, &blur, key.clone());
-
     window.set_visible(false);
 
     PANELS.with(|panels| {
@@ -529,7 +514,6 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 geometry,
                 pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
-                blur,
             },
         );
     });
@@ -852,13 +836,6 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             let Some(panel) = panels.get(&key) else {
                 return;
             };
-            // Clear the blur region before hiding so no frost lingers if the
-            // surface is reused, then drop the (now-defunct) effect handle —
-            // hiding the surface destroys the wl_surface it was bound to.
-            if let Some(sb) = panel.blur.borrow().as_ref() {
-                sb.set_region(None);
-            }
-            panel.blur.borrow_mut().take();
             panel.window.set_visible(false);
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
@@ -1087,49 +1064,6 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
                 let margin = main_margin_for_center(panel, center);
                 set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
             });
-        });
-    });
-}
-
-/// Attach the [`SurfaceBlur`] on map and **clear** its region, suppressing the
-/// drawer frost.
-///
-/// The drawer frost is dropped for now: its card is a *curved* silhouette
-/// (concave wings + convex bottom corners) and a `wl_region` is rectangles-only,
-/// so a rect-scoped frost can't hug those edges — it shimmers along them and
-/// during the reveal slide. The cleaner end state is to remove the
-/// `hytte-modal` layer-rule from the niri config entirely (it is commented out
-/// in `etc/niri/blur.kdl`). Until that rule is dropped from the *live* config,
-/// though, niri would frost the WHOLE fullscreen drawer surface — so we still
-/// attach the effect and hand niri an **empty** region, which it short-circuits
-/// to "blur nothing" (see [`hytte::blur::SurfaceBlur::set_region`]). That
-/// neutralises the still-merged layer-rule without a niri reload.
-///
-/// Re-attach on every map: unlike the sidebar's persistent surface, the drawer
-/// surface is destroyed on close and recreated on open, so the `wl_surface` is
-/// fresh each time. `None` on niri < 26.04 (no client protocol) — there the
-/// layer-rule is the only control, so dropping it from the config is the fix.
-fn wire_blur_attach(window: &gtk::Window, blur: &Rc<RefCell<Option<SurfaceBlur>>>, key: String) {
-    let blur = blur.clone();
-    window.connect_map(move |w| {
-        let w = w.clone();
-        let blur = blur.clone();
-        let key = key.clone();
-        glib::idle_add_local_once(move || {
-            // Drop any handle bound to the previous (now-destroyed) surface.
-            blur.borrow_mut().take();
-            if let Some(sb) = hytte::blur::attach(&w) {
-                // Empty region → niri blurs nothing, overriding the layer-rule.
-                sb.set_region(None);
-                *blur.borrow_mut() = Some(sb);
-                tracing::debug!(monitor = %key, "drawer: frost suppressed (empty blur region)");
-            } else {
-                tracing::debug!(
-                    monitor = %key,
-                    "drawer: client blur-region unavailable (niri < 26.04?); drop the \
-                     hytte-modal layer-rule to remove the frost"
-                );
-            }
         });
     });
 }

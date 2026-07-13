@@ -69,7 +69,7 @@ toml = "1"
 zeroize = "1.8"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 # Native `ext-idle-notify-v1` client (idle_notify.rs, #204 Phase 2). Pure-safe
-# wayland-rs bindings — no `unsafe`, same path hytte-blur proved. Versions match
+# wayland-rs bindings — no `unsafe`. Versions match
 # the existing transitive pins (wayland-client 0.31.x / wayland-protocols 0.32.x)
 # so Cargo unifies to one build; the idle-notify staging protocol lives behind
 # wayland-protocols' `staging` feature (client side).

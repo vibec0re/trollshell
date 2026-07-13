@@ -96,24 +96,5 @@ self:
         value wins over the per-backend default.
       '';
     };
-
-    niri.blurRules = lib.mkOption {
-      type = lib.types.lines;
-      readOnly = true;
-      default = builtins.readFile (self + "/etc/niri/blur.kdl");
-      description = ''
-        The niri `layer-rule` blocks that enable trollshell's frosted-glass blur
-        (bar / sidebar / drawer), sourced from the package's `etc/niri/blur.kdl`.
-        niri has no `include`, so splice this into your niri config, e.g.:
-
-            xdg.configFile."niri/config.kdl".text =
-              myNiriConfigKdl + config.programs.trollshell.niri.blurRules;
-
-        The sidebar/drawer rules use `xray true` (frost the wallpaper behind
-        the overlay) for a consistent dark frost that matches the bar. Set a
-        rule to `xray false` to frost the window behind it instead (pricier).
-        Requires niri >= 26.04.
-      '';
-    };
   };
 }

@@ -1,4 +1,4 @@
-//! `build_history_row` — the row primitive used by `panel_stats` and by
+//! `build_history_row` — the row primitive used by the stats panels and by
 //! the per-interface rows in `panel_network`. Returns
 //! `[name 80px | sparkline hexpand | value 80px]` as a plain `gtk::Box`
 //! (not an `AdwActionRow`) so the sparkline takes the row's full width.

@@ -990,7 +990,10 @@ fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
 
 /// Map a wire [`Page`] onto the host's `modal::Page`. The two enums mirror each
 /// other; written exhaustively so a page added to either side breaks the build
-/// here rather than silently mis-routing.
+/// here rather than silently mis-routing. The one exception is `Stats`: the
+/// host split it into per-resource flyouts, but the wire protocol keeps a single
+/// `Stats` page — a plugin opening it lands on the CPU flyout (the primary
+/// stats panel).
 fn map_page(page: Page) -> crate::modal::Page {
     use crate::modal::Page as M;
     match page {
@@ -999,7 +1002,7 @@ fn map_page(page: Page) -> crate::modal::Page {
         Page::Vpn => M::Vpn,
         Page::Connections => M::Connections,
         Page::Bluetooth => M::Bluetooth,
-        Page::Stats => M::Stats,
+        Page::Stats => M::StatsCpu,
         Page::Audio => M::Audio,
         Page::Power => M::Power,
         Page::PowerMenu => M::PowerMenu,
@@ -1208,7 +1211,8 @@ mod tests {
         );
     }
 
-    /// Every wire `Page` maps to the identically-named `modal::Page`.
+    /// Every wire `Page` maps to the identically-named `modal::Page`, except
+    /// the single wire `Stats` page which lands on the host's CPU stats flyout.
     #[test]
     fn wire_page_maps_to_modal_page() {
         use crate::modal::Page as M;
@@ -1218,7 +1222,7 @@ mod tests {
             (Page::Vpn, M::Vpn),
             (Page::Connections, M::Connections),
             (Page::Bluetooth, M::Bluetooth),
-            (Page::Stats, M::Stats),
+            (Page::Stats, M::StatsCpu),
             (Page::Audio, M::Audio),
             (Page::Power, M::Power),
             (Page::PowerMenu, M::PowerMenu),

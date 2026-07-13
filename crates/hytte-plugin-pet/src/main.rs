@@ -3,7 +3,8 @@
 //!
 //! An out-of-process widget plugin on the `hytte-plugin` SDK (#279): pure
 //! TEA — the model below, a 4-second tick, and a view of exactly one face
-//! and (sometimes) one speech bubble. **Click the face to poke it.**
+//! and (sometimes) one speech bubble, sharing a single horizontal row so the
+//! card stays compact (#313). **Click the face to poke it.**
 //!
 //! # Face (`face.rs`)
 //!
@@ -47,7 +48,7 @@ mod font;
 use std::time::Duration;
 
 use brain::{ThinkKind, ThinkReq};
-use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
+use hytte_plugin::proto::{Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
@@ -338,11 +339,14 @@ impl Plugin for Pet {
             };
             children.push(bubble);
         }
-        Node::Box {
+        // The face and the bubble share one horizontal row (#313): the face
+        // leads at its natural 128 px (a `Row` packs children at their natural
+        // width, so the LCD no longer fills the ~296 px card and aspect-locks
+        // into a ~300 px tower), and the bubble sits to its right in the
+        // remaining slot. With no bubble the row collapses to just the face —
+        // the leading face stays put either way.
+        Node::Row {
             id: Some("pet-root".to_owned()),
-            dir: Dir::Vertical,
-            spacing: 2,
-            scroll: false,
             classes: vec!["pet-root".to_owned()],
             children,
         }
@@ -499,17 +503,19 @@ mod tests {
     #[test]
     fn view_is_a_pokeable_face_with_optional_bubble() {
         let (mut p, _rx) = pet();
-        let Node::Box { children, .. } = p.view() else {
-            panic!("root is a box");
+        // The root is a horizontal `Row` (#313): face-button first, bubble
+        // second only when a line is up, absent (row collapses) at rest.
+        let Node::Row { children, .. } = p.view() else {
+            panic!("root is a row");
         };
         assert_eq!(children.len(), 1, "no bubble at rest");
         assert!(
             matches!(&children[0], Node::Button { id, .. } if id == FACE_ID),
-            "the face is the poke target"
+            "the face leads the row and is the poke target"
         );
         let _ = p.update(Input::App(PetMsg::Thought("hej".to_owned())));
-        let Node::Box { children, .. } = p.view() else {
-            panic!("root is a box");
+        let Node::Row { children, .. } = p.view() else {
+            panic!("root is a row");
         };
         assert_eq!(children.len(), 2);
         // The default bubble is a chunky pixel-font Pixels surface (#304), whose
@@ -537,8 +543,8 @@ mod tests {
         let (mut p, _rx) = pet();
         p.kaomoji_fallback = true;
         let _ = p.update(Input::App(PetMsg::Thought("hej".to_owned())));
-        let Node::Box { children, .. } = p.view() else {
-            panic!("root is a box");
+        let Node::Row { children, .. } = p.view() else {
+            panic!("root is a row");
         };
         assert_eq!(children.len(), 2);
         assert!(
@@ -553,8 +559,8 @@ mod tests {
         // honors the host's `len == w*h*4` invariant.
         let (mut p, _rx) = pet();
         p.kaomoji_fallback = false;
-        let Node::Box { children, .. } = p.view() else {
-            panic!("root is a box");
+        let Node::Row { children, .. } = p.view() else {
+            panic!("root is a row");
         };
         let Node::Button { id, child, .. } = &children[0] else {
             panic!("face is a button");
@@ -579,8 +585,8 @@ mod tests {
         // Fallback: the kaomoji Label returns, still inside Button(FACE_ID).
         let (mut p, _rx2) = pet();
         p.kaomoji_fallback = true;
-        let Node::Box { children, .. } = p.view() else {
-            panic!("root is a box");
+        let Node::Row { children, .. } = p.view() else {
+            panic!("root is a row");
         };
         let Node::Button { child, .. } = &children[0] else {
             panic!("face is a button");

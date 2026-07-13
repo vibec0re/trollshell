@@ -1498,6 +1498,9 @@
  * on `.pet-face`, the real gtk::Button bezel around it; the screen's rounded
  * corners are baked into the buffer in the same dark tone as the bezel. */
 
+/* The pet's root is a horizontal Row (#313): the LCD face on the left at its
+ * natural 128 px, the speech bubble to its right — so the card is roughly half
+ * its old height instead of stacking a ~300 px face over the bubble. */
 .pet-root {
     padding: 0.4em 0.2em;
 }
@@ -1541,7 +1544,10 @@
  * bakes its own lilac background (the PixelSurface ignores CSS fills), so this
  * styling dresses the kaomoji-fallback plain-text Label — the flat fill here
  * matches the baked bubble colour so the two modes read alike. For the Pixels
- * bubble only the layout bits (margin) take effect. */
+ * bubble only the layout bits (margin) take effect. The bubble now sits to the
+ * *right* of the face in the row (#313), so the gap is a left margin; it is
+ * vertically centred against the taller face (its Pixels buffer letterboxes
+ * centred in the row-height allocation, the fallback Label centres its text). */
 .pet-bubble {
     background: rgb(
         58,
@@ -1551,7 +1557,7 @@
     color: #f0e0f8;
     border-radius: 0.8em;
     padding: 0.4em 0.7em;
-    margin-top: 0.35em;
+    margin-left: 0.45em;
     font-size: 0.9em;
 }
 

@@ -40,10 +40,31 @@ const LINE_GAP: usize = 2;
 const PAD: usize = 3;
 /// Radius of the (chunky) rounded-corner cut on the baked bubble background.
 const CORNER: usize = 2;
-/// Wrap width, in glyph cells. Sized so a full line stays comfortably narrower
-/// than the 128 px face buffer, and the pet's 30-char bubble budget wraps to at
-/// most two lines.
-const MAX_COLS: usize = 18;
+/// Target pixel width of the bubble's slot beside the face in the compact row
+/// (#313). The sidebar card is 320 px; inside its ~12 px padding (~296 px) the
+/// 128 px LCD face plus its bezel/border eats ~143 px, so this is roughly the
+/// width left for the bubble — which renders at **1× scale** in the row (a `Row`
+/// packs it at its natural buffer width), so the buffer must fit here directly.
+const BUBBLE_SLOT_PX: usize = 126;
+
+/// Wrap width, in glyph cells: the widest line whose 1× buffer — text plus the
+/// two [`PAD`] borders — still fits [`BUBBLE_SLOT_PX`], so the bubble never
+/// overruns its slot beside the face. Derived from the slot rather than
+/// hand-tuned; still keeps the pet's ~30-char lines to at most [`MAX_LINES`]
+/// wrapped rows.
+const MAX_COLS: usize = max_cols_for(BUBBLE_SLOT_PX);
+
+/// The largest column count whose rendered line width (both [`PAD`] borders
+/// included) fits `slot_px` — the inverse of [`line_px`] with the padding
+/// removed. `const` so [`MAX_COLS`] stays a compile-time constant; clamped to at
+/// least 1 so [`wrap`] always has a positive width to break against.
+const fn max_cols_for(slot_px: usize) -> usize {
+    // Invert `line_px`: cols*GLYPH_W + (cols-1)*SPACING ≤ slot_px - 2*PAD
+    //   ⇒ cols ≤ (content + SPACING) / (GLYPH_W + SPACING).
+    let content = slot_px.saturating_sub(2 * PAD);
+    let cols = (content + SPACING) / (GLYPH_W + SPACING);
+    if cols == 0 { 1 } else { cols }
+}
 /// Hard cap on wrapped lines; an overflow is truncated with a trailing `…`.
 const MAX_LINES: usize = 3;
 
@@ -604,10 +625,12 @@ mod tests {
 
     #[test]
     fn wrap_keeps_an_exactly_full_line_intact() {
-        // "have you had water" is exactly 18 chars — it must not spill early.
-        let lines = wrap("have you had water recently?", MAX_COLS, MAX_LINES);
-        assert_eq!(lines[0], "have you had water");
-        assert_eq!(lines[1], "recently?");
+        // A word of exactly MAX_COLS cells is a full line: it must fill line 0
+        // without spilling early, and the following word drops to line 1.
+        let full = "w".repeat(MAX_COLS);
+        let lines = wrap(&format!("{full} tail"), MAX_COLS, MAX_LINES);
+        assert_eq!(lines[0], full);
+        assert_eq!(lines[1], "tail");
     }
 
     #[test]

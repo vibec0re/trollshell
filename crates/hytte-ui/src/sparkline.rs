@@ -80,6 +80,21 @@ impl Sparkline {
         self.inner.queue_draw();
     }
 
+    /// Replace the ring with `samples` (oldest first, most recent last),
+    /// keeping at most `capacity` of the trailing samples. For when the history
+    /// is owned elsewhere — the sensors service (#231) pushes the whole window
+    /// as a snapshot each tick instead of one sample at a time, so the buffer
+    /// can outlive any one widget (a lazily-built page opens pre-populated).
+    pub fn set_samples(&self, samples: &VecDeque<f64>) {
+        {
+            let mut s = self.samples.borrow_mut();
+            s.clear();
+            let skip = samples.len().saturating_sub(self.capacity);
+            s.extend(samples.iter().skip(skip).copied());
+        }
+        self.inner.queue_draw();
+    }
+
     /// Set a fixed domain max (e.g. `Some(1.0)` for 0..=1 fractions).
     /// `None` enables auto-scaling to the max sample currently in the
     /// ring.
@@ -177,6 +192,21 @@ mod tests {
         let v: Vec<f64> = s.samples.borrow().iter().copied().collect();
         assert_eq!(v.len(), 3);
         assert_eq!(v, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[gtk::test]
+    fn set_samples_keeps_trailing_capacity() {
+        let s = Sparkline::new(3);
+        // A snapshot larger than capacity keeps only the most recent 3.
+        let snap: VecDeque<f64> = (0..5).map(f64::from).collect();
+        s.set_samples(&snap);
+        let v: Vec<f64> = s.samples.borrow().iter().copied().collect();
+        assert_eq!(v, vec![2.0, 3.0, 4.0]);
+        // Replaces (not appends): a shorter snapshot shrinks the ring.
+        let short: VecDeque<f64> = [9.0].into_iter().collect();
+        s.set_samples(&short);
+        let v: Vec<f64> = s.samples.borrow().iter().copied().collect();
+        assert_eq!(v, vec![9.0]);
     }
 
     #[gtk::test]

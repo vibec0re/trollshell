@@ -234,7 +234,10 @@ pub async fn fetch_menu(bus_name: &str, menu_path: &str) -> Option<Menu> {
         let result = match do_fetch_menu(&bus, &path).await {
             Ok(m) => Some(m),
             Err(e) => {
-                tracing::debug!(error = %e, bus_name = bus, menu_path = path, "fetch_menu failed");
+                // `{e:#}` (anyhow alternate Display) walks the full cause chain
+                // on one line — plain `%e` shows only the outermost `.context`
+                // ("call GetLayout"), hiding the real zbus error (#8).
+                tracing::debug!(error = %format!("{e:#}"), bus_name = bus, menu_path = path, "fetch_menu failed");
                 None
             }
         };
@@ -286,7 +289,7 @@ pub fn menu_event(bus_name: &str, menu_path: &str, item_id: i32) {
     let menu_path = menu_path.to_string();
     runtime::handle().spawn(async move {
         if let Err(e) = do_menu_event(&bus_name, &menu_path, item_id).await {
-            tracing::warn!(error = %e, bus_name, menu_path, item_id, "menu_event failed");
+            tracing::warn!(error = %format!("{e:#}"), bus_name, menu_path, item_id, "menu_event failed");
         }
     });
 }

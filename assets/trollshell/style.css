@@ -481,6 +481,21 @@
     margin-bottom: 0.615em;
 }
 
+/* Plugin sidebar cards (#319). Each out-of-process plugin's card root gets
+ * `.ts-plugin-card` (`trollshell/src/plugins.rs` `build_region`), one card per
+ * plugin inside the `.ts-plugin-region` container. Without a fill the plugin's
+ * tree paints flat on the frosted panel; this gives it the same opaque surface
+ * as the built-in sidebar widgets above so its text stays readable. One rule
+ * cards all three sidebar regions (Lead/Top/Bottom) — they share the class.
+ * Deliberately no `padding`: matching the built-ins, the plugin owns its own
+ * inner spacing (PO call on #319 — "no host padding"), so a plugin that already
+ * pads its root doesn't double up. */
+.ts-plugin-card {
+    background: @sidebar_card_background;
+    border-radius: 0.769em;
+    margin-bottom: 0.615em;
+}
+
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {

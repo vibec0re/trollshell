@@ -725,12 +725,82 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
     }
 }
 
-/// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible*
-/// child's natural size — without this, sparse pages (Calendar, `PowerMenu`)
-/// render at the size of the largest mounted page (Stats / Audio).
-fn build_pages_stack() -> gtk::Stack {
+/// Construct the page widget for `page` — the single registry mapping a `Page`
+/// to its panel constructor. The exhaustive `match` (no wildcard arm) is the
+/// compile-time guarantee that adding a `Page` variant forces a build arm here,
+/// so a new page can never silently skip lazy registration.
+///
+/// Called by [`ensure_page`] on a page's first activation (and eagerly for
+/// [`Page::Stats`] from [`build_pages_stack`]). Every panel constructor is
+/// side-effect-free at build time — `bind*` delivers current signal state on
+/// subscribe, and per-page on-show work (clipboard/calendar refresh,
+/// notification dismissal) is driven by [`on_page_show`], not construction — so
+/// deferring a build to first open loses nothing. The sole exception is
+/// [`Page::Stats`], whose sparklines accumulate history *in the widget* from
+/// launch (#231's open fork), so it is built eagerly and never reaches the lazy
+/// path fresh.
+fn build_page(page: Page) -> gtk::Widget {
     use crate::panels;
 
+    match page {
+        Page::Media => panels::panel_media(),
+        Page::Network => panels::panel_network(),
+        Page::Vpn => panels::panel_vpn(),
+        Page::Connections => panels::panel_connections(),
+        Page::Bluetooth => panels::panel_bluetooth(),
+        Page::Stats => panels::panel_stats(),
+        Page::Audio => panels::panel_audio(),
+        Page::Power => panels::panel_power(),
+        Page::PowerMenu => panels::panel_power_menu(),
+        Page::Notifications => panels::panel_notifications(),
+        Page::Appearance => panels::panel_appearance(),
+        Page::Displays => panels::panel_displays(),
+        Page::Clipboard => panels::panel_clipboard(),
+        Page::Calendar => panels::panel_calendar(),
+        Page::Settings => panels::panel_settings(),
+    }
+}
+
+/// Ensure `page`'s widget exists in `stack`, building it on first request
+/// (the build-on-first-open hook, #231). [`gtk::Stack::child_by_name`] is the
+/// source of truth for "is this page built" — no separate `Page`→widget map to
+/// leak or dangle across hot-plug, since a lazily-built child dies with its
+/// stack (mirroring how the old eager pages array was consumed into the stack
+/// and never held elsewhere). Idempotent.
+///
+/// Must run *before* any `set_visible_child_name` for `page`, or GTK silently
+/// no-ops the switch (warns, shows nothing); [`set_stack_page`] is the single
+/// choke point that guarantees it.
+fn ensure_page(stack: &gtk::Stack, page: Page) {
+    if stack.child_by_name(page.stack_name()).is_none() {
+        let widget = build_page(page);
+        stack.add_named(&widget, Some(page.stack_name()));
+    }
+}
+
+/// Switch `panel`'s drawer stack to `page`, building it on first use. The
+/// **single choke point** every visibility-changing path routes through
+/// ([`open`]/[`toggle`]/[`switch_active`]/[`show_panel`]), so no route can
+/// reach `set_visible_child_name` for an unbuilt page.
+fn set_stack_page(panel: &ModalPanel, page: Page) {
+    ensure_page(&panel.stack, page);
+    panel.stack.set_visible_child_name(page.stack_name());
+}
+
+/// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible* child's
+/// natural size — without this, sparse pages (Calendar, `PowerMenu`) render at
+/// the size of the largest mounted page (Stats / Audio). With homogeneous
+/// sizing off the stack sizes to whichever child is visible, so pages need not
+/// all exist for a stable measure — which is exactly what makes lazy building
+/// size-neutral: each page still measures to its own natural size on show.
+///
+/// Only [`Page::Stats`] is built eagerly here (its sparklines accumulate
+/// history in-widget from launch, #231); every other page is built lazily on
+/// first activation via [`ensure_page`]/[`set_stack_page`]. This drops the
+/// startup cost from `15×N` panels (one full set per monitor) to `1×N`. Stats
+/// is added first, so it is the stack's initial visible child — invisible
+/// anyway until the drawer first opens.
+fn build_pages_stack() -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.set_vexpand(false);
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -739,26 +809,8 @@ fn build_pages_stack() -> gtk::Stack {
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
 
-    let pages: [(Page, gtk::Widget); 15] = [
-        (Page::Media, panels::panel_media()),
-        (Page::Network, panels::panel_network()),
-        (Page::Vpn, panels::panel_vpn()),
-        (Page::Connections, panels::panel_connections()),
-        (Page::Bluetooth, panels::panel_bluetooth()),
-        (Page::Stats, panels::panel_stats()),
-        (Page::Audio, panels::panel_audio()),
-        (Page::Power, panels::panel_power()),
-        (Page::PowerMenu, panels::panel_power_menu()),
-        (Page::Notifications, panels::panel_notifications()),
-        (Page::Appearance, panels::panel_appearance()),
-        (Page::Displays, panels::panel_displays()),
-        (Page::Clipboard, panels::panel_clipboard()),
-        (Page::Calendar, panels::panel_calendar()),
-        (Page::Settings, panels::panel_settings()),
-    ];
-    for (page, widget) in pages {
-        stack.add_named(&widget, Some(page.stack_name()));
-    }
+    // Stats stays eager: its history lives in the widget (#231's open fork).
+    ensure_page(&stack, Page::Stats);
     stack
 }
 
@@ -820,7 +872,7 @@ pub fn switch_active(target: Page) {
     PANELS.with(|panels| {
         for panel in panels.borrow().values() {
             if panel.current.borrow().is_some() {
-                panel.stack.set_visible_child_name(target.stack_name());
+                set_stack_page(panel, target);
                 *panel.current.borrow_mut() = Some(target);
                 on_page_show(target);
             }
@@ -914,15 +966,16 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
                 panel.revealer.set_reveal_child(false);
             }
             Some(_) => {
-                panel.stack.set_visible_child_name(page.stack_name());
+                set_stack_page(panel, page);
                 *panel.current.borrow_mut() = Some(page);
                 on_page_show(page);
             }
             None => {
-                // Set the visible child first so `measure` reflects the
-                // target page's natural size, not whatever was last shown.
-                // `show_panel` re-sets it (idempotent).
-                panel.stack.set_visible_child_name(page.stack_name());
+                // Build + set the visible child first so `measure` reflects the
+                // target page's natural size, not whatever was last shown, and
+                // so the `main_margin_for_center` measure below sees the real
+                // page. `show_panel` re-sets it (idempotent).
+                set_stack_page(panel, page);
                 let chip_center = trigger_center(panel, trigger.upcast_ref());
                 *panel.pending_center.borrow_mut() = chip_center;
                 // Best-effort margin now (may use a pre-map measure that
@@ -948,7 +1001,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
 /// GTK margin on the trailing-aligned positioner is equivalent to the old
 /// layer-shell `set_margin` on the content-sized drawer surface.
 fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
-    panel.stack.set_visible_child_name(page.stack_name());
+    set_stack_page(panel, page);
     *panel.current.borrow_mut() = Some(page);
     panel.open_state.set(true);
     on_page_show(page);
@@ -1158,5 +1211,67 @@ fn on_page_show(page: Page) {
         // bound to active.len() drops to zero.
         Page::Notifications => notifications::dismiss_all(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Page;
+    use std::collections::HashSet;
+
+    // These are pure-logic guards for the lazy drawer-page registry (#231).
+    // The two properties that _cannot_ be regressed silently are covered by the
+    // compiler, not a test:
+    //   * `build_page` is an exhaustive `match Page { … }` with no wildcard, so
+    //     adding a `Page` variant fails to compile until it has a build arm —
+    //     a new page can never skip lazy registration.
+    //   * `set_stack_page` is the only caller of `stack.set_visible_child_name`
+    //     and always calls `ensure_page` first, so no route reaches an unbuilt
+    //     page.
+    // What's left to guard at runtime is the *stack-name keyspace* that
+    // `ensure_page` uses with `gtk::Stack::child_by_name` to decide "already
+    // built?". GTK-level idempotence of `ensure_page` needs a display server;
+    // the trollshell binary has no `system-tests`/xvfb harness, so that stays
+    // build- + live-verify-covered.
+
+    /// Tripwire: growing the enum without updating `ALL` (and consciously
+    /// revisiting the lazy registry that keys off `stack_name`) should trip
+    /// here. `ALL` backs the `from_stack_name` reverse lookup used by
+    /// deep-links and the niri command surface.
+    #[test]
+    fn all_has_stable_count() {
+        assert_eq!(Page::ALL.len(), 15);
+    }
+
+    /// Each page's `stack_name` is the key `ensure_page` hands to
+    /// `child_by_name`. If two pages shared a token, the lazy path would treat
+    /// the second as already built and never construct it. Guard every token is
+    /// distinct and non-empty.
+    #[test]
+    fn stack_names_are_unique_and_nonempty() {
+        let mut seen = HashSet::new();
+        for page in Page::ALL {
+            let name = page.stack_name();
+            assert!(!name.is_empty(), "{page:?} has an empty stack name");
+            assert!(seen.insert(name), "duplicate stack name {name:?}");
+        }
+        assert_eq!(seen.len(), Page::ALL.len());
+    }
+
+    /// `stack_name` ⇄ `from_stack_name` round-trips for every page, so the
+    /// reverse lookup resolves exactly the pages the registry can build and
+    /// `ALL` stays consistent with the `stack_name` mapping.
+    #[test]
+    fn stack_name_round_trips() {
+        for page in Page::ALL {
+            assert_eq!(Page::from_stack_name(page.stack_name()), Some(page));
+        }
+    }
+
+    /// An unknown token resolves to `None` — no accidental catch-all that would
+    /// map a bad deep-link to some default page.
+    #[test]
+    fn from_stack_name_rejects_unknown() {
+        assert_eq!(Page::from_stack_name("does-not-exist"), None);
     }
 }

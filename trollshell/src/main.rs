@@ -261,6 +261,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
                 widgets::memory::widget(monitor),
                 widgets::gpu::widget(monitor),
                 widgets::disk::widget(monitor),
+                widgets::services::widget(monitor),
             ]),
             group([widgets::clock::widget(monitor)]),
             group([

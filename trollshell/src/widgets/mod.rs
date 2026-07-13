@@ -14,6 +14,7 @@ pub mod notif_indicator;
 pub mod power_chip;
 pub mod screencast;
 pub mod screenshot;
+pub mod services;
 pub mod settings_chip;
 pub mod sidebar_toggle;
 pub mod tasks;

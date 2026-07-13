@@ -1,6 +1,9 @@
-//! System stats drawer panel — one card per monitored resource
-//! (CPU / Memory / Disks / GPU / Services). Each card groups that
-//! resource's live rows, history sparkline, and top-consumers list.
+//! System stats drawer panels — one panel per monitored resource
+//! (CPU / Memory / Disks / GPU / Services). Each panel is opened from its
+//! own bar chip and shows a single resource's card: live rows, history
+//! sparkline, and top-consumers list. The per-resource cards are the
+//! `build_stats_*` builders below; the `panel_stats_*` entry points wrap
+//! one card each into a drawer page.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -21,18 +24,40 @@ use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
 
-pub fn panel_stats() -> gtk::Widget {
+/// Wrap a single stats card into a drawer page. Each per-resource panel is
+/// one card in a `ts-popup-column`, so the icon-per-resource flyouts stay
+/// visually identical to the cards they used to share.
+fn single_card_page(card: &gtk::Widget) -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
-
-    column.append(build_stats_cpu_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_memory_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_disks_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_gpu_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_services_group().upcast_ref::<gtk::Widget>());
-
+    column.append(card);
     finish_page(&column)
+}
+
+/// CPU stats flyout — opened from the CPU bar chip.
+pub fn panel_stats_cpu() -> gtk::Widget {
+    single_card_page(build_stats_cpu_card().upcast_ref::<gtk::Widget>())
+}
+
+/// Memory stats flyout — opened from the memory bar chip.
+pub fn panel_stats_memory() -> gtk::Widget {
+    single_card_page(build_stats_memory_card().upcast_ref::<gtk::Widget>())
+}
+
+/// Disks stats flyout — opened from the disk bar chip.
+pub fn panel_stats_disks() -> gtk::Widget {
+    single_card_page(build_stats_disks_card().upcast_ref::<gtk::Widget>())
+}
+
+/// GPU stats flyout — opened from the GPU bar chip.
+pub fn panel_stats_gpu() -> gtk::Widget {
+    single_card_page(build_stats_gpu_card().upcast_ref::<gtk::Widget>())
+}
+
+/// Services flyout — opened from the services bar chip (failed-unit count).
+pub fn panel_stats_services() -> gtk::Widget {
+    single_card_page(build_stats_services_group().upcast_ref::<gtk::Widget>())
 }
 
 /// Wrap a bare history-sparkline `gtk::Box` in a `gtk::ListBoxRow` so it joins
@@ -53,7 +78,7 @@ fn history_row_wrapper(child: &gtk::Box) -> gtk::ListBoxRow {
 /// CPU top-apps expander. Processes (a system-load metric) lives here; this is
 /// the one placement Mara didn't pin (flagged in the PR for relocation).
 fn build_stats_cpu_card() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("CPU").build();
+    let group = adw::PreferencesGroup::new();
 
     group.add(&build_live_cpu_row());
     group.add(&build_live_per_core_row());
@@ -72,7 +97,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
 /// Memory card — live memory + swap, memory history sparkline, and the RAM
 /// top-apps expander. The swap row self-hides when no swap is configured.
 fn build_stats_memory_card() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Memory").build();
+    let group = adw::PreferencesGroup::new();
 
     group.add(&build_live_memory_row());
     group.add(&build_live_swap_row());
@@ -89,7 +114,7 @@ fn build_stats_memory_card() -> adw::PreferencesGroup {
 /// Disks card — the per-mount capacity expander plus a live disk-I/O
 /// throughput history row (aggregate read+write rate across physical disks).
 fn build_stats_disks_card() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Disks").build();
+    let group = adw::PreferencesGroup::new();
     group.add(&build_live_disk_expander());
     group.add(&history_row_wrapper(&build_history_disk_io_row()));
     group
@@ -102,7 +127,7 @@ fn build_stats_disks_card() -> adw::PreferencesGroup {
 /// isn't reported. Intel GPUs are supported as of #150, so this card shows on
 /// Arc/iGPU hardware.
 fn build_stats_gpu_card() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("GPU").build();
+    let group = adw::PreferencesGroup::new();
 
     // Hide the entire card when no GPU is present.
     bind(
@@ -1058,7 +1083,7 @@ fn build_history_gpu_temp_row() -> gtk::Box {
 }
 
 fn build_stats_services_group() -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Services").build();
+    let group = adw::PreferencesGroup::new();
 
     bind(
         systemd::failed_units().map(|units| {

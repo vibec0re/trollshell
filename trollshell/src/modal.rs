@@ -167,7 +167,11 @@ pub enum Page {
     Vpn,
     Connections,
     Bluetooth,
-    Stats,
+    StatsCpu,
+    StatsMemory,
+    StatsDisks,
+    StatsGpu,
+    StatsServices,
     Audio,
     Power,
     PowerMenu,
@@ -192,9 +196,11 @@ impl Page {
     /// Pages whose content is backed by the `app_usage` service (the
     /// most-expensive-apps top-N CPU/RAM lists). Used to gate `app_usage`'s
     /// always-on `/proc` poller on whether one of these is actually visible
-    /// (#50, item 5 of #42): only the Stats panel reads those lists.
+    /// (#50, item 5 of #42): only the CPU and Memory stats panels carry the
+    /// top-apps expanders that read those lists — the disks / GPU / services
+    /// flyouts don't, so the poller stays parked unless one of those two is up.
     fn uses_app_usage(self) -> bool {
-        matches!(self, Self::Stats)
+        matches!(self, Self::StatsCpu | Self::StatsMemory)
     }
 
     /// Pages whose content is backed by the `mpris` service's position
@@ -209,13 +215,17 @@ impl Page {
     /// Every drawer page. The single source for reverse lookups
     /// ([`Page::from_stack_name`]); the string mapping still lives only in
     /// [`Page::stack_name`], so a page's token is defined in exactly one place.
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 19] = [
         Self::Media,
         Self::Network,
         Self::Vpn,
         Self::Connections,
         Self::Bluetooth,
-        Self::Stats,
+        Self::StatsCpu,
+        Self::StatsMemory,
+        Self::StatsDisks,
+        Self::StatsGpu,
+        Self::StatsServices,
         Self::Audio,
         Self::Power,
         Self::PowerMenu,
@@ -234,7 +244,11 @@ impl Page {
             Self::Vpn => "vpn",
             Self::Connections => "connections",
             Self::Bluetooth => "bluetooth",
-            Self::Stats => "stats",
+            Self::StatsCpu => "stats-cpu",
+            Self::StatsMemory => "stats-memory",
+            Self::StatsDisks => "stats-disks",
+            Self::StatsGpu => "stats-gpu",
+            Self::StatsServices => "stats-services",
             Self::Audio => "audio",
             Self::Power => "power",
             Self::PowerMenu => "power-menu",
@@ -730,15 +744,15 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
 /// compile-time guarantee that adding a `Page` variant forces a build arm here,
 /// so a new page can never silently skip lazy registration.
 ///
-/// Called by [`ensure_page`] on a page's first activation (and eagerly for
-/// [`Page::Stats`] from [`build_pages_stack`]). Every panel constructor is
-/// side-effect-free at build time — `bind*` delivers current signal state on
-/// subscribe, and per-page on-show work (clipboard/calendar refresh,
-/// notification dismissal) is driven by [`on_page_show`], not construction — so
-/// deferring a build to first open loses nothing. The sole exception is
-/// [`Page::Stats`], whose sparklines accumulate history *in the widget* from
-/// launch (#231's open fork), so it is built eagerly and never reaches the lazy
-/// path fresh.
+/// Called by [`ensure_page`] on a page's first activation (and eagerly for the
+/// graph-bearing stats pages from [`build_pages_stack`]). Every panel
+/// constructor is side-effect-free at build time — `bind*` delivers current
+/// signal state on subscribe, and per-page on-show work (clipboard/calendar
+/// refresh, notification dismissal) is driven by [`on_page_show`], not
+/// construction — so deferring a build to first open loses nothing. The
+/// exceptions are the CPU / Memory / Disks / GPU stats pages, whose sparklines
+/// accumulate history *in the widget* from launch (#231's open fork), so they
+/// are built eagerly and never reach the lazy path fresh.
 fn build_page(page: Page) -> gtk::Widget {
     use crate::panels;
 
@@ -748,7 +762,11 @@ fn build_page(page: Page) -> gtk::Widget {
         Page::Vpn => panels::panel_vpn(),
         Page::Connections => panels::panel_connections(),
         Page::Bluetooth => panels::panel_bluetooth(),
-        Page::Stats => panels::panel_stats(),
+        Page::StatsCpu => panels::panel_stats_cpu(),
+        Page::StatsMemory => panels::panel_stats_memory(),
+        Page::StatsDisks => panels::panel_stats_disks(),
+        Page::StatsGpu => panels::panel_stats_gpu(),
+        Page::StatsServices => panels::panel_stats_services(),
         Page::Audio => panels::panel_audio(),
         Page::Power => panels::panel_power(),
         Page::PowerMenu => panels::panel_power_menu(),
@@ -794,12 +812,13 @@ fn set_stack_page(panel: &ModalPanel, page: Page) {
 /// all exist for a stable measure — which is exactly what makes lazy building
 /// size-neutral: each page still measures to its own natural size on show.
 ///
-/// Only [`Page::Stats`] is built eagerly here (its sparklines accumulate
-/// history in-widget from launch, #231); every other page is built lazily on
-/// first activation via [`ensure_page`]/[`set_stack_page`]. This drops the
-/// startup cost from `15×N` panels (one full set per monitor) to `1×N`. Stats
-/// is added first, so it is the stack's initial visible child — invisible
-/// anyway until the drawer first opens.
+/// Only the graph-bearing stats pages (CPU / Memory / Disks / GPU) are built
+/// eagerly here (their sparklines accumulate history in-widget from launch,
+/// #231); every other page — including the services stats page — is built
+/// lazily on first activation via [`ensure_page`]/[`set_stack_page`]. This drops
+/// the startup cost from `19×N` panels (one full set per monitor) to `4×N`. The
+/// CPU page is added first, so it is the stack's initial visible child —
+/// invisible anyway until the drawer first opens.
 fn build_pages_stack() -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.set_vexpand(false);
@@ -809,8 +828,14 @@ fn build_pages_stack() -> gtk::Stack {
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
 
-    // Stats stays eager: its history lives in the widget (#231's open fork).
-    ensure_page(&stack, Page::Stats);
+    // The four graph-bearing stats panels stay eager: their sparklines
+    // accumulate history in-widget from launch (#231's open fork), so
+    // lazy-building them would open to empty graphs. Services carries no
+    // in-widget history (just the failed-units list) — it stays lazy.
+    ensure_page(&stack, Page::StatsCpu);
+    ensure_page(&stack, Page::StatsMemory);
+    ensure_page(&stack, Page::StatsDisks);
+    ensure_page(&stack, Page::StatsGpu);
     stack
 }
 
@@ -1240,7 +1265,7 @@ mod tests {
     /// deep-links and the niri command surface.
     #[test]
     fn all_has_stable_count() {
-        assert_eq!(Page::ALL.len(), 15);
+        assert_eq!(Page::ALL.len(), 19);
     }
 
     /// Each page's `stack_name` is the key `ensure_page` hands to

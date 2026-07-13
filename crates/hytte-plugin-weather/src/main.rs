@@ -270,6 +270,7 @@ fn error_content(msg: &str) -> Node {
                 id: None,
                 text: msg.to_owned(),
                 max_width_chars: None,
+                ellipsize: false,
                 classes: Vec::new(),
             },
         ],

@@ -4,7 +4,6 @@ pub mod brightness;
 pub mod calendar;
 pub mod clock;
 pub mod cpu;
-pub mod departures;
 pub mod disk;
 pub mod gpu;
 pub mod memory;

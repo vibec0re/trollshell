@@ -94,15 +94,15 @@ now.** During the migration transition it runs _alongside_ the built-in weather
 card (compare, then remove the native mount — see #290); once removed, the
 plugin card takes its place at the top of the sidebar.
 
-`trollshell-plugin-departures.service` is the migration of the built-in
-departures board out-of-process (#289): it mounts `SidebarBottom` — where the
-native board anchors — and renders the same S-Bahn list. It reads its station
-from the same `~/.config/trollshell/places.toml` the shell already writes, and
-it is **visibility-gated**: the poller parks (no HTTP) while the sidebar is
-closed and does an immediate refresh on open, keeping the native board's
-poll-only-while-open energy behavior. During the migration the native board
-stays until the plugin is live-verified, so enable **one** at a time — enable
-this unit only once the native mount is removed (the #289 follow-up).
+`trollshell-plugin-departures.service` is the departures board, migrated
+out-of-process (#289): it mounts `SidebarBottom` — where the native board used
+to anchor — and renders the same S-Bahn list. It reads its station from the
+same `~/.config/trollshell/places.toml` the shell already writes, and it is
+**visibility-gated**: the poller parks (no HTTP) while the sidebar is closed
+and does an immediate refresh on open, matching the retired native board's
+poll-only-while-open energy behavior. The native board is gone — its widget
+mount and open-edge refresh wiring were removed in the #289 follow-up — so
+bringing up departures is just enabling this unit.
 
 ## Required packages
 

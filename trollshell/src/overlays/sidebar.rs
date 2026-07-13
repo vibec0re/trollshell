@@ -88,14 +88,6 @@ pub const SIDEBAR_WIDTH: i32 = 320;
 /// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
 const FRAME_THICKNESS_I32: i32 = 8;
 
-/// While the sidebar is open, re-poll departures on this cadence so the board
-/// stays live — new trains in, departed trains out — instead of freezing on the
-/// single fetch taken at open. The departures service already drops past rows
-/// and coalesces overlapping refreshes, so this is cheap; when the sidebar is
-/// closed the timer is a no-op (nobody's looking). Weather is left on its
-/// open-time refresh — it doesn't change minute-to-minute.
-const REFRESH_WHILE_OPEN: Duration = Duration::from_secs(30);
-
 thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
     /// or earlier (e.g., the frame); writers go through `toggle`.
@@ -117,9 +109,6 @@ struct SidebarPanel {
     /// aggregate (#288). Aborted in [`close_all`] before the monitor is forgotten
     /// so it can't re-add a hot-unplugged connector after teardown.
     visibility_subscription: glib::JoinHandle<()>,
-    /// Periodic departures-refresh timer (fires only while open). Removed in
-    /// [`close_all`] so it doesn't outlive the surface across a hot-plug.
-    refresh_source: glib::SourceId,
     /// Client-side `ext-background-effect` blur scope for this surface (#192/
     /// #193). `None` when niri < 26.04 (or the effect couldn't attach); the
     /// niri layer-rule blur (`etc/niri/blur.kdl`) is the fallback there. Shared
@@ -283,10 +272,10 @@ pub fn install(monitor: &Monitor) {
 
     // Forward this monitor's sidebar open/close edge to the plugin host so
     // out-of-process plugin cards mounted here can park their pollers while the
-    // sidebar is hidden (#288) — the same energy story as the built-in departures
-    // poller below. Kept as its own lightweight subscription (rather than folded
-    // into the blur/zone-heavy `wire_open_subscription`) so that dense function
-    // keeps its argument budget; the host ORs this across monitors before pushing
+    // sidebar is hidden (#288) — e.g. the departures plugin's own poller.
+    // Kept as its own lightweight subscription (rather than folded into the
+    // blur/zone-heavy `wire_open_subscription`) so that dense function keeps
+    // its argument budget; the host ORs this across monitors before pushing
     // `SlotVisibility`. The initial `false` on subscribe seeds this monitor's flag.
     let visibility_subscription = {
         let key = key.clone();
@@ -295,17 +284,6 @@ pub fn install(monitor: &Monitor) {
             std::future::ready(())
         }))
     };
-
-    // Keep the board live while open: re-poll departures on a fixed cadence
-    // (a no-op while closed). The captured open-state clone is independent of
-    // the one stored on the panel.
-    let refresh_open = open_state.clone();
-    let refresh_source = glib::timeout_add_local(REFRESH_WHILE_OPEN, move || {
-        if refresh_open.get() {
-            hytte::services::departures::refresh();
-        }
-        glib::ControlFlow::Continue
-    });
 
     PANELS.with(|panels| {
         panels.borrow_mut().insert(
@@ -316,7 +294,6 @@ pub fn install(monitor: &Monitor) {
                 open_state,
                 subscription,
                 visibility_subscription,
-                refresh_source,
                 blur,
                 blur_tick,
                 zone_tick,
@@ -389,7 +366,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.set_valign(gtk::Align::Fill);
     // vexpand so the card stretches to the full sidebar height — needed
     // for the spacer below to actually have slack to absorb, which is
-    // what anchors the departures widget to the bottom edge.
+    // what anchors the bottom plugin region to the bottom edge.
     card.set_vexpand(true);
 
     card.append(&crate::widgets::weather::widget());
@@ -403,16 +380,15 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card.append(&crate::plugins::sidebar_top_slot());
 
     // Flex gap: eats whatever vertical space the calendar + tasks
-    // didn't claim, so the departures widget settles against the
+    // didn't claim, so the bottom plugin region settles against the
     // bottom edge of the sidebar instead of floating in the middle.
     let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spacer.set_vexpand(true);
     card.append(&spacer);
 
-    card.append(&crate::widgets::departures::widget());
-
     // Plugin mount: `Mount::SidebarBottom` — the bottom plugin *region* (#274),
-    // reconciled below everything.
+    // reconciled below everything. This is where the departures board lives
+    // now (#289 migrated it out-of-process; see `trollshell-plugin-departures`).
     card.append(&crate::plugins::sidebar_bottom_slot());
     card
 }
@@ -493,7 +469,6 @@ fn wire_open_subscription(
             open,
         );
         if open {
-            hytte::services::departures::refresh();
             hytte::services::weather::refresh();
         }
         async {}
@@ -824,7 +799,6 @@ pub fn close_all() {
             // the `open_state.set(false)` below can't fire it and re-add the
             // connector we're about to forget (#288).
             panel.visibility_subscription.abort();
-            panel.refresh_source.remove();
             // Drop this monitor from the plugin-host visibility aggregate (#288):
             // the subscriptions are aborted (so the `false` edge below won't reach
             // the host), and on a true hot-unplug this monitor is gone — so if it

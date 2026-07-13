@@ -10,9 +10,10 @@
 //! The face is a **procedural color LCD** (#284): each tick renders the mood's
 //! expression + a blink cycle into a 128×128 RGBA8 buffer, drawn as a
 //! [`Node::Pixels`] the host upscales nearest-neighbor for the chunky-pixel look
-//! (bezel in CSS, `.pet-face` / `.pet-lcd`). The speech bubble stays text — the
-//! kaomoji voice lives there. Set **`TROLLSHELL_PET_KAOMOJI=1`** to fall back to
-//! the original kaomoji `Label` face instead of the LCD.
+//! (bezel in CSS, `.pet-face` / `.pet-lcd`). The speech bubble is rendered the
+//! same way — the voice speaks in a hand-rolled 5×7 pixel font (`font.rs`, #304),
+//! so it comes out 8-bit chunky too. Set **`TROLLSHELL_PET_KAOMOJI=1`** to fall
+//! back to the original kaomoji `Label` face *and* the plain-text `Label` bubble.
 //!
 //! # Moods
 //!
@@ -34,12 +35,14 @@
 //! Environment: `PET_NAME` (default `nisse`), `PET_LLM_URL` (default
 //! `http://127.0.0.1:8080`; set empty to run canned-only).
 //!
-//! Note: the pet mounts `SidebarTop` — the same slot as the reference
-//! clock demo. The v1 host has one plugin per slot; enable one or the
-//! other.
+//! Note: the pet mounts `SidebarBottom` with `order = -1`, so it perches
+//! **above** the departures board (which mounts the same region unordered,
+//! sorting as 0) — the host's region machinery (#293) sorts co-mounted cards by
+//! `(order, id)` ascending and a lower order renders higher (#303).
 
 mod brain;
 mod face;
+mod font;
 
 use std::time::Duration;
 
@@ -227,7 +230,10 @@ impl Plugin for Pet {
     type Cmd = ThinkReq;
 
     fn manifest() -> Manifest {
-        let mut m = Manifest::new("pet", Mount::SidebarTop);
+        // SidebarBottom, `order = -1`: the pet perches *above* the departures
+        // board, which mounts the same region with no order (sorts as 0) — the
+        // region sorts `(order, id)` ascending, lower renders higher (#303).
+        let mut m = Manifest::new("pet", Mount::SidebarBottom).with_order(-1);
         m.subscribes = vec![StateKey::Clock];
         m
     }
@@ -317,11 +323,20 @@ impl Plugin for Pet {
             child: Box::new(face_child),
         }];
         if let Some((line, _)) = &self.bubble {
-            children.push(Node::Label {
-                id: None,
-                text: line.clone(),
-                classes: vec!["pet-bubble".to_owned()],
-            });
+            // The voice speaks in chunky pixel-font by default (#304), or as the
+            // old kaomoji `Label` under `TROLLSHELL_PET_KAOMOJI=1`. Both keep the
+            // `pet-bubble` class (the Label styles from it; the Pixels honors its
+            // layout — the host's PixelSurface ignores CSS backgrounds).
+            let bubble = if self.kaomoji_fallback {
+                Node::Label {
+                    id: None,
+                    text: line.clone(),
+                    classes: vec!["pet-bubble".to_owned()],
+                }
+            } else {
+                font::bubble_node(line, "pet-bubble", vec!["pet-bubble".to_owned()])
+            };
+            children.push(bubble);
         }
         Node::Box {
             id: Some("pet-root".to_owned()),
@@ -497,9 +512,38 @@ mod tests {
             panic!("root is a box");
         };
         assert_eq!(children.len(), 2);
+        // The default bubble is a chunky pixel-font Pixels surface (#304), whose
+        // buffer honors the host's `len == w*h*4` invariant.
+        let Node::Pixels {
+            width,
+            height,
+            data,
+            classes,
+            ..
+        } = &children[1]
+        else {
+            panic!("default bubble is a Pixels surface");
+        };
+        assert_eq!(
+            data.len(),
+            *width as usize * *height as usize * 4,
+            "bubble buffer must satisfy the host's len == w*h*4 seam"
+        );
+        assert!(classes.iter().any(|c| c == "pet-bubble"));
+    }
+
+    #[test]
+    fn the_kaomoji_fallback_bubble_is_a_plain_label() {
+        let (mut p, _rx) = pet();
+        p.kaomoji_fallback = true;
+        let _ = p.update(Input::App(PetMsg::Thought("hej".to_owned())));
+        let Node::Box { children, .. } = p.view() else {
+            panic!("root is a box");
+        };
+        assert_eq!(children.len(), 2);
         assert!(
             matches!(&children[1], Node::Label { text, .. } if text == "hej"),
-            "the bubble label carries the thought"
+            "the fallback bubble label carries the thought"
         );
     }
 

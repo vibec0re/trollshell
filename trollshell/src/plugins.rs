@@ -29,12 +29,22 @@
 //!
 //! ## Slot visibility (park pollers while hidden) (#288)
 //!
-//! A migrated poller (e.g. a departures/weather plugin) should idle while its
-//! card isn't on screen, the way the shell already gates its built-in pollers.
-//! The host pushes a [`HostMsg::SlotVisibility`] on every sidebar open/close and
+//! A migrated poller (e.g. a departures plugin) should idle while its card
+//! isn't on screen, the way the shell already gates its built-in pollers. The
+//! host pushes a [`HostMsg::SlotVisibility`] on every sidebar open/close and
 //! **once at register** (so a reconnecting plugin starts correct) — mirroring the
 //! clock pump's `watch` + seed-send shape. Delivery is latest-wins (it's state,
 //! not a one-shot event, so no #277 lossiness concern).
+//!
+//! The push is **opt-in via the manifest**: it goes only to a connection that
+//! subscribes [`StateKey::SlotVisible`] (#305), exactly like the `Clock`
+//! snapshot. #294 originally sent it to *every* connection, which crash-looped
+//! plugins built against a pre-#294 proto that can't decode the variant — so
+//! visibility now obeys the same state-subset rule as every other host→plugin
+//! push (see the crate-level compat rule: a new push must be opt-in, never
+//! unconditional). A plugin that wants gating declares the subscription
+//! (`hytte-plugin-departures` does); one that doesn't (weather/pet/clock-demo)
+//! simply never receives the frame.
 //!
 //! Sidebars are **per-monitor** and a plugin's card mirrors onto every monitor's
 //! sidebar region, so `visible` is the **OR across monitors**: `true` while *any*
@@ -76,9 +86,11 @@
 //!
 //! ## v1 scope (see the PR body for the full deferred list)
 //!
-//! - **Mounts:** only the two sidebar slots ([`Mount::SidebarTop`] /
-//!   [`Mount::SidebarBottom`]); bar mounts are accepted but their renders are
-//!   dropped (deferred).
+//! - **Mounts:** the three sidebar regions ([`Mount::SidebarLead`] /
+//!   [`Mount::SidebarTop`] / [`Mount::SidebarBottom`]); bar mounts are accepted
+//!   but their renders are dropped (deferred). `SidebarLead` (#301) leads the
+//!   sidebar — its cards render *above* the built-in weather/calendar/tasks
+//!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot.
 //! - **State:** only [`StateKey::Clock`].
 //! - **Effects:** only [`Effect::OpenPage`] is brokered (mapped to the modal
 //!   drawer); every other effect is logged "unsupported in v1" and skipped.
@@ -146,7 +158,7 @@ struct BrokeredEffect {
     effect: Effect,
 }
 
-/// Registry handles for the plugin host. The two sidebar render mailboxes are
+/// Registry handles for the plugin host. The three sidebar render mailboxes are
 /// written from tokio (a plugin's reader task) and read on the GTK thread (the
 /// reconcilers). `clock_tx` is written on the GTK thread (the clock pump) and
 /// subscribed from tokio (per-conn snapshot tasks). `effects_rx` is the receive
@@ -155,6 +167,7 @@ struct BrokeredEffect {
 /// thread-local to that thread and the receiver is single-consumer).
 #[doc(hidden)]
 pub struct PluginHandles {
+    sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_tx: watch::Sender<Option<ClockState>>,
@@ -169,6 +182,7 @@ pub struct PluginHandles {
 /// Clones of the shared handles handed to the tokio listener + per-conn tasks.
 #[derive(Clone)]
 struct ListenerCtx {
+    sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
@@ -186,6 +200,7 @@ impl Service for PluginsService {
         let (visibility_tx, visibility_rx) = watch::channel(false);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
+            sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
             sidebar_bottom: Mutable::new(Vec::new()),
             clock_tx,
@@ -193,6 +208,7 @@ impl Service for PluginsService {
             effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
+            sidebar_lead: handles.sidebar_lead.clone(),
             sidebar_top: handles.sidebar_top.clone(),
             sidebar_bottom: handles.sidebar_bottom.clone(),
             clock_rx,
@@ -219,7 +235,8 @@ pub fn service() -> PluginsService {
 /// Wire the GTK-main-thread halves of the transport: the clock→wire pump and
 /// the (single, global) effect broker per sidebar mount. Call **once** from the
 /// `App::run` body after services are registered — the reconcilers themselves
-/// mount per-monitor via [`sidebar_top_slot`] / [`sidebar_bottom_slot`].
+/// mount per-monitor via [`sidebar_lead_slot`] / [`sidebar_top_slot`] /
+/// [`sidebar_bottom_slot`].
 pub fn install() {
     // Clock state pump: project the live `clock::now()` into a GTK-free wire
     // `ClockState` and publish it on the watch channel the per-conn snapshot
@@ -336,6 +353,15 @@ fn publish_visibility(visible: bool) {
     });
 }
 
+fn lead_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .sidebar_lead
+            .signal_cloned()
+    })
+}
+
 fn top_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     registry::with(|r| {
         r.get::<PluginHandles>()
@@ -372,6 +398,15 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
 }
 
 // ── GTK-side mount: reconciler-backed sidebar regions ────────────────────────
+
+/// The [`Mount::SidebarLead`] **region** — a vertical container of N plugin
+/// cards. Built per monitor from `overlays::sidebar::build_card` and mounted at
+/// the very **top** of the sidebar, above the built-in weather/calendar/tasks
+/// cards, so a plugin here leads the sidebar (#301).
+#[must_use]
+pub fn sidebar_lead_slot() -> gtk::Widget {
+    build_region(lead_render_signal())
+}
 
 /// The [`Mount::SidebarTop`] **region** — a vertical container of N plugin
 /// cards. Built per monitor from `overlays::sidebar::build_card` and appended
@@ -586,16 +621,29 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .contains(&StateKey::Clock)
         .then(|| tokio::spawn(snapshot_task(ctx.clock_rx.clone(), out_tx.clone())));
 
-    // Slot visibility (#288): seeded at register + pushed on every change. Sent
-    // to EVERY plugin — visibility is universal, not a `StateKey` subscription —
-    // so any plugin can park its own pollers/timers while its card is hidden.
-    let visibility = tokio::spawn(visibility_task(ctx.visibility_rx.clone(), out_tx.clone()));
+    // Slot visibility (#288): seeded at register + pushed on every change — but
+    // ONLY to a plugin that subscribes `StateKey::SlotVisible` (#305). #294 sent
+    // this push to EVERY connection unconditionally, which broke plugins built
+    // against a pre-#294 proto: their `rmp-serde` can't decode the unknown
+    // `HostMsg::SlotVisibility` variant, the session dies, the SDK redials, the
+    // host re-seeds → crash-loop (the out-of-tree vibectl hit exactly this). The
+    // `PROTO_VERSION` exact-match can't catch it (both sides are proto 1); the
+    // "appending a name-tagged variant is additive" rule only holds while old
+    // code never *receives* the new variant. Gating the push behind the manifest
+    // restores the design's opt-in state-subset rule: the host serializes only
+    // subscribed state, so an old binary that never asked for visibility never
+    // receives it. Mirrors the `Clock` snapshot gate above.
+    let visibility = manifest
+        .subscribes
+        .contains(&StateKey::SlotVisible)
+        .then(|| tokio::spawn(visibility_task(ctx.visibility_rx.clone(), out_tx.clone())));
 
     // Reader loop: dispatch inbound frames until the peer disconnects.
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
             Ok(PluginMsg::Render { tree, effects }) => {
                 let region = match mount {
+                    Mount::SidebarLead => Some(&ctx.sidebar_lead),
                     Mount::SidebarTop => Some(&ctx.sidebar_top),
                     Mount::SidebarBottom => Some(&ctx.sidebar_bottom),
                     Mount::BarLeft | Mount::BarCenter | Mount::BarRight => {
@@ -644,12 +692,15 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // still owns it (removes just that card on the GTK side), then stop the
     // outbound + snapshot tasks. Connection-scoped + keyed per plugin id, so a
     // fast-reconnect successor is never evicted and sibling plugins are untouched.
+    clear_region_if_owned(&ctx.sidebar_lead, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_top, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_bottom, &plugin_id, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
-    visibility.abort();
+    if let Some(visibility) = visibility {
+        visibility.abort();
+    }
     writer.abort();
 }
 
@@ -696,7 +747,9 @@ async fn snapshot_task(
 /// Push the aggregate slot visibility on the initial subscribe (the register
 /// seed, so a reconnecting plugin starts in the right state) and on every
 /// change, coalescing bursts latest-wins via `borrow_and_update` (#288). Mirrors
-/// [`snapshot_task`]; runs for every connection since visibility is universal.
+/// [`snapshot_task`]; spawned **only** for a connection that subscribes
+/// [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never receives the
+/// frame.
 async fn visibility_task(
     mut visibility_rx: watch::Receiver<bool>,
     out: mpsc::UnboundedSender<HostMsg>,
@@ -962,11 +1015,13 @@ fn map_page(page: Page) -> crate::modal::Page {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokeredEffect, Effect, HashMap, HostMsg, Mount, Mutable, Page, SlotRender, StateKey,
-        UiDir, UiEventKind, UiNode, any_sidebar_open, apply_forget, apply_open,
-        clear_region_if_owned, map_page, mpsc, pixels_len_ok, to_ui_node, to_wire_event,
-        upsert_region, wire,
+        BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount, Mutable, Page,
+        PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream, any_sidebar_open,
+        apply_forget, apply_open, clear_region_if_owned, handle_conn, map_page, mpsc,
+        pixels_len_ok, read_frame, to_ui_node, to_wire_event, upsert_region, watch, wire,
+        write_frame,
     };
+    use hytte_plugin_proto::Manifest;
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
     /// (incl. `Box { scroll }` and nesting) and produces a field-for-field
@@ -1415,15 +1470,172 @@ mod tests {
         assert!(map.is_empty(), "forgotten monitors leave no stale entries");
     }
 
-    /// A bar mount is a real wire variant the reader must handle; assert the two
-    /// sidebar mounts we support are distinct from the deferred bar mounts.
+    /// A bar mount is a real wire variant the reader must handle; assert the
+    /// three sidebar mounts we support are distinct from each other and from the
+    /// deferred bar mounts.
     #[test]
     fn sidebar_and_bar_mounts_are_distinct() {
+        assert_ne!(Mount::SidebarLead, Mount::SidebarTop);
+        assert_ne!(Mount::SidebarLead, Mount::SidebarBottom);
         assert_ne!(Mount::SidebarTop, Mount::BarLeft);
         assert_ne!(Mount::SidebarBottom, Mount::BarCenter);
         // Effect + StateKey are exercised elsewhere; touch them here so the test
         // module's imports stay honest if the broker/pump code is refactored.
-        assert_eq!(StateKey::Clock, StateKey::Clock);
+        assert_ne!(StateKey::Clock, StateKey::SlotVisible);
         assert!(matches!(Effect::OpenPage(Page::Media), Effect::OpenPage(_)));
+    }
+
+    /// #301 teardown isolation across the **three** sidebar regions: a plugin's
+    /// teardown probes all three (`handle_conn` calls `clear_region_if_owned` on
+    /// each), and clearing the region it actually lives in leaves the other two
+    /// regions' cards untouched. Mirrors the two-region isolation guarantees on
+    /// the new lead region.
+    #[test]
+    fn teardown_is_isolated_across_the_three_regions() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let lead: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        let top: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        let bottom: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+        upsert_region(&lead, render_of("weather", -10, 0, "", &tx));
+        upsert_region(&top, render_of("pet", 0, 1, "", &tx));
+        upsert_region(&bottom, render_of("departures", 0, 2, "", &tx));
+
+        // Weather (lead region) tears down: `handle_conn` probes every region.
+        clear_region_if_owned(&lead, "weather", 0);
+        clear_region_if_owned(&top, "weather", 0);
+        clear_region_if_owned(&bottom, "weather", 0);
+
+        assert!(lead.lock_ref().is_empty(), "weather's lead card removed");
+        assert_eq!(top.lock_ref()[0].plugin_id, "pet", "pet (top) untouched");
+        assert_eq!(
+            bottom.lock_ref()[0].plugin_id,
+            "departures",
+            "departures (bottom) untouched"
+        );
+    }
+
+    // ── Host session gating (#305): the SlotVisibility push is opt-in ─────────
+
+    /// Read one host→plugin frame, failing (not hanging) if none arrives.
+    async fn recv<R>(rd: &mut R) -> HostMsg
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<HostMsg, _>(rd),
+        )
+        .await
+        .expect("a host frame within 5s")
+        .expect("decode HostMsg")
+    }
+
+    fn ctx_with(
+        clock_rx: watch::Receiver<Option<ClockState>>,
+        visibility_rx: watch::Receiver<bool>,
+    ) -> (ListenerCtx, mpsc::UnboundedReceiver<BrokeredEffect>) {
+        let (effects_tx, effects_rx) = mpsc::unbounded_channel();
+        let ctx = ListenerCtx {
+            sidebar_lead: Mutable::new(Vec::new()),
+            sidebar_top: Mutable::new(Vec::new()),
+            sidebar_bottom: Mutable::new(Vec::new()),
+            clock_rx,
+            visibility_rx,
+            effects_tx,
+        };
+        (ctx, effects_rx)
+    }
+
+    /// #305: a connection that does **not** subscribe `SlotVisible` must never
+    /// receive a `SlotVisibility` frame — not the register seed, not an edge. The
+    /// `Clock` snapshot is the ordered control channel: the plugin subscribes
+    /// Clock only, so its only frames are clock snapshots; a visibility edge
+    /// driven mid-stream produces nothing, and the very next frame the plugin
+    /// sees is the following clock snapshot — proving the edge was *filtered*, not
+    /// merely late. (This is the vibectl crash-loop, prevented.)
+    #[tokio::test]
+    async fn visibility_push_gated_off_when_not_subscribed() {
+        let (clock_tx, clock_rx) = watch::channel(Some(ClockState {
+            iso: "t0".into(),
+            unix: 0,
+        }));
+        let (vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        let (mut prd, mut pwr) = plugin_end.into_split();
+        // A legacy-shaped plugin: subscribes Clock, NOT SlotVisible.
+        let mut manifest = Manifest::new("legacy", Mount::SidebarTop);
+        manifest.subscribes = vec![StateKey::Clock];
+        write_frame(&mut pwr, &PluginMsg::Register { manifest })
+            .await
+            .expect("send Register");
+
+        // Seed frame is the clock snapshot (the only subscription) — not visibility.
+        assert!(
+            matches!(recv(&mut prd).await, HostMsg::StateSnapshot { .. }),
+            "register seed is a clock snapshot, never SlotVisibility",
+        );
+
+        // Drive a visibility edge (must be filtered) then a clock edge (passes).
+        vis_tx.send_replace(true);
+        clock_tx.send_replace(Some(ClockState {
+            iso: "t1".into(),
+            unix: 1,
+        }));
+
+        match recv(&mut prd).await {
+            HostMsg::StateSnapshot { snapshot } => assert_eq!(
+                snapshot.clock.map(|c| c.unix),
+                Some(1),
+                "the clock edge came through; the visibility edge produced no frame",
+            ),
+            HostMsg::SlotVisibility { .. } => {
+                panic!("unsubscribed plugin received a SlotVisibility frame (#305 regression)")
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    /// #305: a connection that **does** subscribe `SlotVisible` gets the
+    /// register-time seed and every subsequent edge — the departures poller's
+    /// visibility gate keeps working. Subscribes `SlotVisible` only, so the only
+    /// proactive frames are the visibility pushes (deterministic ordering).
+    #[tokio::test]
+    async fn visibility_push_delivered_when_subscribed() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        let (mut prd, mut pwr) = plugin_end.into_split();
+        let mut manifest = Manifest::new("board", Mount::SidebarBottom);
+        manifest.subscribes = vec![StateKey::SlotVisible];
+        write_frame(&mut pwr, &PluginMsg::Register { manifest })
+            .await
+            .expect("send Register");
+
+        // Register seed: the current aggregate (false, nothing open at boot).
+        assert!(
+            matches!(
+                recv(&mut prd).await,
+                HostMsg::SlotVisibility { visible: false }
+            ),
+            "register seed carries the current visibility",
+        );
+
+        // An open edge is forwarded.
+        vis_tx.send_replace(true);
+        assert!(
+            matches!(
+                recv(&mut prd).await,
+                HostMsg::SlotVisibility { visible: true }
+            ),
+            "the open edge reaches the subscriber",
+        );
     }
 }

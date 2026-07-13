@@ -463,6 +463,53 @@ fn manifest_with_order_round_trips() {
 }
 
 #[test]
+fn every_mount_round_trips_incl_sidebar_lead() {
+    // Every `Mount` variant survives a manifest round-trip, incl. the additive
+    // `SidebarLead` (#301). `Mount` is an externally-tagged unit enum, so each
+    // variant rides the wire as its bare name — appending `SidebarLead` leaves
+    // every other variant's encoding untouched (PROTO_VERSION stays 1).
+    for mount in [
+        Mount::SidebarLead,
+        Mount::SidebarTop,
+        Mount::SidebarBottom,
+        Mount::BarLeft,
+        Mount::BarCenter,
+        Mount::BarRight,
+    ] {
+        let m = Manifest::new("weather", mount);
+        let back: Manifest = decode_body(&encode_body(&m)).expect("decode manifest");
+        assert_eq!(back.mount, mount, "{mount:?} round-trips");
+    }
+    // The new variant rides the wire as its bare, name-tagged variant — the
+    // property that makes appending it additive (older decoders skip an unknown
+    // tag rather than mis-decoding an existing one).
+    let body = encode_body(&Manifest::new("weather", Mount::SidebarLead));
+    assert!(
+        contains(&body, b"SidebarLead"),
+        "the variant name 'SidebarLead' rides the wire"
+    );
+}
+
+#[test]
+fn state_key_subscription_round_trips_incl_slot_visible() {
+    // The subscription set round-trips, incl. the additive `SlotVisible` (#305).
+    // `StateKey` is an externally-tagged unit enum, so each key rides the wire as
+    // its bare name — appending `SlotVisible` is additive (PROTO_VERSION stays 1).
+    let mut m = Manifest::new("departures", Mount::SidebarBottom);
+    m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
+    let body = encode_body(&m);
+    assert!(
+        contains(&body, b"SlotVisible"),
+        "the key name 'SlotVisible' rides the wire"
+    );
+    let back: Manifest = decode_body(&body).expect("decode manifest with subscriptions");
+    assert_eq!(
+        back.subscribes,
+        vec![StateKey::Clock, StateKey::SlotVisible]
+    );
+}
+
+#[test]
 fn backward_compat_missing_optional_field_defaults() {
     // An old payload predating a `#[serde(default)]` field (here: an empty
     // snapshot map) still decodes, defaulting the absent field.

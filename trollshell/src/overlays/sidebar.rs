@@ -369,6 +369,18 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // what anchors the bottom plugin region to the bottom edge.
     card.set_vexpand(true);
 
+    // Plugin mount: `Mount::SidebarLead` — the *leading* plugin *region* (#301),
+    // mounted at the very TOP of the sidebar, ABOVE the built-in cards. This is
+    // the only region whose cards render above weather/calendar/tasks; the
+    // after-tasks `SidebarTop` region (below) cannot. The weather plugin lives
+    // here now (#290). During the migration transition the native weather card
+    // (appended just below) is STILL mounted — its removal is the separate #290
+    // follow-up, gated on Annika's side-by-side — so the plugin card renders
+    // directly above the native one (handy for the very comparison she's making);
+    // after that removal the plugin simply leads the sidebar. Empty until a
+    // plugin dials in.
+    card.append(&crate::plugins::sidebar_lead_slot());
+
     card.append(&crate::widgets::weather::widget());
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));

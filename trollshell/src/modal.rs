@@ -728,15 +728,21 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
 /// compile-time guarantee that adding a `Page` variant forces a build arm here,
 /// so a new page can never silently skip lazy registration.
 ///
-/// Called by [`ensure_page`] on a page's first activation (and eagerly for the
-/// graph-bearing stats pages from [`build_pages_stack`]). Every panel
-/// constructor is side-effect-free at build time — `bind*` delivers current
-/// signal state on subscribe, and per-page on-show work (clipboard/calendar
-/// refresh, notification dismissal) is driven by [`on_page_show`], not
-/// construction — so deferring a build to first open loses nothing. The
-/// exceptions are the CPU / Memory / Disks / GPU stats pages, whose sparklines
-/// accumulate history *in the widget* from launch (#231's open fork), so they
-/// are built eagerly and never reach the lazy path fresh.
+/// Called by [`ensure_page`] on a page's first activation (and eagerly for
+/// [`Page::StatsCpu`] from [`build_pages_stack`]). Every panel constructor is
+/// side-effect-free at build time — `bind*` delivers current signal state on
+/// subscribe, and per-page on-show work (clipboard/calendar refresh,
+/// notification dismissal) is driven by [`on_page_show`], not construction —
+/// so deferring a build to first open loses nothing. The exception is the CPU
+/// stats page: its clock-aggregate row and two per-core `MultiSparkline`s push
+/// history *in the widget* off raw `sensors::cpu()`/`cpu_freq()` samples.
+/// #336 hoisted the *overall* CPU-load line into `sensors::cpu_history()`, but
+/// not the clock or per-core series — `MultiSparkline` has no bulk-seed method
+/// to backfill from a hoisted ring, so this page still can't reach the lazy
+/// path fresh (tracked in the follow-up issue linked from `build_pages_stack`).
+/// Memory / Disks / GPU are fully hoisted as of #336
+/// (`sensors::{memory,disk_io,gpu_load,gpu_vram,gpu_temp}_history()` feeding
+/// `Sparkline::set_samples`), so they build lazily like every other page.
 fn build_page(page: Page) -> gtk::Widget {
     use crate::panels;
 
@@ -796,13 +802,22 @@ fn set_stack_page(panel: &ModalPanel, page: Page) {
 /// all exist for a stable measure — which is exactly what makes lazy building
 /// size-neutral: each page still measures to its own natural size on show.
 ///
-/// Only the graph-bearing stats pages (CPU / Memory / Disks / GPU) are built
-/// eagerly here (their sparklines accumulate history in-widget from launch,
-/// #231); every other page — including the services stats page — is built
-/// lazily on first activation via [`ensure_page`]/[`set_stack_page`]. This drops
-/// the startup cost from `19×N` panels (one full set per monitor) to `4×N`. The
-/// CPU page is added first, so it is the stack's initial visible child —
-/// invisible anyway until the drawer first opens.
+/// Only [`Page::StatsCpu`] is built eagerly here — its clock-aggregate row and
+/// two per-core `MultiSparkline`s still accumulate history in-widget from
+/// launch, unlike the overall CPU-load line, Memory, Disks, and GPU, all of
+/// which #336 hoisted into the `sensors` service and which now backfill
+/// instantly via `Sparkline::set_samples` on first (lazy) build. Every other
+/// page — Memory, Disks, and GPU included — builds lazily on first activation
+/// via [`ensure_page`]/[`set_stack_page`]. This drops the startup cost from
+/// `19×N` panels (one full set per monitor) to `1×N`. The CPU page is added
+/// first, so it is the stack's initial visible child — invisible anyway until
+/// the drawer first opens.
+///
+/// [`EAGER_PAGES`] is the single source for which pages skip the lazy path;
+/// [`tests::eager_pages_is_cpu_only`] tripwires it so a future edit can't
+/// silently grow this set without revisiting the reasoning above.
+const EAGER_PAGES: [Page; 1] = [Page::StatsCpu];
+
 fn build_pages_stack() -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.set_vexpand(false);
@@ -812,14 +827,9 @@ fn build_pages_stack() -> gtk::Stack {
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
 
-    // The four graph-bearing stats panels stay eager: their sparklines
-    // accumulate history in-widget from launch (#231's open fork), so
-    // lazy-building them would open to empty graphs. Services carries no
-    // in-widget history (just the failed-units list) — it stays lazy.
-    ensure_page(&stack, Page::StatsCpu);
-    ensure_page(&stack, Page::StatsMemory);
-    ensure_page(&stack, Page::StatsDisks);
-    ensure_page(&stack, Page::StatsGpu);
+    for page in EAGER_PAGES {
+        ensure_page(&stack, page);
+    }
     stack
 }
 
@@ -1175,7 +1185,7 @@ fn on_page_show(page: Page) {
 
 #[cfg(test)]
 mod tests {
-    use super::Page;
+    use super::{EAGER_PAGES, Page};
     use std::collections::HashSet;
 
     // These are pure-logic guards for the lazy drawer-page registry (#231).
@@ -1232,5 +1242,17 @@ mod tests {
     #[test]
     fn from_stack_name_rejects_unknown() {
         assert_eq!(Page::from_stack_name("does-not-exist"), None);
+    }
+
+    /// Tripwire for `build_pages_stack`'s eager set (#231 part 2): #336 hoisted
+    /// Memory/Disks/GPU sparkline history into the `sensors` service, so only
+    /// `StatsCpu` (whose clock + per-core `MultiSparkline` history is still
+    /// pushed in-widget) should remain eager. If this fails, either a page was
+    /// silently re-added to `EAGER_PAGES` without updating the doc comments on
+    /// `build_page`/`build_pages_stack` explaining why, or `StatsCpu` itself
+    /// finally got its history hoisted and can drop off this list too.
+    #[test]
+    fn eager_pages_is_cpu_only() {
+        assert_eq!(EAGER_PAGES, [Page::StatsCpu]);
     }
 }

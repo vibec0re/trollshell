@@ -69,6 +69,13 @@ pub enum EventKind {
     ValueChanged { value: f64 },
 }
 
+/// Default for [`Node::Slider`]'s `enabled`: an omitted key means an
+/// interactive slider, so a frame built before the field (an older plugin SDK)
+/// decodes to a live, draggable slider rather than a greyed one.
+fn slider_enabled_default() -> bool {
+    true
+}
+
 /// The closed widget vocabulary. A plugin's view is a single root [`Node`].
 ///
 /// Mirrors `hytte_ui::Node`: `Box { scroll }` carries the scroll flag
@@ -200,16 +207,32 @@ pub enum Node {
     /// increment. Style via `classes` (e.g. an `.osd`/`.flat` hook) — the host
     /// draws no value label.
     ///
+    /// `enabled` (default `true`) is a **mutable prop** too: `false` renders the
+    /// slider **insensitive** — the host calls `set_sensitive(false)`, so it
+    /// greys out and stops taking drag/scroll/key input (and thus emits no
+    /// [`EventKind::ValueChanged`]). It lets a plugin keep a slider *in place*,
+    /// visibly inert, when it isn't currently adjustable — the vibectl off-light
+    /// brightness case: the row stays put and greyed instead of the slider
+    /// popping in and out as the light toggles. A same-id re-render flips
+    /// sensitivity in place without a rebuild.
+    ///
     /// Additive: a brand-new name-tagged variant, so every existing frame decodes
-    /// unchanged and `PROTO_VERSION` stays put. See [`EventKind`] for why the
-    /// paired host→plugin `ValueChanged` push is opt-in *by vocabulary* and needs
-    /// no manifest subscription.
+    /// unchanged and `PROTO_VERSION` stays put; `enabled` is a
+    /// `#[serde(default)]` field (defaulting to `true`), so a frame built before
+    /// it — including an older SDK's — decodes to an interactive slider, exactly
+    /// like `Text::ellipsize`. See [`EventKind`] for why the paired host→plugin
+    /// `ValueChanged` push is opt-in *by vocabulary* and needs no manifest
+    /// subscription.
     Slider {
         id: NodeId,
         min: f64,
         max: f64,
         value: f64,
         step: f64,
+        /// Interactive when `true` (the default); `false` ⇒ insensitive/greyed.
+        /// Defaulted so a pre-field frame decodes to an interactive slider.
+        #[serde(default = "slider_enabled_default")]
+        enabled: bool,
         classes: Vec<Cls>,
     },
     /// A `gtk::Revealer`; `open` drives `set_reveal_child`.

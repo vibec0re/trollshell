@@ -186,12 +186,17 @@ pub enum Node {
     /// signal (user-only) rather than `value-changed`, so a programmatic
     /// `set_value` never re-enters the event path — the `bind_two_way`
     /// feedback-loop problem, avoided structurally.
+    ///
+    /// `enabled` maps to `set_sensitive`: `false` greys the scale and stops it
+    /// taking input (so an insensitive slider fires no [`EventKind::ValueChanged`]).
+    /// A mutable prop — a same-id re-render flips sensitivity in place.
     Slider {
         id: NodeId,
         min: f64,
         max: f64,
         value: f64,
         step: f64,
+        enabled: bool,
         classes: Vec<String>,
     },
     /// A `gtk::Revealer`; `open` drives `set_reveal_child`.
@@ -689,6 +694,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             max,
             value,
             step,
+            enabled,
             classes,
         } => {
             // Build via an explicit `Adjustment` (not `Scale::with_range`, which
@@ -699,6 +705,9 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             let scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&adj));
             scale.set_draw_value(false);
             scale.set_hexpand(true);
+            // `enabled: false` ⇒ insensitive: greyed and non-interactive, so it
+            // fires no `change-value` (see the node docs).
+            scale.set_sensitive(*enabled);
             apply_classes(&scale, classes);
             // The change-value handler (user-driven only) is bound once here, to
             // this widget identity — like `Button`'s click — so reuse never stacks
@@ -948,10 +957,15 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             max,
             value,
             step,
+            enabled,
             classes,
             ..
         } => {
             let scale = downcast::<gtk::Scale>(&retained.widget);
+            // `enabled` is a plain mutable prop: flip sensitivity in place. An
+            // insensitive scale takes no input, so this also gates whether the
+            // slider can fire `change-value` at all.
+            scale.set_sensitive(*enabled);
             // Range/step are plain mutable props: push them through the live
             // adjustment (the same one built at `build_node`), then reconcile the
             // value below.
@@ -2555,6 +2569,7 @@ mod gtk_tests {
             max,
             value,
             step,
+            enabled: true,
             classes: vec![],
         }
     }
@@ -2635,6 +2650,35 @@ mod gtk_tests {
             "step updated"
         );
         assert!((after.value() - 7.0).abs() < f64::EPSILON, "value updated");
+    }
+
+    #[gtk::test]
+    fn slider_enabled_toggles_sensitivity_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // Enabled by default (the `slider` helper) → sensitive.
+        rec.render(&slider("b", 0.0, 100.0, 40.0, 5.0));
+        let before = scale_of(&root);
+        assert!(before.is_sensitive(), "enabled slider is sensitive");
+
+        // A same-id re-render flipping `enabled: false` greys it in place —
+        // reused widget, now insensitive (the vibectl off-light case).
+        rec.render(&Node::Slider {
+            id: "b".into(),
+            min: 0.0,
+            max: 100.0,
+            value: 40.0,
+            step: 5.0,
+            enabled: false,
+            classes: vec![],
+        });
+        let after = scale_of(&root);
+        assert_eq!(before, after, "same-id Slider reused, not rebuilt");
+        assert!(!after.is_sensitive(), "enabled:false → insensitive");
+
+        // …and back to interactive.
+        rec.render(&slider("b", 0.0, 100.0, 40.0, 5.0));
+        assert!(scale_of(&root).is_sensitive(), "flips back to sensitive");
     }
 
     #[gtk::test]

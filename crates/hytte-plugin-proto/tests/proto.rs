@@ -93,6 +93,7 @@ fn sample_tree() -> Node {
                 max: 1.0,
                 value: 0.7,
                 step: 0.05,
+                enabled: true,
                 classes: vec!["ts-slider".into()],
             },
             Node::Revealer {
@@ -328,6 +329,8 @@ fn slider_node_round_trips() {
         max: 1.0,
         value: 0.42,
         step: 0.05,
+        // Exercise the non-default so the field is proven to round-trip.
+        enabled: false,
         classes: vec!["ts-slider".into(), "osd".into()],
     };
     let back: Node = decode(&encode(&node)).expect("decode Slider");
@@ -347,9 +350,61 @@ fn slider_is_name_tagged_and_additive() {
         max: 100.0,
         value: 30.0,
         step: 1.0,
+        enabled: true,
         classes: vec![],
     });
     assert!(contains(&body, b"Slider"), "variant name 'Slider' present");
+}
+
+#[test]
+fn slider_without_enabled_decodes_old_frame_compat() {
+    // A `Slider` frame built before the `enabled` field (an older plugin SDK)
+    // carries no `enabled` key. The current decoder must still accept it,
+    // defaulting `enabled` to `true` (`#[serde(default)]` + named-map encoding) —
+    // so an already-deployed plugin's slider stays interactive, never silently
+    // greyed. Modeled as an externally-tagged enum mirroring the pre-field set,
+    // so it serializes as `{"Slider": { id, min, max, value, step, classes }}`
+    // exactly like an old plugin, and `PROTO_VERSION` stays 1.
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Slider {
+            id: String,
+            min: f64,
+            max: f64,
+            value: f64,
+            step: f64,
+            classes: Vec<String>,
+        },
+    }
+
+    let old = NodeOld::Slider {
+        id: "brightness".into(),
+        min: 0.0,
+        max: 100.0,
+        value: 60.0,
+        step: 5.0,
+        classes: vec!["ts-slider".into()],
+    };
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"enabled"),
+        "an old frame carries no enabled key"
+    );
+    let decoded: Node = decode_body(&body).expect("decode pre-enabled Slider frame");
+    assert_eq!(
+        decoded,
+        Node::Slider {
+            id: "brightness".into(),
+            min: 0.0,
+            max: 100.0,
+            value: 60.0,
+            step: 5.0,
+            // Absent `enabled` defaults to an interactive slider.
+            enabled: true,
+            classes: vec!["ts-slider".into()],
+        },
+        "absent enabled defaults to true (interactive)",
+    );
 }
 
 #[test]

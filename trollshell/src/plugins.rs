@@ -956,6 +956,7 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             max,
             value,
             step,
+            enabled,
             classes,
         } => UiNode::Slider {
             id: id.clone(),
@@ -963,6 +964,7 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             max: *max,
             value: *value,
             step: *step,
+            enabled: *enabled,
             classes: classes.clone(),
         },
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
@@ -1107,6 +1109,7 @@ mod tests {
                     max: 1.0,
                     value: 0.3,
                     step: 0.1,
+                    enabled: false,
                     classes: vec!["ts-slider".into()],
                 },
                 wire::Node::Revealer {
@@ -1171,6 +1174,7 @@ mod tests {
                     max: 1.0,
                     value: 0.3,
                     step: 0.1,
+                    enabled: false,
                     classes: vec!["ts-slider".into()],
                 },
                 UiNode::Revealer {

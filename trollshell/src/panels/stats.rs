@@ -660,10 +660,11 @@ fn build_history_disk_io_row() -> gtk::Box {
     // the window (the Sparkline doesn't expose its buffer).
     let window: Rc<RefCell<VecDeque<f64>>> = Rc::new(RefCell::new(VecDeque::with_capacity(WINDOW)));
 
-    let spark_clone = spark.clone();
+    bind(sensors::disk_io_history(), &outer, move |_, h| {
+        spark.set_samples(&h);
+    });
     bind(sensors::disk_io(), &outer, move |_, io| {
         let combined = io.read_bps + io.write_bps;
-        spark_clone.push(combined);
         {
             let mut w = window.borrow_mut();
             if w.len() == WINDOW {
@@ -706,11 +707,15 @@ fn build_history_cpu_row() -> gtk::Box {
     let (row, spark, value) = build_history_row("CPU");
     spark.set_domain_max(Some(1.0));
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::cpu(), &row, move |_, c: CpuLoad| {
-        spark_clone.push(c.overall);
         value_clone.set_text(&format!("{:.0}%", c.overall * 100.0));
+    });
+    // History now lives in the sensors service (#231): snapshot the ring into
+    // the sparkline rather than pushing per-emit, so it's shared across monitors
+    // and survives a lazily-rebuilt page.
+    bind(sensors::cpu_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row
@@ -979,17 +984,17 @@ fn build_history_memory_row() -> gtk::Box {
     let (row, spark, value) = build_history_row("Memory");
     spark.set_domain_max(Some(1.0));
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::memory(), &row, move |_, m| {
         if m.total == 0 {
-            spark_clone.push(0.0);
             value_clone.set_text("\u{2014}");
         } else {
             let frac = (cast::u64_to_f64(m.used) / cast::u64_to_f64(m.total)).clamp(0.0, 1.0);
-            spark_clone.push(frac);
             value_clone.set_text(&format!("{:.0}%", frac * 100.0));
         }
+    });
+    bind(sensors::memory_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row
@@ -1009,16 +1014,16 @@ fn build_history_gpu_usage_row() -> gtk::Box {
         gtk::prelude::WidgetExt::set_visible,
     );
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::gpu(), &row, move |_, g| {
         if let Some(state) = g
             && let Some(l) = state.load
         {
-            let pct = l * 100.0;
-            spark_clone.push(pct);
-            value_clone.set_text(&format!("{pct:.0}%"));
+            value_clone.set_text(&format!("{:.0}%", l * 100.0));
         }
+    });
+    bind(sensors::gpu_load_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row
@@ -1041,7 +1046,6 @@ fn build_history_gpu_vram_row() -> gtk::Box {
         gtk::prelude::WidgetExt::set_visible,
     );
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::gpu(), &row, move |_, g| {
         if let Some(state) = g
@@ -1049,9 +1053,11 @@ fn build_history_gpu_vram_row() -> gtk::Box {
             && total > 0
         {
             let pct = (cast::u64_to_f64(used) / cast::u64_to_f64(total) * 100.0).clamp(0.0, 100.0);
-            spark_clone.push(pct);
             value_clone.set_text(&format!("{pct:.0}%"));
         }
+    });
+    bind(sensors::gpu_vram_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row
@@ -1068,15 +1074,16 @@ fn build_history_gpu_temp_row() -> gtk::Box {
         gtk::prelude::WidgetExt::set_visible,
     );
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::gpu(), &row, move |_, g| {
         if let Some(state) = g
             && let Some(t) = state.temperature_celsius
         {
-            spark_clone.push(t);
             value_clone.set_text(&format!("{t:.0} \u{00b0}C"));
         }
+    });
+    bind(sensors::gpu_temp_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row

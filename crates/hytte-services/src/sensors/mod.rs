@@ -30,10 +30,12 @@ mod meminfo;
 mod net;
 mod proc_stat;
 
-use futures_signals::signal::{Mutable, Signal};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use futures_util::StreamExt;
 use hytte_reactive::{Service, registry};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cast::u64_to_f64_bytes;
@@ -247,7 +249,22 @@ pub struct SensorsHandles {
     /// Live list of real mounts from `/proc/self/mountinfo`. Updated by
     /// `mount_watch_loop`; consumed by `poll_loop`'s disk branch.
     pub(crate) mount_list: Mutable<Vec<MountSpec>>,
+    // ── Sparkline history (#231) ──────────────────────────────────────────────
+    // Process-wide ring buffers (last `HISTORY_CAP` samples) for the Stats-panel
+    // sparklines, so the history lives in the service (one buffer, not one per
+    // monitor) and outlives any widget — a lazily-built Stats page opens
+    // pre-populated. Filled by per-metric accumulator tasks (`spawn_history`).
+    pub(crate) cpu_hist: Mutable<Arc<VecDeque<f64>>>,
+    pub(crate) mem_hist: Mutable<Arc<VecDeque<f64>>>,
+    pub(crate) disk_io_hist: Mutable<Arc<VecDeque<f64>>>,
+    pub(crate) gpu_load_hist: Mutable<Arc<VecDeque<f64>>>,
+    pub(crate) gpu_vram_hist: Mutable<Arc<VecDeque<f64>>>,
+    pub(crate) gpu_temp_hist: Mutable<Arc<VecDeque<f64>>>,
 }
+
+/// Sample count each sparkline history keeps — matches `Sparkline::new(60)` in
+/// the Stats panel so a `set_samples` snapshot fills the whole graph.
+const HISTORY_CAP: usize = 60;
 
 impl Default for SensorsHandles {
     fn default() -> Self {
@@ -263,8 +280,43 @@ impl Default for SensorsHandles {
             net_connections: Mutable::new(NetConnections::default()),
             process_count: Mutable::new(0),
             mount_list: Mutable::new(Vec::new()),
+            cpu_hist: Mutable::new(Arc::new(VecDeque::new())),
+            mem_hist: Mutable::new(Arc::new(VecDeque::new())),
+            disk_io_hist: Mutable::new(Arc::new(VecDeque::new())),
+            gpu_load_hist: Mutable::new(Arc::new(VecDeque::new())),
+            gpu_vram_hist: Mutable::new(Arc::new(VecDeque::new())),
+            gpu_temp_hist: Mutable::new(Arc::new(VecDeque::new())),
         }
     }
+}
+
+/// Spawn a task that accumulates a `HISTORY_CAP`-sample ring for one sparkline:
+/// it subscribes to `source`, and for each emit where `extract` yields a sample
+/// pushes it and republishes the whole window into `sink`. `extract` returning
+/// `None` (e.g. a GPU field that's absent this tick) leaves the ring unchanged —
+/// mirroring the old per-widget "only push when present" behaviour.
+fn spawn_history<T, F>(
+    rt: &tokio::runtime::Handle,
+    source: Mutable<T>,
+    sink: Mutable<Arc<VecDeque<f64>>>,
+    extract: F,
+) where
+    T: Clone + Send + Sync + 'static,
+    F: Fn(&T) -> Option<f64> + Send + 'static,
+{
+    rt.spawn(async move {
+        let mut ring: VecDeque<f64> = VecDeque::with_capacity(HISTORY_CAP);
+        let mut stream = source.signal_cloned().to_stream();
+        while let Some(value) = stream.next().await {
+            if let Some(sample) = extract(&value) {
+                if ring.len() == HISTORY_CAP {
+                    ring.pop_front();
+                }
+                ring.push_back(sample);
+                sink.set(Arc::new(ring.clone()));
+            }
+        }
+    });
 }
 
 // ── Service marker ────────────────────────────────────────────────────────────
@@ -308,6 +360,55 @@ impl Service for SensorsService {
         });
         rt.spawn(mount_watch_loop(mount_list_for_watch));
 
+        // Sparkline history accumulators (#231): one ring per Stats graph, fed
+        // off the live metric signals — extractors mirror each row's old
+        // `spark.push(..)` scalar and its present/absent guard.
+        spawn_history(rt, handles.cpu.clone(), handles.cpu_hist.clone(), |c| {
+            Some(c.overall)
+        });
+        spawn_history(rt, handles.memory.clone(), handles.mem_hist.clone(), |m| {
+            Some(if m.total == 0 {
+                0.0
+            } else {
+                (u64_to_f64_bytes(m.used) / u64_to_f64_bytes(m.total)).clamp(0.0, 1.0)
+            })
+        });
+        spawn_history(
+            rt,
+            handles.disk_io.clone(),
+            handles.disk_io_hist.clone(),
+            |io| Some(io.read_bps + io.write_bps),
+        );
+        spawn_history(
+            rt,
+            handles.gpu.clone(),
+            handles.gpu_load_hist.clone(),
+            |g| g.as_ref().and_then(|s| s.load).map(|l| l * 100.0),
+        );
+        spawn_history(
+            rt,
+            handles.gpu.clone(),
+            handles.gpu_vram_hist.clone(),
+            |g| {
+                g.as_ref()
+                    .and_then(|s| s.memory_used_bytes.zip(s.memory_total_bytes))
+                    .map(|(used, total)| {
+                        if total == 0 {
+                            0.0
+                        } else {
+                            (u64_to_f64_bytes(used) / u64_to_f64_bytes(total) * 100.0)
+                                .clamp(0.0, 100.0)
+                        }
+                    })
+            },
+        );
+        spawn_history(
+            rt,
+            handles.gpu.clone(),
+            handles.gpu_temp_hist.clone(),
+            |g| g.as_ref().and_then(|s| s.temperature_celsius),
+        );
+
         handles
     }
 }
@@ -348,6 +449,49 @@ pub fn memory() -> impl Signal<Item = Memory> {
             .memory
             .signal()
     })
+}
+
+/// Read one sparkline-history ring (`#231`) off the shared handles.
+fn history_of(
+    pick: impl FnOnce(&SensorsHandles) -> &Mutable<Arc<VecDeque<f64>>>,
+) -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    registry::with(|r| {
+        pick(
+            r.get::<SensorsHandles>()
+                .expect("sensors::service() not registered"),
+        )
+        .signal_cloned()
+    })
+}
+
+/// CPU-load history (fraction 0..=1), `HISTORY_CAP` samples. See [`history_of`].
+pub fn cpu_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.cpu_hist)
+}
+
+/// Memory-used-fraction history (0..=1).
+pub fn memory_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.mem_hist)
+}
+
+/// Combined disk read+write throughput history (bytes/s).
+pub fn disk_io_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.disk_io_hist)
+}
+
+/// GPU-load history (percent 0..=100); empty until a load reading appears.
+pub fn gpu_load_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.gpu_load_hist)
+}
+
+/// GPU-VRAM-used history (percent 0..=100).
+pub fn gpu_vram_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.gpu_vram_hist)
+}
+
+/// GPU-temperature history (°C).
+pub fn gpu_temp_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.gpu_temp_hist)
 }
 
 /// Signal that emits the current network I/O snapshot.

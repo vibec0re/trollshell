@@ -715,7 +715,7 @@ fn build_history_cpu_row() -> gtk::Box {
     // the sparkline rather than pushing per-emit, so it's shared across monitors
     // and survives a lazily-rebuilt page.
     bind(sensors::cpu_history(), &row, move |_, h| {
-        spark.set_samples(&h)
+        spark.set_samples(&h);
     });
 
     row

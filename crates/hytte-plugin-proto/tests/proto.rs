@@ -441,7 +441,10 @@ fn raise_osd_is_name_tagged_and_additive() {
     // additive: an older decoder skips an unknown tag rather than mis-decoding an
     // existing variant, and every pre-#236 frame (which can't carry a `RaiseOsd`)
     // decodes byte-for-byte unchanged. So `PROTO_VERSION` stays put.
-    assert_eq!(PROTO_VERSION, 1, "appending a variant must not bump the proto");
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
 
     let body = encode_body(&Effect::RaiseOsd {
         title: "Leave now".into(),

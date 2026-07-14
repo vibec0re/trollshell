@@ -1155,7 +1155,10 @@ mod tests {
         // …and a steady state already below 3 min re-fires nothing (latched).
         assert_eq!(detect_leave_by_crossing(Some(179), 120), None);
         // Slack hitting now/0 fires Now…
-        assert_eq!(detect_leave_by_crossing(Some(1), -1), Some(LeaveByEvent::Now));
+        assert_eq!(
+            detect_leave_by_crossing(Some(1), -1),
+            Some(LeaveByEvent::Now)
+        );
         // …and staying below 0 re-fires nothing.
         assert_eq!(detect_leave_by_crossing(Some(-1), -30), None);
         // A single tick spanning both thresholds fires the more urgent (Now).

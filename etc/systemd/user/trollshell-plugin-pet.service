@@ -15,6 +15,12 @@ ExecStart=/usr/local/bin/hytte-plugin-pet
 # empty — Environment=PET_LLM_URL= — for a fully canned-line pet).
 Environment=PET_NAME=nisse
 Environment=PET_LLM_URL=http://127.0.0.1:8080
+# Cloud brain via OpenRouter instead of a local llama-server: drop a key in
+# ~/.config/trollshell/openrouter.key (never in git or this unit — it's read
+# via hytte-ai-providers::load_key), set a model, and remove the PET_LLM_URL
+# line above so the base defaults to https://openrouter.ai/api. Example:
+#   Environment=PET_LLM_MODEL=google/gemini-2.0-flash-exp:free
+# (PET_LLM_API_KEY still works as an override for the key file if you must.)
 Restart=on-failure
 RestartSec=2
 

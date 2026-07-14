@@ -29,7 +29,7 @@
 //! - kind label: `.ts-osd-label`
 //! - value readout: `.ts-osd-value`
 //! - progress bar: `.ts-osd-progress`
-//! - kind modifier: `.volume`, `.mic`, `.brightness`
+//! - kind modifier: `.volume`, `.mic`, `.brightness`, `.battery`, `.leave-by`
 //! - state modifier: `.muted` (when applicable)
 //! - shown modifier: `.shown` (toggled by Rust to drive CSS transitions)
 
@@ -53,6 +53,15 @@ use hytte::ui::layer_window;
 /// new event resets the timer.
 const HIDE_AFTER_MS: u32 = 1500;
 
+/// Dwell for the leave-by nudge (#236). Much longer than [`HIDE_AFTER_MS`] —
+/// it's a "get up and leave" alert you should have time to read and act on,
+/// not a transient volume/brightness readout.
+const LEAVE_BY_HIDE_AFTER_MS: u32 = 6000;
+
+/// The symbolic icon a leave-by nudge falls back to when the plugin doesn't
+/// name one in its `Effect::RaiseOsd`.
+const LEAVE_BY_ICON: &str = "appointment-soon-symbolic";
+
 /// Distance from top of screen to the OSD window's top edge.
 /// `TOP_MARGIN` (48) + the CSS `.shown` `margin-top` (40) = **88 px** from the
 /// screen top, keeping the resting card position unchanged while the larger
@@ -65,6 +74,9 @@ enum Kind {
     Mic,
     Brightness,
     Battery,
+    /// A plugin-raised "leave-by" nudge (#236) — the generic
+    /// [`nudge`] entry point behind `Effect::RaiseOsd`.
+    LeaveBy,
 }
 
 impl Kind {
@@ -74,6 +86,17 @@ impl Kind {
             Self::Mic => "mic",
             Self::Brightness => "brightness",
             Self::Battery => "battery",
+            Self::LeaveBy => "leave-by",
+        }
+    }
+
+    /// How long this kind lingers before auto-hiding. The volume/brightness
+    /// OSDs are a glance ([`HIDE_AFTER_MS`]); a leave-by nudge is a
+    /// get-up-and-go alert, so it dwells much longer ([`LEAVE_BY_HIDE_AFTER_MS`]).
+    fn hide_after_ms(self) -> u32 {
+        match self {
+            Self::LeaveBy => LEAVE_BY_HIDE_AFTER_MS,
+            _ => HIDE_AFTER_MS,
         }
     }
 }
@@ -408,6 +431,28 @@ fn route_show(state: &State) {
     });
 }
 
+/// Raise a transient "leave-by" nudge — the public entry point behind the
+/// plugin→shell `Effect::RaiseOsd` (#236). Generic and reusable: the caller
+/// (any plugin, via the host effect broker) computes the display strings and
+/// the shell just shows them. `title`
+/// fills the bold `.ts-osd-label` line, `body` the `.ts-osd-value` readout, and
+/// `icon` names a symbolic icon (defaulting to [`LEAVE_BY_ICON`] when `None`).
+/// Routed onto the focused output like every other kind, with the longer
+/// leave-by dwell. GTK-main-thread-only (the effect broker runs there).
+pub fn nudge(title: &str, body: &str, icon: Option<&str>) {
+    let state = State {
+        kind: Kind::LeaveBy,
+        icon: icon.unwrap_or(LEAVE_BY_ICON).to_owned(),
+        // Leave-by carries no meaningful fraction; the `.leave-by` CSS blanks the
+        // progress bar entirely, so this value is never actually shown.
+        fraction: 0.0,
+        label: title.to_owned(),
+        value: body.to_owned(),
+        muted: false,
+    };
+    route_show(&state);
+}
+
 thread_local! {
     /// Mounted OSD instances keyed by `gtk::Monitor.connector()`.
     /// `connector()` matches niri's `Workspace.output` (KMS connector
@@ -429,11 +474,14 @@ thread_local! {
 /// Rendered OSD state — what to display once a signal fires.
 struct State {
     kind: Kind,
-    icon: &'static str,
+    /// Named symbolic icon. `String` (not `&'static str`) so a plugin-supplied
+    /// [`nudge`] icon can flow in alongside the built-in kinds' static names.
+    icon: String,
     fraction: f64,
     /// Kind name shown in `.ts-osd-label` ("Volume" / "Microphone" /
-    /// "Brightness").
-    label: &'static str,
+    /// "Brightness" / a leave-by title). `String` so the dynamic
+    /// plugin-computed nudge title (#236) can live here.
+    label: String,
     /// Percent / "Muted" text shown in `.ts-osd-value`.
     value: String,
     muted: bool,
@@ -517,9 +565,9 @@ fn render_volume(v: Volume) -> State {
     };
     State {
         kind: Kind::Volume,
-        icon,
+        icon: icon.to_owned(),
         fraction: clamp01(v.linear),
-        label: "Volume",
+        label: "Volume".to_owned(),
         value,
         muted: v.muted,
     }
@@ -536,9 +584,9 @@ fn render_mic(source: Option<&Source>) -> Option<State> {
     };
     Some(State {
         kind: Kind::Mic,
-        icon,
+        icon: icon.to_owned(),
         fraction: clamp01(s.volume),
-        label: "Microphone",
+        label: "Microphone".to_owned(),
         value,
         muted: s.muted,
     })
@@ -548,9 +596,9 @@ fn render_brightness(b: Brightness) -> State {
     let pct = pct(b.level);
     State {
         kind: Kind::Brightness,
-        icon: "display-brightness-symbolic",
+        icon: "display-brightness-symbolic".to_owned(),
         fraction: clamp01(b.level),
-        label: "Brightness",
+        label: "Brightness".to_owned(),
         value: format!("{pct}%"),
         muted: false,
     }
@@ -588,9 +636,9 @@ fn render_battery(event: BatteryEvent, batt: &Battery) -> State {
     };
     State {
         kind: Kind::Battery,
-        icon,
+        icon: icon.to_owned(),
         fraction: (batt.percentage / 100.0).clamp(0.0, 1.0),
-        label,
+        label: label.to_owned(),
         value,
         muted: false,
     }
@@ -600,9 +648,9 @@ fn render_battery(event: BatteryEvent, batt: &Battery) -> State {
 /// auto-hide timeout. If a previous timeout was still pending, cancel
 /// it so the OSD stays visible for another full `HIDE_AFTER_MS`.
 fn show(view: &Rc<OsdView>, state: &State) {
-    view.icon.set_icon_name(Some(state.icon));
+    view.icon.set_icon_name(Some(state.icon.as_str()));
     view.progress.set_fraction(state.fraction);
-    view.label.set_text(state.label);
+    view.label.set_text(&state.label);
     view.value.set_text(&state.value);
 
     // Swap kind modifier class.
@@ -648,8 +696,9 @@ fn show(view: &Rc<OsdView>, state: &State) {
         prev.remove();
     }
     let view_for_timeout = view.clone();
-    let id =
-        glib::timeout_add_local_once(Duration::from_millis(u64::from(HIDE_AFTER_MS)), move || {
+    let id = glib::timeout_add_local_once(
+        Duration::from_millis(u64::from(state.kind.hide_after_ms())),
+        move || {
             view_for_timeout.timeout.set(None);
             view_for_timeout.card.remove_css_class("shown");
             // Wait for the 280ms CSS transition + 20ms safety buffer
@@ -660,7 +709,8 @@ fn show(view: &Rc<OsdView>, state: &State) {
                 view_for_fade.window.set_visible(false);
             });
             view_for_timeout.fade_out_timeout.set(Some(fade_id));
-        });
+        },
+    );
     view.timeout.set(Some(id));
 }
 

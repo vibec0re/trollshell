@@ -1480,6 +1480,18 @@
     color: @accent_color;
 }
 
+/* Leave-by nudge (#236): a plugin-raised "get up and go" alert. It carries no
+   meaningful progress fraction, so blank the bar entirely — the card is just the
+   icon + title + the "line · direction · HH:MM" body. */
+.ts-osd-card.leave-by .ts-osd-icon {
+    color: @accent_color;
+}
+
+.ts-osd-card.leave-by .ts-osd-progress {
+    min-height: 0;
+    opacity: 0;
+}
+
 /* ── Lock screen ────────────────────────────────────────────────────────── */
 
 .ts-lock-root {

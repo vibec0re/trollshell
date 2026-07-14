@@ -92,10 +92,12 @@
 //!   sidebar — its cards render *above* the built-in weather/calendar/tasks
 //!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot.
 //! - **State:** only [`StateKey::Clock`].
-//! - **Effects:** only [`Effect::OpenPage`] is brokered (mapped to the modal
-//!   drawer); every other effect is logged "unsupported in v1" and skipped.
-//!   Capability enforcement / audit-log / the `RunCommand` round-trip are
-//!   deferred.
+//! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer) and
+//!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236) are brokered; every
+//!   other effect is logged "unsupported in v1" and skipped. Capability
+//!   enforcement stays **declarative-only** (the cap is requested + audit-logged
+//!   but not enforced by a cap store — v1 parity); audit-log / the `RunCommand`
+//!   round-trip remain deferred.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -380,16 +382,23 @@ fn bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     })
 }
 
-/// Map one wire [`Effect`] onto a real host command. v1 handles [`Effect::OpenPage`]
-/// only (→ the modal drawer); anything else is logged and skipped. Capability
-/// gating + audit-log + the `RunCommand` round-trip are deferred (see the module
-/// doc / PR body).
+/// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
+/// (→ the modal drawer) and [`Effect::RaiseOsd`] (→ the transient OSD nudge,
+/// #236); anything else is logged and skipped. Capability gating is
+/// intentionally **declarative-only** at this stage — like `OpenPage`, the
+/// `RaiseOsd` cap is requested in the manifest and audit-logged here but not
+/// enforced by a cap store (v1 parity; audit-log + the `RunCommand` round-trip
+/// remain deferred — see the module doc / PR body).
 fn broker_effect(plugin_id: &str, effect: &Effect) {
     match effect {
         Effect::OpenPage(page) => {
             let target = map_page(*page);
             tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
             crate::modal::open_on_focused(None, target);
+        }
+        Effect::RaiseOsd { title, body, icon } => {
+            tracing::info!(plugin = %plugin_id, title = %title, "plugin effect: RaiseOsd");
+            crate::overlays::osd::nudge(title, body, icon.as_deref());
         }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");

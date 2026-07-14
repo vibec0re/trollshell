@@ -74,6 +74,18 @@ pub enum Effect {
     /// a separately granted, higher-trust capability). `id` correlates the
     /// resulting [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult).
     RunCommand { id: u64, argv: Vec<String> },
+    /// Raise a transient on-screen-display nudge (cap:
+    /// [`RaiseOsd`](crate::manifest::Capability::RaiseOsd)). A **generic,
+    /// reusable** surface: the *plugin* computes the display strings and the host
+    /// just shows them, so any plugin can pop a "get up and go" style alert
+    /// without the host learning its domain. `title` is the bold kind line,
+    /// `body` the value readout, and `icon` an optional named symbolic icon (the
+    /// host picks a sensible default when `None`). Fire-and-forget.
+    RaiseOsd {
+        title: String,
+        body: String,
+        icon: Option<String>,
+    },
 }
 
 /// The outcome of a brokered [`Effect::RunCommand`], returned to the plugin.

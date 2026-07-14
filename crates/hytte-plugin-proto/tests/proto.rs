@@ -120,6 +120,11 @@ fn sample_effects() -> Vec<Effect> {
             id: 7,
             argv: vec!["vibectl".into(), "status".into()],
         },
+        Effect::RaiseOsd {
+            title: "Leave now".into(),
+            body: "S9 · Spandau · 16:05".into(),
+            icon: Some("appointment-soon-symbolic".into()),
+        },
     ]
 }
 
@@ -425,6 +430,39 @@ fn value_changed_event_round_trips() {
         ),
         "variant name 'ValueChanged' rides the wire (appending it is additive)",
     );
+}
+
+// ── RaiseOsd effect (#236) ───────────────────────────────────────────────────
+
+#[test]
+fn raise_osd_is_name_tagged_and_additive() {
+    // `RaiseOsd` is a brand-new, externally-tagged `Effect` variant, so it rides
+    // the wire as its bare variant *name* — the property that makes appending it
+    // additive: an older decoder skips an unknown tag rather than mis-decoding an
+    // existing variant, and every pre-#236 frame (which can't carry a `RaiseOsd`)
+    // decodes byte-for-byte unchanged. So `PROTO_VERSION` stays put.
+    assert_eq!(PROTO_VERSION, 1, "appending a variant must not bump the proto");
+
+    let body = encode_body(&Effect::RaiseOsd {
+        title: "Leave now".into(),
+        body: "S9 · Spandau · 16:05".into(),
+        icon: Some("appointment-soon-symbolic".into()),
+    });
+    assert!(
+        contains(&body, b"RaiseOsd"),
+        "variant name 'RaiseOsd' present"
+    );
+
+    // Round-trips both the named-icon and the host-default (`None`) icon path.
+    for icon in [Some("appointment-soon-symbolic".to_owned()), None] {
+        let effect = Effect::RaiseOsd {
+            title: "Leave soon".into(),
+            body: "S9 · Spandau · 16:05".into(),
+            icon,
+        };
+        let back: Effect = decode(&encode(&effect)).expect("decode RaiseOsd");
+        assert_eq!(effect, back);
+    }
 }
 
 // ── Pixels node ──────────────────────────────────────────────────────────────

@@ -45,6 +45,8 @@ pub enum Capability {
     Audio,
     /// Spawn commands ([`Effect::RunCommand`](crate::effect::Effect::RunCommand)).
     RunCommand,
+    /// Raise a transient OSD nudge ([`Effect::RaiseOsd`](crate::effect::Effect::RaiseOsd)).
+    RaiseOsd,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

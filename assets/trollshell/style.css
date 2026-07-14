@@ -495,6 +495,50 @@
     border-radius: 0.769em;
     margin-bottom: 0.615em;
 }
+/* A plugin's own `.boxed-list` (blessed as the native card-list recipe, #333)
+ * would otherwise paint its OWN card on top of the automatic `.ts-plugin-card`
+ * surface above — a card-in-card. Flatten it onto the plugin card exactly like
+ * `.ts-net-card` does for the shell's own grouped lists, keeping only the
+ * hairline row separators, so a plugin list reads as one surface. */
+.ts-plugin-card list.boxed-list {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+    margin: 0;
+    min-height: 0;
+}
+/* Interactive plugin sliders (a `Node::Slider` → `gtk::Scale`, e.g. vibectl's
+ * per-light brightness). The default Adwaita scale in a card reads as a thin,
+ * wasted line; give the trough real weight and a visible translucent-white
+ * track so it looks like an intentional control, with the accent-filled
+ * highlight showing the level. An insensitive slider (`enabled: false` — the
+ * off-light case) mutes to plain grey and dims, so it reads as inert without
+ * vanishing from the row. `currentColor` is the sidebar's inherited white. */
+.ts-plugin-card scale {
+    min-height: 1.385em;
+    margin: 0;
+}
+.ts-plugin-card scale > trough {
+    min-height: 0.462em;
+    border-radius: 0.462em;
+    background: alpha(currentColor, 0.15);
+    border: none;
+    padding: 0;
+}
+.ts-plugin-card scale > trough > highlight {
+    border-radius: 0.462em;
+    background: @accent_color;
+    border: none;
+}
+.ts-plugin-card scale:disabled {
+    opacity: 0.5;
+}
+.ts-plugin-card scale:disabled > trough > highlight {
+    /* Grey, not accent, when the light is off — the level is shown but reads as
+       currently unadjustable. */
+    background: alpha(currentColor, 0.3);
+}
 
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */

@@ -958,6 +958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-ai-providers"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "hytte-bus"
 version = "0.1.0"
 dependencies = [

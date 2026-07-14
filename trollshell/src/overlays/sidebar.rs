@@ -328,24 +328,19 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
 
     // Plugin mount: `Mount::SidebarLead` — the *leading* plugin *region* (#301),
     // mounted at the very TOP of the sidebar, ABOVE the built-in cards. This is
-    // the only region whose cards render above weather/calendar/tasks; the
-    // after-tasks `SidebarTop` region (below) cannot. The weather plugin lives
-    // here now (#290). During the migration transition the native weather card
-    // (appended just below) is STILL mounted — its removal is the separate #290
-    // follow-up, gated on Annika's side-by-side — so the plugin card renders
-    // directly above the native one (handy for the very comparison she's making);
-    // after that removal the plugin simply leads the sidebar. Empty until a
-    // plugin dials in.
+    // the only region whose cards render above calendar/tasks; the after-tasks
+    // `SidebarTop` region (below) cannot. This is where the weather card lives
+    // now (#290 migrated it out-of-process; see `trollshell-plugin-weather`).
+    // Empty until a plugin dials in.
     card.append(&crate::plugins::sidebar_lead_slot());
 
-    card.append(&crate::widgets::weather::widget());
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
 
     // Plugin mount: `Mount::SidebarTop` — a *region* holding N out-of-process
     // widget-plugin cards (#274), sorted by each plugin's manifest `order`.
     // Reconciled *after* the built-in cards but above the flex gap (plugins must
-    // not shove weather/calendar/tasks down). Empty until a plugin dials in.
+    // not shove calendar/tasks down). Empty until a plugin dials in.
     card.append(&crate::plugins::sidebar_top_slot());
 
     // Flex gap: eats whatever vertical space the calendar + tasks
@@ -420,9 +415,6 @@ fn wire_open_subscription(
             &zone_tick,
             open,
         );
-        if open {
-            hytte::services::weather::refresh();
-        }
         async {}
     }))
 }

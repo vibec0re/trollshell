@@ -86,8 +86,13 @@ impl Cfg {
         let api_key = std::env::var("PET_LLM_API_KEY")
             .ok()
             .filter(|s| !s.is_empty());
-        let model = std::env::var("PET_LLM_MODEL").ok().filter(|s| !s.is_empty());
-        let llm_base = resolve_base(std::env::var("PET_LLM_URL").ok().as_deref(), api_key.is_some());
+        let model = std::env::var("PET_LLM_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let llm_base = resolve_base(
+            std::env::var("PET_LLM_URL").ok().as_deref(),
+            api_key.is_some(),
+        );
         let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
         Self {
             llm_base,
@@ -258,9 +263,7 @@ fn ask_llm(
             // `OpenRouter` attribution (harmless on any OpenAI-compatible server).
             .header("X-Title", "trollshell-pet");
     }
-    let mut resp = builder
-        .send_json(&body)
-        .map_err(|e| format!("http: {e}"))?;
+    let mut resp = builder.send_json(&body).map_err(|e| format!("http: {e}"))?;
     let parsed: ChatResponse = resp
         .body_mut()
         .read_json()
@@ -660,10 +663,17 @@ mod live_tests {
         // Honors the same env as production: set PET_LLM_API_KEY + PET_LLM_MODEL
         // to live-test the `OpenRouter` path, or leave them unset for a local
         // llama-server.
-        let api_key = std::env::var("PET_LLM_API_KEY").ok().filter(|s| !s.is_empty());
-        let model = std::env::var("PET_LLM_MODEL").ok().filter(|s| !s.is_empty());
-        let base = resolve_base(std::env::var("PET_LLM_URL").ok().as_deref(), api_key.is_some())
-            .expect("model not disabled");
+        let api_key = std::env::var("PET_LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let model = std::env::var("PET_LLM_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let base = resolve_base(
+            std::env::var("PET_LLM_URL").ok().as_deref(),
+            api_key.is_some(),
+        )
+        .expect("model not disabled");
         let url = llm_url(&base);
 
         let poke = ask_llm(

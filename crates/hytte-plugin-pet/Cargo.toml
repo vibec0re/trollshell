@@ -26,8 +26,6 @@ tokio = { version = "1.40", default-features = false, features = [
   "time",
   "sync",
 ] }
-# The brain talks to a local llama-server over plain HTTP (the same blocking
-# ureq + spawn_blocking idiom as hytte-services' weather fetcher).
-ureq = { version = "3.3.0", default-features = false, features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# The shared OpenAI-compatible chat client (provider config, blocking HTTP,
+# key-from-file). The brain runs its `chat()` on a `spawn_blocking` thread.
+hytte-ai-providers = { path = "../hytte-ai-providers" }

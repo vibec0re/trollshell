@@ -1,19 +1,30 @@
 //! The pet's brain: where the words come from.
 //!
 //! A long-running task takes [`ThinkReq`]s from the reducer and always
-//! answers with one short line. The interesting path asks a **local
-//! `llama-server`** (an OpenAI-compatible `/v1/chat/completions` on
-//! localhost — see `etc/systemd/user/trollshell-pet-brain.service`) with a
-//! tiny persona prompt; rate-limiting, unreachability, and nonsense replies
-//! all fall back to the **canned pools**, so the pet stays fully alive with
-//! no model installed at all.
+//! answers with one short line. The interesting path asks an
+//! OpenAI-compatible `/v1/chat/completions` endpoint — through the shared
+//! [`hytte_ai_providers`] client — with a tiny persona prompt. Two backends,
+//! chosen by config:
 //!
-//! HTTP is the house idiom: blocking `ureq` on a `spawn_blocking` thread
-//! (same as `hytte-services`' weather fetcher). The prompt asks for one
-//! plain line; [`sanitize`] enforces it whatever the model does.
+//! - a **local `llama-server`** (the default, on localhost — see
+//!   `etc/systemd/user/trollshell-pet-brain.service`), or
+//! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM) when an API key is
+//!   available — from `~/.config/trollshell/openrouter.key` (see
+//!   [`hytte_ai_providers::load_key`]) or `$PET_LLM_API_KEY` — together with a
+//!   `$PET_LLM_MODEL`.
+//!
+//! Rate-limiting, unreachability, and nonsense (or empty) replies all fall
+//! back to the **canned pools**, so the pet stays fully alive with no model
+//! configured at all.
+//!
+//! The shared client owns the HTTP + provider config; the pet keeps the
+//! persona, the [`sanitize`] step, and the "empty line ⇒ offline ⇒ canned"
+//! policy. The prompt asks for one plain line; [`sanitize`] enforces it
+//! whatever the model does.
 
 use std::time::Duration;
 
+use hytte_ai_providers::{ChatOpts, Message, Provider};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -52,22 +63,55 @@ pub struct ThinkReq {
 
 /// Brain configuration, from the environment.
 struct Cfg {
-    /// `$PET_LLM_URL` — base URL of a llama-server; empty disables the model
-    /// entirely (canned-only pet). Default: `http://127.0.0.1:8080`.
-    llm_base: Option<String>,
+    /// The resolved chat [`Provider`], or `None` for a canned-only pet (an
+    /// empty `$PET_LLM_URL`). See [`resolve_provider`].
+    provider: Option<Provider>,
     /// `$PET_NAME` — the pet's name in its persona. Default: `nisse`.
     name: String,
 }
 
 impl Cfg {
     fn from_env() -> Self {
-        let llm_base = match std::env::var("PET_LLM_URL") {
-            Ok(s) if s.is_empty() => None,
-            Ok(s) => Some(s),
-            Err(_) => Some("http://127.0.0.1:8080".to_owned()),
-        };
+        // The pet's OpenRouter key: the shared key file (`openrouter.key`, or
+        // its `OPENROUTER_API_KEY` override) first, then the pet-specific
+        // `$PET_LLM_API_KEY`.
+        let key = hytte_ai_providers::load_key("openrouter").or_else(|| {
+            std::env::var("PET_LLM_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        let model = std::env::var("PET_LLM_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let provider = resolve_provider(std::env::var("PET_LLM_URL").ok().as_deref(), key, model);
         let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
-        Self { llm_base, name }
+        Self { provider, name }
+    }
+}
+
+/// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
+/// `$PET_LLM_URL` (`None` = unset, `Some("")` = set-but-empty = model
+/// disabled). With no explicit URL, a present `key` selects `OpenRouter`;
+/// otherwise a local `llama-server`. An explicit URL always wins as the base,
+/// with any `key`/`model` layered on (e.g. a self-hosted keyed endpoint).
+fn resolve_provider(
+    url_env: Option<&str>,
+    key: Option<String>,
+    model: Option<String>,
+) -> Option<Provider> {
+    match url_env {
+        Some("") => None,
+        Some(url) => Some(Provider {
+            base_url: url.to_owned(),
+            api_key: key,
+            model,
+        }),
+        None if key.is_some() => Some(Provider {
+            base_url: "https://openrouter.ai/api".to_owned(),
+            api_key: key,
+            model,
+        }),
+        None => Some(Provider::llama("http://127.0.0.1:8080")),
     }
 }
 
@@ -90,11 +134,12 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
             return; // session gone; don't start work nobody will read
         }
         canned_step = canned_step.wrapping_add(1);
-        let line = match &cfg.llm_base {
-            Some(base) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
-                let url = llm_url(base);
+        let line = match &cfg.provider {
+            Some(provider) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
+                let provider = provider.clone();
                 let name = cfg.name.clone();
-                let asked = tokio::task::spawn_blocking(move || ask_llm(&url, &name, req)).await;
+                let asked =
+                    tokio::task::spawn_blocking(move || ask_llm(&provider, &name, req)).await;
                 // Stamp at completion: the gap is between calls, so a slow
                 // call must not immediately qualify the next one.
                 last_llm = Some(Instant::now());
@@ -118,90 +163,24 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
     }
 }
 
-/// The chat endpoint for a configured base URL (tolerates a trailing slash —
-/// llama-server 404s on `//v1/...`).
-fn llm_url(base: &str) -> String {
-    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
-}
-
 // ── The model path ───────────────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
-struct ChatRequest<'a> {
-    messages: [ChatMessage<'a>; 2],
-    max_tokens: u32,
-    temperature: f32,
-    /// `MiniCPM5` (and Qwen-family) templates honor this; without it a
-    /// reasoning model burns the whole token budget on `reasoning_content`
-    /// and `content` comes back empty. Servers whose templates don't know
-    /// the kwarg simply ignore it.
-    chat_template_kwargs: TemplateKwargs,
-}
-
-#[derive(serde::Serialize)]
-struct TemplateKwargs {
-    enable_thinking: bool,
-}
-
-#[derive(serde::Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(serde::Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(serde::Deserialize)]
-struct ChatChoiceMessage {
-    content: String,
-}
-
-/// One blocking chat-completion call (runs on a `spawn_blocking` thread).
-/// llama-server applies the model's own chat template server-side.
-fn ask_llm(url: &str, name: &str, req: ThinkReq) -> Result<String, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
-        .into();
-    let body = ChatRequest {
-        messages: [
-            ChatMessage {
-                role: "system",
-                content: persona(name, req),
-            },
-            ChatMessage {
-                role: "user",
-                content: event(name, req),
-            },
-        ],
+/// One blocking chat-completion call (runs on a `spawn_blocking` thread):
+/// build the persona/event messages, ask the shared client, then [`sanitize`]
+/// the raw reply. An **empty** line is treated as "offline" so the caller
+/// falls back to a canned line — a reasoning model that spends its whole
+/// budget on hidden reasoning returns nothing, and that shouldn't surface as a
+/// blank bubble.
+fn ask_llm(provider: &Provider, name: &str, req: ThinkReq) -> Result<String, String> {
+    let messages = [
+        Message::system(persona(name, req)),
+        Message::user(event(name, req)),
+    ];
+    let opts = ChatOpts {
         max_tokens: 32,
         temperature: 0.9,
-        chat_template_kwargs: TemplateKwargs {
-            enable_thinking: false,
-        },
     };
-    let mut resp = agent
-        .post(url)
-        .send_json(&body)
-        .map_err(|e| format!("http: {e}"))?;
-    let parsed: ChatResponse = resp
-        .body_mut()
-        .read_json()
-        .map_err(|e| format!("bad response body: {e}"))?;
-    let raw = parsed
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .unwrap_or_default();
+    let raw = hytte_ai_providers::chat(provider, &messages, &opts)?;
     let line = sanitize(&raw, name);
     if line.is_empty() {
         Err("model produced an empty line (a reasoning model? run llama-server with --reasoning-budget 0)".to_owned())
@@ -355,18 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn llm_url_tolerates_trailing_slashes() {
-        assert_eq!(
-            llm_url("http://127.0.0.1:8080/"),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
-        assert_eq!(
-            llm_url("http://127.0.0.1:8080"),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn sanitize_strips_the_self_naming_tic_and_emoji() {
         assert_eq!(
             sanitize("Nisse: purring loudly", "nisse"),
@@ -418,29 +385,56 @@ mod tests {
         assert!(CANNED_SLEEPY.contains(&sleepy_idle.as_str()));
     }
 
-    /// Hermetic end-to-end of the model path: a fake llama-server on a local
-    /// socket answers one canned chat completion; `ask_llm` must parse it
-    /// and sanitize the content.
     #[test]
-    fn ask_llm_parses_a_chat_completion() {
+    fn resolve_provider_picks_the_backend() {
+        // Explicitly empty URL → model disabled (canned-only pet).
+        assert!(resolve_provider(Some(""), None, None).is_none());
+        // Explicit URL, no key → that base, no auth; model layered when set.
+        let p = resolve_provider(Some("http://host:1"), None, Some("m".to_owned())).unwrap();
+        assert_eq!(p.base_url, "http://host:1");
+        assert!(p.api_key.is_none());
+        assert_eq!(p.model.as_deref(), Some("m"));
+        // No URL + a key → OpenRouter.
+        let p = resolve_provider(None, Some("sk-1".to_owned()), Some("gpt".to_owned())).unwrap();
+        assert_eq!(p.base_url, "https://openrouter.ai/api");
+        assert_eq!(p.api_key.as_deref(), Some("sk-1"));
+        assert_eq!(p.model.as_deref(), Some("gpt"));
+        // No URL, no key → the local llama default.
+        let p = resolve_provider(None, None, None).unwrap();
+        assert_eq!(p.base_url, "http://127.0.0.1:8080");
+        assert!(p.api_key.is_none());
+        // Explicit URL + key (a self-hosted keyed endpoint) → URL wins, key layered.
+        let p = resolve_provider(Some("http://host:2"), Some("k".to_owned()), None).unwrap();
+        assert_eq!(p.base_url, "http://host:2");
+        assert_eq!(p.api_key.as_deref(), Some("k"));
+    }
+
+    /// A one-shot fake OpenAI-compatible server that answers with `body`.
+    fn spawn_fake(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let server = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
-            // Read the request (enough of it), then answer.
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf);
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"\"purring at your service\"\n"}}]}"#;
             let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len(),
-                body
             );
             sock.write_all(resp.as_bytes()).expect("write");
         });
+        (format!("http://{addr}"), handle)
+    }
 
+    /// End-to-end of the model path: a fake server answers one chat
+    /// completion; `ask_llm` parses it and [`sanitize`]s the content.
+    #[test]
+    fn ask_llm_parses_and_sanitizes() {
+        let (base, server) = spawn_fake(
+            r#"{"choices":[{"message":{"role":"assistant","content":"\"purring at your service\"\n"}}]}"#,
+        );
         let line = ask_llm(
-            &format!("http://{addr}/v1/chat/completions"),
+            &Provider::llama(base),
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Idle,
@@ -449,8 +443,28 @@ mod tests {
                 pokes: 0,
             },
         )
-        .expect("parses the completion");
+        .expect("parses + sanitizes the completion");
         assert_eq!(line, "purring at your service");
+        server.join().expect("server thread");
+    }
+
+    /// A blank reply (e.g. a reasoning model that returned nothing) is the
+    /// pet's "offline" signal → the brain uses a canned line.
+    #[test]
+    fn ask_llm_blank_reply_is_offline() {
+        let (base, server) = spawn_fake(r#"{"choices":[{"message":{"content":"   \n"}}]}"#);
+        let err = ask_llm(
+            &Provider::llama(base),
+            "nisse",
+            ThinkReq {
+                kind: ThinkKind::Poke,
+                hour: 15,
+                mood: "happy",
+                pokes: 1,
+            },
+        )
+        .expect_err("a blank line is treated as offline");
+        assert!(err.contains("empty line"), "{err}");
         server.join().expect("server thread");
     }
 
@@ -462,7 +476,7 @@ mod tests {
             l.local_addr().expect("addr")
         };
         let err = ask_llm(
-            &format!("http://{addr}/v1/chat/completions"),
+            &Provider::llama(format!("http://{addr}")),
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Poke,
@@ -488,10 +502,10 @@ mod live_tests {
     fn live_persona_speaks_one_short_line() {
         let base =
             std::env::var("PET_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
-        let url = format!("{base}/v1/chat/completions");
+        let provider = Provider::llama(base);
 
         let poke = ask_llm(
-            &url,
+            &provider,
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Poke,
@@ -505,7 +519,7 @@ mod live_tests {
         assert!(!poke.is_empty() && poke.chars().count() <= MAX_LINE + 1);
 
         let idle = ask_llm(
-            &url,
+            &provider,
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Idle,

@@ -1,12 +1,24 @@
 //! The pet's brain: where the words come from.
 //!
 //! A long-running task takes [`ThinkReq`]s from the reducer and always
-//! answers with one short line. The interesting path asks a **local
-//! `llama-server`** (an OpenAI-compatible `/v1/chat/completions` on
-//! localhost — see `etc/systemd/user/trollshell-pet-brain.service`) with a
-//! tiny persona prompt; rate-limiting, unreachability, and nonsense replies
-//! all fall back to the **canned pools**, so the pet stays fully alive with
-//! no model installed at all.
+//! answers with one short line. The interesting path asks an **OpenAI-compatible
+//! `/v1/chat/completions`** with a tiny persona prompt — either a **local
+//! `llama-server`** (the default, on localhost — see
+//! `etc/systemd/user/trollshell-pet-brain.service`) or a **cloud endpoint like
+//! [`OpenRouter`](https://openrouter.ai)** when `$PET_LLM_API_KEY` (and a
+//! `$PET_LLM_MODEL`) are set. Rate-limiting, unreachability, and nonsense
+//! replies all fall back to the **canned pools**, so the pet stays fully alive
+//! with no model configured at all.
+//!
+//! # Backends
+//!
+//! Both backends speak the same wire shape, so switching is pure config:
+//! - **llama-server** (default): `$PET_LLM_URL=http://127.0.0.1:8080`, no key,
+//!   its loaded model, and the `enable_thinking:false` template kwarg.
+//! - **`OpenRouter`**: set `$PET_LLM_API_KEY` (sent as `Authorization: Bearer …`)
+//!   and `$PET_LLM_MODEL` (e.g. `google/gemini-2.0-flash-exp:free`); the base
+//!   URL then defaults to `https://openrouter.ai/api` (override with
+//!   `$PET_LLM_URL`). The llama-only template kwarg is dropped for cloud.
 //!
 //! HTTP is the house idiom: blocking `ureq` on a `spawn_blocking` thread
 //! (same as `hytte-services`' weather fetcher). The prompt asks for one
@@ -52,22 +64,49 @@ pub struct ThinkReq {
 
 /// Brain configuration, from the environment.
 struct Cfg {
-    /// `$PET_LLM_URL` — base URL of a llama-server; empty disables the model
-    /// entirely (canned-only pet). Default: `http://127.0.0.1:8080`.
+    /// Base URL of the OpenAI-compatible chat endpoint. `None` disables the
+    /// model entirely (canned-only pet). Resolved by [`resolve_base`] from
+    /// `$PET_LLM_URL`, defaulting to a local llama-server — or to `OpenRouter`
+    /// when an API key is set (see [`resolve_base`]).
     llm_base: Option<String>,
+    /// `$PET_LLM_API_KEY` — bearer token for a cloud endpoint (`OpenRouter`),
+    /// sent as `Authorization: Bearer …`. `None` for a local llama-server,
+    /// which needs no auth.
+    api_key: Option<String>,
+    /// `$PET_LLM_MODEL` — the model id in the request body. **Required by
+    /// `OpenRouter`** (e.g. `google/gemini-2.0-flash-exp:free`); a local
+    /// llama-server ignores it (uses its loaded model), so it's optional there.
+    model: Option<String>,
     /// `$PET_NAME` — the pet's name in its persona. Default: `nisse`.
     name: String,
 }
 
 impl Cfg {
     fn from_env() -> Self {
-        let llm_base = match std::env::var("PET_LLM_URL") {
-            Ok(s) if s.is_empty() => None,
-            Ok(s) => Some(s),
-            Err(_) => Some("http://127.0.0.1:8080".to_owned()),
-        };
+        let api_key = std::env::var("PET_LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let model = std::env::var("PET_LLM_MODEL").ok().filter(|s| !s.is_empty());
+        let llm_base = resolve_base(std::env::var("PET_LLM_URL").ok().as_deref(), api_key.is_some());
         let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
-        Self { llm_base, name }
+        Self {
+            llm_base,
+            api_key,
+            model,
+            name,
+        }
+    }
+}
+
+/// Resolve the model base URL. `url_env` is the raw `$PET_LLM_URL` (`None` =
+/// unset, `Some("")` = set-but-empty = model disabled). With no explicit URL, a
+/// present API key means "use `OpenRouter`"; otherwise the local llama-server.
+fn resolve_base(url_env: Option<&str>, has_key: bool) -> Option<String> {
+    match url_env {
+        Some("") => None,
+        Some(s) => Some(s.to_owned()),
+        None if has_key => Some("https://openrouter.ai/api".to_owned()),
+        None => Some("http://127.0.0.1:8080".to_owned()),
     }
 }
 
@@ -94,7 +133,12 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
             Some(base) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
                 let url = llm_url(base);
                 let name = cfg.name.clone();
-                let asked = tokio::task::spawn_blocking(move || ask_llm(&url, &name, req)).await;
+                let api_key = cfg.api_key.clone();
+                let model = cfg.model.clone();
+                let asked = tokio::task::spawn_blocking(move || {
+                    ask_llm(&url, api_key.as_deref(), model.as_deref(), &name, req)
+                })
+                .await;
                 // Stamp at completion: the gap is between calls, so a slow
                 // call must not immediately qualify the next one.
                 last_llm = Some(Instant::now());
@@ -128,14 +172,21 @@ fn llm_url(base: &str) -> String {
 
 #[derive(serde::Serialize)]
 struct ChatRequest<'a> {
+    /// The model id, sent when configured (`$PET_LLM_MODEL`). **Required by
+    /// `OpenRouter`**; a llama-server ignores it (uses its loaded model), so it's
+    /// omitted from the wire when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
     messages: [ChatMessage<'a>; 2],
     max_tokens: u32,
     temperature: f32,
     /// `MiniCPM5` (and Qwen-family) templates honor this; without it a
     /// reasoning model burns the whole token budget on `reasoning_content`
     /// and `content` comes back empty. Servers whose templates don't know
-    /// the kwarg simply ignore it.
-    chat_template_kwargs: TemplateKwargs,
+    /// the kwarg simply ignore it. Omitted for a cloud endpoint (`OpenRouter`),
+    /// which isn't llama-server and could reject the non-standard field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<TemplateKwargs>,
 }
 
 #[derive(serde::Serialize)]
@@ -165,14 +216,23 @@ struct ChatChoiceMessage {
 }
 
 /// One blocking chat-completion call (runs on a `spawn_blocking` thread).
-/// llama-server applies the model's own chat template server-side.
-fn ask_llm(url: &str, name: &str, req: ThinkReq) -> Result<String, String> {
+/// llama-server applies the model's own chat template server-side; a cloud
+/// endpoint (`OpenRouter`) authenticates via `api_key` and needs an explicit
+/// `model`.
+fn ask_llm(
+    url: &str,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    name: &str,
+    req: ThinkReq,
+) -> Result<String, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
         .into();
     let body = ChatRequest {
+        model,
         messages: [
             ChatMessage {
                 role: "system",
@@ -185,12 +245,20 @@ fn ask_llm(url: &str, name: &str, req: ThinkReq) -> Result<String, String> {
         ],
         max_tokens: 32,
         temperature: 0.9,
-        chat_template_kwargs: TemplateKwargs {
+        // The reasoning-off hint is a llama-server template kwarg; a keyed
+        // (cloud/`OpenRouter`) endpoint wouldn't know it, so send it local-only.
+        chat_template_kwargs: api_key.is_none().then_some(TemplateKwargs {
             enable_thinking: false,
-        },
+        }),
     };
-    let mut resp = agent
-        .post(url)
+    let mut builder = agent.post(url);
+    if let Some(key) = api_key {
+        builder = builder
+            .header("Authorization", format!("Bearer {key}"))
+            // `OpenRouter` attribution (harmless on any OpenAI-compatible server).
+            .header("X-Title", "trollshell-pet");
+    }
+    let mut resp = builder
         .send_json(&body)
         .map_err(|e| format!("http: {e}"))?;
     let parsed: ChatResponse = resp
@@ -441,6 +509,8 @@ mod tests {
 
         let line = ask_llm(
             &format!("http://{addr}/v1/chat/completions"),
+            None,
+            None,
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Idle,
@@ -455,6 +525,105 @@ mod tests {
     }
 
     #[test]
+    fn resolve_base_defaults_and_openrouter() {
+        // No URL, no key → local llama-server.
+        assert_eq!(
+            resolve_base(None, false).as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        // No URL but a key present → `OpenRouter`.
+        assert_eq!(
+            resolve_base(None, true).as_deref(),
+            Some("https://openrouter.ai/api")
+        );
+        // Explicit URL always wins (even with a key).
+        assert_eq!(
+            resolve_base(Some("http://box:9000"), true).as_deref(),
+            Some("http://box:9000")
+        );
+        // Empty URL disables the model entirely.
+        assert_eq!(resolve_base(Some(""), true), None);
+    }
+
+    /// The `OpenRouter` path: an API key + model must ride the request as an
+    /// `Authorization: Bearer` header and a `"model"` body field, and the
+    /// llama-only `chat_template_kwargs` must be dropped.
+    #[test]
+    fn ask_llm_sends_model_and_auth_when_keyed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let captured = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Read until the whole request (headers + Content-Length body) is in
+            // hand — a single read can return just the headers, dropping the
+            // JSON body we assert on.
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&acc);
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let content_len = text[..hdr_end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if acc.len() >= hdr_end + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"mrrp"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).expect("write");
+            String::from_utf8_lossy(&acc).into_owned()
+        });
+
+        let line = ask_llm(
+            &format!("http://{addr}/v1/chat/completions"),
+            Some("sk-or-testkey"),
+            Some("google/gemini-2.0-flash-exp:free"),
+            "nisse",
+            ThinkReq {
+                kind: ThinkKind::Poke,
+                hour: 9,
+                mood: "happy",
+                pokes: 1,
+            },
+        )
+        .expect("parses the completion");
+        assert_eq!(line, "mrrp");
+
+        let req = captured.join().expect("server thread");
+        let lower = req.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer sk-or-testkey"),
+            "auth header sent: {req}"
+        );
+        // The model value is unique to the `model` field (format-agnostic:
+        // ureq pretty-prints, so don't assume compact `"model":"…"`).
+        assert!(
+            req.contains("google/gemini-2.0-flash-exp:free"),
+            "model in body: {req}"
+        );
+        assert!(
+            !req.contains("chat_template_kwargs"),
+            "llama-only kwarg dropped for cloud: {req}"
+        );
+    }
+
+    #[test]
     fn ask_llm_reports_unreachable_server() {
         // A port nothing listens on (bind-then-drop reserves then frees it).
         let addr = {
@@ -463,6 +632,8 @@ mod tests {
         };
         let err = ask_llm(
             &format!("http://{addr}/v1/chat/completions"),
+            None,
+            None,
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Poke,
@@ -486,12 +657,19 @@ mod live_tests {
     #[test]
     #[ignore = "needs a running llama-server with a chat model"]
     fn live_persona_speaks_one_short_line() {
-        let base =
-            std::env::var("PET_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
-        let url = format!("{base}/v1/chat/completions");
+        // Honors the same env as production: set PET_LLM_API_KEY + PET_LLM_MODEL
+        // to live-test the `OpenRouter` path, or leave them unset for a local
+        // llama-server.
+        let api_key = std::env::var("PET_LLM_API_KEY").ok().filter(|s| !s.is_empty());
+        let model = std::env::var("PET_LLM_MODEL").ok().filter(|s| !s.is_empty());
+        let base = resolve_base(std::env::var("PET_LLM_URL").ok().as_deref(), api_key.is_some())
+            .expect("model not disabled");
+        let url = llm_url(&base);
 
         let poke = ask_llm(
             &url,
+            api_key.as_deref(),
+            model.as_deref(),
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Poke,
@@ -506,6 +684,8 @@ mod live_tests {
 
         let idle = ask_llm(
             &url,
+            api_key.as_deref(),
+            model.as_deref(),
             "nisse",
             ThinkReq {
                 kind: ThinkKind::Idle,

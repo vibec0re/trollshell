@@ -35,59 +35,65 @@ fn unwrap_variant(value: OwnedValue) -> Result<OwnedValue> {
     OwnedValue::try_from(inner).context("re-owning unwrapped variant")
 }
 
-/// Recursively parse a single layout node `(i, a{sv}, av)` from an
-/// `OwnedValue`.
-pub(super) fn parse_layout_node(val: OwnedValue) -> Result<Menu> {
-    let val = unwrap_variant(val)?;
-    let structure = Structure::try_from(val).context("layout node not a structure")?;
-    let mut fields = structure.into_fields();
-    if fields.len() < 3 {
-        return Err(anyhow!("layout node has fewer than 3 fields"));
-    }
+/// The concrete `com.canonical.dbusmenu` layout node `(i, a{sv}, av)` as it
+/// deserializes off the wire.
+///
+/// `GetLayout` replies with signature `(u(ia{sv}av))` — a `u32` revision plus
+/// this **concrete struct** (`i32` id, `a{sv}` properties, `av` children).
+/// Issue #8: the old code destructured the reply as `(u32, OwnedValue)`
+/// (signature `(uv)`), but zbus 5.x refuses to coerce a concrete struct into a
+/// bare `Value`/`OwnedValue`, so *every* `GetLayout` failed uniformly with a
+/// `Signature mismatch: got (u(ia{sv}av)), expected (uv)` error and the tray
+/// fell back to the plain `ContextMenu`. Deserializing into this typed shape
+/// (its derived `Type` signature is exactly `(ia{sv}av)`) matches the wire.
+///
+/// Children are `av` (array of variant); each variant wraps another
+/// `(ia{sv}av)` node, surfaced here as an `OwnedValue` and re-parsed
+/// recursively by [`parse_menu_entry`] (which peels any variant wrapper via
+/// [`unwrap_variant`] before `Structure::try_from`).
+#[derive(Debug, serde::Deserialize, zbus::zvariant::Type)]
+pub(super) struct LayoutNode {
+    id: i32,
+    props: HashMap<String, OwnedValue>,
+    children: Vec<OwnedValue>,
+}
 
-    let id = i32::try_from(fields.remove(0)).context("node id")?;
-
-    // Properties: a{sv}
-    let props_val = fields.remove(0);
-    let props: HashMap<String, OwnedValue> =
-        HashMap::try_from(OwnedValue::try_from(props_val).context("props to owned")?)
-            .context("node props")?;
-
-    // Children: av
-    let children_val = fields.remove(0);
-    let children_arr = zbus::zvariant::Array::try_from(
-        OwnedValue::try_from(children_val).context("children to owned")?,
-    )
-    .context("node children")?;
+/// Parse the root [`LayoutNode`] (already deserialized from `GetLayout`'s
+/// `(u(ia{sv}av))` reply) into a [`Menu`].
+///
+/// Never fails: malformed individual children are logged and skipped rather
+/// than aborting the whole tree (the root's `id`/`props`/`children` are already
+/// well-typed by the time they reach here).
+pub(super) fn parse_layout_node(node: LayoutNode) -> Menu {
+    let LayoutNode {
+        id,
+        props,
+        children,
+    } = node;
 
     let visible = bool_prop(&props, "visible", true);
     if !visible {
         // Return a menu with no items for invisible root (unlikely but safe).
-        return Ok(Menu { id, items: vec![] });
+        return Menu { id, items: vec![] };
     }
 
     let item_type = str_prop(&props, "type", "standard");
     if item_type == "separator" {
         // A root node that is a separator — return empty.
-        return Ok(Menu { id, items: vec![] });
+        return Menu { id, items: vec![] };
     }
 
     // Collect children into MenuEntry list.
     let mut items = Vec::new();
-    for child_val in children_arr.iter() {
-        let owned: OwnedValue = child_val
-            .try_clone()
-            .context("clone child value")?
-            .try_into_owned()
-            .context("child to owned")?;
-        match parse_menu_entry(owned) {
+    for child in children {
+        match parse_menu_entry(child) {
             Ok(Some(entry)) => items.push(entry),
             Ok(None) => {} // invisible / skipped
             Err(e) => tracing::debug!(error = %e, "skipping malformed menu entry"),
         }
     }
 
-    Ok(Menu { id, items })
+    Menu { id, items }
 }
 
 /// Parse one child value from the `av` children list into a `MenuEntry`.
@@ -269,6 +275,26 @@ mod tests {
             .expect("node fixture must serialise")
     }
 
+    /// Build a root [`LayoutNode`] directly — the deserialized shape
+    /// `parse_layout_node` now takes. `props` become an `a{sv}` map; each child
+    /// is an `OwnedValue` wrapping a `(ia{sv}av)` node (as `node_owned`
+    /// produces), matching the `av` element shape real deserialization yields.
+    fn layout_node(
+        id: i32,
+        props: Vec<(&str, Value<'static>)>,
+        children: Vec<OwnedValue>,
+    ) -> LayoutNode {
+        let props: HashMap<String, OwnedValue> = props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.try_to_owned().expect("prop fixture serialises")))
+            .collect();
+        LayoutNode {
+            id,
+            props,
+            children,
+        }
+    }
+
     // ── strip_accel ───────────────────────────────────────────────────────────
 
     #[test]
@@ -336,35 +362,41 @@ mod tests {
         assert_eq!(i32_prop(&props, "toggle-state", -1), 1);
     }
 
-    // ── parse_layout_node: structural guards ──────────────────────────────────
+    // ── parse_menu_entry: structural guards (untrusted children) ──────────────
+    //
+    // The root node is now a typed `LayoutNode` (always 3 fields), so the
+    // malformed-shape guards live at the child level — where the untrusted
+    // `av` elements land.
 
     #[test]
-    fn layout_node_rejects_fewer_than_three_fields() {
+    fn menu_entry_rejects_fewer_than_three_fields() {
         // A one-field structure `(i)` must Err, not panic.
         let short = Value::from((5i32,)).try_to_owned().unwrap();
-        assert!(parse_layout_node(short).is_err());
+        assert!(parse_menu_entry(short).is_err());
     }
 
     #[test]
-    fn layout_node_non_structure_errors() {
+    fn menu_entry_non_structure_errors() {
         let not_a_struct = Value::from(42i32).try_to_owned().unwrap();
-        assert!(parse_layout_node(not_a_struct).is_err());
+        assert!(parse_menu_entry(not_a_struct).is_err());
     }
+
+    // ── parse_layout_node: root-node handling ─────────────────────────────────
 
     #[test]
     fn layout_node_invisible_root_yields_empty_items() {
         // Even with a child present, an invisible root short-circuits to empty.
-        let child = node_value(2, vec![("label", Value::from("Child"))], vec![]);
-        let root = node_owned(1, vec![("visible", Value::from(false))], vec![child]);
-        let menu = parse_layout_node(root).expect("invisible root parses");
+        let child = node_owned(2, vec![("label", Value::from("Child"))], vec![]);
+        let root = layout_node(1, vec![("visible", Value::from(false))], vec![child]);
+        let menu = parse_layout_node(root);
         assert_eq!(menu.id, 1);
         assert!(menu.items.is_empty());
     }
 
     #[test]
     fn layout_node_separator_root_yields_empty_items() {
-        let root = node_owned(1, vec![("type", Value::from("separator"))], vec![]);
-        let menu = parse_layout_node(root).expect("separator root parses");
+        let root = layout_node(1, vec![("type", Value::from("separator"))], vec![]);
+        let menu = parse_layout_node(root);
         assert!(menu.items.is_empty());
     }
 
@@ -502,13 +534,12 @@ mod tests {
     }
 
     /// Companion to the nesting test at the root level: a root node with a
-    /// visible standard child now retains that child, since `unwrap_variant`
-    /// peels the `Value::Value` wrapping before `Structure::try_from` (#8).
+    /// visible standard child retains that child.
     #[test]
     fn layout_node_children_preserves_children() {
-        let child = node_value(2, vec![("label", Value::from("Child"))], vec![]);
-        let root = node_owned(1, vec![("label", Value::from("Root"))], vec![child]);
-        let menu = parse_layout_node(root).expect("root parses");
+        let child = node_owned(2, vec![("label", Value::from("Child"))], vec![]);
+        let root = layout_node(1, vec![("label", Value::from("Root"))], vec![child]);
+        let menu = parse_layout_node(root);
         assert_eq!(menu.id, 1);
         assert_eq!(menu.items.len(), 1);
         match &menu.items[0] {
@@ -521,17 +552,17 @@ mod tests {
     /// — the general case behind the single-child regression tests above.
     #[test]
     fn layout_node_parses_all_n_children() {
-        let children: Vec<Value<'static>> = (0..5)
+        let children: Vec<OwnedValue> = (0..5)
             .map(|i| {
-                node_value(
+                node_owned(
                     100 + i,
                     vec![("label", Value::from(format!("Item {i}")))],
                     vec![],
                 )
             })
             .collect();
-        let root = node_owned(1, vec![("label", Value::from("Root"))], children);
-        let menu = parse_layout_node(root).expect("root parses");
+        let root = layout_node(1, vec![("label", Value::from("Root"))], children);
+        let menu = parse_layout_node(root);
         assert_eq!(menu.items.len(), 5);
         for (i, entry) in menu.items.iter().enumerate() {
             match entry {
@@ -543,6 +574,73 @@ mod tests {
                     panic!("expected item at index {i}, got {other:?}")
                 }
             }
+        }
+    }
+
+    // ── GetLayout wire round-trip (the #8 regression lock) ────────────────────
+
+    /// Serialize a real `(u(ia{sv}av))` `GetLayout` reply, deserialize it into
+    /// `(u32, LayoutNode)`, and parse the tree — the end-to-end path the old
+    /// `(u32, OwnedValue)` destructure broke.
+    ///
+    /// `WireNode` derives the concrete `(ia{sv}av)` signature, so a
+    /// `(u32, WireNode)` reply encodes to exactly the wire signature the bug
+    /// report captured (`got (u(ia{sv}av)), expected (uv)`). If the
+    /// `LayoutNode` shape ever drifts from the wire again, this deserialize
+    /// fails and the test catches it — the earlier per-node fixtures build
+    /// `LayoutNode` directly and would *not*. Covers a nested submenu so the
+    /// recursion runs against genuinely round-tripped `av` children.
+    #[test]
+    fn getlayout_reply_deserializes_and_parses() {
+        use zbus::zvariant::serialized::Context;
+        use zbus::zvariant::{Endian, to_bytes};
+
+        /// The concrete root node, mirroring `LayoutNode` on the serialize side
+        /// (children as `Vec<Value>` so each is a variant-wrapped `(ia{sv}av)`).
+        #[derive(serde::Serialize, zbus::zvariant::Type)]
+        struct WireNode {
+            id: i32,
+            props: HashMap<String, Value<'static>>,
+            children: Vec<Value<'static>>,
+        }
+
+        // root(1) → child(10, submenu) → grandchild(20)
+        let grandchild = node_value(20, vec![("label", Value::from("Grandchild"))], vec![]);
+        let child = node_value(
+            10,
+            vec![
+                ("label", Value::from("Child")),
+                ("children-display", Value::from("submenu")),
+            ],
+            vec![grandchild],
+        );
+        let root = WireNode {
+            id: 1,
+            props: [("label".to_string(), Value::from("Root"))]
+                .into_iter()
+                .collect(),
+            children: vec![child],
+        };
+
+        let ctxt = Context::new_dbus(Endian::Little, 0);
+        let encoded = to_bytes(ctxt, &(0u32, root)).expect("serialise GetLayout reply");
+        let (revision, node): (u32, LayoutNode) =
+            encoded.deserialize().expect("deserialise (u(ia{sv}av))").0;
+        assert_eq!(revision, 0);
+
+        let menu = parse_layout_node(node);
+        assert_eq!(menu.id, 1);
+        assert_eq!(menu.items.len(), 1, "root child dropped: {menu:?}");
+
+        let MenuEntry::Item(child_item) = &menu.items[0] else {
+            panic!("expected child item, got {:?}", menu.items[0]);
+        };
+        assert_eq!(child_item.label, "Child");
+        let grandchildren = child_item.submenu.as_ref().expect("child has a submenu");
+        assert_eq!(grandchildren.len(), 1, "grandchild dropped: {grandchildren:?}");
+        match &grandchildren[0] {
+            MenuEntry::Item(g) => assert_eq!(g.label, "Grandchild"),
+            other @ MenuEntry::Separator => panic!("expected grandchild item, got {other:?}"),
         }
     }
 

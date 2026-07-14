@@ -268,7 +268,12 @@ async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
         "children-display",
     ];
 
-    let (_, layout): (u32, OwnedValue) = call(bus_name)
+    // GetLayout returns `(u(ia{sv}av))`: a `u32` revision plus the concrete
+    // root layout-node struct. Deserialize into that exact shape — the old
+    // `(u32, OwnedValue)` (signature `(uv)`) made zbus 5.x reject every reply
+    // with a signature mismatch, dropping the tray to the plain ContextMenu
+    // (#8). See `parse::LayoutNode`.
+    let (_, layout): (u32, parse::LayoutNode) = call(bus_name)
         .bus(BusKind::Session)
         .at_path(menu_path)
         .iface(DBUSMENU_IFACE)
@@ -278,8 +283,7 @@ async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
         .await
         .context("call GetLayout")?;
 
-    let root = parse::parse_layout_node(layout)?;
-    Ok(root)
+    Ok(parse::parse_layout_node(layout))
 }
 
 /// Fire-and-forget: send `Event(id, "clicked", null, timestamp)` on the

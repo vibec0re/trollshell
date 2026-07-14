@@ -286,7 +286,12 @@ mod tests {
     ) -> LayoutNode {
         let props: HashMap<String, OwnedValue> = props
             .into_iter()
-            .map(|(k, v)| (k.to_string(), v.try_to_owned().expect("prop fixture serialises")))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.try_to_owned().expect("prop fixture serialises"),
+                )
+            })
             .collect();
         LayoutNode {
             id,
@@ -637,7 +642,11 @@ mod tests {
         };
         assert_eq!(child_item.label, "Child");
         let grandchildren = child_item.submenu.as_ref().expect("child has a submenu");
-        assert_eq!(grandchildren.len(), 1, "grandchild dropped: {grandchildren:?}");
+        assert_eq!(
+            grandchildren.len(),
+            1,
+            "grandchild dropped: {grandchildren:?}"
+        );
         match &grandchildren[0] {
             MenuEntry::Item(g) => assert_eq!(g.label, "Grandchild"),
             other @ MenuEntry::Separator => panic!("expected grandchild item, got {other:?}"),

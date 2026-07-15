@@ -13,6 +13,47 @@ let
   # (the swww successor; swww is deprecated). It's guarded on existence and
   # asserted clearly if absent (below) rather than branching on option layout —
   # a pre-0.12 channel that still only ships `services.swww` won't have it.
+
+  # Plugin id (#350): an explicit `name` wins; otherwise derive one from the
+  # package's pname, stripping a hytte-plugin-/trollshell-plugin- prefix so
+  # unit names stay short (hytte-plugin-pet -> pet). Falls back to parsing
+  # `name` (à la nix's own name/version split) for packages that never set
+  # `pname` explicitly, e.g. writeShellScriptBin-built fixtures.
+  pluginId =
+    plugin:
+    if plugin.name != null then
+      plugin.name
+    else
+      let
+        base = plugin.package.pname or (builtins.parseDrvName plugin.package.name).name;
+      in
+      lib.removePrefix "trollshell-plugin-" (lib.removePrefix "hytte-plugin-" base);
+
+  # One trollshell-plugin-<id> user service per programs.trollshell.plugins
+  # entry, mirroring etc/systemd/user/trollshell-plugin-pet.service.
+  pluginServices = lib.listToAttrs (
+    map (plugin: {
+      name = "trollshell-plugin-${pluginId plugin}";
+      value = {
+        Unit = {
+          PartOf = [ "niri-session.target" ];
+          After = [
+            "graphical-session.target"
+            "trollshell.service"
+          ];
+          Requisite = [ "graphical-session.target" ];
+        };
+        Service = {
+          Type = "simple";
+          ExecStart = lib.getExe plugin.package;
+          Environment = lib.mapAttrsToList (name: value: "${name}=${value}") plugin.env;
+          Restart = "on-failure";
+          RestartSec = 2;
+        };
+        Install.WantedBy = [ "niri-session.target" ];
+      };
+    }) cfg.plugins
+  );
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
@@ -120,6 +161,13 @@ in
           Install.WantedBy = [ cfg.systemd.target ];
         };
       }
+
+      # Declarative out-of-tree plugins (#350): one trollshell-plugin-<id>
+      # user service per programs.trollshell.plugins entry (built above).
+      # Plugins dial plugin.sock and register themselves; this only wires
+      # the unit — no shell-side spawn/supervise (trollshell/src/plugins.rs)
+      # and no runtime load/unload (that's #348, out of scope here).
+      { systemd.user.services = pluginServices; }
 
       # Group switch: turn the whole extras bundle on, each via mkDefault so an
       # explicit per-feature `enable = false` still wins. The wallpaper daemon

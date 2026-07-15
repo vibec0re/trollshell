@@ -9,6 +9,53 @@ self:
 let
   cfg = config.programs.trollshell;
   backend = cfg.wallpaper.backend;
+
+  # Plugin id (#350): an explicit `name` wins; otherwise derive one from the
+  # package's pname, stripping a hytte-plugin-/trollshell-plugin- prefix so
+  # unit names stay short (hytte-plugin-pet -> pet). Falls back to parsing
+  # `name` (à la nix's own name/version split) for packages that never set
+  # `pname` explicitly, e.g. writeShellScriptBin-built fixtures.
+  pluginId =
+    plugin:
+    if plugin.name != null then
+      plugin.name
+    else
+      let
+        base = plugin.package.pname or (builtins.parseDrvName plugin.package.name).name;
+      in
+      lib.removePrefix "trollshell-plugin-" (lib.removePrefix "hytte-plugin-" base);
+
+  # One trollshell-plugin-<id> user service per programs.trollshell.plugins
+  # entry, mirroring etc/systemd/user/trollshell-plugin-pet.service — using
+  # NixOS's own systemd.user.services schema (lowerCamel top-level keys,
+  # unlike home-manager's Unit/Service/Install), same as the swaybg/
+  # polkit-gnome units below. NB: on a NixOS-only host (no home-manager),
+  # trollshell.service itself is never defined by *this* module — it only
+  # exists via home-manager (see homeModules.default at the bottom of this
+  # file) — so `after = [ "trollshell.service" ]` here just no-ops if that
+  # unit is absent, same as it would for any other missing After= target.
+  pluginServices = lib.listToAttrs (
+    map (plugin: {
+      name = "trollshell-plugin-${pluginId plugin}";
+      value = {
+        description = "trollshell plugin: ${pluginId plugin}";
+        wantedBy = [ "niri-session.target" ];
+        partOf = [ "niri-session.target" ];
+        after = [
+          "graphical-session.target"
+          "trollshell.service"
+        ];
+        requisite = [ "graphical-session.target" ];
+        environment = plugin.env;
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = lib.getExe plugin.package;
+          Restart = "on-failure";
+          RestartSec = 2;
+        };
+      };
+    }) cfg.plugins
+  );
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
@@ -121,6 +168,18 @@ in
           };
         };
       })
+      # Declarative out-of-tree plugins (#350): one trollshell-plugin-<id>
+      # user service per programs.trollshell.plugins entry (built above).
+      # Plugins dial plugin.sock and register themselves; this only wires
+      # the unit — no shell-side spawn/supervise (trollshell/src/plugins.rs)
+      # and no runtime load/unload (that's #348, out of scope here). Note
+      # `programs.trollshell.plugins` set at NixOS system level is a
+      # *separate* declaration from any home-manager per-user
+      # `programs.trollshell.plugins` (home-manager.sharedModules below only
+      # shares the module definition, not config values) — set it wherever
+      # you actually run the shell.
+      { systemd.user.services = pluginServices; }
+
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its
       # daemon is missing, so dropping the lot still leaves a working bar.

@@ -15,7 +15,10 @@ ExecStart=/usr/local/bin/hytte-plugin-pet
 # LLM) — drop a key in ~/.config/trollshell/openrouter.key (never in git or
 # this unit; it's read via hytte-ai-providers::load_key) and pick a model.
 Environment=PET_NAME=nisse
-Environment=PET_LLM_MODEL=google/gemini-2.0-flash-exp:free
+# A small, cheap chat model. OpenRouter's `:free` variants are gated (they need
+# a privacy opt-in / are heavily rate-limited), so the default is a paid one —
+# the pet calls it at most once per 15s, so it's pennies. Swap freely.
+Environment=PET_LLM_MODEL=google/gemini-3.5-flash
 # Local llama-server instead of OpenRouter: set the base URL (see
 # trollshell-pet-brain.service). Leave it empty — Environment=PET_LLM_URL= —
 # for a fully canned-line pet. (PET_LLM_API_KEY overrides the key file.)

@@ -169,6 +169,10 @@ pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Resul
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
         .timeout_global(Some(Duration::from_secs(10)))
+        // Don't collapse a 4xx/5xx into a bare status error — we want to read
+        // the endpoint's JSON error body (OpenRouter explains *why*: an invalid
+        // or restricted model, an auth problem…) and surface it in the message.
+        .http_status_as_error(false)
         .build()
         .into();
     let url = format!(
@@ -192,6 +196,22 @@ pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Resul
             .header("X-Title", "trollshell");
     }
     let mut resp = builder.send_json(&body).map_err(|e| format!("http: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        // Surface the endpoint's error body so callers see the real cause (a bad
+        // model id 400s with `{"error":{"message":"…is not a valid model id"}}`,
+        // etc.) instead of a bare status code. Trimmed so the pet's log line and
+        // the fallback path stay sane.
+        let body: String = resp
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail: String = body.chars().take(200).collect();
+        return Err(format!("http {}: {detail}", status.as_u16()));
+    }
     let parsed: ChatResponse = resp
         .body_mut()
         .read_json()
@@ -309,6 +329,48 @@ mod tests {
             raw
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Like [`fake_server`] but replies with a non-200 `status` line + `body`.
+    fn fake_server_status(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let _ = capture_request(&mut sock);
+            let resp = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            sock.write_all(resp.as_bytes()).expect("write response");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn chat_surfaces_endpoint_error_body_on_non_2xx() {
+        // A bad/restricted model 400s with a JSON error body; `chat` must return
+        // that cause, not a bare status code (the OpenRouter debugging story).
+        let (base, handle) = fake_server_status(
+            "400 Bad Request",
+            r#"{"error":{"message":"google/nope is not a valid model id","code":400}}"#,
+        );
+        let provider = Provider {
+            base_url: base,
+            api_key: Some("sk-x".to_owned()),
+            model: Some("google/nope".to_owned()),
+        };
+        let err = chat(&provider, &[Message::user("hi")], &ChatOpts::default())
+            .expect_err("a non-2xx is an error");
+        assert!(err.contains("400"), "status in the error: {err}");
+        assert!(
+            err.contains("not a valid model id"),
+            "endpoint body surfaced: {err}"
+        );
+        handle.join().expect("server thread");
     }
 
     #[test]

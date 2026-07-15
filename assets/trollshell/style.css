@@ -1726,21 +1726,26 @@
 /* The LCD glass — only sizing is honored (PixelSurface ignores fills); the
  * 128px buffer upscales crisp via nearest-neighbor. */
 .caw-lcd {
-    min-width: 7.5em;
-    min-height: 7.5em;
+    min-width: 9em;
+    min-height: 9em;
     border-radius: 0.5em;
 }
 
 /* caw's speech — a real (TTF) label the shell renders, so it's readable and
- * wraps. It also carries the blessed `heading` class; this adds ink + spacing. */
+ * wraps. A padded bubble (same family as `.pet-bubble`) so the left-aligned
+ * text sits in its own surface instead of hugging the card edge. */
 .caw-say {
+    background: rgb(58, 34, 80); /* a touch lighter than @sidebar_card_background */
     color: #f3e9ff;
-    margin: 0.2em 0.15em 0;
-    font-size: 1.02em;
+    border-radius: 0.8em;
+    padding: 0.45em 0.7em;
+    margin: 0.25em 0.2em 0;
+    font-size: 0.95em;
 }
-/* Her stage direction (*ruffles feathers*) — dim + italic under the line. */
+/* Her stage direction (*ruffles feathers*) — dim + italic under the bubble,
+ * indented to the bubble's text inset. */
 .caw-act {
-    margin: 0 0.15em 0.1em;
-    font-size: 0.9em;
+    margin: 0.1em 0.9em 0.2em;
+    font-size: 0.85em;
     font-style: italic;
 }

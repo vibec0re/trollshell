@@ -249,14 +249,15 @@ impl Plugin for Caw {
             children: vec![Node::Spacer, face, Node::Spacer],
         }];
 
-        // Real-font speech (readable, wraps) — not a pixel font.
+        // Real-font speech (readable, wraps) — not a pixel font. Styled as a
+        // padded bubble by `.caw-say`; no `heading` (bold shouts in a bubble).
         if !message.is_empty() {
             children.push(Node::Text {
                 id: Some("caw-say".to_owned()),
                 text: message,
                 max_width_chars: None,
                 ellipsize: false,
-                classes: vec!["caw-say".to_owned(), "heading".to_owned()],
+                classes: vec!["caw-say".to_owned()],
             });
         }
         if !action.is_empty() {
@@ -352,7 +353,10 @@ mod tests {
         c.poke();
         assert!(c.poke.is_some());
         let (_, line, _) = c.displayed();
-        assert!(POKES.iter().any(|(_, l)| *l == line), "a canned poke line shows");
+        assert!(
+            POKES.iter().any(|(_, l)| *l == line),
+            "a canned poke line shows"
+        );
         for _ in 0..POKE_TTL {
             c.tick(None);
         }
@@ -379,23 +383,33 @@ mod tests {
             panic!("first child is the face row");
         };
         assert!(
-            row.iter().any(|n| matches!(n, Node::Button { id, .. } if id == FACE_ID)),
+            row.iter()
+                .any(|n| matches!(n, Node::Button { id, .. } if id == FACE_ID)),
             "the face button is the poke target"
         );
         // The face carries a Pixels surface with the host's len == w*h*4 buffer.
-        let Some(Node::Button { child, .. }) =
-            row.iter().find(|n| matches!(n, Node::Button { id, .. } if id == FACE_ID))
+        let Some(Node::Button { child, .. }) = row
+            .iter()
+            .find(|n| matches!(n, Node::Button { id, .. } if id == FACE_ID))
         else {
             panic!("face button present");
         };
-        let Node::Pixels { width, height, data, .. } = &**child else {
+        let Node::Pixels {
+            width,
+            height,
+            data,
+            ..
+        } = &**child
+        else {
             panic!("face is a Pixels surface");
         };
         assert_eq!((*width, *height), (128, 128));
         assert_eq!(data.len(), 128 * 128 * 4);
         // A message renders as real-font Text (not pixels).
         assert!(
-            children.iter().any(|n| matches!(n, Node::Text { text, .. } if text == "Rogue DHCP mode engaged")),
+            children
+                .iter()
+                .any(|n| matches!(n, Node::Text { text, .. } if text == "Rogue DHCP mode engaged")),
             "the speech line is a real-font Text node"
         );
     }

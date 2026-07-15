@@ -1,0 +1,17 @@
+[package]
+name = "hytte-ai-providers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared OpenAI-compatible chat client + provider config + key-file loader for hytte plugins"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Blocking HTTP client (same idiom as hytte-services' weather fetcher). The
+# `json` feature pulls in serde_json for send_json/read_json.
+ureq = { version = "3.3.0", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

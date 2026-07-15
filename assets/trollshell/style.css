@@ -1724,10 +1724,18 @@
 }
 
 /* The LCD glass — only sizing is honored (PixelSurface ignores fills); the
- * 128px buffer upscales crisp via nearest-neighbor. */
+ * 128px buffer upscales crisp via nearest-neighbor.
+ *
+ * Sized in px, NOT em: `min-width` only bites above the surface's natural
+ * size (the 128px buffer — PixelSurface reports min 0 / natural 128), and at
+ * the sidebar's ~13px em every em value tried so far (7.5em ≈ 98px, 9em ≈
+ * 117px) was silently BELOW 128px, i.e. a no-op — the crow rendered at native
+ * buffer size regardless. The sidebar is a fixed 320 CSS px, so there is
+ * nothing for the LCD to be font-relative to; 240px leaves ~15px slack after
+ * the sidebar/card/bezel paddings. */
 .caw-lcd {
-    min-width: 11em;
-    min-height: 11em;
+    min-width: 240px;
+    min-height: 240px;
     border-radius: 0.5em;
 }
 

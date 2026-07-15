@@ -249,24 +249,43 @@ impl Plugin for Caw {
             children: vec![Node::Spacer, face, Node::Spacer],
         }];
 
-        // Real-font speech (readable, wraps) — not a pixel font. Styled as a
-        // padded bubble by `.caw-say`; no `heading` (bold shouts in a bubble).
+        // Real-font speech (readable, wraps) — not a pixel font. The label
+        // sits in a padded `.caw-bubble` Box (CSS padding on a wrapping label
+        // is unreliable; the container owns the box model), centered under the
+        // face by the same Spacer dance: short lines hug, long lines wrap.
         if !message.is_empty() {
-            children.push(Node::Text {
-                id: Some("caw-say".to_owned()),
-                text: message,
-                max_width_chars: None,
-                ellipsize: false,
-                classes: vec!["caw-say".to_owned()],
+            let bubble = Node::Box {
+                id: Some("caw-bubble".to_owned()),
+                dir: Dir::Vertical,
+                spacing: 0,
+                scroll: false,
+                classes: vec!["caw-bubble".to_owned()],
+                children: vec![Node::Text {
+                    id: Some("caw-say".to_owned()),
+                    text: message,
+                    max_width_chars: None,
+                    ellipsize: false,
+                    classes: vec!["caw-say".to_owned()],
+                }],
+            };
+            children.push(Node::Row {
+                id: Some("caw-sayrow".to_owned()),
+                classes: vec!["caw-sayrow".to_owned()],
+                children: vec![Node::Spacer, bubble, Node::Spacer],
             });
         }
         if !action.is_empty() {
-            children.push(Node::Text {
+            let act = Node::Text {
                 id: Some("caw-act".to_owned()),
                 text: action,
                 max_width_chars: None,
                 ellipsize: false,
                 classes: vec!["caw-act".to_owned(), "dim-label".to_owned()],
+            };
+            children.push(Node::Row {
+                id: Some("caw-actrow".to_owned()),
+                classes: vec!["caw-actrow".to_owned()],
+                children: vec![Node::Spacer, act, Node::Spacer],
             });
         }
 
@@ -405,12 +424,24 @@ mod tests {
         };
         assert_eq!((*width, *height), (128, 128));
         assert_eq!(data.len(), 128 * 128 * 4);
-        // A message renders as real-font Text (not pixels).
+        // A message renders as real-font Text (not pixels), nested in the
+        // centered `.caw-bubble` Box inside its Spacer row.
         assert!(
             children
                 .iter()
-                .any(|n| matches!(n, Node::Text { text, .. } if text == "Rogue DHCP mode engaged")),
-            "the speech line is a real-font Text node"
+                .any(|n| has_text(n, "Rogue DHCP mode engaged")),
+            "the speech line is a real-font Text node in the bubble"
         );
+    }
+
+    /// Whether `n`'s subtree contains a [`Node::Text`] with exactly `wanted`.
+    fn has_text(n: &Node, wanted: &str) -> bool {
+        match n {
+            Node::Text { text, .. } => text == wanted,
+            Node::Box { children, .. } | Node::Row { children, .. } => {
+                children.iter().any(|c| has_text(c, wanted))
+            }
+            _ => false,
+        }
     }
 }

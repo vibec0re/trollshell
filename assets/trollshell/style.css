@@ -1726,26 +1726,30 @@
 /* The LCD glass — only sizing is honored (PixelSurface ignores fills); the
  * 128px buffer upscales crisp via nearest-neighbor. */
 .caw-lcd {
-    min-width: 9em;
-    min-height: 9em;
+    min-width: 11em;
+    min-height: 11em;
     border-radius: 0.5em;
 }
 
-/* caw's speech — a real (TTF) label the shell renders, so it's readable and
- * wraps. A padded bubble (same family as `.pet-bubble`) so the left-aligned
- * text sits in its own surface instead of hugging the card edge. */
-.caw-say {
+/* caw's speech bubble — a padded Box AROUND the label (`.caw-say`), because
+ * CSS padding on a wrapping GtkLabel is unreliable: the box model belongs on
+ * the container. The bubble is centered under the face by Spacers in the
+ * plugin's view: short lines hug their text, long lines fill the card and
+ * wrap. Same family as `.pet-bubble`. */
+.caw-bubble {
     background: rgb(58, 34, 80); /* a touch lighter than @sidebar_card_background */
-    color: #f3e9ff;
     border-radius: 0.8em;
-    padding: 0.45em 0.7em;
+    padding: 0.5em 0.75em;
     margin: 0.25em 0.2em 0;
+}
+.caw-say {
+    color: #f3e9ff;
     font-size: 0.95em;
 }
-/* Her stage direction (*ruffles feathers*) — dim + italic under the bubble,
- * indented to the bubble's text inset. */
+/* Her stage direction (*ruffles feathers*) — dim + italic, centered under the
+ * bubble by the same Spacer dance. */
 .caw-act {
-    margin: 0.1em 0.9em 0.2em;
+    margin: 0.15em 0.3em 0.2em;
     font-size: 0.85em;
     font-style: italic;
 }

@@ -111,6 +111,31 @@ impl MultiSparkline {
         self.inner.queue_draw();
     }
 
+    /// Replace every series' ring with `frames` (one ring per series, oldest
+    /// first, most recent last), keeping at most `capacity` trailing samples per
+    /// series. The multi-series twin of [`Sparkline::set_samples`]: for when the
+    /// history is owned elsewhere — the sensors service (#338) republishes the
+    /// whole per-core window as a snapshot each tick, so a lazily-built per-core
+    /// row backfills instantly instead of opening to empty/short graphs. Queues
+    /// a redraw.
+    ///
+    /// The series count is taken from `frames.len()` — a differing width just
+    /// re-seeds to the new width (matching [`push_frame`]'s hot-plug reset).
+    ///
+    /// [`Sparkline::set_samples`]: crate::Sparkline::set_samples
+    /// [`push_frame`]: Self::push_frame
+    pub fn set_frames(&self, frames: &[VecDeque<f64>]) {
+        {
+            let mut series = self.series.borrow_mut();
+            series.clear();
+            for frame in frames {
+                let skip = frame.len().saturating_sub(self.capacity);
+                series.push(frame.iter().skip(skip).copied().collect());
+            }
+        }
+        self.inner.queue_draw();
+    }
+
     /// Set a fixed domain max (e.g. `Some(1.0)` for 0..=1 fractions).
     /// `None` enables auto-scaling to the max sample across all series.
     pub fn set_domain_max(&self, max: Option<f64>) {
@@ -454,6 +479,43 @@ mod widget_tests {
     fn empty_frame_is_noop_shape() {
         let g = MultiSparkline::new(5);
         g.push_frame(&[]);
+        assert!(g.series.borrow().is_empty());
+    }
+
+    #[gtk::test]
+    fn set_frames_seeds_all_series_keeping_trailing_capacity() {
+        let g = MultiSparkline::new(3);
+        // Two series, each longer than capacity → keep only the most recent 3.
+        let s0: VecDeque<f64> = (0..5).map(f64::from).collect();
+        let s1: VecDeque<f64> = (10..15).map(f64::from).collect();
+        g.set_frames(&[s0, s1]);
+        let series = g.series.borrow();
+        assert_eq!(series.len(), 2);
+        let got0: Vec<f64> = series[0].iter().copied().collect();
+        let got1: Vec<f64> = series[1].iter().copied().collect();
+        assert_eq!(got0, vec![2.0, 3.0, 4.0]);
+        assert_eq!(got1, vec![12.0, 13.0, 14.0]);
+    }
+
+    #[gtk::test]
+    fn set_frames_replaces_and_reseeds_width() {
+        let g = MultiSparkline::new(10);
+        g.push_frame(&[1.0, 2.0]);
+        // A snapshot with a different series count replaces (not appends): the
+        // core count shrinks 2 → 1 and the ring holds exactly the snapshot.
+        let only: VecDeque<f64> = [7.0, 8.0].into_iter().collect();
+        g.set_frames(&[only]);
+        let series = g.series.borrow();
+        assert_eq!(series.len(), 1);
+        let got: Vec<f64> = series[0].iter().copied().collect();
+        assert_eq!(got, vec![7.0, 8.0]);
+    }
+
+    #[gtk::test]
+    fn set_frames_empty_clears() {
+        let g = MultiSparkline::new(5);
+        g.push_frame(&[1.0, 2.0]);
+        g.set_frames(&[]);
         assert!(g.series.borrow().is_empty());
     }
 

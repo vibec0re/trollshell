@@ -6,12 +6,12 @@
 //! [`hytte_ai_providers`] client — with a tiny persona prompt. Two backends,
 //! chosen by config:
 //!
-//! - a **local `llama-server`** (the default, on localhost — see
-//!   `etc/systemd/user/trollshell-pet-brain.service`), or
-//! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM) when an API key is
-//!   available — from `~/.config/trollshell/openrouter.key` (see
-//!   [`hytte_ai_providers::load_key`]) or `$PET_LLM_API_KEY` — together with a
-//!   `$PET_LLM_MODEL`.
+//! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM — **the default**):
+//!   a key from `~/.config/trollshell/openrouter.key` (see
+//!   [`hytte_ai_providers::load_key`]) or `$PET_LLM_API_KEY`, plus a
+//!   `$PET_LLM_MODEL`, or
+//! - a **local `llama-server`** — opt in with `$PET_LLM_URL` (e.g.
+//!   `http://127.0.0.1:8080`; see `etc/systemd/user/trollshell-pet-brain.service`).
 //!
 //! Rate-limiting, unreachability, and nonsense (or empty) replies all fall
 //! back to the **canned pools**, so the pet stays fully alive with no model
@@ -91,9 +91,11 @@ impl Cfg {
 
 /// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
 /// `$PET_LLM_URL` (`None` = unset, `Some("")` = set-but-empty = model
-/// disabled). With no explicit URL, a present `key` selects `OpenRouter`;
-/// otherwise a local `llama-server`. An explicit URL always wins as the base,
-/// with any `key`/`model` layered on (e.g. a self-hosted keyed endpoint).
+/// disabled). With no explicit URL, the default is **`OpenRouter`** (the pet's
+/// cloud brain), with any `key`/`model` layered on — a missing key just means
+/// the call 401s and the pet falls back to canned lines. An explicit
+/// `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a `llama-server`)
+/// as the base, with any `key`/`model` layered on.
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
@@ -106,12 +108,11 @@ fn resolve_provider(
             api_key: key,
             model,
         }),
-        None if key.is_some() => Some(Provider {
+        None => Some(Provider {
             base_url: "https://openrouter.ai/api".to_owned(),
             api_key: key,
             model,
         }),
-        None => Some(Provider::llama("http://127.0.0.1:8080")),
     }
 }
 
@@ -394,14 +395,16 @@ mod tests {
         assert_eq!(p.base_url, "http://host:1");
         assert!(p.api_key.is_none());
         assert_eq!(p.model.as_deref(), Some("m"));
-        // No URL + a key → OpenRouter.
+        // No URL + a key → OpenRouter (the default), key + model layered on.
         let p = resolve_provider(None, Some("sk-1".to_owned()), Some("gpt".to_owned())).unwrap();
         assert_eq!(p.base_url, "https://openrouter.ai/api");
         assert_eq!(p.api_key.as_deref(), Some("sk-1"));
         assert_eq!(p.model.as_deref(), Some("gpt"));
-        // No URL, no key → the local llama default.
+        // No URL, no key → still OpenRouter (the default); the keyless call just
+        // 401s and the pet falls back to canned. Local llama-server is opt-in
+        // via $PET_LLM_URL.
         let p = resolve_provider(None, None, None).unwrap();
-        assert_eq!(p.base_url, "http://127.0.0.1:8080");
+        assert_eq!(p.base_url, "https://openrouter.ai/api");
         assert!(p.api_key.is_none());
         // Explicit URL + key (a self-hosted keyed endpoint) → URL wins, key layered.
         let p = resolve_provider(Some("http://host:2"), Some("k".to_owned()), None).unwrap();

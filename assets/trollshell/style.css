@@ -1660,3 +1660,87 @@
     font-size: 1.7em;
     color: #e9c9f0;
 }
+
+/* ── caw's desktop body (hytte-plugin-caw, cybercrow) ──────────────────────
+ * Same PixelSurface caveat as the pet: the LCD face buffer ignores CSS fills,
+ * so the bezel + mood glow live on `.caw-face` (the gtk::Button around it).
+ * Unlike the pet, her speech is a REAL-font Text node (`.caw-say`) — crisp and
+ * readable, not a pixel font. The card is a vertical stack: centered face over
+ * her line. */
+.caw-root {
+    padding: 0.5em 0.4em;
+}
+
+/* The bezel — a dark rounded case around the LCD glass, gradient bottoming out
+ * at the buffer's baked corner colour (#120a1e) so screen and case merge. */
+.caw-face {
+    background: linear-gradient(160deg, #241428, #120a1e);
+    border: 1px solid alpha(white, 0.07);
+    border-radius: 1em;
+    padding: 0.5em;
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 14px rgba(102, 242, 255, 0.22);
+    transition: box-shadow 0.25s ease;
+}
+.caw-face:hover {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 20px rgba(255, 90, 200, 0.4);
+}
+/* Poke feedback: press the case in. */
+.caw-face:active {
+    box-shadow:
+        inset 0 3px 9px rgba(0, 0, 0, 0.78),
+        0 0 12px rgba(255, 90, 200, 0.6);
+}
+
+/* Per-mood outer glow — chaos crackles cyan, offended flushes red, chirp goes
+ * pink, sleepy dims right down. (`:hover`/`:active` above still override.) */
+.caw-face.caw-mood-chaos {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 18px rgba(102, 242, 255, 0.5);
+}
+.caw-face.caw-mood-gremlin {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 16px rgba(160, 120, 255, 0.42);
+}
+.caw-face.caw-mood-offended {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 16px rgba(255, 90, 120, 0.45);
+}
+.caw-face.caw-mood-chirp {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 16px rgba(255, 111, 174, 0.45);
+}
+.caw-face.caw-mood-sleepy {
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.6),
+        0 0 8px rgba(131, 56, 236, 0.15);
+}
+
+/* The LCD glass — only sizing is honored (PixelSurface ignores fills); the
+ * 128px buffer upscales crisp via nearest-neighbor. */
+.caw-lcd {
+    min-width: 7.5em;
+    min-height: 7.5em;
+    border-radius: 0.5em;
+}
+
+/* caw's speech — a real (TTF) label the shell renders, so it's readable and
+ * wraps. It also carries the blessed `heading` class; this adds ink + spacing. */
+.caw-say {
+    color: #f3e9ff;
+    margin: 0.2em 0.15em 0;
+    font-size: 1.02em;
+}
+/* Her stage direction (*ruffles feathers*) — dim + italic under the line. */
+.caw-act {
+    margin: 0 0.15em 0.1em;
+    font-size: 0.9em;
+    font-style: italic;
+}

@@ -763,16 +763,26 @@ fn build_expandable_cpu_history_row() -> gtk::ListBoxRow {
     percore_graph.widget().set_hexpand(true);
     percore_box.append(percore_graph.widget());
 
-    let percore_graph_c = percore_graph.clone();
+    // History now lives in the sensors service (#338): snapshot the per-core
+    // ring set into the MultiSparkline via `set_frames` rather than pushing a
+    // frame per emit, so it's shared across monitors and backfills a lazily
+    // (re)built page instantly. The value label still reads the live snapshot.
     let percore_value_c = percore_value.clone();
     bind(sensors::cpu(), &percore_box, move |_, c: CpuLoad| {
-        percore_graph_c.push_frame(&c.per_core);
         percore_value_c.set_text(&format!(
             "{} cores \u{00b7} {:.0}%",
             c.per_core.len(),
             c.overall * 100.0
         ));
     });
+    let percore_graph_c = percore_graph.clone();
+    bind(
+        sensors::cpu_per_core_history(),
+        &percore_box,
+        move |_, h| {
+            percore_graph_c.set_frames(&h);
+        },
+    );
 
     // ── Stack: vhomogeneous(false) so the card grows on expand ───────────
     let stack = gtk::Stack::new();
@@ -835,17 +845,15 @@ fn build_history_cpu_clock_row() -> gtk::Box {
     let (row, spark, value) = build_history_row("Clock");
     spark.set_domain_max(Some(1.0));
 
-    let spark_clone = spark.clone();
     let value_clone = value.clone();
     bind(sensors::cpu_freq(), &row, move |_, f: CpuFreq| {
-        let ceiling = f.max_ceiling_hz;
-        let normalized = if ceiling > 0.0 {
-            f.max_hz / ceiling
-        } else {
-            0.0
-        };
-        spark_clone.push(normalized);
         value_clone.set_text(&fmt_hz(f.max_hz));
+    });
+    // History (the max_ceiling_hz-normalized aggregate clock) is hoisted into
+    // the sensors service (#338): snapshot the ring rather than pushing per-emit,
+    // so it's shared across monitors and survives a lazily-rebuilt page.
+    bind(sensors::cpu_freq_history(), &row, move |_, h| {
+        spark.set_samples(&h);
     });
 
     row
@@ -903,22 +911,26 @@ fn build_expandable_cpu_clock_row() -> gtk::ListBoxRow {
     percore_graph.widget().set_hexpand(true);
     percore_box.append(percore_graph.widget());
 
-    let percore_graph_c = percore_graph.clone();
+    // Per-core clock history (each core normalized to the shared
+    // max_ceiling_hz) is hoisted into the sensors service (#338): snapshot the
+    // ring set via `set_frames` rather than pushing per-emit. The value label
+    // still reads the live snapshot.
     let percore_value_c = percore_value.clone();
     bind(sensors::cpu_freq(), &percore_box, move |_, f: CpuFreq| {
-        let ceiling = f.max_ceiling_hz;
-        let normalized: Vec<f64> = if ceiling > 0.0 {
-            f.per_core.iter().map(|&hz| hz / ceiling).collect()
-        } else {
-            vec![0.0; f.per_core.len()]
-        };
-        percore_graph_c.push_frame(&normalized);
         percore_value_c.set_text(&format!(
             "{} cores \u{00b7} {}",
             f.per_core.len(),
             fmt_hz(f.max_hz)
         ));
     });
+    let percore_graph_c = percore_graph.clone();
+    bind(
+        sensors::cpu_freq_per_core_history(),
+        &percore_box,
+        move |_, h| {
+            percore_graph_c.set_frames(&h);
+        },
+    );
 
     // ── Stack: vhomogeneous(false) so the card grows on expand ───────────
     let stack = gtk::Stack::new();

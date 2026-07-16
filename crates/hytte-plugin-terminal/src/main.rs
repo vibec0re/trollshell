@@ -207,7 +207,10 @@ impl Plugin for Terminal {
                     id: ENTRY_ID.to_owned(),
                     text: self.entry.clone(),
                     placeholder: PLACEHOLDER.to_owned(),
-                    classes: vec!["monospace".to_owned()],
+                    // `ts-terminal-input` dresses the entry in the VFD palette
+                    // (shell CSS) so it reads as part of the preem screen above
+                    // it, not a bare GTK text field (#369).
+                    classes: vec!["monospace".to_owned(), "ts-terminal-input".to_owned()],
                 },
             ],
         }

@@ -83,6 +83,10 @@
           # (used by the systemd ExecStart) still resolves.
           stubPackage = pkgs.writeShellScriptBin "trollshell" "";
 
+          # Stand-in plugin binary for the programs.trollshell.plugins
+          # coverage in the two module-eval checks below (#350/#355).
+          stubPlugin = pkgs.writeShellScriptBin "hytte-plugin-demo" "";
+
           # The hytte-ecal `probe` example binary + fixture sources (a
           # task-list and a calendar), for the eds-nixos-test below.
           probe = pkgs.callPackage ./nix/probe.nix { inherit craneLib; };
@@ -218,8 +222,24 @@
                       enableSessionExtras = true;
                       weather.fallbackCity = "Berlin";
                       systemd.target = "niri-session.target";
+                      # plugins (#350/#355, attrsOf keyed by id): `demo` gets a
+                      # unit; `off` must be filtered out by enable = false.
+                      plugins = {
+                        demo = {
+                          package = stubPlugin;
+                          env.DEMO_TOKEN = "hunter2";
+                        };
+                        off = {
+                          package = stubPlugin;
+                          enable = false;
+                        };
+                      };
                     };
                   }
+                  # A second module contributing to the *same* plugin key —
+                  # attrsOf submodules must merge per-field across modules
+                  # (the point of #355), not conflict or drop an entry.
+                  { programs.trollshell.plugins.demo.env.DEMO_EXTRA = "1"; }
                 ];
               };
               cfg = hm.config;
@@ -230,11 +250,31 @@
               # the predicates, not the messages — a message is the lazy
               # explanation shown when an assertion fails, so forcing it would be
               # both pointless and prone to evaluating intentionally-deferred text.
-              probe = builtins.deepSeq {
-                userUnits = cfg.systemd.user.services;
-                sessionVars = cfg.home.sessionVariables;
-                assertionPredicates = map (a: a.assertion) cfg.assertions;
-              } "ok";
+              units = cfg.systemd.user.services;
+              probe =
+                # plugins (#355): the attr key names the unit, enable = false
+                # filters the entry out, and the demo entry's env merged
+                # per-field across the two modules above.
+                assert units ? trollshell-plugin-demo;
+                assert !(units ? trollshell-plugin-off);
+                # home-manager's unitOption type merges every value into a
+                # list, so normalize with toList before comparing.
+                assert
+                  pkgs.lib.toList units.trollshell-plugin-demo.Service.ExecStart == [
+                    (pkgs.lib.getExe stubPlugin)
+                  ];
+                assert
+                  pkgs.lib.sort pkgs.lib.lessThan (
+                    pkgs.lib.flatten (pkgs.lib.toList units.trollshell-plugin-demo.Service.Environment)
+                  ) == [
+                    "DEMO_EXTRA=1"
+                    "DEMO_TOKEN=hunter2"
+                  ];
+                builtins.deepSeq {
+                  userUnits = units;
+                  sessionVars = cfg.home.sessionVariables;
+                  assertionPredicates = map (a: a.assertion) cfg.assertions;
+                } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-check" { inherit probe; } ''
               echo "$probe" >/dev/null
@@ -261,6 +301,18 @@
                       enable = true;
                       package = stubPackage;
                       weather.fallbackCity = "Berlin";
+                      # plugins (#350/#355, attrsOf keyed by id): `demo` gets a
+                      # unit; `off` must be filtered out by enable = false.
+                      plugins = {
+                        demo = {
+                          package = stubPlugin;
+                          env.DEMO_TOKEN = "hunter2";
+                        };
+                        off = {
+                          package = stubPlugin;
+                          enable = false;
+                        };
+                      };
                     };
                     # Minimal stubs so the NixOS module set evaluates without a
                     # real machine: a bootloader, a root filesystem, and a state
@@ -272,6 +324,10 @@
                     };
                     system.stateVersion = "24.11";
                   }
+                  # A second module contributing to the *same* plugin key —
+                  # attrsOf submodules must merge per-field across modules
+                  # (the point of #355), not conflict or drop an entry.
+                  { programs.trollshell.plugins.demo.env.DEMO_EXTRA = "1"; }
                 ];
               };
               cfg = nixos.config;
@@ -283,14 +339,24 @@
               # `message` is lazy and only well-defined when the assertion fails
               # (e.g. the fileSystems topological-sort error), so deepSeq'ing all
               # messages would trip an unrelated internal assertion's message.
-              probe = builtins.deepSeq {
-                userUnits = builtins.attrNames cfg.systemd.user.services;
-                swaybgExec = cfg.systemd.user.services.swaybg.serviceConfig.ExecStart;
-                sessionVars = cfg.environment.sessionVariables;
-                systemPackageCount = builtins.length cfg.environment.systemPackages;
-                dbusPackageCount = builtins.length cfg.services.dbus.packages;
-                assertionPredicates = map (a: a.assertion) cfg.assertions;
-              } "ok";
+              units = cfg.systemd.user.services;
+              probe =
+                # plugins (#355): the attr key names the unit, enable = false
+                # filters the entry out, and the demo entry's env merged
+                # per-field across the two modules above.
+                assert units ? trollshell-plugin-demo;
+                assert !(units ? trollshell-plugin-off);
+                assert units.trollshell-plugin-demo.serviceConfig.ExecStart == pkgs.lib.getExe stubPlugin;
+                assert units.trollshell-plugin-demo.environment.DEMO_TOKEN == "hunter2";
+                assert units.trollshell-plugin-demo.environment.DEMO_EXTRA == "1";
+                builtins.deepSeq {
+                  userUnits = builtins.attrNames units;
+                  swaybgExec = units.swaybg.serviceConfig.ExecStart;
+                  sessionVars = cfg.environment.sessionVariables;
+                  systemPackageCount = builtins.length cfg.environment.systemPackages;
+                  dbusPackageCount = builtins.length cfg.services.dbus.packages;
+                  assertionPredicates = map (a: a.assertion) cfg.assertions;
+                } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-check" { inherit probe; } ''
               echo "$probe" >/dev/null

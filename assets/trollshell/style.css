@@ -556,6 +556,27 @@
     padding: 0.154em 0.615em;
 }
 
+/* Plugin drawer PANEL (#349 PR2). The per-monitor plugin drawer child gets
+ * `.ts-plugin-panel` (`trollshell/src/plugins.rs` `plugin_panel_slot`) and sits
+ * inside the drawer's `.ts-drawer-content`, which already supplies the dark card
+ * surface + the flare inset margins. So this is deliberately near-empty: no
+ * background and no extra padding (the plugin owns its inner spacing, same "no
+ * host padding" rule as `.ts-plugin-card`) — it exists mainly as a styling hook
+ * and to flatten a panel's own boxed-list. */
+.ts-plugin-panel {
+    background: transparent;
+}
+/* Flatten a panel's own `.boxed-list` onto the drawer surface rather than
+ * painting a nested card, exactly like `.ts-plugin-card list.boxed-list`. */
+.ts-plugin-panel list.boxed-list {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+    margin: 0;
+    min-height: 0;
+}
+
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {

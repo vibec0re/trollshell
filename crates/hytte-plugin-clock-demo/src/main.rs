@@ -252,6 +252,7 @@ mod tests {
         let _ = model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1));
         let render = PluginMsg::Render {
             tree: model.view(),
+            panel: model.panel(),
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

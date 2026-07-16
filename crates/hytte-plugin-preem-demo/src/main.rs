@@ -382,6 +382,7 @@ mod tests {
         let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 42));
         let render = PluginMsg::Render {
             tree: m.view(),
+            panel: m.panel(),
             effects: Vec::new(),
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

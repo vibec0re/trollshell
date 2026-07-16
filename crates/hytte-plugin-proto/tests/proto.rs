@@ -158,6 +158,13 @@ fn plugin_msgs_round_trip() {
     });
     round_trip_plugin(&PluginMsg::Render {
         tree: sample_tree(),
+        panel: None,
+        effects: sample_effects(),
+    });
+    // A panel-bearing render is in the standard round-trip set too (#349 PR2).
+    round_trip_plugin(&PluginMsg::Render {
+        tree: sample_tree(),
+        panel: Some(sample_tree()),
         effects: sample_effects(),
     });
     round_trip_plugin(&PluginMsg::Log {
@@ -532,6 +539,99 @@ fn raise_osd_is_name_tagged_and_additive() {
         let back: Effect = decode(&encode(&effect)).expect("decode RaiseOsd");
         assert_eq!(effect, back);
     }
+}
+
+// ── Plugin panel + PluginSelf page (#349 PR2) ────────────────────────────────
+
+#[test]
+fn page_pluginself_round_trips_and_is_name_tagged() {
+    // `PluginSelf` is a brand-new, externally-tagged `Page` variant, so it rides
+    // the wire as its bare variant *name* — the property that makes appending it
+    // additive: an older decoder skips an unknown tag rather than mis-decoding an
+    // existing variant, so `PROTO_VERSION` stays 1.
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
+
+    let effect = Effect::OpenPage(Page::PluginSelf);
+    let back: Effect = decode(&encode(&effect)).expect("decode OpenPage(PluginSelf)");
+    assert_eq!(effect, back);
+
+    let body = encode_body(&effect);
+    assert!(
+        contains(&body, b"PluginSelf"),
+        "variant name 'PluginSelf' rides the wire",
+    );
+}
+
+#[test]
+fn render_with_panel_round_trips() {
+    // A `Render` carrying a distinct `panel` tree (a second, independent `Node`)
+    // survives the round-trip alongside its chip tree and effects.
+    let msg = PluginMsg::Render {
+        tree: sample_tree(),
+        panel: Some(Node::Label {
+            id: Some("panel-lbl".into()),
+            text: "panel body".into(),
+            classes: vec![],
+        }),
+        effects: vec![Effect::OpenPage(Page::PluginSelf)],
+    };
+    let back: PluginMsg = decode(&encode(&msg)).expect("decode panel-bearing Render");
+    assert_eq!(msg, back);
+}
+
+#[test]
+fn render_without_panel_stays_off_the_wire() {
+    // `panel: None` must NOT put a `panel` key on the wire
+    // (`skip_serializing_if = "Option::is_none"`), so a panel-less frame is
+    // byte-identical to a pre-PR2 frame and `PROTO_VERSION` stays 1.
+    let msg = PluginMsg::Render {
+        tree: sample_tree(),
+        panel: None,
+        effects: vec![],
+    };
+    let body = encode_body(&msg);
+    assert!(
+        !contains(&body, b"panel"),
+        "an absent panel carries no panel key",
+    );
+}
+
+#[test]
+fn render_without_panel_decodes_old_frame_compat() {
+    // A `Render` frame built before PR2 has no `panel` key. The current decoder
+    // must still accept it, defaulting `panel` to `None` (`#[serde(default)]` +
+    // named-map encoding) — the backward-compat guarantee that keeps an
+    // already-deployed panel-less plugin rendering. Modeled as an
+    // externally-tagged enum mirroring the pre-PR2 field set, so it serializes as
+    // `{"Render": { tree, effects }}` exactly like an old plugin.
+    #[derive(serde::Serialize)]
+    enum PluginMsgOld {
+        Render { tree: Node, effects: Vec<Effect> },
+    }
+
+    let old = PluginMsgOld::Render {
+        tree: sample_tree(),
+        effects: vec![Effect::OpenPage(Page::Media)],
+    };
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"panel"),
+        "an old frame carries no panel key",
+    );
+    let decoded: PluginMsg = decode_body(&body).expect("decode pre-PR2 Render frame");
+    assert_eq!(
+        decoded,
+        PluginMsg::Render {
+            tree: sample_tree(),
+            // Absent `panel` defaults to None (no plugin panel).
+            panel: None,
+            effects: vec![Effect::OpenPage(Page::Media)],
+        },
+        "absent panel defaults to None",
+    );
 }
 
 // ── Pixels node ──────────────────────────────────────────────────────────────

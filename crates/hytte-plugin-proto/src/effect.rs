@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 /// A drawer page the host can open. Wire-side mirror of the host's
 /// `modal::Page`; the host maps `wire::Page -> modal::Page` (PR 2).
+///
+/// Every variant names a built-in host page **except** [`Page::PluginSelf`],
+/// which has no `modal::Page` counterpart: it resolves to the *requesting*
+/// plugin's own drawer panel, keyed by the effect's plugin id (the host broker
+/// already carries it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Page {
     Media,
@@ -28,6 +33,14 @@ pub enum Page {
     Clipboard,
     Calendar,
     Settings,
+    /// The plugin's *own* drawer panel (#349 PR2). Unlike the other variants,
+    /// this does not name a built-in host page: the host resolves it to the
+    /// requesting plugin's panel tree, keyed by the effect's plugin id (the
+    /// broker already carries it). A plugin emits
+    /// `Effect::OpenPage(Page::PluginSelf)` from `update` to open its panel; it
+    /// needs the [`OpenPage`](crate::manifest::Capability::OpenPage) capability
+    /// like any other page-open.
+    PluginSelf,
 }
 
 /// A niri compositor action (maps to `hytte_services::niri::*`).

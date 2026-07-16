@@ -269,6 +269,46 @@ impl Page {
     }
 }
 
+/// The fixed stack-child name of the per-monitor plugin drawer page (#349 PR2).
+/// The `__` prefix keeps it out of the [`Page::stack_name`] keyspace (which
+/// `stack_names_are_unique_and_nonempty` guards for `Page` only), so it can never
+/// collide with a built-in page token.
+const PLUGIN_STACK_CHILD: &str = "__plugin";
+
+/// What a drawer is currently showing: a built-in [`Page`], or a plugin's own
+/// panel (keyed by plugin id). Keeps `Page` `Copy` and untouched (#349 PR2) — the
+/// plugin concept lives only here, not in the 19-variant `Page` enum the shell's
+/// ~60 call sites pass by value. A plugin panel drives none of the
+/// netconn/stats/media pollers, so those gates match only `Builtin`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Active {
+    Builtin(Page),
+    Plugin(String),
+}
+
+impl Active {
+    /// The stack-child name to make visible for this active target: the page's
+    /// own token for a built-in, or the single fixed plugin-child name for any
+    /// plugin panel (there is one plugin child per drawer; the active selection
+    /// picks which plugin's tree it shows — see `plugins::plugin_panel_slot`).
+    fn stack_name(&self) -> &str {
+        match self {
+            Self::Builtin(p) => p.stack_name(),
+            Self::Plugin(_) => PLUGIN_STACK_CHILD,
+        }
+    }
+
+    /// The built-in page this target shows, if any — `None` for a plugin panel.
+    /// Used by the poller gates (which only built-in pages drive) and the
+    /// same-page retract compare in [`toggle`].
+    fn builtin(&self) -> Option<Page> {
+        match self {
+            Self::Builtin(p) => Some(*p),
+            Self::Plugin(_) => None,
+        }
+    }
+}
+
 /// Per-monitor drawer handle. Internally owns a single fullscreen layer-shell
 /// window (a transparent click-catching background plus the card overlaid on
 /// top — one surface, no cross-surface restacking for niri to mishandle, #109)
@@ -283,7 +323,9 @@ struct ModalPanel {
     /// content. Measured (post-map) for its real allocated size so the *card*,
     /// not the transparent surface, centers under the trigger chip.
     card: gtk::Overlay,
-    current: RefCell<Option<Page>>,
+    /// What the drawer is currently showing (a built-in [`Page`] or a plugin
+    /// panel), or `None` when closed (#349 PR2 widened this from `Option<Page>`).
+    current: RefCell<Option<Active>>,
     /// The `.ts-modal` positioner box overlaid on the fullscreen window. It
     /// carries the chrome padding and is aligned to the bar's perp+trailing
     /// corner; its GTK margins (set per-open) place the card the same distance
@@ -343,10 +385,13 @@ thread_local! {
 /// notify so we recompute unconditionally and let it dedupe.
 fn recompute_netconn_visible() {
     let visible = PANELS.with(|panels| {
-        panels
-            .borrow()
-            .values()
-            .any(|p| p.current.borrow().is_some_and(Page::uses_netconn))
+        panels.borrow().values().any(|p| {
+            p.current
+                .borrow()
+                .as_ref()
+                .and_then(Active::builtin)
+                .is_some_and(Page::uses_netconn)
+        })
     });
     NETCONN_VISIBLE.with(|m| {
         if m.get() != visible {
@@ -371,10 +416,13 @@ pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
 /// it dedupe.
 fn recompute_stats_visible() {
     let visible = PANELS.with(|panels| {
-        panels
-            .borrow()
-            .values()
-            .any(|p| p.current.borrow().is_some_and(Page::uses_app_usage))
+        panels.borrow().values().any(|p| {
+            p.current
+                .borrow()
+                .as_ref()
+                .and_then(Active::builtin)
+                .is_some_and(Page::uses_app_usage)
+        })
     });
     STATS_VISIBLE.with(|m| {
         if m.get() != visible {
@@ -399,10 +447,13 @@ pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
 /// let it dedupe.
 fn recompute_media_visible() {
     let visible = PANELS.with(|panels| {
-        panels
-            .borrow()
-            .values()
-            .any(|p| p.current.borrow().is_some_and(Page::uses_mpris_position))
+        panels.borrow().values().any(|p| {
+            p.current
+                .borrow()
+                .as_ref()
+                .and_then(Active::builtin)
+                .is_some_and(Page::uses_mpris_position)
+        })
     });
     MEDIA_VISIBLE.with(|m| {
         if m.get() != visible {
@@ -784,13 +835,36 @@ fn ensure_page(stack: &gtk::Stack, page: Page) {
     }
 }
 
-/// Switch `panel`'s drawer stack to `page`, building it on first use. The
-/// **single choke point** every visibility-changing path routes through
-/// ([`open`]/[`toggle`]/[`switch_active`]/[`show_panel`]), so no route can
-/// reach `set_visible_child_name` for an unbuilt page.
+/// Switch `panel`'s drawer stack to `active` (a built-in [`Page`] or the plugin
+/// panel), building a built-in page on first use. The **single choke point**
+/// every visibility-changing path routes through
+/// ([`open`]/[`toggle`]/[`switch_active`]/[`show_panel_active`]), so no route can
+/// reach `set_visible_child_name` for an unbuilt page. The plugin child is added
+/// eagerly in [`build_pages_stack`] and always exists, so it needs no
+/// build-on-first-open (#349 PR2).
+fn set_stack_active(panel: &ModalPanel, active: &Active) {
+    match active {
+        Active::Builtin(page) => ensure_page(&panel.stack, *page),
+        Active::Plugin(_) => {}
+    }
+    panel.stack.set_visible_child_name(active.stack_name());
+}
+
+/// Thin built-in wrapper over [`set_stack_active`] — the four historical callers
+/// that only ever switch to a `Page` (`switch_active`, `toggle`'s swap + open
+/// branches, `show_panel`) keep working unchanged.
 fn set_stack_page(panel: &ModalPanel, page: Page) {
-    ensure_page(&panel.stack, page);
-    panel.stack.set_visible_child_name(page.stack_name());
+    set_stack_active(panel, &Active::Builtin(page));
+}
+
+/// Per-active side-effects on show: a built-in page runs its [`on_page_show`]
+/// hook; a plugin panel publishes the active selection so every per-monitor
+/// plugin drawer child reconciles that plugin's tree (#349 PR2).
+fn on_active_show(active: &Active) {
+    match active {
+        Active::Builtin(page) => on_page_show(*page),
+        Active::Plugin(id) => crate::plugins::set_active_panel(Some(id)),
+    }
 }
 
 /// `hhomogeneous`/`vhomogeneous` off so the stack reports the *visible* child's
@@ -828,6 +902,18 @@ fn build_pages_stack() -> gtk::Stack {
     for page in EAGER_PAGES {
         ensure_page(&stack, page);
     }
+
+    // The one eagerly-added child: the per-monitor plugin drawer page (#349
+    // PR2). Harmless — it's an empty region until a plugin panel is active, and
+    // with `hhomogeneous`/`vhomogeneous` off it contributes zero size while not
+    // visible. It is NOT a `Page` (so it sidesteps `build_page`'s exhaustive
+    // match), added once under the fixed `PLUGIN_STACK_CHILD` name and never
+    // rebuilt. `plugin_panel_slot()` only needs `PluginHandles` registered,
+    // which happens at `App::with(plugins::service())` before any monitor build.
+    stack.add_named(
+        &crate::plugins::plugin_panel_slot(),
+        Some(PLUGIN_STACK_CHILD),
+    );
     stack
 }
 
@@ -848,6 +934,9 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
         });
+        // Clear the plugin-panel selection when the drawer closes so a later
+        // built-in open (or a plugin child that lingers) renders blank (#349 PR2).
+        crate::plugins::set_active_panel(None);
         recompute_netconn_visible();
         recompute_stats_visible();
         recompute_media_visible();
@@ -861,6 +950,10 @@ pub fn close_all() {
             panel.window.close();
         }
     });
+    // A monitor teardown that held the open plugin panel must clear the
+    // selection too, so the v1 "hot-unplug just closes the plugin page with the
+    // drawer" default holds (#349 PR2).
+    crate::plugins::set_active_panel(None);
     // No panels left → no netconn/stats page visible; park the pollers.
     recompute_netconn_visible();
     recompute_stats_visible();
@@ -883,7 +976,7 @@ pub fn switch_active(target: Page) {
         for panel in panels.borrow().values() {
             if panel.current.borrow().is_some() {
                 set_stack_page(panel, target);
-                *panel.current.borrow_mut() = Some(target);
+                *panel.current.borrow_mut() = Some(Active::Builtin(target));
                 on_page_show(target);
             }
         }
@@ -957,6 +1050,48 @@ pub fn open_on_focused(preferred: Option<&str>, page: Page) {
     }
 }
 
+/// Open the drawer to a plugin's **own** panel on the monitor whose connector is
+/// `key` (#349 PR2). The plugin analogue of [`open_by_key`]: no bar-chip context,
+/// so the drawer anchors flush with the bar's trailing edge (`pending_center` =
+/// `None`, `main_margin` = 0). The active selection is published *before*
+/// presenting so the per-monitor plugin drawer child reconciles the panel tree as
+/// early as possible (risk #1 in the PR: measure-before-show). No-op if no drawer
+/// is mounted for `key`.
+fn open_plugin_by_key(key: &str, plugin_id: &str) {
+    PANELS.with(|panels| {
+        let panels = panels.borrow();
+        let Some(panel) = panels.get(key) else {
+            return;
+        };
+        *panel.pending_center.borrow_mut() = None;
+        // Publish the selection BEFORE presenting so the child reconciles first
+        // (`show_panel_active` also publishes it via `on_active_show`; idempotent).
+        crate::plugins::set_active_panel(Some(plugin_id));
+        show_panel_active(panel, Active::Plugin(plugin_id.to_owned()), 0);
+    });
+    recompute_netconn_visible();
+    recompute_stats_visible();
+    recompute_media_visible();
+}
+
+/// Command-surface analogue of [`open_on_focused`] for a plugin's own panel
+/// (#349 PR2): open `plugin_id`'s panel on the `preferred` connector if a drawer
+/// is mounted there, else on any mounted drawer. Called from the plugin effect
+/// broker when a plugin emits `Effect::OpenPage(Page::PluginSelf)`. No-op only
+/// when no drawers are mounted at all.
+pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
+    let key = PANELS.with(|panels| {
+        let panels = panels.borrow();
+        preferred
+            .filter(|k| panels.contains_key(*k))
+            .map(str::to_string)
+            .or_else(|| panels.keys().next().cloned())
+    });
+    if let Some(key) = key {
+        open_plugin_by_key(&key, plugin_id);
+    }
+}
+
 /// Toggle the drawer on `monitor` to the given `page`, centering the drawer
 /// card under `trigger` along the bar's main axis:
 /// - Same page open → start retract.
@@ -970,14 +1105,16 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
         let Some(panel) = panels.get(&key) else {
             return;
         };
-        let current = *panel.current.borrow();
+        let current = panel.current.borrow().clone();
         match current {
-            Some(p) if p == page => {
+            // Same built-in page already open → retract. A plugin panel showing
+            // is never the same as a built-in `page`, so it falls to the swap arm.
+            Some(Active::Builtin(p)) if p == page => {
                 panel.revealer.set_reveal_child(false);
             }
             Some(_) => {
                 set_stack_page(panel, page);
-                *panel.current.borrow_mut() = Some(page);
+                *panel.current.borrow_mut() = Some(Active::Builtin(page));
                 on_page_show(page);
             }
             None => {
@@ -1011,10 +1148,18 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
 /// GTK margin on the trailing-aligned positioner is equivalent to the old
 /// layer-shell `set_margin` on the content-sized drawer surface.
 fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
-    set_stack_page(panel, page);
-    *panel.current.borrow_mut() = Some(page);
+    show_panel_active(panel, Active::Builtin(page), main_margin);
+}
+
+/// The generalized present path (#349 PR2): show `active` — a built-in [`Page`]
+/// or a plugin panel — at `main_margin`. Identical to the old `show_panel`
+/// except it routes through [`set_stack_active`]/[`on_active_show`], so it needs
+/// only `stack_name` + on-show + margins, none of which are `Page`-specific.
+fn show_panel_active(panel: &ModalPanel, active: Active, main_margin: i32) {
+    set_stack_active(panel, &active);
+    on_active_show(&active);
+    *panel.current.borrow_mut() = Some(active);
     panel.open_state.set(true);
-    on_page_show(page);
 
     // Perpendicular margin: bar offset + live-measured thickness, replacing
     // the old hardcoded 59. The bar window is mapped by open time.
@@ -1192,9 +1337,10 @@ mod tests {
     //   * `build_page` is an exhaustive `match Page { … }` with no wildcard, so
     //     adding a `Page` variant fails to compile until it has a build arm —
     //     a new page can never skip lazy registration.
-    //   * `set_stack_page` is the only caller of `stack.set_visible_child_name`
-    //     and always calls `ensure_page` first, so no route reaches an unbuilt
-    //     page.
+    //   * `set_stack_active` is the only caller of `stack.set_visible_child_name`
+    //     and always `ensure_page`s a built-in first (the plugin child is added
+    //     eagerly and always exists), so no route reaches an unbuilt page.
+    //     `set_stack_page` is a thin built-in wrapper over it (#349 PR2).
     // What's left to guard at runtime is the *stack-name keyspace* that
     // `ensure_page` uses with `gtk::Stack::child_by_name` to decide "already
     // built?". GTK-level idempotence of `ensure_page` needs a display server;

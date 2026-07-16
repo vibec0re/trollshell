@@ -203,9 +203,29 @@
 //!
 //! [`Mount::BarLeft`](proto::Mount::BarLeft),
 //! [`BarCenter`](proto::Mount::BarCenter), and
-//! [`BarRight`](proto::Mount::BarRight) renders are not wired up yet (v1
-//! drops them — see `trollshell/src/plugins.rs`), so this card guarantee is
-//! sidebar-only in practice today.
+//! [`BarRight`](proto::Mount::BarRight) render as **bar chips** (#367): the
+//! host mounts your `view()` tree as a single chip in the requested bar
+//! region. A bar chip carries the shell's `.ts-plugin-chip` wrapper (not the
+//! `.ts-plugin-card` surface — a bar chip is a slim inline widget, not a
+//! sidebar card), so the "don't add `.card`/`.ts-plugin-*` yourself" rule
+//! above applies to bar mounts too.
+//!
+//! ## Opening your own panel
+//!
+//! Any plugin — bar chip or sidebar card — may ALSO define an optional drawer
+//! **panel** (#349 PR2) via [`Plugin::panel`]: a second, independent `Node`
+//! tree the host mounts as its own dedicated drawer page. Return `Some(tree)`
+//! from `panel()` to publish it (default `None` = no panel, chip/card only);
+//! it is re-projected every update like `view` and the runtime dedups + sends
+//! it on the render frame. To open it, emit
+//! [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf) from
+//! `update` — typically in response to a click on your chip/card — which needs
+//! the [`OpenPage`](proto::Capability::OpenPage) capability like any other
+//! page-open. The host resolves `PluginSelf` to *your* panel using the effect's
+//! plugin id; you never name a page. The panel gets the drawer's own dark card
+//! chrome, so a plugin panel root should NOT add `.ts-plugin-card`/`.card`
+//! (same "don't double-card" caution as the sidebar-mount section above) — it
+//! owns only its inner content and spacing.
 //!
 //! ## `Node::Pixels` paints no CSS background
 //!
@@ -448,4 +468,16 @@ pub trait Plugin: Sized {
     /// Project the model into the declarative widget tree the host reconciles
     /// into GTK.
     fn view(&self) -> Node;
+
+    /// The plugin's optional drawer **panel** tree (#349 PR2), opened when the
+    /// plugin emits [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf).
+    /// Default `None` = no panel (chip/card only). Re-projected every update
+    /// like [`view`](Plugin::view); the runtime dedups it and sends it on the
+    /// `Render` frame's `panel` field (a panel change alone forces a frame, so
+    /// a plugin can refresh its open panel while its chip stays fixed). See the
+    /// crate-level *Opening your own panel* section.
+    #[must_use]
+    fn panel(&self) -> Option<Node> {
+        None
+    }
 }

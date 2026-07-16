@@ -20,7 +20,21 @@ pub enum PluginMsg {
     Register { manifest: Manifest },
     /// A rendered view plus the shell effects to broker for it. Bundled so a
     /// (tree, effects) frame is applied atomically.
-    Render { tree: Node, effects: Vec<Effect> },
+    Render {
+        tree: Node,
+        /// The plugin's optional drawer *panel* tree (#349 PR2) — a second,
+        /// independent [`Node`] tree the host mounts as a dedicated drawer
+        /// page, opened by
+        /// [`Effect::OpenPage(Page::PluginSelf)`](crate::effect::Page::PluginSelf).
+        /// `None` (the default, and what a pre-PR2 frame decodes to) = the
+        /// plugin has no panel; its chip/card is display-only. Additive:
+        /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps a
+        /// panel-less frame byte-identical on the wire and `PROTO_VERSION`
+        /// unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panel: Option<Node>,
+        effects: Vec<Effect>,
+    },
     /// A diagnostic line surfaced in the host log, tagged with the plugin id.
     Log { level: LogLevel, msg: String },
     /// Liveness reply to a [`HostMsg::Ping`], echoing its `seq`.

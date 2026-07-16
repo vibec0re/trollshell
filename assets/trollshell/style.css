@@ -1667,8 +1667,11 @@
  * Unlike the pet, her speech is a REAL-font Text node (`.caw-say`) — crisp and
  * readable, not a pixel font. The card is a vertical stack: centered face over
  * her line. */
+/* Vertical padding is deliberately larger than horizontal: the face row
+ * already gets ~12px of side gap from the Spacers + sidebar padding, so 1em
+ * top/bottom is what makes the card read evenly inset on all four edges. */
 .caw-root {
-    padding: 0.5em 0.4em;
+    padding: 1em 0.4em;
 }
 
 /* The bezel — a dark rounded case around the LCD glass, gradient bottoming out
@@ -1731,11 +1734,15 @@
  * the sidebar's ~13px em every em value tried so far (7.5em ≈ 98px, 9em ≈
  * 117px) was silently BELOW 128px, i.e. a no-op — the crow rendered at native
  * buffer size regardless. The sidebar is a fixed 320 CSS px, so there is
- * nothing for the LCD to be font-relative to; 240px leaves ~15px slack after
- * the sidebar/card/bezel paddings. */
+ * nothing for the LCD to be font-relative to.
+ *
+ * 256px is exactly 2× the buffer: the nearest-neighbor upscale is an integer
+ * scale, so every source pixel maps to a clean 2×2 block (non-integer sizes
+ * like 240px give uneven pixel rows). It also nearly fills the width budget —
+ * 320 minus sidebar/root/bezel paddings leaves ~270px, so ~14px slack. */
 .caw-lcd {
-    min-width: 240px;
-    min-height: 240px;
+    min-width: 256px;
+    min-height: 256px;
     border-radius: 0.5em;
 }
 

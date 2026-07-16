@@ -24,17 +24,19 @@
 //! `g_return_if_fail`). It does **not** log — the trust boundary that validates
 //! untrusted plugin buffers and warns is the host's `to_ui_node`, upstream.
 //!
-//! # Sizing — aspect-ratio locked
+//! # Sizing — aspect-ratio locked, integer-scalable
 //!
 //! The buffer's pixel dimensions carry an aspect ratio, and the widget honors
 //! it on **both** ends so a `128×128` LCD never renders stretched in a wide card
 //! (issue #302):
 //!
 //! - **Geometry.** The widget is [`HeightForWidth`](gtk::SizeRequestMode): its
-//!   natural width is the buffer width, and `measure` for the height returns
-//!   `for_width * buf_h / buf_w` — so layout itself requests the right *shape*.
-//!   The minimum stays 0 on both axes, so CSS/layout can still scale the widget
-//!   up freely (small buffer, big widget — the LCD look).
+//!   natural width is the buffer width times the [`set_scale`](PixelSurface::set_scale)
+//!   factor (#358 — a crisp integer blow-up without a shell CSS px rule), and
+//!   `measure` for the height returns `for_width * buf_h / buf_w` — so layout
+//!   itself requests the right *shape*. The minimum stays 0 on both axes, so
+//!   CSS/layout can still scale the widget up freely (small buffer, big widget —
+//!   the LCD look).
 //! - **Draw.** As a backstop against a CSS-forced wrong-shape allocation, the
 //!   texture is drawn into the largest buffer-aspect rect that fits the
 //!   allocation, centered ([`fit_rect`]) — letterboxing (padding) rather than
@@ -68,6 +70,15 @@ fn scaled_height(for_width: i32, buf_w: i32, buf_h: i32) -> i32 {
     i32::try_from(h).unwrap_or(i32::MAX)
 }
 
+/// A buffer dimension times the widget's integer upscale factor, saturated to
+/// `i32::MAX` (i64 math, so the product can't overflow) — the natural size one
+/// axis requests. A `scale` of `0` is treated as `1` (the widget's "no scale"
+/// default), so the natural size never collapses to zero on a degenerate input.
+fn scaled_nat(dim: i32, scale: u32) -> i32 {
+    let n = i64::from(dim) * i64::from(scale.max(1));
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// The largest rect preserving the buffer's aspect ratio (`buf_w:buf_h`) that
 /// fits inside an `alloc_w`×`alloc_h` allocation, centered — the letterbox
 /// backstop for `snapshot`. Returns `(x, y, w, h)`; a degenerate input (any
@@ -87,7 +98,7 @@ fn fit_rect(alloc_w: f32, alloc_h: f32, buf_w: f32, buf_h: f32) -> (f32, f32, f3
 }
 
 mod imp {
-    use super::{fit_rect, glib, graphene, gsk, rgba_len_ok, scaled_height};
+    use super::{fit_rect, glib, graphene, gsk, rgba_len_ok, scaled_height, scaled_nat};
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use std::cell::{Cell, RefCell};
@@ -100,6 +111,10 @@ mod imp {
         /// Natural (unscaled) buffer size in pixels, honored by `measure`.
         nat_width: Cell<i32>,
         nat_height: Cell<i32>,
+        /// Integer upscale factor applied to the natural size (#358). The
+        /// `Default`-derived `0` is treated as `1` everywhere (see
+        /// [`scaled_nat`]), so a freshly-built surface measures at 1×.
+        scale: Cell<u32>,
     }
 
     #[glib::object_subclass]
@@ -122,18 +137,20 @@ mod imp {
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             let bw = self.nat_width.get();
             let bh = self.nat_height.get();
+            let scale = self.scale.get();
             let natural = if orientation == gtk::Orientation::Horizontal {
-                // Width: the buffer's natural width.
-                bw
+                // Width: the buffer's natural width × the integer upscale.
+                scaled_nat(bw, scale)
             } else {
                 // Height-for-width: at a known proposed width (`for_size > 0`),
-                // request the aspect-locked height; with the width still
-                // unconstrained (`for_size == -1`), fall back to the natural
-                // buffer height.
+                // request the aspect-locked height (scale-invariant — both axes
+                // multiply by the same factor, so the ratio is unchanged); with
+                // the width still unconstrained (`for_size == -1`), fall back to
+                // the natural buffer height × the upscale.
                 if for_size > 0 {
                     scaled_height(for_size, bw, bh)
                 } else {
-                    bh
+                    scaled_nat(bh, scale)
                 }
             };
             // (min, natural, min_baseline, natural_baseline). min = 0 lets CSS /
@@ -195,6 +212,14 @@ mod imp {
             self.texture.replace(texture);
             self.nat_width.get() != old_w || self.nat_height.get() != old_h
         }
+
+        /// Set the integer upscale factor. Returns whether the *effective*
+        /// scale changed (`0` and `1` are the same 1× — see [`scaled_nat`]), so
+        /// the caller only queues a resize for a real change.
+        pub(super) fn set_scale(&self, scale: u32) -> bool {
+            let old = self.scale.replace(scale);
+            old.max(1) != scale.max(1)
+        }
     }
 }
 
@@ -226,6 +251,19 @@ impl PixelSurface {
             self.queue_draw();
         }
     }
+
+    /// Set the integer upscale factor (#358): the widget's natural size becomes
+    /// the buffer size times `scale` (`128×128` at `2` requests 256px), so a
+    /// small buffer can ask for a crisp integer blow-up without a CSS px rule.
+    /// `0` is treated as `1` (the default, the buffer's natural size). The draw
+    /// itself is unchanged — still nearest-neighbor into whatever the final
+    /// allocation is; only the *requested* size scales. Queues a resize only
+    /// when the effective scale actually changed.
+    pub fn set_scale(&self, scale: u32) {
+        if self.imp().set_scale(scale) {
+            self.queue_resize();
+        }
+    }
 }
 
 impl Default for PixelSurface {
@@ -236,7 +274,7 @@ impl Default for PixelSurface {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_rect, rgba_len_ok, scaled_height};
+    use super::{fit_rect, rgba_len_ok, scaled_height, scaled_nat};
 
     #[test]
     fn rgba_len_ok_matches_exact_product() {
@@ -315,6 +353,29 @@ mod tests {
         assert_eq!(fit_rect(100.0, 100.0, 0.0, 128.0), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(fit_rect(-5.0, 100.0, 128.0, 128.0), (0.0, 0.0, 0.0, 0.0));
     }
+
+    #[test]
+    fn scaled_nat_multiplies_the_natural_dimension() {
+        // The caw lesson: 128px buffer at 2× requests exactly 256px.
+        assert_eq!(scaled_nat(128, 2), 256);
+        assert_eq!(scaled_nat(2, 3), 6);
+    }
+
+    #[test]
+    fn scaled_nat_zero_and_one_are_identity() {
+        // `0` (the Cell default before any set_scale) and `1` both mean 1×.
+        assert_eq!(scaled_nat(128, 0), 128);
+        assert_eq!(scaled_nat(128, 1), 128);
+        // An empty buffer stays empty at any scale.
+        assert_eq!(scaled_nat(0, 5), 0);
+    }
+
+    #[test]
+    fn scaled_nat_saturates_instead_of_overflowing() {
+        // i32::MAX × u32::MAX overflows i32 but not i64; must saturate, never
+        // panic or wrap.
+        assert_eq!(scaled_nat(i32::MAX, u32::MAX), i32::MAX);
+    }
 }
 
 // ── GTK integration tests (need a display → gated to `system-tests`) ─────────
@@ -356,5 +417,24 @@ mod gtk_tests {
         let s = PixelSurface::new();
         assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 0);
         assert_eq!(s.measure(gtk::Orientation::Vertical, 200).1, 0);
+    }
+
+    #[gtk::test]
+    fn set_scale_multiplies_the_natural_request() {
+        let s = wide_surface(); // 2×1 buffer
+        s.set_scale(3);
+        // Natural size is the buffer × scale on both axes…
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 6);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, -1).1, 3);
+        // …while the height-for-width aspect lock is scale-invariant (2:1 at
+        // width 200 is still 100 tall), and the minimum stays 0 so CSS/layout
+        // can shrink below the scaled natural.
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 200).1, 100);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).0, 0);
+        // Back to 1× (and its 0 alias) restores the buffer's natural size.
+        s.set_scale(1);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 2);
+        s.set_scale(0);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 2);
     }
 }

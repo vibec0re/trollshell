@@ -151,15 +151,20 @@ pub enum Node {
     /// (`data`, row-major, 4 bytes/pixel `[R, G, B, A]`, non-premultiplied,
     /// length `width * height * 4`), materialized by a [`crate::pixels`]
     /// `PixelSurface` and scaled up with **nearest-neighbor** filtering for
-    /// crisp "LCD"-style pixels. `data` is a **mutable** prop: a same-id
-    /// re-render swaps the texture in place (like [`Node::Label`]'s `text`).
-    /// An inconsistent buffer renders nothing (the widget is panic-safe); the
-    /// upstream host validates and warns.
+    /// crisp "LCD"-style pixels. `scale` (#358) is an integer upscale hint:
+    /// the surface's natural size becomes `width*scale` × `height*scale`
+    /// (`0` means `1`), so a small buffer can request a crisp integer blow-up
+    /// without a CSS px rule. `data` and `scale` are **mutable** props: a
+    /// same-id re-render swaps the texture / natural size in place (like
+    /// [`Node::Label`]'s `text`). An inconsistent buffer renders nothing (the
+    /// widget is panic-safe); the upstream host validates and warns, and also
+    /// clamps an absurd `scale` before it reaches this node.
     Pixels {
         id: Option<NodeId>,
         width: u32,
         height: u32,
         data: Vec<u8>,
+        scale: u32,
         classes: Vec<String>,
     },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
@@ -661,11 +666,13 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             width,
             height,
             data,
+            scale,
             classes,
             ..
         } => {
             let surface = crate::pixels::PixelSurface::new();
             surface.set_pixels(*width, *height, data);
+            surface.set_scale(*scale);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -929,12 +936,16 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             width,
             height,
             data,
+            scale,
             classes,
             ..
         } => {
             let surface = downcast::<crate::pixels::PixelSurface>(&retained.widget);
-            // `data` is a mutable prop: swap the texture in place (no rebuild).
+            // `data` and `scale` are mutable props: swap the texture / natural
+            // size in place (no rebuild; `set_scale` only queues a resize on a
+            // real change).
             surface.set_pixels(*width, *height, data);
+            surface.set_scale(*scale);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Button { classes, child, .. } => {
@@ -1949,6 +1960,7 @@ mod gtk_tests {
             width,
             height,
             data,
+            scale: 1,
             classes: vec![],
         }
     }
@@ -1977,6 +1989,36 @@ mod gtk_tests {
         rec.render(&pix(Some("lcd"), 1, 1, vec![0, 255, 0, 255]));
         let after = root.first_child().unwrap();
         assert_eq!(before, after, "same-id Pixels reuses the surface in place");
+    }
+
+    #[gtk::test]
+    fn pixels_scale_is_a_mutable_prop() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        let surface = root
+            .first_child()
+            .unwrap()
+            .downcast::<crate::pixels::PixelSurface>()
+            .unwrap();
+        assert_eq!(surface.measure(gtk::Orientation::Horizontal, -1).1, 1);
+
+        // Same id, new scale: mutable-prop update — the widget is reused and
+        // its natural request grows to buffer × scale.
+        rec.render(&Node::Pixels {
+            id: Some("lcd".into()),
+            width: 1,
+            height: 1,
+            data: vec![255, 0, 0, 255],
+            scale: 4,
+            classes: vec![],
+        });
+        assert_eq!(
+            root.first_child().unwrap(),
+            surface.clone().upcast::<gtk::Widget>(),
+            "same-id scale flip reuses the surface in place"
+        );
+        assert_eq!(surface.measure(gtk::Orientation::Horizontal, -1).1, 4);
     }
 
     #[gtk::test]

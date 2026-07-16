@@ -71,6 +71,7 @@ fn sample_tree() -> Node {
                 width: 2,
                 height: 2,
                 data: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                scale: 2,
                 classes: vec!["ts-lcd".into()],
             },
             Node::Button {
@@ -472,11 +473,13 @@ fn raise_osd_is_name_tagged_and_additive() {
 
 #[test]
 fn pixels_node_round_trips() {
+    // Exercise a non-default `scale` so the #358 field is proven to round-trip.
     let node = Node::Pixels {
         id: Some("lcd".into()),
         width: 4,
         height: 2,
         data: (0u8..32).collect(), // 4*2*4
+        scale: 3,
         classes: vec!["ts-lcd".into()],
     };
     let back: Node = decode(&encode(&node)).expect("decode Pixels");
@@ -503,6 +506,7 @@ fn pixels_data_is_one_binary_blob() {
         width: 16,
         height: 16,
         data: data.clone(),
+        scale: 1,
         classes: vec![],
     };
     let body = encode_body(&node);
@@ -532,10 +536,105 @@ fn pixels_with_mismatched_len_still_round_trips() {
         width: 10,
         height: 10,
         data: vec![0, 1, 2], // 3 bytes, not 400
+        scale: 1,
         classes: vec![],
     };
     let back: Node = decode(&encode(&node)).expect("permissive decode of a bad-size Pixels");
     assert_eq!(node, back);
+}
+
+#[test]
+fn pixels_without_scale_decodes_old_frame_compat() {
+    // A `Pixels` frame built before #358 has no `scale` key. The current
+    // decoder must still accept it, defaulting `scale` to `1`
+    // (`#[serde(default = …)]` + named-map encoding) — the backward-compat
+    // guarantee that keeps an already-deployed plugin's LCD at its pre-#358
+    // 1× size. Modeled as an externally-tagged enum mirroring the pre-#358
+    // field set, so it serializes as `{"Pixels": { id, width, height, data,
+    // classes }}` exactly like an old plugin, and `PROTO_VERSION` stays 1.
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Pixels {
+            id: Option<String>,
+            width: u32,
+            height: u32,
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+            classes: Vec<String>,
+        },
+    }
+
+    let old = NodeOld::Pixels {
+        id: Some("lcd".into()),
+        width: 1,
+        height: 1,
+        data: vec![10, 20, 30, 255],
+        classes: vec!["ts-lcd".into()],
+    };
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"scale"),
+        "an old frame carries no scale key"
+    );
+    let decoded: Node = decode_body(&body).expect("decode pre-#358 Pixels frame");
+    assert_eq!(
+        decoded,
+        Node::Pixels {
+            id: Some("lcd".into()),
+            width: 1,
+            height: 1,
+            data: vec![10, 20, 30, 255],
+            // Absent `scale` defaults to the buffer's natural 1× size.
+            scale: 1,
+            classes: vec!["ts-lcd".into()],
+        },
+        "absent scale defaults to 1",
+    );
+}
+
+#[test]
+fn pixels_with_scale_is_skipped_by_an_old_decoder_forward_compat() {
+    // The reverse direction the issue flags explicitly: a NEW plugin frame
+    // carrying the `scale` key hits an OLD host built before #358. The old
+    // decoder must *skip* the unknown field (named-map encoding + serde's
+    // default ignore-unknown-fields) rather than erroring and killing the
+    // session — so `scale` can ship without gating emission on the Register
+    // handshake. Modeled with a pre-#358 replica of the variant deriving
+    // `Deserialize`, fed the real current encoding.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum NodeOld {
+        Pixels {
+            id: Option<String>,
+            width: u32,
+            height: u32,
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+            classes: Vec<String>,
+        },
+    }
+
+    let new = Node::Pixels {
+        id: Some("lcd".into()),
+        width: 1,
+        height: 1,
+        data: vec![10, 20, 30, 255],
+        scale: 2,
+        classes: vec!["ts-lcd".into()],
+    };
+    let body = encode_body(&new);
+    assert!(contains(&body, b"scale"), "the new frame carries scale");
+    let decoded: NodeOld = decode_body(&body).expect("old decoder skips the unknown scale field");
+    assert_eq!(
+        decoded,
+        NodeOld::Pixels {
+            id: Some("lcd".into()),
+            width: 1,
+            height: 1,
+            data: vec![10, 20, 30, 255],
+            classes: vec!["ts-lcd".into()],
+        },
+        "an old host renders the same buffer at its 1× default",
+    );
 }
 
 // ── Proto exact-match rule ───────────────────────────────────────────────────

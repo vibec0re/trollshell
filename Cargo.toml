@@ -13,6 +13,7 @@ members = [
   "crates/hytte-plugin-clock-demo",
   "crates/hytte-plugin-pet",
   "crates/hytte-plugin-preem-demo",
+  "crates/hytte-plugin-terminal",
   "crates/hytte-plugin-caw",
   "crates/hytte-plugin-departures",
   "crates/hytte-plugin-weather",

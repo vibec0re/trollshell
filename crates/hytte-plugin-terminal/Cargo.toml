@@ -1,0 +1,21 @@
+[package]
+name = "hytte-plugin-terminal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Micro-terminal demo plugin (issue #357): a preem VFD screen of local-echo scrollback fed by a Node::Entry input line — no command execution"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-terminal"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY dependency: the plugin runtime SDK, which carries the preem
+# raster kit (`hytte_plugin::preem`) and re-exports the wire protocol as
+# `hytte_plugin::proto`. No gtk / adw / hytte-ui — and no direct tokio —
+# a plugin never links the shell.
+hytte-plugin = { path = "../hytte-plugin" }

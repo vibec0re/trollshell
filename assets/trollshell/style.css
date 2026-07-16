@@ -1752,7 +1752,11 @@
  * plugin's view: short lines hug their text, long lines fill the card and
  * wrap. Same family as `.pet-bubble`. */
 .caw-bubble {
-    background: rgb(58, 34, 80); /* a touch lighter than @sidebar_card_background */
+    background: rgb(
+        58,
+        34,
+        80
+    ); /* a touch lighter than @sidebar_card_background */
     border-radius: 0.8em;
     padding: 0.5em 0.75em;
     margin: 0.25em 0.2em 0;

@@ -233,6 +233,11 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
     const BAR_EDGE_OFFSET: i32 = 0;
 
     overlays::sidebar::install(monitor);
+    // Plugin bar-chip regions (#349): one per bar group (left/center/right),
+    // built like the sidebar's plugin regions but laid out horizontally. Each is
+    // a reconciler-backed container that stays empty (and hidden) until a
+    // `Bar*`-mounted plugin dials in, then shows its `view()` tree as a
+    // `.ts-plugin-chip` pill. Parallel to `sidebar::build_card`'s sidebar slots.
     let bar = Bar::new(monitor)
         .edge(BAR_EDGE)
         .exclusive(true)
@@ -241,9 +246,11 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::sidebar_toggle::widget(monitor),
             widgets::workspaces::widget(monitor),
             widgets::window_list::widget(monitor),
+            plugins::bar_left_slot(),
         ])
-        .center([widgets::mpris::widget(monitor)])
+        .center([widgets::mpris::widget(monitor), plugins::bar_center_slot()])
         .right([
+            plugins::bar_right_slot(),
             group([widgets::tray::widget(monitor)]),
             group([
                 widgets::bluetooth::widget(monitor),

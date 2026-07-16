@@ -540,22 +540,6 @@
     background: alpha(currentColor, 0.3);
 }
 
-/* Plugin BAR chips (#349). A `Bar*`-mounted plugin's card root gets
- * `.ts-plugin-chip` (the horizontal-region parallel of the sidebar's
- * `.ts-plugin-card`), one chip per plugin inside the `.ts-plugin-region` row the
- * host inserts into a bar group (left/center/right). Styled to read as a native
- * bar chip: a subtle translucent pill with the same rounding + padding the
- * built-in `.ts-indicator` chips use, so a plugin chip sits in the bar as one of
- * the family. Like `.ts-plugin-card`, no extra inner padding beyond the pill —
- * the plugin owns its own content spacing, so a chip that already pads its root
- * doesn't double up. */
-.ts-plugin-chip {
-    color: #ffffff;
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 0.769em;
-    padding: 0.154em 0.615em;
-}
-
 /* Plugin drawer PANEL (#349 PR2). The per-monitor plugin drawer child gets
  * `.ts-plugin-panel` (`trollshell/src/plugins.rs` `plugin_panel_slot`) and sits
  * inside the drawer's `.ts-drawer-content`, which already supplies the dark card
@@ -575,6 +559,22 @@
     border-radius: 0;
     margin: 0;
     min-height: 0;
+}
+
+/* Plugin BAR chips (#349). A `Bar*`-mounted plugin's card root gets
+ * `.ts-plugin-chip` (the horizontal-region parallel of the sidebar's
+ * `.ts-plugin-card`), one chip per plugin inside the `.ts-plugin-region` row the
+ * host inserts into a bar group (left/center/right). Styled to read as a native
+ * bar chip: a subtle translucent pill with the same rounding + padding the
+ * built-in `.ts-indicator` chips use, so a plugin chip sits in the bar as one of
+ * the family. Like `.ts-plugin-card`, no extra inner padding beyond the pill —
+ * the plugin owns its own content spacing, so a chip that already pads its root
+ * doesn't double up. */
+.ts-plugin-chip {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 0.769em;
+    padding: 0.154em 0.615em;
 }
 
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;

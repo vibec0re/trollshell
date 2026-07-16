@@ -53,6 +53,17 @@ use crate::components::notif_actions;
 /// individually and do not count toward this cap.
 const MAX_VISIBLE_NONCRITICAL: usize = 4;
 
+/// Maximum rendered lines for a toast's body text (#352). Without a cap, a
+/// long or multi-paragraph body wraps into an unbounded vertical stack and
+/// stretches the toast popover to full-screen height. Paired with
+/// [`clamp_lines`] — see its doc comment for why `Label::set_lines` alone
+/// isn't sufficient.
+const BODY_MAX_LINES: usize = 5;
+
+/// Maximum rendered lines for a toast's summary text (#352). See
+/// [`BODY_MAX_LINES`].
+const SUMMARY_MAX_LINES: usize = 2;
+
 // ── Per-monitor toast view ────────────────────────────────────────────────────
 
 struct ToastView {
@@ -345,6 +356,17 @@ fn build_toast_view(monitor: &Monitor) -> ToastView {
 
 // ── Card builder ──────────────────────────────────────────────────────────────
 
+/// Pre-clamp `text` to at most `n` hard-newline-delimited lines, joined back
+/// with `\n`. Required *in addition to* `Label::set_lines(n)`: Pango treats
+/// each `\n` as a separate paragraph, and `set_lines(n)` only caps lines
+/// produced by *wrapping* — it does not limit the number of hard-newline
+/// paragraphs. Without this pre-clamp, a body with many `\n`s would still
+/// blow up the toast popover height (the #126/#129 lesson, revisited for
+/// toasts in #352).
+fn clamp_lines(text: &str, n: usize) -> String {
+    text.lines().take(n).collect::<Vec<_>>().join("\n")
+}
+
 fn build_card(notif: &Notification) -> gtk::Widget {
     // Outer card: horizontal — [image?] [text column]
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -403,23 +425,30 @@ fn build_card(notif: &Notification) -> gtk::Widget {
 
     column.append(&header);
 
-    // Summary.
+    // Summary. See `clamp_lines` (#352) for why both a hard-newline
+    // pre-clamp and `set_lines` are needed.
     if !notif.summary.is_empty() {
-        let summary = gtk::Label::new(Some(&notif.summary));
+        let clamped = clamp_lines(&notif.summary, SUMMARY_MAX_LINES);
+        let summary = gtk::Label::new(Some(&clamped));
         summary.add_css_class("ts-toast-summary");
         summary.set_xalign(0.0);
         summary.set_wrap(true);
         summary.set_max_width_chars(40);
+        summary.set_lines(i32::try_from(SUMMARY_MAX_LINES).unwrap_or(i32::MAX));
+        summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
         column.append(&summary);
     }
 
-    // Body.
+    // Body. See `clamp_lines` (#352).
     if !notif.body.is_empty() {
-        let body = gtk::Label::new(Some(&notif.body));
+        let clamped = clamp_lines(&notif.body, BODY_MAX_LINES);
+        let body = gtk::Label::new(Some(&clamped));
         body.add_css_class("ts-toast-body");
         body.set_xalign(0.0);
         body.set_wrap(true);
         body.set_max_width_chars(40);
+        body.set_lines(i32::try_from(BODY_MAX_LINES).unwrap_or(i32::MAX));
+        body.set_ellipsize(gtk::pango::EllipsizeMode::End);
         column.append(&body);
     }
 
@@ -553,4 +582,40 @@ fn build_image(image: &NotificationImage) -> gtk::Image {
         }
     }
     img
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_lines;
+
+    #[test]
+    fn clamp_lines_passes_short_text_through() {
+        assert_eq!(clamp_lines("one line", 5), "one line");
+    }
+
+    #[test]
+    fn clamp_lines_caps_hard_newlines() {
+        // The #126/#129 case: many `\n`-separated paragraphs must be
+        // truncated by the pre-clamp itself, since `set_lines` alone only
+        // caps *wrapped* lines, not hard-newline paragraphs.
+        let body = "one\ntwo\nthree\nfour\nfive\nsix\nseven";
+        assert_eq!(clamp_lines(body, 3), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn clamp_lines_exact_count_unchanged() {
+        assert_eq!(clamp_lines("a\nb", 2), "a\nb");
+    }
+
+    #[test]
+    fn clamp_lines_zero_yields_empty() {
+        assert_eq!(clamp_lines("a\nb\nc", 0), "");
+    }
+
+    #[test]
+    fn clamp_lines_empty_input() {
+        assert_eq!(clamp_lines("", 5), "");
+    }
 }

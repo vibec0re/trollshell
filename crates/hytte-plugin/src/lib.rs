@@ -346,7 +346,7 @@ pub enum Input<M> {
     Event {
         /// The interacted node, by the id the plugin assigned in its view.
         node: NodeId,
-        /// What happened (click / scroll).
+        /// What happened (click / scroll / slider move / entry submit).
         kind: EventKind,
     },
     /// The outcome of a brokered

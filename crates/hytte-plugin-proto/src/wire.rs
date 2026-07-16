@@ -348,10 +348,17 @@ pub enum Node {
     /// `text` is the **echo prop** (reconciler-updatable like
     /// [`Slider`](Node::Slider)'s `value`): the plugin states what the entry
     /// should show — e.g. clear it to `""` after handling a submit, or prefill
-    /// a suggestion. The host applies it **only when the prop changed since
-    /// the last render**, so a re-render that merely echoes the unchanged
-    /// value never clobbers what the user is currently typing (the
-    /// entry-shaped analogue of the slider's drag suppression). A programmatic
+    /// a suggestion. The host applies it **when the prop changed since the
+    /// last render**, so a re-render that merely echoes the unchanged value
+    /// never clobbers what the user is currently typing (the entry-shaped
+    /// analogue of the slider's drag suppression) — **or unconditionally on
+    /// the first render after a submit**: the render answering a
+    /// [`Submitted`](EventKind::Submitted) is authoritative even when its
+    /// `text` equals the last-rendered prop, which is what makes
+    /// clear-after-submit work when the prop rests at the same value (render
+    /// `""`, user types, Enter, render `""` again — the widget clears; a plain
+    /// prop-diff would leave the typed text stuck). Anything typed between
+    /// Enter and that answering render is overwritten by it. A programmatic
     /// `set_text` never fires GTK's `activate`, so an echo can't re-emit a
     /// [`Submitted`](EventKind::Submitted) — the same structural no-feedback
     /// guarantee as the slider's `change-value` wiring. `placeholder` is the
@@ -370,8 +377,9 @@ pub enum Node {
     Entry {
         id: NodeId,
         /// The echo prop: what the entry should display (see the variant
-        /// docs — applied only on a prop *change*, so it never fights
-        /// in-progress typing).
+        /// docs — applied on a prop *change* or unconditionally on the first
+        /// render after a submit, so it never fights in-progress typing but
+        /// still clears/rewrites reliably after Enter).
         text: String,
         /// Greyed hint text shown while the entry is empty; `""` for none.
         placeholder: String,

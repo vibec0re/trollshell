@@ -728,21 +728,19 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
 /// compile-time guarantee that adding a `Page` variant forces a build arm here,
 /// so a new page can never silently skip lazy registration.
 ///
-/// Called by [`ensure_page`] on a page's first activation (and eagerly for
-/// [`Page::StatsCpu`] from [`build_pages_stack`]). Every panel constructor is
-/// side-effect-free at build time — `bind*` delivers current signal state on
-/// subscribe, and per-page on-show work (clipboard/calendar refresh,
-/// notification dismissal) is driven by [`on_page_show`], not construction —
-/// so deferring a build to first open loses nothing. The exception is the CPU
-/// stats page: its clock-aggregate row and two per-core `MultiSparkline`s push
-/// history *in the widget* off raw `sensors::cpu()`/`cpu_freq()` samples.
-/// #336 hoisted the *overall* CPU-load line into `sensors::cpu_history()`, but
-/// not the clock or per-core series — `MultiSparkline` has no bulk-seed method
-/// to backfill from a hoisted ring, so this page still can't reach the lazy
-/// path fresh (tracked in the follow-up issue linked from `build_pages_stack`).
-/// Memory / Disks / GPU are fully hoisted as of #336
-/// (`sensors::{memory,disk_io,gpu_load,gpu_vram,gpu_temp}_history()` feeding
-/// `Sparkline::set_samples`), so they build lazily like every other page.
+/// Called by [`ensure_page`] on a page's first activation. Every panel
+/// constructor is side-effect-free at build time — `bind*` delivers current
+/// signal state on subscribe, and per-page on-show work (clipboard/calendar
+/// refresh, notification dismissal) is driven by [`on_page_show`], not
+/// construction — so deferring a build to first open loses nothing. This holds
+/// for every page, the Stats pages included: all sparkline history lives in the
+/// `sensors` service (the scalar `*_history()` rings plus the per-core
+/// `cpu_per_core_history()` / `cpu_freq_per_core_history()`), so a lazily-built
+/// page backfills instantly via `Sparkline::set_samples` /
+/// `MultiSparkline::set_frames`. The CPU page's clock aggregate and its two
+/// per-core `MultiSparkline`s were the last holdout, hoisted in #338 (#336 had
+/// already done Memory/Disks/GPU and the overall CPU-load line); `EAGER_PAGES`
+/// is now empty, so this function is only ever reached lazily.
 fn build_page(page: Page) -> gtk::Widget {
     use crate::panels;
 
@@ -802,21 +800,21 @@ fn set_stack_page(panel: &ModalPanel, page: Page) {
 /// all exist for a stable measure — which is exactly what makes lazy building
 /// size-neutral: each page still measures to its own natural size on show.
 ///
-/// Only [`Page::StatsCpu`] is built eagerly here — its clock-aggregate row and
-/// two per-core `MultiSparkline`s still accumulate history in-widget from
-/// launch, unlike the overall CPU-load line, Memory, Disks, and GPU, all of
-/// which #336 hoisted into the `sensors` service and which now backfill
-/// instantly via `Sparkline::set_samples` on first (lazy) build. Every other
-/// page — Memory, Disks, and GPU included — builds lazily on first activation
-/// via [`ensure_page`]/[`set_stack_page`]. This drops the startup cost from
-/// `19×N` panels (one full set per monitor) to `1×N`. The CPU page is added
-/// first, so it is the stack's initial visible child — invisible anyway until
-/// the drawer first opens.
+/// No page is built eagerly any more: [`EAGER_PAGES`] is empty. Every page —
+/// the CPU stats page included, since #338 hoisted its clock aggregate + the two
+/// per-core `MultiSparkline` series into the `sensors` service (joining
+/// Memory/Disks/GPU + the overall CPU-load line, hoisted in #336) — builds
+/// lazily on first activation via [`ensure_page`]/[`set_stack_page`] and
+/// backfills instantly via `Sparkline::set_samples` / `MultiSparkline::set_frames`.
+/// This drops the startup cost from `19×N` panels (one full set per monitor) to
+/// `0` — the stack starts empty and grows a child per page on first open. Nothing
+/// is visible until the drawer first opens, which is itself a `set_stack_page`
+/// call, so the first-open page is built then.
 ///
 /// [`EAGER_PAGES`] is the single source for which pages skip the lazy path;
-/// [`tests::eager_pages_is_cpu_only`] tripwires it so a future edit can't
-/// silently grow this set without revisiting the reasoning above.
-const EAGER_PAGES: [Page; 1] = [Page::StatsCpu];
+/// [`tests::eager_pages_is_empty`] tripwires it so a future edit can't silently
+/// grow this set without revisiting the reasoning above.
+const EAGER_PAGES: [Page; 0] = [];
 
 fn build_pages_stack() -> gtk::Stack {
     let stack = gtk::Stack::new();
@@ -1244,15 +1242,16 @@ mod tests {
         assert_eq!(Page::from_stack_name("does-not-exist"), None);
     }
 
-    /// Tripwire for `build_pages_stack`'s eager set (#231 part 2): #336 hoisted
-    /// Memory/Disks/GPU sparkline history into the `sensors` service, so only
-    /// `StatsCpu` (whose clock + per-core `MultiSparkline` history is still
-    /// pushed in-widget) should remain eager. If this fails, either a page was
-    /// silently re-added to `EAGER_PAGES` without updating the doc comments on
-    /// `build_page`/`build_pages_stack` explaining why, or `StatsCpu` itself
-    /// finally got its history hoisted and can drop off this list too.
+    /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every
+    /// Stats page's sparkline history is hoisted into the `sensors` service (the
+    /// CPU page's clock aggregate + per-core `MultiSparkline`s were the last
+    /// holdout; #336 did Memory/Disks/GPU + the overall CPU-load line), so no
+    /// page needs to build eagerly — `EAGER_PAGES` is empty and every page takes
+    /// the lazy path. If this fails, a page was silently re-added to
+    /// `EAGER_PAGES` without updating the doc comments on
+    /// `build_page`/`build_pages_stack` explaining why it can't build lazily.
     #[test]
-    fn eager_pages_is_cpu_only() {
-        assert_eq!(EAGER_PAGES, [Page::StatsCpu]);
+    fn eager_pages_is_empty() {
+        assert_eq!(EAGER_PAGES, [] as [Page; 0]);
     }
 }

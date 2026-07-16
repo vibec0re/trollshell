@@ -260,6 +260,20 @@ pub struct SensorsHandles {
     pub(crate) gpu_load_hist: Mutable<Arc<VecDeque<f64>>>,
     pub(crate) gpu_vram_hist: Mutable<Arc<VecDeque<f64>>>,
     pub(crate) gpu_temp_hist: Mutable<Arc<VecDeque<f64>>>,
+    // ── Clock + per-core history (#338) ───────────────────────────────────────
+    // The CPU card's clock-aggregate row and its two per-core `MultiSparkline`
+    // rows used to accumulate history in-widget, which is what kept the StatsCpu
+    // page force-eager-built (#231/#336 hoisted only the *overall* CPU-load
+    // line). Hoisting these here — a scalar ring for the clock aggregate, and
+    // 2-D rings (one per core) for the per-core load/clock series — lets that
+    // page build lazily and open pre-populated via `Sparkline::set_samples` /
+    // `MultiSparkline::set_frames`.
+    /// Aggregate clock ring: `max_hz / max_ceiling_hz` (0..=1) per tick.
+    pub(crate) cpu_freq_hist: Mutable<Arc<VecDeque<f64>>>,
+    /// Per-core load rings: one `HISTORY_CAP` ring per logical core (0..=1).
+    pub(crate) cpu_per_core_hist: Mutable<Arc<Vec<VecDeque<f64>>>>,
+    /// Per-core clock rings: one ring per core, each `hz / max_ceiling_hz` (0..=1).
+    pub(crate) cpu_freq_per_core_hist: Mutable<Arc<Vec<VecDeque<f64>>>>,
 }
 
 /// Sample count each sparkline history keeps — matches `Sparkline::new(60)` in
@@ -286,6 +300,9 @@ impl Default for SensorsHandles {
             gpu_load_hist: Mutable::new(Arc::new(VecDeque::new())),
             gpu_vram_hist: Mutable::new(Arc::new(VecDeque::new())),
             gpu_temp_hist: Mutable::new(Arc::new(VecDeque::new())),
+            cpu_freq_hist: Mutable::new(Arc::new(VecDeque::new())),
+            cpu_per_core_hist: Mutable::new(Arc::new(Vec::new())),
+            cpu_freq_per_core_hist: Mutable::new(Arc::new(Vec::new())),
         }
     }
 }
@@ -315,6 +332,42 @@ fn spawn_history<T, F>(
                 ring.push_back(sample);
                 sink.set(Arc::new(ring.clone()));
             }
+        }
+    });
+}
+
+/// Spawn a task that accumulates a **per-core** history: one `HISTORY_CAP`-sample
+/// ring per series, mirroring `hytte_ui`'s `MultiSparkline::push_frame` width-reset
+/// semantics. For each `source` emit, `extract` yields one frame (one sample per
+/// core); when the frame width changes (a CPU hot-plug, or the first real frame
+/// after the empty default) the rings are cleared and re-sized to the new width
+/// so history restarts cleanly, then the whole 2-D window is republished into
+/// `sink`. Consumed by a lazily-built per-core `MultiSparkline` via `set_frames`.
+fn spawn_per_core_history<T, F>(
+    rt: &tokio::runtime::Handle,
+    source: Mutable<T>,
+    sink: Mutable<Arc<Vec<VecDeque<f64>>>>,
+    extract: F,
+) where
+    T: Clone + Send + Sync + 'static,
+    F: Fn(&T) -> Vec<f64> + Send + 'static,
+{
+    rt.spawn(async move {
+        let mut series: Vec<VecDeque<f64>> = Vec::new();
+        let mut stream = source.signal_cloned().to_stream();
+        while let Some(value) = stream.next().await {
+            let frame = extract(&value);
+            if series.len() != frame.len() {
+                series.clear();
+                series.resize_with(frame.len(), || VecDeque::with_capacity(HISTORY_CAP));
+            }
+            for (buf, &sample) in series.iter_mut().zip(frame.iter()) {
+                if buf.len() == HISTORY_CAP {
+                    buf.pop_front();
+                }
+                buf.push_back(sample);
+            }
+            sink.set(Arc::new(series.clone()));
         }
     });
 }
@@ -409,7 +462,48 @@ impl Service for SensorsService {
             |g| g.as_ref().and_then(|s| s.temperature_celsius),
         );
 
+        // CPU clock + per-core accumulators (#338): the clock aggregate and the
+        // two per-core series that used to push history in-widget in the Stats
+        // CPU card. Extractors mirror each row's old `push`/`push_frame` math and
+        // its `max_ceiling_hz`-normalization (0.0 when no cpufreq governor).
+        spawn_history(
+            rt,
+            handles.cpu_freq.clone(),
+            handles.cpu_freq_hist.clone(),
+            |f| Some(normalized_clock(f.max_hz, f.max_ceiling_hz)),
+        );
+        spawn_per_core_history(
+            rt,
+            handles.cpu.clone(),
+            handles.cpu_per_core_hist.clone(),
+            |c| c.per_core.clone(),
+        );
+        spawn_per_core_history(
+            rt,
+            handles.cpu_freq.clone(),
+            handles.cpu_freq_per_core_hist.clone(),
+            |f| {
+                let ceiling = f.max_ceiling_hz;
+                f.per_core
+                    .iter()
+                    .map(|&hz| normalized_clock(hz, ceiling))
+                    .collect()
+            },
+        );
+
         handles
+    }
+}
+
+/// Normalize a clock frequency against the fixed `max_ceiling_hz` axis (the
+/// highest `cpuinfo_max_freq` across cores), yielding a 0..=1 fraction. Returns
+/// `0.0` when no ceiling is known (no cpufreq governor — VMs), matching the
+/// Stats card's original in-widget normalization.
+fn normalized_clock(hz: f64, ceiling_hz: f64) -> f64 {
+    if ceiling_hz > 0.0 {
+        hz / ceiling_hz
+    } else {
+        0.0
     }
 }
 
@@ -464,9 +558,43 @@ fn history_of(
     })
 }
 
+/// Read one per-core history ring set (`#338`) off the shared handles. The
+/// per-core twin of [`history_of`]: the item is a `Vec` of rings, one per core.
+fn per_core_history_of(
+    pick: impl FnOnce(&SensorsHandles) -> &Mutable<Arc<Vec<VecDeque<f64>>>>,
+) -> impl Signal<Item = Arc<Vec<VecDeque<f64>>>> {
+    registry::with(|r| {
+        pick(
+            r.get::<SensorsHandles>()
+                .expect("sensors::service() not registered"),
+        )
+        .signal_cloned()
+    })
+}
+
 /// CPU-load history (fraction 0..=1), `HISTORY_CAP` samples. See [`history_of`].
 pub fn cpu_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
     history_of(|h| &h.cpu_hist)
+}
+
+/// Aggregate CPU-clock history (fraction 0..=1 of `max_ceiling_hz`),
+/// `HISTORY_CAP` samples. Feeds the Stats CPU card's collapsed clock sparkline.
+pub fn cpu_freq_history() -> impl Signal<Item = Arc<VecDeque<f64>>> {
+    history_of(|h| &h.cpu_freq_hist)
+}
+
+/// Per-core CPU-load history (fraction 0..=1), one `HISTORY_CAP` ring per core.
+/// Feeds the Stats CPU card's expanded per-core `MultiSparkline` via
+/// `set_frames`. Tolerates a changing core count (rings reset on width change).
+pub fn cpu_per_core_history() -> impl Signal<Item = Arc<Vec<VecDeque<f64>>>> {
+    per_core_history_of(|h| &h.cpu_per_core_hist)
+}
+
+/// Per-core CPU-clock history (each core's `hz / max_ceiling_hz`, 0..=1), one
+/// `HISTORY_CAP` ring per core. Feeds the expanded per-core clock
+/// `MultiSparkline` via `set_frames`.
+pub fn cpu_freq_per_core_history() -> impl Signal<Item = Arc<Vec<VecDeque<f64>>>> {
+    per_core_history_of(|h| &h.cpu_freq_per_core_hist)
 }
 
 /// Memory-used-fraction history (0..=1).

@@ -87,10 +87,16 @@
 //! ## v1 scope (see the PR body for the full deferred list)
 //!
 //! - **Mounts:** the three sidebar regions ([`Mount::SidebarLead`] /
-//!   [`Mount::SidebarTop`] / [`Mount::SidebarBottom`]); bar mounts are accepted
-//!   but their renders are dropped (deferred). `SidebarLead` (#301) leads the
-//!   sidebar — its cards render *above* the built-in weather/calendar/tasks
-//!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot.
+//!   [`Mount::SidebarTop`] / [`Mount::SidebarBottom`]) render as sidebar cards,
+//!   and the three bar regions ([`Mount::BarLeft`] / [`Mount::BarCenter`] /
+//!   [`Mount::BarRight`]) render as bar **chips** (#349) — the plugin's `view()`
+//!   tree wrapped in a `.ts-plugin-chip` pill in the matching bar group. Both
+//!   sides share one reconciler path ([`build_region`]); a bar region just lays
+//!   its cards out horizontally with the chip class. `SidebarLead` (#301) leads
+//!   the sidebar — its cards render *above* the built-in weather/calendar/tasks
+//!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot. The
+//!   optional per-chip drawer *panel* (`Effect`-opened) remains a follow-up; a
+//!   chip need not have a drawer.
 //! - **State:** only [`StateKey::Clock`].
 //! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer) and
 //!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236) are brokered; every
@@ -160,18 +166,22 @@ struct BrokeredEffect {
     effect: Effect,
 }
 
-/// Registry handles for the plugin host. The three sidebar render mailboxes are
-/// written from tokio (a plugin's reader task) and read on the GTK thread (the
-/// reconcilers). `clock_tx` is written on the GTK thread (the clock pump) and
-/// subscribed from tokio (per-conn snapshot tasks). `effects_rx` is the receive
-/// end of the non-lossy effect channel; [`install`] takes it once to drain the
-/// broker on the GTK thread (`RefCell<Option<…>>` because the registry is
-/// thread-local to that thread and the receiver is single-consumer).
+/// Registry handles for the plugin host. The six render mailboxes (three
+/// sidebar + three bar, #349) are written from tokio (a plugin's reader task)
+/// and read on the GTK thread (the reconcilers). `clock_tx` is written on the
+/// GTK thread (the clock pump) and subscribed from tokio (per-conn snapshot
+/// tasks). `effects_rx` is the receive end of the non-lossy effect channel;
+/// [`install`] takes it once to drain the broker on the GTK thread
+/// (`RefCell<Option<…>>` because the registry is thread-local to that thread and
+/// the receiver is single-consumer).
 #[doc(hidden)]
 pub struct PluginHandles {
     sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
+    bar_left: Mutable<Vec<SlotRender>>,
+    bar_center: Mutable<Vec<SlotRender>>,
+    bar_right: Mutable<Vec<SlotRender>>,
     clock_tx: watch::Sender<Option<ClockState>>,
     /// Aggregate slot visibility (OR of every monitor's sidebar open flag),
     /// written on the GTK thread ([`set_sidebar_visibility`]) and subscribed
@@ -187,6 +197,9 @@ struct ListenerCtx {
     sidebar_lead: Mutable<Vec<SlotRender>>,
     sidebar_top: Mutable<Vec<SlotRender>>,
     sidebar_bottom: Mutable<Vec<SlotRender>>,
+    bar_left: Mutable<Vec<SlotRender>>,
+    bar_center: Mutable<Vec<SlotRender>>,
+    bar_right: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
     visibility_rx: watch::Receiver<bool>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
@@ -205,6 +218,9 @@ impl Service for PluginsService {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
             sidebar_bottom: Mutable::new(Vec::new()),
+            bar_left: Mutable::new(Vec::new()),
+            bar_center: Mutable::new(Vec::new()),
+            bar_right: Mutable::new(Vec::new()),
             clock_tx,
             visibility_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
@@ -213,6 +229,9 @@ impl Service for PluginsService {
             sidebar_lead: handles.sidebar_lead.clone(),
             sidebar_top: handles.sidebar_top.clone(),
             sidebar_bottom: handles.sidebar_bottom.clone(),
+            bar_left: handles.bar_left.clone(),
+            bar_center: handles.bar_center.clone(),
+            bar_right: handles.bar_right.clone(),
             clock_rx,
             visibility_rx,
             effects_tx,
@@ -382,6 +401,33 @@ fn bottom_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     })
 }
 
+fn bar_left_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .bar_left
+            .signal_cloned()
+    })
+}
+
+fn bar_center_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .bar_center
+            .signal_cloned()
+    })
+}
+
+fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .bar_right
+            .signal_cloned()
+    })
+}
+
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer) and [`Effect::RaiseOsd`] (→ the transient OSD nudge,
 /// #236); anything else is logged and skipped. Capability gating is
@@ -406,7 +452,7 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
     }
 }
 
-// ── GTK-side mount: reconciler-backed sidebar regions ────────────────────────
+// ── GTK-side mount: reconciler-backed regions (sidebar cards + bar chips) ─────
 
 /// The [`Mount::SidebarLead`] **region** — a vertical container of N plugin
 /// cards. Built per monitor from `overlays::sidebar::build_card` and mounted at
@@ -414,7 +460,11 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
 /// cards, so a plugin here leads the sidebar (#301).
 #[must_use]
 pub fn sidebar_lead_slot() -> gtk::Widget {
-    build_region(lead_render_signal())
+    build_region(
+        lead_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+    )
 }
 
 /// The [`Mount::SidebarTop`] **region** — a vertical container of N plugin
@@ -422,14 +472,58 @@ pub fn sidebar_lead_slot() -> gtk::Widget {
 /// above the built-in widgets.
 #[must_use]
 pub fn sidebar_top_slot() -> gtk::Widget {
-    build_region(top_render_signal())
+    build_region(
+        top_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+    )
 }
 
 /// The [`Mount::SidebarBottom`] **region**, appended below the built-in sidebar
 /// widgets.
 #[must_use]
 pub fn sidebar_bottom_slot() -> gtk::Widget {
-    build_region(bottom_render_signal())
+    build_region(
+        bottom_render_signal(),
+        gtk::Orientation::Vertical,
+        "ts-plugin-card",
+    )
+}
+
+/// The [`Mount::BarLeft`] **region** — a horizontal row of N plugin **chips**
+/// (#349). Built per monitor from `main.rs`'s `build_bar` and appended into the
+/// bar's left group. Each plugin's `view()` tree renders inside a
+/// `.ts-plugin-chip` pill, mirroring the sidebar card path but laid out
+/// horizontally so co-mounted chips sit side by side.
+#[must_use]
+pub fn bar_left_slot() -> gtk::Widget {
+    build_region(
+        bar_left_render_signal(),
+        gtk::Orientation::Horizontal,
+        "ts-plugin-chip",
+    )
+}
+
+/// The [`Mount::BarCenter`] **region** — a horizontal row of N plugin chips,
+/// appended into the bar's center group (#349).
+#[must_use]
+pub fn bar_center_slot() -> gtk::Widget {
+    build_region(
+        bar_center_render_signal(),
+        gtk::Orientation::Horizontal,
+        "ts-plugin-chip",
+    )
+}
+
+/// The [`Mount::BarRight`] **region** — a horizontal row of N plugin chips,
+/// appended into the bar's right group (#349).
+#[must_use]
+pub fn bar_right_slot() -> gtk::Widget {
+    build_region(
+        bar_right_render_signal(),
+        gtk::Orientation::Horizontal,
+        "ts-plugin-chip",
+    )
 }
 
 /// One plugin's mounted card within a region: its dedicated reconciler root (a
@@ -449,9 +543,28 @@ struct MountedCard {
 /// Build the `gtk::Box` region driven by `signal` (a mount's sorted render
 /// list). Each connected plugin gets its own reconciler-backed card; the region
 /// reconciles cards in on join / update / reorder / leave, keyed by plugin id.
-fn build_region(signal: impl Signal<Item = Vec<SlotRender>> + 'static) -> gtk::Widget {
-    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+///
+/// `orientation` lays the cards out — `Vertical` for sidebar card stacks,
+/// `Horizontal` for bar chip rows (#349). `card_class` is the CSS class stamped
+/// on each card root: `ts-plugin-card` for a sidebar card, `ts-plugin-chip` for
+/// a bar chip. The region hides itself while empty so an unused bar region never
+/// introduces a phantom inter-widget gap in the bar group it sits in.
+fn build_region(
+    signal: impl Signal<Item = Vec<SlotRender>> + 'static,
+    orientation: gtk::Orientation,
+    card_class: &'static str,
+) -> gtk::Widget {
+    // Chips in a horizontal bar row want a small gap between co-mounted plugins;
+    // sidebar cards stack tight (each card owns its own bottom margin in CSS).
+    let spacing = match orientation {
+        gtk::Orientation::Horizontal => 6,
+        _ => 0,
+    };
+    let container = gtk::Box::new(orientation, spacing);
     container.add_css_class("ts-plugin-region");
+    // Empty until a plugin dials in; a later reconcile reveals it once a card
+    // exists (so an empty region contributes no spacing to its parent group).
+    container.set_visible(false);
 
     // GTK-thread-only per-plugin card state. Order here is just a lookup table;
     // widget order is enforced against the region container directly.
@@ -460,7 +573,12 @@ fn build_region(signal: impl Signal<Item = Vec<SlotRender>> + 'static) -> gtk::W
     let cards_for_signal = cards.clone();
     let container_for_signal = container.clone();
     let handle = glib::MainContext::default().spawn_local(signal.for_each(move |renders| {
-        reconcile_region(&container_for_signal, &cards_for_signal, &renders);
+        reconcile_region(
+            &container_for_signal,
+            &cards_for_signal,
+            &renders,
+            card_class,
+        );
         std::future::ready(())
     }));
 
@@ -481,8 +599,13 @@ fn reconcile_region(
     container: &gtk::Box,
     cards: &Rc<RefCell<Vec<MountedCard>>>,
     renders: &[SlotRender],
+    card_class: &str,
 ) {
     let mut cards = cards.borrow_mut();
+
+    // Reveal the region exactly when it holds at least one card, so an empty
+    // region (no plugin mounted here yet) adds no spacing to its parent group.
+    container.set_visible(!renders.is_empty());
 
     // 1. Drop cards whose plugin vanished from the region (left / disconnected).
     let present: HashSet<&str> = renders.iter().map(|r| r.plugin_id.as_str()).collect();
@@ -510,7 +633,7 @@ fn reconcile_region(
             // New plugin joined: its own root + reconciler, wired to its own
             // outbound cell (so events reach the right connection).
             let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            root.add_css_class("ts-plugin-card");
+            root.add_css_class(card_class);
             let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> =
                 Rc::new(RefCell::new(Some(render.outbound.clone())));
             let ev_outbound = outbound.clone();
@@ -651,39 +774,41 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
             Ok(PluginMsg::Render { tree, effects }) => {
+                // Route the render to its mount region's coalescing mailbox: the
+                // three sidebar regions render as cards, the three bar regions as
+                // chips (#349). Both sides share the reconciler path — the mount
+                // only picks which mailbox (and thus which per-monitor container)
+                // the tree lands in.
                 let region = match mount {
-                    Mount::SidebarLead => Some(&ctx.sidebar_lead),
-                    Mount::SidebarTop => Some(&ctx.sidebar_top),
-                    Mount::SidebarBottom => Some(&ctx.sidebar_bottom),
-                    Mount::BarLeft | Mount::BarCenter | Mount::BarRight => {
-                        tracing::debug!(plugin = %plugin_id, ?mount, "bar mount unsupported in v1; render dropped");
-                        None
-                    }
+                    Mount::SidebarLead => &ctx.sidebar_lead,
+                    Mount::SidebarTop => &ctx.sidebar_top,
+                    Mount::SidebarBottom => &ctx.sidebar_bottom,
+                    Mount::BarLeft => &ctx.bar_left,
+                    Mount::BarCenter => &ctx.bar_center,
+                    Mount::BarRight => &ctx.bar_right,
                 };
-                if let Some(region) = region {
-                    // One-shot effects first, over the (global) non-lossy channel,
-                    // BEFORE parking the idempotent tree — a superseding render
-                    // frame could otherwise coalesce this frame's click away
-                    // (#277). Unchanged by the region model.
-                    for effect in effects {
-                        let _ = ctx.effects_tx.send(BrokeredEffect {
-                            plugin_id: plugin_id.clone(),
-                            effect,
-                        });
-                    }
-                    // Latest-wins per plugin id: upsert overwrites *this* plugin's
-                    // card in place, leaving siblings alone (#274).
-                    upsert_region(
-                        region,
-                        SlotRender {
-                            plugin_id: plugin_id.clone(),
-                            order,
-                            generation,
-                            tree,
-                            outbound: out_tx.clone(),
-                        },
-                    );
+                // One-shot effects first, over the (global) non-lossy channel,
+                // BEFORE parking the idempotent tree — a superseding render
+                // frame could otherwise coalesce this frame's click away
+                // (#277). Unchanged by the region model.
+                for effect in effects {
+                    let _ = ctx.effects_tx.send(BrokeredEffect {
+                        plugin_id: plugin_id.clone(),
+                        effect,
+                    });
                 }
+                // Latest-wins per plugin id: upsert overwrites *this* plugin's
+                // card in place, leaving siblings alone (#274).
+                upsert_region(
+                    region,
+                    SlotRender {
+                        plugin_id: plugin_id.clone(),
+                        order,
+                        generation,
+                        tree,
+                        outbound: out_tx.clone(),
+                    },
+                );
             }
             Ok(PluginMsg::Register { .. }) => {
                 tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
@@ -701,9 +826,15 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // still owns it (removes just that card on the GTK side), then stop the
     // outbound + snapshot tasks. Connection-scoped + keyed per plugin id, so a
     // fast-reconnect successor is never evicted and sibling plugins are untouched.
+    // We probe every region (a plugin lives in exactly one); `clear_region_if_owned`
+    // read-locks first and returns early where this plugin isn't present, so the
+    // extra probes are cheap.
     clear_region_if_owned(&ctx.sidebar_lead, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_top, &plugin_id, generation);
     clear_region_if_owned(&ctx.sidebar_bottom, &plugin_id, generation);
+    clear_region_if_owned(&ctx.bar_left, &plugin_id, generation);
+    clear_region_if_owned(&ctx.bar_center, &plugin_id, generation);
+    clear_region_if_owned(&ctx.bar_right, &plugin_id, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
@@ -802,9 +933,9 @@ fn upsert_region(region: &Mutable<Vec<SlotRender>>, render: SlotRender) {
 /// different id and never matched, so siblings are undisturbed.
 ///
 /// Probes with the read lock first so a teardown never spuriously notifies a
-/// region this plugin isn't even in (each teardown checks *both* sidebar
-/// regions); it re-finds under the write lock to stay correct against a
-/// concurrent mutation.
+/// region this plugin isn't even in (each teardown checks *all six* regions —
+/// three sidebar + three bar, #349); it re-finds under the write lock to stay
+/// correct against a concurrent mutation.
 fn clear_region_if_owned(region: &Mutable<Vec<SlotRender>>, plugin_id: &str, generation: u64) {
     let owns = region
         .lock_ref()
@@ -1701,9 +1832,9 @@ mod tests {
         assert!(map.is_empty(), "forgotten monitors leave no stale entries");
     }
 
-    /// A bar mount is a real wire variant the reader must handle; assert the
-    /// three sidebar mounts we support are distinct from each other and from the
-    /// deferred bar mounts.
+    /// A bar mount is a real wire variant the reader routes to its own region
+    /// (#349); assert the sidebar and bar mounts are all distinct from each other
+    /// so the `handle_conn` match can't confuse two.
     #[test]
     fn sidebar_and_bar_mounts_are_distinct() {
         assert_ne!(Mount::SidebarLead, Mount::SidebarTop);
@@ -1770,11 +1901,103 @@ mod tests {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
             sidebar_bottom: Mutable::new(Vec::new()),
+            bar_left: Mutable::new(Vec::new()),
+            bar_center: Mutable::new(Vec::new()),
+            bar_right: Mutable::new(Vec::new()),
             clock_rx,
             visibility_rx,
             effects_tx,
         };
         (ctx, effects_rx)
+    }
+
+    /// Poll a region mailbox until it holds at least one card — the reader task
+    /// in `handle_conn` fills it asynchronously — failing (not hanging) if it
+    /// never populates. The `lock_ref` guard is dropped before each `await`, so
+    /// it never crosses a yield point.
+    async fn wait_for_region(region: &Mutable<Vec<SlotRender>>) -> Vec<SlotRender> {
+        for _ in 0..200 {
+            {
+                let cards = region.lock_ref();
+                if !cards.is_empty() {
+                    return cards.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("region never populated within timeout");
+    }
+
+    /// #349: a `Bar*`-mounted plugin's render must now reach the matching bar
+    /// region mailbox instead of being dropped (the v1 behavior this PR replaces).
+    /// Registers a `BarCenter` plugin, sends one `Render`, and asserts the card
+    /// lands in `bar_center` — and *only* there (no leak into the sibling bar
+    /// regions or a sidebar). Proves the un-defer end to end through `handle_conn`,
+    /// the same socketpair harness the visibility-gating tests use.
+    #[tokio::test]
+    async fn bar_mount_render_reaches_bar_region() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        // Clone the region handles (Mutable shares its state) before `ctx` moves
+        // into the connection task, so the test can inspect the mailboxes after.
+        let bar_center = ctx.bar_center.clone();
+        let bar_left = ctx.bar_left.clone();
+        let bar_right = ctx.bar_right.clone();
+        let sidebar_top = ctx.sidebar_top.clone();
+
+        let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        let (_prd, mut pwr) = plugin_end.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("barchip", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("send Register");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                },
+                effects: vec![],
+            },
+        )
+        .await
+        .expect("send Render");
+
+        let cards = wait_for_region(&bar_center).await;
+        assert_eq!(
+            cards.len(),
+            1,
+            "the BarCenter render reached bar_center (not dropped)"
+        );
+        assert_eq!(cards[0].plugin_id, "barchip");
+        assert!(
+            matches!(&cards[0].tree, wire::Node::Label { text, .. } if text == "chip"),
+            "the plugin's view tree survived intact into the bar region",
+        );
+
+        // Routed to exactly one region: the sibling bar regions and the sidebar
+        // stay empty (a BarCenter mount must not fan out or fall back).
+        assert!(
+            bar_left.lock_ref().is_empty(),
+            "BarCenter didn't leak into BarLeft"
+        );
+        assert!(
+            bar_right.lock_ref().is_empty(),
+            "BarCenter didn't leak into BarRight"
+        );
+        assert!(
+            sidebar_top.lock_ref().is_empty(),
+            "a bar mount didn't leak into a sidebar region"
+        );
     }
 
     /// #305: a connection that does **not** subscribe `SlotVisible` must never

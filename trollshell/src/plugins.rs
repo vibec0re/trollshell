@@ -1018,6 +1018,17 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             expanded: *expanded,
             classes: classes.clone(),
         },
+        wire::Node::Entry {
+            id,
+            text,
+            placeholder,
+            classes,
+        } => UiNode::Entry {
+            id: id.clone(),
+            text: text.clone(),
+            placeholder: placeholder.clone(),
+            classes: classes.clone(),
+        },
     }
 }
 
@@ -1058,14 +1069,15 @@ fn clamp_pixels_scale(width: u32, height: u32, scale: u32) -> u32 {
 }
 
 /// Map a reconciler event back onto its wire form for the outbound `Event`
-/// frame. Exhaustive over the `EventKind` set (Click + Scroll + `ValueChanged`),
-/// so adding a kind to either side breaks the build here rather than silently
-/// dropping an event.
+/// frame. Exhaustive over the `EventKind` set (Click, Scroll, `ValueChanged`,
+/// `Submitted`), so adding a kind to either side breaks the build here rather
+/// than silently dropping an event.
 fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
     match kind {
         UiEventKind::Click => wire::EventKind::Click,
         UiEventKind::Scroll { dx, dy } => wire::EventKind::Scroll { dx, dy },
         UiEventKind::ValueChanged { value } => wire::EventKind::ValueChanged { value },
+        UiEventKind::Submitted { text } => wire::EventKind::Submitted { text },
     }
 }
 
@@ -1351,6 +1363,33 @@ mod tests {
             to_wire_event(UiEventKind::ValueChanged { value: 0.42 }),
             wire::EventKind::ValueChanged { value: 0.42 }
         );
+        assert_eq!(
+            to_wire_event(UiEventKind::Submitted {
+                text: "help".into()
+            }),
+            wire::EventKind::Submitted {
+                text: "help".into()
+            }
+        );
+    }
+
+    /// The #357 `Entry` maps 1:1: the required id (the `Submitted` event
+    /// target), the `text` echo prop, and the placeholder all carry across.
+    #[test]
+    fn wire_entry_maps_to_ui() {
+        let tree = wire::Node::Entry {
+            id: "term-input".into(),
+            text: String::new(),
+            placeholder: "type a command…".into(),
+            classes: vec!["monospace".into()],
+        };
+        let expected = UiNode::Entry {
+            id: "term-input".into(),
+            text: String::new(),
+            placeholder: "type a command…".into(),
+            classes: vec!["monospace".into()],
+        };
+        assert_eq!(to_ui_node(&tree), expected);
     }
 
     /// Every wire `Page` maps to the identically-named `modal::Page`, except

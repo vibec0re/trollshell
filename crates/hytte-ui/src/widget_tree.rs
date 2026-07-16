@@ -70,8 +70,9 @@ pub enum Dir {
 }
 
 /// A user interaction the reconciler surfaces through the `on_event`
-/// callback, tagged with the originating node's [`NodeId`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// callback, tagged with the originating node's [`NodeId`]. (Not `Copy`:
+/// [`Submitted`](EventKind::Submitted) carries its `String`.)
+#[derive(Clone, Debug, PartialEq)]
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
     Click,
@@ -85,6 +86,14 @@ pub enum EventKind {
     /// does not fire it (the reconciler wires `change-value`, not
     /// `value-changed`; see [`attach_slider`]).
     ValueChanged { value: f64 },
+    /// A [`Node::Entry`]'s text was submitted (the user pressed
+    /// Enter/activate); `text` is the entry's full contents at that moment.
+    /// Fired **only** for the user's activate — a programmatic `set_text`
+    /// never emits GTK's `activate`, so a re-render echoing `text` back can't
+    /// re-enter the event path (the entry analogue of the slider's
+    /// `change-value` wiring). No per-keystroke event exists (v1 — see the
+    /// wire vocab's rationale).
+    Submitted { text: String },
 }
 
 /// The closed widget vocabulary. A plugin tree is a single root `Node`.
@@ -237,6 +246,25 @@ pub enum Node {
         expanded: bool,
         classes: Vec<String>,
     },
+    /// A single-line text input — a `gtk::Entry` (#357). `id` is **required**
+    /// (like [`Node::Button`]): it is the [`EventKind::Submitted`] target,
+    /// fired when the user presses Enter/activate with the entry's full text.
+    ///
+    /// `text` is the **echo prop**: applied on build, and on update **only
+    /// when the prop changed since the last render** — a re-render that merely
+    /// echoes the unchanged value leaves the widget alone, so in-progress user
+    /// typing is never clobbered (the entry analogue of [`Node::Slider`]'s
+    /// drag suppression), while a real prop change (clear-after-submit,
+    /// prefill) still applies even while focused. `placeholder` is the greyed
+    /// empty-state hint (`""` for none); both are mutable props. Events are
+    /// wired on GTK's `activate` (user-only; a programmatic `set_text` never
+    /// fires it), so there is no echo/feedback loop to break.
+    Entry {
+        id: NodeId,
+        text: String,
+        placeholder: String,
+        classes: Vec<String>,
+    },
 }
 
 /// Boxed event callback shared (`Rc`) into every widget's signal handler.
@@ -260,7 +288,8 @@ impl Reconciler {
     ///
     /// `on_event` is invoked on the GTK main thread when a [`Node::Button`]
     /// is clicked, a scroll-enabled (`scroll: true`) [`Node::Box`] is
-    /// scrolled, or a [`Node::Slider`] is moved by the user.
+    /// scrolled, a [`Node::Slider`] is moved by the user, or a
+    /// [`Node::Entry`] is submitted (Enter/activate).
     #[must_use]
     pub fn new(root: &gtk::Box, on_event: impl Fn(NodeId, EventKind) + 'static) -> Self {
         Self {
@@ -325,6 +354,12 @@ struct RetainedNode {
     /// children live in [`RetainedNode::children`] (diffed into `body_box`).
     /// Always `None` for every other node kind.
     expander: Option<Box<ExpanderState>>,
+    /// A [`Node::Entry`]'s last-rendered `text` **prop** (not the widget's
+    /// live text, which the user mutates freely). Retained so
+    /// [`update_in_place`] can tell a real prop change (apply `set_text`) from
+    /// a re-render merely echoing the unchanged prop (leave the widget alone,
+    /// preserving in-progress typing). Always `None` for every other node kind.
+    entry_text: Option<String>,
 }
 
 /// A [`Node::Expander`]'s retained pieces (see [`RetainedNode::expander`]).
@@ -380,6 +415,7 @@ enum NodeKind {
     Separator,
     Spacer,
     Expander,
+    Entry,
 }
 
 // ── The pure diff algorithm ─────────────────────────────────────────────────
@@ -588,6 +624,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut scroll_controller = None;
     let mut slider = None;
     let mut expander = None;
+    let mut entry_text = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -793,6 +830,33 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             }));
             (outer.upcast(), body_kids)
         }
+        Node::Entry {
+            id,
+            text,
+            placeholder,
+            classes,
+        } => {
+            let entry = gtk::Entry::new();
+            entry.set_text(text);
+            apply_entry_placeholder(&entry, placeholder);
+            apply_classes(&entry, classes);
+            // The activate handler (user-driven only: GTK's `activate` fires on
+            // Enter, never on a programmatic `set_text`) is bound once here, to
+            // this widget identity — like `Button`'s click — so reuse never
+            // stacks duplicate handlers and an echoed `text` can't re-emit.
+            let on_submit = on_event.clone();
+            let submit_id = id.clone();
+            entry.connect_activate(move |entry| {
+                on_submit(
+                    submit_id.clone(),
+                    EventKind::Submitted {
+                        text: entry.text().to_string(),
+                    },
+                );
+            });
+            entry_text = Some(text.clone());
+            (entry.upcast(), Vec::new())
+        }
     };
 
     RetainedNode {
@@ -802,6 +866,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         scroll_controller,
         slider,
         expander,
+        entry_text,
     }
 }
 
@@ -1056,6 +1121,26 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
                 on_event,
             );
         }
+        Node::Entry {
+            text,
+            placeholder,
+            classes,
+            ..
+        } => {
+            let entry = downcast::<gtk::Entry>(&retained.widget);
+            // Apply `text` only on a real *prop* change (compared against the
+            // last-rendered prop, not the widget's live text): a re-render that
+            // merely echoes the unchanged value must never clobber what the
+            // user is typing, while an actual change (clear-after-submit,
+            // prefill) applies even while the entry is focused. `set_text`
+            // never fires `activate`, so this can't re-enter the event path.
+            if retained.entry_text.as_deref() != Some(text.as_str()) {
+                entry.set_text(text);
+                retained.entry_text = Some(text.clone());
+            }
+            apply_entry_placeholder(entry, placeholder);
+            reconcile_classes(entry, &retained.desc.classes, classes);
+        }
     }
 
     // Refresh the snapshot so the *next* diff compares against current state.
@@ -1194,6 +1279,13 @@ fn apply_text_flow(label: &gtk::Label, ellipsize: bool) {
         label.set_wrap(true);
         label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     }
+}
+
+/// Set a [`Node::Entry`]'s placeholder: the greyed hint shown while empty.
+/// Shared by build and update so the two never drift; an empty string maps to
+/// no placeholder (`None`) rather than an empty visible hint.
+fn apply_entry_placeholder(entry: &gtk::Entry, placeholder: &str) {
+    entry.set_placeholder_text((!placeholder.is_empty()).then_some(placeholder));
 }
 
 /// Attach a scroll controller to `boxw`, firing [`EventKind::Scroll`]
@@ -1406,6 +1498,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Separator { .. } => NodeKind::Separator,
         Node::Spacer => NodeKind::Spacer,
         Node::Expander { .. } => NodeKind::Expander,
+        Node::Entry { .. } => NodeKind::Entry,
     }
 }
 
@@ -1420,11 +1513,13 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Pixels { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
-        // `Button`, `Slider`, and `Expander` all require an id — it is their
-        // event target (a click for Button/Expander, a value change for Slider).
-        Node::Button { id, .. } | Node::Slider { id, .. } | Node::Expander { id, .. } => {
-            Some(id.as_str())
-        }
+        // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
+        // their event target (a click for Button/Expander, a value change for
+        // Slider, a text submit for Entry).
+        Node::Button { id, .. }
+        | Node::Slider { id, .. }
+        | Node::Expander { id, .. }
+        | Node::Entry { id, .. } => Some(id.as_str()),
         Node::Separator { .. } | Node::Spacer => None,
     }
 }
@@ -1442,6 +1537,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Progress { classes, .. }
         | Node::Slider { classes, .. }
         | Node::Expander { classes, .. }
+        | Node::Entry { classes, .. }
         | Node::Separator { classes } => classes,
         // `Revealer` carries no classes of its own (see the `Node` vocab); it
         // is a transparent open/close wrapper, so style its child instead.
@@ -1989,6 +2085,116 @@ mod gtk_tests {
         rec.render(&pix(Some("lcd"), 1, 1, vec![0, 255, 0, 255]));
         let after = root.first_child().unwrap();
         assert_eq!(before, after, "same-id Pixels reuses the surface in place");
+    }
+
+    fn entry(id: &str, text: &str, placeholder: &str) -> Node {
+        Node::Entry {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            placeholder: placeholder.to_owned(),
+            classes: vec![],
+        }
+    }
+
+    #[gtk::test]
+    fn entry_builds_with_text_and_placeholder() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "prefill", "type here…"));
+        let e = root
+            .first_child()
+            .expect("entry mounted")
+            .downcast::<gtk::Entry>()
+            .expect("Entry maps to a gtk::Entry");
+        assert_eq!(e.text().as_str(), "prefill");
+        assert_eq!(
+            e.placeholder_text().as_deref(),
+            Some("type here…"),
+            "placeholder set"
+        );
+    }
+
+    #[gtk::test]
+    fn entry_submit_fires_once_even_after_reuse() {
+        let root = root();
+        let events: Rc<RefCell<Vec<(String, EventKind)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let mut rec = Reconciler::new(&root, move |id, kind| sink.borrow_mut().push((id, kind)));
+
+        rec.render(&entry("in", "", ""));
+        // Re-render the identical tree: the entry is reused. If the activate
+        // handler were re-connected on reuse, a submit would fire twice.
+        rec.render(&entry("in", "", ""));
+
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        // Stand-in for the user's typing: `set_text` never fires `activate` —
+        // only the explicit emit below does.
+        e.set_text("caw --help");
+        e.emit_activate();
+
+        let recorded = events.borrow();
+        assert_eq!(recorded.len(), 1, "exactly one event, no double-fire");
+        assert_eq!(recorded[0].0, "in");
+        assert_eq!(
+            recorded[0].1,
+            EventKind::Submitted {
+                text: "caw --help".into()
+            },
+            "the submit carries the entry's full text"
+        );
+    }
+
+    #[gtk::test]
+    fn entry_echoed_text_prop_never_clobbers_typing() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "", "hint"));
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+
+        // The user types; a later re-render echoes the *unchanged* text prop
+        // ("") — the reconciler must leave the widget alone (prop-diff, not
+        // widget-diff), preserving the in-progress input.
+        e.set_text("half-typed comm");
+        rec.render(&entry("in", "", "hint"));
+        assert_eq!(
+            e.text().as_str(),
+            "half-typed comm",
+            "an unchanged text prop never clobbers user typing"
+        );
+
+        // A *changed* prop (the clear-after-submit flow) applies in place.
+        rec.render(&entry("in", "cleared", "hint"));
+        assert_eq!(e.text().as_str(), "cleared", "a real prop change applies");
+        // …and clearing back to "" is itself a change from "cleared".
+        rec.render(&entry("in", "", "hint"));
+        assert_eq!(e.text().as_str(), "", "clearing to empty applies too");
+    }
+
+    #[gtk::test]
+    fn entry_placeholder_is_a_mutable_prop() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "", "old hint"));
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        rec.render(&entry("in", "", "new hint"));
+        assert_eq!(e.placeholder_text().as_deref(), Some("new hint"));
+        // An empty placeholder clears the hint. (GTK reports a cleared
+        // placeholder as `Some("")` once one was set — either way, nothing
+        // renders.)
+        rec.render(&entry("in", "", ""));
+        assert_eq!(e.placeholder_text().as_deref().unwrap_or(""), "");
     }
 
     #[gtk::test]
@@ -2755,7 +2961,7 @@ mod gtk_tests {
         let recorded = events.borrow();
         assert_eq!(recorded.len(), 1, "one leading-edge ValueChanged");
         assert_eq!(recorded[0].0, "b", "addressed by the slider id");
-        match recorded[0].1 {
+        match &recorded[0].1 {
             EventKind::ValueChanged { value } => {
                 assert!((value - 0.7).abs() < 1e-9, "carries the moved-to value");
             }

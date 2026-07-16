@@ -105,6 +105,12 @@ fn sample_tree() -> Node {
             Node::Separator {
                 classes: vec!["ts-sep".into()],
             },
+            Node::Entry {
+                id: "term-input".into(),
+                text: String::new(),
+                placeholder: "type a command…".into(),
+                classes: vec!["monospace".into()],
+            },
         ],
     }
 }
@@ -410,6 +416,65 @@ fn slider_without_enabled_decodes_old_frame_compat() {
             classes: vec!["ts-slider".into()],
         },
         "absent enabled defaults to true (interactive)",
+    );
+}
+
+// ── Entry node + Submitted event (#357) ──────────────────────────────────────
+
+#[test]
+fn entry_node_round_trips() {
+    let node = Node::Entry {
+        id: "term-input".into(),
+        text: "ls -la".into(),
+        placeholder: "type a command…".into(),
+        classes: vec!["monospace".into()],
+    };
+    let back: Node = decode(&encode(&node)).expect("decode Entry");
+    assert_eq!(node, back);
+}
+
+#[test]
+fn entry_is_name_tagged_and_additive() {
+    // `Entry` is a brand-new, externally-tagged variant, so it rides the wire
+    // as its bare variant *name* — the property that makes appending it additive
+    // (`PROTO_VERSION` stays 1): an older decoder skips an unknown tag rather
+    // than mis-decoding an existing variant, and every pre-#357 frame (which
+    // can't carry an `Entry`) decodes byte-for-byte unchanged.
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
+    let body = encode_body(&Node::Entry {
+        id: "in".into(),
+        text: String::new(),
+        placeholder: String::new(),
+        classes: vec![],
+    });
+    assert!(contains(&body, b"Entry"), "variant name 'Entry' present");
+}
+
+#[test]
+fn submitted_event_round_trips() {
+    // The paired host→plugin event. Like `ValueChanged` (#315), it is opt-in
+    // *by vocabulary* (#305): the host only addresses an `Event` at a node the
+    // plugin itself rendered, and a plugin built against a pre-#357 proto can't
+    // emit a `Node::Entry` — so it can never be the target of a `Submitted` and
+    // never has to decode the unknown variant. On the wire it is just another
+    // name-tagged `EventKind` variant carrying its `text`.
+    let msg = HostMsg::Event {
+        node: "term-input".into(),
+        kind: EventKind::Submitted {
+            text: "caw --help".into(),
+        },
+    };
+    let back: HostMsg = decode(&encode(&msg)).expect("decode Submitted event");
+    assert_eq!(msg, back);
+    assert!(
+        contains(
+            &encode_body(&EventKind::Submitted { text: "x".into() }),
+            b"Submitted"
+        ),
+        "variant name 'Submitted' rides the wire (appending it is additive)",
     );
 }
 

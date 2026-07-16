@@ -49,7 +49,13 @@ pub enum Dir {
 /// *can* decode it. (Contrast [`HostMsg::SlotVisibility`](crate::msg::HostMsg::SlotVisibility),
 /// which is state the host would otherwise push unconditionally, so that one
 /// needs an explicit [`StateKey`](crate::manifest::StateKey) subscription.)
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// [`Submitted`](EventKind::Submitted) (#357) is opt-in *by vocabulary* the
+/// same way: only a plugin that renders a [`Node::Entry`] can ever be its
+/// target, and rendering one requires a build that can decode it.
+///
+/// (No longer `Copy` since [`Submitted`](EventKind::Submitted) carries its
+/// `String`; `Clone` where a by-value copy used to be implicit.)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
     Click,
@@ -67,6 +73,18 @@ pub enum EventKind {
     /// produce a `ValueChanged` (see `hytte_ui`'s `change-value` vs
     /// `value-changed` note), so there is no echo/feedback loop.
     ValueChanged { value: f64 },
+    /// A [`Node::Entry`]'s text was submitted — the user pressed
+    /// **Enter/activate** in the entry; `text` is its full contents at that
+    /// moment.
+    ///
+    /// Fired on activate **only** — deliberately no per-keystroke `Changed`
+    /// event in v1: a change stream needs the same throttle design as
+    /// [`ValueChanged`](EventKind::ValueChanged) and nothing asked for it yet;
+    /// additive later if a consumer appears. Like `ValueChanged`, it only ever
+    /// reflects a user action: a programmatic re-render that echoes `text`
+    /// back into the entry never fires GTK's `activate`, so there is no
+    /// echo/feedback loop.
+    Submitted { text: String },
 }
 
 /// Default for [`Node::Slider`]'s `enabled`: an omitted key means an
@@ -319,6 +337,44 @@ pub enum Node {
         header: Box<Node>,
         children: Vec<Node>,
         expanded: bool,
+        classes: Vec<Cls>,
+    },
+    /// A single-line **text input** — a `gtk::Entry` (#357), the vocabulary
+    /// half of the micro-terminal ask. The user types into it; pressing
+    /// **Enter/activate** fires an [`EventKind::Submitted`] addressed by `id`
+    /// carrying the entry's full text. `id` is **required**, exactly like
+    /// [`Button`](Node::Button): it is the event target.
+    ///
+    /// `text` is the **echo prop** (reconciler-updatable like
+    /// [`Slider`](Node::Slider)'s `value`): the plugin states what the entry
+    /// should show — e.g. clear it to `""` after handling a submit, or prefill
+    /// a suggestion. The host applies it **only when the prop changed since
+    /// the last render**, so a re-render that merely echoes the unchanged
+    /// value never clobbers what the user is currently typing (the
+    /// entry-shaped analogue of the slider's drag suppression). A programmatic
+    /// `set_text` never fires GTK's `activate`, so an echo can't re-emit a
+    /// [`Submitted`](EventKind::Submitted) — the same structural no-feedback
+    /// guarantee as the slider's `change-value` wiring. `placeholder` is the
+    /// greyed hint shown while empty (`""` for none); it and `text` are
+    /// **mutable props**, updated in place on a same-id re-render.
+    ///
+    /// Deliberately **no per-keystroke event** in v1 — see
+    /// [`EventKind::Submitted`].
+    ///
+    /// Additive: a brand-new name-tagged variant, so every existing frame
+    /// decodes unchanged and [`PROTO_VERSION`](crate::PROTO_VERSION) stays
+    /// put. The paired host→plugin `Submitted` push is opt-in *by vocabulary*
+    /// (see [`EventKind`]) — a plugin that never renders an `Entry` never has
+    /// to decode it, so no manifest opt-in is needed (the #315 Slider
+    /// playbook, per the #305 rule).
+    Entry {
+        id: NodeId,
+        /// The echo prop: what the entry should display (see the variant
+        /// docs — applied only on a prop *change*, so it never fights
+        /// in-progress typing).
+        text: String,
+        /// Greyed hint text shown while the entry is empty; `""` for none.
+        placeholder: String,
         classes: Vec<Cls>,
     },
 }

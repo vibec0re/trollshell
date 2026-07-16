@@ -98,6 +98,10 @@ pub(crate) fn bubble_node(line: &str, id: &str, classes: Vec<String>) -> Node {
         width,
         height,
         data,
+        // 1×: the buffer is already pre-upscaled ×SCALE here (see below); the
+        // #358 `scale` hint is for surfaces that ship their base-resolution
+        // buffer instead.
+        scale: 1,
         classes,
     }
 }

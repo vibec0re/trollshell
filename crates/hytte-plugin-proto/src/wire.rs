@@ -76,6 +76,13 @@ fn slider_enabled_default() -> bool {
     true
 }
 
+/// Default for [`Node::Pixels`]'s `scale`: an omitted key means the buffer's
+/// natural 1× size, so a frame built before the field (an older plugin SDK)
+/// decodes to exactly the pre-#358 behavior.
+fn pixels_scale_default() -> u32 {
+    1
+}
+
 /// The closed widget vocabulary. A plugin's view is a single root [`Node`].
 ///
 /// Mirrors `hytte_ui::Node`: `Box { scroll }` carries the scroll flag
@@ -165,10 +172,34 @@ pub enum Node {
     ///   is ~64 KiB on the wire — well under [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN).
     /// - **Rendering:** the host scales the buffer up with **nearest-neighbor**
     ///   filtering (crisp, chunky pixels — the "LCD" look), never linear
-    ///   interpolation. The buffer's natural size is `width`×`height`, but
-    ///   CSS/layout may size the widget up; the small buffer is then drawn big.
-    /// - `data` is a **mutable** prop: the same `id` re-rendered with new bytes
-    ///   swaps the texture in place rather than rebuilding the widget.
+    ///   interpolation. The buffer's natural size is `width`×`height` times
+    ///   `scale`, but CSS/layout may still size the widget up; the small buffer
+    ///   is then drawn big.
+    /// - **Sizing (`scale`, #358):** an integer upscale hint. The host requests
+    ///   a natural size of `width*scale` × `height*scale`, so a plugin can ask
+    ///   for a crisp integer blow-up (a 128×128 LCD at `scale: 2` renders 256px)
+    ///   without a shell-side CSS px rule per widget. Shell CSS can still
+    ///   override *upward*; the plugin just stops depending on it for a sane
+    ///   default. `0` and an absent key both mean `1` (the buffer's natural
+    ///   size); the host clamps an absurd scale (scaled dimension beyond its
+    ///   size cap) rather than honoring it, mirroring how it degrades a
+    ///   malformed buffer — never crashing the shell on bad input.
+    /// - `data` and `scale` are **mutable** props: the same `id` re-rendered
+    ///   with new bytes (or a new scale) swaps the texture / natural size in
+    ///   place rather than rebuilding the widget.
+    ///
+    /// `scale` is additive exactly like `Text::ellipsize`: a
+    /// **`#[serde(default = …)]` field**, so a `Pixels` frame built before #358
+    /// (no `scale` key) still decodes — defaulting to `1`, i.e. the pre-#358
+    /// sizing is preserved. The reverse direction holds too: a *new* frame's
+    /// `scale` key is skipped by a pre-#358 decoder (named-map encoding, no
+    /// `deny_unknown_fields`), so a new plugin talking to an older host renders
+    /// at 1× instead of breaking the session. Both directions are pinned by
+    /// tests in `tests/proto.rs`. (No `skip_serializing_if`: serde has no
+    /// by-value predicate and a `fn(&u32) -> bool` helper would trip
+    /// `clippy::trivially_copy_pass_by_ref`; a `scale: 1` on the wire is a few
+    /// bytes and costs nothing in compat — the old decoder skips the key either
+    /// way.)
     Pixels {
         id: Option<NodeId>,
         width: u32,
@@ -177,6 +208,11 @@ pub enum Node {
         /// a single binary blob on the wire (see the variant docs).
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+        /// Integer upscale hint: the widget's natural size is the buffer size
+        /// times this (see the variant docs). Defaulted so a pre-#358 frame
+        /// decodes to the buffer's natural 1× size; `0` is treated as `1`.
+        #[serde(default = "pixels_scale_default")]
+        scale: u32,
         classes: Vec<Cls>,
     },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.

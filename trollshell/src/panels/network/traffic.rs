@@ -109,12 +109,17 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
                     entry.ticks_since_nonzero.saturating_add(1)
                 };
             } else {
-                // A brand-new interface starts active (ticks = 0) and unplaced
+                // A brand-new interface is bucketed by its *first* observed
+                // rate, not defaulted to active: a flatlined new iface starts
+                // idle so the panel is decluttered the instant it opens (no
+                // ~60 s soft-start where every container veth shows inline);
+                // an active one starts at ticks = 0. It arrives unplaced
                 // (attached = None); the relayout below drops it into the
-                // inline bucket in sorted order.
-                let entry = build_iface_traffic_row(iface);
+                // right bucket in sorted order.
+                let mut entry = build_iface_traffic_row(iface);
                 entry.spark.push(combined);
                 entry.value.set_text(&value_text);
+                entry.ticks_since_nonzero = if combined > 0.0 { 0 } else { GRACE_TICKS };
                 cache_mut.insert(iface.name.clone(), entry);
                 structure_changed = true;
             }

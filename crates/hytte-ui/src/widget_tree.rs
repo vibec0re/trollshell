@@ -360,6 +360,17 @@ struct RetainedNode {
     /// a re-render merely echoing the unchanged prop (leave the widget alone,
     /// preserving in-progress typing). Always `None` for every other node kind.
     entry_text: Option<String>,
+    /// A [`Node::Entry`]'s "submitted since last render" latch, set by the
+    /// `activate` handler just before it fires [`EventKind::Submitted`]. Once
+    /// the user submits, the widget's live text has diverged from the plugin's
+    /// prop model, so the plugin's *next* render is authoritative and must be
+    /// applied unconditionally — even when the new prop equals the last-rendered
+    /// one (the clear-after-submit flow: `text: ""` → typed → submit → `text:
+    /// ""` again). [`update_in_place`] consumes (resets) the latch and forces
+    /// the `set_text`. Shared with the closure via `Rc<Cell<_>>` — GTK is
+    /// single-threaded, so no locking is needed. Always `None` for every other
+    /// node kind.
+    entry_submitted: Option<Rc<Cell<bool>>>,
 }
 
 /// A [`Node::Expander`]'s retained pieces (see [`RetainedNode::expander`]).
@@ -625,6 +636,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
     let mut slider = None;
     let mut expander = None;
     let mut entry_text = None;
+    let mut entry_submitted = None;
     let (widget, children): (gtk::Widget, Vec<RetainedNode>) = match node {
         Node::Box {
             id,
@@ -846,7 +858,14 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // stacks duplicate handlers and an echoed `text` can't re-emit.
             let on_submit = on_event.clone();
             let submit_id = id.clone();
+            // Latch a submit so the plugin's *next* render re-asserts its `text`
+            // prop unconditionally (see [`RetainedNode::entry_submitted`]): the
+            // handler flips it true *before* firing, so even a synchronous
+            // re-render triggered by the event sees it set.
+            let submitted = Rc::new(Cell::new(false));
+            let submitted_handler = submitted.clone();
             entry.connect_activate(move |entry| {
+                submitted_handler.set(true);
                 on_submit(
                     submit_id.clone(),
                     EventKind::Submitted {
@@ -855,6 +874,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
                 );
             });
             entry_text = Some(text.clone());
+            entry_submitted = Some(submitted);
             (entry.upcast(), Vec::new())
         }
     };
@@ -867,6 +887,7 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         slider,
         expander,
         entry_text,
+        entry_submitted,
     }
 }
 
@@ -1131,10 +1152,21 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // Apply `text` only on a real *prop* change (compared against the
             // last-rendered prop, not the widget's live text): a re-render that
             // merely echoes the unchanged value must never clobber what the
-            // user is typing, while an actual change (clear-after-submit,
-            // prefill) applies even while the entry is focused. `set_text`
-            // never fires `activate`, so this can't re-enter the event path.
-            if retained.entry_text.as_deref() != Some(text.as_str()) {
+            // user is typing, while an actual change (prefill) applies even
+            // while the entry is focused. `set_text` never fires `activate`, so
+            // this can't re-enter the event path.
+            //
+            // The prop-diff alone can't deliver clear-after-submit: after the
+            // user types into an Entry whose prop is "" and submits, the plugin
+            // re-renders "" to clear — equal to the last-rendered prop, so the
+            // diff would skip and the typed text would stick. The submit latch
+            // (set by the `activate` handler, consumed here one-shot) forces the
+            // re-assert so the plugin's post-submit render is always applied.
+            let force = retained
+                .entry_submitted
+                .as_ref()
+                .is_some_and(|c| c.replace(false));
+            if force || retained.entry_text.as_deref() != Some(text.as_str()) {
                 entry.set_text(text);
                 retained.entry_text = Some(text.clone());
             }
@@ -2176,6 +2208,92 @@ mod gtk_tests {
         // …and clearing back to "" is itself a change from "cleared".
         rec.render(&entry("in", "", "hint"));
         assert_eq!(e.text().as_str(), "", "clearing to empty applies too");
+    }
+
+    #[gtk::test]
+    fn entry_clear_after_submit_reapplies_equal_text_prop() {
+        // The regression: an Entry resting at `text: ""` that the user typed
+        // into and submitted must clear when the plugin re-renders `text: ""`.
+        // The new prop *equals* the last-rendered one, so the prop-diff alone
+        // would skip `set_text` and leave the typed text stuck — the submit
+        // latch forces the re-assert.
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "", "hint"));
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+
+        // User types then presses Enter (submit).
+        e.set_text("hello");
+        e.emit_activate();
+
+        // Plugin handles the submit and re-renders the resting prop ("") to
+        // clear the field — the SAME value as the last-rendered prop.
+        rec.render(&entry("in", "", "hint"));
+        assert_eq!(
+            e.text().as_str(),
+            "",
+            "a re-render after submit clears the entry even when the text prop is unchanged"
+        );
+    }
+
+    #[gtk::test]
+    fn entry_prefill_after_submit_applies() {
+        // After a submit, a re-render with a DISTINCT non-empty text still
+        // applies (the latch forces it; the prop-diff would have too).
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "", "hint"));
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+
+        e.set_text("hello");
+        e.emit_activate();
+
+        rec.render(&entry("in", "prefilled", "hint"));
+        assert_eq!(
+            e.text().as_str(),
+            "prefilled",
+            "a distinct text after submit prefills the entry"
+        );
+    }
+
+    #[gtk::test]
+    fn entry_submit_latch_is_one_shot() {
+        // The latch is consumed by the first post-submit render. A *later* echo
+        // re-render of the unchanged prop must fall back to the prop-diff path
+        // and preserve the user's fresh typing — the latch must not linger and
+        // clobber it.
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&entry("in", "", "hint"));
+        let e = root
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+
+        // Type, submit, then the plugin's clearing render consumes the latch.
+        e.set_text("hello");
+        e.emit_activate();
+        rec.render(&entry("in", "", "hint"));
+        assert_eq!(e.text().as_str(), "", "the clearing render fired");
+
+        // The user starts typing again; a plain echo re-render of the unchanged
+        // ("") prop must leave the new input alone (latch already spent).
+        e.set_text("again");
+        rec.render(&entry("in", "", "hint"));
+        assert_eq!(
+            e.text().as_str(),
+            "again",
+            "once consumed, the latch never clobbers later typing"
+        );
     }
 
     #[gtk::test]

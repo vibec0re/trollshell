@@ -238,6 +238,9 @@ impl Plugin for Caw {
                 width: face::SIZE_U32,
                 height: face::SIZE_U32,
                 data: face::render(mood, self.frame, self.intensity()),
+                // 1×: the shell's `.caw-lcd` CSS px rule still owns the on-screen
+                // size (the #358 `scale` hint is for plugins without one).
+                scale: 1,
                 classes: vec!["caw-lcd".to_owned()],
             }),
         };

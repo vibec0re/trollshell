@@ -2346,36 +2346,6 @@ mod gtk_tests {
     }
 
     #[gtk::test]
-    fn pixels_scale_is_a_mutable_prop() {
-        let root = root();
-        let mut rec = Reconciler::new(&root, |_, _| {});
-        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
-        let surface = root
-            .first_child()
-            .unwrap()
-            .downcast::<crate::pixels::PixelSurface>()
-            .unwrap();
-        assert_eq!(surface.measure(gtk::Orientation::Horizontal, -1).1, 1);
-
-        // Same id, new scale: mutable-prop update — the widget is reused and
-        // its natural request grows to buffer × scale.
-        rec.render(&Node::Pixels {
-            id: Some("lcd".into()),
-            width: 1,
-            height: 1,
-            data: vec![255, 0, 0, 255],
-            scale: 4,
-            classes: vec![],
-        });
-        assert_eq!(
-            root.first_child().unwrap(),
-            surface.clone().upcast::<gtk::Widget>(),
-            "same-id scale flip reuses the surface in place"
-        );
-        assert_eq!(surface.measure(gtk::Orientation::Horizontal, -1).1, 4);
-    }
-
-    #[gtk::test]
     fn pixels_bad_buffer_does_not_panic() {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});

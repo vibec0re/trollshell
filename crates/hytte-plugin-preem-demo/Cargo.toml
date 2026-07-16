@@ -1,0 +1,21 @@
+[package]
+name = "hytte-plugin-preem-demo"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Showcase plugin for the SDK's preem raster kit (issue #356): a 7seg clock, dot-matrix ticker, and 8bit textbox cycling the VFD/LCD/OLED skins"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-preem-demo"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY dependency: the plugin runtime SDK, which carries the preem
+# raster kit (`hytte_plugin::preem`) and re-exports the wire protocol as
+# `hytte_plugin::proto`. No gtk / adw / hytte-ui — and no direct tokio —
+# a plugin never links the shell.
+hytte-plugin = { path = "../hytte-plugin" }

@@ -78,6 +78,17 @@
 //! being torn down and re-established anyway. The next session starts from a
 //! clean channel, just as it re-derives the model from the next snapshot.
 //!
+//! # The `preem` raster kit
+//!
+//! [`preem`] is the SDK's GTK-free retro-display toolkit (issue #356): a
+//! shared RGBA8 framebuffer ([`preem::Frame`]), the 5×7 pixel font
+//! ([`preem::font`], promoted from the pet's speech bubble), and predefined
+//! widgets — [`preem::dot_matrix`], [`preem::seven_seg`], and the
+//! [`preem::TextBox`] 8bit textbox — all rendering into
+//! [`Node::Pixels`](proto::Node::Pixels) buffers in the VFD / LCD / OLED
+//! [`preem::DisplayStyle`] skins. See that module's docs; the
+//! `hytte-plugin-preem-demo` crate is the reference consumer.
+//!
 //! # Styling
 //!
 //! A plugin's entire style surface is the `classes` field every [`Node`]
@@ -269,6 +280,8 @@
 //! ```
 
 use hytte_plugin_proto::{Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot};
+
+pub mod preem;
 
 mod runtime;
 

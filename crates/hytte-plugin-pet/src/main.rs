@@ -315,6 +315,9 @@ impl Plugin for Pet {
                 width: face::SIZE_U32,
                 height: face::SIZE_U32,
                 data: face::render(mood, self.frame),
+                // 1×: the shell's `.pet-lcd` CSS px rule still owns the on-screen
+                // size (the #358 `scale` hint is for plugins without one).
+                scale: 1,
                 classes: vec!["pet-lcd".to_owned()],
             }
         };

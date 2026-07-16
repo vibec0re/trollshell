@@ -199,6 +199,11 @@ impl Frame {
             width: u32::try_from(self.width).unwrap_or(0),
             height: u32::try_from(self.height).unwrap_or(0),
             data: self.data,
+            // 1×: the preem kit bakes its own integer upscale into the buffer
+            // (`Frame::upscale` / a widget's `scale` knob), so the buffer is
+            // already at final resolution; the #358 proto hint is for surfaces
+            // that instead ship a base-resolution buffer for the host to scale.
+            scale: 1,
             classes,
         }
     }
@@ -330,6 +335,7 @@ mod tests {
             width,
             height,
             data,
+            scale,
             classes,
         } = f.into_node(Some("x"), vec!["cls".to_owned()])
         else {
@@ -339,6 +345,8 @@ mod tests {
         assert_eq!((width, height), (3, 2));
         assert_eq!(data, bytes);
         assert_eq!(data.len(), 3 * 2 * 4);
+        // Preem bakes its own upscale into the buffer, so the proto hint is 1×.
+        assert_eq!(scale, 1);
         assert_eq!(classes, vec!["cls".to_owned()]);
     }
 }

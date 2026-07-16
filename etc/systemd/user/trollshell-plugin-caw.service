@@ -1,0 +1,23 @@
+[Unit]
+Description=trollshell caw plugin — caw's desktop body (out-of-process widget)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# Mounts SidebarTop as one card in the region (sorted by manifest order since
+# #274), so it coexists with any other SidebarTop plugin — no Conflicts= needed.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-caw
+# caw's opencaw agent publishes her live expression (mood + a line) via its
+# `caw_express` tool; this plugin polls that file. Default is
+# ~/.local/state/caw/expression.json — both ends agree on it with no config.
+# Point opencaw and this unit at the same path if you override it:
+#   Environment=CAW_EXPRESSION_PATH=%h/.local/state/caw/expression.json
+# Unlike the pet, there is NO brain service — caw herself is the brain.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

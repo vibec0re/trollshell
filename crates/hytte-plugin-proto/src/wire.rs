@@ -49,7 +49,13 @@ pub enum Dir {
 /// *can* decode it. (Contrast [`HostMsg::SlotVisibility`](crate::msg::HostMsg::SlotVisibility),
 /// which is state the host would otherwise push unconditionally, so that one
 /// needs an explicit [`StateKey`](crate::manifest::StateKey) subscription.)
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// [`Submitted`](EventKind::Submitted) (#357) is opt-in *by vocabulary* the
+/// same way: only a plugin that renders a [`Node::Entry`] can ever be its
+/// target, and rendering one requires a build that can decode it.
+///
+/// (No longer `Copy` since [`Submitted`](EventKind::Submitted) carries its
+/// `String`; `Clone` where a by-value copy used to be implicit.)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
     Click,
@@ -67,6 +73,18 @@ pub enum EventKind {
     /// produce a `ValueChanged` (see `hytte_ui`'s `change-value` vs
     /// `value-changed` note), so there is no echo/feedback loop.
     ValueChanged { value: f64 },
+    /// A [`Node::Entry`]'s text was submitted — the user pressed
+    /// **Enter/activate** in the entry; `text` is its full contents at that
+    /// moment.
+    ///
+    /// Fired on activate **only** — deliberately no per-keystroke `Changed`
+    /// event in v1: a change stream needs the same throttle design as
+    /// [`ValueChanged`](EventKind::ValueChanged) and nothing asked for it yet;
+    /// additive later if a consumer appears. Like `ValueChanged`, it only ever
+    /// reflects a user action: a programmatic re-render that echoes `text`
+    /// back into the entry never fires GTK's `activate`, so there is no
+    /// echo/feedback loop.
+    Submitted { text: String },
 }
 
 /// Default for [`Node::Slider`]'s `enabled`: an omitted key means an
@@ -74,6 +92,13 @@ pub enum EventKind {
 /// decodes to a live, draggable slider rather than a greyed one.
 fn slider_enabled_default() -> bool {
     true
+}
+
+/// Default for [`Node::Pixels`]'s `scale`: an omitted key means the buffer's
+/// natural 1× size, so a frame built before the field (an older plugin SDK)
+/// decodes to exactly the pre-#358 behavior.
+fn pixels_scale_default() -> u32 {
+    1
 }
 
 /// The closed widget vocabulary. A plugin's view is a single root [`Node`].
@@ -165,10 +190,34 @@ pub enum Node {
     ///   is ~64 KiB on the wire — well under [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN).
     /// - **Rendering:** the host scales the buffer up with **nearest-neighbor**
     ///   filtering (crisp, chunky pixels — the "LCD" look), never linear
-    ///   interpolation. The buffer's natural size is `width`×`height`, but
-    ///   CSS/layout may size the widget up; the small buffer is then drawn big.
-    /// - `data` is a **mutable** prop: the same `id` re-rendered with new bytes
-    ///   swaps the texture in place rather than rebuilding the widget.
+    ///   interpolation. The buffer's natural size is `width`×`height` times
+    ///   `scale`, but CSS/layout may still size the widget up; the small buffer
+    ///   is then drawn big.
+    /// - **Sizing (`scale`, #358):** an integer upscale hint. The host requests
+    ///   a natural size of `width*scale` × `height*scale`, so a plugin can ask
+    ///   for a crisp integer blow-up (a 128×128 LCD at `scale: 2` renders 256px)
+    ///   without a shell-side CSS px rule per widget. Shell CSS can still
+    ///   override *upward*; the plugin just stops depending on it for a sane
+    ///   default. `0` and an absent key both mean `1` (the buffer's natural
+    ///   size); the host clamps an absurd scale (scaled dimension beyond its
+    ///   size cap) rather than honoring it, mirroring how it degrades a
+    ///   malformed buffer — never crashing the shell on bad input.
+    /// - `data` and `scale` are **mutable** props: the same `id` re-rendered
+    ///   with new bytes (or a new scale) swaps the texture / natural size in
+    ///   place rather than rebuilding the widget.
+    ///
+    /// `scale` is additive exactly like `Text::ellipsize`: a
+    /// **`#[serde(default = …)]` field**, so a `Pixels` frame built before #358
+    /// (no `scale` key) still decodes — defaulting to `1`, i.e. the pre-#358
+    /// sizing is preserved. The reverse direction holds too: a *new* frame's
+    /// `scale` key is skipped by a pre-#358 decoder (named-map encoding, no
+    /// `deny_unknown_fields`), so a new plugin talking to an older host renders
+    /// at 1× instead of breaking the session. Both directions are pinned by
+    /// tests in `tests/proto.rs`. (No `skip_serializing_if`: serde has no
+    /// by-value predicate and a `fn(&u32) -> bool` helper would trip
+    /// `clippy::trivially_copy_pass_by_ref`; a `scale: 1` on the wire is a few
+    /// bytes and costs nothing in compat — the old decoder skips the key either
+    /// way.)
     Pixels {
         id: Option<NodeId>,
         width: u32,
@@ -177,6 +226,11 @@ pub enum Node {
         /// a single binary blob on the wire (see the variant docs).
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+        /// Integer upscale hint: the widget's natural size is the buffer size
+        /// times this (see the variant docs). Defaulted so a pre-#358 frame
+        /// decodes to the buffer's natural 1× size; `0` is treated as `1`.
+        #[serde(default = "pixels_scale_default")]
+        scale: u32,
         classes: Vec<Cls>,
     },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
@@ -283,6 +337,52 @@ pub enum Node {
         header: Box<Node>,
         children: Vec<Node>,
         expanded: bool,
+        classes: Vec<Cls>,
+    },
+    /// A single-line **text input** — a `gtk::Entry` (#357), the vocabulary
+    /// half of the micro-terminal ask. The user types into it; pressing
+    /// **Enter/activate** fires an [`EventKind::Submitted`] addressed by `id`
+    /// carrying the entry's full text. `id` is **required**, exactly like
+    /// [`Button`](Node::Button): it is the event target.
+    ///
+    /// `text` is the **echo prop** (reconciler-updatable like
+    /// [`Slider`](Node::Slider)'s `value`): the plugin states what the entry
+    /// should show — e.g. clear it to `""` after handling a submit, or prefill
+    /// a suggestion. The host applies it **when the prop changed since the
+    /// last render**, so a re-render that merely echoes the unchanged value
+    /// never clobbers what the user is currently typing (the entry-shaped
+    /// analogue of the slider's drag suppression) — **or unconditionally on
+    /// the first render after a submit**: the render answering a
+    /// [`Submitted`](EventKind::Submitted) is authoritative even when its
+    /// `text` equals the last-rendered prop, which is what makes
+    /// clear-after-submit work when the prop rests at the same value (render
+    /// `""`, user types, Enter, render `""` again — the widget clears; a plain
+    /// prop-diff would leave the typed text stuck). Anything typed between
+    /// Enter and that answering render is overwritten by it. A programmatic
+    /// `set_text` never fires GTK's `activate`, so an echo can't re-emit a
+    /// [`Submitted`](EventKind::Submitted) — the same structural no-feedback
+    /// guarantee as the slider's `change-value` wiring. `placeholder` is the
+    /// greyed hint shown while empty (`""` for none); it and `text` are
+    /// **mutable props**, updated in place on a same-id re-render.
+    ///
+    /// Deliberately **no per-keystroke event** in v1 — see
+    /// [`EventKind::Submitted`].
+    ///
+    /// Additive: a brand-new name-tagged variant, so every existing frame
+    /// decodes unchanged and [`PROTO_VERSION`](crate::PROTO_VERSION) stays
+    /// put. The paired host→plugin `Submitted` push is opt-in *by vocabulary*
+    /// (see [`EventKind`]) — a plugin that never renders an `Entry` never has
+    /// to decode it, so no manifest opt-in is needed (the #315 Slider
+    /// playbook, per the #305 rule).
+    Entry {
+        id: NodeId,
+        /// The echo prop: what the entry should display (see the variant
+        /// docs — applied on a prop *change* or unconditionally on the first
+        /// render after a submit, so it never fights in-progress typing but
+        /// still clears/rewrites reliably after Enter).
+        text: String,
+        /// Greyed hint text shown while the entry is empty; `""` for none.
+        placeholder: String,
         classes: Vec<Cls>,
     },
 }

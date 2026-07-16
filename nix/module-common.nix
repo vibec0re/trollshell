@@ -98,9 +98,21 @@ self:
     };
 
     plugins = lib.mkOption {
-      type = lib.types.listOf (
+      type = lib.types.attrsOf (
         lib.types.submodule {
           options = {
+            enable = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              example = false;
+              description = ''
+                Whether to generate the systemd user service for this
+                plugin. Lets a downstream module switch a single entry off
+                (`plugins.pet.enable = false;`) without removing its
+                definition.
+              '';
+            };
+
             package = lib.mkOption {
               type = lib.types.package;
               description = ''
@@ -108,20 +120,6 @@ self:
                 built on hytte-plugin). It dials plugin.sock and speaks the
                 Register handshake itself — the shell never spawns or links
                 it (trollshell/src/plugins.rs).
-              '';
-            };
-
-            name = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              example = "hyperhive";
-              description = ''
-                Plugin id, used to name the generated systemd user service
-                (`trollshell-plugin-<id>`). Defaults to `package.pname` with
-                a leading `hytte-plugin-` or `trollshell-plugin-` prefix
-                stripped (e.g. hytte-plugin-pet → pet). Set this explicitly
-                if that default would collide with another entry, or pname
-                isn't a good unit-name fragment.
               '';
             };
 
@@ -142,25 +140,30 @@ self:
           };
         }
       );
-      default = [ ];
+      default = { };
       example = lib.literalExpression ''
-        [
-          {
+        {
+          hyperhive = {
             package = pkgs.hyperhive-plugin;
             env.HYPERHIVE_TOKEN = "…";
-          }
-        ]
+          };
+        }
       '';
       description = ''
-        Declarative out-of-tree plugins (#350): each entry drops in without
-        hand-writing a systemd unit. Home-manager generates one
-        `trollshell-plugin-<id>` user service per entry — same shape as the
-        bundled `etc/systemd/user/trollshell-plugin-pet.service` (bound to
+        Declarative out-of-tree plugins (#350), keyed by plugin id: each
+        attr drops in without hand-writing a systemd unit. One
+        `trollshell-plugin-<id>` user service is generated per entry (the
+        attr key is the id) — same shape as the bundled
+        `etc/systemd/user/trollshell-plugin-pet.service` (bound to
         niri-session.target, started after trollshell.service, restarted
-        on-failure). The plugin dials plugin.sock and registers itself; this
-        option only wires the unit, it does not spawn/supervise the plugin
-        or hot-load it into a running shell (that's runtime load/unload,
-        #348 — out of scope here).
+        on-failure). Being an attrset of submodules (the standard
+        named-instance pattern), entries merge per-field across modules —
+        a second module can override one field of one plugin
+        (`plugins.pet.env.PET_NAME = lib.mkForce "nisse";`) or disable it
+        (`plugins.pet.enable = false;`). The plugin dials plugin.sock and
+        registers itself; this option only wires the unit, it does not
+        spawn/supervise the plugin or hot-load it into a running shell
+        (that's runtime load/unload, #348 — out of scope here).
       '';
     };
   };

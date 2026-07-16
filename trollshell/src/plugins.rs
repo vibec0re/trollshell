@@ -914,6 +914,7 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             width,
             height,
             data,
+            scale,
             classes,
         } => {
             // Validation seam: a plugin's RGBA8 buffer is untrusted, so this is
@@ -937,11 +938,30 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
                 );
                 (0, 0, Vec::new())
             };
+            // Same seam for the `scale` hint (#358): an absurd upscale is
+            // clamped (with a warn) rather than honored, so a malformed plugin
+            // can't request a monster allocation; `0` silently means `1` (the
+            // wire contract's documented default alias, not worth a warning).
+            let scale = {
+                let clamped = clamp_pixels_scale(width, height, *scale);
+                if clamped < *scale {
+                    tracing::warn!(
+                        node = ?id,
+                        width,
+                        height,
+                        scale = *scale,
+                        clamped,
+                        "plugin Pixels scale exceeds the scaled-dimension cap; clamped"
+                    );
+                }
+                clamped
+            };
             UiNode::Pixels {
                 id: id.clone(),
                 width,
                 height,
                 data,
+                scale,
                 classes: classes.clone(),
             }
         }
@@ -998,6 +1018,17 @@ fn to_ui_node(node: &wire::Node) -> UiNode {
             expanded: *expanded,
             classes: classes.clone(),
         },
+        wire::Node::Entry {
+            id,
+            text,
+            placeholder,
+            classes,
+        } => UiNode::Entry {
+            id: id.clone(),
+            text: text.clone(),
+            placeholder: placeholder.clone(),
+            classes: classes.clone(),
+        },
     }
 }
 
@@ -1018,15 +1049,35 @@ fn pixels_len_ok(width: u32, height: u32, data_len: usize) -> bool {
     expected == u64::try_from(data_len).ok()
 }
 
+/// Cap on a [`wire::Node::Pixels`]'s *scaled* natural dimension
+/// (`max(width, height) * scale`), so a hostile/buggy `scale` can't request a
+/// monster widget. 16384 px is a common max-texture edge and far beyond any
+/// sane sidebar surface.
+const MAX_PIXELS_SCALED_DIM: u32 = 16_384;
+
+/// Clamp a [`wire::Node::Pixels`] `scale` hint to something the host will
+/// honor: at least `1` (the wire contract treats `0`/absent as `1`), and small
+/// enough that the scaled natural dimension stays within
+/// [`MAX_PIXELS_SCALED_DIM`]. An empty (or already over-cap) buffer gets `1` —
+/// scale is inert there anyway.
+fn clamp_pixels_scale(width: u32, height: u32, scale: u32) -> u32 {
+    let dim = width.max(height);
+    if dim == 0 {
+        return 1;
+    }
+    scale.clamp(1, (MAX_PIXELS_SCALED_DIM / dim).max(1))
+}
+
 /// Map a reconciler event back onto its wire form for the outbound `Event`
-/// frame. Exhaustive over the `EventKind` set (Click + Scroll + `ValueChanged`),
-/// so adding a kind to either side breaks the build here rather than silently
-/// dropping an event.
+/// frame. Exhaustive over the `EventKind` set (Click, Scroll, `ValueChanged`,
+/// `Submitted`), so adding a kind to either side breaks the build here rather
+/// than silently dropping an event.
 fn to_wire_event(kind: UiEventKind) -> wire::EventKind {
     match kind {
         UiEventKind::Click => wire::EventKind::Click,
         UiEventKind::Scroll { dx, dy } => wire::EventKind::Scroll { dx, dy },
         UiEventKind::ValueChanged { value } => wire::EventKind::ValueChanged { value },
+        UiEventKind::Submitted { text } => wire::EventKind::Submitted { text },
     }
 }
 
@@ -1062,8 +1113,8 @@ mod tests {
     use super::{
         BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount, Mutable, Page,
         PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream, any_sidebar_open,
-        apply_forget, apply_open, clear_region_if_owned, handle_conn, map_page, mpsc,
-        pixels_len_ok, read_frame, to_ui_node, to_wire_event, upsert_region, watch, wire,
+        apply_forget, apply_open, clamp_pixels_scale, clear_region_if_owned, handle_conn, map_page,
+        mpsc, pixels_len_ok, read_frame, to_ui_node, to_wire_event, upsert_region, watch, wire,
         write_frame,
     };
     use hytte_plugin_proto::Manifest;
@@ -1096,6 +1147,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     data: vec![10, 20, 30, 255],
+                    scale: 2,
                     classes: vec!["ts-lcd".into()],
                 },
                 wire::Node::Button {
@@ -1161,6 +1213,7 @@ mod tests {
                     width: 1,
                     height: 1,
                     data: vec![10, 20, 30, 255],
+                    scale: 2,
                     classes: vec!["ts-lcd".into()],
                 },
                 UiNode::Button {
@@ -1310,6 +1363,33 @@ mod tests {
             to_wire_event(UiEventKind::ValueChanged { value: 0.42 }),
             wire::EventKind::ValueChanged { value: 0.42 }
         );
+        assert_eq!(
+            to_wire_event(UiEventKind::Submitted {
+                text: "help".into()
+            }),
+            wire::EventKind::Submitted {
+                text: "help".into()
+            }
+        );
+    }
+
+    /// The #357 `Entry` maps 1:1: the required id (the `Submitted` event
+    /// target), the `text` echo prop, and the placeholder all carry across.
+    #[test]
+    fn wire_entry_maps_to_ui() {
+        let tree = wire::Node::Entry {
+            id: "term-input".into(),
+            text: String::new(),
+            placeholder: "type a command…".into(),
+            classes: vec!["monospace".into()],
+        };
+        let expected = UiNode::Entry {
+            id: "term-input".into(),
+            text: String::new(),
+            placeholder: "type a command…".into(),
+            classes: vec!["monospace".into()],
+        };
+        assert_eq!(to_ui_node(&tree), expected);
     }
 
     /// Every wire `Page` maps to the identically-named `modal::Page`, except
@@ -1422,6 +1502,7 @@ mod tests {
             width: 2,
             height: 2,
             data: vec![0, 1, 2], // 3 bytes, needs 16
+            scale: 2,
             classes: vec!["ts-lcd".into()],
         };
         assert_eq!(
@@ -1431,6 +1512,9 @@ mod tests {
                 width: 0,
                 height: 0,
                 data: vec![],
+                // The degraded (empty) surface renders nothing; scale is inert
+                // there, so it normalizes to 1.
+                scale: 1,
                 classes: vec!["ts-lcd".into()],
             },
             "malformed Pixels degrades to a nothing-rendered surface",
@@ -1441,6 +1525,7 @@ mod tests {
             width: 1,
             height: 2,
             data: vec![1, 2, 3, 4, 5, 6, 7, 8], // 1*2*4
+            scale: 1,
             classes: vec![],
         };
         assert_eq!(
@@ -1450,10 +1535,51 @@ mod tests {
                 width: 1,
                 height: 2,
                 data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                scale: 1,
                 classes: vec![],
             },
             "well-formed Pixels passes through 1:1",
         );
+    }
+
+    /// The #358 `scale` hint crosses the same trust boundary as the buffer:
+    /// sane integer scales pass through, `0` aliases to `1`, and an absurd
+    /// scale is clamped so the scaled natural dimension can never exceed the
+    /// host's cap.
+    #[test]
+    fn pixels_scale_is_clamped_at_the_host_seam() {
+        // Pure clamp behavior.
+        assert_eq!(clamp_pixels_scale(128, 128, 2), 2, "sane scale passes");
+        assert_eq!(clamp_pixels_scale(128, 128, 0), 1, "0 aliases to 1");
+        assert_eq!(
+            clamp_pixels_scale(128, 128, u32::MAX),
+            16_384 / 128,
+            "absurd scale clamps to the scaled-dimension cap"
+        );
+        assert_eq!(
+            clamp_pixels_scale(20_000, 1, 3),
+            1,
+            "an already-over-cap buffer keeps scale 1"
+        );
+        assert_eq!(clamp_pixels_scale(0, 0, 7), 1, "empty surface: inert 1");
+
+        // Through the mapping arm: the caw case — a 1×1 stand-in at 2× passes
+        // untouched; a hostile scale on the same node is capped.
+        let node = |scale: u32| wire::Node::Pixels {
+            id: Some("lcd".into()),
+            width: 1,
+            height: 1,
+            data: vec![9, 9, 9, 255],
+            scale,
+            classes: vec![],
+        };
+        let ui_scale = |n: &wire::Node| match to_ui_node(n) {
+            UiNode::Pixels { scale, .. } => scale,
+            other => panic!("expected Pixels, got {other:?}"),
+        };
+        assert_eq!(ui_scale(&node(2)), 2);
+        assert_eq!(ui_scale(&node(0)), 1);
+        assert_eq!(ui_scale(&node(u32::MAX)), 16_384);
     }
 
     /// #277 (preserved under the region model): a plugin's back-to-back frames

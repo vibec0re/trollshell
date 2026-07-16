@@ -1,0 +1,28 @@
+[package]
+name = "hytte-plugin-caw"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "caw's desktop body — a cybercrow that renders the opencaw agent's live self-expression (mood + speech) in the trollshell sidebar"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-caw"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream
+# (including `wrappers::UnboundedReceiverStream`, which is un-feature-gated).
+hytte-plugin = { path = "../hytte-plugin" }
+# The 2s expression-file poll loop: `rt` for `spawn`, `time` for `interval`,
+# `sync` for the mpsc that feeds each read back into `update`.
+tokio = { version = "1.40", default-features = false, features = [
+  "rt",
+  "time",
+  "sync",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

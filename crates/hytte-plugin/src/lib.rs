@@ -217,6 +217,13 @@
 //! silent no-op there. Wrap a raster node in a `Box` if it needs a themed
 //! backdrop.
 //!
+//! **Size it with `scale`, not shell CSS** (#358): a `Pixels` surface's
+//! natural size is its buffer size times its `scale` hint, so a `128×128`
+//! buffer at `scale: 2` renders a crisp 256 px without any shell-side px
+//! rule (integer factors are the sharp case for the nearest-neighbor
+//! upscale). Host CSS can still override upward, but a plugin no longer
+//! depends on it for a sane default.
+//!
 //! ## What NOT to rely on
 //!
 //! The shell's own sidebar and bar widgets carry internal classes —
@@ -352,7 +359,7 @@ pub enum Input<M> {
     Event {
         /// The interacted node, by the id the plugin assigned in its view.
         node: NodeId,
-        /// What happened (click / scroll).
+        /// What happened (click / scroll / slider move / entry submit).
         kind: EventKind,
     },
     /// The outcome of a brokered

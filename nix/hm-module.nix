@@ -14,46 +14,31 @@ let
   # asserted clearly if absent (below) rather than branching on option layout —
   # a pre-0.12 channel that still only ships `services.swww` won't have it.
 
-  # Plugin id (#350): an explicit `name` wins; otherwise derive one from the
-  # package's pname, stripping a hytte-plugin-/trollshell-plugin- prefix so
-  # unit names stay short (hytte-plugin-pet -> pet). Falls back to parsing
-  # `name` (à la nix's own name/version split) for packages that never set
-  # `pname` explicitly, e.g. writeShellScriptBin-built fixtures.
-  pluginId =
-    plugin:
-    if plugin.name != null then
-      plugin.name
-    else
-      let
-        base = plugin.package.pname or (builtins.parseDrvName plugin.package.name).name;
-      in
-      lib.removePrefix "trollshell-plugin-" (lib.removePrefix "hytte-plugin-" base);
-
   # One trollshell-plugin-<id> user service per programs.trollshell.plugins
-  # entry, mirroring etc/systemd/user/trollshell-plugin-pet.service.
-  pluginServices = lib.listToAttrs (
-    map (plugin: {
-      name = "trollshell-plugin-${pluginId plugin}";
-      value = {
-        Unit = {
-          PartOf = [ "niri-session.target" ];
-          After = [
-            "graphical-session.target"
-            "trollshell.service"
-          ];
-          Requisite = [ "graphical-session.target" ];
-        };
-        Service = {
-          Type = "simple";
-          ExecStart = lib.getExe plugin.package;
-          Environment = lib.mapAttrsToList (name: value: "${name}=${value}") plugin.env;
-          Restart = "on-failure";
-          RestartSec = 2;
-        };
-        Install.WantedBy = [ "niri-session.target" ];
+  # entry (#350/#355; the attr key is the plugin id), mirroring
+  # etc/systemd/user/trollshell-plugin-pet.service. Entries with
+  # enable = false are filtered out before any unit is generated.
+  pluginServices = lib.mapAttrs' (
+    id: plugin:
+    lib.nameValuePair "trollshell-plugin-${id}" {
+      Unit = {
+        PartOf = [ "niri-session.target" ];
+        After = [
+          "graphical-session.target"
+          "trollshell.service"
+        ];
+        Requisite = [ "graphical-session.target" ];
       };
-    }) cfg.plugins
-  );
+      Service = {
+        Type = "simple";
+        ExecStart = lib.getExe plugin.package;
+        Environment = lib.mapAttrsToList (name: value: "${name}=${value}") plugin.env;
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+      Install.WantedBy = [ "niri-session.target" ];
+    }
+  ) (lib.filterAttrs (_: p: p.enable) cfg.plugins);
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the

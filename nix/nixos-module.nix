@@ -10,52 +10,37 @@ let
   cfg = config.programs.trollshell;
   backend = cfg.wallpaper.backend;
 
-  # Plugin id (#350): an explicit `name` wins; otherwise derive one from the
-  # package's pname, stripping a hytte-plugin-/trollshell-plugin- prefix so
-  # unit names stay short (hytte-plugin-pet -> pet). Falls back to parsing
-  # `name` (à la nix's own name/version split) for packages that never set
-  # `pname` explicitly, e.g. writeShellScriptBin-built fixtures.
-  pluginId =
-    plugin:
-    if plugin.name != null then
-      plugin.name
-    else
-      let
-        base = plugin.package.pname or (builtins.parseDrvName plugin.package.name).name;
-      in
-      lib.removePrefix "trollshell-plugin-" (lib.removePrefix "hytte-plugin-" base);
-
   # One trollshell-plugin-<id> user service per programs.trollshell.plugins
-  # entry, mirroring etc/systemd/user/trollshell-plugin-pet.service — using
-  # NixOS's own systemd.user.services schema (lowerCamel top-level keys,
-  # unlike home-manager's Unit/Service/Install), same as the swaybg/
-  # polkit-gnome units below. NB: on a NixOS-only host (no home-manager),
+  # entry (#350/#355; the attr key is the plugin id), mirroring
+  # etc/systemd/user/trollshell-plugin-pet.service — using NixOS's own
+  # systemd.user.services schema (lowerCamel top-level keys, unlike
+  # home-manager's Unit/Service/Install), same as the swaybg/polkit-gnome
+  # units below. Entries with enable = false are filtered out before any
+  # unit is generated. NB: on a NixOS-only host (no home-manager),
   # trollshell.service itself is never defined by *this* module — it only
   # exists via home-manager (see homeModules.default at the bottom of this
   # file) — so `after = [ "trollshell.service" ]` here just no-ops if that
   # unit is absent, same as it would for any other missing After= target.
-  pluginServices = lib.listToAttrs (
-    map (plugin: {
-      name = "trollshell-plugin-${pluginId plugin}";
-      value = {
-        description = "trollshell plugin: ${pluginId plugin}";
-        wantedBy = [ "niri-session.target" ];
-        partOf = [ "niri-session.target" ];
-        after = [
-          "graphical-session.target"
-          "trollshell.service"
-        ];
-        requisite = [ "graphical-session.target" ];
-        environment = plugin.env;
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = lib.getExe plugin.package;
-          Restart = "on-failure";
-          RestartSec = 2;
-        };
+  pluginServices = lib.mapAttrs' (
+    id: plugin:
+    lib.nameValuePair "trollshell-plugin-${id}" {
+      description = "trollshell plugin: ${id}";
+      wantedBy = [ "niri-session.target" ];
+      partOf = [ "niri-session.target" ];
+      after = [
+        "graphical-session.target"
+        "trollshell.service"
+      ];
+      requisite = [ "graphical-session.target" ];
+      environment = plugin.env;
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = lib.getExe plugin.package;
+        Restart = "on-failure";
+        RestartSec = 2;
       };
-    }) cfg.plugins
-  );
+    }
+  ) (lib.filterAttrs (_: p: p.enable) cfg.plugins);
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the

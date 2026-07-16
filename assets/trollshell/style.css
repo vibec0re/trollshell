@@ -1680,9 +1680,10 @@
 /* ── caw's desktop body (hytte-plugin-caw, cybercrow) ──────────────────────
  * Same PixelSurface caveat as the pet: the LCD face buffer ignores CSS fills,
  * so the bezel + mood glow live on `.caw-face` (the gtk::Button around it).
- * Unlike the pet, her speech is a REAL-font Text node (`.caw-say`) — crisp and
- * readable, not a pixel font. The card is a vertical stack: centered face over
- * her line. */
+ * Her speech (`.caw-say`) is now a preem pixel-font PixelSurface too (#368) —
+ * same chunky look as the face — so it also ignores fills. The card is a
+ * vertical stack: centered face over her line over a dim italic stage
+ * direction (`.caw-act`, still real-font). */
 /* Vertical padding is deliberately larger than horizontal: the face row
  * already gets ~12px of side gap from the Spacers + sidebar padding, so 1em
  * top/bottom is what makes the card read evenly inset on all four edges. */
@@ -1762,24 +1763,14 @@
     border-radius: 0.5em;
 }
 
-/* caw's speech bubble — a padded Box AROUND the label (`.caw-say`), because
- * CSS padding on a wrapping GtkLabel is unreliable: the box model belongs on
- * the container. The bubble is centered under the face by Spacers in the
- * plugin's view: short lines hug their text, long lines fill the card and
- * wrap. Same family as `.pet-bubble`. */
-.caw-bubble {
-    background: rgb(
-        58,
-        34,
-        80
-    ); /* a touch lighter than @sidebar_card_background */
-    border-radius: 0.8em;
-    padding: 0.5em 0.75em;
-    margin: 0.25em 0.2em 0;
-}
+/* caw's speech (#368) — a preem pixel-font PixelSurface, like the face: the
+ * violet field, lilac ink, and rounded corners are all baked into the buffer
+ * (see `speech.rs`), so CSS fills/font/radius are ignored here (the same
+ * PixelSurface caveat as `.caw-lcd`). Only the margin below the face is
+ * honored; the plugin's Spacer row centers it, short lines hug and long lines
+ * wrap down. */
 .caw-say {
-    color: #f3e9ff;
-    font-size: 0.95em;
+    margin: 0.35em 0.2em 0;
 }
 /* Her stage direction (*ruffles feathers*) — dim + italic, centered under the
  * bubble by the same Spacer dance. */

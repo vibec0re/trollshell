@@ -1067,6 +1067,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-terminal"
+version = "0.1.0"
+dependencies = [
+ "hytte-plugin",
+]
+
+[[package]]
 name = "hytte-plugin-weather"
 version = "0.1.0"
 dependencies = [

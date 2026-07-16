@@ -114,6 +114,15 @@ animation frame derives from the Clock snapshots the host already pushes. It
 mounts `SidebarTop` alongside the clock demo and the pet, and doubles as the
 visual reference for kit consumers.
 
+`trollshell-plugin-terminal.service` is the micro-terminal demo (#357): a
+sidebar card composing the two pieces the preem-widgets breakout landed — the
+`Node::Entry` text input and the `hytte_plugin::preem` raster kit — into a
+retro VFD "screen" of scrollback over a single entry line. Type a line, press
+Enter and it is echoed onto the screen behind a `> ` prompt (scrolling when the
+screen fills) and the entry clears. It is **pure local echo**: submitted text is
+only ever painted back — the plugin executes nothing, spawns no process, and
+requests no capabilities. It mounts `SidebarTop` after the preem showcase.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

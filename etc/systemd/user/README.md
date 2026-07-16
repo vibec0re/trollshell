@@ -105,6 +105,15 @@ poll-only-while-open energy behavior. The native board is gone — its widget
 mount and open-edge refresh wiring were removed in the #289 follow-up — so
 bringing up departures is just enabling this unit.
 
+`trollshell-plugin-preem-demo.service` is the showcase for the
+`hytte_plugin::preem` raster kit (#356): a sidebar card cycling the retro
+display widgets — a 7-seg HH:MM clock, a dot-matrix ticker, and an 8-bit
+textbox — through the VFD / LCD / OLED skins (rotating every 10 s; click the
+clock face to cycle a skin by hand). It runs no timers of its own: every
+animation frame derives from the Clock snapshots the host already pushes. It
+mounts `SidebarTop` alongside the clock demo and the pet, and doubles as the
+visual reference for kit consumers.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

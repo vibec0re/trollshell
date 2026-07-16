@@ -925,18 +925,26 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         if r.is_child_revealed() {
             return;
         }
-        PANELS.with(|panels| {
+        let closed_plugin_panel = PANELS.with(|panels| {
             let panels = panels.borrow();
             let Some(panel) = panels.get(&key) else {
-                return;
+                return false;
             };
             panel.window.set_visible(false);
+            let was_plugin = matches!(&*panel.current.borrow(), Some(Active::Plugin(_)));
             *panel.current.borrow_mut() = None;
             panel.open_state.set(false);
+            was_plugin
         });
-        // Clear the plugin-panel selection when the drawer closes so a later
-        // built-in open (or a plugin child that lingers) renders blank (#349 PR2).
-        crate::plugins::set_active_panel(None);
+        // Clear the plugin-panel selection only when *this* drawer was the one
+        // showing a plugin panel. `active_panel_id` is a single global selection
+        // shared by every monitor's plugin child, but drawers are per-monitor and
+        // can be open at once — clearing unconditionally would blank a plugin
+        // panel still open on another monitor when an unrelated drawer closes
+        // here (#349 PR2).
+        if closed_plugin_panel {
+            crate::plugins::set_active_panel(None);
+        }
         recompute_netconn_visible();
         recompute_stats_visible();
         recompute_media_visible();

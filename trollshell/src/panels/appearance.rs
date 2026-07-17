@@ -40,9 +40,8 @@ pub fn panel_appearance() -> gtk::Widget {
     let browse = gtk::Button::with_label("Browse\u{2026}");
     browse.set_valign(gtk::Align::Center);
     browse.add_css_class("flat");
-    let browse_for_handler = browse.clone();
     browse.connect_clicked(move |_| {
-        open_wallpaper_picker(&browse_for_handler);
+        open_wallpaper_picker();
     });
     row.add_suffix(&browse);
     row.set_activatable_widget(Some(&browse));
@@ -91,7 +90,7 @@ fn wallpaper_basename(path: &str) -> String {
 /// Open a `gtk::FileDialog` to pick a wallpaper image. On selection, hands
 /// the absolute path to the wallpaper service (which persists + restarts
 /// the swaybg unit). Cancellation / error is logged at debug level.
-fn open_wallpaper_picker(parent_widget: &gtk::Button) {
+fn open_wallpaper_picker() {
     let dialog = gtk::FileDialog::builder()
         .title("Select wallpaper")
         .modal(true)
@@ -110,14 +109,14 @@ fn open_wallpaper_picker(parent_widget: &gtk::Button) {
     dialog.set_filters(Some(&filters));
     dialog.set_default_filter(Some(&filter));
 
-    // Resolve the parent window so the dialog is modal-anchored to the
-    // drawer's layer-shell surface; without it the dialog is parentless
-    // and may not receive focus correctly under niri.
-    let parent = parent_widget
-        .root()
-        .and_then(|root| root.downcast::<gtk::Window>().ok());
-
-    dialog.open(parent.as_ref(), gio::Cancellable::NONE, |result| {
+    // Deliberately unparented: our drawer is a gtk4-layer-shell surface, not
+    // an xdg-toplevel, so there is no valid handle-export path for the
+    // xdg-desktop-portal file chooser (or GTK's fallback) to anchor to it.
+    // On some GTK/gdk-wayland builds that export aborts the whole process
+    // instead of degrading gracefully — the shell-crashing bug in #379. A
+    // slightly less-anchored dialog is a much better failure mode than
+    // taking down the shell.
+    dialog.open(None::<&gtk::Window>, gio::Cancellable::NONE, |result| {
         match result {
             Ok(file) => {
                 if let Some(path) = file.path() {

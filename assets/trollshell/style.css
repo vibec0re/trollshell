@@ -577,6 +577,28 @@
     padding: 0.154em 0.615em;
 }
 
+/* Micro-terminal input (#369). The `hytte-plugin-terminal` plugin stacks a live
+ * `Node::Entry` under its preem VFD dot-matrix screen; a bare GTK text field
+ * clashes with it. Dress the entry in the same VFD palette as the screen
+ * (`DisplayStyle::Vfd`: near-black field #040a0e, phosphor-cyan ink #8df5ff,
+ * ghost #0c1a1f) with a dark bezel, so the two read as one preem terminal. A
+ * *true* pixel-font input would need a bundled bitmap TTF or per-keystroke
+ * `Entry` vocab — a follow-up; this is the CSS match. */
+.ts-terminal-input {
+    color: #8df5ff;
+    caret-color: #8df5ff;
+    background: #040a0e;
+    border: 1px solid #0c1a1f;
+    border-radius: 0.3em;
+    padding: 0.2em 0.45em;
+}
+.ts-terminal-input > text {
+    background: transparent;
+}
+.ts-terminal-input placeholder {
+    color: alpha(#8df5ff, 0.4);
+}
+
 /* Weather card (top of sidebar). Inherits color: white from .ts-sidebar;
  * only the symbolic condition icon + detail rows tweak alpha/size. */
 .ts-weather {

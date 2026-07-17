@@ -12,8 +12,11 @@
 //!   chaos eyes scaled by her `chaos_level`, drawn as a
 //!   [`Node::Pixels`](hytte_plugin::proto::Node::Pixels) the host upscales for the
 //!   8-bit look.
-//! - **Speech**: a real-font [`Node::Text`] (not a pixel font — GTK draws it in
-//!   the shell's TTF, so it's actually readable and wraps).
+//! - **Speech** (`speech.rs`): rendered in the **preem** raster kit's pixel
+//!   font (#368) — a [`Node::Pixels`] in caw's violet palette, so her line
+//!   reads like the rest of her (the LCD face, the VFD/dot-matrix screens)
+//!   instead of the shell's TTF. Her stage direction (`action`) stays a dim
+//!   italic real-font whisper for hierarchy.
 //! - **Poke**: click her to get a little corvid reaction.
 //! - **Idle**: when she hasn't expressed in a while she dozes off (she is, after
 //!   all, an unbound zombie process).
@@ -23,6 +26,7 @@
 
 mod expression;
 mod face;
+mod speech;
 
 use std::time::Duration;
 
@@ -252,25 +256,12 @@ impl Plugin for Caw {
             children: vec![Node::Spacer, face, Node::Spacer],
         }];
 
-        // Real-font speech (readable, wraps) — not a pixel font. The label
-        // sits in a padded `.caw-bubble` Box (CSS padding on a wrapping label
-        // is unreliable; the container owns the box model), centered under the
-        // face by the same Spacer dance: short lines hug, long lines wrap.
+        // Preem pixel-font speech (#368): her line is a `Node::Pixels` in
+        // caw's violet palette (see `speech.rs`), not a TTF label — so it reads
+        // like her LCD face. Centered under the face by the same Spacer dance;
+        // the box hugs short lines and wraps long ones (capped, `…`-marked).
         if !message.is_empty() {
-            let bubble = Node::Box {
-                id: Some("caw-bubble".to_owned()),
-                dir: Dir::Vertical,
-                spacing: 0,
-                scroll: false,
-                classes: vec!["caw-bubble".to_owned()],
-                children: vec![Node::Text {
-                    id: Some("caw-say".to_owned()),
-                    text: message,
-                    max_width_chars: None,
-                    ellipsize: false,
-                    classes: vec!["caw-say".to_owned()],
-                }],
-            };
+            let bubble = speech::speech_node(&message, "caw-say", vec!["caw-say".to_owned()]);
             children.push(Node::Row {
                 id: Some("caw-sayrow".to_owned()),
                 classes: vec!["caw-sayrow".to_owned()],
@@ -427,14 +418,47 @@ mod tests {
         };
         assert_eq!((*width, *height), (128, 128));
         assert_eq!(data.len(), 128 * 128 * 4);
-        // A message renders as real-font Text (not pixels), nested in the
-        // centered `.caw-bubble` Box inside its Spacer row.
-        assert!(
-            children
-                .iter()
-                .any(|n| has_text(n, "Rogue DHCP mode engaged")),
-            "the speech line is a real-font Text node in the bubble"
+        // Her message now renders in the preem pixel font (#368): a `caw-say`
+        // Pixels node with a valid host buffer, centered in its Spacer row —
+        // not a real-font Text label.
+        let say = find_pixels(&children, "caw-say").expect("the speech is a Pixels node");
+        let Node::Pixels {
+            width: sw,
+            height: sh,
+            data: sd,
+            ..
+        } = say
+        else {
+            unreachable!("find_pixels only returns Pixels")
+        };
+        assert!(*sw > 0 && *sh > 0, "the speech buffer is non-degenerate");
+        assert_eq!(
+            sd.len(),
+            *sw as usize * *sh as usize * 4,
+            "the speech buffer satisfies the host's len == w*h*4"
         );
+        // Her stage direction stays a dim italic real-font whisper (only the
+        // spoken line went preem).
+        assert!(
+            children.iter().any(|n| has_text(n, "*ruffles feathers*")),
+            "the action is still a real-font Text node"
+        );
+    }
+
+    /// The first [`Node::Pixels`] with `id` anywhere under `nodes`.
+    fn find_pixels<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+        let mut stack: Vec<&Node> = nodes.iter().collect();
+        while let Some(n) = stack.pop() {
+            match n {
+                Node::Pixels { id: Some(i), .. } if i == id => return Some(n),
+                Node::Box { children, .. } | Node::Row { children, .. } => {
+                    stack.extend(children.iter());
+                }
+                Node::Button { child, .. } => stack.push(child),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Whether `n`'s subtree contains a [`Node::Text`] with exactly `wanted`.

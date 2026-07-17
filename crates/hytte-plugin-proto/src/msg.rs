@@ -70,6 +70,23 @@ pub enum HostMsg {
     /// the host sends `visible: true` while **any** sidebar showing it is open
     /// (OR across monitors) and `false` only once they are all closed.
     SlotVisibility { visible: bool },
+    /// The desktop accent color the host resolved from libadwaita's
+    /// `@accent_color` (#376), delivered so an out-of-process plugin — which
+    /// can't read GTK/adwaita itself — can tint its `preem` widgets' **default**
+    /// color to match the shell. `color` is an opaque RGBA byte quad
+    /// (`[r, g, b, a]`, matching `preem`'s pixel layout); `None` means the host
+    /// couldn't resolve one, in which case the kit keeps its hard-coded per-style
+    /// default. An explicit plugin palette always wins — accent is only the
+    /// fallback default.
+    ///
+    /// **Opt-in (#305):** sent *only* to a plugin that subscribes
+    /// [`StateKey::Accent`](crate::manifest::StateKey::Accent), so appending this
+    /// name-tagged variant stays additive — a pre-#376 binary that never declared
+    /// the key never receives (and never fails to decode) it. The `hytte-plugin`
+    /// SDK auto-declares that subscription, so accent tracking is transparent to
+    /// the plugin author. v1 sends it once at session start (latest-wins if
+    /// re-sent); live re-tint on an accent change is a follow-up.
+    Accent { color: Option<[u8; 4]> },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is
@@ -88,4 +105,33 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostMsg;
+    use crate::codec::{decode, encode};
+    use crate::manifest::{Manifest, Mount, StateKey};
+
+    /// The #376 accent push round-trips, carrying both a resolved color and the
+    /// unresolved (`None`) case byte-for-byte.
+    #[test]
+    fn accent_push_round_trips() {
+        for color in [Some([0x35, 0x84, 0xe4, 0xff]), Some([0, 0, 0, 0]), None] {
+            let msg = HostMsg::Accent { color };
+            let back = decode::<HostMsg>(&encode(&msg)).expect("accent frame decodes");
+            assert_eq!(back, msg);
+        }
+    }
+
+    /// `StateKey::Accent` is a plain name-tagged variant, so a manifest carrying
+    /// it round-trips — the additive opt-in a plugin declares to receive the
+    /// accent push.
+    #[test]
+    fn accent_subscription_round_trips() {
+        let mut manifest = Manifest::new("preem-plugin", Mount::SidebarTop);
+        manifest.subscribes = vec![StateKey::Clock, StateKey::Accent];
+        let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
+        assert_eq!(back, manifest);
+    }
 }

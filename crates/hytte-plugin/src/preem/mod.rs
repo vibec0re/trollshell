@@ -69,3 +69,9 @@ pub use frame::{Frame, Rgba};
 pub use seven_seg::seven_seg;
 pub use style::DisplayStyle;
 pub use textbox::TextBox;
+
+/// Install the host-resolved desktop accent as the kit's default widget tint
+/// (#376). Crate-internal: the SDK transport runtime calls it from the
+/// [`HostMsg::Accent`](hytte_plugin_proto::HostMsg::Accent) frame; a plugin
+/// author never does (an explicit palette still wins).
+pub(crate) use style::set_accent;

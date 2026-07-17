@@ -11,20 +11,25 @@
 //! mood in `main.rs` fails to compile here until its face is defined.
 
 use crate::Mood;
+use hytte_plugin::preem::{Frame, Rgba};
 
 /// LCD buffer edge length in device pixels (square).
 pub(crate) const SIZE: usize = 128;
-/// The same edge as the `u32` the wire's `Pixels { width, height }` wants.
-pub(crate) const SIZE_U32: u32 = 128;
 /// The same edge as `i32`, for signed geometry math.
 const DIM: i32 = 128;
 /// Radius of the baked rounded-corner cut (screen glass edge).
 const CORNER_R: i32 = 12;
 
-const _: () = assert!(SIZE == 128 && SIZE_U32 == 128 && DIM == 128 && CORNER_R < DIM / 2);
+const _: () = assert!(SIZE == 128 && DIM == 128 && CORNER_R < DIM / 2);
 
 /// An opaque RGB color; alpha is always `0xff` on the screen.
 type Rgb = [u8; 3];
+
+/// Widen an opaque [`Rgb`] to the [`Rgba`] the [`Frame`] primitives take —
+/// the LCD is fully lit, so alpha is always `0xff`.
+const fn rgba(c: Rgb) -> Rgba {
+    [c[0], c[1], c[2], 0xff]
+}
 
 // ── Palette — a near-black crow popping off a purple LCD field ──────────────
 const SCREEN_BG: Rgb = [0x31, 0x1e, 0x4e]; // purple screen field (lighter than the bird)
@@ -50,21 +55,22 @@ const DOT: Rgb = [0xd4, 0xbc, 0xee]; // pale scheming dots
 const HUFF: Rgb = [0x8f, 0xc9, 0xff]; // pale-blue offended huff mark
 
 /// Render caw's LCD face for `mood` at animation `frame` with a `0..=255`
-/// `intensity` (her `chaos_level` scaled) into a fresh `SIZE`×`SIZE` RGBA8
-/// buffer (`SIZE*SIZE*4` bytes exactly — the host's validation invariant).
-pub(crate) fn render(mood: Mood, frame: usize, intensity: u8) -> Vec<u8> {
-    let mut buf = vec![0u8; SIZE * SIZE * 4];
+/// `intensity` (her `chaos_level` scaled) into a fresh `SIZE`×`SIZE`
+/// [`Frame`] — its `data()` is `SIZE*SIZE*4` bytes exactly (the host's
+/// validation invariant, upheld by the [`Frame`] type itself). Wrap it for the
+/// wire with [`Frame::into_node`].
+pub(crate) fn render(mood: Mood, frame: usize, intensity: u8) -> Frame {
+    let mut f = Frame::filled(SIZE, SIZE, rgba(SCREEN_BG));
     let face = face_params(mood, frame);
-    fill(&mut buf, SCREEN_BG);
-    draw_body(&mut buf);
-    draw_crest(&mut buf, face.crest, frame);
-    draw_head(&mut buf);
-    draw_sheen(&mut buf, frame);
-    draw_eyes(&mut buf, face.eyes, face.look, face.glow, intensity, frame);
-    draw_beak(&mut buf, face.beak);
-    draw_extra(&mut buf, face.extra, frame, intensity);
-    round_corners(&mut buf);
-    buf
+    draw_body(&mut f);
+    draw_crest(&mut f, face.crest, frame);
+    draw_head(&mut f);
+    draw_sheen(&mut f, frame);
+    draw_eyes(&mut f, face.eyes, face.look, face.glow, intensity, frame);
+    draw_beak(&mut f, face.beak);
+    draw_extra(&mut f, face.extra, frame, intensity);
+    round_corners(&mut f);
+    f
 }
 
 /// One in ~six frames is a blink; a cheap integer hash jitters the cadence and
@@ -193,38 +199,19 @@ fn face_params(mood: Mood, frame: usize) -> Face {
     }
 }
 
-// ── Drawing primitives (pure buffer functions) ─────────────────────────────
+// ── Corvid drawing helpers ──────────────────────────────────────────────────
+//
+// The leaf primitives (`plot`/`fill`/`hline`) now come from [`Frame`], which
+// clips silently exactly as caw's hand-rolled versions did. These shape
+// helpers — discs, ellipses, triangles, arcs — aren't in `Frame`'s vocabulary,
+// so they stay caw-local, built on `Frame::plot`/`hline`.
 
-fn plot(buf: &mut [u8], x: i32, y: i32, col: Rgb) {
-    let (Ok(px), Ok(py)) = (usize::try_from(x), usize::try_from(y)) else {
-        return;
-    };
-    if px >= SIZE || py >= SIZE {
-        return;
-    }
-    let i = (py * SIZE + px) * 4;
-    buf[i..i + 3].copy_from_slice(&col);
-    buf[i + 3] = 0xff;
-}
-
-fn fill(buf: &mut [u8], col: Rgb) {
-    for px in buf.chunks_exact_mut(4) {
-        px[0..3].copy_from_slice(&col);
-        px[3] = 0xff;
-    }
-}
-
-fn hline(buf: &mut [u8], x0: i32, x1: i32, y: i32, col: Rgb) {
-    for x in x0.min(x1)..=x0.max(x1) {
-        plot(buf, x, y, col);
-    }
-}
-
-fn disc(buf: &mut [u8], cx: i32, cy: i32, r: i32, col: Rgb) {
+fn disc(f: &mut Frame, cx: i32, cy: i32, r: i32, col: Rgb) {
+    let c = rgba(col);
     for dy in -r..=r {
         for dx in -r..=r {
             if dx * dx + dy * dy <= r * r {
-                plot(buf, cx + dx, cy + dy, col);
+                f.plot(cx + dx, cy + dy, c);
             }
         }
     }
@@ -241,37 +228,40 @@ fn in_ellipse(dx: i32, dy: i32, rx: i32, ry: i32) -> bool {
 }
 
 /// A filled axis-aligned ellipse — heads and shoulders are longer than tall.
-fn ellipse(buf: &mut [u8], cx: i32, cy: i32, rx: i32, ry: i32, col: Rgb) {
+fn ellipse(f: &mut Frame, cx: i32, cy: i32, rx: i32, ry: i32, col: Rgb) {
+    let c = rgba(col);
     for dy in -ry..=ry {
         for dx in -rx..=rx {
             if in_ellipse(dx, dy, rx, ry) {
-                plot(buf, cx + dx, cy + dy, col);
+                f.plot(cx + dx, cy + dy, c);
             }
         }
     }
 }
 
 /// A hollow ring of radius `r` (a `w`-px-thick annulus), for glow halos.
-fn ring(buf: &mut [u8], cx: i32, cy: i32, r: i32, w: i32, col: Rgb) {
+fn ring(f: &mut Frame, cx: i32, cy: i32, r: i32, w: i32, col: Rgb) {
+    let c = rgba(col);
     let inner = (r - w).max(0);
     for dy in -r..=r {
         for dx in -r..=r {
             let d2 = dx * dx + dy * dy;
             if d2 <= r * r && d2 > inner * inner {
-                plot(buf, cx + dx, cy + dy, col);
+                f.plot(cx + dx, cy + dy, c);
             }
         }
     }
 }
 
-fn line(buf: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
+fn line(f: &mut Frame, mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
+    let c = rgba(col);
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
     loop {
-        plot(buf, x0, y0, col);
+        f.plot(x0, y0, c);
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -287,13 +277,14 @@ fn line(buf: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
     }
 }
 
-fn stroke(buf: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, col: Rgb) {
-    line(buf, x0, y0, x1, y1, col);
-    line(buf, x0, y0 + 1, x1, y1 + 1, col);
+fn stroke(f: &mut Frame, x0: i32, y0: i32, x1: i32, y1: i32, col: Rgb) {
+    line(f, x0, y0, x1, y1, col);
+    line(f, x0, y0 + 1, x1, y1 + 1, col);
 }
 
 #[allow(clippy::many_single_char_names)]
-fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col: Rgb) {
+fn fill_tri(f: &mut Frame, p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col: Rgb) {
+    let c = rgba(col);
     let edge = |a: (i32, i32), b: (i32, i32), px: i32, py: i32| {
         (b.0 - a.0) * (py - a.1) - (b.1 - a.1) * (px - a.0)
     };
@@ -308,7 +299,7 @@ fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col:
             let w2 = edge(p0, p1, px, py);
             let inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
             if inside {
-                plot(buf, px, py, col);
+                f.plot(px, py, c);
             }
         }
     }
@@ -316,18 +307,20 @@ fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col:
 
 /// A shallow 2px arc across `±hw` about (`cx`, `cy`). Positive `depth` bows the
 /// middle **down** (a ‿); negative bows it **up** (a ∩).
-fn arc(buf: &mut [u8], cx: i32, cy: i32, hw: i32, depth: i32, col: Rgb) {
+fn arc(f: &mut Frame, cx: i32, cy: i32, hw: i32, depth: i32, col: Rgb) {
     if hw == 0 {
         return;
     }
+    let c = rgba(col);
     for dx in -hw..=hw {
         let y = cy + depth - depth * dx * dx / (hw * hw);
-        plot(buf, cx + dx, y, col);
-        plot(buf, cx + dx, y + 1, col);
+        f.plot(cx + dx, y, c);
+        f.plot(cx + dx, y + 1, c);
     }
 }
 
-fn round_corners(buf: &mut [u8]) {
+fn round_corners(f: &mut Frame) {
+    let edge_col = rgba(SCREEN_EDGE);
     let last = DIM - 1;
     for py in 0..DIM {
         for px in 0..DIM {
@@ -346,7 +339,7 @@ fn round_corners(buf: &mut [u8]) {
                 0
             };
             if dx * dx + dy * dy > CORNER_R * CORNER_R {
-                plot(buf, px, py, SCREEN_EDGE);
+                f.plot(px, py, edge_col);
             }
         }
     }
@@ -381,69 +374,71 @@ const BEAK_GAPE: (i32, i32) = (74, 66);
 /// Shoulders + breast: a wide dark mass rising to meet the head (no floating
 /// ball), with a folded-wing seam and a few breast-feather ticks so it reads
 /// as plumage.
-fn draw_body(buf: &mut [u8]) {
-    ellipse(buf, 74, 122, 54, 42, OUTLINE);
-    ellipse(buf, 74, 124, 52, 40, FEATHER);
+fn draw_body(f: &mut Frame) {
+    ellipse(f, 74, 122, 54, 42, OUTLINE);
+    ellipse(f, 74, 124, 52, 40, FEATHER);
     // Folded wing: darker seams sweeping over the right shoulder.
-    stroke(buf, 60, 96, 100, 104, OUTLINE);
-    stroke(buf, 70, 108, 104, 118, OUTLINE);
+    stroke(f, 60, 96, 100, 104, OUTLINE);
+    stroke(f, 70, 108, 104, 118, OUTLINE);
     // Breast feather ticks.
     for &(x, y) in &[(46, 108), (56, 118), (42, 120)] {
-        hline(buf, x, x + 4, y, FEATHER_HI);
+        f.hline(x, x + 4, y, rgba(FEATHER_HI));
     }
     // Shoulder rim-light where the screen glow catches the wing.
-    stroke(buf, 92, 92, 112, 104, RIM);
+    stroke(f, 92, 92, 112, 104, RIM);
 }
 
 /// Skull + face: an ellipse with a cool rim-light along the upper-left
 /// silhouette (so the black bird separates from the dark screen) and shaggy
 /// throat hackles where head meets breast.
-fn draw_head(buf: &mut [u8]) {
-    ellipse(buf, HEAD_CX, HEAD_CY, HEAD_RX + 2, HEAD_RY + 2, OUTLINE);
-    ellipse(buf, HEAD_CX, HEAD_CY, HEAD_RX, HEAD_RY, FEATHER);
+fn draw_head(f: &mut Frame) {
+    ellipse(f, HEAD_CX, HEAD_CY, HEAD_RX + 2, HEAD_RY + 2, OUTLINE);
+    ellipse(f, HEAD_CX, HEAD_CY, HEAD_RX, HEAD_RY, FEATHER);
     // Crown light: a softer feather tone over the top third of the skull.
+    let hi = rgba(FEATHER_HI);
     for dy in -HEAD_RY..-(HEAD_RY / 2) {
         for dx in -HEAD_RX..=HEAD_RX {
             if in_ellipse(dx, dy, HEAD_RX, HEAD_RY)
                 && !in_ellipse(dx, dy + 6, HEAD_RX - 8, HEAD_RY - 8)
             {
-                plot(buf, HEAD_CX + dx, HEAD_CY + dy, FEATHER_HI);
+                f.plot(HEAD_CX + dx, HEAD_CY + dy, hi);
             }
         }
     }
     // Rim-light band hugging the inside of the upper-left silhouette.
+    let rim = rgba(RIM);
     for dy in -HEAD_RY..=0 {
         for dx in -HEAD_RX..0 {
             if in_ellipse(dx, dy, HEAD_RX, HEAD_RY)
                 && !in_ellipse(dx, dy, HEAD_RX - 2, HEAD_RY - 2)
                 && dy < -HEAD_RY / 4
             {
-                plot(buf, HEAD_CX + dx, HEAD_CY + dy, RIM);
+                f.plot(HEAD_CX + dx, HEAD_CY + dy, rim);
             }
         }
     }
     // Throat hackles: ragged little feather spikes off the jaw into the breast.
     for &(bx, by, len) in &[(48, 72, 7), (58, 77, 9), (69, 79, 8), (80, 75, 6)] {
-        fill_tri(buf, (bx - 3, by), (bx + 3, by), (bx, by + len), OUTLINE);
-        fill_tri(buf, (bx - 2, by), (bx + 2, by), (bx, by + len - 2), FEATHER);
+        fill_tri(f, (bx - 3, by), (bx + 3, by), (bx, by + len), OUTLINE);
+        fill_tri(f, (bx - 2, by), (bx + 2, by), (bx, by + len - 2), FEATHER);
     }
 }
 
 /// Iridescent sheen streaks that drift across the crown and shoulder with the
 /// frame — the oil-slick blue/teal glint on a corvid's black feathers.
-fn draw_sheen(buf: &mut [u8], frame: usize) {
+fn draw_sheen(f: &mut Frame, frame: usize) {
     let d = i32::try_from(frame % 4).unwrap_or(0) - 1;
-    stroke(buf, 52 + d, 32, 66 + d, 27, SHEEN_BLUE);
-    stroke(buf, 74 - d, 27, 88 - d, 33, SHEEN_TEAL);
-    plot(buf, 62 + d, 26, SHEEN_TEAL);
-    plot(buf, 80 - d, 25, SHEEN_BLUE);
+    stroke(f, 52 + d, 32, 66 + d, 27, SHEEN_BLUE);
+    stroke(f, 74 - d, 27, 88 - d, 33, SHEEN_TEAL);
+    f.plot(62 + d, 26, rgba(SHEEN_TEAL));
+    f.plot(80 - d, 25, rgba(SHEEN_BLUE));
     // A glint on the folded wing too.
-    stroke(buf, 84 - d, 118, 98 - d, 122, SHEEN_BLUE);
+    stroke(f, 84 - d, 118, 98 - d, 122, SHEEN_BLUE);
 }
 
 /// The head-feather crest: four ragged tufts along the crown, their splay set
 /// by mood — short and hugging the skull, not antenna horns.
-fn draw_crest(buf: &mut [u8], crest: Crest, frame: usize) {
+fn draw_crest(f: &mut Frame, crest: Crest, frame: usize) {
     let wob = i32::try_from(frame % 2).unwrap_or(0);
     // (base_x, base_y, tip offset) per tuft; crows keep it low and scruffy.
     let tufts: [(i32, i32, (i32, i32)); 4] = match crest {
@@ -475,9 +470,9 @@ fn draw_crest(buf: &mut [u8], crest: Crest, frame: usize) {
     for (bx, by, (tdx, tdy)) in tufts {
         let tip = (bx + tdx, by + tdy + wob);
         // Solid near-black feathers (light cores read as antennae, not plumage).
-        fill_tri(buf, (bx - 7, by + 5), (bx + 7, by + 5), tip, OUTLINE);
+        fill_tri(f, (bx - 7, by + 5), (bx + 7, by + 5), tip, OUTLINE);
         fill_tri(
-            buf,
+            f,
             shrink((bx - 7, by + 5), tip, 1),
             shrink((bx + 7, by + 5), tip, 1),
             shrink(tip, (bx, by + 5), 1),
@@ -486,72 +481,72 @@ fn draw_crest(buf: &mut [u8], crest: Crest, frame: usize) {
     }
 }
 
-fn draw_eyes(buf: &mut [u8], eyes: EyeShape, look: i32, glow: bool, intensity: u8, frame: usize) {
+fn draw_eyes(f: &mut Frame, eyes: EyeShape, look: i32, glow: bool, intensity: u8, frame: usize) {
     // Chaos glow: a pulsing cyan halo behind each eye, brighter with intensity.
     if glow {
         let pulse = i32::from(frame.is_multiple_of(2));
         let r = 7 + pulse + i32::from(intensity > 160);
         let halo = if intensity > 200 { GLOW_HOT } else { GLOW };
-        ring(buf, EYE_LX, EYE_Y, r, 2, halo);
-        ring(buf, EYE_RX, EYE_Y, r, 2, halo);
+        ring(f, EYE_LX, EYE_Y, r, 2, halo);
+        ring(f, EYE_RX, EYE_Y, r, 2, halo);
     }
     match eyes {
         EyeShape::Round => {
-            corvid_eye(buf, EYE_LX, EYE_Y, 5, look, glow);
-            corvid_eye(buf, EYE_RX, EYE_Y, 5, look, glow);
+            corvid_eye(f, EYE_LX, EYE_Y, 5, look, glow);
+            corvid_eye(f, EYE_RX, EYE_Y, 5, look, glow);
         }
         EyeShape::Wide => {
-            corvid_eye(buf, EYE_LX, EYE_Y, 7, 0, glow);
-            corvid_eye(buf, EYE_RX, EYE_Y, 7, 0, glow);
+            corvid_eye(f, EYE_LX, EYE_Y, 7, 0, glow);
+            corvid_eye(f, EYE_RX, EYE_Y, 7, 0, glow);
         }
         EyeShape::Half => {
-            half_eye(buf, EYE_LX, look);
-            half_eye(buf, EYE_RX, look);
+            half_eye(f, EYE_LX, look);
+            half_eye(f, EYE_RX, look);
         }
         EyeShape::Narrow => {
-            disc(buf, EYE_LX, EYE_Y + 1, 4, EYE_RING);
-            disc(buf, EYE_RX, EYE_Y + 1, 4, EYE_RING);
-            disc(buf, EYE_LX, EYE_Y + 1, 2, PUPIL);
-            disc(buf, EYE_RX, EYE_Y + 1, 2, PUPIL);
+            disc(f, EYE_LX, EYE_Y + 1, 4, EYE_RING);
+            disc(f, EYE_RX, EYE_Y + 1, 4, EYE_RING);
+            disc(f, EYE_LX, EYE_Y + 1, 2, PUPIL);
+            disc(f, EYE_RX, EYE_Y + 1, 2, PUPIL);
             // Angry brow feathers slanting down toward the beak base.
-            stroke(buf, EYE_LX - 7, EYE_Y - 8, EYE_LX + 5, EYE_Y - 3, OUTLINE);
-            stroke(buf, EYE_RX - 5, EYE_Y - 3, EYE_RX + 7, EYE_Y - 8, OUTLINE);
+            stroke(f, EYE_LX - 7, EYE_Y - 8, EYE_LX + 5, EYE_Y - 3, OUTLINE);
+            stroke(f, EYE_RX - 5, EYE_Y - 3, EYE_RX + 7, EYE_Y - 8, OUTLINE);
         }
         EyeShape::Closed => {
-            arc(buf, EYE_LX, EYE_Y, 5, 3, PUPIL);
-            arc(buf, EYE_RX, EYE_Y, 5, 3, PUPIL);
+            arc(f, EYE_LX, EYE_Y, 5, 3, PUPIL);
+            arc(f, EYE_RX, EYE_Y, 5, 3, PUPIL);
         }
     }
 }
 
 /// A half-lidded (smug) eye: a low pupil under a heavy drooping lid.
-fn half_eye(buf: &mut [u8], cx: i32, look: i32) {
-    disc(buf, cx, EYE_Y + 1, 4, EYE_RING);
-    disc(buf, cx + look, EYE_Y + 1, 2, PUPIL);
+fn half_eye(f: &mut Frame, cx: i32, look: i32) {
+    disc(f, cx, EYE_Y + 1, 4, EYE_RING);
+    disc(f, cx + look, EYE_Y + 1, 2, PUPIL);
     // Heavy lid across the top of the eye, slanting for the smug read.
-    stroke(buf, cx - 5, EYE_Y - 2, cx + 5, EYE_Y - 3, PUPIL);
+    stroke(f, cx - 5, EYE_Y - 2, cx + 5, EYE_Y - 3, PUPIL);
 }
 
 /// A corvid eye: pale ring, dark pupil filling most of it, a glint (cyan when
 /// glowing). Beady on purpose — big irises read owl, not crow.
-fn corvid_eye(buf: &mut [u8], cx: i32, cy: i32, r: i32, look: i32, glow: bool) {
-    disc(buf, cx, cy, r, EYE_RING);
-    disc(buf, cx + look, cy, r - 2, PUPIL);
+fn corvid_eye(f: &mut Frame, cx: i32, cy: i32, r: i32, look: i32, glow: bool) {
+    disc(f, cx, cy, r, EYE_RING);
+    disc(f, cx + look, cy, r - 2, PUPIL);
     let glint = if glow { GLOW } else { HIGHLIGHT };
-    disc(buf, cx - 1 + look, cy - 1, 1, glint);
+    disc(f, cx - 1 + look, cy - 1, 1, glint);
 }
 
 /// The beak — the feature that makes her a crow: a long, heavy graphite wedge
 /// from between the eyes jutting down-left past the head silhouette, with a
 /// bright culmen ridge, a gape line, and nares (nostril dots) at the base.
-fn draw_beak(buf: &mut [u8], beak: BeakShape) {
+fn draw_beak(f: &mut Frame, beak: BeakShape) {
     match beak {
         BeakShape::Closed => {
             let tip = (16, 84);
             // One outlined wedge, then the mandible split drawn over it.
-            fill_tri(buf, BEAK_BASE, BEAK_GAPE, tip, OUTLINE);
+            fill_tri(f, BEAK_BASE, BEAK_GAPE, tip, OUTLINE);
             fill_tri(
-                buf,
+                f,
                 shrink(BEAK_BASE, BEAK_GAPE, 2),
                 shrink(BEAK_GAPE, BEAK_BASE, 2),
                 shrink(tip, BEAK_GAPE, 3),
@@ -559,7 +554,7 @@ fn draw_beak(buf: &mut [u8], beak: BeakShape) {
             );
             // Culmen ridge along the top edge so the beak catches light.
             line(
-                buf,
+                f,
                 BEAK_BASE.0,
                 BEAK_BASE.1 + 2,
                 tip.0 + 3,
@@ -568,7 +563,7 @@ fn draw_beak(buf: &mut [u8], beak: BeakShape) {
             );
             // Gape line from the mouth corner to just short of the tip.
             line(
-                buf,
+                f,
                 BEAK_GAPE.0 - 3,
                 BEAK_GAPE.1 - 1,
                 tip.0 + 5,
@@ -576,8 +571,8 @@ fn draw_beak(buf: &mut [u8], beak: BeakShape) {
                 OUTLINE,
             );
             // Nares: two dark nostril dots near the base.
-            plot(buf, 52, 54, OUTLINE);
-            plot(buf, 47, 58, OUTLINE);
+            f.plot(52, 54, rgba(OUTLINE));
+            f.plot(47, 58, rgba(OUTLINE));
         }
         BeakShape::Open => {
             // Both mandibles hinge at the mouth corner so the open beak stays
@@ -586,47 +581,47 @@ fn draw_beak(buf: &mut [u8], beak: BeakShape) {
             let hinge = (72, 63);
             let up_tip = (14, 70);
             let low_tip = (30, 96);
-            fill_tri(buf, (70, 63), (32, 73), (40, 84), BEAK_IN);
+            fill_tri(f, (70, 63), (32, 73), (40, 84), BEAK_IN);
             // Upper mandible.
-            fill_tri(buf, (60, 45), hinge, up_tip, OUTLINE);
+            fill_tri(f, (60, 45), hinge, up_tip, OUTLINE);
             fill_tri(
-                buf,
+                f,
                 shrink((60, 45), hinge, 2),
                 shrink(hinge, (60, 45), 2),
                 shrink(up_tip, hinge, 3),
                 BEAK,
             );
             // Lower mandible.
-            fill_tri(buf, hinge, (77, 71), low_tip, OUTLINE);
+            fill_tri(f, hinge, (77, 71), low_tip, OUTLINE);
             fill_tri(
-                buf,
+                f,
                 shrink(hinge, (77, 71), 1),
                 shrink((77, 71), hinge, 1),
                 shrink(low_tip, (77, 71), 2),
                 BEAK,
             );
-            line(buf, 60, 47, up_tip.0 + 3, up_tip.1 - 1, BEAK_HI);
-            plot(buf, 52, 52, OUTLINE);
-            plot(buf, 47, 56, OUTLINE);
+            line(f, 60, 47, up_tip.0 + 3, up_tip.1 - 1, BEAK_HI);
+            f.plot(52, 52, rgba(OUTLINE));
+            f.plot(47, 56, rgba(OUTLINE));
         }
     }
 }
 
-fn draw_extra(buf: &mut [u8], extra: Extra, frame: usize, intensity: u8) {
+fn draw_extra(f: &mut Frame, extra: Extra, frame: usize, intensity: u8) {
     match extra {
         Extra::None => {}
-        Extra::Glow => draw_glow_bits(buf, frame, intensity),
-        Extra::Sparkle => draw_sparkles(buf, frame),
-        Extra::SchemingDots(n) => draw_dots(buf, n),
-        Extra::Zzz(n) => draw_zzz(buf, n),
-        Extra::Huff => draw_huff(buf, frame),
-        Extra::Chirp => draw_chirp(buf, frame),
+        Extra::Glow => draw_glow_bits(f, frame, intensity),
+        Extra::Sparkle => draw_sparkles(f, frame),
+        Extra::SchemingDots(n) => draw_dots(f, n),
+        Extra::Zzz(n) => draw_zzz(f, n),
+        Extra::Huff => draw_huff(f, frame),
+        Extra::Chirp => draw_chirp(f, frame),
     }
 }
 
 /// Chaos energy: little cyan/magenta glitch pixels flickering around the head,
 /// denser with intensity — the "rogue DHCP broadcasting on UDP 67" static.
-fn draw_glow_bits(buf: &mut [u8], frame: usize, intensity: u8) {
+fn draw_glow_bits(f: &mut Frame, frame: usize, intensity: u8) {
     let bits = [
         (22, 24),
         (108, 22),
@@ -639,59 +634,59 @@ fn draw_glow_bits(buf: &mut [u8], frame: usize, intensity: u8) {
     let n = 2 + (intensity as usize) * (bits.len() - 2) / 255;
     for (i, &(x, y)) in bits.iter().take(n).enumerate() {
         if frame.wrapping_add(i).is_multiple_of(2) {
-            let c = if i % 2 == 0 { GLOW } else { GLOW_HOT };
-            plot(buf, x, y, c);
-            plot(buf, x + 1, y, c);
-            plot(buf, x, y + 1, c);
+            let c = rgba(if i % 2 == 0 { GLOW } else { GLOW_HOT });
+            f.plot(x, y, c);
+            f.plot(x + 1, y, c);
+            f.plot(x, y + 1, c);
         }
     }
 }
 
-fn draw_sparkles(buf: &mut [u8], frame: usize) {
+fn draw_sparkles(f: &mut Frame, frame: usize) {
     let stars = [(24, 22), (106, 34), (104, 96)];
     for (i, &(cx, cy)) in stars.iter().enumerate() {
         let s = 3 + i32::from(frame.wrapping_add(i).is_multiple_of(2)) * 2;
-        hline(buf, cx - s, cx + s, cy, SPARKLE);
+        f.hline(cx - s, cx + s, cy, rgba(SPARKLE));
         for dy in -s..=s {
-            plot(buf, cx, cy + dy, SPARKLE);
+            f.plot(cx, cy + dy, rgba(SPARKLE));
         }
-        plot(buf, cx, cy, HIGHLIGHT);
+        f.plot(cx, cy, rgba(HIGHLIGHT));
     }
 }
 
-fn draw_dots(buf: &mut [u8], n: usize) {
+fn draw_dots(f: &mut Frame, n: usize) {
     let dots = [(98, 20), (108, 20), (118, 20)];
     for &(cx, cy) in dots.iter().take(n) {
-        disc(buf, cx, cy, 2, DOT);
+        disc(f, cx, cy, 2, DOT);
     }
 }
 
-fn draw_zzz(buf: &mut [u8], n: usize) {
+fn draw_zzz(f: &mut Frame, n: usize) {
     let zs = [(98, 34, 5), (106, 22, 7), (114, 8, 9)];
     for &(x, y, s) in zs.iter().take(n) {
-        hline(buf, x, x + s, y, ZZZ);
-        line(buf, x + s, y, x, y + s, ZZZ);
-        hline(buf, x, x + s, y + s, ZZZ);
+        f.hline(x, x + s, y, rgba(ZZZ));
+        line(f, x + s, y, x, y + s, ZZZ);
+        f.hline(x, x + s, y + s, rgba(ZZZ));
     }
 }
 
 /// Two pale-blue huff puffs off the beak tip — indignant *ruffles feathers*.
-fn draw_huff(buf: &mut [u8], frame: usize) {
+fn draw_huff(f: &mut Frame, frame: usize) {
     let d = i32::try_from(frame % 3).unwrap_or(0);
-    disc(buf, 12 - d, 70 - d, 3, HUFF);
-    disc(buf, 22 - d, 62 - d, 2, HUFF);
+    disc(f, 12 - d, 70 - d, 3, HUFF);
+    disc(f, 22 - d, 62 - d, 2, HUFF);
 }
 
 /// A little pink heart and a sparkle — chirp / <3.
-fn draw_chirp(buf: &mut [u8], frame: usize) {
+fn draw_chirp(f: &mut Frame, frame: usize) {
     let (cx, cy) = (104, 30 - i32::try_from(frame % 2).unwrap_or(0));
-    disc(buf, cx - 2, cy, 2, HEART);
-    disc(buf, cx + 2, cy, 2, HEART);
-    fill_tri(buf, (cx - 4, cy + 1), (cx + 4, cy + 1), (cx, cy + 6), HEART);
-    plot(buf, 24, 30, HIGHLIGHT);
-    hline(buf, 22, 26, 30, SPARKLE);
+    disc(f, cx - 2, cy, 2, HEART);
+    disc(f, cx + 2, cy, 2, HEART);
+    fill_tri(f, (cx - 4, cy + 1), (cx + 4, cy + 1), (cx, cy + 6), HEART);
+    f.plot(24, 30, rgba(HIGHLIGHT));
+    f.hline(22, 26, 30, rgba(SPARKLE));
     for dy in -2..=2 {
-        plot(buf, 24, 30 + dy, SPARKLE);
+        f.plot(24, 30 + dy, rgba(SPARKLE));
     }
 }
 
@@ -719,7 +714,7 @@ mod tests {
                 for intensity in [0u8, 128, 255] {
                     let buf = render(mood, frame, intensity);
                     assert_eq!(
-                        buf.len(),
+                        buf.data().len(),
                         SIZE * SIZE * 4,
                         "{mood:?} frame {frame} i{intensity} must be a full 128x128 RGBA8 buffer"
                     );
@@ -731,7 +726,7 @@ mod tests {
     #[test]
     fn every_pixel_is_opaque() {
         let buf = render(Mood::Chaos, 0, 200);
-        assert!(buf.chunks_exact(4).all(|px| px[3] == 0xff));
+        assert!(buf.data().chunks_exact(4).all(|px| px[3] == 0xff));
     }
 
     #[test]
@@ -941,7 +936,7 @@ mod tests {
         for mood in MOODS {
             for frame in 0..40 {
                 for intensity in [0u8, 128, 255] {
-                    let got = fnv1a_64(&render(mood, frame, intensity));
+                    let got = fnv1a_64(render(mood, frame, intensity).data());
                     assert_eq!(
                         got, GOLDEN[i],
                         "byte drift at mood {mood:?} frame {frame} intensity {intensity}"

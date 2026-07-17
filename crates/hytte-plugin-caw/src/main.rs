@@ -234,19 +234,17 @@ impl Plugin for Caw {
     fn view(&self) -> Node {
         let (mood, message, action) = self.displayed();
 
+        // `Frame::into_node` bakes the `Node::Pixels` (id/width/height/data and
+        // the `scale: 1` the preem kit always wants) so caw can't re-introduce
+        // the hand-set `scale` that red-carded main in #364. The shell's
+        // `.caw-lcd` CSS px rule still owns the on-screen size.
         let face = Node::Button {
             id: FACE_ID.to_owned(),
             classes: vec!["caw-face".to_owned(), format!("caw-mood-{}", mood.css())],
-            child: Box::new(Node::Pixels {
-                id: Some("caw-lcd".to_owned()),
-                width: face::SIZE_U32,
-                height: face::SIZE_U32,
-                data: face::render(mood, self.frame, self.intensity()),
-                // 1×: the shell's `.caw-lcd` CSS px rule still owns the on-screen
-                // size (the #358 `scale` hint is for plugins without one).
-                scale: 1,
-                classes: vec!["caw-lcd".to_owned()],
-            }),
+            child: Box::new(
+                face::render(mood, self.frame, self.intensity())
+                    .into_node(Some("caw-lcd"), vec!["caw-lcd".to_owned()]),
+            ),
         };
 
         // Center the 128 px face in the wider card.

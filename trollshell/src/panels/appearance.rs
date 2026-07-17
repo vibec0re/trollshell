@@ -7,11 +7,15 @@
 //!
 //! Per-output (per-monitor) wallpaper, time-of-day rotation, and an explicit
 //! "Clear" button are deliberately deferred. See `etc/wallpaper/README.md`.
+//!
+//! Also home to the **Night light** toggle (color temperature) — an appearance
+//! concern that flips the zero-state `wlsunset` user unit via the `nightlight`
+//! service. Config (lat/lon + day/night temps) lives in the nix module.
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, gio};
 use hytte::prelude::*;
-use hytte::services::wallpaper;
+use hytte::services::{nightlight, wallpaper};
 
 use crate::components::layout::{finish_page, page_box};
 
@@ -45,7 +49,35 @@ pub fn panel_appearance() -> gtk::Widget {
     group.add(&row);
 
     column.append(&group);
+    column.append(&build_display_group());
     finish_page(&column)
+}
+
+/// "Display" preferences group holding the Night light toggle. The switch's
+/// `active` is driven by the daemon's authoritative state
+/// (`nightlight::enabled()`), NOT local widget state — so any monitor's drawer
+/// reflects the same toggle and a drawer rebuild never loses track. Flipping it
+/// starts/stops the `wlsunset` user unit.
+fn build_display_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Display").build();
+
+    let row = adw::SwitchRow::builder()
+        .title("Night light")
+        .subtitle("Warm the screen's color temperature after sunset")
+        .build();
+
+    // Two-way: the authoritative signal drives `active` (the block prevents the
+    // programmatic set_active from re-entering the handler); a user flip calls
+    // set_enabled, which toggles the user unit off the GTK thread.
+    bind_two_way(
+        nightlight::enabled(),
+        &row,
+        adw::SwitchRow::set_active,
+        |r| r.connect_active_notify(|r| nightlight::set_enabled(r.is_active())),
+    );
+
+    group.add(&row);
+    group
 }
 
 /// Last path component of a wallpaper path, with the original returned if

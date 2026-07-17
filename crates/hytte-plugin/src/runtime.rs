@@ -88,10 +88,12 @@ where
     // mounts before the first state snapshot lands.
     let mut model = P::init(cmd_tx);
     let mut last_tree = model.view();
+    let mut last_panel = model.panel();
     write_frame(
         &mut wr,
         &PluginMsg::Render {
             tree: last_tree.clone(),
+            panel: last_panel.clone(),
             effects: Vec::new(),
         },
     )
@@ -153,20 +155,25 @@ where
             },
         };
 
-        // update → view → dedup: send iff the tree changed or there are
-        // effects to deliver (effects ride the render frame, so a non-empty
-        // batch forces a send even for an identical tree).
+        // update → view → dedup: send iff the tree OR the panel changed, or
+        // there are effects to deliver (effects ride the render frame, so a
+        // non-empty batch forces a send even for an identical tree). Extending
+        // dedup to the panel lets a plugin re-render its open panel while the
+        // chip tree is unchanged (the common case) still push a frame.
         let effects = model.update(input);
         let tree = model.view();
-        if !effects.is_empty() || tree != last_tree {
+        let panel = model.panel();
+        if !effects.is_empty() || tree != last_tree || panel != last_panel {
             let frame = PluginMsg::Render {
                 tree: tree.clone(),
+                panel: panel.clone(),
                 effects,
             };
             if let Err(e) = write_frame(&mut wr, &frame).await {
                 break Err(e);
             }
             last_tree = tree;
+            last_panel = panel;
         }
     };
     // Stop reading; the caller drops the write half, which half-closes the
@@ -457,6 +464,50 @@ mod tests {
         }
     }
 
+    /// Constant `view`, but its `panel` flips on a slot-visibility toggle — so a
+    /// panel change with an *unchanged* chip tree still forces a render frame
+    /// (#349 PR2: the panel is deduped independently of the view).
+    struct Paneled {
+        open: bool,
+    }
+
+    impl Plugin for Paneled {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("paneled-test", Mount::BarCenter)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { open: false }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::SlotVisible(v) = input {
+                self.open = v;
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> Node {
+            // Constant chip tree — never changes across the panel flip.
+            Node::Label {
+                id: Some("paneled-chip".to_owned()),
+                text: "chip".to_owned(),
+                classes: Vec::new(),
+            }
+        }
+
+        fn panel(&self) -> Option<Node> {
+            Some(Node::Label {
+                id: Some("paneled-panel".to_owned()),
+                text: if self.open { "open" } else { "closed" }.to_owned(),
+                classes: Vec::new(),
+            })
+        }
+    }
+
     /// A minimal I/O "task" for [`Commander`]: it *is* the sources stream —
     /// each command drained from the [`CmdReceiver`] is turned into an app
     /// message. Stands in for a real plugin's socket/HTTP task, which likewise
@@ -562,7 +613,7 @@ mod tests {
         let PluginMsg::Log { .. } = next_plugin_frame(rd).await else {
             panic!("second frame must be the greeting Log");
         };
-        let PluginMsg::Render { tree, effects } = next_plugin_frame(rd).await else {
+        let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(rd).await else {
             panic!("third frame must be the seed Render");
         };
         assert!(effects.is_empty(), "seed render carries no effects");
@@ -606,7 +657,7 @@ mod tests {
             eat_handshake(&mut hrd, "echo-test").await;
 
             send(&mut hwr, &snapshot("10:00")).await;
-            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("a changed snapshot must re-render");
             };
             assert!(effects.is_empty());
@@ -652,6 +703,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panel_change_alone_forces_a_render() {
+        // #349 PR2: dedup now covers the panel independently of the chip tree.
+        // `Paneled`'s `view` is constant but its `panel` flips on a visibility
+        // toggle, so a panel change with an unchanged chip tree must still emit
+        // a `Render` — and an identical (tree, panel) pair must still be deduped.
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            // Seed handshake: the seed Render carries the initial (closed) panel.
+            let PluginMsg::Register { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("second frame must be the greeting Log");
+            };
+            let PluginMsg::Render {
+                tree,
+                panel,
+                effects,
+            } = next_plugin_frame(&mut hrd).await
+            else {
+                panic!("third frame must be the seed Render");
+            };
+            assert!(effects.is_empty(), "seed render carries no effects");
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "chip"),
+                "seed chip tree",
+            );
+            assert!(
+                matches!(panel, Some(Node::Label { ref text, .. }) if text == "closed"),
+                "seed render carries the initial panel",
+            );
+
+            // Flip the panel while the chip tree stays constant → a frame is
+            // still forced, and its `panel` reflects the change though `tree`
+            // did not.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            let PluginMsg::Render {
+                tree,
+                panel,
+                effects,
+            } = next_plugin_frame(&mut hrd).await
+            else {
+                panic!("a panel change alone must re-render");
+            };
+            assert!(effects.is_empty());
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "chip"),
+                "the chip tree is unchanged across the panel flip",
+            );
+            assert!(
+                matches!(panel, Some(Node::Label { ref text, .. }) if text == "open"),
+                "the render reflects the new panel",
+            );
+
+            // The same visibility again → identical (tree, panel) → deduped. The
+            // Ping is the sync barrier: the next frame must be its Pong.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            send(&mut hwr, &HostMsg::Ping { seq: 5 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 5 }
+                ),
+                "identical (tree, panel) must be deduped (Pong, not Render, follows)",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Paneled, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+    }
+
+    #[tokio::test]
     async fn effects_force_a_send_even_with_unchanged_tree() {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
@@ -668,7 +796,7 @@ mod tests {
                 },
             )
             .await;
-            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("a click with effects must produce a Render frame");
             };
             assert_eq!(effects, vec![Effect::OpenPage(Page::PowerMenu)]);
@@ -836,7 +964,7 @@ mod tests {
 
             // "sidebar opened" → the plugin folds SlotVisible(true) and re-renders.
             send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
-            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("a visibility push must reach update() and re-render");
             };
             assert!(effects.is_empty());
@@ -881,7 +1009,7 @@ mod tests {
                 },
             )
             .await;
-            let PluginMsg::Render { tree, effects } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("the echoed command must re-render");
             };
             assert!(

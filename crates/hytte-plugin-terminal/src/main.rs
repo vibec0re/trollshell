@@ -397,6 +397,7 @@ mod tests {
         let _ = m.update(submit("hej"));
         let render = PluginMsg::Render {
             tree: m.view(),
+            panel: m.panel(),
             effects: Vec::new(),
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

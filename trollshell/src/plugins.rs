@@ -94,13 +94,18 @@
 //!   sides share one reconciler path ([`build_region`]); a bar region just lays
 //!   its cards out horizontally with the chip class. `SidebarLead` (#301) leads
 //!   the sidebar — its cards render *above* the built-in weather/calendar/tasks
-//!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot. The
-//!   optional per-chip drawer *panel* (`Effect`-opened) remains a follow-up; a
-//!   chip need not have a drawer.
+//!   cards, which `SidebarTop`/`SidebarBottom` (mounted after them) cannot. A
+//!   plugin (chip or card) may **also** define an optional drawer *panel* (#349
+//!   PR2): a second `Node` tree carried on the render frame's `panel` field,
+//!   parked in the dedicated [`PluginHandles::panels`] mailbox and rendered by
+//!   the per-monitor plugin drawer child ([`plugin_panel_slot`]); the plugin
+//!   opens it by emitting `Effect::OpenPage(Page::PluginSelf)`. A chip/card need
+//!   not have a panel (`panel: None`).
 //! - **State:** only [`StateKey::Clock`].
-//! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer) and
-//!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236) are brokered; every
-//!   other effect is logged "unsupported in v1" and skipped. Capability
+//! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer, incl. `PluginSelf`
+//!   → the plugin's own panel, #349 PR2) and [`Effect::RaiseOsd`] (→ the
+//!   transient OSD nudge, #236) are brokered; every other effect is logged
+//!   "unsupported in v1" and skipped. Capability
 //!   enforcement stays **declarative-only** (the cap is requested + audit-logged
 //!   but not enforced by a cap store — v1 parity); audit-log / the `RunCommand`
 //!   round-trip remain deferred.
@@ -113,6 +118,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Local};
+use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
@@ -155,6 +161,13 @@ struct SlotRender {
     order: i32,
     generation: u64,
     tree: wire::Node,
+    /// The plugin's optional drawer *panel* tree (#349 PR2), carried alongside
+    /// the chip/card `tree` on the same frame. Ignored by the region
+    /// reconcilers (they render `tree`); read by the per-monitor plugin drawer
+    /// child ([`plugin_panel_slot`]) when this plugin's panel is the active one.
+    /// A `SlotRender` parked in the dedicated `panels` mailbox always carries
+    /// `Some`.
+    panel: Option<wire::Node>,
     outbound: mpsc::UnboundedSender<HostMsg>,
 }
 
@@ -182,6 +195,19 @@ pub struct PluginHandles {
     bar_left: Mutable<Vec<SlotRender>>,
     bar_center: Mutable<Vec<SlotRender>>,
     bar_right: Mutable<Vec<SlotRender>>,
+    /// Every plugin's latest drawer *panel* tree (#349 PR2), coalesced
+    /// latest-wins per plugin id and carrying its generation for teardown — the
+    /// same shape as a region mailbox, but a **single** list across all mounts
+    /// (a plugin has one panel regardless of where its chip/card mounts).
+    /// Written by the reader task; read by the per-monitor plugin drawer child.
+    /// Routing it through the same [`upsert_region`]/[`clear_region_if_owned`]
+    /// as the six regions inherits the #278 generation guard for free.
+    panels: Mutable<Vec<SlotRender>>,
+    /// The plugin id whose panel is currently shown in a drawer (any monitor),
+    /// or `None`. GTK-thread-only: set by [`set_active_panel`] on drawer
+    /// open/switch, cleared on close. Combined with `panels`, it drives which
+    /// panel tree each per-monitor plugin drawer child renders.
+    active_panel_id: Mutable<Option<String>>,
     clock_tx: watch::Sender<Option<ClockState>>,
     /// Aggregate slot visibility (OR of every monitor's sidebar open flag),
     /// written on the GTK thread ([`set_sidebar_visibility`]) and subscribed
@@ -200,6 +226,8 @@ struct ListenerCtx {
     bar_left: Mutable<Vec<SlotRender>>,
     bar_center: Mutable<Vec<SlotRender>>,
     bar_right: Mutable<Vec<SlotRender>>,
+    /// The dedicated panel mailbox (#349 PR2); see [`PluginHandles::panels`].
+    panels: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
     visibility_rx: watch::Receiver<bool>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
@@ -221,6 +249,8 @@ impl Service for PluginsService {
             bar_left: Mutable::new(Vec::new()),
             bar_center: Mutable::new(Vec::new()),
             bar_right: Mutable::new(Vec::new()),
+            panels: Mutable::new(Vec::new()),
+            active_panel_id: Mutable::new(None),
             clock_tx,
             visibility_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
@@ -232,6 +262,7 @@ impl Service for PluginsService {
             bar_left: handles.bar_left.clone(),
             bar_center: handles.bar_center.clone(),
             bar_right: handles.bar_right.clone(),
+            panels: handles.panels.clone(),
             clock_rx,
             visibility_rx,
             effects_tx,
@@ -437,11 +468,16 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// remain deferred — see the module doc / PR body).
 fn broker_effect(plugin_id: &str, effect: &Effect) {
     match effect {
-        Effect::OpenPage(page) => {
-            let target = map_page(*page);
-            tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
-            crate::modal::open_on_focused(None, target);
-        }
+        Effect::OpenPage(page) => match resolve_open_page(*page) {
+            PageAction::OpenBuiltin(target) => {
+                tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
+                crate::modal::open_on_focused(None, target);
+            }
+            PageAction::OpenPluginSelf => {
+                tracing::info!(plugin = %plugin_id, "plugin effect: OpenPage(PluginSelf)");
+                crate::modal::open_plugin_on_focused(None, plugin_id);
+            }
+        },
         Effect::RaiseOsd { title, body, icon } => {
             tracing::info!(plugin = %plugin_id, title = %title, "plugin effect: RaiseOsd");
             crate::overlays::osd::nudge(title, body, icon.as_deref());
@@ -658,6 +694,113 @@ fn reconcile_region(
     }
 }
 
+// ── Plugin drawer panel (#349 PR2) ───────────────────────────────────────────
+
+fn panels_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .panels
+            .signal_cloned()
+    })
+}
+
+fn active_panel_signal() -> impl Signal<Item = Option<String>> {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .active_panel_id
+            .signal_cloned()
+    })
+}
+
+/// Select which plugin's panel the per-monitor drawer children show (#349 PR2).
+/// GTK thread. `Some(id)` on open/switch to a plugin panel; `None` on close.
+/// `modal.rs` calls this from its plugin-open entry points and on drawer close /
+/// monitor teardown.
+pub fn set_active_panel(plugin_id: Option<&str>) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .active_panel_id
+            .set(plugin_id.map(str::to_owned));
+    });
+}
+
+/// An empty panel tree — the blank page a drawer plugin child shows when no
+/// plugin is active (or the active plugin left / has no panel).
+fn empty_panel() -> UiNode {
+    UiNode::Box {
+        id: None,
+        dir: UiDir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+/// The per-monitor plugin drawer child (#349 PR2): a single reconciler-backed
+/// `gtk::Box` whose content is the **active** plugin's `panel` tree. One instance
+/// lives in each monitor's drawer stack under the fixed `PLUGIN_STACK_CHILD`
+/// name (see `modal.rs`); all mirror the same active panel — exactly how sidebar
+/// plugin cards mirror onto every monitor's sidebar region. When no plugin is
+/// active — or the active plugin left, or it has no panel — the child renders an
+/// empty tree (a blank page); the user then closes the drawer.
+///
+/// Panel events (button / slider / entry) route to the **live** connection of
+/// whichever plugin is active, via the same swapped-`outbound` cell as
+/// [`MountedCard`], so a fast plugin reconnect redirects panel events without a
+/// dangling send.
+#[must_use]
+pub fn plugin_panel_slot() -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("ts-plugin-panel");
+
+    // The active connection's outbound, swapped on each render so panel events
+    // reach whichever plugin is active now (mirrors the region card pattern).
+    let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> = Rc::new(RefCell::new(None));
+    let ev_outbound = outbound.clone();
+    let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
+        if let Some(tx) = ev_outbound.borrow().as_ref() {
+            let _ = tx.send(HostMsg::Event {
+                node: id,
+                kind: to_wire_event(kind),
+            });
+        }
+    });
+
+    // Derived signal: the active plugin's current panel `SlotRender` (or `None`
+    // when nothing is active or the active plugin has no panel entry).
+    let active = map_ref! {
+        let panels = panels_render_signal(),
+        let active_id = active_panel_signal() => {
+            active_id
+                .as_ref()
+                .and_then(|id| panels.iter().find(|r| &r.plugin_id == id).cloned())
+        }
+    };
+
+    let handle = glib::MainContext::default().spawn_local(active.for_each(move |slot| {
+        if let Some(render) = slot.as_ref().filter(|r| r.panel.is_some()) {
+            // Swap in the active connection's outbound, then render its panel.
+            *outbound.borrow_mut() = Some(render.outbound.clone());
+            reconciler.render(&to_ui_node(render.panel.as_ref().expect("filtered Some")));
+        } else {
+            // No active plugin (or it left / has no panel): blank the page and
+            // drop any stale outbound so no event can reach a gone connection.
+            *outbound.borrow_mut() = None;
+            reconciler.render(&empty_panel());
+        }
+        std::future::ready(())
+    }));
+
+    // Best-effort teardown: abort the subscription when the drawer child is
+    // destroyed (a per-monitor drawer rebuild on hot-plug).
+    root.connect_destroy(move |_| handle.abort());
+    root.upcast()
+}
+
 // ── tokio-side: listener + per-connection tasks ──────────────────────────────
 
 /// Bind the host socket and accept plugin connections forever. The path comes
@@ -699,6 +842,48 @@ async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
             }
         }
     }
+}
+
+/// Route one plugin `Render` frame (#274 / #277 / #349 PR2): strip its one-shot
+/// effects onto the global non-lossy broker channel, park (or clear) its optional
+/// drawer panel in the dedicated `panels` mailbox, and upsert its chip/card
+/// `tree` into the mount's region mailbox (latest-wins per plugin id). Factored
+/// out of [`handle_conn`] so that reader loop stays within the line budget.
+fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
+    // The mount picks which region mailbox (and thus per-monitor container) the
+    // tree lands in: sidebar regions render as cards, bar regions as chips
+    // (#349); both share the reconciler path.
+    let region = match mount {
+        Mount::SidebarLead => &ctx.sidebar_lead,
+        Mount::SidebarTop => &ctx.sidebar_top,
+        Mount::SidebarBottom => &ctx.sidebar_bottom,
+        Mount::BarLeft => &ctx.bar_left,
+        Mount::BarCenter => &ctx.bar_center,
+        Mount::BarRight => &ctx.bar_right,
+    };
+    // One-shot effects first, over the (global) non-lossy channel, BEFORE
+    // parking the idempotent tree — a superseding render frame could otherwise
+    // coalesce this frame's click away (#277).
+    for effect in effects {
+        let _ = ctx.effects_tx.send(BrokeredEffect {
+            plugin_id: render.plugin_id.clone(),
+            effect,
+        });
+    }
+    // The optional drawer panel (#349 PR2) rides the same frame but lands in the
+    // dedicated `panels` mailbox (a single list across all mounts) so the
+    // per-monitor drawer child can render whichever plugin is active. Upsert it
+    // latest-wins per id when present; clear this connection's entry when the
+    // plugin drops its panel (Some→None). The same `upsert_region` /
+    // `clear_region_if_owned` as the regions → inherits the #278 generation guard.
+    if render.panel.is_some() {
+        upsert_region(&ctx.panels, render.clone());
+    } else {
+        clear_region_if_owned(&ctx.panels, &render.plugin_id, render.generation);
+    }
+    // Latest-wins per plugin id: upsert overwrites *this* plugin's card in place,
+    // leaving siblings alone (#274).
+    upsert_region(region, render);
 }
 
 /// Drive one plugin connection: handshake, then read frames until the peer
@@ -773,43 +958,23 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // Reader loop: dispatch inbound frames until the peer disconnects.
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
-            Ok(PluginMsg::Render { tree, effects }) => {
-                // Route the render to its mount region's coalescing mailbox: the
-                // three sidebar regions render as cards, the three bar regions as
-                // chips (#349). Both sides share the reconciler path — the mount
-                // only picks which mailbox (and thus which per-monitor container)
-                // the tree lands in.
-                let region = match mount {
-                    Mount::SidebarLead => &ctx.sidebar_lead,
-                    Mount::SidebarTop => &ctx.sidebar_top,
-                    Mount::SidebarBottom => &ctx.sidebar_bottom,
-                    Mount::BarLeft => &ctx.bar_left,
-                    Mount::BarCenter => &ctx.bar_center,
-                    Mount::BarRight => &ctx.bar_right,
-                };
-                // One-shot effects first, over the (global) non-lossy channel,
-                // BEFORE parking the idempotent tree — a superseding render
-                // frame could otherwise coalesce this frame's click away
-                // (#277). Unchanged by the region model.
-                for effect in effects {
-                    let _ = ctx.effects_tx.send(BrokeredEffect {
-                        plugin_id: plugin_id.clone(),
-                        effect,
-                    });
-                }
-                // Latest-wins per plugin id: upsert overwrites *this* plugin's
-                // card in place, leaving siblings alone (#274).
-                upsert_region(
-                    region,
-                    SlotRender {
-                        plugin_id: plugin_id.clone(),
-                        order,
-                        generation,
-                        tree,
-                        outbound: out_tx.clone(),
-                    },
-                );
-            }
+            Ok(PluginMsg::Render {
+                tree,
+                panel,
+                effects,
+            }) => route_render(
+                ctx,
+                mount,
+                SlotRender {
+                    plugin_id: plugin_id.clone(),
+                    order,
+                    generation,
+                    tree,
+                    panel,
+                    outbound: out_tx.clone(),
+                },
+                effects,
+            ),
             Ok(PluginMsg::Register { .. }) => {
                 tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
             }
@@ -835,6 +1000,10 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     clear_region_if_owned(&ctx.bar_left, &plugin_id, generation);
     clear_region_if_owned(&ctx.bar_center, &plugin_id, generation);
     clear_region_if_owned(&ctx.bar_right, &plugin_id, generation);
+    // The panel mailbox (#349 PR2) is teardown-scoped the same way; if this
+    // plugin's panel is the one currently shown, the drawer child's derived
+    // signal yields `None` and renders empty (the user then closes the drawer).
+    clear_region_if_owned(&ctx.panels, &plugin_id, generation);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }
@@ -1236,6 +1405,32 @@ fn map_page(page: Page) -> crate::modal::Page {
         Page::Clipboard => M::Clipboard,
         Page::Calendar => M::Calendar,
         Page::Settings => M::Settings,
+        // `PluginSelf` (#349 PR2) has no built-in `modal::Page`: it is
+        // intercepted by `resolve_open_page` in the broker and routed to the
+        // requesting plugin's own panel, so it never reaches `map_page`. The
+        // arm documents the split and keeps the match exhaustive over wire
+        // `Page` (a page added to either side still breaks the build here).
+        Page::PluginSelf => unreachable!(
+            "PluginSelf is intercepted by resolve_open_page and never mapped to a modal::Page",
+        ),
+    }
+}
+
+/// The host action a wire [`Effect::OpenPage`] resolves to (#349 PR2). Split out
+/// as a **pure** function so the [`Page::PluginSelf`] interception — which has no
+/// `modal::Page` counterpart — is unit-testable without GTK, the way [`map_page`]
+/// is. The broker ([`broker_effect`]) calls this, then dispatches: a built-in
+/// page opens by `modal::Page`; `PluginSelf` opens the requesting plugin's own
+/// panel (keyed by the effect's plugin id, which the broker already carries).
+enum PageAction {
+    OpenBuiltin(crate::modal::Page),
+    OpenPluginSelf,
+}
+
+fn resolve_open_page(page: Page) -> PageAction {
+    match page {
+        Page::PluginSelf => PageAction::OpenPluginSelf,
+        other => PageAction::OpenBuiltin(map_page(other)),
     }
 }
 
@@ -1243,10 +1438,10 @@ fn map_page(page: Page) -> crate::modal::Page {
 mod tests {
     use super::{
         BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount, Mutable, Page,
-        PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream, any_sidebar_open,
-        apply_forget, apply_open, clamp_pixels_scale, clear_region_if_owned, handle_conn, map_page,
-        mpsc, pixels_len_ok, read_frame, to_ui_node, to_wire_event, upsert_region, watch, wire,
-        write_frame,
+        PageAction, PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream,
+        any_sidebar_open, apply_forget, apply_open, clamp_pixels_scale, clear_region_if_owned,
+        handle_conn, map_page, mpsc, pixels_len_ok, read_frame, resolve_open_page, to_ui_node,
+        to_wire_event, upsert_region, watch, wire, write_frame,
     };
     use hytte_plugin_proto::Manifest;
 
@@ -1550,6 +1745,36 @@ mod tests {
         }
     }
 
+    /// #349 PR2: `resolve_open_page` is the pure seam the broker uses to split a
+    /// built-in page-open from the `PluginSelf` self-panel open. A built-in page
+    /// resolves to its `modal::Page`; `PluginSelf` resolves to the plugin-self
+    /// action (which the broker dispatches with the effect's plugin id) and never
+    /// reaches `map_page`'s `unreachable!` arm.
+    #[test]
+    fn resolve_open_page_splits_pluginself_from_builtin() {
+        assert!(
+            matches!(
+                resolve_open_page(Page::Media),
+                PageAction::OpenBuiltin(crate::modal::Page::Media)
+            ),
+            "a built-in page resolves to its modal::Page",
+        );
+        assert!(
+            matches!(
+                resolve_open_page(Page::Settings),
+                PageAction::OpenBuiltin(crate::modal::Page::Settings)
+            ),
+            "another built-in page resolves to its modal::Page",
+        );
+        assert!(
+            matches!(
+                resolve_open_page(Page::PluginSelf),
+                PageAction::OpenPluginSelf
+            ),
+            "PluginSelf resolves to the plugin-self action, not a builtin",
+        );
+    }
+
     /// One plugin card carrying an id/order/generation + a label tree, for the
     /// region tests below.
     fn render_of(
@@ -1568,7 +1793,28 @@ mod tests {
                 text: text.to_owned(),
                 classes: vec![],
             },
+            panel: None,
             outbound: tx.clone(),
+        }
+    }
+
+    /// Like [`render_of`], but the card also carries a distinct drawer `panel`
+    /// tree (a `Label` with the given panel text) — for the panels-mailbox tests.
+    fn render_with_panel(
+        plugin_id: &str,
+        order: i32,
+        generation: u64,
+        chip: &str,
+        panel: &str,
+        tx: &mpsc::UnboundedSender<HostMsg>,
+    ) -> SlotRender {
+        SlotRender {
+            panel: Some(wire::Node::Label {
+                id: Some("panel".into()),
+                text: panel.to_owned(),
+                classes: vec![],
+            }),
+            ..render_of(plugin_id, order, generation, chip, tx)
         }
     }
 
@@ -1615,6 +1861,46 @@ mod tests {
             .collect();
         // (0,"aaa") < (0,"clock") < (5,"pet")
         assert_eq!(ids, vec!["aaa", "clock", "pet"]);
+    }
+
+    /// #349 PR2: the dedicated panels mailbox reuses `upsert_region`/
+    /// `clear_region_if_owned`, so it inherits their guarantees for free — a
+    /// plugin's re-render coalesces its own panel latest-wins, and a stale
+    /// (lower-generation) teardown never evicts a fast-reconnect successor's
+    /// panel (the #278 generation guard, now covering panels).
+    #[test]
+    fn panel_upsert_coalesces_and_teardown_is_generation_scoped() {
+        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let panels: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+
+        // The plugin renders its panel twice on generation 0: coalesced in place.
+        upsert_region(&panels, render_with_panel("pet", 0, 0, "chip", "p1", &tx));
+        upsert_region(&panels, render_with_panel("pet", 0, 0, "chip", "p2", &tx));
+        assert_eq!(panels.lock_ref().len(), 1, "one panel entry per plugin id");
+        assert!(
+            matches!(
+                &panels.lock_ref()[0].panel,
+                Some(wire::Node::Label { text, .. }) if text == "p2"
+            ),
+            "the plugin's latest panel wins",
+        );
+
+        // A fast reconnect (generation 1) replaces the entry; the OLD
+        // connection's teardown (generation 0) must NOT evict the successor.
+        upsert_region(&panels, render_with_panel("pet", 0, 1, "chip", "p3", &tx));
+        clear_region_if_owned(&panels, "pet", 0);
+        assert_eq!(
+            panels.lock_ref().len(),
+            1,
+            "a stale-generation teardown leaves the successor's panel",
+        );
+
+        // The owning teardown (generation 1) clears it.
+        clear_region_if_owned(&panels, "pet", 1);
+        assert!(
+            panels.lock_ref().is_empty(),
+            "the owning connection's teardown clears the panel",
+        );
     }
 
     /// A `Pixels` node whose buffer size violates `width*height*4` must not
@@ -1904,6 +2190,7 @@ mod tests {
             bar_left: Mutable::new(Vec::new()),
             bar_center: Mutable::new(Vec::new()),
             bar_right: Mutable::new(Vec::new()),
+            panels: Mutable::new(Vec::new()),
             clock_rx,
             visibility_rx,
             effects_tx,
@@ -1945,6 +2232,7 @@ mod tests {
         let bar_left = ctx.bar_left.clone();
         let bar_right = ctx.bar_right.clone();
         let sidebar_top = ctx.sidebar_top.clone();
+        let panels = ctx.panels.clone();
 
         let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
         tokio::spawn(async move { handle_conn(host_end, &ctx).await });
@@ -1966,6 +2254,9 @@ mod tests {
                     text: "chip".into(),
                     classes: vec![],
                 },
+                // A panel-less render: the chip lands in its bar region, and the
+                // dedicated panels mailbox (#349 PR2) must stay empty.
+                panel: None,
                 effects: vec![],
             },
         )
@@ -1997,6 +2288,112 @@ mod tests {
         assert!(
             sidebar_top.lock_ref().is_empty(),
             "a bar mount didn't leak into a sidebar region"
+        );
+        assert!(
+            panels.lock_ref().is_empty(),
+            "a panel-less render never touches the panels mailbox (#349 PR2)"
+        );
+    }
+
+    /// #349 PR2: a render carrying a `panel` must reach BOTH the plugin's chip
+    /// region AND the dedicated panels mailbox — the chip renders inline while
+    /// the panel is available for the drawer child. A subsequent panel-less
+    /// render (the plugin dropping its panel) clears the panels entry but leaves
+    /// the chip. Drives it end to end through `handle_conn` on the socketpair
+    /// harness the other host tests use.
+    #[tokio::test]
+    async fn panel_render_populates_panels_mailbox() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+        let panels = ctx.panels.clone();
+
+        let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        let (_prd, mut pwr) = plugin_end.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("panelplug", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("send Register");
+        // A panel-bearing render: a chip tree PLUS a distinct panel tree.
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("chip".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                },
+                panel: Some(wire::Node::Label {
+                    id: Some("panel".into()),
+                    text: "panel body".into(),
+                    classes: vec![],
+                }),
+                effects: vec![],
+            },
+        )
+        .await
+        .expect("send panel Render");
+
+        // The chip reaches its bar region…
+        let chips = wait_for_region(&bar_center).await;
+        assert_eq!(chips.len(), 1);
+        assert!(
+            matches!(&chips[0].tree, wire::Node::Label { text, .. } if text == "chip"),
+            "the chip tree reached the bar region",
+        );
+        // …and the panel reaches the dedicated panels mailbox, tree intact.
+        let panel_cards = wait_for_region(&panels).await;
+        assert_eq!(panel_cards.len(), 1, "the panel reached the panels mailbox");
+        assert_eq!(panel_cards[0].plugin_id, "panelplug");
+        assert!(
+            matches!(
+                &panel_cards[0].panel,
+                Some(wire::Node::Label { text, .. }) if text == "panel body"
+            ),
+            "the panel tree survived intact into the panels mailbox",
+        );
+
+        // Now the plugin drops its panel (Some→None): the panels entry clears,
+        // but its chip stays in the bar region.
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("chip".into()),
+                    text: "chip2".into(),
+                    classes: vec![],
+                },
+                panel: None,
+                effects: vec![],
+            },
+        )
+        .await
+        .expect("send panel-less Render");
+
+        // Poll until the panels mailbox drains (the reader clears it async).
+        let mut cleared = false;
+        for _ in 0..200 {
+            if panels.lock_ref().is_empty() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            cleared,
+            "dropping the panel (Some→None) clears the panels entry"
+        );
+        assert_eq!(
+            bar_center.lock_ref().len(),
+            1,
+            "the chip stays in the bar region after the panel is dropped",
         );
     }
 

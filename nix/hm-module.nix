@@ -39,6 +39,20 @@ let
       Install.WantedBy = [ "niri-session.target" ];
     }
   ) (lib.filterAttrs (_: p: p.enable) cfg.plugins);
+
+  # Night light (#222): the wlsunset user unit's ExecStart. Geo mode needs both
+  # lat and lon; while either is unset the unit is declared but inert (starting
+  # it just prints a hint and exits 0, so the shell's toggle never loops a
+  # misconfigured daemon). Coordinates are stringified with toString — pass them
+  # as strings to avoid the trailing zeros nix renders for floats.
+  # NOTE: geoclue lat/lon seeding is a deferred follow-up; v1 is static coords.
+  nl = cfg.nightlight;
+  nlGeoConfigured = nl.latitude != null && nl.longitude != null;
+  nlExecStart =
+    if nlGeoConfigured then
+      "${pkgs.wlsunset}/bin/wlsunset -l ${toString nl.latitude} -L ${toString nl.longitude} -t ${toString nl.nightTemp} -T ${toString nl.dayTemp}"
+    else
+      "${pkgs.bash}/bin/sh -c 'echo \"wlsunset: programs.trollshell.nightlight.{latitude,longitude} are unset — set them to enable the Night light toggle\" >&2; exit 0'";
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
@@ -114,6 +128,9 @@ in
           pkgs.cantarell-fonts
           pkgs.jetbrains-mono
           pkgs.fira-code
+          # Night light daemon (#222): the wlsunset.service unit below drives it;
+          # also on PATH so the user can invoke wlsunset directly.
+          pkgs.wlsunset
         ];
         fonts.fontconfig.enable = lib.mkDefault true;
 
@@ -282,6 +299,34 @@ in
           Install.WantedBy = [ cfg.systemd.target ];
         };
       })
+
+      # wlsunset — night light (#222). No home-manager module exists, so a plain
+      # user unit mirroring swaybg. The shell toggles it on demand via
+      # `systemctl --user start|stop wlsunset.service` (nightlight.rs), so there
+      # is deliberately NO Install/WantedBy — it defaults to inactive and the
+      # Appearance drawer's Night light switch brings it up. Always declared (so
+      # the toggle target exists); inert while lat/lon are unset (see nlExecStart)
+      # rather than hard-failing evaluation. geoclue lat/lon seeding is deferred.
+      {
+        systemd.user.services.wlsunset = {
+          Unit = {
+            Description = "Night light (color temperature) via wlsunset";
+            Documentation = "man:wlsunset(1)";
+            PartOf = [ cfg.systemd.target ];
+            After = [ cfg.systemd.target ];
+            Requisite = [ cfg.systemd.target ];
+          };
+          Service = {
+            Type = "simple";
+            ExecStart = nlExecStart;
+            # Only auto-restart the real daemon; the inert hint exits 0 and must
+            # not loop.
+            Restart = if nlGeoConfigured then "on-failure" else "no";
+            RestartSec = 2;
+          };
+          # No Install section — the shell starts/stops it (see comment above).
+        };
+      }
 
       # cliphist — clipboard history via home-manager's module. allowImages
       # defaults true, so this starts both the text and image wl-paste watchers.

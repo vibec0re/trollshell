@@ -97,6 +97,62 @@ self:
       '';
     };
 
+    # Night-light (color temperature) via a wlsunset user unit. The shell only
+    # toggles the unit on/off (nightlight.rs, mirroring the wallpaper picker's
+    # zero-state daemon playbook); these options parameterise the unit's
+    # ExecStart. The unit itself is declared home-manager-side (nix/hm-module.nix)
+    # alongside the swaybg unit — it is a per-user wlr-gamma-control daemon, not a
+    # system service. lat/lon default to null (unset); the unit stays inert until
+    # both are set. geoclue lat/lon seeding is a deferred follow-up (v1 is static
+    # coordinates only).
+    nightlight = {
+      latitude = lib.mkOption {
+        type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
+        default = null;
+        example = 52.52;
+        description = ''
+          Latitude in decimal degrees for wlsunset's geo (sunrise/sunset) mode
+          (`wlsunset -l <latitude>`). Required — together with `longitude` — for
+          the Night light toggle to do anything; while either is null the
+          `wlsunset.service` unit is declared but inert. May be given as a float
+          (52.52) or a string ("52.52"); a string avoids the trailing zeros nix
+          renders for floats.
+        '';
+      };
+
+      longitude = lib.mkOption {
+        type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
+        default = null;
+        example = 13.405;
+        description = ''
+          Longitude in decimal degrees for wlsunset's geo mode
+          (`wlsunset -L <longitude>`). Required — together with `latitude` — for
+          the Night light toggle to do anything. May be a float or a string (see
+          `latitude`).
+        '';
+      };
+
+      dayTemp = lib.mkOption {
+        type = lib.types.int;
+        default = 6500;
+        example = 6500;
+        description = ''
+          Daytime color temperature in kelvin (`wlsunset -T <dayTemp>`). 6500K is
+          neutral daylight (wlsunset's own default).
+        '';
+      };
+
+      nightTemp = lib.mkOption {
+        type = lib.types.int;
+        default = 4000;
+        example = 3500;
+        description = ''
+          Nighttime color temperature in kelvin (`wlsunset -t <nightTemp>`).
+          Lower is warmer; 4000K is a gentle warm-white.
+        '';
+      };
+    };
+
     plugins = lib.mkOption {
       type = lib.types.attrsOf (
         lib.types.submodule {

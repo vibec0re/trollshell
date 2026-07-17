@@ -767,4 +767,189 @@ mod tests {
             let _ = render(mood, usize::MAX, 255);
         }
     }
+
+    /// FNV-1a-64 over raw bytes — a deterministic, version-stable digest
+    /// (unlike `std::hash::DefaultHasher`, whose `SipHash` keys/output are not
+    /// stable across Rust releases), implemented inline so the golden needs no
+    /// hashing dependency.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h
+    }
+
+    /// Golden digests captured from the pre-`preem::Frame` renderer, one per
+    /// combo in the `MOODS` × `0..40` frames × `[0, 128, 255]` intensity sweep
+    /// (mood outermost, intensity innermost — the same nesting as
+    /// [`golden_render_is_byte_identical`]). The #365 migration is proven
+    /// byte-for-byte iff that test stays green **without editing this array**.
+    #[rustfmt::skip]
+    const GOLDEN: [u64; 840] = [
+        0xe65b_b25a_4336_9fa8, 0xfdd5_b7a5_8df6_fee2, 0x670e_3de6_f863_cee5, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9825_4efd_5bd1_b85e, 0xb37e_e542_4057_93b4, 0xd0ac_5991_d0a5_8c33, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0x68b7_4cd6_fd97_de69, 0x7b3c_f113_419f_3945, 0x7d3a_9466_f34f_4035,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0xe65b_b25a_4336_9fa8, 0xfdd5_b7a5_8df6_fee2, 0x670e_3de6_f863_cee5, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x745d_63db_a3ff_e3b8, 0xe313_4bd5_228d_a9b2, 0x0cdb_3688_306f_3d15, 0xecac_51bb_2e8f_dae1, 0x8396_28c6_af0c_d6ad, 0x6f7c_b8a1_dc2b_80c5,
+        0x9973_239d_2633_3396, 0xac0c_048b_d7fe_1ebc, 0xd9b4_b208_94dc_cf8b, 0x3a79_a975_8de0_0f89, 0x623c_407f_1e76_5ee5, 0x722b_f555_defb_7bad,
+        0x60ec_8de1_6d89_020a, 0x60ec_8de1_6d89_020a, 0x60ec_8de1_6d89_020a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0x4a5c_6b6f_6b7b_5548, 0x4a5c_6b6f_6b7b_5548, 0x4a5c_6b6f_6b7b_5548, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x8505_9f89_5037_885a, 0x8505_9f89_5037_885a, 0x8505_9f89_5037_885a,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x60ec_8de1_6d89_020a, 0x60ec_8de1_6d89_020a, 0x60ec_8de1_6d89_020a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0x24c5_3728_b674_ff4a, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba, 0xf5f1_8fcf_9c4f_d4ba,
+        0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0xcb38_cf04_c085_84b0, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582, 0x70e1_d8b7_8756_f582,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x60e9_354f_6672_c125, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1, 0x8dd7_3dbf_88a8_4ae1,
+        0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x962b_0c63_c340_2e1f, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9, 0x134b_83df_821a_40b9,
+        0x74f2_5076_7fca_4525, 0x74f2_5076_7fca_4525, 0x74f2_5076_7fca_4525, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2,
+        0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62,
+        0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6,
+        0xfc0b_a632_dcd0_7f27, 0xfc0b_a632_dcd0_7f27, 0xfc0b_a632_dcd0_7f27, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de,
+        0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0xd668_ae4b_0920_9416, 0xd668_ae4b_0920_9416, 0xd668_ae4b_0920_9416,
+        0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522,
+        0x74f2_5076_7fca_4525, 0x74f2_5076_7fca_4525, 0x74f2_5076_7fca_4525, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2,
+        0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62,
+        0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6,
+        0xbff9_08c7_068d_799f, 0xbff9_08c7_068d_799f, 0xbff9_08c7_068d_799f, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de,
+        0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0x9af5_68f1_faba_b7a6, 0x9af5_68f1_faba_b7a6, 0x9af5_68f1_faba_b7a6,
+        0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522,
+        0xe4e8_5082_0a6c_7345, 0xe4e8_5082_0a6c_7345, 0xe4e8_5082_0a6c_7345, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2,
+        0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62,
+        0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xa2e3_d795_725f_86d9, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6, 0xdbf0_3779_f0fa_8ea6,
+        0xbff9_08c7_068d_799f, 0xbff9_08c7_068d_799f, 0xbff9_08c7_068d_799f, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de, 0x2aa0_b42e_c4b2_77de,
+        0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0x3f76_7aeb_8d87_98cd, 0x9af5_68f1_faba_b7a6, 0x9af5_68f1_faba_b7a6, 0x9af5_68f1_faba_b7a6,
+        0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x9203_0fd7_db7c_1d6b, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522, 0x3371_901c_44c9_2522,
+        0xe4e8_5082_0a6c_7345, 0xe4e8_5082_0a6c_7345, 0xe4e8_5082_0a6c_7345, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2, 0xb87f_be8a_69cc_e5b2,
+        0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0x632d_d203_9288_4a37, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62, 0xc24e_86fb_6b8c_0f62,
+        0x2500_c1c4_3f49_f4c9, 0x2500_c1c4_3f49_f4c9, 0x2500_c1c4_3f49_f4c9, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1,
+        0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2,
+        0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e,
+        0xfb20_190a_e78b_8bab, 0xfb20_190a_e78b_8bab, 0xfb20_190a_e78b_8bab, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9,
+        0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0x014e_842b_6561_7066, 0x014e_842b_6561_7066, 0x014e_842b_6561_7066,
+        0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae,
+        0x2500_c1c4_3f49_f4c9, 0x2500_c1c4_3f49_f4c9, 0x2500_c1c4_3f49_f4c9, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1,
+        0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2,
+        0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e,
+        0x1c10_040d_ed7c_e7f7, 0x1c10_040d_ed7c_e7f7, 0x1c10_040d_ed7c_e7f7, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9,
+        0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0x2ce6_d6c3_c7a4_79f2, 0x2ce6_d6c3_c7a4_79f2, 0x2ce6_d6c3_c7a4_79f2,
+        0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae,
+        0xfe4b_302f_ba66_4aad, 0xfe4b_302f_ba66_4aad, 0xfe4b_302f_ba66_4aad, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1,
+        0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2,
+        0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x5374_1888_950d_11aa, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e, 0x4d89_92f9_e550_2b9e,
+        0x1c10_040d_ed7c_e7f7, 0x1c10_040d_ed7c_e7f7, 0x1c10_040d_ed7c_e7f7, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9, 0xcd4f_3238_8486_cfe9,
+        0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0xdacd_ac77_505c_a891, 0x2ce6_d6c3_c7a4_79f2, 0x2ce6_d6c3_c7a4_79f2, 0x2ce6_d6c3_c7a4_79f2,
+        0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x21f5_ef10_254e_b79c, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae, 0x51eb_4295_ae64_7eae,
+        0xfe4b_302f_ba66_4aad, 0xfe4b_302f_ba66_4aad, 0xfe4b_302f_ba66_4aad, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1, 0x4b3d_a2ca_542f_d9c1,
+        0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x428f_a781_321b_65fb, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2, 0x494f_d2bf_4564_15b2,
+        0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459,
+        0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619,
+        0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11,
+        0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671,
+        0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31,
+        0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9,
+        0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459,
+        0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619,
+        0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11,
+        0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671,
+        0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31,
+        0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9,
+        0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459,
+        0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619,
+        0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x6ea0_ec01_5bc0_a305, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11, 0x56ce_8645_e2e5_be11,
+        0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x2f58_f665_7821_5503, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671, 0x998c_e379_36f0_c671,
+        0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0xb170_7d56_d694_adfd, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31, 0x3883_59a8_83f9_7d31,
+        0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x57c8_632a_f845_8a97, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9, 0x793c_e384_b79c_d7a9,
+        0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x8060_f9cd_d448_6261, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459, 0x7584_530f_515c_b459,
+        0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0xe6d7_4599_7800_06bf, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619, 0x7b10_9ea4_54bd_9619,
+        0x015d_8b81_b0c0_9074, 0x015d_8b81_b0c0_9074, 0x015d_8b81_b0c0_9074, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0xc734_a373_b9f9_147e, 0xc734_a373_b9f9_147e, 0xc734_a373_b9f9_147e, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0x65ff_ffbd_b050_fae4, 0x65ff_ffbd_b050_fae4, 0x65ff_ffbd_b050_fae4,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0x015d_8b81_b0c0_9074, 0x015d_8b81_b0c0_9074, 0x015d_8b81_b0c0_9074, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+        0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xc224_8606_f316_4c8c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c, 0xd43c_8397_9a1d_cb5c,
+        0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x396d_e4f2_66f7_4256, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74, 0x97b1_328d_f1d6_ed74,
+    ];
+
+    /// Byte-for-byte identity guard for the #365 `preem::Frame` migration:
+    /// every mood/frame/intensity frame must still hash to its committed
+    /// [`GOLDEN`] value. Runs on both the pre- and post-refactor renderer, so a
+    /// green run here *is* the pixel-identity proof (enforced in CI, not merely
+    /// asserted in the PR body).
+    #[test]
+    fn golden_render_is_byte_identical() {
+        let mut i = 0;
+        for mood in MOODS {
+            for frame in 0..40 {
+                for intensity in [0u8, 128, 255] {
+                    let got = fnv1a_64(&render(mood, frame, intensity));
+                    assert_eq!(
+                        got, GOLDEN[i],
+                        "byte drift at mood {mood:?} frame {frame} intensity {intensity}"
+                    );
+                    i += 1;
+                }
+            }
+        }
+        assert_eq!(i, GOLDEN.len(), "sweep length must match the golden array");
+    }
 }

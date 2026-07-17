@@ -27,6 +27,18 @@ pub enum StateKey {
     /// gets the frame (#305), which is what stops a pre-#294 binary that can't
     /// decode the variant from crash-looping.
     SlotVisible,
+    /// Opt-in to the desktop-accent push
+    /// ([`HostMsg::Accent`](crate::msg::HostMsg::Accent), #376): the host
+    /// resolves libadwaita's `@accent_color` and hands it to the plugin so the
+    /// `preem` raster kit can tint its widgets' **default** color to match the
+    /// shell out of the box. Like [`SlotVisible`](StateKey::SlotVisible) this is
+    /// the #305 gate: the host sends the (name-tagged, additive)
+    /// [`HostMsg::Accent`](crate::msg::HostMsg::Accent) variant *only* to a
+    /// plugin that declares this key, so a pre-#376 binary that can't decode it
+    /// never receives it. The `hytte-plugin` SDK auto-declares this on every
+    /// plugin it builds — it knows how to consume the accent — so accent tracking
+    /// is out-of-the-box and a plugin author never writes this by hand.
+    Accent,
 }
 
 /// A shell capability a plugin requests in its manifest. The host auto-grants

@@ -7,7 +7,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use hytte_plugin_proto::{
-    HostMsg, LogLevel, PluginMsg, ProtoError, read_frame, socket_path, write_frame,
+    HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, read_frame, socket_path, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -49,6 +49,16 @@ impl Backoff {
     }
 }
 
+/// One session-loop iteration's work: fold a plugin-facing [`Input`] through
+/// `update`, or perform a runtime-internal [`Rerender`](Step::Rerender) that
+/// refreshes the view without an `update` — used when the host installs a new
+/// accent (#376), which changes what the `preem` kit paints but is not a TEA
+/// message.
+enum Step<M> {
+    Update(Input<M>),
+    Rerender,
+}
+
 /// Drive one connected session: handshake, seed render, then the
 /// read→update→render loop. `Ok(())` means the host sent `Shutdown`; any
 /// transport failure (EOF = the host went away) surfaces as `Err`. Either way
@@ -64,7 +74,16 @@ where
 {
     // Handshake: `Register` MUST be the first frame (else the host drops us),
     // then a greeting through the host log (exercises the `Log` frame path).
-    let manifest = P::manifest();
+    let mut manifest = P::manifest();
+    // Auto-opt-in to the desktop-accent push (#376): the SDK knows how to
+    // consume `HostMsg::Accent` (it feeds the `preem` kit's default tint), so it
+    // declares the subscription on every plugin's behalf — accent tracking is
+    // out-of-the-box, transparent to the plugin author. The host gates the push
+    // on this key (#305), so a *pre-#376* SDK that never adds it simply never
+    // receives the variant it couldn't decode.
+    if !manifest.subscribes.contains(&StateKey::Accent) {
+        manifest.subscribes.push(StateKey::Accent);
+    }
     let plugin_id = manifest.id.clone();
     write_frame(&mut wr, &PluginMsg::Register { manifest }).await?;
     write_frame(
@@ -125,14 +144,23 @@ where
     let mut src_done = false;
 
     let result = loop {
-        let input = tokio::select! {
+        let step = tokio::select! {
             frame = rx.recv() => match frame {
-                Some(Ok(HostMsg::StateSnapshot { snapshot })) => Input::Snapshot(snapshot),
-                Some(Ok(HostMsg::Event { node, kind })) => Input::Event { node, kind },
+                Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
+                Some(Ok(HostMsg::Event { node, kind })) => Step::Update(Input::Event { node, kind }),
                 Some(Ok(HostMsg::EffectResult { id, outcome })) => {
-                    Input::EffectResult { id, outcome }
+                    Step::Update(Input::EffectResult { id, outcome })
                 }
-                Some(Ok(HostMsg::SlotVisibility { visible })) => Input::SlotVisible(visible),
+                Some(Ok(HostMsg::SlotVisibility { visible })) => Step::Update(Input::SlotVisible(visible)),
+                Some(Ok(HostMsg::Accent { color })) => {
+                    // Theme plumbing (#376): the host resolved `@accent_color`
+                    // and handed it over. Feed it to the `preem` kit as the
+                    // default widget tint (an explicit plugin palette still
+                    // wins), then fall through to re-render so the new default
+                    // shows. Never surfaced to the TEA model.
+                    crate::preem::set_accent(color);
+                    Step::Rerender
+                }
                 Some(Ok(HostMsg::Ping { seq })) => {
                     // Liveness is runtime plumbing: answer, don't surface.
                     if let Err(e) = write_frame(&mut wr, &PluginMsg::Pong { seq }).await {
@@ -147,7 +175,7 @@ where
             },
             msg = src.next(), if !src_done => {
                 if let Some(m) = msg {
-                    Input::App(m)
+                    Step::Update(Input::App(m))
                 } else {
                     src_done = true;
                     continue;
@@ -159,8 +187,13 @@ where
         // there are effects to deliver (effects ride the render frame, so a
         // non-empty batch forces a send even for an identical tree). Extending
         // dedup to the panel lets a plugin re-render its open panel while the
-        // chip tree is unchanged (the common case) still push a frame.
-        let effects = model.update(input);
+        // chip tree is unchanged (the common case) still push a frame. A
+        // `Rerender` (e.g. an accent install, #376) refreshes the view without
+        // an `update`, so the accent-tinted frame repaints.
+        let effects = match step {
+            Step::Update(input) => model.update(input),
+            Step::Rerender => Vec::new(),
+        };
         let tree = model.view();
         let panel = model.panel();
         if !effects.is_empty() || tree != last_tree || panel != last_panel {

@@ -10,7 +10,45 @@
 //! palette's ink. That split is what makes VFD phosphor glow, LCD ghost
 //! cells, and OLED true-black bloom all fall out of the same code path.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use super::frame::{Frame, Rgba};
+
+/// The host-resolved desktop accent (#376), packed `[r, g, b, 0xff]`
+/// big-endian into a `u32`; `0` = unset. A resolved accent is always stored
+/// opaque, so it can never pack to `0` — that makes `0` a safe "no accent"
+/// sentinel. Set once per session by the transport runtime from
+/// [`HostMsg::Accent`](hytte_plugin_proto::HostMsg::Accent) and read at render
+/// time by [`DisplayStyle::palette`]. It is a process-global because a plugin
+/// process hosts exactly one plugin (one `run`), and threading it out-of-band
+/// keeps the widget entry points ([`dot_matrix`](super::dot_matrix),
+/// [`seven_seg`](super::seven_seg), [`TextBox`](super::TextBox)) signature-free
+/// of an accent argument.
+static ACCENT: AtomicU32 = AtomicU32::new(0);
+
+/// Pack an optional accent into the [`ACCENT`] sentinel word, forcing alpha
+/// opaque (the ink is always drawn opaque). `None` → `0` (unset).
+fn pack_accent(color: Option<Rgba>) -> u32 {
+    color.map_or(0, |[r, g, b, _]| u32::from_be_bytes([r, g, b, 0xff]))
+}
+
+/// Unpack the [`ACCENT`] sentinel word back to an opaque accent, or `None`
+/// when unset (`0`).
+fn unpack_accent(packed: u32) -> Option<Rgba> {
+    (packed != 0).then(|| packed.to_be_bytes())
+}
+
+/// Install the host-resolved desktop accent as the kit's default widget tint
+/// (#376), or clear it with `None` (older host / resolution failed, keeping the
+/// hard-coded per-style default). Called by the SDK runtime; not plugin-facing.
+pub(crate) fn set_accent(color: Option<Rgba>) {
+    ACCENT.store(pack_accent(color), Ordering::Relaxed);
+}
+
+/// The current host accent, or `None` if none was installed this session.
+fn accent() -> Option<Rgba> {
+    unpack_accent(ACCENT.load(Ordering::Relaxed))
+}
 
 /// The retro display skin a kit widget renders in. Palettes + post-passes
 /// over one shared renderer per widget (see the module docs).
@@ -42,8 +80,33 @@ impl DisplayStyle {
         }
     }
 
-    /// The style's palette + post-pass parameters.
+    /// The style's palette + post-pass parameters, with its **ink** (the lit
+    /// color — i.e. the widget's default color) tinted to the host desktop
+    /// accent when one was installed this session (#376). `bg`/`ghost`/`bloom`
+    /// are the panel's physical character and stay per-style; only the lit ink
+    /// follows the accent, which keeps the glow ramp coherent (the bloom
+    /// composites toward `ink`). With no accent it is exactly the hard-coded
+    /// per-style palette (no regression). An explicit plugin palette
+    /// ([`TextBox::colors`](super::TextBox::colors), a hand-built
+    /// [`Frame`]) never routes through here, so it always wins.
     pub(crate) fn palette(self) -> Palette {
+        self.palette_with_accent(accent())
+    }
+
+    /// [`palette`](Self::palette) with the accent passed explicitly — split out
+    /// so the default-vs-override resolution is unit-testable without the
+    /// process-global.
+    fn palette_with_accent(self, accent: Option<Rgba>) -> Palette {
+        let mut palette = self.base_palette();
+        if let Some(ink) = accent {
+            palette.ink = ink;
+        }
+        palette
+    }
+
+    /// The hard-coded per-style palette — the kit's default look before any
+    /// accent tint.
+    fn base_palette(self) -> Palette {
         match self {
             Self::Vfd => Palette {
                 bg: [0x04, 0x0a, 0x0e, 0xff],
@@ -272,5 +335,51 @@ mod tests {
         assert_eq!(DisplayStyle::Vfd.name(), "vfd");
         assert_eq!(DisplayStyle::Lcd.name(), "lcd");
         assert_eq!(DisplayStyle::Oled.name(), "oled");
+    }
+
+    /// #376: with no host accent, every style keeps its hard-coded ink (no
+    /// regression); with an accent, every style's **ink** becomes it while
+    /// `bg`/`ghost`/`bloom` stay the per-style panel character. Uses the
+    /// explicit-accent seam so it never touches the process-global.
+    #[test]
+    fn accent_tints_ink_but_leaves_the_panel_character() {
+        let accent = [0x9b, 0x59, 0xb6, 0xff];
+        for style in DisplayStyle::ALL {
+            let base = style.palette_with_accent(None);
+            assert_eq!(
+                base.ink,
+                style.base_palette().ink,
+                "{style:?}: no accent keeps the hard-coded ink"
+            );
+
+            let tinted = style.palette_with_accent(Some(accent));
+            assert_eq!(tinted.ink, accent, "{style:?}: accent becomes the ink");
+            assert_eq!(tinted.bg, base.bg, "{style:?}: field is per-style");
+            assert_eq!(tinted.ghost, base.ghost, "{style:?}: ghost is per-style");
+            assert!(
+                tinted.bloom.is_some() == base.bloom.is_some(),
+                "{style:?}: bloom presence is per-style"
+            );
+        }
+    }
+
+    /// An explicit accent overrides the ink even when it equals a sentinel-ish
+    /// value; the pack/unpack keeps `None` distinct from any opaque color and
+    /// forces the stored ink opaque.
+    #[test]
+    fn accent_pack_round_trips_and_forces_opaque() {
+        use super::{pack_accent, unpack_accent};
+        assert_eq!(pack_accent(None), 0, "None is the unset sentinel");
+        assert_eq!(unpack_accent(0), None);
+        // A transparent input still stores opaque (the ink is always drawn opaque).
+        assert_eq!(
+            unpack_accent(pack_accent(Some([0x12, 0x34, 0x56, 0x00]))),
+            Some([0x12, 0x34, 0x56, 0xff])
+        );
+        // A fully opaque black is a real accent, never confused with "unset".
+        assert_eq!(
+            unpack_accent(pack_accent(Some([0, 0, 0, 0xff]))),
+            Some([0, 0, 0, 0xff])
+        );
     }
 }

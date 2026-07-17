@@ -214,6 +214,12 @@ pub struct PluginHandles {
     /// from tokio (per-conn visibility tasks). Starts `false` (nothing open at
     /// boot). See the module-level "Slot visibility" note (#288).
     visibility_tx: watch::Sender<bool>,
+    /// The desktop accent (`@accent_color`) resolved on the GTK thread and
+    /// handed to accent-subscribing plugins (#376). Written by [`install`]
+    /// (via [`publish_accent`]), subscribed from tokio (per-conn accent tasks).
+    /// Starts `None` (unresolved) — a plugin then keeps the kit's hard-coded
+    /// default until the value lands. v1 resolves it once at startup.
+    accent_tx: watch::Sender<Option<[u8; 4]>>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
 
@@ -230,6 +236,8 @@ struct ListenerCtx {
     panels: Mutable<Vec<SlotRender>>,
     clock_rx: watch::Receiver<Option<ClockState>>,
     visibility_rx: watch::Receiver<bool>,
+    /// Subscriber end of [`PluginHandles::accent_tx`] (#376).
+    accent_rx: watch::Receiver<Option<[u8; 4]>>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
 
@@ -241,6 +249,9 @@ impl Service for PluginsService {
         // Slot visibility seeds `false`: no sidebar is open at boot, and each
         // monitor's `install` re-asserts `false` as it wires up (#288).
         let (visibility_tx, visibility_rx) = watch::channel(false);
+        // Accent seeds `None` (unresolved): `install` resolves `@accent_color`
+        // on the GTK thread and publishes it once the display's CSS is up (#376).
+        let (accent_tx, accent_rx) = watch::channel(None);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
             sidebar_lead: Mutable::new(Vec::new()),
@@ -253,6 +264,7 @@ impl Service for PluginsService {
             active_panel_id: Mutable::new(None),
             clock_tx,
             visibility_tx,
+            accent_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
@@ -265,6 +277,7 @@ impl Service for PluginsService {
             panels: handles.panels.clone(),
             clock_rx,
             visibility_rx,
+            accent_rx,
             effects_tx,
         };
         rt.spawn(async move {
@@ -299,6 +312,14 @@ pub fn install() {
         std::future::ready(())
     }));
 
+    // Desktop accent (#376): resolve libadwaita's `@accent_color` once, now that
+    // the display's CSS providers are up, and publish it so accent-subscribing
+    // plugins can tint their `preem` widgets' default color to match the shell.
+    // Static at session start for v1 (live re-tint on accent change is a
+    // follow-up); a failed resolve leaves `None`, so plugins keep the kit's
+    // hard-coded default (no regression).
+    publish_accent(resolve_accent_color());
+
     // Effect broker: drain the non-lossy effect channel in arrival order.
     // Effects are one-shot, so — unlike the idempotent trees on the render
     // mailbox — they must never be coalesced away (#277); the reader tasks strip
@@ -330,6 +351,52 @@ fn set_clock(cs: ClockState) {
             .clock_tx
             .send_replace(Some(cs));
     });
+}
+
+/// Publish the resolved desktop accent to the per-conn accent tasks (#376).
+fn publish_accent(accent: Option<[u8; 4]>) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .accent_tx
+            .send_replace(accent);
+    });
+}
+
+/// Resolve libadwaita's `@accent_color` to an opaque RGBA byte quad on the GTK
+/// thread (#376). Mirrors what the shell's CSS already does for the sparkline
+/// (`.ts-sparkline { color: @accent_color; }`), but materialized in Rust so the
+/// value can be handed to out-of-process plugins that can't read GTK themselves.
+///
+/// libadwaita registers `@accent_color` as a display-scope named color, so a
+/// throwaway, unrealized widget resolves it. The style-context color lookup is
+/// deprecated in GTK4, but the pinned libadwaita is on the `v1_4` feature and
+/// `StyleManager::accent_color_rgba` needs `v1_6` — so this scoped-`allow`s the
+/// deprecation rather than bumping the whole adw feature surface (which would
+/// also risk the sandboxed `nix build` link). `None` when the color isn't
+/// defined yet (e.g. providers not loaded), so the caller falls back to the
+/// kit's hard-coded default.
+fn resolve_accent_color() -> Option<[u8; 4]> {
+    let probe = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    #[allow(deprecated)]
+    let rgba = probe.style_context().lookup_color("accent_color")?;
+    Some(rgba_to_bytes(&rgba))
+}
+
+/// A `gdk::RGBA` (channels in `0.0..=1.0`) as an opaque `[r, g, b, 0xff]` byte
+/// quad — the layout `preem` and [`HostMsg::Accent`] carry. Alpha is forced
+/// opaque: preem frames are screens and the accent is used as an opaque ink.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rgba_to_bytes(rgba: &gtk::gdk::RGBA) -> [u8; 4] {
+    // Each channel is clamped to 0.0..=1.0 then ×255 → 0.0..=255.0 and rounded,
+    // so the cast is exact (mirrors `hytte-plugin-caw`'s `intensity`).
+    let chan = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [
+        chan(rgba.red()),
+        chan(rgba.green()),
+        chan(rgba.blue()),
+        0xff,
+    ]
 }
 
 // ── Slot visibility (#288): OR of every monitor's sidebar open flag ───────────
@@ -955,6 +1022,20 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .contains(&StateKey::SlotVisible)
         .then(|| tokio::spawn(visibility_task(ctx.visibility_rx.clone(), out_tx.clone())));
 
+    // Desktop accent (#376): seed the resolved `@accent_color` at register (and
+    // re-send if it lands after connect) — but ONLY to a plugin that subscribes
+    // `StateKey::Accent`, the same #305 opt-in gate as visibility above. The
+    // `hytte-plugin` SDK auto-declares that subscription, so accent tracking is
+    // out-of-the-box; a pre-#376 binary that never declared it never receives
+    // the `HostMsg::Accent` variant it couldn't decode. v1 never changes the
+    // accent after startup, so the task's change-loop is dormant — it exists so
+    // a late resolve still reaches an already-connected plugin (and to seat the
+    // live-re-tint follow-up).
+    let accent = manifest
+        .subscribes
+        .contains(&StateKey::Accent)
+        .then(|| tokio::spawn(accent_task(ctx.accent_rx.clone(), out_tx.clone())));
+
     // Reader loop: dispatch inbound frames until the peer disconnects.
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -1009,6 +1090,9 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     if let Some(visibility) = visibility {
         visibility.abort();
+    }
+    if let Some(accent) = accent {
+        accent.abort();
     }
     writer.abort();
 }
@@ -1074,6 +1158,31 @@ async fn visibility_task(
     while visibility_rx.changed().await.is_ok() {
         let visible = *visibility_rx.borrow_and_update();
         if out.send(HostMsg::SlotVisibility { visible }).is_err() {
+            break;
+        }
+    }
+}
+
+/// Push the resolved desktop accent on the initial subscribe (the register seed,
+/// so a plugin starts tinted) and on any change, latest-wins via
+/// `borrow_and_update` (#376). Mirrors [`snapshot_task`]/[`visibility_task`];
+/// spawned **only** for a connection that subscribes [`StateKey::Accent`]
+/// (#305) — an unsubscribed plugin never receives the frame. v1 resolves the
+/// accent once at startup, so the change-loop is effectively dormant; it exists
+/// so a resolve that lands after connect still reaches the plugin and to seat
+/// the live-re-tint follow-up.
+async fn accent_task(
+    mut accent_rx: watch::Receiver<Option<[u8; 4]>>,
+    out: mpsc::UnboundedSender<HostMsg>,
+) {
+    // Seed at register (the watch replays its current value).
+    let initial = *accent_rx.borrow_and_update();
+    if out.send(HostMsg::Accent { color: initial }).is_err() {
+        return;
+    }
+    while accent_rx.changed().await.is_ok() {
+        let color = *accent_rx.borrow_and_update();
+        if out.send(HostMsg::Accent { color }).is_err() {
             break;
         }
     }
@@ -2183,6 +2292,10 @@ mod tests {
         visibility_rx: watch::Receiver<bool>,
     ) -> (ListenerCtx, mpsc::UnboundedReceiver<BrokeredEffect>) {
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
+        // Accent is unresolved in the host-session tests (they exercise the
+        // clock/visibility gates), and none of them subscribes `StateKey::Accent`,
+        // so no accent task ever reads this; seed `None` and let the sender drop.
+        let (_accent_tx, accent_rx) = watch::channel(None);
         let ctx = ListenerCtx {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
@@ -2193,6 +2306,7 @@ mod tests {
             panels: Mutable::new(Vec::new()),
             clock_rx,
             visibility_rx,
+            accent_rx,
             effects_tx,
         };
         (ctx, effects_rx)

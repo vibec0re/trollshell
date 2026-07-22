@@ -284,6 +284,43 @@ in
           '')
         ];
 
+        # evolution-alarm-notify (#402): EDS's own alarm daemon. It watches
+        # every source's calendar for VALARM triggers and posts standard
+        # org.freedesktop.Notifications toasts — which trollshell (as the
+        # daemon, crates/hytte-services/src/notifications.rs) renders like any
+        # other notification. Zero application code: daemon-as-state-store
+        # extends to alarm bookkeeping too, so snooze/dismiss/recurring-event
+        # expansion stay in EDS's own battle-tested state machine rather than
+        # a reimplementation in hytte-ecal (see #402's Option A vs B).
+        #
+        # evolution-data-server itself ships this exact unit at
+        # share/systemd/user/evolution-alarm-notify.service, but NixOS has no
+        # systemd.user.packages import mechanism (unlike systemd.packages for
+        # system units, which services.gnome.evolution-data-server's own
+        # module already uses two entries up), so the package's unit is never
+        # picked up on its own — wire it here, matching upstream's Type/BusName
+        # so systemd tracks readiness the same way evolution itself would.
+        # Gated on evolution-data-server specifically (not just the master
+        # switch): the daemon has nothing to watch without it. mkDefault on
+        # `enable` so `systemd.user.services.evolution-alarm-notify.enable =
+        # false;` still wins even with both switches on.
+        systemd.user.services.evolution-alarm-notify =
+          lib.mkIf config.services.gnome.evolution-data-server.enable
+            {
+              enable = lib.mkDefault true;
+              description = "Event and Task Reminders (evolution-alarm-notify)";
+              wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              after = [ "graphical-session.target" ];
+              serviceConfig = {
+                Type = "dbus";
+                BusName = "org.gnome.Evolution-alarm-notify";
+                ExecStart = "${pkgs.evolution-data-server}/libexec/evolution-data-server/evolution-alarm-notify";
+                Restart = "on-failure";
+                RestartSec = 2;
+              };
+            };
+
         # System-bus policy: allow any user to own the two trollshell agent
         # names. BlueZ / iwd policies still gate the actual method ACLs; this
         # only grants the right to RequestName. Without it, hytte_bus::own_name

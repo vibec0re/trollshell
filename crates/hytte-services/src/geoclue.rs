@@ -80,6 +80,39 @@ pub enum LocationState {
     Unavailable,
 }
 
+/// Runtime place override the control-center (#391) sets over the `Control`
+/// D-Bus interface. It lives here (shell-side runtime state) rather than in the
+/// Nix/env config so the companion app can change the location **live**, no
+/// rebuild — see [`set_manual_city`] / [`set_auto_location`].
+///
+/// `auto` mirrors the historical behaviour: `GeoClue2` first, the
+/// `TROLLSHELL_WEATHER_CITY` env var as fallback. When `auto` is `false` and a
+/// `manual_city` is set, that city is forward-geocoded (via the same Open-Meteo
+/// path the env-var fallback uses — no reimplementation) and `GeoClue2` is
+/// skipped entirely. Manual mode with no city yet degrades to auto so weather
+/// never gets stuck.
+///
+/// **Session-only for v1:** the override is not persisted across shell
+/// restarts (a restart reverts to `auto`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceOverride {
+    /// `true` = `GeoClue2` auto-location (the default); `false` = use
+    /// `manual_city`.
+    pub auto: bool,
+    /// City to forward-geocode in manual mode. Preserved across an `auto`
+    /// toggle so flipping back to manual restores the last city.
+    pub manual_city: Option<String>,
+}
+
+impl Default for PlaceOverride {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            manual_city: None,
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Default)]
 pub struct GeoclueHandles {
@@ -93,6 +126,8 @@ pub struct GeoclueHandles {
 struct Shared {
     location: Mutable<LocationState>,
     notify: Arc<Notify>,
+    /// The manual/auto place override (#391), set live over D-Bus.
+    place_override: Mutable<PlaceOverride>,
 }
 static SHARED: OnceLock<Shared> = OnceLock::new();
 
@@ -105,11 +140,13 @@ impl Service for GeoclueService {
         let handles = GeoclueHandles::default();
         let location = handles.location.clone();
         let notify = handles.notify.clone();
+        let place_override = Mutable::new(PlaceOverride::default());
         let _ = SHARED.set(Shared {
             location: location.clone(),
             notify: notify.clone(),
+            place_override: place_override.clone(),
         });
-        rt.spawn(resolve_loop(location, notify));
+        rt.spawn(resolve_loop(location, notify, place_override));
         handles
     }
 }
@@ -139,6 +176,44 @@ pub fn refresh() {
     }
 }
 
+/// The current runtime place override (auto vs. manual city). Reads the
+/// cross-thread shared handle, so it is callable off the GTK main thread (e.g.
+/// from the `Control` D-Bus interface handlers). Returns the default (`auto`)
+/// when [`service`] hasn't started.
+#[must_use]
+pub fn current_override() -> PlaceOverride {
+    SHARED
+        .get()
+        .map(|s| s.place_override.get_cloned())
+        .unwrap_or_default()
+}
+
+/// Switch to manual location: forward-geocode `city` and use it, ignoring
+/// `GeoClue2`. Triggers an immediate re-resolve. Fire-and-forget — a city that
+/// fails to geocode simply keeps the last good location (see [`resolve_loop`]).
+pub fn set_manual_city(city: String) {
+    if let Some(s) = SHARED.get() {
+        s.place_override.set(PlaceOverride {
+            auto: false,
+            manual_city: Some(city),
+        });
+        s.notify.notify_one();
+    }
+}
+
+/// Toggle auto (`GeoClue2`) vs. manual location. Keeps any previously-set
+/// `manual_city` so flipping back to manual restores it. Triggers a re-resolve.
+pub fn set_auto_location(auto: bool) {
+    if let Some(s) = SHARED.get() {
+        let ov = PlaceOverride {
+            auto,
+            ..s.place_override.get_cloned()
+        };
+        s.place_override.set(ov);
+        s.notify.notify_one();
+    }
+}
+
 /// Cross-thread accessor: a clone of the location `Mutable`, for tokio tasks
 /// in sibling services that can't reach the thread-local registry. `None`
 /// until [`service`] has started.
@@ -149,9 +224,13 @@ pub(crate) fn shared_location() -> Option<Mutable<LocationState>> {
 /// Resolve once at boot, then again on every [`refresh`]. We take a single
 /// location per attempt (no live re-subscription) — matches the design's
 /// "first `LocationUpdated` wins" rule.
-async fn resolve_loop(location: Mutable<LocationState>, notify: Arc<Notify>) {
+async fn resolve_loop(
+    location: Mutable<LocationState>,
+    notify: Arc<Notify>,
+    place_override: Mutable<PlaceOverride>,
+) {
     loop {
-        if let Some(loc) = resolve_once().await {
+        if let Some(loc) = resolve_once(&place_override.get_cloned()).await {
             location.set(LocationState::Resolved(loc));
         } else {
             tracing::info!(
@@ -168,7 +247,15 @@ async fn resolve_loop(location: Mutable<LocationState>, notify: Arc<Notify>) {
     }
 }
 
-async fn resolve_once() -> Option<LocationSnapshot> {
+async fn resolve_once(ov: &PlaceOverride) -> Option<LocationSnapshot> {
+    // Manual override (#391): forward-geocode the chosen city and skip
+    // GeoClue2 entirely. Manual-mode-without-a-city falls through to auto so
+    // weather isn't stuck until the user supplies one.
+    if !ov.auto
+        && let Some(city) = ov.manual_city.clone()
+    {
+        return geocode(city).await;
+    }
     match tokio::time::timeout(GEOCLUE_TIMEOUT, resolve_geoclue()).await {
         Ok(Some(loc)) => return Some(loc),
         Ok(None) => tracing::debug!("geoclue: GeoClue2 yielded nothing, trying env var"),
@@ -280,10 +367,17 @@ async fn resolve_configured() -> Option<LocationSnapshot> {
     let city = std::env::var("TROLLSHELL_WEATHER_CITY")
         .ok()
         .filter(|s| !s.trim().is_empty())?;
+    geocode(city).await
+}
+
+/// Forward-geocode a city name off-thread into a `Configured` snapshot, or
+/// `None` on any failure. The single geocoding path shared by the env-var
+/// fallback and the manual place override (#391).
+async fn geocode(city: String) -> Option<LocationSnapshot> {
     match tokio::task::spawn_blocking(move || geocode_city(&city)).await {
         Ok(Ok(snap)) => Some(snap),
         Ok(Err(e)) => {
-            tracing::warn!("geoclue: geocoding TROLLSHELL_WEATHER_CITY failed: {e}");
+            tracing::warn!("geoclue: forward-geocoding city failed: {e}");
             None
         }
         Err(join) => {

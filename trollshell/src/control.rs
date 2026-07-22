@@ -3,10 +3,13 @@
 //!
 //! The shell exposes a session-bus object implementing the
 //! `mov.vibec0re.trollshell.Control` interface so the launch-on-demand
-//! companion app (`trollshell-control-center`) — and, later, its per-tab
-//! consumers (#391 Plugins · #392 Place/Location · #393 AI keys · #348
-//! Display) — have something to bind to. The surface is deliberately trivial
-//! for now: `Ping` and `Version`. Real capabilities land as the tabs do.
+//! companion app (`trollshell-control-center`) — and its per-tab consumers
+//! (#391 Place · #348 Plugins · #392 Display · #393 AI keys) — have something
+//! to bind to. Beyond the foundation's `Ping`/`Version`, the first real tab
+//! (#391) adds the **place** methods: `GetPlace` / `SetManualCity` /
+//! `SetAutoLocation`, which round-trip the shell's runtime location override
+//! (see [`hytte::services::geoclue::PlaceOverride`]). Each further tab adds its
+//! own methods here, following the same shape.
 //!
 //! ## Why a *dedicated* bus name, not the app's primary name
 //!
@@ -33,6 +36,7 @@
 //! clippy-banned) — everything goes through `hytte_bus`.
 
 use hytte::reactive::Service;
+use hytte::services::{geoclue, places};
 
 /// Dedicated well-known bus name for the control endpoint. Distinct from the
 /// app's primary name `mov.vibec0re.trollshell` (owned by `GApplication`) — see
@@ -73,14 +77,19 @@ pub fn service() -> ControlService {
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
 /// Server implementation of `mov.vibec0re.trollshell.Control`. Unit struct —
-/// the walking-skeleton surface is stateless. `Clone` is required by
-/// `OwnNameBuilder::at_path` (the object server re-mounts a clone on reconnect).
+/// it holds no state of its own; the place methods read/write the shell's
+/// runtime location state through the [`geoclue`]/[`places`] services'
+/// cross-thread accessors (the handlers run on the D-Bus task, not the GTK
+/// main thread, so they must use those rather than the thread-local registry).
+/// `Clone` is required by `OwnNameBuilder::at_path` (the object server re-mounts
+/// a clone on reconnect).
 #[derive(Clone)]
 struct ControlIface;
 
 // zbus's `#[interface]` macro requires every handler to be `async fn` even when
-// the body doesn't await, and these trivially return constants without touching
-// `&self`. Allow both at the impl block to keep the noise out of each method.
+// the body doesn't await, and several of these read process-global state
+// without touching `&self`. Allow both at the impl block to keep the noise out
+// of each method.
 #[allow(clippy::unused_async, clippy::unused_self)]
 #[zbus::interface(name = "mov.vibec0re.trollshell.Control")]
 impl ControlIface {
@@ -94,5 +103,79 @@ impl ControlIface {
     /// companion app can surface it and, later, gate on feature availability.
     async fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    // ── Place / location (#391) ─────────────────────────────────────────────
+
+    /// The resolved place — `(label, auto)`. `label` is the effective place
+    /// name the weather widget shows (or the requested city / `"Resolving…"`
+    /// before the first resolution); `auto` is `true` for `GeoClue2`
+    /// auto-location, `false` when a manual city is in force. The companion
+    /// app's Place tab populates itself from this.
+    async fn get_place(&self) -> (String, bool) {
+        let ov = geoclue::current_override();
+        let resolved_name = places::shared_place()
+            .and_then(|m| m.get_cloned())
+            .map(|p| p.name);
+        (place_label(&ov, resolved_name), ov.auto)
+    }
+
+    /// Switch to manual location and forward-geocode `city` (via the shell's
+    /// existing Open-Meteo geocoding path), skipping `GeoClue2`. Takes effect
+    /// live; a city that fails to geocode leaves the last good location in
+    /// place. Re-query [`get_place`](Self::get_place) shortly after to read
+    /// back the resolved label.
+    async fn set_manual_city(&self, city: String) {
+        geoclue::set_manual_city(city);
+    }
+
+    /// Toggle auto (`GeoClue2`) vs. manual location. `true` restores
+    /// auto-location; `false` re-applies the last manual city (if any).
+    async fn set_auto_location(&self, auto: bool) {
+        geoclue::set_auto_location(auto);
+    }
+}
+
+/// The label to surface for the current place. Prefers the effective resolved
+/// place name (what weather shows); before the first resolution it echoes the
+/// requested manual city, else `"Resolving…"`. Pure, so the fallback logic is
+/// unit-testable without a running shell.
+fn place_label(ov: &geoclue::PlaceOverride, resolved_name: Option<String>) -> String {
+    if let Some(name) = resolved_name {
+        return name;
+    }
+    match (&ov.manual_city, ov.auto) {
+        (Some(city), false) => city.clone(),
+        _ => "Resolving…".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hytte::services::geoclue::PlaceOverride;
+
+    #[test]
+    fn label_prefers_resolved_name() {
+        let ov = PlaceOverride {
+            auto: false,
+            manual_city: Some("Paris".to_owned()),
+        };
+        // A resolved name always wins over the requested city.
+        assert_eq!(place_label(&ov, Some("Berlin".to_owned())), "Berlin");
+    }
+
+    #[test]
+    fn label_echoes_manual_city_before_resolution() {
+        let ov = PlaceOverride {
+            auto: false,
+            manual_city: Some("Paris".to_owned()),
+        };
+        assert_eq!(place_label(&ov, None), "Paris");
+    }
+
+    #[test]
+    fn label_resolving_when_auto_and_unresolved() {
+        assert_eq!(place_label(&PlaceOverride::default(), None), "Resolving…");
     }
 }

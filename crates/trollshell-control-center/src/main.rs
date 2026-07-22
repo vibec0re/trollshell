@@ -8,13 +8,16 @@
 //! `mov.vibec0re.trollshell.Control` session-bus endpoint (see the shell's
 //! `control.rs`).
 //!
-//! This is the skeleton: an `adw::ViewStack` with four placeholder tabs
-//! (Plugins · Place · AI Keys · Display) — each a "coming soon" `StatusPage`
-//! stub — and a banner that reports whether the shell answered `Ping`/`Version`.
-//! Each tab is a follow-up issue (#391 / #392 / #393 / #348), all blocked on
-//! this landing. When the shell isn't running the app degrades gracefully to a
-//! "not running" banner rather than panicking.
+//! An `adw::ViewStack` of tabs plus a banner that reports whether the shell
+//! answered `Ping`/`Version`. The **Place** tab (#391) is the first *real* tab:
+//! it manages the location that feeds the weather widget — automatic (`GeoClue`)
+//! vs. a manual, forward-geocoded city — round-tripping over `Control`. The
+//! remaining tabs (Plugins · AI Keys · Display) are still "coming soon"
+//! `StatusPage` stubs, each its own follow-up issue. When the shell isn't
+//! running the app degrades gracefully rather than panicking.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -36,7 +39,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-/// Build the main window: a view-switcher over the four placeholder tabs plus a
+/// Build the main window: a view-switcher over the tabs plus a
 /// connection-status banner, then kick off the async shell probe.
 fn build_window(app: &adw::Application) {
     let stack = adw::ViewStack::new();
@@ -47,12 +50,13 @@ fn build_window(app: &adw::Application) {
         "application-x-addon-symbolic",
         "Enable, disable, and configure widget plugins. Coming soon (#391).",
     );
-    add_placeholder(
-        &stack,
-        "place",
+    // The first real tab (#391): location management, round-tripped over Control.
+    let place_page = build_place_page();
+    stack.add_titled_with_icon(
+        &place_page,
+        Some("place"),
         "Place",
         "mark-location-symbolic",
-        "Manage your location for the weather and departures stack. Coming soon (#392).",
     );
     add_placeholder(
         &stack,
@@ -105,6 +109,131 @@ fn add_placeholder(stack: &adw::ViewStack, name: &str, title: &str, icon: &str, 
         .description(description)
         .build();
     stack.add_titled_with_icon(&page, Some(name), title, icon);
+}
+
+// ── Place tab (#391) ────────────────────────────────────────────────────────
+
+/// Build the real **Place** tab: the resolved place, an auto(`GeoClue`)/manual
+/// switch, and a manual-city entry, all round-tripping over `Control`
+/// (`GetPlace` / `SetAutoLocation` / `SetManualCity`). When the shell isn't
+/// running the calls fail and the row shows an "unavailable" hint — no panic.
+fn build_place_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .title("Location")
+        .description(
+            "The location that feeds the weather widget. Automatic uses GeoClue; \
+             manual forward-geocodes a city you name.",
+        )
+        .build();
+
+    let place_row = adw::ActionRow::builder()
+        .title("Current place")
+        .subtitle("Resolving…")
+        .build();
+    // Default to "auto" so the pre-connection state matches the shell default;
+    // GetPlace corrects it once the shell answers.
+    let auto_switch = adw::SwitchRow::builder()
+        .title("Automatic location")
+        .subtitle("Detect your location automatically (GeoClue)")
+        .active(true)
+        .build();
+    let city_entry = adw::EntryRow::builder()
+        .title("Set city manually")
+        .show_apply_button(true)
+        .build();
+
+    group.add(&place_row);
+    group.add(&auto_switch);
+    group.add(&city_entry);
+    page.add(&group);
+
+    // Guard so programmatically syncing the switch from GetPlace (which fires
+    // `active-notify`) doesn't loop back into a `SetAutoLocation` call.
+    let syncing = Rc::new(Cell::new(false));
+
+    refresh_place(&place_row, &auto_switch, &syncing);
+
+    // Auto/manual toggle → SetAutoLocation, then re-read the resolved place.
+    {
+        let place_row = place_row.clone();
+        let syncing = syncing.clone();
+        auto_switch.connect_active_notify(move |sw| {
+            if syncing.get() {
+                return;
+            }
+            let (place_row, sw, syncing) = (place_row.clone(), sw.clone(), syncing.clone());
+            spawn_on_runtime(set_auto_location(sw.is_active()), move |res| {
+                if let Err(err) = res {
+                    tracing::info!(%err, "SetAutoLocation failed");
+                }
+                refresh_place_soon(&place_row, &sw, &syncing);
+            });
+        });
+    }
+
+    // Manual city applied → SetManualCity (switch flips to manual on re-read).
+    {
+        let place_row = place_row.clone();
+        let auto_switch = auto_switch.clone();
+        let syncing = syncing.clone();
+        city_entry.connect_apply(move |entry| {
+            let city = entry.text().trim().to_owned();
+            if city.is_empty() {
+                return;
+            }
+            let (place_row, auto_switch, syncing) =
+                (place_row.clone(), auto_switch.clone(), syncing.clone());
+            spawn_on_runtime(set_manual_city(city), move |res| {
+                if let Err(err) = res {
+                    tracing::info!(%err, "SetManualCity failed");
+                }
+                refresh_place_soon(&place_row, &auto_switch, &syncing);
+            });
+        });
+    }
+
+    page
+}
+
+/// Read the current place over `Control` and reflect it into the widgets. On
+/// failure (shell not running) the row shows an unavailable hint.
+fn refresh_place(
+    place_row: &adw::ActionRow,
+    auto_switch: &adw::SwitchRow,
+    syncing: &Rc<Cell<bool>>,
+) {
+    let (place_row, auto_switch, syncing) =
+        (place_row.clone(), auto_switch.clone(), syncing.clone());
+    spawn_on_runtime(get_place(), move |res| match res {
+        Ok((label, auto)) => {
+            // Suppress the switch's notify handler during the programmatic sync.
+            syncing.set(true);
+            place_row.set_subtitle(&label);
+            auto_switch.set_active(auto);
+            syncing.set(false);
+        }
+        Err(err) => {
+            tracing::info!(%err, "GetPlace failed");
+            place_row.set_subtitle("Unavailable — is trollshell running?");
+        }
+    });
+}
+
+/// Re-read the place now and once more after the shell's resolve lag (a
+/// forward-geocode + re-resolve takes a beat), so the label catches up to a
+/// just-applied change without the user refreshing.
+fn refresh_place_soon(
+    place_row: &adw::ActionRow,
+    auto_switch: &adw::SwitchRow,
+    syncing: &Rc<Cell<bool>>,
+) {
+    refresh_place(place_row, auto_switch, syncing);
+    let (place_row, auto_switch, syncing) =
+        (place_row.clone(), auto_switch.clone(), syncing.clone());
+    glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+        refresh_place(&place_row, &auto_switch, &syncing);
+    });
 }
 
 /// Probe the running shell's control endpoint on the shared tokio runtime, then
@@ -165,5 +294,67 @@ async fn control_call(method: &str) -> Result<String, hytte_bus::BusError> {
         .timeout(Duration::from_secs(3))
         .retry(RetryPolicy::Never)
         .send::<String>()
+        .await
+}
+
+/// Run `fut` on the shared hytte tokio runtime and deliver its result to
+/// `on_done` back on the GTK main thread. The D-Bus work stays off the UI
+/// thread; the reply crosses back over a oneshot glib's executor awaits. If the
+/// receiver is dropped first (window closed), `on_done` simply never runs.
+fn spawn_on_runtime<T, Fut, F>(fut: Fut, on_done: F)
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    F: FnOnce(T) + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    hytte_reactive::runtime::handle().spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(v) = rx.await {
+            on_done(v);
+        }
+    });
+}
+
+/// `GetPlace` → `(label, auto)`: the resolved place label and whether
+/// auto-location is in force.
+async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("GetPlace")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<(String, bool)>()
+        .await
+}
+
+/// `SetManualCity(city)`: switch to manual location and forward-geocode `city`
+/// shell-side. A slightly longer timeout than the others — the shell does a
+/// network geocode as part of applying it.
+async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("SetManualCity")
+        .args((city,))
+        .timeout(Duration::from_secs(5))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
+        .await
+}
+
+/// `SetAutoLocation(auto)`: toggle auto (`GeoClue`) vs. manual location.
+async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("SetAutoLocation")
+        .args((auto,))
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
         .await
 }

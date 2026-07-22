@@ -3,10 +3,11 @@
 //!
 //! One sidebar card cycling every kit widget through every skin: a
 //! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
-//! per second, and an **8bit textbox**, all rotating VFD → LCD → OLED every
-//! [`STYLE_SECS`] seconds. Tapping the clock advances the skin immediately.
-//! It doubles as the kit's visual regression harness and the copy-from
-//! reference for plugin authors.
+//! per second, a **scrolling marquee** panning a pixel window across a
+//! pre-rendered strip, and an **8bit textbox**, all rotating VFD → LCD → OLED
+//! every [`STYLE_SECS`] seconds. Tapping the clock advances the skin
+//! immediately. It doubles as the kit's visual regression harness and the
+//! copy-from reference for plugin authors.
 //!
 //! # Shape — The Elm Architecture, purely host-driven
 //!
@@ -22,10 +23,11 @@
 //!
 //! Every widget is sized via its **buffer dimensions** (a `Pixels` node's
 //! natural size), not shell CSS: the 7seg clock renders 188 px wide, the
-//! 11-char ticker 268 px, the 22-column ×2 textbox 274 px — all inside the
-//! sidebar card's ~296 px content width.
+//! 11-char ticker 268 px, the marquee window [`MARQUEE_WINDOW_PX`] wide, the
+//! 22-column ×2 textbox 274 px — all inside the sidebar card's ~296 px content
+//! width.
 
-use hytte_plugin::preem::{DisplayStyle, TextBox, dot_matrix, seven_seg};
+use hytte_plugin::preem::{DisplayStyle, Marquee, TextBox, dot_matrix, seven_seg};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin};
 
@@ -37,6 +39,7 @@ const ROOT_ID: &str = "preem-demo-root";
 const CYCLE_BTN: &str = "preem-demo-cycle";
 const SEG_ID: &str = "preem-demo-7seg";
 const TICKER_ID: &str = "preem-demo-ticker";
+const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
 
 /// Seconds each skin holds before the rotation advances.
@@ -47,6 +50,18 @@ const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED ~ 7SEG DOT 8BIT ~ ";
 /// Chars of [`TICKER`] visible at once: 11 dot-matrix cells = 268 px, the
 /// widest that fits the ~296 px sidebar card.
 const TICKER_WINDOW: usize = 11;
+/// The marquee's message — wider than the window, so it scrolls (every char is
+/// font-covered; see the [`demo_copy_is_fully_covered_by_the_font`] test).
+///
+/// [`demo_copy_is_fully_covered_by_the_font`]: tests::demo_copy_is_fully_covered_by_the_font
+const MARQUEE_MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
+/// The marquee window width in pixels — a wide bar-chip ticker that stays
+/// within the ~296 px sidebar card.
+const MARQUEE_WINDOW_PX: usize = 268;
+/// Pixels the marquee pans per host snapshot. The shell re-snapshots ~1 Hz, so
+/// the demo steps once a second; a frame-timer plugin would bump the offset
+/// every frame for a smooth scroll (the kit owns no clock).
+const MARQUEE_STEP_PX: usize = 6;
 /// The textbox wrap width: 22 columns at ×2 scale = 274 px.
 const TEXT_COLS: usize = 22;
 
@@ -90,6 +105,16 @@ impl PreemDemo {
         let len = i64::try_from(chars.len()).unwrap_or(1).max(1);
         let off = usize::try_from(self.unix.rem_euclid(len)).unwrap_or(0);
         chars.iter().cycle().skip(off).take(TICKER_WINDOW).collect()
+    }
+
+    /// The marquee's scroll offset, panning [`MARQUEE_STEP_PX`] px per second.
+    /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window) wraps
+    /// this modulo the strip period, so the raw (unbounded) counter is fine.
+    fn marquee_offset(&self) -> usize {
+        // Bound the seconds before scaling so the multiply can never overflow;
+        // the window's own modulo makes the absolute value irrelevant.
+        let secs = usize::try_from(self.unix.rem_euclid(1_000_000)).unwrap_or(0);
+        secs.saturating_mul(MARQUEE_STEP_PX)
     }
 
     /// The textbox's line — names the current skin so the rotation is
@@ -157,14 +182,18 @@ impl Plugin for PreemDemo {
         Vec::new()
     }
 
-    /// One vertical card: the pokeable 7seg clock, the ticker, the textbox
-    /// — all wearing the same skin — and a dim hint line. Every `Pixels`
-    /// buffer satisfies the host's `len == w * h * 4` invariant by kit
-    /// construction.
+    /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
+    /// marquee, the textbox — all wearing the same skin — and a dim hint line.
+    /// Every `Pixels` buffer satisfies the host's `len == w * h * 4` invariant
+    /// by kit construction.
     fn view(&self) -> Node {
         let style = self.style();
         let clock = seven_seg(&self.hhmm, style);
         let ticker = dot_matrix(&self.ticker_window(), style);
+        let marquee = Marquee::new(style)
+            .window_px(MARQUEE_WINDOW_PX)
+            .render(MARQUEE_MSG)
+            .window(self.marquee_offset());
         let textbox = TextBox::styled(style)
             .cols(TEXT_COLS)
             .scale(2)
@@ -182,6 +211,7 @@ impl Plugin for PreemDemo {
                     child: Box::new(clock.into_node(Some(SEG_ID), Vec::new())),
                 },
                 ticker.into_node(Some(TICKER_ID), Vec::new()),
+                marquee.into_node(Some(MARQUEE_ID), Vec::new()),
                 textbox.into_node(Some(TEXT_ID), Vec::new()),
                 Node::Label {
                     id: None,
@@ -200,7 +230,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{CYCLE_BTN, PreemDemo, STYLE_SECS, parse_hhmm};
-    use hytte_plugin::preem::DisplayStyle;
+    use hytte_plugin::preem::{DisplayStyle, Marquee};
     use hytte_plugin::proto::{
         ClockState, EventKind, Node, PluginMsg, StateSnapshot, decode, encode,
     };
@@ -308,7 +338,7 @@ mod tests {
         for step in 0..6 {
             let tree = m.view();
             let bufs = pixels_of(&tree);
-            assert_eq!(bufs.len(), 3, "clock + ticker + textbox");
+            assert_eq!(bufs.len(), 4, "clock + ticker + marquee + textbox");
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
                 assert!(w > 0 && h > 0);
@@ -349,14 +379,36 @@ mod tests {
         assert_eq!(w0.chars().count(), super::TICKER_WINDOW);
     }
 
-    /// Every ticker/textbox char is covered by the kit font — no accidental
-    /// notdef boxes in the demo's own copy.
+    /// The marquee pans forward with the host clock (a live frame timer would
+    /// bump the offset per frame), and the panned pixels actually move.
+    #[test]
+    fn marquee_pans_with_the_clock() {
+        let mut m = fresh();
+        let _ = m.update(snapshot("2026-07-16T00:00:03+02:00", 300));
+        let o0 = m.marquee_offset();
+        let _ = m.update(snapshot("2026-07-16T00:00:04+02:00", 301));
+        let o1 = m.marquee_offset();
+        assert_eq!(o1 - o0, super::MARQUEE_STEP_PX, "one second, one step");
+
+        let strip = Marquee::new(m.style())
+            .window_px(super::MARQUEE_WINDOW_PX)
+            .render(super::MARQUEE_MSG);
+        assert!(strip.scrolls(), "the demo message overflows the window");
+        assert_ne!(
+            strip.window(o0),
+            strip.window(o1),
+            "the scroll moves pixels"
+        );
+    }
+
+    /// Every ticker/marquee/textbox char is covered by the kit font — no
+    /// accidental notdef boxes in the demo's own copy.
     #[test]
     fn demo_copy_is_fully_covered_by_the_font() {
-        for c in super::TICKER.chars() {
+        for c in super::TICKER.chars().chain(super::MARQUEE_MSG.chars()) {
             assert!(
                 hytte_plugin::preem::font::glyph(c).is_some(),
-                "ticker char {c:?} has a glyph"
+                "ticker/marquee char {c:?} has a glyph"
             );
         }
         for style in DisplayStyle::ALL {

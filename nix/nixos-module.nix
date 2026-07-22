@@ -244,10 +244,32 @@ in
         # under GNOME and Unity, exiting"); under a Niri session it's `niri`,
         # so the bare command bails. The wrapper spoofs the desktop just for
         # this invocation — bind it to a niri keybind, or run it by name.
+        #
+        # Spoofing GNOME also makes g-c-c show its *whole* sidebar, including
+        # shell-only panels that read GSettings schemas only a real GNOME Shell
+        # installs. On a Niri box those schemas are absent, so g-c-c reads a
+        # value off a NULL schema and core-dumps — e.g. opening "Multitasking"
+        # aborts with "Settings schema 'org.gnome.shell.app-switcher' is not
+        # installed" → trace trap (#375). That panel reads
+        # org.gnome.shell.app-switcher / .window-switcher (from gnome-shell) and
+        # org.gnome.mutter (from mutter). We don't want the shell/compositor
+        # themselves — only their compiled *schemas* — so prepend just those two
+        # packages' schema dirs to XDG_DATA_DIRS for this launch; the shell-only
+        # panels then resolve their schemas and render inert instead of aborting.
+        #
+        # Path form: GIO appends `glib-2.0/schemas` to each XDG_DATA_DIRS entry,
+        # and nixpkgs relocates schemas to `share/gsettings-schemas/<name>/`
+        # (NOT bare `share/glib-2.0/schemas`) — the same layout the devShell
+        # points GLib at (nix/devshell.nix). So each entry is the package's
+        # `.../gsettings-schemas/<name>` dir. g-c-c's own wrapGAppsHook wrapper
+        # only *prefixes* XDG_DATA_DIRS, so these tail entries survive to the
+        # real binary. `$XDG_DATA_DIRS` is expanded by the shell before `env`
+        # runs, preserving whatever the session already set.
         environment.systemPackages = [
           pkgs.gnome-control-center
           (pkgs.writeShellScriptBin "trollshell-online-accounts" ''
             exec env XDG_CURRENT_DESKTOP=GNOME \
+              XDG_DATA_DIRS="${pkgs.gnome-shell}/share/gsettings-schemas/${pkgs.gnome-shell.name}:${pkgs.mutter}/share/gsettings-schemas/${pkgs.mutter.name}:$XDG_DATA_DIRS" \
               ${pkgs.gnome-control-center}/bin/gnome-control-center online-accounts "$@"
           '')
         ];
@@ -299,6 +321,52 @@ in
             TimeoutStopSec = 10;
           };
         };
+
+        # xdg-desktop-portal for niri (#375), mirroring the home-manager
+        # module's programs.trollshell.portals.enable (nix/hm-module.nix). The
+        # FileChooser portal is what the Appearance "Browse…" wallpaper picker —
+        # and gnome-control-center's own file dialogs — open through; without a
+        # backend the picker has nothing to talk to. #380 already stopped the
+        # picker from *crashing* the shell (it opens the FileDialog unparented);
+        # this wires an actual portal backend so it *works* out of the box on a
+        # NixOS-module deployment. Home-manager users get this from
+        # programs.trollshell.portals.enable; on a NixOS-only host (no
+        # home-manager) it was wired nowhere. Same routing as
+        # etc/xdg-desktop-portal/niri-portals.conf. mkDefault throughout so an
+        # explicit override still wins.
+        xdg.portal = {
+          enable = lib.mkDefault true;
+          extraPortals = lib.mkDefault [
+            pkgs.xdg-desktop-portal-gnome
+            pkgs.xdg-desktop-portal-wlr
+          ];
+          config.niri = {
+            default = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.FileChooser" = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.Settings" = lib.mkDefault [
+              "gnome"
+              "gtk"
+            ];
+            "org.freedesktop.impl.portal.Screenshot" = lib.mkDefault [ "wlr" ];
+            "org.freedesktop.impl.portal.ScreenCast" = lib.mkDefault [ "wlr" ];
+          };
+        };
+
+        # xdg-desktop-portal picks its per-desktop config (the niri-portals.conf
+        # rendered above) by matching XDG_CURRENT_DESKTOP, and the GNOME backend
+        # only activates when GNOME is in the list. niri advertises itself as
+        # `niri`, so export `niri:GNOME` for the session so both the niri
+        # portal config and the gnome backend engage (see
+        # etc/xdg-desktop-portal/README.md). The home-manager module leaves this
+        # to the user (its portals option doc says so); the NixOS module sets it
+        # here. mkDefault so a hand-set value wins.
+        environment.sessionVariables.XDG_CURRENT_DESKTOP = lib.mkDefault "niri:GNOME";
       })
       # Optional GNOME desktop apps that complement the GOA/EDS stack: a real
       # calendar UI (trollshell's own Calendar page is read-only), plus task

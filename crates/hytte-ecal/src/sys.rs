@@ -62,9 +62,11 @@ pub type ICalComponent = c_void;
 /// return new refs).
 pub type ICalTime = c_void;
 
-/// `ICalTimezone *` — a libical timezone. We only ever use the process-wide
-/// UTC singleton ([`i_cal_timezone_get_utc_timezone`]), which is owned by
-/// libical and must never be unref'd.
+/// `ICalTimezone *` — a libical timezone. We use the process-wide UTC singleton
+/// ([`i_cal_timezone_get_utc_timezone`]) as the conversion zone, and read the
+/// borrowed zone an [`ICalTime`] carries ([`i_cal_time_get_timezone`]) purely to
+/// detect whether a time is absolute. Both are owned by libical and must never
+/// be unref'd.
 pub type ICalTimezone = c_void;
 
 /// `ICalProperty *` — one property of a component (e.g. an RRULE). Returned
@@ -355,6 +357,31 @@ unsafe extern "C" {
     /// True iff the [`ICalTime`] is the libical "null time" sentinel — a
     /// guard before trusting the start/end the callback hands us.
     pub fn i_cal_time_is_null_time(tt: *const ICalTime) -> GBoolean;
+
+    /// True iff the [`ICalTime`] is expressed in UTC (a `…Z` value). Such a
+    /// time already knows its absolute offset, so the zone passed to
+    /// [`i_cal_time_as_timet_with_zone`] is ignored for it. Returns a
+    /// [`GBoolean`]. Used to tell a genuinely floating (zone-less) time apart
+    /// from an absolute one — see #388.
+    pub fn i_cal_time_is_utc(tt: *const ICalTime) -> GBoolean;
+
+    /// The [`ICalTimezone`] a resolved-`TZID` time carries, or `NULL` for a
+    /// floating (zone-less) or DATE value. The returned pointer is a **borrow**
+    /// (owned by the `ICalTime` / libical's builtin table) — never unref it.
+    /// A non-null result means the time already knows its absolute offset, so
+    /// [`i_cal_time_as_timet_with_zone`]'s zone argument is ignored for it.
+    pub fn i_cal_time_get_timezone(tt: *const ICalTime) -> *mut ICalTimezone;
+
+    /// The broken-down wall-clock fields of an [`ICalTime`] (`gint` each).
+    /// Read as-is (no zone conversion), so for a floating value they are the
+    /// literal `DTSTART` digits — which we reinterpret in the local zone via
+    /// chrono rather than assuming UTC (#388). Borrow `tt`; allocate nothing.
+    pub fn i_cal_time_get_year(tt: *const ICalTime) -> c_int;
+    pub fn i_cal_time_get_month(tt: *const ICalTime) -> c_int;
+    pub fn i_cal_time_get_day(tt: *const ICalTime) -> c_int;
+    pub fn i_cal_time_get_hour(tt: *const ICalTime) -> c_int;
+    pub fn i_cal_time_get_minute(tt: *const ICalTime) -> c_int;
+    pub fn i_cal_time_get_second(tt: *const ICalTime) -> c_int;
 
     /// Construct a new [`ICalTime`] from POSIX `time_t` (UTC seconds) in
     /// `zone`. `is_date` non-zero makes it a DATE (no time-of-day). The

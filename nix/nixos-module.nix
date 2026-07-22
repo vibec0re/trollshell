@@ -165,6 +165,16 @@ in
       # you actually run the shell.
       { systemd.user.services = pluginServices; }
 
+      # Control-center companion app (#399): the external GTK settings/management
+      # window (app-id mov.vibec0re.trollshell.ControlCenter) that speaks to the
+      # shell's mov.vibec0re.trollshell.Control endpoint. Installed by default
+      # alongside the shell; its own toggle drops it. Kept as a self-contained
+      # mkMerge branch so it doesn't collide with the systemPackages edits in the
+      # recommended-services block below.
+      (lib.mkIf cfg.controlCenter.enable {
+        environment.systemPackages = [ cfg.controlCenter.package ];
+      })
+
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its
       # daemon is missing, so dropping the lot still leaves a working bar.

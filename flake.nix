@@ -47,9 +47,15 @@
         { pkgs, craneLib, ... }:
         let
           trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          # The control-center companion app (#399). Reuses the shell build's
+          # shared cargoArtifacts (via trollshell.passthru) so it doesn't
+          # trigger a second full deps compile.
+          trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
+            inherit craneLib trollshell;
+          };
         in
         {
-          inherit trollshell;
+          inherit trollshell trollshell-control-center;
           default = trollshell;
         }
       );

@@ -2379,6 +2379,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
+name = "trollshell-control-center"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "hytte-bus",
+ "hytte-reactive",
+ "libadwaita",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

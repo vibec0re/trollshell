@@ -1,6 +1,7 @@
 mod assets;
 mod commands;
 mod components;
+mod control;
 mod modal;
 mod overlays;
 mod panels;
@@ -21,6 +22,10 @@ use hytte::services::{
     tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
 };
 
+// The service-registration builder chain + body closure make `main` one long
+// flat sequence; registering the control service (#390) tips it past the
+// 100-line pedantic limit. Splitting it would only obscure the linear wiring.
+#[allow(clippy::too_many_lines)]
 fn main() -> hytte::ui::Result<()> {
     // `trollshell --scan-aps`: one-shot dump of visible Wi-Fi networks as a
     // paste-ready `ssids = [...]` block for ~/.config/trollshell/places.toml,
@@ -87,6 +92,10 @@ fn main() -> hytte::ui::Result<()> {
         // halves (clock pump, effect broker) are wired via `plugins::install()`
         // below; the sidebar reconciler slots mount in `build_card`.
         .with(plugins::service())
+        // External control-center transport (#390): owns the dedicated
+        // `mov.vibec0re.trollshell.Control` name + Ping/Version interface — see
+        // control.rs (companion app: trollshell-control-center).
+        .with(control::service())
         .with_user_style(assets::path("style.css"))
         .run(|app| {
             // GSettings schemas often aren't visible to `cargo run` from the

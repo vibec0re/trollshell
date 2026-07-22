@@ -99,6 +99,18 @@ pub enum Effect {
         body: String,
         icon: Option<String>,
     },
+    /// Post a **notification toast** through the shell's own notification daemon
+    /// (cap: [`Notify`](crate::manifest::Capability::Notify)). trollshell *is* the
+    /// `org.freedesktop.Notifications` daemon, so a plugin that needs to make
+    /// noise at a moment nobody is watching — a timer hitting zero, a threshold
+    /// crossed (#320), an approval request (#344) — asks the host to inject a
+    /// local toast rather than owning a D-Bus connection of its own. A **generic,
+    /// reusable** surface like [`RaiseOsd`](Effect::RaiseOsd): the *plugin*
+    /// computes the strings and the host renders them through the same path as an
+    /// externally-posted `Notify` (rate-limited, DND-gated), so any plugin can
+    /// alert without the host learning its domain. `summary` is the bold headline,
+    /// `body` the detail line. Fire-and-forget.
+    Notify { summary: String, body: String },
 }
 
 /// The outcome of a brokered [`Effect::RunCommand`], returned to the plugin.

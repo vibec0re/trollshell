@@ -59,6 +59,9 @@ pub enum Capability {
     RunCommand,
     /// Raise a transient OSD nudge ([`Effect::RaiseOsd`](crate::effect::Effect::RaiseOsd)).
     RaiseOsd,
+    /// Post a notification toast through the shell's own notification daemon
+    /// ([`Effect::Notify`](crate::effect::Effect::Notify)).
+    Notify,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

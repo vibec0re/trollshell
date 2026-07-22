@@ -132,6 +132,10 @@ fn sample_effects() -> Vec<Effect> {
             body: "S9 · Spandau · 16:05".into(),
             icon: Some("appointment-soon-symbolic".into()),
         },
+        Effect::Notify {
+            summary: "Timer done".into(),
+            body: "25:00 timer finished".into(),
+        },
     ]
 }
 
@@ -539,6 +543,49 @@ fn raise_osd_is_name_tagged_and_additive() {
         let back: Effect = decode(&encode(&effect)).expect("decode RaiseOsd");
         assert_eq!(effect, back);
     }
+}
+
+// ── Notify effect (#406) ─────────────────────────────────────────────────────
+
+#[test]
+fn notify_is_name_tagged_and_additive() {
+    // `Notify` is a brand-new, externally-tagged `Effect` variant, so it rides
+    // the wire as its bare variant *name* — the property that makes appending it
+    // additive: an older decoder skips an unknown tag rather than mis-decoding an
+    // existing variant, and every pre-#406 frame (which can't carry a `Notify`)
+    // decodes byte-for-byte unchanged. So `PROTO_VERSION` stays put.
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
+
+    let body = encode_body(&Effect::Notify {
+        summary: "Timer done".into(),
+        body: "25:00 timer finished".into(),
+    });
+    assert!(contains(&body, b"Notify"), "variant name 'Notify' present");
+
+    let effect = Effect::Notify {
+        summary: "Timer done".into(),
+        body: "Your 5:00 break is up".into(),
+    };
+    let back: Effect = decode(&encode(&effect)).expect("decode Notify");
+    assert_eq!(effect, back);
+}
+
+#[test]
+fn notify_capability_is_name_tagged() {
+    // The paired manifest capability (#406) that gates the effect. Like every
+    // other `Capability` it rides the wire as its bare variant name, so a
+    // manifest requesting it round-trips and appending it is additive.
+    let mut m = sample_manifest();
+    m.capabilities = vec![Capability::Notify];
+    let back: Manifest = decode(&encode(&m)).expect("decode manifest with Notify cap");
+    assert_eq!(m, back);
+    assert!(
+        contains(&encode_body(&Capability::Notify), b"Notify"),
+        "capability name 'Notify' rides the wire",
+    );
 }
 
 // ── Plugin panel + PluginSelf page (#349 PR2) ────────────────────────────────

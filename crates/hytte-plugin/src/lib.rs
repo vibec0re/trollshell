@@ -52,11 +52,16 @@
 //! # Commands: the outbound I/O lane
 //!
 //! [`update`](Plugin::update) returns shell [`Effect`]s — actions the *host*
-//! brokers (open a page, drive niri/media, run a command). A plugin's **own**
-//! external I/O — send a frame on the WebSocket it holds, fire an HTTP call —
-//! is not a shell effect: the design does that in-process and never round-trips
-//! it through the host. But `update` is sync, so it cannot do the I/O itself;
-//! the sanctioned lane is a typed **command** channel (issue #280).
+//! brokers (open a page, drive niri/media, run a command, post a notification
+//! toast via [`Effect::Notify`](proto::Effect::Notify) once the manifest grants
+//! [`Capability::Notify`](proto::Capability::Notify), #406). The whole effect
+//! vocabulary is the re-exported [`proto::Effect`] enum — a plugin names its
+//! variants directly, so nothing SDK-side gates which effects an author can
+//! emit; the host is the one that brokers (and, eventually, cap-checks) each.
+//! A plugin's **own** external I/O — send a frame on the WebSocket it holds,
+//! fire an HTTP call — is not a shell effect: the design does that in-process and
+//! never round-trips it through the host. But `update` is sync, so it cannot do
+//! the I/O itself; the sanctioned lane is a typed **command** channel (issue #280).
 //!
 //! The runtime creates one fresh channel per session and threads its two ends
 //! for you: [`init`](Plugin::init) receives the

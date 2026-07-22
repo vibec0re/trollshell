@@ -9,14 +9,15 @@
 //! `control.rs`).
 //!
 //! An `adw::ViewStack` of tabs plus a banner that reports whether the shell
-//! answered `Ping`/`Version`. The **Place** tab (#391) is the first *real* tab:
-//! it manages the location that feeds the weather widget — automatic (`GeoClue`)
-//! vs. a manual, forward-geocoded city — round-tripping over `Control`. The
-//! remaining tabs (Plugins · AI Keys · Display) are still "coming soon"
-//! `StatusPage` stubs, each its own follow-up issue. When the shell isn't
-//! running the app degrades gracefully rather than panicking.
+//! answered `Ping`/`Version`. The **Place** tab (#391) manages the location that
+//! feeds the weather widget — automatic (`GeoClue`) vs. a manual, forward-geocoded
+//! city. The **Plugins** tab (#348) lists each `trollshell-plugin-<id>` systemd
+//! **user** unit with a switch that starts/enables or stops/disables it. Both
+//! round-trip over `Control`. The remaining tabs (AI Keys · Display) are still
+//! "coming soon" `StatusPage` stubs, each its own follow-up issue. When the shell
+//! isn't running the app degrades gracefully rather than panicking.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -43,14 +44,15 @@ fn main() -> glib::ExitCode {
 /// connection-status banner, then kick off the async shell probe.
 fn build_window(app: &adw::Application) {
     let stack = adw::ViewStack::new();
-    add_placeholder(
-        &stack,
-        "plugins",
+    // The Plugins tab (#348): start/stop/enable each plugin's systemd user unit.
+    let plugins_page = build_plugins_page();
+    stack.add_titled_with_icon(
+        &plugins_page,
+        Some("plugins"),
         "Plugins",
         "application-x-addon-symbolic",
-        "Enable, disable, and configure widget plugins. Coming soon (#391).",
     );
-    // The first real tab (#391): location management, round-tripped over Control.
+    // The Place tab (#391): location management, round-tripped over Control.
     let place_page = build_place_page();
     stack.add_titled_with_icon(
         &place_page,
@@ -70,7 +72,7 @@ fn build_window(app: &adw::Application) {
         "display",
         "Display",
         "video-display-symbolic",
-        "Arrange monitors, resolution, and scaling. Coming soon (#348).",
+        "Arrange monitors, resolution, and scaling. Coming soon (#392).",
     );
 
     let switcher = adw::ViewSwitcher::builder()
@@ -236,6 +238,158 @@ fn refresh_place_soon(
     });
 }
 
+// ── Plugins tab (#348) ────────────────────────────────────────────────────────
+
+/// Build the real **Plugins** tab: one switch row per `trollshell-plugin-<id>`
+/// systemd **user** unit, round-tripping over `Control`
+/// (`ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled`). Each
+/// switch reflects whether the plugin is running; toggling it starts+enables or
+/// stops+disables the unit, so the choice both applies now and persists across
+/// logins. When the shell isn't running the list call fails and the group shows
+/// an "unavailable" row — no panic.
+///
+/// Scope is the plugins' **systemd-unit state** (tier 1 + 2 of #348). The live
+/// "connected / rendering" overlay from the host's in-process plugin registry
+/// (`plugins.rs`, GTK-thread-local) is a deferred follow-up — it needs a
+/// cross-thread bridge out of that registry.
+fn build_plugins_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .title("Plugins")
+        .description(
+            "Widget plugins run as trollshell-plugin-<id> systemd user units. \
+             Toggle one to start and enable it, or stop and disable it.",
+        )
+        .build();
+    page.add(&group);
+
+    // The rows we've added, so a refresh can remove them before rebuilding.
+    let rows: Rc<RefCell<Vec<gtk::Widget>>> = Rc::new(RefCell::new(Vec::new()));
+    // Guard so programmatically setting a switch from a fetched state doesn't
+    // loop back into a Start/Stop call (mirrors the Place tab's `syncing`).
+    let syncing = Rc::new(Cell::new(false));
+
+    refresh_plugins(&group, &rows, &syncing);
+    page
+}
+
+/// Re-read the plugin list over `Control` and rebuild the group's rows. On
+/// failure (shell not running) the group shows a single "unavailable" row; with
+/// no plugins installed, an informational row.
+fn refresh_plugins(
+    group: &adw::PreferencesGroup,
+    rows: &Rc<RefCell<Vec<gtk::Widget>>>,
+    syncing: &Rc<Cell<bool>>,
+) {
+    let (group, rows, syncing) = (group.clone(), rows.clone(), syncing.clone());
+    spawn_on_runtime(list_plugins(), move |res| {
+        // Drop the previous rows before rebuilding.
+        for row in rows.borrow_mut().drain(..) {
+            group.remove(&row);
+        }
+        match res {
+            Ok(plugins) if !plugins.is_empty() => {
+                for (id, active_state, enabled) in plugins {
+                    let row =
+                        build_plugin_row(&group, &rows, &syncing, &id, &active_state, enabled);
+                    group.add(&row);
+                    rows.borrow_mut().push(row.upcast());
+                }
+            }
+            Ok(_) => {
+                let row = adw::ActionRow::builder()
+                    .title("No plugins installed")
+                    .subtitle("Install a trollshell-plugin-<id> user unit to manage it here.")
+                    .build();
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+            Err(err) => {
+                tracing::info!(%err, "ListPlugins failed");
+                let row = adw::ActionRow::builder()
+                    .title("Unavailable")
+                    .subtitle("Is trollshell running?")
+                    .build();
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+        }
+    });
+}
+
+/// Build one plugin's switch row. The switch reflects whether the unit is
+/// running; toggling it starts+enables (on) or stops+disables (off) the unit,
+/// then re-reads the list so the row catches up to the real state.
+fn build_plugin_row(
+    group: &adw::PreferencesGroup,
+    rows: &Rc<RefCell<Vec<gtk::Widget>>>,
+    syncing: &Rc<Cell<bool>>,
+    id: &str,
+    active_state: &str,
+    enabled: bool,
+) -> adw::SwitchRow {
+    let subtitle = plugin_subtitle(active_state, enabled);
+    let row = adw::SwitchRow::builder()
+        .title(id)
+        .subtitle(&subtitle)
+        .build();
+    // Suppress the notify handler while we set the initial value from the fetch.
+    syncing.set(true);
+    row.set_active(is_running(active_state));
+    syncing.set(false);
+
+    let (group, rows, syncing, id) = (group.clone(), rows.clone(), syncing.clone(), id.to_owned());
+    row.connect_active_notify(move |sw| {
+        if syncing.get() {
+            return;
+        }
+        let want_on = sw.is_active();
+        let (group, rows, syncing, id) = (group.clone(), rows.clone(), syncing.clone(), id.clone());
+        spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
+            if let Err(err) = res {
+                tracing::info!(%err, "plugin start/stop failed");
+            }
+            refresh_plugins_soon(&group, &rows, &syncing);
+        });
+    });
+    row
+}
+
+/// Re-read the plugin list now and again after systemd settles the transition,
+/// so a just-toggled row catches up without the user refreshing.
+fn refresh_plugins_soon(
+    group: &adw::PreferencesGroup,
+    rows: &Rc<RefCell<Vec<gtk::Widget>>>,
+    syncing: &Rc<Cell<bool>>,
+) {
+    refresh_plugins(group, rows, syncing);
+    let (group, rows, syncing) = (group.clone(), rows.clone(), syncing.clone());
+    glib::timeout_add_local_once(Duration::from_millis(1200), move || {
+        refresh_plugins(&group, &rows, &syncing);
+    });
+}
+
+/// Whether a systemd `ActiveState` means the plugin is currently running — the
+/// switch's on-state. `activating` / `reloading` count as on (it's coming up).
+fn is_running(active_state: &str) -> bool {
+    matches!(active_state, "active" | "activating" | "reloading")
+}
+
+/// The row subtitle: a human status from the unit's `ActiveState` plus its
+/// persisted enabled/disabled state.
+fn plugin_subtitle(active_state: &str, enabled: bool) -> String {
+    let status = match active_state {
+        "active" => "Running",
+        "activating" | "reloading" => "Starting…",
+        "deactivating" => "Stopping…",
+        "failed" => "Failed",
+        "inactive" => "Stopped",
+        other => other,
+    };
+    let persist = if enabled { "enabled" } else { "disabled" };
+    format!("{status} · {persist}")
+}
+
 /// Probe the running shell's control endpoint on the shared tokio runtime, then
 /// update `banner` back on the GTK main thread with the result. Never blocks the
 /// UI and never panics when the shell is absent.
@@ -357,4 +511,85 @@ async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
         .retry(RetryPolicy::Never)
         .send::<()>()
         .await
+}
+
+// ── Plugins tab Control calls (#348) ─────────────────────────────────────────
+
+/// `ListPlugins` → `[(id, active_state, enabled)]` for each plugin user unit.
+async fn list_plugins() -> Result<Vec<(String, String, bool)>, hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ListPlugins")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<Vec<(String, String, bool)>>()
+        .await
+}
+
+/// Apply an on/off toggle for plugin `id`: `on` → start + enable, `off` → stop +
+/// disable, so the change both takes effect now and persists across logins. Two
+/// `Control` calls; the first error short-circuits.
+async fn set_plugin_state(id: String, on: bool) -> Result<(), hytte_bus::BusError> {
+    let start_stop = if on { "StartPlugin" } else { "StopPlugin" };
+    plugin_id_call(start_stop, &id).await?;
+    set_plugin_enabled(&id, on).await
+}
+
+/// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
+/// slightly longer timeout — the shell drives a systemd job to apply it.
+async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method(method)
+        .args((id.to_owned(),))
+        .timeout(Duration::from_secs(5))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
+        .await
+}
+
+/// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
+async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("SetPluginEnabled")
+        .args((id.to_owned(), enabled))
+        .timeout(Duration::from_secs(5))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_running, plugin_subtitle};
+
+    #[test]
+    fn running_states_map_the_switch() {
+        assert!(is_running("active"));
+        assert!(is_running("activating"));
+        assert!(is_running("reloading"));
+        assert!(!is_running("inactive"));
+        assert!(!is_running("failed"));
+        assert!(!is_running("deactivating"));
+    }
+
+    #[test]
+    fn subtitle_combines_status_and_persistence() {
+        assert_eq!(plugin_subtitle("active", true), "Running · enabled");
+        assert_eq!(plugin_subtitle("failed", false), "Failed · disabled");
+        assert_eq!(plugin_subtitle("inactive", true), "Stopped · enabled");
+        assert_eq!(plugin_subtitle("activating", false), "Starting… · disabled");
+    }
+
+    #[test]
+    fn subtitle_passes_through_unknown_active_state() {
+        assert_eq!(
+            plugin_subtitle("maintenance", true),
+            "maintenance · enabled"
+        );
+    }
 }

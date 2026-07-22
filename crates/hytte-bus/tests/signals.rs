@@ -18,9 +18,9 @@ async fn task_exits_when_subscription_dropped() {
     let shared = SharedConnection::for_test_session(conn);
 
     // Start a subscription and grab the exit probe *before* dropping.
-    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
-        .at_path("/cc/hannig/test/Pinger")
-        .iface("cc.hannig.test.Pinger")
+    let sub = signals_with(&shared, "mov.vibec0re.test.Pinger")
+        .at_path("/mov/vibec0re/test/Pinger")
+        .iface("mov.vibec0re.test.Pinger")
         .signal("Pinged")
         .start();
 
@@ -48,7 +48,7 @@ async fn task_exits_when_subscription_dropped() {
 
 struct Pinger;
 
-#[zbus::interface(name = "cc.hannig.test.Pinger")]
+#[zbus::interface(name = "mov.vibec0re.test.Pinger")]
 impl Pinger {
     #[zbus(signal)]
     async fn pinged(emitter: &SignalEmitter<'_>, value: u32) -> zbus::Result<()>;
@@ -62,25 +62,25 @@ async fn delivers_emitted_signal() {
     // Mount a server emitter on a separate connection.
     let server = Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Pinger")
+        .name("mov.vibec0re.test.Pinger")
         .unwrap()
-        .serve_at("/cc/hannig/test/Pinger", Pinger)
+        .serve_at("/mov/vibec0re/test/Pinger", Pinger)
         .unwrap()
         .build()
         .await
         .unwrap();
     let object_server = server.object_server();
     let iface_ref = object_server
-        .interface::<_, Pinger>("/cc/hannig/test/Pinger")
+        .interface::<_, Pinger>("/mov/vibec0re/test/Pinger")
         .await
         .unwrap();
 
     // Subscribe via the bus primitive.
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
-    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
-        .at_path("/cc/hannig/test/Pinger")
-        .iface("cc.hannig.test.Pinger")
+    let sub = signals_with(&shared, "mov.vibec0re.test.Pinger")
+        .at_path("/mov/vibec0re/test/Pinger")
+        .iface("mov.vibec0re.test.Pinger")
         .signal("Pinged")
         .start();
     let mut events = sub.events();
@@ -109,9 +109,9 @@ async fn missed_emissions_bumps_on_reconnect() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
-        .at_path("/cc/hannig/test/Pinger")
-        .iface("cc.hannig.test.Pinger")
+    let sub = signals_with(&shared, "mov.vibec0re.test.Pinger")
+        .at_path("/mov/vibec0re/test/Pinger")
+        .iface("mov.vibec0re.test.Pinger")
         .signal("Pinged")
         .start();
 
@@ -159,9 +159,9 @@ async fn cold_start_does_not_bump_missed_emissions() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let sub = signals_with(&shared, "cc.hannig.test.NoSignal")
-        .at_path("/cc/hannig/test/NoSignal")
-        .iface("cc.hannig.test.NoSignal")
+    let sub = signals_with(&shared, "mov.vibec0re.test.NoSignal")
+        .at_path("/mov/vibec0re/test/NoSignal")
+        .iface("mov.vibec0re.test.NoSignal")
         .signal("Pinged")
         .start();
 

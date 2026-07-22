@@ -40,7 +40,7 @@ fn main() -> hytte::ui::Result<()> {
 
     tracing_subscriber::fmt::init();
 
-    App::new("cc.hannig.trollshell")
+    App::new("mov.vibec0re.trollshell")
         .with(clock::service())
         .with(wifiscan::service())
         // wifiscan + geoclue feed `places` (the location resolver); `places`

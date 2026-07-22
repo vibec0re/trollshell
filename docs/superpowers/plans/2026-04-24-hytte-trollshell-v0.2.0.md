@@ -1573,7 +1573,7 @@ use hytte::services::{clock, networkd, niri, pipewire, resolved, upower};
 fn main() -> hytte::ui::Result<()> {
     tracing_subscriber::fmt::init();
 
-    App::new("cc.hannig.trollshell")
+    App::new("mov.vibec0re.trollshell")
         .with(clock::service())
         .with(niri::service())
         .with(upower::service())

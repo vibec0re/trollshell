@@ -1404,7 +1404,7 @@ use hytte::services::{
 Add `.with(departures::service())` to the chain in `App::new(…)`. Place it right after `.with(clock::service())` (line 23):
 
 ```rust
-    App::new("cc.hannig.trollshell")
+    App::new("mov.vibec0re.trollshell")
         .with(clock::service())
         .with(departures::service())   // NEW
         .with(niri::service())

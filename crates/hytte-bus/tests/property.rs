@@ -13,7 +13,7 @@ struct Counter {
     value: u32,
 }
 
-#[zbus::interface(name = "cc.hannig.test.Counter")]
+#[zbus::interface(name = "mov.vibec0re.test.Counter")]
 impl Counter {
     #[zbus(property)]
     fn value(&self) -> u32 {
@@ -34,9 +34,9 @@ async fn cold_start_emits_loading_then_loaded() {
     // Stand up a server that exposes the Counter interface.
     let _server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Counter")
+        .name("mov.vibec0re.test.Counter")
         .unwrap()
-        .serve_at("/cc/hannig/test/Counter", Counter { value: 7 })
+        .serve_at("/mov/vibec0re/test/Counter", Counter { value: 7 })
         .unwrap()
         .build()
         .await
@@ -45,9 +45,9 @@ async fn cold_start_emits_loading_then_loaded() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
 
@@ -77,9 +77,9 @@ async fn properties_changed_emits_loaded_with_new_value() {
 
     let server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Counter")
+        .name("mov.vibec0re.test.Counter")
         .unwrap()
-        .serve_at("/cc/hannig/test/Counter", Counter { value: 1 })
+        .serve_at("/mov/vibec0re/test/Counter", Counter { value: 1 })
         .unwrap()
         .build()
         .await
@@ -88,9 +88,9 @@ async fn properties_changed_emits_loaded_with_new_value() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
     let mut stream = prop.signal().to_stream();
@@ -114,7 +114,7 @@ async fn properties_changed_emits_loaded_with_new_value() {
     // Mutate the server-side property and emit PropertiesChanged.
     let iface_ref = server
         .object_server()
-        .interface::<_, Counter>("/cc/hannig/test/Counter")
+        .interface::<_, Counter>("/mov/vibec0re/test/Counter")
         .await
         .unwrap();
     {
@@ -148,9 +148,9 @@ async fn reconnect_emits_stale_then_loaded() {
     // Stand up a server exposing the Counter interface (value = 42).
     let _server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Counter")
+        .name("mov.vibec0re.test.Counter")
         .unwrap()
-        .serve_at("/cc/hannig/test/Counter", Counter { value: 42 })
+        .serve_at("/mov/vibec0re/test/Counter", Counter { value: 42 })
         .unwrap()
         .build()
         .await
@@ -159,9 +159,9 @@ async fn reconnect_emits_stale_then_loaded() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
 
@@ -229,9 +229,9 @@ async fn task_exits_when_property_signal_dropped() {
     // Start a property tracker. No server is needed — the task will park
     // in its retry loop, but that's fine: we only care that it exits when
     // the handle is dropped.
-    let prop = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let prop = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
 

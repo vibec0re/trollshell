@@ -891,7 +891,7 @@ fn body_runs_on_activate() {
     let ran = Rc::new(Cell::new(false));
     let ran_writer = ran.clone();
 
-    App::new("cc.hannig.hytte.test")
+    App::new("mov.vibec0re.hytte.test")
         .run(move |app| {
             ran_writer.set(true);
             // Don't crash even if there are no monitors (CI/headless edge).
@@ -2213,7 +2213,7 @@ use hytte::services::{clock, niri};
 fn main() -> hytte_ui::Result<()> {
     tracing_subscriber::fmt::init();
 
-    App::new("cc.hannig.trollshell")
+    App::new("mov.vibec0re.trollshell")
         .with(clock::service())
         .with(niri::service())
         .with_user_style(concat!(env!("CARGO_MANIFEST_DIR"), "/style.css"))

@@ -210,7 +210,7 @@ use hytte::ui::{App, Bar, Edge};
 use hytte::services::{niri, mpris, tray, networkd, bluetooth, pipewire};
 
 fn main() -> hytte::Result<()> {
-    App::new("cc.hannig.trollshell")
+    App::new("mov.vibec0re.trollshell")
         .with(niri::service())
         .with(networkd::service())
         .with(bluetooth::service())

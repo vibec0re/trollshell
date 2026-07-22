@@ -79,9 +79,9 @@ async fn cold_start_does_not_bump_missed_emissions() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let sub = signals_with(&shared, "cc.hannig.test.NoSignal")
-        .at_path("/cc/hannig/test/NoSignal")
-        .iface("cc.hannig.test.NoSignal")
+    let sub = signals_with(&shared, "mov.vibec0re.test.NoSignal")
+        .at_path("/mov/vibec0re/test/NoSignal")
+        .iface("mov.vibec0re.test.NoSignal")
         .signal("Pinged")
         .start();
 
@@ -959,15 +959,15 @@ This is a real gap in the bus API. Options:
 
 **Option A: Add `bus::serve_at(path, iface).bus(BusKind::Session).start()` for "mount without owning a name."** This is a foundation-level API addition — 1 day of work.
 
-**Option B: Use the SAME ownership mechanism but with a unique name we generate.** E.g. `cc.hannig.trollshell.PolkitAgent` (or any name we generate). polkit calls back via our unique name (`:1.42`), not the well-known one — so the well-known name is irrelevant from polkit's perspective. We just use `bus::own_name` to anchor the interface.
+**Option B: Use the SAME ownership mechanism but with a unique name we generate.** E.g. `mov.vibec0re.trollshell.PolkitAgent` (or any name we generate). polkit calls back via our unique name (`:1.42`), not the well-known one — so the well-known name is irrelevant from polkit's perspective. We just use `bus::own_name` to anchor the interface.
 
 **Option C: Don't migrate polkit in this round. Keep polkit on direct zbus until we add `serve_at`.**
 
-For Phase 4: choose **Option B**. Own a name that nobody contests (e.g. `cc.hannig.trollshell.polkit-agent.<pid>` to avoid collisions). polkit calls our unique-name path; the well-known name is just an anchor for the interface mount.
+For Phase 4: choose **Option B**. Own a name that nobody contests (e.g. `mov.vibec0re.trollshell.polkit-agent.<pid>` to avoid collisions). polkit calls our unique-name path; the well-known name is just an anchor for the interface mount.
 
 Actually, even simpler: **Option D: own the agent path under a single trollshell-scoped name that all our private interfaces share.** But that name doesn't exist yet.
 
-**Cleanest: Option B with a per-process unique well-known name.** `cc.hannig.trollshell.polkit-agent` works for production (only one trollshell per session) and tests can use a `.test-<n>` suffix.
+**Cleanest: Option B with a per-process unique well-known name.** `mov.vibec0re.trollshell.polkit-agent` works for production (only one trollshell per session) and tests can use a `.test-<n>` suffix.
 
 Actually re-reading carefully: polkit's RegisterAuthenticationAgent takes an `object_path` (string). It then calls back at `<our_unique_bus_name>:<object_path>`. So our well-known name is irrelevant to polkit — what matters is that the agent OBJECT is mounted on a connection that polkit can reach by unique name.
 
@@ -975,7 +975,7 @@ The bus layer's SharedConnection has a unique name (the `:1.42`-style name assig
 
 So **we need `own_name` to mount the interface but don't actually need polkit to know our well-known name**. The well-known name we own is just a "I'm here, please don't kick me out" placeholder for the bus layer's accounting.
 
-Choose **Option B**: own `cc.hannig.trollshell.polkit-agent`.
+Choose **Option B**: own `mov.vibec0re.trollshell.polkit-agent`.
 
 For Phase 4 the plan is to move forward with Option B. If the polkit-agent name turns out to collide with someone else's session (extremely unlikely), refactor to Option A in Phase 5/6.
 
@@ -998,7 +998,7 @@ impl Service for PolkitService {
     }
 }
 
-const ANCHOR_NAME: &str = "cc.hannig.trollshell.polkit-agent";
+const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.polkit-agent";
 
 async fn run_agent_lifecycle() -> Result<()> {
     let session_id = current_session_id().context("XDG_SESSION_ID unset")?;
@@ -1117,7 +1117,7 @@ git commit -m "refactor(polkit): migrate to hytte::bus::{own_name, signals, call
 
 $(cat <<'EOF'
 AuthAgent interface mounted via bus::own_name on a private well-known
-name (cc.hannig.trollshell.polkit-agent — irrelevant to polkit, just an
+name (mov.vibec0re.trollshell.polkit-agent — irrelevant to polkit, just an
 anchor for the bus layer's connection). RegisterAuthenticationAgent +
 AuthenticationAgentResponse2 calls go through bus::call. polkitd
 restart detection via bus::signals on NameOwnerChanged for
@@ -1173,7 +1173,7 @@ After migration:
 
 - Use `bus::signals(...)` for ObjectManager.InterfacesAdded/Removed and Station.PropertiesChanged
 - Use `bus::call(...)` for GetManagedObjects, Scan, Connect, Disconnect, SetPowered
-- Use `bus::own_name(...)` for the Agent (same anchor-name trick as polkit — own a private name like `cc.hannig.trollshell.iwd-agent`)
+- Use `bus::own_name(...)` for the Agent (same anchor-name trick as polkit — own a private name like `mov.vibec0re.trollshell.iwd-agent`)
 - Use `bus::property::<bool>` for Adapter.Powered
 
 This file is large enough that the migration is mostly mechanical pattern translation. Rather than provide every line of the after-state, the plan provides the migration recipe.
@@ -1214,7 +1214,7 @@ This function:
 1. Calls `bus::call(...).method("GetManagedObjects")` against `net.connman.iwd:/` to discover the Station object path.
 2. Subscribes to `bus::signals(...).iface("net.connman.iwd.Station").signal("PropertiesChanged")` for state updates.
 3. Subscribes to `bus::signals(...).iface("org.freedesktop.DBus.ObjectManager").signal("InterfacesAdded")` and `InterfacesRemoved` for network add/remove.
-4. Mounts the Agent interface via `bus::own_name("cc.hannig.trollshell.iwd-agent").at_path(AGENT_PATH, agent)` and registers it with iwd's AgentManager.
+4. Mounts the Agent interface via `bus::own_name("mov.vibec0re.trollshell.iwd-agent").at_path(AGENT_PATH, agent)` and registers it with iwd's AgentManager.
 
 Pseudocode:
 
@@ -1299,7 +1299,7 @@ async fn run_wifi_watcher(
 
     // 7. Mount the Agent + register with iwd AgentManager.
     let agent = WifiAgent::new(prompts_mutable.clone());
-    let _ownership = hytte_bus::own_name("cc.hannig.trollshell.iwd-agent")
+    let _ownership = hytte_bus::own_name("mov.vibec0re.trollshell.iwd-agent")
         .at_path(AGENT_PATH, agent)
         .start();
     let _ = register_iwd_agent().await;
@@ -1397,7 +1397,7 @@ iwd Station discovery via bus::call(GetManagedObjects); state updates
 via bus::signals(Station.PropertiesChanged) + ObjectManager
 InterfacesAdded/Removed. Commands (scan/connect/disconnect/set_powered)
 go through bus::call. Passphrase agent mounted via bus::own_name on
-cc.hannig.trollshell.iwd-agent.
+mov.vibec0re.trollshell.iwd-agent.
 
 Drops:
 - The 2-second flat-rate listen-loop reconnect (the second-largest
@@ -1709,7 +1709,7 @@ BlueZ exposes adapters and devices on `org.bluez` (system bus). Adapter has `Pow
 
 After migration:
 
-- `bus::own_name("cc.hannig.trollshell.bluez-agent")` for the pairing agent (anchor name like polkit/wifi)
+- `bus::own_name("mov.vibec0re.trollshell.bluez-agent")` for the pairing agent (anchor name like polkit/wifi)
 - `bus::call` for all method invocations (Pair, Connect, Disconnect, Trust, RemoveDevice, StartDiscovery, etc.)
 - `bus::signals` for ObjectManager InterfacesAdded/Removed (device hot-plug)
 - `bus::property` for tracked Adapter and Device properties (multiple per object — fan out into a HashMap<DevicePath, Mutable<DeviceState>>)
@@ -1738,7 +1738,7 @@ git commit -m "refactor(bluetooth): migrate to hytte::bus::{own_name, signals, c
 $(cat <<'EOF'
 Adapter/device discovery via bus::signals(ObjectManager); per-device
 proxies via bus::proxy with PeerGone for device-disappeared. Pairing
-agent mounted on cc.hannig.trollshell.bluez-agent. All connect/pair/
+agent mounted on mov.vibec0re.trollshell.bluez-agent. All connect/pair/
 disconnect/trust calls go through bus::call. Adapter and Device
 property tracking via bus::property.
 

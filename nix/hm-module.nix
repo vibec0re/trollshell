@@ -171,6 +171,14 @@ in
       # and no runtime load/unload (that's #348, out of scope here).
       { systemd.user.services = pluginServices; }
 
+      # Control-center companion app (#399): the external GTK settings/management
+      # window (app-id mov.vibec0re.trollshell.ControlCenter) that speaks to the
+      # shell's mov.vibec0re.trollshell.Control endpoint. Installed by default
+      # into the user profile alongside the shell; its own toggle drops it.
+      (lib.mkIf cfg.controlCenter.enable {
+        home.packages = [ cfg.controlCenter.package ];
+      })
+
       # Group switch: turn the whole extras bundle on, each via mkDefault so an
       # explicit per-feature `enable = false` still wins. The wallpaper daemon
       # is whichever wallpaper.backend selects (default swaybg) — backend picks

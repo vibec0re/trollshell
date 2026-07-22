@@ -21,6 +21,33 @@ self:
       description = "The trollshell package to install.";
     };
 
+    # The control-center companion app (#399): an external GTK4/libadwaita
+    # settings & management UI (app-id mov.vibec0re.trollshell.ControlCenter)
+    # that talks to the running shell's mov.vibec0re.trollshell.Control
+    # session-bus endpoint. It's a separate binary from the shell, so it gets
+    # its own toggle + package option here in the shared base — both the NixOS
+    # and home-manager modules install it (system packages / user profile).
+    controlCenter = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Install the trollshell-control-center companion app alongside the
+          shell. It's the external settings/management window (launchable by its
+          app-id, mov.vibec0re.trollshell.ControlCenter) that speaks to the
+          running shell's Control session-bus endpoint. Enabled by default; set
+          false to drop it (the shell itself doesn't depend on it).
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.trollshell-control-center;
+        defaultText = lib.literalExpression "trollshell.packages.\${system}.trollshell-control-center";
+        description = "The trollshell-control-center package to install.";
+      };
+    };
+
     weather.fallbackCity = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;

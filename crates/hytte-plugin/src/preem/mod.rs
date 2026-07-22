@@ -17,6 +17,8 @@
 //!
 //! - [`dot_matrix`] — a single text line as char cells of round-falloff dots,
 //!   in one of the three [`DisplayStyle`] skins.
+//! - [`Marquee`] — a scrolling [`dot_matrix`] ticker: a fixed-width window
+//!   panned across a pre-rendered strip, one frame-offset step at a time.
 //! - [`seven_seg`] — a classic seven-segment readout (digits, `:`, `-`,
 //!   space) with the authentic dim ghost segments behind the lit ones.
 //! - [`TextBox`] — the "8bit textbox": wrapped 5×7 pixel-font text on a
@@ -60,12 +62,14 @@ pub mod font;
 
 mod dot_matrix;
 mod frame;
+mod marquee;
 mod seven_seg;
 mod style;
 mod textbox;
 
 pub use dot_matrix::dot_matrix;
 pub use frame::{Frame, Rgba};
+pub use marquee::{Marquee, MarqueeStrip};
 pub use seven_seg::seven_seg;
 pub use style::DisplayStyle;
 pub use textbox::TextBox;

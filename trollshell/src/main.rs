@@ -17,9 +17,9 @@ use hytte::gtk::{gdk, gio, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     app_usage, bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures,
-    displays, dnd, geoclue, idle_notify, mpris, netconn, networkd, nightlight, niri, notifications,
-    notifications_mute, pipewire, places, power_profiles, resolved, screensaver, sensors, systemd,
-    tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
+    display_config, displays, dnd, geoclue, idle_notify, mpris, netconn, networkd, nightlight,
+    niri, notifications, notifications_mute, pipewire, places, power_profiles, resolved,
+    screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
 };
 
 // The service-registration builder chain + body closure make `main` one long
@@ -84,6 +84,12 @@ fn main() -> hytte::ui::Result<()> {
         // unit — sits by wallpaper as an appearance concern (Appearance panel).
         .with(nightlight::service())
         .with(displays::service())
+        // Serve `org.gnome.Mutter.DisplayConfig` over niri-ipc (#393) so
+        // gnome-control-center's own Display panel drives niri outputs
+        // unmodified ("compatmaxx", decided on #381). Owns the well-known name
+        // on the session bus; reads/writes output state via niri-ipc — see
+        // display_config.rs.
+        .with(display_config::service())
         .with(clipboard::service())
         .with(calendar::service())
         .with(tasks::service())

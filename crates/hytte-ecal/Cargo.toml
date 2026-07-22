@@ -8,6 +8,12 @@ description = "Minimal hand-written FFI for evolution-data-server's libecal-2.0 
 
 [dependencies]
 anyhow = "1.0.102"
+# `clock` pulls in the local-timezone lookup we need to resolve a floating
+# (zone-less) DTSTART in the viewer's zone rather than assuming UTC (#388).
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }
 tracing = "0.1.44"
 
 [build-dependencies]

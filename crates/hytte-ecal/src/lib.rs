@@ -752,6 +752,27 @@ unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
 /// Convert a borrowed `ICalTime*` to POSIX UTC seconds, or `None` if the
 /// pointer is null or libical reports it as the null-time sentinel.
 ///
+/// # Timezone handling (issue #388)
+///
+/// `i_cal_time_as_timet_with_zone(tt, zone)` only consults `zone` when `tt` is
+/// **zone-less (floating)**; a UTC (`…Z`) or resolved-`TZID` time already
+/// carries its own absolute offset and ignores the argument. So passing the UTC
+/// singleton unconditionally silently reads a floating wall-clock time (e.g.
+/// `DTSTART:20260722T113000`) as **UTC**, shifting it by the viewer's offset on
+/// display (11:30 shown as 13:30 in CEST). We therefore split the cases:
+///
+/// - **DATE (all-day):** keep the UTC anchor — the display side (`calendar`'s
+///   `unix_to_local`) reinterprets the resulting midnight-UTC `time_t` as a
+///   local calendar date, so this must stay midnight-UTC or the day would
+///   drift.
+/// - **UTC / own-zone (resolved `TZID`):** already absolute; the zone argument
+///   is ignored, so the UTC-argument call yields the correct instant unchanged.
+/// - **Genuinely floating DATE-TIME:** interpret the wall-clock fields in the
+///   **local** system zone via chrono's `Local` (DST-correct), not UTC. This
+///   also covers a `TZID`'d time whose `VTIMEZONE` wasn't registered on the
+///   handle (libical then treats it as floating) — either way the local zone is
+///   the right fallback.
+///
 /// # Safety
 ///
 /// `tt` must be null or a valid `ICalTime*` borrowed from libical.
@@ -759,11 +780,80 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
     if tt.is_null() {
         return None;
     }
-    if unsafe { sys::i_cal_time_is_null_time(tt.cast_const()) } != 0 {
+    let tt_const = tt.cast_const();
+    if unsafe { sys::i_cal_time_is_null_time(tt_const) } != 0 {
         return None;
     }
-    let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
-    Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt.cast_const(), utc.cast_const()) })
+
+    let is_date = unsafe { sys::i_cal_time_is_date(tt_const) } != 0;
+    let is_utc = unsafe { sys::i_cal_time_is_utc(tt_const) } != 0;
+    let has_own_zone = !unsafe { sys::i_cal_time_get_timezone(tt_const) }.is_null();
+
+    if is_date || is_utc || has_own_zone {
+        // DATE anchors to midnight-UTC by design; absolute times ignore the
+        // zone argument. Both correct with the UTC singleton.
+        let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+        return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
+    }
+
+    // Genuinely floating DATE-TIME: resolve its wall-clock fields in the local
+    // zone rather than assuming UTC.
+    unsafe { WallClock::from_ical(tt) }.to_local_unix()
+}
+
+/// The broken-down wall-clock fields of an `ICalTime` (no timezone attached).
+/// Factored out so the floating-time → local-instant mapping is unit-testable
+/// without a live libical `ICalTime`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WallClock {
+    /// Fields as libical hands them back (`gint`); validated on conversion.
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+}
+
+impl WallClock {
+    /// Read the broken-down fields off a borrowed `ICalTime*`.
+    ///
+    /// # Safety
+    ///
+    /// `tt` must be a valid, non-null `ICalTime*` borrowed from libical.
+    unsafe fn from_ical(tt: *mut sys::ICalTime) -> Self {
+        let c = tt.cast_const();
+        Self {
+            year: unsafe { sys::i_cal_time_get_year(c) },
+            month: unsafe { sys::i_cal_time_get_month(c) },
+            day: unsafe { sys::i_cal_time_get_day(c) },
+            hour: unsafe { sys::i_cal_time_get_hour(c) },
+            minute: unsafe { sys::i_cal_time_get_minute(c) },
+            second: unsafe { sys::i_cal_time_get_second(c) },
+        }
+    }
+
+    /// Interpret these fields as a wall-clock instant in the **local** system
+    /// zone and return POSIX UTC seconds. `None` if the fields don't name a
+    /// real local instant — a value out of range, or one skipped/ambiguous
+    /// across a DST transition (we take `.single()`, so a folded/gapped local
+    /// time yields `None` rather than a guess).
+    fn to_local_unix(self) -> Option<i64> {
+        use chrono::{Local, NaiveDate, NaiveTime, TimeZone as _};
+
+        let month = u32::try_from(self.month).ok()?;
+        let day = u32::try_from(self.day).ok()?;
+        let hour = u32::try_from(self.hour).ok()?;
+        let minute = u32::try_from(self.minute).ok()?;
+        let second = u32::try_from(self.second).ok()?;
+
+        let date = NaiveDate::from_ymd_opt(self.year, month, day)?;
+        let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+        Local
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .map(|dt| dt.timestamp())
+    }
 }
 
 /// True iff the borrowed `ICalTime*` is a DATE (all-day, no time-of-day).
@@ -1162,6 +1252,64 @@ mod tests {
         };
         // Round-trips through a u32 without truncation.
         assert_eq!(err.domain, u32::MAX);
+    }
+
+    // ── Floating-time timezone (issue #388) ───────────────────────────────
+    //
+    // A zone-less (floating) DTSTART must be read in the *local* zone, not
+    // UTC, or every timed event shows shifted by the viewer's offset.
+
+    /// Pure-logic guard: a floating wall clock resolves to the same wall clock
+    /// when rendered back in `Local` — i.e. the fields were interpreted as
+    /// local, never as UTC. Deterministic in any real system zone (11:30 is
+    /// not a DST-gap time).
+    #[test]
+    fn wallclock_resolves_in_local_zone_not_utc() {
+        use chrono::{Datelike as _, Local, TimeZone as _, Timelike as _};
+
+        let wall = super::WallClock {
+            year: 2026,
+            month: 7,
+            day: 22,
+            hour: 11,
+            minute: 30,
+            second: 0,
+        };
+        let unix = wall.to_local_unix().expect("valid local instant");
+        let back = Local.timestamp_opt(unix, 0).single().unwrap();
+        assert_eq!(
+            (back.year(), back.month(), back.day()),
+            (2026, 7, 22),
+            "the local calendar date must be preserved",
+        );
+        assert_eq!(
+            (back.hour(), back.minute(), back.second()),
+            (11, 30, 0),
+            "11:30 floating must render back as 11:30 local, not offset-shifted",
+        );
+    }
+
+    /// End-to-end through the FFI: a floating `DTSTART` (no `TZID`, no `Z`)
+    /// expands to an instant that renders back to the same wall clock in the
+    /// local zone. Deterministic regardless of the test host's `TZ`.
+    #[test]
+    fn floating_datetime_expands_in_local_zone() {
+        use chrono::{Datelike as _, Local, TimeZone as _, Timelike as _};
+
+        let ical = "BEGIN:VEVENT\r\nUID:float\r\nDTSTAMP:20260722T090000Z\r\n\
+                     DTSTART:20260722T113000\r\nDTEND:20260722T120000\r\n\
+                     SUMMARY:Lunch\r\nEND:VEVENT\r\n";
+        // Window = all of 2026 (UTC seconds); brackets the event in any zone.
+        let inst = super::expand_ical_for_test(ical, 1_767_225_600, 1_798_761_600).unwrap();
+        assert_eq!(inst.len(), 1);
+        assert!(!inst[0].all_day);
+        let start = Local.timestamp_opt(inst[0].start_unix, 0).single().unwrap();
+        assert_eq!((start.year(), start.month(), start.day()), (2026, 7, 22));
+        assert_eq!(
+            (start.hour(), start.minute()),
+            (11, 30),
+            "floating 11:30 must land at 11:30 local (issue #388), not 11:30 UTC",
+        );
     }
 
     // ── Recurrence expansion (issue #29) ──────────────────────────────────

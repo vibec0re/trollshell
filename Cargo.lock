@@ -988,6 +988,7 @@ name = "hytte-ecal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "pkg-config",
  "tempfile",
  "tracing",

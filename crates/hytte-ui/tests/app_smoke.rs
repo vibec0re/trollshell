@@ -13,7 +13,7 @@ fn body_runs_on_activate() {
     let ran = Rc::new(Cell::new(false));
     let ran_writer = ran.clone();
 
-    App::new("cc.hannig.hytte.test")
+    App::new("mov.vibec0re.hytte.test")
         .run(move |app| {
             ran_writer.set(true);
             // Don't crash even if there are no monitors (CI/headless edge).

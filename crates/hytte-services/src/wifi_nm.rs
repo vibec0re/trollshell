@@ -102,7 +102,7 @@ pub struct VpnProfile {
 /// Stable identifier for our secret agent. NM keys registered agents by this
 /// reverse-DNS string; reusing it across restarts lets NM replace a stale
 /// registration cleanly.
-pub(crate) const NM_AGENT_IDENTIFIER: &str = "cc.hannig.trollshell";
+pub(crate) const NM_AGENT_IDENTIFIER: &str = "mov.vibec0re.trollshell";
 
 /// Standard object path NM secret agents export their interface at.
 /// (NM itself does not require a specific path — it records our unique name —

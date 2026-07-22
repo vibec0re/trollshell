@@ -289,14 +289,14 @@ in
         # system-bus policy already lets a console user register a secret agent,
         # so no extra <allow own=...> entry is required.
         services.dbus.packages = [
-          (pkgs.writeTextDir "share/dbus-1/system.d/cc.hannig.trollshell.conf" ''
+          (pkgs.writeTextDir "share/dbus-1/system.d/mov.vibec0re.trollshell.conf" ''
             <!DOCTYPE busconfig PUBLIC
               "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
               "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
             <busconfig>
               <policy context="default">
-                <allow own="cc.hannig.trollshell.bluez-agent"/>
-                <allow own="cc.hannig.trollshell.iwd-agent"/>
+                <allow own="mov.vibec0re.trollshell.bluez-agent"/>
+                <allow own="mov.vibec0re.trollshell.iwd-agent"/>
               </policy>
             </busconfig>
           '')

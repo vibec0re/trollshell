@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use zbus::zvariant::OwnedObjectPath;
 
 pub(super) const AGENT_PATH: &str = "/com/trollshell/BluetoothAgent";
-pub(super) const AGENT_ANCHOR_NAME: &str = "cc.hannig.trollshell.bluez-agent";
+pub(super) const AGENT_ANCHOR_NAME: &str = "mov.vibec0re.trollshell.bluez-agent";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]

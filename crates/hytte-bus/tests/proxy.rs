@@ -45,10 +45,10 @@ async fn peer_gone_then_back() {
     let (conn, guard) = ephemeral_bus().await;
     let address = guard.address.clone();
 
-    // Stand up a peer that owns "cc.hannig.test.Vanishable".
+    // Stand up a peer that owns "mov.vibec0re.test.Vanishable".
     let peer = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Vanishable")
+        .name("mov.vibec0re.test.Vanishable")
         .unwrap()
         .build()
         .await
@@ -57,7 +57,7 @@ async fn peer_gone_then_back() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let proxy = proxy_with(&shared, "cc.hannig.test.Vanishable")
+    let proxy = proxy_with(&shared, "mov.vibec0re.test.Vanishable")
         .at_path("/")
         .iface("org.freedesktop.DBus.Peer")
         .build()

@@ -154,7 +154,7 @@ Source layout (each module has a consistent shape — match it when adding):
 ### Conventions
 
 - CSS classes: `hytte-*` come from the library default stylesheet (`assets/hytte-ui/style.css`); `ts-*` come from the binary's `assets/trollshell/style.css` (loaded as user style at higher priority).
-- App ID `cc.hannig.trollshell`; D-Bus agent names `cc.hannig.trollshell.{bluez,iwd}-agent` (polkit is now a standalone external agent, not in-process). The NetworkManager secret agent (`wifi/nm_agent.rs`) registers with NM's `AgentManager` (no extra bus-name; `RegisterWithCapabilities`) rather than owning a `cc.hannig.*` name.
+- App ID `mov.vibec0re.trollshell`; D-Bus agent names `mov.vibec0re.trollshell.{bluez,iwd}-agent` (polkit is now a standalone external agent, not in-process). The NetworkManager secret agent (`wifi/nm_agent.rs`) registers with NM's `AgentManager` (no extra bus-name; `RegisterWithCapabilities`) rather than owning a `mov.vibec0re.*` name.
 - Logging via `tracing`.
 
 ## Deployment & session integration

@@ -518,13 +518,13 @@ Four non-obvious lessons emerged during the hytte-bus implementation (Phases 4�
 
 ### Lesson 1: Anchor-name pattern for D-Bus agents
 
-When mounting an agent interface — one that a daemon calls back into, such as polkit's `AuthAgent`, iwd's `Agent`, or bluez's `PairAgent` — the well-known name we own is irrelevant to the daemon. Daemons look up our connection's **unique name** (`:1.42`-style) at registration time and call back via that. `bus::own_name("cc.hannig.trollshell.<service>-agent")` is used purely as an **anchor** that:
+When mounting an agent interface — one that a daemon calls back into, such as polkit's `AuthAgent`, iwd's `Agent`, or bluez's `PairAgent` — the well-known name we own is irrelevant to the daemon. Daemons look up our connection's **unique name** (`:1.42`-style) at registration time and call back via that. `bus::own_name("mov.vibec0re.trollshell.<service>-agent")` is used purely as an **anchor** that:
 
 - Keeps the bus layer's connection alive (a connection with no registered names can be collected by the broker).
 - Provides a logical path for `at_path` to mount the interface on.
 - Gives the supervisor task something concrete to remount on reconnect — it re-`RequestName`s and re-mounts the interface, which re-exports the object at the same path on the new connection before re-registering with the daemon.
 
-Three services use this pattern: `polkit`, `wifi`, and `bluetooth`. The naming convention is `cc.hannig.trollshell.<short-service-name>-agent`. Recognise the situation: any service that registers a callback object with a daemon (rather than owning a public service name) is using this pattern, even if it never intends for other processes to discover the name.
+Three services use this pattern: `polkit`, `wifi`, and `bluetooth`. The naming convention is `mov.vibec0re.trollshell.<short-service-name>-agent`. Recognise the situation: any service that registers a callback object with a daemon (rather than owning a public service name) is using this pattern, even if it never intends for other processes to discover the name.
 
 ### Lesson 2: Cross-bus rule
 

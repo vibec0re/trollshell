@@ -1065,7 +1065,7 @@ async fn acquires_unowned_name() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.unique").start();
+    let state = own_name_with(&shared, "mov.vibec0re.test.unique").start();
     let final_state = wait_for_state(state, Duration::from_secs(2),
         |s| matches!(s, OwnState::Owned)).await;
 
@@ -1334,7 +1334,7 @@ async fn lost_then_reacquired() {
     let shared = SharedConnection::for_test_session(conn.clone());
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.contested").start();
+    let state = own_name_with(&shared, "mov.vibec0re.test.contested").start();
     let _ = wait_for_state(state.clone(), Duration::from_secs(2),
         |s| matches!(s, OwnState::Owned)).await;
 
@@ -1355,7 +1355,7 @@ async fn lost_then_reacquired() {
     // Steal the name.
     let dbus = zbus::fdo::DBusProxy::new(&conn2).await.unwrap();
     let _ = dbus.request_name(
-        "cc.hannig.test.contested".try_into().unwrap(),
+        "mov.vibec0re.test.contested".try_into().unwrap(),
         zbus::fdo::RequestNameFlags::ReplaceExisting | zbus::fdo::RequestNameFlags::DoNotQueue,
     ).await.unwrap();
 
@@ -1398,7 +1398,7 @@ async fn permanently_taken_after_three_losses() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.camped")
+    let state = own_name_with(&shared, "mov.vibec0re.test.camped")
         .permanent_after(3)
         .start();
 
@@ -1414,7 +1414,7 @@ async fn permanently_taken_after_three_losses() {
                 .expect("camper conn");
             let dbus = zbus::fdo::DBusProxy::new(&conn).await.unwrap();
             let _ = dbus.request_name(
-                "cc.hannig.test.camped".try_into().unwrap(),
+                "mov.vibec0re.test.camped".try_into().unwrap(),
                 zbus::fdo::RequestNameFlags::ReplaceExisting | zbus::fdo::RequestNameFlags::DoNotQueue,
             ).await;
             // Hold the name briefly so we observe the Lost.
@@ -1485,10 +1485,10 @@ use hytte_bus::signals_with;
 use std::time::Duration;
 use zbus::object_server::SignalEmitter;
 
-#[zbus::interface(name = "cc.hannig.test.Pinger")]
+#[zbus::interface(name = "mov.vibec0re.test.Pinger")]
 struct Pinger;
 
-#[zbus::interface(name = "cc.hannig.test.Pinger")]
+#[zbus::interface(name = "mov.vibec0re.test.Pinger")]
 impl Pinger {
     #[zbus(signal)]
     async fn pinged(emitter: &SignalEmitter<'_>, value: u32) -> zbus::Result<()>;
@@ -1502,25 +1502,25 @@ async fn delivers_emitted_signal() {
     // Mount a server emitter on a separate connection.
     let server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Pinger")
+        .name("mov.vibec0re.test.Pinger")
         .unwrap()
-        .serve_at("/cc/hannig/test/Pinger", Pinger)
+        .serve_at("/mov/vibec0re/test/Pinger", Pinger)
         .unwrap()
         .build()
         .await
         .unwrap();
     let object_server = server.object_server();
     let iface_ref = object_server
-        .interface::<_, Pinger>("/cc/hannig/test/Pinger")
+        .interface::<_, Pinger>("/mov/vibec0re/test/Pinger")
         .await
         .unwrap();
 
     // Subscribe via the bus primitive.
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
-    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
-        .at_path("/cc/hannig/test/Pinger")
-        .iface("cc.hannig.test.Pinger")
+    let sub = signals_with(&shared, "mov.vibec0re.test.Pinger")
+        .at_path("/mov/vibec0re/test/Pinger")
+        .iface("mov.vibec0re.test.Pinger")
         .signal("Pinged")
         .start();
     let mut events = sub.events();
@@ -1765,9 +1765,9 @@ async fn missed_emissions_bumps_on_reconnect() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let sub = signals_with(&shared, "cc.hannig.test.Pinger")
-        .at_path("/cc/hannig/test/Pinger")
-        .iface("cc.hannig.test.Pinger")
+    let sub = signals_with(&shared, "mov.vibec0re.test.Pinger")
+        .at_path("/mov/vibec0re/test/Pinger")
+        .iface("mov.vibec0re.test.Pinger")
         .signal("Pinged")
         .start();
 
@@ -2127,12 +2127,12 @@ use hytte_bus::{property_with, PropState};
 use std::time::Duration;
 use zbus::object_server::SignalEmitter;
 
-#[zbus::interface(name = "cc.hannig.test.Counter")]
+#[zbus::interface(name = "mov.vibec0re.test.Counter")]
 struct Counter {
     value: u32,
 }
 
-#[zbus::interface(name = "cc.hannig.test.Counter")]
+#[zbus::interface(name = "mov.vibec0re.test.Counter")]
 impl Counter {
     #[zbus(property)]
     fn value(&self) -> u32 { self.value }
@@ -2149,9 +2149,9 @@ async fn cold_start_emits_loading_then_loaded() {
     // Stand up a server that exposes the Counter interface.
     let _server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Counter")
+        .name("mov.vibec0re.test.Counter")
         .unwrap()
-        .serve_at("/cc/hannig/test/Counter", Counter { value: 7 })
+        .serve_at("/mov/vibec0re/test/Counter", Counter { value: 7 })
         .unwrap()
         .build()
         .await
@@ -2160,9 +2160,9 @@ async fn cold_start_emits_loading_then_loaded() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let signal = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let signal = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
 
@@ -2388,9 +2388,9 @@ async fn properties_changed_emits_loaded_with_new_value() {
 
     let server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Counter")
+        .name("mov.vibec0re.test.Counter")
         .unwrap()
-        .serve_at("/cc/hannig/test/Counter", Counter { value: 1 })
+        .serve_at("/mov/vibec0re/test/Counter", Counter { value: 1 })
         .unwrap()
         .build()
         .await
@@ -2399,9 +2399,9 @@ async fn properties_changed_emits_loaded_with_new_value() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let signal = property_with::<u32>(&shared, "cc.hannig.test.Counter")
-        .at_path("/cc/hannig/test/Counter")
-        .iface("cc.hannig.test.Counter")
+    let signal = property_with::<u32>(&shared, "mov.vibec0re.test.Counter")
+        .at_path("/mov/vibec0re/test/Counter")
+        .iface("mov.vibec0re.test.Counter")
         .name("Value")
         .start();
     let mut stream = signal.to_stream();
@@ -2417,7 +2417,7 @@ async fn properties_changed_emits_loaded_with_new_value() {
 
     // Mutate the server-side property and emit PropertiesChanged.
     let iface_ref = server.object_server()
-        .interface::<_, Counter>("/cc/hannig/test/Counter").await.unwrap();
+        .interface::<_, Counter>("/mov/vibec0re/test/Counter").await.unwrap();
     {
         let mut iface = iface_ref.get_mut().await;
         iface.set_value(99);
@@ -2730,10 +2730,10 @@ async fn peer_gone_then_back() {
     let (conn, guard) = ephemeral_bus().await;
     let address = guard.address().to_string();
 
-    // Stand up a peer that owns "cc.hannig.test.Vanishable".
+    // Stand up a peer that owns "mov.vibec0re.test.Vanishable".
     let peer = zbus::connection::Builder::address(address.as_str())
         .unwrap()
-        .name("cc.hannig.test.Vanishable")
+        .name("mov.vibec0re.test.Vanishable")
         .unwrap()
         .build()
         .await
@@ -2742,7 +2742,7 @@ async fn peer_gone_then_back() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let proxy = proxy_with(&shared, "cc.hannig.test.Vanishable")
+    let proxy = proxy_with(&shared, "mov.vibec0re.test.Vanishable")
         .at_path("/")
         .iface("org.freedesktop.DBus.Peer")
         .build().await.expect("build");

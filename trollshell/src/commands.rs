@@ -4,10 +4,10 @@
 //!
 //! ## Why `GActions`, not a second owned bus name
 //!
-//! The `adw::Application` already owns `cc.hannig.trollshell` on the session
+//! The `adw::Application` already owns `mov.vibec0re.trollshell` on the session
 //! bus (single-instance `GApplication`), and a `GApplication` auto-exports its
 //! own action group over `org.gtk.Actions` at the object path
-//! `/cc/hannig/trollshell`. Registering actions there reuses that name — no
+//! `/mov/vibec0re/trollshell`. Registering actions there reuses that name — no
 //! second `own_name`, no `#[zbus::interface]`, and the handlers fire on the
 //! GTK main thread, so there's no thread hop to reach the drawer/sidebar state
 //! (both live thread-local on the main thread).
@@ -16,10 +16,10 @@
 //!
 //! ```sh
 //! # open the power menu drawer (open-page takes a string arg):
-//! busctl --user call cc.hannig.trollshell /cc/hannig/trollshell \
+//! busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
 //!     org.gtk.Actions Activate 'sava{sv}' open-page 1 s power-menu 0
 //! # toggle the sidebar (no arg):
-//! busctl --user call cc.hannig.trollshell /cc/hannig/trollshell \
+//! busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
 //!     org.gtk.Actions Activate 'sava{sv}' toggle-sidebar 0 0
 //! ```
 //!

@@ -17,7 +17,7 @@ async fn acquires_unowned_name() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.unique").start();
+    let state = own_name_with(&shared, "mov.vibec0re.test.unique").start();
     let final_state = wait_for_state(state.signal_cloned(), Duration::from_secs(2), |s| {
         matches!(s, OwnState::Owned)
     })
@@ -36,7 +36,7 @@ async fn lost_then_reacquired() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.contested").start();
+    let state = own_name_with(&shared, "mov.vibec0re.test.contested").start();
     let _ = wait_for_state(state.signal_cloned(), Duration::from_secs(2), |s| {
         matches!(s, OwnState::Owned)
     })
@@ -52,7 +52,7 @@ async fn lost_then_reacquired() {
     let dbus = zbus::fdo::DBusProxy::new(&conn2).await.unwrap();
     let _ = dbus
         .request_name(
-            "cc.hannig.test.contested".try_into().unwrap(),
+            "mov.vibec0re.test.contested".try_into().unwrap(),
             RequestNameFlags::ReplaceExisting | RequestNameFlags::DoNotQueue,
         )
         .await
@@ -70,7 +70,7 @@ async fn lost_then_reacquired() {
     // Release the name explicitly so our primitive can re-acquire.
     // We can't rely on drop() to flush the async shutdown in time.
     let _ = dbus
-        .release_name("cc.hannig.test.contested".try_into().unwrap())
+        .release_name("mov.vibec0re.test.contested".try_into().unwrap())
         .await;
     drop(dbus);
     drop(conn2);
@@ -96,7 +96,7 @@ async fn permanently_taken_after_three_losses() {
     // We only assert the *first* PermanentlyTaken transition; the cooldown
     // fires in the background and is torn down when the test process exits
     // (per the documented test-leak contract).
-    let state = own_name_with(&shared, "cc.hannig.test.camped")
+    let state = own_name_with(&shared, "mov.vibec0re.test.camped")
         .permanent_after(3)
         .cooldown_after_permanent(Duration::from_millis(100))
         .start();
@@ -117,7 +117,7 @@ async fn permanently_taken_after_three_losses() {
         // Subscribe to NameOwnerChanged for our target name so we know when
         // the primitive re-acquires after each theft.
         let mut changes = dbus
-            .receive_name_owner_changed_with_args(&[(0, "cc.hannig.test.camped")])
+            .receive_name_owner_changed_with_args(&[(0, "mov.vibec0re.test.camped")])
             .await
             .unwrap();
 
@@ -128,7 +128,7 @@ async fn permanently_taken_after_three_losses() {
             // Grab the name (ReplaceExisting works because our primitive uses AllowReplacement).
             let _ = dbus
                 .request_name(
-                    "cc.hannig.test.camped".try_into().unwrap(),
+                    "mov.vibec0re.test.camped".try_into().unwrap(),
                     RequestNameFlags::ReplaceExisting | RequestNameFlags::DoNotQueue,
                 )
                 .await;
@@ -139,7 +139,7 @@ async fn permanently_taken_after_three_losses() {
 
             // Release the name so our primitive can re-acquire.
             let _ = dbus
-                .release_name("cc.hannig.test.camped".try_into().unwrap())
+                .release_name("mov.vibec0re.test.camped".try_into().unwrap())
                 .await;
 
             // Wait until the primitive re-acquires before stealing again, so each
@@ -180,7 +180,7 @@ async fn permanently_taken_after_three_losses() {
 #[derive(Clone)]
 struct Greeter;
 
-#[zbus::interface(name = "cc.hannig.test.Greeter")]
+#[zbus::interface(name = "mov.vibec0re.test.Greeter")]
 impl Greeter {
     #[allow(clippy::unused_self)]
     fn hello(&self) -> String {
@@ -195,8 +195,8 @@ async fn at_path_mounts_iface_callable() {
     let shared = SharedConnection::for_test_session(conn);
     shared.spawn_supervisor_for_test();
 
-    let state = own_name_with(&shared, "cc.hannig.test.greeter")
-        .at_path("/cc/hannig/test/Greeter", Greeter)
+    let state = own_name_with(&shared, "mov.vibec0re.test.greeter")
+        .at_path("/mov/vibec0re/test/Greeter", Greeter)
         .start();
 
     // Wait for Owned.
@@ -217,9 +217,9 @@ async fn at_path_mounts_iface_callable() {
         .expect("connect to ephemeral bus for client");
     let proxy = zbus::Proxy::new(
         &client,
-        "cc.hannig.test.greeter",
-        "/cc/hannig/test/Greeter",
-        "cc.hannig.test.Greeter",
+        "mov.vibec0re.test.greeter",
+        "/mov/vibec0re/test/Greeter",
+        "mov.vibec0re.test.Greeter",
     )
     .await
     .expect("create proxy");

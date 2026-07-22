@@ -32,7 +32,7 @@ struct FdVendor {
     peer: PeerSlot,
 }
 
-#[zbus::interface(name = "cc.hannig.test.FdVendor")]
+#[zbus::interface(name = "mov.vibec0re.test.FdVendor")]
 impl FdVendor {
     /// Create a fresh `socketpair`, stash the peer end for the test to use, and
     /// hand back the other end as a `UNIX_FD` — the same shape as logind's
@@ -50,9 +50,9 @@ impl FdVendor {
 async fn serve_vendor(address: &str, peer: PeerSlot) -> zbus::Connection {
     Builder::address(address)
         .expect("parse ephemeral bus address")
-        .name("cc.hannig.test.fdvendor")
+        .name("mov.vibec0re.test.fdvendor")
         .expect("request well-known name")
-        .serve_at("/cc/hannig/test/FdVendor", FdVendor { peer })
+        .serve_at("/mov/vibec0re/test/FdVendor", FdVendor { peer })
         .expect("mount FdVendor")
         .build()
         .await
@@ -61,9 +61,9 @@ async fn serve_vendor(address: &str, peer: PeerSlot) -> zbus::Connection {
 
 /// Invoke the mock through the new `call_fd()` helper.
 async fn lease_fd(shared: &SharedConnection) -> hytte_bus::FdLease {
-    call_with(shared, "cc.hannig.test.fdvendor")
-        .at_path("/cc/hannig/test/FdVendor")
-        .iface("cc.hannig.test.FdVendor")
+    call_with(shared, "mov.vibec0re.test.fdvendor")
+        .at_path("/mov/vibec0re/test/FdVendor")
+        .iface("mov.vibec0re.test.FdVendor")
         .method("GetFd")
         .args(())
         .call_fd()

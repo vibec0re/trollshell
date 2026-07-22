@@ -150,8 +150,8 @@ impl Default for WifiHandles {
 /// The Wi-Fi service marker type — pass to `App::with`.
 pub struct WifiService;
 
-pub(super) const AGENT_PATH: &str = "/cc/hannig/trollshell/iwd_agent";
-const ANCHOR_NAME: &str = "cc.hannig.trollshell.iwd-agent";
+pub(super) const AGENT_PATH: &str = "/mov/vibec0re/trollshell/iwd_agent";
+const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 
 impl Service for WifiService {
     type Handles = WifiHandles;

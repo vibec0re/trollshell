@@ -1,4 +1,4 @@
-//! Native `ext-idle-notify-v1` idle client (#204 Phase 3a of 4).
+//! Native `ext-idle-notify-v1` idle client (#204 Phase 3a/3b of 4).
 //!
 //! Binds the compositor's `ext_idle_notifier_v1` global and creates one
 //! `ext_idle_notification_v1` per swayidle threshold (240 dim / 300 lock /
@@ -11,17 +11,21 @@
 //!   action — its job is to emit parity logs proving the native notifier fires
 //!   at the same wall-clock points as swayidle (Phase 2). This is the default,
 //!   so merging Phase 3a changes nothing and cannot double-fire with swayidle.
-//! - **Native actions (opt-in, Phase 3a).** When [`NATIVE_ACTIONS_ENV`] is
+//! - **Native actions (opt-in, Phase 3a/3b).** When [`NATIVE_ACTIONS_ENV`] is
 //!   truthy, the same three actions swayidle runs fire natively at their
 //!   thresholds — dim (`brightnessctl -s set 10%`, restored on resume), lock
 //!   (`screensaver::lock`), suspend (`systemctl suspend`) — each **gated on
 //!   logind's `BlockInhibited`** (skip dim/lock while `idle` is inhibited, skip
-//!   suspend while `sleep` is). Intended for the maintainer to live-verify with
-//!   swayidle's handlers parked; see the opt-in's doc for the cutover roadmap.
+//!   suspend while `sleep` is). Additionally (**Phase 3b**) it relocks the
+//!   session just before the system sleeps by handling logind's
+//!   `PrepareForSleep(true)` signal — the native replacement for swayidle's
+//!   `before-sleep 'loginctl lock-session'` (also reusing `screensaver::lock`).
+//!   Intended for the maintainer to live-verify with swayidle's handlers parked;
+//!   see the opt-in's doc for the cutover roadmap.
 //!
 //! The parity logging is unconditional (both modes). Retiring swayidle's
 //! handlers plus the `screensaver.rs` `SIGSTOP` bridge — and then this opt-in —
-//! is Phase 3b/4. See issue #204 for the full roadmap.
+//! is Phase 4. See issue #204 for the full roadmap.
 //!
 //! ## Pure-safe Wayland path
 //!
@@ -38,6 +42,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal};
+use futures_util::StreamExt;
 use hytte_reactive::{Service, registry, runtime};
 use std::collections::BTreeSet;
 use std::process::Stdio;
@@ -67,17 +72,25 @@ const SUSPEND_SECS: u32 = 600;
 /// each.
 const THRESHOLDS: [u32; 3] = [DIM_SECS, LOCK_SECS, SUSPEND_SECS];
 
+/// logind `Manager` on the **system** bus — source of both `BlockInhibited`
+/// (the inhibitor gate for dim/lock/suspend) and the `PrepareForSleep` signal
+/// that drives the Phase-3b before-sleep relock.
+const LOGIN1_NAME: &str = "org.freedesktop.login1";
+const LOGIN1_PATH: &str = "/org/freedesktop/login1";
+const LOGIN1_MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
+
 /// Opt-in env var enabling the **native idle-action pipeline** (dim / lock /
 /// suspend). Truthy (`1`/`true`/`yes`/`on`, case-insensitive) turns it on;
 /// anything else — including unset — leaves it **off**.
 ///
-/// **This is a temporary Phase-3a bridge (#204).** While off (the default),
+/// **This is a temporary Phase-3a/3b bridge (#204).** While off (the default),
 /// `idle_notify` is exactly the Phase-2 observe-only client: it arms the
-/// notifications and emits the parity logs but fires **no** action, so merging
-/// this cannot double-fire with the still-running swayidle. Turning it on lets
-/// the maintainer live-verify the native actions *after* parking swayidle's
-/// handlers (`systemctl --user stop swayidle`; see the PR's live-verify
-/// protocol). Phase 3b/4 then deletes swayidle's handlers and the
+/// notifications and emits the parity logs but fires **no** action — no dim,
+/// lock, suspend, *or* before-sleep relock — so merging this cannot double-fire
+/// with the still-running swayidle. Turning it on lets the maintainer
+/// live-verify the native actions (and the `PrepareForSleep` relock) *after*
+/// parking swayidle's handlers (`systemctl --user stop swayidle`; see the PR's
+/// live-verify protocol). Phase 4 then deletes swayidle's handlers and the
 /// `screensaver.rs` `SIGSTOP` bridge and removes this gate, making the native
 /// path the sole one.
 const NATIVE_ACTIONS_ENV: &str = "TROLLSHELL_NATIVE_IDLE_ACTIONS";
@@ -143,12 +156,12 @@ pub struct IdleNotifyHandles {
 impl Service for IdleNotifyService {
     type Handles = IdleNotifyHandles;
 
-    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let state = Mutable::new(IdleState::default());
         let worker_state = state.clone();
 
-        // Read the opt-in exactly once at startup (Phase-3a bridge; default off
-        // → observe-only, byte-for-byte the Phase-2 behavior). See
+        // Read the opt-in exactly once at startup (Phase-3a/3b bridge; default
+        // off → observe-only, byte-for-byte the Phase-2 behavior). See
         // [`NATIVE_ACTIONS_ENV`].
         let actions_enabled = native_actions_enabled();
         if actions_enabled {
@@ -157,6 +170,13 @@ impl Service for IdleNotifyService {
                 env = NATIVE_ACTIONS_ENV,
                 "native idle actions ENABLED — dim/lock/suspend fire natively (gated on logind inhibitors); park swayidle's handlers (systemctl --user stop swayidle) to avoid double-firing"
             );
+            // Phase 3b: relock on logind `PrepareForSleep(true)`, mirroring
+            // swayidle's `before-sleep 'loginctl lock-session'`. This D-Bus work
+            // runs as a tokio task on the shared runtime (Wayland stays on its
+            // own `!Send` thread), and only when the opt-in is on — so with the
+            // flag off (default) it never subscribes and cannot double-lock
+            // alongside swayidle's own before-sleep handler.
+            rt.spawn(run_prepare_for_sleep_relock());
         }
 
         // Wayland objects are `!Send`; the whole client lives on this dedicated
@@ -345,6 +365,66 @@ impl IdleClient {
     }
 }
 
+// ── Before-sleep relock (Phase 3b, opt-in) ─────────────────────────────────────
+
+/// Should a logind `PrepareForSleep` payload trigger a before-sleep relock?
+///
+/// The signal carries one boolean: `true` fires *just before* the system
+/// suspends/hibernates, `false` fires *after* resume. Only the pre-sleep edge
+/// (`true`) should relock — exactly swayidle's `before-sleep` action; `false`
+/// is a no-op. Factored out as a pure mapping so the edge logic is unit-tested
+/// without a live logind.
+fn should_relock_on_prepare_for_sleep(about_to_sleep: bool) -> bool {
+    about_to_sleep
+}
+
+/// Subscribe to logind's `PrepareForSleep` on the **system** bus and relock the
+/// session on the pre-sleep edge (`PrepareForSleep(true)`), reusing
+/// [`crate::screensaver::lock`] (`loginctl lock-session`) — the native
+/// replacement for swayidle's `before-sleep 'loginctl lock-session'`.
+///
+/// Runs as a tokio task on the shared runtime. `hytte_bus` handles connection
+/// pooling and reconnection, so this just consumes the signal stream in a loop
+/// (a fresh `events()` receiver survives bus reconnects). Only spawned when the
+/// Phase-3a/3b opt-in ([`NATIVE_ACTIONS_ENV`]) is on, so with the flag off it
+/// never subscribes and cannot double-lock alongside the still-running swayidle.
+async fn run_prepare_for_sleep_relock() {
+    let sub = hytte_bus::signals(LOGIN1_NAME)
+        .bus(hytte_bus::BusKind::System)
+        .at_path(LOGIN1_PATH)
+        .iface(LOGIN1_MANAGER_IFACE)
+        .signal("PrepareForSleep")
+        .start();
+    let mut events = sub.events();
+
+    tracing::info!(
+        target: LOG_TARGET,
+        "native before-sleep relock armed (#204 Phase 3b; logind PrepareForSleep(true) → screensaver::lock)"
+    );
+
+    while let Some(event) = events.next().await {
+        // PrepareForSleep carries a single boolean `start`.
+        match event.body.body().deserialize::<bool>() {
+            Ok(about_to_sleep) => {
+                if should_relock_on_prepare_for_sleep(about_to_sleep) {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        "logind PrepareForSleep(true) — relocking session before sleep (native before-sleep)"
+                    );
+                    crate::screensaver::lock();
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    error = %err,
+                    "could not decode logind PrepareForSleep payload; skipping before-sleep relock"
+                );
+            }
+        }
+    }
+}
+
 // ── Native idle actions (Phase 3a, opt-in) ─────────────────────────────────────
 
 /// `true` if the logind `BlockInhibited` set holds `what` (so the matching
@@ -382,12 +462,12 @@ async fn inhibitor_blocks(what: &str) -> bool {
 /// always replies a `Variant` (`v`), so deserialize `OwnedValue` then unwrap to
 /// `String`.
 async fn read_block_inhibited() -> Result<String, hytte_bus::BusError> {
-    let v: OwnedValue = hytte_bus::call("org.freedesktop.login1")
+    let v: OwnedValue = hytte_bus::call(LOGIN1_NAME)
         .bus(hytte_bus::BusKind::System)
-        .at_path("/org/freedesktop/login1")
+        .at_path(LOGIN1_PATH)
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")
-        .args(("org.freedesktop.login1.Manager", "BlockInhibited"))
+        .args((LOGIN1_MANAGER_IFACE, "BlockInhibited"))
         .send::<OwnedValue>()
         .await?;
     String::try_from(v).map_err(|_| hytte_bus::BusError::Permanent {
@@ -610,6 +690,15 @@ mod tests {
         assert!(!block_list_contains("handle-lid-switch", "sleep"));
         // Whole-token match only: no substring false positives.
         assert!(!block_list_contains("idlehint", "idle"));
+    }
+
+    #[test]
+    fn prepare_for_sleep_relocks_only_before_sleep() {
+        // logind PrepareForSleep(true) fires just before suspend → relock
+        // (mirrors swayidle's `before-sleep`); PrepareForSleep(false) fires on
+        // resume → no-op.
+        assert!(should_relock_on_prepare_for_sleep(true));
+        assert!(!should_relock_on_prepare_for_sleep(false));
     }
 
     #[test]

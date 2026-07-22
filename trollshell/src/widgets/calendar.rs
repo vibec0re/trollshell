@@ -15,7 +15,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone as _};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone as _, Timelike,
+};
 use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self, glib};
 use hytte::prelude::*;
@@ -108,7 +110,7 @@ fn build_block() -> gtk::Box {
 
     wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
     wire_events_bind(&state, &group, &rows_track, &placeholder_track);
-    wire_clock_bind(&state, &column);
+    wire_clock_bind(&state, &column, &group, &rows_track, &placeholder_track);
 
     // Inform the service of the initial viewed month so the first scan
     // covers the current month's past days (issue #100).
@@ -271,11 +273,7 @@ fn on_day_clicked(
         calendar::set_viewed_month(ny, nm);
     }
     render(state);
-
-    let today = state.today.get();
-    let evs = state.events.borrow();
-    let anchor = state.selected.get().unwrap_or(today);
-    rebuild_upcoming_list(group, rows_track, placeholder_track, &evs, today, anchor);
+    refresh_upcoming_list(state, group, rows_track, placeholder_track);
 
     let rows = rows_track.borrow();
     if let Some((_d, row)) = rows.iter().find(|(d, _)| *d == date) {
@@ -298,12 +296,8 @@ fn wire_events_bind(
     let rows_track = rows_track.clone();
     let placeholder_track = placeholder_track.clone();
     bind(calendar::events(), group, move |group, evs| {
-        let today = state.today.get();
-        // Anchor the list to the selected day when one is chosen; fall back
-        // to today when nothing is selected (or today itself is selected).
-        let anchor = state.selected.get().unwrap_or(today);
-        rebuild_upcoming_list(group, &rows_track, &placeholder_track, &evs, today, anchor);
         state.events.borrow_mut().clone_from(&evs);
+        refresh_upcoming_list(&state, group, &rows_track, &placeholder_track);
         render(&state);
     });
 }
@@ -315,7 +309,9 @@ fn wire_events_bind(
 /// `today` is the real calendar date (used for relative day labels and the
 /// placeholder wording); `anchor` is the first day to display — normally
 /// equal to `today`, but set to the selected day when the user has clicked a
-/// day in the grid (fix for #36). The anchor section always leads: when no
+/// day in the grid (fix for #36). `now` is the live wall-clock read used to
+/// drop fully-elapsed events when the anchor is today (#389) — see
+/// [`bucket_events_from_anchor`]. The anchor section always leads: when no
 /// events fall on that day it shows a "No events" placeholder row.
 fn rebuild_upcoming_list(
     group: &adw::PreferencesGroup,
@@ -324,6 +320,7 @@ fn rebuild_upcoming_list(
     evs: &[CalendarEvent],
     today: NaiveDate,
     anchor: NaiveDate,
+    now: DateTime<Local>,
 ) {
     for (_d, row) in rows_track.borrow_mut().drain(..) {
         group.remove(&row);
@@ -343,7 +340,7 @@ fn rebuild_upcoming_list(
         return;
     }
 
-    let by_day = bucket_events_from_anchor(evs, anchor);
+    let by_day = bucket_events_from_anchor(evs, anchor, now);
 
     // Lead with the anchor day even when it has no events.
     let mut days: Vec<NaiveDate> = by_day.keys().copied().collect();
@@ -388,6 +385,33 @@ fn rebuild_upcoming_list(
         }
     }
     *rows_track.borrow_mut() = new_rows;
+}
+
+/// Recompute and redraw the Upcoming list from the widget's current state
+/// (selected/today anchor, cached events) against a fresh wall-clock read.
+/// Shared by the events-signal callback, the day-click handler, and the
+/// per-minute clock tick ([`wire_clock_bind`]) so a fully-elapsed event drops
+/// off the list wherever any of the three fire next (#389).
+fn refresh_upcoming_list(
+    state: &State,
+    group: &adw::PreferencesGroup,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
+    placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
+) {
+    let today = state.today.get();
+    // Anchor the list to the selected day when one is chosen; fall back to
+    // today when nothing is selected (or today itself is selected).
+    let anchor = state.selected.get().unwrap_or(today);
+    let evs = state.events.borrow();
+    rebuild_upcoming_list(
+        group,
+        rows_track,
+        placeholder_track,
+        &evs,
+        today,
+        anchor,
+        Local::now(),
+    );
 }
 
 /// iOS-style day-section label: "Today" / "Tomorrow" / "Wed 18 Jun".
@@ -442,24 +466,38 @@ fn build_empty_day_row(day: NaiveDate, today: NaiveDate) -> adw::ActionRow {
     row
 }
 
-// ── Today rollover (re-render on date change) ────────────────────────────────
+// ── Today rollover + live Upcoming-list refresh ──────────────────────────────
 
-/// Re-render when the calendar date rolls over (midnight) so "today" stays
-/// accurate. `clock::now()` ticks every minute; `dedupe_cloned` on the date
-/// portion collapses 1439/1440 ticks to no-ops.
-fn wire_clock_bind(state: &State, anchor: &gtk::Box) {
+/// Re-render the month grid when the calendar date rolls over (midnight) so
+/// "today" stays accurate, and re-filter the Upcoming list once a minute so a
+/// fully-elapsed event drops off within a minute of ending rather than
+/// lingering until some unrelated re-render (#389). `clock::now()` ticks
+/// every second; the manual minute-key check below collapses the other
+/// 59/60 ticks to no-ops.
+fn wire_clock_bind(
+    state: &State,
+    anchor: &gtk::Box,
+    group: &adw::PreferencesGroup,
+    rows_track: &Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>,
+    placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
+) {
     let state = state.clone();
-    bind(
-        hytte::services::clock::now().map(|dt| dt.date_naive()),
-        anchor,
-        move |_, today| {
-            if today == state.today.get() {
-                return;
-            }
+    let group = group.clone();
+    let rows_track = rows_track.clone();
+    let placeholder_track = placeholder_track.clone();
+    let last_minute: Rc<Cell<Option<(NaiveDate, u32)>>> = Rc::new(Cell::new(None));
+    bind(hytte::services::clock::now(), anchor, move |_, now| {
+        let minute_key = (now.date_naive(), now.hour() * 60 + now.minute());
+        if last_minute.replace(Some(minute_key)) == Some(minute_key) {
+            return;
+        }
+        let today = minute_key.0;
+        if today != state.today.get() {
             state.today.set(today);
             render(&state);
-        },
-    );
+        }
+        refresh_upcoming_list(&state, &group, &rows_track, &placeholder_track);
+    });
 }
 
 /// Force a fresh scan when the user opens the sidebar — avoids showing
@@ -594,34 +632,52 @@ fn group_events_by_day(events: &[CalendarEvent]) -> HashMap<NaiveDate, Vec<Strin
 
 /// Pure helper: group `events` into the day buckets that should appear in the
 /// Upcoming list, relative to `anchor` — the first day the list should show.
+/// `now` is the live wall-clock read, threaded in (rather than read
+/// internally via `Local::now()`) so this stays pure and testable.
 ///
-/// Rules (issue #100 fix — keeps the Upcoming list future-focused):
-/// - Events that **fully ended** before the anchor day (i.e. `end` is before
-///   the start of the anchor day) are **excluded entirely** — they are past
-///   events that exist in the feed only for the month-grid dots, not the list.
-/// - Events that started before the anchor but are **still running** on the
-///   anchor day (end ≥ start-of-anchor-day) are **clamped** to the anchor —
-///   shown as ongoing under today/the anchor section.
-/// - Events on or after the anchor land on their own start date.
+/// Rules (issue #100 fix — keeps the Upcoming list future-focused; issue
+/// #389 — keeps it *live*-focused when the anchor is today):
+/// - When `anchor` is the current day (`anchor == now.date_naive()` — the
+///   default Upcoming view, whether reached by falling through or by
+///   explicitly clicking today in the grid), the skip-threshold is **`now`**
+///   itself: an event that has **fully ended** (`end <= now`) drops off the
+///   list the moment it's over. An event you're currently in (`end > now`)
+///   stays visible until it ends.
+/// - When `anchor` is a *different* day — the user navigated to a past/other
+///   day via the day grid (#36) — the threshold falls back to **midnight of
+///   the anchor day**, so browsing still shows that day's full set instead of
+///   hiding events relative to the live clock.
+/// - Either way, events that started before the anchor but are still running
+///   at the threshold are **clamped** to the anchor day — shown as ongoing
+///   under today/the anchor section. Events on or after the anchor land on
+///   their own start date.
 ///
 /// The return value is sorted ascending by day. Used by
 /// [`rebuild_upcoming_list`] and tested directly (no GTK required).
 fn bucket_events_from_anchor<'a>(
     events: &'a [CalendarEvent],
     anchor: NaiveDate,
+    now: DateTime<Local>,
 ) -> BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> {
-    // Start-of-anchor-day in local time for end-before comparisons.
-    let anchor_day_start = Local
-        .from_local_datetime(&anchor.and_hms_opt(0, 0, 0).unwrap_or_default())
-        .earliest()
-        .unwrap_or_else(Local::now);
+    // Anchor is "today" (the default forward view) → cut off on the live
+    // clock so fully-elapsed events disappear as soon as they're over.
+    // Anchor is some other day the user navigated to → cut off on that day's
+    // midnight instead, so browsing still shows the full set for that day.
+    let threshold = if anchor == now.date_naive() {
+        now
+    } else {
+        Local
+            .from_local_datetime(&anchor.and_hms_opt(0, 0, 0).unwrap_or_default())
+            .earliest()
+            .unwrap_or(now)
+    };
 
     let mut by_day: BTreeMap<NaiveDate, Vec<&'a CalendarEvent>> = BTreeMap::new();
     for ev in events {
-        // Skip events that fully ended before or exactly at the anchor midnight.
+        // Skip events that fully ended before or exactly at the threshold.
         // Using <= so an all-day event ending exactly at 00:00 of the anchor
         // day (e.g. a 1-day all-day event on the day before) is excluded.
-        if ev.end <= anchor_day_start {
+        if ev.end <= threshold {
             continue;
         }
         // Clamp ongoing events (started before anchor, still running) to anchor.
@@ -743,6 +799,15 @@ fn flash_row_highlight(row: &gtk::Widget) {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Weekday};
+
+    /// Build a `DateTime<Local>` for a test's `now`/event boundaries without
+    /// repeating the `from_local_datetime(...).single().unwrap()` dance.
+    fn ldt(date: NaiveDate, hour: u32, min: u32, sec: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(&date.and_hms_opt(hour, min, sec).unwrap())
+            .single()
+            .unwrap()
+    }
 
     #[test]
     fn grid_origin_lands_on_monday_at_or_before_first_of_month() {
@@ -870,14 +935,16 @@ mod tests {
     #[test]
     fn anchor_today_shows_all_upcoming() {
         // When anchor == today (the default), all events are shown on their
-        // actual start dates.
+        // actual start dates. `now` is midnight so the #389 live-clock
+        // threshold doesn't interfere with this pre-existing scenario.
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let now = ldt(today, 0, 0, 0);
         let ev_today = make_event(today);
         let ev_tomorrow = make_event(today + chrono::Duration::days(1));
         let ev_next_week = make_event(today + chrono::Duration::days(7));
 
         let evs = vec![ev_today.clone(), ev_tomorrow.clone(), ev_next_week.clone()];
-        let by_day = bucket_events_from_anchor(&evs, today);
+        let by_day = bucket_events_from_anchor(&evs, today, now);
 
         let days: Vec<NaiveDate> = by_day.keys().copied().collect();
         assert_eq!(days.len(), 3);
@@ -892,13 +959,16 @@ mod tests {
         // and ended on today must be fully excluded — NOT clamped to anchor.
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let anchor = today + chrono::Duration::days(3);
+        // `now` stays on `today`, distinct from `anchor`, so this exercises
+        // the browsed-day (midnight-cutoff) path, not the #389 live-clock one.
+        let now = ldt(today, 12, 0, 0);
         // ev_today: 1h event today; fully ends before anchor.
         let ev_today = make_event(today);
         let ev_anchor = make_event(anchor);
         let ev_later = make_event(anchor + chrono::Duration::days(2));
 
         let evs = vec![ev_today, ev_anchor.clone(), ev_later.clone()];
-        let by_day = bucket_events_from_anchor(&evs, anchor);
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
 
         // ev_today fully ended before anchor → excluded entirely.
         assert!(
@@ -921,12 +991,13 @@ mod tests {
         // anchor day — it is still ongoing.
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let anchor = today + chrono::Duration::days(2);
+        let now = ldt(today, 12, 0, 0);
 
         // Event spans today → anchor+1: it is still running at the anchor.
         let ev_ongoing = make_event_spanning(today, anchor + chrono::Duration::days(1));
 
         let evs = vec![ev_ongoing];
-        let by_day = bucket_events_from_anchor(&evs, anchor);
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
 
         // Must be bucketed under anchor, not under today.
         assert!(
@@ -946,6 +1017,7 @@ mod tests {
         // must not pollute the Upcoming list).
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let anchor = today + chrono::Duration::days(3);
+        let now = ldt(today, 12, 0, 0);
 
         // Event ended yesterday (before anchor).
         let ev_past = make_event_spanning(
@@ -954,7 +1026,7 @@ mod tests {
         );
 
         let evs = vec![ev_past];
-        let by_day = bucket_events_from_anchor(&evs, anchor);
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
 
         assert!(
             by_day.is_empty(),
@@ -969,10 +1041,13 @@ mod tests {
     fn allday_event_ending_exactly_at_anchor_midnight_is_excluded() {
         let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
         let yesterday = anchor - chrono::Duration::days(1);
+        // `now` is 5 days after the browsed anchor, so this exercises the
+        // midnight-of-anchor path, not the #389 live-clock one.
+        let now = ldt(anchor + chrono::Duration::days(5), 12, 0, 0);
         // 1-day all-day event for yesterday: end = anchor 00:00.
         let ev_yesterday = make_allday_event(yesterday);
         let evs = [ev_yesterday];
-        let by_day = bucket_events_from_anchor(&evs, anchor);
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
         assert!(
             by_day.is_empty(),
             "all-day event ending exactly at anchor midnight must be excluded"
@@ -984,9 +1059,10 @@ mod tests {
     #[test]
     fn allday_event_on_anchor_day_is_kept() {
         let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let now = ldt(anchor + chrono::Duration::days(5), 12, 0, 0);
         let ev_anchor = make_allday_event(anchor);
         let evs = [ev_anchor];
-        let by_day = bucket_events_from_anchor(&evs, anchor);
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
         assert!(
             by_day.contains_key(&anchor),
             "all-day event on the anchor day must appear in the list"
@@ -996,7 +1072,80 @@ mod tests {
     #[test]
     fn anchor_empty_events_gives_empty_map() {
         let anchor = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
-        let by_day = bucket_events_from_anchor(&[], anchor);
+        let now = ldt(anchor, 0, 0, 0);
+        let by_day = bucket_events_from_anchor(&[], anchor, now);
         assert!(by_day.is_empty());
+    }
+
+    // ── #389: hide fully-past events from the "today" Upcoming view ──────────
+
+    #[test]
+    fn anchor_today_now_threshold_hides_fully_elapsed_event() {
+        // When anchor is today, an event that has fully ended relative to the
+        // live clock must be hidden even though it's well after the anchor's
+        // midnight (the pre-#389 cutoff).
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev_earlier = make_event(today); // 09:00–10:00
+        let now = ldt(today, 14, 0, 0); // 14:00 — event is long over.
+
+        let evs = vec![ev_earlier];
+        let by_day = bucket_events_from_anchor(&evs, today, now);
+
+        assert!(
+            by_day.is_empty(),
+            "fully-elapsed event on the anchor day must be hidden once past `now`"
+        );
+    }
+
+    #[test]
+    fn anchor_today_now_threshold_keeps_in_progress_event() {
+        // An event you're currently in (end > now) must stay visible until it
+        // ends — the triage's chosen semantics (cutoff on `end`, not `start`).
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev_in_progress = make_event(today); // 09:00–10:00
+        let now = ldt(today, 9, 30, 0); // 09:30 — mid-event.
+
+        let evs = vec![ev_in_progress];
+        let by_day = bucket_events_from_anchor(&evs, today, now);
+
+        assert!(
+            by_day.contains_key(&today),
+            "in-progress event must remain visible until it ends"
+        );
+    }
+
+    #[test]
+    fn anchor_today_event_ending_exactly_at_now_is_hidden() {
+        // `end <= now` (not strict `<`) so an event ending at this instant
+        // already reads as over, matching the anchor-midnight `<=` convention.
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).unwrap();
+        let ev = make_event(today); // ends 10:00
+        let now = ldt(today, 10, 0, 0);
+
+        let evs = vec![ev];
+        let by_day = bucket_events_from_anchor(&evs, today, now);
+
+        assert!(
+            by_day.is_empty(),
+            "event ending exactly at `now` must be hidden"
+        );
+    }
+
+    #[test]
+    fn browsing_past_day_uses_midnight_not_live_clock() {
+        // Navigating to a past/other day (anchor != now's date) must keep the
+        // midnight-of-anchor cutoff — browsing still shows that day's full
+        // set even though the event is long over relative to the live clock.
+        let anchor = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
+        let ev = make_event(anchor); // 09:00–10:00 on the browsed day.
+        let now = ldt(anchor + chrono::Duration::days(5), 14, 0, 0);
+
+        let evs = vec![ev];
+        let by_day = bucket_events_from_anchor(&evs, anchor, now);
+
+        assert!(
+            by_day.contains_key(&anchor),
+            "browsed day's events must stay visible regardless of the live clock"
+        );
     }
 }

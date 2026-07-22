@@ -84,8 +84,8 @@ pub enum HostMsg {
     /// name-tagged variant stays additive — a pre-#376 binary that never declared
     /// the key never receives (and never fails to decode) it. The `hytte-plugin`
     /// SDK auto-declares that subscription, so accent tracking is transparent to
-    /// the plugin author. v1 sends it once at session start (latest-wins if
-    /// re-sent); live re-tint on an accent change is a follow-up.
+    /// the plugin author. Sent once at session start and again on every
+    /// accent/scheme change (#396) — always latest-wins on re-send.
     Accent { color: Option<[u8; 4]> },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },

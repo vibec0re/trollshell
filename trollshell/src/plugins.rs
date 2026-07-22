@@ -118,6 +118,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Local};
+use hytte::adw;
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
@@ -218,7 +219,8 @@ pub struct PluginHandles {
     /// handed to accent-subscribing plugins (#376). Written by [`install`]
     /// (via [`publish_accent`]), subscribed from tokio (per-conn accent tasks).
     /// Starts `None` (unresolved) — a plugin then keeps the kit's hard-coded
-    /// default until the value lands. v1 resolves it once at startup.
+    /// default until the value lands. Re-published on every accent/scheme
+    /// change, not just at startup (#396).
     accent_tx: watch::Sender<Option<[u8; 4]>>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
@@ -315,10 +317,27 @@ pub fn install() {
     // Desktop accent (#376): resolve libadwaita's `@accent_color` once, now that
     // the display's CSS providers are up, and publish it so accent-subscribing
     // plugins can tint their `preem` widgets' default color to match the shell.
-    // Static at session start for v1 (live re-tint on accent change is a
-    // follow-up); a failed resolve leaves `None`, so plugins keep the kit's
-    // hard-coded default (no regression).
+    // A failed resolve leaves `None`, so plugins keep the kit's hard-coded
+    // default (no regression).
     publish_accent(resolve_accent_color());
+
+    // Live re-tint (#396, #376 follow-up): re-resolve and re-publish whenever
+    // the accent changes, or the light/dark scheme flips (`@accent_color` can
+    // resolve to a different RGBA per scheme, so a scheme flip needs the same
+    // re-resolve as an accent change). `publish_accent` just re-sends on the
+    // existing `watch::Sender`; the per-conn accent tasks (and the SDK on the
+    // plugin side) already treat a second `Accent` frame as latest-wins, so
+    // nothing else changes. Both signals fire on the GTK main thread, same as
+    // this `install()` call, so no thread hop is needed. `connect_notify_local`
+    // (rather than a typed `connect_accent_color_notify`) sidesteps the same
+    // v1_6-feature gap `resolve_accent_color` already works around.
+    let style_manager = adw::StyleManager::default();
+    style_manager.connect_notify_local(Some("accent-color"), |_, _| {
+        publish_accent(resolve_accent_color());
+    });
+    style_manager.connect_dark_notify(|_| {
+        publish_accent(resolve_accent_color());
+    });
 
     // Effect broker: drain the non-lossy effect channel in arrival order.
     // Effects are one-shot, so — unlike the idempotent trees on the render
@@ -1027,10 +1046,9 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // `StateKey::Accent`, the same #305 opt-in gate as visibility above. The
     // `hytte-plugin` SDK auto-declares that subscription, so accent tracking is
     // out-of-the-box; a pre-#376 binary that never declared it never receives
-    // the `HostMsg::Accent` variant it couldn't decode. v1 never changes the
-    // accent after startup, so the task's change-loop is dormant — it exists so
-    // a late resolve still reaches an already-connected plugin (and to seat the
-    // live-re-tint follow-up).
+    // the `HostMsg::Accent` variant it couldn't decode. The task's change-loop
+    // is live (#396): it re-sends both a late resolve that lands after connect
+    // and any subsequent accent/scheme change to an already-connected plugin.
     let accent = manifest
         .subscribes
         .contains(&StateKey::Accent)
@@ -1167,10 +1185,10 @@ async fn visibility_task(
 /// so a plugin starts tinted) and on any change, latest-wins via
 /// `borrow_and_update` (#376). Mirrors [`snapshot_task`]/[`visibility_task`];
 /// spawned **only** for a connection that subscribes [`StateKey::Accent`]
-/// (#305) — an unsubscribed plugin never receives the frame. v1 resolves the
-/// accent once at startup, so the change-loop is effectively dormant; it exists
-/// so a resolve that lands after connect still reaches the plugin and to seat
-/// the live-re-tint follow-up.
+/// (#305) — an unsubscribed plugin never receives the frame. The change-loop
+/// is live (#396): `install`'s `StyleManager` listener re-publishes on every
+/// accent/scheme change, which lands here as an additional `watch` update
+/// exactly like a late startup resolve.
 async fn accent_task(
     mut accent_rx: watch::Receiver<Option<[u8; 4]>>,
     out: mpsc::UnboundedSender<HostMsg>,

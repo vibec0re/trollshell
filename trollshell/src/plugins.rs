@@ -954,6 +954,35 @@ pub fn plugin_panel_slot() -> gtk::Widget {
 
 // ── tokio-side: listener + per-connection tasks ──────────────────────────────
 
+/// A short backoff applied after a resource-pressure `accept(2)` error, so a
+/// *persistent* one (sustained fd/memory exhaustion) degrades gracefully
+/// instead of spinning the accept loop hot.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Decide how the accept loop should react to an `accept(2)` error. **No accept
+/// error is fatal** — the socket bound successfully and stays valid, so a live
+/// listener is always worth another `accept()`. Terminating the loop here is
+/// exactly what stranded every plugin against a dead socket for the rest of the
+/// session (#426): `accept(2)` returns transient errors (`ECONNABORTED` when a
+/// peer aborts before we take it, or `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` under
+/// momentary resource pressure), yet the plugin-side SDK redials forever, so the
+/// asymmetry left the host permanently deaf. Mirrors the `Lagged → continue`
+/// survival the bus signal loop got in #428.
+///
+/// A connection aborted/reset/refused before we accepted it is a pure per-peer
+/// hiccup — the listener is untouched — so retry **immediately** (`None`).
+/// Anything else gets a short [`ACCEPT_BACKOFF`] (`Some`) before the retry.
+/// Total by construction: every error maps to "retry", never "give up".
+fn accept_backoff(err: &std::io::Error) -> Option<std::time::Duration> {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionRefused => None,
+        _ => Some(ACCEPT_BACKOFF),
+    }
+}
+
 /// Bind the host socket and accept plugin connections forever. The path comes
 /// from [`hytte_plugin_proto::socket_path`] (shared with the plugin-side
 /// runtime — the one definition both ends dial/bind; `None` = same-user-only
@@ -988,8 +1017,20 @@ async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
                 });
             }
             Err(e) => {
-                tracing::warn!(error = %e, "plugin host accept failed; stopping");
-                return Err(e);
+                // Keep the listener alive: a transient `accept(2)` error must
+                // NOT kill the loop, or one syscall hiccup strands every plugin
+                // against a dead socket until restart (#426). Warn and retry;
+                // back off on resource-pressure errors so a persistent one
+                // degrades gracefully instead of spinning hot.
+                match accept_backoff(&e) {
+                    Some(delay) => {
+                        tracing::warn!(error = %e, "plugin host accept failed; backing off and retrying");
+                        tokio::time::sleep(delay).await;
+                    }
+                    None => {
+                        tracing::debug!(error = %e, "plugin host accept: peer aborted before accept; retrying");
+                    }
+                }
             }
         }
     }
@@ -1686,13 +1727,52 @@ fn resolve_open_page(page: Page) -> PageAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount, Mutable, Page,
-        PageAction, PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream,
-        any_sidebar_open, apply_forget, apply_open, clamp_pixels_scale, clear_region_if_owned,
-        handle_conn, map_page, mpsc, pixels_len_ok, read_frame, resolve_open_page, to_ui_node,
-        to_wire_event, upsert_region, watch, wire, write_frame,
+        ACCEPT_BACKOFF, BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount,
+        Mutable, Page, PageAction, PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode,
+        UnixStream, accept_backoff, any_sidebar_open, apply_forget, apply_open, clamp_pixels_scale,
+        clear_region_if_owned, handle_conn, map_page, mpsc, pixels_len_ok, read_frame,
+        resolve_open_page, to_ui_node, to_wire_event, upsert_region, watch, wire, write_frame,
     };
     use hytte_plugin_proto::Manifest;
+
+    /// Regression for #426: the accept loop's error policy must be **total** —
+    /// every `accept(2)` error maps to a retry, never to loop termination.
+    /// Before the fix the `Err` arm did `return Err(e)`, so one transient
+    /// syscall error permanently killed the listener and stranded every plugin
+    /// against a dead socket until the shell restarted. A per-peer abort/reset
+    /// retries immediately (`None`); resource-pressure errors back off (`Some`).
+    #[test]
+    fn accept_error_never_terminates_the_loop() {
+        use std::io::{Error, ErrorKind};
+
+        // Per-peer hiccups: the listener is untouched, so retry immediately.
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+        ] {
+            assert_eq!(
+                accept_backoff(&Error::from(kind)),
+                None,
+                "{kind:?} should retry immediately, not terminate the loop",
+            );
+        }
+
+        // Resource pressure (EMFILE/ENFILE/ENOBUFS/ENOMEM surface as `Other`,
+        // OutOfMemory, etc.): still retryable, but after a short backoff so a
+        // persistent error doesn't spin the loop hot.
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::OutOfMemory,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert_eq!(
+                accept_backoff(&Error::from(kind)),
+                Some(ACCEPT_BACKOFF),
+                "{kind:?} should back off and retry, not terminate the loop",
+            );
+        }
+    }
 
     /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
     /// (incl. `Box { scroll }` and nesting) and produces a field-for-field

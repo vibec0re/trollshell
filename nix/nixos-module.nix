@@ -282,6 +282,17 @@ in
               XDG_DATA_DIRS="${pkgs.gnome-shell}/share/gsettings-schemas/${pkgs.gnome-shell.name}:${pkgs.mutter}/share/gsettings-schemas/${pkgs.mutter.name}:$XDG_DATA_DIRS" \
               ${pkgs.gnome-control-center}/bin/gnome-control-center online-accounts "$@"
           '')
+
+          # Screen-recording flow (#403, crates/hytte-services/src/recorder.rs):
+          # the bar's record-toggle chip spawns `wf-recorder` and picks a region
+          # with `slurp`. Neither is provisioned elsewhere — unlike screenshots,
+          # which go through niri's own compositor-native screenshot UI
+          # (niri::screenshot in hytte-services), there is no existing dep to
+          # mirror here. Missing binaries degrade gracefully (a logged warning,
+          # no recording) rather than crashing, but without this the feature
+          # silently does nothing out of the box (#421).
+          pkgs.wf-recorder
+          pkgs.slurp
         ];
 
         # evolution-alarm-notify (#402): EDS's own alarm daemon. It watches

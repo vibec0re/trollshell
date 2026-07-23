@@ -131,6 +131,18 @@ in
           # Night light daemon (#222): the wlsunset.service unit below drives it;
           # also on PATH so the user can invoke wlsunset directly.
           pkgs.wlsunset
+          # Screen-recording flow (#403, crates/hytte-services/src/recorder.rs):
+          # the bar's record-toggle chip spawns `wf-recorder` and picks a region
+          # with `slurp` — both external tools the shell doesn't bundle. Neither
+          # is behind a toggle (unlike enableSessionExtras' fuzzel/swayidle/etc.)
+          # because the record chip is always present, the same reasoning as
+          # wlsunset above; the screenshot flow provisions nothing to mirror
+          # (niri captures its own screenshots — see the NixOS module's copy of
+          # this comment). Missing binaries degrade gracefully — a logged
+          # warning, no recording — but without this the feature silently does
+          # nothing out of the box (#421).
+          pkgs.wf-recorder
+          pkgs.slurp
         ];
         fonts.fontconfig.enable = lib.mkDefault true;
 

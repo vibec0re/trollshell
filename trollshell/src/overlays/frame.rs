@@ -66,9 +66,6 @@ pub fn install(monitor: &Monitor) {
             return;
         }
     };
-    let (mon_w, _mon_h) = monitor.size();
-    let mon_w = f64::from(mon_w);
-
     let window = layer_window(monitor)
         .layer(Layer::Overlay)
         .anchor(Anchor::Top)
@@ -104,6 +101,15 @@ pub fn install(monitor: &Monitor) {
     // floating window stretched to the output's width. `Layer::Overlay`
     // sits above niri's apps by spec, so without this toggle the frame
     // would paint over those windows.
+    //
+    // The width fed to the edge-span detection is a *live* signal, not a
+    // snapshot: a resolution/mode switch (kanshi profile change) resizes this
+    // output without a monitor hot-plug, so a captured width would leave the
+    // threshold stale until the next real connect/disconnect (#442). The frame's
+    // own cairo cutout already tracks the new size (the anchored layer surface
+    // re-allocates and re-runs the draw func on resize); this keeps the
+    // edge-span threshold in sync too.
+    let mon_w = monitor.size_changed().map(|(w, _)| f64::from(w));
     let visible = niri::edge_window_on(connector.clone(), mon_w).map(|edge| !edge);
     bind_visible(visible, &window);
 

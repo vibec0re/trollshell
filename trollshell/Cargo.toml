@@ -33,10 +33,12 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 [dev-dependencies]
 # Host-side plugin-session tests (#305): `#[tokio::test]` needs `macros`, and the
 # "no visibility frame arrives" assertions need `time` (`tokio::time::timeout`).
-# net/rt/sync are already on the normal dep; dev-dep features merge for tests.
+# `test-util` drives the paused-clock handshake-timeout test (#435). net/rt/sync
+# are already on the normal dep; dev-dep features merge for tests.
 tokio = { version = "1.52.1", features = [
   "macros",
   "time",
+  "test-util",
   "net",
   "rt",
   "sync",

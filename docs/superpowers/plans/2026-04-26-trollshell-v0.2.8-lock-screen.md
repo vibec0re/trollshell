@@ -1,5 +1,11 @@
 # trollshell v0.2.8 native lock screen Implementation Plan
 
+> **Historical note (#204):** the swayidle idle pipeline this plan edits
+> (`etc/swayidle/config`, the SIGSTOP/SIGCONT pause helpers) has been **retired**.
+> trollshell now owns idle → dim → lock → suspend natively in-process — an
+> `ext-idle-notify-v1` client gated on logind inhibitors, before-sleep relock via
+> logind `PrepareForSleep`. See `crates/hytte-services/src/idle_notify.rs` and #204.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace `screensaver::lock()`'s gtklock shell-out with a native trollshell lock surface (per-monitor, layer-shell, exclusive keyboard) that authenticates via in-process libpam and integrates with logind's `Session.Lock`/`Unlock` signals.

@@ -75,8 +75,9 @@ fn main() -> hytte::ui::Result<()> {
         .with(wifi::service())
         .with(power_profiles::service())
         .with(screensaver::service())
-        // Native ext-idle-notify-v1 observer (#204 Phase 2, observe-only): runs
-        // alongside swayidle to validate idle-timing parity. Takes no action.
+        // Native ext-idle-notify-v1 idle manager (#204): owns the idle timeline
+        // in-process — dim@240 / lock@300 / suspend@600 + before-sleep relock,
+        // each gated on logind inhibitors. Replaces swayidle.
         .with(idle_notify::service())
         .with(systemd::service())
         .with(wallpaper::service())

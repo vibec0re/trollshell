@@ -217,6 +217,29 @@ impl SharedConnection {
         }
         result.map_err(BusError::from_zbus)
     }
+
+    /// Invalidate the cached connection and wake the supervisor to reconnect,
+    /// but only if the epoch is still `expected` (i.e. no reconnect has
+    /// happened since the caller captured it).
+    ///
+    /// This mirrors the epoch/generation-guarded invalidate + notify tail of
+    /// [`with_conn`](Self::with_conn), for primitives that issue calls on a
+    /// cached `zbus::Proxy` (notably [`BusProxy`](crate::BusProxy)) and thus
+    /// bypass `with_conn`. Routing their transient failures here keeps them on
+    /// the same shared reconnect path as everything else — a wedged peer's
+    /// connection-level error still kicks the supervisor rather than being
+    /// silently swallowed. Idempotent: a no-op once the connection was already
+    /// replaced or cleared.
+    pub(crate) async fn invalidate_if_epoch(&self, expected: u64) {
+        let mut guard = self.inner.lock().await;
+        if self.epoch() == expected && guard.conn.is_some() {
+            guard.conn = None;
+            drop(guard);
+            if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                notify.notify_one();
+            }
+        }
+    }
 }
 
 // ── Production constructor ────────────────────────────────────────────────────

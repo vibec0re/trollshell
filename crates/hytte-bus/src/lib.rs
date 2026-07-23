@@ -9,6 +9,7 @@ mod call;
 mod connection;
 mod error;
 mod export;
+mod handle;
 mod own;
 mod property;
 mod proxy;

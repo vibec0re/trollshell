@@ -18,7 +18,7 @@
 //! shape lives here.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use niri_ipc::socket::Socket;
 use niri_ipc::{OutputAction, Request, Response, Transform as NiriTransform};
 use std::time::Duration;
@@ -73,12 +73,15 @@ pub struct DisplayService;
 impl Service for DisplayService {
     type Handles = DisplaysHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = DisplaysHandles::default();
         let writer = handles.outputs.clone();
 
-        rt.spawn(async move {
-            poll_loop(writer).await;
+        spawn_supervised("displays", move || {
+            let writer = writer.clone();
+            async move {
+                poll_loop(writer).await;
+            }
         });
 
         handles

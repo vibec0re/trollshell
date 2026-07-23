@@ -34,7 +34,7 @@ mod watcher;
 use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
@@ -190,9 +190,14 @@ impl Service for WifiService {
                 let networks_m = networks_mutable.clone();
                 let prompts_m = prompts_mutable.clone();
                 let adapter_m = adapter_mutable.clone();
-                rt.spawn(watcher::run_wifi_watcher(
-                    station_m, networks_m, prompts_m, adapter_m,
-                ));
+                spawn_supervised("wifi", move || {
+                    watcher::run_wifi_watcher(
+                        station_m.clone(),
+                        networks_m.clone(),
+                        prompts_m.clone(),
+                        adapter_m.clone(),
+                    )
+                });
 
                 (Some(own), None, WifiBackend::Iwd)
             }
@@ -204,9 +209,16 @@ impl Service for WifiService {
                 let wired_m = wired_mutable.clone();
                 let vpn_m = vpn_mutable.clone();
                 let store = Arc::clone(&device_path_store);
-                rt.spawn(crate::wifi_nm::run_nm_wifi_watcher(
-                    station_m, networks_m, adapter_m, wired_m, vpn_m, store,
-                ));
+                spawn_supervised("wifi", move || {
+                    crate::wifi_nm::run_nm_wifi_watcher(
+                        station_m.clone(),
+                        networks_m.clone(),
+                        adapter_m.clone(),
+                        wired_m.clone(),
+                        vpn_m.clone(),
+                        store.clone(),
+                    )
+                });
 
                 // Mount the NM SecretAgent on the SYSTEM bus and register it
                 // with NM's AgentManager. Unlike the iwd agent, NM secret

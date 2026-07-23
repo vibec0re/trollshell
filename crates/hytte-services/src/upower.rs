@@ -22,7 +22,7 @@
 use crate::notifications::Urgency;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, PropertySignal, property};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::time::Duration;
 
 const UPOWER_NAME: &str = "org.freedesktop.UPower";
@@ -129,57 +129,50 @@ impl Default for UpowerHandles {
 impl Service for UpowerService {
     type Handles = UpowerHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = UpowerHandles::default();
         let writer = handles.battery.clone();
 
         bind_prop_field(
-            rt,
             display_device_prop::<f64>("Percentage"),
             0.0,
             writer.clone(),
             |b, v| b.percentage = v,
         );
         bind_prop_field(
-            rt,
             display_device_prop::<u32>("State"),
             0,
             writer.clone(),
             |b, v| b.state = BatteryState::from_u32(v),
         );
         bind_prop_field(
-            rt,
             display_device_prop::<i64>("TimeToEmpty"),
             0,
             writer.clone(),
             |b, v| b.time_to_empty = secs_to_duration(v),
         );
         bind_prop_field(
-            rt,
             display_device_prop::<i64>("TimeToFull"),
             0,
             writer.clone(),
             |b, v| b.time_to_full = secs_to_duration(v),
         );
         bind_prop_field(
-            rt,
             display_device_prop::<String>("IconName"),
             String::new(),
             writer.clone(),
             |b, v| b.icon_name = v,
         );
         bind_prop_field(
-            rt,
             display_device_prop::<u32>("WarningLevel"),
             0,
             writer.clone(),
             |b, v| b.warning_level = WarningLevel::from_u32(v),
         );
 
-        spawn_warning_level_watcher(rt, writer);
+        spawn_warning_level_watcher(writer);
 
         bind_on_battery(
-            rt,
             manager_prop::<bool>("OnBattery"),
             handles.on_battery.clone(),
         );
@@ -225,18 +218,22 @@ where
         .start()
 }
 
-fn bind_on_battery(rt: &tokio::runtime::Handle, prop: PropertySignal<bool>, writer: Mutable<bool>) {
-    rt.spawn(async move {
-        prop.signal()
-            .for_each(move |s| {
-                let v = match s {
-                    PropState::Loaded(v) | PropState::Stale(v) => v,
-                    PropState::Loading => false,
-                };
-                writer.set(v);
-                std::future::ready(())
-            })
-            .await;
+fn bind_on_battery(prop: PropertySignal<bool>, writer: Mutable<bool>) {
+    spawn_supervised("upower", move || {
+        let prop = prop.clone();
+        let writer = writer.clone();
+        async move {
+            prop.signal()
+                .for_each(move |s| {
+                    let v = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => false,
+                    };
+                    writer.set(v);
+                    std::future::ready(())
+                })
+                .await;
+        }
     });
 }
 
@@ -248,11 +245,10 @@ fn secs_to_duration(secs: i64) -> Option<Duration> {
 }
 
 fn bind_prop_field<T>(
-    rt: &tokio::runtime::Handle,
     prop: PropertySignal<T>,
     default: T,
     writer: Mutable<Battery>,
-    apply: impl Fn(&mut Battery, T) + Send + 'static,
+    apply: impl Fn(&mut Battery, T) + Clone + Send + 'static,
 ) where
     T: Clone
         + Send
@@ -261,17 +257,23 @@ fn bind_prop_field<T>(
         + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
 {
-    rt.spawn(async move {
-        prop.signal()
-            .for_each(move |s| {
-                let v = match s {
-                    PropState::Loaded(v) | PropState::Stale(v) => v,
-                    PropState::Loading => default.clone(),
-                };
-                apply(&mut writer.lock_mut(), v);
-                std::future::ready(())
-            })
-            .await;
+    spawn_supervised("upower", move || {
+        let prop = prop.clone();
+        let writer = writer.clone();
+        let default = default.clone();
+        let apply = apply.clone();
+        async move {
+            prop.signal()
+                .for_each(move |s| {
+                    let v = match s {
+                        PropState::Loaded(v) | PropState::Stale(v) => v,
+                        PropState::Loading => default.clone(),
+                    };
+                    apply(&mut writer.lock_mut(), v);
+                    std::future::ready(())
+                })
+                .await;
+        }
     });
 }
 
@@ -322,26 +324,29 @@ fn warning_toast(baseline: Option<WarningLevel>, next: WarningLevel) -> Option<U
 /// Runs on the hytte-tokio runtime, not the GTK thread; `post_local` is
 /// cross-thread-safe (reaches the notifications daemon's `SHARED` handle),
 /// so this is safe regardless of service registration order.
-fn spawn_warning_level_watcher(rt: &tokio::runtime::Handle, battery: Mutable<Battery>) {
-    rt.spawn(async move {
-        let mut baseline: Option<WarningLevel> = None;
-        battery
-            .signal_ref(|b| b.warning_level)
-            .dedupe()
-            .for_each(move |level| {
-                if let Some(urgency) = warning_toast(baseline, level) {
-                    let percentage = battery.lock_ref().percentage;
-                    let summary = match level {
-                        WarningLevel::Critical | WarningLevel::Action => "Battery critical",
-                        _ => "Battery low",
-                    };
-                    let body = format!("{percentage:.0}% remaining");
-                    crate::notifications::post_local("Battery", summary, &body, urgency);
-                }
-                baseline = Some(level);
-                std::future::ready(())
-            })
-            .await;
+fn spawn_warning_level_watcher(battery: Mutable<Battery>) {
+    spawn_supervised("upower-warning", move || {
+        let battery = battery.clone();
+        async move {
+            let mut baseline: Option<WarningLevel> = None;
+            battery
+                .signal_ref(|b| b.warning_level)
+                .dedupe()
+                .for_each(move |level| {
+                    if let Some(urgency) = warning_toast(baseline, level) {
+                        let percentage = battery.lock_ref().percentage;
+                        let summary = match level {
+                            WarningLevel::Critical | WarningLevel::Action => "Battery critical",
+                            _ => "Battery low",
+                        };
+                        let body = format!("{percentage:.0}% remaining");
+                        crate::notifications::post_local("Battery", summary, &body, urgency);
+                    }
+                    baseline = Some(level);
+                    std::future::ready(())
+                })
+                .await;
+        }
     });
 }
 

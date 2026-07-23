@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call, signals};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::time::Duration;
 
 const SYSTEMD_NAME: &str = "org.freedesktop.systemd1";
@@ -62,17 +62,22 @@ pub struct SystemdService;
 impl Service for SystemdService {
     type Handles = SystemdHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = SystemdHandles::default();
         let writer = handles.failed_units.clone();
 
-        rt.spawn(async move {
-            loop {
-                match listen(&writer).await {
-                    Ok(()) => tracing::warn!("systemd listen loop ended, retrying in 5s"),
-                    Err(e) => tracing::warn!(error = %e, "systemd listen error, retrying in 5s"),
+        spawn_supervised("systemd", move || {
+            let writer = writer.clone();
+            async move {
+                loop {
+                    match listen(&writer).await {
+                        Ok(()) => tracing::warn!("systemd listen loop ended, retrying in 5s"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "systemd listen error, retrying in 5s");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
 

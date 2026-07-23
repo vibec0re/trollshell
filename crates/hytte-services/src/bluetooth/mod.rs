@@ -38,7 +38,7 @@ use agent::{AGENT_ANCHOR_NAME, AGENT_PATH, PairAgent, run_agent};
 use devices::listen;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::BusKind;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -129,7 +129,7 @@ pub struct BluetoothService;
 impl Service for BluetoothService {
     type Handles = BluetoothHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed
         // into run_agent to keep the interface alive for its lifetime.
@@ -157,38 +157,43 @@ impl Service for BluetoothService {
         let devices_mutable = handles.devices.clone();
         let path_store = adapter_path_store().clone();
 
-        rt.spawn(async move {
-            loop {
-                match listen(&adapter_mutable, &devices_mutable, &path_store).await {
-                    Ok(()) => {
-                        tracing::warn!("bluetooth watcher closed, reconnecting in 2s");
+        spawn_supervised("bluetooth", move || {
+            let adapter_mutable = adapter_mutable.clone();
+            let devices_mutable = devices_mutable.clone();
+            let path_store = path_store.clone();
+            async move {
+                loop {
+                    match listen(&adapter_mutable, &devices_mutable, &path_store).await {
+                        Ok(()) => {
+                            tracing::warn!("bluetooth watcher closed, reconnecting in 2s");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "bluetooth watcher error, reconnecting in 2s");
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bluetooth watcher error, reconnecting in 2s");
+                    // Clear state when the adapter disappears: the device list,
+                    // any in-flight action markers, the active pair prompt, and
+                    // the pending agent reply (so the agent method handler that's
+                    // awaiting it returns Reject instead of hanging forever).
+                    adapter_mutable.set(None);
+                    devices_mutable.set(Vec::new());
+                    let pending_response = SHARED.get().map(|s| {
+                        s.device_actions.lock_mut().clear();
+                        if s.pair_prompt.lock_ref().is_some() {
+                            s.pair_prompt.set(None);
+                        }
+                        s.pending_response.clone()
+                    });
+                    if let Some(pending) = pending_response
+                        && let Some(tx) = pending.lock().await.take()
+                    {
+                        let _ = tx.send(AgentReply::Reject);
                     }
+                    // Also reset the adapter path store so the next listen()
+                    // call starts fresh.
+                    set_adapter_path_local("").await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                // Clear state when the adapter disappears: the device list,
-                // any in-flight action markers, the active pair prompt, and
-                // the pending agent reply (so the agent method handler that's
-                // awaiting it returns Reject instead of hanging forever).
-                adapter_mutable.set(None);
-                devices_mutable.set(Vec::new());
-                let pending_response = SHARED.get().map(|s| {
-                    s.device_actions.lock_mut().clear();
-                    if s.pair_prompt.lock_ref().is_some() {
-                        s.pair_prompt.set(None);
-                    }
-                    s.pending_response.clone()
-                });
-                if let Some(pending) = pending_response
-                    && let Some(tx) = pending.lock().await.take()
-                {
-                    let _ = tx.send(AgentReply::Reject);
-                }
-                // Also reset the adapter path store so the next listen()
-                // call starts fresh.
-                set_adapter_path_local("").await;
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
 
@@ -196,8 +201,11 @@ impl Service for BluetoothService {
         // for the process lifetime, retrying on errors (e.g. bluetoothd
         // restart). The agent connection is managed by bus::own_name which
         // handles reconnects automatically.
-        rt.spawn(async move {
-            run_agent(ownership).await;
+        spawn_supervised("bluetooth", move || {
+            let ownership = ownership.clone();
+            async move {
+                run_agent(ownership).await;
+            }
         });
 
         handles

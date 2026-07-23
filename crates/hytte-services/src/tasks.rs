@@ -47,7 +47,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
 use hytte_ecal::{CalClient, CalClientView, MainContext, Registry, Source, Waker};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
 };
@@ -187,7 +187,7 @@ pub struct TasksService;
 impl Service for TasksService {
     type Handles = TaskHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = TaskHandles::default();
         let tasks_writer = handles.tasks.clone();
         let lists_writer = handles.lists.clone();
@@ -206,7 +206,7 @@ impl Service for TasksService {
             .expect("spawn EDS worker thread");
 
         // Refresh ticker on the tokio runtime.
-        rt.spawn(async {
+        spawn_supervised("tasks", || async {
             loop {
                 send_op(Op::Refresh);
                 tokio::time::sleep(POLL_INTERVAL).await;

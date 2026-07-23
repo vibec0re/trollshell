@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::BTreeSet;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -114,15 +114,16 @@ pub struct IdleNotifyHandles {
 impl Service for IdleNotifyService {
     type Handles = IdleNotifyHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let state = Mutable::new(IdleState::default());
         let worker_state = state.clone();
 
         // Relock on logind `PrepareForSleep(true)`, mirroring swayidle's
         // `before-sleep 'loginctl lock-session'`. This D-Bus work runs as a
         // tokio task on the shared runtime (Wayland stays on its own `!Send`
-        // thread).
-        rt.spawn(run_prepare_for_sleep_relock());
+        // thread). Supervised so a panic in the signal listener restarts the
+        // relock arm instead of silently disabling before-sleep locking.
+        spawn_supervised("idle_notify", run_prepare_for_sleep_relock);
 
         // Wayland objects are `!Send`; the whole client lives on this dedicated
         // thread and only writes back the `Send + Sync` `Mutable`. A `std::thread`

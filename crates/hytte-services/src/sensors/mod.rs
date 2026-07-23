@@ -32,7 +32,7 @@ mod proc_stat;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -312,25 +312,26 @@ impl Default for SensorsHandles {
 /// pushes it and republishes the whole window into `sink`. `extract` returning
 /// `None` (e.g. a GPU field that's absent this tick) leaves the ring unchanged —
 /// mirroring the old per-widget "only push when present" behaviour.
-fn spawn_history<T, F>(
-    rt: &tokio::runtime::Handle,
-    source: Mutable<T>,
-    sink: Mutable<Arc<VecDeque<f64>>>,
-    extract: F,
-) where
+fn spawn_history<T, F>(source: Mutable<T>, sink: Mutable<Arc<VecDeque<f64>>>, extract: F)
+where
     T: Clone + Send + Sync + 'static,
-    F: Fn(&T) -> Option<f64> + Send + 'static,
+    F: Fn(&T) -> Option<f64> + Clone + Send + 'static,
 {
-    rt.spawn(async move {
-        let mut ring: VecDeque<f64> = VecDeque::with_capacity(HISTORY_CAP);
-        let mut stream = source.signal_cloned().to_stream();
-        while let Some(value) = stream.next().await {
-            if let Some(sample) = extract(&value) {
-                if ring.len() == HISTORY_CAP {
-                    ring.pop_front();
+    spawn_supervised("sensors", move || {
+        let source = source.clone();
+        let sink = sink.clone();
+        let extract = extract.clone();
+        async move {
+            let mut ring: VecDeque<f64> = VecDeque::with_capacity(HISTORY_CAP);
+            let mut stream = source.signal_cloned().to_stream();
+            while let Some(value) = stream.next().await {
+                if let Some(sample) = extract(&value) {
+                    if ring.len() == HISTORY_CAP {
+                        ring.pop_front();
+                    }
+                    ring.push_back(sample);
+                    sink.set(Arc::new(ring.clone()));
                 }
-                ring.push_back(sample);
-                sink.set(Arc::new(ring.clone()));
             }
         }
     });
@@ -344,30 +345,34 @@ fn spawn_history<T, F>(
 /// so history restarts cleanly, then the whole 2-D window is republished into
 /// `sink`. Consumed by a lazily-built per-core `MultiSparkline` via `set_frames`.
 fn spawn_per_core_history<T, F>(
-    rt: &tokio::runtime::Handle,
     source: Mutable<T>,
     sink: Mutable<Arc<Vec<VecDeque<f64>>>>,
     extract: F,
 ) where
     T: Clone + Send + Sync + 'static,
-    F: Fn(&T) -> Vec<f64> + Send + 'static,
+    F: Fn(&T) -> Vec<f64> + Clone + Send + 'static,
 {
-    rt.spawn(async move {
-        let mut series: Vec<VecDeque<f64>> = Vec::new();
-        let mut stream = source.signal_cloned().to_stream();
-        while let Some(value) = stream.next().await {
-            let frame = extract(&value);
-            if series.len() != frame.len() {
-                series.clear();
-                series.resize_with(frame.len(), || VecDeque::with_capacity(HISTORY_CAP));
-            }
-            for (buf, &sample) in series.iter_mut().zip(frame.iter()) {
-                if buf.len() == HISTORY_CAP {
-                    buf.pop_front();
+    spawn_supervised("sensors", move || {
+        let source = source.clone();
+        let sink = sink.clone();
+        let extract = extract.clone();
+        async move {
+            let mut series: Vec<VecDeque<f64>> = Vec::new();
+            let mut stream = source.signal_cloned().to_stream();
+            while let Some(value) = stream.next().await {
+                let frame = extract(&value);
+                if series.len() != frame.len() {
+                    series.clear();
+                    series.resize_with(frame.len(), || VecDeque::with_capacity(HISTORY_CAP));
                 }
-                buf.push_back(sample);
+                for (buf, &sample) in series.iter_mut().zip(frame.iter()) {
+                    if buf.len() == HISTORY_CAP {
+                        buf.pop_front();
+                    }
+                    buf.push_back(sample);
+                }
+                sink.set(Arc::new(series.clone()));
             }
-            sink.set(Arc::new(series.clone()));
         }
     });
 }
@@ -380,7 +385,7 @@ pub struct SensorsService;
 impl Service for SensorsService {
     type Handles = SensorsHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = SensorsHandles::default();
         let cpu_writer = handles.cpu.clone();
         let cpu_freq_writer = handles.cpu_freq.clone();
@@ -395,31 +400,33 @@ impl Service for SensorsService {
         let mount_list_for_poll = handles.mount_list.clone();
         let mount_list_for_watch = handles.mount_list.clone();
 
-        rt.spawn(async move {
-            poll_loop(PollWriters {
-                cpu: cpu_writer,
-                cpu_freq: cpu_freq_writer,
-                mem: mem_writer,
-                net: net_writer,
-                disk_io: disk_io_writer,
-                cpu_temp: cpu_temp_writer,
-                gpu: gpu_writer,
-                disk: disk_writer,
-                net_conn: net_conn_writer,
-                proc_count: proc_count_writer,
-                mount_list: mount_list_for_poll,
-            })
-            .await;
+        spawn_supervised("sensors", move || {
+            let writers = PollWriters {
+                cpu: cpu_writer.clone(),
+                cpu_freq: cpu_freq_writer.clone(),
+                mem: mem_writer.clone(),
+                net: net_writer.clone(),
+                disk_io: disk_io_writer.clone(),
+                cpu_temp: cpu_temp_writer.clone(),
+                gpu: gpu_writer.clone(),
+                disk: disk_writer.clone(),
+                net_conn: net_conn_writer.clone(),
+                proc_count: proc_count_writer.clone(),
+                mount_list: mount_list_for_poll.clone(),
+            };
+            poll_loop(writers)
         });
-        rt.spawn(mount_watch_loop(mount_list_for_watch));
+        spawn_supervised("sensors", move || {
+            mount_watch_loop(mount_list_for_watch.clone())
+        });
 
         // Sparkline history accumulators (#231): one ring per Stats graph, fed
         // off the live metric signals — extractors mirror each row's old
         // `spark.push(..)` scalar and its present/absent guard.
-        spawn_history(rt, handles.cpu.clone(), handles.cpu_hist.clone(), |c| {
+        spawn_history(handles.cpu.clone(), handles.cpu_hist.clone(), |c| {
             Some(c.overall)
         });
-        spawn_history(rt, handles.memory.clone(), handles.mem_hist.clone(), |m| {
+        spawn_history(handles.memory.clone(), handles.mem_hist.clone(), |m| {
             Some(if m.total == 0 {
                 0.0
             } else {
@@ -427,59 +434,43 @@ impl Service for SensorsService {
             })
         });
         spawn_history(
-            rt,
             handles.disk_io.clone(),
             handles.disk_io_hist.clone(),
             |io| Some(io.read_bps + io.write_bps),
         );
-        spawn_history(
-            rt,
-            handles.gpu.clone(),
-            handles.gpu_load_hist.clone(),
-            |g| g.as_ref().and_then(|s| s.load).map(|l| l * 100.0),
-        );
-        spawn_history(
-            rt,
-            handles.gpu.clone(),
-            handles.gpu_vram_hist.clone(),
-            |g| {
-                g.as_ref()
-                    .and_then(|s| s.memory_used_bytes.zip(s.memory_total_bytes))
-                    .map(|(used, total)| {
-                        if total == 0 {
-                            0.0
-                        } else {
-                            (u64_to_f64_bytes(used) / u64_to_f64_bytes(total) * 100.0)
-                                .clamp(0.0, 100.0)
-                        }
-                    })
-            },
-        );
-        spawn_history(
-            rt,
-            handles.gpu.clone(),
-            handles.gpu_temp_hist.clone(),
-            |g| g.as_ref().and_then(|s| s.temperature_celsius),
-        );
+        spawn_history(handles.gpu.clone(), handles.gpu_load_hist.clone(), |g| {
+            g.as_ref().and_then(|s| s.load).map(|l| l * 100.0)
+        });
+        spawn_history(handles.gpu.clone(), handles.gpu_vram_hist.clone(), |g| {
+            g.as_ref()
+                .and_then(|s| s.memory_used_bytes.zip(s.memory_total_bytes))
+                .map(|(used, total)| {
+                    if total == 0 {
+                        0.0
+                    } else {
+                        (u64_to_f64_bytes(used) / u64_to_f64_bytes(total) * 100.0).clamp(0.0, 100.0)
+                    }
+                })
+        });
+        spawn_history(handles.gpu.clone(), handles.gpu_temp_hist.clone(), |g| {
+            g.as_ref().and_then(|s| s.temperature_celsius)
+        });
 
         // CPU clock + per-core accumulators (#338): the clock aggregate and the
         // two per-core series that used to push history in-widget in the Stats
         // CPU card. Extractors mirror each row's old `push`/`push_frame` math and
         // its `max_ceiling_hz`-normalization (0.0 when no cpufreq governor).
         spawn_history(
-            rt,
             handles.cpu_freq.clone(),
             handles.cpu_freq_hist.clone(),
             |f| Some(normalized_clock(f.max_hz, f.max_ceiling_hz)),
         );
         spawn_per_core_history(
-            rt,
             handles.cpu.clone(),
             handles.cpu_per_core_hist.clone(),
             |c| c.per_core.clone(),
         );
         spawn_per_core_history(
-            rt,
             handles.cpu_freq.clone(),
             handles.cpu_freq_per_core_hist.clone(),
             |f| {

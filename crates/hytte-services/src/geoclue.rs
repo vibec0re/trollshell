@@ -20,7 +20,7 @@
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -136,7 +136,7 @@ pub struct GeoclueService;
 impl Service for GeoclueService {
     type Handles = GeoclueHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = GeoclueHandles::default();
         let location = handles.location.clone();
         let notify = handles.notify.clone();
@@ -146,7 +146,9 @@ impl Service for GeoclueService {
             notify: notify.clone(),
             place_override: place_override.clone(),
         });
-        rt.spawn(resolve_loop(location, notify, place_override));
+        spawn_supervised("geoclue", move || {
+            resolve_loop(location.clone(), notify.clone(), place_override.clone())
+        });
         handles
     }
 }

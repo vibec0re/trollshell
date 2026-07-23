@@ -35,6 +35,12 @@ pub enum BusKind {
 /// a transient error until the supervisor re-establishes it.
 struct Inner {
     conn: Option<Connection>,
+    /// Monotonic counter, bumped every time a fresh `conn` is installed.
+    /// `with_conn` captures it before running an op and, on a transient
+    /// failure, only clears the cached connection if it is unchanged — so a
+    /// late failure from a superseded connection attempt cannot clobber a
+    /// newer, already-established connection.
+    generation: u64,
 }
 
 /// Process-wide shared connection to one bus. Cloned freely (cheap, Arc).
@@ -174,10 +180,10 @@ impl SharedConnection {
         F: FnOnce(Connection) -> Fut,
         Fut: std::future::Future<Output = Result<R, zbus::Error>>,
     {
-        let conn = {
+        let (conn, generation) = {
             let guard = self.inner.lock().await;
             if let Some(c) = guard.conn.as_ref() {
-                c.clone()
+                (c.clone(), guard.generation)
             } else {
                 // No cached connection — mid-reconnect.
                 let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
@@ -195,10 +201,18 @@ impl SharedConnection {
             // race us into leaving a known-broken connection cached. The lock is held briefly
             // — only long enough to write None — so the contention window is small.
             let mut guard = self.inner.lock().await;
-            guard.conn = None;
-            drop(guard);
-            if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
-                notify.notify_one();
+            // Only clear if the connection we used is still the current one.
+            // At disconnect several ops are in flight on the old connection;
+            // without this guard each late failure would null the *fresh*
+            // connection the supervisor already re-established and force yet
+            // another reconnect + epoch bump (re-Get / re-subscribe across
+            // every service).
+            if guard.generation == generation {
+                guard.conn = None;
+                drop(guard);
+                if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
+                    notify.notify_one();
+                }
             }
         }
         result.map_err(BusError::from_zbus)
@@ -212,7 +226,10 @@ impl SharedConnection {
     /// and spawns the supervisor on the hytte tokio runtime. The supervisor's
     /// first iteration opens the real connection asynchronously.
     fn start(kind: BusKind) -> Self {
-        let inner = Arc::new(Mutex::new(Inner { conn: None }));
+        let inner = Arc::new(Mutex::new(Inner {
+            conn: None,
+            generation: 0,
+        }));
         let epoch = Arc::new(AtomicU64::new(0));
         let epoch_signal = Mutable::new(0u64);
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -243,7 +260,7 @@ impl SharedConnection {
 #[doc(hidden)]
 pub mod test_support {
     use super::{
-        Arc, AtomicU64, BusKind, Connection, INJECTED_CONN, Inner, Mutable, Mutex,
+        Arc, AtomicU64, BusKind, Connection, INJECTED_CONN, Inner, Mutable, Mutex, Ordering,
         SUPERVISOR_NOTIFY,
     };
 
@@ -267,10 +284,27 @@ pub mod test_support {
         fn for_test(kind: BusKind, conn: Connection) -> Self {
             Self {
                 kind,
-                inner: Arc::new(Mutex::new(Inner { conn: Some(conn) })),
+                inner: Arc::new(Mutex::new(Inner {
+                    conn: Some(conn),
+                    generation: 1,
+                })),
                 epoch: Arc::new(AtomicU64::new(1)),
                 epoch_signal: Mutable::new(1),
             }
+        }
+
+        /// Test-only: install a fresh connection exactly as the supervisor does
+        /// on a successful reconnect (bump generation + epoch). Lets a test
+        /// deterministically reproduce "a fresh connection was installed while
+        /// an old op was still in flight" without racing a real supervisor.
+        #[doc(hidden)]
+        pub async fn install_fresh_connection_for_test(&self, conn: Connection) {
+            let mut g = self.inner.lock().await;
+            g.conn = Some(conn);
+            g.generation += 1;
+            drop(g);
+            let new_epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            self.epoch_signal.set(new_epoch);
         }
 
         /// Test-only: spawn a supervisor loop for a `for_test_*`
@@ -353,6 +387,7 @@ async fn supervisor_loop(
                 Ok(conn) => {
                     let mut g = inner.lock().await;
                     g.conn = Some(conn);
+                    g.generation += 1;
                     drop(g);
                     let new_epoch = epoch.fetch_add(1, Ordering::AcqRel) + 1;
                     signal.set(new_epoch);

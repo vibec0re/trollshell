@@ -106,6 +106,44 @@ mod tests {
     }
 
     #[test]
+    fn service_unknown_is_permanent() {
+        // An absent daemon (e.g. UPower disabled) surfaces as ServiceUnknown.
+        let raw = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown(
+            "org.freedesktop.UPower".to_owned(),
+        )));
+        assert!(
+            !is_transient_zbus_error(&raw),
+            "ServiceUnknown must not be treated as transient"
+        );
+        assert!(
+            !BusError::from_zbus(raw).is_transient(),
+            "ServiceUnknown must be Permanent"
+        );
+    }
+
+    #[test]
+    fn access_denied_is_permanent() {
+        let raw = zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "not authorised".to_owned(),
+        )));
+        assert!(
+            !BusError::from_zbus(raw).is_transient(),
+            "AccessDenied must be Permanent"
+        );
+    }
+
+    #[test]
+    fn unknown_object_is_permanent() {
+        let raw = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownObject(
+            "/no/such/object".to_owned(),
+        )));
+        assert!(
+            !BusError::from_zbus(raw).is_transient(),
+            "UnknownObject must be Permanent"
+        );
+    }
+
+    #[test]
     fn method_error_is_permanent_with_dbus_name() {
         // Build a minimal method-call Message to satisfy the MethodError variant's
         // third field.  The message contents are not examined by from_zbus; only

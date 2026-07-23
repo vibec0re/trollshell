@@ -10,10 +10,11 @@
 //! `SetAutoLocation`, which round-trip the shell's runtime location override
 //! (see [`hytte::services::geoclue::PlaceOverride`]). The **Plugins** tab (#348)
 //! adds `ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled`, which
-//! manage the `trollshell-plugin-<id>` **user** units through
-//! [`hytte::services::systemd`] (plugins run as systemd user units — the host is
-//! transport-only). Each further tab adds its own methods here, following the
-//! same shape.
+//! manage the `trollshell-plugin-<id>` **user** units through the declarative
+//! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
+//! *transient* units the host launches via `systemd-run --user`, with a
+//! `StartUnit`/unit-file fallback for legacy static units. Each further tab
+//! adds its own methods here, following the same shape.
 //!
 //! ## Why a *dedicated* bus name, not the app's primary name
 //!
@@ -40,7 +41,9 @@
 //! clippy-banned) — everything goes through `hytte_bus`.
 
 use hytte::reactive::Service;
-use hytte::services::{geoclue, places, systemd};
+use hytte::services::{geoclue, places};
+
+use crate::plugin_launcher;
 
 /// Dedicated well-known bus name for the control endpoint. Distinct from the
 /// app's primary name `mov.vibec0re.trollshell` (owned by `GApplication`) — see
@@ -139,54 +142,60 @@ impl ControlIface {
         geoclue::set_auto_location(auto);
     }
 
-    // ── Plugins (#348) ──────────────────────────────────────────────────────
+    // ── Plugins (#348, launch model #419) ───────────────────────────────────
     //
-    // Tier 1 (status list) + tier 2 (on/off) of #348, backed by the plugins'
-    // systemd **user** units via [`systemd`] (which uses `hytte-bus`, so these
-    // handlers stay cross-thread-clean off the D-Bus task). The live
-    // "connected / rendering" overlay from the host's in-process plugin registry
-    // (`plugins.rs`, GTK-thread-local) is a deferred follow-up — it needs a
-    // cross-thread bridge out of the registry.
+    // Tier 1 (status list) + tier 2 (on/off) of #348, backed by the declarative
+    // launcher ([`plugin_launcher`] — plain async fns over `hytte-bus` +
+    // `systemd-run`, so these handlers stay cross-thread-clean off the D-Bus
+    // task). Declared plugins (the nix-written `plugins.json`) run as
+    // *transient* units the host launches; legacy static units fall back to
+    // `StartUnit`/unit files. The live "connected / rendering" overlay from the
+    // host's in-process plugin registry (`plugins.rs`, GTK-thread-local) is a
+    // deferred follow-up (#423) — it needs a cross-thread bridge out of the
+    // registry.
 
-    /// The installed plugin units — `(id, active_state, enabled)` per
-    /// `trollshell-plugin-<id>` **user** unit. `active_state` is systemd's
-    /// (`active` / `inactive` / `failed` / `activating` / …); `enabled` is the
-    /// persisted auto-start state. Empty if the user systemd manager can't be
-    /// reached (logged, never panics). The companion app's Plugins tab renders
-    /// one switch row per entry.
+    /// The known plugins — `(id, active_state, enabled)` for the union of the
+    /// *declared* set (the nix-written state file, #419) and the
+    /// `trollshell-plugin-<id>` **user** units systemd knows (transient runs +
+    /// legacy static units). `active_state` is systemd's (`active` /
+    /// `inactive` / `failed` / …; a declared-but-stopped plugin reports
+    /// `inactive`); `enabled` is the declarative flag for declared plugins,
+    /// unit-file enablement for legacy ones. The companion app's Plugins tab
+    /// renders one switch row per entry.
     async fn list_plugins(&self) -> Vec<(String, String, bool)> {
-        match systemd::list_plugin_units().await {
-            Ok(units) => units
-                .into_iter()
-                .map(|u| (u.id, u.active_state, u.enabled))
-                .collect(),
-            Err(err) => {
-                tracing::warn!(%err, "ListPlugins: enumerating plugin units failed");
-                Vec::new()
-            }
-        }
+        plugin_launcher::list()
+            .await
+            .into_iter()
+            .map(|u| (u.id, u.active_state, u.enabled))
+            .collect()
     }
 
-    /// Start plugin `id`'s user unit now. Does not change its enabled state (see
+    /// Start plugin `id` now: a declared plugin is launched as a transient
+    /// unit via `systemd-run --user` (#419); a legacy static unit gets
+    /// `StartUnit`. Does not change its enabled state (see
     /// [`set_plugin_enabled`](Self::set_plugin_enabled)). Re-query
     /// [`list_plugins`](Self::list_plugins) shortly after to read back the state.
     async fn start_plugin(&self, id: String) {
-        if let Err(err) = systemd::start_plugin(&id).await {
+        if let Err(err) = plugin_launcher::start(&id).await {
             tracing::warn!(%err, plugin = %id, "StartPlugin failed");
         }
     }
 
-    /// Stop plugin `id`'s user unit now. Does not change its enabled state.
+    /// Stop plugin `id`'s user unit now (transient or static alike). Does not
+    /// change its enabled state.
     async fn stop_plugin(&self, id: String) {
-        if let Err(err) = systemd::stop_plugin(&id).await {
+        if let Err(err) = plugin_launcher::stop(&id).await {
             tracing::warn!(%err, plugin = %id, "StopPlugin failed");
         }
     }
 
-    /// Enable or disable plugin `id`'s user unit for persistence across logins.
-    /// Runtime state is unchanged — pair with start/stop to also apply it now.
+    /// Enable or disable plugin `id` for persistence across logins. For a
+    /// *declared* plugin enablement is declarative — nix owns it (#419), so
+    /// this is a logged no-op (persist by flipping
+    /// `programs.trollshell.plugins.<id>.enable`); runtime start/stop still
+    /// applies live. Legacy static units keep unit-file enable/disable.
     async fn set_plugin_enabled(&self, id: String, enabled: bool) {
-        if let Err(err) = systemd::set_plugin_enabled(&id, enabled).await {
+        if let Err(err) = plugin_launcher::set_enabled(&id, enabled).await {
             tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
         }
     }

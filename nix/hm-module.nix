@@ -14,31 +14,24 @@ let
   # asserted clearly if absent (below) rather than branching on option layout —
   # a pre-0.12 channel that still only ships `services.swww` won't have it.
 
-  # One trollshell-plugin-<id> user service per programs.trollshell.plugins
-  # entry (#350/#355; the attr key is the plugin id), mirroring
-  # etc/systemd/user/trollshell-plugin-pet.service. Entries with
-  # enable = false are filtered out before any unit is generated.
-  pluginServices = lib.mapAttrs' (
-    id: plugin:
-    lib.nameValuePair "trollshell-plugin-${id}" {
-      Unit = {
-        PartOf = [ "niri-session.target" ];
-        After = [
-          "graphical-session.target"
-          "trollshell.service"
-        ];
-        Requisite = [ "graphical-session.target" ];
-      };
-      Service = {
-        Type = "simple";
-        ExecStart = lib.getExe plugin.package;
-        Environment = lib.mapAttrsToList (name: value: "${name}=${value}") plugin.env;
-        Restart = "on-failure";
-        RestartSec = 2;
-      };
-      Install.WantedBy = [ "niri-session.target" ];
-    }
-  ) (lib.filterAttrs (_: p: p.enable) cfg.plugins);
+  # Declarative plugin launch state (#419; the attr key is the plugin id).
+  # programs.trollshell.plugins no longer emits one static
+  # trollshell-plugin-<id> unit per entry (#350's original shape): the option
+  # renders to a JSON state file the *shell* reads at startup — the host
+  # launches each enabled plugin itself as a transient user unit via
+  # `systemd-run --user` (trollshell/src/plugin_launcher.rs), which is also
+  # where #392's secret injection hooks in at spawn. Every entry is written,
+  # including enable = false ones ("enabled": false — declared but not
+  # auto-launched), so a disabled plugin still lists in the control-center's
+  # Plugins tab and can be started manually.
+  pluginsState = builtins.toJSON {
+    version = 1;
+    plugins = lib.mapAttrs (_: plugin: {
+      exec = lib.getExe plugin.package;
+      inherit (plugin) env;
+      enabled = plugin.enable;
+    }) cfg.plugins;
+  };
 
   # Night light (#222): the wlsunset user unit's ExecStart. Geo mode needs both
   # lat and lon; while either is unset the unit is declared but inert (starting
@@ -186,12 +179,17 @@ in
         };
       }
 
-      # Declarative out-of-tree plugins (#350): one trollshell-plugin-<id>
-      # user service per programs.trollshell.plugins entry (built above).
-      # Plugins dial plugin.sock and register themselves; this only wires
-      # the unit — no shell-side spawn/supervise (trollshell/src/plugins.rs)
-      # and no runtime load/unload (that's #348, out of scope here).
-      { systemd.user.services = pluginServices; }
+      # Declarative plugins (#350, launch model #419): write the launch-state
+      # file (built above) the shell reads at startup instead of generating
+      # static units — the host runs each enabled plugin as a transient
+      # trollshell-plugin-<id> user unit via `systemd-run --user`. Launched
+      # plugins dial plugin.sock and register themselves as before; supervision
+      # (Restart=on-failure) and session lifetime (PartOf=graphical-session
+      # .target) ride on the transient unit. Only written when any plugin is
+      # declared, so a plugin-less config grows no config file.
+      (lib.mkIf (cfg.plugins != { }) {
+        xdg.configFile."trollshell/plugins.json".text = pluginsState;
+      })
 
       # Control-center companion app (#399): the external GTK settings/management
       # window (app-id mov.vibec0re.trollshell.ControlCenter) that speaks to the

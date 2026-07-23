@@ -234,7 +234,10 @@ pub(crate) fn parse_plugin_id(unit: &str) -> Option<String> {
 }
 
 /// `<id>` → `trollshell-plugin-<id>.service`. Inverse of [`parse_plugin_id`].
-fn plugin_unit_name(id: &str) -> String {
+/// `pub` so the shell's declarative launcher (#419) names the transient unit
+/// it hands `systemd-run --user` with the same template.
+#[must_use]
+pub fn plugin_unit_name(id: &str) -> String {
     format!("{PLUGIN_UNIT_PREFIX}{id}{UNIT_SUFFIX}")
 }
 
@@ -242,7 +245,10 @@ fn plugin_unit_name(id: &str) -> String {
 /// charset (ASCII alphanumerics plus `-`/`_`, bounded, non-empty) so a
 /// `StartPlugin`/`StopPlugin` caller on the session bus can't smuggle a crafted
 /// unit name through the `trollshell-plugin-<id>.service` template. Pure.
-pub(crate) fn is_valid_plugin_id(id: &str) -> bool {
+/// `pub` so the shell's declarative launcher (#419) applies the same guard to
+/// ids read from the `plugins.json` state file.
+#[must_use]
+pub fn is_valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id

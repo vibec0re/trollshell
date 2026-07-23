@@ -272,25 +272,27 @@
               # explanation shown when an assertion fails, so forcing it would be
               # both pointless and prone to evaluating intentionally-deferred text.
               units = cfg.systemd.user.services;
+              # The declarative plugin launch state (#419): the module renders
+              # the plugins option to trollshell/plugins.json — read back here
+              # from the generated file's text — instead of emitting units.
+              # fromJSON forbids string context (the exec store path), and this
+              # probe only inspects the eval, so discarding it is sound here.
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
               probe =
-                # plugins (#355): the attr key names the unit, enable = false
-                # filters the entry out, and the demo entry's env merged
-                # per-field across the two modules above.
-                assert units ? trollshell-plugin-demo;
+                # plugins (#419): entries render to the launch-state file, not
+                # static units; enable = false is *declared disabled* (listed,
+                # not auto-launched) rather than filtered out; and the demo
+                # entry's env still merges per-field across the two modules
+                # above (#355).
+                assert !(units ? trollshell-plugin-demo);
                 assert !(units ? trollshell-plugin-off);
-                # home-manager's unitOption type merges every value into a
-                # list, so normalize with toList before comparing.
-                assert
-                  pkgs.lib.toList units.trollshell-plugin-demo.Service.ExecStart == [
-                    (pkgs.lib.getExe stubPlugin)
-                  ];
-                assert
-                  pkgs.lib.sort pkgs.lib.lessThan (
-                    pkgs.lib.flatten (pkgs.lib.toList units.trollshell-plugin-demo.Service.Environment)
-                  ) == [
-                    "DEMO_EXTRA=1"
-                    "DEMO_TOKEN=hunter2"
-                  ];
+                assert pluginsState.plugins.demo.exec == pkgs.lib.getExe stubPlugin;
+                assert pluginsState.plugins.demo.enabled;
+                assert pluginsState.plugins.demo.env.DEMO_TOKEN == "hunter2";
+                assert pluginsState.plugins.demo.env.DEMO_EXTRA == "1";
+                assert !pluginsState.plugins.off.enabled;
                 builtins.deepSeq {
                   userUnits = units;
                   sessionVars = cfg.home.sessionVariables;
@@ -361,15 +363,27 @@
               # (e.g. the fileSystems topological-sort error), so deepSeq'ing all
               # messages would trip an unrelated internal assertion's message.
               units = cfg.systemd.user.services;
+              # The declarative plugin launch state (#419): the NixOS module
+              # renders the plugins option to /etc/xdg/trollshell/plugins.json
+              # (the $XDG_CONFIG_DIRS fallback the shell's launcher reads).
+              # fromJSON forbids string context (the exec store path), and this
+              # probe only inspects the eval, so discarding it is sound here.
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.environment.etc."xdg/trollshell/plugins.json".text
+              );
               probe =
-                # plugins (#355): the attr key names the unit, enable = false
-                # filters the entry out, and the demo entry's env merged
-                # per-field across the two modules above.
-                assert units ? trollshell-plugin-demo;
+                # plugins (#419): entries render to the launch-state file, not
+                # static units; enable = false is *declared disabled* (listed,
+                # not auto-launched) rather than filtered out; and the demo
+                # entry's env still merges per-field across the two modules
+                # above (#355).
+                assert !(units ? trollshell-plugin-demo);
                 assert !(units ? trollshell-plugin-off);
-                assert units.trollshell-plugin-demo.serviceConfig.ExecStart == pkgs.lib.getExe stubPlugin;
-                assert units.trollshell-plugin-demo.environment.DEMO_TOKEN == "hunter2";
-                assert units.trollshell-plugin-demo.environment.DEMO_EXTRA == "1";
+                assert pluginsState.plugins.demo.exec == pkgs.lib.getExe stubPlugin;
+                assert pluginsState.plugins.demo.enabled;
+                assert pluginsState.plugins.demo.env.DEMO_TOKEN == "hunter2";
+                assert pluginsState.plugins.demo.env.DEMO_EXTRA == "1";
+                assert !pluginsState.plugins.off.enabled;
                 builtins.deepSeq {
                   userUnits = builtins.attrNames units;
                   swaybgExec = units.swaybg.serviceConfig.ExecStart;

@@ -189,9 +189,12 @@ self:
               default = true;
               example = false;
               description = ''
-                Whether to generate the systemd user service for this
-                plugin. Lets a downstream module switch a single entry off
-                (`plugins.pet.enable = false;`) without removing its
+                Whether the shell launches this plugin at startup (#419).
+                A disabled entry is still *declared* — written to the launch
+                state as "enabled": false, so it lists in the control-center's
+                Plugins tab and can be started manually — it just doesn't
+                auto-launch. Lets a downstream module switch a single entry
+                off (`plugins.pet.enable = false;`) without removing its
                 definition.
               '';
             };
@@ -199,10 +202,13 @@ self:
             package = lib.mkOption {
               type = lib.types.package;
               description = ''
-                The out-of-tree plugin's package (its out-of-process binary,
-                built on hytte-plugin). It dials plugin.sock and speaks the
-                Register handshake itself — the shell never spawns or links
-                it (trollshell/src/plugins.rs).
+                The plugin's package (its out-of-process binary, built on
+                hytte-plugin — never linked into the shell). The shell
+                launches it as a transient trollshell-plugin-<id> user unit
+                via `systemd-run --user` (#419,
+                trollshell/src/plugin_launcher.rs); once running it dials
+                plugin.sock and speaks the Register handshake itself
+                (trollshell/src/plugins.rs).
               '';
             };
 
@@ -233,20 +239,24 @@ self:
         }
       '';
       description = ''
-        Declarative out-of-tree plugins (#350), keyed by plugin id: each
-        attr drops in without hand-writing a systemd unit. One
-        `trollshell-plugin-<id>` user service is generated per entry (the
-        attr key is the id) — same shape as the bundled
-        `etc/systemd/user/trollshell-plugin-pet.service` (bound to
-        niri-session.target, started after trollshell.service, restarted
-        on-failure). Being an attrset of submodules (the standard
+        Declarative plugins (#350, launch model #419), keyed by plugin id:
+        each attr drops in without hand-writing a systemd unit. The option
+        renders to a JSON launch-state file
+        (`trollshell/plugins.json` under XDG config — per-user via
+        home-manager, /etc/xdg via the NixOS module) that the running shell
+        reads at startup, launching each enabled entry as a *transient*
+        `trollshell-plugin-<id>` user unit via `systemd-run --user`
+        (trollshell/src/plugin_launcher.rs; Restart=on-failure,
+        PartOf=graphical-session.target — supervision and session lifetime
+        stay systemd's job, and the launch env is where #392's key
+        injection hooks in). Being an attrset of submodules (the standard
         named-instance pattern), entries merge per-field across modules —
         a second module can override one field of one plugin
         (`plugins.pet.env.PET_NAME = lib.mkForce "nisse";`) or disable it
-        (`plugins.pet.enable = false;`). The plugin dials plugin.sock and
-        registers itself; this option only wires the unit, it does not
-        spawn/supervise the plugin or hot-load it into a running shell
-        (that's runtime load/unload, #348 — out of scope here).
+        (`plugins.pet.enable = false;`). The launched plugin dials
+        plugin.sock and registers itself; the control-center's Plugins tab
+        (#348) starts/stops the transient units live, while *enablement*
+        stays declared here.
       '';
     };
   };

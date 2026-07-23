@@ -10,37 +10,25 @@ let
   cfg = config.programs.trollshell;
   backend = cfg.wallpaper.backend;
 
-  # One trollshell-plugin-<id> user service per programs.trollshell.plugins
-  # entry (#350/#355; the attr key is the plugin id), mirroring
-  # etc/systemd/user/trollshell-plugin-pet.service — using NixOS's own
-  # systemd.user.services schema (lowerCamel top-level keys, unlike
-  # home-manager's Unit/Service/Install), same as the swaybg/polkit-gnome
-  # units below. Entries with enable = false are filtered out before any
-  # unit is generated. NB: on a NixOS-only host (no home-manager),
-  # trollshell.service itself is never defined by *this* module — it only
-  # exists via home-manager (see homeModules.default at the bottom of this
-  # file) — so `after = [ "trollshell.service" ]` here just no-ops if that
-  # unit is absent, same as it would for any other missing After= target.
-  pluginServices = lib.mapAttrs' (
-    id: plugin:
-    lib.nameValuePair "trollshell-plugin-${id}" {
-      description = "trollshell plugin: ${id}";
-      wantedBy = [ "niri-session.target" ];
-      partOf = [ "niri-session.target" ];
-      after = [
-        "graphical-session.target"
-        "trollshell.service"
-      ];
-      requisite = [ "graphical-session.target" ];
-      environment = plugin.env;
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = lib.getExe plugin.package;
-        Restart = "on-failure";
-        RestartSec = 2;
-      };
-    }
-  ) (lib.filterAttrs (_: p: p.enable) cfg.plugins);
+  # Declarative plugin launch state (#419; the attr key is the plugin id).
+  # programs.trollshell.plugins no longer emits one static
+  # trollshell-plugin-<id> unit per entry (#350's original shape): the option
+  # renders to a JSON state file the *shell* reads at startup — the host
+  # launches each enabled plugin itself as a transient user unit via
+  # `systemd-run --user` (trollshell/src/plugin_launcher.rs), which is also
+  # where #392's secret injection hooks in at spawn. Every entry is written,
+  # including enable = false ones ("enabled": false — declared but not
+  # auto-launched), so a disabled plugin still lists in the control-center's
+  # Plugins tab and can be started manually. Same JSON as the home-manager
+  # module builds; keep the two in sync.
+  pluginsState = builtins.toJSON {
+    version = 1;
+    plugins = lib.mapAttrs (_: plugin: {
+      exec = lib.getExe plugin.package;
+      inherit (plugin) env;
+      enabled = plugin.enable;
+    }) cfg.plugins;
+  };
 in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
@@ -153,17 +141,21 @@ in
           };
         };
       })
-      # Declarative out-of-tree plugins (#350): one trollshell-plugin-<id>
-      # user service per programs.trollshell.plugins entry (built above).
-      # Plugins dial plugin.sock and register themselves; this only wires
-      # the unit — no shell-side spawn/supervise (trollshell/src/plugins.rs)
-      # and no runtime load/unload (that's #348, out of scope here). Note
-      # `programs.trollshell.plugins` set at NixOS system level is a
+      # Declarative plugins (#350, launch model #419): write the launch-state
+      # file (built above) under /etc/xdg — the default $XDG_CONFIG_DIRS entry
+      # the shell's launcher falls back to — instead of generating static
+      # units; the host runs each enabled plugin as a transient
+      # trollshell-plugin-<id> user unit via `systemd-run --user`. A per-user
+      # home-manager file ($XDG_CONFIG_HOME/trollshell/plugins.json) fully
+      # shadows this system one (first existing file wins whole, no merge).
+      # Note `programs.trollshell.plugins` set at NixOS system level is a
       # *separate* declaration from any home-manager per-user
       # `programs.trollshell.plugins` (home-manager.sharedModules below only
       # shares the module definition, not config values) — set it wherever
       # you actually run the shell.
-      { systemd.user.services = pluginServices; }
+      (lib.mkIf (cfg.plugins != { }) {
+        environment.etc."xdg/trollshell/plugins.json".text = pluginsState;
+      })
 
       # Control-center companion app (#399): the external GTK settings/management
       # window (app-id mov.vibec0re.trollshell.ControlCenter) that speaks to the

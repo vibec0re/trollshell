@@ -6,6 +6,9 @@
 //! that dial in and self-identify with [`PluginMsg::Register`]. Supervision is
 //! systemd's job — a crash is just a disconnect. This module is the transport
 //! only: it does **not** spawn or supervise plugins (see the spec's topology).
+//! *Launching* declared plugins (as transient units via `systemd-run --user`)
+//! is [`crate::plugin_launcher`]'s job since #419 — the transport doesn't care
+//! who spawned a connecting plugin.
 //!
 //! ## Topology & threading
 //!

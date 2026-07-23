@@ -355,14 +355,25 @@ const EDGE_TOL: f64 = 4.0;
 /// Useful for overlays that paint along those edges (e.g. the trollshell
 /// frame): they must hide when an edge-spanning window is active, since
 /// every pixel of their gradient or border would overlap the window.
-pub fn edge_window_on(connector: String, mon_w: f64) -> impl Signal<Item = bool> {
+///
+/// `mon_w` is a *signal* of the output's logical width, not a snapshot: a
+/// resolution/mode switch (kanshi profile change) resizes the output without a
+/// monitor connect/disconnect, so a captured width would leave the edge-span
+/// threshold stale (#442). Feed it a live width — e.g.
+/// `monitor.size_changed().map(|(w, _)| f64::from(w))` — so the detection
+/// re-evaluates when the mode changes.
+pub fn edge_window_on(
+    connector: String,
+    mon_w: impl Signal<Item = f64> + 'static,
+) -> impl Signal<Item = bool> {
     use futures_signals::map_ref;
     let workspaces = workspaces();
     let windows = windows();
     map_ref! {
         let ws = workspaces,
-        let w = windows =>
-        has_edge_window(ws, w, &connector, mon_w)
+        let w = windows,
+        let mw = mon_w =>
+        has_edge_window(ws, w, &connector, *mw)
     }
 }
 

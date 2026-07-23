@@ -66,10 +66,11 @@ struct BarGeometry {
     /// The bar's own margin on `edge` (gap between the screen edge and the
     /// bar). Usually 0 for a flush bar.
     offset: i32,
-    /// Monitor size in logical pixels, captured at install. Used to clamp the
-    /// card on-screen along the main axis.
-    mon_w: i32,
-    mon_h: i32,
+    /// The monitor this drawer is on. Its size is re-read live (via
+    /// [`Monitor::size`]) each time the card is positioned — never snapshotted
+    /// — so a resolution/mode switch (kanshi profile change) that resizes the
+    /// output without a hot-plug doesn't leave the centering clamp stale (#442).
+    monitor: Monitor,
     /// The bar's layer-shell window, measured at open time for its real
     /// thickness (height for Top/Bottom, width for Left/Right).
     bar_window: gtk::Window,
@@ -493,12 +494,10 @@ fn monitor_key(m: &Monitor) -> String {
 /// built so the bar window exists to be measured at open time.
 pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     let key = monitor_key(monitor);
-    let (mon_w, mon_h) = monitor.size();
     let geometry = BarGeometry {
         edge,
         offset,
-        mon_w,
-        mon_h,
+        monitor: monitor.clone(),
         bar_window: bar.window().clone(),
     };
 
@@ -1264,18 +1263,19 @@ fn trigger_center(panel: &ModalPanel, trigger: &gtk::Widget) -> Option<i32> {
 /// main_margin = screen_extent - center - chrome_main_end - card_extent/2
 /// ```
 ///
-/// where `screen_extent` is `mon_w` (horizontal) or `mon_h` (vertical) and
-/// `card_extent` is the card's real allocated size on the main axis (its
-/// border box; CSS borders + padding included). Clamped to
-/// `[0, screen_extent - card_footprint]` so the card can't fall off either
-/// end — near the trailing/leading screen edge it collapses to flush.
+/// where `screen_extent` is the monitor's live width (horizontal bars) or
+/// height (vertical), **re-read here** — never a value snapshotted at install —
+/// so a resolution/mode switch (kanshi profile change) that resizes the output
+/// without a hot-plug can't leave the clamp stale (#442). `card_extent` is the
+/// card's real allocated size on the main axis (its border box; CSS borders +
+/// padding included). Clamped to `[0, screen_extent - card_footprint]` so the
+/// card can't fall off either end — near the trailing/leading screen edge it
+/// collapses to flush.
 fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
     let geometry = &panel.geometry;
-    let screen_extent = if geometry.horizontal() {
-        geometry.mon_w
-    } else {
-        geometry.mon_h
-    };
+    // Live monitor size, not a captured snapshot (#442).
+    let (mon_w, mon_h) = geometry.monitor.size();
+    let screen_extent = if geometry.horizontal() { mon_w } else { mon_h };
 
     // Card's real allocated main-axis size once mapped (its border box —
     // CSS borders + padding included). The eager call from `toggle` runs
@@ -1300,10 +1300,34 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
     };
     let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH));
 
-    let chrome_end = geometry.chrome_main_end();
-    let chrome_start = geometry.chrome_main_start();
-    let card_footprint = card_extent + chrome_start + chrome_end;
+    clamp_main_margin(
+        screen_extent,
+        center,
+        card_extent,
+        geometry.chrome_main_start(),
+        geometry.chrome_main_end(),
+    )
+}
 
+/// Pure clamp arithmetic behind [`main_margin_for_center`], split out so the
+/// on-screen centering math is unit-testable without a GTK surface. Given the
+/// live `screen_extent` (the monitor's main-axis size), the trigger `center`,
+/// the measured `card_extent`, and the leading/trailing chrome, returns the
+/// main-axis margin that centers the card under `center`, clamped so the card
+/// never falls off either end.
+///
+/// Isolating this makes the #442 staleness concrete: for a fixed
+/// center/card/chrome, a stale `screen_extent` (the old resolution) yields a
+/// different margin than the live one — which is exactly the misplacement a
+/// snapshotted size caused after a mode switch.
+fn clamp_main_margin(
+    screen_extent: i32,
+    center: i32,
+    card_extent: i32,
+    chrome_start: i32,
+    chrome_end: i32,
+) -> i32 {
+    let card_footprint = card_extent + chrome_start + chrome_end;
     let desired = screen_extent - center - chrome_end - card_extent / 2;
     let max = (screen_extent - card_footprint).max(0);
     desired.clamp(0, max)
@@ -1336,7 +1360,7 @@ fn on_page_show(page: Page) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EAGER_PAGES, Page};
+    use super::{EAGER_PAGES, Page, clamp_main_margin};
     use std::collections::HashSet;
 
     // These are pure-logic guards for the lazy drawer-page registry (#231).
@@ -1394,6 +1418,51 @@ mod tests {
     #[test]
     fn from_stack_name_rejects_unknown() {
         assert_eq!(Page::from_stack_name("does-not-exist"), None);
+    }
+
+    /// Centering a mid-screen chip: the card's center lands on `center`. With
+    /// `chrome_end` inset, the margin is `screen - center - chrome_end -
+    /// card/2`, well inside the clamp bounds.
+    #[test]
+    fn clamp_main_margin_centers_mid_screen() {
+        // 1920 wide, chip centered at 960, 680-wide card, 20/15 chrome.
+        // desired = 1920 - 960 - 15 - 340 = 605; footprint = 680+20+15 = 715;
+        // max = 1920 - 715 = 1205; 605 is within [0, 1205].
+        assert_eq!(clamp_main_margin(1920, 960, 680, 20, 15), 605);
+    }
+
+    /// The card can't fall off the trailing edge: a chip near the leading
+    /// screen edge would want a margin larger than `max`, so it clamps flush.
+    #[test]
+    fn clamp_main_margin_clamps_to_trailing_edge() {
+        // center = 0 → desired = 1920 - 0 - 15 - 340 = 1565, but
+        // max = 1920 - 715 = 1205, so it clamps down to 1205.
+        assert_eq!(clamp_main_margin(1920, 0, 680, 20, 15), 1205);
+    }
+
+    /// The card can't fall off the leading edge: a chip past the trailing edge
+    /// would want a negative margin, so it clamps to 0 (flush).
+    #[test]
+    fn clamp_main_margin_clamps_to_leading_edge() {
+        // center = 1920 → desired = 1920 - 1920 - 15 - 340 = -355 → 0.
+        assert_eq!(clamp_main_margin(1920, 1920, 680, 20, 15), 0);
+    }
+
+    /// The #442 crux: a stale `screen_extent` (the pre-mode-switch resolution)
+    /// yields a *different* margin than the live one for the same chip and card
+    /// — which is exactly the misplacement a size snapshotted at install caused
+    /// after a kanshi mode switch. Re-reading the live monitor size fixes it.
+    #[test]
+    fn clamp_main_margin_tracks_screen_extent() {
+        // Same chip (center = 960) and card (680, chrome 20/15) on two screen
+        // widths. The old (1920) and new (2560) resolutions place the card's
+        // trailing margin differently — proving the value flows from the live
+        // `screen_extent`, so a stale one misplaces the card.
+        let at_1920 = clamp_main_margin(1920, 960, 680, 20, 15);
+        let at_2560 = clamp_main_margin(2560, 960, 680, 20, 15);
+        assert_ne!(at_1920, at_2560);
+        // +640 wider screen shifts the margin from the trailing edge by +640.
+        assert_eq!(at_2560 - at_1920, 640);
     }
 
     /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every

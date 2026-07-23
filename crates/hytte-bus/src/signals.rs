@@ -38,10 +38,29 @@ impl SignalSubscription {
     /// independent receiver; backpressure is handled by zbus' broadcast
     /// channel (slow consumers may lag).
     pub fn events(&self) -> impl futures_util::Stream<Item = SignalEvent> + Unpin {
+        use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.sender.subscribe();
         Box::pin(async_stream::stream! {
-            while let Ok(evt) = rx.recv().await {
-                yield (*evt).clone();
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => yield (*evt).clone(),
+                    // A burst overflowed the broadcast channel and this
+                    // consumer fell behind. The receiver is still usable — the
+                    // next `recv()` yields the oldest event still buffered — so
+                    // warn and keep going. Treating this as end-of-stream (the
+                    // old `while let Ok`) permanently froze every downstream
+                    // subscriber after an event burst (#428).
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            missed = n,
+                            "signal event consumer lagged behind the broadcast \
+                             channel; dropped buffered events and continuing \
+                             (only channel close ends the stream)"
+                        );
+                    }
+                    // The sender was dropped — no more events will ever arrive.
+                    Err(RecvError::Closed) => break,
+                }
             }
         })
     }
@@ -331,5 +350,87 @@ async fn run_subscription(ctx: RunCtx) {
         // Brief pause before re-subscribing to avoid a tight loop when the bus
         // is cycling rapidly.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SignalEvent, SignalSubscription, SubInner};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+    use tokio::sync::broadcast;
+
+    fn event(value: u32) -> Arc<SignalEvent> {
+        let body = zbus::Message::signal("/t", "t.I", "Ping")
+            .expect("signal builder")
+            .build(&value)
+            .expect("build signal message");
+        Arc::new(SignalEvent {
+            body,
+            sender: None,
+            timestamp: SystemTime::now(),
+        })
+    }
+
+    fn subscription(tx: broadcast::Sender<Arc<SignalEvent>>) -> SignalSubscription {
+        let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        SignalSubscription {
+            inner: Arc::new(SubInner {
+                sender: tx,
+                task_done_rx: tokio::sync::Mutex::new(Some(done_rx)),
+            }),
+        }
+    }
+
+    fn value_of(evt: &SignalEvent) -> u32 {
+        evt.body.body().deserialize().expect("decode signal body")
+    }
+
+    /// Regression for #428: a broadcast `Lagged(n)` must NOT end the stream.
+    /// Before the fix, `events()` used `while let Ok(..)`, so the first
+    /// `Lagged` after an overflow terminated the stream and permanently froze
+    /// every downstream subscriber.
+    #[tokio::test]
+    async fn events_survive_broadcast_lag() {
+        let (tx, _keep) = broadcast::channel::<Arc<SignalEvent>>(4);
+        let sub = subscription(tx.clone());
+        let mut events = sub.events();
+
+        // Overflow the capacity-4 channel without consuming: the receiver now
+        // lags, so the next internal `recv()` returns `Lagged`.
+        for i in 0..8u32 {
+            let _ = tx.send(event(i));
+        }
+
+        // First delivery: the implementation swallows `Lagged` and yields the
+        // oldest still-buffered event instead of terminating.
+        let first = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("stream must not end on broadcast lag (#428)")
+            .expect("stream yielded None after lag — #428 regression");
+        // Oldest events were dropped; the first survivor is one of the newest 4.
+        assert!(
+            value_of(&first) >= 4,
+            "expected a post-lag survivor value, got {}",
+            value_of(&first)
+        );
+
+        // The stream keeps working: a subsequent send is delivered.
+        let _ = tx.send(event(100));
+        let mut saw_100 = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
+                Ok(Some(evt)) => {
+                    if value_of(&evt) == 100 {
+                        saw_100 = true;
+                        break;
+                    }
+                }
+                Ok(None) => panic!("stream ended after lag — #428 regression"),
+                Err(_) => break,
+            }
+        }
+        assert!(saw_100, "stream did not deliver the post-lag event");
     }
 }

@@ -207,7 +207,7 @@ impl Service for NetworkdService {
                             match listen(&links_writer, &primary_writer).await {
                                 Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
                                 Err(e) => {
-                                    tracing::warn!(error = ?e, "networkd error, retrying in 2s")
+                                    tracing::warn!(error = ?e, "networkd error, retrying in 2s");
                                 }
                             }
                             tokio::time::sleep(Duration::from_secs(2)).await;

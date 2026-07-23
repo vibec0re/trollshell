@@ -73,7 +73,7 @@ impl Service for SystemdService {
                     match listen(&writer).await {
                         Ok(()) => tracing::warn!("systemd listen loop ended, retrying in 5s"),
                         Err(e) => {
-                            tracing::warn!(error = %e, "systemd listen error, retrying in 5s")
+                            tracing::warn!(error = %e, "systemd listen error, retrying in 5s");
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;

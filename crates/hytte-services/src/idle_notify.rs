@@ -12,7 +12,9 @@
 //! - **suspend** — `systemctl suspend`,
 //!
 //! each **gated on logind's `BlockInhibited`**: dim/lock skip while `idle` is
-//! inhibited, suspend skips while `sleep` is. Additionally it relocks the
+//! inhibited, suspend skips while `idle` *or* `sleep` is — so "Keep awake" /
+//! an idle-inhibiting app (mpv/Firefox/a playing video) holds off the whole
+//! timeline, not just dim/lock (#420). Additionally it relocks the
 //! session just before the system sleeps by handling logind's
 //! `PrepareForSleep(true)` signal — the native replacement for swayidle's
 //! `before-sleep 'loginctl lock-session'` (also reusing
@@ -252,15 +254,16 @@ impl IdleClient {
     }
 
     /// Fire the native idle action for `secs` on the shared runtime, gated on
-    /// the relevant logind inhibitor (`idle` for dim/lock, `sleep` for suspend).
-    /// Runs off the observer thread so the Wayland dispatch loop keeps servicing
-    /// events.
+    /// the relevant logind inhibitor(s): `idle` for dim/lock; `idle` *or*
+    /// `sleep` for suspend, so "Keep awake" / a playing video's `idle`
+    /// inhibitor holds off suspend too, not just dim/lock (#420). Runs off the
+    /// observer thread so the Wayland dispatch loop keeps servicing events.
     fn fire_action(&self, secs: u32) {
         let dimmed = self.dimmed.clone();
         runtime::handle().spawn(async move {
             match secs {
                 DIM_SECS => {
-                    if inhibitor_blocks("idle").await {
+                    if inhibitor_blocks(&["idle"]).await {
                         return;
                     }
                     // `brightnessctl -s set 10%` (save current, then dim).
@@ -269,7 +272,7 @@ impl IdleClient {
                     }
                 }
                 LOCK_SECS => {
-                    if inhibitor_blocks("idle").await {
+                    if inhibitor_blocks(&["idle"]).await {
                         return;
                     }
                     // `loginctl lock-session` — reuse the existing path
@@ -277,7 +280,12 @@ impl IdleClient {
                     crate::screensaver::lock();
                 }
                 SUSPEND_SECS => {
-                    if inhibitor_blocks("sleep").await {
+                    // Skip suspend while EITHER `idle` or `sleep` is inhibited:
+                    // caffeine ("Keep awake") and idle-inhibiting apps hold an
+                    // `idle` inhibitor, and they expect to keep the box awake —
+                    // gating suspend on `sleep` alone let it suspend mid-movie
+                    // (#420).
+                    if inhibitor_blocks(&["idle", "sleep"]).await {
                         return;
                     }
                     run_command("systemctl", &["suspend"]).await;
@@ -360,18 +368,20 @@ async fn run_prepare_for_sleep_relock() {
 
 // ── Native idle actions ─────────────────────────────────────────────────────
 
-/// `true` if the logind `BlockInhibited` set holds `what` (so the matching
-/// native idle action must be **skipped**). On any error reading it we return
-/// `true` (skip) — the safe choice: never fire dim/lock/suspend when we can't
-/// confirm nothing is inhibiting.
-async fn inhibitor_blocks(what: &str) -> bool {
+/// `true` if the logind `BlockInhibited` set holds **any** of `whats` (so the
+/// matching native idle action must be **skipped**). dim/lock pass `["idle"]`;
+/// suspend passes `["idle", "sleep"]`, so a held `idle` inhibitor ("Keep
+/// awake" / a playing video) holds off suspend as well, not just dim/lock
+/// (#420). On any error reading it we return `true` (skip) — the safe choice:
+/// never fire dim/lock/suspend when we can't confirm nothing is inhibiting.
+async fn inhibitor_blocks(whats: &[&str]) -> bool {
     match read_block_inhibited().await {
         Ok(list) => {
-            let blocked = block_list_contains(&list, what);
+            let blocked = block_list_contains_any(&list, whats);
             if blocked {
                 tracing::info!(
                     target: LOG_TARGET,
-                    what,
+                    ?whats,
                     block_inhibited = %list,
                     "native idle action skipped — logind inhibitor held"
                 );
@@ -381,7 +391,7 @@ async fn inhibitor_blocks(what: &str) -> bool {
         Err(err) => {
             tracing::warn!(
                 target: LOG_TARGET,
-                what,
+                ?whats,
                 error = %err,
                 "could not read logind BlockInhibited; skipping native idle action to be safe"
             );
@@ -413,6 +423,16 @@ async fn read_block_inhibited() -> Result<String, hytte_bus::BusError> {
 /// e.g. `block_list_contains("idle:sleep", "idle") == true`.
 fn block_list_contains(block_inhibited: &str, what: &str) -> bool {
     block_inhibited.split(':').any(|part| part == what)
+}
+
+/// Does the colon-separated logind `BlockInhibited` string contain **any** of
+/// `whats`? The suspend gate passes `["idle", "sleep"]`, so it skips when
+/// *either* is inhibited — e.g. `block_list_contains_any("idle", &["idle",
+/// "sleep"]) == true` (an `idle`-only inhibitor now holds off suspend, #420).
+fn block_list_contains_any(block_inhibited: &str, whats: &[&str]) -> bool {
+    whats
+        .iter()
+        .any(|w| block_list_contains(block_inhibited, w))
 }
 
 /// Run a fire-and-forget command off the async worker via `spawn_blocking`
@@ -609,8 +629,8 @@ mod tests {
 
     #[test]
     fn block_list_contains_matches_whole_tokens() {
-        // The exact case the safety gate turns on: `idle` present → skip idle
-        // actions (dim/lock); `sleep` present → skip suspend.
+        // The primitive the safety gate turns on: whole-token membership in the
+        // colon-separated `BlockInhibited` list.
         assert!(block_list_contains("idle:sleep", "idle"));
         assert!(block_list_contains("idle:sleep", "sleep"));
         assert!(block_list_contains("idle", "idle"));
@@ -622,6 +642,46 @@ mod tests {
         assert!(!block_list_contains("handle-lid-switch", "sleep"));
         // Whole-token match only: no substring false positives.
         assert!(!block_list_contains("idlehint", "idle"));
+    }
+
+    #[test]
+    fn suspend_gate_skips_on_idle_or_sleep() {
+        // #420: the suspend action gates on `["idle", "sleep"]`, so an
+        // `idle`-only inhibitor (caffeine "Keep awake" / a playing video) now
+        // holds off the 600 s suspend too — it used to gate on `sleep` alone
+        // and suspend mid-movie.
+        let suspend_gate = &["idle", "sleep"];
+
+        // Skipped when `idle` alone is inhibited — the papercut this fixes.
+        assert!(block_list_contains_any("idle", suspend_gate));
+        // Still skipped when `sleep` is inhibited (unchanged behavior).
+        assert!(block_list_contains_any("sleep", suspend_gate));
+        // Skipped when both are present, in any position.
+        assert!(block_list_contains_any("idle:sleep", suspend_gate));
+        assert!(block_list_contains_any(
+            "handle-power-key:idle:sleep",
+            suspend_gate
+        ));
+
+        // Fires (not skipped) when NEITHER `idle` nor `sleep` is inhibited.
+        assert!(!block_list_contains_any("", suspend_gate));
+        assert!(!block_list_contains_any("handle-power-key", suspend_gate));
+        assert!(!block_list_contains_any(
+            "handle-lid-switch:handle-power-key",
+            suspend_gate
+        ));
+        // Whole-token match only: no substring false positives.
+        assert!(!block_list_contains_any("idlehint", suspend_gate));
+    }
+
+    #[test]
+    fn dim_lock_gate_ignores_sleep() {
+        // dim/lock gate on `["idle"]` only: a `sleep`-only inhibitor must not
+        // hold them off (only the suspend gate widened to include `idle`).
+        let dim_lock_gate = &["idle"];
+        assert!(block_list_contains_any("idle", dim_lock_gate));
+        assert!(!block_list_contains_any("sleep", dim_lock_gate));
+        assert!(!block_list_contains_any("", dim_lock_gate));
     }
 
     #[test]

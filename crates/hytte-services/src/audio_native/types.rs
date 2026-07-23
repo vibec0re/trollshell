@@ -95,6 +95,22 @@ pub(super) struct LinkEdge {
     pub(super) input_node: u32,
 }
 
+/// The audio spectrum capture tap (#405): a `PipeWire` input stream connected to
+/// the default sink's monitor plus its listener. Both must stay alive together —
+/// dropping either stops capture. Held `Option`ally in [`AudioState`] because
+/// the stream is created after the core connects, and is toggled active/inactive
+/// via [`Command::SetSpectrumActive`] so an idle desktop (no subscriber) does no
+/// analysis work.
+pub(super) struct SpectrumCapture {
+    // Field order is the drop order: the listener must drop **before** the
+    // stream, because unregistering a listener (`spa_hook_remove`) walks the
+    // stream's still-live listener list. Dropping the stream first would free
+    // that list out from under it.
+    #[allow(dead_code)] // kept alive solely so its callbacks keep firing
+    pub(super) listener: pw::stream::StreamListener<super::spectrum::SpectrumUserData>,
+    pub(super) stream: pw::stream::StreamRc,
+}
+
 /// State owned by the pipewire-loop thread. Wrapped in `Rc<RefCell<_>>` so
 /// registry-event callbacks (each its own `FnMut`-bound closure) share access.
 pub(super) struct AudioState {
@@ -118,6 +134,9 @@ pub(super) struct AudioState {
     /// Stream→sink routing is derived from this in `emit_snapshots` by
     /// finding the link whose `output_node` matches the stream id.
     pub(super) links: HashMap<u32, LinkEdge>,
+    /// The audio spectrum capture tap (#405), created once the core connects.
+    /// `None` until built (or if creation failed — e.g. no monitor available).
+    pub(super) spectrum_capture: Option<SpectrumCapture>,
     /// Output Mutables — fresh snapshots are pushed here after every state
     /// change. Cloning a `Mutable` clones the `Arc` inside, so this struct
     /// shares ownership with whatever the `Service::start` caller holds.
@@ -142,6 +161,7 @@ impl AudioState {
             default_sink_name: None,
             default_source_name: None,
             links: HashMap::new(),
+            spectrum_capture: None,
             handles,
             last_sink_volume: Volume::default(),
             last_sinks: Vec::new(),
@@ -205,6 +225,13 @@ pub(super) enum Command {
     SetDefaultSource {
         name: String,
     },
+    /// Activate or deactivate the audio spectrum capture tap (#405). The plugin
+    /// host toggles this so the monitor is only tapped while at least one plugin
+    /// subscribes `StateKey::AudioSpectrum` — an idle desktop does no analysis.
+    /// A no-op if the capture stream failed to build.
+    SetSpectrumActive {
+        active: bool,
+    },
 }
 
 /// Clone a `PipewireHandles` for cross-thread sharing. Each `Mutable` is
@@ -216,6 +243,7 @@ pub(super) fn clone_handles(h: &PipewireHandles) -> PipewireHandles {
         sources: h.sources.clone(),
         streams: h.streams.clone(),
         record_streams: h.record_streams.clone(),
+        spectrum: h.spectrum.clone(),
     }
 }
 

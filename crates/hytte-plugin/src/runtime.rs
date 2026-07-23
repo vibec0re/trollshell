@@ -151,6 +151,12 @@ where
                     Step::Update(Input::EffectResult { id, outcome })
                 }
                 Some(Ok(HostMsg::SlotVisibility { visible })) => Step::Update(Input::SlotVisible(visible)),
+                Some(Ok(HostMsg::AudioSpectrum { spectrum })) => {
+                    // #405: an audio-reactive frame (peak + bands), delivered only
+                    // to a plugin that subscribed the key. Surface it to the model
+                    // like any other app-level input.
+                    Step::Update(Input::AudioSpectrum(spectrum))
+                }
                 Some(Ok(HostMsg::Accent { color })) => {
                     // Theme plumbing (#376): the host resolved `@accent_color`
                     // and handed it over. Feed it to the `preem` kit as the
@@ -286,8 +292,9 @@ mod tests {
     use super::{BACKOFF_BASE, BACKOFF_CAP, Backoff, reconnect_loop, session};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::{
-        Capability, ClockState, Effect, EffectOutcome, EventKind, HostMsg, Manifest, Mount, Node,
-        Page, PluginMsg, StateKey, StateSnapshot, read_frame, write_frame,
+        AudioSpectrum, Capability, ClockState, Effect, EffectOutcome, EventKind, HostMsg, Manifest,
+        Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot, read_frame,
+        write_frame,
     };
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -339,7 +346,7 @@ mod tests {
                     self.iso = format!("cmd{id} ok={}", outcome.ok);
                     Vec::new()
                 }
-                Input::SlotVisible(_) => Vec::new(),
+                Input::SlotVisible(_) | Input::AudioSpectrum(_) => Vec::new(),
                 Input::App(never) => match never {},
             }
         }
@@ -598,7 +605,10 @@ mod tests {
                     }
                 }
                 Input::App(done) => self.last = done,
-                Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
+                Input::Snapshot(_)
+                | Input::EffectResult { .. }
+                | Input::SlotVisible(_)
+                | Input::AudioSpectrum(_) => {}
             }
             Vec::new()
         }
@@ -607,6 +617,44 @@ mod tests {
             Node::Label {
                 id: Some("cmd-lbl".to_owned()),
                 text: self.last.clone(),
+                classes: Vec::new(),
+            }
+            .into()
+        }
+    }
+
+    /// Reflects the latest audio-spectrum peak in its view, so a
+    /// [`HostMsg::AudioSpectrum`] arriving as [`Input::AudioSpectrum`] is
+    /// observable as a re-render — the audio-reactive push in miniature (#405).
+    struct Meter {
+        peak: f32,
+    }
+
+    impl Plugin for Meter {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            let mut m = Manifest::new("meter-test", Mount::SidebarTop);
+            m.subscribes = vec![StateKey::AudioSpectrum];
+            m
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { peak: 0.0 }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::AudioSpectrum(spectrum) = input {
+                self.peak = spectrum.peak;
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: None,
+                text: format!("{:.2}", self.peak),
                 classes: Vec::new(),
             }
             .into()
@@ -1016,6 +1064,48 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Watcher, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::AudioSpectrum`] push reaches `update` as
+    /// [`Input::AudioSpectrum`] and re-renders — the mechanism a scope/VU tile
+    /// consumes to animate to the music (#405).
+    #[tokio::test]
+    async fn audio_spectrum_push_reaches_update_as_input() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let seed = eat_handshake(&mut hrd, "meter-test").await;
+            assert!(
+                matches!(seed, Node::Label { ref text, .. } if text == "0.00"),
+                "the fresh meter starts at zero",
+            );
+
+            send(
+                &mut hwr,
+                &HostMsg::AudioSpectrum {
+                    spectrum: AudioSpectrum {
+                        peak: 0.80,
+                        bins: [0.5_f32; SPECTRUM_BINS],
+                    },
+                },
+            )
+            .await;
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a spectrum push must reach update() and re-render");
+            };
+            assert!(effects.is_empty());
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "0.80"),
+                "AudioSpectrum reached update as Input::AudioSpectrum",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Meter, _, _>(prd, pwr), host);
         assert!(result.is_ok());
     }
 

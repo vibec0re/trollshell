@@ -6,7 +6,7 @@ pub mod registry;
 pub mod runtime;
 pub mod supervisor;
 
-pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_visible};
+pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_two_way_drag_safe, bind_visible};
 pub use registry::{Registry, Service, ServiceErased};
 pub use supervisor::spawn_supervised;
 

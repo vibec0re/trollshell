@@ -20,13 +20,23 @@ pub struct Brightness {
 
 /// Sysfs info needed for `SetBrightness` calls: the subsystem (`"backlight"`)
 /// and the device name (`"intel_backlight"`, `"amdgpu_bl1"`, …).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Device {
     name: String,
     max: u32,
 }
 
-static DEVICE: OnceLock<Device> = OnceLock::new();
+/// The device writes target, refreshed by the poll loop whenever the picked
+/// backlight changes. Previously a write-once `OnceLock`, which pinned the very
+/// first-seen device for the whole session — so a backlight reappearing under a
+/// different name (driver reload, dock) silently got stale writes (#434). A
+/// process-global `Mutable` (like `geoclue`'s shared handle) lets the 1 Hz poll
+/// update it, and `do_set` read it, from the tokio runtime without a registry.
+static DEVICE: OnceLock<Mutable<Option<Device>>> = OnceLock::new();
+
+fn device_handle() -> &'static Mutable<Option<Device>> {
+    DEVICE.get_or_init(|| Mutable::new(None))
+}
 
 pub struct BrightnessService;
 
@@ -83,10 +93,9 @@ pub fn set(level: f64) {
 }
 
 async fn do_set(level: f64) -> Result<()> {
-    let device = DEVICE
-        .get()
-        .context("no backlight device discovered yet")?
-        .clone();
+    let device = device_handle()
+        .get_cloned()
+        .context("no backlight device discovered yet")?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let value = (level * f64::from(device.max)).round() as u32;
 
@@ -119,15 +128,25 @@ async fn poll_loop(writer: Mutable<Option<Brightness>>) {
 
 fn read_state() -> Option<Brightness> {
     let (name, current_raw, max) = pick_device()?;
+    let device = Device { name, max };
 
-    // Cache device identity for future writes.
-    let _ = DEVICE.set(Device { name, max });
+    // Refresh the write-target device only when it actually changed — so a
+    // backlight that reappears under a new name is picked up, without cloning
+    // (and dropping) a fresh `Device` every 1 Hz tick.
+    let handle = device_handle();
+    let changed = {
+        let guard = handle.lock_ref();
+        guard.as_ref() != Some(&device)
+    };
+    if changed {
+        handle.set(Some(device.clone()));
+    }
 
-    if max == 0 {
+    if device.max == 0 {
         return None;
     }
     #[allow(clippy::cast_precision_loss)]
-    let level = f64::from(current_raw) / f64::from(max);
+    let level = f64::from(current_raw) / f64::from(device.max);
     Some(Brightness {
         level: level.clamp(0.0, 1.0),
     })

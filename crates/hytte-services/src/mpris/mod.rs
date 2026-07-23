@@ -348,15 +348,60 @@ pub fn set_position(bus_name: &str, track_id: &str, position_us: i64) {
 
 // ── Art cache ─────────────────────────────────────────────────────────────────
 
-type ArtCacheInner = HashMap<String, Vec<u8>>;
-type ArtCacheHandle = Arc<RwLock<ArtCacheInner>>;
+/// How many distinct art URLs to keep decoded in memory. Album art is up to
+/// 4 MiB per entry, so an unbounded cache leaks memory monotonically over a
+/// weeks-long session with a streaming player (a fresh art URL per track); this
+/// caps the working set at [`ART_CACHE_CAP`] × 4 MiB (#434).
+const ART_CACHE_CAP: usize = 16;
 
-#[allow(clippy::type_complexity)]
+/// A tiny bounded LRU keyed by art URL. Not general-purpose: `N` is small
+/// enough that the `Vec<String>` recency list is cheaper than a linked
+/// hash-map, and lookups happen only on a track change (never hot).
+#[derive(Default)]
+struct ArtCache {
+    entries: HashMap<String, Vec<u8>>,
+    /// URLs least- to most-recently-used; `order.last()` is the newest.
+    order: Vec<String>,
+}
+
+impl ArtCache {
+    /// Fetch a cached entry, marking it most-recently-used.
+    fn get(&mut self, url: &str) -> Option<Vec<u8>> {
+        let bytes = self.entries.get(url)?.clone();
+        self.touch(url);
+        Some(bytes)
+    }
+
+    /// Insert (or refresh) an entry, evicting the least-recently-used once over
+    /// [`ART_CACHE_CAP`].
+    fn insert(&mut self, url: String, bytes: Vec<u8>) {
+        if self.entries.insert(url.clone(), bytes).is_some() {
+            self.touch(&url);
+        } else {
+            self.order.push(url);
+            while self.order.len() > ART_CACHE_CAP {
+                let oldest = self.order.remove(0);
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    /// Move `url` to the most-recently-used end of `order`.
+    fn touch(&mut self, url: &str) {
+        if let Some(pos) = self.order.iter().position(|u| u == url) {
+            let u = self.order.remove(pos);
+            self.order.push(u);
+        }
+    }
+}
+
+type ArtCacheHandle = Arc<RwLock<ArtCache>>;
+
 static ART_CACHE: OnceLock<ArtCacheHandle> = OnceLock::new();
 
 fn art_cache() -> ArtCacheHandle {
     ART_CACHE
-        .get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+        .get_or_init(|| Arc::new(RwLock::new(ArtCache::default())))
         .clone()
 }
 
@@ -370,12 +415,13 @@ pub async fn art_for_url(url: &str) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Check cache first (cheap read lock).
+    // Check cache first. Takes a write lock because a hit refreshes LRU
+    // recency; lookups are per-track-change, never hot, so this is fine.
     {
         let cache = art_cache();
-        let guard = cache.read().await;
+        let mut guard = cache.write().await;
         if let Some(bytes) = guard.get(url) {
-            return Some(bytes.clone());
+            return Some(bytes);
         }
     }
 
@@ -880,5 +926,62 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
             0,
             None,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ART_CACHE_CAP, ArtCache};
+
+    /// Store an entry whose payload is the URL's own bytes, so a `get` can
+    /// assert it got the right entry back without index→byte casts (which trip
+    /// clippy's truncation lint).
+    fn put(cache: &mut ArtCache, url: &str) {
+        cache.insert(url.to_string(), url.as_bytes().to_vec());
+    }
+
+    #[test]
+    fn art_cache_evicts_oldest_over_cap() {
+        let mut cache = ArtCache::default();
+        // Insert one more than the cap; the very first URL must be evicted.
+        for i in 0..=ART_CACHE_CAP {
+            put(&mut cache, &format!("url{i}"));
+        }
+        assert_eq!(cache.entries.len(), ART_CACHE_CAP);
+        assert_eq!(cache.order.len(), ART_CACHE_CAP);
+        assert!(
+            cache.get("url0").is_none(),
+            "oldest entry should be evicted"
+        );
+        let newest = format!("url{ART_CACHE_CAP}");
+        assert_eq!(cache.get(&newest), Some(newest.into_bytes()));
+    }
+
+    #[test]
+    fn art_cache_get_refreshes_recency() {
+        let mut cache = ArtCache::default();
+        for i in 0..ART_CACHE_CAP {
+            put(&mut cache, &format!("url{i}"));
+        }
+        // Touch the oldest so it's now most-recently-used, then overflow by one.
+        assert_eq!(cache.get("url0"), Some(b"url0".to_vec()));
+        put(&mut cache, "overflow");
+        // url0 was refreshed, so url1 (now the oldest) is evicted instead.
+        assert_eq!(
+            cache.get("url0"),
+            Some(b"url0".to_vec()),
+            "refreshed entry survives"
+        );
+        assert!(cache.get("url1").is_none(), "new oldest should be evicted");
+    }
+
+    #[test]
+    fn art_cache_reinsert_does_not_grow_order() {
+        let mut cache = ArtCache::default();
+        cache.insert("same".to_string(), vec![1]);
+        cache.insert("same".to_string(), vec![2]);
+        assert_eq!(cache.order.len(), 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.get("same"), Some(vec![2]));
     }
 }

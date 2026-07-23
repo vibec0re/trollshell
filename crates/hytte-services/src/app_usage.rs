@@ -214,48 +214,31 @@ async fn poll_loop(
         if !active.get() {
             let _ = active.signal().wait_for(true).await;
         }
-        let total_now = read_total_cpu_jiffies();
-        let d_total = total_now.saturating_sub(prev_total);
 
-        let mut cur_pid: HashMap<u32, u64> = HashMap::new();
-        // Key: group name (app-id or SYSTEM_BUCKET).
-        let mut groups: HashMap<String, Agg> = HashMap::new();
-
-        for pid in pids() {
-            let Some((cpu_jiffies, rss)) = read_pid_stats(pid) else {
+        // The whole `/proc` walk is hundreds of synchronous file reads — far too
+        // much blocking I/O for a shared tokio worker (#434). Hand it to a
+        // blocking thread, moving the previous per-PID jiffy map in and getting
+        // the fresh one (plus the ranked lists) back. `mem::take` keeps
+        // `prev_pid` valid (empty) on the join-error path.
+        let prev = std::mem::take(&mut prev_pid);
+        let sample = match tokio::task::spawn_blocking(move || sample_proc(&prev, prev_total)).await
+        {
+            Ok(sample) => sample,
+            Err(e) => {
+                tracing::warn!(error = %e, "app_usage: /proc sample task failed");
+                tokio::select! {
+                    () = tokio::time::sleep(POLL) => {}
+                    _ = active.signal().wait_for(false) => {}
+                }
                 continue;
-            };
-            cur_pid.insert(pid, cpu_jiffies);
-            // Unseen PIDs delta to themselves → 0, so a freshly-spawned process
-            // doesn't spike on its first appearance.
-            let delta =
-                cpu_jiffies.saturating_sub(prev_pid.get(&pid).copied().unwrap_or(cpu_jiffies));
+            }
+        };
 
-            // Determine the group key from the cgroup leaf; fall back to System.
-            // A pid that exits between the stat read and the cgroup read returns
-            // None here and is harmlessly misattributed to System for that tick
-            // (no panic, no double-count).
-            let (group_key, app_id) = match read_pid_app_id(pid) {
-                Some(CgroupGroup::App(id)) => (id.clone(), Some(id)),
-                Some(CgroupGroup::Service(name)) => (name, None),
-                None => (SYSTEM_BUCKET.to_string(), None),
-            };
+        by_cpu.set(sample.by_cpu);
+        by_mem.set(sample.by_mem);
 
-            let g = groups.entry(group_key).or_insert_with(|| Agg {
-                app_id,
-                ..Agg::default()
-            });
-            g.cpu_jiffies = g.cpu_jiffies.saturating_add(delta);
-            g.mem_bytes = g.mem_bytes.saturating_add(rss);
-            g.procs = g.procs.saturating_add(1);
-        }
-
-        let samples = finalize(groups, d_total);
-        by_cpu.set(top_by(&samples, |s| Reverse(OrderedF64(s.cpu_frac))));
-        by_mem.set(top_by(&samples, |s| Reverse(s.mem_bytes)));
-
-        prev_pid = cur_pid;
-        prev_total = total_now;
+        prev_pid = sample.cur_pid;
+        prev_total = sample.total_now;
         // Sleep the inter-sample interval, but bail out early if we get gated
         // inactive mid-wait — no point holding the timer when parked. The
         // top-of-loop park then handles the resume edge.
@@ -263,6 +246,64 @@ async fn poll_loop(
             () = tokio::time::sleep(POLL) => {}
             _ = active.signal().wait_for(false) => {}
         }
+    }
+}
+
+/// One full `/proc` sample: the fresh per-PID jiffy map + aggregate total (fed
+/// back as the next tick's baseline) plus the two ranked top-N lists.
+struct Sample {
+    cur_pid: HashMap<u32, u64>,
+    total_now: u64,
+    by_cpu: Vec<ProcSample>,
+    by_mem: Vec<ProcSample>,
+}
+
+/// Walk `/proc` once and rank the app-scope groups. Pure blocking work (hundreds
+/// of synchronous `read_to_string`s), run on `spawn_blocking` from [`poll_loop`]
+/// so it never occupies a shared tokio worker (#434). Takes the previous per-PID
+/// jiffies + aggregate total to compute the CPU-share deltas.
+fn sample_proc(prev_pid: &HashMap<u32, u64>, prev_total: u64) -> Sample {
+    let total_now = read_total_cpu_jiffies();
+    let d_total = total_now.saturating_sub(prev_total);
+
+    let mut cur_pid: HashMap<u32, u64> = HashMap::new();
+    // Key: group name (app-id or SYSTEM_BUCKET).
+    let mut groups: HashMap<String, Agg> = HashMap::new();
+
+    for pid in pids() {
+        let Some((cpu_jiffies, rss)) = read_pid_stats(pid) else {
+            continue;
+        };
+        cur_pid.insert(pid, cpu_jiffies);
+        // Unseen PIDs delta to themselves → 0, so a freshly-spawned process
+        // doesn't spike on its first appearance.
+        let delta = cpu_jiffies.saturating_sub(prev_pid.get(&pid).copied().unwrap_or(cpu_jiffies));
+
+        // Determine the group key from the cgroup leaf; fall back to System.
+        // A pid that exits between the stat read and the cgroup read returns
+        // None here and is harmlessly misattributed to System for that tick
+        // (no panic, no double-count).
+        let (group_key, app_id) = match read_pid_app_id(pid) {
+            Some(CgroupGroup::App(id)) => (id.clone(), Some(id)),
+            Some(CgroupGroup::Service(name)) => (name, None),
+            None => (SYSTEM_BUCKET.to_string(), None),
+        };
+
+        let g = groups.entry(group_key).or_insert_with(|| Agg {
+            app_id,
+            ..Agg::default()
+        });
+        g.cpu_jiffies = g.cpu_jiffies.saturating_add(delta);
+        g.mem_bytes = g.mem_bytes.saturating_add(rss);
+        g.procs = g.procs.saturating_add(1);
+    }
+
+    let samples = finalize(groups, d_total);
+    Sample {
+        by_cpu: top_by(&samples, |s| Reverse(OrderedF64(s.cpu_frac))),
+        by_mem: top_by(&samples, |s| Reverse(s.mem_bytes)),
+        cur_pid,
+        total_now,
     }
 }
 

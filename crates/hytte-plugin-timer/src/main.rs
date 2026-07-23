@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use hytte_plugin::preem::{DisplayStyle, seven_seg};
 use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page};
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::IntervalStream;
 
@@ -298,12 +298,15 @@ impl Plugin for Timer {
         }
     }
 
-    /// The bar **chip**: a clickable button wrapping the `MM:SS` 7seg readout.
-    /// The host wraps this in its own `.ts-plugin-chip` pill (#349) and paints
-    /// the `Pixels` aspect-locked, so the readout fits the bar without a CSS px
-    /// rule; a click opens the panel.
-    fn view(&self) -> Node {
-        Node::Box {
+    /// The rendered [`View`] (#349). The bar **chip**: a clickable button
+    /// wrapping the `MM:SS` 7seg readout — the host wraps it in its own
+    /// `.ts-plugin-chip` pill and paints the `Pixels` aspect-locked, so the
+    /// readout fits the bar without a CSS px rule; a click opens the panel.
+    /// The drawer **panel**: the big readout, the duration entry, the preset
+    /// row (25 / 5 / 15), and the pause/reset row. Its root carries no
+    /// `.card`/`.ts-plugin-*` class — the drawer supplies the chrome.
+    fn view(&self) -> View {
+        let chip = Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Horizontal,
             spacing: 0,
@@ -314,13 +317,7 @@ impl Plugin for Timer {
                 classes: vec!["flat".to_owned()],
                 child: Box::new(seven_seg(&self.mmss(), STYLE).into_node(Some(SEG_ID), Vec::new())),
             }],
-        }
-    }
-
-    /// The drawer **panel** (#349 PR2): the big readout, the duration entry, the
-    /// preset row (25 / 5 / 15), and the pause/reset row. Its root carries no
-    /// `.card`/`.ts-plugin-*` class — the drawer supplies the chrome.
-    fn panel(&self) -> Option<Node> {
+        };
         let readout = seven_seg(&self.mmss(), STYLE).into_node(Some(PANEL_SEG_ID), Vec::new());
         let entry = Node::Entry {
             id: ENTRY_ID.to_owned(),
@@ -345,7 +342,7 @@ impl Plugin for Timer {
                 button(RESET_ID, "Reset"),
             ],
         };
-        Some(Node::Box {
+        View::new(chip).panel(Node::Box {
             id: Some(PANEL_ROOT_ID.to_owned()),
             dir: Dir::Vertical,
             spacing: 8,
@@ -478,7 +475,7 @@ mod tests {
 
         // The rendered entry always shows "" — it clears after a submit and
         // never fights in-progress typing (the echo-prop contract).
-        let Some(Node::Box { children, .. }) = m.panel() else {
+        let Some(Node::Box { children, .. }) = m.view().panel else {
             panic!("panel is a Box");
         };
         let entry = children
@@ -558,7 +555,7 @@ mod tests {
     #[test]
     fn the_chip_is_a_pokeable_seven_seg() {
         let m = fresh();
-        let Node::Box { children, .. } = m.view() else {
+        let Node::Box { children, .. } = m.view().tree else {
             panic!("root is a box");
         };
         let Node::Button { id, child, .. } = &children[0] else {
@@ -606,9 +603,10 @@ mod tests {
         m.start(1);
         let effects = tick(&mut m);
         assert!(matches!(effects.as_slice(), [Effect::Notify { .. }]));
+        let view = m.view();
         let render = PluginMsg::Render {
-            tree: m.view(),
-            panel: m.panel(),
+            tree: view.tree,
+            panel: view.panel,
             effects,
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

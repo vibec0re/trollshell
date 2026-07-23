@@ -40,7 +40,7 @@
 
 use hytte_plugin::preem::{DisplayStyle, Frame, TextBox, font};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
-use hytte_plugin::{CmdSender, Input, Plugin};
+use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key and audit subject.
 const PLUGIN_ID: &str = "terminal";
@@ -194,7 +194,7 @@ impl Plugin for Terminal {
     /// One vertical card: the composed preem screen over the entry line. The
     /// entry re-asserts `text: ""` every render so the host's clear-after-submit
     /// echo empties it after each Enter.
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -214,6 +214,7 @@ impl Plugin for Terminal {
                 },
             ],
         }
+        .into()
     }
 }
 
@@ -319,8 +320,8 @@ mod tests {
             m.history.iter().any(|l| l.contains("no exec")),
             "honest banner"
         );
-        let view = m.view();
-        let (text, placeholder) = entry_of(&view).expect("view has an entry");
+        let tree = m.view().tree;
+        let (text, placeholder) = entry_of(&tree).expect("view has an entry");
         assert_eq!(text, "", "the entry starts empty");
         assert_eq!(placeholder, PLACEHOLDER);
     }
@@ -331,8 +332,8 @@ mod tests {
     fn view_entry_is_cleared_after_submit() {
         let mut m = fresh();
         let _ = m.update(submit("abc"));
-        let view = m.view();
-        let (text, _) = entry_of(&view).expect("view has an entry");
+        let tree = m.view().tree;
+        let (text, _) = entry_of(&tree).expect("view has an entry");
         assert_eq!(text, "", "the rendered entry text is empty after a submit");
         assert_eq!(m.history.last().map(String::as_str), Some("> abc"));
     }
@@ -379,7 +380,7 @@ mod tests {
         let mut m = fresh();
         let _ = m.update(submit("mrrp"));
         assert_eq!(m.view(), m.view(), "view is pure");
-        let bufs = pixels_of(&m.view());
+        let bufs = pixels_of(&m.view().tree);
         assert_eq!(bufs.len(), 1, "exactly one screen buffer");
         for (w, h, len) in bufs {
             assert_eq!(len, (w as usize) * (h as usize) * 4);
@@ -398,9 +399,10 @@ mod tests {
 
         let mut m = fresh();
         let _ = m.update(submit("hej"));
+        let view = m.view();
         let render = PluginMsg::Render {
-            tree: m.view(),
-            panel: m.panel(),
+            tree: view.tree,
+            panel: view.panel,
             effects: Vec::new(),
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

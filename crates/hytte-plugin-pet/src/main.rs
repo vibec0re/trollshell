@@ -50,7 +50,7 @@ use std::time::Duration;
 use brain::{ThinkKind, ThinkReq};
 use hytte_plugin::proto::{Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::IntervalStream;
@@ -296,7 +296,7 @@ impl Plugin for Pet {
         Vec::new()
     }
 
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         let mood = self.mood();
         // The face: an LCD `Pixels` surface by default, or the legacy kaomoji
         // `Label` under `TROLLSHELL_PET_KAOMOJI=1`. Either way it is the same
@@ -353,6 +353,7 @@ impl Plugin for Pet {
             classes: vec!["pet-root".to_owned()],
             children,
         }
+        .into()
     }
 }
 
@@ -508,7 +509,7 @@ mod tests {
         let (mut p, _rx) = pet();
         // The root is a horizontal `Row` (#313): face-button first, bubble
         // second only when a line is up, absent (row collapses) at rest.
-        let Node::Row { children, .. } = p.view() else {
+        let Node::Row { children, .. } = p.view().tree else {
             panic!("root is a row");
         };
         assert_eq!(children.len(), 1, "no bubble at rest");
@@ -517,7 +518,7 @@ mod tests {
             "the face leads the row and is the poke target"
         );
         let _ = p.update(Input::App(PetMsg::Thought("hej".to_owned())));
-        let Node::Row { children, .. } = p.view() else {
+        let Node::Row { children, .. } = p.view().tree else {
             panic!("root is a row");
         };
         assert_eq!(children.len(), 2);
@@ -546,7 +547,7 @@ mod tests {
         let (mut p, _rx) = pet();
         p.kaomoji_fallback = true;
         let _ = p.update(Input::App(PetMsg::Thought("hej".to_owned())));
-        let Node::Row { children, .. } = p.view() else {
+        let Node::Row { children, .. } = p.view().tree else {
             panic!("root is a row");
         };
         assert_eq!(children.len(), 2);
@@ -562,7 +563,7 @@ mod tests {
         // honors the host's `len == w*h*4` invariant.
         let (mut p, _rx) = pet();
         p.kaomoji_fallback = false;
-        let Node::Row { children, .. } = p.view() else {
+        let Node::Row { children, .. } = p.view().tree else {
             panic!("root is a row");
         };
         let Node::Button { id, child, .. } = &children[0] else {
@@ -588,7 +589,7 @@ mod tests {
         // Fallback: the kaomoji Label returns, still inside Button(FACE_ID).
         let (mut p, _rx2) = pet();
         p.kaomoji_fallback = true;
-        let Node::Row { children, .. } = p.view() else {
+        let Node::Row { children, .. } = p.view().tree else {
             panic!("root is a row");
         };
         let Node::Button { child, .. } = &children[0] else {

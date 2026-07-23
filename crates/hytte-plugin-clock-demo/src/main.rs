@@ -25,7 +25,7 @@
 use hytte_plugin::proto::{
     Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
 };
-use hytte_plugin::{CmdSender, Input, Plugin};
+use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
 const PLUGIN_ID: &str = "clock-demo";
@@ -114,7 +114,7 @@ impl Plugin for ClockDemo {
     /// into GTK. A vertical `Box` holding the formatted time (`ts-clock`, the
     /// host's monospace/tabular clock class) above a `Button` that opens the
     /// power menu.
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -138,6 +138,7 @@ impl Plugin for ClockDemo {
                 },
             ],
         }
+        .into()
     }
 }
 
@@ -202,7 +203,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(model.view(), expected);
+        assert_eq!(model.view().tree, expected);
     }
 
     /// A snapshot whose `clock` is `None` (startup window) changes nothing —
@@ -250,9 +251,10 @@ mod tests {
 
         let mut model = fresh();
         let _ = model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1));
+        let view = model.view();
         let render = PluginMsg::Render {
-            tree: model.view(),
-            panel: model.panel(),
+            tree: view.tree,
+            panel: view.panel,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

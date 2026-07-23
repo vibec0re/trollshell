@@ -29,7 +29,7 @@
 
 use hytte_plugin::preem::{DisplayStyle, Marquee, TextBox, dot_matrix, seven_seg};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
-use hytte_plugin::{CmdSender, Input, Plugin};
+use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key.
 const PLUGIN_ID: &str = "preem-demo";
@@ -186,7 +186,7 @@ impl Plugin for PreemDemo {
     /// marquee, the textbox — all wearing the same skin — and a dim hint line.
     /// Every `Pixels` buffer satisfies the host's `len == w * h * 4` invariant
     /// by kit construction.
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         let style = self.style();
         let clock = seven_seg(&self.hhmm, style);
         let ticker = dot_matrix(&self.ticker_window(), style);
@@ -220,6 +220,7 @@ impl Plugin for PreemDemo {
                 },
             ],
         }
+        .into()
     }
 }
 
@@ -336,7 +337,7 @@ mod tests {
     fn every_view_pixels_is_valid_and_fits_the_card() {
         let mut m = fresh();
         for step in 0..6 {
-            let tree = m.view();
+            let tree = m.view().tree;
             let bufs = pixels_of(&tree);
             assert_eq!(bufs.len(), 4, "clock + ticker + marquee + textbox");
             for (w, h, len) in bufs {
@@ -432,9 +433,10 @@ mod tests {
 
         let mut m = fresh();
         let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 42));
+        let view = m.view();
         let render = PluginMsg::Render {
-            tree: m.view(),
-            panel: m.panel(),
+            tree: view.tree,
+            panel: view.panel,
             effects: Vec::new(),
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

@@ -28,6 +28,7 @@ pub mod notifications_mute;
 pub mod pipewire;
 pub mod places;
 pub mod power_profiles;
+pub mod recorder;
 pub mod resolved;
 pub mod screensaver;
 pub mod sensors;

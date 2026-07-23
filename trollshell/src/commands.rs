@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use hytte::gtk::gio;
 use hytte::gtk::glib;
 use hytte::prelude::*;
-use hytte::services::niri;
+use hytte::services::{niri, recorder};
 
 use crate::modal::{self, Page};
 use crate::overlays::sidebar;
@@ -56,6 +56,7 @@ thread_local! {
 ///   (`Page::stack_name` token, e.g. `"media"`, `"power-menu"`).
 /// - `power-menu` (no arg): convenience alias for `open-page("power-menu")`.
 /// - `toggle-sidebar` (no arg): flip the left sidebar.
+/// - `toggle-recording` (no arg): start/stop a screen recording (#403).
 pub fn install(app: &App) {
     // Track the focused output for monitor resolution. No bootstrap
     // suppression — we want the latest known output even before any command
@@ -93,7 +94,14 @@ pub fn install(app: &App) {
         })
         .build();
 
-    app.add_action_entries([open_page, power_menu, toggle_sidebar]);
+    // Screen recording (#403): start if idle, stop if recording. A niri
+    // keybind binds this like the others; the region is picked via `slurp`
+    // when starting. No monitor resolution needed — the recorder is global.
+    let toggle_recording = gio::ActionEntry::builder("toggle-recording")
+        .activate(|_app, _action, _param| recorder::toggle())
+        .build();
+
+    app.add_action_entries([open_page, power_menu, toggle_sidebar, toggle_recording]);
 }
 
 /// Open the drawer to `page` on the focused output (or any mounted drawer).

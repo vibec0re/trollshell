@@ -258,6 +258,34 @@
     color: #ff3b5c;
 }
 
+/* Screen-recording toggle chip (widgets/screenrecord.rs, #403): a record
+ * button next to the screenshot chip. Neutral while idle (the default
+ * .ts-indicator look); while recording it gains .ts-recording-live and reads
+ * as an unmissable red "REC" — pulsing red dot + a live elapsed timer — the
+ * same visual family as the .ts-screencast privacy indicator (#221). */
+.ts-recording-live {
+    background: rgba(255, 59, 92, 0.28);
+}
+.ts-recording-live image {
+    color: #ff3b5c;
+    animation: ts-recording-pulse 1.4s ease-in-out infinite;
+}
+.ts-recording-time {
+    color: #ff3b5c;
+    margin-left: 0.3em;
+}
+@keyframes ts-recording-pulse {
+    0% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.4;
+    }
+    100% {
+        opacity: 1;
+    }
+}
+
 /* Battery chip: tier-colored icon, pulsing when critically low + discharging.
  * Only the symbolic icon takes the color; chip bg + % label keep defaults. */
 .ts-battery-good image {

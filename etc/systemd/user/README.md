@@ -127,6 +127,31 @@ screen fills) and the entry clears. It is **pure local echo**: submitted text is
 only ever painted back — the plugin executes nothing, spawns no process, and
 requests no capabilities. It mounts `SidebarTop` after the preem showcase.
 
+`trollshell-plugin-caw.service` is caw's desktop body (#359): a chunky-pixel
+cybercrow mounting `SidebarTop` alongside the clock demo, pet, and terminal
+(order-sorted, so it coexists — no `Conflicts=` needed). Unlike the pet, there
+is **no separate brain service** — caw herself is the brain: the opencaw agent
+publishes her live mood, a line, and a chaos level via its `caw_express` tool
+into a small JSON file, and this plugin polls it and renders her as a
+procedural LCD corvid face (7 moods, glowing chaos-scaled eyes) plus
+pixel-font speech in her own palette. Poke her for a reaction; she dozes off
+when she hasn't expressed in a while. The expression file path is
+`CAW_EXPRESSION_PATH` (default `~/.local/state/caw/expression.json`) — point
+both this unit and opencaw at the same path if you override it.
+
+`trollshell-plugin-timer.service` is a pomodoro / kitchen timer (#406) and the
+first bundled plugin to mount `Mount::BarRight` — a **bar chip** (a
+seven-segment `MM:SS` countdown) rather than a sidebar card, so there's no
+region to coexist in. Clicking the chip opens its own drawer panel: the big
+readout, a duration entry (`25`, `25m`, `5:00`, `1:30:00`, or `pomo`), the
+25/5/15 presets, and pause/reset. The countdown lives entirely in the plugin —
+ticking at 1 Hz whether or not the chip is on screen, so a host restart just
+re-seeds a fresh idle 25:00 timer, nothing to persist. At zero it posts one
+toast through trollshell's own notification path via `Effect::Notify` (#406's
+payoff, the first customer of that effect) — attributed to the plugin id as
+the app name, no extra unit or D-Bus setup needed. No environment variables to
+set.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

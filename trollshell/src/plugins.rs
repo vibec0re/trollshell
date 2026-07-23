@@ -119,7 +119,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use hytte::adw;
@@ -174,7 +175,7 @@ struct SlotRender {
     /// A `SlotRender` parked in the dedicated `panels` mailbox always carries
     /// `Some`.
     panel: Option<wire::Node>,
-    outbound: mpsc::UnboundedSender<HostMsg>,
+    outbound: mpsc::Sender<HostMsg>,
 }
 
 /// One effect stripped off a render frame, queued on the non-lossy effect
@@ -728,7 +729,7 @@ struct MountedCard {
     reconciler: Reconciler,
     /// Outbound of the connection currently owning this plugin's card, swapped
     /// on each render so events always reach the live connection.
-    outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>>,
+    outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>>,
 }
 
 /// Build the `gtk::Box` region driven by `signal` (a mount's sorted render
@@ -825,12 +826,15 @@ fn reconcile_region(
             // outbound cell (so events reach the right connection).
             let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
             root.add_css_class(card_class);
-            let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> =
+            let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> =
                 Rc::new(RefCell::new(Some(render.outbound.clone())));
             let ev_outbound = outbound.clone();
             let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
                 if let Some(tx) = ev_outbound.borrow().as_ref() {
-                    let _ = tx.send(HostMsg::Event {
+                    // Non-blocking: a stuck plugin's full outbound queue drops the
+                    // event rather than blocking the GTK thread (#435). It's about
+                    // to be reaped by the liveness ping anyway.
+                    let _ = tx.try_send(HostMsg::Event {
                         node: id,
                         kind: to_wire_event(kind),
                     });
@@ -914,11 +918,13 @@ pub fn plugin_panel_slot() -> gtk::Widget {
 
     // The active connection's outbound, swapped on each render so panel events
     // reach whichever plugin is active now (mirrors the region card pattern).
-    let outbound: Rc<RefCell<Option<mpsc::UnboundedSender<HostMsg>>>> = Rc::new(RefCell::new(None));
+    let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> = Rc::new(RefCell::new(None));
     let ev_outbound = outbound.clone();
     let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
         if let Some(tx) = ev_outbound.borrow().as_ref() {
-            let _ = tx.send(HostMsg::Event {
+            // Non-blocking (#435): drop the panel event if the plugin's outbound
+            // queue is full rather than block the GTK thread.
+            let _ = tx.try_send(HostMsg::Event {
                 node: id,
                 kind: to_wire_event(kind),
             });
@@ -1082,6 +1088,121 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
     upsert_region(region, render);
 }
 
+// ── Plugin containment (#435) ────────────────────────────────────────────────
+//
+// Four measures so a misbehaving / hung / hostile plugin can't harm the shell.
+// All limits are named consts; a well-behaved plugin is unaffected by every one.
+
+/// Timeout on the `Register` handshake: a peer that dials the socket but never
+/// identifies itself is dropped rather than parking a task + fd forever.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between host→plugin liveness [`HostMsg::Ping`]s. A well-behaved
+/// plugin answers each with a [`PluginMsg::Pong`]; a hung one is dropped after
+/// [`MAX_MISSED_PONGS`] go unanswered (~`PING_INTERVAL * (MAX_MISSED_PONGS + 1)`
+/// worst case), freeing its region slot instead of leaving a frozen card.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many consecutive unanswered pings mark a plugin as hung (drop it).
+const MAX_MISSED_PONGS: u32 = 2;
+
+/// Bound on the per-connection outbound (host→plugin) queue. A well-behaved
+/// plugin drains it immediately so it sits near-empty; a plugin that stops
+/// reading its socket backs it up to this cap, at which point new frames are
+/// dropped (see [`push_state`]) rather than buffered without limit. Comfortably
+/// above any real burst, so the happy path never fills it.
+const OUTBOUND_CAPACITY: usize = 256;
+
+/// Max effect tokens a connection may hold — the burst of [`Effect`]s it can emit
+/// back-to-back before the sustained cap ([`EFFECT_REFILL_PER_SEC`]) applies.
+const EFFECT_BURST: u32 = 8;
+
+/// Sustained effect budget refilled per second (a token-bucket rate). Together
+/// with [`EFFECT_BURST`] this caps how fast a plugin can flood the drawer / OSD /
+/// toast broker; user-driven effects (a click → `OpenPage`) never approach it.
+const EFFECT_REFILL_PER_SEC: f64 = 1.0;
+
+/// Whether a non-blocking outbound push should keep its producer task running.
+enum Push {
+    /// The frame was sent, or dropped because the queue was momentarily full —
+    /// either way keep going (the next change re-sends the latest value).
+    Continue,
+    /// The receiver (writer task) is gone: the connection is tearing down, stop.
+    Stop,
+}
+
+/// Non-blocking push onto a connection's bounded outbound queue (#435). Every
+/// host→plugin state frame is latest-wins, so a `Full` queue (the plugin stopped
+/// reading) drops the frame rather than growing memory without bound — the stuck
+/// plugin is separately reaped by the liveness ping (it can't answer pings while
+/// not reading). `Closed` means the writer task exited; the producer stops.
+fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
+    match out.try_send(msg) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Push::Continue,
+        Err(mpsc::error::TrySendError::Closed(_)) => Push::Stop,
+    }
+}
+
+/// Per-connection effect rate cap (#435): a token bucket over [`Effect`]
+/// emissions. A plugin may fire up to [`EFFECT_BURST`] effects back-to-back;
+/// beyond that it's limited to [`EFFECT_REFILL_PER_SEC`], so a buggy plugin
+/// emitting an effect per render can't flood the (deliberately non-lossy #277)
+/// effect broker with drawer-opens / OSD nudges / toasts.
+struct EffectRateLimiter {
+    tokens: f64,
+    last: Instant,
+}
+
+impl EffectRateLimiter {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self {
+            tokens: f64::from(EFFECT_BURST),
+            last: now,
+        }
+    }
+
+    /// Refill by the time elapsed since the last call (capped at the burst), then
+    /// try to spend one token. `true` = allowed, `false` = over budget (drop).
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * EFFECT_REFILL_PER_SEC).min(f64::from(EFFECT_BURST));
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Filter a render frame's effects through the connection's rate limiter,
+/// dropping (with a warn) any that exceed the cap. All effects in one frame share
+/// a single `now`, so a burst frame depletes the bucket in order.
+fn throttle_effects(
+    rl: &mut EffectRateLimiter,
+    plugin_id: &str,
+    effects: Vec<Effect>,
+) -> Vec<Effect> {
+    if effects.is_empty() {
+        return effects;
+    }
+    let now = Instant::now();
+    let mut kept = Vec::with_capacity(effects.len());
+    for effect in effects {
+        if rl.allow(now) {
+            kept.push(effect);
+        } else {
+            tracing::warn!(plugin = %plugin_id, ?effect, "plugin effect rate cap exceeded; dropped");
+        }
+    }
+    kept
+}
+
 /// Drive one plugin connection: handshake, then read frames until the peer
 /// disconnects, feeding renders into the mount mailbox and pushing state
 /// snapshots + events back out.
@@ -1093,14 +1214,24 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     let (mut rd, wr) = stream.into_split();
 
     // Handshake: the first frame MUST be `Register`, and its proto must match
-    // exactly — else drop the connection (schema skew fails loud).
-    let first = match read_frame::<PluginMsg, _>(&mut rd).await {
-        Ok(msg) => msg,
-        Err(e) => {
-            tracing::warn!(error = %e, "plugin handshake read failed; dropping");
-            return;
-        }
-    };
+    // exactly — else drop the connection (schema skew fails loud). Bounded by
+    // `REGISTER_TIMEOUT` (#435): a peer that dials in but never identifies itself
+    // must not park a task + fd forever.
+    let first =
+        match tokio::time::timeout(REGISTER_TIMEOUT, read_frame::<PluginMsg, _>(&mut rd)).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "plugin handshake read failed; dropping");
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_s = REGISTER_TIMEOUT.as_secs(),
+                    "plugin did not Register within the handshake timeout; dropping",
+                );
+                return;
+            }
+        };
     let manifest = match first {
         PluginMsg::Register { manifest } => manifest,
         other => {
@@ -1128,8 +1259,11 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         "plugin registered",
     );
 
-    // Outbound writer: the single point that serializes host→plugin frames.
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<HostMsg>();
+    // Outbound writer: the single point that serializes host→plugin frames. The
+    // queue is **bounded** (#435): a plugin that stops reading its socket can no
+    // longer make the host buffer frames without limit — producers drop onto a
+    // full queue (`push_state`) and the liveness ping reaps the stuck connection.
+    let (out_tx, out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(writer_task(wr, out_rx));
 
     // Initial + on-change state snapshots (Clock only, if subscribed).
@@ -1160,7 +1294,7 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // tear down); only sidebar mounts run the change-tracking `visibility_task`.
     let visibility = if manifest.subscribes.contains(&StateKey::SlotVisible) {
         if mount.is_bar() {
-            let _ = out_tx.send(HostMsg::SlotVisibility { visible: true });
+            let _ = out_tx.try_send(HostMsg::SlotVisibility { visible: true });
             None
         } else {
             Some(tokio::spawn(visibility_task(
@@ -1203,35 +1337,86 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
             tokio::spawn(spectrum_task(ctx.spectrum_rx.clone(), out_tx.clone()))
         });
 
-    // Reader loop: dispatch inbound frames until the peer disconnects.
-    loop {
-        match read_frame::<PluginMsg, _>(&mut rd).await {
-            Ok(PluginMsg::Render {
-                tree,
-                panel,
-                effects,
-            }) => route_render(
-                ctx,
-                mount,
-                SlotRender {
-                    plugin_id: plugin_id.clone(),
-                    order,
-                    generation,
+    // Reader + liveness, raced (#435). The reader dispatches inbound frames; the
+    // liveness task pings on an interval and drops the connection if the plugin
+    // stops answering — a hung plugin never EOFs, so without this its stale card
+    // would stay mounted forever. Whichever future finishes first — a peer
+    // disconnect or a failed liveness probe — falls through to the shared teardown.
+    //
+    // `read_frame` is **not** cancellation-safe (a cancelled partial read would
+    // desync the framing), so the reader is kept as a distinct future the
+    // `select!` only ever *abandons* on teardown — it is never resumed after a
+    // cancel, so no partial read is lost mid-stream.
+    let pong_seen = AtomicBool::new(false);
+    let mut effect_rl = EffectRateLimiter::new();
+    let reader = async {
+        loop {
+            match read_frame::<PluginMsg, _>(&mut rd).await {
+                Ok(PluginMsg::Render {
                     tree,
                     panel,
-                    outbound: out_tx.clone(),
-                },
-                effects,
-            ),
-            Ok(PluginMsg::Register { .. }) => {
-                tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
+                    effects,
+                }) => route_render(
+                    ctx,
+                    mount,
+                    SlotRender {
+                        plugin_id: plugin_id.clone(),
+                        order,
+                        generation,
+                        tree,
+                        panel,
+                        outbound: out_tx.clone(),
+                    },
+                    // Effect rate cap (#435): over-budget effects are dropped so a
+                    // plugin can't flood the drawer / OSD / toast broker.
+                    throttle_effects(&mut effect_rl, &plugin_id, effects),
+                ),
+                Ok(PluginMsg::Register { .. }) => {
+                    tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
+                }
+                Ok(PluginMsg::Log { level, msg }) => log_plugin(&plugin_id, level, &msg),
+                Ok(PluginMsg::Pong { seq }) => {
+                    pong_seen.store(true, Ordering::Relaxed);
+                    tracing::trace!(plugin = %plugin_id, seq, "plugin pong");
+                }
+                Err(e) => {
+                    tracing::info!(plugin = %plugin_id, reason = %e, "plugin disconnected");
+                    break;
+                }
             }
-            Ok(PluginMsg::Log { level, msg }) => log_plugin(&plugin_id, level, &msg),
-            Ok(PluginMsg::Pong { seq }) => tracing::trace!(plugin = %plugin_id, seq, "plugin pong"),
-            Err(e) => {
-                tracing::info!(plugin = %plugin_id, reason = %e, "plugin disconnected");
+        }
+    };
+    let liveness = async {
+        // First tick one full interval out, so a well-behaved plugin is never
+        // probed before it settles (and short-lived tests never observe a ping).
+        let mut ping =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seq: u64 = 0;
+        let mut unanswered: u32 = 0;
+        loop {
+            ping.tick().await;
+            if pong_seen.swap(false, Ordering::Relaxed) {
+                unanswered = 0;
+            } else if seq > 0 {
+                // Only count a miss against a ping we actually sent.
+                unanswered += 1;
+            }
+            if unanswered >= MAX_MISSED_PONGS {
                 break;
             }
+            seq += 1;
+            // A full outbound queue here means the plugin stopped reading its
+            // socket (measure 2) — treat it as dead, same as a missed pong.
+            if out_tx.try_send(HostMsg::Ping { seq }).is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        () = reader => {}
+        () = liveness => {
+            tracing::warn!(plugin = %plugin_id, "plugin failed liveness ping; dropping as hung");
         }
     }
 
@@ -1273,7 +1458,7 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
 
 /// Serialize host→plugin frames pulled off the outbound channel until the
 /// channel closes or a write fails.
-async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<HostMsg>) {
+async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<HostMsg>) {
     while let Some(msg) = rx.recv().await {
         if let Err(e) = write_frame(&mut wr, &msg).await {
             tracing::debug!(error = %e, "plugin outbound write failed; closing writer");
@@ -1286,26 +1471,26 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Hos
 /// and on every change, coalescing bursts latest-wins via `borrow_and_update`.
 async fn snapshot_task(
     mut clock_rx: watch::Receiver<Option<ClockState>>,
-    out: mpsc::UnboundedSender<HostMsg>,
+    out: mpsc::Sender<HostMsg>,
 ) {
     // Initial snapshot (the watch replays its current value).
     let initial = clock_rx.borrow_and_update().clone();
-    if out
-        .send(HostMsg::StateSnapshot {
+    if let Push::Stop = push_state(
+        &out,
+        HostMsg::StateSnapshot {
             snapshot: StateSnapshot { clock: initial },
-        })
-        .is_err()
-    {
+        },
+    ) {
         return;
     }
     while clock_rx.changed().await.is_ok() {
         let clock = clock_rx.borrow_and_update().clone();
-        if out
-            .send(HostMsg::StateSnapshot {
+        if let Push::Stop = push_state(
+            &out,
+            HostMsg::StateSnapshot {
                 snapshot: StateSnapshot { clock },
-            })
-            .is_err()
-        {
+            },
+        ) {
             break;
         }
     }
@@ -1318,21 +1503,15 @@ async fn snapshot_task(
 /// subscribes [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never
 /// receives the frame, and a bar mount gets a constant `true` seed instead (its
 /// chip is always on-screen; see `handle_conn`, #438), never this change loop.
-async fn visibility_task(
-    mut visibility_rx: watch::Receiver<bool>,
-    out: mpsc::UnboundedSender<HostMsg>,
-) {
+async fn visibility_task(mut visibility_rx: watch::Receiver<bool>, out: mpsc::Sender<HostMsg>) {
     // Seed at register (the watch replays its current value).
     let initial = *visibility_rx.borrow_and_update();
-    if out
-        .send(HostMsg::SlotVisibility { visible: initial })
-        .is_err()
-    {
+    if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible: initial }) {
         return;
     }
     while visibility_rx.changed().await.is_ok() {
         let visible = *visibility_rx.borrow_and_update();
-        if out.send(HostMsg::SlotVisibility { visible }).is_err() {
+        if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible }) {
             break;
         }
     }
@@ -1346,18 +1525,15 @@ async fn visibility_task(
 /// is live (#396): `install`'s `StyleManager` listener re-publishes on every
 /// accent/scheme change, which lands here as an additional `watch` update
 /// exactly like a late startup resolve.
-async fn accent_task(
-    mut accent_rx: watch::Receiver<Option<[u8; 4]>>,
-    out: mpsc::UnboundedSender<HostMsg>,
-) {
+async fn accent_task(mut accent_rx: watch::Receiver<Option<[u8; 4]>>, out: mpsc::Sender<HostMsg>) {
     // Seed at register (the watch replays its current value).
     let initial = *accent_rx.borrow_and_update();
-    if out.send(HostMsg::Accent { color: initial }).is_err() {
+    if let Push::Stop = push_state(&out, HostMsg::Accent { color: initial }) {
         return;
     }
     while accent_rx.changed().await.is_ok() {
         let color = *accent_rx.borrow_and_update();
-        if out.send(HostMsg::Accent { color }).is_err() {
+        if let Push::Stop = push_state(&out, HostMsg::Accent { color }) {
             break;
         }
     }
@@ -1371,20 +1547,20 @@ async fn accent_task(
 /// unsubscribed plugin never receives the frame.
 async fn spectrum_task(
     mut spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
-    out: mpsc::UnboundedSender<HostMsg>,
+    out: mpsc::Sender<HostMsg>,
 ) {
     // Seed at register (the watch replays its current value; often `None` until
     // audio flows through the freshly-activated tap).
     let seed = *spectrum_rx.borrow_and_update();
     if let Some(spectrum) = seed
-        && out.send(HostMsg::AudioSpectrum { spectrum }).is_err()
+        && let Push::Stop = push_state(&out, HostMsg::AudioSpectrum { spectrum })
     {
         return;
     }
     while spectrum_rx.changed().await.is_ok() {
         let current = *spectrum_rx.borrow_and_update();
         if let Some(spectrum) = current
-            && out.send(HostMsg::AudioSpectrum { spectrum }).is_err()
+            && let Push::Stop = push_state(&out, HostMsg::AudioSpectrum { spectrum })
         {
             break;
         }
@@ -1749,11 +1925,13 @@ fn resolve_open_page(page: Page) -> PageAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCEPT_BACKOFF, BrokeredEffect, ClockState, Effect, HashMap, HostMsg, ListenerCtx, Mount,
-        Mutable, Page, PageAction, PluginMsg, SlotRender, StateKey, UiDir, UiEventKind, UiNode,
-        UnixStream, accept_backoff, any_sidebar_open, apply_forget, apply_open, clamp_pixels_scale,
-        clear_region_if_owned, handle_conn, map_page, mpsc, pixels_len_ok, read_frame,
-        resolve_open_page, to_ui_node, to_wire_event, upsert_region, watch, wire, write_frame,
+        ACCEPT_BACKOFF, BrokeredEffect, ClockState, Duration, EFFECT_BURST, Effect,
+        EffectRateLimiter, HashMap, HostMsg, Instant, ListenerCtx, Mount, Mutable,
+        OUTBOUND_CAPACITY, Page, PageAction, PluginMsg, REGISTER_TIMEOUT, SlotRender, StateKey,
+        UiDir, UiEventKind, UiNode, UnixStream, accept_backoff, any_sidebar_open, apply_forget,
+        apply_open, clamp_pixels_scale, clear_region_if_owned, handle_conn, map_page, mpsc,
+        pixels_len_ok, read_frame, resolve_open_page, to_ui_node, to_wire_event, upsert_region,
+        watch, wire, write_frame,
     };
     use hytte_plugin_proto::Manifest;
 
@@ -2133,7 +2311,7 @@ mod tests {
         order: i32,
         generation: u64,
         text: &str,
-        tx: &mpsc::UnboundedSender<HostMsg>,
+        tx: &mpsc::Sender<HostMsg>,
     ) -> SlotRender {
         SlotRender {
             plugin_id: plugin_id.to_owned(),
@@ -2157,7 +2335,7 @@ mod tests {
         generation: u64,
         chip: &str,
         panel: &str,
-        tx: &mpsc::UnboundedSender<HostMsg>,
+        tx: &mpsc::Sender<HostMsg>,
     ) -> SlotRender {
         SlotRender {
             panel: Some(wire::Node::Label {
@@ -2180,7 +2358,7 @@ mod tests {
     /// its own card, latest-wins) and stays sorted by `(order, plugin_id)`.
     #[test]
     fn upsert_region_coalesces_per_plugin_and_sorts() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         // Arrive out of order; "alpha" renders twice.
         upsert_region(&region, render_of("bravo", 0, 0, "b1", &tx));
@@ -2198,7 +2376,7 @@ mod tests {
     /// reader) ties with `order: 0` and breaks on the stable id.
     #[test]
     fn region_orders_by_order_then_id() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         // pet requests order 5 (renders later); clock had no order → 0; aaa → 0.
         upsert_region(&region, render_of("pet", 5, 0, "", &tx));
@@ -2221,7 +2399,7 @@ mod tests {
     /// panel (the #278 generation guard, now covering panels).
     #[test]
     fn panel_upsert_coalesces_and_teardown_is_generation_scoped() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let panels: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
 
         // The plugin renders its panel twice on generation 0: coalesced in place.
@@ -2356,7 +2534,7 @@ mod tests {
     /// delivered exactly once — not dropped, not duplicated.
     #[test]
     fn effects_survive_region_coalescing() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let (eff_tx, mut eff_rx) = mpsc::unbounded_channel::<BrokeredEffect>();
         let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
 
@@ -2388,7 +2566,7 @@ mod tests {
     /// a sibling plugin's card is keyed by a different id and stays put.
     #[test]
     fn per_plugin_teardown_leaves_siblings() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         upsert_region(&region, render_of("a", 0, 10, "", &tx));
         upsert_region(&region, render_of("b", 0, 11, "", &tx));
@@ -2405,7 +2583,7 @@ mod tests {
     /// plugin id; only the owning generation's own teardown clears the card.
     #[test]
     fn stale_teardown_never_evicts_same_id_successor() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let region: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         // conn gen 1 parks plugin p; a fast reconnect (gen 2) replaces its card.
         upsert_region(&region, render_of("p", 0, 1, "v1", &tx));
@@ -2491,7 +2669,7 @@ mod tests {
     /// the new lead region.
     #[test]
     fn teardown_is_isolated_across_the_three_regions() {
-        let (tx, _rx) = mpsc::unbounded_channel::<HostMsg>();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let lead: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         let top: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
         let bottom: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
@@ -2897,5 +3075,63 @@ mod tests {
             quiet.is_err(),
             "a bar mount receives no sidebar-driven visibility edges (only the seed)",
         );
+    }
+
+    // ── Containment (#435) ────────────────────────────────────────────────────
+
+    /// The effect rate cap is a token bucket: a plugin may fire a full
+    /// [`EFFECT_BURST`] back-to-back, then is limited to the sustained refill;
+    /// a long idle refills back up to (but never beyond) the burst cap. Driven
+    /// with synthetic instants so it's deterministic.
+    #[test]
+    fn effect_rate_limiter_caps_sustained_but_allows_burst() {
+        let t0 = Instant::now();
+        let mut rl = EffectRateLimiter::new_at(t0);
+
+        // The whole burst is available up front, then the bucket is empty.
+        for _ in 0..EFFECT_BURST {
+            assert!(rl.allow(t0), "burst tokens available immediately");
+        }
+        assert!(!rl.allow(t0), "burst exhausted at the same instant");
+
+        // One refill interval later, exactly one more effect is allowed.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(rl.allow(t1), "one token refilled after 1s");
+        assert!(!rl.allow(t1), "only one token per refill interval");
+
+        // A long idle refills to the burst cap — and saturates there, so idle
+        // time can't bank unbounded budget for a later flood.
+        let t2 = t1 + Duration::from_secs(100);
+        for _ in 0..EFFECT_BURST {
+            assert!(
+                rl.allow(t2),
+                "bucket refills up to the burst cap after idle"
+            );
+        }
+        assert!(!rl.allow(t2), "refill saturates at the burst cap");
+    }
+
+    /// #435: a peer that dials the socket but never sends `Register` must be
+    /// dropped after `REGISTER_TIMEOUT`, not park the connection task forever.
+    /// Paused-time so the 10s wall-clock timeout resolves instantly; the plugin
+    /// end is held open (never written) so the handshake read stays pending and
+    /// the *timeout* — not an EOF — is what ends the connection.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_timeout_drops_a_silent_connection() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        let (host_end, _plugin_end) = UnixStream::pair().expect("socketpair");
+        let conn = tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        // Let the task arm its handshake timeout, then jump past it.
+        tokio::task::yield_now().await;
+        tokio::time::advance(REGISTER_TIMEOUT + Duration::from_secs(1)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("handle_conn returns after the handshake timeout")
+            .expect("conn task joined cleanly");
     }
 }

@@ -242,10 +242,27 @@ async fn run_property<T>(
             None => writer.set(PropState::Loading),
         }
 
+        // Subscribe to PropertiesChanged BEFORE the initial Get (#429). A change
+        // emitted in the window between the Get and the AddMatch completing was
+        // otherwise never seen, leaving `Loaded(stale)` until the property next
+        // happened to change — a window that re-opens on every reconnect epoch.
+        // With the subscription live first, any change during the Get is buffered
+        // in `changes` and replayed by `drain_changes` below; because that drain
+        // runs *after* the `Loaded(initial)` set, the buffered (newer) change
+        // wins over the slightly-later Get — latest-wins, no clobber. This mirrors
+        // own.rs (NameOwnerChanged before RequestName) and proxy.rs (NOC before
+        // Live).
+        let Some((mut changes, current_epoch)) = subscribe_properties_changed(&ctx).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        };
+
         // Retry the cold Get until it succeeds (or all handles drop), backing
         // off differently for transient (bus mid-reconnect — retry promptly)
         // versus permanent (`ServiceUnknown`/`AccessDenied` — retry rarely so a
-        // doomed call doesn't hammer the bus at 2 Hz forever).
+        // doomed call doesn't hammer the bus at 2 Hz forever). The subscription
+        // above stays live across every retry, so a change landing mid-Get is
+        // buffered in `changes` and still replayed by `drain_changes` below.
         let mut perm_backoff = Duration::from_millis(500);
         let mut warned_permanent = false;
         let initial = loop {
@@ -290,11 +307,6 @@ async fn run_property<T>(
         };
         last = Some(initial.clone());
         writer.set(PropState::Loaded(initial));
-
-        let Some((mut changes, current_epoch)) = subscribe_properties_changed(&ctx).await else {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            continue;
-        };
 
         let exited = drain_changes::<T>(
             &ctx,

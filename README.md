@@ -17,14 +17,27 @@ controls, system tray, network/Wi-Fi/VPN, bluetooth, volume/mic/brightness,
 battery, CPU/memory/GPU/disk stats, clock, and notification/settings/power
 chips. Clicking a chip opens a slide-out **drawer** with a matching panel.
 Plus a left **sidebar**, on-screen displays (OSD), a notification daemon +
-toasts, password prompts, and an `ext-session-lock-v1` lock screen. (Polkit
-authentication is delegated to a standalone agent — see the flake / `etc/`.) See `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md` for
+toasts, password prompts, and out-of-process **widget plugins** (a clock, a
+kaomoji pet, a timer, a terminal, transit departures, weather, …) that mount
+into the bar and sidebar over a local socket. (Polkit authentication is
+delegated to a standalone agent — see the flake / `etc/`.)
+
+trollshell ships **no in-shell lock screen**: an idle → dim → lock → suspend
+timeline runs natively in-process, but the actual locking is delegated to
+`swaylock` via logind's `Lock` signal (see `etc/README.md`).
+
+A separate windowed companion app, **`trollshell-control-center`**, handles
+heavier settings/management (picking the weather place, toggling plugin
+units, …) over a D-Bus link to the running shell — gnome-control-center-style,
+never linked into the shell itself.
+
+See `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md` for
 the founding design and the dated specs/plans alongside it for each feature.
 
 ## Build & run
 
 Development uses the Nix flake's devShell, which provides the Rust toolchain
-and the GTK/PipeWire/PAM/EDS native deps **and** sets the env the build and
+and the GTK/PipeWire/EDS native deps **and** sets the env the build and
 runtime need (libclang for bindgen, icon-theme + GSettings-schema paths).
 `.envrc` is `use flake`, so [direnv](https://direnv.net/) enters it
 automatically; otherwise run `nix develop` first.
@@ -61,13 +74,15 @@ nix run github:vibec0re/trollshell
 }
 ```
 
-This installs the package and the lock-screen PAM service, plus a bundle of
-recommended-but-optional daemons — the agent-name D-Bus policy, the polkit
-agent, UPower, power-profiles-daemon, geoclue, and the GNOME Online
-Accounts → evolution-data-server stack (with `gnome-control-center` to add
-accounts) that the calendar + tasks panels read from — gated behind
-`programs.trollshell.enableRecommendedServices` (default `true`). Set it to
-`false` for a bare bar, where each chip simply hides when its daemon is absent.
+This installs the package — and, by default, the `trollshell-control-center`
+companion app alongside it (`programs.trollshell.controlCenter.enable`,
+default `true`) — plus a bundle of recommended-but-optional daemons — the
+agent-name D-Bus policy, the polkit agent, UPower, power-profiles-daemon,
+geoclue, and the GNOME Online Accounts → evolution-data-server stack (with
+`gnome-control-center` to add accounts) that the calendar + tasks panels read
+from — gated behind `programs.trollshell.enableRecommendedServices` (default
+`true`). Set it to `false` for a bare bar, where each chip simply hides when
+its daemon is absent.
 
 Calendars/tasks have no in-shell account UI: add an account in **Settings →
 Online Accounts** (`gnome-control-center online-accounts`) and trollshell reads
@@ -88,9 +103,11 @@ it back from evolution-data-server — see
 When home-manager runs as a NixOS module, the NixOS module wires the
 home-manager one in automatically, so per-user `programs.trollshell` settings
 just work. Non-NixOS session integration (systemd user units, niri binds,
-kanshi, the PAM file, …) ships under `etc/` —
+kanshi, cliphist, …) ships under `etc/` —
 see [etc/README.md](etc/README.md). (The idle → dim → lock → suspend pipeline
-is native to trollshell — #204 retired swayidle — so it needs no `etc/` config.)
+is native to trollshell — #204 retired swayidle — so it needs no `etc/`
+config; `swaylock`'s own PAM stack, wired separately, is what actually
+authenticates an unlock — see `etc/README.md`'s "Idle & screen locking".)
 
 ### Wallpaper
 
@@ -131,19 +148,32 @@ standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
 - `crates/hytte-reactive/` — `Service` trait, thread-local handle registry,
   process-wide tokio runtime, and the `bind*` GTK↔`futures-signals` helpers.
 - `crates/hytte-ui/` — `App`, `Bar`, `LayerWindow`, `Popup`, `Monitor`
-  primitives (layer-shell + `ext-session-lock-v1`) + the default stylesheet.
+  primitives (layer-shell) + the default stylesheet.
 - `crates/hytte-bus/` — shared D-Bus capability layer (pooled session/system
   connections; `call`/`property`/`proxy`/`signals`/`own_name` builders).
 - `crates/hytte-services/` — async clients to system daemons exposed as
   services (clock, niri, pipewire, networkd/resolved/wifi, bluetooth, upower,
-  mpris, tray, notifications, calendar, sensors, …).
-- `crates/hytte-pam/` — synchronous PAM authentication for the lock screen.
-- `crates/hytte-ecal/` — hand-written FFI to evolution-data-server (calendar).
+  mpris, tray, notifications, calendar, sensors, idle_notify, …).
+- `crates/hytte-ecal/` — hand-written FFI to evolution-data-server (calendar);
+  the only crate allowed `unsafe`.
+- `crates/hytte-ai-providers/` — shared OpenAI-compatible chat client +
+  key-file loader for the plugins that talk to an LLM (e.g. the pet plugin).
 - `crates/hytte/` — umbrella re-export crate (`bus`, `reactive`, `services`,
   `ui`) + a `prelude`.
+- `crates/hytte-plugin-proto/` + `crates/hytte-plugin/` — the plugin side
+  (out-of-process, never linked into the shell): a GTK-free wire protocol and
+  the Rust plugin runtime SDK a plugin binary depends on.
+- `crates/hytte-plugin-*/` (nine binaries: `clock-demo`, `bar-clock-demo`,
+  `pet`, `preem-demo`, `timer`, `terminal`, `caw`, `departures`, `weather`) —
+  the plugin binaries themselves, each its own systemd user unit.
+- `crates/trollshell-control-center/` — the external settings/management
+  companion app (see "What it does" above); a separate GTK4/libadwaita
+  binary, not linked into the shell.
 - `trollshell/` — the binary: `widgets/` (bar chips), `panels/` (drawer
-  pages), `overlays/` (lock screen, OSD, notifications, dialogs, sidebar),
-  `modal.rs` (the drawer), `components/` (shared building blocks).
+  pages), `overlays/` (frame, OSD, notifications, dialogs, sidebar),
+  `modal.rs` (the drawer), `plugins.rs` (the plugin host transport),
+  `control.rs` (the control-center's D-Bus endpoint), `commands.rs` (the
+  keybind-facing command surface), `components/` (shared building blocks).
 
 `CLAUDE.md` documents the architecture (the handle/work reactive split, the
 per-service pattern, the bus layer, the strict lint gate) in more depth.

@@ -103,9 +103,10 @@
 //!   not have a panel (`panel: None`).
 //! - **State:** only [`StateKey::Clock`].
 //! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer, incl. `PluginSelf`
-//!   → the plugin's own panel, #349 PR2) and [`Effect::RaiseOsd`] (→ the
-//!   transient OSD nudge, #236) are brokered; every other effect is logged
-//!   "unsupported in v1" and skipped. Capability
+//!   → the plugin's own panel, #349 PR2), [`Effect::RaiseOsd`] (→ the transient
+//!   OSD nudge, #236), and [`Effect::Notify`] (→ a local notification toast
+//!   through the shell's own daemon, #406) are brokered; every other effect is
+//!   logged "unsupported in v1" and skipped. Capability
 //!   enforcement stays **declarative-only** (the cap is requested + audit-logged
 //!   but not enforced by a cap store — v1 parity); audit-log / the `RunCommand`
 //!   round-trip remain deferred.
@@ -124,7 +125,7 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
-use hytte::services::clock;
+use hytte::services::{clock, notifications};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
     ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg, StateKey, StateSnapshot,
@@ -546,12 +547,13 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 }
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
-/// (→ the modal drawer) and [`Effect::RaiseOsd`] (→ the transient OSD nudge,
-/// #236); anything else is logged and skipped. Capability gating is
-/// intentionally **declarative-only** at this stage — like `OpenPage`, the
-/// `RaiseOsd` cap is requested in the manifest and audit-logged here but not
-/// enforced by a cap store (v1 parity; audit-log + the `RunCommand` round-trip
-/// remain deferred — see the module doc / PR body).
+/// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
+/// and [`Effect::Notify`] (→ a local notification toast, #406); anything else is
+/// logged and skipped. Capability gating is intentionally **declarative-only** at
+/// this stage — like `OpenPage`, the `RaiseOsd`/`Notify` caps are requested in the
+/// manifest and audit-logged here but not enforced by a cap store (v1 parity;
+/// audit-log + the `RunCommand` round-trip remain deferred — see the module doc /
+/// PR body).
 fn broker_effect(plugin_id: &str, effect: &Effect) {
     match effect {
         Effect::OpenPage(page) => match resolve_open_page(*page) {
@@ -567,6 +569,16 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
         Effect::RaiseOsd { title, body, icon } => {
             tracing::info!(plugin = %plugin_id, title = %title, "plugin effect: RaiseOsd");
             crate::overlays::osd::nudge(title, body, icon.as_deref());
+        }
+        Effect::Notify { summary, body } => {
+            // trollshell owns `org.freedesktop.Notifications`, so a plugin toast
+            // is injected through the shell's own local-post path (#227) rather
+            // than a D-Bus round-trip — same rendering as an external `Notify`
+            // (history, DND gating, rate-limiting). Attributed to the plugin id
+            // as the app name. `Normal` urgency: a plugin alert is informational,
+            // not error-scope, so DND may hold it (see `post_local`'s docs).
+            tracing::info!(plugin = %plugin_id, summary = %summary, "plugin effect: Notify");
+            notifications::post_local(plugin_id, summary, body, notifications::Urgency::Normal);
         }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");

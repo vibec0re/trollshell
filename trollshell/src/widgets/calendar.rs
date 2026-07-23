@@ -65,7 +65,10 @@ struct DayCell {
 /// up-to-60-second-stale data.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let column = build_block();
-    wire_open_refresh(monitor);
+    // Refresh on each sidebar open so users don't see up-to-60-second-stale
+    // data. Scoped to `column`'s lifetime so a hot-plug rebuild drops it
+    // instead of leaking a subscription per cycle (#439).
+    crate::components::open_refresh::on_open(monitor, &column, calendar::refresh);
     column.upcast()
 }
 
@@ -498,23 +501,6 @@ fn wire_clock_bind(
         }
         refresh_upcoming_list(&state, &group, &rows_track, &placeholder_track);
     });
-}
-
-/// Force a fresh scan when the user opens the sidebar — avoids showing
-/// up-to-60-second-stale data on open. Edge-triggered via a `Cell` so the
-/// initial state replay from `signal()` doesn't fire a refresh when the
-/// sidebar starts closed.
-fn wire_open_refresh(monitor: &Monitor) {
-    let last_open = Rc::new(Cell::new(false));
-    glib::MainContext::default().spawn_local(
-        crate::overlays::sidebar::open_signal(monitor).for_each(move |open| {
-            let prev = last_open.replace(open);
-            if open && !prev {
-                calendar::refresh();
-            }
-            async {}
-        }),
-    );
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────

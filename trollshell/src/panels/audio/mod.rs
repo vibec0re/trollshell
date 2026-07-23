@@ -60,8 +60,9 @@ fn audio_section(title: &str, list: &gtk::ListBox) -> gtk::Box {
 }
 
 pub(super) fn truncate_desc(s: &str) -> String {
-    if s.len() > 40 {
-        format!("{}…", &s[..39])
+    if s.chars().count() > 40 {
+        let truncated: String = s.chars().take(39).collect();
+        format!("{truncated}…")
     } else {
         s.to_string()
     }
@@ -90,5 +91,51 @@ pub(super) fn echo_settled<T: Copy + PartialEq>(
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_desc;
+
+    #[test]
+    fn short_ascii_is_unchanged() {
+        assert_eq!(truncate_desc("USB Audio"), "USB Audio");
+    }
+
+    #[test]
+    fn ascii_over_forty_chars_truncates_with_ellipsis() {
+        // 45 'a's — old byte-slice behavior kept the first 39 bytes/chars.
+        let s = "a".repeat(45);
+        let result = truncate_desc(&s);
+        assert_eq!(result, format!("{}…", "a".repeat(39)));
+        assert_eq!(result.chars().count(), 40);
+    }
+
+    #[test]
+    fn ascii_exactly_forty_chars_is_unchanged() {
+        let s = "a".repeat(40);
+        assert_eq!(truncate_desc(&s), s);
+    }
+
+    #[test]
+    fn non_ascii_description_truncates_without_panicking_on_char_boundary() {
+        // Multibyte umlauts throughout — a byte-index slice at 39 would
+        // very likely land mid-codepoint and panic (the #424 bug).
+        let s = "Käthe's Büro-Kopfhörer – Bluetöoth Läutsprecher Änlage".to_string();
+        assert!(s.len() > 40, "fixture should exceed the byte threshold");
+        let result = truncate_desc(&s);
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), 40);
+    }
+
+    #[test]
+    fn emoji_description_truncates_without_panicking() {
+        // Emoji are multi-byte and some are >1 char (grapheme clusters via
+        // combining/ZWJ), but `chars()` still walks scalar values safely.
+        let s = "🎧".repeat(45);
+        let result = truncate_desc(&s);
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), 40);
     }
 }

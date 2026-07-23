@@ -5,6 +5,7 @@ mod control;
 mod modal;
 mod overlays;
 mod panels;
+mod plugin_launcher;
 mod plugins;
 mod scale;
 mod widgets;
@@ -201,6 +202,14 @@ fn main() -> hytte::ui::Result<()> {
             // handles out of the registry. The per-monitor reconciler slots
             // mount separately in `overlays::sidebar::build_card`.
             plugins::install();
+
+            // Launch the *declared* plugins (#419): read the nix-written
+            // `plugins.json` state and spawn each enabled plugin as a transient
+            // user unit via `systemd-run --user`. Runs on the tokio side and is
+            // idempotent across shell restarts (systemd owns the units, so a
+            // still-running plugin is skipped); guarded internally against a
+            // re-fired activate.
+            plugin_launcher::launch_at_startup();
 
             // Gate netconn's always-on `ss -tunpH` poller on drawer
             // visibility (#50): it only feeds the Connections/Network drawer

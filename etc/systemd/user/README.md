@@ -76,6 +76,16 @@ restart) is ridden out in-process rather than crash-looping; systemd's
 `Restart=on-failure` is the outer supervisor. Run more plugins by shipping one
 unit per plugin binary on the same pattern.
 
+> **Nix-managed sessions** don't hand-install these units: since #419 the
+> `programs.trollshell.plugins` option renders to a declarative state file
+> (`~/.config/trollshell/plugins.json` or `/etc/xdg/…`), and the running shell
+> launches each enabled plugin itself as a **transient** user unit of the same
+> `trollshell-plugin-<id>.service` name via `systemd-run --user`
+> (`trollshell/src/plugin_launcher.rs`). Supervision is still systemd's
+> (`Restart=on-failure`, `PartOf=graphical-session.target`), and the static
+> units below keep working as the manual path — the socket doesn't care who
+> spawned the plugin.
+
 `trollshell-plugin-pet.service` is the second in-tree plugin (#276): a
 kaomoji cat in the sidebar's top slot — poke it by clicking. It shares the
 `SidebarTop` mount with the clock demo, but since #274 that mount is a

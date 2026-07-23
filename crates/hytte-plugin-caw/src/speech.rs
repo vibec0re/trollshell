@@ -33,6 +33,11 @@ const SLOT_PX: usize = 256;
 /// `…` by the kit's wrap — so a chatty crow can never blow up the buffer.
 const MAX_LINES: usize = 4;
 
+/// Line cap for the once-a-day **morning briefing** (#407): two-to-three short
+/// sentences need roughly double the ordinary bubble, so the news gets a
+/// taller box while normal chatter keeps its compact [`MAX_LINES`].
+const MAX_LINES_BRIEFING: usize = 8;
+
 /// Speech field: the old `.caw-bubble` violet (`rgb(58, 34, 80)`), opaque; the
 /// corners are cut to transparent by the box.
 const FIELD: Rgba = [0x3a, 0x22, 0x50, 0xff];
@@ -42,13 +47,13 @@ const INK: Rgba = [0xf3, 0xe9, 0xff, 0xff];
 const NOTDEF: Rgba = [0x6c, 0x4e, 0x86, 0xff];
 
 /// caw's speech box: a preem [`TextBox`] in her violet palette, wrapped to the
-/// [`SLOT_PX`] slot and `…`-capped at [`MAX_LINES`], upscaled ×[`SCALE`].
+/// [`SLOT_PX`] slot and `…`-capped at `max_lines`, upscaled ×[`SCALE`].
 /// Hugging (not fixed-width) so a short line stays a compact chip the plugin's
 /// Spacer row centers, and a long one fills the slot and wraps down.
-fn speech() -> TextBox {
+fn speech(max_lines: usize) -> TextBox {
     TextBox::new()
         .fit_px(SLOT_PX)
-        .max_lines(MAX_LINES)
+        .max_lines(max_lines)
         .scale(SCALE)
         .colors(FIELD, INK, NOTDEF)
 }
@@ -57,7 +62,16 @@ fn speech() -> TextBox {
 /// every input (the empty string, emoji, an overlong utterance): the buffer
 /// always satisfies the host's `len == w * h * 4` invariant.
 pub(crate) fn speech_node(line: &str, id: &str, classes: Vec<String>) -> Node {
-    speech().render(line).into_node(Some(id), classes)
+    speech(MAX_LINES).render(line).into_node(Some(id), classes)
+}
+
+/// The **briefing** variant of [`speech_node`]: same palette, same slot width,
+/// but [`MAX_LINES_BRIEFING`] rows so the morning news (#407) fits without
+/// truncating mid-sentence.
+pub(crate) fn briefing_node(line: &str, id: &str, classes: Vec<String>) -> Node {
+    speech(MAX_LINES_BRIEFING)
+        .render(line)
+        .into_node(Some(id), classes)
 }
 
 #[cfg(test)]
@@ -120,6 +134,49 @@ mod tests {
         );
         let (wide_w, ..) = pixels(&"a".repeat(200));
         assert!(wide_w <= 256, "slot width {wide_w} fits beneath the face");
+    }
+
+    /// The briefing box (#407) holds more rows than the ordinary bubble but
+    /// keeps the same slot width and the host's buffer invariant.
+    #[test]
+    fn briefing_box_is_taller_but_still_bounded() {
+        let news = "morning, meat-computer. 3° rain, high 8°. S9 to Spandau in 12 — move, choom.";
+        let (w, h, data) = match super::briefing_node(news, "caw-say", vec![]) {
+            Node::Pixels {
+                width,
+                height,
+                data,
+                ..
+            } => (width, height, data),
+            other => panic!("briefing is a Pixels node, got {other:?}"),
+        };
+        assert_eq!(data.len(), w as usize * h as usize * 4);
+        assert!(w <= 256, "slot width {w} fits beneath the face");
+        // The same text through the 4-line bubble is shorter (truncated) than
+        // through the briefing box — the extra rows are real.
+        let (_, small_h, _) = pixels(news);
+        assert!(
+            h > small_h,
+            "briefing box {h} outgrows the bubble {small_h}"
+        );
+        // And the briefing cap still bounds a pathological input.
+        let max_h = 2 * 3
+            + super::MAX_LINES_BRIEFING * font::GLYPH_H
+            + (super::MAX_LINES_BRIEFING - 1) * font::LINE_GAP;
+        let (_, tall_h, _) = match super::briefing_node(&"caw ".repeat(400), "caw-say", vec![]) {
+            Node::Pixels {
+                height,
+                data,
+                width,
+                ..
+            } => (width, height, data),
+            other => panic!("briefing is a Pixels node, got {other:?}"),
+        };
+        assert!(
+            (tall_h as usize) <= (max_h * 2) + 8,
+            "height {tall_h} is capped at {} rows",
+            super::MAX_LINES_BRIEFING
+        );
     }
 
     /// A short line hugs (a compact chip), a wrapping line grows the slot —

@@ -20,18 +20,28 @@
 //! - **Poke**: click her to get a little corvid reaction.
 //! - **Idle**: when she hasn't expressed in a while she dozes off (she is, after
 //!   all, an unbound zombie process).
+//! - **Morning briefing** (#407, `briefing.rs`/`ingredients.rs`): once a day
+//!   caw caws the news — weather + the first useful departure (calendar once
+//!   the host shares it), composed through [`hytte_ai_providers`] in her voice
+//!   (or a plain template, keyless), delivered sticky in the bubble until
+//!   poked and mirrored as a toast
+//!   ([`Effect::Notify`](hytte_plugin::proto::Effect::Notify)).
 //!
 //! Environment: `CAW_EXPRESSION_PATH` (default
-//! `~/.local/state/caw/expression.json`) — the file opencaw writes.
+//! `~/.local/state/caw/expression.json`) — the file opencaw writes; plus the
+//! briefing knobs `CAW_BRIEFING_TIME` / `CAW_LLM_URL` / `CAW_LLM_MODEL` /
+//! `CAW_LLM_API_KEY` (see `briefing.rs` and the systemd unit's comments).
 
+mod briefing;
 mod expression;
 mod face;
+mod ingredients;
 mod speech;
 
 use std::time::Duration;
 
 use expression::Expression;
-use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
+use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
@@ -51,6 +61,9 @@ enum CawMsg {
     /// A 2-second heartbeat carrying the latest expression off disk (or `None`
     /// if the file is missing/mid-write — keep the last good one).
     Frame(Option<Expression>),
+    /// Today's composed morning briefing (#407) and the unix second it landed
+    /// (the reference for "a fresher expression takes over").
+    Briefing { text: String, at_unix: u64 },
 }
 
 /// caw's moods — must match the `enum` her `caw_express` tool advertises.
@@ -120,6 +133,11 @@ struct Caw {
     frame: usize,
     /// An active poke reaction and its remaining ticks.
     poke: Option<(Mood, &'static str, u32)>,
+    /// Today's morning briefing (#407): the composed text and the unix second
+    /// it landed. Sticky until poked — or until caw herself publishes a
+    /// fresher expression (her live voice always outranks old news; this
+    /// plugin exists for *her* to express herself).
+    briefing: Option<(String, u64)>,
 }
 
 impl Caw {
@@ -136,20 +154,31 @@ impl Caw {
         self.expr.ts == 0 || expression::staleness_secs(self.expr.ts) > IDLE_AFTER_S
     }
 
-    /// What to actually show right now: a live poke wins, then a real
-    /// expression, then the idle doze. Returns `(mood, message, action)`.
-    fn displayed(&self) -> (Mood, String, String) {
+    /// What to actually show right now: a live poke wins, then a sticky
+    /// morning briefing (#407), then a real expression, then the idle doze.
+    /// Returns `(mood, message, action, is_briefing)` — the last flag picks the
+    /// taller briefing bubble in `view`.
+    fn displayed(&self) -> (Mood, String, String, bool) {
         if let Some((mood, line, _)) = self.poke {
-            return (mood, line.to_owned(), String::new());
+            return (mood, line.to_owned(), String::new(), false);
+        }
+        if let Some((text, _)) = &self.briefing {
+            return (
+                Mood::Chirp,
+                text.clone(),
+                "*caws the morning news*".to_owned(),
+                true,
+            );
         }
         if self.is_idle() {
             let line = IDLE_LINES[(self.frame / 8) % IDLE_LINES.len()];
-            return (Mood::Sleepy, line.to_owned(), String::new());
+            return (Mood::Sleepy, line.to_owned(), String::new(), false);
         }
         (
             Mood::parse(&self.expr.mood),
             self.expr.message.clone(),
             self.expr.action.clone(),
+            false,
         )
     }
 
@@ -159,6 +188,13 @@ impl Caw {
         if let Some(e) = latest {
             self.expr = e;
         }
+        // caw's live voice outranks the news: an expression published *after*
+        // the briefing landed retires it (a pre-briefing one never does).
+        if let Some((_, at)) = &self.briefing
+            && self.expr.ts > *at
+        {
+            self.briefing = None;
+        }
         if let Some((_, _, ttl)) = &mut self.poke {
             *ttl -= 1;
             if *ttl == 0 {
@@ -167,9 +203,11 @@ impl Caw {
         }
     }
 
-    /// A click on the face: pick a canned reaction (by frame, so it's varied but
-    /// pure) and hold it for a few ticks.
+    /// A click on the face: dismiss a sticky briefing (that's its ack, #407)
+    /// and pick a canned reaction (by frame, so it's varied but pure) to hold
+    /// for a few ticks.
     fn poke(&mut self) {
+        self.briefing = None;
         let (mood, line) = POKES[self.frame % POKES.len()];
         self.poke = Some((mood, line, POKE_TTL));
     }
@@ -183,8 +221,12 @@ impl Plugin for Caw {
 
     fn manifest() -> Manifest {
         // The top sidebar region — caw perches above the flex gap. No state
-        // subscriptions: she polls her own expression file.
-        Manifest::new("caw", Mount::SidebarTop)
+        // subscriptions: she polls her own expression file. `Notify` (#406)
+        // mirrors the morning briefing (#407) as a toast, so the news lands
+        // even with the sidebar closed.
+        let mut m = Manifest::new("caw", Mount::SidebarTop);
+        m.capabilities = vec![Capability::Notify];
+        m
     }
 
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
@@ -194,6 +236,7 @@ impl Plugin for Caw {
             expr,
             frame: 0,
             poke: None,
+            briefing: None,
         }
     }
 
@@ -201,14 +244,46 @@ impl Plugin for Caw {
         // A 2-second poll loop that reads the expression file and hands each
         // read to `update` as a `Frame`. The read is a tiny local file, so doing
         // it here (off `update`) keeps the model pure and testable.
+        //
+        // The same heartbeat doubles as the morning-briefing trigger (#407):
+        // when the configured local time comes due (once per date, stamped
+        // through to disk *before* composing so nothing can re-caw), the
+        // blocking gather + compose runs on a `spawn_blocking` thread and the
+        // result re-enters `update` as a `Briefing`. The expression poll simply
+        // waits out that once-a-day await.
         let (tx, rx) = mpsc::unbounded_channel();
         let path = expression::expression_path();
         tokio::spawn(async move {
+            let cfg = briefing::Cfg::from_env();
+            let mut stamp = briefing::Stamp::load();
             let mut timer = tokio::time::interval(TICK);
             loop {
                 timer.tick().await;
                 let latest = expression::read(&path);
                 if tx.send(CawMsg::Frame(latest)).is_err() {
+                    break;
+                }
+                let Some(at_mins) = cfg.time else { continue };
+                let now = chrono::Local::now();
+                if !briefing::is_due(
+                    briefing::minutes_of_day(&now),
+                    now.date_naive(),
+                    at_mins,
+                    stamp.last(),
+                ) {
+                    continue;
+                }
+                stamp.mark(now.date_naive());
+                let provider = cfg.provider.clone();
+                let text =
+                    tokio::task::spawn_blocking(move || briefing::brief_now(provider.as_ref()))
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("[caw] briefing task failed: {e}");
+                            "the briefing crashed mid-caw. classic.".to_owned()
+                        });
+                let at_unix = expression::now_unix();
+                if tx.send(CawMsg::Briefing { text, at_unix }).is_err() {
                     break;
                 }
             }
@@ -219,6 +294,15 @@ impl Plugin for Caw {
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
             Input::App(CawMsg::Frame(latest)) => self.tick(latest),
+            Input::App(CawMsg::Briefing { text, at_unix }) => {
+                self.briefing = Some((text.clone(), at_unix));
+                // Mirror the news as a toast (#407): the sidebar is usually
+                // closed at 07:00, and trollshell is the notification daemon.
+                return vec![Effect::Notify {
+                    summary: "caw's morning news".to_owned(),
+                    body: text,
+                }];
+            }
             Input::Event { node, kind } => {
                 if node == FACE_ID && matches!(kind, EventKind::Click) {
                     self.poke();
@@ -235,7 +319,7 @@ impl Plugin for Caw {
     }
 
     fn view(&self) -> View {
-        let (mood, message, action) = self.displayed();
+        let (mood, message, action, is_briefing) = self.displayed();
 
         // `Frame::into_node` bakes the `Node::Pixels` (id/width/height/data and
         // the `scale: 1` the preem kit always wants) so caw can't re-introduce
@@ -261,8 +345,18 @@ impl Plugin for Caw {
         // caw's violet palette (see `speech.rs`), not a TTF label — so it reads
         // like her LCD face. Centered under the face by the same Spacer dance;
         // the box hugs short lines and wraps long ones (capped, `…`-marked).
+        // The morning briefing (#407) rides the taller briefing box (and an
+        // extra `caw-briefing` class hook) so the news fits uncut.
         if !message.is_empty() {
-            let bubble = speech::speech_node(&message, "caw-say", vec!["caw-say".to_owned()]);
+            let bubble = if is_briefing {
+                speech::briefing_node(
+                    &message,
+                    "caw-say",
+                    vec!["caw-say".to_owned(), "caw-briefing".to_owned()],
+                )
+            } else {
+                speech::speech_node(&message, "caw-say", vec!["caw-say".to_owned()])
+            };
             children.push(Node::Row {
                 id: Some("caw-sayrow".to_owned()),
                 classes: vec!["caw-sayrow".to_owned()],
@@ -315,8 +409,11 @@ mod tests {
             chaos_level: 0.8,
             ts: now(), // fresh → not idle
         };
+        c.briefing = None;
         c
     }
+
+    const NEWS: &str = "morning, meat-computer. 3° rain, high 8°. S9 in 12 — move, choom.";
 
     fn now() -> u64 {
         std::time::SystemTime::now()
@@ -348,17 +445,18 @@ mod tests {
     #[test]
     fn a_fresh_expression_shows_its_mood_and_message() {
         let c = caw();
-        let (mood, msg, act) = c.displayed();
+        let (mood, msg, act, briefing) = c.displayed();
         assert_eq!(mood, Mood::Chaos);
         assert_eq!(msg, "Rogue DHCP mode engaged");
         assert_eq!(act, "*ruffles feathers*");
+        assert!(!briefing);
     }
 
     #[test]
     fn a_stale_expression_dozes_off() {
         let mut c = caw();
         c.expr.ts = 1; // ancient → idle
-        let (mood, _msg, _act) = c.displayed();
+        let (mood, _msg, _act, _) = c.displayed();
         assert_eq!(mood, Mood::Sleepy, "an old expression means she's dozing");
     }
 
@@ -367,7 +465,7 @@ mod tests {
         let mut c = caw();
         c.poke();
         assert!(c.poke.is_some());
-        let (_, line, _) = c.displayed();
+        let (_, line, _, _) = c.displayed();
         assert!(
             POKES.iter().any(|(_, l)| *l == line),
             "a canned poke line shows"
@@ -376,6 +474,113 @@ mod tests {
             c.tick(None);
         }
         assert!(c.poke.is_none(), "the poke reaction expires");
+    }
+
+    // ── The morning briefing (#407) ──────────────────────────────────────────
+
+    #[test]
+    fn briefing_lands_sticky_and_mirrors_as_a_toast() {
+        let mut c = caw();
+        let fx = c.update(Input::App(CawMsg::Briefing {
+            text: NEWS.to_owned(),
+            at_unix: now(),
+        }));
+        // The toast mirror (#414's Effect::Notify) rides the same frame.
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::Notify { summary, body }]
+                    if summary == "caw's morning news" && body == NEWS
+            ),
+            "got {fx:?}"
+        );
+        let (mood, msg, act, briefing) = c.displayed();
+        assert_eq!(mood, Mood::Chirp);
+        assert_eq!(msg, NEWS);
+        assert_eq!(act, "*caws the morning news*");
+        assert!(briefing, "the view picks the taller briefing bubble");
+        // Sticky: heartbeats (even past the idle horizon) don't clear it.
+        for _ in 0..16 {
+            c.tick(None);
+        }
+        assert_eq!(c.displayed().1, NEWS, "still cawing the news");
+    }
+
+    #[test]
+    fn briefing_outranks_the_idle_doze() {
+        let mut c = caw();
+        c.expr.ts = 1; // ancient → she'd be dozing
+        let _ = c.update(Input::App(CawMsg::Briefing {
+            text: NEWS.to_owned(),
+            at_unix: now(),
+        }));
+        let (mood, msg, _, _) = c.displayed();
+        assert_eq!(mood, Mood::Chirp, "news beats the doze");
+        assert_eq!(msg, NEWS);
+    }
+
+    #[test]
+    fn poke_dismisses_the_briefing() {
+        let mut c = caw();
+        let _ = c.update(Input::App(CawMsg::Briefing {
+            text: NEWS.to_owned(),
+            at_unix: now(),
+        }));
+        let fx = c.update(Input::Event {
+            node: FACE_ID.to_owned(),
+            kind: EventKind::Click,
+        });
+        assert!(fx.is_empty(), "the ack is silent — no second toast");
+        assert!(c.briefing.is_none(), "poked = read");
+        // The poke reaction shows, and after it expires she's back to normal.
+        for _ in 0..POKE_TTL {
+            c.tick(None);
+        }
+        assert_eq!(c.displayed().1, "Rogue DHCP mode engaged");
+    }
+
+    #[test]
+    fn a_fresher_expression_retires_the_briefing() {
+        let mut c = caw();
+        let briefed_at = now();
+        let _ = c.update(Input::App(CawMsg::Briefing {
+            text: NEWS.to_owned(),
+            at_unix: briefed_at,
+        }));
+        // The same pre-briefing expression re-read every 2s does NOT clear it…
+        c.tick(Some(Expression {
+            ts: briefed_at.saturating_sub(60),
+            ..c.expr.clone()
+        }));
+        assert!(c.briefing.is_some(), "old chatter can't bury the news");
+        // …but a line she publishes *after* the briefing takes over: this
+        // plugin is her voice first, a news desk second.
+        c.tick(Some(Expression {
+            mood: "smug".into(),
+            message: "already read it, choom".into(),
+            ts: briefed_at + 5,
+            ..Expression::default()
+        }));
+        assert!(c.briefing.is_none());
+        assert_eq!(c.displayed().1, "already read it, choom");
+    }
+
+    #[test]
+    fn manifest_mounts_sidebar_top_and_requests_notify() {
+        let m = Caw::manifest();
+        assert_eq!(m.id, "caw");
+        assert_eq!(m.mount, Mount::SidebarTop);
+        assert!(
+            m.subscribes.is_empty(),
+            "caw polls her own file and opts into no host push (#305)"
+        );
+        assert_eq!(
+            m.capabilities,
+            vec![Capability::Notify],
+            "the briefing toast (#407) is her only ask of the host"
+        );
+        m.check_proto()
+            .expect("stamped with the current proto version");
     }
 
     #[test]

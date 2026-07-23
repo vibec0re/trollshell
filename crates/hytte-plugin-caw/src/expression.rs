@@ -26,6 +26,22 @@ pub struct Expression {
     pub ts: u64,
 }
 
+/// The user state directory: `$XDG_STATE_HOME`, else `$HOME/.local/state`,
+/// else the current dir. Shared by the expression file below and the briefing
+/// stamp (`crate::briefing`).
+pub fn state_dir() -> PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local").join("state"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// The file caw writes and we read. `CAW_EXPRESSION_PATH` overrides; default
 /// `$XDG_STATE_HOME/caw/expression.json` (→ `~/.local/state/caw/expression.json`)
 /// — the same default `opencaw`'s `caw_expression_path()` uses, so the two ends
@@ -36,17 +52,7 @@ pub fn expression_path() -> PathBuf {
     {
         return PathBuf::from(p);
     }
-    let base = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local").join("state"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("caw").join("expression.json")
+    state_dir().join("caw").join("expression.json")
 }
 
 /// Read + parse the current expression, or `None` if the file is missing or
@@ -56,13 +62,18 @@ pub fn read(path: &Path) -> Option<Expression> {
     serde_json::from_slice(&raw).ok()
 }
 
+/// The current unix time in whole seconds (0 on a pre-epoch clock).
+#[must_use]
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Seconds since `ts` was published (0 for a future/zero timestamp).
 #[must_use]
 pub fn staleness_secs(ts: u64) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    now.saturating_sub(ts)
+    now_unix().saturating_sub(ts)
 }
 
 #[cfg(test)]

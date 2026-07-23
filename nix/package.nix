@@ -24,20 +24,25 @@ let
   # we keep ONLY the assets the *compile* genuinely reads:
   #   - tests/fixtures — include_str!'d by the internals suite (doCheck runs
   #     `cargo test` in the sandbox).
-  # NO stylesheets are kept: NONE are include_str!'d anymore. The asset
-  # sources live in the top-level `assets/` dir (assets/trollshell/{style.css,
-  # icons} and assets/hytte-ui/style.css) and are loaded from disk at runtime —
-  # the binary resolves them via the makeWrapper env (TROLLSHELL_DATA_DIR /
-  # HYTTE_UI_DATA_DIR → the `assets` derivation below), and dev falls back to
-  # the compile-time CARGO_MANIFEST_DIR path. `assets/` is not cargo sources nor
-  # a test fixture, so the crane src filter already excludes it: editing an icon
-  # or *any* stylesheet no longer invalidates the expensive Rust build — only
-  # the trivial `assets` derivation + the wrapper rebuild (#133).
+  #   - assets/hytte-ui/style.css — hytte-ui's DEFAULT_STYLESHEET fallback
+  #     (crates/hytte-ui/src/app.rs) include_str!'s this one file at compile
+  #     time, so it must be present even though the rest of `assets/` isn't.
+  # No OTHER stylesheets/icons are kept: everything else in `assets/` is
+  # loaded from disk at runtime — the binary resolves them via the
+  # makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets`
+  # derivation below), and dev falls back to the compile-time
+  # CARGO_MANIFEST_DIR path. Keeping `assets/` (bar this one file) out of the
+  # crane src filter means editing an icon or any other stylesheet doesn't
+  # invalidate the expensive Rust build — only the trivial `assets`
+  # derivation + the wrapper rebuild (#133).
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
     filter =
-      path: type: (craneLib.filterCargoSources path type) || (lib.hasInfix "/tests/fixtures/" path);
+      path: type:
+      (craneLib.filterCargoSources path type)
+      || (lib.hasInfix "/tests/fixtures/" path)
+      || (lib.hasSuffix "assets/hytte-ui/style.css" path);
   };
 
   # Standalone assets derivation: depends ONLY on the asset files, so editing a

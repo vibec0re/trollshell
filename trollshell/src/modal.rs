@@ -10,6 +10,7 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 
+use crate::components::visibility_gate::GateRegistry;
 use crate::scale::scale;
 
 /// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
@@ -348,55 +349,65 @@ struct ModalPanel {
     open_state: Mutable<bool>,
 }
 
+/// Identifies one global "is a matching drawer page visible on any monitor"
+/// gate. Add a variant + arm in [`GateId::matches`] to gate another poller;
+/// [`recompute_gates`] and the three named signal accessors below stay
+/// one-line each.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GateId {
+    /// [`Page::uses_netconn`] (Connections / Network) — gates the netconn
+    /// `ss` poller (#50).
+    Netconn,
+    /// [`Page::uses_app_usage`] (Stats) — gates the `app_usage` `/proc` poller
+    /// (#50, item 5 of #42).
+    Stats,
+    /// [`Page::uses_mpris_position`] (Media) — gates the mpris per-player
+    /// `Position` pollers (#228).
+    Media,
+}
+
+impl GateId {
+    fn matches(self, page: Page) -> bool {
+        match self {
+            GateId::Netconn => page.uses_netconn(),
+            GateId::Stats => page.uses_app_usage(),
+            GateId::Media => page.uses_mpris_position(),
+        }
+    }
+}
+
 thread_local! {
     static PANELS: RefCell<HashMap<String, ModalPanel>> = RefCell::new(HashMap::new());
     /// Per-connector drawer-open state, decoupled from `ModalPanel` lifetime
     /// so subscribers (OSD, bar CSS) can wire up before `install` runs and
     /// survive bar rebuilds on hot-plug.
     static DRAWER_OPEN: RefCell<HashMap<String, Mutable<bool>>> = RefCell::new(HashMap::new());
-    /// `true` while a [`Page::uses_netconn`] page is the visible drawer page on
-    /// *any* monitor. Drives [`netconn_visible_signal`] so the netconn `ss`
-    /// poller can park while no one's looking (#50). Global (not per-monitor)
-    /// because the netconn service is global; recomputed by
-    /// [`recompute_netconn_visible`] on every page show/swap/retract.
-    static NETCONN_VISIBLE: Mutable<bool> = Mutable::new(false);
-    /// `true` while a [`Page::uses_app_usage`] page (the Stats panel) is the
-    /// visible drawer page on *any* monitor. Drives [`stats_visible_signal`] so
-    /// the app_usage `/proc` poller can park while no one's looking (#50, item 5
-    /// of #42). Global (not per-monitor) because the app_usage service is
-    /// global; recomputed by [`recompute_stats_visible`] on every page
-    /// show/swap/retract.
-    static STATS_VISIBLE: Mutable<bool> = Mutable::new(false);
-    /// `true` while a [`Page::uses_mpris_position`] page (the Media panel) is
-    /// the visible drawer page on *any* monitor. Drives [`media_visible_signal`]
-    /// so the mpris per-player `Position` pollers can park while no one's
-    /// looking (#228). Global (not per-monitor) because the mpris service is
-    /// global; recomputed by [`recompute_media_visible`] on every page
-    /// show/swap/retract. This is the third copy of the `netconn`/`app_usage`
-    /// `*_VISIBLE`/`recompute_*`/`set_active` gate shape — see #228's PR body
-    /// for a noted follow-up to generalize all three into a single
-    /// `page_visible_signal(Page)` map.
-    static MEDIA_VISIBLE: Mutable<bool> = Mutable::new(false);
+    /// One [`GateId`] gate per poller-parking consumer, `true` while some
+    /// monitor's drawer is currently showing a page matching that gate's
+    /// [`GateId::matches`] predicate. Global (not per-monitor) because each
+    /// backing service is a single global poller; recomputed by
+    /// [`recompute_gates`] on every page show/swap/retract. Was three
+    /// hand-rolled `NETCONN_VISIBLE`/`STATS_VISIBLE`/`MEDIA_VISIBLE`
+    /// `Mutable`s + one `recompute_*_visible` fn apiece before #443 — see
+    /// #228's PR body for the original follow-up note.
+    static GATES: GateRegistry<GateId> = GateRegistry::new();
 }
 
-/// Recompute [`NETCONN_VISIBLE`] from the live panel set: `true` iff some
-/// monitor's drawer is currently showing a [`Page::uses_netconn`] page. Called
-/// after every transition that changes a panel's `current` page (open, in-place
-/// page swap, deep-link switch, retract-finish). `Mutable::set` is a no-op-free
-/// notify so we recompute unconditionally and let it dedupe.
-fn recompute_netconn_visible() {
-    let visible = PANELS.with(|panels| {
-        panels.borrow().values().any(|p| {
-            p.current
-                .borrow()
-                .as_ref()
-                .and_then(Active::builtin)
-                .is_some_and(Page::uses_netconn)
-        })
+/// Recompute every [`GateId`] gate from the live panel set. Called after
+/// every transition that changes a panel's `current` page (open, in-place
+/// page swap, deep-link switch, retract-finish). Each gate's `set` is a
+/// no-op-free notify so we recompute unconditionally and let it dedupe.
+fn recompute_gates() {
+    let pages: Vec<Page> = PANELS.with(|panels| {
+        panels
+            .borrow()
+            .values()
+            .filter_map(|p| p.current.borrow().as_ref().and_then(Active::builtin))
+            .collect()
     });
-    NETCONN_VISIBLE.with(|m| {
-        if m.get() != visible {
-            m.set(visible);
+    GATES.with(|gates| {
+        for id in [GateId::Netconn, GateId::Stats, GateId::Media] {
+            gates.set(id, pages.iter().copied().any(|p| id.matches(p)));
         }
     });
 }
@@ -406,30 +417,7 @@ fn recompute_netconn_visible() {
 /// Wired in `main.rs` to `netconn::set_active` so the always-on `ss` poller
 /// parks when those panels are hidden (#50).
 pub fn netconn_visible_signal() -> impl Signal<Item = bool> + 'static {
-    NETCONN_VISIBLE.with(|m| m.signal())
-}
-
-/// Recompute [`STATS_VISIBLE`] from the live panel set: `true` iff some
-/// monitor's drawer is currently showing a [`Page::uses_app_usage`] page (the
-/// Stats panel). Called after every transition that changes a panel's `current`
-/// page (open, in-place page swap, deep-link switch, retract-finish).
-/// `Mutable::set` is a no-op-free notify so we recompute unconditionally and let
-/// it dedupe.
-fn recompute_stats_visible() {
-    let visible = PANELS.with(|panels| {
-        panels.borrow().values().any(|p| {
-            p.current
-                .borrow()
-                .as_ref()
-                .and_then(Active::builtin)
-                .is_some_and(Page::uses_app_usage)
-        })
-    });
-    STATS_VISIBLE.with(|m| {
-        if m.get() != visible {
-            m.set(visible);
-        }
-    });
+    GATES.with(|gates| gates.mutable(GateId::Netconn)).signal()
 }
 
 /// Signal that emits `true` while the Stats drawer page
@@ -437,30 +425,7 @@ fn recompute_stats_visible() {
 /// `app_usage::set_active` so the always-on `/proc` poller parks when that panel
 /// is hidden (#50, item 5 of #42).
 pub fn stats_visible_signal() -> impl Signal<Item = bool> + 'static {
-    STATS_VISIBLE.with(|m| m.signal())
-}
-
-/// Recompute [`MEDIA_VISIBLE`] from the live panel set: `true` iff some
-/// monitor's drawer is currently showing a [`Page::uses_mpris_position`] page
-/// (the Media panel). Called after every transition that changes a panel's
-/// `current` page (open, in-place page swap, deep-link switch, retract-finish).
-/// `Mutable::set` is a no-op-free notify so we recompute unconditionally and
-/// let it dedupe.
-fn recompute_media_visible() {
-    let visible = PANELS.with(|panels| {
-        panels.borrow().values().any(|p| {
-            p.current
-                .borrow()
-                .as_ref()
-                .and_then(Active::builtin)
-                .is_some_and(Page::uses_mpris_position)
-        })
-    });
-    MEDIA_VISIBLE.with(|m| {
-        if m.get() != visible {
-            m.set(visible);
-        }
-    });
+    GATES.with(|gates| gates.mutable(GateId::Stats)).signal()
 }
 
 /// Signal that emits `true` while the Media drawer page
@@ -468,7 +433,7 @@ fn recompute_media_visible() {
 /// `main.rs` to `mpris::set_active` so the always-on per-player `Position`
 /// pollers park when that panel is hidden (#228).
 pub fn media_visible_signal() -> impl Signal<Item = bool> + 'static {
-    MEDIA_VISIBLE.with(|m| m.signal())
+    GATES.with(|gates| gates.mutable(GateId::Media)).signal()
 }
 
 fn drawer_open_state(key: &str) -> Mutable<bool> {
@@ -944,9 +909,7 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         if closed_plugin_panel {
             crate::plugins::set_active_panel(None);
         }
-        recompute_netconn_visible();
-        recompute_stats_visible();
-        recompute_media_visible();
+        recompute_gates();
     });
 }
 
@@ -962,9 +925,7 @@ pub fn close_all() {
     // drawer" default holds (#349 PR2).
     crate::plugins::set_active_panel(None);
     // No panels left → no netconn/stats page visible; park the pollers.
-    recompute_netconn_visible();
-    recompute_stats_visible();
-    recompute_media_visible();
+    recompute_gates();
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -988,9 +949,7 @@ pub fn switch_active(target: Page) {
             }
         }
     });
-    recompute_netconn_visible();
-    recompute_stats_visible();
-    recompute_media_visible();
+    recompute_gates();
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content
@@ -1033,9 +992,7 @@ fn open_by_key(key: &str, page: Page) {
         *panel.pending_center.borrow_mut() = None;
         show_panel(panel, page, 0);
     });
-    recompute_netconn_visible();
-    recompute_stats_visible();
-    recompute_media_visible();
+    recompute_gates();
 }
 
 /// Command-surface entry point (no `&Monitor` in hand): open `page` on the
@@ -1076,9 +1033,7 @@ fn open_plugin_by_key(key: &str, plugin_id: &str) {
         crate::plugins::set_active_panel(Some(plugin_id));
         show_panel_active(panel, Active::Plugin(plugin_id.to_owned()), 0);
     });
-    recompute_netconn_visible();
-    recompute_stats_visible();
-    recompute_media_visible();
+    recompute_gates();
 }
 
 /// Command-surface analogue of [`open_on_focused`] for a plugin's own panel
@@ -1142,9 +1097,7 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
     });
     // Swap/open may have changed which page is visible; the same-page retract
     // branch is recomputed later by `wire_retract_finish`. Idempotent.
-    recompute_netconn_visible();
-    recompute_stats_visible();
-    recompute_media_visible();
+    recompute_gates();
 }
 
 /// Present the drawer on `page` at `main_margin` pixels from the bar's

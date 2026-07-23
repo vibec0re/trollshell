@@ -14,6 +14,7 @@
 //! user left it. Pending clears once pipewire confirms (snapshot ≈
 //! pending) or after `ECHO_TIMEOUT` as a safety net.
 
+mod endpoint;
 mod playback;
 mod sinks;
 mod sources;

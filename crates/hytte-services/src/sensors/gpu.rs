@@ -73,8 +73,7 @@ fn read_amd_gpu() -> Option<GpuState> {
         // Name from /sys/class/drm/cardN/device/uevent or just hardcode "AMD GPU"
         let gpu_name = fs::read_to_string(device.join("uevent"))
             .ok()
-            .map(|s| amd_gpu_name_from_uevent(&s))
-            .unwrap_or_else(|| "AMD GPU".to_string());
+            .map_or_else(|| "AMD GPU".to_string(), |s| amd_gpu_name_from_uevent(&s));
 
         return Some(GpuState {
             vendor: GpuVendor::Amd,

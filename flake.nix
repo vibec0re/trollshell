@@ -82,6 +82,12 @@
         let
           system = pkgs.stdenv.hostPlatform.system;
           trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          # The control-center companion app (#411), mirroring the `packages`
+          # output above — reuses `trollshell.passthru.cargoArtifacts` so it
+          # doesn't trigger a second full deps compile.
+          trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
+            inherit craneLib trollshell;
+          };
 
           # A cheap stand-in for the real trollshell package so the module-eval
           # checks don't force a full Rust crate build just to type-check the
@@ -122,6 +128,15 @@
         in
         {
           formatting = treefmt-eval.config.build.check self;
+
+          # `nix flake check` only *builds* the derivations listed in `checks`
+          # — it does not build `packages` just because they're evaluable.
+          # Without these two entries, CI (which runs flake check, not
+          # `nix build`) can stay green while `nix build .#trollshell` or
+          # `.#trollshell-control-center` is actually broken — the release
+          # profile, `nix/package.nix`'s src filter, the assets derivation,
+          # and the makeWrapper wrapper are never exercised. See #449.
+          inherit trollshell trollshell-control-center;
 
           # Lint the entire workspace with pedantic-clean Clippy. Reuses
           # cargoArtifacts from the package build so dependencies aren't

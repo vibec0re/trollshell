@@ -3,6 +3,7 @@
 //! See spec section 3.2.
 
 use crate::connection::SharedConnection;
+use crate::handle::HandleTracker;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -19,11 +20,29 @@ pub struct SignalEvent {
     pub timestamp: SystemTime,
 }
 
-/// Handle on a live signal subscription. Cloning is cheap (Arc) and does
-/// not cancel; dropping the last clone tears down the subscription.
-#[derive(Clone)]
+/// Handle on a live signal subscription. Cloning is cheap and does not cancel;
+/// dropping the last clone tears down the subscription (push-based, via
+/// [`HandleTracker`]).
 pub struct SignalSubscription {
     inner: Arc<SubInner>,
+    tracker: Arc<HandleTracker>,
+}
+
+impl Clone for SignalSubscription {
+    fn clone(&self) -> Self {
+        self.tracker.inc();
+        Self {
+            inner: self.inner.clone(),
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+impl Drop for SignalSubscription {
+    fn drop(&mut self) {
+        // Wake the subscription task on the last clone drop so it exits.
+        self.tracker.dec();
+    }
 }
 
 struct SubInner {
@@ -83,11 +102,10 @@ struct RunCtx {
     iface: String,
     signal_name: String,
     tx: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
-    /// Weak reference to the subscription's inner state. When all
-    /// `SignalSubscription` clones have been dropped, `upgrade()` returns
-    /// `None`, which is the definitive signal that no consumer will ever call
-    /// `events()` again and the task can exit.
-    weak: std::sync::Weak<SubInner>,
+    /// Live-handle tracker. When every `SignalSubscription` clone has been
+    /// dropped, `all_dropped()` becomes true — the definitive signal that no
+    /// consumer will ever call `events()` again and the task can exit.
+    tracker: Arc<HandleTracker>,
     /// Fired when the task exits so integration tests can verify teardown.
     task_done_tx: tokio::sync::oneshot::Sender<()>,
 }
@@ -148,13 +166,16 @@ impl SignalsBuilder {
     pub fn start(self) -> SignalSubscription {
         let (tx, _) = tokio::sync::broadcast::channel(64);
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let tracker = HandleTracker::new();
 
         let inner = Arc::new(SubInner {
             sender: tx.clone(),
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
         });
-        let weak = Arc::downgrade(&inner);
-        let sub = SignalSubscription { inner };
+        let sub = SignalSubscription {
+            inner,
+            tracker: tracker.clone(),
+        };
         let ctx = RunCtx {
             shared: self.shared,
             dest: self.destination,
@@ -162,7 +183,7 @@ impl SignalsBuilder {
             iface: self.iface,
             signal_name: self.signal,
             tx,
-            weak,
+            tracker,
             task_done_tx,
         };
         hytte_reactive::runtime::handle().spawn(async move {
@@ -207,8 +228,9 @@ struct DrainCtx<'a> {
     shared: &'a SharedConnection,
     current_epoch: u64,
     tx: &'a tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
-    /// Weak handle — `None` strong count means all subscription handles dropped.
-    weak: &'a std::sync::Weak<SubInner>,
+    /// Live-handle tracker — `all_dropped()` means every subscription handle
+    /// has been dropped. Also the push-based drop wakeup (`dropped()`).
+    tracker: &'a HandleTracker,
     dest: &'a str,
     path: &'a str,
     iface: &'a str,
@@ -223,10 +245,6 @@ async fn drain_signal_stream(
 ) -> DrainOutcome {
     use futures_signals::signal::SignalExt;
     let mut epoch_stream = dc.shared.epoch_signal().to_stream();
-    // Periodic wakeup so we notice when all subscription handles have been
-    // dropped while the task is parked waiting for a signal that never arrives.
-    let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
-    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -251,10 +269,12 @@ async fn drain_signal_stream(
                     return DrainOutcome::Reconnect;
                 }
             }
-            _ = liveness.tick() => {}
+            // The last subscription handle was dropped — fall through to the
+            // all-dropped check below, which exits the task.
+            () = dc.tracker.dropped() => {}
         }
         // After each select arm: exit if all subscription handles are gone.
-        if dc.weak.upgrade().is_none() {
+        if dc.tracker.all_dropped() {
             tracing::debug!(
                 dest = dc.dest,
                 path = dc.path,
@@ -275,13 +295,13 @@ async fn run_subscription(ctx: RunCtx) {
         iface,
         signal_name,
         tx,
-        weak,
+        tracker,
         task_done_tx,
     } = ctx;
 
     loop {
         // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
-        if weak.upgrade().is_none() {
+        if tracker.all_dropped() {
             tracing::debug!(
                 dest,
                 path,
@@ -333,7 +353,7 @@ async fn run_subscription(ctx: RunCtx) {
                 shared: &shared,
                 current_epoch,
                 tx: &tx,
-                weak: &weak,
+                tracker: &tracker,
                 dest: &dest,
                 path: &path,
                 iface: &iface,
@@ -380,6 +400,7 @@ mod tests {
                 sender: tx,
                 task_done_rx: tokio::sync::Mutex::new(Some(done_rx)),
             }),
+            tracker: crate::handle::HandleTracker::new(),
         }
     }
 

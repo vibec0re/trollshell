@@ -88,3 +88,78 @@ async fn peer_gone_then_back() {
     }
     assert!(saw_peer_gone, "expected PeerGone after peer dropped");
 }
+
+#[derive(Clone)]
+struct Slowpoke;
+
+#[zbus::interface(name = "mov.vibec0re.test.Slowpoke")]
+impl Slowpoke {
+    /// Deliberately never replies within a normal timeout.
+    #[allow(clippy::unused_self)]
+    async fn slow(&self) -> String {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        "eventually".to_string()
+    }
+
+    #[allow(clippy::unused_self)]
+    fn fast(&self) -> String {
+        "quick".to_string()
+    }
+}
+
+/// A `BusProxy::call` to a wedged peer must return a (permanent) timeout error
+/// bounded by the proxy's timeout, not hang the caller's task forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_times_out_on_slow_peer() {
+    let (conn, guard) = ephemeral_bus().await;
+    let address = guard.address.clone();
+
+    let _peer = zbus::connection::Builder::address(address.as_str())
+        .unwrap()
+        .name("mov.vibec0re.test.Slowpoke")
+        .unwrap()
+        .serve_at("/", Slowpoke)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let proxy = proxy_with(&shared, "mov.vibec0re.test.Slowpoke")
+        .at_path("/")
+        .iface("mov.vibec0re.test.Slowpoke")
+        .timeout(Duration::from_millis(150))
+        .build()
+        .await
+        .expect("build proxy");
+
+    // Wait for Live.
+    let mut liveness = proxy.liveness().to_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ProxyState::Live)) =
+            tokio::time::timeout(Duration::from_millis(50), liveness.next()).await
+        {
+            break;
+        }
+    }
+
+    // A fast method completes well within the 150 ms timeout.
+    let fast: Result<String, _> = proxy.call("Fast", &()).await;
+    assert_eq!(fast.expect("fast call should succeed"), "quick");
+
+    // The slow method (3 s) exceeds the timeout: the call must RETURN a
+    // permanent timeout error. Bound the whole thing so a regression (no
+    // timeout) fails the test rather than hanging it.
+    let slow: Result<String, hytte_bus::BusError> =
+        tokio::time::timeout(Duration::from_secs(2), proxy.call("Slow", &()))
+            .await
+            .expect("BusProxy::call must return within its own timeout, not hang");
+    let err = slow.expect_err("slow call should have timed out");
+    assert!(
+        !err.is_transient(),
+        "a call timeout is a permanent error, got {err:?}"
+    );
+}

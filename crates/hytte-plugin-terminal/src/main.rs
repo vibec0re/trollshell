@@ -184,7 +184,10 @@ impl Plugin for Terminal {
                 }
             }
             // No subscriptions, no commands, no visibility gating — all no-ops.
-            Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
+            Input::Snapshot(_)
+            | Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_) => {}
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

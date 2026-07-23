@@ -32,6 +32,7 @@
 mod graph;
 mod loop_;
 mod pod;
+mod spectrum;
 mod types;
 
 use hytte_reactive::{Service, registry};
@@ -115,6 +116,14 @@ pub fn set_default_source(name: &str) {
     send_command(Command::SetDefaultSource {
         name: name.to_string(),
     });
+}
+
+/// Activate or deactivate the audio spectrum capture tap (#405). The plugin host
+/// calls this with `true` when the first `StateKey::AudioSpectrum` subscriber
+/// connects and `false` when the last one leaves, so the monitor is only tapped
+/// while something is listening. Fire-and-forget like the other setters.
+pub fn set_spectrum_active(active: bool) {
+    send_command(Command::SetSpectrumActive { active });
 }
 
 /// Set volume on whichever sink is currently the default. Reads the

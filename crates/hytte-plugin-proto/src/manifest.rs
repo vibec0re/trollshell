@@ -39,6 +39,21 @@ pub enum StateKey {
     /// plugin it builds — it knows how to consume the accent — so accent tracking
     /// is out-of-the-box and a plugin author never writes this by hand.
     Accent,
+    /// Opt-in to the audio-reactive spectrum push
+    /// ([`HostMsg::AudioSpectrum`](crate::msg::HostMsg::AudioSpectrum), #405): the
+    /// host taps the default sink's monitor through `PipeWire`, downsamples to a
+    /// peak + [`SPECTRUM_BINS`](crate::state::SPECTRUM_BINS)-band
+    /// [`AudioSpectrum`](crate::state::AudioSpectrum), and pushes it ~20 Hz
+    /// (latest-wins) so a `preem` scope/VU tile or a beat-driven caw can react to
+    /// what's playing. Like [`Accent`](StateKey::Accent) / [`SlotVisible`](StateKey::SlotVisible)
+    /// this is the #305 opt-in gate: the host sends the (name-tagged, additive)
+    /// variant *only* to a plugin that declares this key, so a pre-#405 binary
+    /// that can't decode it never receives it. Unlike `Accent`, the SDK does
+    /// **not** auto-declare it — the spectrum is app data a plugin's own `view`
+    /// consumes, so the plugin subscribes it explicitly (like
+    /// [`Clock`](StateKey::Clock)), and the capture is only run while at least one
+    /// subscriber exists (an idle desktop pays nothing).
+    AudioSpectrum,
 }
 
 /// A shell capability a plugin requests in its manifest. The host auto-grants

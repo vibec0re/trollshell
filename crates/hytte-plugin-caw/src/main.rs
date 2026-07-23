@@ -226,7 +226,10 @@ impl Plugin for Caw {
             }
             // No state subscriptions and no RunCommand, and caw keeps vibing
             // whether or not the sidebar is on screen (a 2s poll is cheap).
-            Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
+            Input::Snapshot(_)
+            | Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_) => {}
         }
         Vec::new()
     }

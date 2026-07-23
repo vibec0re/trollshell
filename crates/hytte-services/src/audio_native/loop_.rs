@@ -10,15 +10,19 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::thread;
 
+use futures_signals::signal::Mutable;
 use pipewire as pw;
 use pw::types::ObjectType;
 
-use super::super::pipewire::{PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume};
+use super::super::pipewire::{
+    AudioSpectrum, PipewireHandles, PlaybackStream, RecordStream, Sink, Source, Volume,
+};
 use super::graph::{resolve_link_dest, resolve_link_source};
 use super::pod::{avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name};
+use super::spectrum::SpectrumUserData;
 use super::types::{
-    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, StateRef,
-    clone_handles,
+    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumCapture,
+    StateRef, clone_handles,
 };
 
 /// Sender shared across all callers. Populated by [`spawn_mainloop`] before
@@ -102,6 +106,19 @@ pub(super) fn run_once(
     };
 
     let state = Rc::new(RefCell::new(AudioState::new(handles)));
+
+    // Audio spectrum capture tap (#405): a capture stream on the default sink's
+    // monitor, built **inactive** so an idle desktop pays nothing. The plugin
+    // host flips it active via `Command::SetSpectrumActive` once a plugin
+    // subscribes `StateKey::AudioSpectrum`. A build failure (no monitor, older
+    // daemon) is logged and simply leaves the spectrum dark — every other audio
+    // feature is unaffected.
+    let spectrum_out = state.borrow().handles.spectrum.clone();
+    if let Some(capture) = build_spectrum_capture(&core, spectrum_out) {
+        state.borrow_mut().spectrum_capture = Some(capture);
+    } else {
+        tracing::warn!("audio_native: spectrum capture unavailable this session");
+    }
 
     // Attach the command channel. The returned `AttachedReceiver` must
     // outlive the loop; deattached after `mainloop.run()` returns so the
@@ -451,6 +468,27 @@ fn handle_command(cmd: Command, state: &StateRef) {
         Command::SetDefaultSource { name } => {
             write_default(state, "default.audio.source", &name);
         }
+        Command::SetSpectrumActive { active } => {
+            set_spectrum_active(state, active);
+        }
+    }
+}
+
+/// Toggle the audio spectrum capture tap active/inactive (#405). Silently
+/// no-ops if the capture stream failed to build this session.
+fn set_spectrum_active(state: &StateRef, active: bool) {
+    let s = state.borrow();
+    let Some(capture) = s.spectrum_capture.as_ref() else {
+        tracing::debug!(
+            active,
+            "audio_native: spectrum capture not built; ignoring toggle"
+        );
+        return;
+    };
+    if let Err(e) = capture.stream.set_active(active) {
+        tracing::warn!(error = ?e, active, "audio_native: set spectrum active failed");
+    } else {
+        tracing::debug!(active, "audio_native: spectrum capture toggled");
     }
 }
 
@@ -675,6 +713,117 @@ pub(super) fn emit_snapshots(state: &mut AudioState) {
         state.last_record_streams.clone_from(&record_streams);
         state.handles.record_streams.set(record_streams);
     }
+}
+
+/// Build the audio spectrum capture stream (#405): an F32 input stream on the
+/// **default sink's monitor** (`stream.capture.sink = true` + autoconnect makes
+/// it follow the default sink), connected **inactive**. The `param_changed`
+/// callback learns the negotiated rate/channels; the `process` callback feeds
+/// samples through the [`super::spectrum::Analyzer`] and publishes each finished
+/// `{peak, bins}` frame to the `out` handle. Returns `None` (logged by the
+/// caller) if any step fails, leaving the feature dark without disturbing the
+/// rest of the audio service.
+///
+/// The `process` callback runs on this loop's own thread (no `RT_PROCESS`
+/// flag), the same thread that already pushes `emit_snapshots`, so writing the
+/// `Mutable` from it is consistent with the rest of the backend.
+fn build_spectrum_capture(
+    core: &pw::core::CoreRc,
+    out: Mutable<Option<AudioSpectrum>>,
+) -> Option<SpectrumCapture> {
+    let props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Music",
+        // Capture the monitor of a sink rather than a real source; with
+        // autoconnect and no explicit target this follows the *default* sink.
+        *pw::keys::STREAM_CAPTURE_SINK => "true",
+        *pw::keys::NODE_NAME => "trollshell-spectrum",
+    };
+
+    let stream = pw::stream::StreamRc::new(core.clone(), "trollshell-spectrum", props)
+        .map_err(|e| tracing::warn!(error = ?e, "audio_native: spectrum stream create failed"))
+        .ok()?;
+
+    let listener = stream
+        .add_local_listener_with_user_data(SpectrumUserData::new(out))
+        .param_changed(|_stream, ud, id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
+            else {
+                return;
+            };
+            if media_type != pw::spa::param::format::MediaType::Audio
+                || media_subtype != pw::spa::param::format::MediaSubtype::Raw
+            {
+                return;
+            }
+            if ud.format.parse(param).is_ok() {
+                ud.analyzer.set_rate(ud.format.rate());
+            }
+        })
+        .process(|stream, ud| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
+            let channels = usize::try_from(ud.format.channels()).unwrap_or(1).max(1);
+            let size = usize::try_from(data.chunk().size()).unwrap_or(0);
+            let Some(bytes) = data.data() else {
+                return;
+            };
+            let usable = size.min(bytes.len());
+            if let Some(spectrum) = ud.analyzer.push_bytes(&bytes[..usable], channels) {
+                ud.out.set(Some(spectrum));
+            }
+        })
+        .register()
+        .map_err(|e| tracing::warn!(error = ?e, "audio_native: spectrum listener failed"))
+        .ok()?;
+
+    let format_bytes = build_enum_format_pod()?;
+    let pod = pw::spa::pod::Pod::from_bytes(&format_bytes)?;
+    let mut params = [pod];
+    stream
+        .connect(
+            pw::spa::utils::Direction::Input,
+            None,
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::INACTIVE,
+            &mut params,
+        )
+        .map_err(|e| tracing::warn!(error = ?e, "audio_native: spectrum connect failed"))
+        .ok()?;
+
+    tracing::debug!("audio_native: spectrum capture built (inactive)");
+    Some(SpectrumCapture { listener, stream })
+}
+
+/// Serialize a one-value `EnumFormat` pod requesting F32 (little-endian) raw
+/// audio, leaving rate and channels empty so the graph's native values are
+/// accepted. Mirrors the pipewire-rs audio-capture example.
+fn build_enum_format_pod() -> Option<Vec<u8>> {
+    let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(pw::spa::param::audio::AudioFormat::F32LE);
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let mut buf = Vec::new();
+    pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(&mut buf),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .ok()?;
+    Some(buf)
 }
 
 /// Send a command on the loop's channel, or warn if the service hasn't

@@ -925,7 +925,53 @@ fn parse_image(hints: &HashMap<String, OwnedValue>, app_icon: &str) -> Option<No
     Some(NotificationImage::IconName(app_icon.to_string()))
 }
 
+/// Upper bound on any single image dimension handed to GTK — a sanity guard so
+/// a bogus multi-gigapixel `image-data` payload can't allocate the world (real
+/// notification thumbnails are at most a few hundred px). `32768` is well above
+/// any legitimate icon yet keeps `rowstride * height` comfortably inside `i64`.
+const MAX_IMAGE_DIM: i32 = 1 << 15;
+
+/// Whether an `image-data` payload is self-consistent enough to become a
+/// `gdk::MemoryTexture` without tripping its size `g_return_val_if_fail` — which
+/// the gtk-rs binding turns into a panic on the GTK main thread.
+///
+/// `image-data` is an arbitrary session-bus payload (any app's `Notify` hint),
+/// so `width`/`height`/`rowstride`/`data.len()` must be cross-checked before the
+/// widget hands them to the texture constructor.
+///
+/// `bytes_per_pixel` is the stride unit GDK actually reads — 4 for the
+/// `has_alpha` RGBA format, 3 for RGB — so the buffer-length check matches the
+/// real texture read rather than the (possibly inconsistent) wire `channels`
+/// field. All arithmetic is done in `i64` so no product can overflow `i32`.
+fn image_data_consistent(
+    width: i32,
+    height: i32,
+    rowstride: i32,
+    bytes_per_pixel: i32,
+    data_len: usize,
+) -> bool {
+    if width <= 0 || height <= 0 || rowstride <= 0 || bytes_per_pixel <= 0 {
+        return false;
+    }
+    if width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return false;
+    }
+    let min_row = i64::from(width) * i64::from(bytes_per_pixel);
+    if i64::from(rowstride) < min_row {
+        return false;
+    }
+    // GDK reads `rowstride` bytes for each of the first `height - 1` rows, then
+    // `width * bytes_per_pixel` bytes of the final row.
+    let needed = i64::from(rowstride) * i64::from(height - 1) + min_row;
+    i64::try_from(data_len).is_ok_and(|len| len >= needed)
+}
+
 /// Decode an `image-data` / `icon_data` `OwnedValue` of type `(iiibiiay)`.
+///
+/// Returns `None` for a malformed payload (bad dimensions/stride or a buffer too
+/// short for the declared geometry) so `parse_image` falls through to the
+/// `image-path` / `app_icon` path rather than the shell panicking when the
+/// widget builds the texture.
 fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
     // The spec defines image-data as (iiibiiay):
     //   width: i32, height: i32, rowstride: i32, has_alpha: bool,
@@ -934,6 +980,23 @@ fn decode_image_data(val: &OwnedValue) -> Option<NotificationImage> {
     let cloned = val.try_clone().ok()?;
     let (width, height, rowstride, has_alpha, _bits_per_sample, channels, data) =
         ImageTuple::try_from(cloned).ok()?;
+    // The widget builds the texture with a format chosen purely from
+    // `has_alpha` (RGBA = 4 bytes/px, RGB = 3), so validate the buffer against
+    // that stride unit — not the wire `channels` field, which a buggy or
+    // hostile app may set inconsistently with `has_alpha`.
+    let bytes_per_pixel = if has_alpha { 4 } else { 3 };
+    if !image_data_consistent(width, height, rowstride, bytes_per_pixel, data.len()) {
+        tracing::warn!(
+            width,
+            height,
+            rowstride,
+            has_alpha,
+            channels,
+            data_len = data.len(),
+            "rejecting malformed notification image-data; falling back to image-path/app_icon"
+        );
+        return None;
+    }
     Some(NotificationImage::Raw {
         width,
         height,
@@ -967,12 +1030,58 @@ fn strip_markup(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, RateLimitMap, clear_local_actions, rate_limit_check,
-        register_local_action, resolve_timeout, take_local_action,
+        DEFAULT_TIMEOUT, LocalActionMap, RateLimitMap, clear_local_actions, image_data_consistent,
+        rate_limit_check, register_local_action, resolve_timeout, take_local_action,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    // ── image-data validation (the #425 panic guard) ─────────────────────────
+
+    #[test]
+    fn image_data_accepts_tightly_packed_rgba() {
+        // 2×2 RGBA, no row padding: rowstride == width*4, len == rowstride*height.
+        assert!(image_data_consistent(2, 2, 8, 4, 16));
+        // 1×1 RGBA.
+        assert!(image_data_consistent(1, 1, 4, 4, 4));
+    }
+
+    #[test]
+    fn image_data_accepts_row_padding_and_rgb() {
+        // Padded RGBA: rowstride 10 > width*4, need = 10*(2-1) + 2*4 = 18.
+        assert!(image_data_consistent(2, 2, 10, 4, 18));
+        assert!(image_data_consistent(2, 2, 10, 4, 19)); // extra trailing slack is fine
+        // 3-byte RGB (has_alpha == false): rowstride == width*3.
+        assert!(image_data_consistent(2, 2, 6, 3, 12));
+    }
+
+    #[test]
+    fn image_data_rejects_short_buffer() {
+        // 2×2 RGBA needs 16 bytes; 15 must be rejected, not fed to GTK.
+        assert!(!image_data_consistent(2, 2, 8, 4, 15));
+        // Padded row: need = 10*1 + 8 = 18; 17 is one short.
+        assert!(!image_data_consistent(2, 2, 10, 4, 17));
+    }
+
+    #[test]
+    fn image_data_rejects_bad_dimensions_and_stride() {
+        assert!(!image_data_consistent(0, 2, 8, 4, 16)); // zero width
+        assert!(!image_data_consistent(2, 0, 8, 4, 16)); // zero height
+        assert!(!image_data_consistent(-4, 2, 8, 4, 16)); // negative width
+        assert!(!image_data_consistent(2, -2, 8, 4, 16)); // negative height
+        assert!(!image_data_consistent(2, 2, -8, 4, 16)); // negative rowstride
+        assert!(!image_data_consistent(2, 2, 0, 4, 16)); // zero rowstride
+        assert!(!image_data_consistent(2, 2, 7, 4, 16)); // rowstride < width*bpp
+        assert!(!image_data_consistent(2, 2, 8, 0, 16)); // zero bytes/px
+    }
+
+    #[test]
+    fn image_data_rejects_absurd_dimensions_without_overflow() {
+        // Bogus giant dims must be rejected by the sane-bound guard, never panic.
+        assert!(!image_data_consistent(i32::MAX, i32::MAX, i32::MAX, 4, 16));
+        assert!(!image_data_consistent(1 << 20, 1, 1 << 22, 4, 8));
+    }
 
     #[test]
     fn rate_limit_blocks_identical_repeats_within_window() {

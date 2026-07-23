@@ -7,7 +7,9 @@ use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
 use hytte_bus::{PropState, property_with};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 struct Counter {
     value: u32,
@@ -278,15 +280,27 @@ async fn task_exits_when_property_signal_dropped() {
 // over the slightly-later `Loaded(1)` → converges to `Loaded(99)`). Under the
 // old Get-then-subscribe order the change is emitted before the subscription
 // exists and is lost, leaving the tracker stuck at `Loaded(1)`.
+//
+// `get_started` turns "safe to emit" from a guessed delay into a deterministic
+// signal: `run_property` subscribes to `PropertiesChanged` *before* calling
+// `cold_get` (property.rs:276, #429), so `value()` — the Get's server-side
+// handler — can only start executing after that subscription is fully live.
+// Firing the notification at the top of `value()`, before its own sleep, lets
+// the test await exactly one instant at which a single emit is guaranteed to
+// land inside the window, rather than re-emitting on a guess-and-poll loop.
 
-struct SlowCounter;
+struct SlowCounter {
+    get_started: Arc<Notify>,
+}
 
 #[zbus::interface(name = "mov.vibec0re.test.SlowCounter")]
 impl SlowCounter {
     #[zbus(property)]
     async fn value(&self) -> u32 {
-        // Hold the Get open long enough for the test to emit a change while the
-        // tracker is parked inside its initial cold_get.
+        // Signal the test that the Get has landed — see `get_started` above —
+        // then hold the Get open long enough for the test to emit a change
+        // while the tracker is parked inside its initial cold_get.
+        self.get_started.notify_one();
         tokio::time::sleep(Duration::from_millis(600)).await;
         1
     }
@@ -306,11 +320,17 @@ async fn change_during_initial_get_window_is_not_lost() {
     let (conn, guard) = ephemeral_bus().await;
     let address = guard.address.clone();
 
+    let get_started = Arc::new(Notify::new());
     let server = zbus::connection::Builder::address(address.as_str())
         .unwrap()
         .name(IFACE)
         .unwrap()
-        .serve_at(PATH, SlowCounter)
+        .serve_at(
+            PATH,
+            SlowCounter {
+                get_started: get_started.clone(),
+            },
+        )
         .unwrap()
         .build()
         .await
@@ -326,41 +346,41 @@ async fn change_during_initial_get_window_is_not_lost() {
         .start();
     let mut stream = prop.signal().to_stream();
 
-    // Rather than guessing a single delay by which the tracker's subscribe
-    // (AddMatch) has landed, keep re-emitting PropertiesChanged(Value = 99)
-    // while polling for delivery. `subscribe_properties_changed` always
-    // completes before `cold_get` is even entered (source-level invariant,
-    // #429) — SlowCounter's 600ms-sleeping `value()` getter only starts
-    // *after* that Get request is dispatched — so once the tracker task has
-    // been scheduled at all, every retry from here on is emitted after the
-    // subscription is live and gets buffered/replayed regardless of exactly
-    // how long that took on this runner. The loop below both re-emits and
-    // polls for the resulting Loaded(99), so it early-exits the moment the
-    // race window has been positively exercised and observed.
+    // Wait (bounded) for the tracker to reach the getter. By source order
+    // (property.rs:276, #429) this can only fire after the PropertiesChanged
+    // subscription is fully live, so it's a deterministic "safe to emit"
+    // signal rather than a guessed delay — see the comment on `SlowCounter`.
+    tokio::time::timeout(Duration::from_secs(2), get_started.notified())
+        .await
+        .expect("tracker never reached the initial Get — subscribe_properties_changed stalled?");
+
+    // Emit exactly once. This is the regression assertion for #429: a single
+    // change, guaranteed (not guessed) to land inside the 600ms Get window,
+    // must be buffered and win over the Get's own `Loaded(1)`. No re-emitting
+    // — if during-window buffering regressed, this change is lost for good
+    // and the wait below must time out, not quietly succeed via post-Get live
+    // delivery.
     let emitter = SignalEmitter::new(&server, PATH).unwrap();
+    let mut changed: HashMap<&str, Value> = HashMap::new();
+    changed.insert("Value", Value::from(99u32));
+    zbus::fdo::Properties::properties_changed(
+        &emitter,
+        InterfaceName::try_from(IFACE).unwrap(),
+        changed,
+        Cow::Borrowed(&[]),
+    )
+    .await
+    .expect("failed to emit PropertiesChanged");
+
+    // Bounded wait for delivery (bus round-trip + tracker wake-up + the
+    // remainder of the 600ms Get) — generous, but never unbounded.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut final_value = None;
     while tokio::time::Instant::now() < deadline && final_value != Some(99) {
-        let mut changed: HashMap<&str, Value> = HashMap::new();
-        changed.insert("Value", Value::from(99u32));
-        let _ = zbus::fdo::Properties::properties_changed(
-            &emitter,
-            InterfaceName::try_from(IFACE).unwrap(),
-            changed,
-            Cow::Borrowed(&[]),
-        )
-        .await;
-
-        let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-        while tokio::time::Instant::now() < poll_deadline {
-            if let Ok(Some(PropState::Loaded(v))) =
-                tokio::time::timeout(Duration::from_millis(20), stream.next()).await
-            {
-                final_value = Some(v);
-                if v == 99 {
-                    break;
-                }
-            }
+        if let Ok(Some(PropState::Loaded(v))) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            final_value = Some(v);
         }
     }
 

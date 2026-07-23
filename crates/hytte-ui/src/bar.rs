@@ -9,11 +9,16 @@ use crate::layer_window::{Anchor, Margin, layer_window};
 use gtk::prelude::*;
 use gtk4_layer_shell::KeyboardMode;
 
+/// Which screen edge a [`Bar`] is docked to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Edge {
+    /// Dock along the top edge.
     Top,
+    /// Dock along the bottom edge.
     Bottom,
+    /// Dock along the left edge.
     Left,
+    /// Dock along the right edge.
     Right,
 }
 

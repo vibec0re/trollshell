@@ -15,7 +15,7 @@ pub mod widget_tree;
 pub use app::{App, AppBuilder};
 pub use bar::{Bar, BarHandle, Edge};
 pub use error::{Error, Result};
-pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window};
+pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window, on_surface_ready};
 pub use monitor::Monitor;
 pub use multi_sparkline::MultiSparkline;
 pub use popup::{Popup, PopupBuilder, Position as PopupPosition, attach_dismiss_catcher};

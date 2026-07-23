@@ -439,13 +439,6 @@ fn sync_list_picker(picker: &gtk::DropDown, lists: &[TaskList]) {
 // ── Edit popover (row body click) ────────────────────────────────────────────
 
 fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
-    let popover = gtk::Popover::new();
-    popover.add_css_class("ts-task-popover");
-    popover.set_parent(parent);
-    // Same as the create popover: the sidebar surface needs a catcher for
-    // outside-click dismissal under niri (issue #9).
-    hytte::ui::attach_dismiss_catcher(&popover, monitor);
-
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
     column.set_margin_top(8);
     column.set_margin_bottom(8);
@@ -477,6 +470,19 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
     actions.append(&cancel);
     actions.append(&save);
     column.append(&actions);
+
+    // `Popup` folds in what this used to hand-roll: the per-monitor
+    // outside-click catcher the sidebar layer surface needs under niri (#9),
+    // and unparent-on-close so each row-tap builds a fresh popover instead of
+    // accumulating them on the row.
+    let popup = Popup::new(parent)
+        .child(column)
+        .has_arrow(true)
+        .css_class("ts-task-popover")
+        .dismiss_catcher(monitor)
+        .unparent_on_close(true)
+        .build();
+    let popover = popup.popover().clone();
 
     let popover_for_save = popover.clone();
     let entry_for_save = entry.clone();
@@ -513,14 +519,7 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
         popover_for_delete.popdown();
     });
 
-    // Detach the popover from `parent` once closed so each click builds
-    // a fresh one — keeps state hygiene simple and avoids accumulating
-    // popovers on the row across edits.
-    popover.connect_closed(|p| {
-        p.unparent();
-    });
-
-    popover.popup();
+    popup.show();
     entry.grab_focus();
 }
 

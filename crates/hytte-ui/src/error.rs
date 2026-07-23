@@ -2,7 +2,12 @@
 
 use std::fmt;
 
+/// Errors returned when constructing or running a hytte [`App`](crate::App).
+///
+/// `#[non_exhaustive]`: more variants may be added, so match with a wildcard
+/// arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// `gtk::init` / `adw::init` failed.
     GtkInit(gtk::glib::BoolError),

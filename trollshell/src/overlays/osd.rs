@@ -290,18 +290,12 @@ fn build_osd_view(monitor: &Monitor) -> Rc<OsdView> {
 fn install_click_through(window: &gtk::Window) {
     use hytte::gtk::cairo;
 
-    fn apply(w: &gtk::Window) {
-        if let Some(surface) = w.surface() {
-            surface.set_input_region(Some(&cairo::Region::create()));
-        } else {
-            tracing::warn!("osd: window has no surface at map");
-        }
-    }
-
-    window.connect_map(apply);
-    if window.is_mapped() {
-        apply(window);
-    }
+    // `on_surface_ready` runs this on the first map and on every subsequent
+    // remap (the OSD remaps on each `set_visible`), and immediately if the
+    // surface is already up — see its docs for the map-once lore this folds in.
+    hytte::ui::on_surface_ready(window, |surface| {
+        surface.set_input_region(Some(&cairo::Region::create()));
+    });
 }
 
 /// Wire the four module-level signal subscriptions exactly once on the

@@ -10,6 +10,7 @@ mod cast;
 pub mod clipboard;
 pub mod clock;
 pub mod departures;
+pub mod display_config;
 pub mod displays;
 pub mod dnd;
 pub mod geoclue;

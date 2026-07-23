@@ -690,7 +690,33 @@ async fn read_item_props(bus_name: &str, object_path: &str) -> Result<TrayItem> 
     })
 }
 
-/// Read `IconPixmap` and return the largest entry as `(w, h, bytes)`.
+/// Upper bound on an SNI icon dimension — a sanity guard so a bogus giant
+/// `IconPixmap` can't allocate the world. `32768` is well above any real tray
+/// icon while keeping `width * height * 4` comfortably inside `i64`.
+const MAX_ICON_DIM: i32 = 1 << 15;
+
+/// Whether an SNI `IconPixmap` entry is a well-formed ARGB32 bitmap: positive,
+/// sanely-bounded dimensions and **exactly** `width * height * 4` bytes.
+///
+/// `IconPixmap` is an arbitrary session-bus payload, so an entry whose declared
+/// dimensions don't match its buffer length — or whose negative width would wrap
+/// the widget's `w as usize * 4` stride into a huge value — must be rejected
+/// before it reaches `gdk::MemoryTexture::new`, which would otherwise fail its
+/// size check and panic the GTK main thread. `i64` math so no product overflows.
+fn icon_pixmap_consistent(width: i32, height: i32, data_len: usize) -> bool {
+    if width <= 0 || height <= 0 || width > MAX_ICON_DIM || height > MAX_ICON_DIM {
+        return false;
+    }
+    let expected = i64::from(width) * i64::from(height) * 4;
+    i64::try_from(data_len).is_ok_and(|len| len == expected)
+}
+
+/// Read `IconPixmap` and return the largest well-formed entry as `(w, h, bytes)`.
+///
+/// Entries whose geometry doesn't match their buffer (see
+/// [`icon_pixmap_consistent`]) are skipped, so the widget only ever builds a
+/// texture from a validated ARGB32 buffer and falls back to the icon-name path
+/// when no entry is usable.
 async fn read_icon_pixmap(bus_name: &str, object_path: &str) -> Option<(i32, i32, Vec<u8>)> {
     // Type: a(iiay)
     let raw: OwnedValue = get_sni_property(bus_name, object_path, "IconPixmap").await?;
@@ -723,6 +749,17 @@ async fn read_icon_pixmap(bus_name: &str, object_path: &str) -> Option<(i32, i32
                 .iter()
                 .filter_map(|v| u8::try_from(v.try_clone().ok()?).ok())
                 .collect();
+            if !icon_pixmap_consistent(w, h, bytes.len()) {
+                tracing::warn!(
+                    width = w,
+                    height = h,
+                    data_len = bytes.len(),
+                    bus_name,
+                    object_path,
+                    "skipping malformed SNI IconPixmap entry (geometry / length mismatch)"
+                );
+                continue;
+            }
             let area = i64::from(w) * i64::from(h);
             if area > best_area {
                 best_area = area;
@@ -773,5 +810,45 @@ async fn read_menu_path(bus_name: &str, object_path: &str) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::icon_pixmap_consistent;
+
+    #[test]
+    fn icon_pixmap_accepts_exact_argb32() {
+        // 16×16 ARGB32 = 16*16*4 = 1024 bytes.
+        assert!(icon_pixmap_consistent(16, 16, 1024));
+        // 1×1.
+        assert!(icon_pixmap_consistent(1, 1, 4));
+    }
+
+    #[test]
+    fn icon_pixmap_rejects_length_mismatch() {
+        // One byte short of 16×16×4, and one byte over — both rejected (the SNI
+        // spec is exact-length, unlike the padded notification path).
+        assert!(!icon_pixmap_consistent(16, 16, 1023));
+        assert!(!icon_pixmap_consistent(16, 16, 1025));
+        // A 22×22 header over a 16×16 buffer: classic `height*stride > len`.
+        assert!(!icon_pixmap_consistent(22, 22, 1024));
+    }
+
+    #[test]
+    fn icon_pixmap_rejects_bad_dimensions() {
+        assert!(!icon_pixmap_consistent(0, 16, 0)); // zero width
+        assert!(!icon_pixmap_consistent(16, 0, 0)); // zero height
+        // Negative width: the widget's `w as usize * 4` would wrap to a huge
+        // stride — must be rejected here.
+        assert!(!icon_pixmap_consistent(-16, 16, 1024));
+        assert!(!icon_pixmap_consistent(16, -16, 1024));
+    }
+
+    #[test]
+    fn icon_pixmap_rejects_absurd_dimensions_without_overflow() {
+        // Bogus giant dimensions must be rejected by the bound, never overflow.
+        assert!(!icon_pixmap_consistent(i32::MAX, i32::MAX, 4));
+        assert!(!icon_pixmap_consistent(1 << 20, 1 << 20, 16));
     }
 }

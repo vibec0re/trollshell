@@ -106,6 +106,7 @@ async fn permanently_taken_after_three_losses() {
     // The camper subscribes to NameOwnerChanged so it can steal EXACTLY when
     // our primitive re-acquires, giving one clean steal per cycle.
     let address_clone = address.clone();
+    let state_for_camper = state.clone();
     tokio::spawn(async move {
         let camper = Builder::address(address_clone.as_str())
             .expect("camper addr")
@@ -133,9 +134,23 @@ async fn permanently_taken_after_three_losses() {
                 )
                 .await;
 
-            // Hold the name briefly so NameOwnerChanged (old=primitive, new=camper) is
-            // delivered to our primitive's stream before we release.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Wait for the primitive to positively observe the theft — its
+            // state moving off `Owned` — before releasing, rather than
+            // guessing a fixed hold is long enough for NameOwnerChanged
+            // delivery. The primitive subscribes to NameOwnerChanged once per
+            // connection, before any RequestName attempt, so this is a
+            // bounded poll on an already-live subscription, not a race to
+            // establish one. We check "not Owned" rather than the exact
+            // `Lost` variant because the primitive sets `Lost` and then
+            // immediately (synchronously, no `.await` between the two)
+            // `Acquiring` on a non-permanent loss — a poller could otherwise
+            // race past the transient `Lost` value entirely.
+            let _ = wait_for_state(
+                state_for_camper.signal_cloned(),
+                Duration::from_secs(2),
+                |s| !matches!(s, OwnState::Owned),
+            )
+            .await;
 
             // Release the name so our primitive can re-acquire.
             let _ = dbus

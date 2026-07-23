@@ -30,11 +30,15 @@ async fn task_exits_when_subscription_dropped() {
         .await
         .expect("task_done_receiver should be Some on first call");
 
-    // Give the task a moment to start up and reach its first select! wait.
-    // The task parks in the inner loop on `stream.next()` / epoch_stream.
-    // After drop, `receiver_count()` becomes 0 and the check fires on the
-    // next select! iteration.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the task actually get scheduled at least once before we drop. This
+    // is a courtesy, not a correctness requirement: `HandleTracker`'s count is
+    // decremented independently of task scheduling (see hytte-bus's
+    // handle.rs), so the task will observe `all_dropped()` the moment it
+    // first checks, even if we dropped before it ever ran. A couple of
+    // scheduler yields exercise the "already running and parked in select!"
+    // path too, without guessing a wall-clock delay.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
 
     // Drop all handles — this is the moment the task should detect the leak.
     drop(sub);
@@ -85,19 +89,33 @@ async fn delivers_emitted_signal() {
         .start();
     let mut events = sub.events();
 
-    // Give the subscription task time to register the match rule with the
-    // daemon before we emit. The task runs on the hytte-reactive runtime so
-    // it needs at least one scheduler yield plus one D-Bus round-trip.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Emit and expect to receive.
+    // Rather than guessing a single delay by which the subscription task has
+    // registered its match rule with the daemon, keep re-emitting (with a
+    // fresh, uniquely-tagged value each attempt) while polling for delivery.
+    // Once the task's AddMatch has landed, the next attempt is delivered and
+    // decoded here — this early-exits as soon as that's observed instead of
+    // paying a fixed tax on every run.
     let emitter = iface_ref.signal_emitter();
-    Pinger::pinged(emitter, 42).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut attempt = 0u32;
+    let mut received = None;
+    while tokio::time::Instant::now() < deadline && received.is_none() {
+        Pinger::pinged(emitter, attempt).await.unwrap();
 
-    let evt = tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .expect("timeout waiting for signal")
-        .expect("stream ended");
-    let body: u32 = evt.body.body().deserialize().expect("decode body");
-    assert_eq!(body, 42);
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while tokio::time::Instant::now() < poll_deadline {
+            if let Ok(Some(evt)) =
+                tokio::time::timeout(Duration::from_millis(20), events.next()).await
+            {
+                let body: u32 = evt.body.body().deserialize().expect("decode body");
+                if body == attempt {
+                    received = Some(body);
+                    break;
+                }
+            }
+        }
+        attempt += 1;
+    }
+
+    assert!(received.is_some(), "timeout waiting for signal delivery");
 }

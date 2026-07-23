@@ -21,10 +21,13 @@ use gtk::prelude::*;
 /// the next emission upgrades to `None`, the loop `break`s, and both the task
 /// and its underlying signal subscription are released.
 ///
-/// (A loop whose widget vanished while it was parked lingers until the next
-/// emission wakes it to break; meanwhile it pins no widget subtree — only the
-/// signal subscription — so the residual is negligible versus the old
-/// strong-clone, which pinned the whole detached subtree forever.)
+/// The apply-loop is *also* aborted eagerly from the widget's `destroy` signal,
+/// so a widget torn down while its signal is parked releases the task (and its
+/// subscription) immediately rather than lingering until the next emission wakes
+/// it to break. The weak upgrade stays as the guarantee — it covers the sliver
+/// between destroy and abort, and any widget freed without emitting `destroy` —
+/// so the #224 free-on-drop behaviour is unchanged; the abort just trims the
+/// residual to zero in the common teardown path.
 pub fn bind<S, W, F>(signal: S, widget: &W, apply: F)
 where
     S: Signal + 'static,
@@ -33,13 +36,23 @@ where
     F: Fn(&W, S::Item) + 'static,
 {
     let weak = widget.downgrade();
-    glib::MainContext::default().spawn_local(async move {
+    let handle = glib::MainContext::default().spawn_local(async move {
         let mut signal = std::pin::pin!(signal);
         while let Some(value) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
             let Some(widget) = weak.upgrade() else { break };
             apply(&widget, value);
         }
     });
+    abort_on_destroy(widget, handle);
+}
+
+/// Abort a bind's parked apply-loop the moment `widget` is destroyed, rather
+/// than leaving it alive until the next emission wakes it to break on a dead
+/// weak ref (see [`bind`]). Because the closure captures only the
+/// [`glib::JoinHandle`] — never the widget — it introduces no strong ref that
+/// could keep the widget alive.
+fn abort_on_destroy<W: IsA<gtk::Widget>>(widget: &W, handle: glib::JoinHandle<()>) {
+    widget.connect_destroy(move |_| handle.abort());
 }
 
 /// Bind a string-producing signal to a `gtk::Label`'s text.
@@ -104,7 +117,7 @@ pub fn bind_two_way<S, W, V, Apply, Connect>(
 {
     let handler_id = connect_user(widget);
     let weak = widget.downgrade();
-    glib::MainContext::default().spawn_local(async move {
+    let handle = glib::MainContext::default().spawn_local(async move {
         let mut signal = std::pin::pin!(signal);
         while let Some(value) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
             let Some(widget) = weak.upgrade() else { break };
@@ -113,6 +126,7 @@ pub fn bind_two_way<S, W, V, Apply, Connect>(
             widget.unblock_signal(&handler_id);
         }
     });
+    abort_on_destroy(widget, handle);
 }
 
 /// How long after the user releases a drag a signal-driven `apply` stays
@@ -206,7 +220,7 @@ pub fn bind_two_way_drag_safe<S, W, V, Apply, Connect>(
     widget.add_controller(controller);
 
     let weak = widget.downgrade();
-    glib::MainContext::default().spawn_local(async move {
+    let handle = glib::MainContext::default().spawn_local(async move {
         let mut signal = std::pin::pin!(signal);
         while let Some(value) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
             let Some(widget) = weak.upgrade() else { break };
@@ -226,6 +240,7 @@ pub fn bind_two_way_drag_safe<S, W, V, Apply, Connect>(
             widget.unblock_signal(&handler_id);
         }
     });
+    abort_on_destroy(widget, handle);
 }
 
 // Pure drag-suppression logic — no GTK, so it runs in the default (hermetic)

@@ -11,9 +11,10 @@ use adw::prelude::*;
 use futures_signals::signal::{Mutable, Signal};
 use gtk::gdk;
 use gtk::gio;
+use gtk::glib;
 use hytte_reactive::registry::{self, ServiceErased};
 use hytte_reactive::runtime;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -72,14 +73,21 @@ impl AppBuilder {
         let user_style = self.user_style;
 
         inner.connect_activate(move |inner_app| {
-            // Hold the application alive without a regular toplevel. `hold()`
-            // returns an `ApplicationHoldGuard` whose `Drop` releases the
-            // hold; we leak it so the hold lasts the process lifetime.
-            std::mem::forget(inner_app.hold());
-
             let Some(body_fn) = body_cell.borrow_mut().take() else {
+                // A redundant activate — e.g. a second launch's forwarded
+                // activation reaching the already-running primary. The shell
+                // is up; don't re-hold or re-run the body.
                 return;
             };
+
+            // First activate only: hold the application alive without a
+            // regular toplevel. `hold()` returns an `ApplicationHoldGuard`
+            // whose `Drop` releases the hold; we leak it so the hold lasts the
+            // process lifetime. Doing this inside the first-activate guard
+            // avoids leaking a fresh guard on every (possibly redundant)
+            // activate.
+            std::mem::forget(inner_app.hold());
+
             let services = services_cell.borrow_mut().take().unwrap_or_default();
 
             install_default_css();
@@ -98,8 +106,23 @@ impl AppBuilder {
             if let Some(display) = gdk::Display::default() {
                 let model = display.monitors();
                 let writer = monitors.clone();
+                // Coalesce a burst of `items_changed` into a single update on
+                // the next main-loop iteration. A replug is delivered as
+                // remove-then-add — two signals — and each raw emission would
+                // otherwise drive a full teardown/rebuild of every bar and all
+                // five overlay families. Debouncing one tick collapses that to
+                // one rebuild; consumers see one `monitors_changed`, not two.
+                let scheduled = Rc::new(Cell::new(false));
                 model.connect_items_changed(move |_, _, _, _| {
-                    writer.set(read_monitors());
+                    if scheduled.replace(true) {
+                        return;
+                    }
+                    let writer = writer.clone();
+                    let scheduled = scheduled.clone();
+                    glib::idle_add_local_once(move || {
+                        scheduled.set(false);
+                        writer.set(read_monitors());
+                    });
                 });
             }
 
@@ -109,6 +132,24 @@ impl AppBuilder {
             };
             body_fn(&app);
         });
+
+        // Register up front so a second launch can be reported *before* it
+        // silently forwards. Default single-instance flags turn a second launch
+        // into the "remote" instance: it registers, finds the primary already
+        // running, forwards its activation, and exits 0. `is_remote()` is only
+        // valid while registered (and after `run` returns the primary is torn
+        // down), so check it here — right after an explicit `register` — rather
+        // than post-run. Surfacing it turns a silent no-op that reads like a
+        // crash into a clear message (a recurring dev head-scratcher next to the
+        // deployed service).
+        if let Err(err) = inner.register(gio::Cancellable::NONE) {
+            tracing::warn!(%err, "failed to register the GApplication");
+        } else if inner.is_remote() {
+            tracing::error!(
+                "another instance of this shell is already running; this launch will \
+                 forward its activation to the primary and start no shell of its own"
+            );
+        }
 
         // Pass only argv[0] so the GTK/GIO option parser never sees Rust test
         // flags (--ignored, --test-threads, …) and does not exit non-zero.
@@ -201,6 +242,15 @@ fn read_monitors() -> Vec<Monitor> {
     out
 }
 
+/// The shipped default stylesheet, compiled into the binary as a last-resort
+/// fallback for [`install_default_css`] when the on-disk copy is missing. The
+/// on-disk path is still preferred so edits don't force a recompile; this only
+/// backstops a deployment that shipped without its assets.
+const DEFAULT_STYLESHEET: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/hytte-ui/style.css"
+));
+
 fn install_default_css() {
     let provider = gtk::CssProvider::new();
     // The default stylesheet is loaded from disk at runtime — never compiled
@@ -210,7 +260,22 @@ fn install_default_css() {
     // compile-time `CARGO_MANIFEST_DIR/../../assets/hytte-ui` path points at
     // the in-repo source (the dev `cargo run` case). Only the *path* is ever
     // baked, never the CSS.
-    provider.load_from_path(default_stylesheet_path());
+    let path = default_stylesheet_path();
+    if path.exists() {
+        provider.load_from_path(&path);
+    } else {
+        // Neither `HYTTE_UI_DATA_DIR` nor the source tree is present (a
+        // deployment shipped without its assets). `load_from_path` on a
+        // missing file loads *nothing* — silently dropping load-bearing rules,
+        // notably the transparent `.hytte-popup-catcher` (without which the
+        // outside-click catcher paints opaque over the whole screen). Fall back
+        // to the copy compiled into the binary so those rules still apply.
+        tracing::warn!(
+            path = %path.display(),
+            "default stylesheet not found on disk; using the compiled-in fallback"
+        );
+        provider.load_from_string(DEFAULT_STYLESHEET);
+    }
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,

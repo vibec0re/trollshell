@@ -1150,6 +1150,7 @@ dependencies = [
  "gtk4-layer-shell",
  "hytte-reactive",
  "libadwaita",
+ "tracing",
 ]
 
 [[package]]

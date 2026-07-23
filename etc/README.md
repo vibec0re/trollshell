@@ -13,12 +13,32 @@ into your user config directory per the per-feature README.
 | [cliphist](cliphist/README.md)                     | Clipboard history                                    | enable units                  |
 | [calendar](calendar/README.md)                     | EDS calendar sync (no config; just a setup pointer)  | use gnome-control-center      |
 | [systemd/user](systemd/user/README.md)             | The umbrella `niri-session.target` and unit topology | symlink units + enable target |
+| [skills/infobroker](skills/infobroker/SKILL.md)    | Agent skill folder for the #487 data broker CLI      | point an agent at the folder  |
 
 For the entire stack: see [systemd/user/README.md](systemd/user/README.md) for the
 full install sequence. That directory also ships
 `trollshell-plugin-clock-demo.service`, the reference out-of-process widget
 plugin (#35) — a separate, GTK-free binary that dials the shell over a Unix
 socket; see its "Out-of-process widget plugins" section.
+
+## Local AI agent data broker (infobroker)
+
+`skills/infobroker/` is the agent-facing half of the **infobroker** (#487) — the
+consent-gated broker that lets a local AI agent read _scoped_ desktop data
+(public-transport departures today; more later) without touching Annika's files
+or daemons. It follows Annika's "mcp is dead" shape: **a skill folder, not an MCP
+server** — a `SKILL.md` teaching the flow plus a `bin/infobroker` wrapper the
+agent shells out to.
+
+The broker itself is an ordinary out-of-process trollshell plugin
+(`trollshell-plugin-infobroker.service`, see
+[systemd/user/README.md](systemd/user/README.md)): a bar-chip shield whose drawer
+panel manages the durable **grants** (agent × datasource → allow/deny) and shows
+a live audit trail. An agent authenticates with `infobroker auth --agent <name>`
+→ a short-lived session token exported into its environment
+(`HYTTE_INFOBROKER_TOKEN`) → scoped `infobroker get departures`. Access is
+**denied until a human grants it** (in the panel or by editing
+`grants.toml`); a denied knock pops a desktop toast so Annika sees it.
 
 ## Idle & screen locking
 

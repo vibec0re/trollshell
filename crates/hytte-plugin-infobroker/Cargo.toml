@@ -1,0 +1,52 @@
+[package]
+name = "hytte-plugin-infobroker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The consent-gated data broker for local AI agents (issue #487, phase 1a): a hytte plugin whose own panel manages grants + audit, plus a boring JSON-lines socket the `infobroker` CLI dials to auth + fetch scoped data"
+
+[lints]
+workspace = true
+
+# The plugin binary: a normal out-of-process hytte widget plugin (chip + panel)
+# that ALSO listens on its own $XDG_RUNTIME_DIR/hytte-infobroker.sock.
+[[bin]]
+name = "hytte-plugin-infobroker"
+path = "src/plugin.rs"
+
+# The CLI the skill folder's agents shell out to (auth → env token → scoped
+# gets). The only client of the broker socket.
+[[bin]]
+name = "infobroker"
+path = "src/cli.rs"
+
+[dependencies]
+# The plugin runtime SDK (used only by the plugin binary — the shared library is
+# SDK-free so the CLI stays lean). Re-exports the proto vocabulary + tokio_stream.
+hytte-plugin = { path = "../hytte-plugin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The durable grant store (grants.toml) + the ported places.toml station config.
+toml = "1"
+# The departures datasource: the same blocking `ureq` + `spawn_blocking` idiom as
+# `hytte-plugin-departures` (accepted code dup — dedup is phase 2, once the proto
+# grows a Datasource capability). `rustls` for HTTPS.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+# RFC 3339 departure timestamps → unix seconds + `HH:MM`, and `Utc::now()` for
+# token TTLs / audit timestamps.
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }
+# The broker socket server (UnixListener + line I/O) and the blocking-fetch
+# offload. `net` for the listener, `io-util` for the buffered line read/write,
+# `rt` for `spawn`/`spawn_blocking`, `macros` for `select!`.
+tokio = { version = "1.40", default-features = false, features = [
+  "rt",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+] }

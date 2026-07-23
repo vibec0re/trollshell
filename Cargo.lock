@@ -1045,6 +1045,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-infobroker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hytte-plugin",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "ureq",
+]
+
+[[package]]
 name = "hytte-plugin-pet"
 version = "0.1.0"
 dependencies = [

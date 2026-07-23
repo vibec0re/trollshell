@@ -152,6 +152,24 @@ payoff, the first customer of that effect) — attributed to the plugin id as
 the app name, no extra unit or D-Bus setup needed. No environment variables to
 set.
 
+`trollshell-plugin-infobroker.service` is the **infobroker** (#487): the
+consent-gated data broker that lets a local AI agent read scoped desktop data.
+Like the timer it's a `Mount::BarRight` bar chip (a shield; a warning triangle +
+badge when an agent is knocking), and clicking it opens its own drawer panel —
+the durable grants (with per-row **Revoke**), the pending knocks (with one-click
+**Allow**), the datasource status, the live sessions, and a recent-requests
+audit trail. Unlike the other plugins it **also binds its own socket**,
+`$XDG_RUNTIME_DIR/hytte-infobroker.sock` (0600, same-user-only), which the
+separate `infobroker` CLI dials so an agent can `auth` (mint a session token) and
+`get` scoped data. Durable grants persist to
+`$XDG_STATE_HOME/hytte-infobroker/grants.toml` (or `~/.local/state/…`); session
+tokens are in-memory only (12 h TTL, killed by a panel revoke or a restart of
+this unit / trollshell). A denied auth/data request raises one informational
+toast via `Effect::Notify` so the human sees the knock (interactive Allow/Deny
+prompting is a later phase). The agent-facing skill folder lives at
+`etc/skills/infobroker/` (`SKILL.md` + a `bin/infobroker` wrapper). No
+environment variables to set.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

@@ -1,5 +1,4 @@
-//! Drawer panel exposing trollshell-wide preferences. v1 (minimal) covers two
-//! knobs:
+//! Drawer panel exposing trollshell-wide preferences. v1 (minimal) covers:
 //!
 //! - Dark mode — delegated to `hytte::services::theme`, which fans out across
 //!   GTK4/libadwaita, legacy GTK (gsettings + settings.ini), and Qt
@@ -11,15 +10,20 @@
 //! - Do Not Disturb — duplicates the toggle at the top of `panel_notifications`.
 //!   Both bindings drive the same `dnd::set_enabled` setter and observe the
 //!   same `dnd::enabled` signal, so they stay in sync.
+//! - Record audio (#421) — whether the next screen recording captures audio
+//!   (`wf-recorder --audio`). Session-only, like `recorder::state` itself;
+//!   `TROLLSHELL_RECORD_AUDIO=1` only seeds the starting value.
 //!
-//! Future v1.x: bar/drawer layout, idle timeouts (#28's swayidle is currently
-//! hand-edited), accent color, notification policy.
+//! Future v1.x: bar/drawer layout, idle timeouts (the native idle manager's
+//! thresholds are currently compile-time constants), accent color, notification
+//! policy.
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::dnd;
 use hytte::services::power_profiles;
+use hytte::services::recorder;
 
 use crate::components::deep_link_row::deep_link_row;
 use crate::components::layout::{finish_page, page_box};
@@ -89,6 +93,30 @@ pub fn panel_settings() -> gtk::Widget {
         gtk::prelude::WidgetExt::set_visible,
     );
     column.append(&power_group);
+
+    // ── Recording ─────────────────────────────────────────────────────────
+    // Audio-capture toggle for the screen-recording chip (#421). Applies to
+    // the *next* recording only — mirrors `recorder::set_audio_enabled`'s own
+    // doc: it never touches a recording already in progress.
+    let recording = adw::PreferencesGroup::builder().title("Recording").build();
+
+    let audio_row = adw::ActionRow::builder()
+        .title("Record audio")
+        .subtitle("Capture audio on the next screen recording (wf-recorder --audio).")
+        .build();
+    let audio_switch = gtk::Switch::new();
+    audio_switch.set_valign(gtk::Align::Center);
+    bind_two_way(
+        recorder::audio_enabled(),
+        &audio_switch,
+        gtk::Switch::set_active,
+        |sw| sw.connect_active_notify(|sw| recorder::set_audio_enabled(sw.is_active())),
+    );
+    audio_row.add_suffix(&audio_switch);
+    audio_row.set_activatable_widget(Some(&audio_switch));
+    recording.add(&audio_row);
+
+    column.append(&recording);
 
     // ── More ──────────────────────────────────────────────────────────────
     // Deep-link rows to drawer pages that don't have a dedicated bar chip.

@@ -96,7 +96,7 @@ pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_b
 pub use effect::{AudioAction, Effect, EffectOutcome, MediaAction, NiriAction, Page};
 pub use manifest::{Capability, Manifest, Mount, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
-pub use state::{ClockState, StateSnapshot};
+pub use state::{AudioSpectrum, ClockState, SPECTRUM_BINS, StateSnapshot};
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{Cls, Dir, EventKind, Node, NodeId};
 

@@ -121,7 +121,10 @@ impl Plugin for BarClock {
             } if node == BTN_ID => vec![Effect::OpenPage(Page::PluginSelf)],
             // Any other interaction, effect result, or sidebar-visibility push
             // (#288) is a no-op that never touches the view.
-            Input::Event { .. } | Input::EffectResult { .. } | Input::SlotVisible(_) => Vec::new(),
+            Input::Event { .. }
+            | Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_) => Vec::new(),
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

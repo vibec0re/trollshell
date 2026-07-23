@@ -294,7 +294,10 @@ impl Plugin for Timer {
             // No host state is subscribed and no command is issued, so the
             // snapshot / effect-result / visibility pushes are all no-ops. The
             // countdown keeps ticking whether or not the chip is on screen.
-            Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => Vec::new(),
+            Input::Snapshot(_)
+            | Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_) => Vec::new(),
         }
     }
 

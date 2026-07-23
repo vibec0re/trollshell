@@ -52,7 +52,8 @@ pub fn panel_power() -> gtk::Widget {
 /// NOT local widget state — so any monitor's drawer reflects the same toggle
 /// and a drawer rebuild never loses track (issue #270). Flipping it acquires /
 /// releases a logind idle-inhibitor fd held in the screensaver service; the
-/// existing swayidle `SIGSTOP` bridge does the actual enforcement.
+/// native idle manager honors that inhibitor (via logind's `BlockInhibited`)
+/// and skips dim/lock while it's held.
 fn build_keep_awake_row() -> gtk::ListBox {
     let list = boxed_list();
 

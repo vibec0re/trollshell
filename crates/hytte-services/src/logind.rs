@@ -57,13 +57,13 @@ pub fn poweroff() {
 /// mode="block")` on `org.freedesktop.login1.Manager`, which lives on the
 /// **system** bus.
 ///
-/// This is only the *state* half of the caffeine hybrid (issue #270). Actual
-/// keep-awake enforcement runs through the swayidle `SIGSTOP` bridge in
-/// [`crate::screensaver`] — which also covers external
-/// `org.freedesktop.ScreenSaver` inhibitors (Firefox/mpv/screen-share) that a
-/// pure-logind `BlockInhibited` watch would miss — so the caller pairs this
-/// lease with a matching screensaver inhibitor. Hold the lease in service-side
-/// state (never a widget) for as long as the inhibition should last.
+/// This is the enforcement mechanism for the "Keep awake" caffeine toggle
+/// (issue #270): the native idle manager ([`crate::idle_notify`], #204) reads
+/// logind's `BlockInhibited` before dimming/locking, so holding this `idle`
+/// lease makes it skip those actions. The caller pairs the lease with a
+/// matching screensaver inhibitor purely for visibility in
+/// [`crate::screensaver::inhibitors`]. Hold the lease in service-side state
+/// (never a widget) for as long as the inhibition should last.
 ///
 /// # Errors
 /// Returns a [`BusError`] if the `Inhibit` call fails: a transient bus error

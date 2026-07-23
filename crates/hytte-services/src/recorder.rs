@@ -22,11 +22,14 @@
 //! ## v1 decisions (#403)
 //!
 //! - `wf-recorder` over niri's portal-screencast path — simpler, dep-light.
-//! - Audio (`--audio`) is **off by default**; `TROLLSHELL_RECORD_AUDIO=1`
-//!   opts in, standing in for a future in-shell toggle.
-//! - `wf-recorder` and `slurp` are external tools that must be on `PATH`;
-//!   provisioning them via the nix module is a deferred follow-up (the
-//!   screenshot flow provisions nothing — niri captures itself).
+//! - Audio (`--audio`) is **off by default**; `TROLLSHELL_RECORD_AUDIO=1` sets
+//!   the initial default and the Settings drawer page (`panels/settings.rs`,
+//!   #421) exposes an in-shell toggle ([`audio_enabled`]/[`set_audio_enabled`])
+//!   that overrides it for the session — neither persists across restarts.
+//! - `wf-recorder` and `slurp` are external tools that must be on `PATH`; the
+//!   nix module now provisions both (#421) — the screenshot flow itself
+//!   provisions nothing (niri captures its own screenshots), so there was
+//!   nothing to mirror there.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -138,6 +141,7 @@ pub struct RecorderService;
 pub struct RecorderHandles {
     state: Mutable<RecordingState>,
     saved: Mutable<Option<SavedRecording>>,
+    audio: Mutable<bool>,
     tx: mpsc::UnboundedSender<Cmd>,
 }
 
@@ -147,9 +151,15 @@ impl Service for RecorderService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let state = Mutable::new(RecordingState::Idle);
         let saved = Mutable::new(None);
+        let audio = Mutable::new(audio_enabled_default());
         let (tx, rx) = mpsc::unbounded_channel();
-        rt.spawn(drive(state.clone(), saved.clone(), rx));
-        RecorderHandles { state, saved, tx }
+        rt.spawn(drive(state.clone(), saved.clone(), audio.clone(), rx));
+        RecorderHandles {
+            state,
+            saved,
+            audio,
+            tx,
+        }
     }
 }
 
@@ -178,6 +188,32 @@ pub fn saved() -> impl Signal<Item = Option<SavedRecording>> {
             .saved
             .signal_cloned()
     })
+}
+
+/// Subscribe to whether the *next* recording will capture audio
+/// (`wf-recorder --audio`). Seeded from `TROLLSHELL_RECORD_AUDIO`; the
+/// Settings drawer page toggles it at runtime via [`set_audio_enabled`].
+/// Changing it never affects a recording already in progress.
+pub fn audio_enabled() -> impl Signal<Item = bool> {
+    registry::with(|r| {
+        r.get::<RecorderHandles>()
+            .expect("recorder::service() not registered")
+            .audio
+            .signal_cloned()
+    })
+}
+
+/// Set whether audio is captured on the next recording (fire-and-forget).
+/// Session-only — not persisted to disk, mirroring how `RecordingState`
+/// itself resets to `Idle` on restart.
+pub fn set_audio_enabled(on: bool) {
+    registry::with(|r| {
+        if let Some(handles) = r.get::<RecorderHandles>() {
+            handles.audio.set(on);
+        } else {
+            tracing::warn!("recorder::service() not registered; ignoring set_audio_enabled");
+        }
+    });
 }
 
 /// Start a screen recording — region picked via `slurp` (fire-and-forget).
@@ -215,6 +251,7 @@ fn send(cmd: Cmd) {
 async fn drive(
     state: Mutable<RecordingState>,
     saved: Mutable<Option<SavedRecording>>,
+    audio: Mutable<bool>,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
 ) {
     let mut child: Option<Child> = None;
@@ -227,7 +264,7 @@ async fn drive(
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break }; // all senders dropped
                 match cmd {
-                    Cmd::Start => start_recording(&mut child, &mut started, &state).await,
+                    Cmd::Start => start_recording(&mut child, &mut started, &state, &audio).await,
                     Cmd::Stop => {
                         stop_recording(&mut child, &mut started, &state, &saved).await;
                     }
@@ -235,7 +272,7 @@ async fn drive(
                         if child.is_some() {
                             stop_recording(&mut child, &mut started, &state, &saved).await;
                         } else {
-                            start_recording(&mut child, &mut started, &state).await;
+                            start_recording(&mut child, &mut started, &state, &audio).await;
                         }
                     }
                 }
@@ -273,6 +310,7 @@ async fn start_recording(
     child: &mut Option<Child>,
     started: &mut Option<Instant>,
     state: &Mutable<RecordingState>,
+    audio: &Mutable<bool>,
 ) {
     if child.is_some() {
         return; // already recording
@@ -292,7 +330,7 @@ async fn start_recording(
         .to_string_lossy()
         .into_owned();
 
-    let args = recorder_args(&path, Some(&geometry), audio_enabled());
+    let args = recorder_args(&path, Some(&geometry), audio.get());
     match Command::new("wf-recorder").args(&args).spawn() {
         Ok(c) => {
             *child = Some(c);
@@ -399,10 +437,10 @@ fn recorder_args(path: &str, geometry: Option<&str>, audio: bool) -> Vec<String>
     args
 }
 
-/// Whether to pass `--audio` to `wf-recorder`. Off by default (#403 v1); an
-/// opt-in via `TROLLSHELL_RECORD_AUDIO=1` stands in for the future in-shell
-/// audio toggle.
-fn audio_enabled() -> bool {
+/// The initial value of the in-shell audio toggle ([`audio_enabled`]), read
+/// once at service start. Off by default (#403 v1); `TROLLSHELL_RECORD_AUDIO=1`
+/// opts in as the starting point, overridable at runtime from Settings.
+fn audio_enabled_default() -> bool {
     matches!(
         std::env::var("TROLLSHELL_RECORD_AUDIO").ok().as_deref(),
         Some("1" | "true" | "yes" | "on")

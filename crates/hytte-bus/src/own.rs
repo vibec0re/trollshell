@@ -44,6 +44,16 @@ pub enum OwnState {
         /// The unique name of the connection that currently holds the name.
         current_owner: String,
     },
+    /// The broker's policy refused this user the right to own the name
+    /// (`RequestName` returned `AccessDenied`). Unlike [`PermanentlyTaken`],
+    /// no peer holds the name — only a policy change (e.g. installing a
+    /// `/etc/dbus-1/system.d/` rule) will let us acquire it. The supervisor
+    /// retries on a long interval so a later policy install is picked up
+    /// **without** a shell restart. Consumers should render this distinctly
+    /// (the service is inert until the policy allows it).
+    ///
+    /// [`PermanentlyTaken`]: OwnState::PermanentlyTaken
+    Denied,
 }
 
 /// A cloneable handle to the live ownership-state signal returned by
@@ -301,6 +311,44 @@ struct InnerCtx<'a> {
     consecutive_losses_to: &'a mut Option<(String, u32)>,
 }
 
+/// Handle a failed `RequestName`: set the appropriate [`OwnState`] and back
+/// off. The caller returns afterward so the outer loop reconnects with a fresh
+/// connection + subscription and re-attempts acquisition.
+///
+/// `AccessDenied` is the notable case: the broker's policy refuses this user
+/// the right to own the name. Installing a `/etc/dbus-1/system.d/` rule
+/// (possibly while the shell is already running) is what fixes it, so we
+/// surface a distinct [`OwnState::Denied`] and retry on the long `cooldown`
+/// interval — a later policy install is then picked up without a restart. The
+/// long interval keeps this from becoming the warn-storm / FD-storm a tight
+/// retry would cause.
+async fn on_request_name_error(
+    e: fdo::Error,
+    name: &str,
+    cooldown: Duration,
+    writer: &Mutable<OwnState>,
+) {
+    if matches!(e, fdo::Error::AccessDenied(_)) {
+        tracing::info!(
+            %name,
+            retry_in_secs = cooldown.as_secs(),
+            "DBus name ownership refused by policy; service inert (install a /etc/dbus-1/system.d/ rule granting it); will retry"
+        );
+        writer.set(OwnState::Denied);
+        tokio::time::sleep(cooldown).await;
+        writer.set(OwnState::Acquiring);
+        return;
+    }
+    let as_zbus = zbus::Error::FDO(Box::new(e));
+    if is_transient_zbus_error(&as_zbus) {
+        writer.set(OwnState::Acquiring);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    } else {
+        tracing::warn!(error = %as_zbus, %name, "RequestName failed");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// Inner retry loop: reuse one connection and one `NameOwnerChanged`
 /// subscription across multiple `RequestName` attempts.
 ///
@@ -347,27 +395,9 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
         {
             Ok(r) => r,
             Err(e) => {
-                // AccessDenied = the broker's policy refuses this user the
-                // right to own the name. No retry will fix it; only
-                // installing a /etc/dbus-1/system.d/ rule will. Log once
-                // at info and park the task forever so consumers see the
-                // service as silently inert instead of a 5s warn-storm.
-                if matches!(e, fdo::Error::AccessDenied(_)) {
-                    tracing::info!(
-                        %name,
-                        "DBus name ownership refused by policy; service inert (install a /etc/dbus-1/system.d/ rule granting it)"
-                    );
-                    std::future::pending::<()>().await;
-                    unreachable!();
-                }
-                let as_zbus = zbus::Error::FDO(Box::new(e));
-                if is_transient_zbus_error(&as_zbus) {
-                    writer.set(OwnState::Acquiring);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                } else {
-                    tracing::warn!(error = %as_zbus, %name, "RequestName failed");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+                on_request_name_error(e, name, cooldown, writer).await;
+                // Return to reconnect with a fresh connection + subscription
+                // and re-attempt RequestName.
                 return;
             }
         };
@@ -480,4 +510,60 @@ async fn watch_for_loss(
         };
     }
     None // stream ended — treat as transient
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnState, on_request_name_error};
+    use futures_signals::signal::{Mutable, SignalExt as _};
+    use futures_util::StreamExt as _;
+    use std::time::Duration;
+    use zbus::fdo;
+
+    /// A `RequestName` `AccessDenied` must surface the distinct `Denied` state
+    /// and then return to `Acquiring` after the cooldown, so the outer loop
+    /// retries (a later policy install is picked up without a restart) — rather
+    /// than parking dead as the old `std::future::pending()` did.
+    #[tokio::test]
+    async fn access_denied_sets_denied_then_reacquires() {
+        let writer = Mutable::new(OwnState::Acquiring);
+        let mut stream = writer.signal_cloned().to_stream();
+        // Consume the initial `Acquiring`.
+        assert_eq!(stream.next().await, Some(OwnState::Acquiring));
+
+        let w = writer.clone();
+        let task = tokio::spawn(async move {
+            on_request_name_error(
+                fdo::Error::AccessDenied("policy refuses ownership".into()),
+                "mov.vibec0re.test.denied",
+                // The cooldown separates the two transitions enough that the
+                // signal stream observes `Denied` before `Acquiring` (no
+                // latest-value coalescing).
+                Duration::from_millis(150),
+                &w,
+            )
+            .await;
+        });
+
+        // Drive the stream until we see Denied followed by Acquiring, bounded so
+        // a regression fails the test instead of hanging it.
+        let mut saw_denied = false;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("timed out waiting for Denied→Acquiring transition");
+            match next {
+                Some(OwnState::Denied) => saw_denied = true,
+                Some(OwnState::Acquiring) if saw_denied => break,
+                Some(other) => panic!("unexpected state before Denied→Acquiring: {other:?}"),
+                None => panic!("state stream ended unexpectedly"),
+            }
+        }
+        assert!(
+            saw_denied,
+            "AccessDenied must surface a distinct Denied state"
+        );
+
+        task.await.expect("on_request_name_error task");
+    }
 }

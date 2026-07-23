@@ -4,6 +4,7 @@
 
 use crate::BusError;
 use crate::connection::SharedConnection;
+use crate::handle::HandleTracker;
 use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt;
 use std::sync::Arc;
@@ -34,11 +35,29 @@ struct PropertyInner<T> {
 
 // ── Public handle ─────────────────────────────────────────────────────────────
 
-/// Handle on a live property-tracking task. Cloning is cheap (Arc) and does
-/// not cancel; dropping the last clone tears down the background task.
-#[derive(Clone)]
+/// Handle on a live property-tracking task. Cloning is cheap and does not
+/// cancel; dropping the last clone tears down the background task (push-based,
+/// via [`HandleTracker`]).
 pub struct PropertySignal<T> {
     inner: Arc<PropertyInner<T>>,
+    tracker: Arc<HandleTracker>,
+}
+
+impl<T> Clone for PropertySignal<T> {
+    fn clone(&self) -> Self {
+        self.tracker.inc();
+        Self {
+            inner: self.inner.clone(),
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+impl<T> Drop for PropertySignal<T> {
+    fn drop(&mut self) {
+        // Wake the tracking task on the last clone drop so it exits.
+        self.tracker.dec();
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> PropertySignal<T> {
@@ -166,11 +185,11 @@ where
     pub fn start(self) -> PropertySignal<T> {
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
 
+        let tracker = HandleTracker::new();
         let inner = Arc::new(PropertyInner {
             state: Mutable::new(PropState::Loading),
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
         });
-        let weak = Arc::downgrade(&inner);
         let writer = inner.state.clone();
 
         let ctx = PropCtx {
@@ -179,32 +198,34 @@ where
             path: self.path,
             iface: self.iface,
             name: self.name,
-            weak,
+            tracker: tracker.clone(),
         };
 
         hytte_reactive::runtime::handle().spawn(async move {
             run_property::<T>(ctx, writer, task_done_tx).await;
         });
 
-        PropertySignal { inner }
+        PropertySignal { inner, tracker }
     }
 }
 
 // ── Context struct ────────────────────────────────────────────────────────────
 
-struct PropCtx<T> {
+struct PropCtx {
     shared: SharedConnection,
     dest: String,
     path: String,
     iface: String,
     name: String,
-    weak: std::sync::Weak<PropertyInner<T>>,
+    /// Live-handle tracker: `all_dropped()` reports when every [`PropertySignal`]
+    /// clone is gone, and `dropped()` is the push-based drop wakeup.
+    tracker: Arc<HandleTracker>,
 }
 
 // ── Core property-tracking loop ──────────────────────────────────────────────
 
 async fn run_property<T>(
-    ctx: PropCtx<T>,
+    ctx: PropCtx,
     writer: Mutable<PropState<T>>,
     task_done_tx: tokio::sync::oneshot::Sender<()>,
 ) where
@@ -219,7 +240,7 @@ async fn run_property<T>(
     let mut task_done_tx = Some(task_done_tx);
 
     loop {
-        if ctx.weak.upgrade().is_none() {
+        if ctx.tracker.all_dropped() {
             tracing::debug!(
                 dest = ctx.dest,
                 path = ctx.path,
@@ -266,7 +287,7 @@ async fn run_property<T>(
         let mut perm_backoff = Duration::from_millis(500);
         let mut warned_permanent = false;
         let initial = loop {
-            if ctx.weak.upgrade().is_none() {
+            if ctx.tracker.all_dropped() {
                 tracing::debug!(
                     dest = ctx.dest,
                     path = ctx.path,
@@ -327,7 +348,7 @@ async fn run_property<T>(
     }
 }
 
-async fn cold_get<T>(ctx: &PropCtx<T>) -> Result<T, BusError>
+async fn cold_get<T>(ctx: &PropCtx) -> Result<T, BusError>
 where
     T: Clone
         + Send
@@ -365,12 +386,9 @@ where
 /// built. Epoch is captured *after* `with_conn` returns so a mid-build
 /// reconnect doesn't leave us watching the wrong connection — same lesson
 /// as signals.rs's cold-start fix.
-async fn subscribe_properties_changed<T>(
-    ctx: &PropCtx<T>,
-) -> Option<(zbus::fdo::PropertiesChangedStream, u64)>
-where
-    T: Clone + Send + Sync + 'static,
-{
+async fn subscribe_properties_changed(
+    ctx: &PropCtx,
+) -> Option<(zbus::fdo::PropertiesChangedStream, u64)> {
     let conn_result = ctx.shared.with_conn(|conn| async move { Ok(conn) }).await;
 
     let current_epoch = ctx.shared.epoch();
@@ -406,12 +424,12 @@ where
 
 /// Pump the `PropertiesChanged` stream until reconnect / invalidation / handle
 /// drop. Returns `true` when all handles have been dropped and the watcher
-/// should exit entirely. Periodic liveness ticks wake the loop so we detect
-/// handle-drops while parked (same pattern as the signals primitive). The
-/// epoch arm catches supervisor reconnects so we don't stay stuck on the old
-/// connection's stream.
+/// should exit entirely. A drop-fired teardown `Notify` wakes the loop so we
+/// detect handle-drops while parked (push-based; same pattern as the other
+/// primitives). The epoch arm catches supervisor reconnects so we don't stay
+/// stuck on the old connection's stream.
 async fn drain_changes<T>(
-    ctx: &PropCtx<T>,
+    ctx: &PropCtx,
     last: &mut Option<T>,
     writer: &Mutable<PropState<T>>,
     changes: &mut zbus::fdo::PropertiesChangedStream,
@@ -427,11 +445,9 @@ where
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
     let mut epoch_stream = ctx.shared.epoch_signal().to_stream();
-    let mut liveness = tokio::time::interval(std::time::Duration::from_millis(100));
-    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        if ctx.weak.upgrade().is_none() {
+        if ctx.tracker.all_dropped() {
             tracing::debug!(
                 dest = ctx.dest,
                 path = ctx.path,
@@ -460,7 +476,9 @@ where
                     return false;
                 }
             }
-            _ = liveness.tick() => {}
+            // The last handle was dropped — loop back to the all-dropped check
+            // at the top, which exits the task.
+            () = ctx.tracker.dropped() => {}
         }
     }
 }
@@ -468,7 +486,7 @@ where
 /// Apply one `PropertiesChanged` signal. Returns `true` when the caller should
 /// break the drain loop (invalidation → re-Get on outer iteration).
 fn apply_change<T>(
-    ctx: &PropCtx<T>,
+    ctx: &PropCtx,
     sig: &zbus::fdo::PropertiesChanged,
     last: &mut Option<T>,
     writer: &Mutable<PropState<T>>,

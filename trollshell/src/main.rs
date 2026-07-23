@@ -2,6 +2,7 @@ mod assets;
 mod commands;
 mod components;
 mod control;
+mod fullscreen;
 mod modal;
 mod overlays;
 mod panels;
@@ -17,9 +18,10 @@ use hytte::gtk::{gdk, gio, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::{
     app_usage, bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures,
-    display_config, displays, dnd, geoclue, idle_notify, mpris, netconn, networkd, nightlight,
-    niri, notifications, notifications_mute, pipewire, places, power_profiles, recorder, resolved,
-    screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
+    display_config, displays, dnd, fullscreen_inhibit, geoclue, idle_notify, mpris, netconn,
+    networkd, nightlight, niri, notifications, notifications_mute, pipewire, places,
+    power_profiles, recorder, resolved, screensaver, sensors, systemd, tasks, tray, upower, vpn,
+    wallpaper, weather, wifi, wifiscan,
 };
 
 // The service-registration builder chain + body closure make `main` one long
@@ -83,6 +85,12 @@ fn main() -> hytte::ui::Result<()> {
         // in-process — dim@240 / lock@300 / suspend@600 + before-sleep relock,
         // each gated on logind inhibitors. Replaces swayidle.
         .with(idle_notify::service())
+        // Fullscreen auto-inhibit (#404): holds a logind idle inhibitor while a
+        // window is genuinely fullscreen (movie/game/presentation), so the idle
+        // manager above skips dim/lock/suspend. Fed the per-output fullscreen
+        // signal by `fullscreen::install` in the monitors loop below; policy
+        // toggle ("Keep awake when fullscreen") lives in the Power panel.
+        .with(fullscreen_inhibit::service())
         .with(systemd::service())
         .with(wallpaper::service())
         // Night-light (color temperature): toggles a zero-state wlsunset user
@@ -160,6 +168,10 @@ fn main() -> hytte::ui::Result<()> {
                         overlays::notifications::close_all();
                         overlays::osd::close_all();
                         overlays::prompt::close_all();
+                        // Abort the per-monitor fullscreen watchers (they pin
+                        // their Monitor, so they can't self-terminate) before
+                        // re-keying below (#404).
+                        fullscreen::close_all();
 
                         *bars.borrow_mut() = monitors.iter().map(build_bar).collect();
 
@@ -174,6 +186,19 @@ fn main() -> hytte::ui::Result<()> {
                             overlays::notifications::install(monitor);
                             overlays::osd::install(monitor);
                         }
+
+                        // Fullscreen auto-inhibit (#404): one watcher per
+                        // monitor forwarding its active-workspace fullscreen
+                        // state into `fullscreen_inhibit`, then drop the bits
+                        // for outputs that just vanished so a gone-but-was-
+                        // fullscreen output can't pin the inhibitor. Same
+                        // close_all → install → retain shape as the overlays.
+                        for monitor in &monitors {
+                            fullscreen::install(monitor);
+                        }
+                        let connectors: Vec<String> =
+                            monitors.iter().filter_map(Monitor::connector).collect();
+                        fullscreen_inhibit::retain_outputs(&connectors);
 
                         // Password prompt overlay on the current primary output.
                         // Guard the zero-monitor / dead-first-output case — never

@@ -256,32 +256,51 @@ async fn resolve_once(ov: &PlaceOverride) -> Option<LocationSnapshot> {
     {
         return geocode(city).await;
     }
-    match tokio::time::timeout(GEOCLUE_TIMEOUT, resolve_geoclue()).await {
-        Ok(Some(loc)) => return Some(loc),
-        Ok(None) => tracing::debug!("geoclue: GeoClue2 yielded nothing, trying env var"),
-        Err(_) => tracing::debug!("geoclue: GeoClue2 timed out, trying env var"),
+    if let Some(loc) = resolve_geoclue().await {
+        return Some(loc);
     }
+    tracing::debug!("geoclue: GeoClue2 yielded nothing (or timed out), trying env var");
     resolve_configured().await
 }
 
 /// The `GeoClue2` D-Bus dance. Untestable without a live daemon; the env-var
 /// fallback in [`resolve_once`] covers any failure here.
+///
+/// Acquires a client, takes a single fix, and — on **every** exit path
+/// (success, no-fix, or timeout) — releases the client via [`release_client`]
+/// so geoclue's Wi-Fi relocation machinery doesn't keep running for the process
+/// lifetime (#434). The fix-acquisition is bounded internally rather than by the
+/// caller so the release still runs on timeout (an external timeout would cancel
+/// us mid-`await` and leak the client).
 async fn resolve_geoclue() -> Option<LocationSnapshot> {
     let client: OwnedObjectPath = call(GEOCLUE_NAME)
         .bus(BusKind::System)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("GetClient")
+        .timeout(GEOCLUE_TIMEOUT)
         .send()
         .await
         .ok()?;
     let client_path = client.as_str().to_owned();
 
-    set_client_prop(&client_path, "DesktopId", Value::from("trollshell"))
+    let outcome = tokio::time::timeout(GEOCLUE_TIMEOUT, acquire_fix(&client_path))
+        .await
+        .unwrap_or(None);
+
+    release_client(&client, &client_path).await;
+    outcome
+}
+
+/// Configure the client, `Start` it, and take the first `LocationUpdated`. Split
+/// out from [`resolve_geoclue`] so the caller can bound it with a timeout and
+/// still release the client afterwards regardless of the outcome.
+async fn acquire_fix(client_path: &str) -> Option<LocationSnapshot> {
+    set_client_prop(client_path, "DesktopId", Value::from("trollshell"))
         .await
         .ok()?;
     set_client_prop(
-        &client_path,
+        client_path,
         "RequestedAccuracyLevel",
         Value::U32(ACCURACY_CITY),
     )
@@ -291,7 +310,7 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
     // Subscribe BEFORE Start so we don't miss the first LocationUpdated.
     let updates = hytte_bus::signals(GEOCLUE_NAME)
         .bus(BusKind::System)
-        .at_path(client_path.clone())
+        .at_path(client_path.to_owned())
         .iface(CLIENT_IFACE)
         .signal("LocationUpdated")
         .start();
@@ -299,7 +318,7 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
 
     call(GEOCLUE_NAME)
         .bus(BusKind::System)
-        .at_path(client_path.clone())
+        .at_path(client_path.to_owned())
         .iface(CLIENT_IFACE)
         .method("Start")
         .send::<()>()
@@ -324,6 +343,31 @@ async fn resolve_geoclue() -> Option<LocationSnapshot> {
         label_hint: None,
         source: LocationSource::GeoClue,
     })
+}
+
+/// Best-effort release of a `GeoClue2` client (#434): `Stop` it — so geoclue
+/// tears down the Wi-Fi-based relocation machinery it spun up — then
+/// `DeleteClient` on the Manager so the client object is dropped rather than
+/// lingering `Start`ed for the process lifetime (a later [`refresh`] then gets a
+/// fresh, un-`Start`ed client instead of re-`Start`ing this one). Errors are
+/// ignored: the client may already be gone, and a failed cleanup must never fail
+/// resolution.
+async fn release_client(client: &OwnedObjectPath, client_path: &str) {
+    let _ = call(GEOCLUE_NAME)
+        .bus(BusKind::System)
+        .at_path(client_path.to_owned())
+        .iface(CLIENT_IFACE)
+        .method("Stop")
+        .send::<()>()
+        .await;
+    let _ = call(GEOCLUE_NAME)
+        .bus(BusKind::System)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("DeleteClient")
+        .args((client.clone(),))
+        .send::<()>()
+        .await;
 }
 
 async fn set_client_prop(

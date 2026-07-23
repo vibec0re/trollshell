@@ -4,12 +4,19 @@
 
 use crate::connection::SharedConnection;
 use crate::error::BusError;
+use crate::handle::HandleTracker;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use zbus::zvariant::Type;
+
+/// Default per-call timeout, matching `call()`'s default and D-Bus
+/// conventions. A call that receives no reply within this window surfaces a
+/// (permanent) timeout error instead of hanging the caller's task forever.
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 
 // ── Public state enum ─────────────────────────────────────────────────────────
 
@@ -40,6 +47,8 @@ struct ProxyInner {
     /// dead connection.
     cached: RwLock<Option<zbus::Proxy<'static>>>,
     liveness: Mutable<ProxyState>,
+    /// Per-call timeout applied to every [`BusProxy::call`].
+    timeout: Duration,
     /// Fired when the watcher task exits. Wrapped in a Mutex so it can be
     /// taken exactly once (for tests).
     task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -47,12 +56,29 @@ struct ProxyInner {
 
 // ── Public handle ─────────────────────────────────────────────────────────────
 
-/// Handle on a live proxy that survives bus reconnects. Cloning is cheap
-/// (Arc) and does not cancel; dropping the last clone tears down the
-/// background watcher task.
-#[derive(Clone)]
+/// Handle on a live proxy that survives bus reconnects. Cloning is cheap and
+/// does not cancel; dropping the last clone tears down the background watcher
+/// task (push-based, via [`HandleTracker`]).
 pub struct BusProxy {
     inner: Arc<ProxyInner>,
+    tracker: Arc<HandleTracker>,
+}
+
+impl Clone for BusProxy {
+    fn clone(&self) -> Self {
+        self.tracker.inc();
+        Self {
+            inner: self.inner.clone(),
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+impl Drop for BusProxy {
+    fn drop(&mut self) {
+        // Wake the watcher on the last clone drop so it exits.
+        self.tracker.dec();
+    }
 }
 
 impl BusProxy {
@@ -66,22 +92,50 @@ impl BusProxy {
     ///
     /// `args` must be a tuple (even for a single argument: `(x,)`) or `()`.
     /// Returns `BusError::Transient` when the proxy is mid-reconnect.
+    ///
+    /// The call is bounded by the proxy's timeout (default 25 s, overridable
+    /// with [`ProxyBuilder::timeout`]): a peer that never replies surfaces a
+    /// (permanent) timeout error rather than hanging the caller's task forever.
+    /// A transient (connection-level) failure additionally kicks the shared
+    /// connection's reconnect path, so it is handled just like a `call()`
+    /// failure instead of being swallowed on the cached proxy.
     pub async fn call<A, R>(&self, method: &str, args: A) -> Result<R, BusError>
     where
         A: Serialize + Type,
         R: DeserializeOwned + Type,
     {
-        let guard = self.inner.cached.read().await;
-        let proxy = guard.as_ref().ok_or_else(|| {
-            let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
-                "proxy mid-reconnect".into(),
-            )));
-            BusError::Transient { source: sentinel }
-        })?;
-        proxy
-            .call::<_, _, R>(method, &args)
-            .await
-            .map_err(BusError::from_zbus)
+        // Snapshot the epoch before the call so a transient failure only
+        // invalidates the connection it was actually issued on.
+        let epoch = self.inner.shared.epoch();
+
+        // Clone the cheap `zbus::Proxy` handle out of the cache and release the
+        // read lock immediately, so a slow call cannot block the watcher from
+        // rebuilding the cache during a reconnect.
+        let proxy = {
+            let guard = self.inner.cached.read().await;
+            guard.as_ref().cloned().ok_or_else(|| {
+                let sentinel = zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                    "proxy mid-reconnect".into(),
+                )));
+                BusError::Transient { source: sentinel }
+            })?
+        };
+
+        let fut = proxy.call::<_, _, R>(method, &args);
+        let outcome = match tokio::time::timeout(self.inner.timeout, fut).await {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(zbus::Error::Failure("proxy call timeout".into())),
+        };
+
+        match outcome.map_err(BusError::from_zbus) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_transient() {
+                    self.inner.shared.invalidate_if_epoch(epoch).await;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Take the oneshot receiver that fires when the internal watcher task
@@ -103,6 +157,7 @@ pub struct ProxyBuilder {
     destination: String,
     path: String,
     iface: String,
+    timeout: Duration,
 }
 
 /// Create a proxy builder for the given destination well-known name.
@@ -121,6 +176,7 @@ pub fn proxy_with(shared: &SharedConnection, destination: impl Into<String>) -> 
         destination: destination.into(),
         path: String::new(),
         iface: String::new(),
+        timeout: DEFAULT_CALL_TIMEOUT,
     }
 }
 
@@ -139,6 +195,7 @@ impl ProxyBuilder {
             destination: self.destination,
             path: self.path,
             iface: self.iface,
+            timeout: self.timeout,
         }
     }
 
@@ -154,6 +211,14 @@ impl ProxyBuilder {
         self
     }
 
+    /// Override the per-call timeout applied to every [`BusProxy::call`]
+    /// (default 25 s). Bound this lower for calls to peers that must stay
+    /// responsive; a call exceeding it returns a timeout error.
+    pub fn timeout(mut self, d: Duration) -> Self {
+        self.timeout = d;
+        self
+    }
+
     /// Build the proxy. Connects to the current bus epoch, builds a cached
     /// `zbus::Proxy`, and spawns a watcher task. The proxy starts in
     /// `Reconnecting` state; the watcher transitions it to `Live` once it has
@@ -163,6 +228,7 @@ impl ProxyBuilder {
     /// Returns `BusError` if the initial connection or proxy construction fails.
     pub async fn build(self) -> Result<BusProxy, BusError> {
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
+        let tracker = HandleTracker::new();
 
         let inner = Arc::new(ProxyInner {
             shared: self.shared,
@@ -171,6 +237,7 @@ impl ProxyBuilder {
             iface: self.iface,
             cached: RwLock::new(None),
             liveness: Mutable::new(ProxyState::Reconnecting),
+            timeout: self.timeout,
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
         });
 
@@ -180,13 +247,17 @@ impl ProxyBuilder {
         // on `liveness()` for `Live` are guaranteed the subscription is active.
         do_rebuild_proxy_cache(&inner).await?;
 
-        // Spawn the watcher that reacts to NameOwnerChanged + epoch advances.
-        let watch_inner = Arc::downgrade(&inner);
+        // Spawn the watcher. Unlike the property/signals tasks, it holds a
+        // strong `inner` (it dereferences the cached proxy / liveness fields);
+        // the `HandleTracker` — not the Arc strong count — is the authority on
+        // when every `BusProxy` clone has been dropped, so this does not leak.
+        let task_inner = inner.clone();
+        let task_tracker = tracker.clone();
         hytte_reactive::runtime::handle().spawn(async move {
-            run_proxy_watcher(watch_inner, task_done_tx).await;
+            run_proxy_watcher(task_inner, task_tracker, task_done_tx).await;
         });
 
-        Ok(BusProxy { inner })
+        Ok(BusProxy { inner, tracker })
     }
 }
 
@@ -251,19 +322,23 @@ fn build_noc_match_rule(dest: &str) -> Result<zbus::OwnedMatchRule, zbus::Error>
 /// 3. Emit Live.
 /// 4. Drain the NOC stream + epoch signal until the stream ends or epoch bumps.
 /// 5. Set Reconnecting, loop.
-async fn run_proxy_watcher(weak: Weak<ProxyInner>, task_done_tx: tokio::sync::oneshot::Sender<()>) {
+async fn run_proxy_watcher(
+    inner: Arc<ProxyInner>,
+    tracker: Arc<HandleTracker>,
+    task_done_tx: tokio::sync::oneshot::Sender<()>,
+) {
     let mut first_iteration = true;
     let mut task_done_tx = Some(task_done_tx);
+    let dest = inner.destination.clone();
 
     loop {
-        let Some(inner) = weak.upgrade() else {
-            tracing::debug!("proxy watcher: all handles dropped; exiting");
+        if tracker.all_dropped() {
+            tracing::debug!(%dest, "proxy watcher: all handles dropped; exiting");
             if let Some(tx) = task_done_tx.take() {
                 let _ = tx.send(());
             }
             return;
-        };
-        let dest = inner.destination.clone();
+        }
 
         let Some(mut stream) = subscribe_noc(&inner, &dest).await else {
             continue;
@@ -283,7 +358,7 @@ async fn run_proxy_watcher(weak: Weak<ProxyInner>, task_done_tx: tokio::sync::on
 
         let exited = drain_noc_stream(
             &inner,
-            &weak,
+            &tracker,
             &dest,
             &mut stream,
             current_epoch,
@@ -338,18 +413,16 @@ async fn subscribe_noc(inner: &Arc<ProxyInner>, dest: &str) -> Option<zbus::Mess
 /// Returns `true` if the watcher should exit entirely (all handles dropped).
 async fn drain_noc_stream(
     inner: &Arc<ProxyInner>,
-    weak: &Weak<ProxyInner>,
+    tracker: &HandleTracker,
     dest: &str,
     stream: &mut zbus::MessageStream,
     current_epoch: u64,
     task_done_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     let mut epoch_stream = inner.shared.epoch_signal().to_stream();
-    let mut liveness_tick = tokio::time::interval(std::time::Duration::from_millis(100));
-    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        if weak.upgrade().is_none() {
+        if tracker.all_dropped() {
             tracing::debug!(%dest, "proxy watcher: all handles dropped (inner loop); exiting");
             if let Some(tx) = task_done_tx.take() {
                 let _ = tx.send(());
@@ -373,7 +446,12 @@ async fn drain_noc_stream(
                     return false;
                 }
             }
-            _ = liveness_tick.tick() => {}
+            // The last BusProxy clone was dropped — loop back to the
+            // all-dropped check at the top, which exits the task. This is the
+            // push-based replacement for the old 100 ms liveness poll (and also
+            // fixes the leak where a quiet, stable connection would never notice
+            // a drop, since the watcher holds a strong `inner`).
+            () = tracker.dropped() => {}
         }
     }
 }

@@ -8,8 +8,12 @@
 //! to bind to. Beyond the foundation's `Ping`/`Version`, the first real tab
 //! (#391) adds the **place** methods: `GetPlace` / `SetManualCity` /
 //! `SetAutoLocation`, which round-trip the shell's runtime location override
-//! (see [`hytte::services::geoclue::PlaceOverride`]). Each further tab adds its
-//! own methods here, following the same shape.
+//! (see [`hytte::services::geoclue::PlaceOverride`]). The **Plugins** tab (#348)
+//! adds `ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled`, which
+//! manage the `trollshell-plugin-<id>` **user** units through
+//! [`hytte::services::systemd`] (plugins run as systemd user units — the host is
+//! transport-only). Each further tab adds its own methods here, following the
+//! same shape.
 //!
 //! ## Why a *dedicated* bus name, not the app's primary name
 //!
@@ -36,7 +40,7 @@
 //! clippy-banned) — everything goes through `hytte_bus`.
 
 use hytte::reactive::Service;
-use hytte::services::{geoclue, places};
+use hytte::services::{geoclue, places, systemd};
 
 /// Dedicated well-known bus name for the control endpoint. Distinct from the
 /// app's primary name `mov.vibec0re.trollshell` (owned by `GApplication`) — see
@@ -133,6 +137,58 @@ impl ControlIface {
     /// auto-location; `false` re-applies the last manual city (if any).
     async fn set_auto_location(&self, auto: bool) {
         geoclue::set_auto_location(auto);
+    }
+
+    // ── Plugins (#348) ──────────────────────────────────────────────────────
+    //
+    // Tier 1 (status list) + tier 2 (on/off) of #348, backed by the plugins'
+    // systemd **user** units via [`systemd`] (which uses `hytte-bus`, so these
+    // handlers stay cross-thread-clean off the D-Bus task). The live
+    // "connected / rendering" overlay from the host's in-process plugin registry
+    // (`plugins.rs`, GTK-thread-local) is a deferred follow-up — it needs a
+    // cross-thread bridge out of the registry.
+
+    /// The installed plugin units — `(id, active_state, enabled)` per
+    /// `trollshell-plugin-<id>` **user** unit. `active_state` is systemd's
+    /// (`active` / `inactive` / `failed` / `activating` / …); `enabled` is the
+    /// persisted auto-start state. Empty if the user systemd manager can't be
+    /// reached (logged, never panics). The companion app's Plugins tab renders
+    /// one switch row per entry.
+    async fn list_plugins(&self) -> Vec<(String, String, bool)> {
+        match systemd::list_plugin_units().await {
+            Ok(units) => units
+                .into_iter()
+                .map(|u| (u.id, u.active_state, u.enabled))
+                .collect(),
+            Err(err) => {
+                tracing::warn!(%err, "ListPlugins: enumerating plugin units failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Start plugin `id`'s user unit now. Does not change its enabled state (see
+    /// [`set_plugin_enabled`](Self::set_plugin_enabled)). Re-query
+    /// [`list_plugins`](Self::list_plugins) shortly after to read back the state.
+    async fn start_plugin(&self, id: String) {
+        if let Err(err) = systemd::start_plugin(&id).await {
+            tracing::warn!(%err, plugin = %id, "StartPlugin failed");
+        }
+    }
+
+    /// Stop plugin `id`'s user unit now. Does not change its enabled state.
+    async fn stop_plugin(&self, id: String) {
+        if let Err(err) = systemd::stop_plugin(&id).await {
+            tracing::warn!(%err, plugin = %id, "StopPlugin failed");
+        }
+    }
+
+    /// Enable or disable plugin `id`'s user unit for persistence across logins.
+    /// Runtime state is unchanged — pair with start/stop to also apply it now.
+    async fn set_plugin_enabled(&self, id: String, enabled: bool) {
+        if let Err(err) = systemd::set_plugin_enabled(&id, enabled).await {
+            tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
+        }
     }
 }
 

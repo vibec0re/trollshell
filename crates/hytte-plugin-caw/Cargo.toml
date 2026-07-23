@@ -17,8 +17,13 @@ path = "src/main.rs"
 # The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream
 # (including `wrappers::UnboundedReceiverStream`, which is un-feature-gated).
 hytte-plugin = { path = "../hytte-plugin" }
-# The 2s expression-file poll loop: `rt` for `spawn`, `time` for `interval`,
-# `sync` for the mpsc that feeds each read back into `update`.
+# The shared OpenAI-compatible chat client (provider config, blocking HTTP,
+# key-from-file) — the morning briefing's voice (#407), same pattern as the
+# pet's brain; keyless it never dials out (canned/plain composition instead).
+hytte-ai-providers = { path = "../hytte-ai-providers" }
+# The 2s expression-file poll loop: `rt` for `spawn` (and the briefing's
+# `spawn_blocking`), `time` for `interval`, `sync` for the mpsc that feeds each
+# read back into `update`.
 tokio = { version = "1.40", default-features = false, features = [
   "rt",
   "time",
@@ -26,3 +31,16 @@ tokio = { version = "1.40", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The briefing's one-shot ingredient fetches (open-meteo, HAFAS) — the same
+# blocking `ureq` + `spawn_blocking` idiom as the weather/departures plugins.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+# Reads the home place (station/walk/lat/lon) out of
+# `~/.config/trollshell/places.toml` — the same file + schema the native
+# `places` service and the departures plugin read.
+toml = "1"
+# Local wall-clock for the briefing trigger (once a day, at a set hour) and
+# RFC 3339 departure timestamps → "in N min". `clock` for `Local::now()`.
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }

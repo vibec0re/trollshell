@@ -16,6 +16,24 @@ ExecStart=/usr/local/bin/hytte-plugin-caw
 # Point opencaw and this unit at the same path if you override it:
 #   Environment=CAW_EXPRESSION_PATH=%h/.local/state/caw/expression.json
 # Unlike the pet, there is NO brain service — caw herself is the brain.
+#
+# Morning briefing (#407): once a day, at/after CAW_BRIEFING_TIME local time
+# (default 07:00; "H" or "H:MM"; "off" disables), caw composes the day's shape
+# — weather + the first useful departure — into a short news caw, sticky in
+# her speech bubble until poked and mirrored as a toast. Only briefed once per
+# date (stamp at ~/.local/state/caw/briefing-stamp) and only while the box is
+# awake, so a machine suspended across the hour briefs on wake.
+#   Environment=CAW_BRIEFING_TIME=7:30
+# Ingredients come from the shared config the shell already owns: the first
+# [[place]] in ~/.config/trollshell/places.toml (lat/lon for weather, station/
+# walk/filters for departures), with $TROLLSHELL_WEATHER_CITY as the weather
+# fallback. Calendar joins once the host shares it (see the #407 spec note).
+# The voice is optional (the pet-brain pattern): a local llama-server via
+#   Environment=CAW_LLM_URL=http://127.0.0.1:8080
+# or the shared ~/.config/trollshell/openrouter.key plus
+#   Environment=CAW_LLM_MODEL=some/model
+# With neither, the briefing is a plain deterministic template — no network
+# round-trips to a brain that isn't there.
 Restart=on-failure
 RestartSec=2
 

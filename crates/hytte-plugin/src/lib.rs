@@ -304,7 +304,9 @@
 //! }
 //! ```
 
-use hytte_plugin_proto::{Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot};
+use hytte_plugin_proto::{
+    AudioSpectrum, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot,
+};
 
 pub mod preem;
 
@@ -411,6 +413,15 @@ pub enum Input<M> {
     /// burst of toggles may coalesce to the newest value; act on the value you
     /// receive, never assume you saw every intermediate edge.
     SlotVisible(bool),
+    /// The latest audio-reactive spectrum off the default sink's monitor (#405):
+    /// the host [`AudioSpectrum`](proto::AudioSpectrum) push, delivered only to a
+    /// plugin that subscribes
+    /// [`StateKey::AudioSpectrum`](proto::StateKey::AudioSpectrum). A `{peak,
+    /// bins}` frame arrives ~20 Hz **latest-wins** — fold it into the model and
+    /// render bars / a needle / beat-driven frames. A plugin rendering slower
+    /// than 20 Hz just sees the freshest frame each time; there is no backlog to
+    /// drain. Ignoring it costs nothing.
+    AudioSpectrum(AudioSpectrum),
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
 }

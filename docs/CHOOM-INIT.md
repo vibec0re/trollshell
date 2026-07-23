@@ -182,8 +182,8 @@ default branch). A source change (even CSS) reaches her system only after **merg
 "merge it and I'll test" is a real round-trip; get the PR right first. niri is a **static
 `config.kdl`** deployed by home-manager (editing `~/.config/niri/config.kdl` directly gets clobbered
 on rebuild); niri layer-rules (incl. blur) deploy with the same rebuild. The `etc/` dir holds the
-full session config the shell expects (systemd user units, keybinds, swayidle, kanshi, PAM file) —
-see `etc/README.md`.
+full session config the shell expects (systemd user units, keybinds, kanshi, PAM file) — see
+`etc/README.md`. The idle → dim → lock → suspend pipeline is native (in-process; #204 retired swayidle).
 
 ## 9. People & references
 

@@ -87,7 +87,7 @@ systemctl --user enable --now kanshi.service
 ```
 
 The unit is `PartOf=niri-session.target` and `WantedBy=niri-session.target`,
-matching swayidle/swaybg, so it starts when niri brings up its session
+matching swaybg, so it starts when niri brings up its session
 target and stops cleanly on session exit.
 
 Confirm:

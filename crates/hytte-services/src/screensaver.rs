@@ -14,25 +14,23 @@
 //! exactly the security-critical wheel not worth reinventing. Both the D-Bus
 //! `Lock()` method and [`lock`] (used by the power menu) run
 //! `loginctl lock-session`, which makes `systemd-logind` emit its `Lock`
-//! signal; the session's configured locker (e.g. swayidle's `lock` handler
-//! running swaylock) takes it from there.
+//! signal; the session's configured locker (`swaylock`, driven by logind)
+//! takes it from there.
 //!
-//! ## swayidle pause / resume
+//! ## Inhibitors and idle-pipeline enforcement
 //!
-//! While at least one inhibitor is active, swayidle is paused via `SIGSTOP`;
-//! when the last inhibitor releases, we send `SIGCONT`. swayidle upstream has
-//! no built-in pause/resume signal contract — `SIGUSR1` in recent versions
-//! actually *triggers* an idle event, which is the opposite of what we want.
-//! STOP/CONT works regardless of swayidle's internal state machine but is
-//! necessarily a process-level halt: any pending `before-sleep` callback in
-//! flight when STOP arrives will not complete until CONT. In practice
-//! swayidle is usually parked on its event loop, so this is fine.
-//!
-//! The integration assumes swayidle is the systemd `swayidle.service` user
-//! unit; PID discovery goes through
-//! `systemctl --user show -p MainPID --value swayidle.service`. If the user
-//! runs swayidle outside the unit, pause/resume becomes a no-op and
-//! inhibitors are tracked but not enforced.
+//! Inhibitors registered here are tracked and surfaced via [`inhibitors`] (the
+//! Power drawer's "what's keeping me awake" list). The native idle manager
+//! ([`crate::idle_notify`], #204) drives dim/lock/suspend and gates each action
+//! on **logind's `BlockInhibited`** — so the enforcement contract is a *logind*
+//! inhibitor, not this session-bus list. The manual "Keep awake" toggle holds a
+//! real logind idle inhibitor (below), so it suppresses dim/lock through that
+//! gate. Modern Wayland apps suppress idle via the compositor's
+//! `zwp_idle_inhibit` protocol (niri pauses `ext-idle-notify` directly for
+//! those), so this freedesktop `org.freedesktop.ScreenSaver` interface is a
+//! compatibility surface for apps that speak only the D-Bus API: their
+//! inhibitors are tracked and shown, but with swayidle (and its `SIGSTOP`
+//! bridge) retired they no longer force-pause the idle pipeline on their own.
 //!
 //! # Public API
 //!
@@ -51,13 +49,12 @@
 //! // Subscribe in widgets (e.g. a "what's keeping me awake" drawer page):
 //! screensaver::inhibitors() -> impl Signal<Item = Vec<Inhibitor>>
 //!
-//! // Manual "Keep awake" (caffeine) toggle — hybrid logind fd + SIGSTOP (#270):
+//! // Manual "Keep awake" (caffeine) toggle — logind idle inhibitor (#270):
 //! screensaver::set_keep_awake(true);                       // engage / release
 //! screensaver::keep_awake() -> impl Signal<Item = bool>    // authoritative on/off
 //! screensaver::other_inhibitors() -> impl Signal<…>        // "Also awake: …" apps
 //! ```
 
-use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::FdLease;
 use hytte_reactive::{Service, registry, runtime};
@@ -94,14 +91,16 @@ static SHARED: OnceLock<ScreenSaverShared> = OnceLock::new();
 
 // ── Manual "Keep awake" (caffeine) ─────────────────────────────────────────────
 //
-// The Power drawer's "Keep awake" toggle is a *hybrid* (issue #270):
-//   - State: a real logind idle-inhibitor fd (`logind::inhibit_idle`) — honest,
-//     inspectable via `systemd-inhibit --list`, survives a shell restart.
-//   - Enforcement: a matching screensaver `Inhibitor` registered here, so the
-//     existing swayidle `SIGSTOP` bridge actually keeps the screen awake — the
-//     same path that already enforces external `org.freedesktop.ScreenSaver`
-//     apps (Firefox/mpv/screen-share) a pure-logind `BlockInhibited` watch
-//     would miss.
+// The Power drawer's "Keep awake" toggle (issue #270) holds a real logind
+// idle-inhibitor fd (`logind::inhibit_idle`) — honest, inspectable via
+// `systemd-inhibit --list`. That fd is what *enforces* keep-awake: the native
+// idle manager (`idle_notify`, #204) gates dim/lock on logind's `BlockInhibited`
+// containing `idle`, so the held inhibitor makes it skip them. A matching
+// screensaver `Inhibitor` is also registered here purely for *visibility* — so
+// the toggle shows up in `inhibitors()` and the "Also awake" list. (Before #204
+// this screensaver inhibitor drove a swayidle `SIGSTOP` bridge for enforcement;
+// that bridge is retired now that the idle manager reads the logind inhibitor
+// directly.)
 // The toggle's authoritative on/off state is read back from `inhibitors()`
 // (via [`keep_awake`]), never from the acquire call's return — so any monitor's
 // drawer can flip it and a drawer rebuild re-derives it.
@@ -126,7 +125,7 @@ struct ManualCaffeine {
 }
 
 /// A live manual caffeine hold: the logind fd (drop = release) plus the
-/// screensaver cookie registered for `SIGSTOP` enforcement.
+/// screensaver cookie registered for visibility in [`inhibitors`].
 struct ManualHold {
     cookie: u32,
     /// Dropping this fd closes it, releasing the logind idle inhibitor. Held,
@@ -246,11 +245,11 @@ pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
 
 /// Turn the manual "Keep awake" caffeine inhibitor on or off.
 ///
-/// `on = true`: acquire a logind idle-inhibitor fd (honest, inspectable state)
-/// **and** register a matching screensaver inhibitor so the existing swayidle
-/// `SIGSTOP` bridge actually enforces keep-awake. `on = false`: drop the fd
-/// (releasing the logind inhibitor) and remove the screensaver inhibitor
-/// (`SIGCONT` if it was the last).
+/// `on = true`: acquire a logind idle-inhibitor fd (honest, inspectable state
+/// that the native idle manager honors via `BlockInhibited`) **and** register a
+/// matching screensaver inhibitor for visibility in [`inhibitors`]. `on =
+/// false`: drop the fd (releasing the logind inhibitor) and remove the
+/// screensaver inhibitor.
 ///
 /// Idempotent — calling it with the state it's already in is a no-op, so the
 /// GTK switch's programmatic `set_active` (from the authoritative-state
@@ -276,9 +275,9 @@ fn is_caffeine(i: &Inhibitor) -> bool {
 
 /// Engage manual caffeine: mark it desired and, unless a hold or an in-flight
 /// acquire already exists, spawn the async logind fd acquire. On success the
-/// task registers the screensaver inhibitor (which drives `SIGSTOP`) and stores
-/// the hold; if the user toggled back off while the fd was in flight it drops
-/// the fd instead, so a fast on→off never leaks an inhibitor.
+/// task registers the screensaver inhibitor (for visibility) and stores the
+/// hold; if the user toggled back off while the fd was in flight it drops the
+/// fd instead, so a fast on→off never leaks an inhibitor.
 fn acquire_manual(shared: &'static ScreenSaverShared) {
     {
         let mut m = shared.manual.lock().expect("caffeine state poisoned");
@@ -313,9 +312,9 @@ fn acquire_manual(shared: &'static ScreenSaverShared) {
             drop(lease);
             return;
         }
-        // Register the enforcement half: a screensaver inhibitor. This pauses
-        // swayidle (SIGSTOP) on the empty→non-empty transition and surfaces the
-        // hold in `inhibitors()` (which drives `keep_awake()`).
+        // Register the visibility half: a screensaver inhibitor that surfaces
+        // the hold in `inhibitors()` (which drives `keep_awake()`). Enforcement
+        // is the logind idle fd above, honored by the native idle manager.
         let cookie = inhibit(CAFFEINE_APP, CAFFEINE_REASON);
         m.hold = Some(ManualHold {
             cookie,
@@ -326,22 +325,22 @@ fn acquire_manual(shared: &'static ScreenSaverShared) {
 
 /// Release manual caffeine: clear the desired flag (so any in-flight acquire
 /// self-releases on completion) and, if a hold exists, drop the logind fd and
-/// remove the screensaver inhibitor (`SIGCONT` if it was the last).
+/// remove the screensaver inhibitor.
 fn release_manual(shared: &ScreenSaverShared) {
     let mut m = shared.manual.lock().expect("caffeine state poisoned");
     m.desired = false;
     if let Some(hold) = m.hold.take() {
-        // uninhibit removes the inhibitor + resumes swayidle if last; dropping
-        // `hold` (at end of scope) closes the logind fd, releasing that lock.
+        // uninhibit removes the screensaver inhibitor; dropping `hold` (at end
+        // of scope) closes the logind fd, releasing that inhibitor.
         uninhibit(hold.cookie);
     }
 }
 
 /// Ask the session to lock. trollshell no longer draws its own lock surface;
 /// this runs `loginctl lock-session`, which makes `systemd-logind` emit its
-/// `Lock` signal — the session's configured locker (swayidle → swaylock, or
-/// whatever you've wired) handles it. Safe to call from any thread: it spawns
-/// onto the shared runtime.
+/// `Lock` signal — the session's configured locker (`swaylock`, or whatever
+/// you've wired) handles it. Safe to call from any thread: it spawns onto the
+/// shared runtime.
 pub fn lock() {
     runtime::handle().spawn(async {
         match tokio::process::Command::new("loginctl")
@@ -372,7 +371,7 @@ pub fn inhibit(application: &str, reason: &str) -> u32 {
         return 0;
     };
     let cookie = shared.next_cookie.fetch_add(1, Ordering::Relaxed);
-    let was_empty = insert_inhibitor(
+    insert_inhibitor(
         &shared.state,
         Inhibitor {
             cookie,
@@ -381,9 +380,6 @@ pub fn inhibit(application: &str, reason: &str) -> u32 {
         },
     );
     publish_inhibitors(&shared.state, &shared.inhibitors);
-    if was_empty {
-        spawn_pause_swayidle();
-    }
     cookie
 }
 
@@ -393,33 +389,22 @@ pub fn uninhibit(cookie: u32) {
     let Some(shared) = SHARED.get() else {
         return;
     };
-    let became_empty = remove_inhibitor(&shared.state, cookie);
+    remove_inhibitor(&shared.state, cookie);
     publish_inhibitors(&shared.state, &shared.inhibitors);
-    if became_empty {
-        spawn_resume_swayidle();
-    }
 }
 
 // ── Internal: inhibitor map mutation ──────────────────────────────────────────
 
-/// Returns `true` if the map went from empty → non-empty (i.e. this is the
-/// transition where we should pause swayidle).
-fn insert_inhibitor(state: &Mutex<HashMap<u32, Inhibitor>>, inh: Inhibitor) -> bool {
+fn insert_inhibitor(state: &Mutex<HashMap<u32, Inhibitor>>, inh: Inhibitor) {
     let mut map = state.lock().expect("screensaver state poisoned");
-    let was_empty = map.is_empty();
     map.insert(inh.cookie, inh);
-    was_empty
 }
 
-/// Returns `true` if the map went from non-empty → empty (i.e. this is
-/// the transition where we should resume swayidle). If the cookie wasn't
-/// present, returns `false`.
-fn remove_inhibitor(state: &Mutex<HashMap<u32, Inhibitor>>, cookie: u32) -> bool {
+/// Remove the inhibitor for `cookie`. Unknown cookies are silently ignored —
+/// apps regularly double-call `UnInhibit` on shutdown.
+fn remove_inhibitor(state: &Mutex<HashMap<u32, Inhibitor>>, cookie: u32) {
     let mut map = state.lock().expect("screensaver state poisoned");
-    if map.remove(&cookie).is_none() {
-        return false;
-    }
-    map.is_empty()
+    map.remove(&cookie);
 }
 
 /// Snapshot the inhibitor map into the reactive `Mutable<Vec<_>>` for UI
@@ -432,63 +417,6 @@ fn publish_inhibitors(state: &Mutex<HashMap<u32, Inhibitor>>, view: &Mutable<Vec
         v
     };
     view.set(snapshot);
-}
-
-// ── Internal: swayidle pause / resume ─────────────────────────────────────────
-
-/// Resolve the swayidle PID by asking systemd-user for the unit's `MainPID`.
-///
-/// Returns `None` if the unit isn't loaded, isn't running, or `systemctl`
-/// itself isn't available. The caller logs and continues — pause/resume
-/// is best-effort, not load-bearing.
-async fn swayidle_pid() -> Option<i32> {
-    let out = tokio::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "-p",
-            "MainPID",
-            "--value",
-            "swayidle.service",
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let pid: i32 = s.trim().parse().ok()?;
-    if pid <= 0 {
-        return None;
-    }
-    Some(pid)
-}
-
-fn spawn_pause_swayidle() {
-    runtime::handle().spawn(async {
-        if let Err(e) = signal_swayidle(nix::sys::signal::Signal::SIGSTOP).await {
-            tracing::debug!(error = %e, "could not pause swayidle (proceeding without)");
-        }
-    });
-}
-
-fn spawn_resume_swayidle() {
-    runtime::handle().spawn(async {
-        if let Err(e) = signal_swayidle(nix::sys::signal::Signal::SIGCONT).await {
-            tracing::debug!(error = %e, "could not resume swayidle (proceeding without)");
-        }
-    });
-}
-
-async fn signal_swayidle(sig: nix::sys::signal::Signal) -> Result<()> {
-    let pid = swayidle_pid()
-        .await
-        .ok_or_else(|| anyhow!("swayidle.service has no MainPID"))?;
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), sig)
-        .with_context(|| format!("kill({pid}, {sig:?})"))?;
-    tracing::debug!(pid, ?sig, "signalled swayidle");
-    Ok(())
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -523,8 +451,9 @@ impl ScreenSaverIface {
     }
 
     /// Register an inhibitor. Returns a cookie the app must keep + pass
-    /// back to `UnInhibit`. Pauses swayidle on the empty → non-empty
-    /// transition.
+    /// back to `UnInhibit`. The inhibitor is tracked and surfaced via
+    /// [`inhibitors`] (the idle manager enforces on logind inhibitors, not this
+    /// list — see the module docs).
     async fn inhibit(&self, application_name: String, reason_for_inhibit: String) -> u32 {
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
         let inh = Inhibitor {
@@ -533,32 +462,24 @@ impl ScreenSaverIface {
             reason: reason_for_inhibit,
         };
         tracing::debug!(cookie, app = %inh.application, reason = %inh.reason, "Inhibit");
-        let was_empty = insert_inhibitor(&self.state, inh);
+        insert_inhibitor(&self.state, inh);
         publish_inhibitors(&self.state, &self.inhibitors);
-        if was_empty {
-            spawn_pause_swayidle();
-        }
         cookie
     }
 
-    /// Release an inhibitor. Resumes swayidle on the non-empty → empty
-    /// transition. Unknown cookies are silently ignored (apps double-call
-    /// `UnInhibit` on shutdown).
+    /// Release an inhibitor. Unknown cookies are silently ignored (apps
+    /// double-call `UnInhibit` on shutdown).
     async fn un_inhibit(&self, cookie: u32) {
         tracing::debug!(cookie, "UnInhibit");
-        let became_empty = remove_inhibitor(&self.state, cookie);
+        remove_inhibitor(&self.state, cookie);
         publish_inhibitors(&self.state, &self.inhibitors);
-        if became_empty {
-            spawn_resume_swayidle();
-        }
     }
 
     /// "Is the screensaver inactive right now (i.e. is the user
-    /// interacting)?" — v1 always returns `false`. niri doesn't expose an
-    /// inverse-of-idle signal, and properly tracking this would mean
-    /// shipping our own `ext-idle-notify-v1` client. Deprioritised; apps
-    /// that rely on this for video-pause heuristics already fall back to
-    /// querying input device events.
+    /// interacting)?" — always returns `false`. The native idle manager
+    /// ([`crate::idle_notify`]) now tracks idle state, but wiring it into this
+    /// legacy stub isn't worth it: apps that rely on this for video-pause
+    /// heuristics already fall back to querying input device events.
     async fn get_active(&self) -> bool {
         false
     }

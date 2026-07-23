@@ -57,7 +57,21 @@ in
 {
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
   # shared base.
-  imports = [ (import ./module-common.nix self) ];
+  imports = [
+    (import ./module-common.nix self)
+    # #204 Phase 4: the idle → dim → lock → suspend pipeline is now native
+    # (in-process in trollshell), so swayidle and its unit are retired. Keep the
+    # removed option declared with a clear message rather than deleting it
+    # silently, so a downstream config that still sets it gets a pointer instead
+    # of a cryptic "option does not exist".
+    (lib.mkRemovedOptionModule [ "programs" "trollshell" "swayidle" "enable" ] ''
+      trollshell now runs the idle → dim → lock → suspend pipeline natively,
+      in-process (#204); swayidle and its user unit have been retired. Remove
+      this option — the native idle manager
+      (crates/hytte-services/src/idle_notify.rs) replaces it and honors logind
+      inhibitors (so the "Keep awake" toggle just works). See etc/README.md.
+    '')
+  ];
 
   # The systemd user service is home-manager-only, so it lives here.
   options.programs.trollshell.systemd = {
@@ -81,19 +95,15 @@ in
   # individual setting. niri keybinds/session live in KDL and have no clean
   # home-manager path, so they stay manual — see etc/niri/.
   options.programs.trollshell.enableSessionExtras = lib.mkEnableOption ''
-    all of the session-integration extras below (fuzzel, swayidle, the
-    wallpaper daemon, cliphist, portals) as a group. Each is set with mkDefault,
-    so you can still flip an individual one off. The wallpaper daemon is the one
-    selected by programs.trollshell.wallpaper.backend (default swaybg), not
-    hardcoded — set backend = "none" to opt out of daemon management entirely'';
+    all of the session-integration extras below (fuzzel, the wallpaper daemon,
+    cliphist, portals) as a group. Each is set with mkDefault, so you can still
+    flip an individual one off. The wallpaper daemon is the one selected by
+    programs.trollshell.wallpaper.backend (default swaybg), not hardcoded — set
+    backend = "none" to opt out of daemon management entirely'';
 
   options.programs.trollshell.fuzzel.enable = lib.mkEnableOption ''
     the bundled fuzzel launcher config via home-manager's programs.fuzzel.
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
-
-  options.programs.trollshell.swayidle.enable = lib.mkEnableOption ''
-    the idle pipeline (dim at 4 min, lock at 5, suspend at 10, lock before
-    sleep) via home-manager's services.swayidle'';
 
   options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
     the bundled swaybg wallpaper user unit standalone, which reads the image
@@ -131,6 +141,18 @@ in
           # Night light daemon (#222): the wlsunset.service unit below drives it;
           # also on PATH so the user can invoke wlsunset directly.
           pkgs.wlsunset
+          # Screen-recording flow (#403, crates/hytte-services/src/recorder.rs):
+          # the bar's record-toggle chip spawns `wf-recorder` and picks a region
+          # with `slurp` — both external tools the shell doesn't bundle. Neither
+          # is behind a toggle (unlike enableSessionExtras' fuzzel/swayidle/etc.)
+          # because the record chip is always present, the same reasoning as
+          # wlsunset above; the screenshot flow provisions nothing to mirror
+          # (niri captures its own screenshots — see the NixOS module's copy of
+          # this comment). Missing binaries degrade gracefully — a logged
+          # warning, no recording — but without this the feature silently does
+          # nothing out of the box (#421).
+          pkgs.wf-recorder
+          pkgs.slurp
         ];
         fonts.fontconfig.enable = lib.mkDefault true;
 
@@ -186,7 +208,6 @@ in
       (lib.mkIf cfg.enableSessionExtras {
         programs.trollshell = {
           fuzzel.enable = lib.mkDefault true;
-          swayidle.enable = lib.mkDefault true;
           # Start the swaybg unit only when it's the chosen backend AND no
           # explicit reloadCommand is set. A hand-set reloadCommand is the
           # pre-enum way to drive another daemon (e.g. `awww img {}`); honoring
@@ -256,31 +277,11 @@ in
         };
       })
 
-      # swayidle — idle dim/lock/suspend pipeline via home-manager's module.
-      # Commands use absolute store paths because swayidle's unit only puts a
-      # shell on PATH. mkDefault keeps the timeouts/events overridable wholesale.
-      (lib.mkIf cfg.swayidle.enable {
-        services.swayidle = {
-          enable = lib.mkDefault true;
-          timeouts = lib.mkDefault [
-            {
-              timeout = 240;
-              command = "${lib.getExe pkgs.brightnessctl} -s set 10%";
-              resumeCommand = "${lib.getExe pkgs.brightnessctl} -r";
-            }
-            {
-              timeout = 300;
-              command = "${pkgs.systemd}/bin/loginctl lock-session";
-            }
-            {
-              timeout = 600;
-              command = "${pkgs.systemd}/bin/systemctl suspend";
-            }
-          ];
-          # loginctl lock-session → logind Lock → trollshell's lock surface.
-          events.before-sleep = lib.mkDefault "${pkgs.systemd}/bin/loginctl lock-session";
-        };
-      })
+      # Idle pipeline: native since #204 Phase 4 — trollshell owns dim → lock →
+      # suspend + before-sleep relock in-process (an ext-idle-notify-v1 client
+      # gated on logind inhibitors), so there is no swayidle unit to wire here.
+      # brightnessctl (for the dim step) is on PATH via the session; add it to
+      # home.packages if your login shell doesn't already provide it.
 
       # swaybg — no home-manager module exists, so a plain user unit. It reads
       # the wallpaper path at start; the Appearance drawer page rewrites that

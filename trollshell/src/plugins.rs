@@ -101,7 +101,10 @@
 //!   the per-monitor plugin drawer child ([`plugin_panel_slot`]); the plugin
 //!   opens it by emitting `Effect::OpenPage(Page::PluginSelf)`. A chip/card need
 //!   not have a panel (`panel: None`).
-//! - **State:** only [`StateKey::Clock`].
+//! - **State:** [`StateKey::Clock`] (the snapshot pump), plus the opt-in
+//!   host→plugin pushes gated on their own keys — [`StateKey::SlotVisible`]
+//!   (#288), [`StateKey::Accent`] (#376), and [`StateKey::AudioSpectrum`] (the
+//!   ~20 Hz audio tap, #405).
 //! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer, incl. `PluginSelf`
 //!   → the plugin's own panel, #349 PR2), [`Effect::RaiseOsd`] (→ the transient
 //!   OSD nudge, #236), and [`Effect::Notify`] (→ a local notification toast
@@ -116,7 +119,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Local};
 use hytte::adw;
@@ -125,11 +128,11 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
-use hytte::services::{clock, notifications};
+use hytte::services::{clock, notifications, pipewire};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
-    ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg, StateKey, StateSnapshot,
-    read_frame, socket_path, wire, write_frame,
+    AudioSpectrum, ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg, StateKey,
+    StateSnapshot, read_frame, socket_path, wire, write_frame,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -223,6 +226,12 @@ pub struct PluginHandles {
     /// default until the value lands. Re-published on every accent/scheme
     /// change, not just at startup (#396).
     accent_tx: watch::Sender<Option<[u8; 4]>>,
+    /// The latest audio-reactive spectrum off the default sink's monitor (#405),
+    /// pumped from `pipewire::audio_spectrum()` on the GTK thread ([`install`]
+    /// via [`publish_spectrum`]) and forwarded to spectrum-subscribing plugins
+    /// from tokio (per-conn spectrum tasks). Starts `None` (capture inactive);
+    /// the tap only runs while [`SPECTRUM_SUBSCRIBERS`] > 0.
+    spectrum_tx: watch::Sender<Option<AudioSpectrum>>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
 
@@ -241,8 +250,17 @@ struct ListenerCtx {
     visibility_rx: watch::Receiver<bool>,
     /// Subscriber end of [`PluginHandles::accent_tx`] (#376).
     accent_rx: watch::Receiver<Option<[u8; 4]>>,
+    /// Subscriber end of [`PluginHandles::spectrum_tx`] (#405).
+    spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
+
+/// Count of connected plugins subscribing [`StateKey::AudioSpectrum`] (#405).
+/// The capture tap is toggled active on the 0→1 edge and inactive on the 1→0
+/// edge, so the default sink's monitor is only tapped while a plugin actually
+/// consumes it — an idle desktop (or one with no audio-reactive plugin) pays
+/// nothing.
+static SPECTRUM_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
 
 impl Service for PluginsService {
     type Handles = PluginHandles;
@@ -255,6 +273,10 @@ impl Service for PluginsService {
         // Accent seeds `None` (unresolved): `install` resolves `@accent_color`
         // on the GTK thread and publishes it once the display's CSS is up (#376).
         let (accent_tx, accent_rx) = watch::channel(None);
+        // Audio spectrum seeds `None` (capture inactive): `install` pumps
+        // `pipewire::audio_spectrum()` and the tap only runs once a subscriber
+        // flips it on (#405).
+        let (spectrum_tx, spectrum_rx) = watch::channel(None);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         let handles = PluginHandles {
             sidebar_lead: Mutable::new(Vec::new()),
@@ -268,6 +290,7 @@ impl Service for PluginsService {
             clock_tx,
             visibility_tx,
             accent_tx,
+            spectrum_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
@@ -281,6 +304,7 @@ impl Service for PluginsService {
             clock_rx,
             visibility_rx,
             accent_rx,
+            spectrum_rx,
             effects_tx,
         };
         rt.spawn(async move {
@@ -340,6 +364,16 @@ pub fn install() {
         publish_accent(resolve_accent_color());
     });
 
+    // Audio spectrum pump (#405): project the live `pipewire::audio_spectrum()`
+    // (a services `AudioSpectrum`, or `None` while the tap is inactive) onto the
+    // GTK-free wire `AudioSpectrum` and publish it on the watch channel the
+    // per-conn spectrum tasks subscribe to. The signal replays its current value
+    // on subscribe, so this is up to date the moment a plugin dials in.
+    glib::MainContext::default().spawn_local(pipewire::audio_spectrum().for_each(|spectrum| {
+        publish_spectrum(spectrum.map(to_wire_spectrum));
+        std::future::ready(())
+    }));
+
     // Effect broker: drain the non-lossy effect channel in arrival order.
     // Effects are one-shot, so — unlike the idempotent trees on the render
     // mailbox — they must never be coalesced away (#277); the reader tasks strip
@@ -381,6 +415,25 @@ fn publish_accent(accent: Option<[u8; 4]>) {
             .accent_tx
             .send_replace(accent);
     });
+}
+
+/// Publish the latest audio spectrum to the per-conn spectrum tasks (#405).
+fn publish_spectrum(spectrum: Option<AudioSpectrum>) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .spectrum_tx
+            .send_replace(spectrum);
+    });
+}
+
+/// Project a services [`pipewire::AudioSpectrum`] onto the GTK-free plugin-proto
+/// [`AudioSpectrum`] the wire carries (field-for-field, #405).
+fn to_wire_spectrum(s: pipewire::AudioSpectrum) -> AudioSpectrum {
+    AudioSpectrum {
+        peak: s.peak,
+        bins: s.bins,
+    }
 }
 
 /// Resolve libadwaita's `@accent_color` to an opaque RGBA byte quad on the GTK
@@ -987,6 +1040,10 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
 /// Drive one plugin connection: handshake, then read frames until the peer
 /// disconnects, feeding renders into the mount mailbox and pushing state
 /// snapshots + events back out.
+// One cohesive per-connection lifecycle (handshake → the four opt-in push tasks
+// → reader loop → teardown); splitting it would scatter the paired setup/abort
+// of each task across helpers for no readability gain.
+#[allow(clippy::too_many_lines)]
 async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     let (mut rd, wr) = stream.into_split();
 
@@ -1066,6 +1123,24 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .contains(&StateKey::Accent)
         .then(|| tokio::spawn(accent_task(ctx.accent_rx.clone(), out_tx.clone())));
 
+    // Audio spectrum (#405): forward the ~20 Hz `{peak, bins}` push — but ONLY to
+    // a plugin that subscribes `StateKey::AudioSpectrum` (the #305 opt-in gate,
+    // exactly like accent/visibility). The capture tap itself is reference-counted
+    // across all such subscribers: the 0→1 edge starts it, the 1→0 edge (in
+    // teardown below) stops it, so the default sink's monitor is only tapped while
+    // something is listening. NOTE: this gates on a subscriber *existing*, not on
+    // its slot being on-screen — finer per-slot visibility gating is deferred (see
+    // the PR body: bar-chip visibility isn't modeled the way sidebar visibility is).
+    let spectrum = manifest
+        .subscribes
+        .contains(&StateKey::AudioSpectrum)
+        .then(|| {
+            if SPECTRUM_SUBSCRIBERS.fetch_add(1, Ordering::SeqCst) == 0 {
+                pipewire::set_spectrum_active(true);
+            }
+            tokio::spawn(spectrum_task(ctx.spectrum_rx.clone(), out_tx.clone()))
+        });
+
     // Reader loop: dispatch inbound frames until the peer disconnects.
     loop {
         match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -1123,6 +1198,13 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     if let Some(accent) = accent {
         accent.abort();
+    }
+    if let Some(spectrum) = spectrum {
+        spectrum.abort();
+        // 1→0 edge: this was the last spectrum subscriber, so stop the tap.
+        if SPECTRUM_SUBSCRIBERS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            pipewire::set_spectrum_active(false);
+        }
     }
     writer.abort();
 }
@@ -1213,6 +1295,34 @@ async fn accent_task(
     while accent_rx.changed().await.is_ok() {
         let color = *accent_rx.borrow_and_update();
         if out.send(HostMsg::Accent { color }).is_err() {
+            break;
+        }
+    }
+}
+
+/// Push the latest audio spectrum on subscribe and on every change, coalescing
+/// bursts latest-wins via `borrow_and_update` (#405). Mirrors [`accent_task`],
+/// but **skips** the `None` (capture inactive / no audio yet) state so a plugin
+/// only ever receives real `{peak, bins}` frames. Spawned **only** for a
+/// connection that subscribes [`StateKey::AudioSpectrum`] (#305) — an
+/// unsubscribed plugin never receives the frame.
+async fn spectrum_task(
+    mut spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
+    out: mpsc::UnboundedSender<HostMsg>,
+) {
+    // Seed at register (the watch replays its current value; often `None` until
+    // audio flows through the freshly-activated tap).
+    let seed = *spectrum_rx.borrow_and_update();
+    if let Some(spectrum) = seed
+        && out.send(HostMsg::AudioSpectrum { spectrum }).is_err()
+    {
+        return;
+    }
+    while spectrum_rx.changed().await.is_ok() {
+        let current = *spectrum_rx.borrow_and_update();
+        if let Some(spectrum) = current
+            && out.send(HostMsg::AudioSpectrum { spectrum }).is_err()
+        {
             break;
         }
     }
@@ -2326,6 +2436,9 @@ mod tests {
         // clock/visibility gates), and none of them subscribes `StateKey::Accent`,
         // so no accent task ever reads this; seed `None` and let the sender drop.
         let (_accent_tx, accent_rx) = watch::channel(None);
+        // Likewise for the audio spectrum (#405): these tests subscribe neither
+        // `StateKey::AudioSpectrum`, so no spectrum task reads this.
+        let (_spectrum_tx, spectrum_rx) = watch::channel(None);
         let ctx = ListenerCtx {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
@@ -2337,6 +2450,7 @@ mod tests {
             clock_rx,
             visibility_rx,
             accent_rx,
+            spectrum_rx,
             effects_tx,
         };
         (ctx, effects_rx)

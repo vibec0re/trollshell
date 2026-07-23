@@ -16,6 +16,13 @@
 //! [`hytte_ecal::CalClient`] connections (one per source UID, opened
 //! lazily on first use).
 //!
+//! Both the init and the caches are resilient (#432, shared machinery in
+//! [`crate::eds_retry`]): a failed worker init retries with backoff (the
+//! boot race against evolution-data-server's own activation; user writes
+//! queued meanwhile are replayed), a cached client that errors is evicted —
+//! together with its live view — and reconnected (EDS restart / list
+//! removed), and repeated all-lists failures rebuild the whole session.
+//!
 //! Public functions enqueue [`Op`] variants onto the worker's channel
 //! and return immediately. Writes are fire-and-forget — errors are
 //! logged via `tracing::warn`. Reads are pushed to a `Mutable<Vec<Task>>`
@@ -37,7 +44,7 @@
 //! the live view, not the poll, is what makes the list feel live. Writes
 //! also enqueue an immediate refresh.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
@@ -51,6 +58,8 @@ use hytte_reactive::{Service, registry};
 use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
 };
+
+use crate::eds_retry::{INIT_BACKOFF_START, SourceFailureStreak, next_backoff, wait_backoff};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -312,6 +321,12 @@ struct Worker {
     /// for that list; opened lazily in [`Worker::ensure_watch`] right after the
     /// list's [`CalClient`]. Dropping an entry stops its view.
     views: HashMap<String, CalClientView>,
+    /// Consecutive all-lists-failed scan tracker (#432). When it trips,
+    /// [`Worker::maybe_rebuild`] tears down and reopens the whole session.
+    failure_streak: SourceFailureStreak,
+    /// Set by [`Worker::scan_all`] when the streak trips; consumed by
+    /// [`Worker::maybe_rebuild`].
+    rebuild_pending: bool,
 }
 
 impl Worker {
@@ -337,24 +352,25 @@ impl Worker {
                     for src in registry.task_lists() {
                         list_names.insert(src.uid(), src.display_name());
                     }
-                    return Ok(Self {
-                        registry,
-                        clients: HashMap::new(),
-                        list_names,
-                        views: HashMap::new(),
-                    });
+                    return Ok(Self::from_parts(registry, list_names));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "tasks: failed to provision default local list");
                 }
             }
         }
-        Ok(Self {
+        Ok(Self::from_parts(registry, list_names))
+    }
+
+    fn from_parts(registry: Registry, list_names: HashMap<String, String>) -> Self {
+        Self {
             registry,
             clients: HashMap::new(),
             list_names,
             views: HashMap::new(),
-        })
+            failure_streak: SourceFailureStreak::default(),
+            rebuild_pending: false,
+        }
     }
 
     /// Open the [`CalClient`] for `list_uid` (lazily) and return a borrow.
@@ -372,26 +388,71 @@ impl Worker {
             .expect("just inserted; lookup can't miss"))
     }
 
+    /// Drop `list_uid`'s cached connection state — the client **and** its
+    /// live view. The view holds the (possibly dead) client's proxy: keeping
+    /// it would both stop push delivery for good and block
+    /// [`Worker::ensure_watch`] from ever re-subscribing (#432).
+    fn evict(&mut self, list_uid: &str) {
+        if self.clients.remove(list_uid).is_some() {
+            tracing::debug!(list = %list_uid, "tasks: evicted cached EDS client");
+        }
+        self.views.remove(list_uid);
+    }
+
+    /// Run `op` against `list_uid`'s (lazily opened) client, evicting the
+    /// cached connection state on failure so the next use reconnects instead
+    /// of being served a dead handle forever (#432). No automatic retry —
+    /// the safe default for writes, where a timed-out-but-applied call must
+    /// not be replayed.
+    fn with_client<T>(
+        &mut self,
+        list_uid: &str,
+        op: impl FnOnce(&CalClient) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let res = op(self.client(list_uid)?);
+        if res.is_err() {
+            self.evict(list_uid);
+        }
+        res
+    }
+
+    /// Like [`Worker::with_client`], but when the failure hit a *previously
+    /// cached* client — the EDS-restart signature: the daemon died under a
+    /// handle we were holding — reconnect and retry once immediately. Only
+    /// for idempotent operations (reads, opening a view).
+    fn with_client_retry<T>(
+        &mut self,
+        list_uid: &str,
+        op: impl Fn(&CalClient) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let cached = self.clients.contains_key(list_uid);
+        match self.with_client(list_uid, &op) {
+            Err(e) if cached => {
+                tracing::info!(
+                    list = %list_uid,
+                    error = %e,
+                    "tasks: cached EDS client failed; reconnecting"
+                );
+                self.with_client(list_uid, &op)
+            }
+            r => r,
+        }
+    }
+
     /// Open a live [`CalClientView`] over `list_uid`'s client (once) so EDS
     /// pushes change notifications for it. The view's callback enqueues an
     /// `Op::Refresh` — coalesced by the channel + the content-diff in
     /// [`Worker::refresh`] — so any external edit re-reads the list. Idempotent:
     /// a list already watched is a no-op. Best-effort — a watch that fails to
-    /// open just leaves that list on the safety-net poll.
+    /// open just leaves that list on the safety-net poll (with the failing
+    /// client evicted, so the next pass starts from a fresh connection).
     fn ensure_watch(&mut self, list_uid: &str) {
         if self.views.contains_key(list_uid) {
             return;
         }
-        let client = match self.client(list_uid) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(list = %list_uid, error = %e, "tasks: watch client connect failed");
-                return;
-            }
-        };
         // The callback runs on this worker thread (inside MainContext::iterate),
         // so it just queues a refresh; the loop drains it on the next turn.
-        match client.watch("#t", || send_op(Op::Refresh)) {
+        match self.with_client_retry(list_uid, |c| c.watch("#t", || send_op(Op::Refresh))) {
             Ok(view) => {
                 tracing::debug!(list = %list_uid, "tasks: live view watching");
                 self.views.insert(list_uid.to_string(), view);
@@ -409,6 +470,31 @@ impl Worker {
         }
     }
 
+    /// If the last scan tripped the all-lists-failed streak, tear down and
+    /// rebuild the whole EDS session (fresh [`Registry`] + empty client and
+    /// view caches) — the per-client evict path can't help when the registry
+    /// connection itself died. Returns `true` when a rebuild happened (the
+    /// caller should rescan immediately on the fresh session).
+    fn maybe_rebuild(&mut self) -> bool {
+        if !self.rebuild_pending {
+            return false;
+        }
+        self.rebuild_pending = false;
+        match Registry::new() {
+            Ok(r) => {
+                tracing::info!("tasks: rebuilt EDS session after repeated scan failures");
+                self.registry = r;
+                self.clients.clear();
+                self.views.clear();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "tasks: EDS session rebuild failed; keeping current one");
+                false
+            }
+        }
+    }
+
     /// Re-scan every task list and emit fresh signals if either the
     /// tasks Vec or the lists Vec differs from the current snapshot.
     fn refresh(
@@ -416,7 +502,13 @@ impl Worker {
         tasks_writer: &Mutable<Vec<Task>>,
         lists_writer: &Mutable<Vec<TaskList>>,
     ) {
-        let (tasks, lists) = self.scan_all();
+        let (mut tasks, mut lists) = self.scan_all();
+        if self.maybe_rebuild() {
+            // The session was just rebuilt after repeated total failures —
+            // rescan now on the fresh connection rather than serving the
+            // failed pass and waiting out another poll interval.
+            (tasks, lists) = self.scan_all();
+        }
         let tasks_changed = {
             let cur = tasks_writer.lock_ref();
             *cur != tasks
@@ -437,9 +529,16 @@ impl Worker {
         // Re-read the source list each refresh — a user adding/removing
         // an account at runtime is rare, but cheap to handle.
         let sources = self.registry.task_lists();
+        // Drop cached clients + views for sources that no longer exist — a
+        // removed list's handles would otherwise sit dead in the caches
+        // forever (#432).
+        let live: HashSet<String> = sources.iter().map(Source::uid).collect();
+        self.clients.retain(|uid, _| live.contains(uid));
+        self.views.retain(|uid, _| live.contains(uid));
+        let mut failed = 0usize;
         let mut tasks: Vec<Task> = Vec::new();
         let mut lists: Vec<TaskList> = Vec::with_capacity(sources.len());
-        for src in sources {
+        for src in &sources {
             let list_uid = src.uid();
             let list_name = src.display_name();
             self.list_names.insert(list_uid.clone(), list_name.clone());
@@ -450,17 +549,11 @@ impl Worker {
             // Establish the live push subscription before reading (idempotent),
             // so newly-appeared lists start delivering change notifications.
             self.ensure_watch(&list_uid);
-            let client = match self.client(&list_uid) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(list = %list_uid, error = %e, "tasks: client connect failed");
-                    continue;
-                }
-            };
-            let objects = match client.get_object_strings("#t") {
+            let objects = match self.with_client_retry(&list_uid, |c| c.get_object_strings("#t")) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(list = %list_uid, error = %e, "tasks: query failed");
+                    tracing::warn!(list = %list_uid, error = %e, "tasks: query failed; will reconnect on the next refresh");
+                    failed += 1;
                     continue;
                 }
             };
@@ -469,6 +562,11 @@ impl Worker {
                     tasks.push(t);
                 }
             }
+        }
+        // Every list failing repeatedly means the registry session itself is
+        // likely dead — schedule a full rebuild (#432).
+        if self.failure_streak.record(sources.len(), failed) {
+            self.rebuild_pending = true;
         }
         tasks.sort_by(sort_tasks);
         (tasks, lists)
@@ -490,9 +588,12 @@ impl Worker {
             todo.due(date_perhaps_time_from_local(dt));
         }
         let ical = wrap(&todo);
-        let client = self.client(list_uid)?;
-        client.create_from_ical(&ical)?;
-        Ok(())
+        // Evict-on-error only (no auto-retry): a timed-out-but-applied
+        // create must not be replayed into a duplicate. The eviction still
+        // means the *next* attempt reconnects fresh (#432).
+        self.with_client(list_uid, |client| {
+            client.create_from_ical(&ical).map(|_uid| ())
+        })
     }
 
     fn modify_in_place<F: FnOnce(&mut Todo)>(
@@ -501,9 +602,11 @@ impl Worker {
         uid: &str,
         mutate: F,
     ) -> anyhow::Result<()> {
-        let client = self.client(list_uid)?;
-        let current = client
-            .get_object_as_string(uid, None)?
+        // Read phase — idempotent, so a dead cached client is retried on a
+        // fresh connection: the first edit after an EDS restart succeeds
+        // instead of burning the user's click on the reconnect (#432).
+        let current = self
+            .with_client_retry(list_uid, |c| c.get_object_as_string(uid, None))?
             .ok_or_else(|| anyhow::anyhow!("task '{uid}' not found on list '{list_uid}'"))?;
         let parsed: Calendar = current
             .parse()
@@ -520,19 +623,16 @@ impl Worker {
         mutate(&mut todo);
         bump_last_modified(&mut todo);
         let ical = wrap(&todo);
-        // Re-borrow: `client()` previously borrowed `self.clients` while
-        // we held `current`; that borrow ended at `?`. Now we can ask
-        // for the client again — it's already in the cache, so the
-        // hit-path is cheap.
-        let client = self.client(list_uid)?;
-        client.modify_from_ical(&ical)?;
-        Ok(())
+        // Write phase — evict-on-error only: a timed-out-but-applied modify
+        // must not be replayed. The read phase above just proved the
+        // connection, so this almost always runs against a live client.
+        self.with_client(list_uid, |c| c.modify_from_ical(&ical))
     }
 
     fn delete(&mut self, list_uid: &str, uid: &str) -> anyhow::Result<()> {
-        let client = self.client(list_uid)?;
-        client.remove(uid, None)?;
-        Ok(())
+        // Evict-on-error only: replaying a delete that actually applied
+        // would surface a confusing not-found warning.
+        self.with_client(list_uid, |c| c.remove(uid, None))
     }
 }
 
@@ -553,16 +653,54 @@ fn run_worker(
     };
     let _ = WAKER.set(ctx.waker());
 
-    let mut worker = match Worker::new() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!(error = %e, "tasks: EDS worker init failed; service inert");
-            // Drain the channel anyway so senders don't get backpressure
-            // errors. We can't recover without restart.
-            for _ in rx {}
-            return;
+    // Init with retry + backoff instead of going permanently inert: at
+    // session bring-up trollshell and evolution-data-server activate
+    // concurrently, so the first `Registry::new()` (a blocking D-Bus
+    // round-trip) plausibly times out. Ops consumed while backing off are
+    // kept: refreshes are subsumed by the post-init refresh, writes are
+    // buffered and replayed so an early user action isn't dropped (#432).
+    let mut attempts = 0u32;
+    let mut backoff = INIT_BACKOFF_START;
+    let mut pending: Vec<Op> = Vec::new();
+    let mut worker = loop {
+        match Worker::new() {
+            Ok(w) => break w,
+            Err(e) => {
+                attempts = attempts.saturating_add(1);
+                // First failure at warn for visibility; the rest at debug so
+                // a machine where EDS never appears doesn't fill the journal.
+                if attempts == 1 {
+                    tracing::warn!(error = %e, retry_in_s = backoff.as_secs(), "tasks: EDS worker init failed; retrying");
+                } else {
+                    tracing::debug!(error = %e, attempts, retry_in_s = backoff.as_secs(), "tasks: EDS worker init failed; retrying");
+                }
+                let alive = wait_backoff(rx, backoff, |op| {
+                    if !matches!(op, Op::Refresh) {
+                        pending.push(op);
+                    }
+                });
+                if !alive {
+                    return; // every sender gone — shutting down
+                }
+                backoff = next_backoff(backoff);
+            }
         }
     };
+    if attempts > 0 {
+        tracing::info!(attempts, "tasks: EDS worker init succeeded after retries");
+    }
+    if pending.is_empty() {
+        if attempts > 0 {
+            // Refresh pings were consumed while backing off — populate now
+            // rather than waiting out the next poll tick.
+            worker.refresh(tasks_writer, lists_writer);
+        }
+    } else {
+        // Replay buffered writes; each one refreshes via `handle`.
+        for op in pending {
+            handle(&mut worker, op, tasks_writer, lists_writer);
+        }
+    }
 
     // Event loop. Each turn: drain every queued op (so a burst of commands or
     // view-pushed refreshes coalesces), then block in one GMainContext

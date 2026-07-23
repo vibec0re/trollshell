@@ -19,6 +19,12 @@
 //! [`hytte_ecal::CalClient`] connections (one per calendar source UID,
 //! opened lazily on first use).
 //!
+//! Both the init and the cache are resilient (#432, shared machinery in
+//! [`crate::eds_retry`]): a failed worker init retries with backoff (the
+//! boot race against evolution-data-server's own activation), a cached
+//! client that errors is evicted and reconnected (EDS restart / calendar
+//! removed), and repeated all-sources failures rebuild the whole session.
+//!
 //! The service exposes [`events()`] — `Signal<Vec<CalendarEvent>>`, sorted
 //! by start time. It covers the **union** of:
 //!
@@ -58,7 +64,7 @@
 //!   `WithTimezone`/chrono-tz fallback no longer gates recurring events.
 //!   All-day instances anchor to local midnight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -69,6 +75,8 @@ use hytte_ecal::sys::ECalClientSourceType;
 use hytte_ecal::{CalClient, EventInstance, Registry, Source};
 use hytte_reactive::{Service, registry};
 use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
+
+use crate::eds_retry::{INIT_BACKOFF_START, SourceFailureStreak, next_backoff, wait_backoff};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -242,6 +250,12 @@ pub fn refresh() {
 struct Worker {
     registry: Registry,
     clients: HashMap<String, CalClient>,
+    /// Consecutive all-sources-failed scan tracker (#432). When it trips,
+    /// [`Worker::maybe_rebuild`] tears down and reopens the whole session.
+    failure_streak: SourceFailureStreak,
+    /// Set by [`Worker::scan_all`] when the streak trips; consumed by
+    /// [`Worker::maybe_rebuild`].
+    rebuild_pending: bool,
 }
 
 impl Worker {
@@ -249,6 +263,8 @@ impl Worker {
         Ok(Self {
             registry: Registry::new()?,
             clients: HashMap::new(),
+            failure_streak: SourceFailureStreak::default(),
+            rebuild_pending: false,
         })
     }
 
@@ -274,11 +290,85 @@ impl Worker {
         }
     }
 
+    /// Query expanded instances for one source, reconnecting once on
+    /// failure: a cached [`CalClient`] whose backing daemon restarted (or
+    /// whose calendar was removed) errors on use — a failure on a
+    /// *previously cached* client is the EDS-restart signature, so evict it
+    /// and retry immediately on a fresh connection. One EDS restart then
+    /// costs one poll cycle, not the rest of the session (#432).
+    fn instances(
+        &mut self,
+        source_uid: &str,
+        start_unix: i64,
+        end_unix: i64,
+    ) -> anyhow::Result<Vec<EventInstance>> {
+        let cached = self.clients.contains_key(source_uid);
+        match self.try_instances(source_uid, start_unix, end_unix) {
+            Err(e) if cached => {
+                tracing::info!(
+                    source = %source_uid,
+                    error = %e,
+                    "calendar: cached EDS client failed; reconnecting"
+                );
+                self.try_instances(source_uid, start_unix, end_unix)
+            }
+            r => r,
+        }
+    }
+
+    /// One expansion attempt against `source_uid`'s (lazily opened) client.
+    /// Any failure evicts the cached client so the next use reconnects
+    /// instead of being served a dead handle forever.
+    fn try_instances(
+        &mut self,
+        source_uid: &str,
+        start_unix: i64,
+        end_unix: i64,
+    ) -> anyhow::Result<Vec<EventInstance>> {
+        let res = self
+            .client(source_uid)?
+            .generate_instances(start_unix, end_unix);
+        if res.is_err() {
+            self.clients.remove(source_uid);
+        }
+        res
+    }
+
+    /// If the last scan tripped the all-sources-failed streak, tear down
+    /// and rebuild the whole EDS session (fresh [`Registry`] + empty client
+    /// cache) — the per-client evict path can't help when the registry
+    /// connection itself died. Returns `true` when a rebuild happened (the
+    /// caller should rescan immediately on the fresh session).
+    fn maybe_rebuild(&mut self) -> bool {
+        if !self.rebuild_pending {
+            return false;
+        }
+        self.rebuild_pending = false;
+        match Registry::new() {
+            Ok(r) => {
+                tracing::info!("calendar: rebuilt EDS session after repeated scan failures");
+                self.registry = r;
+                self.clients.clear();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "calendar: EDS session rebuild failed; keeping current one");
+                false
+            }
+        }
+    }
+
     /// Re-scan every calendar source and emit a fresh `Vec` only if it
     /// differs from the current snapshot (`PartialEq` dedup avoids
     /// re-emitting an identical list every minute).
     fn refresh(&mut self, writer: &Mutable<Vec<CalendarEvent>>) {
-        let snapshot = self.scan_all();
+        let mut snapshot = self.scan_all();
+        if self.maybe_rebuild() {
+            // The session was just rebuilt after repeated total failures —
+            // rescan now on the fresh connection rather than serving the
+            // failed pass and waiting out another poll interval.
+            snapshot = self.scan_all();
+        }
         let changed = {
             let cur = writer.lock_ref();
             *cur != snapshot
@@ -337,17 +427,16 @@ impl Worker {
         // runtime (e.g. a new Nextcloud calendar discovered under the
         // collection source) is picked up without a restart.
         let sources = self.registry.calendars();
+        // Drop cached clients for sources that no longer exist — a removed
+        // calendar's handle would otherwise sit dead in the cache forever
+        // (#432).
+        let live: HashSet<String> = sources.iter().map(Source::uid).collect();
+        self.clients.retain(|uid, _| live.contains(uid));
+        let mut failed = 0usize;
         let mut out: Vec<CalendarEvent> = Vec::new();
-        for src in sources {
+        for src in &sources {
             let source_uid = src.uid();
             let calendar_name = src.display_name();
-            let client = match self.client(&source_uid) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(source = %source_uid, error = %e, "calendar: client connect failed");
-                    continue;
-                }
-            };
             // Ask libecal to EXPAND every component over the window: each
             // recurring event yields one instance per occurrence inside
             // [start_unix, end_unix), with authoritative per-instance
@@ -355,10 +444,11 @@ impl Worker {
             // events come back as a single instance. This replaces the old
             // `get_object_strings("#t")` master-only path — see the
             // module-level "Recurrence expansion" note (#29).
-            let instances = match client.generate_instances(start_unix, end_unix) {
+            let instances = match self.instances(&source_uid, start_unix, end_unix) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(source = %source_uid, error = %e, "calendar: instance expansion failed");
+                    tracing::warn!(source = %source_uid, error = %e, "calendar: source scan failed; will reconnect on the next refresh");
+                    failed += 1;
                     continue;
                 }
             };
@@ -369,6 +459,11 @@ impl Worker {
                     out.push(ev);
                 }
             }
+        }
+        // Every source failing repeatedly means the registry session itself
+        // is likely dead — schedule a full rebuild (#432).
+        if self.failure_streak.record(sources.len(), failed) {
+            self.rebuild_pending = true;
         }
         out.sort_by_key(|e| e.start);
         out
@@ -517,16 +612,41 @@ fn parse_event_meta(ical: &str) -> EventMeta {
 }
 
 fn run_worker(rx: &mpsc::Receiver<()>, writer: &Mutable<Vec<CalendarEvent>>) {
-    let mut worker = match Worker::new() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!(error = %e, "calendar: EDS worker init failed; service inert");
-            // Drain the channel so the ticker's sends don't error out; we
-            // can't recover without a restart.
-            for () in rx {}
-            return;
+    // Init with retry + backoff instead of going permanently inert: at
+    // session bring-up trollshell and evolution-data-server activate
+    // concurrently, so the first `Registry::new()` (a blocking D-Bus
+    // round-trip) plausibly times out. Refresh pings consumed while backing
+    // off are subsumed by the retry itself (#432).
+    let mut attempts = 0u32;
+    let mut backoff = INIT_BACKOFF_START;
+    let mut worker = loop {
+        match Worker::new() {
+            Ok(w) => break w,
+            Err(e) => {
+                attempts = attempts.saturating_add(1);
+                // First failure at warn for visibility; the rest at debug so
+                // a machine where EDS never appears doesn't fill the journal.
+                if attempts == 1 {
+                    tracing::warn!(error = %e, retry_in_s = backoff.as_secs(), "calendar: EDS worker init failed; retrying");
+                } else {
+                    tracing::debug!(error = %e, attempts, retry_in_s = backoff.as_secs(), "calendar: EDS worker init failed; retrying");
+                }
+                if !wait_backoff(rx, backoff, |()| {}) {
+                    return; // every sender gone — shutting down
+                }
+                backoff = next_backoff(backoff);
+            }
         }
     };
+    if attempts > 0 {
+        tracing::info!(
+            attempts,
+            "calendar: EDS worker init succeeded after retries"
+        );
+        // Refresh pings were consumed while backing off — populate now
+        // rather than waiting out the next poll tick.
+        worker.refresh(writer);
+    }
     while rx.recv().is_ok() {
         worker.refresh(writer);
     }

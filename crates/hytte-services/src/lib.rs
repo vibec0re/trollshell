@@ -13,6 +13,7 @@ pub mod departures;
 pub mod display_config;
 pub mod displays;
 pub mod dnd;
+mod eds_retry;
 pub mod geoclue;
 pub mod hooks;
 pub mod idle_notify;

@@ -12,9 +12,14 @@
 //! bar↔frame boundary is seamless. (The frosted-glass/translucent variant is
 //! parked on the `experiment/frosted-glass-blur` branch.)
 //!
-//! Visual constants — match `etc/niri/frame.kdl` struts and the
-//! post-restyle bar geometry from `style.css`. If any of these change,
-//! update both sides.
+//! The top inset is read live from the bar's own `gtk::Window` at draw time
+//! (mirroring `modal::BarGeometry::thickness()`'s "read live, not once"
+//! convention) rather than a hardcoded constant — the bar's padding is
+//! em-based, so a hardcoded height goes stale the moment text-scale or the
+//! configurable bar font-size (#135) pushes it past the 1x baseline (#441).
+//!
+//! `FRAME_THICKNESS`/`CUTOUT_RADIUS` remain static — match `etc/niri/frame.kdl`
+//! struts. If either changes, update both sides.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,9 +51,16 @@ thread_local! {
     static FRAMES: RefCell<HashMap<String, FrameView>> = RefCell::new(HashMap::new());
 }
 
-/// Bar height after restyle: `padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44.
-/// Top inset of the frame (= top of the workspace cutout).
-const BAR_HEIGHT: f64 = 44.0;
+/// Fallback top inset used only for the brief window before the bar's
+/// `gtk::Window` has completed its first layout pass — `gtk_widget_get_height`
+/// returns 0 pre-allocation, and 0 would collapse the cutout onto the bar.
+/// Once the bar is allocated, [`bar_height`] reads its real height instead.
+///
+/// Scaled (rather than a flat literal) so the fallback is still a reasonable
+/// approximation if the effective font is already larger than the 1x
+/// baseline at that point: matches the previous hardcoded `BAR_HEIGHT`
+/// (`padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44) at 1x.
+const FALLBACK_BAR_HEIGHT: i32 = 44;
 
 /// Frame thickness on left, right, and bottom. Must match the niri
 /// `struts` values in `etc/niri/frame.kdl`.
@@ -57,8 +69,10 @@ const FRAME_THICKNESS: f64 = 8.0;
 /// Corner radius for all four corners of the workspace cutout.
 const CUTOUT_RADIUS: f64 = 10.0;
 
-/// Mount one frame overlay on `monitor`.
-pub fn install(monitor: &Monitor) {
+/// Mount one frame overlay on `monitor`. `bar` is the bar built for this
+/// monitor (built just before this in `main.rs`'s per-monitor loop); its
+/// window is read live for the frame's top inset (#441) — see [`bar_height`].
+pub fn install(monitor: &Monitor, bar: &BarHandle) {
     let connector = match monitor.connector() {
         Some(c) if !c.is_empty() => c,
         _ => {
@@ -89,7 +103,7 @@ pub fn install(monitor: &Monitor) {
     area.set_vexpand(true);
     window.set_child(Some(&area));
 
-    install_draw(&area, monitor.clone());
+    install_draw(&area, monitor.clone(), bar.window().clone());
 
     // Empty input region: clicks pass through to the bar (Layer::Top below)
     // and to niri's apps (normal layer below that). Set after realize so
@@ -189,16 +203,17 @@ fn install_click_through(window: &gtk::Window) {
     });
 }
 
-fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
+fn install_draw(area: &gtk::DrawingArea, monitor: Monitor, bar_window: gtk::Window) {
     use hytte::gtk::cairo;
 
     let monitor_for_draw = monitor;
     area.set_draw_func(move |_area, cr: &cairo::Context, width: i32, height: i32| {
         let w = f64::from(width);
         let h = f64::from(height);
+        let bar_h = bar_height(&bar_window);
 
         // Skip if the area is too small to contain the bar + bottom inset.
-        if h <= BAR_HEIGHT + FRAME_THICKNESS || w <= 2.0 * FRAME_THICKNESS {
+        if h <= bar_h + FRAME_THICKNESS || w <= 2.0 * FRAME_THICKNESS {
             return;
         }
 
@@ -208,7 +223,7 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
             &monitor_for_draw,
         ));
 
-        let (cx, cy, cw, ch) = cutout_rect(w, h, left_inset);
+        let (cx, cy, cw, ch) = cutout_rect(w, h, left_inset, bar_h);
         if cw <= 0.0 || ch <= 0.0 {
             return;
         }
@@ -218,7 +233,7 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         // EvenOdd so the cutout is excluded.
         cr.set_fill_rule(cairo::FillRule::EvenOdd);
 
-        // Outer region: from (left_inset, BAR_HEIGHT) to (w, h). Starting at
+        // Outer region: from (left_inset, bar_h) to (w, h). Starting at
         // left_inset (instead of 0) means the frame's cairo paint never enters
         // the sidebar's region — the sidebar's surface (Layer::Top, below this
         // Layer::Overlay frame) shows through naturally. When the sidebar is
@@ -236,7 +251,7 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
         } else {
             0.0
         };
-        cr.rectangle(outer_left, BAR_HEIGHT, w - outer_left, h - BAR_HEIGHT);
+        cr.rectangle(outer_left, bar_h, w - outer_left, h - bar_h);
 
         // Inner cutout: rounded rect at (cx, cy) of size (cw, ch).
         rounded_rect(cr, cx, cy, cw, ch, CUTOUT_RADIUS);
@@ -250,6 +265,26 @@ fn install_draw(area: &gtk::DrawingArea, monitor: Monitor) {
             tracing::warn!(error = %e, "frame: cairo fill failed");
         }
     });
+}
+
+/// The frame's top inset: the bar's real, live allocated height in logical
+/// pixels — read fresh from `bar_window` every call, the same "read live, not
+/// once" convention `modal::BarGeometry::thickness()` uses for the drawer's
+/// perpendicular margin. Replaces the old hardcoded `BAR_HEIGHT` (44), which
+/// went stale the moment the bar's em-based padding grew past the 1x baseline
+/// (e.g. a larger configurable bar font-size (#135) or GNOME text-scaling)
+/// (#441).
+///
+/// Falls back to [`FALLBACK_BAR_HEIGHT`] (scaled) for the brief window before
+/// the bar's `gtk::Window` has completed its first layout pass, where
+/// `gtk_widget_get_height` still reports 0.
+fn bar_height(bar_window: &gtk::Window) -> f64 {
+    let allocated = bar_window.height();
+    if allocated > 0 {
+        f64::from(allocated)
+    } else {
+        f64::from(crate::scale::scale(FALLBACK_BAR_HEIGHT))
+    }
 }
 
 /// Trace a closed rounded-rectangle sub-path of size (`rw`, `rh`) at (`rx`, `ry`)
@@ -267,15 +302,17 @@ fn rounded_rect(cr: &gtk::cairo::Context, rx: f64, ry: f64, rw: f64, rh: f64, ra
 }
 
 /// Cutout bounds for a monitor of size (`width`, `height`), with the cutout's
-/// left edge starting at `left_inset` px from the screen's left edge. Pass
-/// `FRAME_THICKNESS` for the default frame-only inset; pass the sidebar's
-/// current visible width when the sidebar is open. Returns `(x, y, w, h)` of
-/// the cutout's bounding box (corner radius applied at draw time).
-fn cutout_rect(width: f64, height: f64, left_inset: f64) -> (f64, f64, f64, f64) {
+/// left edge starting at `left_inset` px from the screen's left edge and its
+/// top edge starting at `bar_h` px (the bar's live height — see
+/// [`bar_height`]). Pass `FRAME_THICKNESS` for the default frame-only inset;
+/// pass the sidebar's current visible width when the sidebar is open. Returns
+/// `(x, y, w, h)` of the cutout's bounding box (corner radius applied at draw
+/// time).
+fn cutout_rect(width: f64, height: f64, left_inset: f64, bar_h: f64) -> (f64, f64, f64, f64) {
     let x = left_inset;
-    let y = BAR_HEIGHT;
+    let y = bar_h;
     let w = (width - left_inset - FRAME_THICKNESS).max(0.0);
-    let h = (height - BAR_HEIGHT - FRAME_THICKNESS).max(0.0);
+    let h = (height - bar_h - FRAME_THICKNESS).max(0.0);
     (x, y, w, h)
 }
 
@@ -284,14 +321,18 @@ fn cutout_rect(width: f64, height: f64, left_inset: f64) -> (f64, f64, f64, f64)
 mod tests {
     use super::*;
 
+    /// Bar height matching the old hardcoded `BAR_HEIGHT`, for tests that
+    /// don't care about scaling — i.e. the 1x-baseline case.
+    const BASELINE_BAR_HEIGHT: f64 = 44.0;
+
     #[test]
     fn cutout_rect_normal_monitor() {
         // 1920x1080: bar 44 (top) + bottom inset N + L/R inset N each.
-        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS);
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS, BASELINE_BAR_HEIGHT);
         assert_eq!(x, FRAME_THICKNESS);
-        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(y, BASELINE_BAR_HEIGHT);
         assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
-        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BASELINE_BAR_HEIGHT - FRAME_THICKNESS);
     }
 
     #[test]
@@ -299,7 +340,12 @@ mod tests {
         // Pathological tiny monitor: cutout would be negative; clamp to 0
         // to avoid passing negative dimensions into cairo. Use sub-frame
         // dimensions so the clamp engages regardless of FRAME_THICKNESS.
-        let (_x, _y, w, h) = cutout_rect(FRAME_THICKNESS - 1.0, BAR_HEIGHT - 1.0, FRAME_THICKNESS);
+        let (_x, _y, w, h) = cutout_rect(
+            FRAME_THICKNESS - 1.0,
+            BASELINE_BAR_HEIGHT - 1.0,
+            FRAME_THICKNESS,
+            BASELINE_BAR_HEIGHT,
+        );
         assert_eq!(w, 0.0);
         assert_eq!(h, 0.0);
     }
@@ -308,10 +354,31 @@ mod tests {
     fn cutout_rect_with_sidebar_open() {
         // Sidebar fully open at SIDEBAR_WIDTH (320) means the cutout's left
         // edge starts at x = 320 instead of the default FRAME_THICKNESS.
-        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 320.0);
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, 320.0, BASELINE_BAR_HEIGHT);
         assert_eq!(x, 320.0);
-        assert_eq!(y, BAR_HEIGHT);
+        assert_eq!(y, BASELINE_BAR_HEIGHT);
         assert_eq!(w, 1920.0 - 320.0 - FRAME_THICKNESS);
-        assert_eq!(h, 1080.0 - BAR_HEIGHT - FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - BASELINE_BAR_HEIGHT - FRAME_THICKNESS);
+    }
+
+    #[test]
+    fn cutout_rect_taller_bar_shifts_cutout_down() {
+        // #441: a scaled-up bar (e.g. a larger configurable bar font-size or
+        // GNOME text-scaling growing the bar's em-based padding past the 1x
+        // baseline) must push the cutout's top edge down by the *real* bar
+        // height, not a stale 44 — otherwise the frame's cutout starts under
+        // the bar's actual bottom edge (paints over it) or leaves a seam
+        // above it.
+        let taller_bar = 64.0;
+        let (x, y, w, h) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS, taller_bar);
+        assert_eq!(x, FRAME_THICKNESS);
+        assert_eq!(y, taller_bar);
+        assert_eq!(w, 1920.0 - 2.0 * FRAME_THICKNESS);
+        assert_eq!(h, 1080.0 - taller_bar - FRAME_THICKNESS);
+        // And it must differ from the stale baseline-height cutout — the
+        // whole point of deriving it live.
+        let (_x2, y2, _w2, h2) = cutout_rect(1920.0, 1080.0, FRAME_THICKNESS, BASELINE_BAR_HEIGHT);
+        assert_ne!(y, y2);
+        assert_ne!(h, h2);
     }
 }

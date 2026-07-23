@@ -165,8 +165,12 @@ fn main() -> hytte::ui::Result<()> {
 
                         // Notifications + OSD + frame mount on every monitor;
                         // routing picks niri's focused output each emission.
-                        for monitor in &monitors {
-                            overlays::frame::install(monitor);
+                        // Zipped with `bars` (built one-per-monitor, same order,
+                        // just above) so `frame::install` gets that monitor's own
+                        // bar window to read its live height from (#441) — see
+                        // `overlays::frame::bar_height`.
+                        for (monitor, bar) in monitors.iter().zip(bars.borrow().iter()) {
+                            overlays::frame::install(monitor, bar);
                             overlays::notifications::install(monitor);
                             overlays::osd::install(monitor);
                         }

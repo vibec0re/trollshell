@@ -13,6 +13,7 @@ pub mod network;
 pub mod notif_indicator;
 pub mod power_chip;
 pub mod screencast;
+pub mod screenrecord;
 pub mod screenshot;
 pub mod services;
 pub mod settings_chip;

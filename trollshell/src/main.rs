@@ -18,7 +18,7 @@ use hytte::prelude::*;
 use hytte::services::{
     app_usage, bluetooth, bluetooth_audio, brightness, calendar, clipboard, clock, departures,
     display_config, displays, dnd, geoclue, idle_notify, mpris, netconn, networkd, nightlight,
-    niri, notifications, notifications_mute, pipewire, places, power_profiles, resolved,
+    niri, notifications, notifications_mute, pipewire, places, power_profiles, recorder, resolved,
     screensaver, sensors, systemd, tasks, tray, upower, vpn, wallpaper, weather, wifi, wifiscan,
 };
 
@@ -56,6 +56,10 @@ fn main() -> hytte::ui::Result<()> {
         .with(departures::service())
         .with(weather::service())
         .with(niri::service())
+        // Screen recording (#403): drives an external wf-recorder, exposes
+        // idle/recording state + saved-file signal. Sibling of the screenshot
+        // flow (niri) and the cast indicator.
+        .with(recorder::service())
         .with(upower::service())
         .with(vpn::service())
         .with(pipewire::service())
@@ -235,6 +239,11 @@ fn main() -> hytte::ui::Result<()> {
             // `install_screenshot_toast` for why.
             install_screenshot_toast();
 
+            // Post a "Recording saved" toast (Open / Copy path) whenever a
+            // screen recording stops with a file on disk (#403). Same single
+            // global subscription shape as the screenshot toast.
+            install_recording_toast();
+
             // The frame / notifications / OSD / prompt overlays are installed
             // (and re-installed on hot-plug) inside the monitors_changed loop
             // above, alongside the bars — see #225.
@@ -292,6 +301,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             group([
                 widgets::notif_indicator::widget(monitor),
                 widgets::screenshot::widget(monitor),
+                widgets::screenrecord::widget(monitor),
                 widgets::settings_chip::widget(monitor),
                 widgets::power_chip::widget(monitor),
             ]),
@@ -462,6 +472,63 @@ fn copy_screenshot(path: &str) {
             tracing::warn!(error = %e, path, "screenshot: failed to load image for clipboard copy");
         }
     }
+}
+
+/// Post a "Recording saved" toast whenever a screen recording stops with a
+/// file on disk (`recorder::saved()` fires a `Some`), with **Open** / **Copy
+/// path** action buttons — the #403 sibling of [`install_screenshot_toast`].
+///
+/// Single global subscription (not per-monitor) so an N-monitor setup doesn't
+/// fire N toasts for one recording. Actions dispatch locally via
+/// [`notifications::post_local_with_actions`], same as the screenshot toast.
+fn install_recording_toast() {
+    glib::MainContext::default().spawn_local(recorder::saved().for_each(|rec| {
+        if let Some(rec) = rec {
+            let open_path = rec.path.clone();
+            let copy_path = rec.path.clone();
+            notifications::post_local_with_actions(
+                "Screen recording",
+                "Recording saved",
+                &rec.path,
+                notifications::Urgency::Normal,
+                vec![
+                    notifications::LocalAction::new("open", "Open", move || {
+                        open_recording(&open_path);
+                    }),
+                    notifications::LocalAction::new("copy", "Copy path", move || {
+                        copy_recording_path(&copy_path);
+                    }),
+                ],
+            );
+        }
+        std::future::ready(())
+    }));
+}
+
+/// Open a saved recording with the desktop's default handler (typically a
+/// video player). Runs on the GTK main thread — the Open action's callback in
+/// [`install_recording_toast`]. Same `launch_default_for_uri` path as
+/// [`open_screenshot`].
+fn open_recording(path: &str) {
+    let uri = gio::File::for_path(path).uri();
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
+        tracing::warn!(error = %e, path, "recorder: failed to open with default handler");
+    }
+}
+
+/// Copy a saved recording's *path* (not its multi-megabyte contents) to the
+/// clipboard. Unlike [`copy_screenshot`], which copies image bytes, a video's
+/// useful clipboard representation is its path — the Copy-path action's
+/// callback in [`install_recording_toast`]. Runs on the GTK main thread.
+fn copy_recording_path(path: &str) {
+    let Some(display) = gdk::Display::default() else {
+        tracing::warn!(
+            path,
+            "recorder: no default GdkDisplay, cannot copy path to clipboard"
+        );
+        return;
+    };
+    display.clipboard().set_text(path);
 }
 
 /// Wrap a set of related bar chips in a dark-pill subgroup. Rainbow from

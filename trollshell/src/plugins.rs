@@ -1146,10 +1146,27 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // restores the design's opt-in state-subset rule: the host serializes only
     // subscribed state, so an old binary that never asked for visibility never
     // receives it. Mirrors the `Clock` snapshot gate above.
-    let visibility = manifest
-        .subscribes
-        .contains(&StateKey::SlotVisible)
-        .then(|| tokio::spawn(visibility_task(ctx.visibility_rx.clone(), out_tx.clone())));
+    //
+    // A **bar** mount is the special case (#438): a bar chip is effectively
+    // always on-screen — `SlotVisibility` models sidebar open/close, not bar-chip
+    // presence (#288/#422) — so feeding it the sidebar-open aggregate would tell a
+    // bar plugin that parks pollers on `SlotVisible` it's hidden while its chip is
+    // fully visible. Seed a constant `visible: true` for bar mounts and hold no
+    // task (a bar chip's visibility never changes, so there is nothing to track or
+    // tear down); only sidebar mounts run the change-tracking `visibility_task`.
+    let visibility = if manifest.subscribes.contains(&StateKey::SlotVisible) {
+        if mount.is_bar() {
+            let _ = out_tx.send(HostMsg::SlotVisibility { visible: true });
+            None
+        } else {
+            Some(tokio::spawn(visibility_task(
+                ctx.visibility_rx.clone(),
+                out_tx.clone(),
+            )))
+        }
+    } else {
+        None
+    };
 
     // Desktop accent (#376): seed the resolved `@accent_color` at register (and
     // re-send if it lands after connect) — but ONLY to a plugin that subscribes
@@ -1293,9 +1310,10 @@ async fn snapshot_task(
 /// Push the aggregate slot visibility on the initial subscribe (the register
 /// seed, so a reconnecting plugin starts in the right state) and on every
 /// change, coalescing bursts latest-wins via `borrow_and_update` (#288). Mirrors
-/// [`snapshot_task`]; spawned **only** for a connection that subscribes
-/// [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never receives the
-/// frame.
+/// [`snapshot_task`]; spawned **only** for a **sidebar** connection that
+/// subscribes [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never
+/// receives the frame, and a bar mount gets a constant `true` seed instead (its
+/// chip is always on-screen; see `handle_conn`, #438), never this change loop.
 async fn visibility_task(
     mut visibility_rx: watch::Receiver<bool>,
     out: mpsc::UnboundedSender<HostMsg>,
@@ -2825,6 +2843,55 @@ mod tests {
                 HostMsg::SlotVisibility { visible: true }
             ),
             "the open edge reaches the subscriber",
+        );
+    }
+
+    /// #438: a **bar**-mounted plugin that subscribes `SlotVisible` is on-screen
+    /// whenever its chip is (a bar chip has no sidebar-style hide), so the host
+    /// seeds a constant `visible: true` and never feeds it the sidebar-open
+    /// aggregate — otherwise a bar plugin parking pollers on `SlotVisible` (#288)
+    /// would idle while fully visible. The sidebar aggregate starts `false` (a
+    /// sidebar mount would be seeded `false` here), and sidebar edges must not
+    /// reach the bar mount at all.
+    #[tokio::test]
+    async fn visibility_is_constant_true_for_bar_mounts() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+        let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+        let (mut prd, mut pwr) = plugin_end.into_split();
+        let mut manifest = Manifest::new("barchip", Mount::BarCenter);
+        manifest.subscribes = vec![StateKey::SlotVisible];
+        write_frame(&mut pwr, &PluginMsg::Register { manifest })
+            .await
+            .expect("send Register");
+
+        // The register seed is a constant `true` for a bar chip, despite the
+        // sidebar aggregate being `false`.
+        assert!(
+            matches!(
+                recv(&mut prd).await,
+                HostMsg::SlotVisibility { visible: true }
+            ),
+            "a bar mount is seeded visible=true regardless of sidebar state",
+        );
+
+        // Sidebar edges must not reach a bar mount — its chip visibility is
+        // independent of every sidebar. Drive a couple; the constant task already
+        // sent its one seed and returned, so nothing more may arrive.
+        vis_tx.send_replace(true);
+        vis_tx.send_replace(false);
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            read_frame::<HostMsg, _>(&mut prd),
+        )
+        .await;
+        assert!(
+            quiet.is_err(),
+            "a bar mount receives no sidebar-driven visibility edges (only the seed)",
         );
     }
 }

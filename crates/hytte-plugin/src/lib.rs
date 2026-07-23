@@ -9,8 +9,10 @@
 //! everything else: dialing the host socket with bounded backoff, the
 //! `Register` handshake, the read→update→render session loop, liveness, and
 //! reconnection. A plugin binary depends on **this crate alone** (the proto
-//! vocabulary is re-exported; no GTK, no `hytte` umbrella, not even a direct
-//! tokio dependency) and its `main` is one line.
+//! vocabulary, [`tokio`], and [`tokio_stream`] are all re-exported, and
+//! [`tick_stream`] wraps the common periodic-`sources` incantation — so even a
+//! source-driven plugin needs no direct async-runtime dependency; no GTK, no
+//! `hytte` umbrella either) and its `main` is one line.
 //!
 //! `hytte-plugin-clock-demo` is the reference plugin built on this runtime.
 //!
@@ -304,6 +306,8 @@
 //! }
 //! ```
 
+use std::time::Duration;
+
 use hytte_plugin_proto::{
     AudioSpectrum, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot,
 };
@@ -319,9 +323,20 @@ pub use runtime::run;
 /// the codec/framing helpers matter only if you bypass [`run`].)
 pub use hytte_plugin_proto as proto;
 
+/// The async runtime the SDK itself runs on, re-exported so a plugin can spawn
+/// tasks, hold channels, and name tokio types (e.g. from the I/O task its
+/// [`sources`](Plugin::sources) own) without a direct `tokio` dependency —
+/// mirroring the [`proto`] re-export. The SDK enables the `rt`, `time`, `sync`,
+/// `net`, `io-util`, and `macros` features; a plugin needing one beyond those
+/// still adds `tokio` itself.
+pub use tokio;
+
 /// Stream constructors/combinators for building [`Plugin::sources`] values
 /// (`iter`, `wrappers::*`, `StreamExt`, …) — re-exported wholesale so a
-/// source-driven plugin still needs no dependency beyond this crate.
+/// source-driven plugin still needs no dependency beyond this crate. The SDK
+/// enables the `time` (`wrappers::IntervalStream`, wrapped by [`tick_stream`])
+/// and `sync` (`wrappers::UnboundedReceiverStream`) features, so both are usable
+/// straight off this re-export.
 pub use tokio_stream;
 
 /// A boxed message stream returned by [`Plugin::sources`]. Any well-behaved
@@ -330,6 +345,30 @@ pub use tokio_stream;
 /// the runtime polls it inside a `select!`, so it must tolerate being polled
 /// incrementally, as all standard combinators do.
 pub type MsgStream<M> = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = M>>>;
+
+/// A periodic message stream for [`Plugin::sources`]: emit `msg` (cloned) every
+/// `period`, forever. This wraps the copy-pasted
+/// `IntervalStream::new(tokio::time::interval(dt)).map(|_| Msg::Tick)`
+/// incantation so a plugin driving a fixed-cadence re-render needs neither a
+/// direct `tokio`/`tokio_stream` dependency nor the `time`-feature wrapper.
+///
+/// Like [`tokio::time::interval`], the **first tick fires immediately**, then
+/// one every `period` (a heartbeat plugin can treat that leading edge as a
+/// harmless no-op). The result is a plain [`Stream`](tokio_stream::Stream): box
+/// it into a [`MsgStream`] for a timer-only plugin, or
+/// [`merge`](tokio_stream::StreamExt::merge) it with the plugin's other sources.
+///
+/// ```ignore
+/// fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+///     Some(Box::pin(tick_stream(Duration::from_secs(1), Msg::Tick)))
+/// }
+/// ```
+#[must_use = "a tick stream does nothing unless polled (box it into a MsgStream)"]
+pub fn tick_stream<M: Clone>(period: Duration, msg: M) -> impl tokio_stream::Stream<Item = M> {
+    use tokio_stream::StreamExt as _;
+    tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(period))
+        .map(move |_| msg.clone())
+}
 
 /// The sending half of a plugin's per-session **command lane** — the
 /// sanctioned outbound path from [`update`](Plugin::update) to the plugin's
@@ -408,6 +447,14 @@ pub enum Input<M> {
     /// visible, idle while hidden), the same energy behavior the shell already
     /// applies to its built-in pollers. Ignoring it keeps today's always-on
     /// behavior — nothing breaks.
+    ///
+    /// **Sidebar mounts only — a bar chip is always visible.** This models the
+    /// **sidebar** opening and closing (#288/#422), not a bar chip's presence: a
+    /// [`Mount::BarLeft`](proto::Mount::BarLeft)/`BarCenter`/`BarRight` chip is
+    /// effectively always on-screen, so the host seeds it a constant `true` and
+    /// sends no edges. A bar-mounted plugin must therefore **not** park its
+    /// pollers on this signal (it would idle while fully visible) — the park
+    /// pattern above is for sidebar cards.
     ///
     /// **Latest-wins delivery.** Visibility is state, not a one-shot event, so a
     /// burst of toggles may coalesce to the newest value; act on the value you
@@ -538,4 +585,37 @@ pub trait Plugin: Sized {
     /// one `Render` frame. A chip/card-only plugin returns `node.into()`; see
     /// the crate-level *Opening your own panel* section for the paneled shape.
     fn view(&self) -> View;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tick_stream;
+    use std::time::Duration;
+    use tokio_stream::StreamExt as _;
+
+    /// The tick helper leads with an immediate tick, then holds the requested
+    /// cadence. Paused virtual time makes the schedule the assertion: the
+    /// runtime auto-advances to the next interval fire whenever the task blocks,
+    /// so the elapsed virtual clock at each tick pins the period.
+    #[tokio::test(start_paused = true)]
+    async fn tick_stream_leads_immediately_then_holds_the_cadence() {
+        let period = Duration::from_secs(5);
+        let mut ticks = std::pin::pin!(tick_stream(period, 7_u8));
+        let start = tokio::time::Instant::now();
+
+        assert_eq!(ticks.next().await, Some(7), "the message value is emitted…");
+        assert!(start.elapsed() < period, "…and the first tick is immediate");
+
+        assert_eq!(ticks.next().await, Some(7));
+        assert!(
+            start.elapsed() >= period,
+            "the second tick waits one period"
+        );
+
+        assert_eq!(ticks.next().await, Some(7));
+        assert!(
+            start.elapsed() >= period * 2,
+            "and it keeps the fixed cadence"
+        );
+    }
 }

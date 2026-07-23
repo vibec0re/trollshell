@@ -6,16 +6,19 @@
 //! [`hytte_ai_providers`] client — with a tiny persona prompt. Two backends,
 //! chosen by config:
 //!
-//! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM — **the default**):
-//!   a key from `~/.config/trollshell/openrouter.key` (see
+//! - **[`OpenRouter`](https://openrouter.ai)** (a cloud LLM — **the default
+//!   when a key is configured**): a key from
+//!   `~/.config/trollshell/openrouter.key` (see
 //!   [`hytte_ai_providers::load_key`]) or `$PET_LLM_API_KEY`, plus a
 //!   `$PET_LLM_MODEL`, or
 //! - a **local `llama-server`** — opt in with `$PET_LLM_URL` (e.g.
 //!   `http://127.0.0.1:8080`; see `etc/systemd/user/trollshell-pet-brain.service`).
 //!
-//! Rate-limiting, unreachability, and nonsense (or empty) replies all fall
-//! back to the **canned pools**, so the pet stays fully alive with no model
-//! configured at all.
+//! With **no key and no `$PET_LLM_URL`** the brain resolves to canned-only up
+//! front (a keyless cloud call would only 401, so it never attempts one — see
+//! [`resolve_provider`]). Rate-limiting, unreachability, and nonsense (or empty)
+//! replies from a configured backend all fall back to the **canned pools** too,
+//! so the pet stays fully alive with no model configured at all.
 //!
 //! The shared client owns the HTTP + provider config; the pet keeps the
 //! persona, the [`sanitize`] step, and the "empty line ⇒ offline ⇒ canned"
@@ -25,8 +28,8 @@
 use std::time::Duration;
 
 use hytte_ai_providers::{ChatOpts, Message, Provider};
-use tokio::sync::mpsc;
-use tokio::time::Instant;
+use hytte_plugin::tokio::sync::mpsc;
+use hytte_plugin::tokio::time::Instant;
 
 use crate::{GRUMPY_AT, PetMsg};
 
@@ -64,7 +67,7 @@ pub struct ThinkReq {
 /// Brain configuration, from the environment.
 struct Cfg {
     /// The resolved chat [`Provider`], or `None` for a canned-only pet (an
-    /// empty `$PET_LLM_URL`). See [`resolve_provider`].
+    /// empty `$PET_LLM_URL`, or no key and no URL). See [`resolve_provider`].
     provider: Option<Provider>,
     /// `$PET_NAME` — the pet's name in its persona. Default: `nisse`.
     name: String,
@@ -92,25 +95,32 @@ impl Cfg {
 /// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
 /// `$PET_LLM_URL` (`None` = unset, `Some("")` = set-but-empty = model
 /// disabled). With no explicit URL, the default is **`OpenRouter`** (the pet's
-/// cloud brain), with any `key`/`model` layered on — a missing key just means
-/// the call 401s and the pet falls back to canned lines. An explicit
-/// `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a `llama-server`)
-/// as the base, with any `key`/`model` layered on.
+/// cloud brain) **only when a `key` is present**: a keyless `OpenRouter` call
+/// always 401s, so with neither a URL nor a key this short-circuits to `None`
+/// (canned-only) rather than burning a doomed round-trip per thought (#438). An
+/// explicit `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a
+/// `llama-server`, which needs no key) as the base, with any `key`/`model`
+/// layered on.
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
     model: Option<String>,
 ) -> Option<Provider> {
     match url_env {
+        // Explicitly empty `$PET_LLM_URL` → model disabled (canned-only pet).
         Some("") => None,
+        // An explicit URL is a local/self-hosted backend that needs no key —
+        // keep it even keyless.
         Some(url) => Some(Provider {
             base_url: url.to_owned(),
             api_key: key,
             model,
         }),
-        None => Some(Provider {
+        // No URL → the OpenRouter cloud default, but ONLY with a key. Keyless →
+        // `None` (canned-only): the call would just 401, so skip it (#438).
+        None => key.map(|key| Provider {
             base_url: "https://openrouter.ai/api".to_owned(),
-            api_key: key,
+            api_key: Some(key),
             model,
         }),
     }
@@ -139,8 +149,10 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
             Some(provider) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
                 let provider = provider.clone();
                 let name = cfg.name.clone();
-                let asked =
-                    tokio::task::spawn_blocking(move || ask_llm(&provider, &name, req)).await;
+                let asked = hytte_plugin::tokio::task::spawn_blocking(move || {
+                    ask_llm(&provider, &name, req)
+                })
+                .await;
                 // Stamp at completion: the gap is between calls, so a slow
                 // call must not immediately qualify the next one.
                 last_llm = Some(Instant::now());
@@ -400,12 +412,18 @@ mod tests {
         assert_eq!(p.base_url, "https://openrouter.ai/api");
         assert_eq!(p.api_key.as_deref(), Some("sk-1"));
         assert_eq!(p.model.as_deref(), Some("gpt"));
-        // No URL, no key → still OpenRouter (the default); the keyless call just
-        // 401s and the pet falls back to canned. Local llama-server is opt-in
-        // via $PET_LLM_URL.
-        let p = resolve_provider(None, None, None).unwrap();
-        assert_eq!(p.base_url, "https://openrouter.ai/api");
-        assert!(p.api_key.is_none());
+        // No URL, no key → canned-only (#438): a keyless OpenRouter default would
+        // 401 on every call, so short-circuit to `None` instead of a doomed
+        // round-trip. (Local llama-server stays opt-in via $PET_LLM_URL.)
+        assert!(
+            resolve_provider(None, None, None).is_none(),
+            "keyless + URL-less resolves to canned-only, not a doomed OpenRouter call",
+        );
+        // …but a model set without a key still can't authenticate → canned-only.
+        assert!(
+            resolve_provider(None, None, Some("gpt".to_owned())).is_none(),
+            "a model without a key can't authenticate the cloud default either",
+        );
         // Explicit URL + key (a self-hosted keyed endpoint) → URL wins, key layered.
         let p = resolve_provider(Some("http://host:2"), Some("k".to_owned()), None).unwrap();
         assert_eq!(p.base_url, "http://host:2");

@@ -14,18 +14,10 @@ name = "hytte-plugin-pet"
 path = "src/main.rs"
 
 [dependencies]
-# The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream.
+# The plugin runtime SDK; re-exports the proto vocabulary, `tokio`, and
+# `tokio_stream` (with the `time`/`sync` wrappers) plus the `tick_stream`
+# helper — so this plugin needs no direct tokio / tokio-stream dep of its own.
 hytte-plugin = { path = "../hytte-plugin" }
-# The pet's own timer stream (`IntervalStream` sits behind the `time` feature,
-# which the SDK's re-export deliberately doesn't enable).
-tokio-stream = { version = "0.1", default-features = false, features = [
-  "time",
-] }
-tokio = { version = "1.40", default-features = false, features = [
-  "rt",
-  "time",
-  "sync",
-] }
 # The shared OpenAI-compatible chat client (provider config, blocking HTTP,
 # key-from-file). The brain runs its `chat()` on a `spawn_blocking` thread.
 hytte-ai-providers = { path = "../hytte-ai-providers" }

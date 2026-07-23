@@ -23,8 +23,13 @@ tokio = { version = "1.40", default-features = false, features = [
   "sync",
 ] }
 # `Stream` + `StreamExt::next` for the plugin's own `sources()` messages, and
-# `pending()` to normalize the no-sources case.
-tokio-stream = { version = "0.1", default-features = false }
+# `pending()` to normalize the no-sources case. `time` powers `tick_stream`'s
+# `IntervalStream`; `sync` gives `UnboundedReceiverStream` — both re-exported so
+# a source-driven plugin needs no direct `tokio-stream` dep of its own.
+tokio-stream = { version = "0.1", default-features = false, features = [
+  "time",
+  "sync",
+] }
 
 [dev-dependencies]
 # `io::duplex` gives the session loop a hermetic in-memory "socket";

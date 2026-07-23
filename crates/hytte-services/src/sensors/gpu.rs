@@ -392,7 +392,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn compute_intel_usage_counter_reset_clamps_to_full_load() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(1_000);
+        let t1 = t0 + Duration::from_secs(1);
         // rc6 counter went backwards (reset/wrap) — saturating_sub floors the
         // delta at 0, meaning "no idle time observed" → 100% busy.
         let (_new_prev, load) = compute_intel_usage(100, Some((5_000, t0)), t1);
@@ -403,7 +403,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn compute_intel_usage_residency_exceeding_elapsed_clamps_to_100_idle() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(1_000);
+        let t1 = t0 + Duration::from_secs(1);
         // 5000ms of RC6 residency reported over a 1000ms tick — idle% would
         // be 500% uncapped; must clamp to 100% idle (0% usage).
         let (_new_prev, load) = compute_intel_usage(5_000, Some((0, t0)), t1);
@@ -414,7 +414,7 @@ mod tests {
     #[allow(clippy::float_cmp)]
     fn compute_intel_usage_normal_delta_computes_partial_load() {
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(1_000);
+        let t1 = t0 + Duration::from_secs(1);
         // 500ms idle (RC6) out of a 1000ms tick → 50% idle → 50% usage.
         let (new_prev, load) = compute_intel_usage(500, Some((0, t0)), t1);
         assert_eq!(new_prev, Some((500, t1)));

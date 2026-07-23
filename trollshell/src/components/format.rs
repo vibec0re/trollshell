@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn fmt_dur_just_under_an_hour_has_no_hour_component() {
         assert_eq!(
-            fmt_dur(Duration::from_secs(59 * 60), "until full"),
+            fmt_dur(Duration::from_mins(59), "until full"),
             "59m until full"
         );
     }
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn fmt_dur_at_exactly_one_hour() {
         assert_eq!(
-            fmt_dur(Duration::from_secs(60 * 60), "until full"),
+            fmt_dur(Duration::from_hours(1), "until full"),
             "1h 0m until full"
         );
     }
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn fmt_dur_at_ninety_minutes() {
         assert_eq!(
-            fmt_dur(Duration::from_secs(90 * 60), "until full"),
+            fmt_dur(Duration::from_mins(90), "until full"),
             "1h 30m until full"
         );
     }

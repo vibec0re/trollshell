@@ -823,17 +823,6 @@
 
 /* ─── Bluetooth / Wi-Fi rows ────────────────────────────────────── */
 
-.ts-bluetooth-device {
-    padding: 0.308em 0.615em;
-    border-radius: 0.462em;
-}
-.ts-bluetooth-device.connected {
-    background: alpha(@accent_color, 0.2);
-}
-.ts-wifi-headline {
-    font-weight: 600;
-    margin-top: 0.308em;
-}
 .ts-wifi-list {
     /* No distinct background/border — the scroller is part of the Wi-Fi
        card's boxed-list, so it should read as the same surface. Only round
@@ -844,18 +833,6 @@
 .ts-wifi-list,
 .ts-wifi-list > viewport {
     background: transparent;
-}
-.ts-wifi-row {
-    padding: 0.308em 0.615em;
-    background: transparent;
-}
-.ts-wifi-row.connected {
-    background: alpha(@accent_color, 0.25);
-}
-.ts-wifi-suffix {
-    opacity: 0.55;
-    font-size: 0.846em;
-    margin-left: 0.615em;
 }
 
 /* ─── Notification history page ─────────────────────────────────── */
@@ -869,35 +846,6 @@
     border: 1px solid @card_shade_color;
     border-radius: 0.615em;
     background: alpha(@view_bg_color, 0.6);
-}
-.ts-notif-row {
-    padding: 0.615em 0.769em;
-    border-bottom: 1px solid @card_shade_color;
-}
-.ts-notif-row.critical {
-    background: alpha(@destructive_color, 0.15);
-}
-.ts-notif-row-app {
-    color: @accent_color;
-    font-size: 0.846em;
-    font-weight: 600;
-}
-.ts-notif-row-time {
-    opacity: 0.45;
-    font-size: 0.846em;
-}
-.ts-notif-row-summary {
-    font-weight: 600;
-    font-size: 1em;
-}
-.ts-notif-row-body {
-    opacity: 0.8;
-    font-size: 0.923em;
-}
-.ts-notif-empty {
-    opacity: 0.55;
-    padding: 1.231em;
-    font-size: 1em;
 }
 
 /* ─── Audio mixer (pavucontrol-style) ───────────────────────────── */
@@ -924,14 +872,6 @@
     border-radius: 0.462em;
 }
 .ts-audio-mute-btn.muted {
-    background: alpha(@destructive_color, 0.3);
-}
-
-.ts-mute-btn {
-    padding: 0.154em 0.462em;
-    border-radius: 0.462em;
-}
-.ts-mute-btn.active {
     background: alpha(@destructive_color, 0.3);
 }
 
@@ -1274,13 +1214,6 @@
     font-variant-numeric: tabular-nums;
 }
 
-/* Leave-by mode: a walk icon marks the number as "minutes until you must
-   leave", so the bare "7 min" / "now" needs no wordy "leave …" prefix. Dimmed
-   to match the time text; the unreachable fade still dims the whole row. */
-.ts-departure-walk-icon {
-    opacity: 0.85;
-}
-
 .ts-departure-row.ts-cancelled .ts-departure-time,
 .ts-departure-row.ts-cancelled .ts-departure-direction {
     text-decoration: line-through;
@@ -1458,12 +1391,6 @@
     color: alpha(@accent_color, 0.7);
 }
 
-/* New: VPN tunnel-state pill (used by page_vpn). */
-.ts-pill-vpn {
-    background: alpha(@success_color, 0.18);
-    color: @success_color;
-}
-
 .ts-mono {
     font-family: monospace;
 }
@@ -1599,71 +1526,6 @@
 .ts-osd-card.leave-by .ts-osd-progress {
     min-height: 0;
     opacity: 0;
-}
-
-/* ── Lock screen ────────────────────────────────────────────────────────── */
-
-.ts-lock-root {
-    background: alpha(@window_bg_color, 0.95);
-}
-
-.ts-lock-card {
-    padding: 32px 48px;
-    border-radius: 18px;
-    background: alpha(@card_bg_color, 0.92);
-    box-shadow: 0 8px 32px alpha(black, 0.4);
-}
-
-.ts-lock-clock {
-    font-size: 4em;
-    font-weight: 300;
-    font-variant-numeric: tabular-nums;
-    margin-bottom: -8px;
-}
-
-.ts-lock-date {
-    font-size: 1.1em;
-    opacity: 0.7;
-    margin-bottom: 8px;
-}
-
-.ts-lock-user {
-    font-size: 0.95em;
-    opacity: 0.8;
-    margin-top: 16px;
-}
-
-.ts-lock-entry {
-    margin-top: 8px;
-}
-
-.ts-lock-error {
-    color: @error_color;
-    font-size: 0.9em;
-    margin-top: 4px;
-}
-
-@keyframes ts-lock-shake-keyframes {
-    0%,
-    100% {
-        margin-left: 0;
-    }
-    20% {
-        margin-left: -8px;
-    }
-    40% {
-        margin-left: 8px;
-    }
-    60% {
-        margin-left: -6px;
-    }
-    80% {
-        margin-left: 4px;
-    }
-}
-
-.ts-lock-shake {
-    animation: ts-lock-shake-keyframes 400ms ease-in-out;
 }
 
 /* ─── Pet plugin — procedural LCD face (#284) ───────────────────────────────

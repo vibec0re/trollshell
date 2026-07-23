@@ -12,8 +12,9 @@
 //!   Both bindings drive the same `dnd::set_enabled` setter and observe the
 //!   same `dnd::enabled` signal, so they stay in sync.
 //!
-//! Future v1.x: bar/drawer layout, idle timeouts (#28's swayidle is currently
-//! hand-edited), accent color, notification policy.
+//! Future v1.x: bar/drawer layout, idle timeouts (the native idle manager's
+//! thresholds are currently compile-time constants), accent color, notification
+//! policy.
 
 use hytte::adw::{self, prelude::*};
 use hytte::gtk;

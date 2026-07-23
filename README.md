@@ -88,8 +88,9 @@ it back from evolution-data-server — see
 When home-manager runs as a NixOS module, the NixOS module wires the
 home-manager one in automatically, so per-user `programs.trollshell` settings
 just work. Non-NixOS session integration (systemd user units, niri binds,
-swayidle, kanshi, the PAM file, …) ships under `etc/` —
-see [etc/README.md](etc/README.md).
+kanshi, the PAM file, …) ships under `etc/` —
+see [etc/README.md](etc/README.md). (The idle → dim → lock → suspend pipeline
+is native to trollshell — #204 retired swayidle — so it needs no `etc/` config.)
 
 ### Wallpaper
 

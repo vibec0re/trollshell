@@ -1,31 +1,22 @@
-//! Native `ext-idle-notify-v1` idle client (#204 Phase 3a/3b of 4).
+//! Native `ext-idle-notify-v1` idle manager (#204).
 //!
-//! Binds the compositor's `ext_idle_notifier_v1` global and creates one
-//! `ext_idle_notification_v1` per swayidle threshold (240 dim / 300 lock /
-//! 600 suspend, from `etc/swayidle/config`), then exposes "idle since /
-//! resumed" reactively via [`state`].
+//! trollshell owns the idle → dim → lock → suspend timeline in-process — it is
+//! the idle daemon, replacing swayidle entirely. It binds the compositor's
+//! `ext_idle_notifier_v1` global and creates one `ext_idle_notification_v1` per
+//! threshold (240 dim / 300 lock / 600 suspend), exposes "idle since / resumed"
+//! reactively via [`state`], and fires the three actions natively at their
+//! thresholds:
 //!
-//! **Two modes, selected once at startup by [`NATIVE_ACTIONS_ENV`]:**
+//! - **dim** — `brightnessctl -s set 10%` (saved level restored on resume),
+//! - **lock** — [`crate::screensaver::lock`] (`loginctl lock-session`),
+//! - **suspend** — `systemctl suspend`,
 //!
-//! - **Observe-only (default).** Runs *alongside* swayidle and takes **no**
-//!   action — its job is to emit parity logs proving the native notifier fires
-//!   at the same wall-clock points as swayidle (Phase 2). This is the default,
-//!   so merging Phase 3a changes nothing and cannot double-fire with swayidle.
-//! - **Native actions (opt-in, Phase 3a/3b).** When [`NATIVE_ACTIONS_ENV`] is
-//!   truthy, the same three actions swayidle runs fire natively at their
-//!   thresholds — dim (`brightnessctl -s set 10%`, restored on resume), lock
-//!   (`screensaver::lock`), suspend (`systemctl suspend`) — each **gated on
-//!   logind's `BlockInhibited`** (skip dim/lock while `idle` is inhibited, skip
-//!   suspend while `sleep` is). Additionally (**Phase 3b**) it relocks the
-//!   session just before the system sleeps by handling logind's
-//!   `PrepareForSleep(true)` signal — the native replacement for swayidle's
-//!   `before-sleep 'loginctl lock-session'` (also reusing `screensaver::lock`).
-//!   Intended for the maintainer to live-verify with swayidle's handlers parked;
-//!   see the opt-in's doc for the cutover roadmap.
-//!
-//! The parity logging is unconditional (both modes). Retiring swayidle's
-//! handlers plus the `screensaver.rs` `SIGSTOP` bridge — and then this opt-in —
-//! is Phase 4. See issue #204 for the full roadmap.
+//! each **gated on logind's `BlockInhibited`**: dim/lock skip while `idle` is
+//! inhibited, suspend skips while `sleep` is. Additionally it relocks the
+//! session just before the system sleeps by handling logind's
+//! `PrepareForSleep(true)` signal — the native replacement for swayidle's
+//! `before-sleep 'loginctl lock-session'` (also reusing
+//! [`crate::screensaver::lock`]).
 //!
 //! ## Pure-safe Wayland path
 //!
@@ -33,7 +24,7 @@
 //! `wayland-protocols` (`staging`) APIs — no `unsafe`, inheriting the
 //! workspace `unsafe_code = "forbid"`. It opens its **own** `wayland-client`
 //! connection via `Connection::connect_to_env()` (independent of GTK's own
-//! backend — a plain idle observer needs no GTK surface) and drives the event
+//! backend — a plain idle client needs no GTK surface) and drives the event
 //! queue with `blocking_dispatch` on a dedicated `std::thread`. The Wayland
 //! objects are `!Send`, so they live entirely on that thread; only the
 //! `Mutable<IdleState>` (which is `Send + Sync`) is written from it, matching
@@ -58,12 +49,11 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
 use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 use zbus::zvariant::OwnedValue;
 
-/// `tracing` target for the parity logs — the deliverable of this phase.
+/// `tracing` target for the idle manager's logs.
 const LOG_TARGET: &str = "hytte_services::idle_notify";
 
-/// Idle thresholds (seconds) mirrored from `etc/swayidle/config`: dim @ 240,
-/// lock @ 300, suspend @ 600. Observed for parity in every mode; when the
-/// native-action opt-in is on they also gate the corresponding action.
+/// Idle thresholds (seconds): dim @ 240, lock @ 300, suspend @ 600. Each fires
+/// its native action, gated on the relevant logind inhibitor.
 const DIM_SECS: u32 = 240;
 const LOCK_SECS: u32 = 300;
 const SUSPEND_SECS: u32 = 600;
@@ -74,52 +64,18 @@ const THRESHOLDS: [u32; 3] = [DIM_SECS, LOCK_SECS, SUSPEND_SECS];
 
 /// logind `Manager` on the **system** bus — source of both `BlockInhibited`
 /// (the inhibitor gate for dim/lock/suspend) and the `PrepareForSleep` signal
-/// that drives the Phase-3b before-sleep relock.
+/// that drives the before-sleep relock.
 const LOGIN1_NAME: &str = "org.freedesktop.login1";
 const LOGIN1_PATH: &str = "/org/freedesktop/login1";
 const LOGIN1_MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
-
-/// Opt-in env var enabling the **native idle-action pipeline** (dim / lock /
-/// suspend). Truthy (`1`/`true`/`yes`/`on`, case-insensitive) turns it on;
-/// anything else — including unset — leaves it **off**.
-///
-/// **This is a temporary Phase-3a/3b bridge (#204).** While off (the default),
-/// `idle_notify` is exactly the Phase-2 observe-only client: it arms the
-/// notifications and emits the parity logs but fires **no** action — no dim,
-/// lock, suspend, *or* before-sleep relock — so merging this cannot double-fire
-/// with the still-running swayidle. Turning it on lets the maintainer
-/// live-verify the native actions (and the `PrepareForSleep` relock) *after*
-/// parking swayidle's handlers (`systemctl --user stop swayidle`; see the PR's
-/// live-verify protocol). Phase 4 then deletes swayidle's handlers and the
-/// `screensaver.rs` `SIGSTOP` bridge and removes this gate, making the native
-/// path the sole one.
-const NATIVE_ACTIONS_ENV: &str = "TROLLSHELL_NATIVE_IDLE_ACTIONS";
-
-/// Read the [`NATIVE_ACTIONS_ENV`] opt-in. Default **off**. Read once at
-/// service start so the mode is fixed for the process lifetime.
-fn native_actions_enabled() -> bool {
-    std::env::var(NATIVE_ACTIONS_ENV)
-        .ok()
-        .as_deref()
-        .is_some_and(is_truthy)
-}
-
-/// Truthy env-var values: `1`, `true`, `yes`, `on` (case-insensitive, trimmed).
-fn is_truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
 
 // ── Public data shape ─────────────────────────────────────────────────────────
 
 /// Reactive idle state derived from the compositor's `ext-idle-notify-v1`
 /// notifications.
 ///
-/// This reactive shape is independent of the native idle-action pipeline: it
-/// reports whether the seat is idle and, roughly, since when — whether or not
-/// the Phase-3a actions are armed (see [`NATIVE_ACTIONS_ENV`]).
+/// This reactive shape is independent of the native idle actions: it reports
+/// whether the seat is idle and, roughly, since when.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum IdleState {
     /// The seat is active — no idle threshold is currently fired.
@@ -160,24 +116,11 @@ impl Service for IdleNotifyService {
         let state = Mutable::new(IdleState::default());
         let worker_state = state.clone();
 
-        // Read the opt-in exactly once at startup (Phase-3a/3b bridge; default
-        // off → observe-only, byte-for-byte the Phase-2 behavior). See
-        // [`NATIVE_ACTIONS_ENV`].
-        let actions_enabled = native_actions_enabled();
-        if actions_enabled {
-            tracing::warn!(
-                target: LOG_TARGET,
-                env = NATIVE_ACTIONS_ENV,
-                "native idle actions ENABLED — dim/lock/suspend fire natively (gated on logind inhibitors); park swayidle's handlers (systemctl --user stop swayidle) to avoid double-firing"
-            );
-            // Phase 3b: relock on logind `PrepareForSleep(true)`, mirroring
-            // swayidle's `before-sleep 'loginctl lock-session'`. This D-Bus work
-            // runs as a tokio task on the shared runtime (Wayland stays on its
-            // own `!Send` thread), and only when the opt-in is on — so with the
-            // flag off (default) it never subscribes and cannot double-lock
-            // alongside swayidle's own before-sleep handler.
-            rt.spawn(run_prepare_for_sleep_relock());
-        }
+        // Relock on logind `PrepareForSleep(true)`, mirroring swayidle's
+        // `before-sleep 'loginctl lock-session'`. This D-Bus work runs as a
+        // tokio task on the shared runtime (Wayland stays on its own `!Send`
+        // thread).
+        rt.spawn(run_prepare_for_sleep_relock());
 
         // Wayland objects are `!Send`; the whole client lives on this dedicated
         // thread and only writes back the `Send + Sync` `Mutable`. A `std::thread`
@@ -186,8 +129,8 @@ impl Service for IdleNotifyService {
         std::thread::Builder::new()
             .name("hytte-idle-notify".into())
             .spawn(move || {
-                if let Err(err) = run(worker_state, actions_enabled) {
-                    tracing::warn!(target: LOG_TARGET, error = %err, "native idle-notify observer stopped");
+                if let Err(err) = run(worker_state) {
+                    tracing::warn!(target: LOG_TARGET, error = %err, "native idle manager stopped");
                 }
             })
             .expect("spawn hytte-idle-notify thread");
@@ -202,7 +145,7 @@ pub fn service() -> IdleNotifyService {
     IdleNotifyService
 }
 
-/// Reactive idle state from the native `ext-idle-notify-v1` observer. `Active`
+/// Reactive idle state from the native `ext-idle-notify-v1` manager. `Active`
 /// until the first threshold fires; `Idle { .. }` while any threshold is idled.
 pub fn state() -> impl Signal<Item = IdleState> {
     registry::with(|r| {
@@ -215,8 +158,8 @@ pub fn state() -> impl Signal<Item = IdleState> {
 
 // ── Wayland client ────────────────────────────────────────────────────────────
 
-/// Map a threshold to the swayidle action it mirrors, for the parity logs.
-fn swayidle_action(secs: u32) -> &'static str {
+/// Map a threshold to the idle action it drives, for logging.
+fn action_name(secs: u32) -> &'static str {
     match secs {
         DIM_SECS => "dim",
         LOCK_SECS => "lock",
@@ -238,9 +181,6 @@ struct IdleClient {
     idled: BTreeSet<u32>,
     /// Rough wall-clock estimate of when this idle cycle began.
     since: Option<DateTime<Local>>,
-    /// Whether the native idle-action pipeline is armed (the Phase-3a opt-in,
-    /// [`NATIVE_ACTIONS_ENV`]). When `false` this is a pure observer.
-    actions_enabled: bool,
     /// `true` while a native dim is in effect (backlight saved + lowered), so
     /// resume restores exactly what it dimmed and a *skipped* dim (inhibitor
     /// held) leaves nothing to restore. Shared with the spawned action tasks.
@@ -248,19 +188,18 @@ struct IdleClient {
 }
 
 impl IdleClient {
-    fn new(state: Mutable<IdleState>, actions_enabled: bool) -> Self {
+    fn new(state: Mutable<IdleState>) -> Self {
         Self {
             state,
             notifications: Vec::new(),
             idled: BTreeSet::new(),
             since: None,
-            actions_enabled,
             dimmed: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Handle an `idled` event for `secs`: record it, estimate the idle-since
-    /// on the first firing of this cycle, log parity, publish.
+    /// on the first firing of this cycle, log, publish, then fire the action.
     fn on_idled(&mut self, secs: u32) {
         if self.idled.is_empty() {
             // First threshold of this cycle → the seat has already been idle
@@ -271,17 +210,15 @@ impl IdleClient {
         tracing::info!(
             target: LOG_TARGET,
             threshold_secs = secs,
-            swayidle_action = swayidle_action(secs),
-            "ext-idle-notify idled (observe-only parity check vs swayidle)"
+            action = action_name(secs),
+            "ext-idle-notify idled"
         );
         self.publish();
-        if self.actions_enabled {
-            self.fire_action(secs);
-        }
+        self.fire_action(secs);
     }
 
     /// Handle a `resumed` event for `secs`: clear it, drop the idle-since when
-    /// the last threshold resumes, log parity, publish.
+    /// the last threshold resumes, log, publish, and undim at the dim threshold.
     fn on_resumed(&mut self, secs: u32) {
         self.idled.remove(&secs);
         if self.idled.is_empty() {
@@ -290,11 +227,11 @@ impl IdleClient {
         tracing::info!(
             target: LOG_TARGET,
             threshold_secs = secs,
-            swayidle_action = swayidle_action(secs),
-            "ext-idle-notify resumed (observe-only parity check vs swayidle)"
+            action = action_name(secs),
+            "ext-idle-notify resumed"
         );
         self.publish();
-        if self.actions_enabled && secs == DIM_SECS {
+        if secs == DIM_SECS {
             self.restore_dim();
         }
     }
@@ -316,9 +253,8 @@ impl IdleClient {
 
     /// Fire the native idle action for `secs` on the shared runtime, gated on
     /// the relevant logind inhibitor (`idle` for dim/lock, `sleep` for suspend).
-    /// The commands mirror `etc/swayidle/config` exactly. Runs off the observer
-    /// thread so the Wayland dispatch loop keeps servicing events. Only called
-    /// when the Phase-3a opt-in is on.
+    /// Runs off the observer thread so the Wayland dispatch loop keeps servicing
+    /// events.
     fn fire_action(&self, secs: u32) {
         let dimmed = self.dimmed.clone();
         runtime::handle().spawn(async move {
@@ -327,7 +263,7 @@ impl IdleClient {
                     if inhibitor_blocks("idle").await {
                         return;
                     }
-                    // swayidle: `brightnessctl -s set 10%` (save current, then dim).
+                    // `brightnessctl -s set 10%` (save current, then dim).
                     if run_command("brightnessctl", &["-s", "set", "10%"]).await {
                         dimmed.store(true, Ordering::SeqCst);
                     }
@@ -336,7 +272,7 @@ impl IdleClient {
                     if inhibitor_blocks("idle").await {
                         return;
                     }
-                    // swayidle: `loginctl lock-session` — reuse the existing path
+                    // `loginctl lock-session` — reuse the existing path
                     // (screensaver::lock runs exactly that; do not reimplement).
                     crate::screensaver::lock();
                 }
@@ -344,7 +280,6 @@ impl IdleClient {
                     if inhibitor_blocks("sleep").await {
                         return;
                     }
-                    // swayidle: `systemctl suspend`.
                     run_command("systemctl", &["suspend"]).await;
                 }
                 _ => {}
@@ -352,9 +287,9 @@ impl IdleClient {
         });
     }
 
-    /// Undim on resume, mirroring swayidle's `resume 'brightnessctl -r'`. Only
-    /// restores when a native dim is actually in effect (a skipped dim leaves
-    /// the flag clear), so a stale restore never clobbers the saved level.
+    /// Undim on resume (`brightnessctl -r`). Only restores when a native dim is
+    /// actually in effect (a skipped dim leaves the flag clear), so a stale
+    /// restore never clobbers the saved level.
     fn restore_dim(&self) {
         let dimmed = self.dimmed.clone();
         runtime::handle().spawn(async move {
@@ -365,7 +300,7 @@ impl IdleClient {
     }
 }
 
-// ── Before-sleep relock (Phase 3b, opt-in) ─────────────────────────────────────
+// ── Before-sleep relock ─────────────────────────────────────────────────────
 
 /// Should a logind `PrepareForSleep` payload trigger a before-sleep relock?
 ///
@@ -385,9 +320,7 @@ fn should_relock_on_prepare_for_sleep(about_to_sleep: bool) -> bool {
 ///
 /// Runs as a tokio task on the shared runtime. `hytte_bus` handles connection
 /// pooling and reconnection, so this just consumes the signal stream in a loop
-/// (a fresh `events()` receiver survives bus reconnects). Only spawned when the
-/// Phase-3a/3b opt-in ([`NATIVE_ACTIONS_ENV`]) is on, so with the flag off it
-/// never subscribes and cannot double-lock alongside the still-running swayidle.
+/// (a fresh `events()` receiver survives bus reconnects).
 async fn run_prepare_for_sleep_relock() {
     let sub = hytte_bus::signals(LOGIN1_NAME)
         .bus(hytte_bus::BusKind::System)
@@ -399,7 +332,7 @@ async fn run_prepare_for_sleep_relock() {
 
     tracing::info!(
         target: LOG_TARGET,
-        "native before-sleep relock armed (#204 Phase 3b; logind PrepareForSleep(true) → screensaver::lock)"
+        "native before-sleep relock armed (logind PrepareForSleep(true) → screensaver::lock)"
     );
 
     while let Some(event) = events.next().await {
@@ -425,7 +358,7 @@ async fn run_prepare_for_sleep_relock() {
     }
 }
 
-// ── Native idle actions (Phase 3a, opt-in) ─────────────────────────────────────
+// ── Native idle actions ─────────────────────────────────────────────────────
 
 /// `true` if the logind `BlockInhibited` set holds `what` (so the matching
 /// native idle action must be **skipped**). On any error reading it we return
@@ -517,7 +450,7 @@ async fn run_command(program: &'static str, args: &'static [&'static str]) -> bo
 /// notification per threshold, then dispatch events forever. Runs on the
 /// dedicated observer thread; returns only on a fatal Wayland error (or `Ok`
 /// when the compositor advertises no idle-notifier at all).
-fn run(state: Mutable<IdleState>, actions_enabled: bool) -> Result<()> {
+fn run(state: Mutable<IdleState>) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
     let (globals, mut queue) =
@@ -531,20 +464,20 @@ fn run(state: Mutable<IdleState>, actions_enabled: bool) -> Result<()> {
         .context("bind wl_seat (no seat advertised?)")?;
 
     // Graceful no-op if the compositor lacks the global (non-niri / older niri):
-    // swayidle keeps driving the timeline; we simply observe nothing.
+    // the idle timeline simply doesn't run.
     let notifier: ExtIdleNotifierV1 = match globals.bind(&qh, 1..=1, ()) {
         Ok(notifier) => notifier,
         Err(err) => {
-            tracing::info!(
+            tracing::warn!(
                 target: LOG_TARGET,
                 error = %err,
-                "compositor does not advertise ext_idle_notifier_v1; native idle observer disabled (swayidle still runs)"
+                "compositor does not advertise ext_idle_notifier_v1; native idle manager disabled (no dim/lock/suspend)"
             );
             return Ok(());
         }
     };
 
-    let mut client = IdleClient::new(state, actions_enabled);
+    let mut client = IdleClient::new(state);
     for &secs in &THRESHOLDS {
         // Protocol timeout is in milliseconds; the notification's user-data is
         // the threshold in seconds so the event handler can identify it.
@@ -557,8 +490,7 @@ fn run(state: Mutable<IdleState>, actions_enabled: bool) -> Result<()> {
     tracing::info!(
         target: LOG_TARGET,
         thresholds_secs = ?THRESHOLDS,
-        native_actions = actions_enabled,
-        "native ext-idle-notify-v1 client armed (#204 Phase 3a; observe-only unless native_actions=true, which fires dim@240/lock@300/suspend@600 gated on logind inhibitors)"
+        "native ext-idle-notify-v1 idle manager armed (dim@240/lock@300/suspend@600, gated on logind inhibitors)"
     );
 
     loop {
@@ -637,16 +569,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn swayidle_action_maps_known_thresholds() {
-        assert_eq!(swayidle_action(240), "dim");
-        assert_eq!(swayidle_action(300), "lock");
-        assert_eq!(swayidle_action(600), "suspend");
-        assert_eq!(swayidle_action(42), "none");
+    fn action_name_maps_known_thresholds() {
+        assert_eq!(action_name(240), "dim");
+        assert_eq!(action_name(300), "lock");
+        assert_eq!(action_name(600), "suspend");
+        assert_eq!(action_name(42), "none");
     }
 
     #[test]
     fn snapshot_tracks_deepest_active_threshold() {
-        let mut client = IdleClient::new(Mutable::new(IdleState::default()), false);
+        let mut client = IdleClient::new(Mutable::new(IdleState::default()));
         assert_eq!(client.snapshot(), IdleState::Active);
 
         client.on_idled(240);
@@ -699,15 +631,5 @@ mod tests {
         // resume → no-op.
         assert!(should_relock_on_prepare_for_sleep(true));
         assert!(!should_relock_on_prepare_for_sleep(false));
-    }
-
-    #[test]
-    fn is_truthy_recognises_common_on_values() {
-        for on in ["1", "true", "TRUE", "Yes", " on ", "On"] {
-            assert!(is_truthy(on), "{on:?} should be truthy");
-        }
-        for off in ["0", "false", "no", "off", "", "  ", "2", "enable"] {
-            assert!(!is_truthy(off), "{off:?} should be falsy");
-        }
     }
 }

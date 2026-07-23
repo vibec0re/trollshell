@@ -6,7 +6,6 @@ into your user config directory per the per-feature README.
 | Subdirectory                                       | Purpose                                              | Setup                         |
 | -------------------------------------------------- | ---------------------------------------------------- | ----------------------------- |
 | [xdg-desktop-portal](xdg-desktop-portal/README.md) | File-picker + screen-share routing                   | symlink portals.conf          |
-| [swayidle](swayidle/README.md)                     | Idle dim/lock/suspend pipeline                       | symlink + enable unit         |
 | [niri](niri/README.md)                             | Media-key bindings + autostart snippet               | merge into config.kdl         |
 | [fuzzel](fuzzel/README.md)                         | App launcher                                         | symlink                       |
 | [kanshi](kanshi/README.md)                         | Display profiles                                     | symlink + enable unit         |
@@ -21,12 +20,19 @@ full install sequence. That directory also ships
 plugin (#35) — a separate, GTK-free binary that dials the shell over a Unix
 socket; see its "Out-of-process widget plugins" section.
 
-## Screen locking
+## Idle & screen locking
+
+The idle → dim → lock → suspend pipeline is **native to trollshell** — it runs
+in-process as an `ext-idle-notify-v1` client (see
+`crates/hytte-services/src/idle_notify.rs`), so there is no separate idle daemon
+to install. It dims the backlight at 4 min, locks at 5, suspends at 10, and
+relocks just before any suspend (logind `PrepareForSleep`), each gated on logind
+inhibitors (a held `idle` inhibitor — e.g. the Power drawer's "Keep awake"
+toggle — skips dim/lock). This replaced swayidle (#204).
 
 trollshell does **not** ship a lock screen — locking is delegated to an
-established, security-audited tool. This config uses `swaylock` (driven by
-`swayidle`); the trollshell bar's Power → Lock button and any
-`loginctl lock-session` both trigger it via logind's `Lock` signal. Wire
-swaylock's own PAM stack (`/etc/pam.d/swaylock`; NixOS:
-`security.pam.services.swaylock = {};`) — without it swaylock can never
-verify a password.
+established, security-audited tool. This config uses `swaylock`; the native lock
+timer, the trollshell bar's Power → Lock button, and any `loginctl lock-session`
+all trigger it via logind's `Lock` signal. Wire swaylock's own PAM stack
+(`/etc/pam.d/swaylock`; NixOS: `security.pam.services.swaylock = {};`) — without
+it swaylock can never verify a password.

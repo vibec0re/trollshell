@@ -2,13 +2,14 @@
 
 Top-level entry point for "how do I bring up the whole DE." This directory
 ships the systemd user units that, taken together, define the niri session:
-trollshell (bar, drawer, the cluster of services it hosts), the idle daemon,
-and the wallpaper renderer. They all hang off a single umbrella target,
-`niri-session.target`, which the niri compositor pulls in at startup.
+trollshell (bar, drawer, the cluster of services it hosts — including the
+native idle → dim → lock → suspend manager) and the wallpaper renderer. They
+all hang off a single umbrella target, `niri-session.target`, which the niri
+compositor pulls in at startup.
 
-The component-level READMEs (`../../swayidle/README.md`,
-`../../wallpaper/README.md`) document each piece in isolation; this README
-covers the glue.
+The component-level README (`../../wallpaper/README.md`) documents the
+wallpaper piece in isolation; this README covers the glue. The idle pipeline is
+in-process (`crates/hytte-services/src/idle_notify.rs`), not a separate unit.
 
 ## Dependency graph
 
@@ -21,9 +22,9 @@ niri-session.target                   (this directory's umbrella target)
         │
         │ pulls in (WantedBy)
         ├── trollshell.service        (bar + drawer + screensaver
-        │                              + bluetooth-audio + … all in-process)
+        │                              + idle manager + bluetooth-audio
+        │                              + … all in-process)
         ├── trollshell-plugin-clock-demo.service  (out-of-process widget plugin)
-        ├── swayidle.service          (dim → lock → suspend)
         ├── swaybg.service            (wallpaper)
         └── polkit-gnome-authentication-agent-1.service  (polkit prompts)
 ```
@@ -41,17 +42,20 @@ A deliberately incomplete list, because the answer is "almost everything":
 
 - The bar and the drawer (GTK4 + libadwaita).
 - The ScreenSaver D-Bus interface (#29).
+- The native idle → dim → lock → suspend manager (#204) — an
+  `ext-idle-notify-v1` client that replaced swayidle. Needs `brightnessctl`
+  on `PATH` for the dim step.
 - The bluetooth-audio auto-switch service (#37).
 - The OSD popup (#30), pipewire / brightness / mpris / network / etc.
 
 We intentionally don't ship separate units for any of those — they're all
 event loops on the same GLib main context as the bar, and splitting them
 into independent services would only add D-Bus indirection and lifecycle
-complexity for no gain.
+complexity for no gain. The idle pipeline lived in swayidle before #204; owning
+it in-process is what lets it honor logind inhibitors natively.
 
-The exceptions (swayidle, swaybg) are external binaries that already run
-fine as their own units; wrapping them in trollshell would just add a
-supervisor we don't need.
+The one exception (swaybg) is an external binary that already runs fine as its
+own unit; wrapping it in trollshell would just add a supervisor we don't need.
 
 ## Out-of-process widget plugins
 
@@ -134,9 +138,9 @@ Just niri itself — the components have their own package lists:
   `mate-polkit` / `hyprpolkitagent` if you prefer; adjust the unit's
   `ExecStart` accordingly.)
 
-Each child unit's README documents its own dependencies (swayidle pulls in
-brightnessctl; swaybg pulls in swaybg the binary; trollshell is
-this repo's `cargo build --release` output).
+Each child unit's README documents its own dependencies (swaybg pulls in
+swaybg the binary; trollshell is this repo's `cargo build --release` output and
+wants `brightnessctl` on `PATH` for the idle manager's dim step).
 
 Install niri on Arch:
 
@@ -157,8 +161,6 @@ ln -sf "$PWD/etc/systemd/user/niri-session.target" \
        ~/.config/systemd/user/niri-session.target
 ln -sf "$PWD/etc/systemd/user/trollshell.service" \
        ~/.config/systemd/user/trollshell.service
-ln -sf "$PWD/etc/systemd/user/swayidle.service"   \
-       ~/.config/systemd/user/swayidle.service
 ln -sf "$PWD/etc/systemd/user/swaybg.service"     \
        ~/.config/systemd/user/swaybg.service
 ln -sf "$PWD/etc/systemd/user/polkit-gnome-authentication-agent-1.service" \
@@ -167,7 +169,7 @@ ln -sf "$PWD/etc/systemd/user/trollshell-plugin-clock-demo.service" \
        ~/.config/systemd/user/trollshell-plugin-clock-demo.service
 
 systemctl --user daemon-reload
-systemctl --user enable trollshell.service swayidle.service swaybg.service \
+systemctl --user enable trollshell.service swaybg.service \
                         polkit-gnome-authentication-agent-1.service \
                         trollshell-plugin-clock-demo.service
 ```
@@ -232,7 +234,7 @@ and restart the session (or just the service).
 
 ## Verification
 
-After logging into niri, the umbrella target and all three child units
+After logging into niri, the umbrella target and its child units
 should be active:
 
 ```sh
@@ -241,14 +243,13 @@ systemctl --user list-dependencies niri-session.target
 ```
 
 `status` prints `active`; `list-dependencies` shows the tree with
-trollshell.service / swayidle.service / swaybg.service all marked active.
+trollshell.service / swaybg.service all marked active.
 
 To watch the chain start in real time on the next login:
 
 ```sh
 journalctl --user -f -u niri-session.target \
                     -u trollshell.service   \
-                    -u swayidle.service     \
                     -u swaybg.service
 ```
 
@@ -261,10 +262,13 @@ trollshell.service -b` has the panic / log output. `Restart=on-failure`
     goes into `failed` state after systemd's default start-limit kicks in.
 - **swaybg restart-loops.** Almost always a bad / missing
   `~/.config/trollshell/wallpaper.path`. See `../../wallpaper/README.md`.
-- **swayidle starts but the lock never fires.** swayidle runs `swaylock`,
-  which authenticates via PAM — make sure `/etc/pam.d/swaylock` exists
-  (NixOS: `security.pam.services.swaylock = {};`). trollshell no longer
-  ships its own locker.
+- **The idle lock never fires.** The native idle manager runs inside
+  `trollshell.service` and locks via `loginctl lock-session`, which the
+  session's `swaylock` picks up — make sure `/etc/pam.d/swaylock` exists
+  (NixOS: `security.pam.services.swaylock = {};`), or `swaylock` can never
+  verify a password. Check `journalctl --user -u trollshell.service` for the
+  `hytte_services::idle_notify` log lines. (Dim needs `brightnessctl` on
+  `PATH`.)
 - **`niri-session.target` is `inactive`.** niri's spawn-at-startup didn't
   fire, or `import-environment` failed. Log into niri however you normally
   do (greetd, TTY exec, etc.), then watch `journalctl --user -f` for the

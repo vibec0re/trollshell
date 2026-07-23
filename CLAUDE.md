@@ -105,7 +105,13 @@ cargo clippy --workspace --all-targets        # must be clean
 cargo fmt --all
 ```
 
-Edition 2024, MSRV 1.85. The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
+Edition 2024, MSRV 1.91 (`rust-version.workspace = true` in every member since #453 — wiring up the inheritance is what surfaced `clippy::incompatible_msrv` violations against the previously-fictional 1.85 and forced the bump; not independently CI-gated beyond that clippy check — the devShell/crane toolchain floats on nixpkgs' current rustc, ~1.95). The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
+
+Shared dependency versions/feature baselines live in the root `Cargo.toml`'s `[workspace.dependencies]`; members inherit with `dep.workspace = true` rather than hand-repinning (#453). `deny.toml` (repo root) holds a `cargo-deny` advisories+licenses config, run locally — it isn't wired into `nix flake check` (the advisory-db fetch needs network, which sandboxed nix builds don't have):
+
+```sh
+nix shell nixpkgs#cargo-deny --command cargo-deny check
+```
 
 ## Architecture — the reactive core
 

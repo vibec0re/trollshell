@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "GTK4 ↔ futures-signals bridge and service registry for hytte"
 
 [lints]
@@ -15,9 +16,9 @@ workspace = true
 system-tests = []
 
 [dependencies]
-futures-signals = "0.3.34"
-gtk = { version = "0.11.2", package = "gtk4" }
-tokio = { version = "1.52.1", features = [
+futures-signals.workspace = true
+gtk.workspace = true
+tokio = { workspace = true, features = [
   "rt-multi-thread",
   "sync",
   "net",
@@ -25,8 +26,11 @@ tokio = { version = "1.52.1", features = [
   "time",
   "macros",
 ] }
-tracing = "0.1.44"
+tracing.workspace = true
 
 [dev-dependencies]
-futures-executor = "0.3.32"
-futures-util = "0.3.32"
+futures-executor.workspace = true
+# Workspace `futures-util` sets `default-features = false` (what hytte-bus/
+# hytte-services' main dependency needs); widen back to the full default set
+# here, matching this crate's original bare `"0.3.32"` dev-dependency.
+futures-util = { workspace = true, default-features = true }

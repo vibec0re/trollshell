@@ -4,16 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Personal Wayland desktop shell built on hytte"
 
 [lints]
 workspace = true
 
 [dependencies]
-chrono = { version = "0.4.44", default-features = false, features = [
-  "clock",
-  "std",
-] }
+chrono.workspace = true
 hytte = { path = "../crates/hytte" }
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
@@ -21,21 +19,27 @@ hytte = { path = "../crates/hytte" }
 hytte-plugin-proto = { path = "../crates/hytte-plugin-proto", features = [
   "tokio",
 ] }
-tokio = { version = "1.52.1", features = ["net", "rt", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
 # Direct zbus dep for the `#[zbus::interface]` macro backing the
 # `mov.vibec0re.trollshell.Control` object (control.rs, #390). Connection
 # ownership goes through `hytte_bus::own_name`, never a raw zbus connection —
 # same version/features as hytte-services' dep.
-zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+zbus.workspace = true
+tracing.workspace = true
+# Workspace `tracing-subscriber` sets `default-features = false` (what
+# hytte-services' dev-dependency needs); widen back to the full default set
+# here, matching this crate's original (default-features unset) manifest.
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "fmt",
+  "env-filter",
+] }
 
 [dev-dependencies]
 # Host-side plugin-session tests (#305): `#[tokio::test]` needs `macros`, and the
 # "no visibility frame arrives" assertions need `time` (`tokio::time::timeout`).
 # `test-util` drives the paused-clock handshake-timeout test (#435). net/rt/sync
 # are already on the normal dep; dev-dep features merge for tests.
-tokio = { version = "1.52.1", features = [
+tokio = { workspace = true, features = [
   "macros",
   "time",
   "test-util",

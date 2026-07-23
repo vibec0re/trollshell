@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "caw's desktop body — a cybercrow that renders the opencaw agent's live self-expression (mood + speech) in the trollshell sidebar"
 
 [lints]
@@ -24,23 +25,20 @@ hytte-ai-providers = { path = "../hytte-ai-providers" }
 # The 2s expression-file poll loop: `rt` for `spawn` (and the briefing's
 # `spawn_blocking`), `time` for `interval`, `sync` for the mpsc that feeds each
 # read back into `update`.
-tokio = { version = "1.40", default-features = false, features = [
+tokio = { workspace = true, default-features = false, features = [
   "rt",
   "time",
   "sync",
 ] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 # The briefing's one-shot ingredient fetches (open-meteo, HAFAS) — the same
 # blocking `ureq` + `spawn_blocking` idiom as the weather/departures plugins.
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+ureq = { workspace = true, features = ["rustls"] }
 # Reads the home place (station/walk/lat/lon) out of
 # `~/.config/trollshell/places.toml` — the same file + schema the native
 # `places` service and the departures plugin read.
-toml = "1"
+toml.workspace = true
 # Local wall-clock for the briefing trigger (once a day, at a set hour) and
 # RFC 3339 departure timestamps → "in N min". `clock` for `Local::now()`.
-chrono = { version = "0.4.44", default-features = false, features = [
-  "clock",
-  "std",
-] }
+chrono = { workspace = true, features = ["clock", "std"] }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Showcase plugin for the SDK's preem raster kit (issue #356): a 7seg clock, dot-matrix ticker, and 8bit textbox cycling the VFD/LCD/OLED skins"
 
 [lints]

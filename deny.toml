@@ -1,0 +1,64 @@
+# cargo-deny config (#453): advisories + licenses.
+#
+# Local run (not wired into `nix flake check` — see CLAUDE.md's Lint
+# section for why):
+#   nix shell nixpkgs#cargo-deny --command cargo-deny check
+
+[graph]
+# trollshell only ever ships for the two Linux triples flake.nix's `systems`
+# builds (x86_64-linux/aarch64-linux) — pruning the graph to those keeps
+# Windows/wasm-only conditional deps (e.g. windows-sys, r-efi via a wasi
+# backend) out of the advisory/license surface entirely, rather than
+# allow-listing licenses for code that's never actually compiled here.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.39.4 DoS-class findings
+  # (quadratic attribute scan / unbounded namespace-decl allocation). Reached
+  # only via wayland-scanner (a *build-time* codegen dependency of
+  # wayland-client/wayland-protocols that parses the Wayland protocol XML
+  # bundled with those crates, not attacker-controlled input) — not a runtime
+  # dependency, and wayland-scanner's own quick-xml requirement doesn't reach
+  # the fixed 0.41 line yet (`cargo update -p quick-xml` confirmed no bump
+  # available as of #453). Revisit when wayland-scanner updates.
+  { id = "RUSTSEC-2026-0194", reason = "build-time-only codegen (wayland-scanner) parsing trusted, repo-bundled protocol XML; no compatible quick-xml bump available yet" },
+  { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194 — build-time-only codegen, not exposed to untrusted input" },
+]
+
+[licenses]
+# Every license actually present in the pruned graph as of #453 (verified via
+# `cargo deny list`), minus GPL-3.0-or-later — that one is real (niri-ipc) but
+# copyleft, so it's scoped to that one crate via `exceptions` below rather than
+# allow-listed workspace-wide for any future dependency to pick up quietly.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+# Per-crate carve-outs for licenses that aren't allow-listed globally.
+exceptions = [
+  # niri-ipc (hytte-services' Niri IPC client) is GPL-3.0-or-later — niri's own
+  # license. Scoped here rather than a blanket GPL allow so a future dependency
+  # can't pick up copyleft terms silently.
+  { allow = ["GPL-3.0-or-later"], crate = "niri-ipc" },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

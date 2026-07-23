@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "GTK4 + libadwaita + layer-shell primitives for hytte"
 
 [lints]
@@ -15,10 +16,10 @@ workspace = true
 system-tests = []
 
 [dependencies]
-adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
-futures-signals = "0.3.34"
+adw.workspace = true
+futures-signals.workspace = true
 gio = { version = "0.22.5", default-features = false }
-gtk = { version = "0.11.2", package = "gtk4", features = ["v4_14"] }
+gtk = { workspace = true, features = ["v4_14"] }
 gtk4-layer-shell = "0.8.0"
 hytte-reactive = { path = "../hytte-reactive" }
 tracing = "0.1.44"

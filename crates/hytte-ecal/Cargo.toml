@@ -4,24 +4,30 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Minimal hand-written FFI for evolution-data-server's libecal-2.0 + libedataserver-1.2: source enumeration, ECalClient connect, VTODO/VEVENT CRUD."
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow.workspace = true
 # `clock` pulls in the local-timezone lookup we need to resolve a floating
 # (zone-less) DTSTART in the viewer's zone rather than assuming UTC (#388).
-chrono = { version = "0.4.44", default-features = false, features = [
-  "clock",
-  "std",
-] }
-tracing = "0.1.44"
+chrono.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 pkg-config = "0.3"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
+# This crate can't use `[lints] workspace = true` — it's the only workspace
+# member allowed `unsafe_code`, and workspace-lints inheritance is
+# all-or-nothing (no per-lint override), so the umbrella below is hand-mirrored
+# from the root `[workspace.lints]` (see the tripwire comment there) with
+# `unsafe_code` flipped and a few FFI-only allows layered on top. Keep the
+# `rust`/`clippy` tables' shared entries (`all`, `pedantic`,
+# `disallowed_methods`, `module_name_repetitions`, `missing_errors_doc`,
+# `missing_panics_doc`) in sync with root when either changes.
 [lints.rust]
 # Crate-level FFI requires `unsafe`; this is the only crate in the
 # workspace that overrides the global `forbid`. Safe wrappers in
@@ -31,6 +37,7 @@ unsafe_code = "allow"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
+disallowed_methods = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

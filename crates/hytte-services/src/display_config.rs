@@ -75,7 +75,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hytte_bus::{OwnNameSignal, own_name};
-use hytte_reactive::Service;
+use hytte_reactive::{Service, spawn_supervised};
 use niri_ipc::socket::Socket;
 use niri_ipc::{
     ConfiguredMode, ConfiguredPosition, Mode as NiriMode, ModeToSet, Output as NiriOutput,
@@ -677,7 +677,7 @@ pub struct DisplayConfigHandles {
 impl Service for DisplayConfigService {
     type Handles = DisplayConfigHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         // Start above 0 so a client that never called GetCurrentState (serial 0)
         // can't accidentally match.
         let serial = Arc::new(AtomicU32::new(1));
@@ -690,8 +690,12 @@ impl Service for DisplayConfigService {
 
         let serial_loop = serial.clone();
         let ownership_loop = ownership.clone();
-        rt.spawn(async move {
-            monitor_loop(serial_loop, ownership_loop).await;
+        spawn_supervised("display_config", move || {
+            let serial_loop = serial_loop.clone();
+            let ownership_loop = ownership_loop.clone();
+            async move {
+                monitor_loop(serial_loop, ownership_loop).await;
+            }
         });
 
         DisplayConfigHandles {

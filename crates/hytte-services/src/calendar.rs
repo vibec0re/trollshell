@@ -67,7 +67,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone
 use futures_signals::signal::{Mutable, Signal};
 use hytte_ecal::sys::ECalClientSourceType;
 use hytte_ecal::{CalClient, EventInstance, Registry, Source};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
 
 // ── Public data types ────────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ pub struct CalendarService;
 impl Service for CalendarService {
     type Handles = CalendarHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = CalendarHandles::default();
         let writer = handles.events.clone();
 
@@ -198,7 +198,7 @@ impl Service for CalendarService {
 
         // Refresh ticker. The first send fires immediately (initial
         // populate); thereafter every POLL_INTERVAL.
-        rt.spawn(async {
+        spawn_supervised("calendar", || async {
             loop {
                 send_refresh();
                 tokio::time::sleep(POLL_INTERVAL).await;

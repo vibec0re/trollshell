@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use tokio::sync::Notify;
 
 use crate::geoclue::{self, LocationSnapshot, LocationSource, LocationState};
@@ -487,7 +487,7 @@ pub struct PlacesService;
 impl Service for PlacesService {
     type Handles = PlacesHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = PlacesHandles::default();
         let place = handles.place.clone();
         let location = handles.location.clone();
@@ -498,8 +498,13 @@ impl Service for PlacesService {
         let loaded = load_places();
         warn_unsatisfiable_fingerprints(&loaded);
         let places = Mutable::new(Arc::new(loaded));
-        rt.spawn(watch_config(places.clone()));
-        rt.spawn(resolve_loop(place, location, places));
+        spawn_supervised("places", {
+            let places = places.clone();
+            move || watch_config(places.clone())
+        });
+        spawn_supervised("places", move || {
+            resolve_loop(place.clone(), location.clone(), places.clone())
+        });
         handles
     }
 }

@@ -128,6 +128,7 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
+use hytte::reactive::spawn_supervised;
 use hytte::services::{clock, notifications, pipewire};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
@@ -265,7 +266,7 @@ static SPECTRUM_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
 impl Service for PluginsService {
     type Handles = PluginHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let (clock_tx, clock_rx) = watch::channel(None);
         // Slot visibility seeds `false`: no sidebar is open at boot, and each
         // monitor's `install` re-asserts `false` as it wires up (#288).
@@ -307,9 +308,12 @@ impl Service for PluginsService {
             spectrum_rx,
             effects_tx,
         };
-        rt.spawn(async move {
-            if let Err(e) = listen(&ctx).await {
-                tracing::warn!(error = %e, "plugin host listener stopped");
+        spawn_supervised("plugins", move || {
+            let ctx = ctx.clone();
+            async move {
+                if let Err(e) = listen(&ctx).await {
+                    tracing::warn!(error = %e, "plugin host listener stopped");
+                }
             }
         });
         handles

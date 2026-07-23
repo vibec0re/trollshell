@@ -10,7 +10,7 @@
 //! at its last known value.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -173,12 +173,16 @@ pub struct NetconnService;
 impl Service for NetconnService {
     type Handles = NetconnHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NetconnHandles::default();
         let writer = handles.connections.clone();
         let active = handles.active.clone();
-        rt.spawn(async move {
-            poll_loop(writer, active).await;
+        spawn_supervised("netconn", move || {
+            let writer = writer.clone();
+            let active = active.clone();
+            async move {
+                poll_loop(writer, active).await;
+            }
         });
         handles
     }

@@ -10,7 +10,7 @@
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, call, property};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use zbus::zvariant::{OwnedValue, Value};
 
@@ -38,7 +38,7 @@ pub struct PowerProfilesService;
 impl Service for PowerProfilesService {
     type Handles = PowerProfilesHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = PowerProfilesHandles::default();
         let writer = handles.state.clone();
 
@@ -62,40 +62,48 @@ impl Service for PowerProfilesService {
         let active_writer = writer.clone();
         let profiles_writer = writer.clone();
 
-        rt.spawn(async move {
-            active_signal
-                .signal()
-                .for_each(move |state| {
-                    let active = match state {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => String::new(),
-                    };
-                    active_writer.lock_mut().active = active;
-                    std::future::ready(())
-                })
-                .await;
+        spawn_supervised("power_profiles", move || {
+            let active_signal = active_signal.clone();
+            let active_writer = active_writer.clone();
+            async move {
+                active_signal
+                    .signal()
+                    .for_each(move |state| {
+                        let active = match state {
+                            PropState::Loaded(v) | PropState::Stale(v) => v,
+                            PropState::Loading => String::new(),
+                        };
+                        active_writer.lock_mut().active = active;
+                        std::future::ready(())
+                    })
+                    .await;
+            }
         });
 
-        rt.spawn(async move {
-            profiles_signal
-                .signal()
-                .for_each(move |state| {
-                    let raw = match state {
-                        PropState::Loaded(v) | PropState::Stale(v) => v,
-                        PropState::Loading => Vec::new(),
-                    };
-                    let available: Vec<String> = raw
-                        .into_iter()
-                        .filter_map(|m| {
-                            m.get("Profile")
-                                .and_then(|v| v.try_clone().ok())
-                                .and_then(|v| String::try_from(v).ok())
-                        })
-                        .collect();
-                    profiles_writer.lock_mut().available = available;
-                    std::future::ready(())
-                })
-                .await;
+        spawn_supervised("power_profiles", move || {
+            let profiles_signal = profiles_signal.clone();
+            let profiles_writer = profiles_writer.clone();
+            async move {
+                profiles_signal
+                    .signal()
+                    .for_each(move |state| {
+                        let raw = match state {
+                            PropState::Loaded(v) | PropState::Stale(v) => v,
+                            PropState::Loading => Vec::new(),
+                        };
+                        let available: Vec<String> = raw
+                            .into_iter()
+                            .filter_map(|m| {
+                                m.get("Profile")
+                                    .and_then(|v| v.try_clone().ok())
+                                    .and_then(|v| String::try_from(v).ok())
+                            })
+                            .collect();
+                        profiles_writer.lock_mut().available = available;
+                        std::future::ready(())
+                    })
+                    .await;
+            }
         });
 
         handles

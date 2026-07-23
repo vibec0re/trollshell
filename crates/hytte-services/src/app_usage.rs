@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 
 /// Resident page size assumed when converting `/proc/<pid>/statm` pages to
 /// bytes. 4 KiB on every platform trollshell targets; reading the real value
@@ -119,7 +119,7 @@ pub struct AppUsageService;
 impl Service for AppUsageService {
     type Handles = AppUsageHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = AppUsageHandles {
             by_cpu: Mutable::new(Vec::new()),
             by_mem: Mutable::new(Vec::new()),
@@ -128,7 +128,9 @@ impl Service for AppUsageService {
         let by_cpu = handles.by_cpu.clone();
         let by_mem = handles.by_mem.clone();
         let active = handles.active.clone();
-        rt.spawn(poll_loop(by_cpu, by_mem, active));
+        spawn_supervised("app_usage", move || {
+            poll_loop(by_cpu.clone(), by_mem.clone(), active.clone())
+        });
         handles
     }
 }

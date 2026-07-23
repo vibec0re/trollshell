@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use tokio::sync::Notify;
 
 use crate::places::{self, ResolvedPlace};
@@ -403,7 +403,12 @@ impl Service for DeparturesService {
         let handles = DeparturesHandles::default();
         let state = handles.state.clone();
         let notify = handles.notify.clone();
-        rt.spawn(poll_loop(state, notify.clone()));
+        // Supervised: the poll loop owns the `state` signal and parses upstream
+        // departures JSON, so a panic there must restart rather than freeze it.
+        spawn_supervised("departures", {
+            let notify = notify.clone();
+            move || poll_loop(state.clone(), notify.clone())
+        });
 
         // Bridge: re-fetch whenever the resolved place changes (including its
         // first resolution). Reads places' shared handle, which exists because

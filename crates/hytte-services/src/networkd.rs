@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call, signals};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -177,38 +177,45 @@ async fn probe_link_backend() -> LinkBackend {
 impl Service for NetworkdService {
     type Handles = NetworkdHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NetworkdHandles::default();
         let links_writer = handles.links.clone();
         let primary_writer = handles.primary.clone();
 
-        rt.spawn(async move {
-            match probe_link_backend().await {
-                LinkBackend::NetworkManager => {
-                    tracing::info!(
-                        "networkd: sourcing link list from NetworkManager (networkd not managing)"
-                    );
-                    crate::networkd_nm::run_nm_links_watcher(links_writer, primary_writer).await;
-                }
-                LinkBackend::Networkd => {
-                    // Seed once; if the initial refresh fails outright, networkd
-                    // isn't running on this host and no NM is present either —
-                    // log once at info and stay inert rather than hammering dbus
-                    // in a 2s retry loop for the rest of the process lifetime.
-                    if let Err(e) = refresh(&links_writer, &primary_writer).await {
-                        tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
-                        return;
+        spawn_supervised("networkd", move || {
+            let links_writer = links_writer.clone();
+            let primary_writer = primary_writer.clone();
+            async move {
+                match probe_link_backend().await {
+                    LinkBackend::NetworkManager => {
+                        tracing::info!(
+                            "networkd: sourcing link list from NetworkManager (networkd not managing)"
+                        );
+                        crate::networkd_nm::run_nm_links_watcher(links_writer, primary_writer)
+                            .await;
                     }
-                    loop {
-                        match listen(&links_writer, &primary_writer).await {
-                            Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
-                            Err(e) => tracing::warn!(error = ?e, "networkd error, retrying in 2s"),
+                    LinkBackend::Networkd => {
+                        // Seed once; if the initial refresh fails outright, networkd
+                        // isn't running on this host and no NM is present either —
+                        // log once at info and stay inert rather than hammering dbus
+                        // in a 2s retry loop for the rest of the process lifetime.
+                        if let Err(e) = refresh(&links_writer, &primary_writer).await {
+                            tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
+                            return;
                         }
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        loop {
+                            match listen(&links_writer, &primary_writer).await {
+                                Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
+                                Err(e) => {
+                                    tracing::warn!(error = ?e, "networkd error, retrying in 2s")
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
                     }
-                }
-                LinkBackend::None => {
-                    tracing::info!("networkd: no link backend available; service inert");
+                    LinkBackend::None => {
+                        tracing::info!("networkd: no link backend available; service inert");
+                    }
                 }
             }
         });

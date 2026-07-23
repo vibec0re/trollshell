@@ -9,7 +9,7 @@
 //! re-fetch-on-location-change bridge.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -95,7 +95,12 @@ impl Service for WeatherService {
         let handles = WeatherHandles::default();
         let state = handles.state.clone();
         let notify = handles.notify.clone();
-        rt.spawn(poll_loop(state, notify.clone()));
+        // Supervised: the poll loop owns the `state` signal and parses upstream
+        // weather JSON, so a panic there must restart rather than freeze it.
+        spawn_supervised("weather", {
+            let notify = notify.clone();
+            move || poll_loop(state.clone(), notify.clone())
+        });
 
         // Bridge: re-fetch whenever the resolved location changes (including
         // its first resolution). Reads places' shared handle, which exists

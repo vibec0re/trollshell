@@ -11,7 +11,7 @@
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, property};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::net::IpAddr;
 
 pub struct ResolvedService;
@@ -44,7 +44,7 @@ impl Default for ResolvedHandles {
 impl Service for ResolvedService {
     type Handles = ResolvedHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = ResolvedHandles::default();
         let writer = handles.dns.clone();
 
@@ -56,8 +56,11 @@ impl Service for ResolvedService {
             .name("DNS")
             .start();
 
-        rt.spawn(async move {
-            dns_property
+        spawn_supervised("resolved", move || {
+            let dns_property = dns_property.clone();
+            let writer = writer.clone();
+            async move {
+                dns_property
                 .signal()
                 .for_each(move |state| {
                     let raw = match state {
@@ -94,6 +97,7 @@ impl Service for ResolvedService {
                     std::future::ready(())
                 })
                 .await;
+            }
         });
 
         handles

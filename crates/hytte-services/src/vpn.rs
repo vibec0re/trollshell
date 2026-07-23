@@ -20,7 +20,7 @@
 //! listed, just with empty peers / no summary.
 
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::time::{Duration, SystemTime};
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -219,11 +219,14 @@ pub struct VpnService;
 impl Service for VpnService {
     type Handles = VpnHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = VpnHandles::default();
         let writer = handles.tunnels.clone();
-        rt.spawn(async move {
-            poll_loop(writer).await;
+        spawn_supervised("vpn", move || {
+            let writer = writer.clone();
+            async move {
+                poll_loop(writer).await;
+            }
         });
         handles
     }

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::{BusKind, call};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 const NM_NAME: &str = "org.freedesktop.NetworkManager";
@@ -68,11 +68,11 @@ pub struct WifiScanService;
 impl Service for WifiScanService {
     type Handles = WifiScanHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = WifiScanHandles::default();
         let aps = handles.aps.clone();
         let _ = SHARED.set(Shared { aps: aps.clone() });
-        rt.spawn(scan_loop(aps));
+        spawn_supervised("wifiscan", move || scan_loop(aps.clone()));
         handles
     }
 }

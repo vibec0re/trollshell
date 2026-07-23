@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -56,12 +56,15 @@ impl Default for BrightnessHandles {
 impl Service for BrightnessService {
     type Handles = BrightnessHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = BrightnessHandles::default();
         let writer = handles.current.clone();
 
-        rt.spawn(async move {
-            poll_loop(writer).await;
+        spawn_supervised("brightness", move || {
+            let writer = writer.clone();
+            async move {
+                poll_loop(writer).await;
+            }
         });
 
         handles

@@ -3,10 +3,8 @@
 //! See spec section 3.2.
 
 use crate::connection::SharedConnection;
-use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// A single signal emission delivered to the consumer.
@@ -30,8 +28,6 @@ pub struct SignalSubscription {
 
 struct SubInner {
     sender: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
-    missed: Mutable<u64>,
-    missed_counter: Arc<AtomicU64>,
     /// A oneshot receiver that resolves when the internal task exits.
     /// Exposed via `task_done_receiver()` for integration tests.
     task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -48,21 +44,6 @@ impl SignalSubscription {
                 yield (*evt).clone();
             }
         })
-    }
-
-    /// Counter that bumps every time the bus reconnected and we
-    /// re-subscribed — i.e. some signals between disconnect and
-    /// re-subscribe were lost. Consumers that need authoritative state
-    /// should re-fetch when this signal fires.
-    pub fn missed_emissions(&self) -> impl futures_signals::signal::Signal<Item = u64> {
-        self.inner.missed.signal_cloned()
-    }
-
-    /// Read the current missed-emissions count directly. Useful in tests
-    /// that need to poll the counter without setting up a reactive pipeline.
-    #[must_use]
-    pub fn missed_count(&self) -> u64 {
-        self.inner.missed_counter.load(Ordering::Acquire)
     }
 
     /// Take the oneshot receiver that fires when the internal subscription
@@ -88,8 +69,6 @@ struct RunCtx {
     /// `None`, which is the definitive signal that no consumer will ever call
     /// `events()` again and the task can exit.
     weak: std::sync::Weak<SubInner>,
-    missed: Mutable<u64>,
-    missed_counter: Arc<AtomicU64>,
     /// Fired when the task exits so integration tests can verify teardown.
     task_done_tx: tokio::sync::oneshot::Sender<()>,
 }
@@ -149,14 +128,10 @@ impl SignalsBuilder {
     #[must_use]
     pub fn start(self) -> SignalSubscription {
         let (tx, _) = tokio::sync::broadcast::channel(64);
-        let missed = Mutable::new(0u64);
-        let missed_counter = Arc::new(AtomicU64::new(0));
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let inner = Arc::new(SubInner {
             sender: tx.clone(),
-            missed: missed.clone(),
-            missed_counter: missed_counter.clone(),
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
         });
         let weak = Arc::downgrade(&inner);
@@ -169,8 +144,6 @@ impl SignalsBuilder {
             signal_name: self.signal,
             tx,
             weak,
-            missed,
-            missed_counter,
             task_done_tx,
         };
         hytte_reactive::runtime::handle().spawn(async move {
@@ -284,12 +257,9 @@ async fn run_subscription(ctx: RunCtx) {
         signal_name,
         tx,
         weak,
-        missed,
-        missed_counter,
         task_done_tx,
     } = ctx;
 
-    let mut first_iteration = true;
     loop {
         // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
         if weak.upgrade().is_none() {
@@ -304,19 +274,13 @@ async fn run_subscription(ctx: RunCtx) {
             return;
         }
 
-        if !first_iteration {
-            let n = missed_counter.fetch_add(1, Ordering::AcqRel) + 1;
-            missed.set(n);
-        }
-        first_iteration = false;
-
         let conn_result = shared.with_conn(|conn| async move { Ok(conn) }).await;
         // Capture epoch AFTER with_conn returns so that current_epoch reflects
         // the epoch under which the subscription was actually built. Capturing
         // it before with_conn would race against the supervisor's first connect
         // (which bumps epoch 0 → 1), causing drain_signal_stream to see an
-        // immediate epoch advance and spuriously fire missed_emissions on cold
-        // start before any genuine reconnect has occurred.
+        // immediate epoch advance and needlessly tear down and rebuild the
+        // subscription on cold start before any genuine reconnect has occurred.
         let current_epoch = shared.epoch();
         let conn = match conn_result {
             Ok(c) => c,

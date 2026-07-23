@@ -2,10 +2,12 @@
 //!
 //! See spec section 3.4.
 
+use crate::BusError;
 use crate::connection::SharedConnection;
 use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 use zbus::zvariant::{OwnedValue, Value};
 
 /// Three states of a tracked property.
@@ -231,14 +233,60 @@ async fn run_property<T>(
             return;
         }
 
+        // Mark the pre-Get state exactly once per (re)connect cycle. The retry
+        // loop below must not re-emit it on every failed attempt — a permanently
+        // failing property (absent daemon, AccessDenied) would otherwise re-wake
+        // every bound GTK loop at the retry cadence.
         match &last {
             Some(v) => writer.set(PropState::Stale(v.clone())),
             None => writer.set(PropState::Loading),
         }
 
-        let Some(initial) = cold_get::<T>(&ctx).await else {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            continue;
+        // Retry the cold Get until it succeeds (or all handles drop), backing
+        // off differently for transient (bus mid-reconnect — retry promptly)
+        // versus permanent (`ServiceUnknown`/`AccessDenied` — retry rarely so a
+        // doomed call doesn't hammer the bus at 2 Hz forever).
+        let mut perm_backoff = Duration::from_millis(500);
+        let mut warned_permanent = false;
+        let initial = loop {
+            if ctx.weak.upgrade().is_none() {
+                tracing::debug!(
+                    dest = ctx.dest,
+                    path = ctx.path,
+                    iface = ctx.iface,
+                    name = ctx.name,
+                    "all property handles dropped (Get retry); exiting task"
+                );
+                if let Some(tx) = task_done_tx.take() {
+                    let _ = tx.send(());
+                }
+                return;
+            }
+
+            match cold_get::<T>(&ctx).await {
+                Ok(v) => break v,
+                Err(e) if e.is_transient() => {
+                    tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                        iface = ctx.iface, name = ctx.name,
+                        "property Get failed (transient); will retry");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    if warned_permanent {
+                        tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                            iface = ctx.iface, name = ctx.name,
+                            retry_in_ms = perm_backoff.as_millis(),
+                            "property Get still permanently failing");
+                    } else {
+                        warned_permanent = true;
+                        tracing::warn!(error = %e, dest = ctx.dest, path = ctx.path,
+                            iface = ctx.iface, name = ctx.name,
+                            "property Get permanently failing; backing off retries");
+                    }
+                    tokio::time::sleep(perm_backoff).await;
+                    perm_backoff = (perm_backoff * 2).min(Duration::from_mins(1));
+                }
+            }
         };
         last = Some(initial.clone());
         writer.set(PropState::Loaded(initial));
@@ -267,7 +315,7 @@ async fn run_property<T>(
     }
 }
 
-async fn cold_get<T>(ctx: &PropCtx<T>) -> Option<T>
+async fn cold_get<T>(ctx: &PropCtx<T>) -> Result<T, BusError>
 where
     T: Clone
         + Send
@@ -276,8 +324,7 @@ where
         + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
-    let result = ctx
-        .shared
+    ctx.shared
         .with_conn(|conn| {
             let dest = ctx.dest.clone();
             let path = ctx.path.clone();
@@ -299,16 +346,7 @@ where
                 Ok(typed)
             }
         })
-        .await;
-
-    match result {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
-                iface = ctx.iface, name = ctx.name, "property Get failed; will retry");
-            None
-        }
-    }
+        .await
 }
 
 /// Returns the `PropertiesChanged` stream and the epoch under which it was

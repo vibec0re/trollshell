@@ -51,3 +51,51 @@ async fn epoch_bumps_after_supervised_reconnect() {
         "epoch did not advance within 5s of simulated disconnect"
     );
 }
+
+// Regression test for issue #433 fix 1: a late transient failure from a
+// superseded connection attempt must not clobber a connection the supervisor
+// has already re-established.
+#[tokio::test(flavor = "multi_thread")]
+async fn late_transient_failure_does_not_clobber_fresh_connection() {
+    let (conn, guard) = ephemeral_bus().await;
+    let shared = SharedConnection::for_test_session(conn);
+
+    // A replacement connection standing in for the one the supervisor would
+    // install after a disconnect.
+    let fresh = Builder::address(guard.address.as_str())
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("open replacement connection to ephemeral bus");
+
+    // Run an op that, mid-flight, sees a *fresh* connection installed
+    // (generation bump) and only then fails transiently — exactly the "late
+    // failure from a superseded attempt" race. The generation guard in
+    // `with_conn` must decline to clear the fresh connection.
+    let shared_for_op = shared.clone();
+    let shared_for_install = shared.clone();
+    let result = shared_for_op
+        .with_conn(move |_old_conn| async move {
+            shared_for_install
+                .install_fresh_connection_for_test(fresh)
+                .await;
+            Err::<(), zbus::Error>(zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                "late failure from superseded conn".to_owned(),
+            ))))
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "the in-flight op itself must still report its failure"
+    );
+
+    // The fresh connection must still be cached: a subsequent op finds a
+    // connection rather than the mid-reconnect transient sentinel.
+    let after = shared
+        .with_conn(|_c| async move { Ok::<(), zbus::Error>(()) })
+        .await;
+    assert!(
+        after.is_ok(),
+        "late transient failure clobbered the freshly installed connection"
+    );
+}

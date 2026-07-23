@@ -112,17 +112,21 @@
 //!   → the plugin's own panel, #349 PR2), [`Effect::RaiseOsd`] (→ the transient
 //!   OSD nudge, #236), and [`Effect::Notify`] (→ a local notification toast
 //!   through the shell's own daemon, #406) are brokered; every other effect is
-//!   logged "unsupported in v1" and skipped. Capability
-//!   enforcement stays **declarative-only** (the cap is requested + audit-logged
-//!   but not enforced by a cap store — v1 parity); audit-log / the `RunCommand`
-//!   round-trip remain deferred.
+//!   logged "unsupported in v1" and skipped. Capability **enforcement** is host
+//!   policy (#436): an effect whose [`Capability`] the plugin didn't declare in
+//!   its manifest is dropped with a warn in the connection reader
+//!   ([`enforce_capabilities`]) before it ever reaches the broker, making the
+//!   manifest's "the host auto-grants from the manifest" model true. A persisted
+//!   audit-log and the `RunCommand` round-trip remain deferred.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -136,8 +140,8 @@ use hytte::reactive::spawn_supervised;
 use hytte::services::{clock, notifications, pipewire};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
-    AudioSpectrum, ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg, StateKey,
-    StateSnapshot, read_frame, socket_path, wire, write_frame,
+    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg,
+    StateKey, StateSnapshot, read_frame, socket_path, wire, write_frame,
 };
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -257,6 +261,14 @@ struct ListenerCtx {
     accent_rx: watch::Receiver<Option<[u8; 4]>>,
     /// Subscriber end of [`PluginHandles::spectrum_tx`] (#405).
     spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
+    /// This host's set of currently-connected plugin ids (#436). One live
+    /// connection per id: a second `Register` for an id already present is
+    /// rejected (see [`IdGuard`]), so two connections can't fight over one
+    /// region card. An `Arc<Mutex<…>>` because it's shared across the tokio
+    /// per-connection tasks and only ever touched briefly (claim/release), never
+    /// across an await. Scoped to the host (not process-global) so the
+    /// per-connection tests stay isolated from one another.
+    live_ids: Arc<Mutex<HashSet<String>>>,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
 
@@ -310,6 +322,7 @@ impl Service for PluginsService {
             visibility_rx,
             accent_rx,
             spectrum_rx,
+            live_ids: Arc::new(Mutex::new(HashSet::new())),
             effects_tx,
         };
         spawn_supervised("plugins", move || {
@@ -610,11 +623,11 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// and [`Effect::Notify`] (→ a local notification toast, #406); anything else is
-/// logged and skipped. Capability gating is intentionally **declarative-only** at
-/// this stage — like `OpenPage`, the `RaiseOsd`/`Notify` caps are requested in the
-/// manifest and audit-logged here but not enforced by a cap store (v1 parity;
-/// audit-log + the `RunCommand` round-trip remain deferred — see the module doc /
-/// PR body).
+/// logged and skipped. Capability enforcement happens **upstream** of here, per
+/// connection: [`enforce_capabilities`] drops any effect whose [`Capability`] the
+/// plugin didn't declare before it ever reaches this broker (#436), so an effect
+/// arriving here is always one the plugin was granted. A persisted audit-log and
+/// the `RunCommand` round-trip remain deferred.
 fn broker_effect(plugin_id: &str, effect: &Effect) {
     match effect {
         Effect::OpenPage(page) => match resolve_open_page(*page) {
@@ -996,11 +1009,24 @@ fn accept_backoff(err: &std::io::Error) -> Option<std::time::Duration> {
     }
 }
 
+/// Probe whether a live listener already owns the host socket (#436). A
+/// successful `UnixStream::connect` means another trollshell instance is
+/// listening on the path, so a second instance (a dev `cargo run` beside the
+/// deployed user service) must stand down rather than unlink the live socket out
+/// from under it. A refused/failed connect means a stale socket file (a previous
+/// run left it) or no file at all — safe to reclaim. The probe connection is
+/// dropped immediately (it sends nothing), so the live host sees an instant EOF
+/// and reaps it without waiting out the handshake timeout.
+async fn socket_in_use(path: &Path) -> bool {
+    UnixStream::connect(path).await.is_ok()
+}
+
 /// Bind the host socket and accept plugin connections forever. The path comes
 /// from [`hytte_plugin_proto::socket_path`] (shared with the plugin-side
 /// runtime — the one definition both ends dial/bind; `None` = same-user-only
-/// by spec, no fallback). Creates the parent dir (`0700`), unlinks any stale
-/// socket before bind, and tightens the socket to `0600`.
+/// by spec, no fallback). Creates the parent dir (`0700`), refuses to steal a
+/// live sibling's socket (#436), unlinks any stale socket before bind, and
+/// tightens the socket to `0600`.
 async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
     let Some(path) = socket_path() else {
         tracing::warn!("XDG_RUNTIME_DIR unset; plugin host socket not created");
@@ -1010,6 +1036,25 @@ async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
         // Same-user only. Best-effort — the runtime dir is already 0700.
         let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+    // #436: refuse to steal a live sibling's socket. A second shell instance (a
+    // dev `cargo run` beside the deployed user service) must NOT unlink the
+    // running shell's socket and bind its own — that strands every plugin
+    // against the dev instance and leaves a dead socket on the dev instance's
+    // exit (ECONNREFUSED for every reconnect). Probe first: if a listener
+    // already answers on the path, another trollshell owns it, so stand down.
+    // Returning `Ok(())` means the supervisor takes this as a clean completion
+    // and does not restart us, so the dev instance simply runs without a plugin
+    // host. A stale socket (connect refused) falls through and is reclaimed
+    // below, so a normal restart — which stops the old process before starting
+    // the new — still rebinds cleanly.
+    if socket_in_use(&path).await {
+        tracing::warn!(
+            socket = %path.display(),
+            "plugin host socket already has a live listener (another trollshell instance?); \
+             not taking it over",
+        );
+        return Ok(());
     }
     // A stale socket left by a previous run makes `bind` fail with EADDRINUSE.
     match fs::remove_file(&path) {
@@ -1206,6 +1251,97 @@ fn throttle_effects(
     kept
 }
 
+// ── Registration hygiene (#436) ──────────────────────────────────────────────
+//
+// Three Register/lifecycle guards so the blessed dev workflow (a `cargo run`
+// beside the deployed user service) can't corrupt the live shell: the host
+// won't steal a live sibling's socket ([`socket_in_use`], applied in [`listen`]),
+// one id owns at most one live connection ([`IdGuard`]), and an effect a plugin
+// didn't request the capability for is dropped ([`enforce_capabilities`]).
+
+/// RAII claim on a plugin id within one host's live-id set (#436). Held for a
+/// connection's lifetime and released on drop (teardown), so a legitimate
+/// reconnect reclaims the id. Scoped to the host (the [`ListenerCtx`]) rather
+/// than process-wide: "one live connection per id **on this host**", which is
+/// also what keeps the per-connection tests isolated from one another.
+struct IdGuard {
+    ids: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl IdGuard {
+    /// Claim `id` in `ids` for this connection, or `None` if another live
+    /// connection on the same host already holds it (the caller rejects the
+    /// duplicate). `HashSet::insert` returning `false` — the id was already
+    /// present — is exactly the "already connected" test.
+    fn claim(ids: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        let inserted = ids
+            .lock()
+            .expect("live plugin id set poisoned")
+            .insert(id.to_owned());
+        inserted.then(|| Self {
+            ids: ids.clone(),
+            id: id.to_owned(),
+        })
+    }
+}
+
+impl Drop for IdGuard {
+    fn drop(&mut self) {
+        self.ids
+            .lock()
+            .expect("live plugin id set poisoned")
+            .remove(&self.id);
+    }
+}
+
+/// The [`Capability`] a given [`Effect`] requires. Exhaustive over the effect
+/// vocabulary so adding an effect variant is a compile error here (it must
+/// declare which cap gates it), mirroring the wire↔host mapping tables below.
+fn effect_capability(effect: &Effect) -> Capability {
+    match effect {
+        Effect::OpenPage(_) => Capability::OpenPage,
+        Effect::Niri(_) => Capability::Niri,
+        Effect::Media(_) => Capability::Media,
+        Effect::Audio(_) => Capability::Audio,
+        Effect::RunCommand { .. } => Capability::RunCommand,
+        Effect::RaiseOsd { .. } => Capability::RaiseOsd,
+        Effect::Notify { .. } => Capability::Notify,
+    }
+}
+
+/// Drop any effect whose required [`Capability`] the plugin didn't declare in
+/// its manifest (#436). Host-side capability enforcement: the manifest's
+/// `capabilities` are the grant set, and an effect requesting an ungranted cap
+/// is skipped with a warn rather than brokered — making the manifest's
+/// documented "the host auto-grants from the manifest" model actually true
+/// (before this, any connected same-user process could emit `Notify`/`RaiseOsd`/
+/// `OpenPage` without requesting the cap). Runs in the reader **before** the rate
+/// cap so an ungranted flood costs no [`EffectRateLimiter`] tokens.
+fn enforce_capabilities(
+    granted: &[Capability],
+    plugin_id: &str,
+    effects: Vec<Effect>,
+) -> Vec<Effect> {
+    effects
+        .into_iter()
+        .filter(|effect| {
+            let cap = effect_capability(effect);
+            if granted.contains(&cap) {
+                true
+            } else {
+                tracing::warn!(
+                    plugin = %plugin_id,
+                    ?effect,
+                    ?cap,
+                    "plugin effect requires a capability it didn't declare; dropped",
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 /// Drive one plugin connection: handshake, then read frames until the peer
 /// disconnects, feeding renders into the mount mailbox and pushing state
 /// snapshots + events back out.
@@ -1247,9 +1383,34 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         return;
     }
     let plugin_id = manifest.id.clone();
+    // #436: an empty id can't key a region card or the audit log — reject it
+    // outright (the connection is dropped, nothing is mounted).
+    if plugin_id.is_empty() {
+        tracing::warn!("plugin Register carried an empty id; dropping the connection");
+        return;
+    }
+    // #436: one live connection per plugin id on this host. A second Register
+    // for an id already connected (e.g. a dev binary dialing the same socket as
+    // the systemd-launched unit) would otherwise have both connections
+    // alternately overwrite one region card — the card flaps and events route to
+    // whichever rendered last, silently. Claim the id for this connection's
+    // lifetime: the duplicate is rejected here with a deterministic outcome (the
+    // incumbent keeps the card, the newcomer is dropped) rather than left to
+    // fight. The claim releases on teardown (RAII, dropped last), so a legitimate
+    // reconnect — which the SDK backs off ≥100 ms before — reclaims the id.
+    let Some(_id_guard) = IdGuard::claim(&ctx.live_ids, &plugin_id) else {
+        tracing::warn!(
+            plugin = %plugin_id,
+            "plugin id already has a live connection; rejecting the duplicate",
+        );
+        return;
+    };
     let mount = manifest.mount;
     // Region sort key (advisory placement request); `None` sorts as `0` (#274).
     let order = manifest.order.unwrap_or(0);
+    // The manifest's granted capability set (#436), consulted per render frame in
+    // the reader to drop effects the plugin never declared a cap for.
+    let capabilities = manifest.capabilities.clone();
     // Unique per-connection token stamped on every card this connection parks,
     // so teardown can distinguish "still my card in the region" from "a successor
     // connection already replaced it" (#278).
@@ -1370,9 +1531,15 @@ async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                         panel,
                         outbound: out_tx.clone(),
                     },
-                    // Effect rate cap (#435): over-budget effects are dropped so a
-                    // plugin can't flood the drawer / OSD / toast broker.
-                    throttle_effects(&mut effect_rl, &plugin_id, effects),
+                    // #436: drop any effect whose capability the plugin never
+                    // declared, THEN rate-cap the survivors (#435) so an
+                    // ungranted flood costs no tokens. Both are host policy — the
+                    // plugin may request anything; the host decides what runs.
+                    throttle_effects(
+                        &mut effect_rl,
+                        &plugin_id,
+                        enforce_capabilities(&capabilities, &plugin_id, effects),
+                    ),
                 ),
                 Ok(PluginMsg::Register { .. }) => {
                     tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
@@ -1928,15 +2095,16 @@ fn resolve_open_page(page: Page) -> PageAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCEPT_BACKOFF, BrokeredEffect, ClockState, Duration, EFFECT_BURST, Effect,
-        EffectRateLimiter, HashMap, HostMsg, Instant, ListenerCtx, Mount, Mutable,
-        OUTBOUND_CAPACITY, Page, PageAction, PluginMsg, REGISTER_TIMEOUT, SlotRender, StateKey,
-        UiDir, UiEventKind, UiNode, UnixStream, accept_backoff, any_sidebar_open, apply_forget,
-        apply_open, clamp_pixels_scale, clear_region_if_owned, handle_conn, map_page, mpsc,
-        pixels_len_ok, read_frame, resolve_open_page, to_ui_node, to_wire_event, upsert_region,
+        ACCEPT_BACKOFF, Arc, BrokeredEffect, ClockState, Duration, EFFECT_BURST, Effect,
+        EffectRateLimiter, HashMap, HashSet, HostMsg, IdGuard, Instant, ListenerCtx, Mount,
+        Mutable, Mutex, OUTBOUND_CAPACITY, Page, PageAction, PluginMsg, REGISTER_TIMEOUT,
+        SlotRender, StateKey, UiDir, UiEventKind, UiNode, UnixStream, accept_backoff,
+        any_sidebar_open, apply_forget, apply_open, clamp_pixels_scale, clear_region_if_owned,
+        effect_capability, enforce_capabilities, handle_conn, map_page, mpsc, pixels_len_ok,
+        read_frame, resolve_open_page, socket_in_use, to_ui_node, to_wire_event, upsert_region,
         watch, wire, write_frame,
     };
-    use hytte_plugin_proto::Manifest;
+    use hytte_plugin_proto::{AudioAction, Capability, Manifest, MediaAction, NiriAction};
 
     /// Regression for #426: the accept loop's error policy must be **total** —
     /// every `accept(2)` error maps to a retry, never to loop termination.
@@ -2734,6 +2902,7 @@ mod tests {
             visibility_rx,
             accent_rx,
             spectrum_rx,
+            live_ids: Arc::new(Mutex::new(HashSet::new())),
             effects_tx,
         };
         (ctx, effects_rx)
@@ -3136,5 +3305,341 @@ mod tests {
             .await
             .expect("handle_conn returns after the handshake timeout")
             .expect("conn task joined cleanly");
+    }
+
+    // ── Registration hygiene (#436) ───────────────────────────────────────────
+
+    /// #436 item 1: `socket_in_use` reports whether a live listener already owns
+    /// the path — absent socket → false (safe to bind); live listener → true
+    /// (another instance owns it, stand down); a stale socket file left after the
+    /// listener drops → false (reclaimable). Hermetic: a real `UnixListener` in a
+    /// scratch dir, no system daemons.
+    #[tokio::test]
+    async fn socket_in_use_detects_a_live_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("probe.sock");
+
+        assert!(
+            !socket_in_use(&path).await,
+            "an absent socket is not in use (safe to bind)",
+        );
+
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind probe socket");
+        assert!(
+            socket_in_use(&path).await,
+            "a live listener is detected as in use (stand down)",
+        );
+
+        // Dropping the listener leaves the socket file on disk but nothing
+        // answers it — a stale socket, which is reclaimable.
+        drop(listener);
+        assert!(
+            !socket_in_use(&path).await,
+            "a stale socket (no listener) is not in use, so it can be reclaimed",
+        );
+    }
+
+    /// #436 item 2: an [`IdGuard`] claim is exclusive per id within one host's
+    /// set — a second claim of a held id is rejected — and releasing the guard
+    /// (connection teardown) makes the id reclaimable. Distinct ids never
+    /// contend. Hermetic: a local set, no process-global state.
+    #[test]
+    fn duplicate_id_claim_rejected_until_released() {
+        let ids = Arc::new(Mutex::new(HashSet::new()));
+
+        let guard = IdGuard::claim(&ids, "pet").expect("first claim of an id succeeds");
+        assert!(
+            IdGuard::claim(&ids, "pet").is_none(),
+            "a second claim of a live id is rejected",
+        );
+        assert!(
+            IdGuard::claim(&ids, "clock").is_some(),
+            "a distinct id claims independently",
+        );
+
+        drop(guard);
+        assert!(
+            IdGuard::claim(&ids, "pet").is_some(),
+            "the id is reclaimable once the owning guard is dropped",
+        );
+    }
+
+    /// #436 item 3: every [`Effect`] maps to exactly the [`Capability`] its wire
+    /// docs name, so enforcement gates each effect on the cap a plugin must
+    /// declare to use it. Exhaustive over the effect vocabulary.
+    #[test]
+    fn effect_capability_maps_each_effect() {
+        assert_eq!(
+            effect_capability(&Effect::OpenPage(Page::Media)),
+            Capability::OpenPage,
+        );
+        assert_eq!(
+            effect_capability(&Effect::Niri(NiriAction::FocusWorkspace { id: 1 })),
+            Capability::Niri,
+        );
+        assert_eq!(
+            effect_capability(&Effect::Media(MediaAction::PlayPause)),
+            Capability::Media,
+        );
+        assert_eq!(
+            effect_capability(&Effect::Audio(AudioAction::ToggleMute)),
+            Capability::Audio,
+        );
+        assert_eq!(
+            effect_capability(&Effect::RunCommand {
+                id: 0,
+                argv: vec![],
+            }),
+            Capability::RunCommand,
+        );
+        assert_eq!(
+            effect_capability(&Effect::RaiseOsd {
+                title: String::new(),
+                body: String::new(),
+                icon: None,
+            }),
+            Capability::RaiseOsd,
+        );
+        assert_eq!(
+            effect_capability(&Effect::Notify {
+                summary: String::new(),
+                body: String::new(),
+            }),
+            Capability::Notify,
+        );
+    }
+
+    /// #436 item 3: `enforce_capabilities` keeps only effects whose capability
+    /// the plugin declared, dropping the rest (source order preserved). The
+    /// manifest's grant set is authoritative — a plugin can *request* any effect,
+    /// but an ungranted one never reaches the broker.
+    #[test]
+    fn enforce_capabilities_drops_ungranted_effects() {
+        let granted = vec![Capability::OpenPage, Capability::Notify];
+        let effects = vec![
+            Effect::OpenPage(Page::Media), // granted
+            Effect::RaiseOsd {
+                title: "t".into(),
+                body: "b".into(),
+                icon: None,
+            }, // NOT granted
+            Effect::Notify {
+                summary: "s".into(),
+                body: "b".into(),
+            }, // granted
+            Effect::Niri(NiriAction::FocusWindow { id: 7 }), // NOT granted
+        ];
+
+        let kept = enforce_capabilities(&granted, "p", effects);
+        assert_eq!(kept.len(), 2, "only the two granted effects survive");
+        assert!(matches!(kept[0], Effect::OpenPage(Page::Media)));
+        assert!(matches!(kept[1], Effect::Notify { .. }));
+
+        // A plugin that declared no caps has every effect dropped.
+        assert!(
+            enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
+            "a plugin that declared no caps gets every effect dropped",
+        );
+    }
+
+    /// #436 item 2, end to end through `handle_conn`: a second connection that
+    /// Registers an id already held by a live connection is rejected (dropped),
+    /// and the incumbent's region card is left untouched — no flapping. Both
+    /// connections share the same [`ListenerCtx`] (its region mailboxes **and**
+    /// its live-id set), the real production shape.
+    #[tokio::test]
+    async fn duplicate_id_connection_is_rejected_end_to_end() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let ctx_b = ctx.clone(); // shares the region mailboxes AND the live-id set
+        let bar_center = ctx.bar_center.clone();
+
+        // Connection A: registers "twin" and renders a card, claiming the id.
+        let (a_host, a_plugin) = UnixStream::pair().expect("socketpair A");
+        tokio::spawn(async move { handle_conn(a_host, &ctx).await });
+        let (_ard, mut awr) = a_plugin.into_split();
+        write_frame(
+            &mut awr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("twin", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("A Register");
+        write_frame(
+            &mut awr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "A".into(),
+                    classes: vec![],
+                },
+                panel: None,
+                effects: vec![],
+            },
+        )
+        .await
+        .expect("A Render");
+        // A's card landing proves A is connected and holds the "twin" id.
+        wait_for_region(&bar_center).await;
+
+        // Connection B: same id. Must be rejected — the host drops it.
+        let (b_host, b_plugin) = UnixStream::pair().expect("socketpair B");
+        tokio::spawn(async move { handle_conn(b_host, &ctx_b).await });
+        let (mut brd, mut bwr) = b_plugin.into_split();
+        write_frame(
+            &mut bwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("twin", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("B Register");
+
+        // The host rejects B by dropping the connection: B's next read hits EOF.
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<HostMsg, _>(&mut brd),
+        )
+        .await
+        .expect("B is dropped within 5s (not left hanging)");
+        assert!(
+            dropped.is_err(),
+            "the duplicate-id connection is dropped (EOF), not accepted",
+        );
+
+        // A's card is intact — exactly one "twin" card, no flapping.
+        let cards = bar_center.lock_ref();
+        assert_eq!(cards.len(), 1, "the incumbent's card is untouched");
+        assert_eq!(cards[0].plugin_id, "twin");
+        assert!(
+            matches!(&cards[0].tree, wire::Node::Label { text, .. } if text == "A"),
+            "the incumbent (A) still owns the card; B never overwrote it",
+        );
+    }
+
+    /// #436 item 2 (empty id): an **empty** plugin id is rejected outright — it
+    /// can't key a region card. The connection is dropped and no card is parked.
+    #[tokio::test]
+    async fn empty_plugin_id_is_rejected() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (mut prd, mut pwr) = plugin.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register with empty id");
+
+        // Dropped: the next read hits EOF.
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<HostMsg, _>(&mut prd),
+        )
+        .await
+        .expect("the empty-id connection is dropped within 5s");
+        assert!(dropped.is_err(), "an empty-id Register is rejected (EOF)");
+        assert!(
+            bar_center.lock_ref().is_empty(),
+            "no card is parked for an empty id",
+        );
+    }
+
+    /// #436 item 3, end to end: an effect whose capability the plugin didn't
+    /// declare is dropped in the reader and never reaches the effect broker
+    /// channel, while the render tree still lands. `route_render` sends effects
+    /// **before** parking the card, so the card's arrival means the effect
+    /// decision already happened — an empty channel then proves the effect was
+    /// dropped upstream, not merely delayed.
+    #[tokio::test]
+    async fn ungranted_effect_never_reaches_the_broker() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (_prd, mut pwr) = plugin.into_split();
+        // A plugin that declares NO capabilities.
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("nocaps", Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register (no caps)");
+        // …nonetheless emits an OpenPage effect (ungranted).
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "hi".into(),
+                    classes: vec![],
+                },
+                panel: None,
+                effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            },
+        )
+        .await
+        .expect("Render with an ungranted effect");
+
+        wait_for_region(&bar_center).await;
+        assert!(
+            effects_rx.try_recv().is_err(),
+            "an ungranted effect is dropped before the broker (#436)",
+        );
+    }
+
+    /// #436 item 3, positive case end to end: a plugin that declared the cap sees
+    /// its effect brokered (reaches the effect channel), proving the enforcement
+    /// gate passes granted effects through unchanged.
+    #[tokio::test]
+    async fn granted_effect_reaches_the_broker() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, mut effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (_prd, mut pwr) = plugin.into_split();
+        let mut manifest = Manifest::new("withcap", Mount::BarCenter);
+        manifest.capabilities = vec![Capability::OpenPage];
+        write_frame(&mut pwr, &PluginMsg::Register { manifest })
+            .await
+            .expect("Register (OpenPage granted)");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "hi".into(),
+                    classes: vec![],
+                },
+                panel: None,
+                effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            },
+        )
+        .await
+        .expect("Render with a granted effect");
+
+        wait_for_region(&bar_center).await;
+        let got = effects_rx
+            .try_recv()
+            .expect("the granted effect reached the broker");
+        assert_eq!(got.plugin_id, "withcap");
+        assert!(matches!(got.effect, Effect::OpenPage(Page::PowerMenu)));
     }
 }

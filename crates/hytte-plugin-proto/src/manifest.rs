@@ -26,6 +26,12 @@ pub enum StateKey {
     /// accessor. **Required** to receive the push — an unsubscribed plugin never
     /// gets the frame (#305), which is what stops a pre-#294 binary that can't
     /// decode the variant from crash-looping.
+    ///
+    /// **Sidebar semantics.** The bool tracks the **sidebar** opening/closing,
+    /// not a bar chip's presence (#288/#422): a [`Mount::is_bar`] chip is always
+    /// on-screen, so the host seeds it a constant `true` and sends no edges. Park
+    /// pollers on this only for a sidebar mount; a bar-mounted poller must not
+    /// (it would idle while fully visible).
     SlotVisible,
     /// Opt-in to the desktop-accent push
     /// ([`HostMsg::Accent`](crate::msg::HostMsg::Accent), #376): the host
@@ -106,6 +112,18 @@ pub enum Mount {
     BarLeft,
     BarCenter,
     BarRight,
+}
+
+impl Mount {
+    /// Whether this is one of the three **bar** regions (a slim inline chip),
+    /// as opposed to a sidebar card. A bar chip is effectively always on-screen,
+    /// so the host reports a constant [`SlotVisible`](StateKey::SlotVisible) of
+    /// `true` for one — that key models sidebar open/close, not bar-chip presence
+    /// (#288/#422).
+    #[must_use]
+    pub fn is_bar(self) -> bool {
+        matches!(self, Mount::BarLeft | Mount::BarCenter | Mount::BarRight)
+    }
 }
 
 /// A plugin's self-description, sent once in

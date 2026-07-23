@@ -49,11 +49,10 @@ use std::time::Duration;
 
 use brain::{ThinkKind, ThinkReq};
 use hytte_plugin::proto::{Effect, EventKind, Manifest, Mount, Node, StateKey};
+use hytte_plugin::tokio::sync::mpsc;
+use hytte_plugin::tokio_stream::StreamExt as _;
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::IntervalStream;
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
 /// Animation / housekeeping cadence.
 const TICK: Duration = Duration::from_secs(4);
@@ -67,7 +66,7 @@ const IDLE_ODDS: u64 = 75;
 const FACE_ID: &str = "pet-face";
 
 /// Messages from the pet's own sources (the tick stream + the brain).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum PetMsg {
     /// Animation/housekeeping heartbeat.
     Tick,
@@ -262,8 +261,8 @@ impl Plugin for Pet {
         // `cmds` (the command lane, filled from `update`) and re-emits each
         // reply as a `PetMsg::Thought` on the app-message stream below.
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        tokio::spawn(brain::brain(cmds, msg_tx));
-        let ticks = IntervalStream::new(tokio::time::interval(TICK)).map(|_| PetMsg::Tick);
+        hytte_plugin::tokio::spawn(brain::brain(cmds, msg_tx));
+        let ticks = tick_stream(TICK, PetMsg::Tick);
         let thoughts = UnboundedReceiverStream::new(msg_rx);
         Some(Box::pin(ticks.merge(thoughts)))
     }

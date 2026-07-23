@@ -31,6 +31,17 @@
 //! objects are `!Send`, so they live entirely on that thread; only the
 //! `Mutable<IdleState>` (which is `Send + Sync`) is written from it, matching
 //! the reactive core's handle/work split.
+//!
+//! ## Resilience (#431)
+//!
+//! This module is the **only** dim/lock/suspend path in the system, and lock
+//! is a security function — so no arm of it may die permanently on a single
+//! error. The observer thread reruns [`run`] with capped exponential backoff
+//! whenever it exits with an error (connect failure, protocol/dispatch
+//! error), resetting the published state to `Active` and restoring a pending
+//! native dim before each retry. The `PrepareForSleep` relock arm is
+//! supervised against panics (`spawn_supervised`) *and* re-subscribes if its
+//! signal stream ever ends.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -41,6 +52,7 @@ use std::collections::BTreeSet;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -128,14 +140,12 @@ impl Service for IdleNotifyService {
         // Wayland objects are `!Send`; the whole client lives on this dedicated
         // thread and only writes back the `Send + Sync` `Mutable`. A `std::thread`
         // (rather than a tokio task) keeps the blocking dispatch loop off the
-        // shared runtime's worker pool.
+        // shared runtime's worker pool. The loop inside reconnects with capped
+        // backoff on any error exit — one dispatch error must not silently end
+        // dim/lock/suspend for the rest of the session (#431).
         std::thread::Builder::new()
             .name("hytte-idle-notify".into())
-            .spawn(move || {
-                if let Err(err) = run(worker_state) {
-                    tracing::warn!(target: LOG_TARGET, error = %err, "native idle manager stopped");
-                }
-            })
+            .spawn(move || run_observer_with_reconnect(&worker_state))
             .expect("spawn hytte-idle-notify thread");
 
         IdleNotifyHandles { state }
@@ -186,18 +196,20 @@ struct IdleClient {
     since: Option<DateTime<Local>>,
     /// `true` while a native dim is in effect (backlight saved + lowered), so
     /// resume restores exactly what it dimmed and a *skipped* dim (inhibitor
-    /// held) leaves nothing to restore. Shared with the spawned action tasks.
+    /// held) leaves nothing to restore. Shared with the spawned action tasks
+    /// — and owned by the observer's reconnect loop, so it outlives any one
+    /// client incarnation (#431).
     dimmed: Arc<AtomicBool>,
 }
 
 impl IdleClient {
-    fn new(state: Mutable<IdleState>) -> Self {
+    fn new(state: Mutable<IdleState>, dimmed: Arc<AtomicBool>) -> Self {
         Self {
             state,
             notifications: Vec::new(),
             idled: BTreeSet::new(),
             since: None,
-            dimmed: Arc::new(AtomicBool::new(false)),
+            dimmed,
         }
     }
 
@@ -300,12 +312,7 @@ impl IdleClient {
     /// actually in effect (a skipped dim leaves the flag clear), so a stale
     /// restore never clobbers the saved level.
     fn restore_dim(&self) {
-        let dimmed = self.dimmed.clone();
-        runtime::handle().spawn(async move {
-            if dimmed.swap(false, Ordering::SeqCst) {
-                run_command("brightnessctl", &["-r"]).await;
-            }
-        });
+        restore_dim_if_dimmed(&self.dimmed);
     }
 }
 
@@ -328,42 +335,60 @@ fn should_relock_on_prepare_for_sleep(about_to_sleep: bool) -> bool {
 /// replacement for swayidle's `before-sleep 'loginctl lock-session'`.
 ///
 /// Runs as a tokio task on the shared runtime. `hytte_bus` handles connection
-/// pooling and reconnection, so this just consumes the signal stream in a loop
-/// (a fresh `events()` receiver survives bus reconnects).
+/// pooling and reconnection, so one `events()` receiver survives bus
+/// reconnects — but if the stream itself ever *ends* (the bus-layer
+/// subscription task died), a fresh subscription is built after backoff
+/// rather than letting the before-sleep relock silently disappear (#431).
 async fn run_prepare_for_sleep_relock() {
-    let sub = hytte_bus::signals(LOGIN1_NAME)
-        .bus(hytte_bus::BusKind::System)
-        .at_path(LOGIN1_PATH)
-        .iface(LOGIN1_MANAGER_IFACE)
-        .signal("PrepareForSleep")
-        .start();
-    let mut events = sub.events();
+    let mut backoff = RetryBackoff::default();
+    loop {
+        let started = Instant::now();
+        let sub = hytte_bus::signals(LOGIN1_NAME)
+            .bus(hytte_bus::BusKind::System)
+            .at_path(LOGIN1_PATH)
+            .iface(LOGIN1_MANAGER_IFACE)
+            .signal("PrepareForSleep")
+            .start();
+        let mut events = sub.events();
 
-    tracing::info!(
-        target: LOG_TARGET,
-        "native before-sleep relock armed (logind PrepareForSleep(true) → screensaver::lock)"
-    );
+        tracing::info!(
+            target: LOG_TARGET,
+            "native before-sleep relock armed (logind PrepareForSleep(true) → screensaver::lock)"
+        );
 
-    while let Some(event) = events.next().await {
-        // PrepareForSleep carries a single boolean `start`.
-        match event.body.body().deserialize::<bool>() {
-            Ok(about_to_sleep) => {
-                if should_relock_on_prepare_for_sleep(about_to_sleep) {
-                    tracing::info!(
+        while let Some(event) = events.next().await {
+            // PrepareForSleep carries a single boolean `start`.
+            match event.body.body().deserialize::<bool>() {
+                Ok(about_to_sleep) => {
+                    if should_relock_on_prepare_for_sleep(about_to_sleep) {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            "logind PrepareForSleep(true) — relocking session before sleep (native before-sleep)"
+                        );
+                        crate::screensaver::lock();
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
                         target: LOG_TARGET,
-                        "logind PrepareForSleep(true) — relocking session before sleep (native before-sleep)"
+                        error = %err,
+                        "could not decode logind PrepareForSleep payload; skipping before-sleep relock"
                     );
-                    crate::screensaver::lock();
                 }
             }
-            Err(err) => {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    error = %err,
-                    "could not decode logind PrepareForSleep payload; skipping before-sleep relock"
-                );
-            }
         }
+
+        // The stream only ends when the subscription's broadcast channel
+        // closes — hytte-bus re-subscribes across bus reconnects internally,
+        // so reaching here means its subscription task died. Losing the
+        // before-sleep relock is a silent security regression; rebuild.
+        let delay = backoff.next_delay(started.elapsed());
+        tracing::error!(
+            target: LOG_TARGET,
+            retry_in_secs = delay.as_secs_f64(),
+            "logind PrepareForSleep stream ended; re-subscribing after backoff"
+        );
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -467,11 +492,111 @@ async fn run_command(program: &'static str, args: &'static [&'static str]) -> bo
     }
 }
 
+// ── Observer resilience (#431) ──────────────────────────────────────────────
+
+/// Capped-exponential-backoff schedule for the observer's reconnects (and the
+/// relock arm's re-subscribes): 1 s → 2 s → … → 30 s cap, resetting to 1 s
+/// after a run that stayed healthy for ≥ 30 s. Deliberately the same schedule
+/// as `hytte_reactive::spawn_supervised` — this is its `std::thread` /
+/// error-return sibling (the supervisor only guards *panics* in tokio tasks).
+struct RetryBackoff {
+    /// Delay before the next restart; doubles per consecutive failure.
+    delay: Duration,
+    /// Delay after a healthy run (and the schedule's starting point).
+    initial: Duration,
+    /// Ceiling the delay is clamped to as it doubles.
+    max: Duration,
+    /// A run that lived at least this long resets the schedule to `initial`,
+    /// so an isolated failure after a long healthy stretch retries promptly
+    /// instead of inheriting an accumulated delay from an earlier flap.
+    reset_after: Duration,
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self {
+            delay: Duration::from_secs(1),
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+            reset_after: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RetryBackoff {
+    /// The delay to wait before the next restart, given how long the run that
+    /// just failed stayed up. Pure bookkeeping — the caller does the sleeping
+    /// — so the schedule is unit-testable without clocks.
+    fn next_delay(&mut self, ran: Duration) -> Duration {
+        if ran >= self.reset_after {
+            self.delay = self.initial;
+        }
+        let delay = self.delay;
+        self.delay = self.delay.saturating_mul(2).min(self.max);
+        delay
+    }
+}
+
+/// Restore the saved backlight level iff a native dim is currently in effect.
+/// The flag is swapped **synchronously** (so callers observe it cleared on
+/// return); only the `brightnessctl -r` itself is fire-and-forget on the
+/// shared runtime. The flag guard is what keeps a stale restore from
+/// clobbering a manually-set brightness.
+fn restore_dim_if_dimmed(dimmed: &Arc<AtomicBool>) {
+    if dimmed.swap(false, Ordering::SeqCst) {
+        runtime::handle().spawn(async {
+            run_command("brightnessctl", &["-r"]).await;
+        });
+    }
+}
+
+/// Recover the observable side effects of a dead observer incarnation before
+/// retrying: reset the published state to `Active` (whatever `Idle { .. }` it
+/// last set may otherwise stay frozen forever) and restore a still-in-effect
+/// native dim (the seat may resume while the observer is down, in which case
+/// no `resumed` event ever reaches the *next* incarnation's fresh
+/// notification objects — the backlight would stay stuck at 10%).
+fn reset_after_observer_error(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBool>) {
+    state.set(IdleState::Active);
+    restore_dim_if_dimmed(dimmed);
+}
+
+/// Drive [`run`] forever on the dedicated observer thread, reconnecting with
+/// capped exponential backoff whenever it exits with an error (compositor
+/// restart, protocol/dispatch error, connect failure) instead of dying on the
+/// first one — this thread is the only thing standing between "idle" and
+/// "never dims/locks/suspends" (#431). Each error exit first runs
+/// [`reset_after_observer_error`]. A clean return means the compositor
+/// advertises no `ext_idle_notifier_v1` at all — retrying cannot change that,
+/// so the manager stays off (already logged inside [`run`]).
+fn run_observer_with_reconnect(state: &Mutable<IdleState>) {
+    let dimmed = Arc::new(AtomicBool::new(false));
+    let mut backoff = RetryBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run(state.clone(), dimmed.clone()) {
+            Ok(()) => return,
+            Err(err) => {
+                reset_after_observer_error(state, &dimmed);
+                let delay = backoff.next_delay(started.elapsed());
+                tracing::error!(
+                    target: LOG_TARGET,
+                    error = %err,
+                    retry_in_secs = delay.as_secs_f64(),
+                    "native idle-notify observer failed; reconnecting after backoff (dim/lock/suspend paused until then)"
+                );
+                std::thread::sleep(delay);
+            }
+        }
+    }
+}
+
 /// Open an independent Wayland connection, bind `ext_idle_notifier_v1`, arm a
 /// notification per threshold, then dispatch events forever. Runs on the
-/// dedicated observer thread; returns only on a fatal Wayland error (or `Ok`
-/// when the compositor advertises no idle-notifier at all).
-fn run(state: Mutable<IdleState>) -> Result<()> {
+/// dedicated observer thread; returns only on a fatal Wayland error — which
+/// [`run_observer_with_reconnect`] retries with backoff — or `Ok` when the
+/// compositor advertises no idle-notifier at all.
+fn run(state: Mutable<IdleState>, dimmed: Arc<AtomicBool>) -> Result<()> {
     let conn = Connection::connect_to_env()
         .context("connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
     let (globals, mut queue) =
@@ -498,7 +623,7 @@ fn run(state: Mutable<IdleState>) -> Result<()> {
         }
     };
 
-    let mut client = IdleClient::new(state);
+    let mut client = IdleClient::new(state, dimmed);
     for &secs in &THRESHOLDS {
         // Protocol timeout is in milliseconds; the notification's user-data is
         // the threshold in seconds so the event handler can identify it.
@@ -599,7 +724,10 @@ mod tests {
 
     #[test]
     fn snapshot_tracks_deepest_active_threshold() {
-        let mut client = IdleClient::new(Mutable::new(IdleState::default()));
+        let mut client = IdleClient::new(
+            Mutable::new(IdleState::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(client.snapshot(), IdleState::Active);
 
         client.on_idled(240);
@@ -692,5 +820,87 @@ mod tests {
         // resume → no-op.
         assert!(should_relock_on_prepare_for_sleep(true));
         assert!(!should_relock_on_prepare_for_sleep(false));
+    }
+
+    #[test]
+    fn retry_backoff_doubles_then_caps() {
+        // #431: consecutive fast failures (e.g. compositor down, connect
+        // refused) double the delay up to the 30 s cap — never further, and
+        // never a permanent stop.
+        let mut backoff = RetryBackoff::default();
+        let crashed_instantly = Duration::ZERO;
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(30)
+        );
+        // Capped: stays at 30 s, does not keep doubling.
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn retry_backoff_resets_after_healthy_run() {
+        // A run that stayed up ≥ reset_after (30 s) is healthy: the next
+        // failure retries promptly at 1 s instead of inheriting the
+        // accumulated delay from an earlier flap.
+        let mut backoff = RetryBackoff::default();
+        let crashed_instantly = Duration::ZERO;
+        backoff.next_delay(crashed_instantly); // 1 s
+        backoff.next_delay(crashed_instantly); // 2 s
+        backoff.next_delay(crashed_instantly); // 4 s (next would be 8 s)
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(30)),
+            Duration::from_secs(1)
+        );
+        // …and the doubling starts over from there.
+        assert_eq!(
+            backoff.next_delay(crashed_instantly),
+            Duration::from_secs(2)
+        );
+        // Just under the healthy threshold does NOT reset.
+        let mut backoff = RetryBackoff::default();
+        backoff.next_delay(crashed_instantly); // 1 s
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(29)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn observer_error_reset_publishes_active() {
+        // #431: when the observer dies mid-idle-cycle, whatever `Idle { .. }`
+        // it last published must not stay frozen across the reconnect gap.
+        // (dimmed = false here so the no-dim path spawns no restore command —
+        // the dimmed = true path would exec a real `brightnessctl -r`.)
+        let state = Mutable::new(IdleState::Idle {
+            deepest_secs: LOCK_SECS,
+            since: Local::now(),
+        });
+        let dimmed = Arc::new(AtomicBool::new(false));
+        reset_after_observer_error(&state, &dimmed);
+        assert_eq!(state.get_cloned(), IdleState::Active);
+        assert!(!dimmed.load(Ordering::SeqCst));
     }
 }

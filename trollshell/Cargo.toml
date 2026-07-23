@@ -27,13 +27,7 @@ hytte-plugin-proto = { path = "../crates/hytte-plugin-proto", features = [
 serde.workspace = true
 serde_json.workspace = true
 # `fs` reads plugins.json; `process` spawns `systemd-run --user` (#419).
-tokio = { workspace = true, features = [
-  "fs",
-  "net",
-  "process",
-  "rt",
-  "sync",
-] }
+tokio = { workspace = true, features = ["fs", "net", "process", "rt", "sync"] }
 # Direct zbus dep for the `#[zbus::interface]` macro backing the
 # `mov.vibec0re.trollshell.Control` object (control.rs, #390). Connection
 # ownership goes through `hytte_bus::own_name`, never a raw zbus connection —

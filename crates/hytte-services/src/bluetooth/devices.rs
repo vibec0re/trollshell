@@ -435,3 +435,158 @@ async fn handle_device_props_changed(state: &State, evt: PropChangedEvent) {
         state.publish_devices().await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_owned_value<T: Into<zbus::zvariant::Value<'static>>>(v: T) -> OwnedValue {
+        v.into()
+            .try_to_owned()
+            .expect("test value must be serialisable")
+    }
+
+    fn device(path: &str, alias: &str, connected: bool, paired: bool) -> Device {
+        Device {
+            path: path.to_string(),
+            alias: alias.to_string(),
+            connected,
+            paired,
+            ..Device::default()
+        }
+    }
+
+    // ── publish_devices sort comparator ────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_devices_sorts_connected_first_then_paired_then_alias() {
+        let state = State::new(Mutable::new(None), Mutable::new(Vec::new()));
+        {
+            let mut map = state.devices_map.lock().await;
+            map.insert("/dev/a".to_string(), device("/dev/a", "Zeta", false, false));
+            map.insert("/dev/b".to_string(), device("/dev/b", "Alpha", true, false));
+            map.insert("/dev/c".to_string(), device("/dev/c", "Beta", false, true));
+        }
+        state.publish_devices().await;
+
+        let list = state.devices.get_cloned();
+        let aliases: Vec<&str> = list.iter().map(|d| d.alias.as_str()).collect();
+        // Connected wins first ("Alpha"), then paired-but-not-connected
+        // ("Beta"), then neither, alphabetically ("Zeta").
+        assert_eq!(aliases, vec!["Alpha", "Beta", "Zeta"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_devices_alias_tiebreak_is_case_insensitive() {
+        let state = State::new(Mutable::new(None), Mutable::new(Vec::new()));
+        {
+            let mut map = state.devices_map.lock().await;
+            map.insert(
+                "/dev/a".to_string(),
+                device("/dev/a", "banana", false, false),
+            );
+            map.insert(
+                "/dev/b".to_string(),
+                device("/dev/b", "Apple", false, false),
+            );
+        }
+        state.publish_devices().await;
+
+        let list = state.devices.get_cloned();
+        let aliases: Vec<&str> = list.iter().map(|d| d.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["Apple", "banana"]);
+    }
+
+    // ── apply_adapter_props ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_adapter_props_updates_only_changed_fields() {
+        let initial = Adapter {
+            path: "/org/bluez/hci0".to_string(),
+            address: "AA:BB:CC:DD:EE:FF".to_string(),
+            name: "old-name".to_string(),
+            powered: false,
+            discoverable: false,
+            discovering: false,
+        };
+        let state = State::new(Mutable::new(Some(initial)), Mutable::new(Vec::new()));
+
+        let mut changed = HashMap::new();
+        changed.insert("Powered".to_string(), make_owned_value(true));
+        changed.insert("Name".to_string(), make_owned_value("new-name"));
+
+        state.apply_adapter_props(&changed);
+
+        let adapter = state.adapter.get_cloned().expect("adapter still present");
+        assert!(adapter.powered, "Powered was in the changed set");
+        assert_eq!(adapter.name, "new-name", "Name was in the changed set");
+        // Fields absent from `changed` survive the partial update untouched.
+        assert_eq!(adapter.address, "AA:BB:CC:DD:EE:FF");
+        assert!(!adapter.discoverable);
+        assert!(!adapter.discovering);
+    }
+
+    #[test]
+    fn apply_adapter_props_no_op_when_adapter_absent() {
+        let state = State::new(Mutable::new(None), Mutable::new(Vec::new()));
+        let mut changed = HashMap::new();
+        changed.insert("Powered".to_string(), make_owned_value(true));
+
+        // Must not panic when there's no adapter snapshot yet to update.
+        state.apply_adapter_props(&changed);
+
+        assert!(state.adapter.get_cloned().is_none());
+    }
+
+    // ── apply_device_props ──────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_device_props_updates_only_changed_fields() {
+        let state = State::new(Mutable::new(None), Mutable::new(Vec::new()));
+        {
+            let mut map = state.devices_map.lock().await;
+            map.insert(
+                "/dev/x".to_string(),
+                Device {
+                    path: "/dev/x".to_string(),
+                    address: "11:22:33:44:55:66".to_string(),
+                    alias: "old-alias".to_string(),
+                    icon: "old-icon".to_string(),
+                    paired: false,
+                    connected: false,
+                    trusted: false,
+                    battery: None,
+                },
+            );
+        }
+
+        let mut changed = HashMap::new();
+        changed.insert("Connected".to_string(), make_owned_value(true));
+        changed.insert("Alias".to_string(), make_owned_value("new-alias"));
+
+        state.apply_device_props("/dev/x", &changed).await;
+
+        let map = state.devices_map.lock().await;
+        let dev = map.get("/dev/x").expect("device still present");
+        assert!(dev.connected, "Connected was in the changed set");
+        assert_eq!(dev.alias, "new-alias", "Alias was in the changed set");
+        // Fields absent from `changed` survive the partial update untouched.
+        assert_eq!(dev.address, "11:22:33:44:55:66");
+        assert_eq!(dev.icon, "old-icon");
+        assert!(!dev.paired);
+        assert!(!dev.trusted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_device_props_no_op_for_unknown_path() {
+        let state = State::new(Mutable::new(None), Mutable::new(Vec::new()));
+        let mut changed = HashMap::new();
+        changed.insert("Connected".to_string(), make_owned_value(true));
+
+        // Must not panic when the path isn't in the map (e.g. a stale event
+        // for a device that was already removed).
+        state.apply_device_props("/dev/unknown", &changed).await;
+
+        assert!(state.devices_map.lock().await.is_empty());
+    }
+}

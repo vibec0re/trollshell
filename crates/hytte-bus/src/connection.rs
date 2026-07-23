@@ -445,3 +445,51 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
         BusKind::System => Connection::system().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_starts_at_250ms() {
+        let mut b = Backoff::new();
+        assert_eq!(b.next(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn backoff_doubles_each_call() {
+        let mut b = Backoff::new();
+        assert_eq!(b.next(), Duration::from_millis(250));
+        assert_eq!(b.next(), Duration::from_millis(500));
+        assert_eq!(b.next(), Duration::from_millis(1_000));
+        assert_eq!(b.next(), Duration::from_millis(2_000));
+        assert_eq!(b.next(), Duration::from_millis(4_000));
+    }
+
+    #[test]
+    fn backoff_clamps_at_30s_cap() {
+        let mut b = Backoff::new();
+        // 250 -> 500 -> 1000 -> 2000 -> 4000 -> 8000 -> 16000 -> (32000 clamped to) 30000.
+        let mut last = Duration::default();
+        for _ in 0..7 {
+            last = b.next();
+        }
+        assert_eq!(last, Duration::from_millis(16_000));
+        // The next call is the first to clamp: 16000 * 2 = 32000 > cap, so the
+        // *following* returned duration is capped at 30s.
+        assert_eq!(b.next(), Duration::from_millis(30_000));
+        // And it stays capped — doubling a capped value only re-clamps.
+        assert_eq!(b.next(), Duration::from_millis(30_000));
+        assert_eq!(b.next(), Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn backoff_reset_returns_to_initial_value() {
+        let mut b = Backoff::new();
+        b.next();
+        b.next();
+        b.next();
+        b.reset();
+        assert_eq!(b.next(), Duration::from_millis(250));
+    }
+}

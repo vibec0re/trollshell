@@ -5,6 +5,25 @@ use crate::cast::{millicelsius_to_celsius, percent_u64_to_ratio, u64_to_f64_coun
 use super::{GpuState, GpuVendor};
 use std::time::Instant;
 
+/// True when a sysfs `device/vendor` file's contents identify an AMD PCI
+/// device (vendor ID `0x1002`). Factored out of [`read_amd_gpu`] so the
+/// string-parsing rule is testable against fixture strings without touching
+/// `/sys`.
+fn is_amd_vendor(vendor_file_contents: &str) -> bool {
+    vendor_file_contents.trim() == "0x1002"
+}
+
+/// Parse the GPU display name out of a sysfs `device/uevent` file's contents:
+/// pulls the `DRIVER=` line (e.g. `amdgpu`) into `"AMD (amdgpu)"`. Falls back
+/// to `"AMD GPU"` when no `DRIVER=` line is present. Factored out of
+/// [`read_amd_gpu`] so the parsing is testable against fixture strings.
+fn amd_gpu_name_from_uevent(uevent_file_contents: &str) -> String {
+    uevent_file_contents
+        .lines()
+        .find_map(|l| l.strip_prefix("DRIVER=").map(|d| format!("AMD ({d})")))
+        .unwrap_or_else(|| "AMD GPU".to_string())
+}
+
 fn read_amd_gpu() -> Option<GpuState> {
     use std::fs;
     let drm = fs::read_dir("/sys/class/drm").ok()?;
@@ -21,7 +40,7 @@ fn read_amd_gpu() -> Option<GpuState> {
         let Ok(vendor) = fs::read_to_string(device.join("vendor")) else {
             continue;
         };
-        if vendor.trim() != "0x1002" {
+        if !is_amd_vendor(&vendor) {
             continue;
         }
 
@@ -54,10 +73,7 @@ fn read_amd_gpu() -> Option<GpuState> {
         // Name from /sys/class/drm/cardN/device/uevent or just hardcode "AMD GPU"
         let gpu_name = fs::read_to_string(device.join("uevent"))
             .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("DRIVER=").map(|d| format!("AMD ({d})")))
-            })
+            .map(|s| amd_gpu_name_from_uevent(&s))
             .unwrap_or_else(|| "AMD GPU".to_string());
 
         return Some(GpuState {
@@ -310,5 +326,99 @@ pub(super) fn read_gpu_with_cache(cache: GpuCache) -> (Option<GpuState>, GpuCach
                 intel_rc6_prev: None,
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ── is_amd_vendor / amd_gpu_name_from_uevent ─────────────────────────────
+
+    #[test]
+    fn is_amd_vendor_matches_amd_pci_id() {
+        assert!(is_amd_vendor("0x1002\n"));
+        assert!(is_amd_vendor("0x1002"));
+    }
+
+    #[test]
+    fn is_amd_vendor_rejects_other_vendors() {
+        // 0x8086 is Intel, 0x10de is Nvidia.
+        assert!(!is_amd_vendor("0x8086\n"));
+        assert!(!is_amd_vendor("0x10de\n"));
+        assert!(!is_amd_vendor(""));
+    }
+
+    #[test]
+    fn amd_gpu_name_from_uevent_extracts_driver() {
+        let uevent = "DRIVER=amdgpu\nPCI_CLASS=30000\nMODALIAS=pci:foo\n";
+        assert_eq!(amd_gpu_name_from_uevent(uevent), "AMD (amdgpu)");
+    }
+
+    #[test]
+    fn amd_gpu_name_from_uevent_falls_back_without_driver_line() {
+        let uevent = "PCI_CLASS=30000\nMODALIAS=pci:foo\n";
+        assert_eq!(amd_gpu_name_from_uevent(uevent), "AMD GPU");
+    }
+
+    #[test]
+    fn amd_gpu_name_from_uevent_falls_back_on_empty_input() {
+        assert_eq!(amd_gpu_name_from_uevent(""), "AMD GPU");
+    }
+
+    // ── compute_intel_usage ───────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_intel_usage_first_call_has_no_delta() {
+        let now = Instant::now();
+        let (new_prev, load) = compute_intel_usage(1_000, None, now);
+        assert_eq!(new_prev, Some((1_000, now)));
+        assert_eq!(load, Some(0.0), "first sample has nothing to diff against");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_intel_usage_zero_elapsed_reports_zero_load() {
+        let t0 = Instant::now();
+        // Second call lands on the exact same Instant as the first (dt_ms == 0)
+        // — must not divide by zero.
+        let (new_prev, load) = compute_intel_usage(500, Some((100, t0)), t0);
+        assert_eq!(new_prev, Some((500, t0)));
+        assert_eq!(load, Some(0.0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_intel_usage_counter_reset_clamps_to_full_load() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1_000);
+        // rc6 counter went backwards (reset/wrap) — saturating_sub floors the
+        // delta at 0, meaning "no idle time observed" → 100% busy.
+        let (_new_prev, load) = compute_intel_usage(100, Some((5_000, t0)), t1);
+        assert_eq!(load, Some(1.0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_intel_usage_residency_exceeding_elapsed_clamps_to_100_idle() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1_000);
+        // 5000ms of RC6 residency reported over a 1000ms tick — idle% would
+        // be 500% uncapped; must clamp to 100% idle (0% usage).
+        let (_new_prev, load) = compute_intel_usage(5_000, Some((0, t0)), t1);
+        assert_eq!(load, Some(0.0));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn compute_intel_usage_normal_delta_computes_partial_load() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1_000);
+        // 500ms idle (RC6) out of a 1000ms tick → 50% idle → 50% usage.
+        let (new_prev, load) = compute_intel_usage(500, Some((0, t0)), t1);
+        assert_eq!(new_prev, Some((500, t1)));
+        assert_eq!(load, Some(0.5));
     }
 }

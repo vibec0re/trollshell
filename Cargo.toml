@@ -27,8 +27,27 @@ members = [
 edition = "2024"
 license = "MPL-2.0"
 repository = "https://git.hannig.cc/choom/trollshell"
-rust-version = "1.85"
+# Every member inherits this via `rust-version.workspace = true` (#453) — kept
+# next to `edition.workspace = true`. Not independently CI-gated (the
+# devShell/crane toolchain floats on nixpkgs' current rustc, ~1.95); this is a
+# floor declaration, not a pinned-toolchain guarantee.
+#
+# #453 found the previously-declared "1.85" was fictional in the other
+# direction the issue called out — wiring up the inheritance made
+# `clippy::incompatible_msrv` (part of the `clippy::all` umbrella this
+# workspace denies) actually check it for the first time, and it immediately
+# failed several ways: `u32::is_multiple_of` (stable since 1.87, house-style
+# use across hytte-services/hytte-plugin-proto/hytte-plugin-caw/
+# hytte-plugin-pet) and `Duration::from_mins` (stable since 1.91, used in
+# hytte-plugin-weather). Per the issue's own escape hatch ("either add a
+# pinned-1.85 check or drop the claim"), this bumps the floor to the version
+# the code actually requires rather than rewriting call sites across 5 crates.
+rust-version = "1.91"
 
+# hytte-ecal hand-mirrors this table (crates/hytte-ecal/Cargo.toml) instead of
+# `[lints] workspace = true`, because it needs `unsafe_code = "allow"` and
+# Cargo's workspace-lints inheritance is all-or-nothing (no per-lint override).
+# Keep the two in sync when editing this table.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -44,6 +63,57 @@ disallowed_methods = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# Shared dependency versions/feature baselines (#453) — members inherit via
+# `dep.workspace = true`, adding per-crate `features = [...]` on top where
+# their needs diverge (Cargo unions feature lists across inheritance — always
+# safe in either direction). `default-features`, however, is inheritance-
+# asymmetric: a member may WIDEN `false` here back to `true` locally, but may
+# NOT narrow a `true`/unset value down to `false` (Cargo hard-errors that as
+# "cannot override workspace's default-features"). So `default-features =
+# false` is set here whenever ANY consumer needs it off, even if others are
+# fine with the (often equivalent, e.g. tokio's default feature set is empty
+# anyway) default; entries here that already carry the full feature set used
+# by every consumer need no per-member overrides at all (e.g. `chrono`,
+# `zbus`, `adw`); entries whose consumers diverge on named features (e.g.
+# `tokio`, `gtk`, `tracing-subscriber`) intentionally carry only `version`
+# (+ `package` where renamed, + `default-features` where universally false).
+[workspace.dependencies]
+adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
+# RUSTSEC-2026-0190: unsound `Error::downcast_mut()` after `.context()`,
+# fixed in 1.0.103. 1.0.104 is current at time of writing.
+anyhow = "1.0.104"
+chrono = { version = "0.4.44", default-features = false, features = [
+  "clock",
+  "std",
+] }
+futures-channel = "0.3.32"
+futures-executor = "0.3.32"
+futures-signals = "0.3.34"
+# false because hytte-bus/hytte-services' non-dev use wants it off (+ "std");
+# the two dev-dependency consumers that want the full default set widen back
+# to `default-features = true` locally.
+futures-util = { version = "0.3.32", default-features = false }
+gtk = { version = "0.11.2", package = "gtk4" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+# Drift this centralizes: 1.40 (plugin side) vs 1.52.1 (shell side) — the
+# lockfile already unified to one resolved version, this just makes the
+# manifests stop lying about it. Feature lists vary too much per consumer to
+# share here; each member lists its own. `default-features = false` here is a
+# no-op either way (tokio's own `default = []`) but matches what half the
+# consumers already declared explicitly.
+tokio = { version = "1.52.1", default-features = false }
+tokio-stream = { version = "0.1", default-features = false }
+toml = "1"
+tracing = "0.1.44"
+# false because hytte-services' dev-dependency use wants it off (+
+# "registry" only); trollshell/trollshell-control-center widen back to
+# `default-features = true` locally for "fmt"/"env-filter".
+tracing-subscriber = { version = "0.3.23", default-features = false }
+ureq = { version = "3.3.0", default-features = false }
+zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 
 [profile.release]
 lto = "thin"

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "A pomodoro / kitchen timer for the trollshell bar — out-of-process plugin on the preem 7seg, alerting via Effect::Notify at zero (issue #406)"
 
 [lints]
@@ -20,12 +21,10 @@ path = "src/main.rs"
 hytte-plugin = { path = "../hytte-plugin" }
 # The timer's own 1 Hz cadence: `IntervalStream` sits behind the `time` feature,
 # which the SDK's `tokio_stream` re-export deliberately doesn't enable.
-tokio-stream = { version = "0.1", default-features = false, features = [
-  "time",
-] }
+tokio-stream = { workspace = true, features = ["time"] }
 # `tokio::time::interval` for that stream. `rt` + `time` only — the timer holds
 # no channels of its own (its command lane is `Infallible`).
-tokio = { version = "1.40", default-features = false, features = [
+tokio = { workspace = true, default-features = false, features = [
   "rt",
   "time",
 ] }

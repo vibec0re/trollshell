@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "External (out-of-shell) settings & management companion app for trollshell (#381)"
 
 [lints]
@@ -17,8 +18,8 @@ path = "src/main.rs"
 # GTK4 + libadwaita — a normal windowed app (NOT layer-shell; never links the
 # shell). Versions/features mirror hytte-ui's exactly so the workspace lock
 # unifies to a single build of each — no new external crate is pulled.
-adw = { version = "0.9.1", package = "libadwaita", features = ["v1_4"] }
-gtk = { version = "0.11.2", package = "gtk4", features = ["v4_14"] }
+adw.workspace = true
+gtk = { workspace = true, features = ["v4_14"] }
 # D-Bus to the running shell's `mov.vibec0re.trollshell.Control` goes through
 # hytte_bus (raw zbus connections are clippy-banned); the call runs on the
 # shared hytte tokio runtime (hytte-reactive).
@@ -26,6 +27,12 @@ hytte-bus = { path = "../hytte-bus" }
 hytte-reactive = { path = "../hytte-reactive" }
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
 # GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).
-tokio = { version = "1.52.1", features = ["sync"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+# Workspace `tracing-subscriber` sets `default-features = false` (what
+# hytte-services' dev-dependency needs); widen back to the full default set
+# here, matching this crate's original (default-features unset) manifest.
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "fmt",
+  "env-filter",
+] }

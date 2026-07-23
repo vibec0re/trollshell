@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "The trollshell sidebar weather card as an out-of-process plugin — open-meteo over ureq + geoclue over zbus, GTK-free (issue #290)"
 
 [lints]
@@ -17,10 +18,8 @@ path = "src/main.rs"
 # The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream.
 hytte-plugin = { path = "../hytte-plugin" }
 # The msg stream wrapper (results re-enter as Input::App) — same idiom as the pet.
-tokio-stream = { version = "0.1", default-features = false, features = [
-  "time",
-] }
-tokio = { version = "1.40", default-features = false, features = [
+tokio-stream = { workspace = true, features = ["time"] }
+tokio = { workspace = true, default-features = false, features = [
   "rt",
   "time",
   "sync",
@@ -29,10 +28,10 @@ tokio = { version = "1.40", default-features = false, features = [
 # Blocking HTTP for open-meteo + Nominatim, off the reducer path via
 # spawn_blocking — the house idiom (hytte-services' weather fetcher, the pet's
 # brain). `rustls` gives the HTTPS these endpoints need.
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+ureq = { workspace = true, features = ["rustls"] }
+serde.workspace = true
+serde_json.workspace = true
 # Geolocation via geoclue D-Bus. A plugin can't use `hytte-bus` (it links the
 # shell's gtk4 reactive runtime — see `location.rs`), so it opens its own
 # GTK-free zbus connection directly. `tokio` feature = same runtime the SDK owns.
-zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
+zbus.workspace = true

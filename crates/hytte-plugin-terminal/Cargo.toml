@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Micro-terminal demo plugin (issue #357): a preem VFD screen of local-echo scrollback fed by a Node::Entry input line — no command execution"
 
 [lints]

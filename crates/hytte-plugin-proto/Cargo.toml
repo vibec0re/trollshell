@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "GTK-free wire protocol for hytte out-of-process widget plugins (frontend B, issue #35)"
 
 [lints]
@@ -17,17 +18,17 @@ workspace = true
 tokio = ["dep:tokio"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 # One binary blob (MessagePack `bin`) for `Node::Pixels`'s RGBA8 buffer. A bare
 # `Vec<u8>` under named-field encoding would serialize as a per-byte int array
 # (~2× the bytes ≥ 0x80); `serde_bytes` pins the compact `bin` representation.
 serde_bytes = "0.11"
 rmp-serde = "1.3"
-tokio = { version = "1.40", optional = true, default-features = false, features = [
+tokio = { workspace = true, optional = true, default-features = false, features = [
   "io-util",
 ] }
 
 [dev-dependencies]
 # For the forward-compat test: derive `Serialize` on a struct that carries an
 # extra ("future") field, to prove an old decoder skips it.
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true

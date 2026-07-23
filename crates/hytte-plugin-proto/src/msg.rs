@@ -8,7 +8,7 @@
 
 use crate::effect::{Effect, EffectOutcome};
 use crate::manifest::Manifest;
-use crate::state::StateSnapshot;
+use crate::state::{AudioSpectrum, StateSnapshot};
 use crate::wire::{EventKind, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,20 @@ pub enum HostMsg {
     /// the plugin author. Sent once at session start and again on every
     /// accent/scheme change (#396) — always latest-wins on re-send.
     Accent { color: Option<[u8; 4]> },
+    /// The latest audio-reactive spectrum off the default sink's monitor (#405),
+    /// pushed ~20 Hz **latest-wins** so a slow plugin just skips frames. The
+    /// payload is a peak level plus a fixed low→high band split — see
+    /// [`AudioSpectrum`].
+    ///
+    /// **Opt-in (#305):** sent *only* to a plugin that subscribes
+    /// [`StateKey::AudioSpectrum`](crate::manifest::StateKey::AudioSpectrum), so
+    /// appending this name-tagged variant stays additive — a pre-#405 binary that
+    /// never declared the key never receives (and never fails to decode) it.
+    /// Unlike [`Accent`](HostMsg::Accent) the SDK does not auto-declare the
+    /// subscription: the spectrum is data a plugin's own view renders, so the
+    /// plugin opts in explicitly, and the host only runs the capture while a
+    /// subscriber is present.
+    AudioSpectrum { spectrum: AudioSpectrum },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is
@@ -131,6 +145,38 @@ mod tests {
     fn accent_subscription_round_trips() {
         let mut manifest = Manifest::new("preem-plugin", Mount::SidebarTop);
         manifest.subscribes = vec![StateKey::Clock, StateKey::Accent];
+        let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
+        assert_eq!(back, manifest);
+    }
+
+    /// The #405 audio-spectrum push round-trips, carrying its peak and all
+    /// [`SPECTRUM_BINS`](crate::state::SPECTRUM_BINS) band values byte-for-byte —
+    /// the `[f32; 16]` array encodes as a msgpack sequence and decodes back
+    /// exactly.
+    #[test]
+    fn audio_spectrum_push_round_trips() {
+        use crate::state::{AudioSpectrum, SPECTRUM_BINS};
+        let mut bins = [0.0_f32; SPECTRUM_BINS];
+        for (i, b) in bins.iter_mut().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *b = i as f32 / SPECTRUM_BINS as f32;
+            }
+        }
+        let msg = HostMsg::AudioSpectrum {
+            spectrum: AudioSpectrum { peak: 0.75, bins },
+        };
+        let back = decode::<HostMsg>(&encode(&msg)).expect("spectrum frame decodes");
+        assert_eq!(back, msg);
+    }
+
+    /// `StateKey::AudioSpectrum` is a plain name-tagged variant, so a manifest
+    /// declaring it round-trips — the additive opt-in a plugin uses to receive the
+    /// spectrum push (#405).
+    #[test]
+    fn audio_spectrum_subscription_round_trips() {
+        let mut manifest = Manifest::new("scope-plugin", Mount::SidebarTop);
+        manifest.subscribes = vec![StateKey::Clock, StateKey::AudioSpectrum];
         let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
         assert_eq!(back, manifest);
     }

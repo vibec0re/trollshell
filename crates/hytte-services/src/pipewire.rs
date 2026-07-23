@@ -22,9 +22,29 @@ use hytte_reactive::registry;
 
 pub use super::audio_native::{
     PipewireService, service, set_default_sink, set_default_source, set_sink_mute, set_sink_volume,
-    set_source_mute, set_source_volume, set_stream_mute, set_stream_volume, set_volume,
-    toggle_mute,
+    set_source_mute, set_source_volume, set_spectrum_active, set_stream_mute, set_stream_volume,
+    set_volume, toggle_mute,
 };
+
+/// Number of frequency bands in an [`AudioSpectrum`] frame — a fixed low→high
+/// split of the default sink's monitor (#405). Matches the plugin proto's
+/// `SPECTRUM_BINS` so the host maps one onto the other 1:1.
+pub const SPECTRUM_BINS: usize = 16;
+
+/// One audio-reactive frame off the **default sink's monitor** (#405): a peak
+/// level plus a [`SPECTRUM_BINS`]-band magnitude split, low→high frequency, both
+/// normalized to `0.0..=1.0`. Produced ~20 Hz by the capture tap in
+/// [`super::audio_native`] and surfaced through [`audio_spectrum`]. GTK- and
+/// wire-free: the plugin host projects it onto the plugin proto's own
+/// `AudioSpectrum` before pushing it to subscribing plugins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioSpectrum {
+    /// Peak (max-abs) sample magnitude over the analysis window, `0.0..=1.0`.
+    pub peak: f32,
+    /// Per-band normalized magnitude, index `0` = lowest frequency, each
+    /// `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
+    pub bins: [f32; SPECTRUM_BINS],
+}
 
 /// Default-sink volume snapshot, surfaced to the bar chip.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -103,6 +123,11 @@ pub struct PipewireHandles {
     pub(crate) sources: Mutable<Vec<Source>>,
     pub(crate) streams: Mutable<Vec<PlaybackStream>>,
     pub(crate) record_streams: Mutable<Vec<RecordStream>>,
+    /// Latest audio-reactive frame off the default sink's monitor (#405), or
+    /// `None` while the capture tap is inactive (no subscriber) or hasn't
+    /// produced its first window yet. Written from the pipewire-loop thread's
+    /// capture `process` callback; read by [`audio_spectrum`].
+    pub(crate) spectrum: Mutable<Option<AudioSpectrum>>,
 }
 
 impl Default for PipewireHandles {
@@ -113,6 +138,7 @@ impl Default for PipewireHandles {
             sources: Mutable::new(Vec::new()),
             streams: Mutable::new(Vec::new()),
             record_streams: Mutable::new(Vec::new()),
+            spectrum: Mutable::new(None),
         }
     }
 }
@@ -164,6 +190,20 @@ pub fn record_streams() -> impl Signal<Item = Vec<RecordStream>> {
         r.get::<PipewireHandles>()
             .expect("pipewire::service() not registered")
             .record_streams
+            .signal_cloned()
+    })
+}
+
+/// The latest audio-reactive spectrum off the default sink's monitor (#405), or
+/// `None` while the capture is inactive. The plugin host binds this and forwards
+/// each frame to plugins subscribing `StateKey::AudioSpectrum`. The capture only
+/// runs while [`set_spectrum_active(true)`](set_spectrum_active) has been called
+/// (i.e. a subscriber exists), so this stays `None` on an idle desktop.
+pub fn audio_spectrum() -> impl Signal<Item = Option<AudioSpectrum>> {
+    registry::with(|r| {
+        r.get::<PipewireHandles>()
+            .expect("pipewire::service() not registered")
+            .spectrum
             .signal_cloned()
     })
 }

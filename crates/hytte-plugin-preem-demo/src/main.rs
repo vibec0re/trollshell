@@ -5,7 +5,9 @@
 //! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
 //! per second, a **scrolling marquee** panning a pixel window across a
 //! pre-rendered strip, and an **8bit textbox**, all rotating VFD → LCD → OLED
-//! every [`STYLE_SECS`] seconds. Tapping the clock advances the skin
+//! every [`STYLE_SECS`] seconds. Below them an **audio scope tile** (#405/#397)
+//! draws a 16-bar spectrum straight off the `AudioSpectrum` push, so the card
+//! reacts to whatever is playing. Tapping the clock advances the skin
 //! immediately. It doubles as the kit's visual regression harness and the
 //! copy-from reference for plugin authors.
 //!
@@ -27,8 +29,8 @@
 //! 22-column ×2 textbox 274 px — all inside the sidebar card's ~296 px content
 //! width.
 
-use hytte_plugin::preem::{DisplayStyle, Marquee, TextBox, dot_matrix, seven_seg};
-use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
+use hytte_plugin::preem::{DisplayStyle, Frame, Marquee, Rgba, TextBox, dot_matrix, seven_seg};
+use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key.
@@ -41,6 +43,18 @@ const SEG_ID: &str = "preem-demo-7seg";
 const TICKER_ID: &str = "preem-demo-ticker";
 const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
+const SCOPE_ID: &str = "preem-demo-scope";
+
+/// The audio-spectrum scope tile (#405/#397): a 16-bar spectrum drawn from the
+/// [`StateKey::AudioSpectrum`] push. Dimensions fit the ~296 px sidebar card.
+const SCOPE_W: usize = 268;
+const SCOPE_H: usize = 44;
+/// Pixels of horizontal gap between adjacent bars.
+const SCOPE_GAP: usize = 2;
+/// Scope backdrop, bar fill, and the bright cap that tops each bar.
+const SCOPE_BG: Rgba = [0x08, 0x0a, 0x10, 0xff];
+const SCOPE_BAR: Rgba = [0x6d, 0xf0, 0xc0, 0xff];
+const SCOPE_CAP: Rgba = [0xff, 0xff, 0xff, 0xff];
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
@@ -67,7 +81,9 @@ const TEXT_COLS: usize = 22;
 
 /// The demo's entire state — rebuilt on every (re)connect, re-derived from
 /// the next snapshot.
-#[derive(Debug, PartialEq, Eq)]
+// `Eq` is intentionally not derived: `bins` is `[f32; N]`, which is `PartialEq`
+// but not `Eq`. Nothing compares the whole model for equality anyway.
+#[derive(Debug, PartialEq)]
 struct PreemDemo {
     /// `"HH:MM"` from the host clock's ISO timestamp (`"--:--"` until the
     /// first snapshot lands — all-ghost dashes on the readout).
@@ -76,6 +92,42 @@ struct PreemDemo {
     unix: i64,
     /// Click offset into the skin rotation (tapping the clock bumps it).
     style_bump: u32,
+    /// Latest 16-band audio spectrum off the default sink's monitor (#405),
+    /// drawn by the scope tile. All-zero until the first push lands (a flat
+    /// baseline), so the tile shows even on a silent desktop.
+    bins: [f32; SPECTRUM_BINS],
+}
+
+/// Render the 16-band spectrum as a bar tile via the preem [`Frame`] primitives
+/// — the #397 oscilloscope/spectrum tile in minimal form, proving audio → bars
+/// end to end. Each bar's height tracks its band magnitude and carries a bright
+/// cap; a silent band still draws a 1 px baseline so the tile always reads.
+// All coordinates/dimensions here are small compile-time-bounded constants
+// (`SCOPE_W`/`SCOPE_H` ≤ 268) or a band count, so the usize→i32/f32 casts can
+// neither wrap, truncate, nor lose precision.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn scope_tile(bins: &[f32; SPECTRUM_BINS]) -> Frame {
+    let mut frame = Frame::filled(SCOPE_W, SCOPE_H, SCOPE_BG);
+    let bar_w = (SCOPE_W - SCOPE_GAP * (SPECTRUM_BINS - 1)) / SPECTRUM_BINS;
+    let max_h = SCOPE_H - 2;
+    for (i, &v) in bins.iter().enumerate() {
+        let x = (i * (bar_w + SCOPE_GAP)) as i32;
+        let h = (v.clamp(0.0, 1.0) * max_h as f32).round() as usize;
+        if h == 0 {
+            // A 1 px floor so silent bands still read as a baseline.
+            frame.rect(x, (SCOPE_H - 1) as i32, bar_w as i32, 1, SCOPE_BAR);
+            continue;
+        }
+        let y = (SCOPE_H - h) as i32;
+        frame.rect(x, y, bar_w as i32, h as i32, SCOPE_BAR);
+        frame.rect(x, y, bar_w as i32, 1, SCOPE_CAP);
+    }
+    frame
 }
 
 /// The `HH:MM` slice of an RFC 3339 local timestamp
@@ -133,12 +185,13 @@ impl Plugin for PreemDemo {
     /// Purely display: no I/O of its own, no commands.
     type Cmd = std::convert::Infallible;
 
-    /// Subscribes to `Clock`, mounts `SidebarTop` under the clock demo
-    /// (`order = 1`; unordered co-mounts sort as 0 — #303). No capabilities:
-    /// the demo asks nothing of the shell.
+    /// Subscribes to `Clock` (the heartbeat) **and** `AudioSpectrum` (the scope
+    /// tile's input, #405), mounts `SidebarTop` under the clock demo (`order = 1`;
+    /// unordered co-mounts sort as 0 — #303). No capabilities: the demo asks
+    /// nothing of the shell.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(1);
-        m.subscribes = vec![StateKey::Clock];
+        m.subscribes = vec![StateKey::Clock, StateKey::AudioSpectrum];
         m
     }
 
@@ -149,6 +202,7 @@ impl Plugin for PreemDemo {
             hhmm: "--:--".to_owned(),
             unix: 0,
             style_bump: 0,
+            bins: [0.0; SPECTRUM_BINS],
         }
     }
 
@@ -172,6 +226,11 @@ impl Plugin for PreemDemo {
                     self.style_bump = self.style_bump.wrapping_add(1);
                 }
             }
+            // The audio-spectrum push (#405): store the latest bands; the scope
+            // tile renders them on the next `view`.
+            Input::AudioSpectrum(spectrum) => {
+                self.bins = spectrum.bins;
+            }
             // No RunCommand is issued, and the card keeps cycling whether
             // or not anyone is looking (rendering is snapshot-driven and
             // cheap) — both pushes are no-ops.
@@ -183,9 +242,9 @@ impl Plugin for PreemDemo {
     }
 
     /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
-    /// marquee, the textbox — all wearing the same skin — and a dim hint line.
-    /// Every `Pixels` buffer satisfies the host's `len == w * h * 4` invariant
-    /// by kit construction.
+    /// marquee, the textbox — all wearing the same skin — the audio scope tile,
+    /// and a dim hint line. Every `Pixels` buffer satisfies the host's
+    /// `len == w * h * 4` invariant by kit construction.
     fn view(&self) -> View {
         let style = self.style();
         let clock = seven_seg(&self.hhmm, style);
@@ -198,6 +257,7 @@ impl Plugin for PreemDemo {
             .cols(TEXT_COLS)
             .scale(2)
             .render(&Self::textbox_line(style));
+        let scope = scope_tile(&self.bins);
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -213,6 +273,7 @@ impl Plugin for PreemDemo {
                 ticker.into_node(Some(TICKER_ID), Vec::new()),
                 marquee.into_node(Some(MARQUEE_ID), Vec::new()),
                 textbox.into_node(Some(TEXT_ID), Vec::new()),
+                scope.into_node(Some(SCOPE_ID), Vec::new()),
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
@@ -233,7 +294,7 @@ mod tests {
     use super::{CYCLE_BTN, PreemDemo, STYLE_SECS, parse_hhmm};
     use hytte_plugin::preem::{DisplayStyle, Marquee};
     use hytte_plugin::proto::{
-        ClockState, EventKind, Node, PluginMsg, StateSnapshot, decode, encode,
+        ClockState, EventKind, Node, PluginMsg, StateKey, StateSnapshot, decode, encode,
     };
     use hytte_plugin::{Input, Plugin};
 
@@ -248,6 +309,10 @@ mod tests {
                 unix,
             }),
         })
+    }
+
+    fn spectrum(bins: [f32; super::SPECTRUM_BINS]) -> Input<std::convert::Infallible> {
+        Input::AudioSpectrum(hytte_plugin::proto::AudioSpectrum { peak: 0.9, bins })
     }
 
     /// Walk a tree and collect every `Pixels` node's parts.
@@ -339,7 +404,7 @@ mod tests {
         for step in 0..6 {
             let tree = m.view().tree;
             let bufs = pixels_of(&tree);
-            assert_eq!(bufs.len(), 4, "clock + ticker + marquee + textbox");
+            assert_eq!(bufs.len(), 5, "clock + ticker + marquee + textbox + scope");
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
                 assert!(w > 0 && h > 0);
@@ -420,6 +485,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The audio-spectrum push updates the model's bands and the scope tile
+    /// visibly reacts — a loud band paints a taller bar than silence (#405).
+    #[test]
+    fn scope_reacts_to_audio_spectrum() {
+        let mut m = fresh();
+        // Silent baseline vs a single loud band → different pixels.
+        let quiet = super::scope_tile(&[0.0; super::SPECTRUM_BINS]);
+        let mut loud_bins = [0.0_f32; super::SPECTRUM_BINS];
+        loud_bins[8] = 1.0;
+        let loud = super::scope_tile(&loud_bins);
+        assert_ne!(quiet.data(), loud.data(), "a loud band paints a taller bar");
+        assert_eq!(loud.width(), super::SCOPE_W);
+        assert_eq!(loud.height(), super::SCOPE_H);
+
+        // The push folds into the model, so the next view draws those bands.
+        let fx = m.update(spectrum(loud_bins));
+        assert!(fx.is_empty(), "the demo asks nothing of the shell");
+        assert!((m.bins[8] - 1.0).abs() < 1e-6, "band 8 stored");
+        assert!(m.bins[0].abs() < 1e-6, "quiet bands stay low");
+    }
+
+    /// The manifest opts into both the clock heartbeat and the audio spectrum.
+    #[test]
+    fn manifest_subscribes_clock_and_spectrum() {
+        let m = PreemDemo::manifest();
+        assert!(m.subscribes.contains(&StateKey::Clock));
+        assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
     }
 
     /// The frames built from this plugin's data are valid on the wire.

@@ -334,7 +334,11 @@ fn spawn_art_fetch(art: gtk::Image, url: String) {
 
 fn wire_seek(seek: &gtk::Scale, state: &Rc<PlayerState>) {
     let state_for_handler = state.clone();
-    bind_two_way(
+    // Drag-safe: the mpris position poller writes this scale ~4×/s, which would
+    // otherwise yank the thumb back mid-drag. `bind_two_way_drag_safe` suppresses
+    // the poller's applies while the user is grabbing the slider (and briefly
+    // after release) so the seek no longer fights the poller — see #445.
+    bind_two_way_drag_safe(
         mpris::active_player().map(player_seek_fraction),
         seek,
         gtk::prelude::RangeExt::set_value,

@@ -164,8 +164,9 @@ impl Popup {
 /// it stacks reliably above its parent layer-shell surface regardless of
 /// present order — so the catcher sits below the popover without relying
 /// on compositor-specific sibling-surface ordering. The catcher is created
-/// on each show and destroyed when the popover closes, so nothing lingers
-/// between opens.
+/// on each show and destroyed when the popover closes *or* is unmapped (which
+/// covers dispose-while-mapped on hot-plug teardown), so nothing lingers
+/// between opens and no orphan click-eater survives a rebuild.
 ///
 /// Note: the modal drawer used a similar two-surface approach before #109,
 /// but switched to a single fullscreen surface because niri does not
@@ -202,14 +203,36 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
         *catcher_for_show.borrow_mut() = Some(win);
     });
 
-    // On close (whether from a catcher click, a menu-item action, autohide,
-    // or Escape), drop the catcher so it doesn't keep swallowing input.
-    let catcher_for_close = catcher;
-    popover.connect_closed(move |_| {
-        if let Some(win) = catcher_for_close.borrow_mut().take() {
-            win.close();
-        }
-    });
+    // Tear the catcher down on *both* `closed` and `unmap`, funnelling through
+    // the same idempotent `take()`:
+    //
+    // * `closed` is the semantic close (a catcher click, a menu-item action,
+    //   autohide, or Escape) — the common path.
+    // * `unmap` fires on every hide *and* on dispose-while-mapped. `closed` is
+    //   not guaranteed to fire when the popover is destroyed out from under a
+    //   live show — e.g. a bar chip's menu is up when `monitors_changed` tears
+    //   the whole bar down on hot-plug. Without an `unmap` hook the catcher's
+    //   `Rc<RefCell<Option<Window>>>` is merely dropped, but a `gtk::Window`
+    //   toplevel lives in GTK's global toplevel list until `close()`d, so it
+    //   survives as an invisible full-output click-eater with no visible cause.
+    //
+    // Whichever fires first drains and closes the catcher; the other finds
+    // `None` and is a no-op — so there is no double-close and no orphan.
+    let catcher_for_close = catcher.clone();
+    popover.connect_closed(move |_| close_catcher(&catcher_for_close));
+
+    let catcher_for_unmap = catcher;
+    popover.connect_unmap(move |_| close_catcher(&catcher_for_unmap));
+}
+
+/// Idempotently drain and close the catcher window. Called from both the
+/// popover's `closed` and `unmap` handlers; the first to fire takes the window
+/// out of the shared cell and `close()`s it (removing the toplevel from GTK's
+/// window list), leaving the other a harmless no-op.
+fn close_catcher(catcher: &Rc<RefCell<Option<gtk::Window>>>) {
+    if let Some(win) = catcher.borrow_mut().take() {
+        win.close();
+    }
 }
 
 /// Build a single full-screen transparent catcher window whose only job is
@@ -251,5 +274,51 @@ fn map_position(p: Position) -> gtk::PositionType {
         Position::Bottom => gtk::PositionType::Bottom,
         Position::Left => gtk::PositionType::Left,
         Position::Right => gtk::PositionType::Right,
+    }
+}
+
+// The full catcher lifecycle (popover show → layer-shell catcher built →
+// popover disposed → catcher gone) is compositor-dependent: `build_popover_catcher`
+// needs a live `gtk4-layer-shell`, so it can only be live-verified under niri.
+//
+// What *is* exercisable headlessly (needs a display → gated to `system-tests`,
+// run under `xvfb-run`) is the teardown mechanism the fix hinges on: that
+// `close_catcher` idempotently drains the shared cell and that `close()`ing the
+// window actually removes it from GTK's global toplevel list — the very thing a
+// bare drop does *not* do, which is why an un-`close()`d catcher leaks.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::*;
+
+    #[gtk::test]
+    fn close_catcher_drains_and_destroys_idempotently() {
+        // A plain toplevel (not a layer window — no compositor needed) stands in
+        // for the catcher; GTK still tracks it in its global toplevel list.
+        let win = gtk::Window::new();
+        win.present();
+        let weak = win.downgrade();
+
+        // The cell is now the only *named* strong ref (the local `win` moved in);
+        // GTK's toplevel list holds the other.
+        let catcher: Rc<RefCell<Option<gtk::Window>>> = Rc::new(RefCell::new(Some(win)));
+
+        // First teardown drains + closes: destroy drops GTK's ref, the taken
+        // window drops the cell's ref.
+        close_catcher(&catcher);
+        assert!(
+            catcher.borrow().is_none(),
+            "catcher drained on first teardown"
+        );
+
+        // A second teardown (the other of closed/unmap) is a harmless no-op.
+        close_catcher(&catcher);
+        assert!(catcher.borrow().is_none(), "second teardown is idempotent");
+
+        // Let any deferred destroy settle, then prove no orphan toplevel survives.
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            weak.upgrade().is_none(),
+            "the catcher window must be destroyed, not left leaking in the toplevel list",
+        );
     }
 }

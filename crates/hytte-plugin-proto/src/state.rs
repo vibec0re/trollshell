@@ -31,3 +31,30 @@ pub struct StateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<ClockState>,
 }
+
+/// Number of frequency bands in an [`AudioSpectrum`] payload — a fixed,
+/// low→high split of the default sink's monitor (#405). Sixteen is enough for a
+/// legible bar-spectrum / scope tile while keeping the wire frame tiny (a peak
+/// plus 16 floats, pushed ~20 Hz — well under what `Node::Pixels` animation
+/// already moves the other way).
+pub const SPECTRUM_BINS: usize = 16;
+
+/// One audio-reactive frame off the **default sink's monitor** (#405): a peak
+/// level plus a [`SPECTRUM_BINS`]-band magnitude split, low→high frequency.
+///
+/// The host taps the monitor through `PipeWire`, downsamples to this shape at
+/// ~20 Hz, and pushes it to a plugin that subscribes
+/// [`StateKey::AudioSpectrum`](crate::manifest::StateKey::AudioSpectrum) as a
+/// [`HostMsg::AudioSpectrum`](crate::msg::HostMsg::AudioSpectrum) — **latest-wins**,
+/// so a plugin that renders slower than 20 Hz simply skips frames. Both values
+/// are already normalized to `0.0..=1.0` (a heuristic display gain, clamped), so
+/// a consumer maps them straight onto bar heights / needle angles without its
+/// own calibration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AudioSpectrum {
+    /// Peak (max-abs) sample magnitude over the analysis window, `0.0..=1.0`.
+    pub peak: f32,
+    /// Per-band normalized magnitude, index `0` = lowest frequency band, each
+    /// `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
+    pub bins: [f32; SPECTRUM_BINS],
+}

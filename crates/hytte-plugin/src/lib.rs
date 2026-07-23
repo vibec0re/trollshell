@@ -218,11 +218,11 @@
 //! ## Opening your own panel
 //!
 //! Any plugin — bar chip or sidebar card — may ALSO define an optional drawer
-//! **panel** (#349 PR2) via [`Plugin::panel`]: a second, independent `Node`
-//! tree the host mounts as its own dedicated drawer page. Return `Some(tree)`
-//! from `panel()` to publish it (default `None` = no panel, chip/card only);
-//! it is re-projected every update like `view` and the runtime dedups + sends
-//! it on the render frame. To open it, emit
+//! **panel** (#349): a second, independent `Node` tree the host mounts as its
+//! own dedicated drawer page. Publish it by returning it on the [`View`] —
+//! `View::new(chip).panel(detail)` from [`Plugin::view`] (a plain `node.into()`
+//! = no panel, chip/card only); the whole `View` is re-projected every update
+//! and the runtime dedups + sends it as one render frame. To open it, emit
 //! [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf) from
 //! `update` — typically in response to a click on your chip/card — which needs
 //! the [`OpenPage`](proto::Capability::OpenPage) capability like any other
@@ -415,6 +415,55 @@ pub enum Input<M> {
     App(M),
 }
 
+/// One projection of the model — everything [`Plugin::view`] renders: the
+/// mounted **tree** (a bar chip or a sidebar card, per the manifest's
+/// [`Mount`](proto::Mount)) plus the optional drawer **panel** (#349). This is
+/// the SDK-side mirror of the wire frame's `Render { tree, panel, .. }` pair —
+/// the two always travel together in one frame, so they are produced together
+/// by one function.
+///
+/// A chip/card-only plugin converts its root node with `.into()`; a paneled
+/// plugin chains [`panel`](View::panel):
+///
+/// ```ignore
+/// fn view(&self) -> View {
+///     chip_node().into()                    // no panel
+///     // or:
+///     View::new(chip_node()).panel(detail_node())
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct View {
+    /// The tree mounted at the manifest's [`Mount`](proto::Mount) region — the
+    /// bar chip or sidebar card.
+    pub tree: Node,
+    /// The optional dedicated drawer page (#349), opened via
+    /// [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf).
+    /// `None` = no panel; the chip/card is the whole surface.
+    pub panel: Option<Node>,
+}
+
+impl View {
+    /// A panel-less view of `tree` (equivalent to `tree.into()`).
+    #[must_use]
+    pub fn new(tree: Node) -> Self {
+        Self { tree, panel: None }
+    }
+
+    /// Attach the drawer-panel tree.
+    #[must_use]
+    pub fn panel(mut self, panel: Node) -> Self {
+        self.panel = Some(panel);
+        self
+    }
+}
+
+impl From<Node> for View {
+    fn from(tree: Node) -> Self {
+        Self::new(tree)
+    }
+}
+
 /// The Elm Architecture core of a plugin: pure state + `update` + `view`.
 /// Implement this and hand the type to [`run`] — the trait has no transport
 /// surface at all, which is what keeps every method unit-testable without a
@@ -470,19 +519,12 @@ pub trait Plugin: Sized {
     /// decisions.
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect>;
 
-    /// Project the model into the declarative widget tree the host reconciles
-    /// into GTK.
-    fn view(&self) -> Node;
-
-    /// The plugin's optional drawer **panel** tree (#349 PR2), opened when the
-    /// plugin emits [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf).
-    /// Default `None` = no panel (chip/card only). Re-projected every update
-    /// like [`view`](Plugin::view); the runtime dedups it and sends it on the
-    /// `Render` frame's `panel` field (a panel change alone forces a frame, so
-    /// a plugin can refresh its open panel while its chip stays fixed). See the
-    /// crate-level *Opening your own panel* section.
-    #[must_use]
-    fn panel(&self) -> Option<Node> {
-        None
-    }
+    /// Project the model into everything rendered: the mounted widget tree the
+    /// host reconciles into GTK, plus the optional drawer panel — one [`View`].
+    /// Re-projected after every [`update`](Plugin::update); the runtime dedups
+    /// the whole `View` (a panel change alone still forces a frame, so a plugin
+    /// can refresh its open panel while its chip stays fixed) and sends it as
+    /// one `Render` frame. A chip/card-only plugin returns `node.into()`; see
+    /// the crate-level *Opening your own panel* section for the paneled shape.
+    fn view(&self) -> View;
 }

@@ -57,7 +57,7 @@ mod feed;
 use feed::Row;
 use hytte_plugin::proto::{Capability, Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
@@ -442,7 +442,7 @@ impl Plugin for Board {
         }
     }
 
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         let children = match &self.state {
             BoardState::Loading => {
                 vec![status_text("loading departures…", "ts-departures-loading")]
@@ -482,6 +482,7 @@ impl Plugin for Board {
             classes: vec!["ts-departures".to_owned()],
             children,
         }
+        .into()
     }
 }
 
@@ -963,7 +964,7 @@ mod tests {
     fn root_children(board: &Board) -> Vec<Node> {
         let Node::ListBox {
             classes, children, ..
-        } = board.view()
+        } = board.view().tree
         else {
             panic!("root is a ListBox");
         };

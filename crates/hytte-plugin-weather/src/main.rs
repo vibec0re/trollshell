@@ -230,7 +230,7 @@ impl Plugin for Weather {
         Vec::new()
     }
 
-    fn view(&self) -> Node {
+    fn view(&self) -> hytte_plugin::View {
         let content = match &self.state {
             View::Loading => loading_content(),
             View::Resolved(snap) => resolved_content(snap),
@@ -244,6 +244,7 @@ impl Plugin for Weather {
             classes: vec!["flat".to_owned(), "ts-weather".to_owned()],
             child: Box::new(content),
         }
+        .into()
     }
 }
 
@@ -578,7 +579,7 @@ mod tests {
     #[test]
     fn seed_view_is_a_compact_loading_placeholder() {
         let (m, _rx) = model();
-        let tree = m.view();
+        let tree = m.view().tree;
         let Node::Button { id, child, .. } = &tree else {
             panic!("the card root is the refresh button");
         };
@@ -601,7 +602,7 @@ mod tests {
         let (mut m, _rx) = model();
         let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
         assert!(matches!(m.state, View::Resolved(_)));
-        let tree = m.view();
+        let tree = m.view().tree;
 
         assert_eq!(find_text(&tree, LOC_ID).as_deref(), Some("OBERSCHÖNEWEIDE"));
         assert_eq!(
@@ -627,7 +628,7 @@ mod tests {
     fn resolved_view_right_pins_details_and_ellipsizes_single_lines() {
         let (mut m, _rx) = model();
         let _ = m.update(Input::App(WeatherMsg::Weather(sample())));
-        let tree = m.view();
+        let tree = m.view().tree;
 
         // Location + condition stay single-line via ellipsizing Text.
         assert_eq!(
@@ -665,7 +666,7 @@ mod tests {
             matches!(m.state, View::Resolved(_)),
             "a network blip must not clobber a good card"
         );
-        assert_eq!(find_text(&m.view(), TEMP_ID).as_deref(), Some("18°"));
+        assert_eq!(find_text(&m.view().tree, TEMP_ID).as_deref(), Some("18°"));
     }
 
     #[test]
@@ -673,7 +674,7 @@ mod tests {
         let (mut m, _rx) = model();
         let _ = m.update(Input::App(WeatherMsg::FetchError));
         assert_eq!(m.state, View::Error(NETWORK_ERR.to_owned()));
-        assert!(has_class(&m.view(), "ts-weather-error"));
+        assert!(has_class(&m.view().tree, "ts-weather-error"));
     }
 
     #[test]
@@ -683,7 +684,7 @@ mod tests {
         assert_eq!(m.state, View::Error(NO_LOCATION_MSG.to_owned()));
         // The message rides a wrapping Text node so a long hint can't blow the
         // card wide.
-        let tree = m.view();
+        let tree = m.view().tree;
         assert!(tree_has_text(&tree, NO_LOCATION_MSG));
     }
 

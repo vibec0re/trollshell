@@ -33,7 +33,7 @@ use std::time::Duration;
 use expression::Expression;
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 
 /// Poll / animation cadence.
@@ -231,7 +231,7 @@ impl Plugin for Caw {
         Vec::new()
     }
 
-    fn view(&self) -> Node {
+    fn view(&self) -> View {
         let (mood, message, action) = self.displayed();
 
         // `Frame::into_node` bakes the `Node::Pixels` (id/width/height/data and
@@ -289,6 +289,7 @@ impl Plugin for Caw {
             classes: vec!["caw-root".to_owned()],
             children,
         }
+        .into()
     }
 }
 
@@ -385,7 +386,7 @@ mod tests {
     #[test]
     fn view_is_a_vertical_card_with_a_pokeable_face() {
         let c = caw();
-        let Node::Box { dir, children, .. } = c.view() else {
+        let Node::Box { dir, children, .. } = c.view().tree else {
             panic!("root is a vertical box");
         };
         assert!(matches!(dir, Dir::Vertical));

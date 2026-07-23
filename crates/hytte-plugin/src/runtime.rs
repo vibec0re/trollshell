@@ -106,13 +106,12 @@ where
     // Seed render: the fresh model's view goes out immediately, so the slot
     // mounts before the first state snapshot lands.
     let mut model = P::init(cmd_tx);
-    let mut last_tree = model.view();
-    let mut last_panel = model.panel();
+    let mut last_view = model.view();
     write_frame(
         &mut wr,
         &PluginMsg::Render {
-            tree: last_tree.clone(),
-            panel: last_panel.clone(),
+            tree: last_view.tree.clone(),
+            panel: last_view.panel.clone(),
             effects: Vec::new(),
         },
     )
@@ -183,30 +182,28 @@ where
             },
         };
 
-        // update → view → dedup: send iff the tree OR the panel changed, or
-        // there are effects to deliver (effects ride the render frame, so a
-        // non-empty batch forces a send even for an identical tree). Extending
-        // dedup to the panel lets a plugin re-render its open panel while the
-        // chip tree is unchanged (the common case) still push a frame. A
-        // `Rerender` (e.g. an accent install, #376) refreshes the view without
-        // an `update`, so the accent-tinted frame repaints.
+        // update → view → dedup: send iff the `View` (tree or panel) changed,
+        // or there are effects to deliver (effects ride the render frame, so a
+        // non-empty batch forces a send even for an identical view). The whole
+        // `View` compares at once, so a panel change while the chip tree is
+        // unchanged (the common case) still pushes a frame. A `Rerender` (e.g.
+        // an accent install, #376) refreshes the view without an `update`, so
+        // the accent-tinted frame repaints.
         let effects = match step {
             Step::Update(input) => model.update(input),
             Step::Rerender => Vec::new(),
         };
-        let tree = model.view();
-        let panel = model.panel();
-        if !effects.is_empty() || tree != last_tree || panel != last_panel {
+        let view = model.view();
+        if !effects.is_empty() || view != last_view {
             let frame = PluginMsg::Render {
-                tree: tree.clone(),
-                panel: panel.clone(),
+                tree: view.tree.clone(),
+                panel: view.panel.clone(),
                 effects,
             };
             if let Err(e) = write_frame(&mut wr, &frame).await {
                 break Err(e);
             }
-            last_tree = tree;
-            last_panel = panel;
+            last_view = view;
         }
     };
     // Stop reading; the caller drops the write half, which half-closes the
@@ -287,7 +284,7 @@ pub fn run<P: Plugin>() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{BACKOFF_BASE, BACKOFF_CAP, Backoff, reconnect_loop, session};
-    use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+    use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::{
         Capability, ClockState, Effect, EffectOutcome, EventKind, HostMsg, Manifest, Mount, Node,
         Page, PluginMsg, StateKey, StateSnapshot, read_frame, write_frame,
@@ -347,12 +344,13 @@ mod tests {
             }
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             Node::Label {
                 id: Some("echo-lbl".to_owned()),
                 text: self.iso.clone(),
                 classes: Vec::new(),
             }
+            .into()
         }
     }
 
@@ -382,12 +380,13 @@ mod tests {
             Vec::new()
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             Node::Label {
                 id: None,
                 text: if self.visible { "visible" } else { "hidden" }.to_owned(),
                 classes: Vec::new(),
             }
+            .into()
         }
     }
 
@@ -420,12 +419,13 @@ mod tests {
             Vec::new()
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             Node::Label {
                 id: None,
                 text: self.count.to_string(),
                 classes: Vec::new(),
             }
+            .into()
         }
     }
 
@@ -488,18 +488,19 @@ mod tests {
             Vec::new()
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             Node::Label {
                 id: None,
                 text: self.count.to_string(),
                 classes: Vec::new(),
             }
+            .into()
         }
     }
 
-    /// Constant `view`, but its `panel` flips on a slot-visibility toggle — so a
-    /// panel change with an *unchanged* chip tree still forces a render frame
-    /// (#349 PR2: the panel is deduped independently of the view).
+    /// Constant chip tree, but the `View`'s panel flips on a slot-visibility
+    /// toggle — so a panel change with an *unchanged* chip tree still forces a
+    /// render frame (#349: the whole `View` is what dedup compares).
     struct Paneled {
         open: bool,
     }
@@ -523,17 +524,14 @@ mod tests {
             Vec::new()
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             // Constant chip tree — never changes across the panel flip.
-            Node::Label {
+            View::new(Node::Label {
                 id: Some("paneled-chip".to_owned()),
                 text: "chip".to_owned(),
                 classes: Vec::new(),
-            }
-        }
-
-        fn panel(&self) -> Option<Node> {
-            Some(Node::Label {
+            })
+            .panel(Node::Label {
                 id: Some("paneled-panel".to_owned()),
                 text: if self.open { "open" } else { "closed" }.to_owned(),
                 classes: Vec::new(),
@@ -605,12 +603,13 @@ mod tests {
             Vec::new()
         }
 
-        fn view(&self) -> Node {
+        fn view(&self) -> View {
             Node::Label {
                 id: Some("cmd-lbl".to_owned()),
                 text: self.last.clone(),
                 classes: Vec::new(),
             }
+            .into()
         }
     }
 

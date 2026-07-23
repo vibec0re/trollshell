@@ -4,10 +4,10 @@
 //! runtime).
 //!
 //! It is the end-to-end proof for the #349 **chip + panel** slices: a plugin
-//! that mounts [`Mount::BarCenter`] renders its `view()` tree as a bar chip
-//! (where v1 dropped it), and — new in the PR2 **panel** slice — its `HH:MM`
-//! chip is a clickable [`Node::Button`] that opens the plugin's own drawer
-//! [`panel`](Plugin::panel) via [`Effect::OpenPage(Page::PluginSelf)`]. It links
+//! that mounts [`Mount::BarCenter`] renders its `view()` chip tree as a bar
+//! chip (where v1 dropped it), and its `HH:MM` chip is a clickable
+//! [`Node::Button`] that opens the drawer panel carried on the same
+//! [`View`](hytte_plugin::View) via [`Effect::OpenPage(Page::PluginSelf)`]. It links
 //! **no GTK** (only [`hytte_plugin`]) and drives a real bar widget over the Unix
 //! socket — the bar-side twin of `hytte-plugin-clock-demo` (which mounts a
 //! sidebar card). A clock belongs in a bar, so it renders a compact `HH:MM` chip
@@ -30,7 +30,7 @@
 use hytte_plugin::proto::{
     Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
 };
-use hytte_plugin::{CmdSender, Input, Plugin};
+use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-region ownership key and audit-log subject.
 const PLUGIN_ID: &str = "bar-clock-demo";
@@ -127,13 +127,17 @@ impl Plugin for BarClock {
         }
     }
 
-    /// Project the model into the declarative widget tree the host reconciles
-    /// into GTK — wrapped in a `.ts-plugin-chip` pill (#349). A horizontal `Box`
-    /// holding a [`Node::Button`] (the click target that opens the panel, #349
-    /// PR2) whose child is the compact `HH:MM` time (`ts-clock`, the host's
-    /// monospace/tabular clock class).
-    fn view(&self) -> Node {
-        Node::Box {
+    /// Project the model into the rendered [`View`] (#349). The **chip** —
+    /// wrapped by the host in a `.ts-plugin-chip` pill — is a horizontal `Box`
+    /// holding a [`Node::Button`] (the click target that opens the panel) whose
+    /// child is the compact `HH:MM` time (`ts-clock`, the host's
+    /// monospace/tabular clock class). The drawer **panel** is a vertical `Box`
+    /// showing the full projected `ClockState` — the RFC3339 timestamp and the
+    /// raw unix seconds — a second, independent tree distinct from the compact
+    /// chip. Its root carries **no** `.card`/`.ts-plugin-*` class: the drawer
+    /// supplies the card chrome, so the panel owns only its inner content.
+    fn view(&self) -> View {
+        let chip = Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Horizontal,
             spacing: 4,
@@ -148,16 +152,8 @@ impl Plugin for BarClock {
                     classes: vec!["ts-clock".to_owned()],
                 }),
             }],
-        }
-    }
-
-    /// The plugin's drawer **panel** (#349 PR2): a vertical `Box` showing the
-    /// full projected `ClockState` — the RFC3339 timestamp and the raw unix
-    /// seconds — a second, independent tree distinct from the compact chip. Its
-    /// root carries **no** `.card`/`.ts-plugin-*` class: the drawer supplies the
-    /// card chrome, so the panel owns only its inner content.
-    fn panel(&self) -> Option<Node> {
-        Some(Node::Box {
+        };
+        View::new(chip).panel(Node::Box {
             id: Some("bar-clock-demo-panel".to_owned()),
             dir: Dir::Vertical,
             spacing: 6,
@@ -245,7 +241,7 @@ mod tests {
                 }),
             }],
         };
-        assert_eq!(model.view(), expected);
+        assert_eq!(model.view().tree, expected);
     }
 
     /// #349 PR2: a click on the chip button opens the plugin's own panel — the
@@ -294,7 +290,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(model.panel(), Some(expected_panel));
+        assert_eq!(model.view().panel, Some(expected_panel));
     }
 
     /// A snapshot whose `clock` is `None` (startup window) changes nothing — the
@@ -321,11 +317,12 @@ mod tests {
 
         let mut model = fresh();
         let _ = model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1));
-        // A panel-bearing render (the chip button + the drawer panel, #349 PR2)
+        // A panel-bearing render (the chip button + the drawer panel, #349)
         // is what the runtime sends after this plugin's first snapshot.
+        let view = model.view();
         let render = PluginMsg::Render {
-            tree: model.view(),
-            panel: model.panel(),
+            tree: view.tree,
+            panel: view.panel,
             effects: vec![],
         };
         let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");

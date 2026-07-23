@@ -14,5 +14,6 @@ pub mod history_row;
 pub mod layout;
 pub mod mpris_controls;
 pub mod notif_actions;
+pub mod open_refresh;
 pub mod power_profile;
 pub mod reactive_list;

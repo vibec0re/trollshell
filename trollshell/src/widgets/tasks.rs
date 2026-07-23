@@ -25,7 +25,10 @@ use hytte::services::tasks::{self, Task, TaskList};
 /// widget so the user never sees up-to-60-second-stale data.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let column = build_block(monitor);
-    wire_open_refresh(monitor);
+    // Refresh on each sidebar open like the calendar widget, scoped to
+    // `column`'s lifetime so a hot-plug rebuild drops the subscription instead
+    // of leaking one per cycle (#439).
+    crate::components::open_refresh::on_open(monitor, &column, tasks::refresh);
     column.upcast()
 }
 
@@ -805,24 +808,4 @@ fn month(m: u32) -> &'static str {
         12 => "Dec",
         _ => "?",
     }
-}
-
-// ── Open-refresh ─────────────────────────────────────────────────────────────
-
-/// Force a fresh scan when the user opens the sidebar — mirrors the
-/// calendar widget's `wire_open_refresh`. Edge-triggered so the initial
-/// `false` from `signal()` doesn't fire a refresh against a still-closed
-/// sidebar.
-fn wire_open_refresh(monitor: &Monitor) {
-    use std::cell::Cell;
-    let last_open = Rc::new(Cell::new(false));
-    glib::MainContext::default().spawn_local(
-        crate::overlays::sidebar::open_signal(monitor).for_each(move |open| {
-            let prev = last_open.replace(open);
-            if open && !prev {
-                tasks::refresh();
-            }
-            async {}
-        }),
-    );
 }

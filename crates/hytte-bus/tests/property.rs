@@ -107,10 +107,13 @@ async fn properties_changed_emits_loaded_with_new_value() {
     }
     assert_eq!(current, Some(1));
 
-    // Give the tracking task time to advance past Loaded(1) and into the
-    // PropertiesChanged subscription loop before we emit the signal.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // No extra wait needed here: the tracker subscribes to PropertiesChanged
+    // BEFORE issuing its initial Get (#429, see property.rs's run_property),
+    // and that subscribe is a synchronous round-trip (AddMatch + reply). So by
+    // the time we've already observed Loaded(1) above — which can only be set
+    // *after* the Get completes — the subscription is provably live. Emitting
+    // now instead of guessing a fixed delay is the readiness signal.
+    //
     // Mutate the server-side property and emit PropertiesChanged.
     let iface_ref = server
         .object_server()
@@ -182,11 +185,12 @@ async fn reconnect_emits_stale_then_loaded() {
         "did not observe Loaded(42) before simulated disconnect"
     );
 
-    // Give the tracking task time to enter the PropertiesChanged listen loop
-    // before we trigger the disconnect (mirrors the sleep in
+    // No extra wait needed before triggering the disconnect: having already
+    // observed Loaded(42) above proves the subscribe-before-Get round-trip
+    // (#429) already completed, so the tracker is already past the point of
+    // being able to miss a subsequent epoch bump (mirrors the reasoning in
     // properties_changed_emits_loaded_with_new_value).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    //
     // ── Step 2: open a replacement connection and simulate a disconnect ───────
     let replacement = zbus::connection::Builder::address(address.as_str())
         .expect("parse ephemeral bus address")
@@ -241,8 +245,15 @@ async fn task_exits_when_property_signal_dropped() {
         .await
         .expect("task_done_receiver should be Some on first call");
 
-    // Give the task a moment to start and reach its first wait point.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the task actually get scheduled at least once before we drop. This
+    // is a courtesy, not a correctness requirement: `HandleTracker`'s count is
+    // decremented independently of task scheduling (see hytte-bus's
+    // handle.rs), so the task will observe `all_dropped()` on its very first
+    // loop iteration even if we dropped before it ever ran. A couple of
+    // scheduler yields are enough to exercise the "already running" path too,
+    // without guessing a wall-clock delay.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
 
     // Drop the handle — the task must detect this and exit.
     drop(prop);
@@ -315,37 +326,40 @@ async fn change_during_initial_get_window_is_not_lost() {
         .start();
     let mut stream = prop.signal().to_stream();
 
-    // Give the tracker time to set up its subscription and enter cold_get (which
-    // now sleeps 600ms server-side). subscribe is a couple of round-trips (a few
-    // ms on the local bus), so by 150ms the subscription is live and the Get is
-    // mid-sleep.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Emit PropertiesChanged(Value = 99) from the server connection while the
-    // tracker is still parked inside the initial Get.
+    // Rather than guessing a single delay by which the tracker's subscribe
+    // (AddMatch) has landed, keep re-emitting PropertiesChanged(Value = 99)
+    // while polling for delivery. `subscribe_properties_changed` always
+    // completes before `cold_get` is even entered (source-level invariant,
+    // #429) — SlowCounter's 600ms-sleeping `value()` getter only starts
+    // *after* that Get request is dispatched — so once the tracker task has
+    // been scheduled at all, every retry from here on is emitted after the
+    // subscription is live and gets buffered/replayed regardless of exactly
+    // how long that took on this runner. The loop below both re-emits and
+    // polls for the resulting Loaded(99), so it early-exits the moment the
+    // race window has been positively exercised and observed.
     let emitter = SignalEmitter::new(&server, PATH).unwrap();
-    let mut changed: HashMap<&str, Value> = HashMap::new();
-    changed.insert("Value", Value::from(99u32));
-    zbus::fdo::Properties::properties_changed(
-        &emitter,
-        InterfaceName::try_from(IFACE).unwrap(),
-        changed,
-        Cow::Borrowed(&[]),
-    )
-    .await
-    .unwrap();
-
-    // The tracker must converge to Loaded(99): it applies Loaded(1) when the Get
-    // returns, then replays the buffered PropertiesChanged → Loaded(99).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut final_value = None;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(PropState::Loaded(v))) =
-            tokio::time::timeout(Duration::from_millis(100), stream.next()).await
-        {
-            final_value = Some(v);
-            if v == 99 {
-                break;
+    while tokio::time::Instant::now() < deadline && final_value != Some(99) {
+        let mut changed: HashMap<&str, Value> = HashMap::new();
+        changed.insert("Value", Value::from(99u32));
+        let _ = zbus::fdo::Properties::properties_changed(
+            &emitter,
+            InterfaceName::try_from(IFACE).unwrap(),
+            changed,
+            Cow::Borrowed(&[]),
+        )
+        .await;
+
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        while tokio::time::Instant::now() < poll_deadline {
+            if let Ok(Some(PropState::Loaded(v))) =
+                tokio::time::timeout(Duration::from_millis(20), stream.next()).await
+            {
+                final_value = Some(v);
+                if v == 99 {
+                    break;
+                }
             }
         }
     }

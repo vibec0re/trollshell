@@ -22,6 +22,17 @@ a real spec, and it is the source of truth for the first implementation crate,
 `hytte-plugin-proto` (PR 1). It stays deliberately aligned with that crate: the
 types below _are_ the wire types.
 
+> **2026-07-23 note:** that alignment is a v1 snapshot, not a live mirror — the
+> crate is the normative source, this doc is not re-synced on every additive
+> change. Grown since this was written: `Mount::SidebarLead` (a leading sidebar
+> region); `Capability`/`Effect::{RaiseOsd,Notify}` (transient OSD nudges and
+> shell-posted notifications, alongside `OpenPage`/`Niri`/`Media`/`Audio`/
+> `RunCommand`); and a `Node::Pixels` variant (raw pixel-buffer surfaces, the
+> `preem` widget-kit's render target) in the node vocabulary. Read
+> `crates/hytte-plugin-proto/src/{manifest,effect,wire}.rs` for the current
+> wire types; treat the `enum`/`struct` bodies below as illustrative of the
+> shape, not an exhaustive variant list.
+
 ## Background — what was ruled out, and why B
 
 The brainstorm on #35 fanned four options; three collapsed into one architecture

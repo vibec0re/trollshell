@@ -42,9 +42,10 @@ For quick feedback while iterating, `cargo clippy -p <crate> --lib` is much fast
 ### Tests
 
 Tests split into two buckets via the `system-tests` cargo feature (defined in
-`hytte-bus`, `hytte-reactive`, `hytte-ui`). **Internals** (pure logic) run by
-default; **real-system** tests (those needing a `dbus-daemon` or a display
-server) are gated behind the feature so the default run stays hermetic.
+`hytte-bus`, `hytte-reactive`, `hytte-services`, `hytte-ui`). **Internals**
+(pure logic) run by default; **real-system** tests (those needing a
+`dbus-daemon` or a display server) are gated behind the feature so the default
+run stays hermetic.
 
 ```sh
 cargo test                                       # internals only — hermetic, no system deps
@@ -59,9 +60,37 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
 - `hytte-bus`'s system tests **spawn a real `dbus-daemon`** (one ephemeral
   broker per test; must be on `PATH`). They don't touch the host session bus.
 - The GTK-dependent system tests need a display server (`xvfb-run` works).
-- The Nix package sets `doCheck = false`; with the split, the default
-  (internals) suite is now hermetic enough to run in the sandbox if you want to
-  flip it on.
+- `hytte-services`'s gated test round-trips the NetworkManager secret agent
+  (`wifi::nm_agent`'s `GetSecrets`) against a real `dbus-daemon` too.
+- The Nix package (`nix/package.nix`) sets `doCheck = true`: every
+  `nix build .#trollshell` runs the hermetic internals suite
+  (`cargo test --workspace`, deliberately **without** `system-tests`) as part
+  of the build.
+
+### CI (`nix flake check`)
+
+Beyond the package build's `doCheck`, the flake's `checks` output
+(`flake.nix`) gates a fair bit more than tests:
+
+- `cargo clippy --workspace --all-targets --features system-tests -- -D warnings`
+  (the `system-tests` feature is enabled here so the gated integration tests
+  and GTK `mod tests` blocks are lint-checked too, not just compiled once and
+  forgotten).
+- `treefmt` formatting (`nix/treefmt.nix`) — this is what `nix fmt` runs
+  locally.
+- The full `system-tests` cargo-feature bucket, run for real
+  (`cargo test --workspace --features system-tests` under `xvfb-run`, with a
+  `dbus-daemon` on `PATH`) — this is the _only_ place those tests run, since
+  the package build's `doCheck` deliberately skips them.
+- `nixosModules.default` / `homeModules.default` module-eval checks (force the
+  systemd units, session vars, and assertion predicates the modules generate).
+- Two `nixosTest` VMs: `eds-nixos-test` (evolution-data-server / `hytte-ecal`
+  end-to-end) and `wifi-nm-nixos-test` (the NetworkManager Wi-Fi backend
+  against simulated `mac80211_hwsim` radios).
+- Since #449: actually **building** `packages.{trollshell,trollshell-control-center}`
+  as part of `checks` — before that, `nix flake check` could stay green while
+  `nix build .#trollshell` (or the control-center) was broken, because `check`
+  only builds what's listed under `checks`, not `packages`.
 
 ### Lint — strict, treat as the gate
 
@@ -122,14 +151,17 @@ hytte-ui          → App/AppBuilder (wraps adw::Application), Bar, LayerWindow,
 hytte-bus         → shared D-Bus layer: call / property / proxy / signals / own_name builders over pooled session+system connections
 hytte-services    → the service modules (clients to daemons)
 hytte-ecal        → hand-written FFI to evolution-data-server (libecal); the ONLY crate allowed `unsafe`
+hytte-ai-providers → shared OpenAI-compatible chat client + provider config + key-file loader, used by plugins that talk to an LLM (e.g. hytte-plugin-pet)
 hytte             → umbrella: re-exports {bus, reactive, services, ui} + a `prelude`
 trollshell        → the binary; depends on `hytte`
+trollshell-control-center → separate windowed GTK4/libadwaita companion app (#390/#399); talks to the running shell over its own `Control` D-Bus endpoint (trollshell/src/control.rs), never linked into the shell
 
 — plugin side (#35 frontend B; out-of-process, NEVER links the shell):
 hytte-plugin-proto → GTK-free wire protocol (node vocab, manifest, MessagePack framing, socket_path); language-neutral schema anchor, tokio optional
 hytte-plugin       → the Rust plugin runtime SDK over the proto: TEA `Plugin` trait + `run()` (dial/backoff, Register handshake, session loop, render dedup). A plugin binary deps THIS crate alone
 hytte-plugin-clock-demo → the reference plugin: pure manifest/init/update/view + one-line main
 hytte-plugin-pet   → the kaomoji cat (#276): clock-driven moods, pokeable, optional llama-server brain (thin ureq client; canned fallback)
+…and 7 more plugin binaries (hytte-plugin-{bar-clock-demo,preem-demo,timer,terminal,caw,departures,weather}) following the same shape
 ```
 
 Shell code uses `use hytte::prelude::*;` (App, Bar, Edge, Monitor, bind*, Service, …) plus `hytte::gtk` / `hytte::adw` / `hytte::services::*`. Don't add direct deps on gtk/adw/futures-signals in the binary — go through the re-exports.
@@ -140,7 +172,7 @@ All D-Bus goes through here, never raw zbus. Connections are pooled singletons (
 
 ## The `trollshell` binary
 
-`main.rs` builds the `App`, registers 33 services with `.with(…)`, then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
+`main.rs` builds the `App`, registering each service module with its own `.with(foo::service())` call (one line per service — see the `hytte::services::{…}` import list atop `main.rs` for the current roster; there's no count maintained here on purpose, it only rots), then in the body closure builds a `Bar` per monitor and installs overlays. **Multi-monitor is explicit**: iterate `app.monitors()` and react to `app.monitors_changed()` to rebuild bars on hot-plug (there is intentionally no `on_all_monitors` helper).
 
 Source layout (each module has a consistent shape — match it when adding):
 
@@ -150,6 +182,10 @@ Source layout (each module has a consistent shape — match it when adding):
 - `modal.rs` — the slide-out drawer system (`Page` enum, per-monitor drawer window/revealer).
 - `components/` — cross-cutting `pub(crate)` building blocks reused across panels.
 - `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Asset sources live in the top-level `assets/` dir mirroring the runtime `share/` layout: `assets/trollshell/{style.css,icons/}` and `assets/hytte-ui/style.css`.
+- `commands.rs` — `gio::ActionEntry`s registered on the `adw::Application` (`org.gtk.Actions`) so niri keybinds can drive drawer/power-menu/sidebar actions that are otherwise mouse-only (#219).
+- `control.rs` — the `mov.vibec0re.trollshell.Control` D-Bus endpoint that `trollshell-control-center` (and future tabs) bind to; transport only, no UI (#390).
+- `plugins.rs` — the out-of-process widget-plugin **host transport**: the per-user socket listener, the GTK-side clock pump, and the effect broker (#35).
+- `scale.rs` — font-relative pixel scaling (`scale()`) for the handful of Rust-set sizes CSS `em` can't reach (#135).
 
 ### Conventions
 

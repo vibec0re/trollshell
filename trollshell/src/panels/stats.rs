@@ -1,9 +1,9 @@
-//! System stats drawer panels — one panel per monitored resource
-//! (CPU / Memory / Disks / GPU / Services). Each panel is opened from its
-//! own bar chip and shows a single resource's card: live rows, history
-//! sparkline, and top-consumers list. The per-resource cards are the
-//! `build_stats_*` builders below; the `panel_stats_*` entry points wrap
-//! one card each into a drawer page.
+//! System stats drawer panel — the combined view (CPU + Memory + Disks +
+//! GPU + Services cards, stacked in one page) restored in #508 after #307
+//! split it into five single-card pages. Every resource bar chip (and the
+//! self-hiding failed-units services chip) opens this same page; the
+//! per-resource cards are the `build_stats_*` builders below, appended in
+//! order by [`panel_stats`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -24,40 +24,19 @@ use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
 
-/// Wrap a single stats card into a drawer page. Each per-resource panel is
-/// one card in a `ts-popup-column`, so the icon-per-resource flyouts stay
-/// visually identical to the cards they used to share.
-fn single_card_page(card: &gtk::Widget) -> gtk::Widget {
+/// The combined stats flyout — opened from any of the CPU / memory / disk /
+/// GPU / services bar chips. All five cards stack in one `ts-popup-column`,
+/// one click, scroll to see all (pre-#307 shape).
+pub fn panel_stats() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
-    column.append(card);
+    column.append(build_stats_cpu_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_memory_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_disks_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_gpu_card().upcast_ref::<gtk::Widget>());
+    column.append(build_stats_services_group().upcast_ref::<gtk::Widget>());
     finish_page(&column)
-}
-
-/// CPU stats flyout — opened from the CPU bar chip.
-pub fn panel_stats_cpu() -> gtk::Widget {
-    single_card_page(build_stats_cpu_card().upcast_ref::<gtk::Widget>())
-}
-
-/// Memory stats flyout — opened from the memory bar chip.
-pub fn panel_stats_memory() -> gtk::Widget {
-    single_card_page(build_stats_memory_card().upcast_ref::<gtk::Widget>())
-}
-
-/// Disks stats flyout — opened from the disk bar chip.
-pub fn panel_stats_disks() -> gtk::Widget {
-    single_card_page(build_stats_disks_card().upcast_ref::<gtk::Widget>())
-}
-
-/// GPU stats flyout — opened from the GPU bar chip.
-pub fn panel_stats_gpu() -> gtk::Widget {
-    single_card_page(build_stats_gpu_card().upcast_ref::<gtk::Widget>())
-}
-
-/// Services flyout — opened from the services bar chip (failed-unit count).
-pub fn panel_stats_services() -> gtk::Widget {
-    single_card_page(build_stats_services_group().upcast_ref::<gtk::Widget>())
 }
 
 /// Wrap a bare history-sparkline `gtk::Box` in a `gtk::ListBoxRow` so it joins

@@ -2,17 +2,15 @@ use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::systemd;
 
-/// Services bar chip: a failed-unit indicator that opens the services stats
-/// flyout ([`crate::modal::Page::StatsServices`]). The chip self-hides while
-/// every unit is healthy and appears — showing the failed-unit count — only
-/// when something is broken, mirroring the swap-row / GPU-card self-hide
-/// convention so the bar stays quiet until it has something to report.
+/// Services bar chip: a failed-unit indicator that opens the combined stats
+/// flyout ([`crate::modal::Page::Stats`]) as a shortcut into the Services
+/// card (#508: the flyout is combined again, so this is a way in rather than
+/// its own page). The chip self-hides while every unit is healthy and
+/// appears — showing the failed-unit count — only when something is broken,
+/// mirroring the swap-row / GPU-card self-hide convention so the bar stays
+/// quiet until it has something to report.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = crate::components::chip::indicator(
-        "ts-services",
-        crate::modal::Page::StatsServices,
-        monitor,
-    );
+    let btn = crate::components::chip::indicator("ts-services", crate::modal::Page::Stats, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 

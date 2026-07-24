@@ -3,8 +3,7 @@ use hytte::prelude::*;
 use hytte::services::sensors;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn =
-        crate::components::chip::indicator("ts-disk", crate::modal::Page::StatsDisks, monitor);
+    let btn = crate::components::chip::indicator("ts-disk", crate::modal::Page::Stats, monitor);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 

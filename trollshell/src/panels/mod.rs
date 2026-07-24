@@ -32,7 +32,5 @@ pub use notifications::panel_notifications;
 pub use power::panel_power;
 pub use power_menu::panel_power_menu;
 pub use settings::panel_settings;
-pub use stats::{
-    panel_stats_cpu, panel_stats_disks, panel_stats_gpu, panel_stats_memory, panel_stats_services,
-};
+pub use stats::panel_stats;
 pub use vpn::panel_vpn;

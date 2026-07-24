@@ -24,9 +24,13 @@
 //! - [`TextBox`] — the "8bit textbox": wrapped 5×7 pixel-font text on a
 //!   rounded field (the pet's speech bubble is exactly this, dressed in
 //!   lilac).
+//! - [`LedStrip`] — a row of discrete LEDs lighting with a `0.0..=1.0` level,
+//!   topped by a peak-hold dot that floats and decays ([`PeakHold`]) — the VU
+//!   meter (#506).
 //!
 //! `hytte-plugin-preem-demo` is the reference consumer: one sidebar card
-//! cycling every widget through every style.
+//! cycling every widget through every style; `hytte-plugin-audio-widget` is the
+//! reference audio-reactive consumer (dot-matrix + spectrum + [`LedStrip`]).
 //!
 //! # Styles
 //!
@@ -62,6 +66,7 @@ pub mod font;
 
 mod dot_matrix;
 mod frame;
+mod led_strip;
 mod marquee;
 mod seven_seg;
 mod style;
@@ -69,6 +74,7 @@ mod textbox;
 
 pub use dot_matrix::dot_matrix;
 pub use frame::{Frame, Rgba};
+pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};
 pub use seven_seg::seven_seg;
 pub use style::DisplayStyle;

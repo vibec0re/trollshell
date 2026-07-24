@@ -1141,6 +1141,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-audio-widget"
+version = "0.1.0"
+dependencies = [
+ "hytte-plugin",
+]
+
+[[package]]
 name = "hytte-plugin-bar-clock-demo"
 version = "0.1.0"
 dependencies = [

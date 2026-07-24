@@ -21,6 +21,7 @@ members = [
   "crates/hytte-plugin-weather",
   "crates/hytte-plugin-usage",
   "crates/hytte-plugin-infobroker",
+  "crates/hytte-plugin-audio-widget",
   "crates/trollshell-control-center",
   "trollshell",
 ]

@@ -198,6 +198,20 @@ prompting is a later phase). The agent-facing skill folder lives at
 `etc/skills/infobroker/` (`SKILL.md` + a `bin/infobroker` wrapper). No
 environment variables to set.
 
+`trollshell-plugin-audio-widget.service` is the audio-reactive sidebar card
+(#506): a `Mount::SidebarTop` card composing three `hytte_plugin::preem` raster
+widgets off the `StateKey::AudioSpectrum` push (#405) — a dot-matrix marquee, a
+16-band spectrum scope, and the LED peak/level strip this issue adds to the kit
+(a row of discrete LEDs lighting with the overall level, topped by a peak-hold
+dot that floats and decays). It runs its own ~20 Hz frame timer for the
+animation and parks it while the sidebar is closed (`StateKey::SlotVisible`).
+The shell only runs the PipeWire monitor tap while at least one spectrum
+subscriber is connected, so an idle desktop with this plugin off pays nothing.
+The marquee currently shows a decorative banner rather than the current track —
+now-playing metadata isn't reachable out-of-process yet (it needs a host
+`StateKey` projecting `hytte_services::mpris`, the way #405 did for the
+spectrum). No environment variables to set.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

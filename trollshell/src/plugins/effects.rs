@@ -202,7 +202,7 @@ fn run_command(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Send
 /// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`]) and map it
 /// onto an [`EffectOutcome`]. stdin is `/dev/null`; stdout/stderr are captured.
 async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
-    let Some((program, args)) = argv.split_first() else {
+    let Some((program, tail)) = argv.split_first() else {
         tracing::warn!(plugin = %plugin_id, id, "RunCommand with empty argv; nothing to spawn");
         return EffectOutcome {
             ok: false,
@@ -210,7 +210,7 @@ async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOut
         };
     };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
+    cmd.args(tail)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -255,7 +255,7 @@ async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOut
 /// past [`RUN_COMMAND_MAX_OUTPUT`] bytes is truncated on a char boundary.
 fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
     let text = String::from_utf8_lossy(stdout);
-    let trimmed = text.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let trimmed = text.trim_end_matches(['\n', '\r']);
     let output = if trimmed.is_empty() {
         None
     } else {
@@ -371,7 +371,6 @@ pub(super) fn record_audit(plugin_id: &str, effect: &Effect, decision: AuditDeci
     }
 }
 
-#[cfg(not(test))]
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -398,7 +397,7 @@ fn audit_sink() -> Option<&'static mpsc::UnboundedSender<String>> {
 #[cfg(not(test))]
 fn spawn_audit_writer() -> Option<mpsc::UnboundedSender<String>> {
     let path = audit_log_path()?;
-    let display = path.display().to_string();
+    let path_str = path.display().to_string();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let log = AuditLog {
         path,
@@ -411,7 +410,7 @@ fn spawn_audit_writer() -> Option<mpsc::UnboundedSender<String>> {
             }
         }
     });
-    tracing::info!(path = %display, "effect audit log active");
+    tracing::info!(path = %path_str, "effect audit log active");
     Some(tx)
 }
 

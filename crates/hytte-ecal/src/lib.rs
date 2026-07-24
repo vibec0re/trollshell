@@ -1302,11 +1302,31 @@ mod tests {
     // event lands at 12:30 UTC and displays as 14:30 CEST — the +2h double
     // shift. These assert the exact absolute instant, so they are fully
     // deterministic regardless of the test host's `TZ`.
+    //
+    // Every fixture carries its `VTIMEZONE` **inline** in the VCALENDAR (the
+    // shape a synced CalDAV/Google calendar delivers). libical computes the
+    // offset from the inline STANDARD/DAYLIGHT observances alone — it does NOT
+    // touch the system/`tzdata` zoneinfo — so the zone resolves even in a
+    // hermetic sandbox with no zoneinfo installed (the crane/nix test bucket).
+    // A fixture relying on libical's *builtin* `Europe/Berlin` lookup would
+    // instead be read as floating there (no zoneinfo to resolve), falling back
+    // to `Local` — which is UTC in a sandbox with no `/etc/localtime` — and so
+    // would spuriously reproduce the very +2h it means to guard against.
 
     /// The whole of 2026 as a UTC-seconds window — brackets any 2026 event in
     /// any viewer zone.
     const Y2026_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
     const Y2026_END: i64 = 1_798_761_600; // 2027-01-01T00:00:00Z
+
+    /// An inline `Europe/Berlin` `VTIMEZONE` (CET/CEST DST rules). Self-
+    /// contained: libical derives the UTC offset from these observances without
+    /// consulting the host zoneinfo database.
+    const BERLIN_VTIMEZONE: &str = "BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n\
+         BEGIN:DAYLIGHT\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nTZNAME:CEST\r\n\
+         DTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\n\
+         BEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\n\
+         DTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n\
+         END:VTIMEZONE\r\n";
 
     /// 2026-07-24 12:30 in `Europe/Berlin` (CEST, UTC+2) is 10:30 UTC.
     fn expected_1030_utc() -> i64 {
@@ -1316,19 +1336,27 @@ mod tests {
             .timestamp()
     }
 
-    /// A `DTSTART;TZID=Europe/Berlin:…123000` (no `VTIMEZONE` block; libical
-    /// resolves the builtin `Europe/Berlin`) must expand to the absolute
-    /// instant 10:30 UTC — not 12:30 UTC (the +2h bug, #522).
+    /// Wrap `vevent_body` in a VCALENDAR that carries the inline Berlin
+    /// `VTIMEZONE`, so a `TZID=Europe/Berlin` inside it resolves self-contained.
+    fn berlin_calendar(vevent_body: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte-ecal-test//\r\n{BERLIN_VTIMEZONE}BEGIN:VEVENT\r\n{vevent_body}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// A `DTSTART;TZID=Europe/Berlin:…123000` (12:30 CEST) must expand to the
+    /// absolute instant 10:30 UTC — not 12:30 UTC (the +2h double-shift, #522).
+    /// This is the core regression guard.
     #[test]
     fn tzid_datetime_resolves_to_own_zone_instant() {
         use chrono::{TimeZone as _, Utc};
 
-        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:tzid-1\r\n\
-                     DTSTAMP:20260724T090000Z\r\n\
-                     DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
-                     DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
-                     SUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let inst = super::expand_ical_for_test(ical, Y2026_START, Y2026_END).unwrap();
+        let ical = berlin_calendar(
+            "UID:tzid-1\r\nDTSTAMP:20260724T090000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
+             DTEND;TZID=Europe/Berlin:20260724T133000\r\nSUMMARY:Lunch\r\n",
+        );
+        let inst = super::expand_ical_for_test(&ical, Y2026_START, Y2026_END).unwrap();
         assert_eq!(inst.len(), 1);
         assert!(!inst[0].all_day);
         assert_eq!(
@@ -1336,7 +1364,7 @@ mod tests {
             expected_1030_utc(),
             "TZID=Europe/Berlin 12:30 must resolve to 10:30 UTC (its own zone), not 12:30 UTC",
         );
-        // Guard the exact +2h signature the bug produced.
+        // Guard the exact +2h signature the bug produced (wall-clock read as UTC).
         let bug_utc = Utc
             .with_ymd_and_hms(2026, 7, 24, 12, 30, 0)
             .unwrap()
@@ -1345,26 +1373,6 @@ mod tests {
             inst[0].start_unix, bug_utc,
             "must not read the Berlin wall-clock as UTC (the #522 +2h shift)",
         );
-    }
-
-    /// Same event but with the `VTIMEZONE` definition inline in the VCALENDAR
-    /// (the shape a synced CalDAV/Google calendar delivers). Still absolute →
-    /// 10:30 UTC.
-    #[test]
-    fn tzid_datetime_with_inline_vtimezone_resolves_to_own_zone() {
-        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n\
-                     BEGIN:DAYLIGHT\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nTZNAME:CEST\r\n\
-                     DTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\n\
-                     BEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\n\
-                     DTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n\
-                     END:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:tzid-2\r\n\
-                     DTSTAMP:20260724T090000Z\r\n\
-                     DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
-                     DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
-                     SUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let inst = super::expand_ical_for_test(ical, Y2026_START, Y2026_END).unwrap();
-        assert_eq!(inst.len(), 1);
-        assert_eq!(inst[0].start_unix, expected_1030_utc());
     }
 
     /// A `…Z` UTC value is unchanged by the fix: 10:30 UTC in, 10:30 UTC out.
@@ -1385,12 +1393,13 @@ mod tests {
     /// path (`i_cal_recur_iterator_*`), not just the single-occurrence path.
     #[test]
     fn tzid_recurring_occurrences_resolve_to_own_zone() {
-        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:tzid-rec\r\n\
-                     DTSTAMP:20260724T090000Z\r\n\
-                     DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
-                     DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
-                     RRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let inst = super::expand_ical_for_test(ical, Y2026_START, Y2026_END).unwrap();
+        let ical = berlin_calendar(
+            "UID:tzid-rec\r\nDTSTAMP:20260724T090000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
+             DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
+             RRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Standup\r\n",
+        );
+        let inst = super::expand_ical_for_test(&ical, Y2026_START, Y2026_END).unwrap();
         assert_eq!(inst.len(), 3);
         // First occurrence at 10:30 UTC; each subsequent one a wall-clock day
         // later (both days are CEST, so +86400s — no DST transition here).

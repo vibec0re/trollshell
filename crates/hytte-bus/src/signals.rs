@@ -120,25 +120,6 @@ pub struct SignalsBuilder {
 }
 
 impl SignalsBuilder {
-    /// Override which bus this builder targets. The default is determined by
-    /// the constructor: [`signals`](crate::signals) uses the system bus.
-    ///
-    /// Overriding here replaces the `SharedConnection` with the corresponding
-    /// global singleton.
-    #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> SignalsBuilder {
-        SignalsBuilder {
-            shared: match kind {
-                crate::BusKind::Session => crate::connection::session().clone(),
-                crate::BusKind::System => crate::connection::system().clone(),
-            },
-            destination: self.destination,
-            path: self.path,
-            iface: self.iface,
-            signal: self.signal,
-        }
-    }
-
     /// Set the object path to listen on.
     #[must_use]
     pub fn at_path(mut self, path: impl Into<String>) -> Self {

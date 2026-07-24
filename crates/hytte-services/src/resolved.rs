@@ -49,12 +49,12 @@ impl Service for ResolvedService {
         let writer = handles.dns.clone();
 
         // DNS = a(iiay) — array of (ifindex i32, family i32, address bytes).
-        let dns_property = property::<Vec<(i32, i32, Vec<u8>)>>("org.freedesktop.resolve1")
-            .bus(BusKind::System)
-            .at_path("/org/freedesktop/resolve1")
-            .iface("org.freedesktop.resolve1.Manager")
-            .name("DNS")
-            .start();
+        let dns_property =
+            property::<Vec<(i32, i32, Vec<u8>)>>(BusKind::System, "org.freedesktop.resolve1")
+                .at_path("/org/freedesktop/resolve1")
+                .iface("org.freedesktop.resolve1.Manager")
+                .name("DNS")
+                .start();
 
         spawn_supervised("resolved", move || {
             let dns_property = dns_property.clone();

@@ -136,8 +136,7 @@ impl Service for TrayService {
         // The OwnNameSignal is stored in TrayHandles (process lifetime) and in
         // `state.ownership` so that watch_item tasks can emit signals directly
         // without a round-trip D-Bus call.
-        let ownership = hytte_bus::own_name("org.kde.StatusNotifierWatcher")
-            .bus(BusKind::Session)
+        let ownership = hytte_bus::own_name(BusKind::Session, "org.kde.StatusNotifierWatcher")
             .at_path(WATCHER_PATH, watcher)
             .start();
 
@@ -195,8 +194,7 @@ pub fn items() -> impl Signal<Item = Vec<TrayItem>> {
 
 /// Fire-and-forget: send `Activate(0, 0)` to the given `StatusNotifierItem`.
 pub fn activate(bus_name: &str, object_path: &str) {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(object_path)
         .iface(SNI_IFACE)
         .method("Activate")
@@ -208,8 +206,7 @@ pub fn activate(bus_name: &str, object_path: &str) {
 /// context menu. Used as a fallback when an item has no `com.canonical.dbusmenu`
 /// path, and as the primary "show menu" action for `ItemIsMenu` items.
 pub fn context_menu(bus_name: &str, object_path: &str) {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(object_path)
         .iface(SNI_IFACE)
         .method("ContextMenu")
@@ -248,8 +245,7 @@ pub async fn fetch_menu(bus_name: &str, menu_path: &str) -> Option<Menu> {
 
 async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
     // Call AboutToShow(0) — ignore errors (not all apps implement it).
-    let _ = call(bus_name)
-        .bus(BusKind::Session)
+    let _ = call(BusKind::Session, bus_name)
         .at_path(menu_path)
         .iface(DBUSMENU_IFACE)
         .method("AboutToShow")
@@ -273,8 +269,7 @@ async fn do_fetch_menu(bus_name: &str, menu_path: &str) -> Result<Menu> {
     // `(u32, OwnedValue)` (signature `(uv)`) made zbus 5.x reject every reply
     // with a signature mismatch, dropping the tray to the plain ContextMenu
     // (#8). See `parse::LayoutNode`.
-    let (_, layout): (u32, parse::LayoutNode) = call(bus_name)
-        .bus(BusKind::Session)
+    let (_, layout): (u32, parse::LayoutNode) = call(BusKind::Session, bus_name)
         .at_path(menu_path)
         .iface(DBUSMENU_IFACE)
         .method("GetLayout")
@@ -308,8 +303,7 @@ async fn do_menu_event(bus_name: &str, menu_path: &str, item_id: i32) -> Result<
     // data: variant — pass an i32(0) variant as a no-op payload.
     let data = OwnedValue::try_from(Value::I32(0)).unwrap();
 
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(menu_path)
         .iface(DBUSMENU_IFACE)
         .method("Event")
@@ -520,8 +514,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
     // Build a long-lived proxy for this item. The proxy monitors
     // NameOwnerChanged for this exact bus name, giving us PeerGone when the
     // item app exits.
-    let item_proxy = match proxy(bus_name.as_str())
-        .bus(BusKind::Session)
+    let item_proxy = match proxy(BusKind::Session, bus_name.as_str())
         .at_path(object_path.clone())
         .iface(SNI_IFACE)
         .build()
@@ -542,8 +535,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
         let bus2 = bus_name.clone();
         let path2 = object_path.clone();
         let sig = sig_name.to_string();
-        let sub = signals(bus2.as_str())
-            .bus(BusKind::Session)
+        let sub = signals(BusKind::Session, bus2.as_str())
             .at_path(path2)
             .iface(SNI_IFACE)
             .signal(sig.clone())
@@ -605,8 +597,7 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
 /// Subscribe to `NameOwnerChanged` on the session bus and prune items when
 /// their bus name is released.
 async fn watch_name_owner_changes(state: &State) -> Result<()> {
-    let owner_changes = signals("org.freedesktop.DBus")
-        .bus(BusKind::Session)
+    let owner_changes = signals(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .signal("NameOwnerChanged")
@@ -638,8 +629,7 @@ async fn get_sni_property<T>(bus_name: &str, object_path: &str, prop: &'static s
 where
     T: serde::de::DeserializeOwned + zbus::zvariant::Type + 'static,
 {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(object_path)
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")

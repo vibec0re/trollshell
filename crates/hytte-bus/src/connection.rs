@@ -146,6 +146,16 @@ pub(crate) fn system() -> &'static SharedConnection {
     SYSTEM.get_or_init(|| SharedConnection::start(BusKind::System))
 }
 
+/// Resolve a [`BusKind`] to its process-wide shared connection singleton. The
+/// single place the builder constructors map their explicit bus argument onto a
+/// connection.
+pub(crate) fn for_kind(kind: BusKind) -> &'static SharedConnection {
+    match kind {
+        BusKind::Session => session(),
+        BusKind::System => system(),
+    }
+}
+
 // ── SharedConnection public API ───────────────────────────────────────────────
 
 impl SharedConnection {

@@ -343,8 +343,7 @@ async fn run_prepare_for_sleep_relock() {
     let mut backoff = RetryBackoff::default();
     loop {
         let started = Instant::now();
-        let sub = hytte_bus::signals(LOGIN1_NAME)
-            .bus(hytte_bus::BusKind::System)
+        let sub = hytte_bus::signals(hytte_bus::BusKind::System, LOGIN1_NAME)
             .at_path(LOGIN1_PATH)
             .iface(LOGIN1_MANAGER_IFACE)
             .signal("PrepareForSleep")
@@ -451,8 +450,7 @@ async fn inhibitor_blocks(whats: &[&str]) -> bool {
 /// always replies a `Variant` (`v`), so deserialize `OwnedValue` then unwrap to
 /// `String`.
 async fn read_block_inhibited() -> Result<String, hytte_bus::BusError> {
-    let v: OwnedValue = hytte_bus::call(LOGIN1_NAME)
-        .bus(hytte_bus::BusKind::System)
+    let v: OwnedValue = hytte_bus::call(hytte_bus::BusKind::System, LOGIN1_NAME)
         .at_path(LOGIN1_PATH)
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")

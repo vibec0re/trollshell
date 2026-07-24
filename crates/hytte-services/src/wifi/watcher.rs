@@ -24,20 +24,17 @@ struct IwdSubs {
 }
 
 fn subscribe_iwd_events(station_path: &zbus::zvariant::OwnedObjectPath) -> IwdSubs {
-    let station_props = hytte_bus::signals("net.connman.iwd")
-        .bus(BusKind::System)
+    let station_props = hytte_bus::signals(BusKind::System, "net.connman.iwd")
         .at_path(station_path.as_str().to_string())
         .iface("org.freedesktop.DBus.Properties")
         .signal("PropertiesChanged")
         .start();
-    let added = hytte_bus::signals("net.connman.iwd")
-        .bus(BusKind::System)
+    let added = hytte_bus::signals(BusKind::System, "net.connman.iwd")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .signal("InterfacesAdded")
         .start();
-    let removed = hytte_bus::signals("net.connman.iwd")
-        .bus(BusKind::System)
+    let removed = hytte_bus::signals(BusKind::System, "net.connman.iwd")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .signal("InterfacesRemoved")

@@ -195,9 +195,10 @@ impl Service for NotificationsService {
         // The OwnNameSignal is stored both in NotificationsHandles (process
         // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
         // can emit signals directly without a round-trip D-Bus call).
-        let ownership = hytte_bus::own_name("org.freedesktop.Notifications")
-            .at_path("/org/freedesktop/Notifications", iface)
-            .start();
+        let ownership =
+            hytte_bus::own_name(hytte_bus::BusKind::Session, "org.freedesktop.Notifications")
+                .at_path("/org/freedesktop/Notifications", iface)
+                .start();
 
         // Populate the cross-thread shared handle so `dismiss` / `clear_history`
         // can find these Mutables when called from a hytte-tokio worker (the

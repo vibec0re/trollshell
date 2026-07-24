@@ -228,8 +228,7 @@ async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Lin
     // Subscribe to StateChanged on the Manager so we react quickly to
     // link state transitions.  Missed-emissions on reconnect trigger a
     // re-poll too, so we never miss a change across a D-Bus restart.
-    let state_changed = signals(NETWORKD_NAME)
-        .bus(BusKind::System)
+    let state_changed = signals(BusKind::System, NETWORKD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .signal("StateChanged")
@@ -288,22 +287,21 @@ async fn refresh(
 /// `NetworkManager` source. There is no `/sys` fallback (rejected on #80/#91).
 async fn read_networkd_links() -> Result<Vec<Link>> {
     // ListLinks returns array of (idx: i32, name: String, path: ObjectPath).
-    let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> = call(NETWORKD_NAME)
-        .bus(BusKind::System)
-        .at_path(MANAGER_PATH)
-        .iface(MANAGER_IFACE)
-        .method("ListLinks")
-        .args(())
-        .send()
-        .await
-        .context("ListLinks")?;
+    let list: Vec<(i32, String, zbus::zvariant::OwnedObjectPath)> =
+        call(BusKind::System, NETWORKD_NAME)
+            .at_path(MANAGER_PATH)
+            .iface(MANAGER_IFACE)
+            .method("ListLinks")
+            .args(())
+            .send()
+            .await
+            .context("ListLinks")?;
 
     let mut out = Vec::with_capacity(list.len());
     for (idx, name, path) in list {
         let path_str = path.as_str().to_string();
 
-        let describe_json: String = call(NETWORKD_NAME)
-            .bus(BusKind::System)
+        let describe_json: String = call(BusKind::System, NETWORKD_NAME)
             .at_path(path_str.clone())
             .iface(LINK_IFACE)
             .method("Describe")
@@ -315,8 +313,7 @@ async fn read_networkd_links() -> Result<Vec<Link>> {
 
         // OperationalState is also in the Describe JSON, but older networkd
         // only exposes it as a property.  Read it directly so we always have it.
-        let op_prop: String = call(NETWORKD_NAME)
-            .bus(BusKind::System)
+        let op_prop: String = call(BusKind::System, NETWORKD_NAME)
             .at_path(path_str.clone())
             .iface("org.freedesktop.DBus.Properties")
             .method("Get")

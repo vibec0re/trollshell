@@ -273,8 +273,7 @@ async fn resolve_once(ov: &PlaceOverride) -> Option<LocationSnapshot> {
 /// caller so the release still runs on timeout (an external timeout would cancel
 /// us mid-`await` and leak the client).
 async fn resolve_geoclue() -> Option<LocationSnapshot> {
-    let client: OwnedObjectPath = call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    let client: OwnedObjectPath = call(BusKind::System, GEOCLUE_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("GetClient")
@@ -308,16 +307,14 @@ async fn acquire_fix(client_path: &str) -> Option<LocationSnapshot> {
     .ok()?;
 
     // Subscribe BEFORE Start so we don't miss the first LocationUpdated.
-    let updates = hytte_bus::signals(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    let updates = hytte_bus::signals(BusKind::System, GEOCLUE_NAME)
         .at_path(client_path.to_owned())
         .iface(CLIENT_IFACE)
         .signal("LocationUpdated")
         .start();
     let mut events = updates.events();
 
-    call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, GEOCLUE_NAME)
         .at_path(client_path.to_owned())
         .iface(CLIENT_IFACE)
         .method("Start")
@@ -353,15 +350,13 @@ async fn acquire_fix(client_path: &str) -> Option<LocationSnapshot> {
 /// ignored: the client may already be gone, and a failed cleanup must never fail
 /// resolution.
 async fn release_client(client: &OwnedObjectPath, client_path: &str) {
-    let _ = call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    let _ = call(BusKind::System, GEOCLUE_NAME)
         .at_path(client_path.to_owned())
         .iface(CLIENT_IFACE)
         .method("Stop")
         .send::<()>()
         .await;
-    let _ = call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    let _ = call(BusKind::System, GEOCLUE_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("DeleteClient")
@@ -376,8 +371,7 @@ async fn set_client_prop(
     value: Value<'_>,
 ) -> Result<(), ()> {
     let owned = value.try_to_owned().map_err(|_| ())?;
-    call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, GEOCLUE_NAME)
         .at_path(client_path.to_owned())
         .iface(PROPS_IFACE)
         .method("Set")
@@ -393,8 +387,7 @@ async fn get_f64_prop(path: &str, name: &'static str) -> Option<f64> {
 }
 
 async fn get_prop(path: &str, name: &'static str) -> Option<OwnedValue> {
-    call(GEOCLUE_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, GEOCLUE_NAME)
         .at_path(path.to_owned())
         .iface(PROPS_IFACE)
         .method("Get")

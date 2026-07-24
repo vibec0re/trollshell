@@ -525,7 +525,7 @@ fn refresh_ai_status(rows: &Rc<Vec<(String, gtk::Label, gtk::Button)>>) {
 /// `ListAiKeys` → the provider slots that currently have a stored key. Values
 /// are never returned.
 async fn list_ai_keys() -> Result<Vec<String>, hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("ListAiKeys")
@@ -538,7 +538,7 @@ async fn list_ai_keys() -> Result<Vec<String>, hytte_bus::BusError> {
 /// `SetAiKey(slot, value)`: store `value` as the key for `slot` in the shell's
 /// keyring (which then relaunches the plugins that use it).
 async fn set_ai_key(slot: String, value: String) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetAiKey")
@@ -551,7 +551,7 @@ async fn set_ai_key(slot: String, value: String) -> Result<(), hytte_bus::BusErr
 
 /// `ClearAiKey(slot)`: delete the stored key for `slot`.
 async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("ClearAiKey")
@@ -613,7 +613,7 @@ async fn probe_shell() -> Result<(String, String), hytte_bus::BusError> {
 /// timeout + no retry: the companion is interactive, so a missing shell should
 /// resolve to "not running" quickly rather than hang the banner.
 async fn control_call(method: &str) -> Result<String, hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method(method)
@@ -647,7 +647,7 @@ where
 /// `GetPlace` → `(label, auto)`: the resolved place label and whether
 /// auto-location is in force.
 async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("GetPlace")
@@ -661,7 +661,7 @@ async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
 /// shell-side. A slightly longer timeout than the others — the shell does a
 /// network geocode as part of applying it.
 async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetManualCity")
@@ -674,7 +674,7 @@ async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
 
 /// `SetAutoLocation(auto)`: toggle auto (`GeoClue`) vs. manual location.
 async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetAutoLocation")
@@ -689,7 +689,7 @@ async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
 
 /// `ListPlugins` → `[(id, active_state, enabled)]` for each plugin user unit.
 async fn list_plugins() -> Result<Vec<(String, String, bool)>, hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("ListPlugins")
@@ -711,7 +711,7 @@ async fn set_plugin_state(id: String, on: bool) -> Result<(), hytte_bus::BusErro
 /// One `StartPlugin`/`StopPlugin` call carrying a plugin id, returning `()`. A
 /// slightly longer timeout — the shell drives a systemd job to apply it.
 async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method(method)
@@ -724,7 +724,7 @@ async fn plugin_id_call(method: &str, id: &str) -> Result<(), hytte_bus::BusErro
 
 /// `SetPluginEnabled(id, enabled)`: persist the plugin's auto-start state.
 async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("SetPluginEnabled")

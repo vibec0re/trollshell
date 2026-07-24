@@ -190,8 +190,7 @@ where
         + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
 {
-    property::<T>(UPOWER_NAME)
-        .bus(BusKind::System)
+    property::<T>(BusKind::System, UPOWER_NAME)
         .at_path(DISPLAY_DEVICE_PATH)
         .iface(DEVICE_IFACE)
         .name(name)
@@ -210,8 +209,7 @@ where
         + TryFrom<zbus::zvariant::OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<zbus::zvariant::Value<'v>, Error = zbus::zvariant::Error>,
 {
-    property::<T>(UPOWER_NAME)
-        .bus(BusKind::System)
+    property::<T>(BusKind::System, UPOWER_NAME)
         .at_path(MANAGER_PATH)
         .iface(UPOWER_NAME)
         .name(name)

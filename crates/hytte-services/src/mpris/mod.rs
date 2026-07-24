@@ -292,8 +292,7 @@ pub fn set_active(active: bool) {
 
 /// Fire-and-forget: send `PlayPause` to the given bus name.
 pub fn play_pause(bus_name: &str) {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(MPRIS_PATH)
         .iface(PLAYER_IFACE)
         .method("PlayPause")
@@ -303,8 +302,7 @@ pub fn play_pause(bus_name: &str) {
 
 /// Fire-and-forget: send `Next` to the given bus name.
 pub fn next(bus_name: &str) {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(MPRIS_PATH)
         .iface(PLAYER_IFACE)
         .method("Next")
@@ -314,8 +312,7 @@ pub fn next(bus_name: &str) {
 
 /// Fire-and-forget: send `Previous` to the given bus name.
 pub fn previous(bus_name: &str) {
-    call(bus_name)
-        .bus(BusKind::Session)
+    call(BusKind::Session, bus_name)
         .at_path(MPRIS_PATH)
         .iface(PLAYER_IFACE)
         .method("Previous")
@@ -336,8 +333,7 @@ pub fn set_position(bus_name: &str, track_id: &str, position_us: i64) {
             tracing::warn!(track = %track_id, "mpris::set_position: invalid track id");
             return;
         };
-        call(bus.as_str())
-            .bus(BusKind::Session)
+        call(BusKind::Session, bus.as_str())
             .at_path(MPRIS_PATH)
             .iface(PLAYER_IFACE)
             .method("SetPosition")
@@ -580,8 +576,7 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
     // Build a long-lived proxy for this player. The proxy monitors
     // NameOwnerChanged for this exact bus name, giving us PeerGone when the
     // player exits.
-    let player_proxy = match proxy(bus_name.as_str())
-        .bus(BusKind::Session)
+    let player_proxy = match proxy(BusKind::Session, bus_name.as_str())
         .at_path(MPRIS_PATH)
         .iface(PLAYER_IFACE)
         .build()
@@ -596,8 +591,7 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
     };
 
     // Subscribe to PropertiesChanged for this player.
-    let props_changed = signals(bus_name.as_str())
-        .bus(BusKind::Session)
+    let props_changed = signals(BusKind::Session, bus_name.as_str())
         .at_path(MPRIS_PATH)
         .iface("org.freedesktop.DBus.Properties")
         .signal("PropertiesChanged")
@@ -723,8 +717,7 @@ async fn poll_position(state: State, bus_name: String) {
         }
 
         // Read the Position property via a one-shot call.
-        let pos_result = call(bus_name.as_str())
-            .bus(BusKind::Session)
+        let pos_result = call(BusKind::Session, bus_name.as_str())
             .at_path(MPRIS_PATH)
             .iface("org.freedesktop.DBus.Properties")
             .method("Get")
@@ -760,16 +753,14 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
 
     // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
     // names, so we don't miss any registrations during the startup window.
-    let owner_changes = signals("org.freedesktop.DBus")
-        .bus(BusKind::Session)
+    let owner_changes = signals(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .signal("NameOwnerChanged")
         .start();
 
     // List all current names and register existing MPRIS players.
-    let names: Vec<String> = call("org.freedesktop.DBus")
-        .bus(BusKind::Session)
+    let names: Vec<String> = call(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .method("ListNames")
@@ -856,8 +847,7 @@ async fn get_property<T>(
 where
     T: TryFrom<OwnedValue> + 'static,
 {
-    let v: OwnedValue = call(bus_name)
-        .bus(BusKind::Session)
+    let v: OwnedValue = call(BusKind::Session, bus_name)
         .at_path(MPRIS_PATH)
         .iface("org.freedesktop.DBus.Properties")
         .method("Get")

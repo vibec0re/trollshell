@@ -12,8 +12,7 @@ use super::types::{Station, WifiNetwork};
 // ── ObjectManager ─────────────────────────────────────────────────────────────
 
 pub(super) async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .method("GetManagedObjects")
@@ -31,8 +30,7 @@ pub(super) async fn read_networks(
 ) -> Vec<WifiNetwork> {
     // GetOrderedNetworks returns Vec<(ObjectPath, i16)>
     let ordered: Vec<(zbus::zvariant::OwnedObjectPath, i16)> =
-        match hytte_bus::call("net.connman.iwd")
-            .bus(BusKind::System)
+        match hytte_bus::call(BusKind::System, "net.connman.iwd")
             .at_path(station_path.to_string())
             .iface("net.connman.iwd.Station")
             .method("GetOrderedNetworks")
@@ -53,14 +51,16 @@ pub(super) async fn read_networks(
         let net_path_str = net_path.as_str();
 
         // Read per-network properties via Properties.GetAll
-        let props: HashMap<String, OwnedValue> = match hytte_bus::call("net.connman.iwd")
-            .bus(BusKind::System)
-            .at_path(net_path_str.to_string())
-            .iface("org.freedesktop.DBus.Properties")
-            .method("GetAll")
-            .args(("net.connman.iwd.Network",))
-            .send::<HashMap<String, OwnedValue>>()
-            .await
+        let props: HashMap<String, OwnedValue> = match hytte_bus::call(
+            BusKind::System,
+            "net.connman.iwd",
+        )
+        .at_path(net_path_str.to_string())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("GetAll")
+        .args(("net.connman.iwd.Network",))
+        .send::<HashMap<String, OwnedValue>>()
+        .await
         {
             Ok(p) => p,
             Err(e) => {
@@ -109,8 +109,7 @@ pub(super) async fn read_networks(
 /// Read the Name and Type properties from a net.connman.iwd.Network object.
 /// Falls back to the last path segment for the SSID on any error.
 pub(super) async fn read_network_metadata(path: &str) -> (String, String) {
-    match hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    match hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .method("GetAll")
@@ -143,21 +142,21 @@ pub(super) async fn refresh_station(
     station_path: &str,
     station_mutable: &Mutable<Option<Station>>,
 ) {
-    let props: HashMap<String, OwnedValue> = match hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
-        .at_path(station_path.to_string())
-        .iface("org.freedesktop.DBus.Properties")
-        .method("GetAll")
-        .args(("net.connman.iwd.Station",))
-        .send::<HashMap<String, OwnedValue>>()
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "wifi: refresh_station GetAll failed");
-            return;
-        }
-    };
+    let props: HashMap<String, OwnedValue> =
+        match hytte_bus::call(BusKind::System, "net.connman.iwd")
+            .at_path(station_path.to_string())
+            .iface("org.freedesktop.DBus.Properties")
+            .method("GetAll")
+            .args(("net.connman.iwd.Station",))
+            .send::<HashMap<String, OwnedValue>>()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "wifi: refresh_station GetAll failed");
+                return;
+            }
+        };
 
     let state_str = prop_str(&props, "State");
     let scanning = prop_bool(&props, "Scanning");
@@ -221,8 +220,7 @@ pub(super) async fn register_iwd_agent(agent_path: &str) -> Result<(), hytte_bus
         })?
         .to_owned();
 
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path("/net/connman/iwd")
         .iface("net.connman.iwd.AgentManager")
         .method("RegisterAgent")

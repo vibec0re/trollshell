@@ -174,7 +174,7 @@ Shell code uses `use hytte::prelude::*;` (App, Bar, Edge, Monitor, bind*, Servic
 
 ### `hytte-bus`
 
-All D-Bus goes through here, never raw zbus. Connections are pooled singletons (lazy session + system), with reconnection handled in `connection.rs`. Builders: `call()`, `property()`, `proxy()`, `signals()`, `own_name()` — **note their default bus differs** (e.g. `call`/`own_name` default to session; `property`/`signals`/`proxy` default to system) — override with `.bus(BusKind::…)`. Property/proxy subscriptions surface a `PropState`/`ProxyState` (`Loading` → `Loaded`/`Stale`) rather than blocking. zbus is still a direct dep of `hytte-services` only for `zvariant` data types and the `#[zbus::interface]` macros — not for constructing connections.
+All D-Bus goes through here, never raw zbus. Connections are pooled singletons (lazy session + system), with reconnection handled in `connection.rs`. Builders: `call()`, `property()`, `proxy()`, `signals()`, `own_name()`, `export_object()` — each takes the target bus as an explicit first argument, e.g. `call(BusKind::System, "org.freedesktop.UPower")` (#447 retired the asymmetric per-builder defaults and the `.bus(…)` override; the bus is stated at the constructor so a call to a system daemon can never silently land on the session bus). Property/proxy subscriptions surface a `PropState`/`ProxyState` (`Loading` → `Loaded`/`Stale`) rather than blocking. zbus is still a direct dep of `hytte-services` only for `zvariant` data types and the `#[zbus::interface]` macros — not for constructing connections.
 
 ## The `trollshell` binary
 

@@ -102,8 +102,7 @@ async fn do_set(level: f64) -> Result<()> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let value = (level * f64::from(device.max)).round() as u32;
 
-    hytte_bus::call("org.freedesktop.login1")
-        .bus(hytte_bus::BusKind::System)
+    hytte_bus::call(hytte_bus::BusKind::System, "org.freedesktop.login1")
         .at_path("/org/freedesktop/login1/session/auto")
         .iface("org.freedesktop.login1.Session")
         .method("SetBrightness")

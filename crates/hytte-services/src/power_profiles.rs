@@ -45,19 +45,18 @@ impl Service for PowerProfilesService {
         // Two parallel property subscriptions; we coalesce them into the
         // emitted PowerProfilesState by holding the last-known value of
         // each side and re-publishing on every change.
-        let active_signal = property::<String>(CANONICAL_NAME)
-            .bus(BusKind::System)
+        let active_signal = property::<String>(BusKind::System, CANONICAL_NAME)
             .at_path(CANONICAL_PATH)
             .iface(CANONICAL_NAME)
             .name("ActiveProfile")
             .start();
 
-        let profiles_signal = property::<Vec<HashMap<String, OwnedValue>>>(CANONICAL_NAME)
-            .bus(BusKind::System)
-            .at_path(CANONICAL_PATH)
-            .iface(CANONICAL_NAME)
-            .name("Profiles")
-            .start();
+        let profiles_signal =
+            property::<Vec<HashMap<String, OwnedValue>>>(BusKind::System, CANONICAL_NAME)
+                .at_path(CANONICAL_PATH)
+                .iface(CANONICAL_NAME)
+                .name("Profiles")
+                .start();
 
         let active_writer = writer.clone();
         let profiles_writer = writer.clone();
@@ -132,8 +131,7 @@ pub fn set_active(profile: &str) {
             tracing::warn!(profile, "power_profiles set_active: failed to wrap Value");
             return;
         };
-        let result = call(CANONICAL_NAME)
-            .bus(BusKind::System)
+        let result = call(BusKind::System, CANONICAL_NAME)
             .at_path(CANONICAL_PATH)
             .iface("org.freedesktop.DBus.Properties")
             .method("Set")

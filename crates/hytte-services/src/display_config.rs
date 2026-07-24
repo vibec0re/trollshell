@@ -765,7 +765,7 @@ impl Service for DisplayConfigService {
         let iface = DisplayConfigIface {
             serial: serial.clone(),
         };
-        let ownership = own_name(DISPLAY_CONFIG_NAME)
+        let ownership = own_name(hytte_bus::BusKind::Session, DISPLAY_CONFIG_NAME)
             .at_path(DISPLAY_CONFIG_PATH, iface)
             .start();
 

@@ -189,28 +189,6 @@ pub fn call_with(shared: &SharedConnection, destination: impl Into<String>) -> C
 }
 
 impl<A> CallBuilder<A> {
-    /// Override which bus this builder targets. The default is determined by
-    /// the constructor: [`call`](crate::call) uses the session bus.
-    ///
-    /// Overriding here replaces the `SharedConnection` with the corresponding
-    /// global singleton.
-    #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> CallBuilder<A> {
-        CallBuilder {
-            shared: match kind {
-                crate::BusKind::Session => crate::connection::session().clone(),
-                crate::BusKind::System => crate::connection::system().clone(),
-            },
-            destination: self.destination,
-            path: self.path,
-            iface: self.iface,
-            method: self.method,
-            args: self.args,
-            timeout: self.timeout,
-            retry: self.retry,
-        }
-    }
-
     /// Set the object path.
     #[must_use]
     pub fn at_path(mut self, p: impl Into<String>) -> Self {
@@ -305,9 +283,9 @@ where
     /// this future resolves (the reply message — and the fd it carried — is
     /// dropped while our independent dup lives on in the [`FdLease`]).
     ///
-    /// `login1` lives on the **system** bus, so remember `.bus(BusKind::System)`
-    /// — this builder defaults to the session bus. Retry/timeout behaviour is
-    /// identical to [`send`](Self::send).
+    /// `login1` lives on the **system** bus, so construct the call with
+    /// `call(BusKind::System, …)`. Retry/timeout behaviour is identical to
+    /// [`send`](Self::send).
     ///
     /// # Errors
     /// Returns a [`BusError`] if the call fails: a transient bus error (subject

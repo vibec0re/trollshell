@@ -100,8 +100,7 @@ pub(super) type ManagedObjects =
     HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
 
 pub(super) async fn get_managed_objects() -> Result<ManagedObjects, hytte_bus::BusError> {
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .method("GetManagedObjects")
@@ -183,23 +182,20 @@ async fn event_loop(
     adapter_path_store: &Arc<tokio::sync::RwLock<String>>,
 ) -> Result<(), anyhow::Error> {
     // Subscribe to ObjectManager signals on the root path.
-    let ifaces_added_sub = hytte_bus::signals("org.bluez")
-        .bus(BusKind::System)
+    let ifaces_added_sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .signal("InterfacesAdded")
         .start();
 
-    let ifaces_removed_sub = hytte_bus::signals("org.bluez")
-        .bus(BusKind::System)
+    let ifaces_removed_sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path("/")
         .iface("org.freedesktop.DBus.ObjectManager")
         .signal("InterfacesRemoved")
         .start();
 
     // Subscribe to PropertiesChanged on the adapter path.
-    let adapter_props_sub = hytte_bus::signals("org.bluez")
-        .bus(BusKind::System)
+    let adapter_props_sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path(adapter_path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .signal("PropertiesChanged")
@@ -268,8 +264,7 @@ fn subscribe_device_props(
     tx: tokio::sync::mpsc::UnboundedSender<PropChangedEvent>,
 ) -> SignalSubscription {
     let path_str = device_path.to_string();
-    let sub = hytte_bus::signals("org.bluez")
-        .bus(BusKind::System)
+    let sub = hytte_bus::signals(BusKind::System, "org.bluez")
         .at_path(path_str.clone())
         .iface("org.freedesktop.DBus.Properties")
         .signal("PropertiesChanged")

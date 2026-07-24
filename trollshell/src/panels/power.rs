@@ -110,7 +110,9 @@ fn build_fullscreen_inhibit_row() -> adw::SwitchRow {
 
 /// Build the "Keep awake" subtitle from the external inhibitors: a deduped
 /// "Also awake: …" app list, or default help text when nothing else holds it.
-fn keep_awake_subtitle(others: &[Inhibitor]) -> String {
+/// `pub(crate)` so the Settings drawer's mirror of this toggle
+/// (`panels::settings`) shows the identical live subtitle.
+pub(crate) fn keep_awake_subtitle(others: &[Inhibitor]) -> String {
     let mut names: Vec<&str> = Vec::new();
     for i in others {
         let name = i.application.as_str();

@@ -196,6 +196,11 @@ fn throttle_effects(
             kept.push(effect);
         } else {
             tracing::warn!(plugin = %plugin_id, ?effect, "plugin effect rate cap exceeded; dropped");
+            super::effects::record_audit(
+                plugin_id,
+                &effect,
+                super::effects::AuditDecision::DroppedRateCap,
+            );
         }
     }
     kept
@@ -286,6 +291,11 @@ pub(super) fn enforce_capabilities(
                     ?effect,
                     ?cap,
                     "plugin effect requires a capability it didn't declare; dropped",
+                );
+                super::effects::record_audit(
+                    plugin_id,
+                    effect,
+                    super::effects::AuditDecision::DroppedUngranted,
                 );
                 false
             }

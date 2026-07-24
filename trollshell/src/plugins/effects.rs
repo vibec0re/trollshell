@@ -5,24 +5,37 @@
 //! **upstream** in the connection reader ([`super::session::enforce_capabilities`]),
 //! so an effect arriving here is always one the plugin was granted.
 
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use hytte::services::notifications;
-use hytte_plugin_proto::{Effect, HostMsg, Page};
+use hytte_plugin_proto::{Effect, EffectOutcome, HostMsg, Page};
 use tokio::sync::mpsc;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
-/// and [`Effect::Notify`] (→ a local notification toast, #406); anything else is
-/// logged and skipped. Capability enforcement happens **upstream** of here, per
-/// connection: [`super::session::enforce_capabilities`] drops any effect whose
-/// [`Capability`](hytte_plugin_proto::Capability) the plugin didn't declare before
-/// it ever reaches this broker (#436), so an effect arriving here is always one the
-/// plugin was granted. A persisted audit-log and the `RunCommand` round-trip remain
-/// deferred.
+/// [`Effect::Notify`] (→ a local notification toast, #406), [`Effect::RunCommand`]
+/// (→ a spawned `argv`, its outcome routed back as [`HostMsg::EffectResult`], #510),
+/// and [`Effect::RequestConsent`] (→ the interactive consent overlay, #487);
+/// anything else is logged and skipped. Capability enforcement happens
+/// **upstream** of here, per connection: [`super::session::enforce_capabilities`]
+/// drops any effect whose [`Capability`](hytte_plugin_proto::Capability) the plugin
+/// didn't declare before it ever reaches this broker (#436), so an effect arriving
+/// here is always one the plugin was granted. Every effect reaching the broker is
+/// appended to the persisted audit log ([`record_audit`], #510); the two drop sites
+/// in [`super::session`] record the dropped ones.
 ///
-/// `outbound` is the producing connection's host→plugin channel, used only by the
-/// **two-way** [`Effect::RequestConsent`] (#487) to route the human's decision
-/// back as a [`HostMsg::ConsentDecision`]; the one-way effects ignore it.
+/// `outbound` is the producing connection's host→plugin channel, used by the
+/// **two-way** effects to route a reply back to this plugin: the human's decision
+/// for [`Effect::RequestConsent`] as a [`HostMsg::ConsentDecision`] (#487), and the
+/// command outcome for [`Effect::RunCommand`] as a [`HostMsg::EffectResult`] (#510).
+/// The one-way effects ignore it.
 pub(super) fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) {
+    // Every effect reaching the broker cleared capability enforcement + the rate
+    // cap upstream (`session`), so it is an `Allowed` decision in the persisted
+    // audit log (#510); the dropped ones are recorded at their `session` drop sites.
+    record_audit(plugin_id, effect, AuditDecision::Allowed);
     match effect {
         Effect::OpenPage(page) => {
             // #499/#517: open the drawer on niri's focused output, not an
@@ -80,6 +93,15 @@ pub(super) fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::S
                 outbound.clone(),
             );
         }
+        Effect::RunCommand { id, argv } => {
+            // #510: spawn the granted `argv` on the tokio runtime and route the
+            // outcome back to THIS plugin as `HostMsg::EffectResult` keyed by
+            // `id`. Reaching here means the plugin holds `Capability::RunCommand`
+            // (`enforce_capabilities` drops it otherwise) — a separately granted,
+            // higher-trust cap, so the host runs exactly what the manifest allows.
+            tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
+            run_command(plugin_id, *id, argv.clone(), outbound.clone());
+        }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");
         }
@@ -136,5 +158,471 @@ pub(super) fn resolve_open_page(page: Page) -> PageAction {
     match page {
         Page::PluginSelf => PageAction::OpenPluginSelf,
         other => PageAction::OpenBuiltin(map_page(other)),
+    }
+}
+
+// ── RunCommand round-trip (#510) ─────────────────────────────────────────────
+
+/// How long a plugin-spawned command may run before it is killed and reported
+/// as a failed outcome (#510). Bounds a hung child so the plugin never waits
+/// forever on its [`HostMsg::EffectResult`]; matches the hooks runner's bound.
+const RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on captured stdout returned to a plugin (bytes, #510). The proto lets the
+/// host truncate [`EffectOutcome::output`]; keep a single reply frame small.
+const RUN_COMMAND_MAX_OUTPUT: usize = 4096;
+
+/// Spawn a plugin-requested `argv` on the tokio runtime and route the
+/// [`EffectOutcome`] back to the originating plugin as [`HostMsg::EffectResult`]
+/// keyed by `id` (#510). Capability-gated upstream
+/// ([`RunCommand`](hytte_plugin_proto::Capability::RunCommand)); this runs only
+/// for a granted plugin. The broker itself stays on the GTK main thread, so the
+/// actual `spawn` + wait is offloaded to the runtime. Spawn/exec failures are
+/// loud (a warn) and still return an `ok: false` outcome — the same "no silent
+/// swallow" hygiene as the recorder's spawn path (#523) — so a plugin awaiting a
+/// reply never hangs.
+fn run_command(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Sender<HostMsg>) {
+    let plugin_id = plugin_id.to_owned();
+    hytte::reactive::runtime::handle().spawn(async move {
+        let outcome = execute_command(&plugin_id, id, &argv).await;
+        // A one-shot reply we want *delivered* (unlike latest-wins state pushes):
+        // `send().await` waits for outbound capacity, and only fails once the
+        // connection's writer is gone — at which point the plugin is already
+        // leaving, so dropping the reply is correct.
+        if outbound
+            .send(HostMsg::EffectResult { id, outcome })
+            .await
+            .is_err()
+        {
+            tracing::debug!(plugin = %plugin_id, id, "plugin gone before RunCommand result; dropped");
+        }
+    });
+}
+
+/// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`]) and map it
+/// onto an [`EffectOutcome`]. stdin is `/dev/null`; stdout/stderr are captured.
+async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
+    let Some((program, args)) = argv.split_first() else {
+        tracing::warn!(plugin = %plugin_id, id, "RunCommand with empty argv; nothing to spawn");
+        return EffectOutcome {
+            ok: false,
+            output: None,
+        };
+    };
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(RUN_COMMAND_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                tracing::info!(plugin = %plugin_id, id, program = %program, "plugin RunCommand finished");
+            } else {
+                tracing::warn!(
+                    plugin = %plugin_id, id, status = ?output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "plugin RunCommand exited non-zero",
+                );
+            }
+            command_outcome(output.status.success(), &output.stdout)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(plugin = %plugin_id, id, program = %program, error = %e, "plugin RunCommand failed to spawn");
+            EffectOutcome {
+                ok: false,
+                output: None,
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                plugin = %plugin_id, id, program = %program,
+                timeout_s = RUN_COMMAND_TIMEOUT.as_secs(),
+                "plugin RunCommand timed out; killed",
+            );
+            EffectOutcome {
+                ok: false,
+                output: None,
+            }
+        }
+    }
+}
+
+/// Map a finished command's success flag + captured stdout onto the wire
+/// [`EffectOutcome`] (#510). Pure (no process handle) so it is unit-testable:
+/// trailing newlines are trimmed, empty stdout collapses to `None`, and output
+/// past [`RUN_COMMAND_MAX_OUTPUT`] bytes is truncated on a char boundary.
+fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let output = if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_on_char_boundary(trimmed, RUN_COMMAND_MAX_OUTPUT))
+    };
+    EffectOutcome {
+        ok: success,
+        output,
+    }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 code point.
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+// ── Persisted effect audit log (#510) ────────────────────────────────────────
+//
+// Every brokered effect — and every one dropped by capability enforcement (#436)
+// or the rate cap (#435) — is appended to a bounded, rotating log file under XDG
+// state (`$XDG_STATE_HOME/trollshell/effects-audit.log`), so the host's
+// allow/deny decisions are reviewable after the fact rather than only visible in
+// live `tracing` output. Writes are handed to a single background writer over an
+// unbounded channel, so neither the GTK broker thread nor the tokio reader
+// threads block on file IO.
+
+/// Total-bytes cap per audit file before rotation (#510). Two files are kept —
+/// the live `effects-audit.log` and one rotated `effects-audit.log.1` — so the
+/// on-disk footprint is bounded to ~2× this at the effect vocabulary's low,
+/// rate-capped write volume.
+#[cfg(not(test))]
+const MAX_AUDIT_BYTES: u64 = 256 * 1024;
+
+/// The host's allow/deny decision on one effect, recorded in the audit log
+/// (#510). `Allowed` effects reach the broker; the two `Dropped*` decisions are
+/// recorded upstream at their drop sites in [`super::session`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AuditDecision {
+    /// Cleared capability enforcement + the rate cap; brokered.
+    Allowed,
+    /// Dropped: the plugin never declared the required capability (#436).
+    DroppedUngranted,
+    /// Dropped: the plugin exceeded its effect rate cap (#435).
+    DroppedRateCap,
+}
+
+impl AuditDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditDecision::Allowed => "allowed",
+            AuditDecision::DroppedUngranted => "dropped(ungranted-capability)",
+            AuditDecision::DroppedRateCap => "dropped(rate-cap)",
+        }
+    }
+}
+
+/// The short, stable audit name for an effect kind (#510). Exhaustive over the
+/// effect vocabulary so a new variant is a compile error here, mirroring
+/// [`effect_capability`](super::session::effect_capability).
+fn effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::OpenPage(_) => "OpenPage",
+        Effect::Niri(_) => "Niri",
+        Effect::Media(_) => "Media",
+        Effect::Audio(_) => "Audio",
+        Effect::RunCommand { .. } => "RunCommand",
+        Effect::RaiseOsd { .. } => "RaiseOsd",
+        Effect::Notify { .. } => "Notify",
+        Effect::RequestConsent { .. } => "RequestConsent",
+    }
+}
+
+/// Format one audit line (#510): `<rfc3339> plugin=<id> effect=<kind>
+/// decision=<decision>`. Pure (timestamp injected) so the format is
+/// unit-testable. The plugin id is sanitized of control/whitespace characters so
+/// a hostile id can't forge extra log lines.
+fn format_audit_line(ts: &str, plugin_id: &str, kind: &str, decision: AuditDecision) -> String {
+    let id = sanitize_field(plugin_id);
+    let d = decision.as_str();
+    format!("{ts} plugin={id} effect={kind} decision={d}")
+}
+
+/// Replace control/whitespace characters with `_` so a value can't inject a
+/// newline (and thus a forged log record) into the audit file.
+fn sanitize_field(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c.is_whitespace() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Append one effect decision to the persisted audit log (#510). Non-blocking:
+/// formats the line and hands it to the background writer over an unbounded
+/// channel (which serializes the file IO + rotation off both the GTK broker
+/// thread and the tokio reader threads). A no-op if the audit path can't be
+/// resolved (no `$HOME`/`$XDG_STATE_HOME`).
+pub(super) fn record_audit(plugin_id: &str, effect: &Effect, decision: AuditDecision) {
+    if let Some(tx) = audit_sink() {
+        let line = format_audit_line(&now_rfc3339(), plugin_id, effect_kind(effect), decision);
+        let _ = tx.send(line);
+    }
+}
+
+#[cfg(not(test))]
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// The process-wide audit writer sink, initialized once on first use: resolves
+/// the log path and spawns the background writer task. `None` if the path can't
+/// be resolved (audit then no-ops).
+#[cfg(not(test))]
+fn audit_sink() -> Option<&'static mpsc::UnboundedSender<String>> {
+    static SINK: std::sync::OnceLock<Option<mpsc::UnboundedSender<String>>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(spawn_audit_writer).as_ref()
+}
+
+/// Hermetic in unit tests: never resolves a real path or spawns a writer, so the
+/// per-connection tests that exercise `enforce_capabilities` / `throttle_effects`
+/// touch no filesystem. The audit machinery itself is covered directly below
+/// ([`AuditLog`] rotation, [`format_audit_line`]).
+#[cfg(test)]
+fn audit_sink() -> Option<&'static mpsc::UnboundedSender<String>> {
+    None
+}
+
+#[cfg(not(test))]
+fn spawn_audit_writer() -> Option<mpsc::UnboundedSender<String>> {
+    let path = audit_log_path()?;
+    let display = path.display().to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let log = AuditLog {
+        path,
+        max_bytes: MAX_AUDIT_BYTES,
+    };
+    hytte::reactive::runtime::handle().spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if let Err(e) = log.append(&line) {
+                tracing::debug!(error = %e, "effect audit write failed");
+            }
+        }
+    });
+    tracing::info!(path = %display, "effect audit log active");
+    Some(tx)
+}
+
+/// `$XDG_STATE_HOME/trollshell/effects-audit.log`, falling back to
+/// `$HOME/.local/state/…` per the XDG base-dir spec. `None` if neither is set.
+#[cfg(not(test))]
+fn audit_log_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("trollshell").join("effects-audit.log"))
+}
+
+/// Bounded, rotating append-only audit file (#510). On each append, if adding the
+/// line would push the live file past `max_bytes`, the live file is rotated to
+/// `<path>.1` (replacing any previous rotation) and a fresh file is started —
+/// bounding the on-disk footprint to ~2× `max_bytes`.
+struct AuditLog {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+impl AuditLog {
+    /// Append `line` (a newline is added), rotating first if needed. Returns the
+    /// underlying IO error on failure (the caller logs it).
+    fn append(&self, line: &str) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let incoming = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        self.rotate_if_needed(incoming)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    }
+
+    fn rotate_if_needed(&self, incoming: u64) -> std::io::Result<()> {
+        let current = std::fs::metadata(&self.path).map_or(0, |m| m.len());
+        if current > 0 && current.saturating_add(incoming) > self.max_bytes {
+            std::fs::rename(&self.path, self.rotated_path())?;
+        }
+        Ok(())
+    }
+
+    fn rotated_path(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".1");
+        PathBuf::from(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuditDecision, AuditLog, EffectOutcome, RUN_COMMAND_MAX_OUTPUT, command_outcome,
+        effect_kind, format_audit_line, truncate_on_char_boundary,
+    };
+    use hytte_plugin_proto::{Effect, NiriAction, Page};
+
+    #[test]
+    fn command_outcome_maps_success_and_stdout() {
+        // Trailing newline trimmed; success flag preserved.
+        assert_eq!(
+            command_outcome(true, b"hello\n"),
+            EffectOutcome {
+                ok: true,
+                output: Some("hello".to_owned()),
+            },
+        );
+        // Empty stdout collapses to None, whatever the exit status.
+        assert_eq!(
+            command_outcome(false, b""),
+            EffectOutcome {
+                ok: false,
+                output: None,
+            },
+        );
+        assert_eq!(
+            command_outcome(true, b"\n\n"),
+            EffectOutcome {
+                ok: true,
+                output: None,
+            },
+        );
+        // Non-zero exit with output: ok=false but the stdout still comes back.
+        assert_eq!(
+            command_outcome(false, b"partial"),
+            EffectOutcome {
+                ok: false,
+                output: Some("partial".to_owned()),
+            },
+        );
+    }
+
+    #[test]
+    fn command_outcome_truncates_long_output() {
+        let big = vec![b'x'; RUN_COMMAND_MAX_OUTPUT * 2];
+        let out = command_outcome(true, &big).output.expect("output present");
+        assert_eq!(out.len(), RUN_COMMAND_MAX_OUTPUT);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_splits_utf8() {
+        // "é" is 2 bytes; a max landing mid-char must back up to a boundary.
+        let s = "aééé";
+        let t = truncate_on_char_boundary(s, 2);
+        assert!(s.starts_with(&t));
+        assert_eq!(t, "a"); // byte 2 is mid-é, so back up to byte 1
+        // A max at/over the length returns the whole string.
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+    }
+
+    #[test]
+    fn format_audit_line_shape_and_sanitizes_id() {
+        assert_eq!(
+            format_audit_line(
+                "2026-07-24T00:00:00Z",
+                "timer",
+                "RunCommand",
+                AuditDecision::Allowed
+            ),
+            "2026-07-24T00:00:00Z plugin=timer effect=RunCommand decision=allowed",
+        );
+        // A hostile id with whitespace/newline can't forge a second record.
+        let line = format_audit_line("T", "bad\nid here", "Notify", AuditDecision::DroppedRateCap);
+        assert!(
+            !line.contains('\n'),
+            "sanitized id must not inject a newline"
+        );
+        assert_eq!(
+            line,
+            "T plugin=bad_id_here effect=Notify decision=dropped(rate-cap)"
+        );
+    }
+
+    #[test]
+    fn effect_kind_names_the_variants() {
+        assert_eq!(effect_kind(&Effect::OpenPage(Page::Media)), "OpenPage");
+        assert_eq!(
+            effect_kind(&Effect::Niri(NiriAction::FocusWindow { id: 1 })),
+            "Niri"
+        );
+        assert_eq!(
+            effect_kind(&Effect::RunCommand {
+                id: 1,
+                argv: vec!["true".to_owned()],
+            }),
+            "RunCommand",
+        );
+        assert_eq!(
+            effect_kind(&Effect::Notify {
+                summary: String::new(),
+                body: String::new(),
+            }),
+            "Notify",
+        );
+    }
+
+    #[test]
+    fn audit_log_rotates_and_bounds_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("effects-audit.log");
+        let log = AuditLog {
+            path: path.clone(),
+            max_bytes: 200,
+        };
+        // Each line ~30 bytes; 100 of them far exceed the 200-byte cap, forcing
+        // rotation while keeping the live file bounded.
+        for i in 0..100 {
+            log.append(&format!("2026-07-24T00:00:00Z line number {i}"))
+                .expect("append");
+        }
+        let live = std::fs::metadata(&path).expect("live file").len();
+        assert!(
+            live <= 260,
+            "live file should stay near the cap, was {live}"
+        );
+        let rotated = log.rotated_path();
+        assert!(rotated.exists(), "a rotated .1 file should exist");
+        // The most recent line is in the live file, not lost to rotation.
+        let last = std::fs::read_to_string(&path).expect("read live");
+        assert!(
+            last.contains("line number 99"),
+            "live file keeps the newest line"
+        );
+    }
+
+    #[test]
+    fn audit_log_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("state")
+            .join("trollshell")
+            .join("effects-audit.log");
+        let log = AuditLog {
+            path: path.clone(),
+            max_bytes: 1024,
+        };
+        log.append("first").expect("append creates parents");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents, "first\n");
     }
 }

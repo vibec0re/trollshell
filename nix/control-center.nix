@@ -3,11 +3,17 @@
 # the running shell's `mov.vibec0re.trollshell.Control` session-bus endpoint. It
 # ships as its own flake output alongside `.#trollshell`.
 #
-# Rather than run a second (~30-min) deps build, this reuses the shell package's
-# shared `cargoArtifacts` + `commonArgs` (same workspace `Cargo.lock`, so the
-# external-dependency closure is identical) and only recompiles the handful of
-# workspace members the control-center actually links — exactly how the `clippy`
-# and `system-tests` flake checks reuse `trollshell.passthru.cargoArtifacts`.
+# Rather than run a second (~30-min) deps build — or recompile every hytte-*
+# workspace crate a second time — this reuses the shell package's shared
+# `workspaceArtifacts` + `commonArgs` (#530). `workspaceArtifacts` is the
+# intermediate `cargoBuild` that already compiled the ENTIRE workspace once (see
+# nix/package.nix), so this derivation finds every crate it links already built
+# in the warm target dir and does little more than link + install its own
+# binary. (The earlier #411 sharing reused `trollshell.passthru.cargoArtifacts`,
+# but that's crane's `buildDepsOnly` output — external crates only, workspace
+# members stubbed — so it still recompiled all of hytte-* here; #530 fixes that.
+# The `clippy` / `system-tests` flake checks still reuse the deps-only
+# `cargoArtifacts` because they compile a different feature set.)
 #
 # `commonArgs.nativeBuildInputs` already carries `wrapGAppsHook4`, so the crane
 # build wraps the binary with the GApplication schema/icon/resource environment
@@ -23,7 +29,7 @@
   trollshell,
 }:
 let
-  inherit (trollshell.passthru) commonArgs cargoArtifacts;
+  inherit (trollshell.passthru) commonArgs workspaceArtifacts;
 
   # A .desktop launcher named after the app-id so the app is startable by name
   # (and window-matched via StartupWMClass). Exec is the bare binary name — it
@@ -48,20 +54,27 @@ in
 craneLib.buildPackage (
   commonArgs
   // {
-    inherit cargoArtifacts;
+    cargoArtifacts = workspaceArtifacts;
     pname = "trollshell-control-center";
 
-    # Build ONLY the control-center binary; the reused cargoArtifacts already
-    # holds the whole shell's dependency closure (a superset of this crate's).
-    cargoExtraArgs = "-p trollshell-control-center";
+    # Build against the already-compiled whole-workspace target so nothing is
+    # recompiled here (#530). MUST build `--workspace` (not `-p …`) to
+    # feature-match that target — a `-p` scope would fingerprint-mismatch and
+    # recompile ~all of it (see the feature-unification note in package.nix).
+    cargoExtraArgs = "--workspace";
 
-    # The hermetic internals suite already runs in the shell package build
-    # (commonArgs.doCheck = true, --workspace); no need to re-run it here.
+    # No test run here: the hermetic internals suite runs in the trollshell
+    # package's check phase (the shared workspaceArtifacts stage is build-only to
+    # stay feature-pristine — see the notes in package.nix). This matches the
+    # pre-#530 behaviour, where the control-center package never ran tests.
     doCheck = false;
 
-    # Drop the .desktop launcher into place; wrapGAppsHook4 (in commonArgs's
-    # nativeBuildInputs) then wraps the binary in the fixup phase.
+    # A `--workspace` build installs every workspace binary from the build log;
+    # keep ONLY the control-center binary, then drop the .desktop launcher into
+    # place. Both run before wrapGAppsHook4's fixup, so only the surviving
+    # binary gets wrapped.
     postInstall = ''
+      find "$out/bin" -mindepth 1 -maxdepth 1 ! -name trollshell-control-center -exec rm -rf {} +
       mkdir -p $out/share/applications
       cp ${desktopItem}/share/applications/*.desktop $out/share/applications/
     '';

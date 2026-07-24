@@ -155,6 +155,12 @@
             // {
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
               cargoClippyExtraArgs = "--workspace --all-targets --features system-tests -- -D warnings";
+              # This is a leaf/terminal check — nothing chains off its target
+              # dir as `cargoArtifacts` — so don't pack it. crane defaults
+              # `doInstallCargoArtifacts = true`, which would tar the whole
+              # (multi-GiB) target dir into $out for no consumer, burning build
+              # time and disk. Same fix + reason as system-tests below.
+              doInstallCargoArtifacts = false;
             }
           );
 
@@ -189,6 +195,15 @@
                 pkgs.xvfb-run
               ];
               doCheck = true;
+              # Leaf/terminal check: nothing consumes its target dir. crane
+              # defaults `doInstallCargoArtifacts = true`, which packs the whole
+              # ~2.2GiB target dir into a `target.tar.zst` — and that pack step
+              # was OOM-ing CI's disk ("No space left on device" / "zstd: error
+              # 70" in the artifact-install after every test already passed),
+              # systematically failing PRs on runners with tight disks. Turning
+              # it off stops producing the tarball entirely (#530: less artifact
+              # churn overall).
+              doInstallCargoArtifacts = false;
               # No separate build step: `cargo test` compiles as part of the
               # check phase. `commonArgs.preBuild` (the libspa-sys writable-
               # vendor-dir workaround) still runs first via the standard

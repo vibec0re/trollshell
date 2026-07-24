@@ -48,6 +48,8 @@ let
       "${pkgs.bash}/bin/sh -c 'echo \"wlsunset: programs.trollshell.nightlight.{latitude,longitude} are unset — set them to enable the Night light toggle\" >&2; exit 0'";
 in
 {
+  _file = "nix/hm-module.nix";
+
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
   # shared base.
   imports = [
@@ -159,6 +161,12 @@ in
           // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
             # Appearance picker reload command; null = the shell's swaybg default.
             TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
+          })
+          // (lib.optionalAttrs cfg.recorder.audioByDefault {
+            # Arm the record chip's audio capture at session start (#403).
+            # Only set when opted in — unset reads as off, and the env var is
+            # the override, so Settings still flips it live during a session.
+            TROLLSHELL_RECORD_AUDIO = "1";
           });
 
         systemd.user.services.trollshell = lib.mkIf cfg.systemd.enable {

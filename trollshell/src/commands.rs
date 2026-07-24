@@ -25,27 +25,19 @@
 //!
 //! ## Monitor resolution
 //!
-//! The verbs carry no monitor, so they target niri's focused output. We track
-//! it here in a thread-local fed by [`niri::focused_output`] (the same source
-//! the OSD uses) and hand the connector to the modal/sidebar command helpers,
-//! which fall back to any mounted surface when the focused output is unknown.
+//! The verbs carry no monitor, so they target niri's focused output, read via
+//! the shared [`crate::components::focused_output`] cache (also used by the
+//! OSD and notification toasts) and handed to the modal/sidebar command
+//! helpers, which fall back to any mounted surface when the focused output is
+//! unknown.
 
-use std::cell::RefCell;
-
-use hytte::gtk::gio;
-use hytte::gtk::glib;
+use hytte::gtk::{gio, glib};
 use hytte::prelude::*;
-use hytte::services::{niri, recorder};
+use hytte::services::recorder;
 
+use crate::components::focused_output;
 use crate::modal::{self, Page};
 use crate::overlays::sidebar;
-
-thread_local! {
-    /// Most recent focused-output connector from [`niri::focused_output`],
-    /// updated by the subscription started in [`install`]. Read when a command
-    /// action fires so the drawer/sidebar lands on the focused monitor.
-    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
-}
 
 /// Register the shell command `GActions` on `app` and start tracking niri's
 /// focused output. Call once from the body closure (post-activate, after the
@@ -58,13 +50,9 @@ thread_local! {
 /// - `toggle-sidebar` (no arg): flip the left sidebar.
 /// - `toggle-recording` (no arg): start/stop a screen recording (#403).
 pub fn install(app: &App) {
-    // Track the focused output for monitor resolution. No bootstrap
-    // suppression — we want the latest known output even before any command
-    // fires. Mirrors the OSD's `FOCUSED_OUTPUT` subscription.
-    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
-        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
-        std::future::ready(())
-    }));
+    // Wire the shared focused-output cache (idempotent — see its docs) so
+    // command handlers below can resolve the focused monitor.
+    focused_output::install();
 
     let open_page = gio::ActionEntry::builder("open-page")
         .parameter_type(Some(glib::VariantTy::STRING))
@@ -89,7 +77,7 @@ pub fn install(app: &App) {
 
     let toggle_sidebar = gio::ActionEntry::builder("toggle-sidebar")
         .activate(|_app, _action, _param| {
-            let focused = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+            let focused = focused_output::current();
             sidebar::toggle_on_focused(focused.as_deref());
         })
         .build();
@@ -106,6 +94,6 @@ pub fn install(app: &App) {
 
 /// Open the drawer to `page` on the focused output (or any mounted drawer).
 fn open_focused_page(page: Page) {
-    let focused = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+    let focused = focused_output::current();
     modal::open_on_focused(focused.as_deref(), page);
 }

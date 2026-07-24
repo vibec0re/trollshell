@@ -38,12 +38,11 @@ use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::dnd;
-use hytte::services::niri;
 use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
 use hytte::services::notifications_mute;
 use hytte::ui::{Anchor, Margin, layer_window};
 
-use crate::components::notif_actions;
+use crate::components::{focused_output, notif_actions};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -82,11 +81,6 @@ thread_local! {
     /// entry owns its layer-shell window and the per-window state.
     static TOAST_WINDOWS: RefCell<HashMap<String, ToastView>> =
         RefCell::new(HashMap::new());
-
-    /// Most recent focused-output name from
-    /// [`hytte::services::niri::focused_output`]. Routes incoming
-    /// notification batches to the matching window.
-    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
 
     /// Set after the first `install()` call so module-level
     /// subscriptions wire exactly once across all per-monitor mounts.
@@ -137,15 +131,12 @@ pub fn close_all() {
 
 // ── Subscriptions + routing ───────────────────────────────────────────────────
 
-/// Wires the focused-output cell and the combined notification signal.
-/// Runs exactly once across all per-monitor [`install`] calls (gated by
-/// [`SUBS_INSTALLED`]).
+/// Wires the shared focused-output cache and the combined notification
+/// signal. Runs exactly once across all per-monitor [`install`] calls
+/// (gated by [`SUBS_INSTALLED`]).
 fn install_subscriptions() {
-    // niri::focused_output() → FOCUSED_OUTPUT
-    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
-        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
-        std::future::ready(())
-    }));
+    // components::focused_output is idempotent — see its docs.
+    focused_output::install();
 
     // Combined (notifications, dnd, muted) signal → route_emission.
     let toast_signal = map_ref! {
@@ -169,7 +160,7 @@ fn install_subscriptions() {
 /// startup before the first niri focus event lands, and outputs that
 /// trollshell hasn't mounted on).
 fn route_emission(notifs: &[Notification], dnd_on: bool, muted: &HashSet<String>) {
-    let target_name = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+    let target_name = focused_output::current();
     TOAST_WINDOWS.with(|map| {
         let map = map.borrow();
         if map.is_empty() {

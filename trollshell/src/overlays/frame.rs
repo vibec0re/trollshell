@@ -62,9 +62,20 @@ thread_local! {
 /// (`padding: 6px 12px` (12 vertical) + `min-height: 32px` = 44) at 1x.
 const FALLBACK_BAR_HEIGHT: i32 = 44;
 
-/// Frame thickness on left, right, and bottom. Must match the niri
-/// `struts` values in `etc/niri/frame.kdl`.
-const FRAME_THICKNESS: f64 = 8.0;
+/// Frame thickness on left, right, and bottom, in CSS px. Must match the
+/// niri `struts` values in `etc/niri/frame.kdl`. `pub(crate)` so
+/// `overlays::sidebar`'s integer layout math derives from this single
+/// source instead of hand-duplicating the literal (former
+/// `FRAME_THICKNESS_I32` + a "keep in sync" comment).
+pub(crate) const FRAME_THICKNESS_I32: i32 = 8;
+
+/// [`FRAME_THICKNESS_I32`] as `f64`, for this module's cairo draw math.
+/// Lossless: `i32` fits exactly in `f64`'s 53-bit mantissa. `f64::from`
+/// would document that better than `as`, but it isn't const-stable yet
+/// (`From` isn't a const trait on this MSRV), so a const context needs the
+/// cast — hence the explicit allow.
+#[allow(clippy::cast_lossless)]
+const FRAME_THICKNESS: f64 = FRAME_THICKNESS_I32 as f64;
 
 /// Corner radius for all four corners of the workspace cutout.
 const CUTOUT_RADIUS: f64 = 10.0;

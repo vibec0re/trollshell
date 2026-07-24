@@ -19,7 +19,7 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone as _, Timelike,
 };
 use hytte::adw::{self, prelude::*};
-use hytte::gtk::{self, glib};
+use hytte::gtk::{self, gio, glib};
 use hytte::prelude::*;
 use hytte::services::calendar::{self, CalendarEvent};
 
@@ -755,20 +755,28 @@ fn build_calendar_row(ev: &CalendarEvent) -> adw::ActionRow {
     row
 }
 
-/// Launch `gnome-calendar`. Logs a warning if the binary is not found or
-/// the spawn otherwise fails — never panics. The child is reaped in a
-/// detached thread so no zombie accumulates in the long-running shell
-/// process.
+/// Launch gnome-calendar via its registered `gio::AppInfo` desktop entry
+/// instead of shelling out to the `gnome-calendar` binary with
+/// `std::process::Command` + a reaper thread — `gio` tracks and reaps the
+/// child itself, so no thread is needed here.
+///
+/// `gio::DesktopAppInfo` is not available in the gio 0.22 bindings this
+/// workspace vendors (see `panels/stats.rs`'s `resolve_app_meta` doc for the
+/// same constraint), so this scans `gio::AppInfo::all()` for the desktop id
+/// instead — the same lookup idiom already used there. Logs a warning if
+/// the desktop entry isn't installed or the launch otherwise fails; never
+/// panics.
 fn launch_gnome_calendar() {
-    match std::process::Command::new("gnome-calendar").spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "could not launch gnome-calendar");
-        }
+    let app = gio::AppInfo::all().into_iter().find(|info| {
+        info.id()
+            .is_some_and(|id| id == "org.gnome.Calendar.desktop")
+    });
+    let Some(app) = app else {
+        tracing::warn!("gnome-calendar desktop entry not found");
+        return;
+    };
+    if let Err(e) = app.launch(&[], gio::AppLaunchContext::NONE) {
+        tracing::warn!(error = %e, "could not launch gnome-calendar");
     }
 }
 

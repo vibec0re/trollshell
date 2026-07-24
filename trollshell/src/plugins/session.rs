@@ -383,6 +383,11 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         capabilities = ?manifest.capabilities,
         "plugin registered",
     );
+    // Live runtime mirror (#423): this connection is now connected (not yet
+    // rendering). The matching `runtime_remove` runs in teardown while this
+    // connection still owns the id (its `IdGuard` above hasn't released), so a
+    // fast-reconnect successor never clobbers the wrong entry.
+    super::runtime_register(&ctx.runtime, &plugin_id, mount);
 
     // Outbound writer: the single point that serializes host→plugin frames. The
     // queue is **bounded** (#435): a plugin that stops reading its socket can no
@@ -481,27 +486,36 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     tree,
                     panel,
                     effects,
-                }) => route_render(
-                    ctx,
-                    mount,
-                    SlotRender {
-                        plugin_id: plugin_id.clone(),
-                        order,
-                        generation,
-                        tree,
-                        panel,
-                        outbound: out_tx.clone(),
-                    },
+                }) => {
                     // #436: drop any effect whose capability the plugin never
                     // declared, THEN rate-cap the survivors (#435) so an
                     // ungranted flood costs no tokens. Both are host policy — the
                     // plugin may request anything; the host decides what runs.
-                    throttle_effects(
+                    let requested = effects.len();
+                    let kept = throttle_effects(
                         &mut effect_rl,
                         &plugin_id,
                         enforce_capabilities(&capabilities, &plugin_id, effects),
-                    ),
-                ),
+                    );
+                    // Runtime mirror (#423): this frame proves the plugin is
+                    // rendering; the guards' drops feed its violation count.
+                    let dropped =
+                        u32::try_from(requested.saturating_sub(kept.len())).unwrap_or(u32::MAX);
+                    super::runtime_render(&ctx.runtime, &plugin_id, dropped);
+                    route_render(
+                        ctx,
+                        mount,
+                        SlotRender {
+                            plugin_id: plugin_id.clone(),
+                            order,
+                            generation,
+                            tree,
+                            panel,
+                            outbound: out_tx.clone(),
+                        },
+                        kept,
+                    );
+                }
                 Ok(PluginMsg::Register { .. }) => {
                     tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
                 }
@@ -568,6 +582,10 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // plugin's panel is the one currently shown, the drawer child's derived
     // signal yields `None` and renders empty (the user then closes the drawer).
     clear_region_if_owned(&ctx.panels, &plugin_id, generation);
+    // Drop this connection from the runtime mirror (#423) — done here, still
+    // inside the id's exclusive-ownership window (the `IdGuard` releases only
+    // when `handle_conn` returns), so it can't evict a fast-reconnect successor.
+    super::runtime_remove(&ctx.runtime, &plugin_id);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
     }

@@ -1,0 +1,22 @@
+[package]
+name = "hytte-plugin-audio-widget"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Audio-reactive trollshell sidebar plugin (issue #506): a preem raster card composing a dot-matrix marquee, a 16-band spectrum scope, and an LED peak/level strip off the AudioSpectrum push"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-audio-widget"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY dependency: the plugin runtime SDK, which carries the preem raster
+# kit (`hytte_plugin::preem`, including the #506 `LedStrip`) and re-exports the
+# wire protocol as `hytte_plugin::proto` plus the tokio/tokio-stream the frame
+# timer needs. No gtk / adw / hytte-ui — a plugin never links the shell.
+hytte-plugin = { path = "../hytte-plugin" }

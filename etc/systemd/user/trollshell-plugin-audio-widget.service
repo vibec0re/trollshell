@@ -1,0 +1,21 @@
+[Unit]
+Description=trollshell audio widget plugin — dot-matrix + spectrum + LED strip (out-of-process, #506)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# Mounts SidebarTop as one card in the region (sorted by manifest order since
+# #274), so it coexists with any other SidebarTop plugin — no Conflicts= needed.
+# Subscribes StateKey::AudioSpectrum (#405): the shell taps the default sink's
+# monitor through PipeWire and pushes a peak + 16-band spectrum ~20 Hz while at
+# least one subscriber is connected, so an idle desktop with this plugin off
+# pays nothing. No environment variables to set.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-audio-widget
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

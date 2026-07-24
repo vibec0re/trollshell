@@ -31,6 +31,8 @@ let
   };
 in
 {
+  _file = "nix/nixos-module.nix";
+
   # enable / package / weather.fallbackCity / wallpaper.* are declared in the
   # shared base.
   imports = [ (import ./module-common.nix self) ];
@@ -113,6 +115,12 @@ in
         environment.sessionVariables.TROLLSHELL_WALLPAPER_RELOAD_CMD = lib.mkIf (
           cfg.wallpaper.reloadCommand != null
         ) cfg.wallpaper.reloadCommand;
+
+        # Screen-recording audio default (#403): arm the record chip's audio
+        # toggle at session start. mkIf so it's only exported when opted in —
+        # unset reads as off, and the env var is the override (Settings still
+        # flips it live during a session).
+        environment.sessionVariables.TROLLSHELL_RECORD_AUDIO = lib.mkIf cfg.recorder.audioByDefault "1";
       }
 
       # Wallpaper daemon (NixOS side): only swaybg is managed here. swaybg is the

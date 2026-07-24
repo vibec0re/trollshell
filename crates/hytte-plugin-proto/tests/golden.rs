@@ -43,7 +43,8 @@
 use hytte_plugin_proto::{
     AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, Dir, Effect,
     EffectOutcome, EventKind, HostMsg, LogLevel, Manifest, MediaAction, Mount, NiriAction, Node,
-    PROTO_VERSION, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot, decode, encode,
+    NowPlaying, PROTO_VERSION, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot,
+    UpcomingEvent, decode, encode,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -131,6 +132,9 @@ fn full_manifest() -> Manifest {
             StateKey::SlotVisible,
             StateKey::Accent,
             StateKey::AudioSpectrum,
+            StateKey::CalendarUpcoming,
+            StateKey::SessionLocked,
+            StateKey::NowPlaying,
         ],
         capabilities: vec![
             Capability::OpenPage,
@@ -141,6 +145,9 @@ fn full_manifest() -> Manifest {
             Capability::RaiseOsd,
             Capability::Notify,
             Capability::Consent,
+            Capability::Calendar,
+            Capability::SessionState,
+            Capability::NowPlaying,
         ],
         mount: Mount::SidebarLead,
         order: Some(-5),
@@ -348,8 +355,10 @@ fn plugin_control_msgs() -> Vec<PluginMsg> {
 /// Every `HostMsg` variant, including the opt-in-gated
 /// [`HostMsg::Accent`]/[`HostMsg::AudioSpectrum`] pushes (both the resolved
 /// and unresolved `Accent` case), the #487 [`HostMsg::ConsentDecision`] push,
-/// and every [`EventKind`] — the "`StateKey` variants incl Accent/AudioSpectrum"
-/// entry lives here as the pushes those subscriptions gate.
+/// the #484/#528 domain pushes ([`HostMsg::CalendarUpcoming`] populated and
+/// empty, [`HostMsg::SessionLocked`] both states, [`HostMsg::NowPlaying`] playing
+/// and idle), and every [`EventKind`] — the "`StateKey` variants incl
+/// Accent/AudioSpectrum" entry lives here as the pushes those subscriptions gate.
 fn host_msgs() -> Vec<HostMsg> {
     let mut bins = [0.0_f32; SPECTRUM_BINS];
     for (i, b) in bins.iter_mut().enumerate() {
@@ -418,6 +427,35 @@ fn host_msgs() -> Vec<HostMsg> {
         HostMsg::ConsentDecision {
             request_id: 8,
             decision: ConsentDecision::Deny,
+        },
+        HostMsg::CalendarUpcoming {
+            events: vec![
+                UpcomingEvent {
+                    start_unix: 1_752_248_940,
+                    end_unix: 1_752_252_540,
+                    title: "standup".into(),
+                    calendar: "Work".into(),
+                },
+                UpcomingEvent {
+                    start_unix: 1_752_260_000,
+                    end_unix: 1_752_263_600,
+                    title: "the thing".into(),
+                    calendar: "Personal".into(),
+                },
+            ],
+        },
+        HostMsg::CalendarUpcoming { events: Vec::new() },
+        HostMsg::SessionLocked { locked: true },
+        HostMsg::SessionLocked { locked: false },
+        HostMsg::NowPlaying {
+            now_playing: NowPlaying {
+                title: "Chrome Rain".into(),
+                artist: "Choom".into(),
+                playing: true,
+            },
+        },
+        HostMsg::NowPlaying {
+            now_playing: NowPlaying::default(),
         },
         HostMsg::Ping { seq: 1 },
         HostMsg::Shutdown,

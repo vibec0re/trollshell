@@ -22,9 +22,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The single datasource this phase ships. Named on the wire so the vocabulary
-/// is ready for a second one without a schema change.
+/// The departures datasource (phase 1a). Named on the wire so the vocabulary is
+/// ready for more without a schema change.
 pub const DATASOURCE_DEPARTURES: &str = "departures";
+
+/// The calendar datasource (#484/#509 item 4). Unlike departures — which the
+/// broker fetches itself — the broker keeps a **live copy** fed by the shell's
+/// host push (the broker plugin subscribes `CalendarUpcoming` and forwards it
+/// down the command lane), and `get calendar` serves that copy under the normal
+/// grant flow. EDS lives in the shell, so an out-of-process broker can't read it
+/// directly; the host push is the bridge.
+pub const DATASOURCE_CALENDAR: &str = "calendar";
 
 /// One request line from the CLI. Externally tagged on `op` so adding an op is
 /// additive and an unknown op fails to parse loudly rather than silently.
@@ -65,6 +73,19 @@ pub struct DepartureOut {
     pub cancelled: bool,
 }
 
+/// One upcoming calendar event in a [`Response`] (`get calendar` ok, #484). The
+/// broker's SDK-free mirror of the shell's wire `UpcomingEvent`; the broker
+/// plugin maps the proto type onto this at the boundary (as it maps consent
+/// decisions), so the library never links the plugin proto. Times are Unix
+/// seconds — the agent formats them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarEntry {
+    pub start_unix: i64,
+    pub end_unix: i64,
+    pub title: String,
+    pub calendar: String,
+}
+
 /// One grant row in a `grants` [`Response`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantOut {
@@ -102,6 +123,9 @@ pub struct Response {
     /// The scoped departures (`get departures` ok).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub departures: Option<Vec<DepartureOut>>,
+    /// The upcoming calendar events (`get calendar` ok, #484).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<Vec<CalendarEntry>>,
     /// The durable grants (`grants` ok).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<GrantOut>>,
@@ -226,6 +250,30 @@ mod tests {
         // And it decodes back to the same struct.
         let back: Response = serde_json::from_str(&line).expect("decodes");
         assert_eq!(back, ok);
+    }
+
+    #[test]
+    fn calendar_response_round_trips_and_names_its_datasource() {
+        let resp = Response {
+            ok: true,
+            datasource: Some(DATASOURCE_CALENDAR.to_owned()),
+            calendar: Some(vec![CalendarEntry {
+                start_unix: 100,
+                end_unix: 200,
+                title: "standup".to_owned(),
+                calendar: "Work".to_owned(),
+            }]),
+            ..Response::default()
+        };
+        let line = encode_response(&resp);
+        assert!(line.contains(r#""datasource":"calendar""#), "{line}");
+        assert!(line.contains(r#""title":"standup""#), "{line}");
+        assert!(
+            !line.contains("departures"),
+            "unrelated fields skipped: {line}"
+        );
+        let back: Response = serde_json::from_str(&line).expect("decodes");
+        assert_eq!(back, resp);
     }
 
     #[test]

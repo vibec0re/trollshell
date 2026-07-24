@@ -11,18 +11,18 @@ use hytte::futures_signals::signal::Mutable;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, Effect, HostMsg, Manifest, MediaAction, Mount, NiriAction,
-    Page, PluginMsg, StateKey, read_frame, wire, write_frame,
+    NowPlaying, Page, PluginMsg, StateKey, read_frame, wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
 use super::effects::{PageAction, map_page, resolve_open_page};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
-use super::pump::{any_sidebar_open, apply_forget, apply_open};
+use super::pump::{any_sidebar_open, apply_forget, apply_open, to_now_playing, to_upcoming_events};
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
-    effect_capability, enforce_capabilities, handle_conn,
+    effect_capability, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
@@ -812,6 +812,11 @@ fn ctx_with(
     // Likewise for the audio spectrum (#405): these tests subscribe neither
     // `StateKey::AudioSpectrum`, so no spectrum task reads this.
     let (_spectrum_tx, spectrum_rx) = watch::channel(None);
+    // The #484/#528 domain digests: seeded to their defaults; these tests don't
+    // subscribe the domain keys, so no calendar/locked/now-playing task reads them.
+    let (_calendar_tx, calendar_rx) = watch::channel(Vec::new());
+    let (_now_playing_tx, now_playing_rx) = watch::channel(NowPlaying::default());
+    let (_locked_tx, locked_rx) = watch::channel(false);
     let ctx = ListenerCtx {
         sidebar_lead: Mutable::new(Vec::new()),
         sidebar_top: Mutable::new(Vec::new()),
@@ -824,6 +829,9 @@ fn ctx_with(
         visibility_rx,
         accent_rx,
         spectrum_rx,
+        calendar_rx,
+        now_playing_rx,
+        locked_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
         // Host-scoped runtime mirror (#423); like `live_ids`, kept per-ctx so the
         // per-connection tests stay isolated and never publish `PLUGIN_RUNTIME`.
@@ -1375,6 +1383,131 @@ fn enforce_capabilities_drops_ungranted_effects() {
         enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
         "a plugin that declared no caps gets every effect dropped",
     );
+}
+
+// ── #484/#528 domain pushes: gating + projections ────────────────────────────
+
+/// The state-key → capability map is exhaustive and gates exactly the domain
+/// keys; the ambient keys (subscription is their whole opt-in) map to `None`.
+#[test]
+fn state_key_capability_gates_only_the_domain_keys() {
+    assert_eq!(state_key_capability(StateKey::Clock), None);
+    assert_eq!(state_key_capability(StateKey::SlotVisible), None);
+    assert_eq!(state_key_capability(StateKey::Accent), None);
+    assert_eq!(state_key_capability(StateKey::AudioSpectrum), None);
+    assert_eq!(
+        state_key_capability(StateKey::CalendarUpcoming),
+        Some(Capability::Calendar)
+    );
+    assert_eq!(
+        state_key_capability(StateKey::SessionLocked),
+        Some(Capability::SessionState)
+    );
+    assert_eq!(
+        state_key_capability(StateKey::NowPlaying),
+        Some(Capability::NowPlaying)
+    );
+}
+
+/// `push_gate`: an ambient key needs only the subscription; a domain key needs
+/// the subscription **and** its gating capability. Missing either → refused.
+#[test]
+fn push_gate_requires_subscription_and_capability_for_domain_keys() {
+    let mut m = Manifest::new("p", Mount::SidebarTop);
+    // Ambient: subscription alone suffices; an unsubscribed key is refused.
+    m.subscribes = vec![StateKey::Clock];
+    assert!(push_gate(&m, StateKey::Clock));
+    assert!(!push_gate(&m, StateKey::CalendarUpcoming), "not subscribed");
+
+    // Domain: subscribed but missing the cap → refused (declared *and* enforced).
+    m.subscribes = vec![StateKey::CalendarUpcoming];
+    assert!(
+        !push_gate(&m, StateKey::CalendarUpcoming),
+        "a subscribe-only domain key is refused"
+    );
+    // Subscribed + cap → allowed.
+    m.capabilities = vec![Capability::Calendar];
+    assert!(push_gate(&m, StateKey::CalendarUpcoming));
+
+    // The capability without the subscription is not enough either.
+    let mut m2 = Manifest::new("p", Mount::SidebarTop);
+    m2.capabilities = vec![Capability::SessionState];
+    assert!(
+        !push_gate(&m2, StateKey::SessionLocked),
+        "cap without subscription"
+    );
+    m2.subscribes = vec![StateKey::SessionLocked];
+    assert!(push_gate(&m2, StateKey::SessionLocked));
+}
+
+/// `to_upcoming_events` keeps events overlapping the next 24 h (not already
+/// ended, starting inside the window), caps at `MAX_UPCOMING_EVENTS`, and maps
+/// each field.
+#[test]
+fn to_upcoming_events_windows_caps_and_maps() {
+    use chrono::{DateTime, Local};
+    use hytte::services::calendar::CalendarEvent;
+
+    let now = 1_700_000_000_i64;
+    let day = 24 * 3600;
+    let ev = |start: i64, end: i64, summary: &str, cal: &str| CalendarEvent {
+        uid: String::new(),
+        summary: summary.to_owned(),
+        start: DateTime::from_timestamp(start, 0)
+            .expect("ts")
+            .with_timezone(&Local),
+        end: DateTime::from_timestamp(end, 0)
+            .expect("ts")
+            .with_timezone(&Local),
+        location: None,
+        all_day: false,
+        calendar_name: cal.to_owned(),
+    };
+    // Sorted ascending by start, as the calendar service guarantees.
+    let events = vec![
+        ev(now - 200, now - 100, "past", "A"), // already ended → out
+        ev(now - 60, now + 60, "ongoing", "Work"), // ends in future → in
+        ev(now + 100, now + 160, "e2", "A"),
+        ev(now + 200, now + 260, "e3", "A"),
+        ev(now + 300, now + 360, "e4", "A"),
+        ev(now + 400, now + 460, "e5", "A"),
+        ev(now + 500, now + 560, "e6", "A"), // 6th survivor → capped
+        ev(now + day + 100, now + day + 200, "later", "A"), // starts past 24 h → out
+    ];
+    let out = to_upcoming_events(&events, now);
+    assert_eq!(out.len(), 5, "capped at MAX_UPCOMING_EVENTS");
+    let titles: Vec<&str> = out.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(titles, ["ongoing", "e2", "e3", "e4", "e5"]);
+    assert!(!titles.contains(&"past") && !titles.contains(&"later"));
+    // Field mapping on the first survivor.
+    assert_eq!(out[0].start_unix, now - 60);
+    assert_eq!(out[0].end_unix, now + 60);
+    assert_eq!(out[0].calendar, "Work");
+}
+
+/// `to_now_playing` projects the active player (title/artist/playing) and maps
+/// `None` to the empty, not-playing default.
+#[test]
+fn to_now_playing_projects_the_active_player() {
+    use hytte::services::mpris::{PlaybackStatus, Player};
+
+    assert_eq!(to_now_playing(None), NowPlaying::default());
+    let playing = Player {
+        title: "Chrome Rain".to_owned(),
+        artists: "Choom".to_owned(),
+        status: PlaybackStatus::Playing,
+        ..Player::default()
+    };
+    let np = to_now_playing(Some(&playing));
+    assert_eq!(np.title, "Chrome Rain");
+    assert_eq!(np.artist, "Choom");
+    assert!(np.playing);
+    // Paused / stopped read as not playing.
+    let paused = Player {
+        status: PlaybackStatus::Paused,
+        ..playing.clone()
+    };
+    assert!(!to_now_playing(Some(&paused)).playing);
 }
 
 /// #436 item 2, end to end through `handle_conn`: a second connection that

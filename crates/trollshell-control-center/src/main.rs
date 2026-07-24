@@ -950,7 +950,7 @@ async fn list_plugins() -> Result<Vec<(String, String, bool)>, hytte_bus::BusErr
 /// Plugins tab draws on top of the unit list.
 async fn list_plugin_states() -> Result<Vec<(String, bool, String, u64, u32)>, hytte_bus::BusError>
 {
-    hytte_bus::call(CONTROL_NAME)
+    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
         .method("ListPluginStates")

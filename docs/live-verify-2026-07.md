@@ -79,14 +79,14 @@ Everything else is unchecked and still wants a pass in a real Niri session.
       sessions, audit trail — render correctly in a real session (only
       unit-tested via the node tree so far, never GTK-reconciled live).
 - [ ] **(#493)** Toast delivery: trigger a denied `auth` from an unauthorized
-      agent (`infobroker auth --agent <name>` with no grant) and confirm the
-      `Effect::Notify` toast actually lands ("agent X requested departures —
+      agent (`hytte-infobroker auth --agent <name>` with no grant) and confirm
+      the `Effect::Notify` toast actually lands ("agent X requested departures —
       denied").
-- [ ] **(#493)** Live datasource fetch: `infobroker auth --agent claude` →
-      `export HYTTE_INFOBROKER_TOKEN=…` → `infobroker get departures` against
-      a real, configured `places.toml` — confirm the HAFAS round-trip and
+- [ ] **(#493)** Live datasource fetch: `hytte-infobroker auth --agent claude` →
+      `export HYTTE_INFOBROKER_TOKEN=…` → `hytte-infobroker get departures`
+      against a real, configured `places.toml` — confirm the HAFAS round-trip and
       scoped JSON response.
-- [ ] **(#493)** Icon check: confirm `channel-secure-symbolic` /
+- [ ] **(#493)** Icon check: confirm `emblem-shared-symbolic` /
       `dialog-warning-symbolic` render as real icons in the live Adwaita
       theme, not `image-missing`.
 

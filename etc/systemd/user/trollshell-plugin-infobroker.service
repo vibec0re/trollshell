@@ -10,8 +10,8 @@ After=graphical-session.target trollshell.service
 # (grants + revoke, pending + allow, datasource status, sessions, audit trail).
 #
 # It ALSO binds its own socket, $XDG_RUNTIME_DIR/hytte-infobroker.sock (0600),
-# which the `infobroker` CLI dials — that's how a local agent auths and fetches
-# scoped data. Durable grants live in $XDG_STATE_HOME/hytte-infobroker/grants.toml
+# which the `hytte-infobroker` CLI dials — that's how a local agent auths and
+# fetches scoped data. Durable grants live in $XDG_STATE_HOME/hytte-infobroker/grants.toml
 # (or ~/.local/state/…); session tokens are in-memory only (12 h TTL, killed by a
 # panel revoke or this unit / trollshell restarting). See etc/skills/infobroker/
 # for the agent-facing skill folder. No environment variables to set.

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The consent-gated data broker for local AI agents (issue #487, phase 1a): a hytte plugin whose own panel manages grants + audit, plus a boring JSON-lines socket the `infobroker` CLI dials to auth + fetch scoped data"
+description = "The consent-gated data broker for local AI agents (issue #487, phase 1a): a hytte plugin whose own panel manages grants + audit, plus a boring JSON-lines socket the `hytte-infobroker` CLI dials to auth + fetch scoped data"
 
 [lints]
 workspace = true
@@ -16,9 +16,10 @@ name = "hytte-plugin-infobroker"
 path = "src/plugin.rs"
 
 # The CLI the skill folder's agents shell out to (auth → env token → scoped
-# gets). The only client of the broker socket.
+# gets). The only client of the broker socket. `hytte-`-prefixed (#498) so the
+# binary that lands in $PATH follows the crate's naming convention.
 [[bin]]
-name = "infobroker"
+name = "hytte-infobroker"
 path = "src/cli.rs"
 
 [dependencies]

@@ -569,7 +569,7 @@ impl BrokerState {
         let Some(auth) = self.tokens.resolve(token, now) else {
             // Transient/technical — the agent just re-auths; no consent toast.
             return (
-                Response::error("invalid or expired token — re-auth with `infobroker auth`"),
+                Response::error("invalid or expired token — re-auth with `hytte-infobroker auth`"),
                 None,
             );
         };

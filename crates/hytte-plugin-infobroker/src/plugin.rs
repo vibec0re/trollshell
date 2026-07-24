@@ -185,19 +185,24 @@ impl Infobroker {
         Vec::new()
     }
 
-    /// The bar chip: a shield icon (a warning triangle when something is
-    /// pending), plus a small badge of the pending / live-session count. Clicking
-    /// it opens the panel. The host wraps this in its own `.ts-plugin-chip` pill,
-    /// so the root adds no card/chip class of its own.
+    /// The bar chip: a neutral data-sharing icon (a warning triangle when
+    /// something is pending), plus a small badge of the pending / live-session
+    /// count. Clicking it opens the panel. The host wraps this in its own
+    /// `.ts-plugin-chip` pill, so the root adds no card/chip class of its own.
+    ///
+    /// The idle icon is `emblem-shared-symbolic` — a neutral "shared data"
+    /// glyph — deliberately **not** a padlock (#503): a red lock on the bar read
+    /// as an alarm rather than a data broker. Lock imagery stays where it's
+    /// semantically right: the interactive consent prompt.
     fn chip(&self) -> Node {
         let pending = self.snapshot.pending.len();
         let sessions = self.snapshot.tokens.len();
         let (icon_name, badge, badge_class) = if pending > 0 {
             ("dialog-warning-symbolic", pending.to_string(), "warning")
         } else if sessions > 0 {
-            ("channel-secure-symbolic", sessions.to_string(), "dim-label")
+            ("emblem-shared-symbolic", sessions.to_string(), "dim-label")
         } else {
-            ("channel-secure-symbolic", String::new(), "dim-label")
+            ("emblem-shared-symbolic", String::new(), "dim-label")
         };
 
         let mut chip_children = vec![Node::Icon {
@@ -230,75 +235,94 @@ impl Infobroker {
     /// The drawer panel: pending knocks, grants, datasources, sessions, activity.
     /// The drawer supplies the card chrome, so the panel root adds no
     /// `.card`/`.ts-plugin-*` class — only its own vertical spacing.
+    ///
+    /// # Layout (#500)
+    ///
+    /// A `title-4` panel title, then one grouped **section** per topic. Each
+    /// section is an emphasized `heading` above a `.boxed-list` card (or a single
+    /// muted line when empty); a hairline [`divider`] between sections gives the
+    /// preferences-page hierarchy. Rows are two-line action rows (an emphasized
+    /// title over muted secondary text) rather than a run of adjacent labels —
+    /// the node vocab's `Row` has no inter-child spacing, so packing several bare
+    /// labels into one rendered them concatenated ("fnorddeparturesalways").
     fn panel(&self) -> Node {
-        let mut sections = vec![heading("Info broker", "title-4")];
-
-        // Pending knocks — the actionable top of the panel.
+        // The topic sections, in order. Pending knocks lead when present (the
+        // actionable top of the panel); the rest always render.
+        let mut sections: Vec<Node> = Vec::new();
         if !self.snapshot.pending.is_empty() {
-            sections.push(heading("Pending requests", "heading"));
-            sections.push(list(
-                self.snapshot
-                    .pending
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| pending_row(i, p))
-                    .collect(),
+            sections.push(section(
+                "Pending requests",
+                list(
+                    self.snapshot
+                        .pending
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| pending_row(i, p))
+                        .collect(),
+                ),
             ));
         }
-
-        // Grants.
-        sections.push(heading("Grants", "heading"));
-        if self.snapshot.grants.is_empty() {
-            sections.push(muted_text(
-                "No grants yet — an agent must be allowed before it can read.",
-            ));
-        } else {
-            sections.push(list(
+        sections.push(section(
+            "Grants",
+            if self.snapshot.grants.is_empty() {
+                muted_text("No grants yet — an agent must be allowed before it can read.")
+            } else {
+                list(
+                    self.snapshot
+                        .grants
+                        .iter()
+                        .enumerate()
+                        .map(|(i, g)| grant_row(i, g))
+                        .collect(),
+                )
+            },
+        ));
+        sections.push(section(
+            "Datasources",
+            list(
                 self.snapshot
-                    .grants
+                    .datasources
                     .iter()
-                    .enumerate()
-                    .map(|(i, g)| grant_row(i, g))
+                    .map(datasource_row)
                     .collect(),
-            ));
-        }
-
-        // Datasources.
-        sections.push(heading("Datasources", "heading"));
-        sections.push(list(
-            self.snapshot
-                .datasources
-                .iter()
-                .map(datasource_row)
-                .collect(),
+            ),
+        ));
+        sections.push(section(
+            "Sessions",
+            if self.snapshot.tokens.is_empty() {
+                muted_text("No active sessions.")
+            } else {
+                list(
+                    self.snapshot
+                        .tokens
+                        .iter()
+                        .map(|t| token_row(t, self.now_unix))
+                        .collect(),
+                )
+            },
+        ));
+        sections.push(section(
+            "Recent activity",
+            if self.snapshot.audit.is_empty() {
+                muted_text("No requests yet.")
+            } else {
+                list(
+                    self.snapshot
+                        .audit
+                        .iter()
+                        .map(|a| audit_row(a, self.now_unix))
+                        .collect(),
+                )
+            },
         ));
 
-        // Live sessions (tokens).
-        sections.push(heading("Sessions", "heading"));
-        if self.snapshot.tokens.is_empty() {
-            sections.push(muted_text("No active sessions."));
-        } else {
-            sections.push(list(
-                self.snapshot
-                    .tokens
-                    .iter()
-                    .map(|t| token_row(t, self.now_unix))
-                    .collect(),
-            ));
-        }
-
-        // Recent activity (audit trail, newest first).
-        sections.push(heading("Recent activity", "heading"));
-        if self.snapshot.audit.is_empty() {
-            sections.push(muted_text("No requests yet."));
-        } else {
-            sections.push(list(
-                self.snapshot
-                    .audit
-                    .iter()
-                    .map(|a| audit_row(a, self.now_unix))
-                    .collect(),
-            ));
+        // Assemble: the panel title, then each section preceded by a divider so
+        // the sections read as distinct groups (and the title is set off from the
+        // first one).
+        let mut children = vec![label("Info broker", &["title-4"])];
+        for s in sections {
+            children.push(divider());
+            children.push(s);
         }
 
         Node::Box {
@@ -307,7 +331,7 @@ impl Infobroker {
             spacing: 8,
             scroll: true,
             classes: Vec::new(),
-            children: sections,
+            children,
         }
     }
 }
@@ -322,11 +346,8 @@ fn label(text: &str, classes: &[&str]) -> Node {
     }
 }
 
-fn heading(text: &str, class: &str) -> Node {
-    label(text, &[class])
-}
-
-/// A wrapping, muted status line (won't force the drawer wider).
+/// A wrapping, muted status line (won't force the drawer wider). Used for the
+/// empty-state line under a section header.
 fn muted_text(text: &str) -> Node {
     Node::Text {
         id: None,
@@ -346,6 +367,58 @@ fn list(children: Vec<Node>) -> Node {
     }
 }
 
+/// One topic **section**: an emphasized `heading` above its `body` (a boxed
+/// list, or a single muted line when empty), grouped tightly in a small-spacing
+/// vertical box so the header reads as belonging to the rows beneath it. Sections
+/// are separated by a [`divider`] in [`Infobroker::panel`].
+fn section(title: &str, body: Node) -> Node {
+    Node::Box {
+        id: None,
+        dir: Dir::Vertical,
+        spacing: 6,
+        scroll: false,
+        classes: Vec::new(),
+        children: vec![label(title, &["heading"]), body],
+    }
+}
+
+/// A hairline section divider (`gtk::Separator`).
+fn divider() -> Node {
+    Node::Separator {
+        classes: Vec::new(),
+    }
+}
+
+/// A two-line list row: an emphasized `title` over muted `subtitle` secondary
+/// text, with an optional right-pinned `trailing` node (a Revoke/Allow button or
+/// a status label). The stacked title/subtitle live in a small-spacing vertical
+/// box — a `Row`'s own inter-child spacing is 0, so folding several bare labels
+/// into one row rendered them concatenated (#500); the explicit box spaces the
+/// two lines, and single formatted strings carry any inline separators.
+fn action_row(title: &str, subtitle: &str, trailing: Option<Node>) -> Node {
+    let stack = Node::Box {
+        id: None,
+        dir: Dir::Vertical,
+        spacing: 2,
+        scroll: false,
+        classes: Vec::new(),
+        children: vec![
+            label(title, &["heading"]),
+            label(subtitle, &["dim-label", "caption"]),
+        ],
+    };
+    let mut children = vec![stack];
+    if let Some(t) = trailing {
+        children.push(Node::Spacer);
+        children.push(t);
+    }
+    Node::Row {
+        id: None,
+        classes: Vec::new(),
+        children,
+    }
+}
+
 /// A small labelled button (`id` carries the action, e.g. `revoke:0`).
 fn action_button(id: String, text: &str, classes: &[&str]) -> Node {
     Node::Button {
@@ -355,72 +428,76 @@ fn action_button(id: String, text: &str, classes: &[&str]) -> Node {
     }
 }
 
+/// A pending knock: `<agent>` over `wants <datasource>`, Allow right-pinned.
 fn pending_row(index: usize, p: &PendingView) -> Node {
-    Node::Row {
-        id: None,
-        classes: Vec::new(),
-        children: vec![
-            label(&format!("{} wants {}", p.agent, p.datasource), &[]),
-            Node::Spacer,
-            action_button(format!("allow:{index}"), "Allow", &["suggested-action"]),
-        ],
-    }
+    action_row(
+        &p.agent,
+        &format!("wants {}", p.datasource),
+        Some(action_button(
+            format!("allow:{index}"),
+            "Allow",
+            &["suggested-action"],
+        )),
+    )
 }
 
+/// A durable grant: `<agent>` over `<datasource> · <decision>`, Revoke
+/// right-pinned. The `datasource · decision` subtitle is one formatted string so
+/// its two fields stay legibly separated (they used to render as adjacent bare
+/// labels — "departuresalways").
 fn grant_row(index: usize, g: &GrantView) -> Node {
-    Node::Row {
-        id: None,
-        classes: Vec::new(),
-        children: vec![
-            label(&g.agent, &["heading"]),
-            label(&g.datasource, &["dim-label"]),
-            label(g.decision, &["dim-label", "numeric"]),
-            Node::Spacer,
-            action_button(format!("revoke:{index}"), "Revoke", &["destructive-action"]),
-        ],
-    }
+    action_row(
+        &g.agent,
+        &format!("{} · {}", g.datasource, g.decision),
+        Some(action_button(
+            format!("revoke:{index}"),
+            "Revoke",
+            &["destructive-action"],
+        )),
+    )
 }
 
+/// A datasource: `<name>` over its muted `<status>` (e.g. `station 900192001`).
 fn datasource_row(d: &DatasourceView) -> Node {
-    Node::Row {
-        id: None,
-        classes: Vec::new(),
-        children: vec![
-            label(&d.name, &["heading"]),
-            Node::Spacer,
-            label(&d.status, &["dim-label"]),
-        ],
-    }
+    action_row(&d.name, &d.status, None)
 }
 
+/// A live session token: `<agent>` over `expires in <label>`.
 fn token_row(t: &TokenView, now_unix: i64) -> Node {
-    Node::Row {
-        id: None,
-        classes: Vec::new(),
-        children: vec![
-            label(&t.agent, &["heading"]),
-            Node::Spacer,
-            label(
-                &format!("expires in {}", expires_label(now_unix, t.expires_unix)),
-                &["dim-label"],
-            ),
-        ],
-    }
+    action_row(
+        &t.agent,
+        &format!("expires in {}", expires_label(now_unix, t.expires_unix)),
+        None,
+    )
 }
 
+/// One audit-trail entry: a colored `granted`/`denied` tag and the
+/// `<agent> · <resource>` it applied to on one spaced line, with the relative
+/// timestamp right-pinned and muted. The outcome tag and the target sit in a
+/// small-spacing horizontal box so they don't concatenate ("grantedfnord").
 fn audit_row(a: &AuditView, now_unix: i64) -> Node {
     let outcome_class = match a.outcome {
         Outcome::Granted => "success",
         Outcome::Denied => "warning",
     };
+    let head = Node::Box {
+        id: None,
+        dir: Dir::Horizontal,
+        spacing: 6,
+        scroll: false,
+        classes: Vec::new(),
+        children: vec![
+            label(a.outcome.label(), &[outcome_class, "caption-heading"]),
+            label(&format!("{} · {}", a.agent, a.resource), &[]),
+        ],
+    };
     Node::Row {
         id: None,
         classes: Vec::new(),
         children: vec![
-            label(a.outcome.label(), &[outcome_class]),
-            label(&format!("{} · {}", a.agent, a.resource), &[]),
+            head,
             Node::Spacer,
-            label(&ago_label(now_unix, a.at_unix), &["dim-label"]),
+            label(&ago_label(now_unix, a.at_unix), &["dim-label", "caption"]),
         ],
     }
 }
@@ -730,11 +807,77 @@ mod tests {
             panic!("chip is a Button");
         };
         assert_eq!(id, CHIP_ID);
-        // The panel exists and leads with the title heading.
+        // The panel exists and leads with the title heading, then a divider +
+        // the first section (the #500 grouped-section layout).
         let panel = panel.expect("the plugin defines a panel");
         let Node::Box { children, .. } = panel else {
             panic!("panel root is a Box");
         };
         assert!(matches!(&children[0], Node::Label { text, .. } if text == "Info broker"));
+        assert!(
+            matches!(&children[1], Node::Separator { .. }),
+            "sections are set off by a divider"
+        );
+        assert!(
+            matches!(&children[2], Node::Box { .. }),
+            "each section is a grouped vertical box"
+        );
+    }
+
+    #[test]
+    fn grant_row_folds_datasource_and_decision_into_one_spaced_subtitle() {
+        // The #500 regression: three bare labels in a spacing-0 `Row` rendered
+        // concatenated ("fnorddeparturesalways"). Now the agent is the row title
+        // and "<datasource> · <decision>" is a single formatted subtitle string.
+        let g = GrantView {
+            agent: "fnord".to_owned(),
+            datasource: "departures".to_owned(),
+            decision: "always",
+        };
+        let Node::Row { children, .. } = grant_row(0, &g) else {
+            panic!("grant_row is a Row");
+        };
+        let Node::Box {
+            children: stack, ..
+        } = &children[0]
+        else {
+            panic!("row leads with the title/subtitle stack");
+        };
+        assert!(matches!(&stack[0], Node::Label { text, .. } if text == "fnord"));
+        assert!(
+            matches!(&stack[1], Node::Label { text, .. } if text == "departures · always"),
+            "datasource and decision are one spaced subtitle, not adjacent bare labels"
+        );
+        // Revoke stays right-pinned after a spacer.
+        assert!(matches!(&children[1], Node::Spacer));
+        assert!(matches!(&children[2], Node::Button { id, .. } if id == "revoke:0"));
+    }
+
+    #[test]
+    fn audit_row_spaces_the_outcome_tag_from_its_target() {
+        let a = AuditView {
+            at_unix: 1_750_000_000,
+            agent: "fnord".to_owned(),
+            resource: "departures".to_owned(),
+            outcome: Outcome::Granted,
+        };
+        let Node::Row { children, .. } = audit_row(&a, 1_750_000_000) else {
+            panic!("audit_row is a Row");
+        };
+        // The outcome tag + target share a spaced horizontal box (spacing > 0), so
+        // "granted" and "fnord · departures" can't concatenate ("grantedfnord").
+        let Node::Box {
+            spacing,
+            dir,
+            children: head,
+            ..
+        } = &children[0]
+        else {
+            panic!("audit head is a Box");
+        };
+        assert_eq!(*dir, Dir::Horizontal);
+        assert!(*spacing > 0, "the outcome tag is spaced off its target");
+        assert!(matches!(&head[0], Node::Label { text, .. } if text == "granted"));
+        assert!(matches!(&head[1], Node::Label { text, .. } if text == "fnord · departures"));
     }
 }

@@ -30,6 +30,13 @@
 //! (walking nothing) while the panel is hidden and resumes — taking a fresh
 //! sample immediately — when it reappears (#50, item 5 of #42).
 //!
+//! # Battery-aware cadence
+//!
+//! Independent of panel-gating, the poll period itself stretches from
+//! [`POLL`] to [`BATTERY_POLL`] (4x) while [`crate::upower::on_battery`]
+//! reports the system on battery power — the heaviest of the always-on
+//! pollers gets the biggest cadence cut (#505).
+//!
 //! # Public API
 //!
 //! ```ignore
@@ -53,10 +60,32 @@ const PAGE_SIZE: u64 = 4096;
 /// Rows kept in each list.
 const TOP_N: usize = 6;
 
-/// Poll period. Heavier than the aggregate `sensors` reads (2 files per PID),
-/// so it runs at half that cadence; it's additionally gated to "Stats panel
-/// visible" via [`set_active`] so it idles entirely when no one's looking.
+/// Poll period on AC power. Heavier than the aggregate `sensors` reads (2
+/// files per PID), so it runs at half that cadence; it's additionally gated
+/// to "Stats panel visible" via [`set_active`] so it idles entirely when no
+/// one's looking.
 const POLL: Duration = Duration::from_secs(2);
+
+/// Poll period on battery power: 4x AC. This is the priciest of the
+/// always-on pollers (a full `/proc` walk — two file reads per PID), so it
+/// gets the biggest stretch in the battery-aware sweep (#505).
+const BATTERY_POLL: Duration = Duration::from_secs(8);
+
+/// Battery-aware poll cadence: [`BATTERY_POLL`] while on battery power, else
+/// [`POLL`]. Pure so the on-battery → interval mapping is unit-testable.
+fn cadence(on_battery: bool) -> Duration {
+    if on_battery { BATTERY_POLL } else { POLL }
+}
+
+/// Best-effort on-battery snapshot, read directly off `upower`'s registered
+/// handle rather than the panicking `upower::on_battery()` accessor — see the
+/// identical helper (and rationale) in `crate::netconn` (#505).
+fn on_battery() -> bool {
+    registry::with(|r| {
+        r.get::<crate::upower::UpowerHandles>()
+            .is_some_and(|h| h.on_battery.get())
+    })
+}
 
 /// Synthetic group key for all pids that don't belong to a recognised app scope
 /// or systemd service.
@@ -229,7 +258,7 @@ async fn poll_loop(
             Err(e) => {
                 tracing::warn!(error = %e, "app_usage: /proc sample task failed");
                 tokio::select! {
-                    () = tokio::time::sleep(POLL) => {}
+                    () = tokio::time::sleep(cadence(on_battery())) => {}
                     _ = active.signal().wait_for(false) => {}
                 }
                 continue;
@@ -241,11 +270,11 @@ async fn poll_loop(
 
         prev_pid = sample.cur_pid;
         prev_total = sample.total_now;
-        // Sleep the inter-sample interval, but bail out early if we get gated
-        // inactive mid-wait — no point holding the timer when parked. The
-        // top-of-loop park then handles the resume edge.
+        // Sleep the battery-aware inter-sample interval, but bail out early if
+        // we get gated inactive mid-wait — no point holding the timer when
+        // parked. The top-of-loop park then handles the resume edge.
         tokio::select! {
-            () = tokio::time::sleep(POLL) => {}
+            () = tokio::time::sleep(cadence(on_battery())) => {}
             _ = active.signal().wait_for(false) => {}
         }
     }
@@ -632,6 +661,19 @@ fn parse_total_cpu(text: &str) -> u64 {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    // ── Battery-aware cadence (#505) ─────────────────────────────────────────
+
+    #[test]
+    fn cadence_is_poll_on_ac() {
+        assert_eq!(cadence(false), POLL);
+    }
+
+    #[test]
+    fn cadence_stretches_on_battery() {
+        assert_eq!(cadence(true), BATTERY_POLL);
+        assert!(BATTERY_POLL > POLL);
+    }
 
     // ── cgroup / scope-leaf parsing ──────────────────────────────────────────
 

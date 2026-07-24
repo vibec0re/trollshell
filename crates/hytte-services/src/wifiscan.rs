@@ -11,9 +11,13 @@
 //! changes — and the neighbours discriminate between places even when your own
 //! SSID is deployed everywhere.
 //!
-//! `NetworkManager` scans on its own cadence; we re-read every [`SCAN_INTERVAL`]
-//! (the visible set only changes when you physically move, so a leisurely poll
-//! is plenty).
+//! `NetworkManager` scans on its own cadence; we re-read every
+//! [`SCAN_INTERVAL`] on AC power, stretched to [`BATTERY_SCAN_INTERVAL`] (3x)
+//! on battery (#505) — the visible set only changes when you physically move,
+//! so a leisurely poll is plenty either way. The wait is checked in
+//! [`RECHECK`]-sized steps rather than one fixed `tokio::time::interval`, so a
+//! power-state flip mid-wait is honoured within a few seconds instead of only
+//! on the next cycle.
 //!
 //! Published via [`current`] (registry signal, GTK thread) and [`shared_aps`]
 //! (a process-global clone) so the `places` resolver's tokio task can read it
@@ -35,8 +39,61 @@ const WIRELESS_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 
-/// Re-read cadence. Location changes at building scale, so this is leisurely.
+/// Re-read cadence on AC power. Location changes at building scale, so this
+/// is leisurely.
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Re-read cadence on battery power: 3x AC (#505).
+const BATTERY_SCAN_INTERVAL: Duration = Duration::from_secs(90);
+
+/// How often [`wait_cadence`] re-checks the target cadence against elapsed
+/// wait time. Small relative to [`SCAN_INTERVAL`] so a battery-state flip
+/// mid-wait is honoured promptly, without turning this into a busy poll (each
+/// recheck is a single in-memory read, no D-Bus I/O).
+const RECHECK: Duration = Duration::from_secs(5);
+
+/// Battery-aware re-scan cadence: [`BATTERY_SCAN_INTERVAL`] while on battery
+/// power, else [`SCAN_INTERVAL`]. Pure so the on-battery → interval mapping is
+/// unit-testable.
+fn cadence(on_battery: bool) -> Duration {
+    if on_battery {
+        BATTERY_SCAN_INTERVAL
+    } else {
+        SCAN_INTERVAL
+    }
+}
+
+/// Best-effort on-battery snapshot, read directly off `upower`'s registered
+/// handle rather than the panicking `upower::on_battery()` accessor.
+///
+/// `main.rs` registers `wifiscan::service()` *before* `upower::service()`
+/// today, so calling the panicking accessor here would race upower's startup
+/// (this task is spawned — and may run — before `upower::service()`'s handles
+/// land in the registry). A direct snapshot read degrades to "assume AC"
+/// (`false`) until upower registers, then reflects the real value from then
+/// on (#505).
+fn on_battery() -> bool {
+    registry::with(|r| {
+        r.get::<crate::upower::UpowerHandles>()
+            .is_some_and(|h| h.on_battery.get())
+    })
+}
+
+/// Wait out the current battery-aware cadence, re-checking every [`RECHECK`]
+/// so a mid-wait power-state flip shortens or lengthens the remaining wait
+/// instead of only taking effect on the next cycle.
+async fn wait_cadence() {
+    let mut waited = Duration::ZERO;
+    loop {
+        let target = cadence(on_battery());
+        if waited >= target {
+            return;
+        }
+        let step = RECHECK.min(target.saturating_sub(waited));
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+}
 
 /// One visible network: its SSID and the strongest signal it's been seen at. A
 /// mesh broadcasting one SSID from several APs collapses to a single entry —
@@ -131,10 +188,10 @@ pub fn format_scan_block(aps: &[AccessPoint]) -> String {
 }
 
 async fn scan_loop(aps: Mutable<Vec<AccessPoint>>) {
-    let mut tick = tokio::time::interval(SCAN_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First iteration scans immediately (mirrors `tokio::time::interval`'s
+    // instant first tick — the loop used before #505), then waits the
+    // battery-aware cadence between reads. See `wait_cadence`.
     loop {
-        tick.tick().await;
         match collect_aps(false).await {
             Ok(list) => {
                 if aps.get_cloned() != list {
@@ -145,6 +202,7 @@ async fn scan_loop(aps: Mutable<Vec<AccessPoint>>) {
                 tracing::debug!(error = %e, "wifiscan: read failed (NetworkManager absent?)");
             }
         }
+        wait_cadence().await;
     }
 }
 
@@ -280,6 +338,19 @@ mod tests {
         p.insert("Ssid".to_string(), owned(Value::from(ssid.to_vec())));
         p.insert("Strength".to_string(), owned(Value::from(strength)));
         p
+    }
+
+    // ── Battery-aware cadence (#505) ─────────────────────────────────────────
+
+    #[test]
+    fn cadence_is_scan_interval_on_ac() {
+        assert_eq!(cadence(false), SCAN_INTERVAL);
+    }
+
+    #[test]
+    fn cadence_stretches_on_battery() {
+        assert_eq!(cadence(true), BATTERY_SCAN_INTERVAL);
+        assert!(BATTERY_SCAN_INTERVAL > SCAN_INTERVAL);
     }
 
     #[test]

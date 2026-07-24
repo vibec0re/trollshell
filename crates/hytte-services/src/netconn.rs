@@ -9,8 +9,8 @@
 //! Failures (`ss` missing, parse error) log once and the signal stays
 //! at its last known value.
 
-use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, gated_poll, registry, spawn_supervised};
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_reactive::{Service, registry, spawn_supervised};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -188,14 +188,63 @@ impl Service for NetconnService {
     }
 }
 
-async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
-    // Park while gated inactive, sample `ss` every 2s, and dedup-by-ref before
-    // publishing — all handled by `gated_poll`. `None` (ss missing / failed)
-    // keeps the last-known list. See the `active` field doc on `NetconnHandles`.
-    gated_poll(active, Duration::from_secs(2), writer, || async {
-        run_ss().await.map(|out| parse_ss_output(&out))
+/// Poll interval on AC power.
+const POLL: Duration = Duration::from_secs(2);
+
+/// Poll interval on battery: 3x AC. The connections list backs a panel that's
+/// rarely open, so trading a little freshness for fewer `ss` wakeups is
+/// basically free (#505).
+const BATTERY_POLL: Duration = Duration::from_secs(6);
+
+/// Battery-aware poll cadence: [`BATTERY_POLL`] while on battery power, else
+/// [`POLL`]. Pure so the on-battery → interval mapping is unit-testable.
+fn cadence(on_battery: bool) -> Duration {
+    if on_battery { BATTERY_POLL } else { POLL }
+}
+
+/// Best-effort on-battery snapshot, read directly off `upower`'s registered
+/// handle rather than the panicking `upower::on_battery()` accessor.
+///
+/// `netconn::service()` happens to register after `upower::service()` in
+/// `main.rs` today, but this poller shouldn't depend on that ordering — a
+/// snapshot read degrades to "assume AC" (`false`) if upower isn't registered
+/// yet, rather than panicking, and starts reflecting the real value the
+/// moment it is (#505).
+fn on_battery() -> bool {
+    registry::with(|r| {
+        r.get::<crate::upower::UpowerHandles>()
+            .is_some_and(|h| h.on_battery.get())
     })
-    .await;
+}
+
+async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
+    // Park while gated inactive (mirrors `gated_poll`'s shape — see
+    // `hytte_reactive::gated_poll` — but inlined so the inter-sample sleep
+    // can use a battery-aware duration that `gated_poll`'s fixed `Duration`
+    // parameter can't express). `None` (ss missing / failed) keeps the
+    // last-known list. See the `active` field doc on `NetconnHandles`.
+    loop {
+        if !active.get() {
+            let _ = active.signal().wait_for(true).await;
+        }
+
+        if let Some(next) = run_ss().await.map(|out| parse_ss_output(&out)) {
+            // Dedup by reference: only write (and re-fire the signal) when the
+            // sample actually differs from what's currently published.
+            let changed = *writer.lock_ref() != next;
+            if changed {
+                writer.set(next);
+            }
+        }
+
+        // Sleep the battery-aware inter-sample interval, but bail out early if
+        // we get gated inactive mid-wait — no point holding the timer when
+        // parked. The top-of-loop park then handles the resume edge.
+        tokio::select! {
+            () = tokio::time::sleep(cadence(on_battery())) => {}
+            _ = active.signal().wait_for(false) => {}
+        }
+    }
 }
 
 async fn run_ss() -> Option<String> {
@@ -303,6 +352,19 @@ mod tests {
         assert!(parse_ss_line("").is_none());
         assert!(parse_ss_line("just one column").is_none());
         assert!(parse_ss_line("ipv9 ESTAB 0 0 a:1 b:2").is_none());
+    }
+
+    // ── Battery-aware cadence (#505) ─────────────────────────────────────────
+
+    #[test]
+    fn cadence_is_poll_on_ac() {
+        assert_eq!(cadence(false), POLL);
+    }
+
+    #[test]
+    fn cadence_stretches_on_battery() {
+        assert_eq!(cadence(true), BATTERY_POLL);
+        assert!(BATTERY_POLL > POLL);
     }
 
     #[test]

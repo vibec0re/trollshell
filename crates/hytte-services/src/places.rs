@@ -48,10 +48,59 @@ use crate::wifiscan::{self, AccessPoint};
 /// Config file under `~/.config/trollshell/`.
 const CONFIG_FILE: &str = "places.toml";
 
-/// How often the running shell re-checks `places.toml` for live reload. Each
-/// tick is a single `stat` on a cached inode, so it stays snappy while you edit
-/// with no measurable idle cost; the file is only re-read when the mtime moves.
+/// How often the running shell re-checks `places.toml` for live reload on AC
+/// power. Each tick is a single `stat` on a cached inode, so it stays snappy
+/// while you edit with no measurable idle cost; the file is only re-read when
+/// the mtime moves.
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Re-check cadence on battery power: 3x AC (#505). The `stat` is nearly free
+/// either way, but it's still a wakeup, and config edits are rare enough that
+/// a slower catch-up on battery goes unnoticed.
+const BATTERY_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(9);
+
+/// How often [`wait_cadence`] re-checks the target cadence against elapsed
+/// wait time — see the identical rationale on `crate::wifiscan::RECHECK`.
+const RECHECK: Duration = Duration::from_secs(1);
+
+/// Battery-aware config re-check cadence: [`BATTERY_CONFIG_POLL_INTERVAL`]
+/// while on battery power, else [`CONFIG_POLL_INTERVAL`]. Pure so the
+/// on-battery → interval mapping is unit-testable.
+fn cadence(on_battery: bool) -> Duration {
+    if on_battery {
+        BATTERY_CONFIG_POLL_INTERVAL
+    } else {
+        CONFIG_POLL_INTERVAL
+    }
+}
+
+/// Best-effort on-battery snapshot, read directly off `upower`'s registered
+/// handle rather than the panicking `upower::on_battery()` accessor — `places`
+/// registers before `upower` in `main.rs`, so this task may start (and run)
+/// before upower's handles land in the registry. See the identical helper
+/// (and full rationale) in `crate::wifiscan` (#505).
+fn on_battery() -> bool {
+    registry::with(|r| {
+        r.get::<crate::upower::UpowerHandles>()
+            .is_some_and(|h| h.on_battery.get())
+    })
+}
+
+/// Wait out the current battery-aware cadence, re-checking every [`RECHECK`]
+/// so a mid-wait power-state flip shortens or lengthens the remaining wait
+/// instead of only taking effect on the next cycle.
+async fn wait_cadence() {
+    let mut waited = Duration::ZERO;
+    loop {
+        let target = cadence(on_battery());
+        if waited >= target {
+            return;
+        }
+        let step = RECHECK.min(target.saturating_sub(waited));
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+}
 
 /// Documented default, written on first run and used as the fallback for a
 /// missing/empty/malformed config. Kept *as TOML* so the loader has one parse
@@ -541,15 +590,14 @@ pub fn shared_location() -> Option<Mutable<LocationState>> {
 }
 
 /// Poll `places.toml` and republish the parsed list when it changes, so config
-/// edits take effect within [`CONFIG_POLL_INTERVAL`] without restarting the
+/// edits take effect within [`CONFIG_POLL_INTERVAL`] (or
+/// [`BATTERY_CONFIG_POLL_INTERVAL`] on battery — #505) without restarting the
 /// shell. [`resolve_loop`] subscribes to the same handle and re-resolves on
 /// each swap, exactly as it does for the Wi-Fi and `GeoClue` sensors.
 async fn watch_config(places: Mutable<Arc<Vec<Place>>>) {
     let mut watcher = ConfigWatcher::new();
-    let mut tick = tokio::time::interval(CONFIG_POLL_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tick.tick().await;
+        wait_cadence().await;
         let current = places.get_cloned();
         if let Some(reloaded) = watcher.poll(&current) {
             warn_unsatisfiable_fingerprints(&reloaded);
@@ -711,6 +759,19 @@ mod tests {
             lines: Vec::new(),
             directions: Vec::new(),
         }
+    }
+
+    // ── Battery-aware cadence (#505) ─────────────────────────────────────────
+
+    #[test]
+    fn cadence_is_config_poll_interval_on_ac() {
+        assert_eq!(cadence(false), CONFIG_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn cadence_stretches_on_battery() {
+        assert_eq!(cadence(true), BATTERY_CONFIG_POLL_INTERVAL);
+        assert!(BATTERY_CONFIG_POLL_INTERVAL > CONFIG_POLL_INTERVAL);
     }
 
     // ── Config ─────────────────────────────────────────────────────────────

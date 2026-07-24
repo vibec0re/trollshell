@@ -223,7 +223,29 @@ self:
                 Environment variables passed to the plugin binary — the
                 config idiom the bundled plugins already use (PET_NAME,
                 PET_LLM_MODEL, …; see etc/systemd/user/trollshell-plugin-pet.service).
-                Values must be strings.
+                Values must be strings. Do NOT put API keys here — the file is
+                world-readable; use `secrets` (below) instead.
+              '';
+            };
+
+            secrets = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "openrouter" ];
+              description = ''
+                AI-provider key *slots* to inject into this plugin at launch
+                (#392). For each slot the shell reads the key stored in your
+                login keyring — managed by the control-center's AI Keys tab,
+                never written to disk or this config — and passes it to the
+                plugin as the `<SLOT>_API_KEY` environment variable (e.g.
+                "openrouter" → OPENROUTER_API_KEY), which is exactly the
+                override hytte-ai-providers' `load_key` reads first. So an
+                LLM-backed plugin picks the key up with no per-plugin config:
+                `plugins.pet.secrets = [ "openrouter" ];`. A slot with no
+                stored key is simply skipped (the plugin runs keyless and uses
+                its own fallback); a plugin that doesn't list a slot never gets
+                that key in its environment. Rotating a key in the
+                control-center relaunches the running plugins that declare it.
               '';
             };
           };

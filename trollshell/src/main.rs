@@ -9,6 +9,7 @@ mod panels;
 mod plugin_launcher;
 mod plugins;
 mod scale;
+mod secrets;
 mod widgets;
 
 use std::cell::RefCell;

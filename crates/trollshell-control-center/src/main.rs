@@ -12,10 +12,12 @@
 //! answered `Ping`/`Version`. The **Place** tab (#391) manages the location that
 //! feeds the weather widget — automatic (`GeoClue`) vs. a manual, forward-geocoded
 //! city. The **Plugins** tab (#348) lists each `trollshell-plugin-<id>` systemd
-//! **user** unit with a switch that starts/enables or stops/disables it. Both
-//! round-trip over `Control`. The remaining tabs (AI Keys · Display) are still
-//! "coming soon" `StatusPage` stubs, each its own follow-up issue. When the shell
-//! isn't running the app degrades gracefully rather than panicking.
+//! **user** unit with a switch that starts/enables or stops/disables it. The
+//! **AI Keys** tab (#392) stores the LLM-backed plugins' API keys in the login
+//! keyring (gnome-keyring/libsecret) — never on disk — and rotates them. All
+//! round-trip over `Control`. The remaining **Display** tab (#393) is still a
+//! "coming soon" `StatusPage` stub. When the shell isn't running the app
+//! degrades gracefully rather than panicking.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -60,19 +62,21 @@ fn build_window(app: &adw::Application) {
         "Place",
         "mark-location-symbolic",
     );
-    add_placeholder(
-        &stack,
-        "ai-keys",
+    // The AI Keys tab (#392): store/rotate the LLM-backed plugins' API keys in
+    // the login keyring, round-tripped over Control.
+    let ai_keys_page = build_ai_keys_page();
+    stack.add_titled_with_icon(
+        &ai_keys_page,
+        Some("ai-keys"),
         "AI Keys",
         "dialog-password-symbolic",
-        "Store and rotate API keys for the LLM-backed plugins. Coming soon (#393).",
     );
     add_placeholder(
         &stack,
         "display",
         "Display",
         "video-display-symbolic",
-        "Arrange monitors, resolution, and scaling. Coming soon (#392).",
+        "Arrange monitors, resolution, and scaling. Coming soon (#393).",
     );
 
     let switcher = adw::ViewSwitcher::builder()
@@ -388,6 +392,174 @@ fn plugin_subtitle(active_state: &str, enabled: bool) -> String {
     };
     let persist = if enabled { "enabled" } else { "disabled" };
     format!("{status} · {persist}")
+}
+
+// ── AI Keys tab (#392) ─────────────────────────────────────────────────────
+
+/// The LLM providers the AI Keys tab manages, `(slot, label, help)`. The `slot`
+/// is the provider name the shell stores the key under and injects as
+/// `<SLOT>_API_KEY` at plugin launch — for `openrouter` that's
+/// `OPENROUTER_API_KEY`, exactly what the pet and caw plugins read. Add a row
+/// here to surface a new provider.
+const KNOWN_AI_PROVIDERS: &[(&str, &str, &str)] = &[(
+    "openrouter",
+    "OpenRouter",
+    "Cloud LLM used by the pet and caw plugins. Create a key at openrouter.ai.",
+)];
+
+/// Build the **AI Keys** tab: one password-entry row per known provider. Each
+/// row stores a key in the shell's keyring (`SetAiKey` over `Control`) and shows
+/// whether a key is currently stored (`ListAiKeys`) — the value itself is never
+/// read back. The apply button sets/updates the key (wiping the entry after, so
+/// the plaintext isn't retained in the widget); the trash button clears it. When
+/// the shell isn't running the calls fail and the rows show "Unavailable".
+fn build_ai_keys_page() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::builder()
+        .title("AI provider keys")
+        .description(
+            "API keys for the LLM-backed plugins, stored in your login keyring \
+             (gnome-keyring/libsecret) — never on disk or in config. A key is \
+             injected only into the plugins that declare it, and changing one \
+             relaunches those plugins.",
+        )
+        .build();
+
+    // (slot, entry, status label, clear button) per provider while building.
+    let mut built = Vec::new();
+    for (slot, label, help) in KNOWN_AI_PROVIDERS {
+        let entry = adw::PasswordEntryRow::builder()
+            .title(*label)
+            .show_apply_button(true)
+            .build();
+        entry.set_tooltip_text(Some(help));
+
+        let status_lbl = gtk::Label::new(Some("…"));
+        status_lbl.add_css_class("dim-label");
+        let clear_btn = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Clear the stored key")
+            .valign(gtk::Align::Center)
+            .sensitive(false)
+            .build();
+        clear_btn.add_css_class("flat");
+        entry.add_suffix(&status_lbl);
+        entry.add_suffix(&clear_btn);
+
+        group.add(&entry);
+        built.push((*slot, entry, status_lbl, clear_btn));
+    }
+    page.add(&group);
+
+    // Immutable shared (slot, status label, clear button) list for the refresh.
+    let status: Rc<Vec<(String, gtk::Label, gtk::Button)>> = Rc::new(
+        built
+            .iter()
+            .map(|(slot, _entry, lbl, btn)| ((*slot).to_owned(), lbl.clone(), btn.clone()))
+            .collect(),
+    );
+
+    for (slot, entry, _lbl, clear_btn) in built {
+        // Apply → SetAiKey, then wipe the entry (don't keep the plaintext) and
+        // re-read the stored-key status.
+        {
+            let (slot, status) = (slot.to_owned(), status.clone());
+            entry.connect_apply(move |e| {
+                let value = e.text().to_string();
+                if value.is_empty() {
+                    return;
+                }
+                let (e, slot, status) = (e.clone(), slot.clone(), status.clone());
+                spawn_on_runtime(set_ai_key(slot, value), move |res| {
+                    if let Err(err) = res {
+                        tracing::info!(%err, "SetAiKey failed");
+                    }
+                    e.set_text("");
+                    refresh_ai_status(&status);
+                });
+            });
+        }
+        // Clear → ClearAiKey, then re-read the status.
+        {
+            let (slot, status) = (slot.to_owned(), status.clone());
+            clear_btn.connect_clicked(move |_| {
+                let (slot, status) = (slot.clone(), status.clone());
+                spawn_on_runtime(clear_ai_key(slot), move |res| {
+                    if let Err(err) = res {
+                        tracing::info!(%err, "ClearAiKey failed");
+                    }
+                    refresh_ai_status(&status);
+                });
+            });
+        }
+    }
+
+    refresh_ai_status(&status);
+    page
+}
+
+/// Re-read which providers have a stored key (`ListAiKeys`) and reflect it into
+/// each row's status label + clear-button sensitivity. On failure (shell not
+/// running) every row shows "Unavailable".
+fn refresh_ai_status(rows: &Rc<Vec<(String, gtk::Label, gtk::Button)>>) {
+    let rows = rows.clone();
+    spawn_on_runtime(list_ai_keys(), move |res| match res {
+        Ok(slots) => {
+            let set: std::collections::HashSet<String> = slots.into_iter().collect();
+            for (slot, lbl, btn) in rows.iter() {
+                let has = set.contains(slot);
+                lbl.set_text(if has { "Key stored" } else { "No key set" });
+                btn.set_sensitive(has);
+            }
+        }
+        Err(err) => {
+            tracing::info!(%err, "ListAiKeys failed");
+            for (_slot, lbl, btn) in rows.iter() {
+                lbl.set_text("Unavailable");
+                btn.set_sensitive(false);
+            }
+        }
+    });
+}
+
+/// `ListAiKeys` → the provider slots that currently have a stored key. Values
+/// are never returned.
+async fn list_ai_keys() -> Result<Vec<String>, hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ListAiKeys")
+        .timeout(Duration::from_secs(3))
+        .retry(RetryPolicy::Never)
+        .send::<Vec<String>>()
+        .await
+}
+
+/// `SetAiKey(slot, value)`: store `value` as the key for `slot` in the shell's
+/// keyring (which then relaunches the plugins that use it).
+async fn set_ai_key(slot: String, value: String) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("SetAiKey")
+        .args((slot, value))
+        .timeout(Duration::from_secs(5))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
+        .await
+}
+
+/// `ClearAiKey(slot)`: delete the stored key for `slot`.
+async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(CONTROL_NAME)
+        .at_path(CONTROL_PATH)
+        .iface(CONTROL_IFACE)
+        .method("ClearAiKey")
+        .args((slot,))
+        .timeout(Duration::from_secs(5))
+        .retry(RetryPolicy::Never)
+        .send::<()>()
+        .await
 }
 
 /// Probe the running shell's control endpoint on the shared tokio runtime, then

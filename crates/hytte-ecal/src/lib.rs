@@ -752,26 +752,31 @@ unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
 /// Convert a borrowed `ICalTime*` to POSIX UTC seconds, or `None` if the
 /// pointer is null or libical reports it as the null-time sentinel.
 ///
-/// # Timezone handling (issue #388)
+/// # Timezone handling (issues #388, #522)
 ///
-/// `i_cal_time_as_timet_with_zone(tt, zone)` only consults `zone` when `tt` is
-/// **zone-less (floating)**; a UTC (`…Z`) or resolved-`TZID` time already
-/// carries its own absolute offset and ignores the argument. So passing the UTC
-/// singleton unconditionally silently reads a floating wall-clock time (e.g.
-/// `DTSTART:20260722T113000`) as **UTC**, shifting it by the viewer's offset on
-/// display (11:30 shown as 13:30 in CEST). We therefore split the cases:
+/// `i_cal_time_as_timet_with_zone(tt, zone)` treats `zone` as the **source**
+/// zone the wall-clock fields are expressed in, for any `tt` that is neither a
+/// DATE nor a UTC (`…Z`) value — it does **not** substitute the resolved zone a
+/// `TZID` time already carries. Passing the UTC singleton for every time (the
+/// pre-#388 behaviour) therefore reads *both* a floating time *and* a
+/// resolved-`TZID` time as UTC, shifting each by the viewer's offset on display
+/// (a 12:30 event shown as 14:30 in CEST). #388 fixed only the floating case;
+/// the `TZID` case stayed broken (#522). We split by what `tt` actually is:
 ///
 /// - **DATE (all-day):** keep the UTC anchor — the display side (`calendar`'s
 ///   `unix_to_local`) reinterprets the resulting midnight-UTC `time_t` as a
 ///   local calendar date, so this must stay midnight-UTC or the day would
-///   drift.
-/// - **UTC / own-zone (resolved `TZID`):** already absolute; the zone argument
-///   is ignored, so the UTC-argument call yields the correct instant unchanged.
+///   drift. The zone argument is immaterial for a DATE.
+/// - **Resolved zone (a `…Z` UTC time, or a `TZID` whose `VTIMEZONE` libical
+///   could resolve — registered on the component or a builtin like
+///   `Europe/Berlin`):** pass the time's **own** zone as the source, so libical
+///   converts *from* that zone to the absolute instant. A UTC time carries the
+///   UTC singleton as its own zone, so this is correct for it too (#522).
 /// - **Genuinely floating DATE-TIME:** interpret the wall-clock fields in the
-///   **local** system zone via chrono's `Local` (DST-correct), not UTC. This
-///   also covers a `TZID`'d time whose `VTIMEZONE` wasn't registered on the
-///   handle (libical then treats it as floating) — either way the local zone is
-///   the right fallback.
+///   **local** system zone via chrono's `Local` (DST-correct), not UTC (#388).
+///   This also covers a `TZID`'d time whose `VTIMEZONE` libical could not
+///   resolve (it then reports the time as floating) — the local zone is the
+///   right fallback for the viewer.
 ///
 /// # Safety
 ///
@@ -787,17 +792,52 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
 
     let is_date = unsafe { sys::i_cal_time_is_date(tt_const) } != 0;
     let is_utc = unsafe { sys::i_cal_time_is_utc(tt_const) } != 0;
-    let has_own_zone = !unsafe { sys::i_cal_time_get_timezone(tt_const) }.is_null();
+    let own_zone = unsafe { sys::i_cal_time_get_timezone(tt_const) };
+    let has_own_zone = !own_zone.is_null();
 
-    if is_date || is_utc || has_own_zone {
-        // DATE anchors to midnight-UTC by design; absolute times ignore the
-        // zone argument. Both correct with the UTC singleton.
+    if is_date {
+        // DATE anchors to midnight-UTC by design: the display side
+        // (`calendar`'s `unix_to_local`) reinterprets the resulting
+        // midnight-UTC `time_t` as a *local* calendar date, so this must stay
+        // midnight-UTC or the day would drift. The zone argument is irrelevant
+        // for a DATE (no time-of-day to shift) — pass the UTC singleton.
         let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
 
-    // Genuinely floating DATE-TIME: resolve its wall-clock fields in the local
-    // zone rather than assuming UTC.
+    if has_own_zone {
+        // Absolute DATE-TIME carrying a resolved zone — a `…Z` (UTC) time or
+        // one whose `TZID`'s `VTIMEZONE` libical could resolve (registered on
+        // the component, or a builtin like `Europe/Berlin`).
+        //
+        // `i_cal_time_as_timet_with_zone(tt, zone)` reads `zone` as the *source*
+        // zone the wall-clock is expressed in whenever `tt` is a non-DATE,
+        // non-UTC value — it does **not** substitute the time's own resolved
+        // zone (issue #522; the #388 fix wrongly assumed the argument was
+        // ignored for these). So the source zone MUST be the time's own zone:
+        // passing the UTC singleton instead reads the wall-clock as UTC, so a
+        // `TZID=Europe/Berlin` 12:30 becomes 12:30 UTC and displays as 14:30
+        // CEST — the +2h double-shift. A UTC (`…Z`) time carries the UTC
+        // singleton as its own zone, so this yields the correct instant for it
+        // unchanged.
+        return Some(unsafe {
+            sys::i_cal_time_as_timet_with_zone(tt_const, own_zone.cast_const())
+        });
+    }
+
+    if is_utc {
+        // A UTC-flagged time with no attached zone pointer (defensive: some
+        // libical values carry the `is_utc` bit without a zone object). It is
+        // already absolute — the UTC singleton is the correct source zone.
+        let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+        return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
+    }
+
+    // Genuinely floating DATE-TIME (no zone, not UTC): resolve its wall-clock
+    // fields in the local zone rather than assuming UTC (issue #388). Also
+    // covers a `TZID`'d time whose `VTIMEZONE` libical could not resolve (it
+    // then reports the time as floating) — the local zone is the right
+    // fallback for the viewer.
     unsafe { WallClock::from_ical(tt) }.to_local_unix()
 }
 
@@ -1252,6 +1292,120 @@ mod tests {
         };
         // Round-trips through a u32 without truncation.
         assert_eq!(err.domain, u32::MAX);
+    }
+
+    // ── Zoned (`TZID`) timezone (issue #522) ──────────────────────────────
+    //
+    // A DATE-TIME with a resolved `TZID` (or a `…Z` UTC value) is *absolute*:
+    // its instant is fixed regardless of the viewer's zone. It must be read in
+    // its own zone, not the UTC singleton, or a `TZID=Europe/Berlin` 12:30
+    // event lands at 12:30 UTC and displays as 14:30 CEST — the +2h double
+    // shift. These assert the exact absolute instant, so they are fully
+    // deterministic regardless of the test host's `TZ`.
+    //
+    // Every fixture carries its `VTIMEZONE` **inline** in the VCALENDAR (the
+    // shape a synced CalDAV/Google calendar delivers). libical computes the
+    // offset from the inline STANDARD/DAYLIGHT observances alone — it does NOT
+    // touch the system/`tzdata` zoneinfo — so the zone resolves even in a
+    // hermetic sandbox with no zoneinfo installed (the crane/nix test bucket).
+    // A fixture relying on libical's *builtin* `Europe/Berlin` lookup would
+    // instead be read as floating there (no zoneinfo to resolve), falling back
+    // to `Local` — which is UTC in a sandbox with no `/etc/localtime` — and so
+    // would spuriously reproduce the very +2h it means to guard against.
+
+    /// The whole of 2026 as a UTC-seconds window — brackets any 2026 event in
+    /// any viewer zone.
+    const Y2026_START: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+    const Y2026_END: i64 = 1_798_761_600; // 2027-01-01T00:00:00Z
+
+    /// An inline `Europe/Berlin` `VTIMEZONE` (CET/CEST DST rules). Self-
+    /// contained: libical derives the UTC offset from these observances without
+    /// consulting the host zoneinfo database.
+    const BERLIN_VTIMEZONE: &str = "BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\n\
+         BEGIN:DAYLIGHT\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nTZNAME:CEST\r\n\
+         DTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\n\
+         BEGIN:STANDARD\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\n\
+         DTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n\
+         END:VTIMEZONE\r\n";
+
+    /// 2026-07-24 12:30 in `Europe/Berlin` (CEST, UTC+2) is 10:30 UTC.
+    fn expected_1030_utc() -> i64 {
+        use chrono::{TimeZone as _, Utc};
+        Utc.with_ymd_and_hms(2026, 7, 24, 10, 30, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    /// Wrap `vevent_body` in a VCALENDAR that carries the inline Berlin
+    /// `VTIMEZONE`, so a `TZID=Europe/Berlin` inside it resolves self-contained.
+    fn berlin_calendar(vevent_body: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//hytte-ecal-test//\r\n{BERLIN_VTIMEZONE}BEGIN:VEVENT\r\n{vevent_body}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// A `DTSTART;TZID=Europe/Berlin:…123000` (12:30 CEST) must expand to the
+    /// absolute instant 10:30 UTC — not 12:30 UTC (the +2h double-shift, #522).
+    /// This is the core regression guard.
+    #[test]
+    fn tzid_datetime_resolves_to_own_zone_instant() {
+        use chrono::{TimeZone as _, Utc};
+
+        let ical = berlin_calendar(
+            "UID:tzid-1\r\nDTSTAMP:20260724T090000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
+             DTEND;TZID=Europe/Berlin:20260724T133000\r\nSUMMARY:Lunch\r\n",
+        );
+        let inst = super::expand_ical_for_test(&ical, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(inst.len(), 1);
+        assert!(!inst[0].all_day);
+        assert_eq!(
+            inst[0].start_unix,
+            expected_1030_utc(),
+            "TZID=Europe/Berlin 12:30 must resolve to 10:30 UTC (its own zone), not 12:30 UTC",
+        );
+        // Guard the exact +2h signature the bug produced (wall-clock read as UTC).
+        let bug_utc = Utc
+            .with_ymd_and_hms(2026, 7, 24, 12, 30, 0)
+            .unwrap()
+            .timestamp();
+        assert_ne!(
+            inst[0].start_unix, bug_utc,
+            "must not read the Berlin wall-clock as UTC (the #522 +2h shift)",
+        );
+    }
+
+    /// A `…Z` UTC value is unchanged by the fix: 10:30 UTC in, 10:30 UTC out.
+    /// (Control for the three-input table: UTC / TZID / floating.)
+    #[test]
+    fn utc_datetime_instant_unchanged() {
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:utc-1\r\n\
+                     DTSTAMP:20260724T090000Z\r\n\
+                     DTSTART:20260724T103000Z\r\nDTEND:20260724T113000Z\r\n\
+                     SUMMARY:Sync\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let inst = super::expand_ical_for_test(ical, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].start_unix, expected_1030_utc());
+    }
+
+    /// The recurrence iterator preserves the resolved zone: every occurrence of
+    /// a `TZID`'d daily series is absolute in its own zone. Guards the iterator
+    /// path (`i_cal_recur_iterator_*`), not just the single-occurrence path.
+    #[test]
+    fn tzid_recurring_occurrences_resolve_to_own_zone() {
+        let ical = berlin_calendar(
+            "UID:tzid-rec\r\nDTSTAMP:20260724T090000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
+             DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
+             RRULE:FREQ=DAILY;COUNT=3\r\nSUMMARY:Standup\r\n",
+        );
+        let inst = super::expand_ical_for_test(&ical, Y2026_START, Y2026_END).unwrap();
+        assert_eq!(inst.len(), 3);
+        // First occurrence at 10:30 UTC; each subsequent one a wall-clock day
+        // later (both days are CEST, so +86400s — no DST transition here).
+        assert_eq!(inst[0].start_unix, expected_1030_utc());
+        assert_eq!(inst[1].start_unix, expected_1030_utc() + 86_400);
+        assert_eq!(inst[2].start_unix, expected_1030_utc() + 2 * 86_400);
     }
 
     // ── Floating-time timezone (issue #388) ───────────────────────────────

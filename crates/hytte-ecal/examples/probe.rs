@@ -16,7 +16,11 @@
 //!   `recurring instance count: N`. It also seeds a second `COUNT=5` series
 //!   with an `EXDATE` cancelling one day and prints `exdate instance count: N`
 //!   plus `exdate cancelled occurrence present: <bool>`, so the nixosTest can
-//!   assert the cancelled occurrence is excluded (the #29 follow-up).
+//!   assert the cancelled occurrence is excluded (the #29 follow-up). Finally it
+//!   seeds a `DTSTART;TZID=Europe/Berlin:…123000` event and prints
+//!   `tzid instance start_unix: N`, so the nixosTest can assert the zoned time
+//!   resolves to its absolute instant (10:30 UTC), not the +2h double-shift
+//!   (issue #522).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -298,9 +302,77 @@ fn probe_calendar_recurrence(registry: &Registry) -> anyhow::Result<()> {
         );
     }
 
+    // Zoned-time expansion (#522): its own end-to-end round-trip on the same
+    // writable calendar.
+    probe_calendar_zoned_time(&client)?;
+
     client.remove(&uid, None)?;
     println!("removed recurring {uid}");
     client.remove(&exdate_uid, None)?;
     println!("removed exdate {exdate_uid}");
+    Ok(())
+}
+
+/// Seed a single-occurrence event with an explicit `TZID=Europe/Berlin`
+/// (carrying its `VTIMEZONE` inline, the shape a synced CalDAV/Google calendar
+/// delivers) on `client`, expand it, and report its absolute start_unix — the
+/// #522 regression guard.
+///
+/// 12:30 in CEST (UTC+2) is the absolute instant 10:30 UTC (start_unix
+/// 1784889000), regardless of the viewer's zone. The pre-fix conversion read
+/// the Berlin wall-clock as UTC, yielding 12:30 UTC (1784896200) which the
+/// display side then shifted to 14:30 CEST — a 12:30 event surfacing as 14:30.
+/// This drives the whole end-to-end path (create → EDS store →
+/// get_object_list → generate_instances → ical_time_to_unix) through a real
+/// backend, not just the hermetic string parser.
+fn probe_calendar_zoned_time(client: &CalClient) -> anyhow::Result<()> {
+    let ical_tzid = "\
+        BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//hytte-ecal-probe//\r\n\
+        BEGIN:VTIMEZONE\r\n\
+        TZID:Europe/Berlin\r\n\
+        BEGIN:DAYLIGHT\r\n\
+        TZOFFSETFROM:+0100\r\n\
+        TZOFFSETTO:+0200\r\n\
+        TZNAME:CEST\r\n\
+        DTSTART:19700329T020000\r\n\
+        RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\n\
+        END:DAYLIGHT\r\n\
+        BEGIN:STANDARD\r\n\
+        TZOFFSETFROM:+0200\r\n\
+        TZOFFSETTO:+0100\r\n\
+        TZNAME:CET\r\n\
+        DTSTART:19701025T030000\r\n\
+        RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\n\
+        END:STANDARD\r\n\
+        END:VTIMEZONE\r\n\
+        BEGIN:VEVENT\r\n\
+        UID:hytte-ecal-tzid-1\r\n\
+        DTSTAMP:20260724T090000Z\r\n\
+        DTSTART;TZID=Europe/Berlin:20260724T123000\r\n\
+        DTEND;TZID=Europe/Berlin:20260724T133000\r\n\
+        SUMMARY:Zoned lunch (Europe/Berlin)\r\n\
+        END:VEVENT\r\n\
+        END:VCALENDAR\r\n";
+
+    let tzid_uid = client.create_from_ical(ical_tzid)?;
+    println!("created tzid uid: {tzid_uid}");
+
+    // A window bracketing 2026-07-24.
+    let jul_start = 1_782_864_000; // 2026-07-01T00:00:00Z
+    let jul_end = 1_785_542_400; // 2026-08-01T00:00:00Z
+    let instances = client.generate_instances(jul_start, jul_end)?;
+    let tzid: Vec<_> = instances
+        .iter()
+        .filter(|i| i.ical.contains("hytte-ecal-tzid-1"))
+        .collect();
+    println!("tzid instance count: {}", tzid.len());
+    for inst in &tzid {
+        println!("tzid instance start_unix: {}", inst.start_unix);
+    }
+
+    client.remove(&tzid_uid, None)?;
+    println!("removed tzid {tzid_uid}");
     Ok(())
 }

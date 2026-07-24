@@ -32,17 +32,20 @@ pub use super::audio_native::{
 pub const SPECTRUM_BINS: usize = 16;
 
 /// One audio-reactive frame off the **default sink's monitor** (#405): a peak
-/// level plus a [`SPECTRUM_BINS`]-band magnitude split, low→high frequency, both
-/// normalized to `0.0..=1.0`. Produced ~20 Hz by the capture tap in
-/// [`super::audio_native`] and surfaced through [`audio_spectrum`]. GTK- and
-/// wire-free: the plugin host projects it onto the plugin proto's own
-/// `AudioSpectrum` before pushing it to subscribing plugins.
+/// level plus a [`SPECTRUM_BINS`]-band split, low→high frequency. Both fields are
+/// **perceptual dBFS levels** in `0.0..=1.0` (#504) — `1.0` at full scale,
+/// dropping to `0.0` ~48 dB below it — so a consumer maps them straight onto a
+/// bar that fills its height. Produced ~20 Hz by the capture tap in
+/// [`super::audio_native`] (see `spectrum::linear_to_level`) and surfaced through
+/// [`audio_spectrum`]. GTK- and wire-free: the plugin host projects it onto the
+/// plugin proto's own `AudioSpectrum` before pushing it to subscribing plugins.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AudioSpectrum {
-    /// Peak (max-abs) sample magnitude over the analysis window, `0.0..=1.0`.
+    /// Peak window level on a perceptual dBFS scale, `0.0..=1.0` (#504) — the
+    /// max-abs sample amplitude mapped through the shared dB curve.
     pub peak: f32,
-    /// Per-band normalized magnitude, index `0` = lowest frequency, each
-    /// `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
+    /// Per-band level on the same perceptual dBFS scale, index `0` = lowest
+    /// frequency, each `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
     pub bins: [f32; SPECTRUM_BINS],
 }
 

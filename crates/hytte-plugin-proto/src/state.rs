@@ -47,14 +47,17 @@ pub const SPECTRUM_BINS: usize = 16;
 /// [`StateKey::AudioSpectrum`](crate::manifest::StateKey::AudioSpectrum) as a
 /// [`HostMsg::AudioSpectrum`](crate::msg::HostMsg::AudioSpectrum) — **latest-wins**,
 /// so a plugin that renders slower than 20 Hz simply skips frames. Both values
-/// are already normalized to `0.0..=1.0` (a heuristic display gain, clamped), so
-/// a consumer maps them straight onto bar heights / needle angles without its
-/// own calibration.
+/// are **perceptual dBFS levels** in `0.0..=1.0` (#504): `1.0` at full scale,
+/// falling to `0.0` ~48 dB below it, on the same logarithmic taper
+/// `PipeWire`/`PulseAudio` show volume on. Human loudness is logarithmic, so a
+/// consumer maps a level straight onto a bar height / needle angle and it fills
+/// the range — a raw *linear* amplitude (the pre-#504 contract) crushed all but
+/// the loudest content into the bottom of the bar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AudioSpectrum {
-    /// Peak (max-abs) sample magnitude over the analysis window, `0.0..=1.0`.
+    /// Peak window level on a perceptual dBFS scale, `0.0..=1.0` (#504).
     pub peak: f32,
-    /// Per-band normalized magnitude, index `0` = lowest frequency band, each
-    /// `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
+    /// Per-band level on the same perceptual dBFS scale, index `0` = lowest
+    /// frequency band, each `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
     pub bins: [f32; SPECTRUM_BINS],
 }

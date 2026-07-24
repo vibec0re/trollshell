@@ -9,10 +9,17 @@
 //! not just a time-domain energy split — a pure tone lights the band that
 //! contains its frequency (see the tests).
 //!
-//! The one non-obvious knob is [`DISPLAY_GAIN`]: FFT band magnitudes are
-//! normalized so a full-scale tone reads ~0.25 per band; the gain lifts typical
-//! program material into a legible `0.0..=1.0` bar range and everything is
-//! clamped. It is a display heuristic, not a calibrated measurement.
+//! The one non-obvious knob is the **level scale** ([`linear_to_level`], #504):
+//! human loudness is logarithmic, so the linear amplitudes the FFT produces
+//! crush all but the loudest content into the bottom of a bar (this was the
+//! bug — the spectrum "didn't scale over its full height"). Instead of a linear
+//! display gain, both the [`AudioSpectrum::peak`] and each band are mapped onto
+//! `0.0..=1.0` on a **dBFS** scale: 0 dBFS (full scale) tops the bar and
+//! [`DB_RANGE`] dB below it empties the bar, linear in between. This is the same
+//! perceptual (not linear) taper `PipeWire`/`PulseAudio` show volume on, so a
+//! consumer still maps the value straight onto a bar height — it just fills the
+//! height now. The mapping is a display calibration, not an absolute-SPL
+//! measurement.
 
 use std::f32::consts::PI;
 
@@ -30,9 +37,35 @@ const FFT_SIZE: usize = 2048;
 /// Sample rate assumed until the stream's `param_changed` reports the real one.
 const DEFAULT_RATE: u32 = 48_000;
 
-/// Heuristic display gain applied to each normalized band magnitude before the
-/// `0.0..=1.0` clamp (see the module docs).
-const DISPLAY_GAIN: f32 = 6.0;
+/// Peak FFT-bin magnitude — after the `1/N` normalization in [`analyze_window`]
+/// — of a Hann-windowed **full-scale sine**, i.e. the loudest a single band can
+/// read. Dividing a band's normalized magnitude by this puts a full-scale tone
+/// at `1.0` (0 dBFS), so [`linear_to_level`] can map bands and
+/// [`AudioSpectrum::peak`] on one shared dBFS scale. Derived analytically (½ per
+/// exponential of the sine × ½ mean Hann gain = ¼) and pinned by
+/// [`tests::full_scale_tone_reads_unity`].
+const FULLSCALE_TONE_MAG: f32 = 0.25;
+
+/// Visible dynamic range, in dB: content from `-DB_RANGE` dBFS up to 0 dBFS
+/// (full scale) maps linearly onto an empty→full bar; anything quieter reads
+/// empty. 48 dB (~8 bits) keeps quiet passages moving without lifting the noise
+/// floor off the baseline. Tunable — it is the one calibration knob left.
+const DB_RANGE: f32 = 48.0;
+
+/// Map a linear amplitude/magnitude where `1.0` == full scale (0 dBFS) onto a
+/// perceptual `0.0..=1.0` **level** via dBFS, linear between `-`[`DB_RANGE`] and
+/// 0 dB and clamped outside it. This is the #504 fix: human loudness is
+/// logarithmic, so the pre-#504 linear mapping crushed all but the loudest
+/// content into the bottom of the bar. dB spreads it across the full height —
+/// the same perceptual taper `PipeWire`/`PulseAudio` use for volume. `0.0` (and
+/// any non-positive input) floors to an empty bar.
+fn linear_to_level(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * x.log10(); // ≤ 0 dB for x ≤ 1 (full scale)
+    (1.0 + db / DB_RANGE).clamp(0.0, 1.0)
+}
 
 /// `usize` → `f32` for DSP index/length math. Every value here is bounded by
 /// [`FFT_SIZE`] (2048), far below f32's 2^24 exact-integer limit, so no
@@ -143,7 +176,9 @@ fn analyze_window(window: &[f32], _rate: u32) -> AudioSpectrum {
     let n = window.len();
     debug_assert!(n.is_power_of_two(), "FFT window must be a power of two");
 
-    let peak = window.iter().fold(0.0_f32, |m, &s| m.max(s.abs())).min(1.0);
+    // Time-domain peak amplitude → a perceptual dBFS level (#504).
+    let peak_amp = window.iter().fold(0.0_f32, |m, &s| m.max(s.abs())).min(1.0);
+    let peak = linear_to_level(peak_amp);
 
     let mut re = vec![0.0_f32; n];
     let mut im = vec![0.0_f32; n];
@@ -162,7 +197,10 @@ fn analyze_window(window: &[f32], _rate: u32) -> AudioSpectrum {
             let mag = (re[k] * re[k] + im[k] * im[k]).sqrt();
             peak_mag = peak_mag.max(mag);
         }
-        *slot = (peak_mag * norm * DISPLAY_GAIN).clamp(0.0, 1.0);
+        // Normalize so a full-scale tone in this band reads 1.0 (0 dBFS), then
+        // map onto the shared perceptual dBFS level (#504).
+        let band_full_scale = peak_mag * norm / FULLSCALE_TONE_MAG;
+        *slot = linear_to_level(band_full_scale);
     }
 
     AudioSpectrum { peak, bins }
@@ -244,8 +282,20 @@ impl SpectrumUserData {
 #[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::{
-        Analyzer, DEFAULT_RATE, FFT_SIZE, PI, SPECTRUM_BINS, analyze_window, band_bins, fft,
+        Analyzer, DB_RANGE, DEFAULT_RATE, FFT_SIZE, PI, SPECTRUM_BINS, analyze_window, band_bins,
+        fft, linear_to_level,
     };
+
+    /// The linear amplitude that sits exactly `db` dBFS below full scale.
+    fn amp_at_dbfs(db: f32) -> f32 {
+        10.0_f32.powf(db / 20.0)
+    }
+
+    /// A frequency landing exactly on FFT bin `k` at the default rate — no
+    /// scalloping loss, so a full-scale tone there reads its coherent peak.
+    fn bin_centered_freq(k: usize) -> f32 {
+        k as f32 * DEFAULT_RATE as f32 / FFT_SIZE as f32
+    }
 
     /// Build one interleaved little-endian f32 byte chunk from mono samples
     /// duplicated across `channels`.
@@ -290,12 +340,83 @@ mod tests {
     fn peak_tracks_amplitude() {
         let window = sine_window(1000.0, 0.5, DEFAULT_RATE);
         let spec = analyze_window(&window, DEFAULT_RATE);
-        // A 0.5-amplitude sine peaks near 0.5 (sampling misses the exact crest,
-        // so allow a small shortfall).
+        // Peak is now a perceptual dBFS *level* (#504), not the raw 0.5
+        // amplitude: 20·log10(0.5) = −6.02 dB over a 48 dB range → ~0.87.
+        // Sampling misses the exact crest, so allow a small shortfall.
+        let expected = linear_to_level(0.5);
         assert!(
-            (spec.peak - 0.5).abs() < 0.05,
-            "peak {} should track the 0.5 amplitude",
+            (spec.peak - expected).abs() < 0.02,
+            "peak {} should be the dB level of a 0.5 amplitude (~{expected})",
             spec.peak
+        );
+        assert!(spec.peak > 0.8, "half amplitude is loud on a dB scale");
+    }
+
+    /// The perceptual dB mapping (#504): silence and sub-floor content read
+    /// empty, full scale tops out, and the curve is logarithmic between — a
+    /// half-height level sits at `-DB_RANGE/2` dB, not at half amplitude.
+    #[test]
+    fn level_mapping_is_perceptual_db() {
+        assert!(linear_to_level(0.0).abs() < 1e-6, "silence → empty bar");
+        assert!(
+            linear_to_level(-1.0).abs() < 1e-6,
+            "negative input guards to empty"
+        );
+        assert!(
+            (linear_to_level(1.0) - 1.0).abs() < 1e-6,
+            "full scale → full bar"
+        );
+        assert!(
+            linear_to_level(amp_at_dbfs(-(DB_RANGE + 6.0))).abs() < 1e-6,
+            "below the floor reads empty"
+        );
+        assert!(
+            (linear_to_level(amp_at_dbfs(-DB_RANGE / 2.0)) - 0.5).abs() < 1e-3,
+            "half the dB range lands at half height"
+        );
+        // Strictly monotone increasing — a louder input never reads lower.
+        assert!(linear_to_level(0.1) < linear_to_level(0.3));
+        assert!(linear_to_level(0.3) < linear_to_level(0.9));
+    }
+
+    /// The calibration anchor: a full-scale, bin-centered tone reads ~1.0 in
+    /// its band and ~1.0 peak, pinning `FULLSCALE_TONE_MAG` and the shared 0 dBFS
+    /// reference both fields map against.
+    #[test]
+    fn full_scale_tone_reads_unity() {
+        let spec = analyze_window(
+            &sine_window(bin_centered_freq(85), 1.0, DEFAULT_RATE),
+            DEFAULT_RATE,
+        );
+        let band = max_band(&spec);
+        assert!(
+            spec.bins[band] > 0.98,
+            "a full-scale tone tops its band (got {})",
+            spec.bins[band]
+        );
+        assert!(
+            spec.peak > 0.98,
+            "a full-scale peak tops out (got {})",
+            spec.peak
+        );
+    }
+
+    /// The #504 regression guard, known input → expected bar height: a −30 dBFS
+    /// band (typical mid/high program content) now reads a legible ~0.375 of the
+    /// height, where the old linear×gain map crushed it under ~5%.
+    #[test]
+    fn quiet_content_is_lifted_off_the_floor() {
+        let amp = amp_at_dbfs(-30.0);
+        let spec = analyze_window(
+            &sine_window(bin_centered_freq(85), amp, DEFAULT_RATE),
+            DEFAULT_RATE,
+        );
+        let band = max_band(&spec);
+        // −30 dBFS over the 48 dB range → (48−30)/48 = 0.375.
+        assert!(
+            (spec.bins[band] - 0.375).abs() < 0.03,
+            "−30 dBFS band reads ~0.375 (got {}), not the sub-0.1 the linear map gave",
+            spec.bins[band]
         );
     }
 

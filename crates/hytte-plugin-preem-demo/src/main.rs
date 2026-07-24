@@ -508,6 +508,50 @@ mod tests {
         assert!(m.bins[0].abs() < 1e-6, "quiet bands stay low");
     }
 
+    /// Known input → expected bar height: the scope maps a band level linearly
+    /// onto the tile's drawable height, so `1.0` fills it, `0.5` is about half,
+    /// and it is monotone (#504 — the tap now emits dB levels that use this
+    /// full range instead of hugging the baseline).
+    #[test]
+    fn scope_bar_height_tracks_level() {
+        use super::{SCOPE_BG, SCOPE_GAP, SCOPE_H, SCOPE_W, SPECTRUM_BINS, scope_tile};
+        // Fill height of the first bar's centre column: rows that aren't backdrop.
+        fn bar0_height(level: f32) -> usize {
+            let mut bins = [0.0_f32; SPECTRUM_BINS];
+            bins[0] = level;
+            let frame = scope_tile(&bins);
+            let bar_w = (SCOPE_W - SCOPE_GAP * (SPECTRUM_BINS - 1)) / SPECTRUM_BINS;
+            let x = bar_w / 2;
+            let w = frame.width();
+            let data = frame.data();
+            (0..frame.height())
+                .filter(|&y| {
+                    let i = (y * w + x) * 4;
+                    data[i..i + 4] != SCOPE_BG
+                })
+                .count()
+        }
+        let max_h = SCOPE_H - 2;
+        assert_eq!(
+            bar0_height(1.0),
+            max_h,
+            "a full level fills the drawable height"
+        );
+        assert!(
+            bar0_height(0.5).abs_diff(max_h / 2) <= 1,
+            "half a level is about half height"
+        );
+        assert!(
+            bar0_height(0.25) < bar0_height(0.5) && bar0_height(0.5) < bar0_height(1.0),
+            "height is monotone in level"
+        );
+        assert_eq!(
+            bar0_height(0.0),
+            1,
+            "a silent band still draws a 1 px baseline"
+        );
+    }
+
     /// The manifest opts into both the clock heartbeat and the audio spectrum.
     #[test]
     fn manifest_subscribes_clock_and_spectrum() {

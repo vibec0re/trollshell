@@ -43,6 +43,35 @@ pub(crate) fn indicator(class: &str, page: Page, monitor: &Monitor) -> gtk::Butt
     btn
 }
 
+/// Like [`indicator`], but wired to [`crate::modal::toggle_keep_open`]
+/// instead of [`crate::modal::toggle`], and runs `on_click` first.
+///
+/// Used by chips that route into a page shared with other triggers (#516:
+/// the five combined-Stats resource chips point at the same `Page::Stats`).
+/// `toggle_keep_open`'s "don't retract an already-open shared page" behavior
+/// means clicking a *different* resource chip while the Stats drawer is open
+/// jumps within it instead of closing it; `on_click` is where each chip
+/// stashes which card to land on (e.g. `panels::stats::set_scroll_target`)
+/// before the toggle call runs.
+pub(crate) fn indicator_scroll(
+    class: &str,
+    page: Page,
+    monitor: &Monitor,
+    on_click: impl Fn() + 'static,
+) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.add_css_class("ts-indicator");
+    btn.add_css_class(class);
+
+    let monitor_for_click = monitor.clone();
+    btn.connect_clicked(move |b| {
+        on_click();
+        crate::modal::toggle_keep_open(&monitor_for_click, page, b);
+    });
+
+    btn
+}
+
 /// Build a non-interactive chip button: same `"ts-indicator"` + `class`
 /// scaffold as [`indicator`], but with no `connect_clicked` wiring and no
 /// `Page` to open — for chips that are pure status lights (nothing to drill

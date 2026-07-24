@@ -50,8 +50,9 @@ pub fn poweroff() {
 /// leased fd whose open-ness *is* the lock: while the lease is alive the
 /// system won't run its idle actions (screen blank/dim, auto-lock on idle);
 /// dropping the lease releases the inhibition. This is honest, inspectable
-/// state — `systemd-inhibit --list` shows it — and it survives a shell
-/// restart because the lock lives in logind, not in trollshell.
+/// state — `systemd-inhibit --list` shows it. (The fd, and therefore the
+/// inhibitor, is owned by this process; see below on surviving a shell
+/// restart.)
 ///
 /// Calls `Inhibit(what="idle", who="trollshell", why="Keep awake",
 /// mode="block")` on `org.freedesktop.login1.Manager`, which lives on the
@@ -64,6 +65,13 @@ pub fn poweroff() {
 /// matching screensaver inhibitor purely for visibility in
 /// [`crate::screensaver::inhibitors`]. Hold the lease in service-side state
 /// (never a widget) for as long as the inhibition should last.
+///
+/// **The fd is owned by *this* process.** It closes when trollshell exits,
+/// which releases the inhibitor — so the hold does *not* by itself survive a
+/// shell restart (the `BlockInhibited` entry vanishes the moment the process
+/// dies). A caller that wants "Keep awake" to outlast a restart must persist
+/// its own desired-state and re-acquire on the next start; that is exactly what
+/// [`crate::screensaver`] does (#534).
 ///
 /// # Errors
 /// Returns a [`BusError`] if the `Inhibit` call fails: a transient bus error

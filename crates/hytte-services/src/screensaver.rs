@@ -55,12 +55,67 @@
 //! screensaver::other_inhibitors() -> impl Signal<…>        // "Also awake: …" apps
 //! ```
 
+use crate::config_file;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::FdLease;
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+// ── Keep-awake persistence (#534) ─────────────────────────────────────────────
+//
+// The logind idle-inhibitor fd is owned by *this* process, so it closes on
+// exit and the hold vanishes on a shell restart (`crate::logind::inhibit_idle`
+// docs). To make "Keep awake" actually survive a restart — as a user reasonably
+// expects and the mechanism claimed — the desired flag is persisted to
+// `~/.config/trollshell/keep-awake.toml` and re-acquired on the next
+// `Service::start`. Flat `enabled = true|false`, **default OFF** (a fresh
+// install has caffeine off), mirroring `dnd`.
+
+/// Config file under `~/.config/trollshell/` holding the persisted keep-awake
+/// desire.
+const KEEP_AWAKE_CONFIG_FILE: &str = "keep-awake.toml";
+
+/// Load the persisted "Keep awake" desire. **Default OFF**: only an explicit
+/// `enabled = true` re-engages caffeine on start; a missing/malformed/empty
+/// file leaves it off.
+fn load_keep_awake_from_disk() -> bool {
+    let Some(text) = config_file::read(KEEP_AWAKE_CONFIG_FILE) else {
+        return false;
+    };
+    parse_keep_awake(&text)
+}
+
+/// Parse the flat `enabled = true|false` body. Default OFF — a missing key, a
+/// malformed value, or an empty file all leave caffeine off. Split out as a
+/// pure fn so it's unit-testable without touching `$HOME`; mirrors `dnd`'s
+/// parser.
+fn parse_keep_awake(text: &str) -> bool {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rhs) = trimmed.strip_prefix("enabled") {
+            let rhs = rhs.trim_start_matches([' ', '=', '\t']).trim();
+            if rhs.eq_ignore_ascii_case("true") {
+                return true;
+            }
+            if rhs.eq_ignore_ascii_case("false") {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Persist the "Keep awake" desire. Best-effort; failure is logged and the live
+/// hold remains the source of truth for this process.
+fn save_keep_awake_to_disk(on: bool) {
+    config_file::write(
+        "keep-awake",
+        KEEP_AWAKE_CONFIG_FILE,
+        &format!("enabled = {on}\n"),
+    );
+}
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -102,6 +157,12 @@ struct ScreenSaverShared {
 // The toggle's authoritative on/off state is read back from `inhibitors()`
 // (via [`keep_awake`]), never from the acquire call's return — so any monitor's
 // drawer can flip it and a drawer rebuild re-derives it.
+//
+// The held fd is owned by *this* process, so it closes on exit — the hold does
+// not survive a shell restart on its own. The desire is therefore persisted to
+// `~/.config/trollshell/keep-awake.toml` and re-acquired on the next
+// `Service::start` (#534), so "Keep awake" stays on across a restart/upgrade
+// instead of silently lapsing while the box quietly goes back to idle-locking.
 
 /// Sentinel identity of the manual caffeine inhibitor in the shared inhibitor
 /// map, so it can be told apart from external app inhibitors when deriving the
@@ -196,6 +257,19 @@ impl Service for ScreenSaverService {
             manual: Arc::new(Mutex::new(ManualCaffeine::default())),
         });
 
+        // Re-engage a persisted keep-awake hold (#534). The logind idle fd is
+        // owned by *this* process — the previous session's fd closed when that
+        // process exited, so nothing is holding the box awake right now.
+        // Persisting the desire (in `set_keep_awake`) and re-acquiring here is
+        // what makes "Keep awake" actually survive a shell restart. We call
+        // `acquire_manual` directly (not `set_keep_awake`) so this re-acquire
+        // doesn't rewrite the file it just read.
+        if load_keep_awake_from_disk()
+            && let Some(shared) = shared::get::<ScreenSaverShared>()
+        {
+            acquire_manual(shared);
+        }
+
         ScreenSaverHandles {
             _state: state,
             inhibitors,
@@ -253,11 +327,23 @@ pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
 /// GTK switch's programmatic `set_active` (from the authoritative-state
 /// binding) can never thrash the logind fd. Safe to call from any thread; the
 /// async fd acquire runs on the shared runtime.
+///
+/// The desire is persisted to `~/.config/trollshell/keep-awake.toml` so the
+/// hold is re-acquired on the next shell start (#534) — the logind fd is
+/// process-owned and would otherwise be silently dropped on restart. Persisting
+/// the user's *intent* (rather than only a confirmed hold) means a transiently
+/// failed acquire is simply retried next launch.
 pub fn set_keep_awake(on: bool) {
     let Some(shared) = shared::get::<ScreenSaverShared>() else {
         // Service not registered (test harness?) — nothing to hold.
         return;
     };
+    // Persist the desire off the GTK main thread. The two-way switch binding
+    // blocks its programmatic `set_active` from re-entering the handler, so
+    // this fires on genuine user flips, not on authoritative-state sync; the
+    // startup re-acquire bypasses this path (calls `acquire_manual` directly),
+    // so it never rewrites the file.
+    runtime::handle().spawn_blocking(move || save_keep_awake_to_disk(on));
     if on {
         acquire_manual(shared);
     } else {
@@ -495,5 +581,62 @@ impl ScreenSaverIface {
     /// the case Inhibit/UnInhibit handles for us.
     async fn simulate_user_activity(&self) {
         tracing::debug!("SimulateUserActivity (ignored)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_keep_awake_defaults_off() {
+        // A fresh install has caffeine OFF; only an explicit `enabled = true`
+        // re-engages it on start. Missing key / malformed value / empty / comment
+        // bodies all leave it off (unlike fullscreen-inhibit, which defaults on).
+        assert!(!parse_keep_awake(""));
+        assert!(!parse_keep_awake("# just a comment\n"));
+        assert!(!parse_keep_awake("something = else\n"));
+        assert!(!parse_keep_awake("enabled = maybe\n"));
+    }
+
+    #[test]
+    fn parse_keep_awake_explicit_on_off() {
+        // The round-trip the #534 restart-survival hinges on: an explicit
+        // `enabled = true` re-engages the hold on the next start.
+        assert!(parse_keep_awake("enabled = true\n"));
+        assert!(!parse_keep_awake("enabled = false\n"));
+        // Tolerant of spacing / case, like the `dnd` parser it mirrors.
+        assert!(parse_keep_awake("enabled=TRUE"));
+        assert!(!parse_keep_awake("  enabled  =  False  "));
+    }
+
+    #[test]
+    fn keep_awake_save_body_round_trips_through_parse() {
+        // What `save_keep_awake_to_disk` writes must parse back to the same
+        // value — otherwise a persisted "on" wouldn't re-engage on restart.
+        assert!(parse_keep_awake(&format!("enabled = {}\n", true)));
+        assert!(!parse_keep_awake(&format!("enabled = {}\n", false)));
+    }
+
+    #[test]
+    fn is_caffeine_matches_only_the_sentinel() {
+        // The identity that `keep_awake()` / `other_inhibitors()` (and thus the
+        // switch state) hinge on — the manual toggle vs. an external app.
+        assert!(is_caffeine(&Inhibitor {
+            cookie: 1,
+            application: CAFFEINE_APP.to_string(),
+            reason: CAFFEINE_REASON.to_string(),
+        }));
+        assert!(!is_caffeine(&Inhibitor {
+            cookie: 2,
+            application: "Firefox".to_string(),
+            reason: "Playing video".to_string(),
+        }));
+        // A partial match (right app, wrong reason) is NOT the caffeine toggle.
+        assert!(!is_caffeine(&Inhibitor {
+            cookie: 3,
+            application: CAFFEINE_APP.to_string(),
+            reason: "Screen sharing".to_string(),
+        }));
     }
 }

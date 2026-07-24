@@ -53,10 +53,10 @@
 //! are best-effort; failure is logged and the in-memory state is the source
 //! of truth for the running process.
 
+use crate::config_file;
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry, runtime};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,18 +66,11 @@ use crate::pipewire::{self, Sink};
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-const CONFIG_REL_PATH: &str = ".config/trollshell/bluetooth-audio.toml";
-
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(CONFIG_REL_PATH))
-}
+/// Config file under `~/.config/trollshell/`.
+const CONFIG_FILE: &str = "bluetooth-audio.toml";
 
 fn load_enabled_from_disk() -> bool {
-    let Some(path) = config_path() else {
-        return true;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Some(text) = config_file::read(CONFIG_FILE) else {
         return true;
     };
     // Permissive: look for `enabled = false` anywhere; otherwise default ON.
@@ -97,19 +90,11 @@ fn load_enabled_from_disk() -> bool {
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    let Some(path) = config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(error = %e, path = %parent.display(), "bluetooth-audio: mkdir failed");
-        return;
-    }
-    let body = format!("enabled = {enabled}\n");
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::warn!(error = %e, path = %path.display(), "bluetooth-audio: write failed");
-    }
+    config_file::write(
+        "bluetooth-audio",
+        CONFIG_FILE,
+        &format!("enabled = {enabled}\n"),
+    );
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────
@@ -169,16 +154,21 @@ pub fn auto_switch_enabled() -> impl Signal<Item = bool> {
 /// Update the toggle and persist it to disk. Idempotent — no-op when the
 /// value already matches.
 pub fn set_auto_switch_enabled(on: bool) {
-    let prev = registry::with(|r| {
+    // `Some(true)` only when the service is registered AND the value actually
+    // flipped. `None` (service unregistered) must NOT persist — the old
+    // `prev != Some(on)` guard wrote the file even then, since `None != Some(_)`
+    // (mirrors `notifications_mute`'s correct guard).
+    let changed = registry::with(|r| {
         r.get::<BluetoothAudioHandles>().map(|h| {
-            let cur = h.enabled.get();
-            if cur != on {
+            if h.enabled.get() == on {
+                false
+            } else {
                 h.enabled.set(on);
+                true
             }
-            cur
         })
     });
-    if prev != Some(on) {
+    if changed == Some(true) {
         // File I/O off the GTK main thread.
         runtime::handle().spawn_blocking(move || save_enabled_to_disk(on));
     }

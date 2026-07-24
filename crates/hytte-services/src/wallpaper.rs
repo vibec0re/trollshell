@@ -38,14 +38,15 @@
 //! (with kanshi-style profile awareness) is a follow-up. There is no
 //! "clear" / "unset" path — the user re-picks via the drawer.
 
+use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry, runtime};
-use std::path::PathBuf;
 use std::process::Stdio;
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-const CONFIG_REL_PATH: &str = ".config/trollshell/wallpaper.path";
+/// Config file under `~/.config/trollshell/`.
+const CONFIG_FILE: &str = "wallpaper.path";
 
 /// Env var naming a shell command run after the path file is written, to tell
 /// the wallpaper daemon to pick up the new image. Run via `sh -c`. Unset/empty
@@ -69,14 +70,8 @@ const PATH_PLACEHOLDER: &str = "{}";
 /// options, where `$`-references get expanded away.
 const WALLPAPER_PATH_ENV: &str = "TROLLSHELL_WALLPAPER_PATH";
 
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(CONFIG_REL_PATH))
-}
-
 fn load_path_from_disk() -> Option<String> {
-    let path = config_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = config_file::read(CONFIG_FILE)?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
@@ -86,19 +81,7 @@ fn load_path_from_disk() -> Option<String> {
 }
 
 fn save_path_to_disk(value: &str) {
-    let Some(path) = config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(error = %e, path = %parent.display(), "wallpaper: mkdir failed");
-        return;
-    }
-    let body = format!("{value}\n");
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::warn!(error = %e, path = %path.display(), "wallpaper: write failed");
-    }
+    config_file::write("wallpaper", CONFIG_FILE, &format!("{value}\n"));
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────

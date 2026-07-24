@@ -56,7 +56,7 @@ fn missing_service_panics_with_helpful_message() {
 }
 
 #[test]
-fn registry_keys_by_type_with_absent_and_overwrite() {
+fn registry_keys_by_type_with_absent() {
     use hytte_reactive::registry::Registry;
 
     let mut r = Registry::default();
@@ -66,7 +66,18 @@ fn registry_keys_by_type_with_absent_and_overwrite() {
     assert_eq!(r.get::<u32>(), Some(&7));
     assert_eq!(r.get::<String>().map(String::as_str), Some("hi"));
     assert_eq!(r.get::<i64>(), None, "an unregistered type reads back None");
+}
 
-    r.insert(9u32); // same type overwrites the previous value
-    assert_eq!(r.get::<u32>(), Some(&9));
+#[test]
+#[should_panic(expected = "duplicate service registration")]
+#[cfg(debug_assertions)] // tripwire is a debug_assert!; release doCheck compiles it out
+fn duplicate_insert_of_same_type_trips_the_tripwire() {
+    use hytte_reactive::registry::Registry;
+
+    // Re-inserting the same handle type is the `main.rs` double-`.with(…)`
+    // mistake: it still overwrites (release), but now trips a `debug_assert!`
+    // in debug/test builds so the stray registration surfaces loudly.
+    let mut r = Registry::default();
+    r.insert(7u32);
+    r.insert(9u32);
 }

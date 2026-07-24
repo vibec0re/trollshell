@@ -21,12 +21,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::{BusKind, call};
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, registry, runtime, shared, spawn_supervised};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 const NM_NAME: &str = "org.freedesktop.NetworkManager";
@@ -61,7 +60,6 @@ pub struct WifiScanHandles {
 struct Shared {
     aps: Mutable<Vec<AccessPoint>>,
 }
-static SHARED: OnceLock<Shared> = OnceLock::new();
 
 pub struct WifiScanService;
 
@@ -71,7 +69,7 @@ impl Service for WifiScanService {
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = WifiScanHandles::default();
         let aps = handles.aps.clone();
-        let _ = SHARED.set(Shared { aps: aps.clone() });
+        shared::insert(Shared { aps: aps.clone() });
         spawn_supervised("wifiscan", move || scan_loop(aps.clone()));
         handles
     }
@@ -97,7 +95,7 @@ pub fn current() -> impl Signal<Item = Vec<AccessPoint>> {
 /// (the `places` resolver). `None` until [`service`] has started.
 #[must_use]
 pub fn shared_aps() -> Option<Mutable<Vec<AccessPoint>>> {
-    SHARED.get().map(|s| s.aps.clone())
+    shared::get::<Shared>().map(|s| s.aps.clone())
 }
 
 /// One-shot blocking scan for the `--scan-aps` CLI: forces a fresh scan, waits

@@ -31,20 +31,22 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use hytte_reactive::{Service, registry, shared, spawn_supervised};
 use tokio::sync::Notify;
 
+use crate::config_file;
 use crate::geoclue::{self, LocationSnapshot, LocationSource, LocationState};
 use crate::hooks;
 use crate::wifiscan::{self, AccessPoint};
 
 // ── Config ────────────────────────────────────────────────────────────────--
 
-const CONFIG_REL_PATH: &str = ".config/trollshell/places.toml";
+/// Config file under `~/.config/trollshell/`.
+const CONFIG_FILE: &str = "places.toml";
 
 /// How often the running shell re-checks `places.toml` for live reload. Each
 /// tick is a single `stat` on a cached inode, so it stays snappy while you edit
@@ -197,8 +199,7 @@ fn default_match_min() -> usize {
 }
 
 fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(CONFIG_REL_PATH))
+    config_file::path(CONFIG_FILE)
 }
 
 /// Drop empty/whitespace-only entries (a stray `""` would otherwise become an
@@ -253,7 +254,7 @@ fn load_places() -> Vec<Place> {
             if let Some(migrated) = migrate_legacy_departures(&path) {
                 return migrated;
             }
-            write_default_config(&path);
+            write_default_config();
             return default();
         }
         Err(e) => {
@@ -276,18 +277,9 @@ fn load_places() -> Vec<Place> {
     }
 }
 
-fn write_default_config(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(error = %e, path = %parent.display(), "places: mkdir for default config failed");
-        return;
-    }
-    match std::fs::write(path, DEFAULT_CONFIG) {
-        Ok(()) => tracing::info!(path = %path.display(), "places: wrote default config"),
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "places: writing default config failed");
-        }
+fn write_default_config() {
+    if config_file::write("places", CONFIG_FILE, DEFAULT_CONFIG) {
+        tracing::info!(file = CONFIG_FILE, "places: wrote default config");
     }
 }
 
@@ -480,7 +472,6 @@ struct Shared {
     place: Mutable<Option<ResolvedPlace>>,
     location: Mutable<LocationState>,
 }
-static SHARED: OnceLock<Shared> = OnceLock::new();
 
 pub struct PlacesService;
 
@@ -491,7 +482,7 @@ impl Service for PlacesService {
         let handles = PlacesHandles::default();
         let place = handles.place.clone();
         let location = handles.location.clone();
-        let _ = SHARED.set(Shared {
+        shared::insert(Shared {
             place: place.clone(),
             location: location.clone(),
         });
@@ -528,7 +519,7 @@ pub fn current_place() -> impl Signal<Item = Option<ResolvedPlace>> {
 /// Process-global clone of the current-place handle, for tokio-side readers.
 #[must_use]
 pub fn shared_place() -> Option<Mutable<Option<ResolvedPlace>>> {
-    SHARED.get().map(|s| s.place.clone())
+    shared::get::<Shared>().map(|s| s.place.clone())
 }
 
 /// Signal of the effective location (for weather): place coords + name when a
@@ -546,7 +537,7 @@ pub fn current() -> impl Signal<Item = LocationState> {
 /// readers (weather).
 #[must_use]
 pub fn shared_location() -> Option<Mutable<LocationState>> {
-    SHARED.get().map(|s| s.location.clone())
+    shared::get::<Shared>().map(|s| s.location.clone())
 }
 
 /// Poll `places.toml` and republish the parsed list when it changes, so config

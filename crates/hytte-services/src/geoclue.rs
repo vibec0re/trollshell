@@ -20,8 +20,8 @@
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call};
-use hytte_reactive::{Service, registry, spawn_supervised};
-use std::sync::{Arc, OnceLock};
+use hytte_reactive::{Service, registry, shared, spawn_supervised};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -129,7 +129,6 @@ struct Shared {
     /// The manual/auto place override (#391), set live over D-Bus.
     place_override: Mutable<PlaceOverride>,
 }
-static SHARED: OnceLock<Shared> = OnceLock::new();
 
 pub struct GeoclueService;
 
@@ -141,7 +140,7 @@ impl Service for GeoclueService {
         let location = handles.location.clone();
         let notify = handles.notify.clone();
         let place_override = Mutable::new(PlaceOverride::default());
-        let _ = SHARED.set(Shared {
+        shared::insert(Shared {
             location: location.clone(),
             notify: notify.clone(),
             place_override: place_override.clone(),
@@ -173,7 +172,7 @@ pub fn current() -> impl Signal<Item = LocationState> {
 /// Re-run resolution: cancel any cached result and try `GeoClue2` + the env
 /// var again. Lets consumers recover from a transient failure.
 pub fn refresh() {
-    if let Some(s) = SHARED.get() {
+    if let Some(s) = shared::get::<Shared>() {
         s.notify.notify_one();
     }
 }
@@ -184,8 +183,7 @@ pub fn refresh() {
 /// when [`service`] hasn't started.
 #[must_use]
 pub fn current_override() -> PlaceOverride {
-    SHARED
-        .get()
+    shared::get::<Shared>()
         .map(|s| s.place_override.get_cloned())
         .unwrap_or_default()
 }
@@ -194,7 +192,7 @@ pub fn current_override() -> PlaceOverride {
 /// `GeoClue2`. Triggers an immediate re-resolve. Fire-and-forget — a city that
 /// fails to geocode simply keeps the last good location (see [`resolve_loop`]).
 pub fn set_manual_city(city: String) {
-    if let Some(s) = SHARED.get() {
+    if let Some(s) = shared::get::<Shared>() {
         s.place_override.set(PlaceOverride {
             auto: false,
             manual_city: Some(city),
@@ -206,7 +204,7 @@ pub fn set_manual_city(city: String) {
 /// Toggle auto (`GeoClue2`) vs. manual location. Keeps any previously-set
 /// `manual_city` so flipping back to manual restores it. Triggers a re-resolve.
 pub fn set_auto_location(auto: bool) {
-    if let Some(s) = SHARED.get() {
+    if let Some(s) = shared::get::<Shared>() {
         let ov = PlaceOverride {
             auto,
             ..s.place_override.get_cloned()
@@ -220,7 +218,7 @@ pub fn set_auto_location(auto: bool) {
 /// in sibling services that can't reach the thread-local registry. `None`
 /// until [`service`] has started.
 pub(crate) fn shared_location() -> Option<Mutable<LocationState>> {
-    SHARED.get().map(|s| s.location.clone())
+    shared::get::<Shared>().map(|s| s.location.clone())
 }
 
 /// Resolve once at boot, then again on every [`refresh`]. We take a single

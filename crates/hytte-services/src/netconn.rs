@@ -9,8 +9,8 @@
 //! Failures (`ss` missing, parse error) log once and the signal stays
 //! at its last known value.
 
-use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use futures_signals::signal::{Mutable, Signal};
+use hytte_reactive::{Service, gated_poll, registry, spawn_supervised};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -189,31 +189,13 @@ impl Service for NetconnService {
 }
 
 async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
-    loop {
-        // Park (forking nothing) while gated inactive. `wait_for(true)` resolves
-        // as soon as `set_active(true)` lands — `Mutable::signal()` replays the
-        // current value on first poll, so if we've already been reactivated by
-        // the time we get here it returns immediately, with no lost wakeup.
-        // Reactivation is thus instant rather than waiting out a sleep tick.
-        if !active.get() {
-            let _ = active.signal().wait_for(true).await;
-        }
-        if let Some(out) = run_ss().await {
-            let next = parse_ss_output(&out);
-            // Avoid no-op re-emissions: the signal would still emit because
-            // `set` always notifies, so compare and skip when unchanged.
-            if writer.lock_ref().clone() != next {
-                writer.set(next);
-            }
-        }
-        // Sleep the inter-sample interval, but bail out early if we get gated
-        // inactive mid-wait — no point holding the timer when parked. The
-        // top-of-loop park then handles the resume edge.
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(2)) => {}
-            _ = active.signal().wait_for(false) => {}
-        }
-    }
+    // Park while gated inactive, sample `ss` every 2s, and dedup-by-ref before
+    // publishing — all handled by `gated_poll`. `None` (ss missing / failed)
+    // keeps the last-known list. See the `active` field doc on `NetconnHandles`.
+    gated_poll(active, Duration::from_secs(2), writer, || async {
+        run_ss().await.map(|out| parse_ss_output(&out))
+    })
+    .await;
 }
 
 async fn run_ss() -> Option<String> {

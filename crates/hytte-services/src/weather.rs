@@ -7,6 +7,18 @@
 //! `App` builder — `start` reads places' shared location handle (place coords
 //! when a place is matched, else the raw `GeoClue` fix) to wire the
 //! re-fetch-on-location-change bridge.
+//!
+//! **Card label (#501):** when a configured place is matched, or the location
+//! came from the `TROLLSHELL_WEATHER_CITY` env var / a manual city, the
+//! location's own `label_hint` already carries the right name. For a raw
+//! `GeoClue` fix that matches no configured place, the label used to come
+//! from an independent Nominatim reverse-geocode of the fix coordinates —
+//! which can name a different, nearby locality than the one
+//! [`crate::places`] (and the control-center's Place tab, over `GetPlace`)
+//! resolve for the exact same fix, showing two disagreeing place names for
+//! one location. [`fetch_weather`] now reuses `places`' own resolved name
+//! (see [`choose_location_label`]) in that case, so the two never diverge;
+//! reverse-geocoding is kept only as a last-resort fallback.
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry, spawn_supervised};
@@ -177,21 +189,34 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
             }
         };
 
-        let next = match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {
-            Ok(Ok(snap)) => WeatherState::Resolved(snap),
-            Ok(Err(e)) => {
-                tracing::warn!("weather: fetch failed: {e}");
-                // Keep a good prior value rather than flashing an error.
-                match state.get_cloned() {
-                    prev @ WeatherState::Resolved(_) => prev,
-                    _ => WeatherState::Error("network error".to_string()),
+        // The SAME resolved-place name `places`/the control-center's Place tab
+        // show for this fix (#501) — reused below so a `GeoClue` location that
+        // matches no configured place doesn't get its own, possibly-
+        // divergent reverse-geocoded label. Read fresh, right next to `loc`,
+        // so the two are the same snapshot in time (`places::resolve_loop`
+        // publishes both together on every re-resolve).
+        let place_name = places::shared_place()
+            .and_then(|m| m.get_cloned())
+            .map(|p| p.name);
+
+        let next =
+            match tokio::task::spawn_blocking(move || fetch_weather(&loc, place_name.as_deref()))
+                .await
+            {
+                Ok(Ok(snap)) => WeatherState::Resolved(snap),
+                Ok(Err(e)) => {
+                    tracing::warn!("weather: fetch failed: {e}");
+                    // Keep a good prior value rather than flashing an error.
+                    match state.get_cloned() {
+                        prev @ WeatherState::Resolved(_) => prev,
+                        _ => WeatherState::Error("network error".to_string()),
+                    }
                 }
-            }
-            Err(join) => {
-                tracing::warn!("weather: fetch join failed: {join}");
-                WeatherState::Error("network error".to_string())
-            }
-        };
+                Err(join) => {
+                    tracing::warn!("weather: fetch join failed: {join}");
+                    WeatherState::Error("network error".to_string())
+                }
+            };
 
         if state.get_cloned() != next {
             state.set(next);
@@ -236,9 +261,13 @@ fn daily_min_max(f: &ForecastResponse) -> Option<(f64, f64)> {
 }
 
 /// One blocking Open-Meteo fetch + parse for `loc`. Runs on a
-/// `spawn_blocking` thread. For a `GeoClue`-sourced location (no name) it
-/// also reverse-geocodes a friendly place name.
-fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
+/// `spawn_blocking` thread. `place_name` is `places`' currently-resolved
+/// place name (the same one the control-center's Place tab shows) for this
+/// same fix — see [`choose_location_label`] for how it's used.
+fn fetch_weather(
+    loc: &LocationSnapshot,
+    place_name: Option<&str>,
+) -> Result<WeatherSnapshot, String> {
     let agent = http_agent();
     let url = format!(
         "https://api.open-meteo.com/v1/forecast\
@@ -263,11 +292,9 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
     let (temp_max_c, temp_min_c) =
         daily_min_max(&forecast).unwrap_or((current.temperature_2m, current.temperature_2m));
 
-    let location = match &loc.label_hint {
-        Some(name) => name.clone(),
-        None => reverse_geocode(&agent, loc.lat, loc.lon)
-            .unwrap_or_else(|| "Current location".to_string()),
-    };
+    let location = choose_location_label(loc.label_hint.as_deref(), place_name, || {
+        reverse_geocode(&agent, loc.lat, loc.lon)
+    });
 
     Ok(WeatherSnapshot {
         location,
@@ -282,6 +309,37 @@ fn fetch_weather(loc: &LocationSnapshot) -> Result<WeatherSnapshot, String> {
     })
 }
 
+/// Choose the weather card's location label (#501). In priority order:
+///
+/// 1. `label_hint` — set whenever the location already has a name attached: a
+///    matched configured place, or the `TROLLSHELL_WEATHER_CITY` env var /
+///    manual city (both forward-geocoded). Always correct, never overridden.
+/// 2. `place_name` — `places`' *currently resolved* place name for this same
+///    fix (what the control-center's Place tab shows over `GetPlace`), used
+///    when `label_hint` is absent (a raw `GeoClue` fix matching no configured
+///    place). Reusing it rather than reverse-geocoding independently means
+///    the bar's weather card and the control-center can never name the same
+///    location differently.
+/// 3. `reverse_geocoded` — only called (it's a network round-trip, so kept
+///    lazy) when neither of the above is available; practically only reachable
+///    if `places` hasn't resolved anything yet, since a forward-geocoded
+///    location always has a `label_hint` and `places` always publishes a name
+///    for a `GeoClue` fix (a matched place, or the generic "away" label).
+/// 4. A generic fallback string, if even the reverse-geocode fails.
+fn choose_location_label(
+    label_hint: Option<&str>,
+    place_name: Option<&str>,
+    reverse_geocoded: impl FnOnce() -> Option<String>,
+) -> String {
+    if let Some(name) = label_hint {
+        return name.to_owned();
+    }
+    if let Some(name) = place_name {
+        return name.to_owned();
+    }
+    reverse_geocoded().unwrap_or_else(|| "Current location".to_string())
+}
+
 fn parse_forecast(body: &str) -> Result<ForecastResponse, String> {
     serde_json::from_str::<ForecastResponse>(body).map_err(|e| format!("decode: {e}"))
 }
@@ -292,7 +350,12 @@ fn pct_to_u8(v: f64) -> u8 {
     v.round().clamp(0.0, 100.0) as u8
 }
 
-// ── Reverse geocoding (GeoClue source only) ────────────────────────────────
+// ── Reverse geocoding (GeoClue source, last-resort fallback) ───────────────
+//
+// Since #501, this is only reached via `choose_location_label` when `places`
+// hasn't resolved a name for the current fix yet — normally its own resolved
+// name (or a configured place / forward-geocoded city's `label_hint`) is used
+// instead, so the weather card and the control-center's Place tab agree.
 
 /// Descriptive User-Agent for Nominatim, whose usage policy rejects stock
 /// library User-Agents. Volume is tiny — we only reverse-geocode on a location
@@ -405,6 +468,42 @@ mod tests {
         assert_eq!(c.label, "Unknown");
         assert_eq!(c.icon, "weather-severe-alert-symbolic");
         assert_eq!(c.code, 200);
+    }
+
+    // ── Location label choice (#501) ────────────────────────────────────────
+
+    #[test]
+    fn label_prefers_label_hint_over_everything_else() {
+        // A matched configured place, or a forward-geocoded env-var/manual
+        // city: `label_hint` wins outright, and the (network) reverse-geocode
+        // thunk must never even run.
+        let label = choose_location_label(Some("Schöneweide"), Some("Nearby"), || {
+            panic!("reverse-geocode must not be called when label_hint is set")
+        });
+        assert_eq!(label, "Schöneweide");
+    }
+
+    #[test]
+    fn label_uses_places_resolved_name_when_no_label_hint() {
+        // A raw GeoClue fix matching no configured place: use the SAME name
+        // `places` (and the control-center's Place tab) resolved for this fix,
+        // instead of an independent reverse-geocode that could disagree.
+        let label = choose_location_label(None, Some("Nearby"), || {
+            panic!("reverse-geocode must not be called when a place name is available")
+        });
+        assert_eq!(label, "Nearby");
+    }
+
+    #[test]
+    fn label_falls_back_to_reverse_geocode_when_neither_available() {
+        let label = choose_location_label(None, None, || Some("Oberschöneweide".to_string()));
+        assert_eq!(label, "Oberschöneweide");
+    }
+
+    #[test]
+    fn label_falls_back_to_generic_when_all_unavailable() {
+        let label = choose_location_label(None, None, || None);
+        assert_eq!(label, "Current location");
     }
 
     #[test]

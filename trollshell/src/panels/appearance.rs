@@ -8,7 +8,10 @@
 //!   listed from niri's output topology), falling back to the default.
 //! - **Time of day** — a rotation toggle plus a morning/day/evening/night
 //!   image; when on it drives all displays on a fixed schedule.
-//! - **Clear wallpaper** — an explicit reset back to no background.
+//! - **Clear wallpaper** — an explicit reset back to no background. Disabled
+//!   under a custom reload backend (`reloadCommand` / awww), which is
+//!   single-image and can't be told "no wallpaper" — the button would be a
+//!   silent no-op there (see [`wallpaper::has_custom_reload_backend`]).
 //!
 //! The user picks a file with `gtk::FileDialog`; the service rewrites its state
 //! file, re-derives the swaybg arguments, and restarts (or, on clear, stops)
@@ -66,9 +69,24 @@ fn build_wallpaper_group() -> adw::PreferencesGroup {
     clear.set_valign(gtk::Align::Center);
     clear.add_css_class("flat");
     clear.add_css_class("destructive-action");
-    clear.connect_clicked(|_| wallpaper::clear());
-    clear_row.add_suffix(&clear);
-    clear_row.set_activatable_widget(Some(&clear));
+    if wallpaper::has_custom_reload_backend() {
+        // A custom reload backend (reloadCommand / awww) is single-image and
+        // driven only by "here's the new image" — it can't be told "no
+        // wallpaper", so a clear would be a silent no-op (the daemon keeps
+        // painting the last image). Disable the button rather than pretend it
+        // works. The tooltip goes on the row: an insensitive button eats no
+        // pointer events, so its own tooltip would never show.
+        clear.set_sensitive(false);
+        clear_row.set_tooltip_text(Some(
+            "Clearing isn't available with a custom wallpaper backend \u{2014} \
+             remove the wallpaper from your daemon instead",
+        ));
+        clear_row.add_suffix(&clear);
+    } else {
+        clear.connect_clicked(|_| wallpaper::clear());
+        clear_row.add_suffix(&clear);
+        clear_row.set_activatable_widget(Some(&clear));
+    }
     group.add(&clear_row);
 
     group

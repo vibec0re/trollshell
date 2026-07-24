@@ -1,0 +1,42 @@
+[package]
+name = "hytte-plugin-usage"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The Claude usage-limits monitor as an out-of-process trollshell sidebar card — a slow, visibility-gated ureq poll of the exponentials Grafana public dashboard rendered as a spend gauge (issue #320)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-usage"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK; re-exports the proto vocabulary and tokio_stream
+# (including the un-feature-gated `wrappers::UnboundedReceiverStream`).
+hytte-plugin = { path = "../hytte-plugin" }
+# The visibility-gated poll task: `select!` over the command lane + interval,
+# `spawn`/`spawn_blocking` for the blocking HTTP offload.
+tokio = { workspace = true, default-features = false, features = [
+  "rt",
+  "macros",
+  "time",
+  "sync",
+] }
+# Blocking HTTP to the Grafana public-dashboard query API — the house idiom
+# (weather / departures fetchers, the pet's brain). `rustls` for the HTTPS the
+# dashboard rides; `json` for `send_json` on the panel-query POST (the same
+# pair `hytte-ai-providers` uses).
+ureq = { workspace = true, features = ["rustls", "json"] }
+# The dashboard model + query responses are parsed **generically** into
+# `serde_json::Value` (the exact panel/series shape is unknown until the live
+# URL exists — see `fetch.rs`), and `json!` builds the query body.
+serde_json.workspace = true
+# `~/.config/trollshell/usage.toml` — the config-file fallback behind the env.
+toml.workspace = true
+# `Local::now()` stamps each reading with a local `HH:MM` "last updated" time,
+# same blocking-fetch-time stamp idiom as the departures board.
+chrono.workspace = true

@@ -1098,6 +1098,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-usage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hytte-plugin",
+ "serde_json",
+ "tokio",
+ "toml",
+ "ureq",
+]
+
+[[package]]
 name = "hytte-plugin-weather"
 version = "0.1.0"
 dependencies = [

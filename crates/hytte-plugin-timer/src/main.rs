@@ -298,7 +298,10 @@ impl Plugin for Timer {
             | Input::EffectResult { .. }
             | Input::SlotVisible(_)
             | Input::AudioSpectrum(_)
-            | Input::ConsentDecision { .. } => Vec::new(),
+            | Input::ConsentDecision { .. }
+            | Input::CalendarUpcoming(_)
+            | Input::SessionLocked(_)
+            | Input::NowPlaying(_) => Vec::new(),
         }
     }
 

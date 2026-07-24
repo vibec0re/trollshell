@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
-    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Mount, PluginMsg, StateKey,
-    StateSnapshot, read_frame, write_frame,
+    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Manifest, Mount, NowPlaying,
+    PluginMsg, StateKey, StateSnapshot, UpcomingEvent, read_frame, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -266,6 +266,52 @@ pub(super) fn effect_capability(effect: &Effect) -> Capability {
     }
 }
 
+/// The [`Capability`] a domain [`StateKey`] push additionally requires (#484/#528),
+/// or `None` for an *ambient* key whose subscription alone is the opt-in
+/// (`Clock`/`SlotVisible`/`Accent`/`AudioSpectrum`). Exhaustive over the key
+/// vocabulary so adding a `StateKey` is a compile error here until it declares
+/// whether — and behind which capability — it is gated (the same compiler-forced
+/// mapping as [`effect_capability`], per #495). The domain keys carry personal /
+/// privacy-relevant data, so the host requires the capability **on top of** the
+/// subscription — a subscribe-only plugin is refused the push (see [`push_gate`]).
+pub(super) fn state_key_capability(key: StateKey) -> Option<Capability> {
+    match key {
+        StateKey::Clock | StateKey::SlotVisible | StateKey::Accent | StateKey::AudioSpectrum => {
+            None
+        }
+        StateKey::CalendarUpcoming => Some(Capability::Calendar),
+        StateKey::SessionLocked => Some(Capability::SessionState),
+        StateKey::NowPlaying => Some(Capability::NowPlaying),
+    }
+}
+
+/// Whether the host should push `key` to this connection: the plugin subscribed
+/// it **and**, for a capability-gated domain key ([`state_key_capability`]),
+/// declared the gating capability. A subscription without the required capability
+/// is refused with a warn — the same "declared *and* enforced" posture as
+/// [`enforce_capabilities`], applied to a host→plugin push rather than an effect.
+pub(super) fn push_gate(manifest: &Manifest, key: StateKey) -> bool {
+    if !manifest.subscribes.contains(&key) {
+        return false;
+    }
+    match state_key_capability(key) {
+        None => true,
+        Some(cap) => {
+            if manifest.capabilities.contains(&cap) {
+                true
+            } else {
+                tracing::warn!(
+                    plugin = %manifest.id,
+                    ?key,
+                    ?cap,
+                    "plugin subscribed a capability-gated state key without declaring the capability; push refused",
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Drop any effect whose required [`Capability`] the plugin didn't declare in
 /// its manifest (#436). Host-side capability enforcement: the manifest's
 /// `capabilities` are the grant set, and an effect requesting an ungranted cap
@@ -467,6 +513,18 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
             tokio::spawn(spectrum_task(ctx.spectrum_rx.clone(), out_tx.clone()))
         });
 
+    // The #484/#528 domain pushes: calendar / session-locked / now-playing. Each
+    // is gated on the plugin BOTH subscribing the key AND declaring its gating
+    // capability ([`push_gate`], per #495's exhaustive mapping) — a subscribe-only
+    // plugin is refused (and warned) because these carry personal / privacy-
+    // relevant data. Mirrors the seed-then-on-change accent/spectrum tasks.
+    let calendar = push_gate(&manifest, StateKey::CalendarUpcoming)
+        .then(|| tokio::spawn(calendar_task(ctx.calendar_rx.clone(), out_tx.clone())));
+    let locked = push_gate(&manifest, StateKey::SessionLocked)
+        .then(|| tokio::spawn(locked_task(ctx.locked_rx.clone(), out_tx.clone())));
+    let now_playing = push_gate(&manifest, StateKey::NowPlaying)
+        .then(|| tokio::spawn(now_playing_task(ctx.now_playing_rx.clone(), out_tx.clone())));
+
     // Reader + liveness, raced (#435). The reader dispatches inbound frames; the
     // liveness task pings on an interval and drops the connection if the plugin
     // stops answering — a hung plugin never EOFs, so without this its stale card
@@ -602,6 +660,15 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
             pipewire::set_spectrum_active(false);
         }
     }
+    if let Some(calendar) = calendar {
+        calendar.abort();
+    }
+    if let Some(locked) = locked {
+        locked.abort();
+    }
+    if let Some(now_playing) = now_playing {
+        now_playing.abort();
+    }
     writer.abort();
 }
 
@@ -711,6 +778,70 @@ async fn spectrum_task(
         if let Some(spectrum) = current
             && let Push::Stop = push_state(&out, HostMsg::AudioSpectrum { spectrum })
         {
+            break;
+        }
+    }
+}
+
+/// Push the upcoming-calendar digest on subscribe (the register seed) and on every
+/// change, coalescing bursts latest-wins via `borrow_and_update` (#484). Mirrors
+/// [`accent_task`]; an empty list is meaningful ("no upcoming events"), so — unlike
+/// [`spectrum_task`] — it is always sent. Spawned only for a connection that passes
+/// [`push_gate`] for [`StateKey::CalendarUpcoming`] (subscribed + `Capability::Calendar`).
+async fn calendar_task(
+    mut calendar_rx: watch::Receiver<Vec<UpcomingEvent>>,
+    out: mpsc::Sender<HostMsg>,
+) {
+    let initial = calendar_rx.borrow_and_update().clone();
+    if let Push::Stop = push_state(&out, HostMsg::CalendarUpcoming { events: initial }) {
+        return;
+    }
+    while calendar_rx.changed().await.is_ok() {
+        let events = calendar_rx.borrow_and_update().clone();
+        if let Push::Stop = push_state(&out, HostMsg::CalendarUpcoming { events }) {
+            break;
+        }
+    }
+}
+
+/// Push the session-locked hint on subscribe (the register seed, so a plugin
+/// starts in the right state) and on every change, latest-wins (#484). Mirrors
+/// [`visibility_task`]; spawned only for a connection that passes [`push_gate`]
+/// for [`StateKey::SessionLocked`] (subscribed + `Capability::SessionState`).
+async fn locked_task(mut locked_rx: watch::Receiver<bool>, out: mpsc::Sender<HostMsg>) {
+    let initial = *locked_rx.borrow_and_update();
+    if let Push::Stop = push_state(&out, HostMsg::SessionLocked { locked: initial }) {
+        return;
+    }
+    while locked_rx.changed().await.is_ok() {
+        let locked = *locked_rx.borrow_and_update();
+        if let Push::Stop = push_state(&out, HostMsg::SessionLocked { locked }) {
+            break;
+        }
+    }
+}
+
+/// Push the now-playing digest on subscribe and on every change, coalescing bursts
+/// latest-wins via `borrow_and_update` (#528). Mirrors [`accent_task`]; the empty,
+/// not-playing default is meaningful, so it is always sent. Spawned only for a
+/// connection that passes [`push_gate`] for [`StateKey::NowPlaying`]
+/// (subscribed + `Capability::NowPlaying`).
+async fn now_playing_task(
+    mut now_playing_rx: watch::Receiver<NowPlaying>,
+    out: mpsc::Sender<HostMsg>,
+) {
+    let initial = now_playing_rx.borrow_and_update().clone();
+    if let Push::Stop = push_state(
+        &out,
+        HostMsg::NowPlaying {
+            now_playing: initial,
+        },
+    ) {
+        return;
+    }
+    while now_playing_rx.changed().await.is_ok() {
+        let now_playing = now_playing_rx.borrow_and_update().clone();
+        if let Push::Stop = push_state(&out, HostMsg::NowPlaying { now_playing }) {
             break;
         }
     }

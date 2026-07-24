@@ -188,7 +188,10 @@ impl Plugin for Terminal {
             | Input::EffectResult { .. }
             | Input::SlotVisible(_)
             | Input::AudioSpectrum(_)
-            | Input::ConsentDecision { .. } => {}
+            | Input::ConsentDecision { .. }
+            | Input::CalendarUpcoming(_)
+            | Input::SessionLocked(_)
+            | Input::NowPlaying(_) => {}
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

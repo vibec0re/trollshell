@@ -61,3 +61,52 @@ pub struct AudioSpectrum {
     /// frequency band, each `0.0..=1.0`. Exactly [`SPECTRUM_BINS`] long.
     pub bins: [f32; SPECTRUM_BINS],
 }
+
+/// Cap on the [`UpcomingEvent`] list the host pushes as
+/// [`HostMsg::CalendarUpcoming`](crate::msg::HostMsg::CalendarUpcoming) (#484):
+/// the **next five** events in the coming 24 hours. Small on purpose — this is a
+/// briefing-shaped digest (caw's morning news, the infobroker's `get calendar`),
+/// not the sidebar's full month view — so the wire frame stays tiny and the
+/// host's projection is a cheap, push-on-change slice of the calendar service.
+pub const MAX_UPCOMING_EVENTS: usize = 5;
+
+/// One upcoming calendar event, projected GTK-/chrono-free onto the wire (#484):
+/// the host fills these from its `hytte_services::calendar` handles (the EDS
+/// backend), capped to the next [`MAX_UPCOMING_EVENTS`] in the coming 24 h and
+/// pushed on change (EDS is signal-driven, not polled) to a plugin that opts into
+/// [`StateKey::CalendarUpcoming`](crate::manifest::StateKey::CalendarUpcoming)
+/// **and** holds [`Capability::Calendar`](crate::manifest::Capability::Calendar).
+/// Times are Unix seconds (the consumer formats them in local time), so the wire
+/// carries no timezone/`chrono` types.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpcomingEvent {
+    /// Event start, Unix seconds.
+    pub start_unix: i64,
+    /// Event end, Unix seconds.
+    pub end_unix: i64,
+    /// The event's title (the calendar's `SUMMARY`; the host substitutes a
+    /// placeholder for an empty one).
+    pub title: String,
+    /// The calendar source's human label (e.g. `"Personal"`, `"Work"`).
+    pub calendar: String,
+}
+
+/// The current-track digest a plugin renders when it opts into
+/// [`StateKey::NowPlaying`](crate::manifest::StateKey::NowPlaying) (#528, mirroring
+/// the #405 spectrum projection): the host projects
+/// `hytte_services::mpris`'s active player onto this GTK-free shape and pushes it
+/// on change (latest-wins) as
+/// [`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying). The motivating
+/// consumer is the audio widget's dot-matrix marquee, which scrolls the live
+/// title/artist while something plays and falls back to its own banner otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NowPlaying {
+    /// The track title (`xesam:title`), or empty when nothing is playing.
+    pub title: String,
+    /// The track artist(s) (`xesam:artist`, comma-joined), or empty.
+    pub artist: String,
+    /// Whether the active player is currently *playing* (as opposed to paused /
+    /// stopped / absent). A consumer keys its "show the track vs the fallback"
+    /// choice off this.
+    pub playing: bool,
+}

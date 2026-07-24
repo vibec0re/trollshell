@@ -41,9 +41,10 @@ mod speech;
 use std::time::Duration;
 
 use expression::Expression;
-use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node};
+use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, StateKey};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
+use ingredients::EventBrief;
 use tokio::sync::mpsc;
 
 /// Poll / animation cadence.
@@ -64,6 +65,22 @@ enum CawMsg {
     /// Today's composed morning briefing (#407) and the unix second it landed
     /// (the reference for "a fresher expression takes over").
     Briefing { text: String, at_unix: u64 },
+}
+
+/// Commands from `update` down to the briefing loop (the #280 lane). The host
+/// pushes calendar events and the session-lock state to `update`; those two
+/// facts belong in the blocking briefing loop that owns the trigger + compose, so
+/// `update` relays them here (#484).
+#[derive(Debug)]
+enum CawCmd {
+    /// The latest host-pushed upcoming events, briefing-shaped — folded into the
+    /// next compose (fills the previously-empty calendar slot).
+    Calendar(Vec<EventBrief>),
+    /// The session's lock state: `true` while locked. The briefing loop gates its
+    /// trigger on `!locked`, so the news fires on the **first unlock** inside the
+    /// window rather than while the human is away (#484 replacing #407's
+    /// suspend-window stand-in).
+    Locked(bool),
 }
 
 /// caw's moods — must match the `enum` her `caw_express` tool advertises.
@@ -138,6 +155,10 @@ struct Caw {
     /// fresher expression (her live voice always outranks old news; this
     /// plugin exists for *her* to express herself).
     briefing: Option<(String, u64)>,
+    /// The command lane to the briefing loop (#484): `update` relays the host's
+    /// calendar/lock pushes down it so the loop that owns the trigger + compose
+    /// sees them.
+    cmd_tx: CmdSender<CawCmd>,
 }
 
 impl Caw {
@@ -215,21 +236,28 @@ impl Caw {
 
 impl Plugin for Caw {
     type Msg = CawMsg;
-    /// caw drives this plugin one-way (she publishes; we render), so there is no
-    /// outbound command lane.
-    type Cmd = std::convert::Infallible;
+    /// caw relays the host's calendar/lock pushes to her briefing loop over this
+    /// lane (#484); she has no other outbound I/O.
+    type Cmd = CawCmd;
 
     fn manifest() -> Manifest {
-        // The top sidebar region — caw perches above the flex gap. No state
-        // subscriptions: she polls her own expression file. `Notify` (#406)
-        // mirrors the morning briefing (#407) as a toast, so the news lands
-        // even with the sidebar closed.
+        // The top sidebar region — caw perches above the flex gap. She polls her
+        // own expression file, but subscribes the two host digests her morning
+        // briefing (#407) consumes: `CalendarUpcoming` (the day's events) and
+        // `SessionLocked` (fire on first unlock), each paired with its gating
+        // capability (#484). `Notify` (#406) mirrors the briefing as a toast, so
+        // the news lands even with the sidebar closed.
         let mut m = Manifest::new("caw", Mount::SidebarTop);
-        m.capabilities = vec![Capability::Notify];
+        m.subscribes = vec![StateKey::CalendarUpcoming, StateKey::SessionLocked];
+        m.capabilities = vec![
+            Capability::Notify,
+            Capability::Calendar,
+            Capability::SessionState,
+        ];
         m
     }
 
-    fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+    fn init(cmds: CmdSender<Self::Cmd>) -> Self {
         // Seed with whatever is already published, so the first frame is right.
         let expr = expression::read(&expression::expression_path()).unwrap_or_default();
         Self {
@@ -237,54 +265,77 @@ impl Plugin for Caw {
             frame: 0,
             poke: None,
             briefing: None,
+            cmd_tx: cmds,
         }
     }
 
-    fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+    fn sources(mut cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         // A 2-second poll loop that reads the expression file and hands each
         // read to `update` as a `Frame`. The read is a tiny local file, so doing
         // it here (off `update`) keeps the model pure and testable.
         //
-        // The same heartbeat doubles as the morning-briefing trigger (#407):
-        // when the configured local time comes due (once per date, stamped
-        // through to disk *before* composing so nothing can re-caw), the
-        // blocking gather + compose runs on a `spawn_blocking` thread and the
-        // result re-enters `update` as a `Briefing`. The expression poll simply
-        // waits out that once-a-day await.
+        // The same heartbeat is the morning-briefing trigger (#407/#484): when
+        // the configured local time comes due (once per date, stamped through to
+        // disk *before* composing so nothing can re-caw) **and the session is
+        // unlocked**, the blocking gather + compose runs on a `spawn_blocking`
+        // thread and the result re-enters `update` as a `Briefing`. Gating on
+        // `!locked` is what makes the briefing fire on the *first unlock* inside
+        // the window (the heartbeat runs even while locked, so this holds it until
+        // the human is back) rather than announcing to an empty chair.
+        //
+        // The loop also drains the command lane: the host's calendar events and
+        // lock state arrive at `update`, which relays them here, so the compose
+        // sees the day's events and the trigger sees the live lock state.
         let (tx, rx) = mpsc::unbounded_channel();
         let path = expression::expression_path();
         tokio::spawn(async move {
             let cfg = briefing::Cfg::from_env();
             let mut stamp = briefing::Stamp::load();
             let mut timer = tokio::time::interval(TICK);
+            let mut locked = false;
+            let mut events: Vec<EventBrief> = Vec::new();
             loop {
-                timer.tick().await;
-                let latest = expression::read(&path);
-                if tx.send(CawMsg::Frame(latest)).is_err() {
-                    break;
-                }
-                let Some(at_mins) = cfg.time else { continue };
-                let now = chrono::Local::now();
-                if !briefing::is_due(
-                    briefing::minutes_of_day(&now),
-                    now.date_naive(),
-                    at_mins,
-                    stamp.last(),
-                ) {
-                    continue;
-                }
-                stamp.mark(now.date_naive());
-                let provider = cfg.provider.clone();
-                let text =
-                    tokio::task::spawn_blocking(move || briefing::brief_now(provider.as_ref()))
+                tokio::select! {
+                    _ = timer.tick() => {
+                        let latest = expression::read(&path);
+                        if tx.send(CawMsg::Frame(latest)).is_err() {
+                            break;
+                        }
+                        let Some(at_mins) = cfg.time else { continue };
+                        let now = chrono::Local::now();
+                        if !briefing::should_brief(
+                            briefing::minutes_of_day(&now),
+                            now.date_naive(),
+                            at_mins,
+                            stamp.last(),
+                            locked,
+                        ) {
+                            continue;
+                        }
+                        stamp.mark(now.date_naive());
+                        let provider = cfg.provider.clone();
+                        let ev = events.clone();
+                        let text = tokio::task::spawn_blocking(move || {
+                            briefing::brief_now(provider.as_ref(), ev)
+                        })
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("[caw] briefing task failed: {e}");
                             "the briefing crashed mid-caw. classic.".to_owned()
                         });
-                let at_unix = expression::now_unix();
-                if tx.send(CawMsg::Briefing { text, at_unix }).is_err() {
-                    break;
+                        let at_unix = expression::now_unix();
+                        if tx.send(CawMsg::Briefing { text, at_unix }).is_err() {
+                            break;
+                        }
+                    }
+                    cmd = cmds.recv() => {
+                        match cmd {
+                            Some(CawCmd::Calendar(e)) => events = e,
+                            Some(CawCmd::Locked(l)) => locked = l,
+                            // The lane closed: the session is tearing down.
+                            None => break,
+                        }
+                    }
                 }
             }
         });
@@ -308,13 +359,26 @@ impl Plugin for Caw {
                     self.poke();
                 }
             }
-            // No state subscriptions and no RunCommand, and caw keeps vibing
-            // whether or not the sidebar is on screen (a 2s poll is cheap).
+            // The host's calendar digest (#484): relay the briefing-shaped events
+            // down the lane to the compose loop. A send failure just means the
+            // session is tearing down.
+            Input::CalendarUpcoming(events) => {
+                let briefs = events.iter().map(EventBrief::from_upcoming).collect();
+                let _ = self.cmd_tx.send(CawCmd::Calendar(briefs));
+            }
+            // The host's lock state (#484): relay it so the briefing loop gates
+            // its trigger on `!locked` (fire on first unlock).
+            Input::SessionLocked(locked) => {
+                let _ = self.cmd_tx.send(CawCmd::Locked(locked));
+            }
+            // caw keeps vibing whether or not the sidebar is on screen (a 2s poll
+            // is cheap), and subscribes none of these.
             Input::Snapshot(_)
             | Input::EffectResult { .. }
             | Input::SlotVisible(_)
             | Input::AudioSpectrum(_)
-            | Input::ConsentDecision { .. } => {}
+            | Input::ConsentDecision { .. }
+            | Input::NowPlaying(_) => {}
         }
         Vec::new()
     }
@@ -400,7 +464,13 @@ mod tests {
     use super::*;
 
     fn caw() -> Caw {
-        let (tx, _rx) = hytte_plugin::cmd_channel::<std::convert::Infallible>();
+        caw_with_lane().0
+    }
+
+    /// A caw model plus the live end of its command lane — for the tests that
+    /// assert `update` relays the host's calendar/lock pushes down it (#484).
+    fn caw_with_lane() -> (Caw, CmdReceiver<CawCmd>) {
+        let (tx, rx) = hytte_plugin::cmd_channel::<CawCmd>();
         let mut c = Caw::init(tx);
         // Deterministic: pin a fresh, non-idle expression.
         c.expr = Expression {
@@ -411,7 +481,7 @@ mod tests {
             ts: now(), // fresh → not idle
         };
         c.briefing = None;
-        c
+        (c, rx)
     }
 
     const NEWS: &str = "morning, meat-computer. 3° rain, high 8°. S9 in 12 — move, choom.";
@@ -567,21 +637,54 @@ mod tests {
     }
 
     #[test]
-    fn manifest_mounts_sidebar_top_and_requests_notify() {
+    fn manifest_mounts_sidebar_top_and_subscribes_the_briefing_digests() {
         let m = Caw::manifest();
         assert_eq!(m.id, "caw");
         assert_eq!(m.mount, Mount::SidebarTop);
+        // #484: she now opts into the two briefing digests…
+        assert!(m.subscribes.contains(&StateKey::CalendarUpcoming));
+        assert!(m.subscribes.contains(&StateKey::SessionLocked));
+        // …each paired with its gating capability, plus `Notify` for the toast.
         assert!(
-            m.subscribes.is_empty(),
-            "caw polls her own file and opts into no host push (#305)"
+            m.capabilities.contains(&Capability::Notify),
+            "briefing toast"
         );
-        assert_eq!(
-            m.capabilities,
-            vec![Capability::Notify],
-            "the briefing toast (#407) is her only ask of the host"
+        assert!(
+            m.capabilities.contains(&Capability::Calendar),
+            "gates the calendar push"
+        );
+        assert!(
+            m.capabilities.contains(&Capability::SessionState),
+            "gates the session-lock push"
         );
         m.check_proto()
             .expect("stamped with the current proto version");
+    }
+
+    #[test]
+    fn update_relays_calendar_and_lock_to_the_briefing_lane() {
+        use hytte_plugin::proto::UpcomingEvent;
+        let (mut c, mut rx) = caw_with_lane();
+        // A calendar push relays a briefing-shaped event list down the lane.
+        let fx = c.update(Input::CalendarUpcoming(vec![UpcomingEvent {
+            start_unix: 1_752_222_000,
+            end_unix: 1_752_225_600,
+            title: "standup".to_owned(),
+            calendar: "Work".to_owned(),
+        }]));
+        assert!(fx.is_empty(), "relaying asks the host for nothing");
+        match rx.try_recv() {
+            Ok(CawCmd::Calendar(events)) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].summary, "standup");
+            }
+            other => panic!("expected a Calendar command, got {other:?}"),
+        }
+        // A lock push relays the boolean.
+        let _ = c.update(Input::SessionLocked(true));
+        assert!(matches!(rx.try_recv(), Ok(CawCmd::Locked(true))));
+        let _ = c.update(Input::SessionLocked(false));
+        assert!(matches!(rx.try_recv(), Ok(CawCmd::Locked(false))));
     }
 
     #[test]

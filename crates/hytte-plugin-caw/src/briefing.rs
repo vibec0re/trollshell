@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use chrono::{Datelike, NaiveDate, Timelike};
 use hytte_ai_providers::{ChatOpts, Message, Provider};
 
-use crate::ingredients::{self, Ingredients};
+use crate::ingredients::{self, EventBrief, Ingredients};
 
 /// Default briefing time: 07:00 local.
 const DEFAULT_TIME_MINS: u16 = 7 * 60;
@@ -156,6 +156,23 @@ pub(crate) fn is_due(
         return false;
     }
     now_mins >= at_mins && now_mins < at_mins.saturating_add(WINDOW_MINS)
+}
+
+/// The full briefing trigger (#484): [`is_due`] **and** the session is unlocked.
+/// The heartbeat evaluates this every 2 s, so — because it runs while locked too —
+/// gating on `!locked` makes the briefing fire on the **first unlock** inside the
+/// window (the human returning) rather than announcing the morning news to a
+/// locked screen. If the session is already unlocked when the hour arrives, the
+/// very next heartbeat fires it (there is no unlock edge to wait for). Pure — the
+/// caller supplies the clock and the live lock state.
+pub(crate) fn should_brief(
+    now_mins: u16,
+    today: NaiveDate,
+    at_mins: u16,
+    last_briefed: Option<NaiveDate>,
+    locked: bool,
+) -> bool {
+    !locked && is_due(now_mins, today, at_mins, last_briefed)
 }
 
 /// The once-a-day guard, persisted as a bare `YYYY-MM-DD` next to caw's
@@ -349,12 +366,14 @@ fn is_dropped(c: char) -> bool {
 
 // ── The pipeline ─────────────────────────────────────────────────────────────
 
-/// Compose today's briefing: gather the ingredients (blocking I/O), then voice
-/// them through the provider — or hand back the plain template keyless / on
-/// any model failure. Always returns *something*; run on a `spawn_blocking`
-/// thread.
-pub(crate) fn brief_now(provider: Option<&Provider>) -> String {
-    let ing = ingredients::gather();
+/// Compose today's briefing: gather the reachable ingredients (blocking weather /
+/// departures I/O), fold in the host-pushed `events` (#484), then voice them
+/// through the provider — or hand back the plain template keyless / on any model
+/// failure. Always returns *something*; run on a `spawn_blocking` thread.
+pub(crate) fn brief_now(provider: Option<&Provider>, events: Vec<EventBrief>) -> String {
+    let mut ing = ingredients::gather();
+    // The calendar slot no longer fetches itself — the host shares it (#484).
+    ing.events = events;
     let now = chrono::Local::now();
     let plain = compose_plain(&ing, usize::try_from(now.ordinal()).unwrap_or(0));
     let Some(provider) = provider else {
@@ -451,6 +470,25 @@ mod tests {
         assert!(!is_due(at + 5, today, at, Some(today)));
         // A *previous* date's stamp doesn't block today.
         assert!(is_due(at + 5, today, at, Some(date("2026-07-22"))));
+    }
+
+    #[test]
+    fn should_brief_gates_on_unlocked_inside_the_window() {
+        let today = date("2026-07-23");
+        let at = 7 * 60;
+        // Due + unlocked → brief.
+        assert!(should_brief(at, today, at, None, false));
+        // Due but locked → hold (the human is away; wait for the first unlock).
+        assert!(
+            !should_brief(at, today, at, None, true),
+            "a locked screen doesn't get the morning news"
+        );
+        // Unlocking inside the window → the next heartbeat fires it.
+        assert!(should_brief(at + 30, today, at, None, false));
+        // Not due (before the hour) → unlocked doesn't matter.
+        assert!(!should_brief(at - 1, today, at, None, false));
+        // Already briefed today → locked or not, never again.
+        assert!(!should_brief(at + 5, today, at, Some(today), false));
     }
 
     #[test]

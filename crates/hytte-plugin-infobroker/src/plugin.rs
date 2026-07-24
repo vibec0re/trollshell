@@ -26,6 +26,7 @@
 
 use hytte_plugin::proto::{
     Capability, ConsentDecision, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
+    UpcomingEvent,
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -33,6 +34,7 @@ use hytte_plugin_infobroker::broker::{
     AuditView, BrokerMsg, BrokerSnapshot, Cmd, ConsentDecision as BrokerConsentDecision,
     DatasourceView, GrantView, Outcome, PendingView, TokenView,
 };
+use hytte_plugin_infobroker::wire::CalendarEntry;
 use tokio::sync::mpsc;
 
 /// Stable plugin id — the host's mount-slot key, the audit-log subject, and the
@@ -52,6 +54,10 @@ const PANEL_ID: &str = "infobroker-panel";
 struct Infobroker {
     snapshot: BrokerSnapshot,
     now_unix: i64,
+    /// Whether the session is locked (#484). While `true` the panel blanks its
+    /// sensitive content (grants / sessions / audit) — the privacy note from the
+    /// domain-StateKeys design.
+    locked: bool,
     cmd_tx: CmdSender<Cmd>,
 }
 
@@ -66,15 +72,24 @@ impl Plugin for Infobroker {
     /// labels; the SDK adds the accent subscription on its behalf.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::BarRight);
-        m.subscribes = vec![StateKey::Clock];
-        // `OpenPage` (open its own panel), `Notify` (the denied-knock toast), and
-        // `Consent` (#487 phase 1b — raise the interactive prompt + receive the
-        // decision). `Consent` is also the #305 opt-in that gates the host's
-        // `ConsentDecision` push.
+        // `Clock` relabels the panel; `CalendarUpcoming` feeds the live copy that
+        // `get calendar` serves (#484); `SessionLocked` drives the privacy blank.
+        m.subscribes = vec![
+            StateKey::Clock,
+            StateKey::CalendarUpcoming,
+            StateKey::SessionLocked,
+        ];
+        // `OpenPage` (open its own panel), `Notify` (the denied-knock toast),
+        // `Consent` (#487 phase 1b — the interactive prompt + decision), plus the
+        // two #484 push gates: `Calendar` (the calendar datasource) and
+        // `SessionState` (the lock signal). `Consent`/`Calendar`/`SessionState` are
+        // also the #305 opt-ins gating their respective host pushes.
         m.capabilities = vec![
             Capability::OpenPage,
             Capability::Notify,
             Capability::Consent,
+            Capability::Calendar,
+            Capability::SessionState,
         ];
         m
     }
@@ -83,6 +98,7 @@ impl Plugin for Infobroker {
         Self {
             snapshot: BrokerSnapshot::default(),
             now_unix: 0,
+            locked: false,
             cmd_tx: cmds,
         }
     }
@@ -145,8 +161,22 @@ impl Plugin for Infobroker {
                 });
                 Vec::new()
             }
+            // The host's upcoming-calendar digest (#484): relay it down the lane
+            // to the broker, which replaces the live copy `get calendar` serves.
+            // Mapped from the proto type at the boundary (the library is SDK-free).
+            Input::CalendarUpcoming(events) => {
+                let entries = events.into_iter().map(map_event).collect();
+                let _ = self.cmd_tx.send(Cmd::Calendar(entries));
+                Vec::new()
+            }
+            // The session lock state (#484): drives the panel's privacy blank.
+            Input::SessionLocked(locked) => {
+                self.locked = locked;
+                Vec::new()
+            }
             Input::Event { node, kind } => self.on_event(&node, &kind),
-            // No RunCommand / spectrum / (bar chip) visibility handling needed.
+            // No RunCommand / spectrum / now-playing (unsubscribed) / bar-chip
+            // visibility handling needed.
             _ => Vec::new(),
         }
     }
@@ -245,7 +275,24 @@ impl Infobroker {
     /// title over muted secondary text) rather than a run of adjacent labels —
     /// the node vocab's `Row` has no inter-child spacing, so packing several bare
     /// labels into one rendered them concatenated ("fnorddeparturesalways").
+    ///
+    /// While the session is locked (#484) the panel blanks its sensitive content
+    /// (grants / live sessions / audit trail expose who accessed what) behind a
+    /// placeholder — the privacy note from the domain-StateKeys design.
     fn panel(&self) -> Node {
+        if self.locked {
+            return Node::Box {
+                id: Some(PANEL_ID.to_owned()),
+                dir: Dir::Vertical,
+                spacing: 8,
+                scroll: false,
+                classes: Vec::new(),
+                children: vec![
+                    label("Info broker", &["title-4"]),
+                    muted_text("Hidden while the session is locked."),
+                ],
+            };
+        }
         // The topic sections, in order. Pending knocks lead when present (the
         // actionable top of the panel); the rest always render.
         let mut sections: Vec<Node> = Vec::new();
@@ -510,6 +557,18 @@ fn parse_index(node: &str, prefix: &str) -> Option<usize> {
     node.strip_prefix(prefix).and_then(|s| s.parse().ok())
 }
 
+/// Map a proto [`UpcomingEvent`] onto the broker library's SDK-free
+/// [`CalendarEntry`] (#484) — the boundary translation that keeps the library
+/// free of the plugin proto, the same shape as [`map_decision`].
+fn map_event(event: UpcomingEvent) -> CalendarEntry {
+    CalendarEntry {
+        start_unix: event.start_unix,
+        end_unix: event.end_unix,
+        title: event.title,
+        calendar: event.calendar,
+    }
+}
+
 /// Map the proto's consent decision onto the broker library's own mirror enum
 /// (#487 phase 1b) — the SDK-free library defines its own so it never links the
 /// proto, so the plugin translates at the boundary (as it maps a broker `Toast`
@@ -571,6 +630,7 @@ mod tests {
             Infobroker {
                 snapshot: BrokerSnapshot::default(),
                 now_unix: 1_750_000_000,
+                locked: false,
                 cmd_tx: tx,
             },
             rx,
@@ -597,6 +657,85 @@ mod tests {
             m.subscribes.contains(&StateKey::Clock),
             "Clock relabels the panel"
         );
+        // #484: the calendar datasource + the privacy blank, each capability-gated.
+        assert!(m.subscribes.contains(&StateKey::CalendarUpcoming));
+        assert!(m.subscribes.contains(&StateKey::SessionLocked));
+        assert!(
+            m.capabilities.contains(&Capability::Calendar),
+            "gates the calendar push (get calendar)"
+        );
+        assert!(
+            m.capabilities.contains(&Capability::SessionState),
+            "gates the session-lock push (privacy blank)"
+        );
+    }
+
+    #[test]
+    fn a_calendar_input_dispatches_a_mapped_calendar_command() {
+        let (mut m, mut rx) = model();
+        let fx = m.update(Input::CalendarUpcoming(vec![UpcomingEvent {
+            start_unix: 100,
+            end_unix: 200,
+            title: "standup".to_owned(),
+            calendar: "Work".to_owned(),
+        }]));
+        assert!(fx.is_empty(), "the digest rides the lane, not an effect");
+        match rx.try_recv() {
+            Ok(Cmd::Calendar(entries)) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].title, "standup");
+                assert_eq!(entries[0].start_unix, 100);
+            }
+            other => panic!("expected a Calendar command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_locked_session_blanks_the_sensitive_panel_content() {
+        let (mut m, _rx) = model();
+        // Seed some sensitive state (a grant + audit) that the panel would show.
+        m.snapshot = BrokerSnapshot {
+            grants: vec![GrantView {
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+                decision: "always",
+            }],
+            ..BrokerSnapshot::default()
+        };
+        // Unlocked: the panel lists the grant.
+        assert!(
+            panel_mentions(&m.panel(), "claude"),
+            "unlocked shows grants"
+        );
+        // Locked: the sensitive content is blanked behind the placeholder.
+        let _ = m.update(Input::SessionLocked(true));
+        let panel = m.panel();
+        assert!(
+            !panel_mentions(&panel, "claude"),
+            "a locked session hides the grants"
+        );
+        assert!(
+            panel_mentions(&panel, "Hidden while the session is locked."),
+            "the locked placeholder shows"
+        );
+        // Unlocking restores it.
+        let _ = m.update(Input::SessionLocked(false));
+        assert!(
+            panel_mentions(&m.panel(), "claude"),
+            "unlock restores grants"
+        );
+    }
+
+    /// Whether any `Label`/`Text` node under `node` carries exactly `needle`.
+    fn panel_mentions(node: &Node, needle: &str) -> bool {
+        match node {
+            Node::Label { text, .. } | Node::Text { text, .. } => text == needle,
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => children.iter().any(|c| panel_mentions(c, needle)),
+            Node::Button { child, .. } => panel_mentions(child, needle),
+            _ => false,
+        }
     }
 
     #[test]
@@ -669,6 +808,19 @@ mod tests {
     fn clicking_the_chip_opens_the_panel() {
         let (mut m, _rx) = model();
         let fx = m.on_event(CHIP_ID, &EventKind::Click);
+        assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
+    }
+
+    /// End-to-end through `update`: a chip click routes to `on_event` and opens
+    /// the panel (guards the `Input::Event` arm — a dropped arm would make clicks
+    /// silently dead while the direct-`on_event` test above still passed).
+    #[test]
+    fn a_chip_click_through_update_opens_the_panel() {
+        let (mut m, _rx) = model();
+        let fx = m.update(Input::Event {
+            node: CHIP_ID.to_owned(),
+            kind: EventKind::Click,
+        });
         assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
     }
 

@@ -310,7 +310,7 @@ use std::time::Duration;
 
 use hytte_plugin_proto::{
     AudioSpectrum, ConsentDecision, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId,
-    StateSnapshot,
+    NowPlaying, StateSnapshot, UpcomingEvent,
 };
 
 pub mod preem;
@@ -486,6 +486,29 @@ pub enum Input<M> {
         /// The human's choice (or `Deny` on the 60 s timeout).
         decision: ConsentDecision,
     },
+    /// The next few upcoming calendar events (#484): the host
+    /// [`CalendarUpcoming`](proto::HostMsg::CalendarUpcoming) push, delivered only
+    /// to a plugin that subscribes
+    /// [`StateKey::CalendarUpcoming`](proto::StateKey::CalendarUpcoming) **and**
+    /// declares [`Capability::Calendar`](proto::Capability::Calendar). A capped
+    /// digest (the next [`MAX_UPCOMING_EVENTS`](proto::MAX_UPCOMING_EVENTS) in the
+    /// coming 24 h), pushed on change; fold it into the model like any other host
+    /// input. Times are Unix seconds — format them in the consumer's local time.
+    CalendarUpcoming(Vec<UpcomingEvent>),
+    /// The session's logind lock state (#484): the host
+    /// [`SessionLocked`](proto::HostMsg::SessionLocked) push, `true` while locked.
+    /// Delivered only to a plugin that subscribes
+    /// [`StateKey::SessionLocked`](proto::StateKey::SessionLocked) **and** declares
+    /// [`Capability::SessionState`](proto::Capability::SessionState). Seeded at
+    /// register, then pushed on every change — key a "first unlock" action off the
+    /// `true`→`false` transition, or blank sensitive content while `true`.
+    SessionLocked(bool),
+    /// The current-track digest off the mpris active player (#528): the host
+    /// [`NowPlaying`](proto::HostMsg::NowPlaying) push, delivered only to a plugin
+    /// that subscribes [`StateKey::NowPlaying`](proto::StateKey::NowPlaying) **and**
+    /// declares [`Capability::NowPlaying`](proto::Capability::NowPlaying). Pushed on
+    /// change (latest-wins), like [`AudioSpectrum`](Input::AudioSpectrum).
+    NowPlaying(NowPlaying),
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
 }

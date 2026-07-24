@@ -358,7 +358,10 @@ mod tests {
         h.decay();
         // Clamped `>= 0.0`, so `<= 0.0` is exact rest (no undershoot) sans a
         // float `==`.
-        assert!(h.value() <= 0.0, "bottoms out at exactly zero, no undershoot");
+        assert!(
+            h.value() <= 0.0,
+            "bottoms out at exactly zero, no undershoot"
+        );
         h.decay();
         assert!(h.value() <= 0.0, "and stays there");
 

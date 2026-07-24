@@ -3,7 +3,12 @@ use hytte::prelude::*;
 use hytte::services::sensors;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let btn = crate::components::chip::indicator("ts-cpu", crate::modal::Page::Stats, monitor);
+    let btn = crate::components::chip::indicator_scroll(
+        "ts-cpu",
+        crate::modal::Page::Stats,
+        monitor,
+        || crate::panels::stats::set_scroll_target(crate::panels::stats::StatsSection::Cpu),
+    );
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 

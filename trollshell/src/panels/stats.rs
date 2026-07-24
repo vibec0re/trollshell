@@ -4,6 +4,13 @@
 //! self-hiding failed-units services chip) opens this same page; the
 //! per-resource cards are the `build_stats_*` builders below, appended in
 //! order by [`panel_stats`].
+//!
+//! #516 adds scroll-to-section precision on top of the #508 restore, without
+//! re-splitting the page: each resource chip stashes a [`StatsSection`] via
+//! [`set_scroll_target`] just before it opens/re-shows the drawer, and the
+//! combined page — wrapped in a `ScrolledWindow` here so five stacked cards
+//! don't run past screen height — scrolls its own target card to the top.
+//! See [`StatsSection`] for how `crate::modal` triggers the (re)scroll.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -11,7 +18,7 @@ use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::Signal;
-use hytte::gtk::{self, gio};
+use hytte::gtk::{self, gio, glib};
 use hytte::prelude::*;
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuFreq, CpuLoad};
@@ -24,19 +31,136 @@ use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::reactive_list::reactive_list;
 
+/// One card in the combined Stats page (#516). Named after the resource chip
+/// that scrolls to it, in the same top-to-bottom order [`panel_stats`] stacks
+/// the cards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatsSection {
+    Cpu,
+    Memory,
+    Disks,
+    Gpu,
+    Services,
+}
+
+thread_local! {
+    /// The card a resource chip wants the combined Stats page to land on next
+    /// (#516). Set by [`set_scroll_target`] synchronously just before the
+    /// chip calls `crate::modal::toggle`/`toggle_keep_open`; read (not
+    /// consumed — a stale value is harmless, and re-reading lets both the
+    /// window-map path and the already-open re-show path apply the same
+    /// target) by the `"stats.scroll"` action each built page installs on
+    /// itself in [`panel_stats`].
+    static PENDING_SCROLL: Cell<Option<StatsSection>> = const { Cell::new(None) };
+}
+
+/// Stash which card the next Stats-page open/re-show should scroll to (#516).
+/// Called by a resource chip's click handler immediately before it opens or
+/// re-shows the combined Stats page; consumed by the page's own
+/// `"stats.scroll"` action (wired in [`panel_stats`]) the next time
+/// `crate::modal` triggers it.
+pub fn set_scroll_target(section: StatsSection) {
+    PENDING_SCROLL.with(|c| c.set(Some(section)));
+}
+
 /// The combined stats flyout — opened from any of the CPU / memory / disk /
 /// GPU / services bar chips. All five cards stack in one `ts-popup-column`,
 /// one click, scroll to see all (pre-#307 shape).
+///
+/// Wrapped in a `gtk::ScrolledWindow` (mirroring `connections.rs`/`wifi.rs`'s
+/// #84 pattern) so five stacked cards can't push the drawer past screen
+/// height. A `"stats"`-prefixed `gio::SimpleActionGroup` carrying one
+/// `"scroll"` action is inserted on the returned page widget: activating it
+/// re-applies whatever [`StatsSection`] is currently pending in
+/// [`PENDING_SCROLL`]. Routing the trigger through a widget-local action
+/// (rather than a cross-module registry keyed by monitor) is what lets
+/// `crate::modal` poke *this specific monitor's* built page instance armed
+/// with only the `gtk::Widget` it already gets back from
+/// `gtk::Stack::child_by_name` — this page never needs to know which monitor
+/// it's on.
 pub fn panel_stats() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
     column.set_spacing(16);
-    column.append(build_stats_cpu_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_memory_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_disks_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_gpu_card().upcast_ref::<gtk::Widget>());
-    column.append(build_stats_services_group().upcast_ref::<gtk::Widget>());
-    finish_page(&column)
+
+    let cpu_card = build_stats_cpu_card();
+    let memory_card = build_stats_memory_card();
+    let disks_card = build_stats_disks_card();
+    let gpu_card = build_stats_gpu_card();
+    let services_card = build_stats_services_group();
+
+    column.append(cpu_card.upcast_ref::<gtk::Widget>());
+    column.append(memory_card.upcast_ref::<gtk::Widget>());
+    column.append(disks_card.upcast_ref::<gtk::Widget>());
+    column.append(gpu_card.upcast_ref::<gtk::Widget>());
+    column.append(services_card.upcast_ref::<gtk::Widget>());
+
+    // Soft default (flagged for review, same spirit as the disk-I/O row's
+    // own "soft defaults" caveat further down this file): 560 leaves a
+    // couple of cards visible on a typical laptop panel while still
+    // requiring a scroll to reach the rest, the same trade-off
+    // connections.rs's 480 and wifi.rs's 240 caps make.
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(crate::scale::scale(560));
+    scrolled.set_child(Some(&column));
+
+    let sections: Vec<(StatsSection, gtk::Widget)> = vec![
+        (StatsSection::Cpu, cpu_card.upcast()),
+        (StatsSection::Memory, memory_card.upcast()),
+        (StatsSection::Disks, disks_card.upcast()),
+        (StatsSection::Gpu, gpu_card.upcast()),
+        (StatsSection::Services, services_card.upcast()),
+    ];
+    let scrolled_for_action = scrolled.clone();
+    let column_for_action = column.clone();
+    let action_group = gio::SimpleActionGroup::new();
+    let scroll_action = gio::SimpleAction::new("scroll", None);
+    scroll_action.connect_activate(move |_, _| {
+        apply_scroll(&scrolled_for_action, &column_for_action, &sections);
+    });
+    action_group.add_action(&scroll_action);
+
+    let page = finish_page(&scrolled);
+    page.insert_action_group("stats", Some(&action_group));
+    page
+}
+
+/// Resolve the pending [`StatsSection`] (if any) against `sections` and
+/// scroll `scrolled` so that card's top edge lands at the top of the
+/// viewport. Deferred one main-loop idle tick past this call so a
+/// just-mapped or just-swapped-to page's layout is settled before
+/// `compute_bounds` reads it — the same "allocation isn't ready before
+/// map/tick" guarantee `modal.rs`'s own post-map recenter math relies on
+/// (#212-family lore). No-ops quietly if nothing is pending, the target
+/// isn't one of this page's cards, or the page isn't laid out yet (e.g. the
+/// drawer was closed again before the idle tick ran).
+fn apply_scroll(
+    scrolled: &gtk::ScrolledWindow,
+    column: &gtk::Box,
+    sections: &[(StatsSection, gtk::Widget)],
+) {
+    let Some(target) = PENDING_SCROLL.with(Cell::get) else {
+        return;
+    };
+    let Some((_, card)) = sections.iter().find(|(section, _)| *section == target) else {
+        return;
+    };
+
+    let scrolled = scrolled.clone();
+    let column = column.clone();
+    let card = card.clone();
+    glib::idle_add_local_once(move || {
+        let Some(bounds) = card.compute_bounds(&column) else {
+            return;
+        };
+        let vadj = scrolled.vadjustment();
+        let lower = vadj.lower();
+        let upper = (vadj.upper() - vadj.page_size()).max(lower);
+        vadj.set_value(f64::from(bounds.y()).clamp(lower, upper));
+    });
 }
 
 /// Wrap a bare history-sparkline `gtk::Box` in a `gtk::ListBoxRow` so it joins

@@ -800,9 +800,9 @@ fn set_stack_page(panel: &ModalPanel, page: Page) {
 /// Per-active side-effects on show: a built-in page runs its [`on_page_show`]
 /// hook; a plugin panel publishes the active selection so every per-monitor
 /// plugin drawer child reconciles that plugin's tree (#349 PR2).
-fn on_active_show(active: &Active) {
+fn on_active_show(panel: &ModalPanel, active: &Active) {
     match active {
-        Active::Builtin(page) => on_page_show(*page),
+        Active::Builtin(page) => on_page_show(panel, *page),
         Active::Plugin(id) => crate::plugins::set_active_panel(Some(id)),
     }
 }
@@ -929,7 +929,7 @@ pub fn switch_active(target: Page) {
             if panel.current.borrow().is_some() {
                 set_stack_page(panel, target);
                 *panel.current.borrow_mut() = Some(Active::Builtin(target));
-                on_page_show(target);
+                on_page_show(panel, target);
             }
         }
     });
@@ -1045,6 +1045,29 @@ pub fn open_plugin_on_focused(preferred: Option<&str>, plugin_id: &str) {
 ///   the drawer surface keeps its existing position.
 /// - Closed → reposition under `trigger`, present surface, reveal.
 pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
+    toggle_inner(monitor, page, trigger, true);
+}
+
+/// Like [`toggle`], but never retracts when `page` is already the drawer's
+/// visible page — it re-runs the on-show hook instead. Used by chips that
+/// route into a page shared with other triggers (#516: the five combined-
+/// Stats resource chips all pass `Page::Stats`), so a click from a
+/// *different* chip while that shared page is already open jumps within it
+/// (`on_page_show`'s `Page::Stats` arm re-applies the pending scroll target)
+/// rather than closing the drawer. Re-clicking the *same* chip lands here
+/// too — it just re-applies the same target, which is a harmless no-op.
+pub fn toggle_keep_open(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
+    toggle_inner(monitor, page, trigger, false);
+}
+
+/// Shared implementation behind [`toggle`]/[`toggle_keep_open`]; `retract_on_same`
+/// picks which of the two the "page already open" branch takes.
+fn toggle_inner(
+    monitor: &Monitor,
+    page: Page,
+    trigger: &impl IsA<gtk::Widget>,
+    retract_on_same: bool,
+) {
     let key = monitor_key(monitor);
     PANELS.with(|panels| {
         let panels = panels.borrow();
@@ -1053,15 +1076,21 @@ pub fn toggle(monitor: &Monitor, page: Page, trigger: &impl IsA<gtk::Widget>) {
         };
         let current = panel.current.borrow().clone();
         match current {
-            // Same built-in page already open → retract. A plugin panel showing
-            // is never the same as a built-in `page`, so it falls to the swap arm.
+            // Same built-in page already open → retract (`toggle`) or re-run
+            // the on-show hook in place (`toggle_keep_open`). A plugin panel
+            // showing is never the same as a built-in `page`, so it falls to
+            // the swap arm.
             Some(Active::Builtin(p)) if p == page => {
-                panel.revealer.set_reveal_child(false);
+                if retract_on_same {
+                    panel.revealer.set_reveal_child(false);
+                } else {
+                    on_page_show(panel, page);
+                }
             }
             Some(_) => {
                 set_stack_page(panel, page);
                 *panel.current.borrow_mut() = Some(Active::Builtin(page));
-                on_page_show(page);
+                on_page_show(panel, page);
             }
             None => {
                 // Build + set the visible child first so `measure` reflects the
@@ -1101,7 +1130,7 @@ fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
 /// only `stack_name` + on-show + margins, none of which are `Page`-specific.
 fn show_panel_active(panel: &ModalPanel, active: Active, main_margin: i32) {
     set_stack_active(panel, &active);
-    on_active_show(&active);
+    on_active_show(panel, &active);
     *panel.current.borrow_mut() = Some(active);
     panel.open_state.set(true);
 
@@ -1146,6 +1175,16 @@ fn set_widget_margin(widget: &impl IsA<gtk::Widget>, edge: LayerEdge, margin: i3
 /// so the recompute is deferred to the next main-loop idle — by then the card
 /// has a real allocation (`card.width()`/`card.height()`, which include the
 /// card's borders and padding). Fires on every map.
+///
+/// Also (#516) re-applies any pending Stats-page scroll target here. A fresh
+/// drawer open runs [`on_page_show`] *before* `window.present()` (see
+/// [`show_panel_active`]), so that first attempt may fire against an
+/// allocation that isn't settled yet; re-triggering it once the window is
+/// genuinely mapped guarantees a correct final position regardless — the
+/// same settled-frame guarantee the margin recompute below needs. Both
+/// triggers land on the same idempotent idle-deferred computation
+/// (`panels::stats`'s own `"stats.scroll"` action handler), so firing twice
+/// is harmless.
 fn wire_recenter_on_map(window: &gtk::Window, key: String) {
     window.connect_map(move |_| {
         let key = key.clone();
@@ -1155,6 +1194,7 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
                 let Some(panel) = panels.get(&key) else {
                     return;
                 };
+                apply_stats_scroll(panel);
                 let Some(center) = *panel.pending_center.borrow() else {
                     return;
                 };
@@ -1283,7 +1323,7 @@ pub fn drawer_open_signal(monitor: &Monitor) -> impl Signal<Item = bool> + 'stat
 /// Per-page side-effects that should run whenever a page becomes visible
 /// (initial open OR cross-fade swap from another page). Add a match arm
 /// here when a new page needs an on-show fetch.
-fn on_page_show(page: Page) {
+fn on_page_show(panel: &ModalPanel, page: Page) {
     match page {
         Page::Clipboard => clipboard::refresh(),
         Page::Calendar => calendar::refresh(),
@@ -1291,7 +1331,35 @@ fn on_page_show(page: Page) {
         // Dismiss all active toasts (move to history); the bell counter
         // bound to active.len() drops to zero.
         Page::Notifications => notifications::dismiss_all(),
+        // #516: (re)land the combined Stats page on whichever resource
+        // chip's card is currently pending. Fires here on every open/swap/
+        // re-show of the page — including the "already open" `toggle_keep_open`
+        // path, which is exactly the case that needs it (the stack's visible
+        // child doesn't change, so nothing else would trigger a rescroll).
+        Page::Stats => apply_stats_scroll(panel),
         _ => {}
+    }
+}
+
+/// Trigger `panel`'s built Stats page to re-apply its own pending scroll
+/// target (#516). A no-op if the page was never opened on this monitor yet
+/// (not in `panel.stack` — `gtk::Stack::child_by_name` returns `None`, e.g.
+/// the drawer just opened straight to a different page).
+///
+/// Routes through `gtk::Widget::activate_action` on the page widget itself
+/// rather than a monitor-keyed registry here: `panels::stats::panel_stats`
+/// installs a `"stats"`-prefixed action group carrying a `"scroll"` action on
+/// the widget it returns, so this only needs the `gtk::Widget` `crate::panels`
+/// already handed back — no need for `modal.rs` to track per-monitor
+/// Stats-page state of its own. An `Err` here would mean that action group
+/// somehow wasn't installed, which shouldn't happen for the real Stats page;
+/// logged rather than ignored so a future regression there isn't silent.
+fn apply_stats_scroll(panel: &ModalPanel) {
+    let Some(widget) = panel.stack.child_by_name(Page::Stats.stack_name()) else {
+        return;
+    };
+    if let Err(e) = widget.activate_action("stats.scroll", None) {
+        tracing::debug!(error = %e, "modal: stats scroll action activation failed");
     }
 }
 

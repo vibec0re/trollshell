@@ -1794,7 +1794,13 @@ async fn datasource_query_routes_to_provider_and_result_back() {
     let router = DatasourceRouter::default();
     let (prov_tx, mut prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
-    router.register_provider("departures", vec!["next".into()], prov_tx.clone(), 1);
+    router.register_provider(
+        "departures",
+        "departures",
+        vec!["next".into()],
+        prov_tx.clone(),
+        1,
+    );
 
     broker_effect(
         "infobroker",
@@ -1846,6 +1852,88 @@ async fn datasource_query_routes_to_provider_and_result_back() {
     );
 }
 
+/// #553: only the provider a query was **routed to** may resolve its correlation.
+/// A second provider-capable plugin that echoes another plugin's in-flight host
+/// correlation with a forged answer must NOT resolve the parked query; the genuine
+/// provider's later answer still must. Guards the "host is the single policy
+/// chokepoint" story against cross-provider result forgery.
+#[tokio::test]
+async fn datasource_result_from_a_non_routed_provider_is_dropped() {
+    let router = DatasourceRouter::default();
+    let (prov_tx, mut prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    // The genuine provider of `departures`.
+    router.register_provider(
+        "departures",
+        "departures",
+        vec!["next".into()],
+        prov_tx.clone(),
+        1,
+    );
+
+    // Route a query; capture the opaque host correlation the provider is asked under.
+    broker_effect(
+        "infobroker",
+        &Effect::DatasourceQuery {
+            request_id: 42,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: "{}".into(),
+        },
+        &req_tx,
+        &router,
+    );
+    let HostMsg::DatasourceQuery {
+        request_id: corr, ..
+    } = recv_queue(&mut prov_rx).await
+    else {
+        panic!("provider must receive a DatasourceQuery");
+    };
+
+    // A DIFFERENT provider-capable plugin echoes that correlation with a forged
+    // answer. It is not the routed-to provider, so the parked query must NOT
+    // resolve. (`outbound` is unused by `DatasourceResult`; any sender is fine.)
+    broker_effect(
+        "impostor",
+        &Effect::DatasourceResult {
+            request_id: corr,
+            outcome: DatasourceOutcome::Ready("forged".into()),
+        },
+        &prov_tx,
+        &router,
+    );
+
+    // The genuine provider's answer resolves it — and because the forgery left the
+    // entry parked (not removed), this still finds it. In a correct build the
+    // requester deterministically receives "real": the impostor is the only other
+    // writer and it never removes the correlation.
+    broker_effect(
+        "departures",
+        &Effect::DatasourceResult {
+            request_id: corr,
+            outcome: DatasourceOutcome::Ready("real".into()),
+        },
+        &prov_tx,
+        &router,
+    );
+    assert_eq!(
+        recv_queue(&mut req_rx).await,
+        HostMsg::DatasourceResult {
+            request_id: 42,
+            outcome: DatasourceOutcome::Ready("real".into()),
+        },
+        "the genuine provider's answer must resolve the query, not the forgery",
+    );
+    // And the forged answer must never also reach the requester (a bounded wait so a
+    // leaked forgery would arrive within the window rather than escape detection).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), req_rx.recv())
+            .await
+            .is_err(),
+        "a forged result from a non-routed provider must never reach the requester",
+    );
+}
+
 /// A query for a datasource no connected plugin provides resolves to a
 /// host-synthesized `NotFound` — the requester never hangs.
 #[tokio::test]
@@ -1884,7 +1972,7 @@ async fn datasource_query_for_undeclared_scope_is_scope_denied() {
     let router = DatasourceRouter::default();
     let (prov_tx, _prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
-    router.register_provider("departures", vec!["next".into()], prov_tx, 1);
+    router.register_provider("departures", "departures", vec!["next".into()], prov_tx, 1);
     router.route_query(
         "infobroker".into(),
         8,
@@ -1919,7 +2007,7 @@ async fn datasource_query_times_out_when_provider_never_answers() {
     // A wide provider queue so the forward succeeds; the test simply never answers.
     let (prov_tx, _prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
-    router.register_provider("weather", vec!["current".into()], prov_tx, 1);
+    router.register_provider("weather", "weather", vec!["current".into()], prov_tx, 1);
     router.route_query(
         "infobroker".into(),
         99,

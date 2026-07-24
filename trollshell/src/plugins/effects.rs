@@ -146,9 +146,11 @@ pub(super) fn broker_effect(
             // host forwarded (echoed verbatim here, NOT the requester's token).
             // Reaching here means the plugin holds `Capability::DatasourceProvider`.
             // The router maps the correlation back to the parked requester and its
-            // original `request_id`; an unknown/expired correlation is dropped.
+            // original `request_id`; an unknown/expired correlation is dropped, and
+            // (#553) so is one echoed by any plugin other than the provider the query
+            // was routed to — `plugin_id` is that identity check.
             tracing::info!(plugin = %plugin_id, request_id = *request_id, "plugin effect: DatasourceResult");
-            datasource.deliver_result(*request_id, outcome.clone());
+            datasource.deliver_result(*request_id, plugin_id.to_owned(), outcome.clone());
         }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");

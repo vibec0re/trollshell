@@ -2,10 +2,11 @@
 name: infobroker
 description: >-
   Read scoped data from Annika's trollshell desktop (public-transport
-  departures, more later) through the consent-gated infobroker. Use when a task
-  needs live data from her machine — "when's my next train", "what's leaving
-  Schöneweide" — that only the desktop can source. Every datasource is behind an
-  explicit human grant; ask for the minimum and handle a denial gracefully.
+  departures, weather, calendar) through the consent-gated infobroker. Use when a
+  task needs live data from her machine — "when's my next train", "what's the
+  weather", "what's on my calendar" — that only the desktop can source. Every
+  datasource is behind an explicit human grant; ask for the minimum and handle a
+  denial gracefully.
 ---
 
 # infobroker — the trollshell data broker
@@ -43,6 +44,8 @@ eval "$(hytte-infobroker auth --agent claude)"
 # 2. Read scoped data (uses $HYTTE_INFOBROKER_TOKEN):
 hytte-infobroker get departures            # next catchable S-Bahn departures (JSON)
 hytte-infobroker get departures --limit 3  # just the next few
+hytte-infobroker get weather               # current conditions (one JSON object)
+hytte-infobroker get calendar --limit 5    # upcoming calendar events (JSON)
 
 # 3. See what you're allowed to read:
 hytte-infobroker grants list
@@ -62,7 +65,7 @@ stderr. **Do not** keep re-running it — a denial is a standing "not yet".
 ### `get <datasource> [--limit N]`
 
 Fetches scoped data as JSON on stdout, authenticated by
-`$HYTTE_INFOBROKER_TOKEN`. Phase 1a ships one datasource:
+`$HYTTE_INFOBROKER_TOKEN`. Three datasources are served:
 
 - **`departures`** — the next catchable S-Bahn departures from Annika's
   configured home station. Each row: `{ line, direction, hhmm, in_minutes,
@@ -82,7 +85,36 @@ delay_minutes, cancelled }`. Example:
   ```
 
   `in_minutes` is whole minutes from now; `delay_minutes` is lateness (0 = on
-  time); a cancelled run has `cancelled: true`.
+  time); a cancelled run has `cancelled: true`. `--limit` caps the rows.
+
+- **`weather`** — the current reading for the desktop's configured location, as a
+  single JSON **object** (not an array): `{ location, temp_c, apparent_c,
+temp_max_c, temp_min_c, humidity_pct, wind_kmh, condition_code, condition_label,
+condition_icon }`. Temperatures are °C, `wind_kmh` is km/h, `condition_code` is
+  the raw WMO weather code with a human `condition_label`/`condition_icon`
+  alongside. `--limit` doesn't apply (it's one reading).
+
+- **`calendar`** — the upcoming calendar events. Each row: `{ start_unix,
+end_unix, title, calendar }`; times are Unix seconds (format them yourself),
+  `calendar` is the source calendar's name. `--limit` caps how many events come
+  back.
+
+**Datasource dependencies — read this.** Since #509 the broker no longer fetches
+`departures` and `weather` itself; they are **routed through their provider widget
+plugins** (`hytte-plugin-departures` / `hytte-plugin-weather`) over the desktop's
+host query protocol. So each needs its plugin enabled and running: if it isn't,
+the `get` fails with a message like
+
+```
+departures: no connected provider for datasource 'departures'
+```
+
+(likewise `weather: no connected provider for datasource 'weather'`). That's a
+standing "the provider isn't up", **not** a consent denial — surface it and stop;
+retrying won't help until the plugin is enabled. `calendar` has no such
+dependency: the desktop pushes its upcoming events into the broker (the host's
+`CalendarUpcoming` feed), so `get calendar` reads the broker's own live copy
+directly.
 
 ### `grants list`
 
@@ -117,8 +149,19 @@ same-user-only). One request object per line in, one response per line out:
 → {"op":"get","token":"…","datasource":"departures","limit":5}
 ← {"ok":true,"datasource":"departures","departures":[ … ]}
 
+→ {"op":"get","token":"…","datasource":"weather"}
+← {"ok":true,"datasource":"weather","weather":{ … }}
+
+→ {"op":"get","token":"…","datasource":"calendar","limit":5}
+← {"ok":true,"datasource":"calendar","calendar":[ … ]}
+
 → {"op":"grants"}
 ← {"ok":true,"grants":[{"agent":"claude","datasource":"departures","scope":"*","decision":"always"}]}
 
 ← {"ok":false,"error":"…","hint":"…"}        (any denied request)
 ```
+
+`get` is the same op for every datasource; only the `datasource` field and which
+payload field the answer populates (`departures` / `weather` / `calendar`) differ.
+A `departures`/`weather` `get` whose provider plugin isn't running comes back as
+`{"ok":false,"error":"departures: no connected provider for datasource 'departures'"}`.

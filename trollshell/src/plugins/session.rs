@@ -459,6 +459,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
             for ds in &manifest.provides {
                 ctx.datasource.register_provider(
                     &ds.id,
+                    &plugin_id,
                     ds.scopes.clone(),
                     out_tx.clone(),
                     generation,

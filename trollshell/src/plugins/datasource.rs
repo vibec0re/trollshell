@@ -43,11 +43,17 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// A connected datasource provider (#509): the outbound channel to its connection,
-/// the scopes it declared for this datasource, and the connection generation — so
-/// teardown removes only an entry this same connection still owns (the #278
-/// generation guard the region mailboxes use).
+/// A connected datasource provider (#509): the providing connection's plugin id,
+/// the outbound channel to its connection, the scopes it declared for this
+/// datasource, and the connection generation — so teardown removes only an entry
+/// this same connection still owns (the #278 generation guard the region mailboxes
+/// use).
 struct ProviderEntry {
+    /// The providing connection's plugin id (#553): stamped onto every query routed
+    /// here (see [`PendingQuery::provider_id`]) so the result leg can verify an
+    /// answer came back from *this* provider, not another provider-capable plugin
+    /// echoing a guessed correlation.
+    plugin_id: String,
     outbound: mpsc::Sender<HostMsg>,
     scopes: Vec<String>,
     generation: u64,
@@ -59,6 +65,19 @@ struct ProviderEntry {
 struct PendingQuery {
     requester: mpsc::Sender<HostMsg>,
     request_id: u64,
+    /// The plugin id of the provider this query was routed to (#553). Only that
+    /// provider may resolve this correlation: a [`DatasourceResult`] echoing the
+    /// correlation from any *other* plugin is dropped, not delivered — the host, not
+    /// the guessable correlation counter, is the identity authority.
+    ///
+    /// [`DatasourceResult`]: hytte_plugin_proto::Effect::DatasourceResult
+    provider_id: String,
+    /// Abort handle for this query's armed timeout task (#553). Aborted the moment
+    /// the query resolves, so a successful answer leaves no timer lingering the full
+    /// [`QUERY_TIMEOUT`] — the #544 [`tokio::time::timeout`] parity, adapted to the
+    /// router's decoupled request/answer legs (the two never share one future to
+    /// wrap, so an abort handle stands in for cancelling the timer).
+    timeout: tokio::task::AbortHandle,
 }
 
 /// The cross-thread datasource query router (#509). One per host, shared (as an
@@ -77,13 +96,16 @@ pub(super) struct DatasourceRouter {
 }
 
 impl DatasourceRouter {
-    /// Register `id` as served by a connection (its `outbound`, declared `scopes`,
-    /// and `generation`). Latest-wins on a duplicate id from a *different* provider
+    /// Register datasource `id` as served by a connection (its `plugin_id`,
+    /// `outbound`, declared `scopes`, and `generation`). The `plugin_id` is the
+    /// answer-leg identity check (#553): only this provider may resolve a query
+    /// routed here. Latest-wins on a duplicate id from a *different* provider
     /// (logged) — teardown's generation guard keeps a stale provider from evicting a
     /// live successor.
     pub(super) fn register_provider(
         &self,
         id: &str,
+        plugin_id: &str,
         scopes: Vec<String>,
         outbound: mpsc::Sender<HostMsg>,
         generation: u64,
@@ -95,6 +117,7 @@ impl DatasourceRouter {
             .insert(
                 id.to_owned(),
                 ProviderEntry {
+                    plugin_id: plugin_id.to_owned(),
                     outbound,
                     scopes,
                     generation,
@@ -144,15 +167,15 @@ impl DatasourceRouter {
         let pending = self.pending.clone();
         let next_corr = self.next_corr.clone();
         hytte::reactive::runtime::handle().spawn(async move {
-            // Look up the provider's outbound + scopes, cloning out of the lock so
-            // nothing is held across an await.
+            // Look up the provider's plugin id + outbound + scopes, cloning out of
+            // the lock so nothing is held across an await.
             let found = {
                 let guard = providers.lock().expect("datasource providers poisoned");
                 guard
                     .get(&provider)
-                    .map(|e| (e.outbound.clone(), e.scopes.clone()))
+                    .map(|e| (e.plugin_id.clone(), e.outbound.clone(), e.scopes.clone()))
             };
-            let Some((provider_out, scopes)) = found else {
+            let Some((provider_id, provider_out, scopes)) = found else {
                 tracing::info!(
                     requester = %requester_id, %provider, %scope,
                     "datasource query for an unprovided datasource; NotFound",
@@ -181,11 +204,18 @@ impl DatasourceRouter {
                 return;
             }
             let corr = next_corr.fetch_add(1, Ordering::Relaxed);
+            // Arm the timeout *before* parking, so its abort handle can ride in the
+            // `PendingQuery` and be cancelled the instant the query resolves (#553) —
+            // a successful answer no longer leaves this task sleeping out the full
+            // bound. The task sleeps immediately, so it never races the `insert` below.
+            let timeout = arm_query_timeout(pending.clone(), corr);
             pending.lock().expect("datasource pending poisoned").insert(
                 corr,
                 PendingQuery {
                     requester: requester.clone(),
                     request_id,
+                    provider_id,
+                    timeout,
                 },
             );
             tracing::info!(
@@ -193,7 +223,8 @@ impl DatasourceRouter {
                 "datasource query routed to provider",
             );
             // Forward to the provider under the opaque host correlation. A closed
-            // outbound means the provider is tearing down — synthesize NotFound.
+            // outbound means the provider is tearing down — synthesize NotFound (and
+            // abort the timeout we just armed, so it doesn't linger on a dead query).
             if provider_out
                 .send(HostMsg::DatasourceQuery {
                     request_id: corr,
@@ -204,10 +235,13 @@ impl DatasourceRouter {
                 .await
                 .is_err()
             {
-                pending
+                if let Some(p) = pending
                     .lock()
                     .expect("datasource pending poisoned")
-                    .remove(&corr);
+                    .remove(&corr)
+                {
+                    p.timeout.abort();
+                }
                 fail(
                     &requester,
                     request_id,
@@ -215,48 +249,58 @@ impl DatasourceRouter {
                     format!("provider '{provider}' disconnected before answering"),
                 )
                 .await;
-                return;
             }
-            // Arm the timeout: if the correlation is still parked after the bound,
-            // the provider never answered — reap it and fail the requester.
-            let pending_to = pending.clone();
-            hytte::reactive::runtime::handle().spawn(async move {
-                tokio::time::sleep(QUERY_TIMEOUT).await;
-                let taken = pending_to
-                    .lock()
-                    .expect("datasource pending poisoned")
-                    .remove(&corr);
-                if let Some(p) = taken {
-                    tracing::warn!(
-                        corr,
-                        request_id = p.request_id,
-                        "datasource query timed out; no provider answer"
-                    );
-                    fail(
-                        &p.requester,
-                        p.request_id,
-                        DatasourceError::Timeout,
-                        "provider did not answer within the query timeout".to_owned(),
-                    )
-                    .await;
-                }
-            });
         });
     }
 
     /// Route a provider's [`Effect::DatasourceResult`](hytte_plugin_proto::Effect::DatasourceResult)
     /// (#509) back to the parked requester, keyed by the opaque host correlation the
-    /// provider echoed. A correlation with no parked entry (already timed out, or a
-    /// bogus/duplicate echo) is logged and dropped. Runs on the GTK broker thread;
-    /// the async send is offloaded to the runtime.
-    pub(super) fn deliver_result(&self, corr: u64, outcome: DatasourceOutcome) {
+    /// provider echoed. `responder_id` is the plugin id of the connection that
+    /// emitted the result: only the provider the query was **routed to** may resolve
+    /// its correlation (#553). A result whose `responder_id` doesn't match the parked
+    /// `provider_id` is a cross-provider forgery — a different provider-capable plugin
+    /// echoing a guessed correlation to inject or cancel another plugin's answer — so
+    /// it is dropped and audited **without** removing the entry, leaving the genuine
+    /// provider's later answer free to resolve it. A correlation with no parked entry
+    /// (already timed out, or a bogus/duplicate echo) is likewise logged and dropped.
+    /// Runs on the GTK broker thread; the async send is offloaded to the runtime.
+    pub(super) fn deliver_result(
+        &self,
+        corr: u64,
+        responder_id: String,
+        outcome: DatasourceOutcome,
+    ) {
         let pending = self.pending.clone();
         hytte::reactive::runtime::handle().spawn(async move {
-            let taken = pending
-                .lock()
-                .expect("datasource pending poisoned")
-                .remove(&corr);
+            let taken = {
+                let mut guard = pending.lock().expect("datasource pending poisoned");
+                // Peek the routed-to provider id first (cloned so the borrow is
+                // released before the conditional `remove`); resolve only on a match.
+                match guard.get(&corr).map(|p| p.provider_id.clone()) {
+                    Some(routed_to) if routed_to == responder_id => guard.remove(&corr),
+                    Some(routed_to) => {
+                        tracing::warn!(
+                            corr,
+                            responder = %responder_id,
+                            routed_to = %routed_to,
+                            "datasource result from a plugin that is not the routed-to provider; dropped",
+                        );
+                        None
+                    }
+                    None => {
+                        tracing::debug!(
+                            corr,
+                            responder = %responder_id,
+                            "datasource result for an unknown/expired query; dropped",
+                        );
+                        None
+                    }
+                }
+            };
             if let Some(p) = taken {
+                // The query resolved — cancel its armed timeout so no timer lingers
+                // (#553; a no-op if the timeout already fired and reaped the entry).
+                p.timeout.abort();
                 let _ = p
                     .requester
                     .send(HostMsg::DatasourceResult {
@@ -264,14 +308,44 @@ impl DatasourceRouter {
                         outcome,
                     })
                     .await;
-            } else {
-                tracing::debug!(
-                    corr,
-                    "datasource result for an unknown/expired query; dropped"
-                );
             }
         });
     }
+}
+
+/// Spawn the timeout reaper for a query parked at `corr` and return its abort
+/// handle (#553). It sleeps [`QUERY_TIMEOUT`], then — if the correlation is still
+/// parked (the provider never answered) — removes it and synthesizes a
+/// [`DatasourceError::Timeout`] to the requester. The handle rides in the
+/// [`PendingQuery`] so a resolving answer can [`abort`](tokio::task::AbortHandle::abort)
+/// it, leaving no timer lingering after success.
+fn arm_query_timeout(
+    pending: Arc<Mutex<HashMap<u64, PendingQuery>>>,
+    corr: u64,
+) -> tokio::task::AbortHandle {
+    hytte::reactive::runtime::handle()
+        .spawn(async move {
+            tokio::time::sleep(QUERY_TIMEOUT).await;
+            let taken = pending
+                .lock()
+                .expect("datasource pending poisoned")
+                .remove(&corr);
+            if let Some(p) = taken {
+                tracing::warn!(
+                    corr,
+                    request_id = p.request_id,
+                    "datasource query timed out; no provider answer"
+                );
+                fail(
+                    &p.requester,
+                    p.request_id,
+                    DatasourceError::Timeout,
+                    "provider did not answer within the query timeout".to_owned(),
+                )
+                .await;
+            }
+        })
+        .abort_handle()
 }
 
 /// Send a synthesized [`DatasourceOutcome::Failed`] result back to a requester.
@@ -300,9 +374,10 @@ mod tests {
     #[test]
     fn register_then_lookup_and_scope_check() {
         let r = DatasourceRouter::default();
-        r.register_provider("departures", vec!["next".into()], chan(), 1);
+        r.register_provider("departures", "dep-plugin", vec!["next".into()], chan(), 1);
         let guard = r.providers.lock().unwrap();
         let entry = guard.get("departures").expect("registered");
+        assert_eq!(entry.plugin_id, "dep-plugin");
         assert!(entry.scopes.iter().any(|s| s == "next"));
         assert!(!entry.scopes.iter().any(|s| s == "history"));
     }
@@ -310,7 +385,7 @@ mod tests {
     #[test]
     fn unregister_only_removes_a_generation_match() {
         let r = DatasourceRouter::default();
-        r.register_provider("weather", vec!["current".into()], chan(), 5);
+        r.register_provider("weather", "wx-plugin", vec!["current".into()], chan(), 5);
         // A stale generation (an already-superseded connection) must not evict it.
         r.unregister_provider("weather", 4);
         assert!(r.providers.lock().unwrap().contains_key("weather"));
@@ -322,8 +397,8 @@ mod tests {
     #[test]
     fn latest_provider_wins_on_a_duplicate_id() {
         let r = DatasourceRouter::default();
-        r.register_provider("x", vec!["a".into()], chan(), 1);
-        r.register_provider("x", vec!["b".into()], chan(), 2);
+        r.register_provider("x", "first", vec!["a".into()], chan(), 1);
+        r.register_provider("x", "second", vec!["b".into()], chan(), 2);
         // The newer registration wins; the older generation's teardown is a no-op.
         r.unregister_provider("x", 1);
         let guard = r.providers.lock().unwrap();

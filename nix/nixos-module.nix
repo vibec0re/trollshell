@@ -124,8 +124,8 @@ in
       }
 
       # Wallpaper daemon (NixOS side): only swaybg is managed here. swaybg is the
-      # bundled default and reads the wallpaper.path file itself (the Appearance
-      # picker restarts this unit). The awww backend's daemon is run by
+      # bundled default and reads the swaybg.args file the service renders (the
+      # Appearance picker restarts this unit). The awww backend's daemon is run by
       # home-manager's services.awww — a NixOS-only user without home-manager
       # runs the awww daemon themselves — so for awww the NixOS module just
       # exports the reload command above. backend = "none" manages nothing.
@@ -138,12 +138,16 @@ in
           wantedBy = [ "graphical-session.target" ];
           partOf = [ "graphical-session.target" ];
           after = [ "graphical-session.target" ];
-          # Stay inactive until the Appearance picker has written a path —
-          # otherwise `swaybg -i ""` fails and Restart loops on a fresh install.
-          unitConfig.ConditionPathExists = "%h/.config/trollshell/wallpaper.path";
+          # Stay inactive until the Appearance picker has rendered a wallpaper —
+          # the service writes swaybg.args (one swaybg arg per line, per-output
+          # aware) and removes it on Clear, so its existence gates the unit.
+          unitConfig.ConditionPathExists = "%h/.config/trollshell/swaybg.args";
           serviceConfig = {
             Type = "simple";
-            ExecStart = "${pkgs.bash}/bin/sh -c 'exec ${pkgs.swaybg}/bin/swaybg -i \"$(${pkgs.coreutils}/bin/cat %h/.config/trollshell/wallpaper.path)\" -m fill'";
+            # Read swaybg.args a line at a time into the positional args (paths
+            # with spaces survive), then exec swaybg with the full per-output
+            # argument list the service derived.
+            ExecStart = "${pkgs.bash}/bin/sh -c 'set --; while IFS= read -r a; do set -- \"$@\" \"$a\"; done < %h/.config/trollshell/swaybg.args; exec ${pkgs.swaybg}/bin/swaybg \"$@\"'";
             Restart = "on-failure";
             RestartSec = 2;
           };

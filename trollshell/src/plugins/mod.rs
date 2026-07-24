@@ -130,7 +130,7 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
 use hytte::reactive::spawn_supervised;
-use hytte::services::{clock, niri, pipewire};
+use hytte::services::{clock, pipewire};
 use hytte_plugin_proto::{AudioSpectrum, ClockState, Effect, HostMsg, wire};
 use tokio::sync::{mpsc, watch};
 
@@ -384,16 +384,14 @@ pub fn install() {
         std::future::ready(())
     }));
 
-    // Focused output (#499, deferred #440 hunk): track niri's focused output so a
-    // plugin-driven drawer-open (`Effect::OpenPage`) and the consent overlay
-    // (#487) both land on the output the user is looking at, not an arbitrary one.
-    // Local tracking pending the shared `components::focused_output` component
-    // (#496/#440) — fold this in once that lands. Replays its current value on
-    // subscribe, so it's up to date the moment a plugin/prompt needs it.
-    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
-        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
-        std::future::ready(())
-    }));
+    // Focused output (#499 → #517): a plugin-driven drawer-open
+    // (`Effect::OpenPage`) and the consent overlay (#487) route onto niri's
+    // focused output via the shared `components::focused_output` cache (#496/#440)
+    // — the host no longer keeps its own tracker (its base predated #496's merge).
+    // `install` is idempotent (every consumer wires it from its own setup path),
+    // so calling it here just guarantees the one subscription is up before any
+    // plugin effect needs `current()`.
+    crate::components::focused_output::install();
 
     // Effect broker: drain the non-lossy effect channel in arrival order.
     // Effects are one-shot, so — unlike the idempotent trees on the render
@@ -416,21 +414,4 @@ pub fn install() {
             }
         });
     }
-}
-
-thread_local! {
-    /// niri's most recent focused-output connector, tracked by the subscription
-    /// [`install`] wires (#499, deferred #440 hunk). GTK-thread-only. Read by
-    /// [`focused_output`] to route a plugin-driven drawer-open / consent prompt to
-    /// the output the user is on. `None` until niri reports one (callers then fall
-    /// back to a default output). Local pending the `components::focused_output`
-    /// consolidation (#496/#440).
-    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-/// niri's current focused-output connector name, or `None` if not yet known
-/// (#499). GTK-thread-only. Feeds the drawer-open routing (`effects::broker_effect`)
-/// and the consent overlay ([`crate::overlays::consent`]).
-pub(crate) fn focused_output() -> Option<String> {
-    FOCUSED_OUTPUT.with(|c| c.borrow().clone())
 }

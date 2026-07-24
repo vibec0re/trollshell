@@ -25,11 +25,12 @@ use tokio::sync::mpsc;
 pub(super) fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) {
     match effect {
         Effect::OpenPage(page) => {
-            // #499 (deferred #440 hunk): open the drawer on niri's focused output,
-            // not an arbitrary one. `preferred = None` let `open_on_focused` pick
-            // any mounted drawer; passing the focused connector routes it to the
-            // screen the user is on (the consent overlay wants the same routing).
-            let focused = super::focused_output();
+            // #499/#517: open the drawer on niri's focused output, not an
+            // arbitrary one. `preferred = None` let `open_on_focused` pick any
+            // mounted drawer; passing the focused connector routes it to the screen
+            // the user is on (the consent overlay wants the same routing). Sourced
+            // from the shared `components::focused_output` cache (#496/#440).
+            let focused = crate::components::focused_output::current();
             match resolve_open_page(*page) {
                 PageAction::OpenBuiltin(target) => {
                     tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");

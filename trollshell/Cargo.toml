@@ -55,3 +55,6 @@ tokio = { workspace = true, features = [
   "rt",
   "sync",
 ] }
+# The `socket_in_use` single-instancing probe test (#436) binds a real
+# `UnixListener` in a scratch dir; tempfile gives it (and cleans it up).
+tempfile.workspace = true

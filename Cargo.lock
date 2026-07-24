@@ -2416,6 +2416,7 @@ dependencies = [
  "hytte-plugin-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

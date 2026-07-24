@@ -70,6 +70,7 @@ fn registry_keys_by_type_with_absent() {
 
 #[test]
 #[should_panic(expected = "duplicate service registration")]
+#[cfg(debug_assertions)] // tripwire is a debug_assert!; release doCheck compiles it out
 fn duplicate_insert_of_same_type_trips_the_tripwire() {
     use hytte_reactive::registry::Registry;
 

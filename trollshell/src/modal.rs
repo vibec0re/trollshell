@@ -167,11 +167,7 @@ pub enum Page {
     Vpn,
     Connections,
     Bluetooth,
-    StatsCpu,
-    StatsMemory,
-    StatsDisks,
-    StatsGpu,
-    StatsServices,
+    Stats,
     Audio,
     Power,
     PowerMenu,
@@ -196,11 +192,10 @@ impl Page {
     /// Pages whose content is backed by the `app_usage` service (the
     /// most-expensive-apps top-N CPU/RAM lists). Used to gate `app_usage`'s
     /// always-on `/proc` poller on whether one of these is actually visible
-    /// (#50, item 5 of #42): only the CPU and Memory stats panels carry the
-    /// top-apps expanders that read those lists — the disks / GPU / services
-    /// flyouts don't, so the poller stays parked unless one of those two is up.
+    /// (#50, item 5 of #42): the combined Stats page carries the CPU and
+    /// Memory cards' top-apps expanders that read those lists.
     fn uses_app_usage(self) -> bool {
-        matches!(self, Self::StatsCpu | Self::StatsMemory)
+        matches!(self, Self::Stats)
     }
 
     /// Pages whose content is backed by the `mpris` service's position
@@ -215,17 +210,13 @@ impl Page {
     /// Every drawer page. The single source for reverse lookups
     /// ([`Page::from_stack_name`]); the string mapping still lives only in
     /// [`Page::stack_name`], so a page's token is defined in exactly one place.
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 15] = [
         Self::Media,
         Self::Network,
         Self::Vpn,
         Self::Connections,
         Self::Bluetooth,
-        Self::StatsCpu,
-        Self::StatsMemory,
-        Self::StatsDisks,
-        Self::StatsGpu,
-        Self::StatsServices,
+        Self::Stats,
         Self::Audio,
         Self::Power,
         Self::PowerMenu,
@@ -244,11 +235,7 @@ impl Page {
             Self::Vpn => "vpn",
             Self::Connections => "connections",
             Self::Bluetooth => "bluetooth",
-            Self::StatsCpu => "stats-cpu",
-            Self::StatsMemory => "stats-memory",
-            Self::StatsDisks => "stats-disks",
-            Self::StatsGpu => "stats-gpu",
-            Self::StatsServices => "stats-services",
+            Self::Stats => "stats",
             Self::Audio => "audio",
             Self::Power => "power",
             Self::PowerMenu => "power-menu",
@@ -748,8 +735,8 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
 /// signal state on subscribe, and per-page on-show work (clipboard/calendar
 /// refresh, notification dismissal) is driven by [`on_page_show`], not
 /// construction — so deferring a build to first open loses nothing. This holds
-/// for every page, the Stats pages included: all sparkline history lives in the
-/// `sensors` service (the scalar `*_history()` rings plus the per-core
+/// for every page, the combined Stats page included: all sparkline history
+/// lives in the `sensors` service (the scalar `*_history()` rings plus the per-core
 /// `cpu_per_core_history()` / `cpu_freq_per_core_history()`), so a lazily-built
 /// page backfills instantly via `Sparkline::set_samples` /
 /// `MultiSparkline::set_frames`. The CPU page's clock aggregate and its two
@@ -765,11 +752,7 @@ fn build_page(page: Page) -> gtk::Widget {
         Page::Vpn => panels::panel_vpn(),
         Page::Connections => panels::panel_connections(),
         Page::Bluetooth => panels::panel_bluetooth(),
-        Page::StatsCpu => panels::panel_stats_cpu(),
-        Page::StatsMemory => panels::panel_stats_memory(),
-        Page::StatsDisks => panels::panel_stats_disks(),
-        Page::StatsGpu => panels::panel_stats_gpu(),
-        Page::StatsServices => panels::panel_stats_services(),
+        Page::Stats => panels::panel_stats(),
         Page::Audio => panels::panel_audio(),
         Page::Power => panels::panel_power(),
         Page::PowerMenu => panels::panel_power_menu(),
@@ -1338,7 +1321,7 @@ mod tests {
     /// deep-links and the niri command surface.
     #[test]
     fn all_has_stable_count() {
-        assert_eq!(Page::ALL.len(), 19);
+        assert_eq!(Page::ALL.len(), 15);
     }
 
     /// Each page's `stack_name` is the key `ensure_page` hands to

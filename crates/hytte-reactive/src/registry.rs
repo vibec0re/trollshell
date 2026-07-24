@@ -133,6 +133,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "duplicate service registration")]
+    #[cfg(debug_assertions)] // the tripwire is a debug_assert!; release doCheck (crane) compiles it out
     fn duplicate_insert_trips_the_debug_assert() {
         // Two registrations of the same handle type is the `main.rs` diff
         // mistake the tripwire exists to catch. In debug/test builds it panics;

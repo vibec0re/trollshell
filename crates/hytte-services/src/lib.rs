@@ -9,6 +9,7 @@ pub mod calendar;
 mod cast;
 pub mod clipboard;
 pub mod clock;
+mod config_file;
 pub mod departures;
 pub mod display_config;
 pub mod displays;

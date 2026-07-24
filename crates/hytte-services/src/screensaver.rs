@@ -57,10 +57,10 @@
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::FdLease;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -86,8 +86,6 @@ struct ScreenSaverShared {
     /// reverse, so the two can't deadlock.
     manual: Arc<Mutex<ManualCaffeine>>,
 }
-
-static SHARED: OnceLock<ScreenSaverShared> = OnceLock::new();
 
 // ── Manual "Keep awake" (caffeine) ─────────────────────────────────────────────
 //
@@ -191,7 +189,7 @@ impl Service for ScreenSaverService {
             .at_path(PATH_LEGACY, iface)
             .start();
 
-        let _ = SHARED.set(ScreenSaverShared {
+        shared::insert(ScreenSaverShared {
             state: state.clone(),
             inhibitors: inhibitors.clone(),
             next_cookie: next_cookie.clone(),
@@ -256,14 +254,14 @@ pub fn other_inhibitors() -> impl Signal<Item = Vec<Inhibitor>> {
 /// binding) can never thrash the logind fd. Safe to call from any thread; the
 /// async fd acquire runs on the shared runtime.
 pub fn set_keep_awake(on: bool) {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared::get::<ScreenSaverShared>() else {
         // Service not registered (test harness?) — nothing to hold.
         return;
     };
     if on {
         acquire_manual(shared);
     } else {
-        release_manual(shared);
+        release_manual(&shared);
     }
 }
 
@@ -278,7 +276,7 @@ fn is_caffeine(i: &Inhibitor) -> bool {
 /// task registers the screensaver inhibitor (for visibility) and stores the
 /// hold; if the user toggled back off while the fd was in flight it drops the
 /// fd instead, so a fast on→off never leaks an inhibitor.
-fn acquire_manual(shared: &'static ScreenSaverShared) {
+fn acquire_manual(shared: Arc<ScreenSaverShared>) {
     {
         let mut m = shared.manual.lock().expect("caffeine state poisoned");
         m.desired = true;
@@ -365,7 +363,7 @@ pub fn lock() {
 /// through D-Bus.
 #[must_use]
 pub fn inhibit(application: &str, reason: &str) -> u32 {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared::get::<ScreenSaverShared>() else {
         // Service not registered (test harness?): return a sentinel so the
         // caller can still "release" without panicking.
         return 0;
@@ -386,7 +384,7 @@ pub fn inhibit(application: &str, reason: &str) -> u32 {
 /// Release a cookie returned from [`inhibit`]. Unknown cookies are
 /// silently ignored — apps regularly double-call `UnInhibit` on shutdown.
 pub fn uninhibit(cookie: u32) {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared::get::<ScreenSaverShared>() else {
         return;
     };
     remove_inhibitor(&shared.state, cookie);

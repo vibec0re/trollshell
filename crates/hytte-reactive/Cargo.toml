@@ -34,3 +34,6 @@ futures-executor.workspace = true
 # hytte-services' main dependency needs); widen back to the full default set
 # here, matching this crate's original bare `"0.3.32"` dev-dependency.
 futures-util = { workspace = true, default-features = true }
+# `test-util` unlocks `tokio::time::pause()` so the `gated_poll` tests drive a
+# virtual clock (deterministic, no wall-clock sleeps).
+tokio = { workspace = true, features = ["test-util"] }

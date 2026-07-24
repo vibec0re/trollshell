@@ -14,7 +14,7 @@
 //! `Agent1` callbacks on that same connection. This mirrors the polkit pattern:
 //! agent + anchor name both on the system bus.
 
-use super::SHARED;
+use super::shared_state;
 use super::types::{AgentReply, PairPrompt, PromptKind};
 use futures_util::StreamExt;
 use hytte_bus::BusKind;
@@ -146,8 +146,7 @@ impl PairAgent {
 /// falls through to the MAC address, and ultimately "Unknown device" so a
 /// raw D-Bus object path never bleeds into UI copy.
 fn lookup_alias(path: &str) -> String {
-    SHARED
-        .get()
+    shared_state()
         .and_then(|s| {
             let devs = s.devices.lock_ref();
             devs.iter().find(|d| d.path == path).map(|d| {
@@ -165,7 +164,7 @@ fn lookup_alias(path: &str) -> String {
 
 fn pending_response_arc()
 -> Option<std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Sender<AgentReply>>>>> {
-    SHARED.get().map(|s| s.pending_response.clone())
+    shared_state().map(|s| s.pending_response.clone())
 }
 
 async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
@@ -174,7 +173,7 @@ async fn take_pending() -> Option<oneshot::Sender<AgentReply>> {
 }
 
 fn set_prompt(p: Option<PairPrompt>) {
-    if let Some(s) = SHARED.get() {
+    if let Some(s) = shared_state() {
         s.pair_prompt.set(p);
     }
 }

@@ -11,7 +11,6 @@
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry, spawn_supervised};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
@@ -140,8 +139,9 @@ pub fn current() -> impl Signal<Item = WeatherState> {
     })
 }
 
-/// Force a fetch now (e.g. when the sidebar opens with stale data). A no-op
-/// if a fetch is already in flight (the loop's single-flight guard).
+/// Force a fetch now (e.g. when the sidebar opens with stale data) by waking
+/// the poll loop's `select!`. If a fetch is already running the wake is
+/// coalesced by the `Notify` permit and serviced right after it completes.
 pub fn refresh() {
     registry::with(|r| {
         if let Some(h) = r.get::<WeatherHandles>() {
@@ -153,17 +153,16 @@ pub fn refresh() {
 async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let in_flight = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             () = notify.notified() => {}
         }
-        // Cheap synchronous location check before the single-flight guard,
-        // which only needs to wrap the HTTP fetch. `Resolving` means geoclue's
-        // first attempt is still in flight — stay on whatever we're showing
-        // (Loading at boot) rather than flashing an error before the fix lands.
+        // Cheap synchronous location check before the fetch. `Resolving` means
+        // geoclue's first attempt is still in flight — stay on whatever we're
+        // showing (Loading at boot) rather than flashing an error before the
+        // fix lands.
         let loc = match places::shared_location().map(|m| m.get_cloned()) {
             Some(LocationState::Resolved(loc)) => loc,
             None | Some(LocationState::Resolving) => continue,
@@ -178,9 +177,6 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
             }
         };
 
-        if in_flight.swap(true, Ordering::SeqCst) {
-            continue;
-        }
         let next = match tokio::task::spawn_blocking(move || fetch_weather(&loc)).await {
             Ok(Ok(snap)) => WeatherState::Resolved(snap),
             Ok(Err(e)) => {
@@ -196,7 +192,6 @@ async fn poll_loop(state: Mutable<WeatherState>, notify: Arc<Notify>) {
                 WeatherState::Error("network error".to_string())
             }
         };
-        in_flight.store(false, Ordering::SeqCst);
 
         if state.get_cloned() != next {
             state.set(next);

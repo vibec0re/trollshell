@@ -18,28 +18,20 @@
 //! logged and the in-memory state is the source of truth for the running
 //! process.
 
+use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-const CONFIG_REL_PATH: &str = ".config/trollshell/muted-apps.toml";
-
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(CONFIG_REL_PATH))
-}
+/// Config file under `~/.config/trollshell/`.
+const CONFIG_FILE: &str = "muted-apps.toml";
 
 fn load_from_disk() -> HashSet<String> {
-    let Some(path) = config_path() else {
-        return HashSet::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    parse_apps_line(&text)
+    config_file::read(CONFIG_FILE)
+        .map(|text| parse_apps_line(&text))
+        .unwrap_or_default()
 }
 
 /// Parse a single `apps = ["X", "Y", ...]` line out of the TOML body.
@@ -68,15 +60,6 @@ fn parse_apps_line(text: &str) -> HashSet<String> {
 }
 
 fn save_to_disk(apps: &HashSet<String>) {
-    let Some(path) = config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(error = %e, path = %parent.display(), "notifications_mute: mkdir failed");
-        return;
-    }
     let mut sorted: Vec<&String> = apps.iter().collect();
     sorted.sort();
     let parts: Vec<String> = sorted
@@ -85,9 +68,7 @@ fn save_to_disk(apps: &HashSet<String>) {
         .map(|s| format!("\"{s}\""))
         .collect();
     let body = format!("apps = [{}]\n", parts.join(", "));
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::warn!(error = %e, path = %path.display(), "notifications_mute: write failed");
-    }
+    config_file::write("notifications_mute", CONFIG_FILE, &body);
 }
 
 // ── Service handle ───────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@
 
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::OwnNameSignal;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,18 +31,19 @@ use zbus::zvariant::OwnedValue;
 // Using `registry::with` from a hytte-tokio thread silently no-ops (no
 // handles → early return), which is the root cause of the "history is empty
 // / clear-all does nothing" bug: the auto-expire path never reaches the
-// `history.insert(...)` line. A static `OnceLock` populated by
-// `Service::start` is the cross-thread-safe alternative — `Mutable<T>` and
-// `Arc<AtomicU32>` are both `Send + Sync`, so storing them in a static is
-// safe.
+// `history.insert(...)` line. The cross-thread-safe alternative is
+// `hytte_reactive::shared` (the process-global registry mirror): `Service::start`
+// publishes this bag with `shared::insert`, and any thread reads it back via
+// `shared::get::<NotificationsShared>()` — `Mutable<T>`, `Arc<AtomicU32>`, and
+// `Mutex<…>` are all `Send + Sync`.
 struct NotificationsShared {
     active: Mutable<Vec<Notification>>,
     history: Mutable<Vec<HistoryEntry>>,
     /// Shared id counter — the **same** `Arc<AtomicU32>` the D-Bus `Notify`
     /// handler (`NotificationsIface::next_id`) allocates from. Stored here so
-    /// `post_local`, which runs on a hytte-tokio worker and can only reach
-    /// `SHARED` (the registry counter is GTK-thread-only), draws ids from that
-    /// one monotonic sequence — a locally-posted toast can therefore never
+    /// `post_local`, which runs on a hytte-tokio worker and can only reach the
+    /// shared registry (the thread-local counter is GTK-thread-only), draws ids
+    /// from that one monotonic sequence — a locally-posted toast can never
     /// collide with a `Notify`-allocated id.
     next_id: Arc<AtomicU32>,
     /// Ownership handle used to emit D-Bus signals directly on the owned
@@ -61,8 +62,6 @@ struct NotificationsShared {
     /// critical section is non-async map surgery.
     local_actions: Mutex<LocalActionMap>,
 }
-
-static SHARED: OnceLock<NotificationsShared> = OnceLock::new();
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -194,8 +193,8 @@ impl Service for NotificationsService {
         // mako/dunst is camping the name.
         //
         // The OwnNameSignal is stored both in NotificationsHandles (process
-        // lifetime keep-alive) and in SHARED (so dismiss/invoke_action can
-        // emit signals directly without a round-trip D-Bus call).
+        // lifetime keep-alive) and in the shared registry (so dismiss/invoke_action
+        // can emit signals directly without a round-trip D-Bus call).
         let ownership = hytte_bus::own_name("org.freedesktop.Notifications")
             .at_path("/org/freedesktop/Notifications", iface)
             .start();
@@ -204,7 +203,7 @@ impl Service for NotificationsService {
         // can find these Mutables when called from a hytte-tokio worker (the
         // thread-local registry is GTK-only). Calling Service::start a second
         // time would `set` fail silently — services are registered once.
-        let _ = SHARED.set(NotificationsShared {
+        shared::insert(NotificationsShared {
             active: active.clone(),
             history: history.clone(),
             next_id: next_id.clone(),
@@ -274,7 +273,7 @@ pub fn clear_history() {
 /// the runtime.
 pub fn dismiss(id: u32, reason: u32) {
     // Local state mutation. Synchronous — Mutable is thread-safe.
-    if let Some(shared) = SHARED.get() {
+    if let Some(shared) = shared::get::<NotificationsShared>() {
         let removed = {
             let mut list = shared.active.lock_mut();
             let pos = list.iter().position(|n| n.id == id);
@@ -314,7 +313,7 @@ pub fn dismiss(id: u32, reason: u32) {
     }
 
     // Emit the NotificationClosed signal directly on the owned connection.
-    if let Some(shared) = SHARED.get() {
+    if let Some(shared) = shared::get::<NotificationsShared>() {
         let ownership = shared.ownership.clone();
         runtime::handle().spawn(async move {
             let result = ownership
@@ -339,7 +338,7 @@ pub fn dismiss(id: u32, reason: u32) {
 /// Safe to call from any thread; each id is forwarded to [`dismiss`], which
 /// is itself thread-safe.
 pub fn dismiss_all() {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
     // Snapshot ids first so we don't hold the read guard across a write
@@ -374,7 +373,7 @@ pub fn dismiss_all() {
 ///
 /// Both the toast widget and the history page wire action buttons to this.
 pub fn invoke_action(id: u32, action_key: &str) {
-    if let Some(shared) = SHARED.get()
+    if let Some(shared) = shared::get::<NotificationsShared>()
         && let Ok(mut map) = shared.local_actions.lock()
         && let Some(callback) = take_local_action(&mut map, id, action_key)
     {
@@ -384,7 +383,7 @@ pub fn invoke_action(id: u32, action_key: &str) {
     }
 
     let action_key = action_key.to_string();
-    if let Some(shared) = SHARED.get() {
+    if let Some(shared) = shared::get::<NotificationsShared>() {
         let ownership = shared.ownership.clone();
         runtime::handle().spawn(async move {
             let key_for_log = action_key.clone();
@@ -468,7 +467,7 @@ type LocalActionMap = HashMap<(u32, String), LocalActionCallback>;
 
 /// Register `callback` for `(id, key)`. Pure map mutation, factored out of
 /// [`post_local_with_actions`] so registration can be unit-tested without
-/// the process-global `SHARED` state.
+/// the process-global shared registry.
 fn register_local_action(
     map: &mut LocalActionMap,
     id: u32,
@@ -547,9 +546,9 @@ fn rate_limit_allow(app_name: &str, summary: &str, body: &str) -> bool {
 /// auto-expires after the server-default timeout via the same spawn/[`dismiss`]
 /// pattern the D-Bus handler uses.
 ///
-/// Callable from **any** thread: it only touches the cross-thread `SHARED`
-/// handle (never the GTK-thread-local registry), so command helpers running on
-/// the hytte-tokio runtime can post directly.
+/// Callable from **any** thread: it only touches the cross-thread shared
+/// registry (never the GTK-thread-local registry), so command helpers running
+/// on the hytte-tokio runtime can post directly.
 ///
 /// # Urgency / Do-Not-Disturb
 ///
@@ -597,7 +596,7 @@ pub fn post_local_with_actions(
     urgency: Urgency,
     actions: Vec<LocalAction>,
 ) {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
         return;
     };
 

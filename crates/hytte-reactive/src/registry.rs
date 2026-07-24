@@ -46,8 +46,33 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Insert a service's handle bag, keyed by its concrete type.
+    ///
+    /// Registering the same `Handles` type twice is a `main.rs` bug — a second
+    /// `App::with(foo::service())` for an already-registered service spawns a
+    /// full second task set while orphaning the first set's handles (duplicate
+    /// D-Bus subscriptions, and widgets keep reading the *first* set). That used
+    /// to happen silently; now it trips a `tracing::error!` in every build and a
+    /// `debug_assert!` panic in debug/test builds so the stray `.with(…)` call
+    /// surfaces immediately instead of as a runtime mystery.
     pub fn insert<T: 'static>(&mut self, value: T) {
-        self.entries.insert(TypeId::of::<T>(), Box::new(value));
+        let replaced = self
+            .entries
+            .insert(TypeId::of::<T>(), Box::new(value))
+            .is_some();
+        if replaced {
+            tracing::error!(
+                handles = std::any::type_name::<T>(),
+                "duplicate service registration: overwrote already-registered \
+                 handles; the previous set's background tasks are now orphaned \
+                 (a service was passed to App::with more than once)"
+            );
+        }
+        debug_assert!(
+            !replaced,
+            "duplicate service registration for {}",
+            std::any::type_name::<T>()
+        );
     }
 
     #[must_use]
@@ -82,8 +107,38 @@ pub fn install(service: Box<dyn ServiceErased>, rt: &tokio::runtime::Handle) {
     });
 }
 
-/// Wipe the registry — exposed for tests only.
+/// Wipe both registries — exposed for tests only.
+///
+/// Clears the thread-local registry *and* the process-global
+/// [`crate::shared`] mirror, so one reset gives a second in-process `App` run
+/// a clean slate on both cross-thread paths.
 #[doc(hidden)]
 pub fn reset_for_tests() {
     REGISTRY.with(|cell| *cell.borrow_mut() = Registry::default());
+    crate::shared::reset_for_tests();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Registry;
+
+    #[test]
+    fn insert_then_get_roundtrips() {
+        let mut reg = Registry::default();
+        reg.insert::<u32>(42);
+        assert_eq!(reg.get::<u32>(), Some(&42));
+        // A different type is independent (keyed by TypeId).
+        assert_eq!(reg.get::<i64>(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate service registration")]
+    fn duplicate_insert_trips_the_debug_assert() {
+        // Two registrations of the same handle type is the `main.rs` diff
+        // mistake the tripwire exists to catch. In debug/test builds it panics;
+        // in release it logs + overwrites (can't assert the log here).
+        let mut reg = Registry::default();
+        reg.insert::<u32>(1);
+        reg.insert::<u32>(2);
+    }
 }

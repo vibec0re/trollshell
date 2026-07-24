@@ -61,8 +61,10 @@ use tokio::sync::oneshot;
 //     `lookup_alias`, `pending_response_arc`, `set_prompt`, `clear_prompt`
 //     — all of which used `registry::with`.
 //
-// A static `OnceLock` populated by `Service::start` is the cross-thread-safe
-// alternative — `Mutable<T>` and `Arc<AsyncMutex<…>>` are `Send + Sync`.
+// The cross-thread-safe alternative is `hytte_reactive::shared` (the
+// process-global registry mirror): `Service::start` publishes this bag with
+// `shared::insert`, and any thread reads it back via [`shared_state`] —
+// `Mutable<T>` and `Arc<AsyncMutex<…>>` are `Send + Sync`.
 pub(super) struct BluetoothShared {
     pub(super) devices: Mutable<Vec<Device>>,
     pub(super) device_actions: Mutable<HashSet<String>>,
@@ -70,7 +72,12 @@ pub(super) struct BluetoothShared {
     pub(super) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
 }
 
-pub(super) static SHARED: OnceLock<BluetoothShared> = OnceLock::new();
+/// Cross-thread accessor for the shared handle bag published in
+/// `Service::start`. `None` until the service has started. Callable from any
+/// thread (unlike `registry::with`, which only works on the GTK main thread).
+pub(super) fn shared_state() -> Option<Arc<BluetoothShared>> {
+    hytte_reactive::shared::get::<BluetoothShared>()
+}
 
 // ── Adapter path storage ──────────────────────────────────────────────────────
 
@@ -146,7 +153,7 @@ impl Service for BluetoothService {
             pending_response: Arc::new(AsyncMutex::new(None)),
             _ownership: ownership.clone(),
         };
-        let _ = SHARED.set(BluetoothShared {
+        hytte_reactive::shared::insert(BluetoothShared {
             devices: handles.devices.clone(),
             device_actions: handles.device_actions.clone(),
             pair_prompt: handles.pair_prompt.clone(),
@@ -177,7 +184,7 @@ impl Service for BluetoothService {
                     // awaiting it returns Reject instead of hanging forever).
                     adapter_mutable.set(None);
                     devices_mutable.set(Vec::new());
-                    let pending_response = SHARED.get().map(|s| {
+                    let pending_response = shared_state().map(|s| {
                         s.device_actions.lock_mut().clear();
                         if s.pair_prompt.lock_ref().is_some() {
                             s.pair_prompt.set(None);
@@ -300,7 +307,7 @@ pub fn submit_passkey(passkey: u32) {
 }
 
 fn send_reply(reply: AgentReply) {
-    let Some(pending) = SHARED.get().map(|s| s.pending_response.clone()) else {
+    let Some(pending) = shared_state().map(|s| s.pending_response.clone()) else {
         return;
     };
     runtime::handle().spawn(async move {
@@ -312,7 +319,7 @@ fn send_reply(reply: AgentReply) {
 }
 
 fn mark_busy(path: &str) {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared_state() else {
         return;
     };
     // Peek with a read lock first — `lock_mut()` always fires the
@@ -325,7 +332,7 @@ fn mark_busy(path: &str) {
 }
 
 fn mark_idle(path: &str) {
-    let Some(shared) = SHARED.get() else {
+    let Some(shared) = shared_state() else {
         return;
     };
     if !shared.device_actions.lock_ref().contains(path) {

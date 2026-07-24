@@ -21,6 +21,7 @@ The service owns three files; you normally never touch them — the Appearance
 page does:
 
 - **`wallpaper.json`** — the source of truth (a small JSON document):
+
   ```json
   {
     "default": "/home/you/Pictures/wall.png",
@@ -40,6 +41,7 @@ page does:
     are fixed local-clock ranges: morning `06:00–11:00`, day `11:00–17:00`,
     evening `17:00–21:00`, night otherwise. An unset active slot falls back to
     `default`.
+
 - **`swaybg.args`** — derived render spec: swaybg's argument list, one argument
   per line. The swaybg unit's `ExecStart` reads this. Its presence gates the
   unit (Clear removes it, which stops swaybg). You should not edit it by hand;

@@ -17,11 +17,9 @@
 //! button click, `Esc`, or the timeout wins and tears down the rest.
 //!
 //! **Focused output.** [`install`] registers each monitor by connector;
-//! [`request`] picks the monitor for niri's focused output via
-//! [`crate::plugins::focused_output`] (the plugin host owns that tracker, #499),
-//! falling back to any mounted one. *(The one-focused-output-component refactor
-//! #496/#440 is still open at the time of writing; fold this — and the host's
-//! tracker — into that component once it lands.)*
+//! [`request`] picks the monitor for niri's focused output via the shared
+//! [`crate::components::focused_output`] cache (#496/#440/#517), falling back to
+//! any mounted one.
 //!
 //! CSS hooks (`ts-`-prefixed, matching the prompt overlay's shape):
 //! - window root: `.ts-consent`
@@ -35,7 +33,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::plugins::focused_output;
+use crate::components::focused_output;
 
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
@@ -62,8 +60,8 @@ thread_local! {
 
 /// Register `monitor` as a candidate output for consent prompts. Called per
 /// monitor from `main.rs`'s `monitors_changed` loop. The focused-output *tracker*
-/// lives in the plugin host ([`crate::plugins::focused_output`], #499), so this
-/// only maintains the connector→`Monitor` map [`request`] resolves against.
+/// lives in the shared [`crate::components::focused_output`] cache (#496/#440/#517),
+/// so this only maintains the connector→`Monitor` map [`request`] resolves against.
 pub fn install(monitor: &Monitor) {
     let Some(connector) = monitor.connector().filter(|c| !c.is_empty()) else {
         tracing::debug!("consent::install: monitor has no connector name; skipping");
@@ -248,7 +246,7 @@ pub fn request(
 /// The `Monitor` for niri's focused output, or any mounted one as a fallback
 /// (niri startup / a just-vanished output), or `None` if none are mounted.
 fn focused_monitor() -> Option<Monitor> {
-    let focused = focused_output();
+    let focused = focused_output::current();
     MONITORS.with(|m| {
         let m = m.borrow();
         focused

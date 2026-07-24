@@ -24,15 +24,33 @@
 //!   (hot-plug / mode / scale / position), detected by a background poll (niri
 //!   26.4 has no output event on its IPC event stream — see the poll note).
 //!
-//! # What is deferred (documented, not silently wrong)
+//! # Persistence: live-apply + a nudge, never a config write (#393)
 //!
-//! * **True persistence (kanshi).** niri's `Request::Output` is *explicitly
-//!   temporary* — the compositor forgets it as soon as its own output config
-//!   reloads (niri-ipc docs). So *every* IPC apply here is non-persistent;
-//!   `method = persistent` currently applies live and logs that a kanshi-profile
-//!   write (`etc/kanshi/`) is the follow-up. GNOME's "keep these settings?"
-//!   confirmation flow still works — only survival across a niri output-config
-//!   reload is missing.
+//! niri's `Request::Output` is *explicitly temporary* — the compositor forgets
+//! it as soon as its own output config reloads (niri-ipc docs). So every IPC
+//! apply here is non-persistent by nature, and we deliberately do **not** paper
+//! over that by writing `etc/kanshi/` or niri `config.kdl`:
+//!
+//! * `method = persistent` (g-c-c's "Keep Changes") applies **live**, exactly
+//!   like `method = temporary`, and returns success — so GNOME's apply →
+//!   revert-countdown → confirm flow works end-to-end.
+//! * On a *successful* persistent apply we post a shell toast: the layout is
+//!   live, and to keep it across a session restart the user should save it as a
+//!   kanshi profile. We don't write that profile for them.
+//!
+//! Why not auto-write kanshi: those configs are **hand-owned** (`etc/kanshi/`'s
+//! README: *"persistent layout decisions live in this config file, not in
+//! trollshell"*), they're keyed by the connector-*set* and hand-tuned
+//! (positions, `scale`, `transform`, `exec` hooks, profile ordering), and a
+//! single `ApplyMonitorsConfig` carries one layout with no profile identity —
+//! there is no honest way to create/replace *one* profile block without risking
+//! a clobber of the user's edits. It also keeps the shim consistent with this
+//! repo's `system-daemon-as-state-store` rule: persistent state lives in a
+//! daemon, not in shell-written config. So, like the rest of the shim, we
+//! clamp/nudge rather than lie.
+//!
+//! # What is not supported
+//!
 //! * **Mirroring.** niri-ipc exposes no mirror action, so an
 //!   `ApplyMonitorsConfig` that assigns two monitors to one logical monitor is
 //!   rejected (`NotSupported`) rather than faked.
@@ -427,6 +445,44 @@ fn build_current_state(serial: u32, outputs: &BTreeMap<String, NiriOutput>) -> C
 
 // ── Apply planning (pure, testable) ───────────────────────────────────────────
 
+/// The `method` field of an `ApplyMonitorsConfig` request, parsed into the three
+/// things that actually differ downstream. Mutter's wire values are `0` =
+/// verify, `1` = temporary, `2` = persistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMethod {
+    /// `0` — validate the plan only; never touch niri.
+    Verify,
+    /// `1` — apply live (g-c-c's initial "Apply", before its revert countdown).
+    Temporary,
+    /// `2` — apply live, then nudge the user to persist via kanshi (g-c-c's
+    /// "Keep Changes"). We don't write the profile ourselves — see module docs.
+    Persistent,
+}
+
+impl ApplyMethod {
+    /// Parse the wire `method`. `None` for an unknown value (→ `InvalidArgs`),
+    /// which keeps the shim honest rather than silently treating it as verify.
+    fn from_wire(method: u32) -> Option<Self> {
+        match method {
+            0 => Some(Self::Verify),
+            1 => Some(Self::Temporary),
+            2 => Some(Self::Persistent),
+            _ => None,
+        }
+    }
+
+    /// Whether this method actually pushes the plan to niri. `Verify` never does.
+    fn applies_live(self) -> bool {
+        matches!(self, Self::Temporary | Self::Persistent)
+    }
+
+    /// Whether a *successful* apply should surface the "persist via kanshi"
+    /// toast. Only `Persistent` (the user's "Keep Changes" commit) does.
+    fn nudges_persistence(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+}
+
 /// One niri action to apply to a connector, in a form that's easy to assert on
 /// in tests (niri's own `OutputAction` isn't `PartialEq`). All variants are
 /// `Copy` (niri's `ConfiguredMode`/`ConfiguredPosition`/`Transform` are), so
@@ -596,6 +652,31 @@ fn apply_plan_blocking(plan: Vec<(String, Vec<PlannedAction>)>) -> Result<(), St
     Ok(())
 }
 
+// ── Persistence nudge ─────────────────────────────────────────────────────────
+
+/// App name the "persist via kanshi" toast posts under.
+const PERSIST_APP_NAME: &str = "Displays";
+/// Summary line of the persistence nudge.
+const PERSIST_SUMMARY: &str = "Display configuration applied";
+/// Body of the persistence nudge — applied live, plus how to make it survive a
+/// session restart. Deliberately points at kanshi rather than claiming the shim
+/// persisted anything (it doesn't write config — see module docs).
+const PERSIST_BODY: &str = "Applied for this session. To keep this layout across a restart, save it as a kanshi profile (etc/kanshi/).";
+
+/// Toast the user after a successful *persistent* apply (g-c-c's "Keep
+/// Changes"): the layout is live, but survival across a niri output-config
+/// reload / session restart needs a kanshi profile, which we deliberately don't
+/// write. No-op if the notifications service isn't registered (headless tests);
+/// `post_local` is cross-thread-safe so this is fine from the D-Bus task.
+fn notify_persist_via_kanshi() {
+    crate::notifications::post_local(
+        PERSIST_APP_NAME,
+        PERSIST_SUMMARY,
+        PERSIST_BODY,
+        crate::notifications::Urgency::Normal,
+    );
+}
+
 // ── Change detection / signal ─────────────────────────────────────────────────
 
 /// Cheap change key: connector, enabled, current mode, position, scale,
@@ -740,8 +821,10 @@ impl DisplayConfigIface {
     /// Apply a requested logical-monitor layout to niri.
     ///
     /// `method`: `0` = verify (validate only), `1` = temporary, `2` =
-    /// persistent. niri-ipc applies are inherently temporary, so `2` currently
-    /// applies live and logs that kanshi persistence is a follow-up (#393).
+    /// persistent. niri-ipc applies are inherently temporary, so *both* live
+    /// methods drive niri identically; `persistent` additionally posts a shell
+    /// toast pointing the user at kanshi. The shim never writes config itself —
+    /// see the module docs and #393.
     async fn apply_monitors_config(
         &self,
         serial: u32,
@@ -757,31 +840,31 @@ impl DisplayConfigIface {
                 "stale serial {serial} (current {current}); re-read GetCurrentState"
             )));
         }
-        if method > 2 {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "unknown apply method {method}"
-            )));
-        }
+        let method = ApplyMethod::from_wire(method).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("unknown apply method {method}"))
+        })?;
 
         let outputs = tokio::task::spawn_blocking(query_outputs_raw)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("niri query join error: {e}")))?;
         let plan = plan_apply(&outputs, &logical_monitors).map_err(|e| apply_error_to_fdo(&e))?;
 
-        // method 0 = verify: the plan built, so the config is applicable.
-        if method == 0 {
+        // Verify: the plan built, so the config is applicable — never touch niri.
+        if !method.applies_live() {
             return Ok(());
-        }
-        if method == 2 {
-            tracing::warn!(
-                "ApplyMonitorsConfig(persistent): niri-ipc applies are temporary; kanshi-profile persistence is a #393 follow-up. Applying live."
-            );
         }
 
         tokio::task::spawn_blocking(move || apply_plan_blocking(plan))
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("niri apply join error: {e}")))?
             .map_err(zbus::fdo::Error::Failed)?;
+
+        // Persistent (g-c-c's "Keep Changes"): the apply succeeded live, but
+        // survival across a session restart needs a kanshi profile we don't
+        // write — nudge the user rather than silently lose it on next reload.
+        if method.nudges_persistence() {
+            notify_persist_via_kanshi();
+        }
         Ok(())
     }
 
@@ -1106,5 +1189,36 @@ mod tests {
         assert_ne!(fp, fingerprint(&moved));
         assert_ne!(fp, fingerprint(&off));
         assert_eq!(fp, fingerprint(&base), "stable for identical state");
+    }
+
+    // ── Apply method ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_method_parses_known_wire_values() {
+        assert_eq!(ApplyMethod::from_wire(0), Some(ApplyMethod::Verify));
+        assert_eq!(ApplyMethod::from_wire(1), Some(ApplyMethod::Temporary));
+        assert_eq!(ApplyMethod::from_wire(2), Some(ApplyMethod::Persistent));
+    }
+
+    #[test]
+    fn apply_method_rejects_unknown_wire_values() {
+        assert_eq!(ApplyMethod::from_wire(3), None);
+        assert_eq!(ApplyMethod::from_wire(u32::MAX), None);
+    }
+
+    #[test]
+    fn only_live_methods_touch_niri() {
+        assert!(!ApplyMethod::Verify.applies_live());
+        assert!(ApplyMethod::Temporary.applies_live());
+        assert!(ApplyMethod::Persistent.applies_live());
+    }
+
+    #[test]
+    fn only_persistent_nudges_kanshi() {
+        // The persistence toast fires on exactly one method — the user's
+        // "Keep Changes" commit — not on the temporary pre-confirm apply.
+        assert!(!ApplyMethod::Verify.nudges_persistence());
+        assert!(!ApplyMethod::Temporary.nudges_persistence());
+        assert!(ApplyMethod::Persistent.nudges_persistence());
     }
 }

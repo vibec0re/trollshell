@@ -9,6 +9,7 @@ pub mod connection_row;
 pub mod deep_link_row;
 pub mod diff;
 pub mod focus;
+pub mod focused_output;
 pub mod format;
 pub mod history_row;
 pub mod layout;

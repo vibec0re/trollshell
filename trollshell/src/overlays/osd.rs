@@ -42,9 +42,8 @@ use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 
-use crate::components::cast;
+use crate::components::{cast, focused_output};
 use hytte::services::brightness::{self, Brightness};
-use hytte::services::niri;
 use hytte::services::pipewire::{self, Source, Volume};
 use hytte::services::upower::{self, Battery, BatteryState};
 use hytte::ui::layer_window;
@@ -393,20 +392,16 @@ fn install_subscriptions() {
 
     // ── Focused output ────────────────────────────────────────────────
     //
-    // Updates `FOCUSED_OUTPUT` used by `route_show`. No bootstrap
-    // suppression: we want the latest known focused output even before
-    // any media/brightness event lands.
-    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
-        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
-        std::future::ready(())
-    }));
+    // Wires the shared `components::focused_output` cache used by
+    // `route_show` (idempotent — see its docs).
+    focused_output::install();
 }
 
 /// Route `state` to the OSD on the focused monitor. Falls back to the
 /// first mounted OSD when the focused output is unknown or not in the
 /// map (e.g. niri startup, monitor disconnect).
 fn route_show(state: &State) {
-    let target_name: Option<String> = FOCUSED_OUTPUT.with(|c| c.borrow().clone());
+    let target_name: Option<String> = focused_output::current();
     OSDS.with(|map| {
         let map = map.borrow();
         if map.is_empty() {
@@ -453,11 +448,6 @@ thread_local! {
     /// names like `"DP-1"`, `"eDP-1"`).
     static OSDS: RefCell<HashMap<String, Rc<OsdView>>> =
         RefCell::new(HashMap::new());
-
-    /// Most recent focused-output name from
-    /// [`hytte::services::niri::focused_output`]. Updated by the
-    /// module-level subscription.
-    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
 
     /// Set after the first `install()` call to ensure module-level
     /// signal subscriptions are wired exactly once across all

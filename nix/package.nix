@@ -136,9 +136,23 @@ let
     # runs for both the deps build and the final build (NIX_BUILD_TOP is the
     # same /build in each), so the source path matches and cargo reuses the
     # cached libspa artifact instead of recompiling it read-only.
+    #
+    # `--preserve=timestamps` is LOAD-BEARING for artifact reuse (#530). The
+    # vendored sources in the nix store carry the normalised mtime (1 s past the
+    # epoch); a plain `cp` would instead stamp the copy with the *current* build
+    # time. Cargo's build-script staleness check compares each vendored source's
+    # mtime against the (inherited, mtime-1) build-script output — so a
+    # current-time copy makes EVERY build-script crate (proc-macro2, libc,
+    # serde, the *-sys crates, …) look newer than its cached output and rebuild,
+    # cascading into ~the whole graph. That silently defeated all cross-stage
+    # inheritance (deps-only → workspace → packages), which is exactly what made
+    # #530's per-package recompiles unavoidable. Preserving the epoch mtime keeps
+    # source-vs-output equal, so cargo reuses the inherited artifacts. (chmod
+    # still adds u+w for the libspa bindgen scratch writes — writability and
+    # timestamps are independent.)
     preBuild = ''
       writableVendor="$NIX_BUILD_TOP/writable-vendor"
-      cp -rL --no-preserve=mode,ownership "$cargoVendorDir" "$writableVendor"
+      cp -rL --preserve=timestamps --no-preserve=mode,ownership "$cargoVendorDir" "$writableVendor"
       chmod -R u+w "$writableVendor"
       substituteInPlace "$CARGO_HOME/config.toml" \
         --replace-fail "$cargoVendorDir" "$writableVendor"
@@ -146,6 +160,52 @@ let
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # Whole-workspace COMPILE stage (#530). `cargoArtifacts` (buildDepsOnly) caches
+  # only the EXTERNAL dependency closure — every workspace member (the hytte-*
+  # crates, trollshell, trollshell-control-center) is stubbed out during that
+  # deps build. Without an intermediate stage each package derivation
+  # (trollshell + control-center) recompiled *all* of those workspace crates
+  # from scratch, so they compiled twice — exactly the bloat Mara flagged in
+  # #530 (and the `trollshell` package's own build recompiled every crate the
+  # control-center links, too). This `cargoBuild` compiles the ENTIRE workspace
+  # once on top of the deps and packs its `target` dir — `cargoBuild` keeps
+  # crane's `doInstallCargoArtifacts = true` default (unlike `buildPackage`,
+  # which installs binaries and sets it false), so its `$out` is the packed
+  # target that BOTH packages consume as their `cargoArtifacts`.
+  #
+  # Two hard-won constraints make this actually reuse (both verified by
+  # measuring recompile counts in the build log):
+  #
+  # 1. FEATURE UNIFICATION. Cargo derives each dependency's feature set from the
+  #    UNION of every package built in one invocation, and fingerprints each
+  #    artifact on that exact set. A `--workspace` build and a `-p trollshell`
+  #    build therefore DISAGREE on shared-dep features, so a `-p trollshell`
+  #    build against this `--workspace` target misses the cache and recompiles
+  #    ~all of it (~160 crates observed). So both package builds below ALSO
+  #    build `--workspace` (matching this scope exactly → they recompile
+  #    nothing) and then prune `$out/bin` down to their own binary.
+  #
+  # 2. NO TESTS HERE. `cargo test --workspace` compiles dev-dependencies, whose
+  #    features unify into the shared normal deps and shift their fingerprints;
+  #    a subsequent plain `cargo build --workspace` in the packages then no
+  #    longer matches and rebuilds ~everything (also observed). So this stage is
+  #    build-ONLY (doCheck stays off), keeping the packed target feature-pristine
+  #    for the package builds. The hermetic internals suite instead runs in the
+  #    `trollshell` package's check phase (doCheck = true there) — exactly once
+  #    on the `nix build .#trollshell` path, same as before this change. (This is
+  #    why the shared stage can't also host the test run, contrary to the first
+  #    instinct in the #530 triage.)
+  workspaceArtifacts = craneLib.cargoBuild (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      # Compile every workspace member, not just `-p trollshell`.
+      cargoExtraArgs = "--workspace --locked";
+      # Build only — tests run in the trollshell package (see constraint 2).
+      doCheck = false;
+    }
+  );
 
   # The actual Rust binary. Crucially it does NOT reference `assets`: nothing
   # about its inputs or build env mentions an asset path, so its drvPath is
@@ -155,12 +215,39 @@ let
   unwrapped = craneLib.buildPackage (
     commonArgs
     // {
-      inherit cargoArtifacts;
+      # Build against the already-compiled whole-workspace target (#530), so
+      # this stage recompiles nothing — it re-emits the cargo build log and
+      # installs the binaries from the warm target. It MUST build `--workspace`
+      # (overriding commonArgs' `-p trollshell`) to feature-match that target;
+      # a `-p trollshell` scope would fingerprint-mismatch and recompile ~all of
+      # it (see the feature-unification note on workspaceArtifacts above).
+      cargoArtifacts = workspaceArtifacts;
+      cargoExtraArgs = "--workspace";
+      # Run the hermetic internals suite here (constraint 2 on workspaceArtifacts
+      # above): the shared stage stays build-only, so the trollshell package's
+      # check phase is the single home of the test run — once, on the
+      # `nix build .#trollshell` path. `cargoExtraArgs` already scopes the test
+      # command to `--workspace`, so drop commonArgs' `cargoTestExtraArgs` to
+      # avoid a redundant second `--workspace`.
+      doCheck = true;
+      cargoTestExtraArgs = "";
+      # A `--workspace` build installs every workspace binary (the plugin bins +
+      # the control-center bin) from the build log; keep ONLY trollshell — this
+      # package ships just the shell. (Mara, #530: the trollshell package must
+      # not also carry the control-center binary.) Runs before wrapGAppsHook's
+      # fixup, so only the surviving binary gets wrapped.
+      postInstall = ''
+        find "$out/bin" -mindepth 1 -maxdepth 1 ! -name trollshell -exec rm -rf {} +
+      '';
 
       # Raw input lists for the dev shell to reuse without crane's build hooks.
       passthru.devInputs = { inherit nativeBuildInputs buildInputs; };
       passthru.commonArgs = commonArgs;
+      # The deps-only artifacts stay exposed for the leaf flake checks (clippy /
+      # system-tests) that reuse them with a different feature set; the packages
+      # chain off `workspaceArtifacts` instead (see control-center.nix).
       passthru.cargoArtifacts = cargoArtifacts;
+      passthru.workspaceArtifacts = workspaceArtifacts;
 
       meta = {
         description = "hytte-based Wayland desktop shell (unwrapped — no asset env)";
@@ -183,8 +270,9 @@ runCommand "trollshell-0.1.0"
     nativeBuildInputs = [ makeWrapper ];
 
     # Preserve the consumed passthru/meta from the inner build so flake.nix
-    # (commonArgs/cargoArtifacts) and the dev shell (devInputs) keep resolving,
-    # and `nix run` still finds the main program.
+    # (commonArgs/cargoArtifacts), control-center.nix (workspaceArtifacts), and
+    # the dev shell (devInputs) keep resolving, and `nix run` still finds the
+    # main program.
     passthru = unwrapped.passthru // {
       inherit unwrapped assets;
     };

@@ -137,7 +137,7 @@ use hytte::gtk::{self, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
 use hytte::reactive::spawn_supervised;
-use hytte::services::{clock, notifications, pipewire};
+use hytte::services::{clock, niri, notifications, pipewire};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Mount, Page, PluginMsg,
@@ -186,11 +186,14 @@ struct SlotRender {
 }
 
 /// One effect stripped off a render frame, queued on the non-lossy effect
-/// channel for the GTK-side broker. Carries the producing plugin's id purely
-/// for the audit log.
+/// channel for the GTK-side broker. Carries the producing plugin's id for the
+/// audit log, and its connection's `outbound` so a **two-way** effect (consent,
+/// #487) can route its reply back to the plugin as a [`HostMsg`]; one-way
+/// effects ignore it.
 struct BrokeredEffect {
     plugin_id: String,
     effect: Effect,
+    outbound: mpsc::Sender<HostMsg>,
 }
 
 /// Registry handles for the plugin host. The six render mailboxes (three
@@ -395,6 +398,17 @@ pub fn install() {
         std::future::ready(())
     }));
 
+    // Focused output (#499, deferred #440 hunk): track niri's focused output so a
+    // plugin-driven drawer-open (`Effect::OpenPage`) and the consent overlay
+    // (#487) both land on the output the user is looking at, not an arbitrary one.
+    // Local tracking pending the shared `components::focused_output` component
+    // (#496/#440) — fold this in once that lands. Replays its current value on
+    // subscribe, so it's up to date the moment a plugin/prompt needs it.
+    glib::MainContext::default().spawn_local(niri::focused_output().for_each(|out| {
+        FOCUSED_OUTPUT.with(|c| *c.borrow_mut() = out);
+        std::future::ready(())
+    }));
+
     // Effect broker: drain the non-lossy effect channel in arrival order.
     // Effects are one-shot, so — unlike the idempotent trees on the render
     // mailbox — they must never be coalesced away (#277); the reader tasks strip
@@ -412,7 +426,7 @@ pub fn install() {
     if let Some(mut effects_rx) = effects_rx {
         glib::MainContext::default().spawn_local(async move {
             while let Some(brokered) = effects_rx.recv().await {
-                broker_effect(&brokered.plugin_id, &brokered.effect);
+                broker_effect(&brokered.plugin_id, &brokered.effect, &brokered.outbound);
             }
         });
     }
@@ -620,6 +634,23 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     })
 }
 
+thread_local! {
+    /// niri's most recent focused-output connector, tracked by the subscription
+    /// [`install`] wires (#499, deferred #440 hunk). GTK-thread-only. Read by
+    /// [`focused_output`] to route a plugin-driven drawer-open / consent prompt to
+    /// the output the user is on. `None` until niri reports one (callers then fall
+    /// back to a default output). Local pending the `components::focused_output`
+    /// consolidation (#496/#440).
+    static FOCUSED_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// niri's current focused-output connector name, or `None` if not yet known
+/// (#499). GTK-thread-only. Feeds the drawer-open routing below and the consent
+/// overlay ([`crate::overlays::consent`]).
+pub(crate) fn focused_output() -> Option<String> {
+    FOCUSED_OUTPUT.with(|c| c.borrow().clone())
+}
+
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// and [`Effect::Notify`] (→ a local notification toast, #406); anything else is
@@ -628,18 +659,29 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// plugin didn't declare before it ever reaches this broker (#436), so an effect
 /// arriving here is always one the plugin was granted. A persisted audit-log and
 /// the `RunCommand` round-trip remain deferred.
-fn broker_effect(plugin_id: &str, effect: &Effect) {
+///
+/// `outbound` is the producing connection's host→plugin channel, used only by the
+/// **two-way** [`Effect::RequestConsent`] (#487) to route the human's decision
+/// back as a [`HostMsg::ConsentDecision`]; the one-way effects ignore it.
+fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) {
     match effect {
-        Effect::OpenPage(page) => match resolve_open_page(*page) {
-            PageAction::OpenBuiltin(target) => {
-                tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
-                crate::modal::open_on_focused(None, target);
+        Effect::OpenPage(page) => {
+            // #499 (deferred #440 hunk): open the drawer on niri's focused output,
+            // not an arbitrary one. `preferred = None` let `open_on_focused` pick
+            // any mounted drawer; passing the focused connector routes it to the
+            // screen the user is on (the consent overlay wants the same routing).
+            let focused = focused_output();
+            match resolve_open_page(*page) {
+                PageAction::OpenBuiltin(target) => {
+                    tracing::info!(plugin = %plugin_id, ?target, "plugin effect: OpenPage");
+                    crate::modal::open_on_focused(focused.as_deref(), target);
+                }
+                PageAction::OpenPluginSelf => {
+                    tracing::info!(plugin = %plugin_id, "plugin effect: OpenPage(PluginSelf)");
+                    crate::modal::open_plugin_on_focused(focused.as_deref(), plugin_id);
+                }
             }
-            PageAction::OpenPluginSelf => {
-                tracing::info!(plugin = %plugin_id, "plugin effect: OpenPage(PluginSelf)");
-                crate::modal::open_plugin_on_focused(None, plugin_id);
-            }
-        },
+        }
         Effect::RaiseOsd { title, body, icon } => {
             tracing::info!(plugin = %plugin_id, title = %title, "plugin effect: RaiseOsd");
             crate::overlays::osd::nudge(title, body, icon.as_deref());
@@ -653,6 +695,30 @@ fn broker_effect(plugin_id: &str, effect: &Effect) {
             // not error-scope, so DND may hold it (see `post_local`'s docs).
             tracing::info!(plugin = %plugin_id, summary = %summary, "plugin effect: Notify");
             notifications::post_local(plugin_id, summary, body, notifications::Urgency::Normal);
+        }
+        Effect::RequestConsent {
+            request_id,
+            agent,
+            datasource,
+            scope,
+            detail,
+        } => {
+            // #487 phase 1b: raise the interactive consent overlay on the focused
+            // output and route the human's decision back to THIS plugin as
+            // `HostMsg::ConsentDecision`. Reaching here means the plugin holds
+            // `Capability::Consent` (`enforce_capabilities` drops the effect
+            // otherwise), so the `ConsentDecision` reply only ever goes to a
+            // connection that can decode it — the #305 opt-in gate, enforced
+            // upstream.
+            tracing::info!(plugin = %plugin_id, %agent, %datasource, "plugin effect: RequestConsent");
+            crate::overlays::consent::request(
+                *request_id,
+                agent,
+                datasource,
+                scope,
+                detail,
+                outbound.clone(),
+            );
         }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");
@@ -1118,6 +1184,9 @@ fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Ve
         let _ = ctx.effects_tx.send(BrokeredEffect {
             plugin_id: render.plugin_id.clone(),
             effect,
+            // The connection's outbound, so a two-way effect (consent, #487) can
+            // send its reply frame back to this plugin.
+            outbound: render.outbound.clone(),
         });
     }
     // The optional drawer panel (#349 PR2) rides the same frame but lands in the
@@ -1307,6 +1376,7 @@ fn effect_capability(effect: &Effect) -> Capability {
         Effect::RunCommand { .. } => Capability::RunCommand,
         Effect::RaiseOsd { .. } => Capability::RaiseOsd,
         Effect::Notify { .. } => Capability::Notify,
+        Effect::RequestConsent { .. } => Capability::Consent,
     }
 }
 
@@ -2715,6 +2785,7 @@ mod tests {
             .send(BrokeredEffect {
                 plugin_id: "p".into(),
                 effect: Effect::OpenPage(Page::PowerMenu),
+                outbound: tx.clone(),
             })
             .expect("effect queued");
         upsert_region(&region, render_of("p", 0, 0, "A", &tx));
@@ -3406,6 +3477,16 @@ mod tests {
                 body: String::new(),
             }),
             Capability::Notify,
+        );
+        assert_eq!(
+            effect_capability(&Effect::RequestConsent {
+                request_id: 1,
+                agent: String::new(),
+                datasource: String::new(),
+                scope: String::new(),
+                detail: String::new(),
+            }),
+            Capability::Consent,
         );
     }
 

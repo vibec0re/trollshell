@@ -297,7 +297,8 @@ impl Plugin for Timer {
             Input::Snapshot(_)
             | Input::EffectResult { .. }
             | Input::SlotVisible(_)
-            | Input::AudioSpectrum(_) => Vec::new(),
+            | Input::AudioSpectrum(_)
+            | Input::ConsentDecision { .. } => Vec::new(),
         }
     }
 

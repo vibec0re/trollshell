@@ -6,7 +6,7 @@
 //! internal timer, an external fetch completing), not only in reply to a host
 //! message. See the crate root for the framing/encoding.
 
-use crate::effect::{Effect, EffectOutcome};
+use crate::effect::{ConsentDecision, Effect, EffectOutcome};
 use crate::manifest::Manifest;
 use crate::state::{AudioSpectrum, StateSnapshot};
 use crate::wire::{EventKind, Node, NodeId};
@@ -101,6 +101,23 @@ pub enum HostMsg {
     /// plugin opts in explicitly, and the host only runs the capture while a
     /// subscriber is present.
     AudioSpectrum { spectrum: AudioSpectrum },
+    /// The human's answer to an [`Effect::RequestConsent`](crate::effect::Effect::RequestConsent)
+    /// prompt (#487 phase 1b), keyed by the same `request_id` the plugin chose.
+    /// The request/response mate of `RequestConsent`, exactly as
+    /// [`EffectResult`](HostMsg::EffectResult) is `RunCommand`'s. Surfaced to the
+    /// SDK as `Input::ConsentDecision`.
+    ///
+    /// **Opt-in (#305):** a new host→plugin push, so it must be gated on an opt-in
+    /// the plugin declared — here [`Capability::Consent`](crate::manifest::Capability::Consent).
+    /// The host only sends this to a connection that actually emitted a
+    /// `RequestConsent` (which requires the `Consent` cap, or host cap-enforcement
+    /// drops the effect), so a pre-1b plugin that never declared `Consent` never
+    /// receives this name-tagged variant it couldn't decode — the same additive
+    /// rule as [`Accent`](HostMsg::Accent)/[`AudioSpectrum`](HostMsg::AudioSpectrum).
+    ConsentDecision {
+        request_id: u64,
+        decision: ConsentDecision,
+    },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is

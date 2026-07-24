@@ -309,7 +309,8 @@
 use std::time::Duration;
 
 use hytte_plugin_proto::{
-    AudioSpectrum, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId, StateSnapshot,
+    AudioSpectrum, ConsentDecision, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId,
+    StateSnapshot,
 };
 
 pub mod preem;
@@ -469,6 +470,22 @@ pub enum Input<M> {
     /// than 20 Hz just sees the freshest frame each time; there is no backlog to
     /// drain. Ignoring it costs nothing.
     AudioSpectrum(AudioSpectrum),
+    /// The human's answer to an [`Effect::RequestConsent`](proto::Effect::RequestConsent)
+    /// this plugin raised (#487 phase 1b), the host
+    /// [`ConsentDecision`](proto::HostMsg::ConsentDecision) push. Keyed by the
+    /// `request_id` the plugin chose on the originating `RequestConsent`, so a
+    /// plugin with several prompts in flight can correlate the answer. Delivered
+    /// only to a plugin that declared
+    /// [`Capability::Consent`](proto::Capability::Consent) and actually requested
+    /// a prompt; an unanswered prompt resolves to
+    /// [`ConsentDecision::Deny`](proto::ConsentDecision::Deny) after the host's
+    /// 60 s timeout, so this always eventually arrives.
+    ConsentDecision {
+        /// The `request_id` the plugin chose on the originating `RequestConsent`.
+        request_id: u64,
+        /// The human's choice (or `Deny` on the 60 s timeout).
+        decision: ConsentDecision,
+    },
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
 }

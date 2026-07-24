@@ -83,6 +83,17 @@ pub enum Capability {
     /// Post a notification toast through the shell's own notification daemon
     /// ([`Effect::Notify`](crate::effect::Effect::Notify)).
     Notify,
+    /// Raise an interactive consent prompt
+    /// ([`Effect::RequestConsent`](crate::effect::Effect::RequestConsent), #487
+    /// phase 1b). Declaring this cap is **also** the #305 opt-in gate for the
+    /// paired host→plugin push: the host only sends
+    /// [`HostMsg::ConsentDecision`](crate::msg::HostMsg::ConsentDecision) — the
+    /// answer to a `RequestConsent` — back to a connection that requested one, and
+    /// a `RequestConsent` from a plugin that never declared `Consent` is dropped
+    /// by host cap-enforcement (so it never receives a decision it couldn't
+    /// decode). A pre-1b plugin that never declares `Consent` therefore never
+    /// meets the new variant.
+    Consent,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

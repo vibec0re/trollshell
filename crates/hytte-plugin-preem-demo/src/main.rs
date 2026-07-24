@@ -234,7 +234,7 @@ impl Plugin for PreemDemo {
             // No RunCommand is issued, and the card keeps cycling whether
             // or not anyone is looking (rendering is snapshot-driven and
             // cheap) — both pushes are no-ops.
-            Input::EffectResult { .. } | Input::SlotVisible(_) => {}
+            Input::EffectResult { .. } | Input::SlotVisible(_) | Input::ConsentDecision { .. } => {}
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

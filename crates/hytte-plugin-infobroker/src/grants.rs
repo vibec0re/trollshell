@@ -146,6 +146,17 @@ impl GrantStore {
             .any(|g| g.agent == agent && g.decision == Decision::Always)
     }
 
+    /// Whether `agent` has at least one `deny` grant (any datasource) — a
+    /// standing "no" that `auth` refuses **without** re-prompting (#487 phase
+    /// 1b): a deliberate `Deny` decision is remembered, so the agent is denied
+    /// silently rather than knocking again.
+    #[must_use]
+    pub fn has_any_deny(&self, agent: &str) -> bool {
+        self.grants
+            .iter()
+            .any(|g| g.agent == agent && g.decision == Decision::Deny)
+    }
+
     /// Add (or upgrade an existing row to) an `always` grant for
     /// `(agent, datasource)` and persist. Idempotent: a matching row is updated
     /// in place rather than duplicated.
@@ -162,6 +173,32 @@ impl GrantStore {
             SCOPE_ALL.clone_into(&mut g.scope);
         } else {
             self.grants.push(Grant::always(agent, datasource));
+        }
+        self.save()
+    }
+
+    /// Add (or downgrade an existing row to) a `deny` grant for
+    /// `(agent, datasource)` and persist — the durable half of an `AllowAlways`
+    /// decision's opposite: a deliberate `Deny` consent (#487 phase 1b). Idempotent
+    /// (a matching row is updated in place), mirroring [`grant_always`](GrantStore::grant_always).
+    ///
+    /// # Errors
+    /// If persisting the updated store fails.
+    pub fn grant_deny(&mut self, agent: &str, datasource: &str) -> Result<(), String> {
+        if let Some(g) = self
+            .grants
+            .iter_mut()
+            .find(|g| g.agent == agent && g.datasource == datasource)
+        {
+            g.decision = Decision::Deny;
+            SCOPE_ALL.clone_into(&mut g.scope);
+        } else {
+            self.grants.push(Grant {
+                agent: agent.to_owned(),
+                datasource: datasource.to_owned(),
+                scope: SCOPE_ALL.to_owned(),
+                decision: Decision::Deny,
+            });
         }
         self.save()
     }
@@ -339,6 +376,30 @@ mod tests {
             !store.revoke("claude", "departures").expect("no-op"),
             "revoking a missing grant reports false"
         );
+    }
+
+    #[test]
+    fn grant_deny_persists_and_downgrades_an_always_in_place() {
+        let mut store = GrantStore::from_grants(Vec::new());
+        // A fresh deny is added…
+        store.grant_deny("scratch", "departures").expect("denied");
+        assert_eq!(store.grants().len(), 1);
+        assert_eq!(
+            store.decision_for("scratch", "departures"),
+            Some(Decision::Deny)
+        );
+        assert!(store.has_any_deny("scratch"));
+        assert!(!store.has_any_always("scratch"));
+
+        // …and an existing `always` is downgraded in place (no dup).
+        store.grant_always("claude", "departures").expect("granted");
+        store.grant_deny("claude", "departures").expect("denied");
+        assert_eq!(store.grants().len(), 2, "downgrade updates in place");
+        assert_eq!(
+            store.decision_for("claude", "departures"),
+            Some(Decision::Deny)
+        );
+        assert!(!store.has_any_always("claude"));
     }
 
     #[test]

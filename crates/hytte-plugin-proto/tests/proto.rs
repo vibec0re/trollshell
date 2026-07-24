@@ -3,9 +3,10 @@
 //! sockets, no display — pure encode/decode.
 
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, Dir, Effect, EffectOutcome, EventKind, HostMsg, LogLevel,
-    MAX_FRAME_LEN, Manifest, MediaAction, Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg,
-    ProtoError, StateKey, StateSnapshot, decode, decode_body, encode, encode_body,
+    AudioAction, Capability, ClockState, ConsentDecision, Dir, Effect, EffectOutcome, EventKind,
+    HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction, Mount, NiriAction, Node,
+    PROTO_VERSION, Page, PluginMsg, ProtoError, StateKey, StateSnapshot, decode, decode_body,
+    encode, encode_body,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -586,6 +587,86 @@ fn notify_capability_is_name_tagged() {
         contains(&encode_body(&Capability::Notify), b"Notify"),
         "capability name 'Notify' rides the wire",
     );
+}
+
+// ── Consent (#487 phase 1b) ──────────────────────────────────────────────────
+
+#[test]
+fn request_consent_effect_is_name_tagged_and_additive() {
+    // `RequestConsent` is a brand-new, externally-tagged `Effect` variant, so it
+    // rides the wire as its bare variant *name* — the property that makes
+    // appending it additive: an older decoder skips an unknown tag rather than
+    // mis-decoding an existing variant, and every pre-1b frame decodes byte-for-
+    // byte unchanged. So `PROTO_VERSION` stays put.
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
+
+    let effect = Effect::RequestConsent {
+        request_id: 42,
+        agent: "claude".into(),
+        datasource: "departures".into(),
+        scope: "*".into(),
+        detail: "next S-Bahn departures".into(),
+    };
+    let body = encode_body(&effect);
+    assert!(
+        contains(&body, b"RequestConsent"),
+        "variant name 'RequestConsent' present"
+    );
+    let back: Effect = decode(&encode(&effect)).expect("decode RequestConsent");
+    assert_eq!(effect, back);
+}
+
+#[test]
+fn consent_capability_is_name_tagged() {
+    // The paired manifest capability (#487) that gates the effect *and* is the
+    // #305 opt-in for the `ConsentDecision` push. Like every other `Capability`
+    // it rides the wire as its bare variant name, so a manifest requesting it
+    // round-trips and appending it is additive.
+    let mut m = sample_manifest();
+    m.capabilities = vec![Capability::Consent];
+    let back: Manifest = decode(&encode(&m)).expect("decode manifest with Consent cap");
+    assert_eq!(m, back);
+    assert!(
+        contains(&encode_body(&Capability::Consent), b"Consent"),
+        "capability name 'Consent' rides the wire",
+    );
+}
+
+#[test]
+fn consent_decision_push_round_trips_every_variant() {
+    // The paired host→plugin push (#487): a `HostMsg::ConsentDecision` carrying
+    // each of the four decisions round-trips, and both the variant name and the
+    // decision names ride the wire (name-tagged → appending is additive).
+    assert!(
+        contains(
+            &encode_body(&HostMsg::ConsentDecision {
+                request_id: 1,
+                decision: ConsentDecision::Deny,
+            }),
+            b"ConsentDecision"
+        ),
+        "variant name 'ConsentDecision' rides the wire",
+    );
+    for (decision, name) in [
+        (ConsentDecision::AllowOnce, b"AllowOnce".as_slice()),
+        (ConsentDecision::AllowSession, b"AllowSession"),
+        (ConsentDecision::AllowAlways, b"AllowAlways"),
+        (ConsentDecision::Deny, b"Deny"),
+    ] {
+        let msg = HostMsg::ConsentDecision {
+            request_id: 7,
+            decision,
+        };
+        let back: HostMsg = decode(&encode(&msg)).expect("decode ConsentDecision");
+        assert_eq!(msg, back, "{decision:?} round-trips");
+        assert!(
+            contains(&encode_body(&decision), name),
+            "decision name rides the wire",
+        );
+    }
 }
 
 // ── Plugin panel + PluginSelf page (#349 PR2) ────────────────────────────────

@@ -66,6 +66,10 @@ enum Step<M> {
 ///
 /// Generic over the I/O halves (not `UnixStream`) so the whole loop is
 /// hermetically testable over `tokio::io::duplex`.
+// One cohesive session lifecycle (handshake → seed render → the select loop over
+// every host frame → dedup); the length is the host-frame vocabulary, not
+// branching complexity — splitting it would scatter the loop for no gain.
+#[allow(clippy::too_many_lines)]
 async fn session<P, R, W>(rd: R, mut wr: W) -> Result<(), ProtoError>
 where
     P: Plugin,
@@ -157,6 +161,15 @@ where
                     // like any other app-level input.
                     Step::Update(Input::AudioSpectrum(spectrum))
                 }
+                // #487 phase 1b: the human's answer to a `RequestConsent` this
+                // plugin raised (or `Deny` on the host's 60 s timeout).
+                Some(Ok(HostMsg::ConsentDecision {
+                    request_id,
+                    decision,
+                })) => Step::Update(Input::ConsentDecision {
+                    request_id,
+                    decision,
+                }),
                 Some(Ok(HostMsg::Accent { color })) => {
                     // Theme plumbing (#376): the host resolved `@accent_color`
                     // and handed it over. Feed it to the `preem` kit as the
@@ -292,9 +305,9 @@ mod tests {
     use super::{BACKOFF_BASE, BACKOFF_CAP, Backoff, reconnect_loop, session};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::{
-        AudioSpectrum, Capability, ClockState, Effect, EffectOutcome, EventKind, HostMsg, Manifest,
-        Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot, read_frame,
-        write_frame,
+        AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
+        HostMsg, Manifest, Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot,
+        read_frame, write_frame,
     };
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -344,6 +357,13 @@ mod tests {
                 }
                 Input::EffectResult { id, outcome } => {
                     self.iso = format!("cmd{id} ok={}", outcome.ok);
+                    Vec::new()
+                }
+                Input::ConsentDecision {
+                    request_id,
+                    decision,
+                } => {
+                    self.iso = format!("consent{request_id}={decision:?}");
                     Vec::new()
                 }
                 Input::SlotVisible(_) | Input::AudioSpectrum(_) => Vec::new(),
@@ -608,7 +628,8 @@ mod tests {
                 Input::Snapshot(_)
                 | Input::EffectResult { .. }
                 | Input::SlotVisible(_)
-                | Input::AudioSpectrum(_) => {}
+                | Input::AudioSpectrum(_)
+                | Input::ConsentDecision { .. } => {}
             }
             Vec::new()
         }
@@ -1106,6 +1127,42 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Meter, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::ConsentDecision`] push reaches `update` as
+    /// [`Input::ConsentDecision`] and re-renders — the mechanism a plugin
+    /// (infobroker) consumes to complete a parked consent knock (#487 phase 1b).
+    #[tokio::test]
+    async fn consent_decision_push_reaches_update_as_input() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+
+            send(
+                &mut hwr,
+                &HostMsg::ConsentDecision {
+                    request_id: 3,
+                    decision: ConsentDecision::AllowSession,
+                },
+            )
+            .await;
+            let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a consent decision must reach update() and re-render");
+            };
+            assert!(effects.is_empty());
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "consent3=AllowSession"),
+                "ConsentDecision reached update as Input::ConsentDecision",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
         assert!(result.is_ok());
     }
 

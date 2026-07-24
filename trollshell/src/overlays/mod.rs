@@ -3,6 +3,7 @@
 //! to the relevant signal source. Moved out of `widgets/` so that
 //! `widgets/` reads strictly as bar chips.
 
+pub mod consent;
 pub mod frame;
 pub mod notifications;
 pub mod osd;

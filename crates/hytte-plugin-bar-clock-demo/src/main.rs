@@ -124,7 +124,8 @@ impl Plugin for BarClock {
             Input::Event { .. }
             | Input::EffectResult { .. }
             | Input::SlotVisible(_)
-            | Input::AudioSpectrum(_) => Vec::new(),
+            | Input::AudioSpectrum(_)
+            | Input::ConsentDecision { .. } => Vec::new(),
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

@@ -12,9 +12,9 @@
 //!   #349/#415 `View { tree, panel }` mechanism) listing grants, datasource
 //!   status, and a recent-requests audit trail, with per-row revoke/allow
 //!   buttons. It ALSO runs the broker socket server ([`broker::serve`]).
-//! - **`infobroker`** (`src/cli.rs`) — the only client of the broker socket; the
-//!   binary the skill folder's agents shell out to (`auth` → env token → scoped
-//!   `get`s).
+//! - **`hytte-infobroker`** (`src/cli.rs`) — the only client of the broker
+//!   socket; the binary the skill folder's agents shell out to (`auth` → env
+//!   token → scoped `get`s).
 //!
 //! The library is deliberately **SDK-free** (it never links `hytte_plugin`), so
 //! the CLI stays lean and the pure logic — the grant store, the token TTL

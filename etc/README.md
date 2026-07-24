@@ -27,16 +27,17 @@ socket; see its "Out-of-process widget plugins" section.
 consent-gated broker that lets a local AI agent read _scoped_ desktop data
 (public-transport departures today; more later) without touching Annika's files
 or daemons. It follows Annika's "mcp is dead" shape: **a skill folder, not an MCP
-server** — a `SKILL.md` teaching the flow plus a `bin/infobroker` wrapper the
-agent shells out to.
+server** — a `SKILL.md` teaching the flow plus a `bin/hytte-infobroker` wrapper
+the agent shells out to.
 
 The broker itself is an ordinary out-of-process trollshell plugin
 (`trollshell-plugin-infobroker.service`, see
 [systemd/user/README.md](systemd/user/README.md)): a bar-chip shield whose drawer
 panel manages the durable **grants** (agent × datasource → allow/deny) and shows
-a live audit trail. An agent authenticates with `infobroker auth --agent <name>`
-→ a short-lived session token exported into its environment
-(`HYTTE_INFOBROKER_TOKEN`) → scoped `infobroker get departures`. Access is
+a live audit trail. An agent authenticates with
+`hytte-infobroker auth --agent <name>` → a short-lived session token exported
+into its environment (`HYTTE_INFOBROKER_TOKEN`) → scoped
+`hytte-infobroker get departures`. Access is
 **denied until a human grants it** (in the panel or by editing
 `grants.toml`); a denied knock pops a desktop toast so Annika sees it.
 

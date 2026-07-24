@@ -10,21 +10,21 @@ description: >-
 
 # infobroker — the trollshell data broker
 
-`infobroker` is a small CLI that lets you read **scoped, consent-gated** data
-from the running trollshell desktop. A human (Annika) decides, per agent and per
-datasource, whether you may read it. You never touch her files or daemons
+`hytte-infobroker` is a small CLI that lets you read **scoped, consent-gated**
+data from the running trollshell desktop. A human (Annika) decides, per agent and
+per datasource, whether you may read it. You never touch her files or daemons
 directly — you ask the broker, and it answers only what you've been granted.
 
-The whole surface is one CLI (this skill's `bin/infobroker`, a pointer to the
-installed binary). There is no MCP server and no network endpoint — it talks to
-a local Unix socket the desktop owns.
+The whole surface is one CLI (this skill's `bin/hytte-infobroker`, a pointer to
+the installed binary). There is no MCP server and no network endpoint — it talks
+to a local Unix socket the desktop owns.
 
 ## The model (read this once)
 
 - **Identity is a token.** You authenticate as an _agent name_ (pick a stable
-  one, e.g. `claude`). `infobroker auth` mints a short-lived **session token**
-  and prints an `export HYTTE_INFOBROKER_TOKEN=…` line. `eval` it; subsequent
-  `get`s read that env var.
+  one, e.g. `claude`). `hytte-infobroker auth` mints a short-lived **session
+  token** and prints an `export HYTTE_INFOBROKER_TOKEN=…` line. `eval` it;
+  subsequent `get`s read that env var.
 - **Tokens are ephemeral, grants are durable.** A token lives ≤ 12 h and dies on
   a desktop restart or an explicit revoke — re-auth is cheap. The _grant_ (your
   agent × a datasource) is what persists; a human sets it once.
@@ -38,14 +38,14 @@ a local Unix socket the desktop owns.
 
 ```sh
 # 1. Authenticate once per session (pick a stable agent name):
-eval "$(infobroker auth --agent claude)"
+eval "$(hytte-infobroker auth --agent claude)"
 
 # 2. Read scoped data (uses $HYTTE_INFOBROKER_TOKEN):
-infobroker get departures            # next catchable S-Bahn departures (JSON)
-infobroker get departures --limit 3  # just the next few
+hytte-infobroker get departures            # next catchable S-Bahn departures (JSON)
+hytte-infobroker get departures --limit 3  # just the next few
 
 # 3. See what you're allowed to read:
-infobroker grants list
+hytte-infobroker grants list
 ```
 
 ### `auth --agent <name>`
@@ -97,7 +97,7 @@ what you may read before you `get`.
 - **Auth once per session**, then reuse the env token. Don't re-`auth` before
   every `get`.
 - **Handle denial gracefully.** If `auth`/`get` is denied, tell the human what
-  you tried and that they can allow it in the _infobroker panel_ (the shield
+  you tried and that they can allow it in the _infobroker panel_ (the infobroker
   chip on the trollshell bar → the drawer's "Pending requests") or by adding a
   line to `grants.toml`. Then stop — do not spin.
 - **A token can vanish mid-task** (TTL, restart, or revoke). If a `get` says the

@@ -1,18 +1,18 @@
-//! `infobroker` — the broker's command-line client (issue #487, phase 1a).
+//! `hytte-infobroker` — the broker's command-line client (issue #487, phase 1a).
 //!
 //! The only client of the broker socket, and the binary the skill folder's
 //! agents shell out to. Three subcommands over the boring JSON-lines wire
 //! ([`hytte_plugin_infobroker::wire`]):
 //!
 //! ```text
-//! infobroker auth --agent <name>        # → `export HYTTE_INFOBROKER_TOKEN=…`
-//! infobroker get departures [--limit N] # uses $HYTTE_INFOBROKER_TOKEN → JSON
-//! infobroker grants list                # the durable grants (introspection)
+//! hytte-infobroker auth --agent <name>        # → `export HYTTE_INFOBROKER_TOKEN=…`
+//! hytte-infobroker get departures [--limit N] # uses $HYTTE_INFOBROKER_TOKEN → JSON
+//! hytte-infobroker grants list                # the durable grants (introspection)
 //! ```
 //!
 //! The auth line is meant to be `eval`'d:
-//! `eval "$(infobroker auth --agent claude)"`. Blocking std sockets only — no
-//! async runtime, so the CLI stays a fast, tiny binary.
+//! `eval "$(hytte-infobroker auth --agent claude)"`. Blocking std sockets only —
+//! no async runtime, so the CLI stays a fast, tiny binary.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
@@ -26,26 +26,26 @@ use hytte_plugin_infobroker::wire::{DATASOURCE_DEPARTURES, Request, Response};
 const ENV_TOKEN: &str = "HYTTE_INFOBROKER_TOKEN";
 
 const USAGE: &str = "\
-infobroker — the trollshell data broker CLI (issue #487)
+hytte-infobroker — the trollshell data broker CLI (issue #487)
 
 USAGE:
-    infobroker auth --agent <name>          mint a session token (prints an
-                                            `export HYTTE_INFOBROKER_TOKEN=…`
-                                            line to eval)
-    infobroker get departures [--limit N]   fetch scoped data (needs the env
-                                            token from a prior auth)
-    infobroker grants list                  list the durable grants
+    hytte-infobroker auth --agent <name>          mint a session token (prints an
+                                                  `export HYTTE_INFOBROKER_TOKEN=…`
+                                                  line to eval)
+    hytte-infobroker get departures [--limit N]   fetch scoped data (needs the env
+                                                  token from a prior auth)
+    hytte-infobroker grants list                  list the durable grants
 
 Typical agent flow:
-    eval \"$(infobroker auth --agent claude)\"
-    infobroker get departures --limit 5";
+    eval \"$(hytte-infobroker auth --agent claude)\"
+    hytte-infobroker get departures --limit 5";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("infobroker: {e}");
+            eprintln!("hytte-infobroker: {e}");
             ExitCode::FAILURE
         }
     }
@@ -84,7 +84,7 @@ fn cmd_auth(args: &[String]) -> Result<(), String> {
     // stderr: the human-facing note.
     if let Some(exp) = resp.expires_unix {
         eprintln!(
-            "infobroker: session token for '{agent}' minted (expires at unix {exp}); \
+            "hytte-infobroker: session token for '{agent}' minted (expires at unix {exp}); \
              eval the line above to use it."
         );
     }
@@ -110,7 +110,9 @@ fn cmd_get(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let token = std::env::var(ENV_TOKEN).map_err(|_| {
-        format!("get: {ENV_TOKEN} not set — run `eval \"$(infobroker auth --agent <name>)\"` first")
+        format!(
+            "get: {ENV_TOKEN} not set — run `eval \"$(hytte-infobroker auth --agent <name>)\"` first"
+        )
     })?;
     let resp = call(&Request::Get {
         token,

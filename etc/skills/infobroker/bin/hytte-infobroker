@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Skill entry point for the hytte-infobroker CLI.
+#
+# This is a thin pointer to the *installed* `hytte-infobroker` binary (shipped by
+# the hytte-plugin-infobroker crate / the trollshell package). It exists so an
+# agent can invoke `bin/hytte-infobroker …` from this skill folder without caring
+# where the real binary lives. It prefers whatever `hytte-infobroker` is already
+# on PATH, then falls back to the conventional install location the systemd unit
+# uses.
+set -euo pipefail
+
+if command -v hytte-infobroker >/dev/null 2>&1; then
+  exec hytte-infobroker "$@"
+fi
+
+for candidate in \
+  /usr/local/bin/hytte-infobroker \
+  /run/current-system/sw/bin/hytte-infobroker \
+  "${HOME}/.nix-profile/bin/hytte-infobroker"; do
+  if [[ -x "$candidate" ]]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+echo "hytte-infobroker: CLI not found on PATH or in the usual install locations." >&2
+echo "Install the hytte-plugin-infobroker crate (it ships the 'hytte-infobroker' binary)" >&2
+echo "and make sure the trollshell-plugin-infobroker.service plugin is running." >&2
+exit 127

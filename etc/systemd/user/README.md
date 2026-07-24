@@ -188,14 +188,14 @@ the durable grants (with per-row **Revoke**), the pending knocks (with one-click
 **Allow**), the datasource status, the live sessions, and a recent-requests
 audit trail. Unlike the other plugins it **also binds its own socket**,
 `$XDG_RUNTIME_DIR/hytte-infobroker.sock` (0600, same-user-only), which the
-separate `infobroker` CLI dials so an agent can `auth` (mint a session token) and
-`get` scoped data. Durable grants persist to
+separate `hytte-infobroker` CLI dials so an agent can `auth` (mint a session
+token) and `get` scoped data. Durable grants persist to
 `$XDG_STATE_HOME/hytte-infobroker/grants.toml` (or `~/.local/state/…`); session
 tokens are in-memory only (12 h TTL, killed by a panel revoke or a restart of
 this unit / trollshell). A denied auth/data request raises one informational
 toast via `Effect::Notify` so the human sees the knock (interactive Allow/Deny
 prompting is a later phase). The agent-facing skill folder lives at
-`etc/skills/infobroker/` (`SKILL.md` + a `bin/infobroker` wrapper). No
+`etc/skills/infobroker/` (`SKILL.md` + a `bin/hytte-infobroker` wrapper). No
 environment variables to set.
 
 `trollshell-plugin-audio-widget.service` is the audio-reactive sidebar card

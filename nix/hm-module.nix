@@ -101,9 +101,9 @@ in
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
 
   options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
-    the bundled swaybg wallpaper user unit standalone, which reads the image
-    path from ~/.config/trollshell/wallpaper.path (the Appearance drawer page
-    writes it). Gently deprecated in favor of
+    the bundled swaybg wallpaper user unit standalone, which reads its
+    argument list from ~/.config/trollshell/swaybg.args (the Appearance drawer
+    page writes it — per-output images and rotation supported). Gently deprecated in favor of
     programs.trollshell.wallpaper.backend = "swaybg" + enableSessionExtras: the
     extras bundle now starts the swaybg unit when backend is "swaybg" (the
     default). This option is still honored — set it true to run the swaybg unit

@@ -394,26 +394,46 @@ async fn run_prepare_for_sleep_relock() {
 
 // ── Native idle actions ─────────────────────────────────────────────────────
 
-/// `true` if the logind `BlockInhibited` set holds **any** of `whats` (so the
-/// matching native idle action must be **skipped**). dim/lock pass `["idle"]`;
-/// suspend passes `["idle", "sleep"]`, so a held `idle` inhibitor ("Keep
-/// awake" / a playing video) holds off suspend as well, not just dim/lock
-/// (#420). On any error reading it we return `true` (skip) — the safe choice:
-/// never fire dim/lock/suspend when we can't confirm nothing is inhibiting.
+/// Fail-**closed** gate decision from a `BlockInhibited` read.
+///
+/// `None` means the read itself failed — we then **skip** the action (`true`),
+/// never firing dim/lock/suspend when we cannot confirm that nothing is
+/// inhibiting. This direction is load-bearing for "Keep awake" (#534): the
+/// gate must fail *toward not acting*, not toward locking. `Some(list)` does
+/// whole-token membership over the colon-separated list. Pure, so the
+/// fail-closed direction is unit-tested without a live bus — a regression that
+/// flipped the `None` arm to `false` (fail-open, "keep-awake still locked me")
+/// would trip the test.
+fn should_skip_action(block_inhibited: Option<&str>, whats: &[&str]) -> bool {
+    match block_inhibited {
+        Some(list) => block_list_contains_any(list, whats),
+        // A failed read must never allow the action.
+        None => true,
+    }
+}
+
+/// `true` if the matching native idle action must be **skipped** — because a
+/// logind inhibitor is held, *or* because we couldn't read the inhibitor set
+/// (in which case we skip to be safe; see [`should_skip_action`]). dim/lock
+/// pass `["idle"]`; suspend passes `["idle", "sleep"]`, so a held `idle`
+/// inhibitor ("Keep awake" / a playing video) holds off suspend as well, not
+/// just dim/lock (#420). The `BlockInhibited` is read **fresh** on every fire
+/// (not from a cached subscription), so there is no arm-time/fire-time
+/// staleness window: the decision reflects logind's live inhibitor set at the
+/// instant the threshold fires.
 async fn inhibitor_blocks(whats: &[&str]) -> bool {
-    match read_block_inhibited().await {
-        Ok(list) => {
-            let blocked = block_list_contains_any(&list, whats);
-            if blocked {
-                tracing::info!(
-                    target: LOG_TARGET,
-                    ?whats,
-                    block_inhibited = %list,
-                    "native idle action skipped — logind inhibitor held"
-                );
-            }
-            blocked
+    let read = read_block_inhibited().await;
+    let skip = should_skip_action(read.as_deref().ok(), whats);
+    match &read {
+        Ok(list) if skip => {
+            tracing::info!(
+                target: LOG_TARGET,
+                ?whats,
+                block_inhibited = %list,
+                "native idle action skipped — logind inhibitor held"
+            );
         }
+        Ok(_) => {}
         Err(err) => {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -421,9 +441,9 @@ async fn inhibitor_blocks(whats: &[&str]) -> bool {
                 error = %err,
                 "could not read logind BlockInhibited; skipping native idle action to be safe"
             );
-            true
         }
     }
+    skip
 }
 
 /// Read `org.freedesktop.login1.Manager.BlockInhibited` (a colon-separated list
@@ -771,6 +791,38 @@ mod tests {
         assert!(!block_list_contains("handle-lid-switch", "sleep"));
         // Whole-token match only: no substring false positives.
         assert!(!block_list_contains("idlehint", "idle"));
+    }
+
+    #[test]
+    fn gate_fails_closed_on_read_error() {
+        // #534: a failed `BlockInhibited` read must SKIP the action
+        // (fail-closed) — never fire dim/lock/suspend when we can't confirm
+        // nothing inhibits. This pins the exact direction a "keep-awake still
+        // locked me" regression would flip: the `None` (read-failed) arm to
+        // `false`. Fail-open here is the difference between an idle box that
+        // stays awake and one that locks despite the hold.
+        assert!(should_skip_action(None, &["idle"]));
+        assert!(should_skip_action(None, &["idle", "sleep"]));
+    }
+
+    #[test]
+    fn gate_decision_matches_live_inhibitor_set() {
+        // Successful read, relevant inhibitor absent → do NOT skip (fire).
+        assert!(!should_skip_action(Some(""), &["idle"]));
+        assert!(!should_skip_action(Some("handle-power-key"), &["idle"]));
+        // Relevant inhibitor present → skip (this is the keep-awake hold).
+        assert!(should_skip_action(Some("idle"), &["idle"]));
+        assert!(should_skip_action(
+            Some("handle-power-key:idle:sleep"),
+            &["idle"]
+        ));
+        // Suspend gate skips on either `idle` or `sleep`.
+        assert!(should_skip_action(Some("idle"), &["idle", "sleep"]));
+        assert!(should_skip_action(Some("sleep"), &["idle", "sleep"]));
+        assert!(!should_skip_action(
+            Some("handle-lid-switch"),
+            &["idle", "sleep"]
+        ));
     }
 
     #[test]

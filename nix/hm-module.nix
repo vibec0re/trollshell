@@ -101,9 +101,9 @@ in
     Bind Mod+D to `fuzzel` in niri yourself (etc/niri/binds.kdl)'';
 
   options.programs.trollshell.swaybg.enable = lib.mkEnableOption ''
-    the bundled swaybg wallpaper user unit standalone, which reads the image
-    path from ~/.config/trollshell/wallpaper.path (the Appearance drawer page
-    writes it). Gently deprecated in favor of
+    the bundled swaybg wallpaper user unit standalone, which reads its
+    argument list from ~/.config/trollshell/swaybg.args (the Appearance drawer
+    page writes it — per-output images and rotation supported). Gently deprecated in favor of
     programs.trollshell.wallpaper.backend = "swaybg" + enableSessionExtras: the
     extras bundle now starts the swaybg unit when backend is "swaybg" (the
     default). This option is still honored — set it true to run the swaybg unit
@@ -290,8 +290,9 @@ in
       # home.packages if your login shell doesn't already provide it.
 
       # swaybg — no home-manager module exists, so a plain user unit. It reads
-      # the wallpaper path at start; the Appearance drawer page rewrites that
-      # file and restarts this unit to apply a new image. %h = home dir.
+      # the swaybg.args file the service renders at start; the Appearance drawer
+      # page rewrites that file (per-output aware) and restarts this unit to
+      # apply a new image. %h = home dir.
       (lib.mkIf cfg.swaybg.enable {
         systemd.user.services.swaybg = {
           Unit = {
@@ -300,14 +301,17 @@ in
             PartOf = [ cfg.systemd.target ];
             After = [ cfg.systemd.target ];
             Requisite = [ cfg.systemd.target ];
-            # Stay inactive until the Appearance picker has written a wallpaper
-            # path; otherwise ExecStart's `cat` yields empty, swaybg fails, and
-            # Restart=on-failure loops it on a fresh install.
-            ConditionPathExists = "%h/.config/trollshell/wallpaper.path";
+            # Stay inactive until the Appearance picker has rendered a wallpaper —
+            # the service writes swaybg.args (one swaybg arg per line) and removes
+            # it on Clear, so its existence gates the unit.
+            ConditionPathExists = "%h/.config/trollshell/swaybg.args";
           };
           Service = {
             Type = "simple";
-            ExecStart = "${pkgs.bash}/bin/sh -c 'exec ${pkgs.swaybg}/bin/swaybg -i \"$(${pkgs.coreutils}/bin/cat %h/.config/trollshell/wallpaper.path)\" -m fill'";
+            # Read swaybg.args a line at a time into the positional args (paths
+            # with spaces survive), then exec swaybg with the full per-output
+            # argument list the service derived.
+            ExecStart = "${pkgs.bash}/bin/sh -c 'set --; while IFS= read -r a; do set -- \"$@\" \"$a\"; done < %h/.config/trollshell/swaybg.args; exec ${pkgs.swaybg}/bin/swaybg \"$@\"'";
             Restart = "on-failure";
             RestartSec = 2;
           };

@@ -324,6 +324,10 @@ async fn start_recording(
     let dir = videos_dir();
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(error = %e, dir = %dir.display(), "recorder: could not create output dir");
+        toast_start_failure(&format!(
+            "Couldn't create the recordings folder {}: {e}",
+            dir.display()
+        ));
         return;
     }
     let path = output_path(&dir, Local::now())
@@ -340,6 +344,7 @@ async fn start_recording(
         }
         Err(e) => {
             tracing::warn!(error = %e, "recorder: failed to spawn wf-recorder (is it installed?)");
+            toast_start_failure(&spawn_error_body("wf-recorder", &e));
         }
     }
 }
@@ -407,6 +412,7 @@ async fn pick_region() -> Option<String> {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(error = %e, "recorder: failed to run slurp (is it installed?)");
+            toast_start_failure(&spawn_error_body("slurp (the region picker)", &e));
             return None;
         }
     };
@@ -421,7 +427,43 @@ async fn pick_region() -> Option<String> {
     }
 }
 
+/// Surface a recording-*start* failure as a **loud** critical toast on top of
+/// the caller's `tracing::warn!` — the fix for #502.
+///
+/// Before this, a failed `slurp` / `wf-recorder` spawn (e.g. neither binary on
+/// the `systemd --user` service's `PATH`) only logged, so the record chip read
+/// to the user as "the button does nothing at all" — a silent dead end. Now
+/// every start-path failure says out loud *why* it failed.
+///
+/// [`Urgency::Critical`](crate::notifications::Urgency::Critical) so the toast
+/// bypasses Do-Not-Disturb and the own-app mute — a failure the user just
+/// triggered by clicking the chip must not be swallowed (see
+/// [`crate::notifications::post_local`]'s DND section). Safe to call from the
+/// driver task on the hytte-tokio runtime: `post_local` only touches the
+/// cross-thread notifications handle, and no-ops when the service is
+/// unregistered (headless tests).
+fn toast_start_failure(body: &str) {
+    crate::notifications::post_local(
+        "Screen recording",
+        "Couldn't start recording",
+        body,
+        crate::notifications::Urgency::Critical,
+    );
+}
+
 // ── Pure helpers (unit-tested) ───────────────────────────────────────────────
+
+/// A human-readable reason an external tool failed to launch, for the #502
+/// failure toast. `NotFound` (the overwhelmingly likely case — the tool isn't
+/// installed or isn't on the service's `PATH`) gets a plain, actionable line
+/// naming the tool; any other spawn error carries the raw `io::Error`.
+fn spawn_error_body(tool: &str, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!("{tool} isn't installed or isn't on PATH.")
+    } else {
+        format!("Couldn't launch {tool}: {e}")
+    }
+}
 
 /// Build the `wf-recorder` argument vector: `-f <path>`, an optional
 /// `-g <geometry>` region, and `--audio` when enabled.
@@ -590,6 +632,28 @@ mod tests {
         assert_eq!(
             recorder_args("/tmp/a.mp4", None, false),
             vec!["-f", "/tmp/a.mp4"],
+        );
+    }
+
+    // ── spawn_error_body (#502 loud failure) ─────────────────────────────────
+
+    #[test]
+    fn spawn_error_body_not_found_names_tool_and_path() {
+        // The #502 case: the tool isn't installed / on PATH → a plain,
+        // actionable line rather than a bare "No such file or directory".
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            spawn_error_body("slurp", &e),
+            "slurp isn't installed or isn't on PATH.",
+        );
+    }
+
+    #[test]
+    fn spawn_error_body_other_error_carries_raw_message() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            spawn_error_body("wf-recorder", &e),
+            "Couldn't launch wf-recorder: denied",
         );
     }
 

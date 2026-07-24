@@ -6,6 +6,9 @@ use gtk::gdk::prelude::MonitorExt;
 use gtk::glib;
 use gtk::prelude::ObjectExt;
 
+/// A connected output. Thin, cheaply-cloned wrapper around `gdk::Monitor`
+/// exposing just the metadata bars and overlays need (connector, geometry,
+/// and a geometry-change signal).
 #[derive(Clone, Debug)]
 pub struct Monitor {
     inner: gdk::Monitor,

@@ -26,4 +26,5 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Convenience alias for a `Result` whose error is this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;

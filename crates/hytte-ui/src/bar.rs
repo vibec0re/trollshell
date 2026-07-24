@@ -22,6 +22,8 @@ pub enum Edge {
     Right,
 }
 
+/// Builder for a layer-shell status bar. Start from [`Bar::new`], set the
+/// edge / margin / widget groups, then [`Bar::build`] to present it.
 pub struct Bar {
     monitor: Monitor,
     edge: Edge,
@@ -34,6 +36,8 @@ pub struct Bar {
 }
 
 impl Bar {
+    /// Start building a bar on `monitor` (defaults: top edge, exclusive zone
+    /// on, no margin, keyboard input off).
     #[must_use]
     pub fn new(monitor: &Monitor) -> Self {
         Self {
@@ -48,18 +52,22 @@ impl Bar {
         }
     }
 
+    /// Dock the bar to `edge` (top/bottom/left/right).
     #[must_use]
     pub fn edge(mut self, edge: Edge) -> Self {
         self.edge = edge;
         self
     }
 
+    /// Set the gaps between the bar and the screen edges it spans.
     #[must_use]
     pub fn margin(mut self, m: Margin) -> Self {
         self.margin = m;
         self
     }
 
+    /// Reserve an exclusive zone so tiled windows don't overlap the bar
+    /// (on by default).
     #[must_use]
     pub fn exclusive(mut self, on: bool) -> Self {
         self.exclusive = on;
@@ -78,18 +86,21 @@ impl Bar {
         self
     }
 
+    /// Append widgets to the leading (left / top) group. Repeatable.
     #[must_use]
     pub fn left(mut self, widgets: impl IntoIterator<Item = gtk::Widget>) -> Self {
         self.left.extend(widgets);
         self
     }
 
+    /// Append widgets to the center group. Repeatable.
     #[must_use]
     pub fn center(mut self, widgets: impl IntoIterator<Item = gtk::Widget>) -> Self {
         self.center.extend(widgets);
         self
     }
 
+    /// Append widgets to the trailing (right / bottom) group. Repeatable.
     #[must_use]
     pub fn right(mut self, widgets: impl IntoIterator<Item = gtk::Widget>) -> Self {
         self.right.extend(widgets);

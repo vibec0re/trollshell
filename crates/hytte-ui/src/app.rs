@@ -27,12 +27,16 @@ pub struct AppBuilder {
 }
 
 impl AppBuilder {
+    /// Register a service. Its handles are installed into the thread-local
+    /// registry on first activate, before the body closure runs.
     #[must_use]
     pub fn with<S: hytte_reactive::Service>(mut self, service: S) -> Self {
         self.services.push(Box::new(service));
         self
     }
 
+    /// Load a user stylesheet from `path` at `STYLE_PROVIDER_PRIORITY_USER`
+    /// (above the default sheet), on top of the built-in one.
     #[must_use]
     pub fn with_user_style(mut self, path: impl AsRef<Path>) -> Self {
         self.user_style = Some(path.as_ref().to_path_buf());
@@ -171,6 +175,9 @@ pub struct App {
 }
 
 impl App {
+    /// Start building an app with the given D-Bus/GTK application id (e.g.
+    /// `"mov.vibec0re.trollshell"`). Chain `with`/`with_user_style`, then
+    /// [`AppBuilder::run`].
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
     pub fn new(app_id: &str) -> AppBuilder {

@@ -24,6 +24,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+/// A single-series sparkline widget. Cheap to clone (refcounted internals);
+/// see the module docs for the ring-buffer / cairo model.
 #[derive(Clone)]
 pub struct Sparkline {
     inner: gtk::DrawingArea,

@@ -41,6 +41,8 @@ const SERIES_LIGHTNESS: f64 = 0.6;
 /// distinguishable where they cross.
 const STROKE_ALPHA: f64 = 0.85;
 
+/// A multi-series sparkline widget (one generated hue per series). Cheap to
+/// clone (refcounted internals); see the module docs for the model.
 #[derive(Clone)]
 pub struct MultiSparkline {
     inner: gtk::DrawingArea,

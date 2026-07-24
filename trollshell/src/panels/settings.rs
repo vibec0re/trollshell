@@ -7,6 +7,12 @@
 //!   Trollshell *is* the compositor session, so "follow system" is
 //!   meaningless — if gsettings reads back `default` (externally set), the
 //!   service surfaces Dark and the next user pick makes it canonical.
+//! - Keep awake (#513) — the on-demand "stop idle-locking" caffeine toggle.
+//!   Duplicates the switch in `panel_power`'s "Keep awake" section (both drive
+//!   `screensaver::set_keep_awake` / observe `screensaver::keep_awake()`, so
+//!   they stay in sync). It lives here because the Settings chip is always in
+//!   the bar, while the Power panel hides with the battery/brightness chips on
+//!   desktops.
 //! - Do Not Disturb — duplicates the toggle at the top of `panel_notifications`.
 //!   Both bindings drive the same `dnd::set_enabled` setter and observe the
 //!   same `dnd::enabled` signal, so they stay in sync.
@@ -24,6 +30,7 @@ use hytte::prelude::*;
 use hytte::services::dnd;
 use hytte::services::power_profiles;
 use hytte::services::recorder;
+use hytte::services::screensaver;
 
 use crate::components::deep_link_row::deep_link_row;
 use crate::components::layout::{finish_page, page_box};
@@ -56,6 +63,41 @@ pub fn panel_settings() -> gtk::Widget {
     appearance.add(&theme_row);
 
     column.append(&appearance);
+
+    // ── Keep awake ────────────────────────────────────────────────────────
+    // The on-demand "stop idle-locking" switch (#513). It duplicates the
+    // caffeine toggle in `panel_power`'s "Keep awake" section: both drive
+    // `screensaver::set_keep_awake` and observe the authoritative
+    // `screensaver::keep_awake()` signal, so they stay in sync
+    // (daemon-as-state-store; `set_keep_awake` is idempotent, so the mirrored
+    // programmatic `set_active` can't thrash the logind fd). Surfaced here
+    // because the Settings chip is always in the bar, whereas the Power panel
+    // is reachable only via the battery / brightness chips — both of which
+    // hide on desktops with no battery or backlight, leaving the toggle
+    // otherwise unreachable there.
+    let awake = adw::PreferencesGroup::builder()
+        .title("Keep awake")
+        .description("Stop the screen dimming or locking while idle")
+        .build();
+
+    let awake_row = adw::SwitchRow::builder().title("Keep awake").build();
+    // Two-way: the authoritative signal drives `active` (block guards re-entry
+    // of the programmatic set); a user flip calls the idempotent setter.
+    bind_two_way(
+        screensaver::keep_awake(),
+        &awake_row,
+        adw::SwitchRow::set_active,
+        |r| r.connect_active_notify(|r| screensaver::set_keep_awake(r.is_active())),
+    );
+    // Subtitle: what else is holding the system awake (Firefox, mpv, screen
+    // share, …), so an off toggle doesn't imply the screen will sleep. Reuses
+    // the Power panel's helper for an identical live subtitle.
+    bind(screensaver::other_inhibitors(), &awake_row, |r, others| {
+        r.set_subtitle(&crate::panels::power::keep_awake_subtitle(&others));
+    });
+    awake.add(&awake_row);
+
+    column.append(&awake);
 
     // ── Notifications ─────────────────────────────────────────────────────
     let notif = adw::PreferencesGroup::builder()

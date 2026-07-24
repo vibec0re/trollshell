@@ -128,6 +128,28 @@ If trollshell's Displays page shows a state you didn't expect, check
 **both** configs — the last writer wins, and `niri-msg outputs` reports
 the final state regardless of who set it.
 
+## kanshi vs the gnome-control-center Displays shim (#393)
+
+trollshell serves the `org.gnome.Mutter.DisplayConfig` D-Bus API over niri-ipc
+(`crates/hytte-services/src/display_config.rs`), so **gnome-control-center's own
+Displays panel** drives your niri outputs live — resolution, scale, rotation,
+arrangement, on/off. It is a _live_ control surface, not a persistence store:
+
+- g-c-c's **Apply → "Keep Changes"** flow works end-to-end. The apply takes
+  effect immediately on niri.
+- On "Keep Changes" the shell posts a toast — _"Display configuration applied …
+  save it as a kanshi profile"_ — because the shim **does not write any config
+  file**. niri-ipc applies are inherently temporary (niri forgets them on its
+  next output-config reload), and this file is hand-owned.
+
+So the split is: **g-c-c** for quick live tweaks, **this file** for what
+survives a session restart. When a live g-c-c arrangement is one you want to
+keep, transcribe it into a `profile` block here (use `niri msg outputs` to read
+back the exact mode/scale/position the shim applied). The shim deliberately
+won't edit this file for you — it can't know which connector-set profile you
+mean, and clobbering your hand-tuned blocks (positions, `exec` hooks, ordering)
+would be worse than an honest nudge.
+
 ## What this does NOT do
 
 - No GUI editor for kanshi profiles. Edit the config file by hand for now;

@@ -13,6 +13,11 @@ use hytte::gtk::{self, prelude::*};
 
 use crate::scale::scale;
 
+/// Drawer's max content width, in CSS px (`AdwClamp.maximum_size` below, and
+/// the per-trigger margin clamp in `modal.rs` that keeps the card from
+/// falling off-screen left) — single source so the two never drift apart.
+pub(crate) const DRAWER_MAX_WIDTH: i32 = 680;
+
 pub(crate) fn page_box() -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
     b.add_css_class("ts-modal-page");
@@ -36,7 +41,7 @@ pub(crate) fn finish_page(content: &impl IsA<gtk::Widget>) -> gtk::Widget {
     // With threshold == maximum_size that formula collapses to exactly
     // `maximum_size` and the overshoot disappears. Both values are scaled with
     // the font so the cap grows consistently with the rest of the shell (#114).
-    let cap = scale(680);
+    let cap = scale(DRAWER_MAX_WIDTH);
     let clamp = adw::Clamp::builder()
         .maximum_size(cap)
         .tightening_threshold(cap)

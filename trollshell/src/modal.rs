@@ -10,12 +10,10 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 
+use crate::components::layout::DRAWER_MAX_WIDTH;
+use crate::components::monitor_key::{is_fallback_key, monitor_key};
 use crate::components::visibility_gate::GateRegistry;
 use crate::scale::scale;
-
-/// Drawer's max content width (`AdwClamp.maximum_size` in `components::layout::finish_page`).
-/// Used to clamp the per-trigger margin so the card never falls off-screen left.
-const DRAWER_MAX_WIDTH: i32 = 680;
 
 /// Concave flare radius for the drawer's two top corners — where the card
 /// sweeps *outward* to meet the bar so it "grows out of the bar" instead of
@@ -430,11 +428,6 @@ fn drawer_open_state(key: &str) -> Mutable<bool> {
             .or_insert_with(|| Mutable::new(false))
             .clone()
     })
-}
-
-fn monitor_key(m: &Monitor) -> String {
-    m.connector()
-        .unwrap_or_else(|| format!("monitor:{:p}", m.gdk()))
 }
 
 /// Build the drawer for one monitor and mount it as a layer-shell window.
@@ -903,6 +896,14 @@ pub fn close_all() {
             panel.window.close();
         }
     });
+    // DRAWER_OPEN is keyed per-monitor and deliberately survives a rebuild
+    // for connector-named monitors (so a subscriber wired up before the
+    // rebuild — OSD, bar CSS — keeps working after it). But a
+    // connector-less monitor's fallback key is the now-defunct GdkMonitor
+    // pointer: the next rebuild mints a *different* pointer, so that entry
+    // can never be looked up again. Left un-pruned it's a pure leak — one
+    // stale `Mutable` per hot-plug cycle for every connector-less monitor.
+    DRAWER_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the
     // drawer" default holds (#349 PR2).

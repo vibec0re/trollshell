@@ -70,15 +70,14 @@ use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
 use hytte::ui::{Anchor, Layer, LayerShell, layer_window};
 
+use super::frame;
+use crate::components::monitor_key::{is_fallback_key, monitor_key};
+
 /// Width of the sidebar surface when fully open, in CSS px. Matches the
 /// "frame border ~320px" geometry from the spec; the frame's cutout left
-/// edge animates from `FRAME_THICKNESS` (8) up to this value while the
-/// sidebar reveals.
+/// edge animates from [`frame::FRAME_THICKNESS_I32`] (8) up to this value
+/// while the sidebar reveals.
 pub const SIDEBAR_WIDTH: i32 = 320;
-
-/// Frame-strut thickness, duplicated from `frame.rs` so this module stays
-/// self-contained. Keep in sync with `frame.rs::FRAME_THICKNESS`.
-const FRAME_THICKNESS_I32: i32 = 8;
 
 thread_local! {
     /// Per-connector open/closed bool. Subscribers connect at `install` time
@@ -107,11 +106,6 @@ struct SidebarPanel {
     /// can never settle, its frame clock having stopped) would otherwise loop on
     /// the main context forever, keeping the window/revealer clones alive.
     zone_tick: Rc<RefCell<Option<glib::SourceId>>>,
-}
-
-fn monitor_key(m: &Monitor) -> String {
-    m.connector()
-        .unwrap_or_else(|| format!("monitor:{:p}", m.gdk()))
 }
 
 fn sidebar_open_state(key: &str) -> Mutable<bool> {
@@ -158,7 +152,7 @@ pub fn toggle_on_focused(preferred: Option<&str>) {
 }
 
 /// Currently visible width of the sidebar card on `monitor`, in CSS px.
-/// Returns `FRAME_THICKNESS_I32` when the sidebar is closed, hasn't been
+/// Returns `frame::FRAME_THICKNESS_I32` when the sidebar is closed, hasn't been
 /// installed yet, or the per-monitor panel is missing. The frame uses
 /// this to compute its cutout's left edge each animation tick.
 pub fn current_visible_width(monitor: &Monitor) -> i32 {
@@ -172,7 +166,7 @@ fn current_visible_width_for_key(key: &str) -> i32 {
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map_or(FRAME_THICKNESS_I32, |_| SIDEBAR_WIDTH)
+            .map_or(frame::FRAME_THICKNESS_I32, |_| SIDEBAR_WIDTH)
     })
 }
 
@@ -625,6 +619,14 @@ pub fn close_all() {
             panel.window.close();
         }
     });
+    // SIDEBAR_OPEN is keyed per-monitor and deliberately survives a rebuild
+    // for connector-named monitors (see the module doc's "State is
+    // per-connector" note). But a connector-less monitor's fallback key is
+    // the now-defunct GdkMonitor pointer: the next rebuild mints a
+    // *different* pointer, so that entry can never be looked up again. Left
+    // un-pruned it's a pure leak — one stale `Mutable` per hot-plug cycle
+    // for every connector-less monitor.
+    SIDEBAR_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
 }
 
 #[cfg(test)]
@@ -651,7 +653,7 @@ mod tests {
     }
 
     /// When no sidebar surface has been installed yet (or the connector is
-    /// unknown), `current_visible_width` must return `FRAME_THICKNESS_I32`
+    /// unknown), `current_visible_width` must return `frame::FRAME_THICKNESS_I32`
     /// so the frame's cutout draws at its default left edge.
     #[test]
     fn current_visible_width_defaults_to_frame_thickness_when_no_panel() {
@@ -660,7 +662,7 @@ mod tests {
         // private fallback path.
         assert_eq!(
             current_visible_width_for_key("nonexistent"),
-            FRAME_THICKNESS_I32
+            frame::FRAME_THICKNESS_I32
         );
     }
 

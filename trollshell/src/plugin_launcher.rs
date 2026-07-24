@@ -79,6 +79,14 @@ struct PluginSpec {
     /// bundled plugins use — `PET_NAME`, …). Passed as `--setenv=K=V`.
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// AI-key **slots** this plugin opts into (#392) — provider names (e.g.
+    /// `"openrouter"`). At launch each slot's key is read from the login keyring
+    /// ([`crate::secrets`]) and injected as `--setenv=<SLOT>_API_KEY=<value>`
+    /// (see [`crate::secrets::env_var_for`]); a slot with no stored key is
+    /// skipped (the plugin runs keyless). A plugin that doesn't list a slot
+    /// never gets that key in its environment.
+    #[serde(default)]
+    secrets: Vec<String>,
     /// Whether the host launches this plugin at startup. A disabled plugin is
     /// still *declared* — it lists in the control-center and can be started
     /// manually — it just doesn't auto-launch.
@@ -129,6 +137,15 @@ fn sanitize(plugins: BTreeMap<String, PluginSpec>) -> BTreeMap<String, PluginSpe
                 let ok = !k.is_empty() && !k.contains('=');
                 if !ok {
                     tracing::warn!(plugin = %id, key = %k, "plugins.json: invalid env key; dropped");
+                }
+                ok
+            });
+            // A secret slot must map to a valid `<SLOT>_API_KEY` env-var name
+            // (#392); drop any that wouldn't (a nix-written file shouldn't).
+            spec.secrets.retain(|slot| {
+                let ok = crate::secrets::is_valid_slot(slot);
+                if !ok {
+                    tracing::warn!(plugin = %id, %slot, "plugins.json: invalid secret slot; dropped");
                 }
                 ok
             });
@@ -255,6 +272,23 @@ async fn launch(id: &str, spec: &PluginSpec, extra_env: &[(String, String)]) -> 
     Ok(())
 }
 
+/// Read every AI-key slot the plugin opted into ([`PluginSpec::secrets`], #392)
+/// from the login keyring and map each to its injected `(<SLOT>_API_KEY, value)`
+/// env pair. A slot with no stored key is skipped — the plugin launches keyless
+/// and its own fallback (e.g. the pet's canned lines) applies. Secret values are
+/// never logged (only the slot, and only on the skip path).
+async fn resolve_secret_env(spec: &PluginSpec) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(spec.secrets.len());
+    for slot in &spec.secrets {
+        if let Some(value) = crate::secrets::get(slot).await {
+            out.push((crate::secrets::env_var_for(slot), value));
+        } else {
+            tracing::debug!(slot = %slot, "no stored AI key for slot; launching plugin without it");
+        }
+    }
+    out
+}
+
 /// Whether a systemd `ActiveState` means the unit is already running (or on
 /// its way), i.e. a startup launch should skip it.
 fn is_running(active_state: &str) -> bool {
@@ -292,7 +326,8 @@ async fn launch_enabled() {
             tracing::info!(plugin = %id, "already running (systemd owns it); skipping launch");
             continue;
         }
-        if let Err(err) = launch(id, spec, &[]).await {
+        let extra_env = resolve_secret_env(spec).await;
+        if let Err(err) = launch(id, spec, &extra_env).await {
             tracing::warn!(plugin = %id, %err, "plugin launch failed");
         }
     }
@@ -359,7 +394,10 @@ fn merge_declared(
 pub async fn start(id: &str) -> anyhow::Result<()> {
     let declared = load_declared().await;
     match declared.get(id) {
-        Some(spec) => launch(id, spec, &[]).await,
+        Some(spec) => {
+            let extra_env = resolve_secret_env(spec).await;
+            launch(id, spec, &extra_env).await
+        }
         None => systemd::start_plugin(id).await,
     }
 }
@@ -394,6 +432,84 @@ pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
     systemd::set_plugin_enabled(id, enabled).await
 }
 
+// ── Secret rotation (#392): relaunch to re-inject a changed key ───────────────
+
+/// Relaunch every **running** declared plugin whose `secrets` allowlist
+/// includes `slot`, so a just-changed key (set or cleared in the control-center)
+/// takes effect — rotation is stop + relaunch, re-reading the slot from the
+/// keyring. Called from the `SetAiKey`/`ClearAiKey` control handlers after the
+/// keyring write.
+///
+/// Stopped plugins and legacy static units are left alone: a stopped plugin
+/// re-reads the key on its next start, and a static unit gets no injection at
+/// all. Best-effort — each plugin's failure is logged, never propagated.
+pub async fn relaunch_for_secret(slot: &str) {
+    let declared = load_declared().await;
+    let affected: Vec<(&String, &PluginSpec)> = declared
+        .iter()
+        .filter(|(_, spec)| spec.secrets.iter().any(|s| s == slot))
+        .collect();
+    if affected.is_empty() {
+        tracing::debug!(%slot, "no declared plugin uses this secret slot; nothing to relaunch");
+        return;
+    }
+    let running: HashSet<String> = match systemd::list_plugin_units().await {
+        Ok(units) => units
+            .into_iter()
+            .filter(|u| is_running(&u.active_state))
+            .map(|u| u.id)
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
+            return;
+        }
+    };
+    for (id, spec) in affected {
+        if !running.contains(id) {
+            tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
+            continue;
+        }
+        if let Err(err) = restart(id, spec).await {
+            tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
+        } else {
+            tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
+        }
+    }
+}
+
+/// Stop a declared plugin's transient unit, wait for it to actually go down (so
+/// its `--collect` unit name frees up), then relaunch it with freshly resolved
+/// secret env. `systemd-run` refuses to replace a live unit, hence the
+/// wait-until-stopped rather than a bare stop→launch.
+async fn restart(id: &str, spec: &PluginSpec) -> anyhow::Result<()> {
+    stop(id).await?;
+    wait_until_stopped(id).await;
+    let extra_env = resolve_secret_env(spec).await;
+    launch(id, spec, &extra_env).await
+}
+
+/// Poll the plugin's unit until it is no longer running (inactive/failed, or
+/// gone — a collected transient unit vanishes), bounded to ~5s so a stuck stop
+/// can't wedge the relaunch. On a list error we return early and let the launch
+/// attempt surface any "still exists" error itself.
+async fn wait_until_stopped(id: &str) {
+    for _ in 0..25 {
+        match systemd::list_plugin_units().await {
+            Ok(units) => {
+                if !units
+                    .iter()
+                    .any(|u| u.id == id && is_running(&u.active_state))
+                {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tracing::warn!(plugin = %id, "unit still running after stop; relaunch may fail");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +518,7 @@ mod tests {
         PluginSpec {
             exec: exec.to_owned(),
             env: BTreeMap::new(),
+            secrets: Vec::new(),
             enabled,
         }
     }
@@ -429,6 +546,38 @@ mod tests {
         // env defaults empty; explicit enabled=false honored.
         assert!(plugins["weather"].env.is_empty());
         assert!(!plugins["weather"].enabled);
+    }
+
+    #[test]
+    fn parse_reads_secret_slots_defaulting_empty() {
+        let json = r#"{
+            "plugins": {
+                "pet": {
+                    "exec": "/bin/pet",
+                    "secrets": ["openrouter"]
+                },
+                "timer": { "exec": "/bin/timer" }
+            }
+        }"#;
+        let plugins = parse_state(json).unwrap();
+        assert_eq!(plugins["pet"].secrets, vec!["openrouter".to_owned()]);
+        // A plugin that declares no secrets defaults to none injected.
+        assert!(plugins["timer"].secrets.is_empty());
+    }
+
+    #[test]
+    fn sanitize_drops_invalid_secret_slots() {
+        let mut plugins = BTreeMap::new();
+        let mut s = spec("/bin/ok", true);
+        s.secrets = vec![
+            "openrouter".to_owned(),
+            "Bad Slot".to_owned(), // space / uppercase
+            "bad=slot".to_owned(), // '=' would corrupt --setenv
+            "9live".to_owned(),    // leading digit
+        ];
+        plugins.insert("p".to_owned(), s);
+        let out = sanitize(plugins);
+        assert_eq!(out["p"].secrets, vec!["openrouter".to_owned()]);
     }
 
     #[test]

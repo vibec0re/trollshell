@@ -4,7 +4,7 @@
 //! The shell exposes a session-bus object implementing the
 //! `mov.vibec0re.trollshell.Control` interface so the launch-on-demand
 //! companion app (`trollshell-control-center`) — and its per-tab consumers
-//! (#391 Place · #348 Plugins · #392 Display · #393 AI keys) — have something
+//! (#391 Place · #348 Plugins · #392 AI keys · #393 Display) — have something
 //! to bind to. Beyond the foundation's `Ping`/`Version`, the first real tab
 //! (#391) adds the **place** methods: `GetPlace` / `SetManualCity` /
 //! `SetAutoLocation`, which round-trip the shell's runtime location override
@@ -13,8 +13,11 @@
 //! manage the `trollshell-plugin-<id>` **user** units through the declarative
 //! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
 //! *transient* units the host launches via `systemd-run --user`, with a
-//! `StartUnit`/unit-file fallback for legacy static units. Each further tab
-//! adds its own methods here, following the same shape.
+//! `StartUnit`/unit-file fallback for legacy static units. The **AI Keys** tab
+//! (#392) adds `ListAiKeys` / `SetAiKey` / `ClearAiKey`, which store the
+//! LLM-backed plugins' API keys in the login keyring ([`crate::secrets`]) and
+//! relaunch the plugins that use them so a rotated key takes effect. Each
+//! further tab adds its own methods here, following the same shape.
 //!
 //! ## Why a *dedicated* bus name, not the app's primary name
 //!
@@ -43,7 +46,7 @@
 use hytte::reactive::Service;
 use hytte::services::{geoclue, places};
 
-use crate::plugin_launcher;
+use crate::{plugin_launcher, secrets};
 
 /// Dedicated well-known bus name for the control endpoint. Distinct from the
 /// app's primary name `mov.vibec0re.trollshell` (owned by `GApplication`) — see
@@ -198,6 +201,63 @@ impl ControlIface {
         if let Err(err) = plugin_launcher::set_enabled(&id, enabled).await {
             tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
         }
+    }
+
+    // ── AI keys (#392) ──────────────────────────────────────────────────────
+    //
+    // Store the LLM-backed plugins' API keys in the login keyring
+    // ([`crate::secrets`], Secret Service / gnome-keyring) — never on disk or in
+    // config. A "slot" is a provider name (e.g. "openrouter"), and a plugin opts
+    // in via its `plugins.json` `secrets` allowlist; the launcher injects the
+    // stored key as `<SLOT>_API_KEY` at spawn, which is exactly the override
+    // `hytte_ai_providers::load_key` reads. **Values only ever cross this
+    // interface inbound (Set); they are never returned and never logged.**
+
+    /// The provider slots that currently have a stored key — e.g.
+    /// `["openrouter"]`. Values are **not** returned, so the control-center's
+    /// AI Keys tab can show "key set / not set" per provider without ever
+    /// handling the secret. An unreadable keyring yields an empty list.
+    async fn list_ai_keys(&self) -> Vec<String> {
+        secrets::list().await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "ListAiKeys: reading the keyring failed");
+            Vec::new()
+        })
+    }
+
+    /// Store `value` as the API key for `slot` (e.g. `"openrouter"`) in the
+    /// login keyring, replacing any existing key, then relaunch the running
+    /// plugins that declare the slot so the new key takes effect (rotation =
+    /// relaunch). The relaunch is fired off the D-Bus task so the call returns
+    /// promptly; the value is never written to disk/config and never logged.
+    async fn set_ai_key(&self, slot: String, value: String) {
+        if !secrets::is_valid_slot(&slot) {
+            tracing::warn!(%slot, "SetAiKey: invalid slot name; ignored");
+            return;
+        }
+        if let Err(err) = secrets::set(&slot, &value).await {
+            tracing::warn!(%slot, %err, "SetAiKey: storing the key failed");
+            return;
+        }
+        tracing::info!(%slot, "stored AI key; relaunching affected plugins");
+        hytte::reactive::runtime::handle()
+            .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
+    }
+
+    /// Delete the stored API key for `slot`, then relaunch the running plugins
+    /// that declare it (so they drop back to keyless/fallback). Idempotent —
+    /// clearing an unset slot is a no-op.
+    async fn clear_ai_key(&self, slot: String) {
+        if !secrets::is_valid_slot(&slot) {
+            tracing::warn!(%slot, "ClearAiKey: invalid slot name; ignored");
+            return;
+        }
+        if let Err(err) = secrets::clear(&slot).await {
+            tracing::warn!(%slot, %err, "ClearAiKey: clearing the key failed");
+            return;
+        }
+        tracing::info!(%slot, "cleared AI key; relaunching affected plugins");
+        hytte::reactive::runtime::handle()
+            .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
     }
 }
 

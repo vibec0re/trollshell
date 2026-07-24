@@ -25,7 +25,7 @@ let
     version = 1;
     plugins = lib.mapAttrs (_: plugin: {
       exec = lib.getExe plugin.package;
-      inherit (plugin) env;
+      inherit (plugin) env secrets;
       enabled = plugin.enable;
     }) cfg.plugins;
   };

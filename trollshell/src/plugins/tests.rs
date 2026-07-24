@@ -825,6 +825,9 @@ fn ctx_with(
         accent_rx,
         spectrum_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
+        // Host-scoped runtime mirror (#423); like `live_ids`, kept per-ctx so the
+        // per-connection tests stay isolated and never publish `PLUGIN_RUNTIME`.
+        runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         effects_tx,
     };
     (ctx, effects_rx)

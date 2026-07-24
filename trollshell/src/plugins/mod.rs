@@ -121,8 +121,9 @@
 //!   A persisted audit-log and the `RunCommand` round-trip remain deferred.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use hytte::adw;
 use hytte::futures_signals::signal::Mutable;
@@ -131,7 +132,7 @@ use hytte::prelude::*;
 use hytte::reactive::registry;
 use hytte::reactive::spawn_supervised;
 use hytte::services::{clock, pipewire};
-use hytte_plugin_proto::{AudioSpectrum, ClockState, Effect, HostMsg, wire};
+use hytte_plugin_proto::{AudioSpectrum, ClockState, Effect, HostMsg, Mount, wire};
 use tokio::sync::{mpsc, watch};
 
 mod effects;
@@ -149,6 +150,152 @@ pub use region::{
     bar_center_slot, bar_left_slot, bar_right_slot, plugin_panel_slot, set_active_panel,
     sidebar_bottom_slot, sidebar_lead_slot, sidebar_top_slot,
 };
+
+// ── Live runtime mirror (#423) ───────────────────────────────────────────────
+//
+// A cross-thread mirror of every *connected* plugin's host-side runtime state,
+// so the tokio-side `Control` endpoint (`crate::control`) can overlay
+// "connected / rendering" onto the systemd-unit list the control-center already
+// shows — without reaching into the GTK-thread-local reconciler registry. The
+// per-connection session tasks write it (register → render → teardown); the
+// `Control` handler snapshots it via [`plugin_states`].
+
+/// One connected plugin's host-side runtime state. Written by its per-connection
+/// session task, read (as a [`PluginState`] snapshot) by the `Control` endpoint.
+#[derive(Clone, Debug)]
+struct PluginRuntime {
+    /// The mount region the plugin registered for (a stable wire name, e.g.
+    /// `"SidebarTop"`).
+    mount: &'static str,
+    /// `true` once the plugin has parked at least one render frame (its card /
+    /// chip is live); still `false` for a connection that completed `Register`
+    /// but hasn't rendered yet — the "connected, not crashed, not yet drawing"
+    /// state the unit list can't see.
+    rendering: bool,
+    /// When the host last saw activity from this plugin — its `Register`, then
+    /// each render frame. [`plugin_states`] reports the age in whole seconds.
+    last_seen: Instant,
+    /// Effects the containment guards dropped over the connection's life (#435
+    /// rate cap + #436 capability enforcement). A nonzero count flags a
+    /// misbehaving plugin.
+    violations: u32,
+}
+
+/// Cross-thread mirror of every connected plugin's [`PluginRuntime`], keyed by
+/// plugin id. A `Mutex<BTreeMap>` (not a `futures-signals` `Mutable`) because
+/// both ends live on the tokio side and the reader only ever snapshots — the
+/// `BTreeMap` yields the snapshot in a stable id order. Host-scoped in
+/// [`ListenerCtx`] (mirrors `live_ids`, keeping the per-connection tests
+/// isolated from one another); the single production host additionally publishes
+/// its store into [`PLUGIN_RUNTIME`] for the `Control` endpoint.
+type PluginRuntimeStore = Arc<Mutex<BTreeMap<String, PluginRuntime>>>;
+
+/// The production host's [`PluginRuntimeStore`], published by
+/// [`PluginsService::start`] so the tokio-side `Control` handler can read live
+/// plugin state without a handle to the host's [`ListenerCtx`]. Set once — there
+/// is exactly one host per process. The per-connection tests build their
+/// `ListenerCtx` directly (never through `start`) and so never touch this; it
+/// stays unset under test and [`plugin_states`] reports empty.
+static PLUGIN_RUNTIME: OnceLock<PluginRuntimeStore> = OnceLock::new();
+
+/// A cross-thread snapshot of one connected plugin's runtime state, returned by
+/// [`plugin_states`] for the `Control` endpoint's live overlay (#423). Every
+/// entry is a currently **connected** plugin; the `Control`/control-center layer
+/// maps each onto its `trollshell-plugin-<id>` unit row (a unit that is active
+/// but absent from the snapshot started but never connected).
+pub struct PluginState {
+    /// The plugin id (matches its manifest id / `trollshell-plugin-<id>` unit).
+    pub id: String,
+    /// The mount region the plugin registered for (wire name, e.g.
+    /// `"SidebarTop"`), or `""` when unknown.
+    pub mount: String,
+    /// Whether the plugin has rendered at least one frame (its card is live).
+    pub rendering: bool,
+    /// Seconds since the host last saw the plugin (its `Register` or newest
+    /// render frame).
+    pub last_seen_secs: u64,
+    /// Effects dropped by containment (#435/#436) over the connection's life.
+    pub violations: u32,
+}
+
+/// Snapshot the connected plugins' host-side runtime state for the `Control`
+/// endpoint (#423). Reads the production host's [`PLUGIN_RUNTIME`] mirror off the
+/// tokio side; returns empty before the host publishes it (or under the
+/// per-connection tests, which never set it). Presence of an id here is the
+/// "connected" signal the control-center overlays onto its unit list.
+#[must_use]
+pub fn plugin_states() -> Vec<PluginState> {
+    let Some(store) = PLUGIN_RUNTIME.get() else {
+        return Vec::new();
+    };
+    let now = Instant::now();
+    store
+        .lock()
+        .expect("plugin runtime store poisoned")
+        .iter()
+        .map(|(id, rt)| PluginState {
+            id: id.clone(),
+            mount: rt.mount.to_owned(),
+            rendering: rt.rendering,
+            last_seen_secs: now.saturating_duration_since(rt.last_seen).as_secs(),
+            violations: rt.violations,
+        })
+        .collect()
+}
+
+/// The stable wire name for a mount region, for the runtime overlay (#423).
+/// `Mount` lives in `hytte-plugin-proto` and has no name accessor, so map it
+/// here.
+fn mount_name(mount: Mount) -> &'static str {
+    match mount {
+        Mount::SidebarLead => "SidebarLead",
+        Mount::SidebarTop => "SidebarTop",
+        Mount::SidebarBottom => "SidebarBottom",
+        Mount::BarLeft => "BarLeft",
+        Mount::BarCenter => "BarCenter",
+        Mount::BarRight => "BarRight",
+    }
+}
+
+/// Record a newly-registered connection in the runtime mirror (#423): connected,
+/// not yet rendering. Called from the session handshake once the id is claimed.
+fn runtime_register(store: &PluginRuntimeStore, id: &str, mount: Mount) {
+    store.lock().expect("plugin runtime store poisoned").insert(
+        id.to_owned(),
+        PluginRuntime {
+            mount: mount_name(mount),
+            rendering: false,
+            last_seen: Instant::now(),
+            violations: 0,
+        },
+    );
+}
+
+/// Record a render frame in the runtime mirror (#423): mark the plugin
+/// rendering, bump its last-seen, and add the `dropped` effects the containment
+/// guards removed this frame to its violation count.
+fn runtime_render(store: &PluginRuntimeStore, id: &str, dropped: u32) {
+    if let Some(rt) = store
+        .lock()
+        .expect("plugin runtime store poisoned")
+        .get_mut(id)
+    {
+        rt.rendering = true;
+        rt.last_seen = Instant::now();
+        rt.violations = rt.violations.saturating_add(dropped);
+    }
+}
+
+/// Drop a disconnected plugin from the runtime mirror (#423). Called from
+/// teardown while the connection still exclusively owns the id (its `IdGuard`
+/// hasn't released yet), so a fast-reconnect successor never removes the wrong
+/// entry.
+fn runtime_remove(store: &PluginRuntimeStore, id: &str) {
+    store
+        .lock()
+        .expect("plugin runtime store poisoned")
+        .remove(id);
+}
 
 // ── Service ─────────────────────────────────────────────────────────────────
 
@@ -265,6 +412,11 @@ struct ListenerCtx {
     /// across an await. Scoped to the host (not process-global) so the
     /// per-connection tests stay isolated from one another.
     live_ids: Arc<Mutex<HashSet<String>>>,
+    /// Cross-thread mirror of connected plugins' runtime state (#423), written by
+    /// the per-connection tasks and snapshotted by the `Control` endpoint via
+    /// [`plugin_states`]. Host-scoped like `live_ids`; the production host also
+    /// publishes it into [`PLUGIN_RUNTIME`].
+    runtime: PluginRuntimeStore,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
 }
 
@@ -284,6 +436,12 @@ impl Service for PluginsService {
         // flips it on (#405).
         let (spectrum_tx, spectrum_rx) = watch::channel(None);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
+        // Live runtime mirror (#423): the per-connection tasks write it, and the
+        // tokio-side `Control` handler reads it via `plugin_states`. Publish this
+        // (single, production) host's store so `Control` can reach it without a
+        // handle to the `ListenerCtx`.
+        let runtime: PluginRuntimeStore = Arc::new(Mutex::new(BTreeMap::new()));
+        let _ = PLUGIN_RUNTIME.set(runtime.clone());
         let handles = PluginHandles {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
@@ -312,6 +470,7 @@ impl Service for PluginsService {
             accent_rx,
             spectrum_rx,
             live_ids: Arc::new(Mutex::new(HashSet::new())),
+            runtime,
             effects_tx,
         };
         spawn_supervised("plugins", move || {

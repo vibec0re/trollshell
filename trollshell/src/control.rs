@@ -9,7 +9,9 @@
 //! (#391) adds the **place** methods: `GetPlace` / `SetManualCity` /
 //! `SetAutoLocation`, which round-trip the shell's runtime location override
 //! (see [`hytte::services::geoclue::PlaceOverride`]). The **Plugins** tab (#348)
-//! adds `ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled`, which
+//! adds `ListPlugins` / `StartPlugin` / `StopPlugin` / `SetPluginEnabled` (plus
+//! `ListPluginStates`, #423 — the live connected/rendering overlay read from the
+//! host's in-process plugin registry), which
 //! manage the `trollshell-plugin-<id>` **user** units through the declarative
 //! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
 //! *transient* units the host launches via `systemd-run --user`, with a
@@ -152,10 +154,10 @@ impl ControlIface {
     // `systemd-run`, so these handlers stay cross-thread-clean off the D-Bus
     // task). Declared plugins (the nix-written `plugins.json`) run as
     // *transient* units the host launches; legacy static units fall back to
-    // `StartUnit`/unit files. The live "connected / rendering" overlay from the
-    // host's in-process plugin registry (`plugins.rs`, GTK-thread-local) is a
-    // deferred follow-up (#423) — it needs a cross-thread bridge out of the
-    // registry.
+    // `StartUnit`/unit files. Tier 3 (#423) — the live "connected / rendering"
+    // overlay — rides `ListPluginStates`, which reads the host's cross-thread
+    // runtime mirror ([`crate::plugins::plugin_states`]) rather than the
+    // GTK-thread-local registry, so it too stays clean off the D-Bus task.
 
     /// The known plugins — `(id, active_state, enabled)` for the union of the
     /// *declared* set (the nix-written state file, #419) and the
@@ -201,6 +203,36 @@ impl ControlIface {
         if let Err(err) = plugin_launcher::set_enabled(&id, enabled).await {
             tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
         }
+    }
+
+    /// Live per-plugin **runtime** state from the host's in-process plugin
+    /// registry (#423) — the connected/rendering overlay the Plugins tab draws on
+    /// top of the systemd-unit list [`list_plugins`](Self::list_plugins) reports.
+    /// Each tuple is `(id, rendering, mount, last_seen_secs, violations)` for a
+    /// plugin with a **live** host connection (it dialed the socket and completed
+    /// the `Register` handshake):
+    /// - `rendering` — `true` once the plugin has parked at least one frame (its
+    ///   card/chip is live in a mount region); `false` for a connection that
+    ///   registered but hasn't rendered yet (never crashed after start).
+    /// - `mount` — the region it registered for (`"SidebarTop"`, `"BarCenter"`,
+    ///   …), or `""` if unknown.
+    /// - `last_seen_secs` — seconds since its newest frame (or the `Register`
+    ///   before its first frame).
+    /// - `violations` — effects the containment guards dropped over the
+    ///   connection's life (#435 rate cap / #436 capability enforcement); a
+    ///   nonzero count flags a misbehaving plugin.
+    ///
+    /// **Presence is the "connected" signal:** a `trollshell-plugin-<id>` unit
+    /// that [`list_plugins`](Self::list_plugins) reports `active` but that is
+    /// *absent* here started but never connected (crashed after launch / never
+    /// registered) — exactly the case the unit list alone can't tell apart from a
+    /// healthy plugin. Reads the host's cross-thread runtime mirror
+    /// ([`crate::plugins::plugin_states`]); empty before the host is up.
+    async fn list_plugin_states(&self) -> Vec<(String, bool, String, u64, u32)> {
+        crate::plugins::plugin_states()
+            .into_iter()
+            .map(|s| (s.id, s.rendering, s.mount, s.last_seen_secs, s.violations))
+            .collect()
     }
 
     // ── AI keys (#392) ──────────────────────────────────────────────────────

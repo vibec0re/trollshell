@@ -25,13 +25,13 @@
 //!   Allow/Deny prompting is deferred to phase 1b.
 
 use hytte_plugin::proto::{
-    Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
+    Capability, ConsentDecision, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use hytte_plugin_infobroker::broker::{
-    AuditView, BrokerMsg, BrokerSnapshot, Cmd, DatasourceView, GrantView, Outcome, PendingView,
-    TokenView,
+    AuditView, BrokerMsg, BrokerSnapshot, Cmd, ConsentDecision as BrokerConsentDecision,
+    DatasourceView, GrantView, Outcome, PendingView, TokenView,
 };
 use tokio::sync::mpsc;
 
@@ -67,7 +67,15 @@ impl Plugin for Infobroker {
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::BarRight);
         m.subscribes = vec![StateKey::Clock];
-        m.capabilities = vec![Capability::OpenPage, Capability::Notify];
+        // `OpenPage` (open its own panel), `Notify` (the denied-knock toast), and
+        // `Consent` (#487 phase 1b — raise the interactive prompt + receive the
+        // decision). `Consent` is also the #305 opt-in that gates the host's
+        // `ConsentDecision` push.
+        m.capabilities = vec![
+            Capability::OpenPage,
+            Capability::Notify,
+            Capability::Consent,
+        ];
         m
     }
 
@@ -111,6 +119,31 @@ impl Plugin for Infobroker {
                     })
                     .into_iter()
                     .collect()
+            }
+            // A parked request wants human consent (#487 phase 1b): surface it as
+            // the shell's interactive prompt. The decision returns via
+            // `Input::ConsentDecision` below.
+            Input::App(BrokerMsg::RequestConsent(prompt)) => {
+                vec![Effect::RequestConsent {
+                    request_id: prompt.request_id,
+                    agent: prompt.agent,
+                    datasource: prompt.datasource,
+                    scope: prompt.scope,
+                    detail: prompt.detail,
+                }]
+            }
+            // The human answered (or the host's 60 s timeout fired → `Deny`):
+            // forward the decision down the lane to the broker, which resolves the
+            // parked request. Fire-and-forget, no effect of its own.
+            Input::ConsentDecision {
+                request_id,
+                decision,
+            } => {
+                let _ = self.cmd_tx.send(Cmd::Decision {
+                    request_id,
+                    decision: map_decision(decision),
+                });
+                Vec::new()
             }
             Input::Event { node, kind } => self.on_event(&node, &kind),
             // No RunCommand / spectrum / (bar chip) visibility handling needed.
@@ -400,6 +433,19 @@ fn parse_index(node: &str, prefix: &str) -> Option<usize> {
     node.strip_prefix(prefix).and_then(|s| s.parse().ok())
 }
 
+/// Map the proto's consent decision onto the broker library's own mirror enum
+/// (#487 phase 1b) — the SDK-free library defines its own so it never links the
+/// proto, so the plugin translates at the boundary (as it maps a broker `Toast`
+/// onto `Effect::Notify`).
+fn map_decision(decision: ConsentDecision) -> BrokerConsentDecision {
+    match decision {
+        ConsentDecision::AllowOnce => BrokerConsentDecision::AllowOnce,
+        ConsentDecision::AllowSession => BrokerConsentDecision::AllowSession,
+        ConsentDecision::AllowAlways => BrokerConsentDecision::AllowAlways,
+        ConsentDecision::Deny => BrokerConsentDecision::Deny,
+    }
+}
+
 /// A coarse "expires in" label: `"2h 5m"`, `"9m"`, or `"<1m"`. Clock ticks
 /// relabel it live; an already-past value (shouldn't reach the panel, since the
 /// broker prunes) reads `"soon"`.
@@ -455,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_requests_openpage_and_notify_and_subscribes_clock() {
+    fn manifest_requests_openpage_notify_consent_and_subscribes_clock() {
         let m = Infobroker::manifest();
         assert_eq!(m.mount, Mount::BarRight);
         assert!(
@@ -467,8 +513,78 @@ mod tests {
             "toasts denied knocks"
         );
         assert!(
+            m.capabilities.contains(&Capability::Consent),
+            "raises the interactive consent prompt (#487)"
+        );
+        assert!(
             m.subscribes.contains(&StateKey::Clock),
             "Clock relabels the panel"
+        );
+    }
+
+    #[test]
+    fn a_request_consent_broker_msg_raises_the_prompt_effect() {
+        let (mut m, _rx) = model();
+        let fx = m.update(Input::App(BrokerMsg::RequestConsent(
+            hytte_plugin_infobroker::broker::ConsentPrompt {
+                request_id: 5,
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+                scope: "read access".to_owned(),
+                detail: "claude wants to read the departures board".to_owned(),
+            },
+        )));
+        match fx.as_slice() {
+            [
+                Effect::RequestConsent {
+                    request_id,
+                    agent,
+                    datasource,
+                    ..
+                },
+            ] => {
+                assert_eq!(*request_id, 5);
+                assert_eq!(agent, "claude");
+                assert_eq!(datasource, "departures");
+            }
+            other => panic!("expected one RequestConsent effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_consent_decision_input_dispatches_a_mapped_decision_command() {
+        let (mut m, mut rx) = model();
+        let fx = m.update(Input::ConsentDecision {
+            request_id: 5,
+            decision: ConsentDecision::AllowSession,
+        });
+        assert!(fx.is_empty(), "the decision rides the lane, not an effect");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Cmd::Decision {
+                request_id: 5,
+                decision: BrokerConsentDecision::AllowSession,
+            })
+        );
+    }
+
+    #[test]
+    fn map_decision_covers_every_variant() {
+        assert_eq!(
+            map_decision(ConsentDecision::AllowOnce),
+            BrokerConsentDecision::AllowOnce
+        );
+        assert_eq!(
+            map_decision(ConsentDecision::AllowSession),
+            BrokerConsentDecision::AllowSession
+        );
+        assert_eq!(
+            map_decision(ConsentDecision::AllowAlways),
+            BrokerConsentDecision::AllowAlways
+        );
+        assert_eq!(
+            map_decision(ConsentDecision::Deny),
+            BrokerConsentDecision::Deny
         );
     }
 

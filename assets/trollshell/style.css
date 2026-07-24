@@ -821,6 +821,31 @@
     font-weight: 600;
 }
 
+/* ─── Consent prompt (#487) ─────────────────────────────────────── */
+
+.ts-consent {
+    background: transparent;
+}
+.ts-consent-root {
+    margin: 40px;
+    background: @window_bg_color;
+    color: @window_fg_color;
+    border: 1px solid @borders;
+    border-radius: 12px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+.ts-consent-title {
+    font-weight: 600;
+    font-size: 1.154em;
+}
+.ts-consent-subtitle {
+    font-size: 1em;
+}
+.ts-consent-detail {
+    opacity: 0.65;
+    font-size: 0.923em;
+}
+
 /* ─── Bluetooth / Wi-Fi rows ────────────────────────────────────── */
 
 .ts-wifi-list {

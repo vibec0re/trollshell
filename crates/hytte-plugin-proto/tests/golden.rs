@@ -41,9 +41,9 @@
 //! the wire break this suite exists to catch.
 
 use hytte_plugin_proto::{
-    AudioAction, AudioSpectrum, Capability, ClockState, Dir, Effect, EffectOutcome, EventKind,
-    HostMsg, LogLevel, Manifest, MediaAction, Mount, NiriAction, Node, PROTO_VERSION, Page,
-    PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot, decode, encode,
+    AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, Dir, Effect,
+    EffectOutcome, EventKind, HostMsg, LogLevel, Manifest, MediaAction, Mount, NiriAction, Node,
+    PROTO_VERSION, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot, decode, encode,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -140,6 +140,7 @@ fn full_manifest() -> Manifest {
             Capability::RunCommand,
             Capability::RaiseOsd,
             Capability::Notify,
+            Capability::Consent,
         ],
         mount: Mount::SidebarLead,
         order: Some(-5),
@@ -276,8 +277,8 @@ fn panel_tree() -> Node {
     }
 }
 
-/// Every [`Effect`] variant, including [`Effect::Notify`] and
-/// [`Effect::RaiseOsd`] — the "each Effect incl Notify/RaiseOsd" entry.
+/// Every [`Effect`] variant, including [`Effect::Notify`], [`Effect::RaiseOsd`],
+/// and [`Effect::RequestConsent`] (#487) — the "each Effect" entry.
 fn effect_table() -> Vec<Effect> {
     vec![
         Effect::OpenPage(Page::PluginSelf),
@@ -305,6 +306,13 @@ fn effect_table() -> Vec<Effect> {
         Effect::Notify {
             summary: "Timer done".into(),
             body: "25:00 timer finished".into(),
+        },
+        Effect::RequestConsent {
+            request_id: 7,
+            agent: "claude".into(),
+            datasource: "departures".into(),
+            scope: "*".into(),
+            detail: "next S-Bahn departures".into(),
         },
     ]
 }
@@ -339,9 +347,9 @@ fn plugin_control_msgs() -> Vec<PluginMsg> {
 
 /// Every `HostMsg` variant, including the opt-in-gated
 /// [`HostMsg::Accent`]/[`HostMsg::AudioSpectrum`] pushes (both the resolved
-/// and unresolved `Accent` case) and every [`EventKind`] — the
-/// "`StateKey` variants incl Accent/AudioSpectrum" entry lives here as the
-/// pushes those subscriptions gate.
+/// and unresolved `Accent` case), the #487 [`HostMsg::ConsentDecision`] push,
+/// and every [`EventKind`] — the "`StateKey` variants incl Accent/AudioSpectrum"
+/// entry lives here as the pushes those subscriptions gate.
 fn host_msgs() -> Vec<HostMsg> {
     let mut bins = [0.0_f32; SPECTRUM_BINS];
     for (i, b) in bins.iter_mut().enumerate() {
@@ -402,6 +410,14 @@ fn host_msgs() -> Vec<HostMsg> {
         HostMsg::Accent { color: None },
         HostMsg::AudioSpectrum {
             spectrum: AudioSpectrum { peak: 0.75, bins },
+        },
+        HostMsg::ConsentDecision {
+            request_id: 7,
+            decision: ConsentDecision::AllowAlways,
+        },
+        HostMsg::ConsentDecision {
+            request_id: 8,
+            decision: ConsentDecision::Deny,
         },
         HostMsg::Ping { seq: 1 },
         HostMsg::Shutdown,

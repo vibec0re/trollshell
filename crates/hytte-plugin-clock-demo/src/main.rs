@@ -104,9 +104,10 @@ impl Plugin for ClockDemo {
             // Two no-ops: no RunCommand is issued (so no EffectResult is
             // expected), and the clock demo has no pollers to park, so it just
             // ignores the sidebar-visibility push (#288) — neither touches the view.
-            Input::EffectResult { .. } | Input::SlotVisible(_) | Input::AudioSpectrum(_) => {
-                Vec::new()
-            }
+            Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_)
+            | Input::ConsentDecision { .. } => Vec::new(),
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

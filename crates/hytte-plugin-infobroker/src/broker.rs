@@ -8,17 +8,28 @@
 //! (durable) and the [`TokenStore`] (ephemeral) — no shared mutex, because it
 //! processes one connection or one panel command at a time.
 //!
-//! Consent policy (phase 1a — interactive Allow/Deny prompting is 1b):
-//! - `auth` mints a token **silently** iff an `always` grant covers the agent;
-//!   otherwise it is **denied** with a hint, and an informational
-//!   [`Toast`] is raised so the human sees the knock.
-//! - `get <datasource>` requires a valid token *and* an `always` grant for that
-//!   `(agent, datasource)`; a missing grant is denied + toasted the same way.
+//! Consent policy (phase 1b — interactive Allow/Deny prompting, over the 1a
+//! grant/token machinery):
+//! - `auth` mints a token **silently** iff an `always` grant covers the agent.
+//! - A standing `deny` grant refuses `auth` **silently** — a settled "no" isn't
+//!   re-prompted — with an informational [`Toast`] so the knock is still visible.
+//! - Otherwise (no standing grant) `auth` **parks** the socket request and fires
+//!   a consent prompt at the human (`Effect::RequestConsent` via the plugin,
+//!   #487). The decision resolves the parked request per
+//!   [`BrokerState::apply_consent`]: `AllowAlways`/`Deny` persist to grants.toml,
+//!   `AllowSession` mints a session-scoped token, `AllowOnce` a single-fetch
+//!   token. An unanswered prompt (a pre-1b / wedged host, or a genuinely ignored
+//!   one) times out to a **transient** deny + the 1a toast — the phase-1a
+//!   fallback ([`BrokerState::on_consent_timeout`]).
+//! - `get <datasource>` requires a valid token whose data-access authority
+//!   ([`TokenScope`]) — durable grant, session, or a single once — covers the
+//!   datasource; a spent/uncovered token is denied *without* a toast (re-auth to
+//!   re-consent).
 //! - An **invalid/expired token** is a transient technical failure (the agent
 //!   just re-auths), so it is denied *without* a toast — only genuine consent
 //!   knocks alert the human.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use chrono::Utc;
@@ -27,7 +38,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::grants::{Decision, GrantStore};
-use crate::tokens::TokenStore;
+use crate::tokens::{Token, TokenScope, TokenStore};
 use crate::wire::{
     DATASOURCE_DEPARTURES, GrantOut, Request, Response, encode_response, parse_request,
 };
@@ -40,15 +51,27 @@ const AUDIT_CAP: usize = 30;
 /// broker gives up on it (so a stuck client can't wedge the accept loop).
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the broker holds a **parked** consent request before giving up and
+/// timing it out (#487 phase 1b). Deliberately a touch longer than the shell's
+/// own 60 s prompt bound: the shell owns the user-facing countdown and always
+/// sends a decision within it (an explicit click, or `Deny` on its own timeout),
+/// so a live shell's answer reliably arrives first — this is the pure fallback
+/// for a wedged or pre-1b host that never surfaces the prompt at all.
+const CONSENT_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+
 // ── Pure consent decisions (unit-tested) ──────────────────────────────────────
 
-/// The outcome of an `auth` request against the grant store.
+/// The outcome of an `auth` request against the grant store (#487 phase 1b).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// The agent has an `always` grant — mint a token silently.
     Granted,
-    /// No `always` grant covers the agent — deny, with a how-to-grant hint.
+    /// A standing `deny` grant covers the agent — a settled "no": refuse silently
+    /// (no re-prompt), with a how-to-grant hint.
     Denied { hint: String },
+    /// No standing grant either way — knock the human with an interactive consent
+    /// prompt and park the request until the decision (or the 60 s bound).
+    NeedsConsent,
 }
 
 /// The outcome of a `get <datasource>` request against the grant store.
@@ -68,15 +91,20 @@ fn grant_hint(agent: &str, datasource: &str) -> String {
     )
 }
 
-/// Decide an `auth`: granted iff the agent already has any `always` grant.
+/// Decide an `auth` (#487 phase 1b): a standing `always` grant mints silently; a
+/// standing `deny` grant refuses silently (no re-prompt); anything else needs an
+/// interactive consent decision. `always` wins over `deny` if both somehow exist
+/// (a live "yes" beats a stale "no").
 #[must_use]
 pub fn authorize_auth(grants: &GrantStore, agent: &str) -> AuthOutcome {
     if grants.has_any_always(agent) {
         AuthOutcome::Granted
-    } else {
+    } else if grants.has_any_deny(agent) {
         AuthOutcome::Denied {
             hint: grant_hint(agent, DATASOURCE_DEPARTURES),
         }
+    } else {
+        AuthOutcome::NeedsConsent
     }
 }
 
@@ -164,14 +192,37 @@ pub struct BrokerSnapshot {
 
 // ── The panel command lane + the outbound message ─────────────────────────────
 
-/// A command from the plugin's panel down to the broker task (the #280 lane
-/// pattern). Both variants mutate the durable grant store.
+/// The broker-local mirror of the proto's four-way consent choice (#487 phase
+/// 1b). The library stays SDK-free — it never links `hytte_plugin`/its proto —
+/// so the plugin binary (`plugin.rs`) maps `proto::ConsentDecision` onto this
+/// when forwarding a decision down the [`Cmd`] lane, exactly as it maps a
+/// [`Toast`] onto `Effect::Notify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsentDecision {
+    /// Allow exactly this one request (a single-fetch token).
+    AllowOnce,
+    /// Allow for the rest of this session (a session-scoped token, no persist).
+    AllowSession,
+    /// Allow always (persist an `always` grant + mint a token).
+    AllowAlways,
+    /// Deny (persist a standing `deny` grant).
+    Deny,
+}
+
+/// A command from the plugin down to the broker task (the #280 lane pattern).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cmd {
     /// Delete `(agent, datasource)`'s grant and kill that agent's live tokens.
     Revoke { agent: String, datasource: String },
     /// Add an `always` grant for `(agent, datasource)` — the panel's Allow.
     Allow { agent: String, datasource: String },
+    /// The human's answer to a parked consent knock (#487 phase 1b), keyed by the
+    /// `request_id` the broker minted for it. Routed to the matching parked
+    /// request rather than through [`BrokerState::apply_cmd`].
+    Decision {
+        request_id: u64,
+        decision: ConsentDecision,
+    },
 }
 
 /// An informational toast the plugin should post via `Effect::Notify`.
@@ -181,15 +232,34 @@ pub struct Toast {
     pub body: String,
 }
 
-/// The broker → plugin message: a fresh panel snapshot, plus an optional toast
-/// to raise (present only on a consent denial). One message type keeps the
-/// plugin reducer a one-liner.
+/// A pending consent knock the plugin should surface as `Effect::RequestConsent`
+/// (#487 phase 1b). The human-facing strings the broker computes; `request_id`
+/// correlates the eventual [`Cmd::Decision`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsentPrompt {
+    pub request_id: u64,
+    pub agent: String,
+    pub datasource: String,
+    /// A short human-readable scope phrase (e.g. `"read access"`), not the grant
+    /// store's internal `*` scope.
+    pub scope: String,
+    /// A secondary detail line for the prompt.
+    pub detail: String,
+}
+
+/// The broker → plugin message. One message type keeps the plugin reducer a
+/// short match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerMsg {
+    /// A fresh panel snapshot, plus an optional toast to raise (present only on a
+    /// consent denial / timeout).
     Update {
         snapshot: BrokerSnapshot,
         toast: Option<Toast>,
     },
+    /// Raise an interactive consent prompt for a parked request (#487 phase 1b).
+    /// The plugin turns this into `Effect::RequestConsent`.
+    RequestConsent(ConsentPrompt),
 }
 
 // ── The broker state ──────────────────────────────────────────────────────────
@@ -327,36 +397,52 @@ impl BrokerState {
                     tracing_eprintln(&format!("allow {agent}/{datasource} failed: {e}"));
                 }
             }
+            // A consent decision is routed to its parked request in `serve`, not
+            // applied here; this arm keeps the match exhaustive.
+            Cmd::Decision { .. } => {}
         }
     }
 
-    /// Handle one client connection: read its request line, dispatch, write the
-    /// response line. Returns a [`Toast`] iff the request was a consent denial.
-    async fn handle_conn(&mut self, stream: UnixStream) -> Option<Toast> {
+    /// Handle one client connection: read its request line and dispatch. Either
+    /// writes the response inline ([`ConnResult::Answered`]) or hands the stream
+    /// back to [`serve`] to **park** while a consent prompt is out
+    /// ([`ConnResult::NeedsConsent`], #487 phase 1b).
+    async fn handle_conn(&mut self, stream: UnixStream) -> ConnResult {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         let read = tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await;
-        let (response, toast) = match read {
-            Ok(Ok(0)) => return None, // client closed without a request
-            Ok(Ok(_)) => self.dispatch(line.trim()).await,
-            Ok(Err(e)) => (Response::error(format!("read error: {e}")), None),
-            Err(_) => (Response::error("timed out waiting for a request"), None),
-        };
-        let mut out = encode_response(&response);
-        out.push('\n');
         let mut stream = reader.into_inner();
-        if let Err(e) = stream.write_all(out.as_bytes()).await {
-            tracing_eprintln(&format!("writing response failed: {e}"));
+        let dispatch = match read {
+            Ok(Ok(0)) => return ConnResult::Answered { toast: None }, // client closed, no request
+            Ok(Ok(_)) => self.dispatch(line.trim()).await,
+            Ok(Err(e)) => Dispatch::Answer(Response::error(format!("read error: {e}")), None),
+            Err(_) => Dispatch::Answer(Response::error("timed out waiting for a request"), None),
+        };
+        match dispatch {
+            Dispatch::Answer(response, toast) => {
+                write_response(&mut stream, &response).await;
+                ConnResult::Answered { toast }
+            }
+            Dispatch::Consent {
+                agent,
+                datasource,
+                scope,
+                detail,
+            } => ConnResult::NeedsConsent {
+                agent,
+                datasource,
+                scope,
+                detail,
+                stream,
+            },
         }
-        let _ = stream.flush().await;
-        toast
     }
 
     /// Dispatch one parsed request to its handler.
-    async fn dispatch(&mut self, line: &str) -> (Response, Option<Toast>) {
+    async fn dispatch(&mut self, line: &str) -> Dispatch {
         let req = match parse_request(line) {
             Ok(req) => req,
-            Err(e) => return (Response::error(e), None),
+            Err(e) => return Dispatch::Answer(Response::error(e), None),
         };
         match req {
             Request::Auth { agent } => self.handle_auth(&agent),
@@ -364,39 +450,115 @@ impl BrokerState {
                 token,
                 datasource,
                 limit,
-            } => self.handle_get(&token, &datasource, limit).await,
-            Request::Grants => (self.handle_grants(), None),
+            } => {
+                let (resp, toast) = self.handle_get(&token, &datasource, limit).await;
+                Dispatch::Answer(resp, toast)
+            }
+            Request::Grants => Dispatch::Answer(self.handle_grants(), None),
         }
     }
 
-    /// `auth`: mint silently on an `always` grant, else deny + toast.
-    fn handle_auth(&mut self, agent: &str) -> (Response, Option<Toast>) {
+    /// `auth` (#487 phase 1b): mint silently on an `always` grant; refuse
+    /// silently (+ toast) on a standing `deny`; otherwise ask for consent (the
+    /// caller parks the request).
+    fn handle_auth(&mut self, agent: &str) -> Dispatch {
         let now = now_unix();
         if agent.trim().is_empty() {
-            return (Response::error("auth: empty agent name"), None);
+            return Dispatch::Answer(Response::error("auth: empty agent name"), None);
         }
         match authorize_auth(&self.grants, agent) {
             AuthOutcome::Granted => {
                 let token = self.tokens.mint(agent, now);
                 self.record(agent, "auth", Outcome::Granted, now);
-                let resp = Response {
-                    ok: true,
-                    token: Some(token.value),
-                    expires_unix: Some(token.expires_unix),
-                    agent: Some(agent.to_owned()),
-                    ..Response::default()
-                };
-                (resp, None)
+                Dispatch::Answer(auth_ok_response(agent, &token), None)
             }
             AuthOutcome::Denied { hint } => {
                 self.record(agent, "auth", Outcome::Denied, now);
-                let resp = Response::denied(format!("no grant for agent '{agent}'"), hint);
-                (resp, Some(denied_toast(agent, "access")))
+                Dispatch::Answer(
+                    Response::denied(format!("no grant for agent '{agent}'"), hint),
+                    Some(denied_toast(agent, "access")),
+                )
+            }
+            AuthOutcome::NeedsConsent => Dispatch::Consent {
+                agent: agent.to_owned(),
+                datasource: DATASOURCE_DEPARTURES.to_owned(),
+                scope: "read access".to_owned(),
+                detail: format!("{agent} wants to read the {DATASOURCE_DEPARTURES} board"),
+            },
+        }
+    }
+
+    /// Resolve a parked consent knock (#487 phase 1b) once the human decides.
+    /// `AllowAlways`/`Deny` persist to grants.toml; `AllowSession` mints a
+    /// session-scoped token; `AllowOnce` a single-fetch token. Every allow answers
+    /// the parked `auth` with a fresh token; a deny persists a standing "no".
+    fn apply_consent(
+        &mut self,
+        agent: &str,
+        datasource: &str,
+        decision: ConsentDecision,
+        now: i64,
+    ) -> (Response, Option<Toast>) {
+        match decision {
+            ConsentDecision::Deny => {
+                if let Err(e) = self.grants.grant_deny(agent, datasource) {
+                    tracing_eprintln(&format!("persisting deny for {agent}/{datasource}: {e}"));
+                }
+                self.record(agent, "auth", Outcome::Denied, now);
+                (
+                    Response::denied(
+                        format!("consent denied for agent '{agent}'"),
+                        grant_hint(agent, datasource),
+                    ),
+                    Some(denied_toast(agent, "access")),
+                )
+            }
+            ConsentDecision::AllowAlways => {
+                if let Err(e) = self.grants.grant_always(agent, datasource) {
+                    tracing_eprintln(&format!("persisting always for {agent}/{datasource}: {e}"));
+                }
+                let token = self.tokens.mint_scoped(agent, now, TokenScope::Grant);
+                self.record(agent, "auth", Outcome::Granted, now);
+                (auth_ok_response(agent, &token), None)
+            }
+            ConsentDecision::AllowSession => {
+                let token = self.tokens.mint_scoped(agent, now, TokenScope::Session);
+                self.record(agent, "auth", Outcome::Granted, now);
+                (auth_ok_response(agent, &token), None)
+            }
+            ConsentDecision::AllowOnce => {
+                let token = self.tokens.mint_scoped(agent, now, TokenScope::Once);
+                self.record(agent, "auth", Outcome::Granted, now);
+                (auth_ok_response(agent, &token), None)
             }
         }
     }
 
-    /// `get <datasource>`: token → agent → grant → scoped fetch.
+    /// A parked consent knock that ran out its [`CONSENT_PARK_TIMEOUT`] with no
+    /// decision (a pre-1b / wedged host, or a genuinely ignored prompt). Deny THIS
+    /// request **transiently** — no persisted "no", so the agent may re-ask — and
+    /// raise the 1a informational toast so the missed knock stays visible (the
+    /// phase-1a fallback path).
+    fn on_consent_timeout(
+        &mut self,
+        agent: &str,
+        datasource: &str,
+        now: i64,
+    ) -> (Response, Option<Toast>) {
+        self.record(agent, "auth", Outcome::Denied, now);
+        (
+            Response::denied(
+                format!("consent request for agent '{agent}' timed out"),
+                grant_hint(agent, datasource),
+            ),
+            Some(denied_toast(agent, "access")),
+        )
+    }
+
+    /// `get <datasource>` (#487 phase 1b): token → `(agent, scope)` →
+    /// data-access authority → scoped fetch. A token's [`TokenScope`] carries the
+    /// consent decision that minted it, so `get` never re-prompts — it just
+    /// honors (or spends) the authority already granted at `auth`.
     async fn handle_get(
         &mut self,
         token: &str,
@@ -404,13 +566,14 @@ impl BrokerState {
         limit: Option<usize>,
     ) -> (Response, Option<Toast>) {
         let now = now_unix();
-        let Some(agent) = self.tokens.agent_for(token, now) else {
+        let Some(auth) = self.tokens.resolve(token, now) else {
             // Transient/technical — the agent just re-auths; no consent toast.
             return (
                 Response::error("invalid or expired token — re-auth with `infobroker auth`"),
                 None,
             );
         };
+        let agent = auth.agent;
         if datasource != DATASOURCE_DEPARTURES {
             self.record(&agent, datasource, Outcome::Denied, now);
             return (
@@ -421,38 +584,51 @@ impl BrokerState {
                 None,
             );
         }
-        match authorize_get(&self.grants, &agent, datasource) {
-            GetOutcome::Allowed => {
-                // The access decision is granted; the fetch itself may still fail
-                // (network/config) — that's not a consent problem, so no toast.
-                let result = tokio::task::spawn_blocking(move || departures::fetch_scoped(limit))
-                    .await
-                    .unwrap_or_else(|e| Err(format!("join: {e}")));
-                self.record(&agent, datasource, Outcome::Granted, now);
-                match result {
-                    Ok(rows) => {
-                        let resp = Response {
-                            ok: true,
-                            datasource: Some(datasource.to_owned()),
-                            departures: Some(rows),
-                            ..Response::default()
-                        };
-                        (resp, None)
-                    }
-                    Err(e) => (
-                        Response::error(format!("departures fetch failed: {e}")),
-                        None,
-                    ),
-                }
+        // Data-access authority: a durable `always` grant (for a plain identity
+        // token), an open session token, or a single as-yet-unspent once token —
+        // which this fetch consumes.
+        let allowed = match auth.scope {
+            TokenScope::Grant => {
+                matches!(
+                    authorize_get(&self.grants, &agent, datasource),
+                    GetOutcome::Allowed
+                )
             }
-            GetOutcome::Denied { hint } => {
-                self.record(&agent, datasource, Outcome::Denied, now);
-                let resp = Response::denied(
-                    format!("agent '{agent}' has no grant for '{datasource}'"),
-                    hint,
-                );
-                (resp, Some(denied_toast(&agent, datasource)))
+            TokenScope::Session => true,
+            TokenScope::Once => !auth.spent && self.tokens.spend_once(token),
+        };
+        if !allowed {
+            // A spent once, or an identity token whose grant is gone: transient —
+            // re-auth to re-consent — so no toast (only genuine knocks alert).
+            self.record(&agent, datasource, Outcome::Denied, now);
+            return (
+                Response::denied(
+                    format!("agent '{agent}' has no current grant for '{datasource}'"),
+                    grant_hint(&agent, datasource),
+                ),
+                None,
+            );
+        }
+        // The access decision is granted; the fetch itself may still fail
+        // (network/config) — that's not a consent problem, so no toast.
+        let result = tokio::task::spawn_blocking(move || departures::fetch_scoped(limit))
+            .await
+            .unwrap_or_else(|e| Err(format!("join: {e}")));
+        self.record(&agent, datasource, Outcome::Granted, now);
+        match result {
+            Ok(rows) => {
+                let resp = Response {
+                    ok: true,
+                    datasource: Some(datasource.to_owned()),
+                    departures: Some(rows),
+                    ..Response::default()
+                };
+                (resp, None)
             }
+            Err(e) => (
+                Response::error(format!("departures fetch failed: {e}")),
+                None,
+            ),
         }
     }
 
@@ -485,10 +661,91 @@ fn denied_toast(agent: &str, resource: &str) -> Toast {
     }
 }
 
+/// The `auth`-ok response carrying the minted token, its expiry, and the resolved
+/// agent identity (the same shape for every mint path).
+fn auth_ok_response(agent: &str, token: &Token) -> Response {
+    Response {
+        ok: true,
+        token: Some(token.value.clone()),
+        expires_unix: Some(token.expires_unix),
+        agent: Some(agent.to_owned()),
+        ..Response::default()
+    }
+}
+
 /// stderr diagnostic — systemd routes it to the journal (the SDK plugin uses
 /// stderr for diagnostics; `tracing` isn't wired on the plugin side).
 fn tracing_eprintln(msg: &str) {
     eprintln!("[infobroker] {msg}");
+}
+
+/// Write one response line (JSON + `\n`) to a client stream, best-effort.
+async fn write_response(stream: &mut UnixStream, response: &Response) {
+    let mut out = encode_response(response);
+    out.push('\n');
+    if let Err(e) = stream.write_all(out.as_bytes()).await {
+        tracing_eprintln(&format!("writing response failed: {e}"));
+    }
+    let _ = stream.flush().await;
+}
+
+// ── Consent parking (#487 phase 1b) ───────────────────────────────────────────
+
+/// The result of [`BrokerState::handle_conn`]: either the response is already
+/// written, or the request is parked awaiting a human consent decision.
+enum ConnResult {
+    /// The response has been written; carries an optional toast to raise.
+    Answered { toast: Option<Toast> },
+    /// The request needs consent: the stream is handed back to [`serve`] to park
+    /// until the decision (or [`CONSENT_PARK_TIMEOUT`]) resolves it.
+    NeedsConsent {
+        agent: String,
+        datasource: String,
+        scope: String,
+        detail: String,
+        stream: UnixStream,
+    },
+}
+
+/// A dispatched request's disposition, before the stream is written or parked.
+enum Dispatch {
+    /// A ready response (+ optional toast) to write back immediately.
+    Answer(Response, Option<Toast>),
+    /// The request needs a consent decision; [`serve`] parks the connection.
+    Consent {
+        agent: String,
+        datasource: String,
+        scope: String,
+        detail: String,
+    },
+}
+
+/// A socket request parked awaiting a consent decision (#487 phase 1b): the
+/// stream to answer on, the `(agent, datasource)` the decision applies to, and
+/// the fallback deadline.
+struct PendingConsent {
+    agent: String,
+    datasource: String,
+    stream: UnixStream,
+    deadline: tokio::time::Instant,
+}
+
+/// Push a fresh panel snapshot (+ optional toast) to the plugin.
+fn send_update(
+    out: &mpsc::UnboundedSender<BrokerMsg>,
+    snapshot: BrokerSnapshot,
+    toast: Option<Toast>,
+) {
+    let _ = out.send(BrokerMsg::Update { snapshot, toast });
+}
+
+/// Sleep until the nearest parked deadline, or forever when nothing is parked —
+/// the timeout arm of [`serve`]'s `select!`.
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
 }
 
 // ── The socket server ─────────────────────────────────────────────────────────
@@ -549,36 +806,83 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
     tracing_eprintln(&format!("listening on {}", sock.display()));
 
     // Seed the panel with the current grants/status before any request.
-    let _ = out.send(BrokerMsg::Update {
-        snapshot: state.snapshot(now_unix()),
-        toast: None,
-    });
+    send_update(&out, state.snapshot(now_unix()), None);
+
+    // Parked consent requests (#487 phase 1b), keyed by the request_id the broker
+    // minted; each holds the client stream open until its decision or deadline.
+    let mut pending: HashMap<u64, PendingConsent> = HashMap::new();
+    let mut next_request_id: u64 = 1;
 
     loop {
+        // The nearest parked deadline drives the timeout arm; `None` = park forever.
+        let next_deadline = pending.values().map(|p| p.deadline).min();
         tokio::select! {
-            // Prefer draining panel commands (revoke/allow) so a click lands
-            // promptly rather than behind a slow fetch.
+            // Prefer draining commands (revoke / allow / a consent decision) so a
+            // click — or an answer to a live prompt — lands promptly rather than
+            // behind a slow fetch.
             biased;
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else {
                     break; // lane closed → session teardown
                 };
-                state.apply_cmd(cmd);
-                let _ = out.send(BrokerMsg::Update {
-                    snapshot: state.snapshot(now_unix()),
-                    toast: None,
-                });
+                match cmd {
+                    Cmd::Revoke { .. } | Cmd::Allow { .. } => {
+                        state.apply_cmd(cmd);
+                        send_update(&out, state.snapshot(now_unix()), None);
+                    }
+                    Cmd::Decision { request_id, decision } => {
+                        if let Some(mut p) = pending.remove(&request_id) {
+                            let (resp, toast) =
+                                state.apply_consent(&p.agent, &p.datasource, decision, now_unix());
+                            write_response(&mut p.stream, &resp).await;
+                            send_update(&out, state.snapshot(now_unix()), toast);
+                        }
+                        // else: a late/unknown decision (already timed out) — ignore.
+                    }
+                }
             }
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => {
-                        let toast = state.handle_conn(stream).await;
-                        let _ = out.send(BrokerMsg::Update {
-                            snapshot: state.snapshot(now_unix()),
-                            toast,
-                        });
-                    }
+                    Ok((stream, _addr)) => match state.handle_conn(stream).await {
+                        ConnResult::Answered { toast } => {
+                            send_update(&out, state.snapshot(now_unix()), toast);
+                        }
+                        ConnResult::NeedsConsent { agent, datasource, scope, detail, stream } => {
+                            let request_id = next_request_id;
+                            next_request_id = next_request_id.wrapping_add(1);
+                            pending.insert(request_id, PendingConsent {
+                                agent: agent.clone(),
+                                datasource: datasource.clone(),
+                                stream,
+                                deadline: tokio::time::Instant::now() + CONSENT_PARK_TIMEOUT,
+                            });
+                            // Ask the shell to prompt the human; the request stays
+                            // parked until the answering `Cmd::Decision` arrives.
+                            let _ = out.send(BrokerMsg::RequestConsent(ConsentPrompt {
+                                request_id, agent, datasource, scope, detail,
+                            }));
+                            send_update(&out, state.snapshot(now_unix()), None);
+                        }
+                    },
                     Err(e) => tracing_eprintln(&format!("accept error: {e}")),
+                }
+            }
+            () = wait_for_deadline(next_deadline) => {
+                // The bound elapsed on the earliest parked request(s): time them
+                // out with a transient deny + the 1a toast (the fallback path).
+                let now_inst = tokio::time::Instant::now();
+                let expired: Vec<u64> = pending
+                    .iter()
+                    .filter(|(_, p)| p.deadline <= now_inst)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired {
+                    if let Some(mut p) = pending.remove(&id) {
+                        let (resp, toast) =
+                            state.on_consent_timeout(&p.agent, &p.datasource, now_unix());
+                        write_response(&mut p.stream, &resp).await;
+                        send_update(&out, state.snapshot(now_unix()), toast);
+                    }
                 }
             }
         }
@@ -595,32 +899,32 @@ mod tests {
     }
 
     #[test]
-    fn auth_granted_only_with_an_always_grant() {
+    fn authorize_auth_grants_denies_or_prompts() {
+        // An `always` grant → silent mint.
         let s = store(vec![Grant::always("claude", "departures")]);
         assert_eq!(authorize_auth(&s, "claude"), AuthOutcome::Granted);
-        // An unknown agent is denied with an actionable hint.
-        let AuthOutcome::Denied { hint } = authorize_auth(&s, "stranger") else {
-            panic!("expected denial");
-        };
-        assert!(
-            hint.contains("grants.toml"),
-            "hint points at the grant surface: {hint}"
-        );
-        assert!(hint.contains("infobroker panel"));
+        // A stranger with no standing grant now needs a consent decision (#487).
+        assert_eq!(authorize_auth(&s, "stranger"), AuthOutcome::NeedsConsent);
     }
 
     #[test]
-    fn auth_denied_for_a_deny_only_agent() {
+    fn auth_denied_silently_for_a_deny_only_agent() {
+        // A standing `deny` is a settled "no": denied with an actionable hint, and
+        // — unlike a no-grant knock — NOT re-prompted for consent.
         let s = store(vec![Grant {
             agent: "scratch".to_owned(),
             datasource: "departures".to_owned(),
             scope: "*".to_owned(),
             decision: Decision::Deny,
         }]);
-        assert!(matches!(
-            authorize_auth(&s, "scratch"),
-            AuthOutcome::Denied { .. }
-        ));
+        let AuthOutcome::Denied { hint } = authorize_auth(&s, "scratch") else {
+            panic!("a standing deny refuses without prompting");
+        };
+        assert!(
+            hint.contains("grants.toml"),
+            "hint points at the grant surface: {hint}"
+        );
+        assert!(hint.contains("infobroker panel"));
     }
 
     #[test]
@@ -656,11 +960,19 @@ mod tests {
         ));
     }
 
+    /// Destructure a [`Dispatch::Answer`], panicking on a consent knock.
+    fn answer(d: Dispatch) -> (Response, Option<Toast>) {
+        match d {
+            Dispatch::Answer(r, t) => (r, t),
+            Dispatch::Consent { .. } => panic!("expected an immediate answer, got a consent knock"),
+        }
+    }
+
     #[test]
     fn handle_auth_mints_and_audits_then_get_serves_decision() {
         let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
         // Auth mints a token and records a granted audit entry.
-        let (resp, toast) = state.handle_auth("claude");
+        let (resp, toast) = answer(state.handle_auth("claude"));
         assert!(resp.ok);
         assert!(toast.is_none(), "a silent mint raises no toast");
         let token = resp.token.expect("minted token");
@@ -687,64 +999,159 @@ mod tests {
     }
 
     #[test]
-    fn denied_auth_toasts_and_surfaces_as_pending() {
+    fn no_grant_auth_knocks_for_consent_and_records_nothing_yet() {
         let mut state = BrokerState::new(store(Vec::new()));
-        let (resp, toast) = state.handle_auth("stranger");
-        assert!(!resp.ok);
-        assert!(resp.hint.is_some(), "a denial carries a how-to-grant hint");
-        let toast = toast.expect("a denied knock raises a toast");
-        assert!(toast.summary.contains("stranger"));
-        assert!(toast.body.contains("infobroker panel"));
-        // It shows up as a pending Allow the human can click.
-        let snap = state.snapshot(now_unix());
-        assert_eq!(
-            snap.pending,
-            vec![PendingView {
-                agent: "stranger".to_owned(),
-                datasource: "departures".to_owned(),
-            }]
-        );
+        let Dispatch::Consent {
+            agent, datasource, ..
+        } = state.handle_auth("stranger")
+        else {
+            panic!("a no-grant auth must knock for consent, not deny");
+        };
+        assert_eq!(agent, "stranger");
+        assert_eq!(datasource, "departures");
+        // The knock parks; nothing is minted or audited until the decision lands.
+        assert!(state.audit.is_empty(), "the knock itself isn't audited");
+        assert!(state.tokens.active(now_unix()).is_empty(), "no token yet");
     }
 
     #[test]
     fn empty_agent_is_rejected_without_a_toast() {
         let mut state = BrokerState::new(store(Vec::new()));
-        let (resp, toast) = state.handle_auth("   ");
+        let (resp, toast) = answer(state.handle_auth("   "));
         assert!(!resp.ok);
         assert!(toast.is_none());
         assert!(state.audit.is_empty(), "a blank auth isn't audited");
     }
 
     #[test]
-    fn allow_command_clears_pending_and_revoke_kills_tokens() {
+    fn apply_consent_allow_always_persists_grant_and_mints_a_usable_token() {
         let mut state = BrokerState::new(store(Vec::new()));
-        // A knock leaves the agent pending.
-        state.handle_auth("claude");
-        assert_eq!(state.snapshot(now_unix()).pending.len(), 1);
-
-        // Allow grants always → pending clears, auth now mints.
-        state.apply_cmd(Cmd::Allow {
-            agent: "claude".to_owned(),
-            datasource: "departures".to_owned(),
-        });
-        assert!(
-            state.snapshot(now_unix()).pending.is_empty(),
-            "allow clears pending"
+        let (resp, toast) = state.apply_consent(
+            "claude",
+            "departures",
+            ConsentDecision::AllowAlways,
+            now_unix(),
         );
-        let (resp, _) = state.handle_auth("claude");
-        let token = resp.token.expect("now mints");
+        assert!(
+            resp.ok && toast.is_none(),
+            "an allow answers with a token, no toast"
+        );
+        let token = resp.token.expect("minted");
+        // The durable grant persisted, and a Grant-scoped token was minted.
+        assert_eq!(
+            state.grants.decision_for("claude", "departures"),
+            Some(Decision::Always)
+        );
         assert!(state.tokens.agent_for(&token, now_unix()).is_some());
+    }
 
-        // Revoke deletes the grant AND kills the live token.
-        state.apply_cmd(Cmd::Revoke {
-            agent: "claude".to_owned(),
-            datasource: "departures".to_owned(),
-        });
-        assert!(state.grants.decision_for("claude", "departures").is_none());
-        assert!(
-            state.tokens.agent_for(&token, now_unix()).is_none(),
-            "revoking a grant invalidates its live tokens"
+    #[test]
+    fn apply_consent_allow_session_mints_a_token_without_persisting_a_grant() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let (resp, _) = state.apply_consent(
+            "claude",
+            "departures",
+            ConsentDecision::AllowSession,
+            now_unix(),
         );
+        let token = resp.token.expect("minted");
+        assert!(
+            state.grants.decision_for("claude", "departures").is_none(),
+            "a session decision persists no durable grant"
+        );
+        assert!(state.tokens.agent_for(&token, now_unix()).is_some());
+    }
+
+    #[test]
+    fn apply_consent_allow_once_mints_a_single_fetch_token() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let (resp, _) = state.apply_consent(
+            "claude",
+            "departures",
+            ConsentDecision::AllowOnce,
+            now_unix(),
+        );
+        assert!(resp.token.is_some(), "once still hands back a token");
+        assert!(state.grants.decision_for("claude", "departures").is_none());
+    }
+
+    #[test]
+    fn apply_consent_deny_persists_a_standing_no_and_toasts() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let (resp, toast) =
+            state.apply_consent("scratch", "departures", ConsentDecision::Deny, now_unix());
+        assert!(!resp.ok);
+        assert_eq!(
+            state.grants.decision_for("scratch", "departures"),
+            Some(Decision::Deny),
+            "a deliberate deny persists a standing no"
+        );
+        let toast = toast.expect("a deny toasts");
+        assert!(toast.summary.contains("scratch"));
+        // …and a subsequent auth is now refused silently (no re-prompt).
+        assert!(matches!(
+            authorize_auth(&state.grants, "scratch"),
+            AuthOutcome::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn consent_timeout_is_a_transient_deny_with_a_toast_and_no_persist() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        let (resp, toast) = state.on_consent_timeout("claude", "departures", now_unix());
+        assert!(!resp.ok);
+        let toast = toast.expect("a timeout raises the 1a fallback toast");
+        assert!(toast.summary.contains("claude"));
+        // A timeout is NOT a durable decision — no grant is written, so the agent
+        // may re-ask (a fresh knock next time, not a standing no).
+        assert!(
+            state.grants.decision_for("claude", "departures").is_none(),
+            "an unanswered prompt persists nothing"
+        );
+        assert_eq!(
+            authorize_auth(&state.grants, "claude"),
+            AuthOutcome::NeedsConsent
+        );
+    }
+
+    #[test]
+    fn get_authority_follows_the_token_scope() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mut state = BrokerState::new(store(Vec::new()));
+            // A session token authorizes a get with no durable grant. (We stop at
+            // the authorization decision — the live fetch needs the network — by
+            // asserting a Session token resolves as allowed via the scope, which
+            // the handler consults before fetching.)
+            let session = state
+                .tokens
+                .mint_scoped("claude", now_unix(), TokenScope::Session);
+            let auth = state
+                .tokens
+                .resolve(&session.value, now_unix())
+                .expect("resolves");
+            assert_eq!(auth.scope, TokenScope::Session);
+
+            // A once token authorizes exactly one fetch: the first spend succeeds,
+            // the second is denied (spent).
+            let once = state
+                .tokens
+                .mint_scoped("claude", now_unix(), TokenScope::Once);
+            assert!(state.tokens.spend_once(&once.value), "first fetch allowed");
+            assert!(
+                !state.tokens.spend_once(&once.value),
+                "the once authority is spent after one fetch"
+            );
+
+            // A Grant-scoped token with NO durable grant is denied (no toast).
+            let identity = state.tokens.mint("stranger", now_unix()); // Grant scope
+            let (resp, toast) = state.handle_get(&identity.value, "departures", None).await;
+            assert!(!resp.ok, "an identity token without a grant can't fetch");
+            assert!(toast.is_none(), "a scope miss is transient, not a knock");
+        });
     }
 
     #[test]
@@ -795,7 +1202,7 @@ mod tests {
             .expect("rt");
         rt.block_on(async {
             let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
-            let token = state.handle_auth("claude").0.token.expect("token");
+            let token = answer(state.handle_auth("claude")).0.token.expect("token");
             let (resp, toast) = state.handle_get(&token, "weather", None).await;
             assert!(!resp.ok);
             assert!(

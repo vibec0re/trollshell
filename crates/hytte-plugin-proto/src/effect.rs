@@ -111,6 +111,58 @@ pub enum Effect {
     /// alert without the host learning its domain. `summary` is the bold headline,
     /// `body` the detail line. Fire-and-forget.
     Notify { summary: String, body: String },
+    /// Ask the shell to raise an **interactive consent prompt** on the focused
+    /// output (cap: [`Consent`](crate::manifest::Capability::Consent), #487 phase
+    /// 1b). The motivating consumer is the `infobroker` data broker: when a local
+    /// AI agent asks for data it has no standing grant for, the broker emits this
+    /// to get a human yes/no rather than silently denying.
+    ///
+    /// The host shows *"⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩"* (with `detail`
+    /// as a secondary line) and four choices — Allow once / this session / always /
+    /// Deny — then routes the answer back to *this* plugin as
+    /// [`HostMsg::ConsentDecision`](crate::msg::HostMsg::ConsentDecision) keyed by
+    /// the same `request_id`. **Not** fire-and-forget: it is a request/response
+    /// pair, mirroring [`RunCommand`](Effect::RunCommand)→
+    /// [`EffectResult`](crate::msg::HostMsg::EffectResult). An unanswered prompt
+    /// times out to [`ConsentDecision::Deny`] after 60 s, so a wedged UI can never
+    /// leave the requester hanging. `request_id` is the plugin's own correlation
+    /// token (a fresh one per prompt); the other fields are the human-facing
+    /// strings the plugin computes (the host learns no domain).
+    RequestConsent {
+        request_id: u64,
+        agent: String,
+        datasource: String,
+        scope: String,
+        detail: String,
+    },
+}
+
+/// The human's answer to an [`Effect::RequestConsent`] knock (#487 phase 1b),
+/// delivered back to the requesting plugin inside
+/// [`HostMsg::ConsentDecision`](crate::msg::HostMsg::ConsentDecision) and
+/// surfaced to the SDK as `Input::ConsentDecision`. The four choices the shell's
+/// consent overlay offers; an unanswered prompt (60 s) resolves to
+/// [`Deny`](ConsentDecision::Deny).
+///
+/// The meanings are the requester's to honor — the host only relays the choice —
+/// but the intended semantics (as implemented by `infobroker`) are:
+/// - [`AllowOnce`](ConsentDecision::AllowOnce) — allow exactly this one request.
+/// - [`AllowSession`](ConsentDecision::AllowSession) — allow for the rest of this
+///   session (until the requester restarts).
+/// - [`AllowAlways`](ConsentDecision::AllowAlways) — allow, and persist a standing
+///   grant so future asks are silent.
+/// - [`Deny`](ConsentDecision::Deny) — refuse (and, for a deliberate click,
+///   persist a standing "no").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsentDecision {
+    /// Allow this one request only.
+    AllowOnce,
+    /// Allow for the rest of this session.
+    AllowSession,
+    /// Allow always (persist a standing grant).
+    AllowAlways,
+    /// Deny.
+    Deny,
 }
 
 /// The outcome of a brokered [`Effect::RunCommand`], returned to the plugin.

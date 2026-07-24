@@ -77,8 +77,7 @@ pub fn poweroff() {
 /// Returns a [`BusError`] if the `Inhibit` call fails: a transient bus error
 /// (subject to the default retry), a timeout, or a D-Bus error reply.
 pub async fn inhibit_idle() -> Result<FdLease, BusError> {
-    hytte_bus::call(LOGIN1_DEST)
-        .bus(hytte_bus::BusKind::System)
+    hytte_bus::call(hytte_bus::BusKind::System, LOGIN1_DEST)
         .at_path(LOGIN1_PATH)
         .iface(MANAGER_IFACE)
         .method("Inhibit")
@@ -89,8 +88,7 @@ pub async fn inhibit_idle() -> Result<FdLease, BusError> {
 
 fn spawn_manager_call(method: &'static str) {
     runtime::handle().spawn(async move {
-        let result = hytte_bus::call(LOGIN1_DEST)
-            .bus(hytte_bus::BusKind::System)
+        let result = hytte_bus::call(hytte_bus::BusKind::System, LOGIN1_DEST)
             .at_path(LOGIN1_PATH)
             .iface(MANAGER_IFACE)
             .method(method)

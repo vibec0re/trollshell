@@ -40,8 +40,7 @@ pub enum BackendChoice {
 /// Does not return an error — any bus failure is logged and treated as an
 /// empty name list; the other call's result still contributes.
 pub async fn probe_backend() -> BackendChoice {
-    let owned: Vec<String> = hytte_bus::call("org.freedesktop.DBus")
-        .bus(BusKind::System)
+    let owned: Vec<String> = hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .method("ListNames")
@@ -53,8 +52,7 @@ pub async fn probe_backend() -> BackendChoice {
             Vec::new()
         });
 
-    let activatable: Vec<String> = hytte_bus::call("org.freedesktop.DBus")
-        .bus(BusKind::System)
+    let activatable: Vec<String> = hytte_bus::call(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .method("ListActivatableNames")

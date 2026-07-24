@@ -245,10 +245,11 @@ impl Service for ScreenSaverService {
         };
 
         // Own the well-known name on session bus, mount at both paths.
-        let ownership = hytte_bus::own_name("org.freedesktop.ScreenSaver")
-            .at_path(PATH_CANONICAL, iface.clone())
-            .at_path(PATH_LEGACY, iface)
-            .start();
+        let ownership =
+            hytte_bus::own_name(hytte_bus::BusKind::Session, "org.freedesktop.ScreenSaver")
+                .at_path(PATH_CANONICAL, iface.clone())
+                .at_path(PATH_LEGACY, iface)
+                .start();
 
         shared::insert(ScreenSaverShared {
             state: state.clone(),

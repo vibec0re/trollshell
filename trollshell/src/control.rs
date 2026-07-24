@@ -69,7 +69,7 @@ impl Service for ControlService {
     type Handles = ControlHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        let ownership = hytte::bus::own_name(CONTROL_NAME)
+        let ownership = hytte::bus::own_name(hytte::bus::BusKind::Session, CONTROL_NAME)
             .at_path(CONTROL_PATH, ControlIface)
             .start();
         ControlHandles {

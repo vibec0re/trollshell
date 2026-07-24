@@ -120,8 +120,7 @@ type UnitTuple = (
 async fn listen(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
     // REQUIRED: systemd only emits signals to clients that have called
     // Subscribe(). Without this, JobRemoved never fires.
-    call(SYSTEMD_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("Subscribe")
@@ -135,8 +134,7 @@ async fn listen(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
 
     // Subscribe to JobRemoved so we re-fetch whenever a job completes
     // (which may change the failed-unit set).
-    let job_removed = signals(SYSTEMD_NAME)
-        .bus(BusKind::System)
+    let job_removed = signals(BusKind::System, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .signal("JobRemoved")
@@ -153,8 +151,7 @@ async fn listen(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
 }
 
 async fn refresh_failed(writer: &Mutable<Vec<FailedUnit>>) -> Result<()> {
-    let units: Vec<UnitTuple> = call(SYSTEMD_NAME)
-        .bus(BusKind::System)
+    let units: Vec<UnitTuple> = call(BusKind::System, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("ListUnitsFiltered")
@@ -322,8 +319,7 @@ pub(crate) fn merge_plugin_units(
 /// Propagates any `hytte_bus` call error (e.g. no user manager reachable).
 pub async fn list_plugin_units() -> Result<Vec<PluginUnit>> {
     let pattern = format!("{PLUGIN_UNIT_PREFIX}*{UNIT_SUFFIX}");
-    let files: Vec<UnitFileTuple> = call(SYSTEMD_NAME)
-        .bus(BusKind::Session)
+    let files: Vec<UnitFileTuple> = call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("ListUnitFilesByPatterns")
@@ -331,8 +327,7 @@ pub async fn list_plugin_units() -> Result<Vec<PluginUnit>> {
         .send()
         .await
         .context("ListUnitFilesByPatterns")?;
-    let loaded: Vec<UnitTuple> = call(SYSTEMD_NAME)
-        .bus(BusKind::Session)
+    let loaded: Vec<UnitTuple> = call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method("ListUnitsByPatterns")
@@ -366,8 +361,7 @@ pub async fn stop_plugin(id: &str) -> Result<()> {
 async fn manage_unit(id: &str, method: &'static str) -> Result<()> {
     anyhow::ensure!(is_valid_plugin_id(id), "invalid plugin id: {id:?}");
     let unit = plugin_unit_name(id);
-    let _job: zbus::zvariant::OwnedObjectPath = call(SYSTEMD_NAME)
-        .bus(BusKind::Session)
+    let _job: zbus::zvariant::OwnedObjectPath = call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
         .method(method)
@@ -390,8 +384,7 @@ pub async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<()> {
     if enabled {
         // (files, runtime = false → persistent, force = true → replace any
         //  conflicting symlink). Reply `(carries_install_info, changes)` — discarded.
-        let _reply: (bool, Vec<(String, String, String)>) = call(SYSTEMD_NAME)
-            .bus(BusKind::Session)
+        let _reply: (bool, Vec<(String, String, String)>) = call(BusKind::Session, SYSTEMD_NAME)
             .at_path(MANAGER_PATH)
             .iface(MANAGER_IFACE)
             .method("EnableUnitFiles")
@@ -401,8 +394,7 @@ pub async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<()> {
             .with_context(|| format!("EnableUnitFiles for plugin {id}"))?;
     } else {
         // Reply `changes: a(sss)` — discarded.
-        let _changes: Vec<(String, String, String)> = call(SYSTEMD_NAME)
-            .bus(BusKind::Session)
+        let _changes: Vec<(String, String, String)> = call(BusKind::Session, SYSTEMD_NAME)
             .at_path(MANAGER_PATH)
             .iface(MANAGER_IFACE)
             .method("DisableUnitFiles")

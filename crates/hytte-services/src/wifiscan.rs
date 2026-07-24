@@ -246,8 +246,7 @@ async fn collect_aps(force_scan: bool) -> Result<Vec<AccessPoint>, hytte_bus::Bu
 }
 
 async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    call(NM_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("GetDevices")
@@ -259,8 +258,7 @@ async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
 async fn get_all_access_points(
     device: &OwnedObjectPath,
 ) -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    call(NM_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, NM_NAME)
         .at_path(device.as_str().to_string())
         .iface(WIRELESS_IFACE)
         .method("GetAllAccessPoints")
@@ -271,8 +269,7 @@ async fn get_all_access_points(
 
 async fn request_scan(device: &OwnedObjectPath) -> Result<(), hytte_bus::BusError> {
     let options: HashMap<String, zbus::zvariant::Value<'static>> = HashMap::new();
-    call(NM_NAME)
-        .bus(BusKind::System)
+    call(BusKind::System, NM_NAME)
         .at_path(device.as_str().to_string())
         .iface(WIRELESS_IFACE)
         .method("RequestScan")
@@ -282,8 +279,7 @@ async fn request_scan(device: &OwnedObjectPath) -> Result<(), hytte_bus::BusErro
 }
 
 async fn read_ap(ap_path: &OwnedObjectPath) -> Option<AccessPoint> {
-    let props: HashMap<String, OwnedValue> = call(NM_NAME)
-        .bus(BusKind::System)
+    let props: HashMap<String, OwnedValue> = call(BusKind::System, NM_NAME)
         .at_path(ap_path.as_str().to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")

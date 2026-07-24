@@ -225,8 +225,7 @@ pub(super) async fn run_agent(_ownership: hytte_bus::OwnNameSignal) {
     // Watch for org.bluez owner changes. When bluetoothd restarts (loses
     // its name), our registration is gone and we must re-register.
     // We re-register once the owner comes back.
-    let bluez_gone_sub = hytte_bus::signals("org.freedesktop.DBus")
-        .bus(BusKind::System)
+    let bluez_gone_sub = hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
         .signal("NameOwnerChanged")
@@ -273,8 +272,7 @@ async fn try_register_agent() {
 
     // RegisterAgent — capability "DisplayYesNo": we can show a code and
     // accept yes/no, which is what RequestConfirmation needs.
-    if let Err(e) = hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    if let Err(e) = hytte_bus::call(BusKind::System, "org.bluez")
         .at_path("/org/bluez")
         .iface("org.bluez.AgentManager1")
         .method("RegisterAgent")
@@ -289,8 +287,7 @@ async fn try_register_agent() {
     // RequestDefaultAgent — make us the system-wide default. Without this
     // BlueZ may use whichever Agent it sees first, including stale ones
     // from a previous trollshell run if any.
-    if let Err(e) = hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    if let Err(e) = hytte_bus::call(BusKind::System, "org.bluez")
         .at_path("/org/bluez")
         .iface("org.bluez.AgentManager1")
         .method("RequestDefaultAgent")

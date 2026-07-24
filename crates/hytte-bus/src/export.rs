@@ -66,19 +66,6 @@ pub fn export_object_with(shared: &SharedConnection, path: impl Into<String>) ->
 }
 
 impl ExportBuilder {
-    /// Override which bus to export on. The default is determined by the
-    /// constructor: [`export_object`](crate::export_object) uses the system bus.
-    #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> ExportBuilder {
-        ExportBuilder {
-            shared: match kind {
-                crate::BusKind::Session => crate::connection::session().clone(),
-                crate::BusKind::System => crate::connection::system().clone(),
-            },
-            path: self.path,
-        }
-    }
-
     /// Mount `iface` at the configured object path and keep it mounted across
     /// reconnects. Returns an [`ExportHandle`]; hold it for as long as the
     /// object should be served. Spawns a supervisor task on the hytte runtime

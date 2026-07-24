@@ -137,26 +137,6 @@ where
         + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
-    /// Override which bus this builder targets. The default is determined by
-    /// the constructor: [`property`](crate::property) uses the system bus.
-    ///
-    /// Overriding here replaces the `SharedConnection` with the corresponding
-    /// global singleton.
-    #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> PropertyBuilder<T> {
-        PropertyBuilder {
-            shared: match kind {
-                crate::BusKind::Session => crate::connection::session().clone(),
-                crate::BusKind::System => crate::connection::system().clone(),
-            },
-            destination: self.destination,
-            path: self.path,
-            iface: self.iface,
-            name: self.name,
-            _t: std::marker::PhantomData,
-        }
-    }
-
     /// Set the object path.
     #[must_use]
     pub fn at_path(mut self, p: impl Into<String>) -> Self {

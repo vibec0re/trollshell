@@ -121,25 +121,6 @@ pub struct OwnNameBuilder {
 }
 
 impl OwnNameBuilder {
-    /// Override which bus this builder targets. The default is determined by
-    /// the constructor: [`own_name`](crate::own_name) uses the session bus.
-    ///
-    /// Overriding here replaces the `SharedConnection` with the corresponding
-    /// global singleton.
-    #[must_use]
-    pub fn bus(self, kind: crate::BusKind) -> OwnNameBuilder {
-        OwnNameBuilder {
-            shared: match kind {
-                crate::BusKind::Session => crate::connection::session().clone(),
-                crate::BusKind::System => crate::connection::system().clone(),
-            },
-            name: self.name,
-            permanent_after: self.permanent_after,
-            cooldown: self.cooldown,
-            mounts: self.mounts,
-        }
-    }
-
     /// Register a D-Bus interface at `path` on every connection this builder
     /// acquires. The interface is mounted BEFORE `RequestName` so that callers
     /// racing the `NameAcquired` signal always find the object already present.

@@ -102,8 +102,7 @@ fn prop_object_path(props: &HashMap<String, OwnedValue>, key: &str) -> Option<St
 // ── NM D-Bus calls ────────────────────────────────────────────────────────────
 
 async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("GetDevices")
@@ -116,8 +115,7 @@ async fn get_all(
     path: &str,
     iface: &str,
 ) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(path.to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -280,20 +278,17 @@ pub(crate) async fn run_nm_links_watcher(
     links_out: Mutable<Vec<Link>>,
     primary_out: Mutable<Option<Link>>,
 ) {
-    let device_added = hytte_bus::signals(NM_NAME)
-        .bus(BusKind::System)
+    let device_added = hytte_bus::signals(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .signal("DeviceAdded")
         .start();
-    let device_removed = hytte_bus::signals(NM_NAME)
-        .bus(BusKind::System)
+    let device_removed = hytte_bus::signals(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .signal("DeviceRemoved")
         .start();
-    let manager_props = hytte_bus::signals(NM_NAME)
-        .bus(BusKind::System)
+    let manager_props = hytte_bus::signals(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(PROPS_IFACE)
         .signal("PropertiesChanged")

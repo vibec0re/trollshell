@@ -247,8 +247,7 @@ fn prop_bytes(props: &HashMap<String, OwnedValue>, key: &str) -> Option<Vec<u8>>
 // ── NM D-Bus calls ────────────────────────────────────────────────────────────
 
 async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("GetDevices")
@@ -260,8 +259,7 @@ async fn get_devices() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
 async fn get_device_props(
     device: &str,
 ) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(device.to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -273,8 +271,7 @@ async fn get_device_props(
 async fn get_wireless_props(
     device: &str,
 ) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(device.to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -284,8 +281,7 @@ async fn get_wireless_props(
 }
 
 async fn get_manager_props() -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -295,8 +291,7 @@ async fn get_manager_props() -> Result<HashMap<String, OwnedValue>, hytte_bus::B
 }
 
 async fn get_ap_props(ap: &str) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(ap.to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -306,8 +301,7 @@ async fn get_ap_props(ap: &str) -> Result<HashMap<String, OwnedValue>, hytte_bus
 }
 
 async fn get_all_access_points(device: &str) -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(device.to_string())
         .iface(NM_WIRELESS_IFACE)
         .method("GetAllAccessPoints")
@@ -319,8 +313,7 @@ async fn get_all_access_points(device: &str) -> Result<Vec<OwnedObjectPath>, hyt
 async fn get_active_connection_props(
     active: &str,
 ) -> Result<HashMap<String, OwnedValue>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(active.to_string())
         .iface(PROPS_IFACE)
         .method("GetAll")
@@ -612,8 +605,7 @@ async fn nm_vpn_profiles() -> Vec<VpnProfile> {
 
 /// List all saved connection profiles (`Settings.ListConnections() -> ao`).
 async fn list_connections() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_SETTINGS_PATH)
         .iface(NM_SETTINGS_IFACE)
         .method("ListConnections")
@@ -627,8 +619,7 @@ async fn list_connections() -> Result<Vec<OwnedObjectPath>, hytte_bus::BusError>
 async fn get_connection_settings(
     connection_path: &str,
 ) -> Result<ConnectionSettings, hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(connection_path.to_string())
         .iface(NM_SETTINGS_CONNECTION_IFACE)
         .method("GetSettings")
@@ -934,30 +925,26 @@ pub(crate) async fn run_nm_wifi_watcher(
         refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
 
         // Subscribe to PropertiesChanged on the device and on the manager.
-        let device_sub = hytte_bus::signals(NM_NAME)
-            .bus(BusKind::System)
+        let device_sub = hytte_bus::signals(BusKind::System, NM_NAME)
             .at_path(device_path.clone())
             .iface(PROPS_IFACE)
             .signal("PropertiesChanged")
             .start();
 
-        let manager_sub = hytte_bus::signals(NM_NAME)
-            .bus(BusKind::System)
+        let manager_sub = hytte_bus::signals(BusKind::System, NM_NAME)
             .at_path(NM_PATH)
             .iface(PROPS_IFACE)
             .signal("PropertiesChanged")
             .start();
 
         // Also watch AccessPointAdded / AccessPointRemoved on the device.
-        let ap_added_sub = hytte_bus::signals(NM_NAME)
-            .bus(BusKind::System)
+        let ap_added_sub = hytte_bus::signals(BusKind::System, NM_NAME)
             .at_path(device_path.clone())
             .iface(NM_WIRELESS_IFACE)
             .signal("AccessPointAdded")
             .start();
 
-        let ap_removed_sub = hytte_bus::signals(NM_NAME)
-            .bus(BusKind::System)
+        let ap_removed_sub = hytte_bus::signals(BusKind::System, NM_NAME)
             .at_path(device_path.clone())
             .iface(NM_WIRELESS_IFACE)
             .signal("AccessPointRemoved")
@@ -966,8 +953,7 @@ pub(crate) async fn run_nm_wifi_watcher(
         // Watch the manager's DeviceRemoved signal so we can re-discover when
         // the Wi-Fi device is unplugged (USB dongle) or otherwise unregistered
         // by NM.  The signal carries a single object-path argument.
-        let device_removed_sub = hytte_bus::signals(NM_NAME)
-            .bus(BusKind::System)
+        let device_removed_sub = hytte_bus::signals(BusKind::System, NM_NAME)
             .at_path(NM_PATH)
             .iface(NM_IFACE)
             .signal("DeviceRemoved")
@@ -1033,8 +1019,7 @@ pub(crate) async fn run_nm_wifi_watcher(
 /// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. NM is rate-limiting scans).
 pub(crate) async fn nm_scan(device_path: &str) -> Result<(), hytte_bus::BusError> {
     let options: HashMap<String, Value<'static>> = HashMap::new();
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(device_path.to_string())
         .iface(NM_WIRELESS_IFACE)
         .method("RequestScan")
@@ -1074,8 +1059,7 @@ pub(crate) async fn nm_connect(
             dbus_name: None,
         })?
         .to_owned();
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("ActivateConnection")
@@ -1120,8 +1104,7 @@ pub(crate) async fn nm_activate_connection(
     let connection_obj_path = owned_object_path(connection_path, "connection path")?;
     let device_obj_path = owned_object_path(device_path, "device path")?;
     let specific_object = owned_object_path("/", "specific object")?;
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("ActivateConnection")
@@ -1149,8 +1132,7 @@ pub(crate) async fn nm_activate_vpn(connection_path: &str) -> Result<(), hytte_b
     let connection_obj_path = owned_object_path(connection_path, "connection path")?;
     let device_obj_path = owned_object_path("/", "device")?;
     let specific_object = owned_object_path("/", "specific object")?;
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("ActivateConnection")
@@ -1176,8 +1158,7 @@ pub(crate) async fn nm_deactivate_connection(
     active_conn_path: &str,
 ) -> Result<(), hytte_bus::BusError> {
     let active_obj_path = owned_object_path(active_conn_path, "active connection path")?;
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("DeactivateConnection")
@@ -1192,8 +1173,7 @@ pub(crate) async fn nm_deactivate_connection(
 ///
 /// Returns a [`hytte_bus::BusError`] if the D-Bus call fails.
 pub(crate) async fn nm_disconnect(device_path: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(device_path.to_string())
         .iface(NM_DEVICE_IFACE)
         .method("Disconnect")
@@ -1216,8 +1196,7 @@ pub(crate) async fn nm_disconnect(device_path: &str) -> Result<(), hytte_bus::Bu
 /// Returns a [`hytte_bus::BusError`] if the D-Bus call fails (e.g. the profile
 /// was already removed, or policy denies the delete).
 pub(crate) async fn nm_forget(connection_path: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(connection_path.to_string())
         .iface(NM_SETTINGS_CONNECTION_IFACE)
         .method("Delete")
@@ -1238,8 +1217,7 @@ pub(crate) async fn nm_set_powered(on: bool) -> Result<(), hytte_bus::BusError> 
             reason: e.to_string(),
             dbus_name: None,
         })?;
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(PROPS_IFACE)
         .method("Set")
@@ -1274,8 +1252,7 @@ const NM_SECRET_AGENT_CAPABILITY_VPN_HINTS: u32 = 0x1;
 /// running, or policy refuses agent registration).
 pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
     let capabilities: u32 = NM_SECRET_AGENT_CAPABILITY_VPN_HINTS;
-    hytte_bus::call(NM_NAME)
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_AGENT_MANAGER_PATH)
         .iface(NM_AGENT_MANAGER_IFACE)
         .method("RegisterWithCapabilities")

@@ -140,8 +140,7 @@ impl Service for BluetoothService {
         // Build the own_name handle first so it can be stored in Handles for
         // parity with other services (polkit, screensaver, etc.) and passed
         // into run_agent to keep the interface alive for its lifetime.
-        let ownership = hytte_bus::own_name(AGENT_ANCHOR_NAME)
-            .bus(BusKind::System)
+        let ownership = hytte_bus::own_name(BusKind::System, AGENT_ANCHOR_NAME)
             .at_path(AGENT_PATH, PairAgent)
             .start();
 
@@ -493,8 +492,7 @@ async fn do_set_adapter_bool(
             dbus_name: None,
         })?;
     let prop = prop.to_string();
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(adapter_path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .method("Set")
@@ -515,8 +513,7 @@ async fn do_set_device_bool(
             dbus_name: None,
         })?;
     let prop = prop.to_string();
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(device_path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .method("Set")
@@ -526,8 +523,7 @@ async fn do_set_device_bool(
 }
 
 async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(adapter_path.to_string())
         .iface("org.bluez.Adapter1")
         .method(method)
@@ -537,8 +533,7 @@ async fn do_adapter_call(adapter_path: &str, method: &str) -> Result<(), hytte_b
 }
 
 async fn do_device_call(device_path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(device_path.to_string())
         .iface("org.bluez.Device1")
         .method(method)
@@ -557,8 +552,7 @@ async fn do_remove_device(
             dbus_name: None,
         })?
         .to_owned();
-    hytte_bus::call("org.bluez")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "org.bluez")
         .at_path(adapter_path.to_string())
         .iface("org.bluez.Adapter1")
         .method("RemoveDevice")

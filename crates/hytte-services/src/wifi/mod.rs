@@ -181,8 +181,7 @@ impl Service for WifiService {
                     prompts: prompts_mutable.clone(),
                     waiters: waiters_arc,
                 };
-                let own = hytte_bus::own_name(ANCHOR_NAME)
-                    .bus(BusKind::System)
+                let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
                     .at_path(AGENT_PATH, agent)
                     .start();
 
@@ -231,9 +230,9 @@ impl Service for WifiService {
                     prompts: prompts_mutable.clone(),
                     waiters: waiters_arc,
                 };
-                let export = hytte_bus::export_object(crate::wifi_nm::NM_AGENT_PATH)
-                    .bus(BusKind::System)
-                    .start(nm_agent);
+                let export =
+                    hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH)
+                        .start(nm_agent);
                 rt.spawn(async {
                     // Give the export a moment to mount on the live connection
                     // before registering, so NM never calls back before the
@@ -697,8 +696,7 @@ pub fn cancel_prompt(id: u64) {
 // ── Command helpers ───────────────────────────────────────────────────────────
 
 async fn do_station_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(path.to_string())
         .iface("net.connman.iwd.Station")
         .method(method)
@@ -708,8 +706,7 @@ async fn do_station_call(path: &str, method: &str) -> Result<(), hytte_bus::BusE
 }
 
 async fn do_network_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(path.to_string())
         .iface("net.connman.iwd.Network")
         .method(method)
@@ -725,8 +722,7 @@ async fn do_set_powered(adapter_path: &str, on: bool) -> Result<(), hytte_bus::B
             reason: e.to_string(),
             dbus_name: None,
         })?;
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(adapter_path.to_string())
         .iface("org.freedesktop.DBus.Properties")
         .method("Set")
@@ -736,8 +732,7 @@ async fn do_set_powered(adapter_path: &str, on: bool) -> Result<(), hytte_bus::B
 }
 
 async fn do_known_network_call(path: &str, method: &str) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call("net.connman.iwd")
-        .bus(BusKind::System)
+    hytte_bus::call(BusKind::System, "net.connman.iwd")
         .at_path(path.to_string())
         .iface("net.connman.iwd.KnownNetwork")
         .method(method)

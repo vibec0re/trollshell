@@ -40,7 +40,10 @@
 mod fetch;
 mod location;
 
-use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
+use hytte_plugin::proto::{
+    Capability, DatasourceError, DatasourceOutcome, Dir, Effect, EventKind, Manifest, Mount, Node,
+    ProvidedDatasource,
+};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
@@ -55,6 +58,9 @@ const ORDER: i32 = -10;
 
 /// The whole card is a flat button; a click is the "refresh now" target.
 const CARD_BTN: &str = "weather-card";
+/// The `weather` datasource's one scope (#509): the current reading. The
+/// provider↔requester JSON payload is a [`WeatherJson`] object.
+const SCOPE_CURRENT: &str = "current";
 // Ids on the dynamic labels so the host reconciler mutates text in place across
 // renders rather than rebuilding the subtree.
 const LOC_ID: &str = "weather-loc";
@@ -175,6 +181,63 @@ impl Weather {
             }
         }
     }
+
+    /// Answer a `weather` datasource query (#509) from the current reading. Served
+    /// from the model — Loading / an error surface as a provider-sourced failure.
+    fn answer_query(&self, request_id: u64) -> Effect {
+        let outcome = match &self.state {
+            View::Resolved(snap) => {
+                let payload = WeatherJson {
+                    location: &snap.location,
+                    temp_c: snap.temp_c,
+                    apparent_c: snap.apparent_c,
+                    temp_max_c: snap.temp_max_c,
+                    temp_min_c: snap.temp_min_c,
+                    humidity_pct: snap.humidity_pct,
+                    wind_kmh: snap.wind_kmh,
+                    condition_code: snap.condition.code,
+                    condition_label: snap.condition.label,
+                    condition_icon: snap.condition.icon,
+                };
+                match serde_json::to_string(&payload) {
+                    Ok(p) => DatasourceOutcome::Ready(p),
+                    Err(e) => DatasourceOutcome::Failed {
+                        error: DatasourceError::Provider,
+                        message: format!("serialize weather: {e}"),
+                    },
+                }
+            }
+            View::Loading => DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: "weather not loaded yet".to_owned(),
+            },
+            View::Error(msg) => DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: msg.clone(),
+            },
+        };
+        Effect::DatasourceResult {
+            request_id,
+            outcome,
+        }
+    }
+}
+
+/// The `weather` datasource payload — the JSON contract a requester decodes (#509).
+/// A flat object mirroring [`Snapshot`], with the condition split into its raw WMO
+/// `code` plus the display `label`/`icon` so a requester needn't re-derive them.
+#[derive(serde::Serialize)]
+struct WeatherJson<'a> {
+    location: &'a str,
+    temp_c: f64,
+    apparent_c: f64,
+    temp_max_c: f64,
+    temp_min_c: f64,
+    humidity_pct: u8,
+    wind_kmh: f64,
+    condition_code: u8,
+    condition_label: &'a str,
+    condition_icon: &'a str,
 }
 
 impl Plugin for Weather {
@@ -191,8 +254,17 @@ impl Plugin for Weather {
         // subscriptions: weather sources its own data and doesn't gate on
         // visibility (see the crate docs), so it opts into no host push — which
         // also keeps it clear of the #305 hazard. No capabilities either (it
-        // renders + fetches; it asks nothing of the host).
-        Manifest::new(PLUGIN_ID, Mount::SidebarLead).with_order(ORDER)
+        // renders + fetches; it asks nothing of the host). It DOES serve its
+        // reading as the `weather` datasource (#509) — `DatasourceProvider` +
+        // `provides` — so the infobroker can source weather through this running
+        // plugin. Scope `current` = the latest reading the card holds.
+        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarLead).with_order(ORDER);
+        m.capabilities = vec![Capability::DatasourceProvider];
+        m.provides = vec![ProvidedDatasource::new(
+            PLUGIN_ID,
+            vec![SCOPE_CURRENT.to_owned()],
+        )];
+        m
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
@@ -219,6 +291,12 @@ impl Plugin for Weather {
             // `send` errs only mid-teardown — safe to drop.
             Input::Event { node, kind } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
                 let _ = self.cmd_tx.send(WeatherCmd::RefreshNow);
+            }
+            // #509: answer a `weather` datasource query from the current reading
+            // (the card keeps it live off its worker, so there's nothing to fetch).
+            // The single scope carries no params, so both are ignored.
+            Input::DatasourceQuery { request_id, .. } => {
+                return vec![self.answer_query(request_id)];
             }
             // Weather subscribes to no state and issues no effects, so `Snapshot`
             // and `EffectResult` (and a foreign/scroll `Event`) are no-ops.
@@ -566,10 +644,16 @@ mod tests {
             m.subscribes.is_empty(),
             "weather sources its own data and opts into no host push — no SlotVisible (#305)"
         );
-        assert!(
-            m.capabilities.is_empty(),
-            "weather asks nothing of the host"
+        // #509: weather serves its reading as the `weather` datasource, so it now
+        // declares `DatasourceProvider` + a `provides` entry (nothing else).
+        assert_eq!(
+            m.capabilities,
+            vec![hytte_plugin::proto::Capability::DatasourceProvider],
+            "the only capability is the datasource-provider one (#509)"
         );
+        assert_eq!(m.provides.len(), 1, "provides the `weather` datasource");
+        assert_eq!(m.provides[0].id, "weather");
+        assert!(m.provides[0].serves_scope("current"));
         m.check_proto()
             .expect("stamped with the current proto version");
     }

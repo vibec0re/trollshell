@@ -34,18 +34,24 @@
 //! (the shell-side consent overlay, post-#419); this crate makes **zero
 //! shell-side changes**.
 //!
-//! # The one datasource
+//! # The datasources
 //!
-//! [`departures`] is a one-shot, consent-gated fetch of the next N catchable
-//! S-Bahn departures — an acknowledged code dup of `hytte-plugin-departures`'
-//! fetch path, to be deduped in phase 2 once the proto grows a `Datasource`
-//! capability.
+//! - **`departures`** / **`weather`** (#509) are **routed through their provider
+//!   plugins** (`hytte-plugin-departures` / `hytte-plugin-weather`, which declare
+//!   `provides`) over the shell host's generic datasource query protocol: a `get`
+//!   parks the client, the plugin emits `Effect::DatasourceQuery`, and the answer
+//!   comes back as a `Cmd::QueryResult`. The broker never fetches — the earlier
+//!   in-crate departures fetch was deduped here.
+//! - **`calendar`** (#484) is served from a **live copy** the shell's
+//!   `CalendarUpcoming` host push feeds down the command lane (EDS lives in the
+//!   shell, so an out-of-process broker can't read it directly).
+//!
+//! All three ride the same `(agent × datasource × scope)` grant + token flow.
 
 pub mod broker;
-pub mod departures;
 pub mod grants;
 pub mod paths;
 pub mod tokens;
 pub mod wire;
 
-pub use broker::{BrokerMsg, BrokerSnapshot, Cmd, Toast, serve};
+pub use broker::{BrokerMsg, BrokerSnapshot, Cmd, QueryOutcome, QueryRequest, Toast, serve};

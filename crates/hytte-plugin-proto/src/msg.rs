@@ -6,7 +6,7 @@
 //! internal timer, an external fetch completing), not only in reply to a host
 //! message. See the crate root for the framing/encoding.
 
-use crate::effect::{ConsentDecision, Effect, EffectOutcome};
+use crate::effect::{ConsentDecision, DatasourceOutcome, Effect, EffectOutcome};
 use crate::manifest::Manifest;
 use crate::state::{AudioSpectrum, NowPlaying, StateSnapshot, UpcomingEvent};
 use crate::wire::{EventKind, Node, NodeId};
@@ -149,6 +149,47 @@ pub enum HostMsg {
     /// [`StateKey::NowPlaying`](crate::manifest::StateKey::NowPlaying) **and**
     /// declares [`Capability::NowPlaying`](crate::manifest::Capability::NowPlaying).
     NowPlaying { now_playing: NowPlaying },
+    /// A datasource query forwarded to the **provider** plugin (#509),
+    /// host→provider. The host routes a requester's
+    /// [`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery) here after
+    /// confirming this connection provides `datasource` (in
+    /// [`Manifest::provides`](crate::manifest::Manifest::provides)) and declared
+    /// `scope`. `request_id` is an **opaque host correlation**, not the requester's
+    /// token — the host rewrites it on both legs so provider and requester id-spaces
+    /// never collide; the provider echoes it verbatim in its
+    /// [`Effect::DatasourceResult`](crate::effect::Effect::DatasourceResult). `params`
+    /// is the requester's opaque JSON request (the provider↔requester contract).
+    ///
+    /// **Opt-in (#305) + capability:** sent only to a connection that declares
+    /// [`Capability::DatasourceProvider`](crate::manifest::Capability::DatasourceProvider)
+    /// **and** lists `datasource` in `provides`, so a plugin that isn't a registered
+    /// provider never meets this name-tagged variant — the same additive gate as the
+    /// domain-state pushes.
+    DatasourceQuery {
+        request_id: u64,
+        datasource: String,
+        scope: String,
+        params: String,
+    },
+    /// The result of a datasource query the plugin issued (#509), host→requester —
+    /// the answer to its
+    /// [`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery), keyed by
+    /// the same `request_id` the requester chose. Carries either the provider's
+    /// answer or a host-synthesized error (no provider / denied scope / 10 s
+    /// timeout). The request/response mate of `DatasourceQuery`, exactly as
+    /// [`EffectResult`](HostMsg::EffectResult) is `RunCommand`'s. Surfaced to the SDK
+    /// as `Input::DatasourceResult`.
+    ///
+    /// **Opt-in (#305):** the host routes this only to a connection that emitted a
+    /// query — which requires
+    /// [`Capability::DatasourceQuery`](crate::manifest::Capability::DatasourceQuery),
+    /// or host cap-enforcement drops the effect — so a plugin that never declared
+    /// that cap never receives this name-tagged variant it couldn't decode, the same
+    /// additive rule as [`ConsentDecision`](HostMsg::ConsentDecision).
+    DatasourceResult {
+        request_id: u64,
+        outcome: DatasourceOutcome,
+    },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is

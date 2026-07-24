@@ -137,12 +137,15 @@ use hytte_plugin_proto::{
 };
 use tokio::sync::{mpsc, watch};
 
+mod datasource;
 mod effects;
 mod listener;
 mod pump;
 mod region;
 mod session;
 mod wire_map;
+
+use datasource::DatasourceRouter;
 
 #[cfg(test)]
 mod tests;
@@ -402,6 +405,11 @@ pub struct PluginHandles {
     /// from tokio. Starts `false` (unlocked).
     locked_tx: watch::Sender<bool>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
+    /// The datasource query router (#509), shared with the tokio session tasks
+    /// (which register/unregister providers) so the GTK effect broker can route a
+    /// [`Effect::DatasourceQuery`] to a provider and its result back to the
+    /// requester. Cloned into [`install`]'s broker loop.
+    datasource: DatasourceRouter,
 }
 
 /// Clones of the shared handles handed to the tokio listener + per-conn tasks.
@@ -441,6 +449,11 @@ struct ListenerCtx {
     /// publishes it into [`PLUGIN_RUNTIME`].
     runtime: PluginRuntimeStore,
     effects_tx: mpsc::UnboundedSender<BrokeredEffect>,
+    /// The datasource query router (#509); the per-connection session task
+    /// registers this connection's provided datasources here at register and
+    /// removes them at teardown. Shared (an `Arc<Mutex<…>>` pair inside) with the
+    /// GTK effect broker, which does the actual query/result routing.
+    datasource: DatasourceRouter,
 }
 
 impl Service for PluginsService {
@@ -471,6 +484,10 @@ impl Service for PluginsService {
         // handle to the `ListenerCtx`.
         let runtime: PluginRuntimeStore = Arc::new(Mutex::new(BTreeMap::new()));
         let _ = PLUGIN_RUNTIME.set(runtime.clone());
+        // The datasource query router (#509): one per host, shared between the
+        // tokio session tasks (provider register/unregister) and the GTK effect
+        // broker (query/result routing).
+        let datasource = DatasourceRouter::default();
         let handles = PluginHandles {
             sidebar_lead: Mutable::new(Vec::new()),
             sidebar_top: Mutable::new(Vec::new()),
@@ -488,6 +505,7 @@ impl Service for PluginsService {
             now_playing_tx,
             locked_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
+            datasource: datasource.clone(),
         };
         let ctx = ListenerCtx {
             sidebar_lead: handles.sidebar_lead.clone(),
@@ -507,6 +525,7 @@ impl Service for PluginsService {
             live_ids: Arc::new(Mutex::new(HashSet::new())),
             runtime,
             effects_tx,
+            datasource,
         };
         spawn_supervised("plugins", move || {
             let ctx = ctx.clone();
@@ -621,17 +640,24 @@ pub fn install() {
     // is exactly once per effect, regardless of how many monitors mirror the
     // tree (the mailbox fan-out never sees effects). Reconcilers render the
     // tree; they never touch effects.
-    let effects_rx = registry::with(|r| {
-        r.get::<PluginHandles>()
-            .expect("plugins::service() not registered")
-            .effects_rx
-            .borrow_mut()
-            .take()
+    let (effects_rx, datasource) = registry::with(|r| {
+        let handles = r
+            .get::<PluginHandles>()
+            .expect("plugins::service() not registered");
+        (
+            handles.effects_rx.borrow_mut().take(),
+            handles.datasource.clone(),
+        )
     });
     if let Some(mut effects_rx) = effects_rx {
         glib::MainContext::default().spawn_local(async move {
             while let Some(brokered) = effects_rx.recv().await {
-                effects::broker_effect(&brokered.plugin_id, &brokered.effect, &brokered.outbound);
+                effects::broker_effect(
+                    &brokered.plugin_id,
+                    &brokered.effect,
+                    &brokered.outbound,
+                    &datasource,
+                );
             }
         });
     }

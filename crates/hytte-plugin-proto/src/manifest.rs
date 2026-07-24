@@ -147,6 +147,25 @@ pub enum Capability {
     /// [`StateKey::NowPlaying`](StateKey::NowPlaying) subscription, gates
     /// [`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying).
     NowPlaying,
+    /// Emit datasource queries ([`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery),
+    /// #509) — the **requester/consumer** side of the generic datasource protocol.
+    /// Declaring this cap is also the #305 opt-in gate for the paired
+    /// [`HostMsg::DatasourceResult`](crate::msg::HostMsg::DatasourceResult) push: the
+    /// host routes a result back only to a connection that emitted a query (which
+    /// requires this cap, or host cap-enforcement drops the effect), so a plugin that
+    /// never declared it never meets the variant. The motivating consumer is the
+    /// `infobroker`, which sources departures/weather through their provider plugins.
+    DatasourceQuery,
+    /// Answer datasource queries ([`Effect::DatasourceResult`](crate::effect::Effect::DatasourceResult),
+    /// #509) — the **provider** side. Paired with a non-empty
+    /// [`provides`](Manifest::provides): the host registers a connection as routable
+    /// for a datasource — and pushes it
+    /// [`HostMsg::DatasourceQuery`](crate::msg::HostMsg::DatasourceQuery) — only when
+    /// it BOTH declares this cap AND lists the datasource in `provides`, the same
+    /// declared-**and**-enforced posture as the domain-state pushes (a plugin that
+    /// lists a datasource but omits this cap is refused and warned). The motivating
+    /// providers are `hytte-plugin-departures` and `hytte-plugin-weather`.
+    DatasourceProvider,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host
@@ -190,6 +209,43 @@ impl Mount {
     }
 }
 
+/// A datasource a plugin serves (#509), declared in
+/// [`Manifest::provides`]. `id` is the datasource name a requester queries
+/// (`provider` on [`Effect::DatasourceQuery`](crate::effect::Effect::DatasourceQuery));
+/// `scopes` are the sub-views the provider answers for (the host refuses a query
+/// naming a scope not listed here with
+/// [`DatasourceError::ScopeDenied`](crate::effect::DatasourceError::ScopeDenied)).
+/// A provider declaring this must ALSO hold
+/// [`Capability::DatasourceProvider`](Capability::DatasourceProvider). The
+/// request/response payloads are opaque JSON at the proto layer — their schema is
+/// the provider↔requester contract, documented per-datasource (e.g. in a
+/// `SKILL.md`), so the wire vocabulary stays stable as datasources multiply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvidedDatasource {
+    /// The datasource id a requester names to query it (e.g. `"departures"`).
+    pub id: String,
+    /// The scopes this provider answers for (e.g. `["next"]`). A query naming a
+    /// scope outside this list is refused by the host.
+    pub scopes: Vec<String>,
+}
+
+impl ProvidedDatasource {
+    /// A provided datasource with the given `id` and `scopes`.
+    #[must_use]
+    pub fn new(id: impl Into<String>, scopes: Vec<String>) -> Self {
+        Self {
+            id: id.into(),
+            scopes,
+        }
+    }
+
+    /// Whether this provider declared `scope` (the host's scope check).
+    #[must_use]
+    pub fn serves_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+}
+
 /// A plugin's self-description, sent once in
 /// [`PluginMsg::Register`](crate::msg::PluginMsg::Register) right after it dials
 /// into the host socket. The host validates [`proto`](Manifest::proto) by exact
@@ -219,6 +275,17 @@ pub struct Manifest {
     /// is byte-identical on the wire to an old field-less manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<i32>,
+    /// The datasources this plugin serves (#509) — empty for a non-provider (the
+    /// default, and what a pre-#509 manifest decodes to). A provider must also
+    /// declare [`Capability::DatasourceProvider`](Capability::DatasourceProvider);
+    /// the host then registers each listed [`ProvidedDatasource::id`] as routable to
+    /// this connection and pushes it
+    /// [`HostMsg::DatasourceQuery`](crate::msg::HostMsg::DatasourceQuery) for matching
+    /// queries. Additive under the crate's compat rules — same [`PROTO_VERSION`],
+    /// `#[serde(default)]` for backward decode, and `skip_serializing_if` so a
+    /// non-provider's manifest stays byte-identical on the wire to a pre-#509 one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<ProvidedDatasource>,
 }
 
 impl Manifest {
@@ -233,6 +300,7 @@ impl Manifest {
             capabilities: Vec::new(),
             mount,
             order: None,
+            provides: Vec::new(),
         }
     }
 

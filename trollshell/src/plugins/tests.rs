@@ -10,12 +10,15 @@ use std::time::{Duration, Instant};
 use hytte::futures_signals::signal::Mutable;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, Effect, HostMsg, Manifest, MediaAction, Mount, NiriAction,
-    NowPlaying, Page, PluginMsg, StateKey, read_frame, wire, write_frame,
+    AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
+    Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource,
+    StateKey, read_frame, wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
+use super::datasource::DatasourceRouter;
+use super::effects::broker_effect;
 use super::effects::{PageAction, map_page, resolve_open_page};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
 use super::pump::{any_sidebar_open, apply_forget, apply_open, to_now_playing, to_upcoming_events};
@@ -837,6 +840,9 @@ fn ctx_with(
         // per-connection tests stay isolated and never publish `PLUGIN_RUNTIME`.
         runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         effects_tx,
+        // Host-scoped datasource router (#509); like `live_ids`/`runtime`, kept
+        // per-ctx so the per-connection tests stay isolated.
+        datasource: DatasourceRouter::default(),
     };
     (ctx, effects_rx)
 }
@@ -1709,4 +1715,348 @@ async fn granted_effect_reaches_the_broker() {
         .expect("the granted effect reached the broker");
     assert_eq!(got.plugin_id, "withcap");
     assert!(matches!(got.effect, Effect::OpenPage(Page::PowerMenu)));
+}
+
+// ── Datasource query routing (#509) ──────────────────────────────────────────
+
+/// Read one host→plugin frame off an outbound mpsc queue (the requester/provider
+/// side of a routed query), failing rather than hanging.
+async fn recv_queue(rx: &mut mpsc::Receiver<HostMsg>) -> HostMsg {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a routed frame within 5s")
+        .expect("the queue is open")
+}
+
+/// The requester/provider capability each datasource effect requires — the
+/// exhaustive `effect_capability` mapping for the two #509 variants.
+#[test]
+fn effect_capability_maps_datasource_effects() {
+    assert_eq!(
+        effect_capability(&Effect::DatasourceQuery {
+            request_id: 0,
+            provider: String::new(),
+            scope: String::new(),
+            params: String::new(),
+        }),
+        Capability::DatasourceQuery,
+    );
+    assert_eq!(
+        effect_capability(&Effect::DatasourceResult {
+            request_id: 0,
+            outcome: DatasourceOutcome::Ready(String::new()),
+        }),
+        Capability::DatasourceProvider,
+    );
+}
+
+/// #509 capability enforcement: a `DatasourceQuery` needs `DatasourceQuery`, a
+/// `DatasourceResult` needs `DatasourceProvider` — each is dropped without its own
+/// cap, and one cap never smuggles the other effect through.
+#[test]
+fn enforce_capabilities_gates_datasource_effects() {
+    let query = Effect::DatasourceQuery {
+        request_id: 1,
+        provider: "departures".into(),
+        scope: "next".into(),
+        params: "{}".into(),
+    };
+    let result = Effect::DatasourceResult {
+        request_id: 1,
+        outcome: DatasourceOutcome::Ready("x".into()),
+    };
+    // No caps → both dropped.
+    assert!(
+        enforce_capabilities(&[], "p", vec![query.clone(), result.clone()]).is_empty(),
+        "ungranted datasource effects are dropped",
+    );
+    // The requester cap keeps only the query.
+    let kept = enforce_capabilities(
+        &[Capability::DatasourceQuery],
+        "p",
+        vec![query.clone(), result.clone()],
+    );
+    assert_eq!(kept.len(), 1);
+    assert!(matches!(kept[0], Effect::DatasourceQuery { .. }));
+    // The provider cap keeps only the result.
+    let kept = enforce_capabilities(&[Capability::DatasourceProvider], "p", vec![query, result]);
+    assert_eq!(kept.len(), 1);
+    assert!(matches!(kept[0], Effect::DatasourceResult { .. }));
+}
+
+/// The end-to-end broker round-trip: a requester's `DatasourceQuery` is routed to
+/// the registered provider under an **opaque host correlation** (not the
+/// requester's token), and the provider's `DatasourceResult` comes back to the
+/// requester keyed by its **own** `request_id`. Exercises `broker_effect` on both
+/// legs, so it covers the broker dispatch + the router's correlation translation.
+#[tokio::test]
+async fn datasource_query_routes_to_provider_and_result_back() {
+    let router = DatasourceRouter::default();
+    let (prov_tx, mut prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.register_provider("departures", vec!["next".into()], prov_tx.clone(), 1);
+
+    broker_effect(
+        "infobroker",
+        &Effect::DatasourceQuery {
+            request_id: 42,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: r#"{"limit":3}"#.into(),
+        },
+        &req_tx,
+        &router,
+    );
+
+    // The provider sees the query under a host correlation, never the requester's 42.
+    let HostMsg::DatasourceQuery {
+        request_id: corr,
+        datasource,
+        scope,
+        params,
+    } = recv_queue(&mut prov_rx).await
+    else {
+        panic!("provider must receive a DatasourceQuery");
+    };
+    assert_eq!(datasource, "departures");
+    assert_eq!(scope, "next");
+    assert_eq!(params, r#"{"limit":3}"#);
+    assert_ne!(
+        corr, 42,
+        "the provider sees a host correlation, not the requester token"
+    );
+
+    // The provider answers under that correlation; the requester gets it back keyed
+    // by its own request_id.
+    broker_effect(
+        "departures",
+        &Effect::DatasourceResult {
+            request_id: corr,
+            outcome: DatasourceOutcome::Ready("rows".into()),
+        },
+        &prov_tx,
+        &router,
+    );
+    assert_eq!(
+        recv_queue(&mut req_rx).await,
+        HostMsg::DatasourceResult {
+            request_id: 42,
+            outcome: DatasourceOutcome::Ready("rows".into()),
+        },
+    );
+}
+
+/// A query for a datasource no connected plugin provides resolves to a
+/// host-synthesized `NotFound` — the requester never hangs.
+#[tokio::test]
+async fn datasource_query_for_unknown_provider_is_not_found() {
+    let router = DatasourceRouter::default();
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        7,
+        "nope".into(),
+        "x".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceResult {
+        request_id,
+        outcome,
+    } = recv_queue(&mut req_rx).await
+    else {
+        panic!("a result must come back");
+    };
+    assert_eq!(request_id, 7);
+    assert!(matches!(
+        outcome,
+        DatasourceOutcome::Failed {
+            error: DatasourceError::NotFound,
+            ..
+        }
+    ));
+}
+
+/// A query naming a scope the provider never declared resolves to `ScopeDenied` —
+/// the host enforces the provider's declared `scopes`, not the provider itself.
+#[tokio::test]
+async fn datasource_query_for_undeclared_scope_is_scope_denied() {
+    let router = DatasourceRouter::default();
+    let (prov_tx, _prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.register_provider("departures", vec!["next".into()], prov_tx, 1);
+    router.route_query(
+        "infobroker".into(),
+        8,
+        "departures".into(),
+        "history".into(), // not a declared scope
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceResult {
+        request_id,
+        outcome,
+    } = recv_queue(&mut req_rx).await
+    else {
+        panic!("a result must come back");
+    };
+    assert_eq!(request_id, 8);
+    assert!(matches!(
+        outcome,
+        DatasourceOutcome::Failed {
+            error: DatasourceError::ScopeDenied,
+            ..
+        }
+    ));
+}
+
+/// A provider that accepts a forwarded query but never answers is reaped by the
+/// host timeout, which synthesizes `Timeout` to the requester (`QUERY_TIMEOUT` is
+/// shortened under test).
+#[tokio::test]
+async fn datasource_query_times_out_when_provider_never_answers() {
+    let router = DatasourceRouter::default();
+    // A wide provider queue so the forward succeeds; the test simply never answers.
+    let (prov_tx, _prov_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.register_provider("weather", vec!["current".into()], prov_tx, 1);
+    router.route_query(
+        "infobroker".into(),
+        99,
+        "weather".into(),
+        "current".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceResult {
+        request_id,
+        outcome,
+    } = recv_queue(&mut req_rx).await
+    else {
+        panic!("the timeout must synthesize a result");
+    };
+    assert_eq!(request_id, 99);
+    assert!(matches!(
+        outcome,
+        DatasourceOutcome::Failed {
+            error: DatasourceError::Timeout,
+            ..
+        }
+    ));
+}
+
+/// End to end through `handle_conn`: a plugin whose manifest declares `provides` +
+/// `Capability::DatasourceProvider` becomes routable — a query for its datasource
+/// is forwarded to its connection.
+#[tokio::test]
+async fn provider_manifest_registers_a_routable_datasource() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bottom = ctx.sidebar_bottom.clone();
+    let router = ctx.datasource.clone();
+
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (mut prd, mut pwr) = plugin.into_split();
+    let mut manifest = Manifest::new("departures", Mount::SidebarBottom);
+    manifest.capabilities = vec![Capability::DatasourceProvider];
+    manifest.provides = vec![ProvidedDatasource::new("departures", vec!["next".into()])];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register (provider)");
+    // A render frame lets us wait for registration to complete: provider
+    // registration runs in the handshake, before the reader loop parks any card.
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "board".into(),
+                classes: vec![],
+            },
+            panel: None,
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("Render");
+    wait_for_region(&bottom).await;
+
+    // Route a query; the provider connection receives the forwarded frame.
+    let (req_tx, _req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        3,
+        "departures".into(),
+        "next".into(),
+        r#"{"limit":2}"#.into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceQuery {
+        datasource, scope, ..
+    } = recv(&mut prd).await
+    else {
+        panic!("the provider connection must receive the forwarded query");
+    };
+    assert_eq!(datasource, "departures");
+    assert_eq!(scope, "next");
+}
+
+/// The provider gate: a plugin that lists `provides` but omits
+/// `Capability::DatasourceProvider` is **not** registered, so a query for its
+/// datasource resolves to `NotFound`.
+#[tokio::test]
+async fn provides_without_capability_is_not_registered() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bottom = ctx.sidebar_bottom.clone();
+    let router = ctx.datasource.clone();
+
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (_prd, mut pwr) = plugin.into_split();
+    let mut manifest = Manifest::new("departures", Mount::SidebarBottom);
+    // Lists a datasource but omits the gating capability.
+    manifest.provides = vec![ProvidedDatasource::new("departures", vec!["next".into()])];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("Register (no provider cap)");
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "board".into(),
+                classes: vec![],
+            },
+            panel: None,
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("Render");
+    wait_for_region(&bottom).await;
+
+    // The datasource was never registered → the query fails NotFound.
+    let (req_tx, mut req_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+    router.route_query(
+        "infobroker".into(),
+        4,
+        "departures".into(),
+        "next".into(),
+        "{}".into(),
+        req_tx,
+    );
+    let HostMsg::DatasourceResult { outcome, .. } = recv_queue(&mut req_rx).await else {
+        panic!("a result must come back");
+    };
+    assert!(matches!(
+        outcome,
+        DatasourceOutcome::Failed {
+            error: DatasourceError::NotFound,
+            ..
+        }
+    ));
 }

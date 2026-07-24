@@ -265,7 +265,9 @@ impl Plugin for AudioWidget {
             | Input::EffectResult { .. }
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
-            | Input::SessionLocked(_) => {}
+            | Input::SessionLocked(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => {}
         }
         Vec::new()
     }

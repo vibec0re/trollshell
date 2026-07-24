@@ -41,10 +41,10 @@
 //! the wire break this suite exists to catch.
 
 use hytte_plugin_proto::{
-    AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, Dir, Effect,
-    EffectOutcome, EventKind, HostMsg, LogLevel, Manifest, MediaAction, Mount, NiriAction, Node,
-    NowPlaying, PROTO_VERSION, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot,
-    UpcomingEvent, decode, encode,
+    AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, DatasourceError,
+    DatasourceOutcome, Dir, Effect, EffectOutcome, EventKind, HostMsg, LogLevel, Manifest,
+    MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page, PluginMsg,
+    ProvidedDatasource, SPECTRUM_BINS, StateKey, StateSnapshot, UpcomingEvent, decode, encode,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -148,9 +148,15 @@ fn full_manifest() -> Manifest {
             Capability::Calendar,
             Capability::SessionState,
             Capability::NowPlaying,
+            Capability::DatasourceQuery,
+            Capability::DatasourceProvider,
         ],
         mount: Mount::SidebarLead,
         order: Some(-5),
+        provides: vec![
+            ProvidedDatasource::new("departures", vec!["next".into()]),
+            ProvidedDatasource::new("weather", vec!["current".into()]),
+        ],
     }
 }
 
@@ -321,6 +327,23 @@ fn effect_table() -> Vec<Effect> {
             scope: "*".into(),
             detail: "next S-Bahn departures".into(),
         },
+        Effect::DatasourceQuery {
+            request_id: 11,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: r#"{"limit":5}"#.into(),
+        },
+        Effect::DatasourceResult {
+            request_id: 12,
+            outcome: DatasourceOutcome::Ready(r#"[{"line":"S9","direction":"Spandau"}]"#.into()),
+        },
+        Effect::DatasourceResult {
+            request_id: 13,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: "fetch failed".into(),
+            },
+        },
     ]
 }
 
@@ -357,8 +380,11 @@ fn plugin_control_msgs() -> Vec<PluginMsg> {
 /// and unresolved `Accent` case), the #487 [`HostMsg::ConsentDecision`] push,
 /// the #484/#528 domain pushes ([`HostMsg::CalendarUpcoming`] populated and
 /// empty, [`HostMsg::SessionLocked`] both states, [`HostMsg::NowPlaying`] playing
-/// and idle), and every [`EventKind`] — the "`StateKey` variants incl
-/// Accent/AudioSpectrum" entry lives here as the pushes those subscriptions gate.
+/// and idle), the #509 datasource pushes, and every [`EventKind`] — the "`StateKey`
+/// variants incl Accent/AudioSpectrum" entry lives here as the pushes those
+/// subscriptions gate.
+// A flat data table of every variant; splitting it into helpers gains nothing.
+#[allow(clippy::too_many_lines)]
 fn host_msgs() -> Vec<HostMsg> {
     let mut bins = [0.0_f32; SPECTRUM_BINS];
     for (i, b) in bins.iter_mut().enumerate() {
@@ -456,6 +482,23 @@ fn host_msgs() -> Vec<HostMsg> {
         },
         HostMsg::NowPlaying {
             now_playing: NowPlaying::default(),
+        },
+        HostMsg::DatasourceQuery {
+            request_id: 44,
+            datasource: "departures".into(),
+            scope: "next".into(),
+            params: r#"{"limit":5}"#.into(),
+        },
+        HostMsg::DatasourceResult {
+            request_id: 44,
+            outcome: DatasourceOutcome::Ready(r#"[{"line":"S9","direction":"Spandau"}]"#.into()),
+        },
+        HostMsg::DatasourceResult {
+            request_id: 45,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::Timeout,
+                message: "provider did not answer".into(),
+            },
         },
         HostMsg::Ping { seq: 1 },
         HostMsg::Shutdown,

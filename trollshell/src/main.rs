@@ -346,6 +346,7 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
                 widgets::notif_indicator::widget(monitor),
                 widgets::screenshot::widget(monitor),
                 widgets::screenrecord::widget(monitor),
+                widgets::keep_awake::widget(monitor),
                 widgets::settings_chip::widget(monitor),
                 widgets::power_chip::widget(monitor),
             ]),

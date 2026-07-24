@@ -6,6 +6,7 @@ pub mod clock;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;
+pub mod keep_awake;
 pub mod memory;
 pub mod microphone;
 pub mod mpris;

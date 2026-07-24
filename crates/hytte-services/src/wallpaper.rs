@@ -11,8 +11,11 @@
 //! - **Time-of-day rotation** — a whole-screen mode that switches the wallpaper
 //!   on a fixed morning/day/evening/night schedule (see [`Slot`]). Driven by a
 //!   cheap 60 s main-loop tick; when the active slot's image changes the render
-//!   is re-applied. While rotation is on it wins over the static per-output
-//!   selection (it's a whole-screen mode).
+//!   is re-applied. While rotation is on *and resolves to an image* it wins over
+//!   the static per-output selection (it's a whole-screen mode). When it resolves
+//!   to nothing — the active slot is unset and there's no default — the render
+//!   falls back to the static per-output/default selection rather than blanking,
+//!   so a per-output-only setup keeps its wallpapers.
 //! - **Clear** — the render collapses to *no wallpaper* when nothing is set,
 //!   which stops the swaybg unit rather than restarting it on an empty arg list.
 //!
@@ -243,8 +246,28 @@ fn active_global(state: &WallpaperState, hour: u32) -> Option<&str> {
 /// means *no wallpaper* — the caller stops the unit rather than launching
 /// swaybg with no image.
 fn swaybg_args(state: &WallpaperState, hour: u32) -> Vec<String> {
+    // Rotation is a whole-screen mode: when it's on *and* resolves to an image
+    // — the active slot's, or the default as a per-slot fallback — that one
+    // image wins and per-output overrides are suppressed.
+    if state.rotation.enabled
+        && let Some(image) = active_global(state, hour)
+    {
+        return vec![
+            "-i".to_string(),
+            image.to_string(),
+            "-m".to_string(),
+            "fill".to_string(),
+        ];
+    }
+
+    // Static render — also the fallback when rotation is on but resolves to
+    // nothing (the active slot is unset and there's no default). Falling back
+    // here rather than emitting an empty vector keeps a per-output-only setup
+    // from blanking (which would stop the unit and drop its wallpapers) the
+    // moment it enters an empty rotation slot. The default leads; each
+    // per-output override follows.
     let mut args = Vec::new();
-    if let Some(image) = active_global(state, hour) {
+    if let Some(image) = state.default.as_deref() {
         args.extend([
             "-i".to_string(),
             image.to_string(),
@@ -252,18 +275,15 @@ fn swaybg_args(state: &WallpaperState, hour: u32) -> Vec<String> {
             "fill".to_string(),
         ]);
     }
-    // Per-output overrides apply only in static mode — rotation is whole-screen.
-    if !state.rotation.enabled {
-        for (name, image) in &state.outputs {
-            args.extend([
-                "-o".to_string(),
-                name.clone(),
-                "-i".to_string(),
-                image.clone(),
-                "-m".to_string(),
-                "fill".to_string(),
-            ]);
-        }
+    for (name, image) in &state.outputs {
+        args.extend([
+            "-o".to_string(),
+            name.clone(),
+            "-i".to_string(),
+            image.clone(),
+            "-m".to_string(),
+            "fill".to_string(),
+        ]);
     }
     args
 }
@@ -517,6 +537,20 @@ pub fn state() -> impl Signal<Item = WallpaperState> {
 /// Signal of the default (all-outputs) image path. `None` when unset.
 pub fn default_path() -> impl Signal<Item = Option<String>> {
     state().map(|s| s.default)
+}
+
+/// Whether a custom wallpaper backend — a [`RELOAD_CMD_ENV`] reload command
+/// (e.g. `awww`) — is configured for this session.
+///
+/// Such a backend is single-image and driven only by "here's the new image":
+/// the `{}` placeholder can't express *no wallpaper*, so [`clear`] would leave
+/// the external daemon painting the last image (a silent no-op). The appearance
+/// panel consults this to disable its Clear button under a custom backend rather
+/// than pretend it works. The value is fixed for the session (the env var is
+/// delivered at launch), so callers can read it once.
+#[must_use]
+pub fn has_custom_reload_backend() -> bool {
+    std::env::var(RELOAD_CMD_ENV).is_ok_and(|cmd| !cmd.trim().is_empty())
 }
 
 // ── Public API — commands ────────────────────────────────────────────────────
@@ -849,5 +883,72 @@ mod tests {
             swaybg_args(&state, 8),
             args(&["-i", "/d.png", "-m", "fill"])
         );
+    }
+
+    // ── rotation fallback (#551) ─────────────────────────────────────────────
+
+    #[test]
+    fn rotation_unresolved_falls_back_to_per_output() {
+        // A per-output-only setup (no default) with rotation on but the active
+        // slot empty. Rather than blanking — which would stop swaybg and drop
+        // the per-output wallpapers — fall back to the static per-output render.
+        let mut state = WallpaperState {
+            rotation: Rotation {
+                enabled: true,
+                morning: Some("/m.png".into()),
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        state.outputs.insert("DP-1".into(), "/dp1.png".into());
+        // Hour 14 ⇒ Day slot (unset) and no default ⇒ rotation resolves to
+        // nothing ⇒ the per-output override renders, not an empty vector.
+        assert_eq!(
+            swaybg_args(&state, 14),
+            args(&["-o", "DP-1", "-i", "/dp1.png", "-m", "fill"])
+        );
+        // Primary likewise falls through to the per-output image (not None).
+        assert_eq!(primary_image(&state, 14).as_deref(), Some("/dp1.png"));
+    }
+
+    #[test]
+    fn rotation_unresolved_falls_back_to_default_and_outputs() {
+        // With rotation on but the active slot empty *and* a default set, the
+        // default already resolves the whole-screen image (existing behavior).
+        // The fallback path proper only triggers when nothing resolves at all;
+        // this guards that a default present alongside outputs still wins
+        // whole-screen (per-output suppressed) — i.e. we didn't start leaking
+        // per-output rows into a resolved rotation render.
+        let mut state = WallpaperState {
+            default: Some("/d.png".into()),
+            rotation: Rotation {
+                enabled: true,
+                morning: Some("/m.png".into()),
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        state.outputs.insert("DP-1".into(), "/dp1.png".into());
+        // Hour 14 ⇒ Day unset ⇒ resolves to the default, whole-screen only.
+        assert_eq!(
+            swaybg_args(&state, 14),
+            args(&["-i", "/d.png", "-m", "fill"])
+        );
+    }
+
+    #[test]
+    fn rotation_on_with_nothing_configured_is_still_empty() {
+        // Rotation on but literally nothing configured (no slots, no default, no
+        // outputs) ⇒ the static fallback is itself empty ⇒ still no wallpaper.
+        // No crash, no spurious args.
+        let state = WallpaperState {
+            rotation: Rotation {
+                enabled: true,
+                ..Rotation::default()
+            },
+            ..WallpaperState::default()
+        };
+        assert!(swaybg_args(&state, 3).is_empty());
+        assert_eq!(primary_image(&state, 3), None);
     }
 }

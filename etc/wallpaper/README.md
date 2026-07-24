@@ -40,7 +40,10 @@ page does:
     (a whole-screen mode that wins over the static per-output selection). Slots
     are fixed local-clock ranges: morning `06:00–11:00`, day `11:00–17:00`,
     evening `17:00–21:00`, night otherwise. An unset active slot falls back to
-    `default`.
+    `default`; if that too is unset (rotation resolves to no image at all), the
+    render falls back to the static per-output/default selection rather than
+    blanking — so a per-output-only setup keeps its wallpapers when it enters an
+    empty slot.
 
 - **`swaybg.args`** — derived render spec: swaybg's argument list, one argument
   per line. The swaybg unit's `ExecStart` reads this. Its presence gates the
@@ -120,6 +123,13 @@ after each pick, with `{}` replaced by the primary image (shell-quoted) and
 command is **single-image only**: per-output overrides can't be expressed
 through the placeholder, so it receives the primary image (the rotation's active
 slot or the default).
+
+Because a reload command only ever says "here's the new image" — the `{}`
+placeholder has no way to express _no wallpaper_ — the Appearance page's **Clear
+wallpaper** button is **disabled** when a custom backend is configured (it would
+otherwise be a silent no-op, leaving the daemon painting the last image). To
+remove the wallpaper on a custom backend, clear it through your daemon directly
+(e.g. `awww clear`, or stop the daemon).
 
 ## What this does NOT do
 

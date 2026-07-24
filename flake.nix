@@ -404,7 +404,9 @@
           # run the hytte-ecal probe against it end-to-end. The probe also
           # creates FREQ=DAILY;COUNT=5 VEVENTs (one with an EXDATE) and expands
           # them, so this gates the RRULE-expansion fix for #29 and its
-          # EXDATE/RDATE follow-up. Verified to run under TCG (no KVM needed);
+          # EXDATE/RDATE follow-up, plus a TZID=Europe/Berlin event whose
+          # absolute instant guards the zoned-time fix (#522). Verified to run
+          # under TCG (no KVM needed);
           # GitHub's Linux runners have /dev/kvm for speed.
           eds-nixos-test = pkgs.testers.runNixOSTest {
             name = "eds-nixos-test";
@@ -511,6 +513,23 @@
               assert "exdate instance count: 4" in output, output
               assert "exdate cancelled occurrence present: false" in output, output
               assert "removed exdate" in output, output
+
+              # Zoned time (#522): a `DTSTART;TZID=Europe/Berlin:…123000` event
+              # (12:30 CEST) round-tripped through EDS must expand to the
+              # *absolute* instant 10:30 UTC = start_unix 1784889000 — never
+              # 1784896200 (12:30 UTC), the +2h double-shift that surfaced a
+              # 12:30 event as 14:30 in the Upcoming list. This is the honest
+              # end-to-end guard against the pre-fix bug and against #388
+              # regressing in reverse; it exercises the real backend store, not
+              # just the hermetic string parser.
+              assert "created tzid uid:" in output, output
+              assert "tzid instance count: 1" in output, output
+              assert "tzid instance start_unix: 1784889000" in output, (
+                  "TZID=Europe/Berlin 12:30 must resolve to 10:30 UTC "
+                  "(1784889000), not 12:30 UTC (1784896200): " + output
+              )
+              assert "tzid instance start_unix: 1784896200" not in output, output
+              assert "removed tzid" in output, output
             '';
           };
 

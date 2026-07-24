@@ -40,7 +40,8 @@ use tokio::sync::mpsc;
 use crate::grants::{Decision, GrantStore};
 use crate::tokens::{Token, TokenScope, TokenStore};
 use crate::wire::{
-    DATASOURCE_DEPARTURES, GrantOut, Request, Response, encode_response, parse_request,
+    CalendarEntry, DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, GrantOut, Request, Response,
+    encode_response, parse_request,
 };
 use crate::{departures, paths};
 
@@ -81,6 +82,24 @@ pub enum GetOutcome {
     Allowed,
     /// No `always` grant (missing or an explicit `deny`) — deny + hint.
     Denied { hint: String },
+}
+
+/// The calendar rows a `get calendar` serves: the live copy, clamped to `limit`
+/// (the host already caps the copy at five). Pure — the copy is in-memory, so
+/// there's nothing to fetch. `#[must_use]` isn't needed on a private helper.
+fn calendar_scoped(calendar: &[CalendarEntry], limit: Option<usize>) -> Vec<CalendarEntry> {
+    let n = limit.map_or(calendar.len(), |l| l.min(calendar.len()));
+    calendar.iter().take(n).cloned().collect()
+}
+
+/// The calendar datasource's panel status line — how many events the live copy
+/// holds (#484). Pure.
+fn calendar_status(len: usize) -> String {
+    match len {
+        0 => "no upcoming events".to_owned(),
+        1 => "1 upcoming".to_owned(),
+        n => format!("{n} upcoming"),
+    }
 }
 
 /// The how-to-grant hint pointing the human at the two grant surfaces.
@@ -223,6 +242,10 @@ pub enum Cmd {
         request_id: u64,
         decision: ConsentDecision,
     },
+    /// The shell's latest upcoming-calendar digest (#484), relayed by the plugin
+    /// from its `CalendarUpcoming` host push. Replaces the broker's live copy that
+    /// `get calendar` serves — the broker can't read EDS itself.
+    Calendar(Vec<CalendarEntry>),
 }
 
 /// An informational toast the plugin should post via `Effect::Notify`.
@@ -273,11 +296,16 @@ struct AuditEntry {
     outcome: Outcome,
 }
 
-/// The broker's owned state: durable grants, ephemeral tokens, the audit ring.
+/// The broker's owned state: durable grants, ephemeral tokens, the audit ring,
+/// and the live calendar copy the host push feeds (#484).
 struct BrokerState {
     grants: GrantStore,
     tokens: TokenStore,
     audit: VecDeque<AuditEntry>,
+    /// The latest upcoming-calendar digest relayed from the shell's host push
+    /// (#484). `get calendar` serves this — the broker can't read EDS itself, so
+    /// the live copy *is* the datasource. Empty until the first push lands.
+    calendar: Vec<CalendarEntry>,
 }
 
 /// The current wall clock in unix seconds.
@@ -291,6 +319,7 @@ impl BrokerState {
             grants,
             tokens: TokenStore::default(),
             audit: VecDeque::with_capacity(AUDIT_CAP),
+            calendar: Vec::new(),
         }
     }
 
@@ -363,10 +392,16 @@ impl BrokerState {
             })
             .collect();
 
-        let datasources = vec![DatasourceView {
-            name: DATASOURCE_DEPARTURES.to_owned(),
-            status: departures::status(),
-        }];
+        let datasources = vec![
+            DatasourceView {
+                name: DATASOURCE_DEPARTURES.to_owned(),
+                status: departures::status(),
+            },
+            DatasourceView {
+                name: DATASOURCE_CALENDAR.to_owned(),
+                status: calendar_status(self.calendar.len()),
+            },
+        ];
 
         BrokerSnapshot {
             grants,
@@ -397,6 +432,9 @@ impl BrokerState {
                     tracing_eprintln(&format!("allow {agent}/{datasource} failed: {e}"));
                 }
             }
+            // The host-pushed calendar digest replaces the live copy `get calendar`
+            // serves (#484).
+            Cmd::Calendar(entries) => self.calendar = entries,
             // A consent decision is routed to its parked request in `serve`, not
             // applied here; this arm keeps the match exhaustive.
             Cmd::Decision { .. } => {}
@@ -574,12 +612,14 @@ impl BrokerState {
             );
         };
         let agent = auth.agent;
-        if datasource != DATASOURCE_DEPARTURES {
+        if datasource != DATASOURCE_DEPARTURES && datasource != DATASOURCE_CALENDAR {
             self.record(&agent, datasource, Outcome::Denied, now);
             return (
                 Response::denied(
                     format!("unknown datasource '{datasource}'"),
-                    format!("the only datasource in phase 1a is '{DATASOURCE_DEPARTURES}'"),
+                    format!(
+                        "known datasources: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_CALENDAR}'"
+                    ),
                 ),
                 None,
             );
@@ -609,8 +649,21 @@ impl BrokerState {
                 None,
             );
         }
-        // The access decision is granted; the fetch itself may still fail
-        // (network/config) — that's not a consent problem, so no toast.
+        // The access decision is granted; serve the datasource. Calendar is a
+        // live in-memory copy (the host push feeds it), so there is no fetch to
+        // fail — serve it straight.
+        if datasource == DATASOURCE_CALENDAR {
+            self.record(&agent, datasource, Outcome::Granted, now);
+            let resp = Response {
+                ok: true,
+                datasource: Some(datasource.to_owned()),
+                calendar: Some(calendar_scoped(&self.calendar, limit)),
+                ..Response::default()
+            };
+            return (resp, None);
+        }
+        // Departures: the fetch itself may still fail (network/config) — that's
+        // not a consent problem, so no toast.
         let result = tokio::task::spawn_blocking(move || departures::fetch_scoped(limit))
             .await
             .unwrap_or_else(|e| Err(format!("join: {e}")));
@@ -826,7 +879,7 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                     break; // lane closed → session teardown
                 };
                 match cmd {
-                    Cmd::Revoke { .. } | Cmd::Allow { .. } => {
+                    Cmd::Revoke { .. } | Cmd::Allow { .. } | Cmd::Calendar(_) => {
                         state.apply_cmd(cmd);
                         send_update(&out, state.snapshot(now_unix()), None);
                     }
@@ -1211,5 +1264,105 @@ mod tests {
             );
             assert!(resp.error.unwrap().contains("unknown datasource"));
         });
+    }
+
+    // ── The calendar datasource (#484) ────────────────────────────────────────
+
+    fn calendar_fixture() -> Vec<CalendarEntry> {
+        vec![
+            CalendarEntry {
+                start_unix: 100,
+                end_unix: 200,
+                title: "standup".to_owned(),
+                calendar: "Work".to_owned(),
+            },
+            CalendarEntry {
+                start_unix: 300,
+                end_unix: 400,
+                title: "the thing".to_owned(),
+                calendar: "Personal".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn apply_cmd_calendar_replaces_the_live_copy_and_labels_the_datasource() {
+        let mut state = BrokerState::new(store(Vec::new()));
+        assert!(state.calendar.is_empty());
+        // A calendar status line rides the snapshot even when empty…
+        let snap = state.snapshot(now_unix());
+        let cal = snap
+            .datasources
+            .iter()
+            .find(|d| d.name == "calendar")
+            .expect("calendar datasource is listed");
+        assert_eq!(cal.status, "no upcoming events");
+        // …and updates when the host push replaces the copy.
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        assert_eq!(state.calendar.len(), 2);
+        let snap = state.snapshot(now_unix());
+        let cal = snap
+            .datasources
+            .iter()
+            .find(|d| d.name == "calendar")
+            .expect("calendar datasource is listed");
+        assert_eq!(cal.status, "2 upcoming");
+    }
+
+    #[test]
+    fn get_calendar_serves_the_live_copy_under_the_grant_flow() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            // An `always` grant for calendar → a Grant-scoped identity token can
+            // serve it (the normal grant flow, datasource-scoped).
+            let mut state = BrokerState::new(store(vec![Grant::always("claude", "calendar")]));
+            state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+            let token = answer(state.handle_auth("claude")).0.token.expect("token");
+            let (resp, toast) = state.handle_get(&token, "calendar", None).await;
+            assert!(resp.ok, "the granted agent gets the calendar copy");
+            assert!(toast.is_none(), "a served datasource raises no toast");
+            let rows = resp.calendar.expect("calendar rows");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].title, "standup");
+            // `limit` clamps the served rows.
+            let (resp, _) = state.handle_get(&token, "calendar", Some(1)).await;
+            assert_eq!(resp.calendar.expect("rows").len(), 1);
+        });
+    }
+
+    #[test]
+    fn get_calendar_without_a_grant_is_denied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            // A departures-only grant does NOT cover calendar (per-datasource).
+            let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
+            state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+            let token = answer(state.handle_auth("claude")).0.token.expect("token");
+            let (resp, toast) = state.handle_get(&token, "calendar", None).await;
+            assert!(!resp.ok, "no calendar grant → denied");
+            assert!(toast.is_none(), "a scope miss is transient, not a knock");
+            assert!(resp.calendar.is_none());
+        });
+    }
+
+    #[test]
+    fn calendar_status_labels_by_count() {
+        assert_eq!(calendar_status(0), "no upcoming events");
+        assert_eq!(calendar_status(1), "1 upcoming");
+        assert_eq!(calendar_status(4), "4 upcoming");
+    }
+
+    #[test]
+    fn calendar_scoped_clamps_to_the_limit() {
+        let cal = calendar_fixture();
+        assert_eq!(calendar_scoped(&cal, None).len(), 2, "None = all");
+        assert_eq!(calendar_scoped(&cal, Some(1)).len(), 1);
+        assert_eq!(calendar_scoped(&cal, Some(9)).len(), 2, "over-limit clamps");
     }
 }

@@ -131,8 +131,10 @@ use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
 use hytte::reactive::spawn_supervised;
-use hytte::services::{clock, pipewire};
-use hytte_plugin_proto::{AudioSpectrum, ClockState, Effect, HostMsg, Mount, wire};
+use hytte::services::{calendar, clock, logind, mpris, pipewire};
+use hytte_plugin_proto::{
+    AudioSpectrum, ClockState, Effect, HostMsg, Mount, NowPlaying, UpcomingEvent, wire,
+};
 use tokio::sync::{mpsc, watch};
 
 mod effects;
@@ -384,6 +386,21 @@ pub struct PluginHandles {
     /// plugins from tokio (per-conn spectrum tasks). Starts `None` (capture
     /// inactive); the tap only runs while a subscriber exists.
     spectrum_tx: watch::Sender<Option<AudioSpectrum>>,
+    /// The upcoming-calendar digest (#484), projected from `calendar::events()`
+    /// on the GTK thread ([`install`] via `pump::set_calendar`) and forwarded to
+    /// calendar-subscribing plugins from tokio (per-conn calendar tasks). Starts
+    /// empty (no events yet).
+    calendar_tx: watch::Sender<Vec<UpcomingEvent>>,
+    /// The now-playing digest (#528), projected from `mpris::active_player()` on
+    /// the GTK thread ([`install`] via `pump::publish_now_playing`) and forwarded
+    /// to now-playing-subscribing plugins from tokio. Starts at the empty,
+    /// not-playing default.
+    now_playing_tx: watch::Sender<NowPlaying>,
+    /// The session-locked hint (#484), mirrored from logind's `LockedHint`
+    /// (`logind::session_locked()`) on the GTK thread ([`install`] via
+    /// `pump::publish_locked`) and forwarded to session-state-subscribing plugins
+    /// from tokio. Starts `false` (unlocked).
+    locked_tx: watch::Sender<bool>,
     effects_rx: RefCell<Option<mpsc::UnboundedReceiver<BrokeredEffect>>>,
 }
 
@@ -404,6 +421,12 @@ struct ListenerCtx {
     accent_rx: watch::Receiver<Option<[u8; 4]>>,
     /// Subscriber end of [`PluginHandles::spectrum_tx`] (#405).
     spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
+    /// Subscriber end of [`PluginHandles::calendar_tx`] (#484).
+    calendar_rx: watch::Receiver<Vec<UpcomingEvent>>,
+    /// Subscriber end of [`PluginHandles::now_playing_tx`] (#528).
+    now_playing_rx: watch::Receiver<NowPlaying>,
+    /// Subscriber end of [`PluginHandles::locked_tx`] (#484).
+    locked_rx: watch::Receiver<bool>,
     /// This host's set of currently-connected plugin ids (#436). One live
     /// connection per id: a second `Register` for an id already present is
     /// rejected (see `session::IdGuard`), so two connections can't fight over one
@@ -435,6 +458,12 @@ impl Service for PluginsService {
         // `pipewire::audio_spectrum()` and the tap only runs once a subscriber
         // flips it on (#405).
         let (spectrum_tx, spectrum_rx) = watch::channel(None);
+        // The three #484/#528 domain digests. Calendar seeds empty (no events),
+        // now-playing the not-playing default, locked `false` (unlocked); `install`
+        // pumps each from its service signal on the GTK thread.
+        let (calendar_tx, calendar_rx) = watch::channel(Vec::new());
+        let (now_playing_tx, now_playing_rx) = watch::channel(NowPlaying::default());
+        let (locked_tx, locked_rx) = watch::channel(false);
         let (effects_tx, effects_rx) = mpsc::unbounded_channel();
         // Live runtime mirror (#423): the per-connection tasks write it, and the
         // tokio-side `Control` handler reads it via `plugin_states`. Publish this
@@ -455,6 +484,9 @@ impl Service for PluginsService {
             visibility_tx,
             accent_tx,
             spectrum_tx,
+            calendar_tx,
+            now_playing_tx,
+            locked_tx,
             effects_rx: RefCell::new(Some(effects_rx)),
         };
         let ctx = ListenerCtx {
@@ -469,6 +501,9 @@ impl Service for PluginsService {
             visibility_rx,
             accent_rx,
             spectrum_rx,
+            calendar_rx,
+            now_playing_rx,
+            locked_rx,
             live_ids: Arc::new(Mutex::new(HashSet::new())),
             runtime,
             effects_tx,
@@ -540,6 +575,33 @@ pub fn install() {
     // on subscribe, so this is up to date the moment a plugin dials in.
     glib::MainContext::default().spawn_local(pipewire::audio_spectrum().for_each(|spectrum| {
         pump::publish_spectrum(spectrum.map(pump::to_wire_spectrum));
+        std::future::ready(())
+    }));
+
+    // Upcoming-calendar digest (#484): project the live `calendar::events()`
+    // (the full month/upcoming window, sorted ascending) onto the next-5-in-24h
+    // wire digest and publish it, capability-gated per-connection in `session`.
+    // The signal replays its current value on subscribe, so a plugin dialing in
+    // later still gets a seed.
+    glib::MainContext::default().spawn_local(calendar::events().for_each(|events| {
+        let now_unix = chrono::Local::now().timestamp();
+        pump::set_calendar(pump::to_upcoming_events(&events, now_unix));
+        std::future::ready(())
+    }));
+
+    // Now-playing digest (#528): project the mpris active player onto the
+    // title/artist/playing wire digest and publish it.
+    glib::MainContext::default().spawn_local(mpris::active_player().for_each(|player| {
+        pump::publish_now_playing(pump::to_now_playing(player.as_ref()));
+        std::future::ready(())
+    }));
+
+    // Session-locked hint (#484): mirror logind's `LockedHint` and publish it, so
+    // session-state-subscribing plugins can fire a "first unlock" action or blank
+    // sensitive content while locked. `logind::session_locked()` lazily starts its
+    // own system-bus subscription; the signal replays its current value here.
+    glib::MainContext::default().spawn_local(logind::session_locked().for_each(|locked| {
+        pump::publish_locked(locked);
         std::future::ready(())
     }));
 

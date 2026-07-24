@@ -35,26 +35,26 @@
 //! parks while nobody is looking, exactly the pattern the SDK documents for a
 //! sidebar-mounted poller. It re-derives from the next push on reopen.
 //!
-//! # Dot-matrix data source — a decorative banner, pending an mpris `StateKey`
+//! # Dot-matrix data source — the live track (#528), with a banner fallback
 //!
-//! The marquee *wants* to scroll the current track title (mpris), falling back
-//! to the default sink name. Neither is cleanly reachable out-of-process: the
-//! host pushes only `{peak, bins}` (no now-playing/sink metadata), and mpris
-//! player-tracking is a session-bus surface that belongs in a shell service, not
-//! hacked into a widget plugin (the `pet`/`caw`/`terminal` plugins reach their
-//! data via files/HTTP, never that). The shell already has the mpris service
-//! (`hytte_services::mpris`); it just needs a wire projection + `StateKey` the
-//! way #405 gave the spectrum one. Until then the marquee shows a decorative
-//! banner, flipping between a "vibing" line and a "silence" line off the one
-//! datum that *is* reachable — the peak level. Tracked as a follow-up; revisit
-//! when a now-playing `StateKey` lands.
+//! The marquee scrolls the **current track** (`title — artist`) whenever the
+//! host reports a *playing* player, off the [`StateKey::NowPlaying`] push (#528):
+//! the shell projects its own `hytte_services::mpris` active-player state onto a
+//! GTK-free `NowPlaying { title, artist, playing }` the same way #405 projected
+//! the spectrum — so this out-of-process plugin never touches the session bus.
+//! When nothing is playing (paused / stopped / no player, or no title) it falls
+//! back to the pre-#528 decorative banner, flipping between a "vibing" line and a
+//! "silence" line off the one always-reachable datum, the peak level. (#529
+//! shipped only the banner as a placeholder; #528 is the follow-up it flagged.)
 
 mod spectrum;
 
 use std::time::Duration;
 
 use hytte_plugin::preem::{DisplayStyle, LedStrip, Marquee, PeakHold};
-use hytte_plugin::proto::{Dir, Effect, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
+use hytte_plugin::proto::{
+    Capability, Dir, Effect, Manifest, Mount, Node, NowPlaying, SPECTRUM_BINS, StateKey,
+};
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
@@ -126,6 +126,10 @@ struct AudioWidget {
     level: PeakHold,
     /// The LED peak-hold dot — a slow-releasing peak-hold of the overall level.
     peak: PeakHold,
+    /// The current-track digest off the host's now-playing push (#528). The
+    /// marquee scrolls `title — artist` while `playing`, and falls back to the
+    /// decorative banner otherwise (see [`AudioWidget::marquee_text`]).
+    now_playing: NowPlaying,
 }
 
 impl AudioWidget {
@@ -154,9 +158,24 @@ impl AudioWidget {
         self.peak.value() > ACTIVE_THRESHOLD
     }
 
-    /// The marquee banner for the current state (see the crate docs' note).
-    fn marquee_message(&self) -> &'static str {
-        if self.active() { ACTIVE_MSG } else { IDLE_MSG }
+    /// The marquee text (#528): the live track (`title — artist`, or just the
+    /// title) while the host reports a *playing* player with a title, else the
+    /// decorative banner off the peak level (the pre-#528 fallback). The trailing
+    /// gap keeps the scroll from butting the wrap point against itself.
+    fn marquee_text(&self) -> String {
+        if self.now_playing.playing && !self.now_playing.title.trim().is_empty() {
+            let title = self.now_playing.title.trim();
+            let artist = self.now_playing.artist.trim();
+            if artist.is_empty() {
+                format!("{title}   ")
+            } else {
+                format!("{title} — {artist}   ")
+            }
+        } else if self.active() {
+            ACTIVE_MSG.to_owned()
+        } else {
+            IDLE_MSG.to_owned()
+        }
     }
 
     /// The marquee scroll offset. [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window)
@@ -175,12 +194,18 @@ impl Plugin for AudioWidget {
 
     /// Mounts [`Mount::SidebarTop`] (`order = 2`, so it sorts below the clock /
     /// preem demos if co-mounted). Subscribes [`StateKey::AudioSpectrum`] (the
-    /// data) and [`StateKey::SlotVisible`] (the park gate); the SDK adds the
-    /// accent subscription (#376) on its behalf. No capabilities — it asks
-    /// nothing of the shell.
+    /// data), [`StateKey::SlotVisible`] (the park gate), and
+    /// [`StateKey::NowPlaying`] (the marquee track, #528) — the last paired with
+    /// [`Capability::NowPlaying`], the capability the host requires on top of the
+    /// subscription. The SDK adds the accent subscription (#376) on its behalf.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(2);
-        m.subscribes = vec![StateKey::AudioSpectrum, StateKey::SlotVisible];
+        m.subscribes = vec![
+            StateKey::AudioSpectrum,
+            StateKey::SlotVisible,
+            StateKey::NowPlaying,
+        ];
+        m.capabilities = vec![Capability::NowPlaying];
         m
     }
 
@@ -194,6 +219,7 @@ impl Plugin for AudioWidget {
             bins: [0.0; SPECTRUM_BINS],
             level: PeakHold::new(LEVEL_RELEASE),
             peak: PeakHold::new(PEAK_RELEASE),
+            now_playing: NowPlaying::default(),
         }
     }
 
@@ -223,12 +249,23 @@ impl Plugin for AudioWidget {
                     self.tick();
                 }
             }
+            // The now-playing push (#528): adopt it while visible so the marquee
+            // shows the live track; ignore it while parked (the card re-derives
+            // from the next push on reopen, like the spectrum).
+            Input::NowPlaying(np) => {
+                if self.visible {
+                    self.now_playing = np;
+                }
+            }
             // No Clock subscription (empty snapshot), no interactive nodes, no
-            // commands or consent — all no-ops.
+            // commands or consent, and the other domain pushes aren't subscribed —
+            // all no-ops.
             Input::Snapshot(_)
             | Input::Event { .. }
             | Input::EffectResult { .. }
-            | Input::ConsentDecision { .. } => {}
+            | Input::ConsentDecision { .. }
+            | Input::CalendarUpcoming(_)
+            | Input::SessionLocked(_) => {}
         }
         Vec::new()
     }
@@ -241,7 +278,7 @@ impl Plugin for AudioWidget {
     fn view(&self) -> View {
         let marquee = Marquee::new(STYLE)
             .window_px(MARQUEE_WINDOW_PX)
-            .render(self.marquee_message())
+            .render(&self.marquee_text())
             .window(self.marquee_offset());
         let scope = spectrum::scope_tile(&self.bins);
         let leds = LedStrip::new(STYLE).render(self.level.value(), self.peak.value());
@@ -317,16 +354,26 @@ mod tests {
         out
     }
 
-    /// The manifest opts into the spectrum + the visibility gate and mounts a
-    /// sidebar card, asking for no capabilities.
+    /// The manifest opts into the spectrum, the visibility gate, and the
+    /// now-playing track (#528, paired with its capability), and mounts a sidebar
+    /// card.
     #[test]
     fn manifest_subscribes_spectrum_and_visibility() {
+        use hytte_plugin::proto::Capability;
         let m = AudioWidget::manifest();
         assert_eq!(m.id, PLUGIN_ID);
         assert_eq!(m.mount, Mount::SidebarTop);
         assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
         assert!(m.subscribes.contains(&StateKey::SlotVisible));
-        assert!(m.capabilities.is_empty(), "asks nothing of the shell");
+        assert!(
+            m.subscribes.contains(&StateKey::NowPlaying),
+            "opts into the now-playing track (#528)"
+        );
+        assert_eq!(
+            m.capabilities,
+            vec![Capability::NowPlaying],
+            "the now-playing push is capability-gated on top of the subscription"
+        );
         m.check_proto()
             .expect("stamped with the current proto version");
     }
@@ -390,21 +437,82 @@ mod tests {
         assert_ne!(m.view(), before, "a shown card folds the push");
     }
 
-    /// The marquee flips banner on the audio-active state (off the lingering
-    /// peak-hold), and only the active banner scrolls.
+    /// The marquee falls back to the decorative banner on the audio-active state
+    /// (off the lingering peak-hold) when nothing is playing, and only the active
+    /// banner scrolls.
     #[test]
     fn the_marquee_reflects_audio_state() {
         let mut m = shown();
         assert!(!m.active(), "silent at rest");
-        assert_eq!(m.marquee_message(), IDLE_MSG);
+        assert_eq!(m.marquee_text(), IDLE_MSG);
         let _ = m.update(spectrum(0.9, 0, 0.9));
         assert!(m.active(), "a loud push reads as playing");
-        assert_eq!(m.marquee_message(), ACTIVE_MSG);
+        assert_eq!(m.marquee_text(), ACTIVE_MSG);
         // The active banner overflows the window (scrolls); a step moves pixels.
         let strip = hytte_plugin::preem::Marquee::new(super::STYLE)
             .window_px(super::MARQUEE_WINDOW_PX)
             .render(ACTIVE_MSG);
         assert!(strip.scrolls(), "the active banner scrolls");
+    }
+
+    /// The now-playing push (#528) takes over the marquee while playing — title
+    /// and artist — and releases back to the banner when it stops.
+    #[test]
+    fn now_playing_drives_the_marquee_over_the_banner() {
+        use hytte_plugin::proto::NowPlaying;
+        let mut m = shown();
+        // A loud push would otherwise pick the active banner…
+        let _ = m.update(spectrum(0.9, 0, 0.9));
+        assert_eq!(m.marquee_text(), ACTIVE_MSG);
+        // …but a playing track wins.
+        m.update(Input::NowPlaying(NowPlaying {
+            title: "Chrome Rain".to_owned(),
+            artist: "Choom".to_owned(),
+            playing: true,
+        }));
+        assert!(
+            m.marquee_text().starts_with("Chrome Rain — Choom"),
+            "playing track scrolls title — artist: {}",
+            m.marquee_text()
+        );
+        // Title only (no artist).
+        m.update(Input::NowPlaying(NowPlaying {
+            title: "Untitled".to_owned(),
+            artist: String::new(),
+            playing: true,
+        }));
+        assert!(m.marquee_text().starts_with("Untitled"));
+        assert!(!m.marquee_text().contains('—'), "no dash without an artist");
+        // Paused → back to the banner off the peak level.
+        m.update(Input::NowPlaying(NowPlaying {
+            title: "Chrome Rain".to_owned(),
+            artist: "Choom".to_owned(),
+            playing: false,
+        }));
+        assert_eq!(
+            m.marquee_text(),
+            ACTIVE_MSG,
+            "a not-playing track falls back to the banner"
+        );
+    }
+
+    /// While hidden the now-playing push is ignored (the card parks), exactly like
+    /// the spectrum push.
+    #[test]
+    fn a_hidden_card_ignores_now_playing() {
+        use hytte_plugin::proto::NowPlaying;
+        let mut m = fresh(); // never shown → parked
+        let before = m.view();
+        m.update(Input::NowPlaying(NowPlaying {
+            title: "Chrome Rain".to_owned(),
+            artist: "Choom".to_owned(),
+            playing: true,
+        }));
+        assert_eq!(
+            m.view(),
+            before,
+            "a parked card ignores the now-playing push"
+        );
     }
 
     /// The scroll offset advances one step per frame tick and wraps the counter.

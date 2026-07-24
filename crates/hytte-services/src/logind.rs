@@ -24,12 +24,18 @@
 //!   to the active session's agent (the canonical behavior of
 //!   `systemctl suspend` etc.).
 
-use hytte_bus::{BusError, FdLease};
+use std::sync::OnceLock;
+
+use futures_signals::signal::{Mutable, Signal, SignalExt as _};
+use futures_util::StreamExt as _;
+use hytte_bus::{BusError, BusKind, FdLease, PropState};
 use hytte_reactive::runtime;
+use zbus::zvariant::OwnedObjectPath;
 
 const LOGIN1_DEST: &str = "org.freedesktop.login1";
 const LOGIN1_PATH: &str = "/org/freedesktop/login1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
+const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 
 /// Suspend the system. Fire-and-forget; errors logged at warn level.
 pub fn suspend() {
@@ -88,7 +94,7 @@ pub async fn inhibit_idle() -> Result<FdLease, BusError> {
 
 fn spawn_manager_call(method: &'static str) {
     runtime::handle().spawn(async move {
-        let result = hytte_bus::call(hytte_bus::BusKind::System, LOGIN1_DEST)
+        let result = hytte_bus::call(BusKind::System, LOGIN1_DEST)
             .at_path(LOGIN1_PATH)
             .iface(MANAGER_IFACE)
             .method(method)
@@ -99,4 +105,118 @@ fn spawn_manager_call(method: &'static str) {
             tracing::warn!(error = %e, method, "logind: Manager.{method} failed");
         }
     });
+}
+
+// ── Session lock state (#484) ─────────────────────────────────────────────────
+
+/// Lazily-started tracker of the session's logind `LockedHint`. First call
+/// spawns the subscription; the [`Mutable`] it writes lives here rather than in
+/// a registered [`Service`](hytte_reactive::Service) so the plugin host can pull
+/// the signal without a `main.rs` registration line.
+static SESSION_LOCKED: OnceLock<Mutable<bool>> = OnceLock::new();
+
+/// A signal of the session's logind `LockedHint` — `true` while the session is
+/// locked (#484). Sourced from `org.freedesktop.login1.Session.LockedHint` on the
+/// **system** bus, tracked live via [`hytte_bus::property`] so an unlock (a
+/// swaylock `SetLockedHint(false)`, `loginctl unlock-session`) flips it back.
+///
+/// Starts `false` (unlocked) and stays there if the session can't be resolved —
+/// the safe default for a shell in use (sensitive content shows, "first unlock"
+/// actions still fire). Lazily started on first call and shared across callers
+/// (a single subscription, one `Mutable`), so pulling this repeatedly is cheap.
+///
+/// The trollshell plugin host projects this onto the `SessionLocked` wire push so
+/// subscribing plugins (caw's briefing, the infobroker privacy blank) see it.
+pub fn session_locked() -> impl Signal<Item = bool> {
+    SESSION_LOCKED
+        .get_or_init(|| {
+            let locked = Mutable::new(false);
+            let writer = locked.clone();
+            runtime::handle().spawn(track_session_locked(writer));
+            locked
+        })
+        .signal()
+}
+
+/// Project one [`PropState<bool>`] onto the tracked lock value, or `None` to keep
+/// the last one (`Loading` — the pre-`Get` / reconnect gap). Pure, so the
+/// keep-last policy is unit-testable without a live bus.
+fn locked_from_prop(state: &PropState<bool>) -> Option<bool> {
+    match state {
+        PropState::Loaded(locked) | PropState::Stale(locked) => Some(*locked),
+        PropState::Loading => None,
+    }
+}
+
+/// Resolve the caller's concrete logind session path and track its `LockedHint`.
+/// The concrete path (not the `session/auto` alias) is required so
+/// `PropertiesChanged` — which logind emits on the real object path — actually
+/// reaches the subscription.
+async fn track_session_locked(writer: Mutable<bool>) {
+    let Some(path) = resolve_session_path().await else {
+        tracing::warn!("logind: could not resolve session path; LockedHint stays unlocked");
+        return;
+    };
+    // Held for the loop's lifetime: dropping the last `PropertySignal` clone tears
+    // the tracking task down, so this binding keeps it alive.
+    let prop = hytte_bus::property::<bool>(BusKind::System, LOGIN1_DEST)
+        .at_path(path)
+        .iface(SESSION_IFACE)
+        .name("LockedHint")
+        .start();
+    let mut states = prop.signal().to_stream();
+    while let Some(state) = states.next().await {
+        if let Some(locked) = locked_from_prop(&state) {
+            writer.set_neq(locked);
+        }
+    }
+}
+
+/// The caller's concrete logind session object path: prefer `$XDG_SESSION_ID`
+/// via `GetSession`, else `GetSessionByPID(0)` (0 = the calling process). `None`
+/// when logind can't be reached or the caller isn't in a session.
+async fn resolve_session_path() -> Option<String> {
+    if let Ok(id) = std::env::var("XDG_SESSION_ID")
+        && !id.is_empty()
+        && let Ok(path) = manager_object_path("GetSession", (id,)).await
+    {
+        return Some(path.as_str().to_owned());
+    }
+    match manager_object_path("GetSessionByPID", (0u32,)).await {
+        Ok(path) => Some(path.as_str().to_owned()),
+        Err(e) => {
+            tracing::warn!(error = %e, "logind: could not resolve the session path");
+            None
+        }
+    }
+}
+
+/// Call a logind `Manager` method returning a single object path.
+async fn manager_object_path<A>(method: &'static str, args: A) -> Result<OwnedObjectPath, BusError>
+where
+    A: serde::Serialize + zbus::zvariant::Type + Send + Sync + Clone + 'static,
+{
+    hytte_bus::call(BusKind::System, LOGIN1_DEST)
+        .at_path(LOGIN1_PATH)
+        .iface(MANAGER_IFACE)
+        .method(method)
+        .args(args)
+        .send::<OwnedObjectPath>()
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locked_from_prop;
+    use hytte_bus::PropState;
+
+    #[test]
+    fn locked_maps_loaded_and_stale_and_keeps_last_on_loading() {
+        assert_eq!(locked_from_prop(&PropState::Loaded(true)), Some(true));
+        assert_eq!(locked_from_prop(&PropState::Loaded(false)), Some(false));
+        // Stale (bus reconnecting) still carries the last known value…
+        assert_eq!(locked_from_prop(&PropState::Stale(true)), Some(true));
+        // …while Loading (pre-Get) keeps whatever we had (no clobber to a default).
+        assert_eq!(locked_from_prop(&PropState::<bool>::Loading), None);
+    }
 }

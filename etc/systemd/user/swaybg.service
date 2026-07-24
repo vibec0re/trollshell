@@ -4,10 +4,15 @@ Documentation=man:swaybg(1)
 PartOf=niri-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
+# Stay inactive until the Appearance picker has rendered a wallpaper — the
+# service writes swaybg.args (one swaybg arg per line) and removes it on Clear.
+ConditionPathExists=%h/.config/trollshell/swaybg.args
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'exec /usr/bin/swaybg -i "$(cat %h/.config/trollshell/wallpaper.path)" -m fill'
+# Read swaybg.args a line at a time into the positional args (so paths with
+# spaces survive), then exec swaybg with the full per-output argument list.
+ExecStart=/bin/sh -c 'set --; while IFS= read -r a; do set -- "$@" "$a"; done < %h/.config/trollshell/swaybg.args; exec /usr/bin/swaybg "$@"'
 Restart=on-failure
 RestartSec=2
 

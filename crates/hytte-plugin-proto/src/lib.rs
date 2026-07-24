@@ -98,7 +98,10 @@ pub use effect::{
 };
 pub use manifest::{Capability, Manifest, Mount, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
-pub use state::{AudioSpectrum, ClockState, SPECTRUM_BINS, StateSnapshot};
+pub use state::{
+    AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, SPECTRUM_BINS, StateSnapshot,
+    UpcomingEvent,
+};
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{Cls, Dir, EventKind, Node, NodeId};
 

@@ -87,12 +87,30 @@ pub(crate) struct DepartureBrief {
     pub leave_in: Option<i64>,
 }
 
-/// One upcoming calendar event (reserved for the host-shared calendar key).
-#[derive(Debug)]
+/// One upcoming calendar event, briefing-shaped. Filled from the host's
+/// [`CalendarUpcoming`](hytte_plugin::proto::StateKey::CalendarUpcoming) push
+/// (#484) via [`EventBrief::from_upcoming`]. `Clone` so the briefing loop can keep
+/// the latest list and hand a copy to each `spawn_blocking` compose.
+#[derive(Debug, Clone)]
 pub(crate) struct EventBrief {
     /// Local `HH:MM` start.
     pub hhmm: String,
     pub summary: String,
+}
+
+impl EventBrief {
+    /// Project a host-pushed [`UpcomingEvent`](hytte_plugin::proto::UpcomingEvent)
+    /// onto the briefing shape (#484): the start's local `HH:MM` plus the title.
+    /// Times ride the wire as Unix seconds, so the local formatting lives here.
+    pub(crate) fn from_upcoming(event: &hytte_plugin::proto::UpcomingEvent) -> Self {
+        let hhmm = DateTime::from_timestamp(event.start_unix, 0).map_or_else(String::new, |dt| {
+            dt.with_timezone(&chrono::Local).format("%H:%M").to_string()
+        });
+        Self {
+            hhmm,
+            summary: event.title.clone(),
+        }
+    }
 }
 
 /// Gather every ingredient, best-effort. Blocking (two HTTPS round-trips at
@@ -545,6 +563,31 @@ mod tests {
         assert!(pick_departure(&hafas_body(), &place(), ts("2030-01-01T18:00:00+01:00")).is_none());
         // Garbage body → none, no panic.
         assert!(pick_departure("not json", &place(), now).is_none());
+    }
+
+    #[test]
+    fn event_brief_from_upcoming_formats_local_hhmm_and_keeps_the_title() {
+        use hytte_plugin::proto::UpcomingEvent;
+        // 2026-07-11T13:49:00Z — the local HH:MM depends on the test box's zone,
+        // so assert the shape (two colon-separated fields) and the title rather
+        // than a fixed clock.
+        let e = EventBrief::from_upcoming(&UpcomingEvent {
+            start_unix: 1_752_241_740,
+            end_unix: 1_752_245_340,
+            title: "standup".to_owned(),
+            calendar: "Work".to_owned(),
+        });
+        assert_eq!(e.summary, "standup");
+        let (h, m) = e.hhmm.split_once(':').expect("HH:MM");
+        assert!(h.len() == 2 && m.len() == 2 && h.parse::<u8>().is_ok());
+        // A zero/garbage timestamp degrades to an empty label, never a panic.
+        let bad = EventBrief::from_upcoming(&UpcomingEvent {
+            start_unix: i64::MAX,
+            end_unix: i64::MAX,
+            title: "overflow".to_owned(),
+            calendar: String::new(),
+        });
+        assert_eq!(bad.hhmm, "");
     }
 
     #[test]

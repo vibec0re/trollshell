@@ -8,7 +8,7 @@
 
 use crate::effect::{ConsentDecision, Effect, EffectOutcome};
 use crate::manifest::Manifest;
-use crate::state::{AudioSpectrum, StateSnapshot};
+use crate::state::{AudioSpectrum, NowPlaying, StateSnapshot, UpcomingEvent};
 use crate::wire::{EventKind, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +118,37 @@ pub enum HostMsg {
         request_id: u64,
         decision: ConsentDecision,
     },
+    /// The next few upcoming calendar events (#484), pushed on change (EDS is
+    /// signal-driven) as a small digest — the next
+    /// [`MAX_UPCOMING_EVENTS`](crate::state::MAX_UPCOMING_EVENTS)
+    /// [`UpcomingEvent`]s in the coming 24 h — off the host's
+    /// `hytte_services::calendar` handles.
+    ///
+    /// **Opt-in (#305) + capability:** sent only to a plugin that subscribes
+    /// [`StateKey::CalendarUpcoming`](crate::manifest::StateKey::CalendarUpcoming)
+    /// **and** declares [`Capability::Calendar`](crate::manifest::Capability::Calendar)
+    /// — a calendar is personal data, so the host gates the push on the capability
+    /// on top of the subscription (a subscribe-only plugin is refused it and
+    /// warned). A pre-#484 binary that declares neither never meets this
+    /// name-tagged variant, keeping the addition additive.
+    CalendarUpcoming { events: Vec<UpcomingEvent> },
+    /// The session's logind `LockedHint` (#484): `true` while the session is
+    /// locked. Pushed on change so a plugin can fire a "first unlock" action or
+    /// blank sensitive content while locked.
+    ///
+    /// **Opt-in (#305) + capability:** sent only to a plugin that subscribes
+    /// [`StateKey::SessionLocked`](crate::manifest::StateKey::SessionLocked) **and**
+    /// declares [`Capability::SessionState`](crate::manifest::Capability::SessionState)
+    /// — the same subscribe-and-capability rule as [`CalendarUpcoming`](HostMsg::CalendarUpcoming).
+    SessionLocked { locked: bool },
+    /// The current-track digest off the mpris active player (#528), pushed on
+    /// change (latest-wins), exactly the way [`AudioSpectrum`](HostMsg::AudioSpectrum)
+    /// projected the spectrum. See [`NowPlaying`].
+    ///
+    /// **Opt-in (#305) + capability:** sent only to a plugin that subscribes
+    /// [`StateKey::NowPlaying`](crate::manifest::StateKey::NowPlaying) **and**
+    /// declares [`Capability::NowPlaying`](crate::manifest::Capability::NowPlaying).
+    NowPlaying { now_playing: NowPlaying },
     /// A liveness probe; answer with [`PluginMsg::Pong`] carrying the same `seq`.
     Ping { seq: u64 },
     /// The host is going away; no further frames follow and the connection is
@@ -194,6 +225,82 @@ mod tests {
     fn audio_spectrum_subscription_round_trips() {
         let mut manifest = Manifest::new("scope-plugin", Mount::SidebarTop);
         manifest.subscribes = vec![StateKey::Clock, StateKey::AudioSpectrum];
+        let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
+        assert_eq!(back, manifest);
+    }
+
+    /// The #484 upcoming-calendar push round-trips, carrying the whole event list
+    /// (and the empty "no upcoming events" case) byte-for-byte.
+    #[test]
+    fn calendar_upcoming_push_round_trips() {
+        use crate::state::UpcomingEvent;
+        for events in [
+            Vec::new(),
+            vec![
+                UpcomingEvent {
+                    start_unix: 1_752_248_940,
+                    end_unix: 1_752_252_540,
+                    title: "standup".into(),
+                    calendar: "Work".into(),
+                },
+                UpcomingEvent {
+                    start_unix: 1_752_260_000,
+                    end_unix: 1_752_263_600,
+                    title: "the thing".into(),
+                    calendar: "Personal".into(),
+                },
+            ],
+        ] {
+            let msg = HostMsg::CalendarUpcoming { events };
+            let back = decode::<HostMsg>(&encode(&msg)).expect("calendar frame decodes");
+            assert_eq!(back, msg);
+        }
+    }
+
+    /// The #484 session-locked push round-trips both boolean states.
+    #[test]
+    fn session_locked_push_round_trips() {
+        for locked in [true, false] {
+            let msg = HostMsg::SessionLocked { locked };
+            let back = decode::<HostMsg>(&encode(&msg)).expect("locked frame decodes");
+            assert_eq!(back, msg);
+        }
+    }
+
+    /// The #528 now-playing push round-trips (playing and idle).
+    #[test]
+    fn now_playing_push_round_trips() {
+        use crate::state::NowPlaying;
+        for now_playing in [
+            NowPlaying {
+                title: "Chrome Rain".into(),
+                artist: "Choom".into(),
+                playing: true,
+            },
+            NowPlaying::default(),
+        ] {
+            let msg = HostMsg::NowPlaying { now_playing };
+            let back = decode::<HostMsg>(&encode(&msg)).expect("now-playing frame decodes");
+            assert_eq!(back, msg);
+        }
+    }
+
+    /// The three #484/#528 domain subscriptions and their gating capabilities are
+    /// plain name-tagged variants, so a manifest declaring them round-trips.
+    #[test]
+    fn domain_subscriptions_and_capabilities_round_trip() {
+        use crate::manifest::Capability;
+        let mut manifest = Manifest::new("domain-plugin", Mount::SidebarTop);
+        manifest.subscribes = vec![
+            StateKey::CalendarUpcoming,
+            StateKey::SessionLocked,
+            StateKey::NowPlaying,
+        ];
+        manifest.capabilities = vec![
+            Capability::Calendar,
+            Capability::SessionState,
+            Capability::NowPlaying,
+        ];
         let back = decode::<Manifest>(&encode(&manifest)).expect("manifest decodes");
         assert_eq!(back, manifest);
     }

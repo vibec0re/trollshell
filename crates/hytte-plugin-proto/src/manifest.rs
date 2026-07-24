@@ -60,6 +60,39 @@ pub enum StateKey {
     /// [`Clock`](StateKey::Clock)), and the capture is only run while at least one
     /// subscriber exists (an idle desktop pays nothing).
     AudioSpectrum,
+    /// Opt-in to the upcoming-calendar push
+    /// ([`HostMsg::CalendarUpcoming`](crate::msg::HostMsg::CalendarUpcoming), #484):
+    /// the host projects the next
+    /// [`MAX_UPCOMING_EVENTS`](crate::state::MAX_UPCOMING_EVENTS)
+    /// [`UpcomingEvent`](crate::state::UpcomingEvent)s in the coming 24 h off its
+    /// `hytte_services::calendar` handles and pushes them on change (EDS is
+    /// signal-driven, not polled). Like [`AudioSpectrum`](StateKey::AudioSpectrum)
+    /// this is the #305 opt-in gate, **and** — because a calendar is personal data
+    /// — the push additionally requires
+    /// [`Capability::Calendar`](Capability::Calendar): the host sends the
+    /// (name-tagged, additive) variant only to a plugin that both subscribes this
+    /// key *and* declares that capability, so a pre-#484 binary never meets it. The
+    /// motivating consumers are caw's morning briefing and the infobroker's
+    /// `get calendar` datasource.
+    CalendarUpcoming,
+    /// Opt-in to the session-locked push
+    /// ([`HostMsg::SessionLocked`](crate::msg::HostMsg::SessionLocked), #484): the
+    /// host mirrors logind's session `LockedHint` and pushes the boolean on change,
+    /// so a plugin can fire a "first unlock" action (caw's briefing) or **blank
+    /// sensitive content while locked** (the infobroker's privacy note). The #305
+    /// opt-in gate, additionally gated on
+    /// [`Capability::SessionState`](Capability::SessionState) — the same
+    /// subscribe-**and**-capability rule as [`CalendarUpcoming`](StateKey::CalendarUpcoming).
+    SessionLocked,
+    /// Opt-in to the now-playing push
+    /// ([`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying), #528): the host
+    /// projects `hytte_services::mpris`'s active player onto a GTK-free
+    /// [`NowPlaying`](crate::state::NowPlaying) (title / artist / playing) and
+    /// pushes it on change (latest-wins), exactly the way #405 projected the
+    /// spectrum. The #305 opt-in gate, additionally gated on
+    /// [`Capability::NowPlaying`](Capability::NowPlaying). The motivating consumer
+    /// is the audio widget's dot-matrix track marquee.
+    NowPlaying,
 }
 
 /// A shell capability a plugin requests in its manifest. The host auto-grants
@@ -94,6 +127,26 @@ pub enum Capability {
     /// decode). A pre-1b plugin that never declares `Consent` therefore never
     /// meets the new variant.
     Consent,
+    /// Receive the upcoming-calendar push (#484). Unlike the effect-gating caps
+    /// above, this gates a **host→plugin push**: paired with a
+    /// [`StateKey::CalendarUpcoming`](StateKey::CalendarUpcoming) subscription, it
+    /// is what lets a plugin receive
+    /// [`HostMsg::CalendarUpcoming`](crate::msg::HostMsg::CalendarUpcoming). A
+    /// calendar is personal data, so the host requires the capability on top of the
+    /// subscription (a subscribe-only plugin is refused the push and warned), which
+    /// is also part of the #305 additive gate. The consumers are caw's morning
+    /// briefing and the infobroker's `get calendar` datasource.
+    Calendar,
+    /// Receive the session-locked push (#484): paired with a
+    /// [`StateKey::SessionLocked`](StateKey::SessionLocked) subscription, gates
+    /// [`HostMsg::SessionLocked`](crate::msg::HostMsg::SessionLocked). The lock
+    /// state doubles as a privacy signal, so it is capability-gated like
+    /// [`Calendar`](Capability::Calendar).
+    SessionState,
+    /// Receive the now-playing push (#528): paired with a
+    /// [`StateKey::NowPlaying`](StateKey::NowPlaying) subscription, gates
+    /// [`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying).
+    NowPlaying,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

@@ -10,10 +10,19 @@ use std::collections::HashMap;
 use chrono::{DateTime, Local};
 use hytte::gtk::{self, prelude::*};
 use hytte::reactive::registry;
+use hytte::services::calendar::CalendarEvent;
+use hytte::services::mpris::{PlaybackStatus, Player};
 use hytte::services::pipewire;
-use hytte_plugin_proto::{AudioSpectrum, ClockState};
+use hytte_plugin_proto::{
+    AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, UpcomingEvent,
+};
 
 use super::PluginHandles;
+
+/// The upcoming-calendar digest window (#484): events starting within the next
+/// 24 h. Paired with the [`MAX_UPCOMING_EVENTS`] cap, this is the "briefing-shaped
+/// slice" the host projects off the full calendar service.
+const CALENDAR_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Publish the latest clock state to the per-conn snapshot tasks.
 pub(super) fn set_clock(cs: ClockState) {
@@ -52,6 +61,101 @@ pub(super) fn to_wire_spectrum(s: pipewire::AudioSpectrum) -> AudioSpectrum {
         peak: s.peak,
         bins: s.bins,
     }
+}
+
+/// Publish the upcoming-calendar digest to the per-conn calendar tasks (#484).
+/// Skips a redundant re-send (the calendar signal re-emits its full window every
+/// refresh even when the briefing slice is unchanged) so subscribers don't
+/// re-render on identical data.
+pub(super) fn set_calendar(events: Vec<UpcomingEvent>) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .calendar_tx
+            .send_if_modified(|current| {
+                if *current == events {
+                    false
+                } else {
+                    *current = events;
+                    true
+                }
+            });
+    });
+}
+
+/// Publish the now-playing digest to the per-conn now-playing tasks (#528).
+/// Latest-wins; skips a redundant re-send so a metadata poll that produced the
+/// same title/artist/playing doesn't wake subscribers.
+pub(super) fn publish_now_playing(now_playing: NowPlaying) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .now_playing_tx
+            .send_if_modified(|current| {
+                if *current == now_playing {
+                    false
+                } else {
+                    *current = now_playing;
+                    true
+                }
+            });
+    });
+}
+
+/// Publish the session-locked hint to the per-conn locked tasks (#484). Skips a
+/// redundant re-send (mirrors [`publish_visibility`]).
+pub(super) fn publish_locked(locked: bool) {
+    registry::with(|r| {
+        r.get::<PluginHandles>()
+            .expect("plugins::service() not registered")
+            .locked_tx
+            .send_if_modified(|current| {
+                if *current == locked {
+                    false
+                } else {
+                    *current = locked;
+                    true
+                }
+            });
+    });
+}
+
+/// Project the calendar service's [`CalendarEvent`]s onto the GTK-free wire
+/// [`UpcomingEvent`] digest (#484): the events overlapping the next
+/// [`CALENDAR_WINDOW_SECS`] (not already ended, starting within the window),
+/// capped at [`MAX_UPCOMING_EVENTS`]. The calendar signal is sorted ascending by
+/// start, so taking the first survivors of the filter yields the *next* events.
+/// Pure, so the windowing/cap is unit-testable without the calendar service.
+pub(super) fn to_upcoming_events(events: &[CalendarEvent], now_unix: i64) -> Vec<UpcomingEvent> {
+    let window_end = now_unix.saturating_add(CALENDAR_WINDOW_SECS);
+    events
+        .iter()
+        .filter(|e| {
+            let start = e.start.timestamp();
+            let end = e.end.timestamp();
+            // Not already over, and it starts inside the window.
+            end > now_unix && start < window_end
+        })
+        .take(MAX_UPCOMING_EVENTS)
+        .map(|e| UpcomingEvent {
+            start_unix: e.start.timestamp(),
+            end_unix: e.end.timestamp(),
+            title: e.summary.clone(),
+            calendar: e.calendar_name.clone(),
+        })
+        .collect()
+}
+
+/// Project the mpris active [`Player`] onto the GTK-free wire [`NowPlaying`]
+/// digest (#528): title/artist off its metadata, `playing` iff the player is
+/// actually playing (paused/stopped/absent all read as not playing). `None`
+/// (no active player) is the empty, not-playing default. Pure.
+pub(super) fn to_now_playing(player: Option<&Player>) -> NowPlaying {
+    player.map_or_else(NowPlaying::default, |p| NowPlaying {
+        title: p.title.clone(),
+        artist: p.artists.clone(),
+        playing: p.status == PlaybackStatus::Playing,
+    })
 }
 
 /// Resolve libadwaita's `@accent_color` to an opaque RGBA byte quad on the GTK

@@ -293,7 +293,10 @@ impl Plugin for Pet {
             Input::EffectResult { .. }
             | Input::SlotVisible(_)
             | Input::AudioSpectrum(_)
-            | Input::ConsentDecision { .. } => {}
+            | Input::ConsentDecision { .. }
+            | Input::CalendarUpcoming(_)
+            | Input::SessionLocked(_)
+            | Input::NowPlaying(_) => {}
         }
         Vec::new()
     }

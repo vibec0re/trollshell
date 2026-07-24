@@ -50,3 +50,23 @@ pub(crate) fn write(service: &str, file: &str, body: &str) -> bool {
     }
     true
 }
+
+/// Delete `~/.config/trollshell/<file>` if it exists.
+///
+/// Best-effort, like [`write`]: a missing file is success (nothing to do); a
+/// `$HOME`-unset or non-`NotFound` I/O error logs a `warn!` scoped to
+/// `service`. Callers use it to return a persisted UI-state toggle to its
+/// zero-state (e.g. the wallpaper picker's "Clear" clearing the render files).
+pub(crate) fn remove(service: &str, file: &str) {
+    let Some(path) = path(file) else {
+        tracing::warn!(service, file, "config remove skipped: $HOME unset");
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(service, error = %e, path = %path.display(), "config remove failed");
+        }
+    }
+}

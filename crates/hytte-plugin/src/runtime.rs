@@ -170,6 +170,19 @@ where
                     request_id,
                     decision,
                 }),
+                // #484: the upcoming-calendar digest, delivered only to a plugin
+                // that subscribed the key and holds `Capability::Calendar`.
+                Some(Ok(HostMsg::CalendarUpcoming { events })) => {
+                    Step::Update(Input::CalendarUpcoming(events))
+                }
+                // #484: the session lock state (seeded at register, then on change).
+                Some(Ok(HostMsg::SessionLocked { locked })) => {
+                    Step::Update(Input::SessionLocked(locked))
+                }
+                // #528: the now-playing digest off the mpris active player.
+                Some(Ok(HostMsg::NowPlaying { now_playing })) => {
+                    Step::Update(Input::NowPlaying(now_playing))
+                }
                 Some(Ok(HostMsg::Accent { color })) => {
                     // Theme plumbing (#376): the host resolved `@accent_color`
                     // and handed it over. Feed it to the `preem` kit as the
@@ -329,8 +342,18 @@ mod tests {
 
         fn manifest() -> Manifest {
             let mut m = Manifest::new("echo-test", Mount::SidebarTop);
-            m.subscribes = vec![StateKey::Clock];
-            m.capabilities = vec![Capability::OpenPage];
+            m.subscribes = vec![
+                StateKey::Clock,
+                StateKey::CalendarUpcoming,
+                StateKey::SessionLocked,
+                StateKey::NowPlaying,
+            ];
+            m.capabilities = vec![
+                Capability::OpenPage,
+                Capability::Calendar,
+                Capability::SessionState,
+                Capability::NowPlaying,
+            ];
             m
         }
 
@@ -364,6 +387,27 @@ mod tests {
                     decision,
                 } => {
                     self.iso = format!("consent{request_id}={decision:?}");
+                    Vec::new()
+                }
+                // #484/#528 domain pushes — reflect each into the view so a test
+                // can observe it arriving at `update`.
+                Input::CalendarUpcoming(events) => {
+                    self.iso = format!(
+                        "cal:{}",
+                        events
+                            .iter()
+                            .map(|e| e.title.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    Vec::new()
+                }
+                Input::SessionLocked(locked) => {
+                    self.iso = format!("locked={locked}");
+                    Vec::new()
+                }
+                Input::NowPlaying(np) => {
+                    self.iso = format!("np:{}|{}|{}", np.title, np.artist, np.playing);
                     Vec::new()
                 }
                 Input::SlotVisible(_) | Input::AudioSpectrum(_) => Vec::new(),
@@ -629,7 +673,10 @@ mod tests {
                 | Input::EffectResult { .. }
                 | Input::SlotVisible(_)
                 | Input::AudioSpectrum(_)
-                | Input::ConsentDecision { .. } => {}
+                | Input::ConsentDecision { .. }
+                | Input::CalendarUpcoming(_)
+                | Input::SessionLocked(_)
+                | Input::NowPlaying(_) => {}
             }
             Vec::new()
         }
@@ -1159,6 +1206,115 @@ mod tests {
                 "ConsentDecision reached update as Input::ConsentDecision",
             );
 
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::CalendarUpcoming`] push reaches `update` as
+    /// [`Input::CalendarUpcoming`] and re-renders — the digest caw's briefing and
+    /// the infobroker consume (#484).
+    #[tokio::test]
+    async fn calendar_upcoming_push_reaches_update_as_input() {
+        use hytte_plugin_proto::UpcomingEvent;
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            send(
+                &mut hwr,
+                &HostMsg::CalendarUpcoming {
+                    events: vec![
+                        UpcomingEvent {
+                            start_unix: 1,
+                            end_unix: 2,
+                            title: "standup".to_owned(),
+                            calendar: "Work".to_owned(),
+                        },
+                        UpcomingEvent {
+                            start_unix: 3,
+                            end_unix: 4,
+                            title: "lunch".to_owned(),
+                            calendar: "Personal".to_owned(),
+                        },
+                    ],
+                },
+            )
+            .await;
+            let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a calendar push must reach update() and re-render");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "cal:standup,lunch"),
+                "CalendarUpcoming reached update as Input::CalendarUpcoming",
+            );
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::SessionLocked`] push reaches `update` as
+    /// [`Input::SessionLocked`] and re-renders — the lock/unlock edge caw and the
+    /// infobroker key off (#484).
+    #[tokio::test]
+    async fn session_locked_push_reaches_update_as_input() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            send(&mut hwr, &HostMsg::SessionLocked { locked: true }).await;
+            let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a session-locked push must reach update() and re-render");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "locked=true"),
+                "SessionLocked reached update as Input::SessionLocked",
+            );
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// A host [`HostMsg::NowPlaying`] push reaches `update` as
+    /// [`Input::NowPlaying`] and re-renders — the track digest the audio widget's
+    /// marquee consumes (#528).
+    #[tokio::test]
+    async fn now_playing_push_reaches_update_as_input() {
+        use hytte_plugin_proto::NowPlaying;
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            send(
+                &mut hwr,
+                &HostMsg::NowPlaying {
+                    now_playing: NowPlaying {
+                        title: "Chrome Rain".to_owned(),
+                        artist: "Choom".to_owned(),
+                        playing: true,
+                    },
+                },
+            )
+            .await;
+            let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a now-playing push must reach update() and re-render");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "np:Chrome Rain|Choom|true"),
+                "NowPlaying reached update as Input::NowPlaying",
+            );
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 

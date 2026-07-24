@@ -65,7 +65,9 @@ pub type NodeId = String;
 /// Orientation for a [`Node::Box`], mapped to `gtk::Orientation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
+    /// Lay children out left-to-right (`gtk::Orientation::Horizontal`).
     Horizontal,
+    /// Lay children out top-to-bottom (`gtk::Orientation::Vertical`).
     Vertical,
 }
 
@@ -78,14 +80,22 @@ pub enum EventKind {
     Click,
     /// A [`Node::Box`] with `scroll: true` was scrolled. `dx`/`dy` are the
     /// raw GTK scroll deltas.
-    Scroll { dx: f64, dy: f64 },
+    Scroll {
+        /// Horizontal scroll delta.
+        dx: f64,
+        /// Vertical scroll delta.
+        dy: f64,
+    },
     /// A [`Node::Slider`] was moved by the user (drag / scroll / keyboard).
     /// `value` is its new position, clamped to the slider's `min..=max`. Emitted
     /// on a trailing-edge throttle (never one per raw motion tick) and **only**
     /// for user-driven changes — a programmatic re-render that moves the thumb
     /// does not fire it (the reconciler wires `change-value`, not
     /// `value-changed`; see [`attach_slider`]).
-    ValueChanged { value: f64 },
+    ValueChanged {
+        /// The slider's new position, clamped to its `min..=max`.
+        value: f64,
+    },
     /// A [`Node::Entry`]'s text was submitted (the user pressed
     /// Enter/activate); `text` is the entry's full contents at that moment.
     /// Fired **only** for the user's activate — a programmatic `set_text`
@@ -93,7 +103,10 @@ pub enum EventKind {
     /// re-enter the event path (the entry analogue of the slider's
     /// `change-value` wiring). No per-keystroke event exists (v1 — see the
     /// wire vocab's rationale).
-    Submitted { text: String },
+    Submitted {
+        /// The entry's full contents at submit time.
+        text: String,
+    },
 }
 
 /// The closed widget vocabulary. A plugin tree is a single root `Node`.
@@ -107,32 +120,47 @@ pub enum Node {
     /// target (an `EventControllerScroll` forwarding raw deltas via
     /// [`EventKind::Scroll`]).
     Box {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Child layout orientation.
         dir: Dir,
+        /// Inter-child gap in pixels.
         spacing: i32,
+        /// Make the box a scroll event target (emits [`EventKind::Scroll`]).
         scroll: bool,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Child nodes, diffed by key/position.
         children: Vec<Node>,
     },
     /// A list **row** — a horizontal `gtk::Box` sibling of [`Node::Box`] for
     /// list-y cards. Children are diffed exactly like a `Box`'s.
     Row {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Child nodes, diffed by key/position.
         children: Vec<Node>,
     },
     /// A vertical list **container** stacking its children (typically
     /// [`Node::Row`]s). Materialized as a vertical `gtk::Box`; children diff
     /// like a `Box`'s.
     ListBox {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Child nodes (typically [`Node::Row`]s), diffed by key/position.
         children: Vec<Node>,
     },
     /// A `gtk::Label`.
     Label {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Label text (mutable prop: updated in place on a same-id re-render).
         text: String,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A **wrapping** `gtk::Label` (word/char wrap): unlike [`Node::Label`] its
@@ -144,16 +172,27 @@ pub enum Node {
     /// departures-row look. `text`, `max_width_chars`, and `ellipsize` all update
     /// in place (a same-id re-render flips the flow mode without a rebuild).
     Text {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Label text (mutable prop: updated in place on a same-id re-render).
         text: String,
+        /// Cap on the natural width (`set_max_width_chars`); `None` leaves the
+        /// wrap bounded by the container.
         max_width_chars: Option<i32>,
+        /// Run single-line and truncate with a trailing ellipsis instead of
+        /// wrapping (mutable prop).
         ellipsize: bool,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A `gtk::Image` set from a themed icon `name`.
     Icon {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Themed icon name (mutable prop: swapped in place on a same-id
+        /// re-render).
         name: String,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A raster image: a `width`×`height` block of **RGBA8** pixels
@@ -169,23 +208,36 @@ pub enum Node {
     /// widget is panic-safe); the upstream host validates and warns, and also
     /// clamps an absurd `scale` before it reaches this node.
     Pixels {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Buffer width in pixels.
         width: u32,
+        /// Buffer height in pixels.
         height: u32,
+        /// Row-major RGBA8 pixels, `width * height * 4` bytes (mutable prop).
         data: Vec<u8>,
+        /// Integer upscale hint (`0` means `1`); natural size becomes
+        /// `width*scale` × `height*scale` (mutable prop).
         scale: u32,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
+        /// **Required** diff key and [`EventKind::Click`] target.
         id: NodeId,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// The button's single child node (its label/content).
         child: Box<Node>,
     },
     /// A `gtk::ProgressBar`, `fraction` in `0.0..=1.0`.
     Progress {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Fill fraction in `0.0..=1.0` (mutable prop).
         fraction: f64,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// An interactive horizontal `gtk::Scale` — the writable counterpart to
@@ -205,22 +257,35 @@ pub enum Node {
     /// taking input (so an insensitive slider fires no [`EventKind::ValueChanged`]).
     /// A mutable prop — a same-id re-render flips sensitivity in place.
     Slider {
+        /// **Required** diff key and [`EventKind::ValueChanged`] target.
         id: NodeId,
+        /// Range lower bound.
         min: f64,
+        /// Range upper bound.
         max: f64,
+        /// Current position (mutable prop; suppressed while the user drags).
         value: f64,
+        /// Keyboard/scroll increment.
         step: f64,
+        /// Whether the scale accepts input (`set_sensitive`; mutable prop).
         enabled: bool,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A `gtk::Revealer`; `open` drives `set_reveal_child`.
     Revealer {
+        /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
+        /// Whether the child is revealed (`set_reveal_child`; mutable prop).
         open: bool,
+        /// The revealer's single child node.
         child: Box<Node>,
     },
     /// A `gtk::Separator`.
-    Separator { classes: Vec<String> },
+    Separator {
+        /// GTK CSS classes applied verbatim (`add_css_class`).
+        classes: Vec<String>,
+    },
     /// An **expanding gap**: an empty, style-less `gtk::Box` with `hexpand` and
     /// `vexpand` set, so it soaks up a container's slack and justifies its
     /// siblings (`Label + Spacer + Label` right-pins the trailing label in a
@@ -240,10 +305,16 @@ pub enum Node {
     /// (`pan-end` ⇄ `pan-down`) in place without a rebuild. `id` is **required** —
     /// it is the click target.
     Expander {
+        /// **Required** diff key and header-click [`EventKind::Click`] target.
         id: NodeId,
+        /// The always-visible header node (wrapped in the clickable button).
         header: Box<Node>,
+        /// Body nodes revealed when expanded, stacked vertically.
         children: Vec<Node>,
+        /// Whether the body is revealed (mutable prop; the plugin owns the
+        /// toggle).
         expanded: bool,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
     /// A single-line text input — a `gtk::Entry` (#357). `id` is **required**
@@ -260,9 +331,14 @@ pub enum Node {
     /// wired on GTK's `activate` (user-only; a programmatic `set_text` never
     /// fires it), so there is no echo/feedback loop to break.
     Entry {
+        /// **Required** diff key and [`EventKind::Submitted`] target.
         id: NodeId,
+        /// Echo prop: applied on build and on update only when it changed
+        /// since the last render, so in-progress typing is never clobbered.
         text: String,
+        /// Greyed empty-state hint (`""` for none; mutable prop).
         placeholder: String,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
 }

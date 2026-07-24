@@ -52,6 +52,8 @@ pub enum Position {
     Right,
 }
 
+/// Builder for a [`Popup`]. Start from [`Popup::new`], set the child /
+/// position / dismissal behaviour, then [`PopupBuilder::build`].
 pub struct PopupBuilder {
     anchor: gtk::Widget,
     child: Option<gtk::Widget>,
@@ -63,24 +65,29 @@ pub struct PopupBuilder {
 }
 
 impl PopupBuilder {
+    /// Set the popover's content widget.
     #[must_use]
     pub fn child(mut self, child: impl IsA<gtk::Widget>) -> Self {
         self.child = Some(child.upcast());
         self
     }
 
+    /// Choose which side of the anchor the popover points from
+    /// (default [`Position::Bottom`]).
     #[must_use]
     pub fn position(mut self, position: Position) -> Self {
         self.position = position;
         self
     }
 
+    /// Toggle the popover's pointing arrow (off by default).
     #[must_use]
     pub fn has_arrow(mut self, on: bool) -> Self {
         self.has_arrow = on;
         self
     }
 
+    /// Add an extra CSS class alongside the built-in `hytte-popup`.
     #[must_use]
     pub fn css_class(mut self, class: impl Into<String>) -> Self {
         self.css_class = Some(class.into());
@@ -148,6 +155,8 @@ pub struct Popup {
 }
 
 impl Popup {
+    /// Start building a popover parented to `anchor` (it positions itself
+    /// relative to the anchor's allocation).
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
     pub fn new(anchor: &impl IsA<gtk::Widget>) -> PopupBuilder {
@@ -162,14 +171,17 @@ impl Popup {
         }
     }
 
+    /// Present the popover.
     pub fn show(&self) {
         self.popover.popup();
     }
 
+    /// Dismiss the popover.
     pub fn hide(&self) {
         self.popover.popdown();
     }
 
+    /// Present the popover if hidden, dismiss it if shown.
     pub fn toggle(&self) {
         if self.popover.is_visible() {
             self.popover.popdown();

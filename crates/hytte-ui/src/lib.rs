@@ -1,4 +1,5 @@
 //! GTK4 + libadwaita + gtk4-layer-shell window primitives.
+#![warn(missing_docs)]
 
 mod app;
 mod bar;

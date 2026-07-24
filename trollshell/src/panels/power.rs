@@ -5,6 +5,7 @@ use hytte::adw::{self, prelude::*};
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::brightness;
+use hytte::services::fullscreen_inhibit;
 use hytte::services::screensaver::{self, Inhibitor};
 use hytte::services::upower::{self, Battery, BatteryState};
 
@@ -76,7 +77,35 @@ fn build_keep_awake_row() -> gtk::ListBox {
     });
 
     list.append(&row);
+    list.append(&build_fullscreen_inhibit_row());
     list
+}
+
+/// "Keep awake when fullscreen" policy toggle (#404): an `adw::SwitchRow`
+/// bound to the authoritative `fullscreen_inhibit::enabled()` flag (default
+/// ON, persisted). While it's on, the shell holds a logind idle inhibitor for
+/// as long as a window is genuinely fullscreen (movie/game/presentation), so
+/// the native idle manager skips dim/lock/suspend — an automatic sibling of
+/// the manual caffeine switch above. Turning it off lets fullscreen windows
+/// dim/lock as normal (well-behaved players like mpv/Firefox still self-inhibit
+/// on their own).
+fn build_fullscreen_inhibit_row() -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title("Keep awake when fullscreen")
+        .subtitle("Hold off dim/lock while a window is fullscreen")
+        .build();
+
+    // Two-way, same shape as the caffeine row: the authoritative signal drives
+    // `active` (block guards re-entry); a user flip calls set_enabled, which is
+    // idempotent so mirrored state can't thrash the policy or its fd.
+    bind_two_way(
+        fullscreen_inhibit::enabled(),
+        &row,
+        adw::SwitchRow::set_active,
+        |r| r.connect_active_notify(|r| fullscreen_inhibit::set_enabled(r.is_active())),
+    );
+
+    row
 }
 
 /// Build the "Keep awake" subtitle from the external inhibitors: a deduped

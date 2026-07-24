@@ -14,6 +14,7 @@ pub mod display_config;
 pub mod displays;
 pub mod dnd;
 mod eds_retry;
+pub mod fullscreen_inhibit;
 pub mod geoclue;
 pub mod hooks;
 pub mod idle_notify;

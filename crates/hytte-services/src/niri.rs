@@ -404,6 +404,76 @@ fn has_edge_window(
     })
 }
 
+/// Signal: `true` when the active (visible) workspace on `connector` contains
+/// a window that is **fullscreen** — its tile spans the full output in *both*
+/// dimensions (within [`EDGE_TOL`]).
+///
+/// Distinct from [`edge_window_on`], which is width-only and therefore also
+/// fires for niri's `MaximizeWindowToEdges` and edge-stretched floating
+/// windows. Fullscreen additionally covers the full *height* — including the
+/// area the bar's exclusive zone reserves (a niri fullscreen window ignores
+/// layer-shell exclusive zones and covers the whole output), whereas a
+/// maximize-to-edges window stops at the bar and so is ~one bar-height short.
+/// That height check is what tells the two apart. This is the signal the
+/// fullscreen idle-inhibitor rides (#404): "don't dim/lock/suspend while a
+/// movie/game/presentation is genuinely fullscreen", *not* while an ordinary
+/// window happens to be maximized.
+///
+/// Scoped to the **active** workspace on `connector` (the one currently
+/// visible on that output), so a fullscreen window scrolled off onto a
+/// non-active workspace doesn't count. A disabled output never has a live
+/// `Monitor` to feed this, so it's excluded structurally by the caller.
+///
+/// `mon_size` is a *signal* of the output's logical `(width, height)`, not a
+/// snapshot — feed it a live source (e.g.
+/// `monitor.size_changed().map(|(w, h)| (f64::from(w), f64::from(h)))`) so a
+/// resolution/mode switch (kanshi profile change, #442) re-evaluates the
+/// threshold rather than leaving it stale.
+pub fn fullscreen_window_on(
+    connector: String,
+    mon_size: impl Signal<Item = (f64, f64)> + 'static,
+) -> impl Signal<Item = bool> {
+    use futures_signals::map_ref;
+    let workspaces = workspaces();
+    let windows = windows();
+    map_ref! {
+        let ws = workspaces,
+        let w = windows,
+        let sz = mon_size =>
+        has_fullscreen_window(ws, w, &connector, sz.0, sz.1)
+    }
+}
+
+/// Pure predicate behind [`fullscreen_window_on`]. Returns `true` when the
+/// active workspace on `connector` contains any window whose tile spans the
+/// full output in **both** width and height (each within [`EDGE_TOL`]).
+///
+/// The height term is the discriminator against maximize-to-edges: a
+/// fullscreen tile is `(mon_w, mon_h)`; a maximize-to-edges tile is
+/// `(mon_w, mon_h - bar_zone)` — short by the bar's exclusive zone (tens of
+/// logical px, far larger than [`EDGE_TOL`]), so it fails the height check.
+/// The `>=` comparisons are robust against fractional-scale rounding: a tile
+/// can never *exceed* the output size in practice.
+fn has_fullscreen_window(
+    workspaces: &[Workspace],
+    windows: &[Window],
+    connector: &str,
+    mon_w: f64,
+    mon_h: f64,
+) -> bool {
+    let active_id = workspaces
+        .iter()
+        .find(|ws| ws.output.as_deref() == Some(connector) && ws.is_active)
+        .map(|ws| ws.id);
+    active_id.is_some_and(|id| {
+        windows.iter().any(|w| {
+            w.workspace_id == Some(id)
+                && w.layout.tile_size.0 >= mon_w - EDGE_TOL
+                && w.layout.tile_size.1 >= mon_h - EDGE_TOL
+        })
+    })
+}
+
 /// Focus the workspace with the given id (fire-and-forget).
 pub fn focus_workspace(id: u64) {
     send_action(Action::FocusWorkspace {
@@ -553,6 +623,72 @@ mod tests {
         let ws = vec![mk_workspace(1, CONNECTOR, true)];
         let w = vec![mk_window(10, 1, (MON_W - 2.0, MON_H - BAR_H))];
         assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W));
+    }
+
+    #[test]
+    fn has_fullscreen_window_fullscreen() {
+        // A genuinely fullscreen window: tile spans the whole output in both
+        // dimensions (covering the bar's exclusive zone too).
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_fullscreen_window_maximize_to_edges_is_not_fullscreen() {
+        // The key discriminator vs. `has_edge_window`: maximize-to-edges spans
+        // the full WIDTH but stops one bar-height short of full HEIGHT (the bar
+        // keeps its exclusive zone), so it is NOT treated as fullscreen — an
+        // ordinary maximized window must not pin the idle inhibitor.
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H - BAR_H))];
+        assert!(has_edge_window(&ws, &w, CONNECTOR, MON_W)); // width-only: yes
+        assert!(!has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H)); // both: no
+    }
+
+    #[test]
+    fn has_fullscreen_window_normal_tiled_false() {
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W - 200.0, MON_H - BAR_H - 8.0))];
+        assert!(!has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_fullscreen_window_within_tolerance() {
+        // Fractional-scale rounding can put the tile a hair under the output
+        // size in either dimension; EDGE_TOL (4.0) slack keeps it fullscreen.
+        let ws = vec![mk_workspace(1, CONNECTOR, true)];
+        let w = vec![mk_window(10, 1, (MON_W - 2.0, MON_H - 2.0))];
+        assert!(has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_fullscreen_window_other_workspace_ignored() {
+        // Fullscreen window sits on an inactive (scrolled-off) workspace — not
+        // visible, so it must not count.
+        let ws = vec![
+            mk_workspace(1, CONNECTOR, true),
+            mk_workspace(2, CONNECTOR, false),
+        ];
+        let w = vec![
+            mk_window(10, 1, (MON_W - 200.0, MON_H - BAR_H - 8.0)),
+            mk_window(20, 2, (MON_W, MON_H)),
+        ];
+        assert!(!has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_fullscreen_window_other_output_ignored() {
+        let ws = vec![mk_workspace(1, "HDMI-A-1", true)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(!has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
+    }
+
+    #[test]
+    fn has_fullscreen_window_no_active_workspace() {
+        let ws = vec![mk_workspace(1, CONNECTOR, false)];
+        let w = vec![mk_window(10, 1, (MON_W, MON_H))];
+        assert!(!has_fullscreen_window(&ws, &w, CONNECTOR, MON_W, MON_H));
     }
 
     fn mk_layout(tile: (f64, f64)) -> WindowLayout {

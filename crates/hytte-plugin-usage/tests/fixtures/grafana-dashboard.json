@@ -1,0 +1,20 @@
+{
+  "meta": { "publicDashboardAccessToken": "abc123" },
+  "dashboard": {
+    "uid": "claude-usage",
+    "title": "Claude usage",
+    "panels": [
+      {
+        "id": 1,
+        "type": "row",
+        "title": "Spend",
+        "collapsed": false,
+        "panels": [
+          { "id": 4, "type": "stat", "title": "Cost this window" }
+        ]
+      },
+      { "id": 2, "type": "timeseries", "title": "Cost over time" },
+      { "id": 3, "type": "text", "title": "Notes" }
+    ]
+  }
+}

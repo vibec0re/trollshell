@@ -19,6 +19,7 @@ members = [
   "crates/hytte-plugin-caw",
   "crates/hytte-plugin-departures",
   "crates/hytte-plugin-weather",
+  "crates/hytte-plugin-usage",
   "crates/hytte-plugin-infobroker",
   "crates/trollshell-control-center",
   "trollshell",

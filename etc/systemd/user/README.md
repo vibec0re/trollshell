@@ -119,6 +119,24 @@ poll-only-while-open energy behavior. The native board is gone — its widget
 mount and open-edge refresh wiring were removed in the #289 follow-up — so
 bringing up departures is just enabling this unit.
 
+`trollshell-plugin-usage.service` is the Claude usage-limits monitor (#320): a
+`SidebarTop` card that renders how much of a spend budget has been **burned
+within a window** as an accent-tinted gauge — a slow, **visibility-gated**
+`ureq` poll (60 s, parked while the sidebar is closed) of the exponentials
+Grafana **public dashboard**. The metric is honestly _spend_, not rolling
+rate-limit headroom (Claude Code's OTEL surface exports `claude_code.cost.usage`
+/ `token.usage`, not the `/usage` window percentages), so the card reads
+"burned ÷ a budget you set". **The dashboard URL is configuration, not a build
+input**: with none set the card renders a calm "no dashboard configured" empty
+state and makes zero network calls — set `TROLLSHELL_USAGE_DASHBOARD_URL` (the
+`…/public-dashboards/<token>` link, a secret kept in the unit) to go live.
+`TROLLSHELL_USAGE_BUDGET` is the optional gauge denominator; `_PANEL` pins the
+panel id (else the first value panel is discovered); `_WINDOW` sets the range
+(default `now-5h`). All four also read from `~/.config/trollshell/usage.toml`
+(`dashboard_url` / `budget` / `panel` / `window`) as an env fallback. Clicking
+the card opens its own drawer panel (the gauge + the window figures +
+last-updated). It links no GTK and asks the host for nothing but `OpenPage`.
+
 `trollshell-plugin-preem-demo.service` is the showcase for the
 `hytte_plugin::preem` raster kit (#356): a sidebar card cycling the retro
 display widgets — a 7-seg HH:MM clock, a dot-matrix ticker, and an 8-bit

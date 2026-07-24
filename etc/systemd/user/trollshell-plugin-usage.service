@@ -1,0 +1,34 @@
+[Unit]
+Description=trollshell Claude usage-limits monitor plugin (out-of-process, #320)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+# Mounts SidebarTop alongside the pet / weather / clock demo. Since #274 that
+# mount is a *region* holding N plugin cards (sorted by manifest `order`), so
+# they coexist — no `Conflicts=` needed. Usage requests order=-5, so it renders
+# near the top of the plugin region. Clicking the card opens its own drawer
+# panel (the gauge + the window figures + last-updated).
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hytte-plugin-usage
+# Configuration is env-first, falling back to ~/.config/trollshell/usage.toml.
+# With NO dashboard URL the card renders a calm "no dashboard configured"
+# empty state and makes zero network calls — set the URL to go live. The URL is
+# the exponentials Grafana public-dashboard link (…/public-dashboards/<token>);
+# it is a secret, so keep it here in the unit, never committed.
+#   Environment=TROLLSHELL_USAGE_DASHBOARD_URL=https://exponentials.vibec0re.mov/public-dashboards/<token>
+# The gauge denominator ("burned ÷ budget"). Optional — without it the card
+# shows the raw spend figure and no gauge.
+#   Environment=TROLLSHELL_USAGE_BUDGET=30
+# Pin the dashboard panel by numeric id (otherwise the first value panel is
+# discovered from the dashboard model). Optional.
+#   Environment=TROLLSHELL_USAGE_PANEL=2
+# The Grafana time-range the spend is summed over (default now-5h). Optional.
+#   Environment=TROLLSHELL_USAGE_WINDOW=now-5h
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target

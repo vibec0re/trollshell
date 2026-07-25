@@ -5,11 +5,22 @@
 //! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
 //! per second, a **scrolling marquee** panning a pixel window across a
 //! pre-rendered strip, and an **8bit textbox**, all rotating VFD → LCD → OLED
-//! every [`STYLE_SECS`] seconds. Below them an **audio scope tile** (#405/#397)
-//! draws a 16-bar spectrum straight off the `AudioSpectrum` push, so the card
-//! reacts to whatever is playing. Tapping the clock advances the skin
-//! immediately. It doubles as the kit's visual regression harness and the
-//! copy-from reference for plugin authors.
+//! every [`STYLE_SECS`] seconds. Below them a real **oscilloscope**
+//! ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum` push as a
+//! glow-trace waveform over a graticule, with real phosphor decay — a silent
+//! sink flatlines on the axis while the old trail keeps ghosting. Tapping the
+//! clock advances the skin immediately. It doubles as the kit's visual
+//! regression harness and the copy-from reference for plugin authors.
+//!
+//! # The scope is the card's one stateful widget
+//!
+//! Every other widget is a pure function of the snapshot, but the scope carries
+//! a phosphor buffer across frames, so it lives in the model: each host
+//! heartbeat (the ~1 Hz `Clock` snapshot) [`advance`](Scope::advance)s it one
+//! sweep with the latest bands, and `view` [`render`](Scope::render)s the
+//! current trace. A frame-timer plugin would advance per frame for a fast
+//! sweep; at the demo's 1 Hz heartbeat the lush decay is on full display (you
+//! watch the ghost linger for several seconds).
 //!
 //! # Shape — The Elm Architecture, purely host-driven
 //!
@@ -26,10 +37,10 @@
 //! Every widget is sized via its **buffer dimensions** (a `Pixels` node's
 //! natural size), not shell CSS: the 7seg clock renders 188 px wide, the
 //! 11-char ticker 268 px, the marquee window [`MARQUEE_WINDOW_PX`] wide, the
-//! 22-column ×2 textbox 274 px — all inside the sidebar card's ~296 px content
-//! width.
+//! 22-column ×2 textbox 274 px, and the scope's default 288 px — all inside the
+//! sidebar card's ~296 px content width.
 
-use hytte_plugin::preem::{DisplayStyle, Frame, Marquee, Rgba, TextBox, dot_matrix, seven_seg};
+use hytte_plugin::preem::{DisplayStyle, Marquee, Scope, TextBox, dot_matrix, seven_seg};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
@@ -44,17 +55,6 @@ const TICKER_ID: &str = "preem-demo-ticker";
 const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
 const SCOPE_ID: &str = "preem-demo-scope";
-
-/// The audio-spectrum scope tile (#405/#397): a 16-bar spectrum drawn from the
-/// [`StateKey::AudioSpectrum`] push. Dimensions fit the ~296 px sidebar card.
-const SCOPE_W: usize = 268;
-const SCOPE_H: usize = 44;
-/// Pixels of horizontal gap between adjacent bars.
-const SCOPE_GAP: usize = 2;
-/// Scope backdrop, bar fill, and the bright cap that tops each bar.
-const SCOPE_BG: Rgba = [0x08, 0x0a, 0x10, 0xff];
-const SCOPE_BAR: Rgba = [0x6d, 0xf0, 0xc0, 0xff];
-const SCOPE_CAP: Rgba = [0xff, 0xff, 0xff, 0xff];
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
@@ -93,41 +93,13 @@ struct PreemDemo {
     /// Click offset into the skin rotation (tapping the clock bumps it).
     style_bump: u32,
     /// Latest 16-band audio spectrum off the default sink's monitor (#405),
-    /// drawn by the scope tile. All-zero until the first push lands (a flat
-    /// baseline), so the tile shows even on a silent desktop.
+    /// swept by the scope. All-zero until the first push lands (a flat
+    /// baseline), so the trace shows even on a silent desktop.
     bins: [f32; SPECTRUM_BINS],
-}
-
-/// Render the 16-band spectrum as a bar tile via the preem [`Frame`] primitives
-/// — the #397 oscilloscope/spectrum tile in minimal form, proving audio → bars
-/// end to end. Each bar's height tracks its band magnitude and carries a bright
-/// cap; a silent band still draws a 1 px baseline so the tile always reads.
-// All coordinates/dimensions here are small compile-time-bounded constants
-// (`SCOPE_W`/`SCOPE_H` ≤ 268) or a band count, so the usize→i32/f32 casts can
-// neither wrap, truncate, nor lose precision.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
-fn scope_tile(bins: &[f32; SPECTRUM_BINS]) -> Frame {
-    let mut frame = Frame::filled(SCOPE_W, SCOPE_H, SCOPE_BG);
-    let bar_w = (SCOPE_W - SCOPE_GAP * (SPECTRUM_BINS - 1)) / SPECTRUM_BINS;
-    let max_h = SCOPE_H - 2;
-    for (i, &v) in bins.iter().enumerate() {
-        let x = (i * (bar_w + SCOPE_GAP)) as i32;
-        let h = (v.clamp(0.0, 1.0) * max_h as f32).round() as usize;
-        if h == 0 {
-            // A 1 px floor so silent bands still read as a baseline.
-            frame.rect(x, (SCOPE_H - 1) as i32, bar_w as i32, 1, SCOPE_BAR);
-            continue;
-        }
-        let y = (SCOPE_H - h) as i32;
-        frame.rect(x, y, bar_w as i32, h as i32, SCOPE_BAR);
-        frame.rect(x, y, bar_w as i32, 1, SCOPE_CAP);
-    }
-    frame
+    /// The oscilloscope (#556): a stateful widget carrying its phosphor buffer
+    /// across frames. Advanced one sweep per host heartbeat with [`Self::bins`],
+    /// rendered by `view` in the current skin.
+    scope: Scope,
 }
 
 /// The `HH:MM` slice of an RFC 3339 local timestamp
@@ -203,6 +175,7 @@ impl Plugin for PreemDemo {
             unix: 0,
             style_bump: 0,
             bins: [0.0; SPECTRUM_BINS],
+            scope: Scope::new(),
         }
     }
 
@@ -219,6 +192,10 @@ impl Plugin for PreemDemo {
                     }
                     self.unix = clock.unix;
                 }
+                // The heartbeat is the scope's sweep tick: advance the phosphor
+                // one frame with the latest bands (silence flatlines on the axis
+                // while the old trail decays — the honest ghost).
+                self.scope.advance(&self.bins);
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
@@ -227,7 +204,7 @@ impl Plugin for PreemDemo {
                 }
             }
             // The audio-spectrum push (#405): store the latest bands; the scope
-            // tile renders them on the next `view`.
+            // sweeps them on the next heartbeat tick.
             Input::AudioSpectrum(spectrum) => {
                 self.bins = spectrum.bins;
             }
@@ -249,9 +226,9 @@ impl Plugin for PreemDemo {
     }
 
     /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
-    /// marquee, the textbox — all wearing the same skin — the audio scope tile,
-    /// and a dim hint line. Every `Pixels` buffer satisfies the host's
-    /// `len == w * h * 4` invariant by kit construction.
+    /// marquee, the textbox — all wearing the same skin — the audio
+    /// oscilloscope, and a dim hint line. Every `Pixels` buffer satisfies the
+    /// host's `len == w * h * 4` invariant by kit construction.
     fn view(&self) -> View {
         let style = self.style();
         let clock = seven_seg(&self.hhmm, style);
@@ -264,7 +241,9 @@ impl Plugin for PreemDemo {
             .cols(TEXT_COLS)
             .scale(2)
             .render(&Self::textbox_line(style));
-        let scope = scope_tile(&self.bins);
+        // The scope carries its phosphor across frames; `advance` already ran on
+        // the heartbeat, so `view` just renders the current trace in this skin.
+        let scope = self.scope.render(style);
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -494,69 +473,54 @@ mod tests {
         }
     }
 
-    /// The audio-spectrum push updates the model's bands and the scope tile
-    /// visibly reacts — a loud band paints a taller bar than silence (#405).
+    /// The audio-spectrum push updates the model's bands, and a loud band bends
+    /// the scope trace off the axis versus silence (#405/#556).
     #[test]
     fn scope_reacts_to_audio_spectrum() {
-        let mut m = fresh();
-        // Silent baseline vs a single loud band → different pixels.
-        let quiet = super::scope_tile(&[0.0; super::SPECTRUM_BINS]);
+        use hytte_plugin::preem::{DisplayStyle, Scope};
+        // Silent baseline vs a single loud band → the trace renders differently.
+        let mut quiet = Scope::new();
+        quiet.advance(&[0.0; super::SPECTRUM_BINS]);
         let mut loud_bins = [0.0_f32; super::SPECTRUM_BINS];
         loud_bins[8] = 1.0;
-        let loud = super::scope_tile(&loud_bins);
-        assert_ne!(quiet.data(), loud.data(), "a loud band paints a taller bar");
-        assert_eq!(loud.width(), super::SCOPE_W);
-        assert_eq!(loud.height(), super::SCOPE_H);
+        let mut loud = Scope::new();
+        loud.advance(&loud_bins);
+        assert_ne!(
+            quiet.render(DisplayStyle::Vfd),
+            loud.render(DisplayStyle::Vfd),
+            "a loud band bends the trace"
+        );
 
-        // The push folds into the model, so the next view draws those bands.
+        // The push folds into the model, so the next heartbeat sweeps those bands.
+        let mut m = fresh();
         let fx = m.update(spectrum(loud_bins));
         assert!(fx.is_empty(), "the demo asks nothing of the shell");
         assert!((m.bins[8] - 1.0).abs() < 1e-6, "band 8 stored");
         assert!(m.bins[0].abs() < 1e-6, "quiet bands stay low");
     }
 
-    /// Known input → expected bar height: the scope maps a band level linearly
-    /// onto the tile's drawable height, so `1.0` fills it, `0.5` is about half,
-    /// and it is monotone (#504 — the tap now emits dB levels that use this
-    /// full range instead of hugging the baseline).
+    /// The scope sweeps on the host heartbeat and ghosts honestly when the sink
+    /// goes silent: the old trace decays across ticks rather than snapping to
+    /// black or freezing (the #556 phosphor showcase). Compares the scope
+    /// buffer directly so the marquee's own scroll doesn't confound it.
     #[test]
-    fn scope_bar_height_tracks_level() {
-        use super::{SCOPE_BG, SCOPE_GAP, SCOPE_H, SCOPE_W, SPECTRUM_BINS, scope_tile};
-        // Fill height of the first bar's centre column: rows that aren't backdrop.
-        fn bar0_height(level: f32) -> usize {
-            let mut bins = [0.0_f32; SPECTRUM_BINS];
-            bins[0] = level;
-            let frame = scope_tile(&bins);
-            let bar_w = (SCOPE_W - SCOPE_GAP * (SPECTRUM_BINS - 1)) / SPECTRUM_BINS;
-            let x = bar_w / 2;
-            let w = frame.width();
-            let data = frame.data();
-            (0..frame.height())
-                .filter(|&y| {
-                    let i = (y * w + x) * 4;
-                    data[i..i + 4] != SCOPE_BG
-                })
-                .count()
-        }
-        let max_h = SCOPE_H - 2;
-        assert_eq!(
-            bar0_height(1.0),
-            max_h,
-            "a full level fills the drawable height"
-        );
-        assert!(
-            bar0_height(0.5).abs_diff(max_h / 2) <= 1,
-            "half a level is about half height"
-        );
-        assert!(
-            bar0_height(0.25) < bar0_height(0.5) && bar0_height(0.5) < bar0_height(1.0),
-            "height is monotone in level"
-        );
-        assert_eq!(
-            bar0_height(0.0),
-            1,
-            "a silent band still draws a 1 px baseline"
-        );
+    fn scope_sweeps_on_the_heartbeat_with_a_decay_ghost() {
+        use hytte_plugin::preem::DisplayStyle;
+        let mut m = fresh();
+        // A loud band, then the heartbeat draws it.
+        let mut loud = [0.0_f32; super::SPECTRUM_BINS];
+        loud[2] = 1.0;
+        let _ = m.update(spectrum(loud));
+        let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", 1));
+        let lit = m.scope.render(DisplayStyle::Vfd);
+        // Silence: the heartbeat keeps sweeping and the loud trail decays.
+        let _ = m.update(spectrum([0.0; super::SPECTRUM_BINS]));
+        let _ = m.update(snapshot("2026-07-16T00:00:01+02:00", 2));
+        let ghost = m.scope.render(DisplayStyle::Vfd);
+        assert_ne!(ghost, lit, "silence decays the loud trace to a ghost");
+        let _ = m.update(snapshot("2026-07-16T00:00:02+02:00", 3));
+        let ghost2 = m.scope.render(DisplayStyle::Vfd);
+        assert_ne!(ghost2, ghost, "the ghost keeps fading each heartbeat");
     }
 
     /// The manifest opts into both the clock heartbeat and the audio spectrum.

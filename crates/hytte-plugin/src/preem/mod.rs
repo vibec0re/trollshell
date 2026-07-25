@@ -27,6 +27,9 @@
 //! - [`LedStrip`] — a row of discrete LEDs lighting with a `0.0..=1.0` level,
 //!   topped by a peak-hold dot that floats and decays ([`PeakHold`]) — the VU
 //!   meter (#506).
+//! - [`Scope`] — a glow-trace oscilloscope over a graticule, with real
+//!   phosphor persistence: the beam trail decays exponentially across frames
+//!   rather than redrawing from black (#556, a #397 skin).
 //!
 //! `hytte-plugin-preem-demo` is the reference consumer: one sidebar card
 //! cycling every widget through every style; `hytte-plugin-audio-widget` is the
@@ -68,6 +71,7 @@ mod dot_matrix;
 mod frame;
 mod led_strip;
 mod marquee;
+mod scope;
 mod seven_seg;
 mod style;
 mod textbox;
@@ -76,6 +80,7 @@ pub use dot_matrix::dot_matrix;
 pub use frame::{Frame, Rgba};
 pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};
+pub use scope::Scope;
 pub use seven_seg::seven_seg;
 pub use style::DisplayStyle;
 pub use textbox::TextBox;

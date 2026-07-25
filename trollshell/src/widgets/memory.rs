@@ -5,11 +5,17 @@ use hytte::services::sensors;
 use crate::components::cast;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
+    let monitor_for_scroll = monitor.clone();
     let btn = crate::components::chip::indicator_scroll(
         "ts-memory",
         crate::modal::Page::Stats,
         monitor,
-        || crate::panels::stats::set_scroll_target(crate::panels::stats::StatsSection::Memory),
+        move || {
+            crate::panels::stats::set_scroll_target(
+                &monitor_for_scroll,
+                crate::panels::stats::StatsSection::Memory,
+            );
+        },
     );
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);

@@ -5,8 +5,9 @@
 //! carries a [`Decision`]. Tokens — the ephemeral half — live only in memory
 //! ([`crate::tokens`]).
 //!
-//! Phase 1a only ever writes `always`/`deny` decisions (interactive
-//! `once`/`session` prompting is deferred to 1b), and `scope` is always
+//! Phase 1a only ever writes `always`/`deny` decisions (the interactive
+//! `once`/`session` prompting shipped in phase 1b (#514), but those decisions
+//! are ephemeral and never reach this durable store), and `scope` is always
 //! [`SCOPE_ALL`] — the field exists so a finer scope (a specific station, a
 //! read-vs-subscribe split) is additive later without a schema break.
 //!

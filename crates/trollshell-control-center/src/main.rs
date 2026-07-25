@@ -48,7 +48,7 @@ fn main() -> glib::ExitCode {
 fn build_window(app: &adw::Application) {
     let stack = adw::ViewStack::new();
     // The Plugins tab (#348): start/stop/enable each plugin's systemd user unit.
-    let plugins_page = build_plugins_page();
+    let (plugins_page, plugins_poll) = build_plugins_page();
     stack.add_titled_with_icon(
         &plugins_page,
         Some("plugins"),
@@ -103,6 +103,19 @@ fn build_window(app: &adw::Application) {
         .default_height(560)
         .content(&toolbar)
         .build();
+
+    // The Plugins tab's 2 s poll timer is scoped to this window: drop it on
+    // close so a dismissed window stops polling `Control`, and a re-launch while
+    // another window is still resident can't leave the first window's timer
+    // double-polling behind it (#542). Wrapped in a cell + `.take()` so the
+    // one-shot removal is clean under the `Fn` close handler.
+    let plugins_poll = RefCell::new(Some(plugins_poll));
+    window.connect_close_request(move |_| {
+        if let Some(source) = plugins_poll.borrow_mut().take() {
+            source.remove();
+        }
+        glib::Propagation::Proceed
+    });
 
     check_shell_connection(&banner);
     window.present();
@@ -318,7 +331,7 @@ struct PluginsState {
 /// connected-but-idle, and the diagnostic case a unit list alone can't:
 /// active-but-never-connected (crashed after start). A poll timer keeps the
 /// badges live.
-fn build_plugins_page() -> adw::PreferencesPage {
+fn build_plugins_page() -> (adw::PreferencesPage, glib::SourceId) {
     let page = adw::PreferencesPage::new();
     let group = adw::PreferencesGroup::builder()
         .title("Plugins")
@@ -343,15 +356,17 @@ fn build_plugins_page() -> adw::PreferencesPage {
 
     // Live overlay (#423): poll on an interval so the badges track reality
     // without the user reopening the tab. `refresh_plugins` updates in place
-    // while the plugin set is unchanged, so a steady set never flickers.
-    {
+    // while the plugin set is unchanged, so a steady set never flickers. The
+    // caller ties the returned `SourceId` to the window so the timer dies with
+    // it (#542) rather than polling `Control` forever after the window closes.
+    let poll = {
         let state = state.clone();
         glib::timeout_add_local(PLUGIN_POLL_INTERVAL, move || {
             refresh_plugins(&state);
             glib::ControlFlow::Continue
-        });
-    }
-    page
+        })
+    };
+    (page, poll)
 }
 
 /// Re-read the unit list (`ListPlugins`) plus the runtime overlay

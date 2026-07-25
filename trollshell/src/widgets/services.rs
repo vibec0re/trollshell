@@ -10,11 +10,17 @@ use hytte::services::systemd;
 /// mirroring the swap-row / GPU-card self-hide convention so the bar stays
 /// quiet until it has something to report.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
+    let monitor_for_scroll = monitor.clone();
     let btn = crate::components::chip::indicator_scroll(
         "ts-services",
         crate::modal::Page::Stats,
         monitor,
-        || crate::panels::stats::set_scroll_target(crate::panels::stats::StatsSection::Services),
+        move || {
+            crate::panels::stats::set_scroll_target(
+                &monitor_for_scroll,
+                crate::panels::stats::StatsSection::Services,
+            );
+        },
     );
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);

@@ -25,6 +25,7 @@
 //!   `systemctl suspend` etc.).
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt as _;
@@ -120,9 +121,10 @@ static SESSION_LOCKED: OnceLock<Mutable<bool>> = OnceLock::new();
 /// **system** bus, tracked live via [`hytte_bus::property`] so an unlock (a
 /// swaylock `SetLockedHint(false)`, `loginctl unlock-session`) flips it back.
 ///
-/// Starts `false` (unlocked) and stays there if the session can't be resolved —
-/// the safe default for a shell in use (sensitive content shows, "first unlock"
-/// actions still fire). Lazily started on first call and shared across callers
+/// Starts `false` (unlocked) — the safe default for a shell in use (sensitive
+/// content shows, "first unlock" actions still fire) — and holds there until the
+/// session path resolves, which is retried with backoff rather than given up on
+/// after one transient miss (#542). Lazily started on first call and shared across callers
 /// (a single subscription, one `Mutable`), so pulling this repeatedly is cheap.
 ///
 /// The trollshell plugin host projects this onto the `SessionLocked` wire push so
@@ -153,10 +155,12 @@ fn locked_from_prop(state: &PropState<bool>) -> Option<bool> {
 /// `PropertiesChanged` — which logind emits on the real object path — actually
 /// reaches the subscription.
 async fn track_session_locked(writer: Mutable<bool>) {
-    let Some(path) = resolve_session_path().await else {
-        tracing::warn!("logind: could not resolve session path; LockedHint stays unlocked");
-        return;
-    };
+    // Resolve with backoff rather than giving up on the first miss: at session
+    // bring-up logind and the shell come up concurrently, so `GetSession` /
+    // `GetSessionByPID` can transiently fail before the session is registered. A
+    // one-shot resolve would then disable lock tracking for the rest of the
+    // session (fail-open = unlocked); retrying keeps it eventually correct (#542).
+    let path = resolve_session_path_with_retry().await;
     // Held for the loop's lifetime: dropping the last `PropertySignal` clone tears
     // the tracking task down, so this binding keeps it alive.
     let prop = hytte_bus::property::<bool>(BusKind::System, LOGIN1_DEST)
@@ -185,9 +189,48 @@ async fn resolve_session_path() -> Option<String> {
     match manager_object_path("GetSessionByPID", (0u32,)).await {
         Ok(path) => Some(path.as_str().to_owned()),
         Err(e) => {
-            tracing::warn!(error = %e, "logind: could not resolve the session path");
+            // The retry wrapper owns the user-facing cadence, so keep the
+            // per-attempt detail at debug — a retry loop must not spam warn (#542).
+            tracing::debug!(error = %e, "logind: GetSessionByPID failed");
             None
         }
+    }
+}
+
+/// Resolve the concrete session path, retrying with capped exponential backoff
+/// until it succeeds (#542). A transient startup miss (logind slow to answer, the
+/// session not yet registered) must not permanently disable lock tracking, so
+/// this keeps trying — 1 s → 2 s → … → 30 s cap — rather than falling back to
+/// "unlocked forever". Mirrors the calendar/idle services' init-retry idiom.
+async fn resolve_session_path_with_retry() -> String {
+    const BACKOFF_START: Duration = Duration::from_secs(1);
+    const BACKOFF_CAP: Duration = Duration::from_secs(30);
+    let mut backoff = BACKOFF_START;
+    let mut attempts = 0u32;
+    loop {
+        if let Some(path) = resolve_session_path().await {
+            if attempts > 0 {
+                tracing::info!(attempts, "logind: session path resolved after retries");
+            }
+            return path;
+        }
+        attempts = attempts.saturating_add(1);
+        // First miss at warn for visibility; the rest at debug so a machine where
+        // logind never answers doesn't fill the journal.
+        if attempts == 1 {
+            tracing::warn!(
+                retry_in_s = backoff.as_secs(),
+                "logind: could not resolve session path; retrying (lock tracking paused until then)"
+            );
+        } else {
+            tracing::debug!(
+                attempts,
+                retry_in_s = backoff.as_secs(),
+                "logind: session path still unresolved; retrying"
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_CAP);
     }
 }
 

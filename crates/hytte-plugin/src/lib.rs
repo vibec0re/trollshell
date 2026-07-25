@@ -270,7 +270,7 @@
 //! surface — a new plugin should reach for the blessed set and the
 //! `.ts-plugin-card` guarantee above, not grep these two for class names.
 //!
-//! ## Scoped plugin stylesheets: deferred (issue #316, gap 3)
+//! ## Scoped plugin stylesheets: a deliberate non-goal (issue #316, gap 3)
 //!
 //! A plugin cannot register CSS of its own, scoped to its mount — `classes`
 //! only ever select into stylesheets the *host* loads. That is a deliberate

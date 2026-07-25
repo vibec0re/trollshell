@@ -29,6 +29,7 @@ use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
 use crate::components::layout::{finish_page, page_box};
+use crate::components::monitor_key::monitor_key;
 use crate::components::reactive_list::reactive_list;
 
 /// One card in the combined Stats page (#516). Named after the resource chip
@@ -44,23 +45,30 @@ pub enum StatsSection {
 }
 
 thread_local! {
-    /// The card a resource chip wants the combined Stats page to land on next
-    /// (#516). Set by [`set_scroll_target`] synchronously just before the
-    /// chip calls `crate::modal::toggle`/`toggle_keep_open`; read (not
-    /// consumed — a stale value is harmless, and re-reading lets both the
-    /// window-map path and the already-open re-show path apply the same
-    /// target) by the `"stats.scroll"` action each built page installs on
-    /// itself in [`panel_stats`].
-    static PENDING_SCROLL: Cell<Option<StatsSection>> = const { Cell::new(None) };
+    /// The card a resource chip wants the combined Stats page to land on next,
+    /// keyed per monitor (#516; per-monitor since #542). Set by
+    /// [`set_scroll_target`] synchronously just before the chip calls
+    /// `crate::modal::toggle`/`toggle_keep_open`; read (not consumed — a stale
+    /// value is harmless, and re-reading lets both the window-map path and the
+    /// already-open re-show path apply the same target) by the `"stats.scroll"`
+    /// action each built page installs on itself in [`panel_stats`], with the
+    /// target monitor's key handed in as the action's parameter. Keying per
+    /// monitor keeps one monitor's chip choice from leaking onto another
+    /// monitor's page, and lets a keybind/notification open on a monitor whose
+    /// chip never ran land at the top rather than inherit a neighbour's section.
+    static PENDING_SCROLL: RefCell<HashMap<String, StatsSection>> =
+        RefCell::new(HashMap::new());
 }
 
-/// Stash which card the next Stats-page open/re-show should scroll to (#516).
-/// Called by a resource chip's click handler immediately before it opens or
-/// re-shows the combined Stats page; consumed by the page's own
-/// `"stats.scroll"` action (wired in [`panel_stats`]) the next time
+/// Stash which card the next Stats-page open/re-show on `monitor` should scroll
+/// to (#516). Called by a resource chip's click handler immediately before it
+/// opens or re-shows the combined Stats page; consumed by that monitor's page's
+/// own `"stats.scroll"` action (wired in [`panel_stats`]) the next time
 /// `crate::modal` triggers it.
-pub fn set_scroll_target(section: StatsSection) {
-    PENDING_SCROLL.with(|c| c.set(Some(section)));
+pub fn set_scroll_target(monitor: &Monitor, section: StatsSection) {
+    PENDING_SCROLL.with(|m| {
+        m.borrow_mut().insert(monitor_key(monitor), section);
+    });
 }
 
 /// The combined stats flyout — opened from any of the CPU / memory / disk /
@@ -71,13 +79,13 @@ pub fn set_scroll_target(section: StatsSection) {
 /// #84 pattern) so five stacked cards can't push the drawer past screen
 /// height. A `"stats"`-prefixed `gio::SimpleActionGroup` carrying one
 /// `"scroll"` action is inserted on the returned page widget: activating it
-/// re-applies whatever [`StatsSection`] is currently pending in
-/// [`PENDING_SCROLL`]. Routing the trigger through a widget-local action
-/// (rather than a cross-module registry keyed by monitor) is what lets
-/// `crate::modal` poke *this specific monitor's* built page instance armed
-/// with only the `gtk::Widget` it already gets back from
+/// re-applies the [`StatsSection`] pending in [`PENDING_SCROLL`] for the monitor
+/// named by the action's string parameter (#542). Routing the trigger through a
+/// widget-local action (rather than a cross-module registry keyed by monitor) is
+/// what lets `crate::modal` poke *this specific monitor's* built page instance
+/// armed with only the `gtk::Widget` it already gets back from
 /// `gtk::Stack::child_by_name` — this page never needs to know which monitor
-/// it's on.
+/// it's on, only which key it was handed at activation.
 pub fn panel_stats() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
@@ -117,9 +125,15 @@ pub fn panel_stats() -> gtk::Widget {
     let scrolled_for_action = scrolled.clone();
     let column_for_action = column.clone();
     let action_group = gio::SimpleActionGroup::new();
-    let scroll_action = gio::SimpleAction::new("scroll", None);
-    scroll_action.connect_activate(move |_, _| {
-        apply_scroll(&scrolled_for_action, &column_for_action, &sections);
+    // The activation carries the target monitor's key as its string parameter
+    // (#542): `PENDING_SCROLL` is keyed per monitor, and `crate::modal` hands in
+    // the key of whichever monitor's drawer is (re)showing this page.
+    let scroll_action = gio::SimpleAction::new("scroll", Some(glib::VariantTy::STRING));
+    scroll_action.connect_activate(move |_, param| {
+        let Some(key) = param.and_then(glib::Variant::str) else {
+            return;
+        };
+        apply_scroll(&scrolled_for_action, &column_for_action, &sections, key);
     });
     action_group.add_action(&scroll_action);
 
@@ -128,32 +142,51 @@ pub fn panel_stats() -> gtk::Widget {
     page
 }
 
-/// Resolve the pending [`StatsSection`] (if any) against `sections` and
-/// scroll `scrolled` so that card's top edge lands at the top of the
-/// viewport. Deferred one main-loop idle tick past this call so a
+/// Resolve the [`StatsSection`] pending for `key`'s monitor (if any) against
+/// `sections` and scroll `scrolled` so that card's top edge lands at the top of
+/// the viewport. Deferred one main-loop idle tick past this call so a
 /// just-mapped or just-swapped-to page's layout is settled before
 /// `compute_bounds` reads it — the same "allocation isn't ready before
 /// map/tick" guarantee `modal.rs`'s own post-map recenter math relies on
-/// (#212-family lore). No-ops quietly if nothing is pending, the target
-/// isn't one of this page's cards, or the page isn't laid out yet (e.g. the
-/// drawer was closed again before the idle tick ran).
+/// (#212-family lore). No-ops quietly if nothing is pending for that monitor,
+/// the target isn't one of this page's cards, or the page isn't laid out yet
+/// (e.g. the drawer was closed again before the idle tick ran).
 fn apply_scroll(
     scrolled: &gtk::ScrolledWindow,
     column: &gtk::Box,
     sections: &[(StatsSection, gtk::Widget)],
+    key: &str,
 ) {
-    let Some(target) = PENDING_SCROLL.with(Cell::get) else {
+    let Some(target) = PENDING_SCROLL.with(|m| m.borrow().get(key).copied()) else {
         return;
     };
     let Some((_, card)) = sections.iter().find(|(section, _)| *section == target) else {
         return;
     };
 
-    let scrolled = scrolled.clone();
-    let column = column.clone();
-    let card = card.clone();
+    // One bounded retry (#542): on a first-ever build-on-swap the page's
+    // allocation can still be unsettled on the first idle tick, so
+    // `compute_bounds` returns `None` and the scroll silently no-ops. Re-arm one
+    // more idle in that case — capped at a single retry so a genuinely off-page
+    // target can't spin the main loop forever.
+    scroll_card_to_top_when_ready(scrolled.clone(), column.clone(), card.clone(), 1);
+}
+
+/// Deferred scroll worker for [`apply_scroll`]: on the next main-loop idle, land
+/// `card`'s top edge at the top of `scrolled`'s viewport. If `card`'s bounds
+/// don't resolve yet (`compute_bounds` → `None`, an unsettled allocation),
+/// re-arm up to `retries` more idles before giving up (#542).
+fn scroll_card_to_top_when_ready(
+    scrolled: gtk::ScrolledWindow,
+    column: gtk::Box,
+    card: gtk::Widget,
+    retries: u32,
+) {
     glib::idle_add_local_once(move || {
         let Some(bounds) = card.compute_bounds(&column) else {
+            if retries > 0 {
+                scroll_card_to_top_when_ready(scrolled, column, card, retries - 1);
+            }
             return;
         };
         let vadj = scrolled.vadjustment();

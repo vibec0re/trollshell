@@ -118,7 +118,8 @@
 //!   its manifest is dropped with a warn in the connection reader
 //!   ([`enforce_capabilities`](session)) before it ever reaches the broker,
 //!   making the manifest's "the host auto-grants from the manifest" model true.
-//!   A persisted audit-log and the `RunCommand` round-trip remain deferred.
+//!   Every brokered effect is now appended to a persisted audit log, and the
+//!   `RunCommand` round-trip is brokered too (both #510).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};

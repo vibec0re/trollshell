@@ -6,7 +6,7 @@ use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentDecision, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction,
     Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, ProtoError, ProvidedDatasource,
-    StateKey, StateSnapshot, decode, decode_body, encode, encode_body,
+    StateKey, StateSnapshot, VOCAB, decode, decode_body, encode, encode_body,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -15,6 +15,7 @@ fn sample_manifest() -> Manifest {
     Manifest {
         id: "vibectl".into(),
         proto: PROTO_VERSION,
+        vocab: VOCAB,
         subscribes: vec![StateKey::Clock],
         capabilities: vec![Capability::OpenPage, Capability::RunCommand],
         mount: Mount::SidebarTop,
@@ -1167,7 +1168,14 @@ fn forward_compat_extra_field_is_skipped() {
     };
 
     let decoded: Manifest = decode_body(&encode_body(&future)).expect("skip extra field");
-    assert_eq!(decoded, sample_manifest());
+    // Its map also predates `vocab`, so that field defaults to generation 0.
+    assert_eq!(
+        decoded,
+        Manifest {
+            vocab: 0,
+            ..sample_manifest()
+        }
+    );
 }
 
 #[test]
@@ -1202,7 +1210,15 @@ fn manifest_without_order_decodes_old_plugin_compat() {
         "absent order stays off the wire"
     );
     let decoded: Manifest = decode_body(&body).expect("decode old field-less manifest");
-    assert_eq!(decoded, sample_manifest(), "order defaults to None");
+    // The same old map also predates `vocab`, which defaults to generation 0.
+    assert_eq!(
+        decoded,
+        Manifest {
+            vocab: 0,
+            ..sample_manifest()
+        },
+        "order defaults to None and vocab to generation 0",
+    );
     assert_eq!(decoded.order, None);
 }
 
@@ -1214,6 +1230,84 @@ fn manifest_with_order_round_trips() {
     assert!(contains(&body, b"order"), "a set order rides the wire");
     let back: Manifest = decode_body(&body).expect("decode manifest with order");
     assert_eq!(back, m);
+}
+
+#[test]
+fn manifest_without_vocab_decodes_to_generation_zero() {
+    // #437: an older plugin (built before the `vocab` counter existed) sends a
+    // Register whose manifest map has NO `vocab` key. The current host must still
+    // decode it, defaulting `vocab` to `0` (relies on `#[serde(default)]` +
+    // named-map encoding). Generation 0 is what those plugins always pass at.
+    #[derive(serde::Serialize)]
+    struct ManifestNoVocab {
+        id: String,
+        proto: u16,
+        subscribes: Vec<StateKey>,
+        capabilities: Vec<Capability>,
+        mount: Mount,
+    }
+
+    let old = ManifestNoVocab {
+        id: "vibectl".into(),
+        proto: PROTO_VERSION,
+        subscribes: vec![StateKey::Clock],
+        capabilities: vec![Capability::OpenPage, Capability::RunCommand],
+        mount: Mount::SidebarTop,
+    };
+
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"vocab"),
+        "an old manifest carries no vocab key",
+    );
+    let decoded: Manifest = decode_body(&body).expect("decode a pre-vocab manifest");
+    assert_eq!(decoded.vocab, 0, "absent vocab defaults to generation 0");
+    // Generation 0 always clears the host's check (any host's VOCAB >= 0).
+    decoded
+        .check_vocab()
+        .expect("a generation-0 (pre-vocab) plugin always passes check_vocab");
+}
+
+#[test]
+fn manifest_vocab_is_stamped_and_rides_the_wire() {
+    // `Manifest::new` stamps the build's VOCAB automatically, like `proto` — a
+    // plugin author never sets it. Unlike `order`/`provides` it carries no
+    // `skip_serializing_if`, so it is always on the wire (a host can always read
+    // the generation a plugin declares). A non-zero value round-trips intact.
+    let m = Manifest::new("caw", Mount::SidebarTop);
+    assert_eq!(m.vocab, VOCAB, "new() stamps the current VOCAB");
+    assert!(
+        contains(&encode_body(&m), b"vocab"),
+        "vocab is always serialized (no skip_serializing_if)",
+    );
+
+    let mut newer = Manifest::new("future-plugin", Mount::SidebarTop);
+    newer.vocab = 7;
+    let back: Manifest = decode_body(&encode_body(&newer)).expect("decode a newer-vocab manifest");
+    assert_eq!(back.vocab, 7, "a non-zero vocab round-trips");
+}
+
+#[test]
+fn check_vocab_rejects_newer_and_accepts_same_or_older() {
+    // #437: a plugin at the host's own vocabulary (or older, incl. the pre-vocab
+    // generation 0) passes; one built against a *newer* vocabulary is refused with
+    // a self-explanatory error naming both generations.
+    let mut m = Manifest::new("p", Mount::SidebarTop);
+    m.vocab = VOCAB;
+    m.check_vocab().expect("same vocab is accepted");
+    m.vocab = 0;
+    m.check_vocab().expect("older (generation 0) is accepted");
+
+    m.vocab = VOCAB + 1;
+    let err = m.check_vocab().expect_err("a newer vocab is rejected");
+    assert!(
+        matches!(err, ProtoError::VocabTooNew { ours, theirs } if ours == VOCAB && theirs == VOCAB + 1),
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("newer") && msg.contains("update the shell"),
+        "the error is self-explanatory: {msg}",
+    );
 }
 
 #[test]

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Manifest, Mount, NowPlaying,
-    PluginMsg, StateKey, StateSnapshot, UpcomingEvent, read_frame, write_frame,
+    PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -393,6 +393,24 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         tracing::warn!(plugin = %manifest.id, error = %e, "plugin proto mismatch; dropping");
         return;
     }
+    // #437: reject a plugin built against a NEWER wire vocabulary than this host —
+    // one that can render a `Node`/`Effect` variant this host can't decode. The
+    // `PROTO_VERSION` exact-match above can't catch that (both sides are the same
+    // proto), so without this the plugin's first render frame would fail to decode,
+    // the host would treat it as an ordinary disconnect, and the redialing SDK
+    // would crash-loop it every 5 s with only an info-level trace. Rejecting here
+    // turns that silent loop into one loud, self-explanatory handshake refusal. An
+    // older plugin that predates the field decodes to `vocab = 0` and always passes.
+    if let Err(e) = manifest.check_vocab() {
+        tracing::warn!(
+            plugin = %manifest.id,
+            plugin_vocab = manifest.vocab,
+            host_vocab = VOCAB,
+            error = %e,
+            "plugin built against a newer wire vocabulary than this host understands — update the shell; rejecting the connection",
+        );
+        return;
+    }
     let plugin_id = manifest.id.clone();
     // #436: an empty id can't key a region card or the audit log — reject it
     // outright (the connection is dropped, nothing is mounted).
@@ -612,6 +630,21 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                 Ok(PluginMsg::Pong { seq }) => {
                     pong_seen.store(true, Ordering::Relaxed);
                     tracing::trace!(plugin = %plugin_id, seq, "plugin pong");
+                }
+                // A clean EOF (the plugin closed its socket) is an ordinary
+                // disconnect — info. A *decode* failure is not: a well-behaved
+                // peer never sends a frame this host can't parse, so it points at
+                // a schema skew — most likely a plugin built against a newer wire
+                // vocabulary than this host (#437; check_vocab catches the common
+                // case at the handshake, but a mid-session decode failure gets the
+                // same hint). Surface it at warn so the crash-loop leaves a trace.
+                Err(ProtoError::Decode(e)) => {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        error = %e,
+                        "plugin frame failed to decode (schema skew? a plugin built against a newer wire vocabulary than this host); closing the connection",
+                    );
+                    break;
                 }
                 Err(e) => {
                     tracing::info!(plugin = %plugin_id, reason = %e, "plugin disconnected");

@@ -44,7 +44,8 @@ use hytte_plugin_proto::{
     AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, DatasourceError,
     DatasourceOutcome, Dir, Effect, EffectOutcome, EventKind, HostMsg, LogLevel, Manifest,
     MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page, PluginMsg,
-    ProvidedDatasource, SPECTRUM_BINS, StateKey, StateSnapshot, UpcomingEvent, decode, encode,
+    ProvidedDatasource, SPECTRUM_BINS, StateKey, StateSnapshot, UpcomingEvent, VOCAB, decode,
+    encode,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -127,6 +128,7 @@ fn full_manifest() -> Manifest {
     Manifest {
         id: "vibectl".into(),
         proto: PROTO_VERSION,
+        vocab: VOCAB,
         subscribes: vec![
             StateKey::Clock,
             StateKey::SlotVisible,

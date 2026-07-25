@@ -55,7 +55,9 @@
 //! - Adding an **optional field** to a struct (carry `#[serde(default)]`, and
 //!   `#[serde(skip_serializing_if = …)]` where it should stay off the wire).
 //! - Appending a **new enum variant** (name-tagged, so existing variants keep
-//!   their meaning).
+//!   their meaning) — but this also **bumps [`VOCAB`]** (see the vocab-counter
+//!   section below): a new wire variant grows the vocabulary, and the counter is
+//!   how a host detects a plugin that renders one it can't decode.
 //!
 //! What **requires a [`PROTO_VERSION`] bump**:
 //!
@@ -79,6 +81,38 @@
 //! opt-in never receives the variable it can't decode. (Visibility, #288, was
 //! retrofitted onto [`StateKey::SlotVisible`](manifest::StateKey::SlotVisible)
 //! for this reason.)
+//!
+//! ### The wire-vocabulary counter must be bumped on every appended variant (#437)
+//!
+//! The #305 rule guards **host→plugin** pushes. The mirror hazard is
+//! **plugin→host**: a plugin built against a *newer* proto (same
+//! [`PROTO_VERSION`], one appended [`Node`](wire::Node) / [`EventKind`](wire::EventKind) /
+//! [`Effect`](effect::Effect) variant) can *render* that variant in its
+//! [`Render`](msg::PluginMsg::Render) tree. An older host's `rmp-serde` then fails
+//! to decode the frame, the host treats it as an ordinary disconnect, the SDK
+//! redials and re-sends the identical tree — a permanent, near-silent 5 s
+//! crash-loop the [`PROTO_VERSION`] exact-match can't catch (both sides are the
+//! same version).
+//!
+//! [`VOCAB`] closes that gap. It is a **monotonic generation counter of the wire
+//! vocabulary**, independent of [`PROTO_VERSION`]. Every plugin stamps its
+//! build-time [`VOCAB`] into its [`Manifest`](manifest::Manifest) automatically —
+//! [`Manifest::new`](manifest::Manifest::new) does it, like `proto` — and the host
+//! rejects a `Register` whose `vocab` exceeds its own at the handshake
+//! ([`Manifest::check_vocab`](manifest::Manifest::check_vocab)), turning the silent
+//! crash-loop into one loud, self-explanatory rejection. An older plugin that
+//! predates the field decodes to `vocab = 0` (`#[serde(default)]`) and always
+//! passes.
+//!
+//! **The rule: appending a wire variant ⇒ bump [`VOCAB`].** Any new
+//! [`Node`](wire::Node), [`EventKind`](wire::EventKind), [`Effect`](effect::Effect),
+//! [`StateKey`](manifest::StateKey), or [`HostMsg`](msg::HostMsg) variant a peer
+//! can put on the wire grows the vocabulary the other side must understand;
+//! bumping [`VOCAB`] is what lets an older host detect (and cleanly refuse) a
+//! plugin that speaks the newer one. (A purely host→plugin addition — a new
+//! `HostMsg` push — is already covered by the #305 opt-in, but bumping [`VOCAB`]
+//! for it too keeps the counter a faithful census of the whole vocabulary and
+//! costs nothing.)
 
 pub mod codec;
 pub mod effect;
@@ -91,6 +125,26 @@ pub mod wire;
 /// The wire protocol version. Exact-matched on [`Register`](msg::PluginMsg::Register)
 /// (see [`Manifest::check_proto`]); bump it per the crate-level compat rules.
 pub const PROTO_VERSION: u16 = 1;
+
+/// The **wire-vocabulary generation** — a monotonic counter of how many times the
+/// on-the-wire vocabulary has grown, independent of [`PROTO_VERSION`] (#437).
+///
+/// Every plugin stamps this into its [`Manifest`](manifest::Manifest) at build
+/// time (automatically, via [`Manifest::new`](manifest::Manifest::new)); the host
+/// refuses a `Register` whose `vocab` exceeds its own
+/// ([`Manifest::check_vocab`](manifest::Manifest::check_vocab)), so a plugin built
+/// against a newer vocabulary — one that can render a [`Node`](wire::Node) /
+/// [`Effect`](effect::Effect) variant this host can't decode — fails loud at the
+/// handshake instead of silently crash-looping (see the crate root's
+/// wire-vocabulary section).
+///
+/// **Bump this by 1 whenever you append a wire variant** — a [`Node`](wire::Node),
+/// [`EventKind`](wire::EventKind), [`Effect`](effect::Effect),
+/// [`StateKey`](manifest::StateKey), or [`HostMsg`](msg::HostMsg) case. The counter
+/// starts at `1` (this PR); generation `0` is reserved for an older, pre-`vocab`
+/// manifest, which decodes to `0` (`#[serde(default)]`) and so always clears a
+/// host's check — a pre-counter plugin is treated as the oldest generation.
+pub const VOCAB: u16 = 1;
 
 pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_body};
 pub use effect::{

@@ -73,6 +73,10 @@ pub enum AudioAction {
 /// All variants are fire-and-forget **except** [`Effect::RunCommand`], whose
 /// outcome comes back as a [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult)
 /// keyed by its `id`.
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
+/// emits these on its render frame, so an older host must be able to detect and
+/// refuse a plugin built against the newer vocabulary at the handshake.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     /// Open a drawer page (cap: [`OpenPage`](crate::manifest::Capability::OpenPage)).

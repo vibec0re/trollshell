@@ -296,7 +296,9 @@ impl Plugin for Pet {
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
             | Input::SessionLocked(_)
-            | Input::NowPlaying(_) => {}
+            | Input::NowPlaying(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => {}
         }
         Vec::new()
     }

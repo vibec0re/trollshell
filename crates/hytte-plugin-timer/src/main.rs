@@ -301,7 +301,9 @@ impl Plugin for Timer {
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
             | Input::SessionLocked(_)
-            | Input::NowPlaying(_) => Vec::new(),
+            | Input::NowPlaying(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => Vec::new(),
         }
     }
 

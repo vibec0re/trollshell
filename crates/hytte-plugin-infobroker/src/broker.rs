@@ -38,12 +38,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::grants::{Decision, GrantStore};
+use crate::paths;
 use crate::tokens::{Token, TokenScope, TokenStore};
 use crate::wire::{
-    CalendarEntry, DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, GrantOut, Request, Response,
-    encode_response, parse_request,
+    CalendarEntry, DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, DATASOURCE_WEATHER, DepartureOut,
+    GrantOut, Request, Response, WeatherOut, encode_response, parse_request,
 };
-use crate::{departures, paths};
 
 /// Cap on the in-memory audit ring shown in the panel. Oldest entries fall off.
 const AUDIT_CAP: usize = 30;
@@ -59,6 +59,21 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// so a live shell's answer reliably arrives first — this is the pure fallback
 /// for a wedged or pre-1b host that never surfaces the prompt at all.
 const CONSENT_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+
+/// How long the broker holds a **parked** datasource query before giving up
+/// (#509). A backstop for a wedged/pre-#509 host: the shell's own query router has
+/// a 10 s bound that ALWAYS relays a result (the provider's answer or a synthesized
+/// timeout), so a live shell's `Cmd::QueryResult` reliably arrives first — this is
+/// the pure fallback for a host that never relays one at all.
+const QUERY_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The default row `limit` for a departures query when the client sends none.
+const DEFAULT_DEPARTURES_LIMIT: usize = 8;
+
+/// The `departures` datasource scope the broker queries (#509).
+const SCOPE_DEPARTURES_NEXT: &str = "next";
+/// The `weather` datasource scope the broker queries (#509).
+const SCOPE_WEATHER_CURRENT: &str = "current";
 
 // ── Pure consent decisions (unit-tested) ──────────────────────────────────────
 
@@ -100,6 +115,66 @@ fn calendar_status(len: usize) -> String {
         1 => "1 upcoming".to_owned(),
         n => format!("{n} upcoming"),
     }
+}
+
+/// Whether `datasource` is one the broker serves (#509): departures/weather (routed
+/// through their provider plugins) or calendar (the host-fed live copy).
+fn is_known_datasource(datasource: &str) -> bool {
+    matches!(
+        datasource,
+        DATASOURCE_DEPARTURES | DATASOURCE_WEATHER | DATASOURCE_CALENDAR
+    )
+}
+
+/// The provider scope + opaque JSON params for a routed `get <datasource>` (#509).
+/// departures carries the row `limit`; weather takes no params.
+fn query_scope_and_params(datasource: &str, limit: Option<usize>) -> (String, String) {
+    if datasource == DATASOURCE_WEATHER {
+        (SCOPE_WEATHER_CURRENT.to_owned(), "{}".to_owned())
+    } else {
+        let n = limit.unwrap_or(DEFAULT_DEPARTURES_LIMIT);
+        (
+            SCOPE_DEPARTURES_NEXT.to_owned(),
+            format!("{{\"limit\":{n}}}"),
+        )
+    }
+}
+
+/// Build a `get` [`Response`] from a routed datasource query's outcome (#509).
+/// Decodes the provider's opaque JSON payload into the datasource's typed rows; a
+/// failure (host routing error, provider error, or an unreadable payload) becomes a
+/// transient `Response::error` the agent can retry. Pure — unit-tested.
+fn query_response(datasource: &str, outcome: QueryOutcome) -> Response {
+    match outcome {
+        QueryOutcome::Ready(payload) => match datasource {
+            DATASOURCE_DEPARTURES => match serde_json::from_str::<Vec<DepartureOut>>(&payload) {
+                Ok(rows) => Response {
+                    ok: true,
+                    datasource: Some(datasource.to_owned()),
+                    departures: Some(rows),
+                    ..Response::default()
+                },
+                Err(e) => Response::error(format!("departures: unreadable provider payload: {e}")),
+            },
+            DATASOURCE_WEATHER => match serde_json::from_str::<WeatherOut>(&payload) {
+                Ok(weather) => Response {
+                    ok: true,
+                    datasource: Some(datasource.to_owned()),
+                    weather: Some(weather),
+                    ..Response::default()
+                },
+                Err(e) => Response::error(format!("weather: unreadable provider payload: {e}")),
+            },
+            other => Response::error(format!("unexpected routed datasource '{other}'")),
+        },
+        QueryOutcome::Failed(message) => Response::error(format!("{datasource}: {message}")),
+    }
+}
+
+/// The panel status line for a datasource routed through a provider plugin (#509) —
+/// the broker doesn't hold the provider's live state, so it names the route.
+fn routed_status(datasource: &str) -> String {
+    format!("via the {datasource} plugin")
 }
 
 /// The how-to-grant hint pointing the human at the two grant surfaces.
@@ -228,6 +303,37 @@ pub enum ConsentDecision {
     Deny,
 }
 
+/// The broker-local mirror of the proto's datasource query outcome (#509). The
+/// library stays SDK-free — it never links `hytte_plugin`/its proto — so the
+/// plugin binary (`plugin.rs`) maps `proto::DatasourceOutcome` onto this when
+/// relaying a query result down the [`Cmd`] lane, exactly as it maps a
+/// [`ConsentDecision`] onto the proto one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryOutcome {
+    /// The provider answered; the opaque JSON payload (the provider↔broker
+    /// contract) is decoded per-datasource into the [`Response`].
+    Ready(String),
+    /// The query failed — a host routing failure (no provider / denied scope /
+    /// timeout) or the provider's own error. The string is the human message.
+    Failed(String),
+}
+
+/// A datasource query the broker asks the plugin to route to the shell host
+/// (#509): the plugin turns it into `Effect::DatasourceQuery`, and the answer
+/// returns as [`Cmd::QueryResult`] keyed by the same `request_id`. The broker
+/// itself never dials a provider — the host is the chokepoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryRequest {
+    /// The broker-minted correlation, echoed back in [`Cmd::QueryResult`].
+    pub request_id: u64,
+    /// The datasource id / provider name (e.g. `"departures"`).
+    pub provider: String,
+    /// The provider scope (e.g. `"next"`).
+    pub scope: String,
+    /// The opaque JSON request payload (the provider↔broker contract).
+    pub params: String,
+}
+
 /// A command from the plugin down to the broker task (the #280 lane pattern).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cmd {
@@ -246,6 +352,14 @@ pub enum Cmd {
     /// from its `CalendarUpcoming` host push. Replaces the broker's live copy that
     /// `get calendar` serves — the broker can't read EDS itself.
     Calendar(Vec<CalendarEntry>),
+    /// The result of a datasource query the broker issued (#509), relayed by the
+    /// plugin from its `Input::DatasourceResult` host push, keyed by the
+    /// `request_id` the broker minted on the originating [`BrokerMsg::Query`].
+    /// Routed to the matching parked `get` rather than through `apply_cmd`.
+    QueryResult {
+        request_id: u64,
+        outcome: QueryOutcome,
+    },
 }
 
 /// An informational toast the plugin should post via `Effect::Notify`.
@@ -283,6 +397,9 @@ pub enum BrokerMsg {
     /// Raise an interactive consent prompt for a parked request (#487 phase 1b).
     /// The plugin turns this into `Effect::RequestConsent`.
     RequestConsent(ConsentPrompt),
+    /// Route a datasource query to the shell host (#509). The plugin turns this
+    /// into `Effect::DatasourceQuery`; the answer returns as [`Cmd::QueryResult`].
+    Query(QueryRequest),
 }
 
 // ── The broker state ──────────────────────────────────────────────────────────
@@ -392,10 +509,17 @@ impl BrokerState {
             })
             .collect();
 
+        // departures/weather are routed through their provider plugins (#509), so
+        // the broker names the route rather than a live status it no longer holds;
+        // calendar is the host-fed live copy, so it reports its count.
         let datasources = vec![
             DatasourceView {
                 name: DATASOURCE_DEPARTURES.to_owned(),
-                status: departures::status(),
+                status: routed_status(DATASOURCE_DEPARTURES),
+            },
+            DatasourceView {
+                name: DATASOURCE_WEATHER.to_owned(),
+                status: routed_status(DATASOURCE_WEATHER),
             },
             DatasourceView {
                 name: DATASOURCE_CALENDAR.to_owned(),
@@ -435,9 +559,9 @@ impl BrokerState {
             // The host-pushed calendar digest replaces the live copy `get calendar`
             // serves (#484).
             Cmd::Calendar(entries) => self.calendar = entries,
-            // A consent decision is routed to its parked request in `serve`, not
-            // applied here; this arm keeps the match exhaustive.
-            Cmd::Decision { .. } => {}
+            // A consent decision / query result is routed to its parked request in
+            // `serve`, not applied here; these arms keep the match exhaustive.
+            Cmd::Decision { .. } | Cmd::QueryResult { .. } => {}
         }
     }
 
@@ -452,7 +576,7 @@ impl BrokerState {
         let mut stream = reader.into_inner();
         let dispatch = match read {
             Ok(Ok(0)) => return ConnResult::Answered { toast: None }, // client closed, no request
-            Ok(Ok(_)) => self.dispatch(line.trim()).await,
+            Ok(Ok(_)) => self.dispatch(line.trim()),
             Ok(Err(e)) => Dispatch::Answer(Response::error(format!("read error: {e}")), None),
             Err(_) => Dispatch::Answer(Response::error("timed out waiting for a request"), None),
         };
@@ -473,11 +597,24 @@ impl BrokerState {
                 detail,
                 stream,
             },
+            // #509: a routed datasource query — park the client and ask the plugin
+            // to route it to the shell host; the answering `Cmd::QueryResult`
+            // resolves it.
+            Dispatch::Query {
+                datasource,
+                scope,
+                params,
+            } => ConnResult::NeedsQuery {
+                datasource,
+                scope,
+                params,
+                stream,
+            },
         }
     }
 
     /// Dispatch one parsed request to its handler.
-    async fn dispatch(&mut self, line: &str) -> Dispatch {
+    fn dispatch(&mut self, line: &str) -> Dispatch {
         let req = match parse_request(line) {
             Ok(req) => req,
             Err(e) => return Dispatch::Answer(Response::error(e), None),
@@ -488,10 +625,18 @@ impl BrokerState {
                 token,
                 datasource,
                 limit,
-            } => {
-                let (resp, toast) = self.handle_get(&token, &datasource, limit).await;
-                Dispatch::Answer(resp, toast)
-            }
+            } => match self.handle_get(&token, &datasource, limit) {
+                GetDisposition::Answer(resp, toast) => Dispatch::Answer(resp, toast),
+                GetDisposition::Query {
+                    datasource,
+                    scope,
+                    params,
+                } => Dispatch::Query {
+                    datasource,
+                    scope,
+                    params,
+                },
+            },
             Request::Grants => Dispatch::Answer(self.handle_grants(), None),
         }
     }
@@ -593,32 +738,36 @@ impl BrokerState {
         )
     }
 
-    /// `get <datasource>` (#487 phase 1b): token → `(agent, scope)` →
-    /// data-access authority → scoped fetch. A token's [`TokenScope`] carries the
-    /// consent decision that minted it, so `get` never re-prompts — it just
-    /// honors (or spends) the authority already granted at `auth`.
-    async fn handle_get(
+    /// `get <datasource>` (#487 phase 1b / #509): token → `(agent, scope)` →
+    /// data-access authority → serve. A token's [`TokenScope`] carries the consent
+    /// decision that minted it, so `get` never re-prompts — it just honors (or
+    /// spends) the authority already granted at `auth`. Once authorized, `calendar`
+    /// is served inline from the host-fed live copy, while `departures`/`weather` are
+    /// **routed through their provider plugins** over the host's datasource query
+    /// protocol ([`GetDisposition::Query`]) rather than fetched here — the #509 dedup
+    /// of the broker's former internal departures fetch.
+    fn handle_get(
         &mut self,
         token: &str,
         datasource: &str,
         limit: Option<usize>,
-    ) -> (Response, Option<Toast>) {
+    ) -> GetDisposition {
         let now = now_unix();
         let Some(auth) = self.tokens.resolve(token, now) else {
             // Transient/technical — the agent just re-auths; no consent toast.
-            return (
+            return GetDisposition::Answer(
                 Response::error("invalid or expired token — re-auth with `hytte-infobroker auth`"),
                 None,
             );
         };
         let agent = auth.agent;
-        if datasource != DATASOURCE_DEPARTURES && datasource != DATASOURCE_CALENDAR {
+        if !is_known_datasource(datasource) {
             self.record(&agent, datasource, Outcome::Denied, now);
-            return (
+            return GetDisposition::Answer(
                 Response::denied(
                     format!("unknown datasource '{datasource}'"),
                     format!(
-                        "known datasources: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_CALENDAR}'"
+                        "known datasources: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_WEATHER}', '{DATASOURCE_CALENDAR}'"
                     ),
                 ),
                 None,
@@ -626,7 +775,7 @@ impl BrokerState {
         }
         // Data-access authority: a durable `always` grant (for a plain identity
         // token), an open session token, or a single as-yet-unspent once token —
-        // which this fetch consumes.
+        // which this get consumes.
         let allowed = match auth.scope {
             TokenScope::Grant => {
                 matches!(
@@ -641,7 +790,7 @@ impl BrokerState {
             // A spent once, or an identity token whose grant is gone: transient —
             // re-auth to re-consent — so no toast (only genuine knocks alert).
             self.record(&agent, datasource, Outcome::Denied, now);
-            return (
+            return GetDisposition::Answer(
                 Response::denied(
                     format!("agent '{agent}' has no current grant for '{datasource}'"),
                     grant_hint(&agent, datasource),
@@ -649,39 +798,28 @@ impl BrokerState {
                 None,
             );
         }
-        // The access decision is granted; serve the datasource. Calendar is a
-        // live in-memory copy (the host push feeds it), so there is no fetch to
-        // fail — serve it straight.
+        // The access decision is granted; record it once here (the eventual serve
+        // outcome — a live copy, or the routed query's success/failure — is separate,
+        // exactly as the old inline fetch recorded granted before it could fail).
+        self.record(&agent, datasource, Outcome::Granted, now);
+        // Calendar is a live in-memory copy (the host push feeds it), served straight.
         if datasource == DATASOURCE_CALENDAR {
-            self.record(&agent, datasource, Outcome::Granted, now);
             let resp = Response {
                 ok: true,
                 datasource: Some(datasource.to_owned()),
                 calendar: Some(calendar_scoped(&self.calendar, limit)),
                 ..Response::default()
             };
-            return (resp, None);
+            return GetDisposition::Answer(resp, None);
         }
-        // Departures: the fetch itself may still fail (network/config) — that's
-        // not a consent problem, so no toast.
-        let result = tokio::task::spawn_blocking(move || departures::fetch_scoped(limit))
-            .await
-            .unwrap_or_else(|e| Err(format!("join: {e}")));
-        self.record(&agent, datasource, Outcome::Granted, now);
-        match result {
-            Ok(rows) => {
-                let resp = Response {
-                    ok: true,
-                    datasource: Some(datasource.to_owned()),
-                    departures: Some(rows),
-                    ..Response::default()
-                };
-                (resp, None)
-            }
-            Err(e) => (
-                Response::error(format!("departures fetch failed: {e}")),
-                None,
-            ),
+        // departures / weather: route through the running provider plugin. The
+        // broker never fetches — `serve` parks the client and asks the plugin to
+        // emit `Effect::DatasourceQuery`; the answer resolves the parked request.
+        let (scope, params) = query_scope_and_params(datasource, limit);
+        GetDisposition::Query {
+            datasource: datasource.to_owned(),
+            scope,
+            params,
         }
     }
 
@@ -744,8 +882,25 @@ async fn write_response(stream: &mut UnixStream, response: &Response) {
 
 // ── Consent parking (#487 phase 1b) ───────────────────────────────────────────
 
+/// How a `get <datasource>` resolves (#509): answered inline (calendar / a
+/// denial), or routed through a provider plugin (departures / weather).
+// `Answer` carries a full `Response` — the common case (it IS the reply), not a
+// rare large variant — so boxing it would just allocate on the hot path.
+#[allow(clippy::large_enum_variant)]
+enum GetDisposition {
+    /// A ready response (+ optional toast) to write back immediately.
+    Answer(Response, Option<Toast>),
+    /// Route to the datasource's provider plugin over the host query protocol.
+    Query {
+        datasource: String,
+        scope: String,
+        params: String,
+    },
+}
+
 /// The result of [`BrokerState::handle_conn`]: either the response is already
-/// written, or the request is parked awaiting a human consent decision.
+/// written, or the request is parked awaiting a human consent decision (#487) or a
+/// routed datasource query answer (#509).
 enum ConnResult {
     /// The response has been written; carries an optional toast to raise.
     Answered { toast: Option<Toast> },
@@ -758,9 +913,20 @@ enum ConnResult {
         detail: String,
         stream: UnixStream,
     },
+    /// The request needs a routed datasource query (#509): the stream is parked
+    /// until the plugin relays a `Cmd::QueryResult` (or [`QUERY_PARK_TIMEOUT`]).
+    NeedsQuery {
+        datasource: String,
+        scope: String,
+        params: String,
+        stream: UnixStream,
+    },
 }
 
 /// A dispatched request's disposition, before the stream is written or parked.
+// `Answer` carries a full `Response` (the common case, not a rare large variant),
+// so the large-variant delta is expected — same as [`GetDisposition`].
+#[allow(clippy::large_enum_variant)]
 enum Dispatch {
     /// A ready response (+ optional toast) to write back immediately.
     Answer(Response, Option<Toast>),
@@ -771,6 +937,12 @@ enum Dispatch {
         scope: String,
         detail: String,
     },
+    /// The request needs a routed datasource query (#509); [`serve`] parks it.
+    Query {
+        datasource: String,
+        scope: String,
+        params: String,
+    },
 }
 
 /// A socket request parked awaiting a consent decision (#487 phase 1b): the
@@ -778,6 +950,15 @@ enum Dispatch {
 /// the fallback deadline.
 struct PendingConsent {
     agent: String,
+    datasource: String,
+    stream: UnixStream,
+    deadline: tokio::time::Instant,
+}
+
+/// A socket request parked awaiting a routed datasource query answer (#509): the
+/// stream to answer on, the `datasource` (to shape the response from the provider's
+/// opaque payload), and the fallback deadline.
+struct PendingQuery {
     datasource: String,
     stream: UnixStream,
     deadline: tokio::time::Instant,
@@ -829,6 +1010,10 @@ fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
 /// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
 /// per-session lane ends, which are exactly these types), so this whole module
 /// never links the plugin runtime.
+// One cohesive `select!` loop (accept / command / timeout) over the parked-request
+// state (consent + query maps); splitting its arms into helpers would scatter that
+// shared state for no readability gain — same stance as the host's `handle_conn`.
+#[allow(clippy::too_many_lines)]
 pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedSender<BrokerMsg>) {
     let Some(sock) = paths::socket_path() else {
         tracing_eprintln("XDG_RUNTIME_DIR unset; broker socket not created");
@@ -864,11 +1049,20 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
     // Parked consent requests (#487 phase 1b), keyed by the request_id the broker
     // minted; each holds the client stream open until its decision or deadline.
     let mut pending: HashMap<u64, PendingConsent> = HashMap::new();
+    // Parked datasource queries (#509), keyed by the same minted `request_id`
+    // counter; each holds the client stream open until the plugin relays a
+    // `Cmd::QueryResult` (or the query deadline elapses).
+    let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
     let mut next_request_id: u64 = 1;
 
     loop {
-        // The nearest parked deadline drives the timeout arm; `None` = park forever.
-        let next_deadline = pending.values().map(|p| p.deadline).min();
+        // The nearest parked deadline (consent OR query) drives the timeout arm;
+        // `None` = park forever.
+        let next_deadline = pending
+            .values()
+            .map(|p| p.deadline)
+            .chain(pending_queries.values().map(|q| q.deadline))
+            .min();
         tokio::select! {
             // Prefer draining commands (revoke / allow / a consent decision) so a
             // click — or an answer to a live prompt — lands promptly rather than
@@ -891,6 +1085,15 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                             send_update(&out, state.snapshot(now_unix()), toast);
                         }
                         // else: a late/unknown decision (already timed out) — ignore.
+                    }
+                    // #509: a routed query's answer — shape the response from the
+                    // provider's payload and write it back to the parked client.
+                    Cmd::QueryResult { request_id, outcome } => {
+                        if let Some(mut q) = pending_queries.remove(&request_id) {
+                            let resp = query_response(&q.datasource, outcome);
+                            write_response(&mut q.stream, &resp).await;
+                        }
+                        // else: a late/unknown result (already timed out) — ignore.
                     }
                 }
             }
@@ -916,13 +1119,29 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                             }));
                             send_update(&out, state.snapshot(now_unix()), None);
                         }
+                        // #509: a routed datasource query — park the client and ask
+                        // the plugin to route it to the shell host; the answering
+                        // `Cmd::QueryResult` (or the deadline) resolves it.
+                        ConnResult::NeedsQuery { datasource, scope, params, stream } => {
+                            let request_id = next_request_id;
+                            next_request_id = next_request_id.wrapping_add(1);
+                            pending_queries.insert(request_id, PendingQuery {
+                                datasource: datasource.clone(),
+                                stream,
+                                deadline: tokio::time::Instant::now() + QUERY_PARK_TIMEOUT,
+                            });
+                            let _ = out.send(BrokerMsg::Query(QueryRequest {
+                                request_id, provider: datasource, scope, params,
+                            }));
+                        }
                     },
                     Err(e) => tracing_eprintln(&format!("accept error: {e}")),
                 }
             }
             () = wait_for_deadline(next_deadline) => {
                 // The bound elapsed on the earliest parked request(s): time them
-                // out with a transient deny + the 1a toast (the fallback path).
+                // out. A consent knock times out with a transient deny + the 1a
+                // toast (the fallback path); a routed query with a transient error.
                 let now_inst = tokio::time::Instant::now();
                 let expired: Vec<u64> = pending
                     .iter()
@@ -935,6 +1154,22 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                             state.on_consent_timeout(&p.agent, &p.datasource, now_unix());
                         write_response(&mut p.stream, &resp).await;
                         send_update(&out, state.snapshot(now_unix()), toast);
+                    }
+                }
+                // #509: expire parked queries the plugin never answered (a wedged /
+                // pre-#509 host). A transient error — the agent may retry.
+                let expired_q: Vec<u64> = pending_queries
+                    .iter()
+                    .filter(|(_, q)| q.deadline <= now_inst)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired_q {
+                    if let Some(mut q) = pending_queries.remove(&id) {
+                        let resp = Response::error(format!(
+                            "{}: datasource query timed out (no host response)",
+                            q.datasource
+                        ));
+                        write_response(&mut q.stream, &resp).await;
                     }
                 }
             }
@@ -1013,11 +1248,23 @@ mod tests {
         ));
     }
 
-    /// Destructure a [`Dispatch::Answer`], panicking on a consent knock.
+    /// Destructure a [`Dispatch::Answer`], panicking on a consent knock or a
+    /// routed query.
     fn answer(d: Dispatch) -> (Response, Option<Toast>) {
         match d {
             Dispatch::Answer(r, t) => (r, t),
             Dispatch::Consent { .. } => panic!("expected an immediate answer, got a consent knock"),
+            Dispatch::Query { .. } => panic!("expected an immediate answer, got a routed query"),
+        }
+    }
+
+    /// Destructure a [`GetDisposition::Answer`], panicking on a routed query.
+    fn get_answer(d: GetDisposition) -> (Response, Option<Toast>) {
+        match d {
+            GetDisposition::Answer(r, t) => (r, t),
+            GetDisposition::Query { .. } => {
+                panic!("expected an inline answer, got a routed query")
+            }
         }
     }
 
@@ -1201,7 +1448,7 @@ mod tests {
 
             // A Grant-scoped token with NO durable grant is denied (no toast).
             let identity = state.tokens.mint("stranger", now_unix()); // Grant scope
-            let (resp, toast) = state.handle_get(&identity.value, "departures", None).await;
+            let (resp, toast) = get_answer(state.handle_get(&identity.value, "departures", None));
             assert!(!resp.ok, "an identity token without a grant can't fetch");
             assert!(toast.is_none(), "a scope miss is transient, not a knock");
         });
@@ -1230,40 +1477,29 @@ mod tests {
 
     #[test]
     fn get_with_a_bad_token_is_a_toastless_error() {
-        // Async handler, but no live fetch is reached on the bad-token path.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
-            let (resp, toast) = state.handle_get("not-a-token", "departures", None).await;
-            assert!(!resp.ok);
-            assert!(
-                toast.is_none(),
-                "an expired/invalid token is transient, not a consent knock"
-            );
-            assert!(resp.error.unwrap().contains("re-auth"));
-        });
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
+        let (resp, toast) = get_answer(state.handle_get("not-a-token", "departures", None));
+        assert!(!resp.ok);
+        assert!(
+            toast.is_none(),
+            "an expired/invalid token is transient, not a consent knock"
+        );
+        assert!(resp.error.unwrap().contains("re-auth"));
     }
 
     #[test]
     fn get_unknown_datasource_is_denied_without_a_toast() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
-            let token = answer(state.handle_auth("claude")).0.token.expect("token");
-            let (resp, toast) = state.handle_get(&token, "weather", None).await;
-            assert!(!resp.ok);
-            assert!(
-                toast.is_none(),
-                "an unknown datasource is a request error, not a consent knock"
-            );
-            assert!(resp.error.unwrap().contains("unknown datasource"));
-        });
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
+        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        // `stocks` is a genuinely unknown datasource (departures/weather/calendar
+        // are the known set, #509).
+        let (resp, toast) = get_answer(state.handle_get(&token, "stocks", None));
+        assert!(!resp.ok);
+        assert!(
+            toast.is_none(),
+            "an unknown datasource is a request error, not a consent knock"
+        );
+        assert!(resp.error.unwrap().contains("unknown datasource"));
     }
 
     // ── The calendar datasource (#484) ────────────────────────────────────────
@@ -1311,44 +1547,32 @@ mod tests {
 
     #[test]
     fn get_calendar_serves_the_live_copy_under_the_grant_flow() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            // An `always` grant for calendar → a Grant-scoped identity token can
-            // serve it (the normal grant flow, datasource-scoped).
-            let mut state = BrokerState::new(store(vec![Grant::always("claude", "calendar")]));
-            state.apply_cmd(Cmd::Calendar(calendar_fixture()));
-            let token = answer(state.handle_auth("claude")).0.token.expect("token");
-            let (resp, toast) = state.handle_get(&token, "calendar", None).await;
-            assert!(resp.ok, "the granted agent gets the calendar copy");
-            assert!(toast.is_none(), "a served datasource raises no toast");
-            let rows = resp.calendar.expect("calendar rows");
-            assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].title, "standup");
-            // `limit` clamps the served rows.
-            let (resp, _) = state.handle_get(&token, "calendar", Some(1)).await;
-            assert_eq!(resp.calendar.expect("rows").len(), 1);
-        });
+        // An `always` grant for calendar → a Grant-scoped identity token can serve
+        // it (the normal grant flow, datasource-scoped).
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "calendar")]));
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let (resp, toast) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(resp.ok, "the granted agent gets the calendar copy");
+        assert!(toast.is_none(), "a served datasource raises no toast");
+        let rows = resp.calendar.expect("calendar rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title, "standup");
+        // `limit` clamps the served rows.
+        let (resp, _) = get_answer(state.handle_get(&token, "calendar", Some(1)));
+        assert_eq!(resp.calendar.expect("rows").len(), 1);
     }
 
     #[test]
     fn get_calendar_without_a_grant_is_denied() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            // A departures-only grant does NOT cover calendar (per-datasource).
-            let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
-            state.apply_cmd(Cmd::Calendar(calendar_fixture()));
-            let token = answer(state.handle_auth("claude")).0.token.expect("token");
-            let (resp, toast) = state.handle_get(&token, "calendar", None).await;
-            assert!(!resp.ok, "no calendar grant → denied");
-            assert!(toast.is_none(), "a scope miss is transient, not a knock");
-            assert!(resp.calendar.is_none());
-        });
+        // A departures-only grant does NOT cover calendar (per-datasource).
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "departures")]));
+        state.apply_cmd(Cmd::Calendar(calendar_fixture()));
+        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        let (resp, toast) = get_answer(state.handle_get(&token, "calendar", None));
+        assert!(!resp.ok, "no calendar grant → denied");
+        assert!(toast.is_none(), "a scope miss is transient, not a knock");
+        assert!(resp.calendar.is_none());
     }
 
     #[test]
@@ -1364,5 +1588,142 @@ mod tests {
         assert_eq!(calendar_scoped(&cal, None).len(), 2, "None = all");
         assert_eq!(calendar_scoped(&cal, Some(1)).len(), 1);
         assert_eq!(calendar_scoped(&cal, Some(9)).len(), 2, "over-limit clamps");
+    }
+
+    // ── Routed datasources: departures + weather (#509) ────────────────────────
+
+    #[test]
+    fn known_datasources_are_the_routed_two_plus_calendar() {
+        assert!(is_known_datasource("departures"));
+        assert!(is_known_datasource("weather"));
+        assert!(is_known_datasource("calendar"));
+        assert!(!is_known_datasource("stocks"));
+    }
+
+    #[test]
+    fn query_scope_and_params_shapes_by_datasource() {
+        let (scope, params) = query_scope_and_params("departures", Some(3));
+        assert_eq!(scope, "next");
+        assert!(
+            params.contains("\"limit\":3"),
+            "params carry the limit: {params}"
+        );
+        // A missing limit falls back to the default.
+        let (_, params) = query_scope_and_params("departures", None);
+        assert!(params.contains(&format!("\"limit\":{DEFAULT_DEPARTURES_LIMIT}")));
+        // Weather takes the `current` scope and empty params.
+        let (scope, params) = query_scope_and_params("weather", None);
+        assert_eq!(scope, "current");
+        assert_eq!(params, "{}");
+    }
+
+    #[test]
+    fn query_response_departures_decodes_the_provider_payload() {
+        let payload = serde_json::to_string(&vec![DepartureOut {
+            line: "S9".to_owned(),
+            direction: "Spandau".to_owned(),
+            hhmm: "16:05".to_owned(),
+            in_minutes: 7,
+            delay_minutes: 1,
+            cancelled: false,
+        }])
+        .unwrap();
+        let resp = query_response("departures", QueryOutcome::Ready(payload));
+        assert!(resp.ok);
+        assert_eq!(resp.datasource.as_deref(), Some("departures"));
+        let rows = resp.departures.expect("departures rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].line, "S9");
+        assert!(resp.weather.is_none());
+    }
+
+    #[test]
+    fn query_response_weather_decodes_the_provider_payload() {
+        let payload = serde_json::to_string(&WeatherOut {
+            location: "Berlin".to_owned(),
+            temp_c: 21.0,
+            apparent_c: 20.0,
+            temp_max_c: 24.0,
+            temp_min_c: 15.0,
+            humidity_pct: 55,
+            wind_kmh: 9.0,
+            condition_code: 0,
+            condition_label: "Clear".to_owned(),
+            condition_icon: "weather-clear-symbolic".to_owned(),
+        })
+        .unwrap();
+        let resp = query_response("weather", QueryOutcome::Ready(payload));
+        assert!(resp.ok);
+        assert_eq!(resp.datasource.as_deref(), Some("weather"));
+        let w = resp.weather.expect("weather reading");
+        assert_eq!(w.location, "Berlin");
+        assert_eq!(w.condition_label, "Clear");
+        assert!(resp.departures.is_none());
+    }
+
+    #[test]
+    fn query_response_failure_is_a_transient_error() {
+        let resp = query_response("departures", QueryOutcome::Failed("no provider".to_owned()));
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("no provider"));
+    }
+
+    #[test]
+    fn query_response_unreadable_payload_is_an_error() {
+        let resp = query_response("weather", QueryOutcome::Ready("not json".to_owned()));
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn handle_get_departures_routes_a_query_under_the_grant_flow() {
+        // A session token authorizes any datasource get; departures now routes a
+        // query rather than fetching inline (#509 dedup).
+        let mut state = BrokerState::new(store(Vec::new()));
+        let token = state
+            .tokens
+            .mint_scoped("claude", now_unix(), TokenScope::Session);
+        match state.handle_get(&token.value, "departures", Some(4)) {
+            GetDisposition::Query {
+                datasource,
+                scope,
+                params,
+            } => {
+                assert_eq!(datasource, "departures");
+                assert_eq!(scope, "next");
+                assert!(params.contains("\"limit\":4"));
+            }
+            GetDisposition::Answer(resp, _) => panic!("expected a routed query, got {resp:?}"),
+        }
+        // The access grant is audited even though the answer is deferred.
+        assert_eq!(
+            state.audit.back().expect("audited").outcome,
+            Outcome::Granted
+        );
+    }
+
+    #[test]
+    fn handle_get_weather_routes_a_query_under_the_grant_flow() {
+        let mut state = BrokerState::new(store(vec![Grant::always("claude", "weather")]));
+        let token = answer(state.handle_auth("claude")).0.token.expect("token");
+        match state.handle_get(&token, "weather", None) {
+            GetDisposition::Query {
+                datasource, scope, ..
+            } => {
+                assert_eq!(datasource, "weather");
+                assert_eq!(scope, "current");
+            }
+            GetDisposition::Answer(resp, _) => panic!("expected a routed query, got {resp:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_get_departures_without_a_grant_is_denied_inline() {
+        // No standing grant + a plain identity token → denied inline, never routed.
+        let mut state = BrokerState::new(store(Vec::new()));
+        let identity = state.tokens.mint("stranger", now_unix());
+        let (resp, toast) = get_answer(state.handle_get(&identity.value, "departures", None));
+        assert!(!resp.ok, "no grant → denied, not routed");
+        assert!(toast.is_none());
     }
 }

@@ -55,13 +55,20 @@
 mod feed;
 
 use feed::Row;
-use hytte_plugin::proto::{Capability, Effect, EventKind, Manifest, Mount, Node, StateKey};
+use hytte_plugin::proto::{
+    Capability, DatasourceError, DatasourceOutcome, Effect, EventKind, Manifest, Mount, Node,
+    ProvidedDatasource, StateKey,
+};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
 const PLUGIN_ID: &str = "departures";
+/// The `departures` datasource's one scope (#509): the upcoming catchable
+/// departures. The provider↔requester JSON payload is an array of
+/// [`DepartureJson`], documented as the datasource contract.
+const SCOPE_NEXT: &str = "next";
 /// The root `ListBox` node id.
 const ROOT_ID: &str = "departures-root";
 
@@ -367,7 +374,15 @@ impl Plugin for Board {
         // (sole card in the region today).
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom);
         m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
-        m.capabilities = vec![Capability::RaiseOsd];
+        // `DatasourceProvider` + `provides` (#509): this board also serves its next
+        // departures as the `departures` datasource, so the infobroker can source
+        // them through the running plugin rather than duplicating the fetch. Scope
+        // `next` = the upcoming catchable departures the card already holds.
+        m.capabilities = vec![Capability::RaiseOsd, Capability::DatasourceProvider];
+        m.provides = vec![ProvidedDatasource::new(
+            PLUGIN_ID,
+            vec![SCOPE_NEXT.to_owned()],
+        )];
         m
     }
 
@@ -435,9 +450,17 @@ impl Plugin for Board {
                 }
                 Vec::new()
             }
-            // Additive `Input` variants — today `EffectResult` (this board issues
-            // no `RunCommand`), plus any future kind. A wildcard keeps new
-            // variants from breaking the build.
+            // A datasource query (#509): answer the `departures` datasource from the
+            // board's current rows. The board keeps them live off its poller, so the
+            // answer is served straight from the model — no extra fetch.
+            Input::DatasourceQuery {
+                request_id, params, ..
+            } => {
+                vec![self.answer_query(request_id, &params)]
+            }
+            // Additive `Input` variants — today `EffectResult`/`DatasourceResult`
+            // (this board issues no `RunCommand` and no query of its own), plus any
+            // future kind. A wildcard keeps new variants from breaking the build.
             _ => Vec::new(),
         }
     }
@@ -483,6 +506,78 @@ impl Plugin for Board {
             children,
         }
         .into()
+    }
+}
+
+// ── Datasource provider (#509) ───────────────────────────────────────────────
+
+/// One departure row in the `departures` datasource payload — the JSON contract a
+/// requester (e.g. the infobroker) decodes. Mirrors the shape the infobroker
+/// already used for its own fetch (`line`/`direction`/`hhmm`/`in_minutes`/
+/// `delay_minutes`/`cancelled`), so the dedup is a drop-in on the requester side.
+#[derive(serde::Serialize)]
+struct DepartureJson<'a> {
+    line: &'a str,
+    direction: &'a str,
+    hhmm: &'a str,
+    /// Whole minutes from the query instant until departure (`0` = now/imminent).
+    in_minutes: i64,
+    delay_minutes: i64,
+    cancelled: bool,
+}
+
+/// The `{"limit": n}` request payload a requester may send. Absent/garbage params
+/// fall back to the whole held list.
+#[derive(serde::Deserialize, Default)]
+struct QueryParams {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+impl Board {
+    /// Answer a `departures` datasource query (#509) from the board's current rows.
+    /// The rows are live off the poller, so this serves the model — Loading/Err
+    /// surface as a provider-sourced failure the requester can relay.
+    fn answer_query(&self, request_id: u64, params: &str) -> Effect {
+        let limit = serde_json::from_str::<QueryParams>(params)
+            .unwrap_or_default()
+            .limit;
+        let outcome = match &self.state {
+            BoardState::Ok { items, .. } | BoardState::Stale { items, .. } => {
+                let take = limit.unwrap_or(items.len());
+                let rows: Vec<DepartureJson> = items
+                    .iter()
+                    .take(take)
+                    .map(|r| DepartureJson {
+                        line: &r.line,
+                        direction: &r.direction,
+                        hhmm: &r.hhmm,
+                        in_minutes: ((r.actual_unix - self.now_unix).max(0)) / 60,
+                        delay_minutes: r.delay_minutes,
+                        cancelled: r.cancelled,
+                    })
+                    .collect();
+                match serde_json::to_string(&rows) {
+                    Ok(payload) => DatasourceOutcome::Ready(payload),
+                    Err(e) => DatasourceOutcome::Failed {
+                        error: DatasourceError::Provider,
+                        message: format!("serialize departures: {e}"),
+                    },
+                }
+            }
+            BoardState::Loading => DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: "departures not loaded yet".to_owned(),
+            },
+            BoardState::Err { err } => DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: err.clone(),
+            },
+        };
+        Effect::DatasourceResult {
+            request_id,
+            outcome,
+        }
     }
 }
 
@@ -1142,6 +1237,17 @@ mod tests {
             m.capabilities.contains(&Capability::RaiseOsd),
             "the board raises OSD nudges, so it requests the RaiseOsd cap"
         );
+    }
+
+    #[test]
+    fn manifest_provides_the_departures_datasource() {
+        // #509: the board serves its next departures as the `departures` datasource,
+        // so it declares `DatasourceProvider` + a matching `provides` entry.
+        let m = Board::manifest();
+        assert!(m.capabilities.contains(&Capability::DatasourceProvider));
+        assert_eq!(m.provides.len(), 1);
+        assert_eq!(m.provides[0].id, "departures");
+        assert!(m.provides[0].serves_scope("next"));
     }
 
     #[test]

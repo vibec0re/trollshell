@@ -135,6 +135,87 @@ pub enum Effect {
         scope: String,
         detail: String,
     },
+    /// Query a datasource served by **another** plugin (#509), gated on
+    /// [`DatasourceQuery`](crate::manifest::Capability::DatasourceQuery). The
+    /// requester side of the generic datasource protocol; the calendar case is
+    /// already served by the host directly
+    /// ([`StateKey::CalendarUpcoming`](crate::manifest::StateKey::CalendarUpcoming)),
+    /// so this exists for **third-party** datasources.
+    ///
+    /// **Host-routed** — the requester never dials the provider. The host is the
+    /// single policy chokepoint: it validates a provider for `provider` is connected
+    /// and declared `scope`, forwards the query to it as
+    /// [`HostMsg::DatasourceQuery`](crate::msg::HostMsg::DatasourceQuery), then
+    /// routes the answer back to *this* plugin as
+    /// [`HostMsg::DatasourceResult`](crate::msg::HostMsg::DatasourceResult) keyed by
+    /// the same `request_id`. **Not** fire-and-forget: it is a request/response pair,
+    /// mirroring [`RunCommand`](Effect::RunCommand)→
+    /// [`EffectResult`](crate::msg::HostMsg::EffectResult). A missing provider, a
+    /// denied scope, or an unanswered query (10 s host timeout) resolves to a
+    /// synthesized [`DatasourceOutcome::Failed`], so a requester never hangs.
+    ///
+    /// `request_id` is the requester's own correlation token (a fresh one per
+    /// query); `provider` names the datasource id (matched against providers'
+    /// [`Manifest::provides`](crate::manifest::Manifest::provides)); `scope` selects
+    /// a sub-view the provider declared; and `params` is an **opaque JSON** request
+    /// string — the provider↔requester contract, documented per-datasource, that the
+    /// host never interprets (keeping the vocab stable as datasources multiply).
+    DatasourceQuery {
+        request_id: u64,
+        provider: String,
+        scope: String,
+        params: String,
+    },
+    /// A provider's answer to a host-forwarded datasource query (#509), gated on
+    /// [`DatasourceProvider`](crate::manifest::Capability::DatasourceProvider). Sent
+    /// by a provider plugin in reply to the
+    /// [`HostMsg::DatasourceQuery`](crate::msg::HostMsg::DatasourceQuery) the host
+    /// pushed it. The provider echoes the host's `request_id` verbatim — an **opaque
+    /// host correlation**, *not* the requester's token (the host translates it on
+    /// both legs so provider and requester id-spaces can never collide) — and returns
+    /// the [`DatasourceOutcome`]. The host routes it on to the original requester.
+    DatasourceResult {
+        request_id: u64,
+        outcome: DatasourceOutcome,
+    },
+}
+
+/// The outcome of a datasource query (#509). Travels twice: from a provider back
+/// to the host in [`Effect::DatasourceResult`], and from the host on to the
+/// requester in [`HostMsg::DatasourceResult`](crate::msg::HostMsg::DatasourceResult).
+/// A provider returns [`Ready`](DatasourceOutcome::Ready) with an opaque JSON
+/// payload (the provider↔requester contract, never interpreted by the host) or
+/// [`Failed`](DatasourceOutcome::Failed) for a failure of its own; the host itself
+/// synthesizes a [`Failed`](DatasourceOutcome::Failed) for a routing failure — no
+/// connected provider, a scope the provider never declared, or an unanswered query.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatasourceOutcome {
+    /// The query succeeded; `String` is the provider's opaque JSON payload.
+    Ready(String),
+    /// The query failed. `error` classifies it (host- or provider-sourced);
+    /// `message` is a human-readable detail line.
+    Failed {
+        error: DatasourceError,
+        message: String,
+    },
+}
+
+/// Why a datasource query failed (#509), carried in
+/// [`DatasourceOutcome::Failed`]. The first three are **host-synthesized** routing
+/// failures the requester sees without the provider ever running; [`Provider`](DatasourceError::Provider)
+/// is a failure the provider itself reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatasourceError {
+    /// No connected plugin provides the named datasource (host-synthesized).
+    NotFound,
+    /// A provider is connected but did not declare the requested scope
+    /// (host-synthesized).
+    ScopeDenied,
+    /// The provider did not answer within the host's query timeout
+    /// (host-synthesized).
+    Timeout,
+    /// The provider answered with a failure of its own (provider-sourced).
+    Provider,
 }
 
 /// The human's answer to an [`Effect::RequestConsent`] knock (#487 phase 1b),

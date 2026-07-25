@@ -94,9 +94,10 @@ pub const PROTO_VERSION: u16 = 1;
 
 pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_body};
 pub use effect::{
-    AudioAction, ConsentDecision, Effect, EffectOutcome, MediaAction, NiriAction, Page,
+    AudioAction, ConsentDecision, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
+    MediaAction, NiriAction, Page,
 };
-pub use manifest::{Capability, Manifest, Mount, StateKey};
+pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use state::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, SPECTRUM_BINS, StateSnapshot,

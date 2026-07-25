@@ -13,6 +13,8 @@ use hytte::services::notifications;
 use hytte_plugin_proto::{Effect, EffectOutcome, HostMsg, Page};
 use tokio::sync::mpsc;
 
+use super::datasource::DatasourceRouter;
+
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// [`Effect::Notify`] (→ a local notification toast, #406), [`Effect::RunCommand`]
@@ -31,7 +33,18 @@ use tokio::sync::mpsc;
 /// for [`Effect::RequestConsent`] as a [`HostMsg::ConsentDecision`] (#487), and the
 /// command outcome for [`Effect::RunCommand`] as a [`HostMsg::EffectResult`] (#510).
 /// The one-way effects ignore it.
-pub(super) fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) {
+///
+/// `datasource` is the host's cross-connection [`DatasourceRouter`] (#509): unlike
+/// the two-way effects above (whose reply routes back to the *same* connection via
+/// `outbound`), a datasource query routes to a **different** connection (the
+/// provider) and its result back again, so the broker hands those two effects to
+/// the router rather than answering on `outbound`.
+pub(super) fn broker_effect(
+    plugin_id: &str,
+    effect: &Effect,
+    outbound: &mpsc::Sender<HostMsg>,
+    datasource: &DatasourceRouter,
+) {
     // Every effect reaching the broker cleared capability enforcement + the rate
     // cap upstream (`session`), so it is an `Allowed` decision in the persisted
     // audit log (#510); the dropped ones are recorded at their `session` drop sites.
@@ -101,6 +114,43 @@ pub(super) fn broker_effect(plugin_id: &str, effect: &Effect, outbound: &mpsc::S
             // higher-trust cap, so the host runs exactly what the manifest allows.
             tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
             run_command(plugin_id, *id, argv.clone(), outbound.clone());
+        }
+        Effect::DatasourceQuery {
+            request_id,
+            provider,
+            scope,
+            params,
+        } => {
+            // #509: host-routed to the providing connection. Reaching here means the
+            // plugin holds `Capability::DatasourceQuery` (`enforce_capabilities`
+            // drops it otherwise). The router validates a provider is connected +
+            // serves the scope, parks the requester keyed by a host correlation, and
+            // forwards the query; a missing provider / denied scope / 10 s timeout
+            // synthesizes a `Failed` result back to `outbound`, so the requester
+            // never hangs.
+            tracing::info!(plugin = %plugin_id, %provider, %scope, request_id = *request_id, "plugin effect: DatasourceQuery");
+            datasource.route_query(
+                plugin_id.to_owned(),
+                *request_id,
+                provider.clone(),
+                scope.clone(),
+                params.clone(),
+                outbound.clone(),
+            );
+        }
+        Effect::DatasourceResult {
+            request_id,
+            outcome,
+        } => {
+            // #509: a provider's answer, keyed by the opaque host correlation the
+            // host forwarded (echoed verbatim here, NOT the requester's token).
+            // Reaching here means the plugin holds `Capability::DatasourceProvider`.
+            // The router maps the correlation back to the parked requester and its
+            // original `request_id`; an unknown/expired correlation is dropped, and
+            // (#553) so is one echoed by any plugin other than the provider the query
+            // was routed to — `plugin_id` is that identity check.
+            tracing::info!(plugin = %plugin_id, request_id = *request_id, "plugin effect: DatasourceResult");
+            datasource.deliver_result(*request_id, plugin_id.to_owned(), outcome.clone());
         }
         other => {
             tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");
@@ -332,6 +382,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::RaiseOsd { .. } => "RaiseOsd",
         Effect::Notify { .. } => "Notify",
         Effect::RequestConsent { .. } => "RequestConsent",
+        Effect::DatasourceQuery { .. } => "DatasourceQuery",
+        Effect::DatasourceResult { .. } => "DatasourceResult",
     }
 }
 

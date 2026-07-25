@@ -378,7 +378,9 @@ impl Plugin for Caw {
             | Input::SlotVisible(_)
             | Input::AudioSpectrum(_)
             | Input::ConsentDecision { .. }
-            | Input::NowPlaying(_) => {}
+            | Input::NowPlaying(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => {}
         }
         Vec::new()
     }

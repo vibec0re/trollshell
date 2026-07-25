@@ -25,14 +25,14 @@
 //!   Allow/Deny prompting is deferred to phase 1b.
 
 use hytte_plugin::proto::{
-    Capability, ConsentDecision, Dir, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
-    UpcomingEvent,
+    Capability, ConsentDecision, DatasourceError, DatasourceOutcome, Dir, Effect, EventKind,
+    Manifest, Mount, Node, Page, StateKey, UpcomingEvent,
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use hytte_plugin_infobroker::broker::{
     AuditView, BrokerMsg, BrokerSnapshot, Cmd, ConsentDecision as BrokerConsentDecision,
-    DatasourceView, GrantView, Outcome, PendingView, TokenView,
+    DatasourceView, GrantView, Outcome, PendingView, QueryOutcome, QueryRequest, TokenView,
 };
 use hytte_plugin_infobroker::wire::CalendarEntry;
 use tokio::sync::mpsc;
@@ -90,6 +90,10 @@ impl Plugin for Infobroker {
             Capability::Consent,
             Capability::Calendar,
             Capability::SessionState,
+            // #509: the requester side of the datasource protocol — the broker
+            // sources `departures`/`weather` through their provider plugins via
+            // `Effect::DatasourceQuery`, so it needs this cap.
+            Capability::DatasourceQuery,
         ];
         m
     }
@@ -148,6 +152,22 @@ impl Plugin for Infobroker {
                     detail: prompt.detail,
                 }]
             }
+            // The broker wants a datasource query routed to the host (#509): turn it
+            // into `Effect::DatasourceQuery`. The result returns via
+            // `Input::DatasourceResult` below and is relayed back down the lane.
+            Input::App(BrokerMsg::Query(QueryRequest {
+                request_id,
+                provider,
+                scope,
+                params,
+            })) => {
+                vec![Effect::DatasourceQuery {
+                    request_id,
+                    provider,
+                    scope,
+                    params,
+                }]
+            }
             // The human answered (or the host's 60 s timeout fired → `Deny`):
             // forward the decision down the lane to the broker, which resolves the
             // parked request. Fire-and-forget, no effect of its own.
@@ -172,6 +192,20 @@ impl Plugin for Infobroker {
             // The session lock state (#484): drives the panel's privacy blank.
             Input::SessionLocked(locked) => {
                 self.locked = locked;
+                Vec::new()
+            }
+            // A routed datasource query's answer (#509): relay it down the lane to
+            // the broker, which resolves the parked `get`. Mapped from the proto
+            // type at the boundary (the library is SDK-free), exactly as consent
+            // decisions and calendar digests are.
+            Input::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
+                let _ = self.cmd_tx.send(Cmd::QueryResult {
+                    request_id,
+                    outcome: map_query_outcome(outcome),
+                });
                 Vec::new()
             }
             Input::Event { node, kind } => self.on_event(&node, &kind),
@@ -582,6 +616,25 @@ fn map_decision(decision: ConsentDecision) -> BrokerConsentDecision {
     }
 }
 
+/// Map the proto's datasource query outcome onto the broker library's SDK-free
+/// mirror (#509), translating at the boundary like [`map_decision`]. A failure
+/// keeps the host's/provider's message and prefixes a short kind label so the
+/// broker's `Response::error` reads well (`no provider`, `denied scope`, …).
+fn map_query_outcome(outcome: DatasourceOutcome) -> QueryOutcome {
+    match outcome {
+        DatasourceOutcome::Ready(payload) => QueryOutcome::Ready(payload),
+        DatasourceOutcome::Failed { error, message } => {
+            let label = match error {
+                DatasourceError::NotFound => "no provider",
+                DatasourceError::ScopeDenied => "denied scope",
+                DatasourceError::Timeout => "timed out",
+                DatasourceError::Provider => "provider error",
+            };
+            QueryOutcome::Failed(format!("{label}: {message}"))
+        }
+    }
+}
+
 /// A coarse "expires in" label: `"2h 5m"`, `"9m"`, or `"<1m"`. Clock ticks
 /// relabel it live; an already-past value (shouldn't reach the panel, since the
 /// broker prunes) reads `"soon"`.
@@ -802,6 +855,30 @@ mod tests {
             map_decision(ConsentDecision::Deny),
             BrokerConsentDecision::Deny
         );
+    }
+
+    #[test]
+    fn map_query_outcome_translates_ready_and_every_error() {
+        assert_eq!(
+            map_query_outcome(DatasourceOutcome::Ready("payload".to_owned())),
+            QueryOutcome::Ready("payload".to_owned()),
+        );
+        // Each proto error kind becomes a labeled, still-human broker failure.
+        for (error, label) in [
+            (DatasourceError::NotFound, "no provider"),
+            (DatasourceError::ScopeDenied, "denied scope"),
+            (DatasourceError::Timeout, "timed out"),
+            (DatasourceError::Provider, "provider error"),
+        ] {
+            let QueryOutcome::Failed(msg) = map_query_outcome(DatasourceOutcome::Failed {
+                error,
+                message: "detail".to_owned(),
+            }) else {
+                panic!("a failure maps to QueryOutcome::Failed");
+            };
+            assert!(msg.starts_with(label), "{msg}");
+            assert!(msg.contains("detail"));
+        }
     }
 
     #[test]

@@ -34,6 +34,12 @@ pub const DATASOURCE_DEPARTURES: &str = "departures";
 /// directly; the host push is the bridge.
 pub const DATASOURCE_CALENDAR: &str = "calendar";
 
+/// The weather datasource (#509 item 3). Like departures, the broker sources it
+/// through the running provider plugin over the host's generic datasource query
+/// protocol (a `hytte-plugin-weather` that declares `provides = ["weather"]`) —
+/// the broker itself never fetches.
+pub const DATASOURCE_WEATHER: &str = "weather";
+
 /// One request line from the CLI. Externally tagged on `op` so adding an op is
 /// additive and an unknown op fails to parse loudly rather than silently.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +92,25 @@ pub struct CalendarEntry {
     pub calendar: String,
 }
 
+/// The current weather reading in a [`Response`] (`get weather` ok, #509). The
+/// broker's SDK-free mirror of the `hytte-plugin-weather` provider's payload; the
+/// broker decodes the provider's opaque JSON into this at the query boundary. The
+/// condition is split into its raw WMO `code` plus a display `label`/`icon` so an
+/// agent needn't re-derive them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WeatherOut {
+    pub location: String,
+    pub temp_c: f64,
+    pub apparent_c: f64,
+    pub temp_max_c: f64,
+    pub temp_min_c: f64,
+    pub humidity_pct: u8,
+    pub wind_kmh: f64,
+    pub condition_code: u8,
+    pub condition_label: String,
+    pub condition_icon: String,
+}
+
 /// One grant row in a `grants` [`Response`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantOut {
@@ -97,8 +122,9 @@ pub struct GrantOut {
 }
 
 /// One response line. `ok` is the only required field; the rest are populated
-/// per op and skipped when absent, so the JSON stays tight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// per op and skipped when absent, so the JSON stays tight. (Not `Eq`: `weather`
+/// carries `f64` readings, #509.)
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     /// A one-line failure reason (present iff `!ok`).
@@ -123,6 +149,9 @@ pub struct Response {
     /// The scoped departures (`get departures` ok).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub departures: Option<Vec<DepartureOut>>,
+    /// The current weather reading (`get weather` ok, #509).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weather: Option<WeatherOut>,
     /// The upcoming calendar events (`get calendar` ok, #484).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar: Option<Vec<CalendarEntry>>,

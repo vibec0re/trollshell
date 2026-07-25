@@ -183,6 +183,29 @@ where
                 Some(Ok(HostMsg::NowPlaying { now_playing })) => {
                     Step::Update(Input::NowPlaying(now_playing))
                 }
+                // #509: a datasource query forwarded to this provider plugin.
+                // Answer it by returning an `Effect::DatasourceResult` echoing
+                // `request_id` (the opaque host correlation).
+                Some(Ok(HostMsg::DatasourceQuery {
+                    request_id,
+                    datasource,
+                    scope,
+                    params,
+                })) => Step::Update(Input::DatasourceQuery {
+                    request_id,
+                    datasource,
+                    scope,
+                    params,
+                }),
+                // #509: the answer to a query this requester plugin issued, keyed by
+                // its own `request_id`.
+                Some(Ok(HostMsg::DatasourceResult {
+                    request_id,
+                    outcome,
+                })) => Step::Update(Input::DatasourceResult {
+                    request_id,
+                    outcome,
+                }),
                 Some(Ok(HostMsg::Accent { color })) => {
                     // Theme plumbing (#376): the host resolved `@accent_color`
                     // and handed it over. Feed it to the `preem` kit as the
@@ -408,6 +431,22 @@ mod tests {
                 }
                 Input::NowPlaying(np) => {
                     self.iso = format!("np:{}|{}|{}", np.title, np.artist, np.playing);
+                    Vec::new()
+                }
+                // #509: as a provider, answer a forwarded query by echoing the host
+                // correlation back in a `DatasourceResult`.
+                Input::DatasourceQuery { request_id, .. } => {
+                    vec![Effect::DatasourceResult {
+                        request_id,
+                        outcome: hytte_plugin_proto::DatasourceOutcome::Ready("echo".to_owned()),
+                    }]
+                }
+                // #509: as a requester, reflect the query result into the view.
+                Input::DatasourceResult {
+                    request_id,
+                    outcome,
+                } => {
+                    self.iso = format!("ds{request_id}={outcome:?}");
                     Vec::new()
                 }
                 Input::SlotVisible(_) | Input::AudioSpectrum(_) => Vec::new(),
@@ -676,7 +715,9 @@ mod tests {
                 | Input::ConsentDecision { .. }
                 | Input::CalendarUpcoming(_)
                 | Input::SessionLocked(_)
-                | Input::NowPlaying(_) => {}
+                | Input::NowPlaying(_)
+                | Input::DatasourceQuery { .. }
+                | Input::DatasourceResult { .. } => {}
             }
             Vec::new()
         }

@@ -263,6 +263,10 @@ pub(super) fn effect_capability(effect: &Effect) -> Capability {
         Effect::RaiseOsd { .. } => Capability::RaiseOsd,
         Effect::Notify { .. } => Capability::Notify,
         Effect::RequestConsent { .. } => Capability::Consent,
+        // #509: the requester side of the datasource protocol.
+        Effect::DatasourceQuery { .. } => Capability::DatasourceQuery,
+        // #509: the provider side — answering a forwarded query.
+        Effect::DatasourceResult { .. } => Capability::DatasourceProvider,
     }
 }
 
@@ -441,6 +445,33 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // full queue (`push_state`) and the liveness ping reaps the stuck connection.
     let (out_tx, out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(writer_task(wr, out_rx));
+
+    // Datasource providers (#509): register each datasource this connection serves
+    // so the effect broker can route a matching `Effect::DatasourceQuery` (from any
+    // requester) to THIS connection's outbound. Gated on BOTH a non-empty `provides`
+    // entry AND `Capability::DatasourceProvider` — the same declared-*and*-enforced
+    // posture as the domain-state push gate (`push_gate`): a plugin that lists
+    // datasources but omits the capability is refused registration and warned.
+    // Registered under this connection's `generation`, so teardown removes only
+    // entries a fast-reconnect successor hasn't already replaced.
+    if !manifest.provides.is_empty() {
+        if capabilities.contains(&Capability::DatasourceProvider) {
+            for ds in &manifest.provides {
+                ctx.datasource.register_provider(
+                    &ds.id,
+                    &plugin_id,
+                    ds.scopes.clone(),
+                    out_tx.clone(),
+                    generation,
+                );
+            }
+        } else {
+            tracing::warn!(
+                plugin = %plugin_id,
+                "plugin lists `provides` datasources without declaring Capability::DatasourceProvider; not registered as a provider",
+            );
+        }
+    }
 
     // Initial + on-change state snapshots (Clock only, if subscribed).
     let snapshot = manifest
@@ -640,6 +671,13 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // plugin's panel is the one currently shown, the drawer child's derived
     // signal yields `None` and renders empty (the user then closes the drawer).
     clear_region_if_owned(&ctx.panels, &plugin_id, generation);
+    // Datasource providers (#509): drop each datasource this connection served,
+    // generation-guarded so a fast-reconnect successor's registration is never
+    // evicted (the same #278 guard as the region clears above). A no-op for a
+    // non-provider, or for an entry a newer connection already replaced.
+    for ds in &manifest.provides {
+        ctx.datasource.unregister_provider(&ds.id, generation);
+    }
     // Drop this connection from the runtime mirror (#423) — done here, still
     // inside the id's exclusive-ownership window (the `IdGuard` releases only
     // when `handle_conn` returns), so it can't evict a fast-reconnect successor.

@@ -5,10 +5,12 @@
 //! ([`hytte_plugin_infobroker::wire`]):
 //!
 //! ```text
-//! hytte-infobroker auth --agent <name>        # → `export HYTTE_INFOBROKER_TOKEN=…`
-//! hytte-infobroker get departures [--limit N] # uses $HYTTE_INFOBROKER_TOKEN → JSON
-//! hytte-infobroker grants list                # the durable grants (introspection)
+//! hytte-infobroker auth --agent <name>          # → `export HYTTE_INFOBROKER_TOKEN=…`
+//! hytte-infobroker get <datasource> [--limit N] # uses $HYTTE_INFOBROKER_TOKEN → JSON
+//! hytte-infobroker grants list                  # the durable grants (introspection)
 //! ```
+//!
+//! `<datasource>` is `departures` / `weather` / `calendar` (#509/#484).
 //!
 //! The auth line is meant to be `eval`'d:
 //! `eval "$(hytte-infobroker auth --agent claude)"`. Blocking std sockets only —
@@ -19,7 +21,9 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use hytte_plugin_infobroker::paths;
-use hytte_plugin_infobroker::wire::{DATASOURCE_DEPARTURES, Request, Response};
+use hytte_plugin_infobroker::wire::{
+    DATASOURCE_CALENDAR, DATASOURCE_DEPARTURES, DATASOURCE_WEATHER, Request, Response,
+};
 
 /// The environment variable carrying the session token, injected by `auth` and
 /// read by `get`.
@@ -32,8 +36,10 @@ USAGE:
     hytte-infobroker auth --agent <name>          mint a session token (prints an
                                                   `export HYTTE_INFOBROKER_TOKEN=…`
                                                   line to eval)
-    hytte-infobroker get departures [--limit N]   fetch scoped data (needs the env
-                                                  token from a prior auth)
+    hytte-infobroker get <datasource> [--limit N] fetch scoped data (needs the env
+                                                  token from a prior auth).
+                                                  <datasource>: departures | weather
+                                                  | calendar
     hytte-infobroker grants list                  list the durable grants
 
 Typical agent flow:
@@ -91,15 +97,23 @@ fn cmd_auth(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `get departures [--limit N]` → the scoped departures as pretty JSON on
-/// stdout, using the env token.
+/// `get <datasource> [--limit N]` → the scoped data as pretty JSON on stdout,
+/// using the env token. The datasource must be one the broker serves —
+/// `departures` / `weather` (each answered by its provider plugin over the host's
+/// query protocol) or `calendar` (the host-fed live copy). `--limit` caps the row
+/// datasources (`departures` / `calendar`); `weather` is a single reading and
+/// ignores it.
 fn cmd_get(args: &[String]) -> Result<(), String> {
     let datasource = args
         .first()
         .ok_or("get: missing datasource (try `get departures`)")?;
-    if datasource != DATASOURCE_DEPARTURES {
+    if !matches!(
+        datasource.as_str(),
+        DATASOURCE_DEPARTURES | DATASOURCE_WEATHER | DATASOURCE_CALENDAR
+    ) {
         return Err(format!(
-            "get: unknown datasource '{datasource}' (phase 1a ships only '{DATASOURCE_DEPARTURES}')"
+            "get: unknown datasource '{datasource}' \
+             (known: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_WEATHER}', '{DATASOURCE_CALENDAR}')"
         ));
     }
     let limit = match flag_value(&args[1..], "--limit") {
@@ -122,8 +136,20 @@ fn cmd_get(args: &[String]) -> Result<(), String> {
     if !resp.ok {
         return Err(deny_message(&resp));
     }
-    let rows = resp.departures.unwrap_or_default();
-    let json = serde_json::to_string_pretty(&rows).map_err(|e| format!("encoding output: {e}"))?;
+    // Each `get` populates exactly one payload field (the broker shapes it per
+    // datasource); print that one as pretty JSON. A row datasource with no rows
+    // prints as `[]`; weather is a single object.
+    let json = match datasource.as_str() {
+        DATASOURCE_WEATHER => {
+            let reading = resp
+                .weather
+                .ok_or("get: broker returned ok without a weather reading")?;
+            serde_json::to_string_pretty(&reading)
+        }
+        DATASOURCE_CALENDAR => serde_json::to_string_pretty(&resp.calendar.unwrap_or_default()),
+        _ => serde_json::to_string_pretty(&resp.departures.unwrap_or_default()),
+    }
+    .map_err(|e| format!("encoding output: {e}"))?;
     println!("{json}");
     Ok(())
 }

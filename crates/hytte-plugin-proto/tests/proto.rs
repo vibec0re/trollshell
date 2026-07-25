@@ -3,10 +3,10 @@
 //! sockets, no display — pure encode/decode.
 
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, ConsentDecision, Dir, Effect, EffectOutcome, EventKind,
-    HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction, Mount, NiriAction, Node,
-    PROTO_VERSION, Page, PluginMsg, ProtoError, StateKey, StateSnapshot, decode, decode_body,
-    encode, encode_body,
+    AudioAction, Capability, ClockState, ConsentDecision, DatasourceError, DatasourceOutcome, Dir,
+    Effect, EffectOutcome, EventKind, HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction,
+    Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, ProtoError, ProvidedDatasource,
+    StateKey, StateSnapshot, decode, decode_body, encode, encode_body,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -19,6 +19,7 @@ fn sample_manifest() -> Manifest {
         capabilities: vec![Capability::OpenPage, Capability::RunCommand],
         mount: Mount::SidebarTop,
         order: None,
+        provides: Vec::new(),
     }
 }
 
@@ -137,6 +138,23 @@ fn sample_effects() -> Vec<Effect> {
             summary: "Timer done".into(),
             body: "25:00 timer finished".into(),
         },
+        Effect::DatasourceQuery {
+            request_id: 3,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: r#"{"limit":5}"#.into(),
+        },
+        Effect::DatasourceResult {
+            request_id: 91,
+            outcome: DatasourceOutcome::Ready(r#"[{"line":"S9"}]"#.into()),
+        },
+        Effect::DatasourceResult {
+            request_id: 92,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: "fetch failed".into(),
+            },
+        },
     ]
 }
 
@@ -210,6 +228,16 @@ fn host_msgs_round_trip() {
     });
     round_trip_host(&HostMsg::SlotVisibility { visible: true });
     round_trip_host(&HostMsg::SlotVisibility { visible: false });
+    round_trip_host(&HostMsg::DatasourceQuery {
+        request_id: 5,
+        datasource: "departures".into(),
+        scope: "next".into(),
+        params: r#"{"limit":3}"#.into(),
+    });
+    round_trip_host(&HostMsg::DatasourceResult {
+        request_id: 5,
+        outcome: DatasourceOutcome::Ready(r#"[{"line":"S9"}]"#.into()),
+    });
     round_trip_host(&HostMsg::Ping { seq: 1 });
     round_trip_host(&HostMsg::Shutdown);
 }
@@ -667,6 +695,132 @@ fn consent_decision_push_round_trips_every_variant() {
             "decision name rides the wire",
         );
     }
+}
+
+// ── Datasource protocol (#509) ───────────────────────────────────────────────
+
+#[test]
+fn datasource_effects_are_name_tagged_and_additive() {
+    // The two new `Effect` variants ride the wire as their bare variant *names*,
+    // so appending them is additive and `PROTO_VERSION` stays 1.
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a variant must not bump the proto"
+    );
+
+    let query = Effect::DatasourceQuery {
+        request_id: 1,
+        provider: "departures".into(),
+        scope: "next".into(),
+        params: r#"{"limit":5}"#.into(),
+    };
+    assert!(
+        contains(&encode_body(&query), b"DatasourceQuery"),
+        "variant name 'DatasourceQuery' rides the wire",
+    );
+    assert_eq!(
+        query,
+        decode::<Effect>(&encode(&query)).expect("decode DatasourceQuery"),
+    );
+
+    let result = Effect::DatasourceResult {
+        request_id: 1,
+        outcome: DatasourceOutcome::Ready("payload".into()),
+    };
+    assert!(contains(&encode_body(&result), b"DatasourceResult"));
+    assert_eq!(
+        result,
+        decode::<Effect>(&encode(&result)).expect("decode DatasourceResult"),
+    );
+}
+
+#[test]
+fn datasource_outcome_round_trips_every_shape() {
+    // The success payload and each host-/provider-sourced error kind survive the
+    // round-trip, and the error names ride the wire (name-tagged → additive).
+    let cases = [
+        DatasourceOutcome::Ready(r#"{"ok":true}"#.into()),
+        DatasourceOutcome::Failed {
+            error: DatasourceError::NotFound,
+            message: "no provider".into(),
+        },
+        DatasourceOutcome::Failed {
+            error: DatasourceError::ScopeDenied,
+            message: "scope not served".into(),
+        },
+        DatasourceOutcome::Failed {
+            error: DatasourceError::Timeout,
+            message: "no answer".into(),
+        },
+        DatasourceOutcome::Failed {
+            error: DatasourceError::Provider,
+            message: "upstream failed".into(),
+        },
+    ];
+    for outcome in cases {
+        let msg = HostMsg::DatasourceResult {
+            request_id: 7,
+            outcome: outcome.clone(),
+        };
+        assert_eq!(
+            msg,
+            decode::<HostMsg>(&encode(&msg)).expect("decode DatasourceResult"),
+            "{outcome:?} round-trips",
+        );
+    }
+    for name in [
+        b"NotFound".as_slice(),
+        b"ScopeDenied",
+        b"Timeout",
+        b"Provider",
+    ] {
+        let outcome = DatasourceOutcome::Failed {
+            error: match name {
+                b"NotFound" => DatasourceError::NotFound,
+                b"ScopeDenied" => DatasourceError::ScopeDenied,
+                b"Timeout" => DatasourceError::Timeout,
+                _ => DatasourceError::Provider,
+            },
+            message: String::new(),
+        };
+        assert!(
+            contains(&encode_body(&outcome), name),
+            "error name rides the wire",
+        );
+    }
+}
+
+#[test]
+fn datasource_capabilities_and_provides_are_additive() {
+    // The two new caps ride the wire as bare names, and the `provides` field is an
+    // additive, skip-when-empty manifest field: a non-provider manifest is
+    // byte-identical to a pre-#509 one, and a provider's round-trips.
+    for cap in [Capability::DatasourceQuery, Capability::DatasourceProvider] {
+        let mut m = sample_manifest();
+        m.capabilities = vec![cap];
+        assert_eq!(m, decode::<Manifest>(&encode(&m)).expect("decode cap"));
+    }
+
+    // A non-provider's `provides` is empty and skipped on the wire → byte-identical
+    // to a pre-#509 manifest that never had the field.
+    let plain = sample_manifest();
+    assert!(plain.provides.is_empty());
+    assert!(
+        !contains(&encode_body(&plain), b"provides"),
+        "an empty `provides` is skipped on the wire",
+    );
+
+    // A provider's manifest round-trips carrying its provided datasources + cap.
+    let mut provider = sample_manifest();
+    provider.capabilities = vec![Capability::DatasourceProvider];
+    provider.provides = vec![
+        ProvidedDatasource::new("departures", vec!["next".into()]),
+        ProvidedDatasource::new("weather", vec!["current".into()]),
+    ];
+    let back: Manifest = decode(&encode(&provider)).expect("decode provider manifest");
+    assert_eq!(provider, back);
+    assert!(back.provides[0].serves_scope("next"));
+    assert!(!back.provides[0].serves_scope("nope"));
 }
 
 // ── Plugin panel + PluginSelf page (#349 PR2) ────────────────────────────────

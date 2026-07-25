@@ -309,8 +309,8 @@
 use std::time::Duration;
 
 use hytte_plugin_proto::{
-    AudioSpectrum, ConsentDecision, Effect, EffectOutcome, EventKind, Manifest, Node, NodeId,
-    NowPlaying, StateSnapshot, UpcomingEvent,
+    AudioSpectrum, ConsentDecision, DatasourceOutcome, Effect, EffectOutcome, EventKind, Manifest,
+    Node, NodeId, NowPlaying, StateSnapshot, UpcomingEvent,
 };
 
 pub mod preem;
@@ -509,6 +509,43 @@ pub enum Input<M> {
     /// declares [`Capability::NowPlaying`](proto::Capability::NowPlaying). Pushed on
     /// change (latest-wins), like [`AudioSpectrum`](Input::AudioSpectrum).
     NowPlaying(NowPlaying),
+    /// A datasource query forwarded to this **provider** plugin (#509): the host
+    /// [`DatasourceQuery`](proto::HostMsg::DatasourceQuery) push, delivered only to a
+    /// plugin that declares [`Capability::DatasourceProvider`](proto::Capability::DatasourceProvider)
+    /// and lists `datasource` in [`Manifest::provides`](proto::Manifest::provides).
+    /// Answer it by returning an
+    /// [`Effect::DatasourceResult`](proto::Effect::DatasourceResult) from
+    /// [`update`](Plugin::update), echoing `request_id` **verbatim** (it is an opaque
+    /// host correlation the host maps back to the original requester — do not
+    /// interpret or reuse it) and carrying the [`DatasourceOutcome`](proto::DatasourceOutcome).
+    /// `params` is the requester's opaque JSON request (the provider↔requester
+    /// contract); a provider that serves one scope can usually ignore `scope`.
+    DatasourceQuery {
+        /// The opaque host correlation to echo back in the result. Not the
+        /// requester's token — the host translates it on both legs.
+        request_id: u64,
+        /// Which datasource is being queried (a provider serving several
+        /// [`Manifest::provides`](proto::Manifest::provides) entries dispatches on it).
+        datasource: String,
+        /// The requested scope (a sub-view the provider declared).
+        scope: String,
+        /// The requester's opaque JSON request payload.
+        params: String,
+    },
+    /// The result of a datasource query this **requester** plugin issued (#509): the
+    /// host [`DatasourceResult`](proto::HostMsg::DatasourceResult) push, keyed by the
+    /// `request_id` the plugin chose on the originating
+    /// [`Effect::DatasourceQuery`](proto::Effect::DatasourceQuery). Delivered only to
+    /// a plugin that declared [`Capability::DatasourceQuery`](proto::Capability::DatasourceQuery).
+    /// Carries either the provider's answer or a host-synthesized error (no provider
+    /// / denied scope / timeout), so a query always eventually resolves — the
+    /// datasource mate of [`EffectResult`](Input::EffectResult).
+    DatasourceResult {
+        /// The `request_id` the plugin chose on the originating query.
+        request_id: u64,
+        /// The provider's payload, or a host-/provider-sourced failure.
+        outcome: DatasourceOutcome,
+    },
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
 }

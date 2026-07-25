@@ -191,7 +191,9 @@ impl Plugin for Terminal {
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
             | Input::SessionLocked(_)
-            | Input::NowPlaying(_) => {}
+            | Input::NowPlaying(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => {}
             // `Msg = Infallible`: there are no app messages to receive.
             Input::App(never) => match never {},
         }

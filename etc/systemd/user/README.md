@@ -85,6 +85,13 @@ unit per plugin binary on the same pattern.
 > (`Restart=on-failure`, `PartOf=graphical-session.target`), and the static
 > units below keep working as the manual path — the socket doesn't care who
 > spawned the plugin.
+>
+> Since #558 each bundled plugin also ships as its own flake package
+> (`hytte-plugin-<id>`), so the declarative path needs no out-of-tree
+> derivation — point `package` straight at it:
+> `programs.trollshell.plugins.pet.package =
+trollshell.packages.${system}.hytte-plugin-pet;`. The static units below
+> remain the legacy fallback (they exec hand-copied binaries, not a nix path).
 
 `trollshell-plugin-pet.service` is the second in-tree plugin (#276): a
 kaomoji cat in the sidebar's top slot — poke it by clicking. It shares the

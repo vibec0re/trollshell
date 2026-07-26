@@ -360,9 +360,11 @@ self:
       default = { };
       example = lib.literalExpression ''
         {
-          hyperhive = {
-            package = pkgs.hyperhive-plugin;
-            env.HYPERHIVE_TOKEN = "…";
+          # A bundled plugin, wired from this flake's per-plugin package
+          # (see the list of ids in the description below):
+          pet = {
+            package = trollshell.packages.''${system}.hytte-plugin-pet;
+            env.PET_NAME = "nisse";
           };
         }
       '';
@@ -385,6 +387,17 @@ self:
         plugin.sock and registers itself; the control-center's Plugins tab
         (#348) starts/stops the transient units live, while *enablement*
         stays declared here.
+
+        Each bundled plugin ships as its own package in this flake (#558), so
+        `package` points straight at a `hytte-plugin-<id>` output — no
+        out-of-tree derivation needed:
+
+            plugins.pet.package = trollshell.packages.''${system}.hytte-plugin-pet;
+
+        The bundled ids are: audio-widget, bar-clock-demo, caw, clock-demo,
+        departures, infobroker, pet, preem-demo, terminal, timer, usage,
+        weather (each output named `hytte-plugin-<id>`). Their per-plugin
+        runtime knobs go through `env` / `secrets` above.
       '';
     };
   };

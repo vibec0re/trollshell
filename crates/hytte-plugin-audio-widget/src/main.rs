@@ -49,9 +49,10 @@
 
 mod spectrum;
 
+use std::cell::RefCell;
 use std::time::Duration;
 
-use hytte_plugin::preem::{DisplayStyle, LedStrip, Marquee, PeakHold};
+use hytte_plugin::preem::{DisplayStyle, Frame, LedStrip, Marquee, MarqueeStrip, PeakHold};
 use hytte_plugin::proto::{
     Capability, Dir, Effect, Manifest, Mount, Node, NowPlaying, SPECTRUM_BINS, StateKey,
 };
@@ -108,11 +109,55 @@ enum Msg {
     Tick,
 }
 
+/// The rasterized marquee strip, cached by the exact text it was drawn from.
+///
+/// The preem [`Marquee`] API is render-**once**, then [`window`](MarqueeStrip::window)
+/// a slice per frame (`crates/hytte-plugin/src/preem/marquee.rs`): `render` runs
+/// the full dot-matrix pipeline (per-glyph ghost + lit + bloom passes), while
+/// `window` is a cheap sub-rect blit. But the SDK calls [`view`](AudioWidget::view)
+/// on every input — ~43×/s while visible (the 20 Hz tick + ~23 Hz spectrum
+/// push) — for marquee text that changes only when the track or the idle/active
+/// state flips (#560). So the strip is rasterized once per distinct text and
+/// merely windowed each frame.
+#[derive(Debug, Default)]
+struct MarqueeCache {
+    /// The cached `(text, strip)`: the strip rasterized from that exact text.
+    /// `None` before the first [`frame`](Self::frame).
+    entry: Option<(String, MarqueeStrip)>,
+    /// How many times the strip has been (re)rasterized — a test hook (see
+    /// `the_marquee_strip_is_cached`) proving the strip re-renders **iff** the
+    /// text changed. Not logical state, so it's `#[cfg(test)]`-only and never
+    /// rides in the shipped widget.
+    #[cfg(test)]
+    renders: u64,
+}
+
+impl MarqueeCache {
+    /// The `MARQUEE_WINDOW_PX`-wide marquee frame for `text` at scroll `offset`.
+    /// Re-rasterizes the strip only when `text` differs from the last render;
+    /// otherwise it just slides the window over the cached strip.
+    fn frame(&mut self, text: &str, offset: usize) -> Frame {
+        if self.entry.as_ref().is_none_or(|(t, _)| t.as_str() != text) {
+            let strip = Marquee::new(STYLE)
+                .window_px(MARQUEE_WINDOW_PX)
+                .render(text);
+            self.entry = Some((text.to_owned(), strip));
+            #[cfg(test)]
+            {
+                self.renders += 1;
+            }
+        }
+        self.entry
+            .as_ref()
+            .expect("populated above")
+            .1
+            .window(offset)
+    }
+}
+
 /// The whole audio widget — rebuilt on every (re)connect (the host stores
 /// nothing), re-derived from the next spectrum push.
-// `Eq` is intentionally not derived: `bins` is `[f32; N]` (PartialEq, not Eq),
-// and nothing compares the whole model for equality.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct AudioWidget {
     /// Whether the sidebar (and so this card) is currently shown — the
     /// [`SlotVisible`](Input::SlotVisible) gate for the frame timer's work.
@@ -130,6 +175,25 @@ struct AudioWidget {
     /// marquee scrolls `title — artist` while `playing`, and falls back to the
     /// decorative banner otherwise (see [`AudioWidget::marquee_text`]).
     now_playing: NowPlaying,
+    /// The rasterized-marquee cache (#560). `RefCell` because [`view`](Self::view)
+    /// takes `&self` yet refills the cache lazily.
+    marquee_cache: RefCell<MarqueeCache>,
+}
+
+// `PartialEq` is hand-written (not derived) to exclude `marquee_cache`: it's a
+// pure derived-render cache, so two models with equal logical state must compare
+// equal regardless of what either has cached — otherwise a stale/differing cache
+// could leak into the SDK's `view() != last_view` dedup or model equality.
+// (`Eq` stays underived: `bins` is `[f32; N]`, `PartialEq` but not `Eq`.)
+impl PartialEq for AudioWidget {
+    fn eq(&self, other: &Self) -> bool {
+        self.visible == other.visible
+            && self.frame == other.frame
+            && self.bins == other.bins
+            && self.level == other.level
+            && self.peak == other.peak
+            && self.now_playing == other.now_playing
+    }
 }
 
 impl AudioWidget {
@@ -220,6 +284,7 @@ impl Plugin for AudioWidget {
             level: PeakHold::new(LEVEL_RELEASE),
             peak: PeakHold::new(PEAK_RELEASE),
             now_playing: NowPlaying::default(),
+            marquee_cache: RefCell::default(),
         }
     }
 
@@ -278,10 +343,13 @@ impl Plugin for AudioWidget {
     /// fits the ~296 px sidebar content width. No `.card`/`.ts-plugin-*` class —
     /// the host's region wrapper supplies the card chrome.
     fn view(&self) -> View {
-        let marquee = Marquee::new(STYLE)
-            .window_px(MARQUEE_WINDOW_PX)
-            .render(&self.marquee_text())
-            .window(self.marquee_offset());
+        // Render the marquee strip once per distinct text, then window it per
+        // frame (#560) — see [`MarqueeCache`]. `borrow_mut` is uncontended: the
+        // runtime never calls `view` reentrantly.
+        let marquee = self
+            .marquee_cache
+            .borrow_mut()
+            .frame(&self.marquee_text(), self.marquee_offset());
         let scope = spectrum::scope_tile(&self.bins);
         let leds = LedStrip::new(STYLE).render(self.level.value(), self.peak.value());
         Node::Box {
@@ -524,6 +592,70 @@ mod tests {
         let o0 = m.marquee_offset();
         tick(&mut m);
         assert_eq!(m.marquee_offset() - o0, MARQUEE_STEP, "one tick, one step");
+    }
+
+    /// The marquee strip is rasterized **once per distinct text** and merely
+    /// windowed per frame (#560): identical text over repeated `view()`s
+    /// re-renders nothing, advancing the scroll offset re-renders nothing, and a
+    /// text change (idle banner → active banner) re-rasterizes exactly once. The
+    /// rasterization count is read off the widget's own cache — no SDK hook.
+    #[test]
+    fn the_marquee_strip_is_cached() {
+        let mut m = shown();
+        assert_eq!(m.marquee_text(), IDLE_MSG, "silent at rest");
+
+        // First view rasterizes the idle banner.
+        let _ = m.view();
+        assert_eq!(
+            m.marquee_cache.borrow().renders,
+            1,
+            "the first view rasterizes the strip"
+        );
+
+        // Same text over more views (offset unchanged) → no re-rasterization.
+        let _ = m.view();
+        let _ = m.view();
+        assert_eq!(
+            m.marquee_cache.borrow().renders,
+            1,
+            "identical text reuses the cached strip"
+        );
+
+        // A tick advances the scroll offset but not the text — still windowing,
+        // never re-rasterizing.
+        tick(&mut m);
+        assert_eq!(m.marquee_text(), IDLE_MSG, "still silent, same text");
+        let _ = m.view();
+        assert_eq!(
+            m.marquee_cache.borrow().renders,
+            1,
+            "advancing the window offset does not re-rasterize"
+        );
+
+        // A loud push flips the banner idle → active: exactly one re-rasterization.
+        let _ = m.update(spectrum(0.9, 0, 0.9));
+        assert_eq!(m.marquee_text(), ACTIVE_MSG, "a loud push reads as playing");
+        let _ = m.view();
+        assert_eq!(
+            m.marquee_cache.borrow().renders,
+            2,
+            "a text change re-rasterizes the strip once"
+        );
+
+        // The active banner scrolls; ticking advances the offset and windows the
+        // same strip — still no re-rasterization.
+        tick(&mut m);
+        assert_eq!(
+            m.marquee_text(),
+            ACTIVE_MSG,
+            "the peak lingers, still active"
+        );
+        let _ = m.view();
+        assert_eq!(
+            m.marquee_cache.borrow().renders,
+            2,
+            "scrolling the active banner windows the cached strip"
+        );
     }
 
     /// Every `Pixels` buffer honors the host's `len == w*h*4` seam and the ~296 px

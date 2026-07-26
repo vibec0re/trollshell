@@ -18,6 +18,16 @@ use crate::scale::scale;
 /// falling off-screen left) — single source so the two never drift apart.
 pub(crate) const DRAWER_MAX_WIDTH: i32 = 680;
 
+/// Wider drawer max content width for the Stats multicolumn layout (#508). Two
+/// side-by-side history graphs inside the global `DRAWER_MAX_WIDTH` (680) would
+/// each squeeze to ~330px — the opposite of #508's "the panel got smaller"
+/// complaint — so the multicolumn Stats page opts into this via
+/// [`finish_page_clamped`]. `modal.rs`'s centering clamp
+/// (`main_margin_for_center`) uses this as its upper bound too, so a card up to
+/// this wide still centers correctly under its trigger chip. No other page uses
+/// it — every other page stays on `finish_page`/`DRAWER_MAX_WIDTH`.
+pub(crate) const DRAWER_MAX_WIDTH_WIDE: i32 = 1080;
+
 pub(crate) fn page_box() -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
     b.add_css_class("ts-modal-page");
@@ -42,6 +52,22 @@ pub(crate) fn finish_page(content: &impl IsA<gtk::Widget>) -> gtk::Widget {
     // `maximum_size` and the overshoot disappears. Both values are scaled with
     // the font so the cap grows consistently with the rest of the shell (#114).
     let cap = scale(DRAWER_MAX_WIDTH);
+    let clamp = adw::Clamp::builder()
+        .maximum_size(cap)
+        .tightening_threshold(cap)
+        .child(content)
+        .build();
+    clamp.upcast()
+}
+
+/// [`finish_page`] with a caller-chosen max width instead of the global
+/// `DRAWER_MAX_WIDTH`. Added for the Stats multicolumn layout (#508), which
+/// wants a wider clamp ([`DRAWER_MAX_WIDTH_WIDE`]) than the other pages so its
+/// two columns each get a usable width. Same `threshold == maximum_size`
+/// no-overshoot trick and font-scaling as [`finish_page`] — see that function's
+/// comment for why the two clamp values are equal.
+pub(crate) fn finish_page_clamped(content: &impl IsA<gtk::Widget>, max_width: i32) -> gtk::Widget {
+    let cap = scale(max_width);
     let clamp = adw::Clamp::builder()
         .maximum_size(cap)
         .tightening_threshold(cap)

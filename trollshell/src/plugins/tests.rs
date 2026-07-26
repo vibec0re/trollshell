@@ -2257,3 +2257,294 @@ async fn provides_without_capability_is_not_registered() {
         }
     ));
 }
+
+// ── Session-lane wave: spectrum demand-gate (#559) + now-playing re-seed (#542) ─
+
+/// #559: the per-connection spectrum-tap demand state machine
+/// ([`super::session::SpectrumGate`]). A connection contributes at most one unit
+/// to the (here local) refcount; the count's 0↔1 crossing is the
+/// `set_spectrum_active` edge. Pins the invariants the visibility gating relies
+/// on: no double count, no missed re-arm, idempotent transitions.
+#[test]
+fn spectrum_gate_counts_and_edges_are_exact() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = AtomicUsize::new(0);
+    let mut g = super::session::SpectrumGate::new();
+
+    // First demand (subscribed + visible): 0→1, activate.
+    assert_eq!(g.apply(true, &count), Some(true), "0→1 activates the tap");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // A repeated demand is idempotent — no double count, no spurious edge.
+    assert_eq!(g.apply(true, &count), None, "a repeated demand is a no-op");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // Goes off-screen: 1→0, deactivate.
+    assert_eq!(
+        g.apply(false, &count),
+        Some(false),
+        "1→0 deactivates the tap"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    // A repeated release is idempotent — no double decrement.
+    assert_eq!(
+        g.apply(false, &count),
+        None,
+        "a repeated release is a no-op"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    // Back on-screen: 0→1, re-arm the tap (no missed re-arm).
+    assert_eq!(
+        g.apply(true, &count),
+        Some(true),
+        "invisible→visible re-arms"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+/// #559: the invisible-then-disconnect path releases EXACTLY once. Going
+/// invisible drops the unit; the teardown release (the `SpectrumDemand` guard's
+/// `Drop`, modeled here as a final `apply(false)`) must then be a no-op —
+/// otherwise the refcount would underflow and stop the tap out from under a live
+/// sibling subscriber.
+#[test]
+fn spectrum_gate_invisible_then_disconnect_releases_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = AtomicUsize::new(0);
+    let mut g = super::session::SpectrumGate::new();
+
+    g.apply(true, &count); // visible: +1
+    assert_eq!(
+        g.apply(false, &count),
+        Some(false),
+        "going invisible is the sole release"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    // Teardown while already invisible must not decrement again.
+    assert_eq!(
+        g.apply(false, &count),
+        None,
+        "teardown after invisibility never double-decrements"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+/// #559: multiple on-screen subscribers share the tap through the refcount — it
+/// activates on the first and deactivates only on the last. A bar-mounted
+/// subscriber is always on-screen (modeled as a gate held constantly `true`), so
+/// it keeps its unit for the connection's life and a sidebar card opening/closing
+/// beneath it never toggles the tap.
+#[test]
+fn spectrum_gate_refcount_shares_the_tap_across_connections() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = AtomicUsize::new(0);
+    let mut sidebar = super::session::SpectrumGate::new();
+    let mut bar = super::session::SpectrumGate::new();
+
+    // The bar chip (always on-screen) starts the tap.
+    assert_eq!(
+        bar.apply(true, &count),
+        Some(true),
+        "the first on-screen subscriber starts the tap"
+    );
+    // A sidebar card opens: a second unit, tap already running → no edge.
+    assert_eq!(
+        sidebar.apply(true, &count),
+        None,
+        "a second on-screen subscriber adds no edge"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    // The sidebar closes: back to one (the bar) — still no 1→0 edge.
+    assert_eq!(
+        sidebar.apply(false, &count),
+        None,
+        "the bar subscriber keeps the tap alive"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // The bar subscriber finally leaves: 1→0, deactivate.
+    assert_eq!(
+        bar.apply(false, &count),
+        Some(false),
+        "the last subscriber stops the tap"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+/// Build a full `ListenerCtx` for the session-lane end-to-end tests, returning
+/// the visibility and now-playing senders the test drives. Unlike [`ctx_with`]
+/// (which surfaces only clock + visibility), this exposes the now-playing channel
+/// so the #542 unpark re-seed can be exercised through `handle_conn`.
+fn ctx_now_playing_lane() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<NowPlaying>) {
+    let (effects_tx, _effects_rx) = mpsc::unbounded_channel();
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (visibility_tx, visibility_rx) = watch::channel(false);
+    let (_accent_tx, accent_rx) = watch::channel(None);
+    let (_spectrum_tx, spectrum_rx) = watch::channel(None);
+    let (_calendar_tx, calendar_rx) = watch::channel(Vec::new());
+    let (now_playing_tx, now_playing_rx) = watch::channel(NowPlaying::default());
+    let (_locked_tx, locked_rx) = watch::channel(false);
+    let ctx = ListenerCtx {
+        sidebar_lead: Mutable::new(Vec::new()),
+        sidebar_top: Mutable::new(Vec::new()),
+        sidebar_bottom: Mutable::new(Vec::new()),
+        bar_left: Mutable::new(Vec::new()),
+        bar_center: Mutable::new(Vec::new()),
+        bar_right: Mutable::new(Vec::new()),
+        panels: Mutable::new(Vec::new()),
+        clock_rx,
+        visibility_rx,
+        accent_rx,
+        spectrum_rx,
+        calendar_rx,
+        now_playing_rx,
+        locked_rx,
+        live_ids: Arc::new(Mutex::new(HashSet::new())),
+        runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+        effects_tx,
+        datasource: DatasourceRouter::default(),
+    };
+    (ctx, visibility_tx, now_playing_tx)
+}
+
+/// #542, end to end through `handle_conn`: when a parked sidebar card unparks
+/// (`SlotVisible` false→true), the host re-seeds the current now-playing **after**
+/// the `SlotVisibility(true)` frame — so a marquee that dropped now-playing
+/// pushes while hidden resumes with the live track, not a stale one. Ordering is
+/// the crux (the widget only adopts now-playing while visible), which is why the
+/// re-seed rides the visibility task rather than a racing separate task.
+#[tokio::test]
+async fn now_playing_is_reseeded_on_the_unpark_edge() {
+    let (ctx, vis_tx, np_tx) = ctx_now_playing_lane();
+    // Seed a live track BEFORE connect, so the now-playing task seeds it and no
+    // later change fires — keeping the post-edge frames deterministic.
+    let track = NowPlaying {
+        title: "Chrome Rain".to_owned(),
+        artist: "Choom".to_owned(),
+        playing: true,
+    };
+    np_tx.send_replace(track.clone());
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (mut prd, mut pwr) = plugin_end.into_split();
+    // A sidebar card that parks on visibility and shows the live track (the
+    // audio-widget's shape): subscribes SlotVisible + NowPlaying, holds the
+    // NowPlaying capability the push is gated on.
+    let mut manifest = Manifest::new("marquee", Mount::SidebarTop);
+    manifest.subscribes = vec![StateKey::SlotVisible, StateKey::NowPlaying];
+    manifest.capabilities = vec![Capability::NowPlaying];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("send Register");
+
+    // The two register seeds arrive from two tasks in an unspecified order:
+    // SlotVisibility(false) and NowPlaying(track). Collect both.
+    let mut got_vis_seed = false;
+    let mut got_np_seed = false;
+    for _ in 0..2 {
+        match recv(&mut prd).await {
+            HostMsg::SlotVisibility { visible: false } => got_vis_seed = true,
+            HostMsg::NowPlaying { now_playing } => {
+                assert_eq!(now_playing, track, "the now-playing seed carries the track");
+                got_np_seed = true;
+            }
+            other => panic!("unexpected register seed: {other:?}"),
+        }
+    }
+    assert!(
+        got_vis_seed && got_np_seed,
+        "both the visibility and now-playing register seeds arrive",
+    );
+
+    // Unpark: open the sidebar. The visibility task sends SlotVisibility(true)…
+    vis_tx.send_replace(true);
+    assert!(
+        matches!(
+            recv(&mut prd).await,
+            HostMsg::SlotVisibility { visible: true }
+        ),
+        "the unpark edge delivers SlotVisibility(true) first",
+    );
+    // …then re-seeds the current now-playing, ordered right behind it, so the
+    // just-unparked marquee adopts the live track instead of resuming stale.
+    match recv(&mut prd).await {
+        HostMsg::NowPlaying { now_playing } => assert_eq!(
+            now_playing, track,
+            "the unpark re-seed carries the current track"
+        ),
+        other => {
+            panic!("expected the now-playing re-seed after SlotVisibility(true), got {other:?}")
+        }
+    }
+}
+
+/// #542: the unpark re-seed is scoped to the RISING edge. Closing the sidebar
+/// (true→false) delivers `SlotVisibility(false)` but must NOT re-seed now-playing
+/// — only a parked card *reopening* needs the refresh, not one going away. Proven
+/// by using a real now-playing change after the close as a sync barrier: the very
+/// next frame must be that change, so no spurious re-seed slipped in between.
+#[tokio::test]
+async fn now_playing_reseed_only_fires_on_the_rising_edge() {
+    let (ctx, vis_tx, np_tx) = ctx_now_playing_lane();
+    let track = NowPlaying {
+        title: "Neon".to_owned(),
+        artist: "Choom".to_owned(),
+        playing: true,
+    };
+    np_tx.send_replace(track.clone());
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (mut prd, mut pwr) = plugin_end.into_split();
+    let mut manifest = Manifest::new("marquee2", Mount::SidebarTop);
+    manifest.subscribes = vec![StateKey::SlotVisible, StateKey::NowPlaying];
+    manifest.capabilities = vec![Capability::NowPlaying];
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("send Register");
+
+    // Consume the two register seeds (SlotVisibility(false) + NowPlaying(track)),
+    // unspecified order.
+    for _ in 0..2 {
+        match recv(&mut prd).await {
+            HostMsg::SlotVisibility { visible: false } | HostMsg::NowPlaying { .. } => {}
+            other => panic!("unexpected register seed: {other:?}"),
+        }
+    }
+
+    // Open (rising edge): SlotVisibility(true) then the now-playing re-seed.
+    vis_tx.send_replace(true);
+    assert!(matches!(
+        recv(&mut prd).await,
+        HostMsg::SlotVisibility { visible: true }
+    ));
+    assert!(
+        matches!(recv(&mut prd).await, HostMsg::NowPlaying { .. }),
+        "the rising edge re-seeds now-playing",
+    );
+
+    // Close (falling edge): SlotVisibility(false) and nothing else. Drive a real
+    // now-playing change as the sync barrier — the frame right after the close
+    // must be that change, not a spurious re-seed of the old track.
+    vis_tx.send_replace(false);
+    assert!(
+        matches!(
+            recv(&mut prd).await,
+            HostMsg::SlotVisibility { visible: false }
+        ),
+        "closing delivers the visibility edge",
+    );
+    let next = NowPlaying {
+        title: "Rain".to_owned(),
+        artist: "Choom".to_owned(),
+        playing: true,
+    };
+    np_tx.send_replace(next.clone());
+    match recv(&mut prd).await {
+        HostMsg::NowPlaying { now_playing } => assert_eq!(
+            now_playing, next,
+            "no re-seed on the falling edge — the next frame is the real change",
+        ),
+        other => panic!("the falling edge must not re-seed now-playing: {other:?}"),
+    }
+}

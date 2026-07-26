@@ -34,12 +34,85 @@ use super::{BrokeredEffect, ListenerCtx, SlotRender};
 /// still owns it (see [`clear_region_if_owned`]).
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Count of connected plugins subscribing [`StateKey::AudioSpectrum`] (#405).
+/// Count of spectrum subscribers that are currently **on-screen** (#405/#559).
 /// The capture tap is toggled active on the 0→1 edge and inactive on the 1→0
-/// edge, so the default sink's monitor is only tapped while a plugin actually
-/// consumes it — an idle desktop (or one with no audio-reactive plugin) pays
-/// nothing.
+/// edge, so the default sink's monitor is only tapped while a plugin is both
+/// subscribed to [`StateKey::AudioSpectrum`] **and** visible (its sidebar is
+/// open, or it is bar-mounted — always on-screen). Before #559 this counted
+/// *connected* subscribers, which pinned the tap on all session because the
+/// audio-widget plugin is a persistent unit; keying on visibility means a
+/// closed sidebar drops the tap to inactive and an idle desktop genuinely pays
+/// nothing. Each connection contributes at most one unit, owned by its
+/// [`SpectrumDemand`] guard, so it can neither double-count nor miss a re-arm.
 static SPECTRUM_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-connection spectrum-tap demand state machine (#559). A spectrum
+/// subscriber "demands" the capture tap only while on-screen; this owns the
+/// connection's single contribution to the process-wide [`SPECTRUM_SUBSCRIBERS`]
+/// refcount so the counting is unit-testable in isolation from the live socket
+/// plumbing and the shared static.
+pub(super) struct SpectrumGate {
+    /// Whether this connection is currently contributing its one refcount unit.
+    demanding: bool,
+}
+
+impl SpectrumGate {
+    pub(super) fn new() -> Self {
+        Self { demanding: false }
+    }
+
+    /// Flip this connection's demand and fold the ±1 into `count`, returning the
+    /// tap-activation edge to drive: `Some(true)` when the count crosses 0→1
+    /// (start the capture), `Some(false)` on 1→0 (stop it), and `None` when
+    /// neither the demand nor the global edge changed. Idempotent per connection
+    /// — a repeated `demand` is a no-op — so a connection contributes at most one
+    /// unit and can neither double-count (an invisible→disconnect decrements
+    /// exactly once) nor miss a re-arm (an invisible→visible re-adds). Takes the
+    /// counter by reference so a test drives it over a local [`AtomicUsize`],
+    /// never the shared static.
+    pub(super) fn apply(&mut self, demand: bool, count: &AtomicUsize) -> Option<bool> {
+        if demand == self.demanding {
+            return None;
+        }
+        self.demanding = demand;
+        if demand {
+            (count.fetch_add(1, Ordering::SeqCst) == 0).then_some(true)
+        } else {
+            (count.fetch_sub(1, Ordering::SeqCst) == 1).then_some(false)
+        }
+    }
+}
+
+/// RAII spectrum-tap demand for one connection (#559): the [`SpectrumGate`]
+/// state machine wired to the real [`SPECTRUM_SUBSCRIBERS`] refcount and
+/// `pipewire::set_spectrum_active`. [`set`](SpectrumDemand::set) flips the
+/// connection's demand and drives the tap's 0↔1 activation edge; `Drop` releases
+/// a held unit — so a connection tearing down (its `spectrum_task` aborted)
+/// while it was demanding fires the 1→0 deactivation exactly once, with no
+/// inline decrement needed in teardown.
+struct SpectrumDemand {
+    gate: SpectrumGate,
+}
+
+impl SpectrumDemand {
+    fn new() -> Self {
+        Self {
+            gate: SpectrumGate::new(),
+        }
+    }
+
+    fn set(&mut self, demand: bool) {
+        if let Some(active) = self.gate.apply(demand, &SPECTRUM_SUBSCRIBERS) {
+            pipewire::set_spectrum_active(active);
+        }
+    }
+}
+
+impl Drop for SpectrumDemand {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
 
 /// Route one plugin `Render` frame (#274 / #277 / #349 PR2): strip its one-shot
 /// effects onto the global non-lossy broker channel, park (or clear) its optional
@@ -517,13 +590,25 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // fully visible. Seed a constant `visible: true` for bar mounts and hold no
     // task (a bar chip's visibility never changes, so there is nothing to track or
     // tear down); only sidebar mounts run the change-tracking `visibility_task`.
+    // Whether this connection is a gated now-playing subscriber (#528): reused
+    // below for the now-playing push task AND for the #542 unpark re-seed, which
+    // the sidebar visibility task carries so it lands *after* the
+    // `SlotVisibility(true)` frame (see `visibility_task`).
+    let now_playing_gated = push_gate(&manifest, StateKey::NowPlaying);
     let visibility = if manifest.subscribes.contains(&StateKey::SlotVisible) {
         if mount.is_bar() {
             let _ = out_tx.try_send(HostMsg::SlotVisibility { visible: true });
             None
         } else {
+            // #542: hand the sidebar visibility task the now-playing receiver
+            // too (only for a gated now-playing subscriber), so the unpark
+            // rising edge can re-seed the current track right after
+            // `SlotVisibility(true)` — a parked marquee drops now-playing pushes,
+            // so without the re-seed it resumes stale on reopen.
+            let np_rx = now_playing_gated.then(|| ctx.now_playing_rx.clone());
             Some(tokio::spawn(visibility_task(
                 ctx.visibility_rx.clone(),
+                np_rx,
                 out_tx.clone(),
             )))
         }
@@ -544,22 +629,26 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .contains(&StateKey::Accent)
         .then(|| tokio::spawn(accent_task(ctx.accent_rx.clone(), out_tx.clone())));
 
-    // Audio spectrum (#405): forward the ~20 Hz `{peak, bins}` push — but ONLY to
-    // a plugin that subscribes `StateKey::AudioSpectrum` (the #305 opt-in gate,
-    // exactly like accent/visibility). The capture tap itself is reference-counted
-    // across all such subscribers: the 0→1 edge starts it, the 1→0 edge (in
-    // teardown below) stops it, so the default sink's monitor is only tapped while
-    // something is listening. NOTE: this gates on a subscriber *existing*, not on
-    // its slot being on-screen — finer per-slot visibility gating is deferred (see
-    // the PR body: bar-chip visibility isn't modeled the way sidebar visibility is).
+    // Audio spectrum (#405/#559): forward the ~20 Hz `{peak, bins}` push — but
+    // ONLY to a plugin that subscribes `StateKey::AudioSpectrum` (the #305 opt-in
+    // gate, exactly like accent/visibility). The capture tap is reference-counted
+    // across the subscribers that are currently ON-SCREEN: the `spectrum_task`'s
+    // `SpectrumDemand` guard adds this connection's unit while it is visible
+    // (sidebar open, or a bar mount — always on-screen) and removes it when it
+    // goes off-screen or the connection tears down, driving the tap's 0↔1
+    // `set_spectrum_active` edge. So the default sink's monitor is tapped only
+    // while an audio-reactive card is actually being looked at — a closed sidebar
+    // (the audio-widget's card's usual state) drops it to inactive within a tick.
     let spectrum = manifest
         .subscribes
         .contains(&StateKey::AudioSpectrum)
         .then(|| {
-            if SPECTRUM_SUBSCRIBERS.fetch_add(1, Ordering::SeqCst) == 0 {
-                pipewire::set_spectrum_active(true);
-            }
-            tokio::spawn(spectrum_task(ctx.spectrum_rx.clone(), out_tx.clone()))
+            tokio::spawn(spectrum_task(
+                ctx.spectrum_rx.clone(),
+                ctx.visibility_rx.clone(),
+                mount.is_bar(),
+                out_tx.clone(),
+            ))
         });
 
     // The #484/#528 domain pushes: calendar / session-locked / now-playing. Each
@@ -571,7 +660,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         .then(|| tokio::spawn(calendar_task(ctx.calendar_rx.clone(), out_tx.clone())));
     let locked = push_gate(&manifest, StateKey::SessionLocked)
         .then(|| tokio::spawn(locked_task(ctx.locked_rx.clone(), out_tx.clone())));
-    let now_playing = push_gate(&manifest, StateKey::NowPlaying)
+    let now_playing = now_playing_gated
         .then(|| tokio::spawn(now_playing_task(ctx.now_playing_rx.clone(), out_tx.clone())));
 
     // Reader + liveness, raced (#435). The reader dispatches inbound frames; the
@@ -725,11 +814,11 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         accent.abort();
     }
     if let Some(spectrum) = spectrum {
+        // The task's `SpectrumDemand` guard releases this connection's refcount
+        // unit on drop (aborting the task drops its future) — firing the 1→0
+        // tap-deactivation edge if it was the last on-screen subscriber — so no
+        // inline decrement here (which would double-count against the guard).
         spectrum.abort();
-        // 1→0 edge: this was the last spectrum subscriber, so stop the tap.
-        if SPECTRUM_SUBSCRIBERS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            pipewire::set_spectrum_active(false);
-        }
     }
     if let Some(calendar) = calendar {
         calendar.abort();
@@ -790,16 +879,39 @@ async fn snapshot_task(
 /// subscribes [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never
 /// receives the frame, and a bar mount gets a constant `true` seed instead (its
 /// chip is always on-screen; see `handle_conn`, #438), never this change loop.
-async fn visibility_task(mut visibility_rx: watch::Receiver<bool>, out: mpsc::Sender<HostMsg>) {
+///
+/// #542: when `now_playing_rx` is `Some` (a gated now-playing subscriber), the
+/// unpark rising edge (`false`→`true`) additionally re-seeds the current
+/// now-playing **after** the `SlotVisibility(true)` frame. A parked card drops
+/// now-playing pushes while hidden (the audio-widget's marquee does), so without
+/// this re-seed it would resume showing a stale/stopped track until the next
+/// change. Carrying it here — rather than in a separate task — is what
+/// guarantees the ordering: the plugin flips `visible` before it adopts the
+/// re-seeded track (a separate task would race the visibility frame).
+async fn visibility_task(
+    mut visibility_rx: watch::Receiver<bool>,
+    now_playing_rx: Option<watch::Receiver<NowPlaying>>,
+    out: mpsc::Sender<HostMsg>,
+) {
     // Seed at register (the watch replays its current value).
-    let initial = *visibility_rx.borrow_and_update();
-    if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible: initial }) {
+    let mut visible = *visibility_rx.borrow_and_update();
+    if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible }) {
         return;
     }
     while visibility_rx.changed().await.is_ok() {
-        let visible = *visibility_rx.borrow_and_update();
+        let now_visible = *visibility_rx.borrow_and_update();
+        let rising = now_visible && !visible;
+        visible = now_visible;
         if let Push::Stop = push_state(&out, HostMsg::SlotVisibility { visible }) {
             break;
+        }
+        // #542: re-seed the current now-playing on the unpark edge, ordered
+        // after the `SlotVisibility(true)` frame above.
+        if rising && let Some(np_rx) = now_playing_rx.as_ref() {
+            let now_playing = np_rx.borrow().clone();
+            if let Push::Stop = push_state(&out, HostMsg::NowPlaying { now_playing }) {
+                break;
+            }
         }
     }
 }
@@ -832,11 +944,26 @@ async fn accent_task(mut accent_rx: watch::Receiver<Option<[u8; 4]>>, out: mpsc:
 /// only ever receives real `{peak, bins}` frames. Spawned **only** for a
 /// connection that subscribes [`StateKey::AudioSpectrum`] (#305) — an
 /// unsubscribed plugin never receives the frame.
+///
+/// #559: this task also owns the connection's demand on the capture tap via a
+/// [`SpectrumDemand`] guard. The tap is only worth running while the card is
+/// on-screen, so demand tracks visibility — a sidebar card demands while its
+/// sidebar is open (the `visibility_rx` edges), and a bar chip is always
+/// on-screen (`always_visible`, no edges to track). The guard drives the
+/// `SPECTRUM_SUBSCRIBERS` 0↔1 `set_spectrum_active` edge and, on `Drop`
+/// (task abort at teardown), releases this connection's unit exactly once.
 async fn spectrum_task(
     mut spectrum_rx: watch::Receiver<Option<AudioSpectrum>>,
+    mut visibility_rx: watch::Receiver<bool>,
+    always_visible: bool,
     out: mpsc::Sender<HostMsg>,
 ) {
-    // Seed at register (the watch replays its current value; often `None` until
+    // Seed the tap demand from the initial visibility: a bar chip demands
+    // unconditionally, a sidebar card only while its sidebar is currently open.
+    let mut demand = SpectrumDemand::new();
+    demand.set(always_visible || *visibility_rx.borrow_and_update());
+
+    // Seed the current spectrum (the watch replays its value; often `None` until
     // audio flows through the freshly-activated tap).
     let seed = *spectrum_rx.borrow_and_update();
     if let Some(spectrum) = seed
@@ -844,14 +971,32 @@ async fn spectrum_task(
     {
         return;
     }
-    while spectrum_rx.changed().await.is_ok() {
-        let current = *spectrum_rx.borrow_and_update();
-        if let Some(spectrum) = current
-            && let Push::Stop = push_state(&out, HostMsg::AudioSpectrum { spectrum })
-        {
-            break;
+    loop {
+        tokio::select! {
+            changed = spectrum_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let current = *spectrum_rx.borrow_and_update();
+                if let Some(spectrum) = current
+                    && let Push::Stop = push_state(&out, HostMsg::AudioSpectrum { spectrum })
+                {
+                    break;
+                }
+            }
+            // Re-compute demand as the sidebar opens/closes. A bar chip is always
+            // on-screen, so it never tracks these edges (the arm is disabled) and
+            // its demand stays the constant `true` seeded above.
+            changed = visibility_rx.changed(), if !always_visible => {
+                if changed.is_err() {
+                    break;
+                }
+                demand.set(*visibility_rx.borrow_and_update());
+            }
         }
     }
+    // `demand` drops here (natural exit) or when this task's future is dropped
+    // (teardown abort), releasing the tap contribution exactly once.
 }
 
 /// Push the upcoming-calendar digest on subscribe (the register seed) and on every

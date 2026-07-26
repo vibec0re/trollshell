@@ -158,21 +158,38 @@ pub(super) fn broker_effect(
     }
 }
 
-/// Map a wire [`Page`] onto the host's `modal::Page`. The two enums mirror each
-/// other 1:1 (restored in #508: the host's `Stats` page was briefly split into
-/// per-resource flyouts by #307, which made this a lossy approximation onto
-/// the CPU flyout; the combined page restores the exact match); written
-/// exhaustively so a page added to either side breaks the build here rather
-/// than silently mis-routing.
+/// Map a wire [`Page`] onto the host's `modal::Page`, reading the runtime Stats
+/// layout (#508) for the one page that isn't 1:1. Thin wrapper over the pure
+/// [`map_page_for_layout`] so the layout-independent arms stay unit-testable
+/// without touching the env.
 pub(super) fn map_page(page: Page) -> crate::modal::Page {
+    map_page_for_layout(page, crate::panels::stats::stats_layout())
+}
+
+/// Pure core of [`map_page`]: map a wire [`Page`] onto the host's `modal::Page`
+/// for a given [`crate::panels::stats::StatsLayout`]. The two enums mirror each
+/// other 1:1 except `Stats`: the wire protocol only ever had a single `Stats`
+/// page, so in the `split` layout (#508, which resurrects #307's five
+/// per-resource pages) it lands on the CPU flyout (`StatsCpu`, the primary
+/// stats page), the same approximation #307 made; in `combined`/`multicolumn`
+/// it's an exact `Stats` match. Written exhaustively so a page added to either
+/// side breaks the build here rather than silently mis-routing.
+pub(super) fn map_page_for_layout(
+    page: Page,
+    layout: crate::panels::stats::StatsLayout,
+) -> crate::modal::Page {
     use crate::modal::Page as M;
+    use crate::panels::stats::StatsLayout;
     match page {
         Page::Media => M::Media,
         Page::Network => M::Network,
         Page::Vpn => M::Vpn,
         Page::Connections => M::Connections,
         Page::Bluetooth => M::Bluetooth,
-        Page::Stats => M::Stats,
+        Page::Stats => match layout {
+            StatsLayout::Split => M::StatsCpu,
+            StatsLayout::Combined | StatsLayout::Multicolumn => M::Stats,
+        },
         Page::Audio => M::Audio,
         Page::Power => M::Power,
         Page::PowerMenu => M::PowerMenu,

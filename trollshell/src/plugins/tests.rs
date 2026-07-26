@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::datasource::DatasourceRouter;
 use super::effects::broker_effect;
-use super::effects::{PageAction, map_page, resolve_open_page};
+use super::effects::{PageAction, map_page, map_page_for_layout, resolve_open_page};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
 use super::pump::{any_sidebar_open, apply_forget, apply_open, to_now_playing, to_upcoming_events};
 use super::region::{clear_region_if_owned, upsert_region};
@@ -342,11 +342,14 @@ fn wire_entry_maps_to_ui() {
     assert_eq!(to_ui_node(&tree), expected);
 }
 
-/// Every wire `Page` maps to the identically-named `modal::Page` (#508: an
-/// exact 1:1 match again, now that the host's `Stats` page is combined).
+/// Every wire `Page` maps to the identically-named `modal::Page` in the
+/// combined/multicolumn layouts (#508: an exact 1:1 match, since those layouts
+/// keep the single `Stats` page). Uses the pure `map_page_for_layout` so the
+/// assertion doesn't depend on `TROLLSHELL_STATS_LAYOUT` in the test env.
 #[test]
 fn wire_page_maps_to_modal_page() {
     use crate::modal::Page as M;
+    use crate::panels::stats::StatsLayout;
     let cases = [
         (Page::Media, M::Media),
         (Page::Network, M::Network),
@@ -365,8 +368,37 @@ fn wire_page_maps_to_modal_page() {
         (Page::Settings, M::Settings),
     ];
     for (wire_page, modal_page) in cases {
-        assert_eq!(map_page(wire_page), modal_page);
+        assert_eq!(
+            map_page_for_layout(wire_page, StatsLayout::Combined),
+            modal_page
+        );
+        assert_eq!(
+            map_page_for_layout(wire_page, StatsLayout::Multicolumn),
+            modal_page
+        );
     }
+}
+
+/// In the `split` layout (#508), the wire protocol's single `Stats` page lands
+/// on the host's CPU flyout (`StatsCpu`) — the #307 approximation — while every
+/// other page stays a 1:1 match. `map_page` itself (env-read) resolves to the
+/// combined `Stats` in the hermetic test env (no env var set), guarding the
+/// default path.
+#[test]
+fn split_layout_maps_stats_to_cpu() {
+    use crate::modal::Page as M;
+    use crate::panels::stats::StatsLayout;
+    assert_eq!(
+        map_page_for_layout(Page::Stats, StatsLayout::Split),
+        M::StatsCpu
+    );
+    // A non-Stats page is layout-independent.
+    assert_eq!(
+        map_page_for_layout(Page::Media, StatsLayout::Split),
+        M::Media
+    );
+    // Default (env unset in tests) is the combined Stats.
+    assert_eq!(map_page(Page::Stats), M::Stats);
 }
 
 /// #349 PR2: `resolve_open_page` is the pure seam the broker uses to split a

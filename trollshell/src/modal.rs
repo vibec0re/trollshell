@@ -10,7 +10,7 @@ use hytte::services::clipboard;
 use hytte::services::notifications;
 use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
 
-use crate::components::layout::DRAWER_MAX_WIDTH;
+use crate::components::layout::DRAWER_MAX_WIDTH_WIDE;
 use crate::components::monitor_key::{is_fallback_key, monitor_key};
 use crate::components::visibility_gate::GateRegistry;
 use crate::scale::scale;
@@ -165,7 +165,19 @@ pub enum Page {
     Vpn,
     Connections,
     Bluetooth,
+    /// The combined (and multicolumn) Stats page. Chips open this in the
+    /// `combined`/`multicolumn` layouts; `build_page` picks `panel_stats` vs
+    /// `panel_stats_multicolumn` off [`crate::panels::stats::stats_layout`].
     Stats,
+    /// The five per-resource Stats pages (#307's split, restored in #508
+    /// alongside `Stats`). Only reached in the `split` layout: the resource
+    /// chips target their own variant instead of `Stats`, and the plugin wire
+    /// `Stats` page maps to `StatsCpu`. Inert in the other two layouts.
+    StatsCpu,
+    StatsMemory,
+    StatsDisks,
+    StatsGpu,
+    StatsServices,
     Audio,
     Power,
     PowerMenu,
@@ -190,10 +202,14 @@ impl Page {
     /// Pages whose content is backed by the `app_usage` service (the
     /// most-expensive-apps top-N CPU/RAM lists). Used to gate `app_usage`'s
     /// always-on `/proc` poller on whether one of these is actually visible
-    /// (#50, item 5 of #42): the combined Stats page carries the CPU and
-    /// Memory cards' top-apps expanders that read those lists.
+    /// (#50, item 5 of #42). The combined/multicolumn Stats page carries the
+    /// CPU and Memory cards' top-apps expanders; in the `split` layout (#508)
+    /// those expanders live on the per-resource `StatsCpu` / `StatsMemory`
+    /// pages instead. Listing all three keeps the gate correct in every layout
+    /// (only the layout's actual pages are ever registered/visible, so the
+    /// unused variants never match at runtime).
     fn uses_app_usage(self) -> bool {
-        matches!(self, Self::Stats)
+        matches!(self, Self::Stats | Self::StatsCpu | Self::StatsMemory)
     }
 
     /// Pages whose content is backed by the `mpris` service's position
@@ -208,13 +224,18 @@ impl Page {
     /// Every drawer page. The single source for reverse lookups
     /// ([`Page::from_stack_name`]); the string mapping still lives only in
     /// [`Page::stack_name`], so a page's token is defined in exactly one place.
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 20] = [
         Self::Media,
         Self::Network,
         Self::Vpn,
         Self::Connections,
         Self::Bluetooth,
         Self::Stats,
+        Self::StatsCpu,
+        Self::StatsMemory,
+        Self::StatsDisks,
+        Self::StatsGpu,
+        Self::StatsServices,
         Self::Audio,
         Self::Power,
         Self::PowerMenu,
@@ -234,6 +255,11 @@ impl Page {
             Self::Connections => "connections",
             Self::Bluetooth => "bluetooth",
             Self::Stats => "stats",
+            Self::StatsCpu => "stats-cpu",
+            Self::StatsMemory => "stats-memory",
+            Self::StatsDisks => "stats-disks",
+            Self::StatsGpu => "stats-gpu",
+            Self::StatsServices => "stats-services",
             Self::Audio => "audio",
             Self::Power => "power",
             Self::PowerMenu => "power-menu",
@@ -738,6 +764,7 @@ fn draw_drawer_silhouette(cr: &gtk::cairo::Context, w: f64, h: f64, base: gdk::R
 /// is now empty, so this function is only ever reached lazily.
 fn build_page(page: Page) -> gtk::Widget {
     use crate::panels;
+    use crate::panels::stats::StatsLayout;
 
     match page {
         Page::Media => panels::panel_media(),
@@ -745,7 +772,18 @@ fn build_page(page: Page) -> gtk::Widget {
         Page::Vpn => panels::panel_vpn(),
         Page::Connections => panels::panel_connections(),
         Page::Bluetooth => panels::panel_bluetooth(),
-        Page::Stats => panels::panel_stats(),
+        // The single Stats page renders combined or multicolumn per the runtime
+        // layout (#508); `split` never opens `Page::Stats` (chips target the
+        // per-resource variants), so combined is the harmless fallback there.
+        Page::Stats => match crate::panels::stats::stats_layout() {
+            StatsLayout::Multicolumn => panels::panel_stats_multicolumn(),
+            StatsLayout::Combined | StatsLayout::Split => panels::panel_stats(),
+        },
+        Page::StatsCpu => panels::panel_stats_cpu(),
+        Page::StatsMemory => panels::panel_stats_memory(),
+        Page::StatsDisks => panels::panel_stats_disks(),
+        Page::StatsGpu => panels::panel_stats_gpu(),
+        Page::StatsServices => panels::panel_stats_services(),
         Page::Audio => panels::panel_audio(),
         Page::Power => panels::panel_power(),
         Page::PowerMenu => panels::panel_power_menu(),
@@ -1275,7 +1313,14 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
         let (_, nat, _, _) = panel.card.measure(orientation, -1);
         nat
     };
-    let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH));
+    // Upper bound is the *wide* Stats clamp (#508), not `DRAWER_MAX_WIDTH`, so
+    // the multicolumn Stats page (which `finish_page_clamped`s to
+    // `DRAWER_MAX_WIDTH_WIDE`) still centers under its trigger chip instead of
+    // being measured as if it were 680 wide. Every other page measures well
+    // under 680, so widening the ceiling is a no-op for them — the clamp only
+    // ever bites on a pathological over-request, and now that ceiling covers the
+    // one page that legitimately reaches past 680.
+    let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH_WIDE));
 
     clamp_main_margin(
         screen_extent,
@@ -1393,7 +1438,9 @@ mod tests {
     /// deep-links and the niri command surface.
     #[test]
     fn all_has_stable_count() {
-        assert_eq!(Page::ALL.len(), 15);
+        // 15 core pages + the 5 per-resource `Stats*` split variants (#508
+        // restored #307's split alongside the combined page).
+        assert_eq!(Page::ALL.len(), 20);
     }
 
     /// Each page's `stack_name` is the key `ensure_page` hands to

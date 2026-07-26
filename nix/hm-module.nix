@@ -154,20 +154,26 @@ in
         # Session vars, each set only when its option is non-null. optionalAttrs
         # + // keeps the two independent (mkIf on a whole attrset would force an
         # all-or-nothing block).
-        home.sessionVariables =
-          (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
-            TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
-          })
-          // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
-            # Appearance picker reload command; null = the shell's swaybg default.
-            TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
-          })
-          // (lib.optionalAttrs cfg.recorder.audioByDefault {
-            # Arm the record chip's audio capture at session start (#403).
-            # Only set when opted in — unset reads as off, and the env var is
-            # the override, so Settings still flips it live during a session.
-            TROLLSHELL_RECORD_AUDIO = "1";
-          });
+        home.sessionVariables = {
+          # Stats-drawer layout (#508). Always set (not optionalAttrs): the
+          # value is a total enum whose default equals the shell's own runtime
+          # default ("combined"), so exporting it explicitly is harmless and
+          # keeps the session env self-describing.
+          TROLLSHELL_STATS_LAYOUT = cfg.stats.layout;
+        }
+        // (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
+          TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
+        })
+        // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
+          # Appearance picker reload command; null = the shell's swaybg default.
+          TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
+        })
+        // (lib.optionalAttrs cfg.recorder.audioByDefault {
+          # Arm the record chip's audio capture at session start (#403).
+          # Only set when opted in — unset reads as off, and the env var is
+          # the override, so Settings still flips it live during a session.
+          TROLLSHELL_RECORD_AUDIO = "1";
+        });
 
         systemd.user.services.trollshell = lib.mkIf cfg.systemd.enable {
           Unit = {

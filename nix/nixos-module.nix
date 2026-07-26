@@ -100,6 +100,12 @@ in
           pkgs.fira-code
         ];
 
+        # Stats-drawer layout (#508). Always exported (not mkIf): the value is a
+        # total enum whose default equals the shell's own runtime default
+        # ("combined"), so setting it explicitly is harmless and keeps the
+        # session env self-describing.
+        environment.sessionVariables.TROLLSHELL_STATS_LAYOUT = cfg.stats.layout;
+
         # Weather widget location fallback. Stays outside the recommended-
         # services switch on purpose: it's the manual alternative to geoclue,
         # so it must keep working when auto-location is turned off. weather

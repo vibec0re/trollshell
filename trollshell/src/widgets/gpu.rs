@@ -3,18 +3,24 @@ use hytte::prelude::*;
 use hytte::services::sensors;
 
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let monitor_for_scroll = monitor.clone();
-    let btn = crate::components::chip::indicator_scroll(
-        "ts-gpu",
-        crate::modal::Page::Stats,
-        monitor,
-        move || {
-            crate::panels::stats::set_scroll_target(
-                &monitor_for_scroll,
-                crate::panels::stats::StatsSection::Gpu,
-            );
-        },
-    );
+    // Layout-dependent target (#508): `split` → own page; otherwise the shared
+    // combined/multicolumn `Page::Stats` with a scroll-to-section target.
+    let btn = if crate::panels::stats::stats_layout() == crate::panels::stats::StatsLayout::Split {
+        crate::components::chip::indicator("ts-gpu", crate::modal::Page::StatsGpu, monitor)
+    } else {
+        let monitor_for_scroll = monitor.clone();
+        crate::components::chip::indicator_scroll(
+            "ts-gpu",
+            crate::modal::Page::Stats,
+            monitor,
+            move || {
+                crate::panels::stats::set_scroll_target(
+                    &monitor_for_scroll,
+                    crate::panels::stats::StatsSection::Gpu,
+                );
+            },
+        )
+    };
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
 

@@ -33,6 +33,19 @@ const IMMEDIATE_FAILURE: Duration = Duration::from_secs(2);
 /// trace a human can act on.
 const SKEW_WARN_AFTER: u32 = 3;
 
+/// Minimum interval between full `view()` recomputation + dedup + `write_frame`
+/// passes in the session loop (~33 ms ≈ 30 Hz), the SDK-wide view-rate cap
+/// (#560). `update()` still runs on **every** event so a plugin's model/
+/// ballistics never lag; only the render step is coalesced. A high-frequency
+/// plugin (e.g. the audio widget, whose 20 Hz frame tick and the host's ~23 Hz
+/// spectrum push are independent events → ~43 view passes/s) is capped to one
+/// render per interval instead. A plugin that emits below this rate is
+/// unaffected: its events land ≥ this interval apart, so each renders
+/// immediately (the leading edge). A burst that stops still renders its final
+/// state — a suppressed view arms a deadline that flushes the trailing frame at
+/// the interval boundary (see [`session`]).
+const VIEW_MIN_INTERVAL: Duration = Duration::from_millis(33);
+
 /// Bounded exponential reconnect backoff. [`delay`](Backoff::delay) yields the
 /// current wait and doubles the next (capped); only a session that *lived*
 /// past the cap resets it (via [`note_session`](Backoff::note_session)), so a
@@ -102,6 +115,11 @@ impl Redial {
 enum Step<M> {
     Update(Input<M>),
     Rerender,
+    /// The view-rate cap's deferred-render deadline fired (#560): recompute the
+    /// view and send the coalesced trailing frame, with no `update` — like
+    /// [`Rerender`](Step::Rerender), but triggered by the cap boundary rather
+    /// than a host accent install.
+    Flush,
 }
 
 /// Drive one connected session: handshake, seed render, then the
@@ -165,6 +183,16 @@ where
         },
     )
     .await?;
+
+    // View-rate cap state (#560). `next_send_allowed` is the earliest instant a
+    // coalesced view send may go out; seeded to *now* (not now + interval) so the
+    // first real event after this seed render still renders immediately — the
+    // leading edge, matching the pre-#560 behavior for a plugin that emits below
+    // the cap. `pending` marks a view change that was suppressed within the
+    // interval and is waiting for the flush deadline to deliver the trailing
+    // frame. Effects (one-shot, #277) always bypass the cap.
+    let mut next_send_allowed = tokio::time::Instant::now();
+    let mut pending = false;
 
     // `read_frame` is cancel-safe only at frame boundaries, so it must not
     // race in a `select!` arm (the losing future would drop mid-frame and
@@ -280,21 +308,33 @@ where
                     continue;
                 }
             },
+            // The view-rate cap's trailing-frame deadline (#560): only armed
+            // while a view change is `pending` (suppressed within the interval).
+            // Firing at `next_send_allowed` guarantees the coalesced final state
+            // of a burst is delivered even after the events stop.
+            () = tokio::time::sleep_until(next_send_allowed), if pending => Step::Flush,
         };
 
-        // update → view → dedup: send iff the `View` (tree or panel) changed,
-        // or there are effects to deliver (effects ride the render frame, so a
-        // non-empty batch forces a send even for an identical view). The whole
-        // `View` compares at once, so a panel change while the chip tree is
-        // unchanged (the common case) still pushes a frame. A `Rerender` (e.g.
-        // an accent install, #376) refreshes the view without an `update`, so
-        // the accent-tinted frame repaints.
+        // update → view → dedup, behind the view-rate cap (#560). `update()`
+        // runs on every event so the model/ballistics never lag; the render step
+        // is coalesced. A `Rerender` (accent install, #376) or a `Flush` (the
+        // cap deadline) refreshes the view without an `update`.
         let effects = match step {
             Step::Update(input) => model.update(input),
-            Step::Rerender => Vec::new(),
+            Step::Rerender | Step::Flush => Vec::new(),
         };
         let view = model.view();
-        if !effects.is_empty() || view != last_view {
+        // Dedup is unchanged: the whole `View` compares at once, so a panel
+        // change while the chip tree is unchanged (the common case) still counts.
+        let changed = view != last_view;
+        let now = tokio::time::Instant::now();
+        // Send iff there are effects (one-shot — never coalesced, they ride the
+        // render frame), or the view changed AND the cap interval has elapsed
+        // since the last send. A change within the interval is deferred: `pending`
+        // arms the flush deadline (`next_send_allowed`) that delivers the
+        // coalesced trailing frame.
+        let send = !effects.is_empty() || (changed && now >= next_send_allowed);
+        if send {
             let frame = PluginMsg::Render {
                 tree: view.tree.clone(),
                 panel: view.panel.clone(),
@@ -304,7 +344,12 @@ where
                 break Err(e);
             }
             last_view = view;
+            next_send_allowed = now + VIEW_MIN_INTERVAL;
         }
+        // A view change we couldn't send yet stays `pending` (keeps the flush arm
+        // armed); anything else clears it (a send satisfied it, or there is no
+        // outstanding change).
+        pending = changed && !send;
     };
     // Stop reading; the caller drops the write half, which half-closes the
     // socket and lets the host reap the connection.
@@ -905,6 +950,8 @@ mod tests {
         let host = async move {
             eat_handshake(&mut hrd, "echo-test").await;
 
+            // The first change after the seed renders immediately (the view-rate
+            // cap's leading edge, #560 — the seed doesn't count against it).
             send(&mut hwr, &snapshot("10:00")).await;
             let PluginMsg::Render { tree, effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("a changed snapshot must re-render");
@@ -927,22 +974,60 @@ mod tests {
                 "identical tree must be deduped (Pong, not Render, follows)"
             );
 
-            // A burst with a *pending* render: a changed snapshot and a Ping
-            // queued back-to-back must come out strictly FIFO — Render, then
-            // Pong.
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+    }
+
+    /// #560: the view-rate cap coalesces renders. A view change that lands within
+    /// `VIEW_MIN_INTERVAL` of the last send is **deferred**, not sent inline —
+    /// so a `Ping` arriving right behind it is answered *first* (liveness stays
+    /// prompt), and the deferred render then flushes as a trailing frame at the
+    /// cap boundary. `start_paused` drives the interval deterministically. This
+    /// is the (deliberately) reordered successor to the old "queued snapshot
+    /// renders strictly before the Pong" assertion, which the cap retires.
+    #[tokio::test(start_paused = true)]
+    async fn view_cap_defers_a_within_window_change_and_flushes_the_trailing_frame() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+
+            // Leading edge: the first change after the seed renders at once.
+            send(&mut hwr, &snapshot("10:00")).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Render { tree: Node::Label { ref text, .. }, .. } if text == "10:00"
+                ),
+                "the leading-edge change renders immediately",
+            );
+
+            // Now, within the cap interval (paused clock hasn't advanced), a
+            // changed snapshot AND a Ping, back to back. The render is deferred,
+            // so the Pong comes out first…
             send(&mut hwr, &snapshot("11:00")).await;
             send(&mut hwr, &HostMsg::Ping { seq: 8 }).await;
             assert!(
                 matches!(
                     next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 8 }
+                ),
+                "a within-window render is deferred, so the following Ping answers first",
+            );
+            // …and the deferred render flushes as the trailing frame once the
+            // interval elapses (auto-advanced under paused time).
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
                     PluginMsg::Render { tree: Node::Label { ref text, .. }, .. } if text == "11:00"
                 ),
-                "the queued snapshot renders before the Pong"
+                "the deferred change flushes at the cap boundary (no dropped trailing frame)",
             );
-            assert!(matches!(
-                next_plugin_frame(&mut hrd).await,
-                PluginMsg::Pong { seq: 8 }
-            ));
 
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
@@ -1091,7 +1176,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sources_feed_app_inputs_and_a_finished_source_keeps_the_session_alive() {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
@@ -1100,14 +1185,20 @@ mod tests {
         let host = async move {
             eat_handshake(&mut hrd, "ticker-test").await;
 
-            // The three source messages fold in order: 1, 1+2, 1+2+3.
-            for expected in ["1", "3", "6"] {
+            // The three `iter([1,2,3])` source messages are all immediately
+            // ready, so `update()` folds them in one frozen instant: 1, 1+2,
+            // 1+2+3. Every one reaches `update` (the count is exact) — but the
+            // view-rate cap (#560) coalesces the renders: the first fold "1"
+            // renders on the leading edge, then "3" and "6" land within the
+            // interval and coalesce, so the trailing frame carries the final
+            // "6". Under paused time this is the deterministic ["1", "6"].
+            for expected in ["1", "6"] {
                 let PluginMsg::Render { tree, .. } = next_plugin_frame(&mut hrd).await else {
-                    panic!("each source message must re-render");
+                    panic!("the folded source messages must re-render");
                 };
                 assert!(
                     matches!(tree, Node::Label { ref text, .. } if text == expected),
-                    "source messages fold in order (expected {expected})"
+                    "source folds coalesce to the leading + trailing frame (expected {expected})"
                 );
             }
 

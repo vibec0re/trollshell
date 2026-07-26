@@ -108,7 +108,8 @@
 //! - **State:** [`StateKey::Clock`] (the snapshot pump), plus the opt-in
 //!   host→plugin pushes gated on their own keys — [`StateKey::SlotVisible`]
 //!   (#288), [`StateKey::Accent`] (#376), and [`StateKey::AudioSpectrum`] (the
-//!   ~20 Hz audio tap, #405).
+//!   ~20 Hz audio tap, #405; its capture is demand-gated on the subscriber's
+//!   card being on-screen since #559).
 //! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer, incl. `PluginSelf`
 //!   → the plugin's own panel, #349 PR2), [`Effect::RaiseOsd`] (→ the transient
 //!   OSD nudge, #236), and [`Effect::Notify`] (→ a local notification toast
@@ -388,7 +389,8 @@ pub struct PluginHandles {
     /// pumped from `pipewire::audio_spectrum()` on the GTK thread ([`install`]
     /// via `pump::publish_spectrum`) and forwarded to spectrum-subscribing
     /// plugins from tokio (per-conn spectrum tasks). Starts `None` (capture
-    /// inactive); the tap only runs while a subscriber exists.
+    /// inactive); the tap only runs while a subscriber's card is on-screen
+    /// (#559 — a closed sidebar drops it to inactive; see `session`).
     spectrum_tx: watch::Sender<Option<AudioSpectrum>>,
     /// The upcoming-calendar digest (#484), projected from `calendar::events()`
     /// on the GTK thread ([`install`] via `pump::set_calendar`) and forwarded to

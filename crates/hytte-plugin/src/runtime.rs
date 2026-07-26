@@ -20,6 +20,19 @@ use crate::{Input, Plugin};
 const BACKOFF_BASE: Duration = Duration::from_millis(100);
 const BACKOFF_CAP: Duration = Duration::from_secs(5);
 
+/// A session that ends in **error** faster than this is an *immediate* failure —
+/// long enough to complete `Register` + the seed render and be dropped, short
+/// enough that a healthy session never looks immediate. Used to detect the #437
+/// wire-vocab-skew crash-loop (session dies right after the first render, the SDK
+/// redials, the identical tree re-renders, the older host drops it again).
+const IMMEDIATE_FAILURE: Duration = Duration::from_secs(2);
+
+/// Consecutive immediate failures before the runtime escalates its log from the
+/// ordinary per-session line to a warning naming the likely cause (a plugin↔host
+/// wire-vocabulary skew), so an otherwise near-silent 5 s crash-loop leaves a
+/// trace a human can act on.
+const SKEW_WARN_AFTER: u32 = 3;
+
 /// Bounded exponential reconnect backoff. [`delay`](Backoff::delay) yields the
 /// current wait and doubles the next (capped); only a session that *lived*
 /// past the cap resets it (via [`note_session`](Backoff::note_session)), so a
@@ -45,6 +58,38 @@ impl Backoff {
     fn note_session(&mut self, lived: Duration) {
         if lived >= BACKOFF_CAP {
             self.next = BACKOFF_BASE;
+        }
+    }
+}
+
+/// Tracks consecutive *immediate* session failures so the runtime can escalate
+/// its log once a plugin is stuck in a silent redial crash-loop — the #437
+/// wire-vocab-skew signature. Pure/stateful so it is unit-testable off the async
+/// loop.
+struct Redial {
+    immediate_failures: u32,
+}
+
+impl Redial {
+    fn new() -> Self {
+        Self {
+            immediate_failures: 0,
+        }
+    }
+
+    /// Record a completed session and return whether the runtime should escalate
+    /// its log to a skew warning. A clean end (`ended_ok`, i.e. host `Shutdown`)
+    /// or any session that outlived [`IMMEDIATE_FAILURE`] resets the streak;
+    /// otherwise the streak grows, and once it reaches [`SKEW_WARN_AFTER`] this
+    /// returns `true` — the cue to warn about a likely host/plugin vocabulary
+    /// skew instead of the ordinary per-session line.
+    fn note(&mut self, lived: Duration, ended_ok: bool) -> bool {
+        if ended_ok || lived >= IMMEDIATE_FAILURE {
+            self.immediate_failures = 0;
+            false
+        } else {
+            self.immediate_failures = self.immediate_failures.saturating_add(1);
+            self.immediate_failures >= SKEW_WARN_AFTER
         }
     }
 }
@@ -281,15 +326,26 @@ where
     Fut: Future<Output = std::io::Result<(R, W)>>,
 {
     let mut backoff = Backoff::new();
+    let mut redial = Redial::new();
     loop {
         match connect().await {
             Ok((rd, wr)) => {
                 let started = Instant::now();
-                match session::<P, _, _>(rd, wr).await {
+                let outcome = session::<P, _, _>(rd, wr).await;
+                let lived = started.elapsed();
+                // Escalate the log iff we've hit a streak of immediate failures —
+                // the #437 crash-loop signature — so it isn't a silent 5 s spin.
+                let skew = redial.note(lived, outcome.is_ok());
+                match outcome {
                     Ok(()) => eprintln!("[{plugin_id}] host shut down; will reconnect"),
+                    Err(e) if skew => eprintln!(
+                        "[{plugin_id}] WARNING: session keeps failing immediately ({e}); \
+                         the host may be older than this plugin's wire vocabulary \
+                         (schema skew, #437) — update the shell",
+                    ),
                     Err(e) => eprintln!("[{plugin_id}] session ended: {e}"),
                 }
-                backoff.note_session(started.elapsed());
+                backoff.note_session(lived);
             }
             Err(e) => {
                 eprintln!("[{plugin_id}] connect failed: {e}");
@@ -338,7 +394,10 @@ pub fn run<P: Plugin>() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKOFF_BASE, BACKOFF_CAP, Backoff, reconnect_loop, session};
+    use super::{
+        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, Redial, SKEW_WARN_AFTER,
+        reconnect_loop, session,
+    };
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
@@ -347,6 +406,7 @@ mod tests {
     };
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, duplex};
 
     // ── Test plugins ─────────────────────────────────────────────────────────
@@ -1541,5 +1601,37 @@ mod tests {
         // …while one that lived past the cap does.
         b.note_session(BACKOFF_CAP);
         assert_eq!(b.delay(), BACKOFF_BASE);
+    }
+
+    /// #437: a streak of *immediate* session failures (the wire-vocab-skew
+    /// crash-loop) escalates to a skew warning at [`SKEW_WARN_AFTER`]; a session
+    /// that lives long enough, or a clean host `Shutdown`, resets the streak so a
+    /// later transient blip doesn't inherit a stale count.
+    #[test]
+    fn immediate_failures_escalate_to_a_skew_warning_then_reset() {
+        let quick = Duration::from_millis(50);
+        let mut r = Redial::new();
+        // The first SKEW_WARN_AFTER-1 immediate failures stay quiet…
+        for _ in 0..SKEW_WARN_AFTER - 1 {
+            assert!(!r.note(quick, false), "below the threshold stays quiet");
+        }
+        // …the next crosses the threshold, and every further one keeps warning.
+        assert!(
+            r.note(quick, false),
+            "the streak reaches the warn threshold"
+        );
+        assert!(r.note(quick, false), "a sustained loop keeps warning");
+
+        // A session that outlived IMMEDIATE_FAILURE resets the streak.
+        assert!(!r.note(IMMEDIATE_FAILURE, false), "a stable session resets");
+        assert!(!r.note(quick, false), "the streak restarts from zero");
+
+        // A clean shutdown (ended_ok) also resets, regardless of how brief.
+        let mut r2 = Redial::new();
+        for _ in 0..SKEW_WARN_AFTER {
+            let _ = r2.note(quick, false);
+        }
+        assert!(!r2.note(quick, true), "a clean shutdown resets the streak");
+        assert!(!r2.note(quick, false), "…so the next failure starts over");
     }
 }

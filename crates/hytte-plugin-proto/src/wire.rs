@@ -8,6 +8,11 @@
 //!
 //! The set is closed and the encoding is name-tagged (see the crate root's
 //! compat rules), so new node kinds and new node fields are additive.
+//!
+//! **Appending a [`Node`] or [`EventKind`] variant ⇒ bump
+//! [`VOCAB`](crate::VOCAB)** (#437): a plugin can render the new variant, so an
+//! older host must be able to detect and refuse it at the handshake rather than
+//! silently failing to decode the render frame.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +60,10 @@ pub enum Dir {
 ///
 /// (No longer `Copy` since [`Submitted`](EventKind::Submitted) carries its
 /// `String`; `Clone` where a by-value copy used to be implicit.)
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437), the same
+/// as [`Node`] — a plugin can be the target of the new event once it renders the
+/// node that emits it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A [`Node::Button`] was clicked.
@@ -105,6 +114,9 @@ fn pixels_scale_default() -> u32 {
 ///
 /// Mirrors `hytte_ui::Node`: `Box { scroll }` carries the scroll flag
 /// explicitly, so mapping to the GTK-side node is a trivial 1:1 in the host.
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
+/// renders these, so the counter is how an older host refuses one it can't decode.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;

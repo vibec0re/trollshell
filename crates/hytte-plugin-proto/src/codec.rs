@@ -50,6 +50,16 @@ pub enum ProtoError {
         /// The peer's declared proto.
         theirs: u16,
     },
+    /// A `Register` manifest's `vocab` was **newer** than this host's
+    /// [`VOCAB`](crate::VOCAB) (#437): the plugin was built against a newer wire
+    /// vocabulary and can render a variant this host can't decode, so it is
+    /// refused at the handshake (see [`Manifest::check_vocab`](crate::Manifest::check_vocab)).
+    VocabTooNew {
+        /// This build's [`VOCAB`](crate::VOCAB).
+        ours: u16,
+        /// The peer's declared (newer) vocab.
+        theirs: u16,
+    },
     /// Underlying I/O error (only from the `tokio` framed helpers).
     #[cfg(feature = "tokio")]
     Io(std::io::Error),
@@ -70,6 +80,13 @@ impl std::fmt::Display for ProtoError {
             }
             Self::ProtoMismatch { ours, theirs } => {
                 write!(f, "plugin proto {theirs} != host proto {ours}")
+            }
+            Self::VocabTooNew { ours, theirs } => {
+                write!(
+                    f,
+                    "plugin wire vocabulary {theirs} is newer than host {ours} — \
+                     the plugin was built against a newer wire vocabulary; update the shell"
+                )
             }
             #[cfg(feature = "tokio")]
             Self::Io(e) => write!(f, "frame I/O failed: {e}"),

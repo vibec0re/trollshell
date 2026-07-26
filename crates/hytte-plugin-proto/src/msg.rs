@@ -42,6 +42,11 @@ pub enum PluginMsg {
 }
 
 /// Host → plugin frames.
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437) in addition
+/// to the #305 opt-in gate: the push itself must be gated on a manifest opt-in so
+/// an old plugin never receives it, and bumping the counter keeps it a faithful
+/// census of the whole wire vocabulary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HostMsg {
     /// The full subscribed-state subset (sent initially and on every change,

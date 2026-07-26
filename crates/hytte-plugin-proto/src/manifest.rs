@@ -1,7 +1,7 @@
 //! The plugin manifest, the subscription keys, and the capability model.
 
-use crate::PROTO_VERSION;
 use crate::codec::ProtoError;
+use crate::{PROTO_VERSION, VOCAB};
 use serde::{Deserialize, Serialize};
 
 /// A host-state key a plugin can subscribe to. The set is additive (appending a
@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 /// [`HostMsg`](crate::msg::HostMsg) push *only* for the keys it declares. This
 /// is the rule that keeps a new push additive — an older binary that never asked
 /// for it never receives (and never fails to decode) the new variant (#305).
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
+/// declares these in its manifest, so the counter keeps a faithful census of the
+/// whole wire vocabulary (a subscription's push is separately #305-gated).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateKey {
     /// `hytte_services::clock::now()` → [`ClockState`](crate::state::ClockState),
@@ -256,6 +260,21 @@ pub struct Manifest {
     pub id: String,
     /// The [`PROTO_VERSION`] the plugin was built against — exact-matched.
     pub proto: u16,
+    /// The [`VOCAB`] (wire-vocabulary generation, #437) the plugin was built
+    /// against — the host refuses a `Register` whose `vocab` exceeds its own
+    /// ([`Manifest::check_vocab`]), catching a plugin that can render a wire
+    /// variant this host can't decode (the plugin→host counterpart to the #305
+    /// opt-in that guards host→plugin pushes). Stamped automatically by
+    /// [`Manifest::new`], never set by a plugin author.
+    ///
+    /// Additive under the crate's compat rules — same [`PROTO_VERSION`], and
+    /// `#[serde(default)]` so an older, pre-`vocab` manifest that omits the key
+    /// decodes to `0` (generation 0, the pre-counter default) and always passes.
+    /// Unlike [`order`](Manifest::order)/[`provides`](Manifest::provides) it carries
+    /// **no** `skip_serializing_if`: like [`proto`](Manifest::proto) it is always on
+    /// the wire, so a host can always read the generation a plugin declares.
+    #[serde(default)]
+    pub vocab: u16,
     /// The host-state subset the plugin wants pushed to it.
     pub subscribes: Vec<StateKey>,
     /// The shell capabilities the plugin requests.
@@ -296,6 +315,7 @@ impl Manifest {
         Self {
             id: id.into(),
             proto: PROTO_VERSION,
+            vocab: VOCAB,
             subscribes: Vec::new(),
             capabilities: Vec::new(),
             mount,
@@ -323,6 +343,25 @@ impl Manifest {
             Err(ProtoError::ProtoMismatch {
                 ours: PROTO_VERSION,
                 theirs: self.proto,
+            })
+        }
+    }
+
+    /// The wire-vocabulary rule the host applies on `Register` (#437): a plugin
+    /// built against a **newer** [`VOCAB`] than this host — one that can render a
+    /// [`Node`](crate::wire::Node)/[`Effect`](crate::effect::Effect) variant the
+    /// host can't decode — is rejected at the handshake, so the plugin→host skew
+    /// fails loud here instead of becoming a silent redial crash-loop. A plugin at
+    /// the same or an **older** vocabulary passes: it can only render variants this
+    /// host already understands. An older, pre-`vocab` manifest decodes to `0` and
+    /// always passes.
+    pub fn check_vocab(&self) -> Result<(), ProtoError> {
+        if self.vocab <= VOCAB {
+            Ok(())
+        } else {
+            Err(ProtoError::VocabTooNew {
+                ours: VOCAB,
+                theirs: self.vocab,
             })
         }
     }

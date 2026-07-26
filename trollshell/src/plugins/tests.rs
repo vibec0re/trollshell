@@ -12,7 +12,7 @@ use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
     Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource,
-    StateKey, read_frame, wire, write_frame,
+    StateKey, VOCAB, read_frame, wire, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
@@ -1626,6 +1626,83 @@ async fn empty_plugin_id_is_rejected() {
         bar_center.lock_ref().is_empty(),
         "no card is parked for an empty id",
     );
+}
+
+/// #437, end to end through `handle_conn`: a Register whose `vocab` is **newer**
+/// than this host's [`VOCAB`] is rejected at the handshake (the connection is
+/// dropped, no card parked) — the plugin→host skew that used to be a silent 5 s
+/// redial crash-loop now fails loud. A Register at the host's own vocab is
+/// accepted (its card lands). Mirrors the `empty_plugin_id_is_rejected` /
+/// duplicate-id reject harness.
+#[tokio::test]
+async fn newer_vocab_register_is_rejected_and_equal_vocab_is_accepted() {
+    // ── Reject: a plugin built against a newer wire vocabulary. ──
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bar_center = ctx.bar_center.clone();
+
+    let (host, plugin) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host, &ctx).await });
+    let (mut prd, mut pwr) = plugin.into_split();
+    let mut too_new = Manifest::new("from-the-future", Mount::BarCenter);
+    too_new.vocab = VOCAB + 1; // one wire generation ahead of this host
+    write_frame(&mut pwr, &PluginMsg::Register { manifest: too_new })
+        .await
+        .expect("send too-new Register");
+
+    // Dropped at the handshake: the next read hits EOF.
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_frame::<HostMsg, _>(&mut prd),
+    )
+    .await
+    .expect("the too-new-vocab connection is dropped within 5s");
+    assert!(
+        dropped.is_err(),
+        "a Register with vocab > host's is rejected (EOF)",
+    );
+    assert!(
+        bar_center.lock_ref().is_empty(),
+        "no card is parked for a rejected too-new plugin",
+    );
+
+    // ── Accept: a plugin at the host's own vocabulary renders normally. ──
+    let (_clock_tx2, clock_rx2) = watch::channel(None);
+    let (_vis_tx2, vis_rx2) = watch::channel(false);
+    let (ctx2, _effects_rx2) = ctx_with(clock_rx2, vis_rx2);
+    let bar_center2 = ctx2.bar_center.clone();
+
+    let (host2, plugin2) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host2, &ctx2).await });
+    let (_prd2, mut pwr2) = plugin2.into_split();
+    let mut ok = Manifest::new("current", Mount::BarCenter);
+    ok.vocab = VOCAB; // equal to the host — accepted
+    write_frame(&mut pwr2, &PluginMsg::Register { manifest: ok })
+        .await
+        .expect("send equal-vocab Register");
+    write_frame(
+        &mut pwr2,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "chip".into(),
+                classes: vec![],
+            },
+            panel: None,
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("send Render");
+
+    let cards = wait_for_region(&bar_center2).await;
+    assert_eq!(
+        cards.len(),
+        1,
+        "an equal-vocab plugin is accepted and renders"
+    );
+    assert_eq!(cards[0].plugin_id, "current");
 }
 
 /// #436 item 3, end to end: an effect whose capability the plugin didn't

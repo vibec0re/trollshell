@@ -1351,14 +1351,17 @@ fn on_page_show(panel: &ModalPanel, page: Page) {
 /// installs a `"stats"`-prefixed action group carrying a `"scroll"` action on
 /// the widget it returns, so this only needs the `gtk::Widget` `crate::panels`
 /// already handed back — no need for `modal.rs` to track per-monitor
-/// Stats-page state of its own. An `Err` here would mean that action group
-/// somehow wasn't installed, which shouldn't happen for the real Stats page;
-/// logged rather than ignored so a future regression there isn't silent.
+/// Stats-page state of its own. This monitor's key rides along as the action's
+/// string parameter (#542), since `panels::stats` keys its pending-scroll map
+/// per monitor. An `Err` here would mean that action group somehow wasn't
+/// installed, which shouldn't happen for the real Stats page; logged rather than
+/// ignored so a future regression there isn't silent.
 fn apply_stats_scroll(panel: &ModalPanel) {
     let Some(widget) = panel.stack.child_by_name(Page::Stats.stack_name()) else {
         return;
     };
-    if let Err(e) = widget.activate_action("stats.scroll", None) {
+    let key = monitor_key(&panel.geometry.monitor);
+    if let Err(e) = widget.activate_action("stats.scroll", Some(&key.to_variant())) {
         tracing::debug!(error = %e, "modal: stats scroll action activation failed");
     }
 }

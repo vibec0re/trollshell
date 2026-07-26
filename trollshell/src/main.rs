@@ -430,7 +430,7 @@ fn apply_scaled_base_font(provider: &gtk::CssProvider) {
 /// `netconn`/`app_usage` single-subscription shape in [`main`].
 ///
 /// Actions dispatch locally via [`notifications::post_local_with_actions`]
-/// (#220's deferred half — see that function and `invoke_action`'s "Local
+/// (#220's local-dispatch half, shipped in #283 — see that function and `invoke_action`'s "Local
 /// dispatch" doc for the mechanism): clicking Open/Copy never touches
 /// D-Bus, it runs [`open_screenshot`]/[`copy_screenshot`] directly on the
 /// GTK main thread, same as the click that invoked it.

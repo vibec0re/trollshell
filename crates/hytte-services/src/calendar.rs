@@ -358,9 +358,18 @@ impl Worker {
         }
     }
 
-    /// Re-scan every calendar source and emit a fresh `Vec` only if it
-    /// differs from the current snapshot (`PartialEq` dedup avoids
-    /// re-emitting an identical list every minute).
+    /// Re-scan every calendar source and publish a fresh `Vec` on **every**
+    /// pass — unconditionally, not only when the event set changed. Downstream
+    /// consumers derive *time-relative* views off this signal at emit time: the
+    /// plugin host's upcoming-calendar digest projects a rolling 24 h window
+    /// (`plugins::pump::to_upcoming_events`), and the drawer widget drops
+    /// fully-elapsed events against a live `now`. Both need a wall-clock re-emit
+    /// to stay fresh between calendar changes, so the minutely poll tick
+    /// (`POLL_INTERVAL`) doubles as that re-anchor. Re-publishing an unchanged
+    /// list every minute is cheap; the earlier `PartialEq` emit-dedup instead
+    /// left those windows frozen at the last list change, drifting to surface
+    /// just-ended events (#542). Writes are single-owner (this worker thread), so
+    /// the unconditional `set` can't race the on-demand `refresh()` path.
     fn refresh(&mut self, writer: &Mutable<Vec<CalendarEvent>>) {
         let mut snapshot = self.scan_all();
         if self.maybe_rebuild() {
@@ -369,13 +378,7 @@ impl Worker {
             // failed pass and waiting out another poll interval.
             snapshot = self.scan_all();
         }
-        let changed = {
-            let cur = writer.lock_ref();
-            *cur != snapshot
-        };
-        if changed {
-            writer.set(snapshot);
-        }
+        writer.set(snapshot);
     }
 
     fn scan_all(&mut self) -> Vec<CalendarEvent> {
@@ -525,8 +528,8 @@ fn instance_to_calendar_event(
         .uid
         .unwrap_or_else(|| format!("anon:{calendar_name}:{anon_index}"));
     // Disambiguate a recurring series' occurrences (which all share one UID)
-    // by appending the instance start — keeps PartialEq dedup + per-row
-    // identity correct when several instances are in the window.
+    // by appending the instance start — keeps per-row identity correct when
+    // several instances are in the window.
     let uid = format!("{uid}@{}", inst.start_unix);
     let summary = meta.summary.unwrap_or_else(|| "(no title)".to_string());
 
@@ -808,7 +811,7 @@ mod tests {
     #[test]
     fn instance_recurring_distinct_uids_per_occurrence() {
         // Two occurrences of one series (same UID) must produce DISTINCT
-        // CalendarEvent uids so PartialEq dedup + per-row identity hold.
+        // CalendarEvent uids so per-row identity holds.
         let now = Local::now();
         let day1 = now + Duration::days(1);
         let day2 = now + Duration::days(2);

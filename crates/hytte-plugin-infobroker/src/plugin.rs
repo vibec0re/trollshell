@@ -22,7 +22,8 @@
 //!   plugin's own panel (cap [`Capability::OpenPage`]).
 //! - [`Effect::Notify`] — a denied auth/data knock raises one informational
 //!   toast so the human sees it (cap [`Capability::Notify`], #414). Interactive
-//!   Allow/Deny prompting is deferred to phase 1b.
+//!   Allow/Deny prompting shipped in phase 1b (#514) — a parked request surfaces
+//!   as an interactive consent prompt via `Effect::RequestConsent`.
 
 use hytte_plugin::proto::{
     Capability, ConsentDecision, DatasourceError, DatasourceOutcome, Dir, Effect, EventKind,

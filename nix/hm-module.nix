@@ -46,6 +46,35 @@ let
       "${pkgs.wlsunset}/bin/wlsunset -l ${toString nl.latitude} -L ${toString nl.longitude} -t ${toString nl.nightTemp} -T ${toString nl.dayTemp}"
     else
       "${pkgs.bash}/bin/sh -c 'echo \"wlsunset: programs.trollshell.nightlight.{latitude,longitude} are unset — set them to enable the Night light toggle\" >&2; exit 0'";
+
+  # The env the option surface renders to, built once and fed to BOTH
+  # home.sessionVariables (login shells, `cargo run` from a terminal) and the
+  # trollshell unit's Environment= below. The systemd user manager never
+  # sources hm-session-vars.sh, so a unit-less copy means every one of these
+  # options silently no-ops under systemd.enable (#568: stats.layout = "split"
+  # had no effect). Each var is set only when its option is non-null;
+  # optionalAttrs + // keeps them independent (mkIf on a whole attrset would
+  # force an all-or-nothing block).
+  trollshellSessionEnv = {
+    # Stats-drawer layout (#508). Always set (not optionalAttrs): the value
+    # is a total enum whose default equals the shell's own runtime default,
+    # so exporting it explicitly is harmless and keeps the session env
+    # self-describing.
+    TROLLSHELL_STATS_LAYOUT = cfg.stats.layout;
+  }
+  // (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
+    TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
+  })
+  // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
+    # Appearance picker reload command; null = the shell's swaybg default.
+    TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
+  })
+  // (lib.optionalAttrs cfg.recorder.audioByDefault {
+    # Arm the record chip's audio capture at session start (#403). Only set
+    # when opted in — unset reads as off, and the env var is the override,
+    # so Settings still flips it live during a session.
+    TROLLSHELL_RECORD_AUDIO = "1";
+  });
 in
 {
   _file = "nix/hm-module.nix";
@@ -151,29 +180,9 @@ in
         ];
         fonts.fontconfig.enable = lib.mkDefault true;
 
-        # Session vars, each set only when its option is non-null. optionalAttrs
-        # + // keeps the two independent (mkIf on a whole attrset would force an
-        # all-or-nothing block).
-        home.sessionVariables = {
-          # Stats-drawer layout (#508). Always set (not optionalAttrs): the
-          # value is a total enum whose default equals the shell's own runtime
-          # default ("combined"), so exporting it explicitly is harmless and
-          # keeps the session env self-describing.
-          TROLLSHELL_STATS_LAYOUT = cfg.stats.layout;
-        }
-        // (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
-          TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
-        })
-        // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
-          # Appearance picker reload command; null = the shell's swaybg default.
-          TROLLSHELL_WALLPAPER_RELOAD_CMD = cfg.wallpaper.reloadCommand;
-        })
-        // (lib.optionalAttrs cfg.recorder.audioByDefault {
-          # Arm the record chip's audio capture at session start (#403).
-          # Only set when opted in — unset reads as off, and the env var is
-          # the override, so Settings still flips it live during a session.
-          TROLLSHELL_RECORD_AUDIO = "1";
-        });
+        # See trollshellSessionEnv in the let above — shared with the unit's
+        # Environment= so shells and the service agree.
+        home.sessionVariables = trollshellSessionEnv;
 
         systemd.user.services.trollshell = lib.mkIf cfg.systemd.enable {
           Unit = {
@@ -188,6 +197,13 @@ in
             Restart = "on-failure";
             RestartSec = 2;
             Slice = "session.slice";
+            # The option-rendered session env, delivered where the process
+            # actually reads it — the user manager never sources
+            # hm-session-vars.sh (#568). Each assignment is quoted whole so a
+            # value with spaces (wallpaper.reloadCommand) survives systemd's
+            # Environment= word splitting; embedded double quotes in a value
+            # are not supported.
+            Environment = lib.mapAttrsToList (name: value: "\"${name}=${value}\"") trollshellSessionEnv;
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };

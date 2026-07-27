@@ -33,6 +33,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
@@ -485,7 +486,52 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     });
     card.add_controller(gesture);
 
+    // Hover-pause the auto-expiry countdown while the pointer is over the card.
+    attach_hover_pause(&card, notif.id);
+
     card.upcast()
+}
+
+/// Wire hover-pause of a toast's auto-expiry onto `card` (#567). While the
+/// pointer is over the card, the service holds the expiry timer; on leave it
+/// resumes with the remaining time.
+///
+/// `holds_enter` clamps THIS card's contribution to the service-side
+/// hover-count to at most one, so repeated enter/leave signals (or a stray
+/// leave) can't drift the count, and multiple per-monitor toast copies each
+/// contribute independently. The `connect_unmap` teardown balances the count
+/// if the card is removed while still hovered — GTK does not guarantee a
+/// `leave` on unmap, which would otherwise strand the timer paused forever.
+/// A sticky notification (no service-side timer) makes the pause/resume calls
+/// harmless no-ops.
+fn attach_hover_pause(card: &gtk::Box, id: u32) {
+    let holds_enter = Rc::new(Cell::new(false));
+
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let holds = holds_enter.clone();
+        motion.connect_enter(move |_, _, _| {
+            if !holds.replace(true) {
+                notifications::pause_expiry(id);
+            }
+        });
+    }
+    {
+        let holds = holds_enter.clone();
+        motion.connect_leave(move |_| {
+            if holds.replace(false) {
+                notifications::resume_expiry(id);
+            }
+        });
+    }
+    card.add_controller(motion);
+
+    let holds = holds_enter;
+    card.connect_unmap(move |_| {
+        if holds.replace(false) {
+            notifications::resume_expiry(id);
+        }
+    });
 }
 
 // ── Overflow card builder ─────────────────────────────────────────────────────

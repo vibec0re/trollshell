@@ -676,6 +676,19 @@ fn arm_expiry(id: u32, timeout: Duration) {
     }
 }
 
+/// Drop any expiry timer for `id` without closing the notification. Called
+/// when a `replaces_id` re-post resolves to a sticky timeout: the armed sleep
+/// from the finite post it replaced must not fire later and "expire" a
+/// notification that now never expires. No-op when no timer exists.
+fn disarm_expiry(id: u32) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
+    if let Ok(mut timers) = shared.timers.lock() {
+        clear_timer(&mut timers, id);
+    }
+}
+
 /// Remove and cancel the expiry timer for `id`. Called from [`dismiss`] — the
 /// funnel for every close path — so a closed toast leaves behind no armed task
 /// or bookkeeping entry. Pure map surgery over the abort handle; factored out
@@ -1031,9 +1044,13 @@ impl NotificationsIface {
         tracing::debug!(id, app_name, summary, "notification added");
 
         // Arm the hover-pausable auto-dismiss timer for a finite timeout.
-        // Sticky notifications (`timeout == None`) never expire — no timer.
+        // Sticky notifications (`timeout == None`) never expire — no timer,
+        // and a `replaces_id` re-post that turned sticky disarms the stale
+        // sleep left over from the finite post it replaced.
         if let Some(dur) = timeout {
             crate::notifications::arm_expiry(id, dur);
+        } else {
+            crate::notifications::disarm_expiry(id);
         }
 
         id

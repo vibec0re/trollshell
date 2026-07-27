@@ -50,6 +50,10 @@
   # Bundled plugins name their binary after the crate
   # (crates/hytte-plugin-<id>/Cargo.toml's [[bin]]).
   name,
+  # `meta.description`. The default fits the bundled widget plugins; standalone
+  # tools (hytte-infobroker) pass their own so the description doesn't
+  # over-claim plugin-hood.
+  description ? "trollshell bundled widget plugin — ${name}",
 }:
 let
   inherit (trollshell.passthru) commonArgs workspaceArtifacts;
@@ -86,7 +90,7 @@ craneLib.buildPackage (
     '';
 
     meta = {
-      description = "trollshell bundled widget plugin — ${name}";
+      inherit description;
       homepage = "https://github.com/vibec0re/trollshell/";
       license = lib.licenses.mpl20;
       platforms = lib.platforms.linux;

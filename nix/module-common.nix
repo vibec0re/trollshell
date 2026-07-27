@@ -304,29 +304,24 @@ self:
                 world-readable; use `secrets` (below) instead, which injects the
                 key from the login keyring at spawn.
 
-                Known knobs of the bundled plugins (each also readable from the
-                environment directly; the nix option is just the declarative way
-                to set it):
+                A few representative examples (each also readable from the
+                environment directly; the nix option is just the declarative
+                way to set it):
 
                 - `pet` (hytte-plugin-pet): `PET_NAME` (display name),
-                  `PET_LLM_MODEL` / `PET_LLM_URL` (the optional llama-server
-                  brain — the API *key* is a `secrets` slot, not env),
-                  `TROLLSHELL_PET_KAOMOJI=1` (force the kaomoji fallback face).
-                - `caw` (hytte-plugin-caw): `CAW_BRIEFING_TIME` (local briefing
-                  time, `H`/`H:MM`, or `off`; default 07:00),
-                  `CAW_LLM_MODEL` / `CAW_LLM_URL` (voiced-briefing provider — key
-                  via `secrets`), `CAW_EXPRESSION_PATH` (override the expression
-                  file path).
+                  `PET_LLM_URL` (opt into a local llama-server brain — the API
+                  *key* is a `secrets` slot, not env).
                 - `usage` (hytte-plugin-usage): `TROLLSHELL_USAGE_DASHBOARD_URL`
                   (the Grafana public-dashboard URL — the value that flips the
-                  card from empty-state to live), `TROLLSHELL_USAGE_BUDGET` (the
-                  "burned ÷ budget" denominator), `TROLLSHELL_USAGE_PANEL` (pin a
-                  numeric panel id), `TROLLSHELL_USAGE_WINDOW` (Grafana `from`,
-                  e.g. `now-5h`).
+                  card from empty-state to live).
                 - `weather` (hytte-plugin-weather): `TROLLSHELL_WEATHER_CITY`
                   (geocoded fallback when GeoClue is unavailable — usually set
                   session-wide via `programs.trollshell.weather.fallbackCity`
                   instead of per-plugin here).
+
+                The full inventory — swept from source, all 12 bundled
+                plugins including the ones with zero knobs — lives in
+                [`docs/plugin-env.md`](https://github.com/vibec0re/trollshell/blob/main/docs/plugin-env.md).
 
                 Precedence for a plugin that also reads a config file (e.g.
                 usage's `~/.config/trollshell/usage.toml`): environment (this

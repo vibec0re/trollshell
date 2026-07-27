@@ -1,11 +1,12 @@
-# Packages a single bundled widget plugin binary (#558) as its own flake output
-# so `programs.trollshell.plugins.<id>.package` finally has something in THIS
-# flake to point at. Before this the workspace build compiled all 12
-# `hytte-plugin-*` binaries, but every package derivation pruned `$out/bin` down
-# to its own binary (#530), so each bundled plugin was buildable yet never
-# shippable — the options doc couldn't honestly document how to enable one
-# (#457, #558). One parameterized derivation, called once per plugin from
-# flake.nix.
+# Packages a single workspace binary — a bundled widget plugin, or a standalone
+# CLI tool like `hytte-infobroker` (#562) — as its own flake output (#558) so
+# `programs.trollshell.plugins.<id>.package` (for plugins) or a plain
+# `home.packages` entry (for tools) finally has something in THIS flake to
+# point at. Before this the workspace build compiled all 12 `hytte-plugin-*`
+# binaries, but every package derivation pruned `$out/bin` down to its own
+# binary (#530), so each bundled plugin was buildable yet never shippable — the
+# options doc couldn't honestly document how to enable one (#457, #558). One
+# parameterized derivation, called once per binary from flake.nix.
 #
 # Like `nix/control-center.nix` (#530), this reuses the shell package's shared
 # `workspaceArtifacts` + `commonArgs` rather than run a second (~30-min) deps

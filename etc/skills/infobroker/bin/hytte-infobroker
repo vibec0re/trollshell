@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Skill entry point for the hytte-infobroker CLI.
 #
-# This is a thin pointer to the *installed* `hytte-infobroker` binary (shipped by
-# the hytte-plugin-infobroker crate / the trollshell package). It exists so an
-# agent can invoke `bin/hytte-infobroker …` from this skill folder without caring
-# where the real binary lives. It prefers whatever `hytte-infobroker` is already
-# on PATH, then falls back to the conventional install location the systemd unit
-# uses.
+# This is a thin pointer to the *installed* `hytte-infobroker` binary. It is its
+# own flake package (`packages.hytte-infobroker`, #562 — built via
+# nix/plugin.nix, the same #530 warm-artifact pattern the bundled widget
+# plugins use). It is NOT shipped by the trollshell package itself, which
+# prunes `$out/bin` down to just `trollshell` (#530) — so this script does not
+# assume the CLI is merely "installed alongside" the shell. See this skill's
+# SKILL.md for the `home.packages` line that puts it on PATH. This script
+# exists so an agent can invoke `bin/hytte-infobroker …` from this skill folder
+# without caring where the real binary lives. It prefers whatever
+# `hytte-infobroker` is already on PATH, then falls back to the conventional
+# install locations below.
 set -euo pipefail
 
 if command -v hytte-infobroker >/dev/null 2>&1; then
@@ -23,6 +28,6 @@ for candidate in \
 done
 
 echo "hytte-infobroker: CLI not found on PATH or in the usual install locations." >&2
-echo "Install the hytte-plugin-infobroker crate (it ships the 'hytte-infobroker' binary)" >&2
-echo "and make sure the trollshell-plugin-infobroker.service plugin is running." >&2
+echo "Install the trollshell flake's 'hytte-infobroker' package, e.g. in home-manager:" >&2
+echo "  home.packages = [ trollshell.packages.\${system}.hytte-infobroker ];" >&2
 exit 127

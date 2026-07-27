@@ -81,8 +81,8 @@ self:
         "multicolumn"
         "split"
       ];
-      default = "combined";
-      example = "multicolumn";
+      default = "multicolumn";
+      example = "combined";
       description = ''
         How the System Stats drawer page arranges its five resource cards
         (CPU / Memory / Disks / GPU / Services). Sets TROLLSHELL_STATS_LAYOUT
@@ -92,25 +92,26 @@ self:
         design principle is otherwise "composable, not configurable" — the shell
         is wired in Rust, not config — so most appearance choices are made in
         `main.rs`, not here. The Stats layout is the deliberate exception,
-        blessed on the #508 thread, because both the combined and split shapes
-        have real users and neither is a clear default.
+        blessed on the #508 thread, because the combined and split shapes both
+        have real users.
 
-        - `combined` (default): all five cards stacked in one scrolling page.
-          The original pre-#307 shape, restored by #518 after #307 had split it.
+        - `multicolumn` (default): the same five cards in a two-column grid —
+          CPU beside Memory, Disks beside GPU, Services spanning both columns
+          underneath. Uses a wider drawer clamp (~1080px vs. the usual 680px)
+          so the two side-by-side history graphs each keep a usable width.
+          Chips still open this one page, scrolled to their card.
+        - `combined`: all five cards stacked in one scrolling page. The
+          original pre-#307 shape, restored by #518 after #307 had split it.
           Clicking any resource bar chip opens this page scrolled to that card
           (the #516/#547 deep-links).
-        - `multicolumn`: the same five cards in a two-column grid — CPU beside
-          Memory, Disks beside GPU, Services spanning both columns underneath.
-          Uses a wider drawer clamp (~1080px vs. the usual 680px) so the two
-          side-by-side history graphs each keep a usable width. Chips still open
-          this one page, scrolled to their card.
         - `split`: five separate single-card pages, one per bar chip — #307's
           shape (filed by kaesaecracker), resurrected here alongside the
           combined page so it is a declarative option rather than a fork patch.
           Each chip opens only its own resource's page.
 
-        An unrecognized value falls back to `combined` (the enum type rejects
-        one at evaluation time; the runtime fallback covers a hand-set env var).
+        An unrecognized value falls back to `multicolumn` (the enum type
+        rejects one at evaluation time; the runtime fallback covers a hand-set
+        env var).
       '';
     };
 

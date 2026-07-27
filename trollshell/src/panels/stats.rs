@@ -2,10 +2,10 @@
 //! five per-resource cards (CPU / Memory / Disks / GPU / Services), chosen by
 //! the `TROLLSHELL_STATS_LAYOUT` env var (read once via [`stats_layout`]):
 //!
-//! - **`combined`** (default) — all five cards stacked in one page
+//! - **`combined`** — all five cards stacked in one page
 //!   ([`panel_stats`]); every resource chip opens it. This is the #508 restore
 //!   of the pre-#307 shape.
-//! - **`multicolumn`** — the same five cards in a 2-column grid
+//! - **`multicolumn`** (default) — the same five cards in a 2-column grid
 //!   ([`panel_stats_multicolumn`]) under a wider Stats-specific clamp; chips
 //!   still open the one `Page::Stats`.
 //! - **`split`** — @kaesaecracker's five per-chip single-card pages
@@ -68,9 +68,9 @@ pub enum StatsSection {
 /// each layout renders.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatsLayout {
-    /// All five cards stacked in one page — today's/pre-#307 shape (default).
+    /// All five cards stacked in one page — today's/pre-#307 shape.
     Combined,
-    /// The five cards in a 2-column grid under a wider clamp.
+    /// The five cards in a 2-column grid under a wider clamp (default).
     Multicolumn,
     /// Five per-chip single-card pages (#307's split, restored in #508).
     Split,
@@ -78,15 +78,15 @@ pub enum StatsLayout {
 
 /// Parse a raw `TROLLSHELL_STATS_LAYOUT` value into a [`StatsLayout`].
 ///
-/// `None` (unset) resolves to [`StatsLayout::Combined`] silently — combined is
-/// the documented default and, like `TROLLSHELL_RECORD_AUDIO` /
+/// `None` (unset) resolves to [`StatsLayout::Multicolumn`] silently — multicolumn
+/// is the documented default and, like `TROLLSHELL_RECORD_AUDIO` /
 /// `TROLLSHELL_WEATHER_CITY`, an unset override reads as its default rather than
 /// a misconfiguration. A present-but-unrecognized value returns `Err(other)` so
-/// [`stats_layout`] can warn once and fall back to combined.
+/// [`stats_layout`] can warn once and fall back to multicolumn.
 fn parse_stats_layout(raw: Option<&str>) -> Result<StatsLayout, &str> {
     match raw {
-        None | Some("combined") => Ok(StatsLayout::Combined),
-        Some("multicolumn") => Ok(StatsLayout::Multicolumn),
+        None | Some("multicolumn") => Ok(StatsLayout::Multicolumn),
+        Some("combined") => Ok(StatsLayout::Combined),
         Some("split") => Ok(StatsLayout::Split),
         Some(other) => Err(other),
     }
@@ -97,7 +97,7 @@ fn parse_stats_layout(raw: Option<&str>) -> Result<StatsLayout, &str> {
 /// a session env var — so it's resolved on first use and reused everywhere
 /// (chips, drawer routing, the plugin wire mapping) rather than re-read per
 /// click. A present-but-unrecognized value warns once (via the `OnceLock`
-/// init running exactly once) and falls back to [`StatsLayout::Combined`].
+/// init running exactly once) and falls back to [`StatsLayout::Multicolumn`].
 pub fn stats_layout() -> StatsLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<StatsLayout> = OnceLock::new();
@@ -109,9 +109,9 @@ pub fn stats_layout() -> StatsLayout {
                 tracing::warn!(
                     value = %other,
                     "TROLLSHELL_STATS_LAYOUT unrecognized (expected combined/multicolumn/split); \
-                     using combined",
+                     using multicolumn",
                 );
-                StatsLayout::Combined
+                StatsLayout::Multicolumn
             }
         }
     })
@@ -145,9 +145,9 @@ pub fn set_scroll_target(monitor: &Monitor, section: StatsSection) {
 }
 
 /// The combined stats flyout — opened from any of the CPU / memory / disk /
-/// GPU / services bar chips when `TROLLSHELL_STATS_LAYOUT` is `combined`
-/// (default) or unset. All five cards stack in one `ts-popup-column`, one
-/// click, scroll to see all (pre-#307 shape).
+/// GPU / services bar chips when `TROLLSHELL_STATS_LAYOUT=combined`. All five
+/// cards stack in one `ts-popup-column`, one click, scroll to see all
+/// (pre-#307 shape).
 ///
 /// Wrapped in a `gtk::ScrolledWindow` (mirroring `connections.rs`/`wifi.rs`'s
 /// #84 pattern) so five stacked cards can't push the drawer past screen
@@ -206,10 +206,10 @@ pub fn panel_stats() -> gtk::Widget {
 /// The multicolumn stats flyout (#508) — the same five cards as [`panel_stats`]
 /// laid out in a 2-column [`page_grid`]: CPU | Memory on the first row,
 /// Disks | GPU on the second, and Services spanning both columns on the third.
-/// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT=multicolumn`;
-/// the chips still target the single `Page::Stats` (this replaces
-/// [`panel_stats`] for that page in multicolumn mode — see
-/// `crate::modal::build_page`).
+/// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT` is
+/// `multicolumn` (default) or unset; the chips still target the single
+/// `Page::Stats` (this replaces [`panel_stats`] for that page in multicolumn
+/// mode — see `crate::modal::build_page`).
 ///
 /// Uses a wider Stats-specific clamp ([`DRAWER_MAX_WIDTH_WIDE`]) via
 /// [`finish_page_clamped`] so two side-by-side history graphs each keep a usable
@@ -1477,13 +1477,13 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
 mod tests {
     use super::{StatsLayout, parse_stats_layout};
 
-    /// Unset resolves to the documented `combined` default, silently — no warn
-    /// (the `stats_layout` accessor only warns on a present-but-unrecognized
+    /// Unset resolves to the documented `multicolumn` default, silently — no
+    /// warn (the `stats_layout` accessor only warns on a present-but-unrecognized
     /// value). Matches the repo's `TROLLSHELL_RECORD_AUDIO` / `_WEATHER_CITY`
-    /// convention that an unset override reads as its default (#508).
+    /// convention that an unset override reads as its default (#508, #566).
     #[test]
-    fn parse_unset_is_combined() {
-        assert_eq!(parse_stats_layout(None), Ok(StatsLayout::Combined));
+    fn parse_unset_is_multicolumn() {
+        assert_eq!(parse_stats_layout(None), Ok(StatsLayout::Multicolumn));
     }
 
     /// Each recognized token maps to its layout.
@@ -1501,7 +1501,8 @@ mod tests {
     }
 
     /// A present-but-unrecognized value is returned as `Err` so `stats_layout`
-    /// can warn once and fall back to combined — case-sensitive, no fuzzy match.
+    /// can warn once and fall back to multicolumn — case-sensitive, no fuzzy
+    /// match.
     #[test]
     fn parse_unknown_is_err() {
         assert_eq!(parse_stats_layout(Some("Combined")), Err("Combined"));

@@ -55,7 +55,10 @@
 //!
 //! The window is the **only** bound on expansion, so an unbounded
 //! `FREQ=DAILY` series is naturally capped by the range rather than expanded
-//! years out. (RDATE/EXDATE refinement is a `hytte-ecal` follow-up.)
+//! years out. The rest of the recurrence set (RFC 5545 §3.8.5) is applied by
+//! `hytte-ecal` during that expansion: `EXDATE` occurrences are dropped and
+//! in-window `RDATE`s added (deduped against the RRULE-expanded starts, with
+//! `EXDATE` winning when the two collide), in both DATE and DATE-TIME forms.
 //!
 //! # Limitations / notes
 //!

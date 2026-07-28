@@ -246,11 +246,16 @@
           stubPlugin = pkgs.writeShellScriptBin "hytte-plugin-demo" "";
 
           # The hytte-ecal `probe` example binary + fixture sources (a
-          # task-list and a calendar), for the eds-nixos-test below.
-          probe = pkgs.callPackage ./nix/probe.nix { inherit craneLib; };
+          # task-list and a calendar), for the eds-nixos-test below. Since #588
+          # this is a slice of `workspace` — a `cp` + a GApps wrap, no cargo and
+          # no crane — exactly like the plugin packages above. Before #588 it
+          # was its own `buildDepsOnly` + `buildPackage` pair with its own `src`
+          # filter, i.e. a second full dependency compile per cold flake check.
+          probe = pkgs.callPackage ./nix/probe.nix { inherit workspace; };
           # The hytte-services `wifi_probe` example binary, for the
-          # wifi-nm-nixos-test below.
-          wifiProbe = pkgs.callPackage ./nix/wifi-probe.nix { inherit craneLib; };
+          # wifi-nm-nixos-test below. Same slice treatment (#588) — it was the
+          # third full dependency compile.
+          wifiProbe = pkgs.callPackage ./nix/wifi-probe.nix { inherit workspace; };
           taskSource = pkgs.writeText "test-tasks.source" ''
             [Data Source]
             DisplayName=Test Tasks

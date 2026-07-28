@@ -6,11 +6,15 @@
 //! here) — a per-monitor subscription in this widget would fire one toast
 //! per bar on a multi-monitor setup for a single capture.
 //!
-//! Deliberately no Open/Copy action buttons on that toast: the #220 triage
-//! flagged that a self-posted toast has no local-action-dispatch path today
-//! (`notifications::invoke_action` only broadcasts `ActionInvoked` on the bus
-//! for an external app to catch; nothing in trollshell subscribes to its
-//! own). Wiring that is a follow-up, not this slice.
+//! That toast **does** carry Open/Copy action buttons (whenever niri wrote a
+//! file — a clipboard-only capture has nothing to open). The local-action
+//! dispatch path they need — `notifications::post_local_with_actions` +
+//! `invoke_action`'s local-callback branch, which #220's triage flagged as
+//! missing — shipped in #283, so a self-posted toast is no longer limited to
+//! the outward-only `ActionInvoked` broadcast. See `main.rs`'s
+//! `install_screenshot_toast` for the wiring and
+//! `notifications::invoke_action`'s "Local dispatch" section for the
+//! mechanism.
 
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;

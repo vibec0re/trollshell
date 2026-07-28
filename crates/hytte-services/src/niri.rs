@@ -501,6 +501,22 @@ pub fn screenshot() {
     });
 }
 
+/// Stop the screencast session `session_id` (fire-and-forget).
+///
+/// Backs the screencast privacy chip's click (#221/#578). niri stops *every*
+/// stream belonging to the session, so a session that fanned out into
+/// multiple [`Cast`]s needs only one call — callers iterating
+/// [`active_casts()`] should dedup by `Cast::session_id` rather than send one
+/// request per cast.
+///
+/// **Only `CastKind::PipeWire` casts can be stopped this way.** niri's IPC has
+/// no equivalent for `CastKind::WlrScreencopy` (wf-recorder,
+/// xdg-desktop-portal-wlr); calling this for such a session is a no-op on
+/// niri's side, so filter on `kind` before offering the affordance.
+pub fn stop_cast(session_id: u64) {
+    send_action(Action::StopCast { session_id });
+}
+
 /// Ask niri to exit the session (fire-and-forget).
 ///
 /// `skip_confirmation = false` lets niri's built-in confirmation overlay

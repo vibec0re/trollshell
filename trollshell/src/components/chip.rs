@@ -9,10 +9,15 @@
 //!
 //! [`indicator`] covers both steps; chips call it instead of repeating the
 //! boilerplate inline. [`indicator`] *always* wires a click-through to some
-//! drawer `Page` — there's no click-less variant of it. A chip that's a pure
-//! status light with no page to open (e.g. the screencast privacy indicator)
-//! uses [`static_indicator`] instead, which shares the same CSS scaffold but
-//! wires no click at all.
+//! drawer `Page`, so [`action_indicator`] covers the chip whose click is a
+//! one-shot command with no page to open — same CSS scaffold, but
+//! `connect_clicked` runs a caller-supplied closure (#578: the screencast
+//! privacy chip stopping the cast).
+//!
+//! There was a third shape, `static_indicator`, wiring no click at all for a
+//! pure status light. The screencast chip was its only caller and #578 gave
+//! that chip a click, so it was removed rather than left dead — resurrect it
+//! from git history if a genuinely inert chip ever turns up.
 //!
 //! For the bar chips that display a small vertical fill bar (cpu / memory /
 //! gpu / disk), [`vertical_bar`] builds the `gtk::ProgressBar` with the
@@ -72,20 +77,22 @@ pub(crate) fn indicator_scroll(
     btn
 }
 
-/// Build a non-interactive chip button: same `"ts-indicator"` + `class`
-/// scaffold as [`indicator`], but with no `connect_clicked` wiring and no
-/// `Page` to open — for chips that are pure status lights (nothing to drill
-/// into today). `can_target`/`focusable` are turned off so it doesn't eat
-/// pointer/keyboard focus it has no use for.
+/// Build a chip button that acts on click without opening a drawer `Page`:
+/// same `"ts-indicator"` + `class` scaffold as [`indicator`], but
+/// `connect_clicked` runs `on_click` instead of [`crate::modal::toggle`].
+///
+/// For chips whose click *is* the whole interaction — a one-shot command
+/// with no detail view to drill into (#578: the screencast privacy chip
+/// stopping the cast). Targetable and focusable like [`indicator`], so the
+/// click is reachable by pointer *and* keyboard.
 ///
 /// The caller is responsible for attaching a child widget (icon, label, …)
 /// via `btn.set_child(…)` after this call.
-pub(crate) fn static_indicator(class: &str) -> gtk::Button {
+pub(crate) fn action_indicator(class: &str, on_click: impl Fn() + 'static) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-indicator");
     btn.add_css_class(class);
-    btn.set_can_target(false);
-    btn.set_focusable(false);
+    btn.connect_clicked(move |_| on_click());
     btn
 }
 

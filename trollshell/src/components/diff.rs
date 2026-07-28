@@ -1,12 +1,11 @@
 //! Generic keyed-diff planner for turning a `Vec<T>` signal into in-place
 //! GTK widget updates instead of a teardown-and-rebuild on every emission.
 //!
-//! This is the same shape as `widgets/tray.rs`'s `plan_diff`/`DiffOp` (#198),
-//! pulled out so `widgets/workspaces.rs` and `widgets/window_list.rs` (#229)
-//! can share it instead of hand-rolling their own copies. `widgets/tray.rs`
-//! itself still carries its original, non-generic copy — folding it onto
-//! this shared helper is out of scope for #229 (tray.rs wasn't touched) and
-//! left for a follow-up.
+//! `widgets/tray.rs` originated this shape as a `String`-keyed private pair
+//! (#198); #229 generalised it here so `widgets/workspaces.rs` and
+//! `widgets/window_list.rs` could share it instead of hand-rolling copies,
+//! and #578 folded `tray.rs` itself onto it — so this is now the single
+//! implementation, and its tests below are the only ones the algorithm has.
 
 use std::collections::HashSet;
 use std::hash::Hash;

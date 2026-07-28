@@ -3,34 +3,33 @@
 # the running shell's `mov.vibec0re.trollshell.Control` session-bus endpoint. It
 # ships as its own flake output alongside `.#trollshell`.
 #
-# Rather than run a second (~30-min) deps build — or recompile every hytte-*
-# workspace crate a second time — this reuses the shell package's shared
-# `workspaceArtifacts` + `commonArgs` (#530). `workspaceArtifacts` is the
-# intermediate `cargoBuild` that already compiled the ENTIRE workspace once (see
-# nix/package.nix), so this derivation finds every crate it links already built
-# in the warm target dir and does little more than link + install its own
-# binary. (The earlier #411 sharing reused `trollshell.passthru.cargoArtifacts`,
-# but that's crane's `buildDepsOnly` output — external crates only, workspace
-# members stubbed — so it still recompiled all of hytte-* here; #530 fixes that.
-# The `clippy` / `system-tests` flake checks still reuse the deps-only
-# `cargoArtifacts` because they compile a different feature set.)
+# THIS FILE RUNS NO CARGO AND NO CRANE (#572). `workspace` (nix/package.nix) is
+# the single derivation that compiles the whole workspace; this slices its one
+# binary out and wraps it. The previous shape was a second
+# `craneLib.buildPackage` inheriting `workspace`'s packed `target` dir as
+# `cargoArtifacts` and re-running `cargo build --workspace` in the hope that
+# cargo would find everything fresh — #572 measured that hope and found the
+# control center recompiled the same cascade the plugin packages did, so the
+# #530 "reuse works for the second binary" premise never actually held.
 #
-# `commonArgs.nativeBuildInputs` already carries `wrapGAppsHook4`, so the crane
-# build wraps the binary with the GApplication schema/icon/resource environment
-# (`XDG_DATA_DIRS`/`GSETTINGS_SCHEMA_DIR`/`GI_TYPELIB_PATH`) exactly like the
-# shell binary gets — this is a normal windowed GTK app, so without it the
-# GSettings-backed adwaita styling and symbolic icons would be missing. Unlike
-# `trollshell` it reads no bundled assets (no `TROLLSHELL_DATA_DIR`), so it needs
-# no extra makeWrapper asset layer — the crane output is the final package.
+# `workspace` installs raw, unwrapped ELFs (`dontWrapGApps = true` there) so the
+# GTK-free plugin binaries don't drag a GTK closure. This is a normal windowed
+# GTK app, so it gets wrapped here instead — with the *same* `buildInputs` the
+# compile used (`workspace.passthru.devInputs`), so the GApplication
+# environment the wrapper bakes in (`XDG_DATA_DIRS` / `GSETTINGS_SCHEMA_DIR` /
+# `GI_TYPELIB_PATH`) is exactly what the in-crane wrapping produced before.
+# Without it the GSettings-backed adwaita styling and symbolic icons would be
+# missing. Unlike `trollshell` it reads no bundled assets (no
+# `TROLLSHELL_DATA_DIR`), so there is nothing else to inject.
 {
   lib,
-  craneLib,
+  stdenv,
   makeDesktopItem,
-  trollshell,
+  wrapGAppsHook4,
+  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
+  workspace,
 }:
 let
-  inherit (trollshell.passthru) commonArgs workspaceArtifacts;
-
   # A .desktop launcher named after the app-id so the app is startable by name
   # (and window-matched via StartupWMClass). Exec is the bare binary name — it
   # resolves on PATH once the package is on the system/user profile.
@@ -41,7 +40,7 @@ let
     comment = "Settings & management companion for the trollshell desktop shell";
     exec = "trollshell-control-center";
     # No bundled app icon yet; use a stock settings glyph from the Adwaita theme
-    # (adwaita-icon-theme is in commonArgs.buildInputs) so the launcher shows
+    # (adwaita-icon-theme is in the shared buildInputs) so the launcher shows
     # something rather than a broken image.
     icon = "preferences-system";
     startupWMClass = "mov.vibec0re.trollshell.ControlCenter";
@@ -51,40 +50,31 @@ let
     ];
   };
 in
-craneLib.buildPackage (
-  commonArgs
-  // {
-    cargoArtifacts = workspaceArtifacts;
-    pname = "trollshell-control-center";
+stdenv.mkDerivation {
+  pname = "trollshell-control-center";
+  version = "0.1.0";
 
-    # Build against the already-compiled whole-workspace target so nothing is
-    # recompiled here (#530). MUST build `--workspace` (not `-p …`) to
-    # feature-match that target — a `-p` scope would fingerprint-mismatch and
-    # recompile ~all of it (see the feature-unification note in package.nix).
-    cargoExtraArgs = "--workspace";
+  dontUnpack = true;
+  dontConfigure = true;
+  dontBuild = true;
 
-    # No test run here: the hermetic internals suite runs in the trollshell
-    # package's check phase (the shared workspaceArtifacts stage is build-only to
-    # stay feature-pristine — see the notes in package.nix). This matches the
-    # pre-#530 behaviour, where the control-center package never ran tests.
-    doCheck = false;
+  nativeBuildInputs = [ wrapGAppsHook4 ];
+  inherit (workspace.passthru.devInputs) buildInputs;
 
-    # A `--workspace` build installs every workspace binary from the build log;
-    # keep ONLY the control-center binary, then drop the .desktop launcher into
-    # place. Both run before wrapGAppsHook4's fixup, so only the surviving
-    # binary gets wrapped.
-    postInstall = ''
-      find "$out/bin" -mindepth 1 -maxdepth 1 ! -name trollshell-control-center -exec rm -rf {} +
-      mkdir -p $out/share/applications
-      cp ${desktopItem}/share/applications/*.desktop $out/share/applications/
-    '';
+  installPhase = ''
+    runHook preInstall
+    install -Dm755 ${workspace}/bin/trollshell-control-center \
+      "$out/bin/trollshell-control-center"
+    mkdir -p "$out/share/applications"
+    cp ${desktopItem}/share/applications/*.desktop "$out/share/applications/"
+    runHook postInstall
+  '';
 
-    meta = {
-      description = "trollshell control center — external GTK settings & management companion";
-      homepage = "https://github.com/vibec0re/trollshell/";
-      license = lib.licenses.mpl20;
-      platforms = lib.platforms.linux;
-      mainProgram = "trollshell-control-center";
-    };
-  }
-)
+  meta = {
+    description = "trollshell control center — external GTK settings & management companion";
+    homepage = "https://github.com/vibec0re/trollshell/";
+    license = lib.licenses.mpl20;
+    platforms = lib.platforms.linux;
+    mainProgram = "trollshell-control-center";
+  };
+}

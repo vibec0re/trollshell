@@ -21,8 +21,8 @@ use super::graph::{resolve_link_dest, resolve_link_source};
 use super::pod::{avg_volume, build_props_pod, decode_props, parse_default_name, pick_app_name};
 use super::spectrum::SpectrumUserData;
 use super::types::{
-    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumCapture,
-    StateRef, clone_handles,
+    AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumAction,
+    SpectrumCapture, StateRef, clone_handles,
 };
 
 /// Sender shared across all callers. Populated by [`spawn_mainloop`] before
@@ -107,25 +107,21 @@ pub(super) fn run_once(
 
     let state = Rc::new(RefCell::new(AudioState::new(handles)));
 
-    // Audio spectrum capture tap (#405): a capture stream on the default sink's
-    // monitor, built **inactive** so an idle desktop pays nothing. The plugin
-    // host flips it active via `Command::SetSpectrumActive` once a plugin
-    // subscribes `StateKey::AudioSpectrum`. A build failure (no monitor, older
-    // daemon) is logged and simply leaves the spectrum dark — every other audio
-    // feature is unaffected.
-    let spectrum_out = state.borrow().handles.spectrum.clone();
-    if let Some(capture) = build_spectrum_capture(&core, spectrum_out) {
-        state.borrow_mut().spectrum_capture = Some(capture);
-    } else {
-        tracing::warn!("audio_native: spectrum capture unavailable this session");
-    }
-
     // Attach the command channel. The returned `AttachedReceiver` must
     // outlive the loop; deattached after `mainloop.run()` returns so the
     // bare `Receiver` can be re-attached on the next session.
+    //
+    // The core rides along with the state because the audio spectrum capture tap
+    // (#405) is built **lazily** (#581): `Command::SetSpectrumActive { active:
+    // true }` constructs and connects it on the 0→1 demand edge, and `false`
+    // drops it again — and `StreamRc::new` needs a core to construct against.
+    // Nothing about the tap touches pipewire until a subscriber actually asks for
+    // it, so a session where nobody opens an audio-reactive card never puts a
+    // `trollshell-spectrum` node in the graph at all.
     let state_for_cmds = Rc::clone(&state);
+    let core_for_cmds = core.clone();
     let attached = rx.attach(mainloop.loop_(), move |cmd| {
-        handle_command(cmd, &state_for_cmds);
+        handle_command(cmd, &state_for_cmds, &core_for_cmds);
     });
 
     // Core error → quit the mainloop so run_once returns cleanly and the
@@ -442,7 +438,7 @@ fn bind_default_metadata(
 /// Dispatch a [`Command`] arriving from the tokio side. Resolves the target
 /// node, builds a Props pod (Phase 3 — `channelVolumes` or `mute`), and
 /// calls `node.set_param`. Runs on the pw-loop thread.
-fn handle_command(cmd: Command, state: &StateRef) {
+fn handle_command(cmd: Command, state: &StateRef, core: &pw::core::CoreRc) {
     match cmd {
         Command::SetSinkVolume { name, linear } => {
             apply_volume_by_name(state, &name, AudioRole::Sink, linear);
@@ -469,26 +465,90 @@ fn handle_command(cmd: Command, state: &StateRef) {
             write_default(state, "default.audio.source", &name);
         }
         Command::SetSpectrumActive { active } => {
-            set_spectrum_active(state, active);
+            set_spectrum_active(state, core, active);
         }
     }
 }
 
-/// Toggle the audio spectrum capture tap active/inactive (#405). Silently
-/// no-ops if the capture stream failed to build this session.
-fn set_spectrum_active(state: &StateRef, active: bool) {
-    let s = state.borrow();
-    let Some(capture) = s.spectrum_capture.as_ref() else {
-        tracing::debug!(
-            active,
-            "audio_native: spectrum capture not built; ignoring toggle"
-        );
-        return;
+/// Build or tear down the audio spectrum capture tap (#405/#581).
+///
+/// Demand is an edge, not a level: `true` constructs + connects + activates the
+/// stream if it doesn't exist yet, `false` disconnects and drops it. The tap used
+/// to be built at loop start and merely `set_active`-toggled, which left a
+/// `trollshell-spectrum` capture client parked in the graph for the whole session
+/// — visible in `wpctl status`, pavucontrol's Recording tab and Helvum whether or
+/// not anything was listening (#581). Now the node exists only while something is
+/// actually looking at the spectrum. The cost is one format renegotiation per
+/// sidebar open, which is rare and cheap.
+///
+/// A build failure (no monitor, older daemon) is logged and leaves the feature
+/// dark — it never panics and never poisons the loop, so every other audio
+/// feature keeps working and the next demand edge retries from scratch.
+///
+/// # Borrow discipline
+///
+/// Both the build and the teardown run pipewire code, so the `RefCell` borrow is
+/// released before either: the inputs are read into locals up front, and the
+/// stream is cloned out (it's an `Rc`) rather than used through a live borrow.
+fn set_spectrum_active(state: &StateRef, core: &pw::core::CoreRc, active: bool) {
+    // Read both inputs and drop the borrow immediately — nothing below may run
+    // while it is held.
+    let (built, out) = {
+        let s = state.borrow();
+        (s.spectrum_capture.is_some(), s.handles.spectrum.clone())
     };
-    if let Err(e) = capture.stream.set_active(active) {
-        tracing::warn!(error = ?e, active, "audio_native: set spectrum active failed");
+
+    match SpectrumAction::decide(active, built) {
+        SpectrumAction::BuildAndActivate => {
+            let Some(capture) = build_spectrum_capture(core, out) else {
+                tracing::warn!("audio_native: spectrum capture unavailable; leaving it dark");
+                return;
+            };
+            activate_spectrum(&capture.stream);
+            state.borrow_mut().spectrum_capture = Some(capture);
+        }
+        SpectrumAction::Activate => {
+            // Already built (a redundant or re-asserted `true`). Rebuilding would
+            // put a second tap on the monitor, so only re-activate.
+            let stream = state
+                .borrow()
+                .spectrum_capture
+                .as_ref()
+                .map(|c| c.stream.clone());
+            if let Some(stream) = stream {
+                activate_spectrum(&stream);
+            }
+        }
+        SpectrumAction::Teardown => {
+            let taken = state.borrow_mut().spectrum_capture.take();
+            if let Some(capture) = taken {
+                if let Err(e) = capture.stream.disconnect() {
+                    tracing::warn!(error = ?e, "audio_native: spectrum disconnect failed");
+                }
+                // Clear the last published frame so a re-open doesn't hand a
+                // subscriber a stale spectrum from the previous session, and so
+                // `pipewire::audio_spectrum()` really is `None` while the capture
+                // is down, as documented.
+                out.set(None);
+                tracing::debug!("audio_native: spectrum capture torn down");
+                // `capture` drops here — listener first, then the stream (field
+                // order in `SpectrumCapture`), destroying the node.
+            }
+        }
+        SpectrumAction::Nothing => {
+            tracing::debug!("audio_native: spectrum capture already down; nothing to tear down");
+        }
+    }
+}
+
+/// Start a spectrum stream that has just been built (or was already present).
+/// Only ever called with `true` — deactivation is a full teardown now, not a
+/// pause, so there is no `set_active(false)` path left.
+fn activate_spectrum(stream: &pw::stream::StreamRc) {
+    if let Err(e) = stream.set_active(true) {
+        tracing::warn!(error = ?e, "audio_native: activating spectrum capture failed");
     } else {
-        tracing::debug!(active, "audio_native: spectrum capture toggled");
+        tracing::debug!("audio_native: spectrum capture active");
     }
 }
 
@@ -717,16 +777,26 @@ pub(super) fn emit_snapshots(state: &mut AudioState) {
 
 /// Build the audio spectrum capture stream (#405): an F32 input stream on the
 /// **default sink's monitor** (`stream.capture.sink = true` + autoconnect makes
-/// it follow the default sink), connected **inactive**. The `param_changed`
-/// callback learns the negotiated rate/channels; the `process` callback feeds
-/// samples through the [`super::spectrum::Analyzer`] and publishes each finished
-/// `{peak, bins}` frame to the `out` handle. Returns `None` (logged by the
-/// caller) if any step fails, leaving the feature dark without disturbing the
-/// rest of the audio service.
+/// it follow the default sink). The `param_changed` callback learns the
+/// negotiated rate/channels; the `process` callback feeds samples through the
+/// [`super::spectrum::Analyzer`] and publishes each finished `{peak, bins}` frame
+/// to the `out` handle. Returns `None` (logged by the caller) if any step fails,
+/// leaving the feature dark without disturbing the rest of the audio service.
+///
+/// Called **on demand** from [`set_spectrum_active`] (#581), never at startup.
+/// The connect still passes [`INACTIVE`] and activation stays a separate
+/// [`activate_spectrum`] call: that keeps this function's post-condition a single
+/// "constructed and connected, not yet running", leaves activation in exactly one
+/// place, and lets a fresh build and a redundant re-assert take the identical
+/// path. There is no observable paused window — both calls happen in one
+/// synchronous turn of the loop callback, with no round trip to the daemon in
+/// between.
 ///
 /// The `process` callback runs on this loop's own thread (no `RT_PROCESS`
 /// flag), the same thread that already pushes `emit_snapshots`, so writing the
 /// `Mutable` from it is consistent with the rest of the backend.
+///
+/// [`INACTIVE`]: pw::stream::StreamFlags::INACTIVE
 fn build_spectrum_capture(
     core: &pw::core::CoreRc,
     out: Mutable<Option<AudioSpectrum>>,
@@ -802,7 +872,7 @@ fn build_spectrum_capture(
         .map_err(|e| tracing::warn!(error = ?e, "audio_native: spectrum connect failed"))
         .ok()?;
 
-    tracing::debug!("audio_native: spectrum capture built (inactive)");
+    tracing::debug!("audio_native: spectrum capture built");
     Some(SpectrumCapture { listener, stream })
 }
 

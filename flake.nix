@@ -31,8 +31,9 @@
         "aarch64-linux"
       ];
       # The 12 bundled widget plugins (#558), by crate = binary = flake-output
-      # name. Each is packaged by nix/plugin.nix (a link + install of one
-      # already-compiled binary — the #530 warm-artifact pattern). Shared
+      # name. Each is packaged by nix/plugin.nix, which since #572 is a plain
+      # `cp` of one already-compiled binary out of the single whole-workspace
+      # compile (`trollshell.passthru.workspace`) — no cargo, no crane. Shared
       # between the `packages` output (per-plugin flake outputs, so
       # `programs.trollshell.plugins.<id>.package` has something in THIS flake to
       # point at) and the `checks` output (build coverage, #449), so the list
@@ -69,20 +70,26 @@
         { pkgs, craneLib, ... }:
         let
           trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
-          # The control-center companion app (#399). Reuses the shell build's
-          # shared cargoArtifacts (via trollshell.passthru) so it doesn't
-          # trigger a second full deps compile.
+          # The single whole-workspace compile (#572). EVERY package output
+          # below is a slice of this one derivation — a `cp` of one binary out
+          # of its `$out/bin`, optionally wrapped — so there is exactly one
+          # cargo invocation on the package path and nothing that can miss a
+          # cross-derivation artifact cache. See nix/package.nix.
+          workspace = trollshell.passthru.workspace;
+
+          # The control-center companion app (#399): the workspace binary, GApps-
+          # wrapped, plus a .desktop launcher. No cargo (#572).
           trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
-            inherit craneLib trollshell;
+            inherit workspace;
           };
 
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
           # each of the 12 bundled plugins. Generated from `bundledPluginNames`
-          # (one attr each) rather than hand-written, and reuses the shell
-          # build's warm workspace artifacts via nix/plugin.nix (link + install,
-          # seconds apiece — the #530 pattern).
+          # (one attr each) rather than hand-written. Since #572 each is a `cp`
+          # of one already-compiled binary out of `workspace` — no cargo, no
+          # crane, no recompile.
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
-            name: pkgs.callPackage ./nix/plugin.nix { inherit craneLib trollshell name; }
+            name: pkgs.callPackage ./nix/plugin.nix { inherit workspace name; }
           );
 
           # The `hytte-infobroker` CLI (#562): the #487 consent-gated broker's
@@ -93,7 +100,7 @@
           # nothing in `programs.trollshell.plugins` should point at it; install
           # it with a plain `home.packages` entry instead (see the skill docs).
           hytte-infobroker = pkgs.callPackage ./nix/plugin.nix {
-            inherit craneLib trollshell;
+            inherit workspace;
             name = "hytte-infobroker";
             description = "trollshell consent-gated agent-bridge broker CLI (#487)";
           };
@@ -197,11 +204,14 @@
         let
           system = pkgs.stdenv.hostPlatform.system;
           trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          # The single whole-workspace compile (#572), mirroring the `packages`
+          # output above.
+          workspace = trollshell.passthru.workspace;
+
           # The control-center companion app (#411), mirroring the `packages`
-          # output above — reuses `trollshell.passthru.cargoArtifacts` so it
-          # doesn't trigger a second full deps compile.
+          # output above — a slice of `workspace`, no cargo of its own (#572).
           trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
-            inherit craneLib trollshell;
+            inherit workspace;
           };
 
           # The 12 per-plugin packages (#558), mirroring the `packages` output.
@@ -209,9 +219,10 @@
           # each one — the same reason #449 wired the two existing packages into
           # checks: flake check only builds what's listed here, so without this a
           # broken plugin package could stay green until someone ran `nix build
-          # .#hytte-plugin-<id>`. Near-free: warm-artifact link + install.
+          # .#hytte-plugin-<id>`. Genuinely near-free since #572: each is a `cp`
+          # out of the one `workspace` output every other check already forces.
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
-            name: pkgs.callPackage ./nix/plugin.nix { inherit craneLib trollshell name; }
+            name: pkgs.callPackage ./nix/plugin.nix { inherit workspace name; }
           );
 
           # The `hytte-infobroker` CLI package (#562), mirroring the `packages`
@@ -219,7 +230,7 @@
           # `bundledPlugins`: without it, `nix flake check` could stay green
           # while `nix build .#hytte-infobroker` was actually broken.
           hytte-infobroker = pkgs.callPackage ./nix/plugin.nix {
-            inherit craneLib trollshell;
+            inherit workspace;
             name = "hytte-infobroker";
             description = "trollshell consent-gated agent-bridge broker CLI (#487)";
           };
@@ -270,7 +281,7 @@
           # `nix build`) can stay green while `nix build .#trollshell` or
           # `.#trollshell-control-center` is actually broken — the release
           # profile, `nix/package.nix`'s src filter, the assets derivation,
-          # and the makeWrapper wrapper are never exercised. See #449.
+          # and the wrapper derivations are never exercised. See #449.
           inherit trollshell trollshell-control-center hytte-infobroker;
 
           # Lint the entire workspace with pedantic-clean Clippy. Reuses
@@ -289,7 +300,10 @@
             trollshell.passthru.commonArgs
             // {
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
-              cargoClippyExtraArgs = "--workspace --all-targets --features system-tests -- -D warnings";
+              # `commonArgs.cargoExtraArgs` already carries `--workspace
+              # --locked` (#572), so only the lint-specific flags go here; the
+              # effective command is unchanged.
+              cargoClippyExtraArgs = "--all-targets --features system-tests -- -D warnings";
               # This is a leaf/terminal check — nothing chains off its target
               # dir as `cargoArtifacts` — so don't pack it. crane defaults
               # `doInstallCargoArtifacts = true`, which would tar the whole
@@ -303,9 +317,10 @@
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,
           # feature = "system-tests"))]` GTK unit-test modules in hytte-ui.
-          # These never compile anywhere else — the package build (doCheck
-          # above) deliberately omits the feature to stay hermetic — so this
-          # is their only home. Built via `mkCargoDerivation` directly
+          # These never compile anywhere else — the workspace compile's own
+          # `doCheck` (nix/package.nix) deliberately omits the feature to stay
+          # hermetic — so this is their only home. Built via
+          # `mkCargoDerivation` directly
           # (rather than `craneLib.cargoTest`) because `cargoTest.nix`
           # hardcodes `checkPhaseCargoCommand`, silently discarding any
           # override — we need that command to wrap `cargo test` in

@@ -29,17 +29,20 @@
 //! moved here, to the same place the toggle happens. [`set_enabled`] resolves
 //! coordinates *before* starting the unit, in priority order:
 //!
-//! 1. **The live location fix** — `places::shared_location()`, the same
+//! 1. **The configured static coordinates** — `$TROLLSHELL_NIGHTLIGHT_LATITUDE`
+//!    / `$TROLLSHELL_NIGHTLIGHT_LONGITUDE`, rendered from the nix options by
+//!    `nix/hm-module.nix`. Configuring these is an explicit statement of where
+//!    you are, so they win outright: someone who writes coordinates into their
+//!    config and *also* runs `GeoClue` gets the coordinates they wrote. They
+//!    also short-circuit step 2 entirely, so a configured user never waits on
+//!    a location fix they didn't ask for.
+//! 2. **The live location fix** — `places::shared_location()`, the same
 //!    tokio-side handle `weather.rs` reads (the registry accessor
 //!    `places::current()` is thread-local to the GTK main thread and so is
 //!    unreachable from here). That handle is the *effective* location, so the
 //!    `TROLLSHELL_WEATHER_CITY` fallback and the control-center's manual place
-//!    override feed night light too, for free.
-//! 2. **The configured static coordinates** — `$TROLLSHELL_NIGHTLIGHT_LATITUDE`
-//!    / `$TROLLSHELL_NIGHTLIGHT_LONGITUDE`, rendered from the nix options by
-//!    `nix/hm-module.nix`. These are the override for anyone who does not want
-//!    `GeoClue` running at all: with no location service there is no fix, so
-//!    step 1 finds nothing and these win.
+//!    override feed night light too, for free. This is the zero-config path,
+//!    and the one that makes the switch work out of the box.
 //! 3. **Nothing** — the unit is *not* started, a `warn!` says why, and
 //!    `enabled` is re-published as `false` so the switch snaps back instead of
 //!    sitting on over a dead daemon.
@@ -158,8 +161,9 @@ pub fn enabled() -> impl Signal<Item = bool> {
 
 /// Toggle the night-light unit. Fire-and-forget.
 ///
-/// Turning it **on** first resolves coordinates (see the module docs: live fix
-/// → configured static override → nothing), writes them to [`ARGS_FILE`], and
+/// Turning it **on** first resolves coordinates (see the module docs:
+/// configured static coordinates → live fix → nothing), writes them to
+/// [`ARGS_FILE`], and
 /// only then runs `systemctl --user start wlsunset.service`. With no
 /// coordinates the unit is deliberately *not* started — starting it would just
 /// print a hint and exit 0, which is the silent no-op this whole path exists to
@@ -238,14 +242,18 @@ impl Coords {
     }
 }
 
-/// Resolve the coordinates to start `wlsunset` with: the live location fix
-/// first, then the configured static override, then nothing. See the module
+/// Resolve the coordinates to start `wlsunset` with: the configured static
+/// coordinates first, then the live location fix, then nothing. See the module
 /// docs for why that order.
+///
+/// Configured-first is also why a user who set coordinates never pays
+/// [`FIX_WAIT`]: `static_coords()` is a synchronous env read, so it returns
+/// before [`live_coords`] is ever awaited.
 async fn resolve_coords() -> Option<Coords> {
-    if let Some(c) = live_coords().await {
+    if let Some(c) = static_coords() {
         return Some(c);
     }
-    static_coords()
+    live_coords().await
 }
 
 /// Coordinates from the live location fix, via the tokio-side `places` handle
@@ -268,7 +276,7 @@ async fn live_coords() -> Option<Coords> {
     } else {
         tracing::warn!(
             secs = FIX_WAIT.as_secs(),
-            "nightlight: location still resolving; falling back to configured coordinates"
+            "nightlight: location still resolving and no coordinates configured; not starting"
         );
         None
     }

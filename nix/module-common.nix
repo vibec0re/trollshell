@@ -188,10 +188,10 @@ self:
     # system service.
     #
     # Since #577 the coordinates are resolved at *toggle* time by the shell, not
-    # at nix-eval time: the live location fix (GeoClue2, which ships with
-    # enableRecommendedServices) is preferred, and lat/lon below are the static
-    # override for a session that has no location service. Leaving both null is
-    # therefore a working configuration, not an inert one.
+    # at nix-eval time: lat/lon below win when set (configuring them is an
+    # explicit statement of where you are), and otherwise the live location fix
+    # is used (GeoClue2, which ships with enableRecommendedServices). Leaving
+    # both null is therefore a working configuration, not an inert one.
     nightlight = {
       latitude = lib.mkOption {
         type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
@@ -199,12 +199,12 @@ self:
         example = 52.52;
         description = ''
           Latitude in decimal degrees for wlsunset's geo (sunrise/sunset) mode
-          (`wlsunset -l <latitude>`). Optional: the Night light toggle prefers
-          the live location fix and only falls back to this, so set it (together
-          with `longitude`) if you do not run GeoClue2 — or to pin night light
-          to a fixed place. With neither a fix nor these set, the toggle refuses
-          to start the daemon and logs why. May be given as a float (52.52) or a
-          string ("52.52").
+          (`wlsunset -l <latitude>`). Optional. When set (together with
+          `longitude`) it takes precedence over the live location fix, so use it
+          to pin night light to a fixed place, or if you do not run GeoClue2.
+          Leave both null to follow the live fix instead. With neither a fix nor
+          these set, the toggle refuses to start the daemon and logs why. May be
+          given as a float (52.52) or a string ("52.52").
         '';
       };
 

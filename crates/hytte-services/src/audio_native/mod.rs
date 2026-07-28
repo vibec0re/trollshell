@@ -118,10 +118,16 @@ pub fn set_default_source(name: &str) {
     });
 }
 
-/// Activate or deactivate the audio spectrum capture tap (#405). The plugin host
-/// calls this with `true` when the first `StateKey::AudioSpectrum` subscriber
-/// connects and `false` when the last one leaves, so the monitor is only tapped
-/// while something is listening. Fire-and-forget like the other setters.
+/// Build or tear down the audio spectrum capture tap (#405/#581). The plugin host
+/// calls this with `true` when the first on-screen `StateKey::AudioSpectrum`
+/// subscriber appears and `false` when the last one goes away.
+///
+/// `true` **creates** the `trollshell-spectrum` capture node and `false`
+/// **destroys** it — it is not an active/paused toggle over a permanently
+/// connected stream. So with nothing subscribed there is no capture client in the
+/// graph for `wpctl status` / pavucontrol / Helvum to list at all, which is what
+/// "only records when needed" has to mean to be worth anything (#581).
+/// Fire-and-forget like the other setters.
 pub fn set_spectrum_active(active: bool) {
     send_command(Command::SetSpectrumActive { active });
 }
@@ -165,7 +171,46 @@ pub fn toggle_mute() {
 
 #[cfg(test)]
 mod tests {
-    use super::types::AudioRole;
+    use super::types::{AudioRole, SpectrumAction};
+
+    /// #581: the tap is demand-built, so the (requested, currently-built) truth
+    /// table is the whole contract. Pinned here because the effectful half needs a
+    /// live `PipeWire` daemon and can't be exercised in CI.
+    #[test]
+    fn spectrum_action_truth_table() {
+        // 0→1 with nothing built: create the node, then start it.
+        assert_eq!(
+            SpectrumAction::decide(true, false),
+            SpectrumAction::BuildAndActivate,
+        );
+        // Demand re-asserted over a live stream must NOT build a second tap on
+        // the same monitor — just make sure the existing one is running.
+        assert_eq!(SpectrumAction::decide(true, true), SpectrumAction::Activate);
+        // 1→0: a full teardown. Regression guard for the actual bug — pausing
+        // instead would leave the node listed as a capture client all session.
+        assert_eq!(
+            SpectrumAction::decide(false, true),
+            SpectrumAction::Teardown,
+        );
+        // `false` with nothing built (the last subscriber of a session that never
+        // managed to build a tap): no work, and above all no build.
+        assert_eq!(
+            SpectrumAction::decide(false, false),
+            SpectrumAction::Nothing,
+        );
+    }
+
+    /// The two states that must never construct a stream, stated separately from
+    /// the table so the intent survives a future refactor of the enum.
+    #[test]
+    fn spectrum_action_never_builds_when_demand_is_off() {
+        for built in [true, false] {
+            assert_ne!(
+                SpectrumAction::decide(false, built),
+                SpectrumAction::BuildAndActivate,
+            );
+        }
+    }
 
     #[test]
     fn audio_role_classifies_the_four_relevant_classes() {

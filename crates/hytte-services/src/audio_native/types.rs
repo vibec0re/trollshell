@@ -97,10 +97,13 @@ pub(super) struct LinkEdge {
 
 /// The audio spectrum capture tap (#405): a `PipeWire` input stream connected to
 /// the default sink's monitor plus its listener. Both must stay alive together —
-/// dropping either stops capture. Held `Option`ally in [`AudioState`] because
-/// the stream is created after the core connects, and is toggled active/inactive
-/// via [`Command::SetSpectrumActive`] so an idle desktop (no subscriber) does no
-/// analysis work.
+/// dropping either stops capture.
+///
+/// Held `Option`ally in [`AudioState`] because the tap is built **lazily** (#581):
+/// [`Command::SetSpectrumActive`] constructs and connects it on the 0→1 demand
+/// edge and drops it on 1→0, so the `trollshell-spectrum` node only exists in the
+/// graph while something is actually looking at the spectrum. `None` means no such
+/// node exists — not merely a paused one.
 pub(super) struct SpectrumCapture {
     // Field order is the drop order: the listener must drop **before** the
     // stream, because unregistering a listener (`spa_hook_remove`) walks the
@@ -225,13 +228,49 @@ pub(super) enum Command {
     SetDefaultSource {
         name: String,
     },
-    /// Activate or deactivate the audio spectrum capture tap (#405). The plugin
-    /// host toggles this so the monitor is only tapped while at least one plugin
-    /// subscribes `StateKey::AudioSpectrum` — an idle desktop does no analysis.
-    /// A no-op if the capture stream failed to build.
+    /// Build or tear down the audio spectrum capture tap (#405/#581). The plugin
+    /// host sends `true` on the 0→1 subscriber edge and `false` on 1→0, so the
+    /// `trollshell-spectrum` node is **constructed** when something starts looking
+    /// at the spectrum and **destroyed** when nothing is — an idle desktop does no
+    /// analysis *and* shows no capture client in any mixer. `true` degrades to a
+    /// log line if the stream fails to build this session.
     SetSpectrumActive {
         active: bool,
     },
+}
+
+/// What a [`Command::SetSpectrumActive`] should actually do, given the requested
+/// demand state and whether the capture stream currently exists (#581).
+///
+/// Split out as a pure decision so the truth table can be pinned by a hermetic
+/// test — the effectful half (construct / connect / drop a `PipeWire` stream)
+/// needs a live daemon and can only be checked by hand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SpectrumAction {
+    /// Demand went 0→1 and no stream exists: construct, connect, then activate.
+    BuildAndActivate,
+    /// Demand asserted while the stream already exists (a redundant `true`, or a
+    /// re-assert): just make sure it is running. Never rebuilds — a second node
+    /// would double-tap the monitor.
+    Activate,
+    /// Demand went 1→0: disconnect and drop, removing the node from the graph.
+    /// Deliberately **not** a `set_active(false)` pause — a paused stream still
+    /// shows up as a capture client in `wpctl status` / pavucontrol (#581).
+    Teardown,
+    /// Already dark, nothing to tear down. The common case for the `false` the
+    /// host sends when a plugin that never built a tap disconnects.
+    Nothing,
+}
+
+impl SpectrumAction {
+    pub(super) fn decide(active: bool, built: bool) -> Self {
+        match (active, built) {
+            (true, false) => Self::BuildAndActivate,
+            (true, true) => Self::Activate,
+            (false, true) => Self::Teardown,
+            (false, false) => Self::Nothing,
+        }
+    }
 }
 
 /// Clone a `PipewireHandles` for cross-thread sharing. Each `Mutable` is

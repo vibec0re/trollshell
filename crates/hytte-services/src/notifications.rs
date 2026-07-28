@@ -1628,6 +1628,39 @@ mod tests {
     }
 
     #[test]
+    fn hold_transfer_across_a_card_rebuild_never_unpauses() {
+        // The overlay's #593 card swap, as pure state transitions: the
+        // successor card's hold is taken BEFORE the outgoing card is unmapped,
+        // so the count goes 1 → 2 → 1 and never touches zero. Nothing re-arms
+        // mid-hover and the recorded remainder is not recomputed. (The widget
+        // half — that a stationary pointer gets no fresh `enter` — isn't
+        // testable without a real compositor.)
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        assert_eq!(s.pause(t0 + Duration::from_secs(1)), TimerAction::Abort); // pointer enters
+        assert_eq!(s.remaining, Duration::from_secs(4));
+
+        // Successor's hold, taken while the old card is still mounted…
+        assert_eq!(s.pause(t0 + Duration::from_secs(2)), TimerAction::Nothing);
+        // …then the old card unmaps and releases its own.
+        assert_eq!(
+            s.resume(t0 + Duration::from_secs(2), MIN_RESUME),
+            TimerAction::Nothing
+        );
+        assert_eq!(s.hover_count, 1);
+        assert_eq!(s.deadline, None); // still paused
+        assert_eq!(s.remaining, Duration::from_secs(4)); // remainder untouched
+
+        // The successor's own leave is the one — and only one — that re-arms.
+        assert_eq!(
+            s.resume(t0 + Duration::from_secs(9), MIN_RESUME),
+            TimerAction::Arm(Duration::from_secs(4))
+        );
+        assert_eq!(s.hover_count, 0);
+    }
+
+    #[test]
     fn clear_timer_removes_only_the_given_id() {
         // Cleanup on dismiss: the id's bookkeeping is gone, siblings untouched,
         // no leaked entry. (`abort: None` keeps this runtime-free.)

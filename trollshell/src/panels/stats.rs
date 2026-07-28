@@ -1,5 +1,5 @@
 //! System stats drawer panel — three runtime-selectable layouts of the same
-//! five per-resource cards (CPU / Memory / Disks / GPU / Services), chosen by
+//! five per-resource cards (CPU / Memory / GPU / Disks / Services), chosen by
 //! the `TROLLSHELL_STATS_LAYOUT` env var (read once via [`stats_layout`]):
 //!
 //! - **`combined`** — all five cards stacked in one page
@@ -56,8 +56,8 @@ use crate::components::reactive_list::reactive_list;
 pub enum StatsSection {
     Cpu,
     Memory,
-    Disks,
     Gpu,
+    Disks,
     Services,
 }
 
@@ -168,14 +168,14 @@ pub fn panel_stats() -> gtk::Widget {
 
     let cpu_card = build_stats_cpu_card();
     let memory_card = build_stats_memory_card();
-    let disks_card = build_stats_disks_card();
     let gpu_card = build_stats_gpu_card();
+    let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_group();
 
     column.append(cpu_card.upcast_ref::<gtk::Widget>());
     column.append(memory_card.upcast_ref::<gtk::Widget>());
-    column.append(disks_card.upcast_ref::<gtk::Widget>());
     column.append(gpu_card.upcast_ref::<gtk::Widget>());
+    column.append(disks_card.upcast_ref::<gtk::Widget>());
     column.append(services_card.upcast_ref::<gtk::Widget>());
 
     // Soft default (flagged for review, same spirit as the disk-I/O row's
@@ -188,8 +188,8 @@ pub fn panel_stats() -> gtk::Widget {
     let sections: Vec<(StatsSection, gtk::Widget)> = vec![
         (StatsSection::Cpu, cpu_card.upcast()),
         (StatsSection::Memory, memory_card.upcast()),
-        (StatsSection::Disks, disks_card.upcast()),
         (StatsSection::Gpu, gpu_card.upcast()),
+        (StatsSection::Disks, disks_card.upcast()),
         (StatsSection::Services, services_card.upcast()),
     ];
 
@@ -205,7 +205,7 @@ pub fn panel_stats() -> gtk::Widget {
 
 /// The multicolumn stats flyout (#508) — the same five cards as [`panel_stats`]
 /// laid out in a 2-column [`page_grid`]: CPU | Memory on the first row,
-/// Disks | GPU on the second, and Services spanning both columns on the third.
+/// GPU | Disks on the second, and Services spanning both columns on the third.
 /// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT` is
 /// `multicolumn` (default) or unset; the chips still target the single
 /// `Page::Stats` (this replaces [`panel_stats`] for that page in multicolumn
@@ -225,18 +225,41 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
 
     let cpu_card = build_stats_cpu_card();
     let memory_card = build_stats_memory_card();
-    let disks_card = build_stats_disks_card();
     let gpu_card = build_stats_gpu_card();
+    let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_group();
 
     grid.attach(cpu_card.upcast_ref::<gtk::Widget>(), 0, 0, 1, 1);
     grid.attach(memory_card.upcast_ref::<gtk::Widget>(), 1, 0, 1, 1);
-    grid.attach(disks_card.upcast_ref::<gtk::Widget>(), 0, 1, 1, 1);
-    grid.attach(gpu_card.upcast_ref::<gtk::Widget>(), 1, 1, 1, 1);
+    grid.attach(gpu_card.upcast_ref::<gtk::Widget>(), 0, 1, 1, 1);
+    grid.attach(disks_card.upcast_ref::<gtk::Widget>(), 1, 1, 1, 1);
     // Services spans both columns on its own row: the failed-units list can grow
-    // tall and has no natural column partner (GPU can self-hide, leaving Disks
-    // alone on row 1 — a full-width Services row keeps the grid balanced below).
+    // tall and has no natural column partner.
     grid.attach(services_card.upcast_ref::<gtk::Widget>(), 0, 2, 2, 1);
+
+    // GPU can self-hide entirely when no GPU is present (`build_stats_gpu_card`'s
+    // own bind to `sensors::gpu()`'s presence signal). Left as the fixed attach
+    // above, that self-hide would leave row 1's column 0 empty with Disks
+    // stranded in column 1 — GtkGrid keeps column 0 at CPU's width (row 0 still
+    // occupies it), so the gap doesn't collapse, it just sits there as a hole
+    // (#571). Reflow Disks into column 0 whenever GPU is hidden, and back to
+    // column 1 when it reappears, by moving its `GtkGridLayoutChild` rather
+    // than re-attaching. Tracks the GPU card's own `visible` property directly
+    // (rather than re-deriving the same condition from `sensors::gpu()`) so
+    // this can never drift from whatever actually controls the card's
+    // presence; applied once immediately for the first render, then kept live
+    // via `notify::visible`.
+    let disks_layout_child = grid
+        .layout_manager()
+        .expect("gtk::Grid always installs a GtkGridLayout")
+        .layout_child(disks_card.upcast_ref::<gtk::Widget>())
+        .downcast::<gtk::GridLayoutChild>()
+        .expect("a GtkGrid's layout children are GtkGridLayoutChild");
+    let reflow_disks_column = move |gpu_visible: bool| {
+        disks_layout_child.set_column(i32::from(gpu_visible));
+    };
+    reflow_disks_column(gpu_card.is_visible());
+    gpu_card.connect_visible_notify(move |gpu| reflow_disks_column(gpu.is_visible()));
 
     // Two columns roughly halve the stacked height versus the combined page, so
     // this 560 cap is usually slack — everything fits without a scrollbar. It
@@ -247,8 +270,8 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     let sections: Vec<(StatsSection, gtk::Widget)> = vec![
         (StatsSection::Cpu, cpu_card.upcast()),
         (StatsSection::Memory, memory_card.upcast()),
-        (StatsSection::Disks, disks_card.upcast()),
         (StatsSection::Gpu, gpu_card.upcast()),
+        (StatsSection::Disks, disks_card.upcast()),
         (StatsSection::Services, services_card.upcast()),
     ];
 
@@ -324,14 +347,14 @@ pub fn panel_stats_memory() -> gtk::Widget {
     single_card_page(build_stats_memory_card().upcast_ref::<gtk::Widget>())
 }
 
-/// Disks stats flyout — opened from the disk bar chip in `split` layout.
-pub fn panel_stats_disks() -> gtk::Widget {
-    single_card_page(build_stats_disks_card().upcast_ref::<gtk::Widget>())
-}
-
 /// GPU stats flyout — opened from the GPU bar chip in `split` layout.
 pub fn panel_stats_gpu() -> gtk::Widget {
     single_card_page(build_stats_gpu_card().upcast_ref::<gtk::Widget>())
+}
+
+/// Disks stats flyout — opened from the disk bar chip in `split` layout.
+pub fn panel_stats_disks() -> gtk::Widget {
+    single_card_page(build_stats_disks_card().upcast_ref::<gtk::Widget>())
 }
 
 /// Services flyout — opened from the services bar chip in `split` layout.
@@ -1475,7 +1498,25 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatsLayout, parse_stats_layout};
+    use super::{StatsLayout, StatsSection, parse_stats_layout};
+
+    /// The [`StatsSection`] declaration order is the panel's canonical
+    /// resource order and must agree with the always-visible bar chip order
+    /// (`main.rs`'s CPU/Memory/GPU/Disk/Services resource `group`, #571).
+    /// Every `sections` vec in this file (and the multicolumn grid
+    /// coordinates) is built by hand rather than derived from the enum, so
+    /// this can't catch every drift on its own — but a fieldless enum's
+    /// implicit discriminants follow declaration order, so pinning them here
+    /// is a cheap, GTK-free tripwire against an accidental reshuffle of the
+    /// enum itself falling back out of sync with the bar.
+    #[test]
+    fn stats_section_declaration_order_matches_bar() {
+        assert_eq!(StatsSection::Cpu as u8, 0);
+        assert_eq!(StatsSection::Memory as u8, 1);
+        assert_eq!(StatsSection::Gpu as u8, 2);
+        assert_eq!(StatsSection::Disks as u8, 3);
+        assert_eq!(StatsSection::Services as u8, 4);
+    }
 
     /// Unset resolves to the documented `multicolumn` default, silently — no
     /// warn (the `stats_layout` accessor only warns on a present-but-unrecognized

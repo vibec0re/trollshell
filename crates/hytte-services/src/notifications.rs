@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::AbortHandle;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
@@ -61,6 +62,14 @@ struct NotificationsShared {
     /// is fine here for the same reason as `POST_LOCAL_SEEN`: every
     /// critical section is non-async map surgery.
     local_actions: Mutex<LocalActionMap>,
+    /// Hover-pausable per-id expiry timers (#567). Keyed by notification id,
+    /// each entry pairs the pure [`TimerState`] bookkeeping with the live
+    /// `sleep → dismiss` task's abort handle. Reached from BOTH the GTK main
+    /// thread (the overlay's motion controller calls [`pause_expiry`] /
+    /// [`resume_expiry`]) and hytte-tokio (the sleep task, and [`dismiss`]'s
+    /// cleanup) — a plain `std::sync::Mutex` suffices for the same reason as
+    /// `local_actions`: every critical section is non-async map surgery.
+    timers: Mutex<TimerMap>,
 }
 
 // ── Public data shapes ────────────────────────────────────────────────────────
@@ -210,6 +219,7 @@ impl Service for NotificationsService {
             next_id: next_id.clone(),
             ownership: ownership.clone(),
             local_actions: Mutex::new(HashMap::new()),
+            timers: Mutex::new(HashMap::new()),
         });
 
         NotificationsHandles {
@@ -310,6 +320,17 @@ pub fn dismiss(id: u32, reason: u32) {
         // populate this map.
         if let Ok(mut map) = shared.local_actions.lock() {
             clear_local_actions(&mut map, id);
+        }
+
+        // Cancel and drop any armed expiry timer for this id. Every close path
+        // (auto-expiry, user dismiss, `CloseNotification`) funnels through
+        // `dismiss`, so this is the one place the timer bookkeeping is
+        // reclaimed — no leaked entry or orphaned sleep task (#567). Runs
+        // unconditionally (like the `local_actions` sweep above): a
+        // `close_notification` that already pulled the notification out of the
+        // active list still needs its timer torn down here.
+        if let Ok(mut timers) = shared.timers.lock() {
+            clear_timer(&mut timers, id);
         }
     }
 
@@ -490,6 +511,239 @@ fn clear_local_actions(map: &mut LocalActionMap, id: u32) {
     map.retain(|(nid, _), _| *nid != id);
 }
 
+// ── Hover-pausable expiry timers (#567) ───────────────────────────────────────
+//
+// Each finite-timeout notification arms a tokio `sleep(dur) → dismiss(id, 1)`
+// task. It used to be fire-and-forget; now it's cancellable so a toast can
+// hold its countdown while the pointer hovers it (parity with mako/dunst).
+//
+// The bookkeeping splits in two, mirroring the file's hytte-tokio vs GTK split:
+//   - `TimerState` is pure — just the numbers (hover count, deadline, recorded
+//     remainder). Its arm/pause/resume transitions are unit-tested in the
+//     hermetic bucket with explicit `Instant`s, no runtime needed.
+//   - `TimerEntry` pairs that state with the live task's `AbortHandle`; the
+//     effect functions (`arm_expiry` / `pause_expiry` / `resume_expiry`)
+//     translate a `TimerAction` into a spawn/abort against it.
+
+/// Minimum duration re-armed when the last hover leaves. A toast must not
+/// vanish the instant the pointer leaves, so the resumed sleep is floored here
+/// even if only a sliver remained when the hover began.
+const MIN_RESUME: Duration = Duration::from_secs(1);
+
+/// What the effect layer should do after a pure [`TimerState`] transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerAction {
+    /// (Re-)arm a fresh sleep of this duration and store its abort handle.
+    Arm(Duration),
+    /// Abort the currently-armed sleep, if any.
+    Abort,
+    /// No effect.
+    Nothing,
+}
+
+/// Pure per-notification expiry bookkeeping — holds no tokio types, so the
+/// arm/pause/resume math is testable in the hermetic bucket. The live task's
+/// [`AbortHandle`] lives beside it in [`TimerEntry`].
+#[derive(Debug)]
+struct TimerState {
+    /// Full resolved timeout — armed at post time and reset on a `replaces_id`
+    /// re-post. Also the fallback for the restart-vs-remainder switch.
+    timeout: Duration,
+    /// Hover-enters not yet balanced by a leave. The countdown is armed only
+    /// while this is 0; any positive value means at least one toast copy is
+    /// hovered and expiry is paused.
+    hover_count: u32,
+    /// Deadline of the currently-armed sleep: `Some` while armed, `None` while
+    /// paused. Used to compute the remainder at the moment a hover pauses it.
+    deadline: Option<Instant>,
+    /// Remainder recorded at pause, re-armed (floored at [`MIN_RESUME`]) when
+    /// the last hover leaves. Seeded to `timeout` so a never-hovered timer
+    /// resumes with its full duration.
+    remaining: Duration,
+}
+
+impl TimerState {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            hover_count: 0,
+            deadline: None,
+            remaining: timeout,
+        }
+    }
+
+    /// Start (or restart, on a `replaces_id` re-post) the countdown from the
+    /// full `timeout`. Arms immediately unless a hover is currently held, in
+    /// which case it stays paused and arms from the new full timeout when the
+    /// last hover leaves — a re-post must never fire out from behind a hover.
+    fn start(&mut self, timeout: Duration, now: Instant) -> TimerAction {
+        self.timeout = timeout;
+        self.remaining = timeout;
+        if self.hover_count == 0 {
+            self.deadline = Some(now + timeout);
+            TimerAction::Arm(timeout)
+        } else {
+            self.deadline = None;
+            TimerAction::Nothing
+        }
+    }
+
+    /// A hover entered. Increments the count; the first hover pauses the
+    /// countdown, recording how much time was left. Further hovers (other
+    /// per-monitor toast copies) only bump the count so they can't fight.
+    fn pause(&mut self, now: Instant) -> TimerAction {
+        self.hover_count += 1;
+        if self.hover_count == 1
+            && let Some(deadline) = self.deadline.take()
+        {
+            self.remaining = deadline.saturating_duration_since(now);
+            TimerAction::Abort
+        } else {
+            TimerAction::Nothing
+        }
+    }
+
+    /// A hover left. A leave with no matching enter (count already 0) is
+    /// clamped to a no-op so the count can't go negative and a live task is
+    /// never stranded. Only the *last* hover leaving re-arms the countdown,
+    /// floored at `floor`.
+    fn resume(&mut self, now: Instant, floor: Duration) -> TimerAction {
+        if self.hover_count == 0 {
+            return TimerAction::Nothing;
+        }
+        self.hover_count -= 1;
+        if self.hover_count == 0 {
+            let dur = self.resume_duration().max(floor);
+            self.deadline = Some(now + dur);
+            TimerAction::Arm(dur)
+        } else {
+            TimerAction::Nothing
+        }
+    }
+
+    /// The single remainder-vs-restart switch (#567). `self.remaining` resumes
+    /// the countdown where it paused — mako's behaviour, and our default. Swap
+    /// to `self.timeout` to restart the full timeout on every un-hover.
+    fn resume_duration(&self) -> Duration {
+        self.remaining
+    }
+}
+
+/// A [`TimerState`] paired with its live sleep task's abort handle. `abort` is
+/// `Some` exactly while the countdown is armed, `None` while paused.
+struct TimerEntry {
+    state: TimerState,
+    abort: Option<AbortHandle>,
+}
+
+/// Per-id expiry timers backing [`NotificationsShared::timers`].
+type TimerMap = HashMap<u32, TimerEntry>;
+
+/// Spawn the `sleep(dur) → dismiss(id, 1 = expired)` task and return its abort
+/// handle. Runs on the shared runtime so it's callable from any thread.
+fn spawn_expiry(id: u32, dur: Duration) -> AbortHandle {
+    runtime::handle()
+        .spawn(async move {
+            tokio::time::sleep(dur).await;
+            dismiss(id, 1); // 1 = expired
+        })
+        .abort_handle()
+}
+
+/// Arm (or, on a `replaces_id` re-post, re-arm) the expiry timer for `id`.
+/// Called synchronously when a finite-timeout notification is posted — before
+/// the toast can render and be hovered, so [`pause_expiry`] always finds the
+/// entry. Sticky notifications never call this. Callable from any thread; it
+/// only touches the cross-thread shared registry.
+fn arm_expiry(id: u32, timeout: Duration) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
+    if let Ok(mut timers) = shared.timers.lock() {
+        let now = Instant::now();
+        let entry = timers.entry(id).or_insert_with(|| TimerEntry {
+            state: TimerState::new(timeout),
+            abort: None,
+        });
+        // Cancel any task already armed for this id (a `replaces_id` re-post)
+        // so a stale sleep can't dismiss the refreshed notification early.
+        if let Some(handle) = entry.abort.take() {
+            handle.abort();
+        }
+        if let TimerAction::Arm(dur) = entry.state.start(timeout, now) {
+            entry.abort = Some(spawn_expiry(id, dur));
+        }
+    }
+}
+
+/// Drop any expiry timer for `id` without closing the notification. Called
+/// when a `replaces_id` re-post resolves to a sticky timeout: the armed sleep
+/// from the finite post it replaced must not fire later and "expire" a
+/// notification that now never expires. No-op when no timer exists.
+fn disarm_expiry(id: u32) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
+    if let Ok(mut timers) = shared.timers.lock() {
+        clear_timer(&mut timers, id);
+    }
+}
+
+/// Remove and cancel the expiry timer for `id`. Called from [`dismiss`] — the
+/// funnel for every close path — so a closed toast leaves behind no armed task
+/// or bookkeeping entry. Pure map surgery over the abort handle; factored out
+/// for unit-testing.
+fn clear_timer(timers: &mut TimerMap, id: u32) {
+    if let Some(entry) = timers.remove(&id)
+        && let Some(handle) = entry.abort
+    {
+        handle.abort();
+    }
+}
+
+/// Pause notification `id`'s auto-expiry while the pointer hovers its toast
+/// (#567). The first hovering copy cancels the sleep and records the remaining
+/// time; further copies only bump the hover-count. Idempotent guarding lives
+/// in the overlay (each card contributes at most one enter).
+///
+/// Called from the GTK main thread (the toast's `EventControllerMotion`); the
+/// cancelled task ran on hytte-tokio. No-op for sticky notifications (no timer)
+/// and after the notification has closed (entry already cleared).
+pub fn pause_expiry(id: u32) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
+    if let Ok(mut timers) = shared.timers.lock()
+        && let Some(entry) = timers.get_mut(&id)
+        && entry.state.pause(Instant::now()) == TimerAction::Abort
+        && let Some(handle) = entry.abort.take()
+    {
+        handle.abort();
+    }
+}
+
+/// Resume notification `id`'s auto-expiry when the pointer leaves its toast
+/// (#567). Only the last hover leaving re-arms the countdown — with the
+/// recorded remainder, floored at [`MIN_RESUME`] so the toast doesn't vanish
+/// the instant the pointer leaves. See [`pause_expiry`] for the threading.
+pub fn resume_expiry(id: u32) {
+    let Some(shared) = shared::get::<NotificationsShared>() else {
+        return;
+    };
+    if let Ok(mut timers) = shared.timers.lock()
+        && let Some(entry) = timers.get_mut(&id)
+        && let TimerAction::Arm(dur) = entry.state.resume(Instant::now(), MIN_RESUME)
+    {
+        // Invariant: `abort` is None here (the matching pause cleared it).
+        // Cancel defensively regardless so a logic drift can never strand a
+        // live task behind a freshly-armed one.
+        if let Some(handle) = entry.abort.take() {
+            handle.abort();
+        }
+        entry.abort = Some(spawn_expiry(id, dur));
+    }
+}
+
 /// Key for the [`post_local`] rate-limiter: `(app_name, summary, body)`.
 type RateLimitKey = (String, String, String);
 /// Last-emit instants keyed by [`RateLimitKey`].
@@ -656,11 +910,8 @@ pub fn post_local_with_actions(
     shared.active.lock_mut().push(notification);
     tracing::debug!(id, app_name, summary, "local notification posted");
 
-    // Auto-dismiss after the server-default timeout, mirroring `notify()`.
-    runtime::handle().spawn(async move {
-        tokio::time::sleep(DEFAULT_TIMEOUT).await;
-        dismiss(id, 1); // 1 = expired
-    });
+    // Arm the hover-pausable auto-dismiss timer, mirroring `notify()`.
+    arm_expiry(id, DEFAULT_TIMEOUT);
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -792,12 +1043,14 @@ impl NotificationsIface {
 
         tracing::debug!(id, app_name, summary, "notification added");
 
-        // Schedule auto-dismiss if this notification has a finite timeout.
+        // Arm the hover-pausable auto-dismiss timer for a finite timeout.
+        // Sticky notifications (`timeout == None`) never expire — no timer,
+        // and a `replaces_id` re-post that turned sticky disarms the stale
+        // sleep left over from the finite post it replaced.
         if let Some(dur) = timeout {
-            tokio::spawn(async move {
-                tokio::time::sleep(dur).await;
-                crate::notifications::dismiss(id, 1); // 1 = expired
-            });
+            crate::notifications::arm_expiry(id, dur);
+        } else {
+            crate::notifications::disarm_expiry(id);
         }
 
         id
@@ -1030,7 +1283,8 @@ fn strip_markup(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TIMEOUT, LocalActionMap, RateLimitMap, clear_local_actions, image_data_consistent,
+        DEFAULT_TIMEOUT, LocalActionMap, MIN_RESUME, RateLimitMap, TimerAction, TimerEntry,
+        TimerMap, TimerState, clear_local_actions, clear_timer, image_data_consistent,
         rate_limit_check, register_local_action, resolve_timeout, take_local_action,
     };
     use std::sync::Arc;
@@ -1246,6 +1500,157 @@ mod tests {
 
         clear_local_actions(&mut map, 999);
 
+        assert_eq!(map.len(), 1);
+    }
+
+    // ── Hover-pausable expiry timers (#567) ──────────────────────────────────
+    //
+    // All pure `TimerState` transitions — no runtime, explicit `Instant`s.
+
+    #[test]
+    fn timer_arms_full_timeout_when_not_hovered() {
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let now = Instant::now();
+        assert_eq!(
+            s.start(Duration::from_secs(5), now),
+            TimerAction::Arm(Duration::from_secs(5))
+        );
+        assert_eq!(s.deadline, Some(now + Duration::from_secs(5)));
+        assert_eq!(s.hover_count, 0);
+    }
+
+    #[test]
+    fn hover_pauses_and_records_remaining() {
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        // Pointer enters 2s in: pause the sleep, ~3s recorded as remaining.
+        assert_eq!(s.pause(t0 + Duration::from_secs(2)), TimerAction::Abort);
+        assert_eq!(s.deadline, None);
+        assert_eq!(s.remaining, Duration::from_secs(3));
+        assert_eq!(s.hover_count, 1);
+    }
+
+    #[test]
+    fn resume_rearms_with_remaining_not_full_timeout() {
+        // The #567 behaviour call: resume with the REMAINING time, not a fresh
+        // full timeout (mako semantics). This is the test that pins the
+        // `resume_duration` switch.
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        s.pause(t0 + Duration::from_secs(2)); // 3s left
+        let leave = t0 + Duration::from_secs(9); // hovered a good while
+        assert_eq!(
+            s.resume(leave, MIN_RESUME),
+            TimerAction::Arm(Duration::from_secs(3))
+        );
+        assert_eq!(s.deadline, Some(leave + Duration::from_secs(3)));
+        assert_eq!(s.hover_count, 0);
+    }
+
+    #[test]
+    fn resume_floors_tiny_remainder() {
+        // Enter with only a sliver left → resume must floor to MIN_RESUME so
+        // the toast doesn't vanish the instant the pointer leaves.
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        s.pause(t0 + Duration::from_millis(4900)); // 100ms left
+        assert_eq!(s.remaining, Duration::from_millis(100));
+        assert_eq!(
+            s.resume(t0 + Duration::from_secs(30), MIN_RESUME),
+            TimerAction::Arm(MIN_RESUME)
+        );
+    }
+
+    #[test]
+    fn multiple_hover_copies_only_last_leave_rearms() {
+        // Two per-monitor toast copies both hovered: the hover-count guards
+        // one copy leaving from re-arming while the other still holds it.
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        assert_eq!(s.pause(t0 + Duration::from_secs(1)), TimerAction::Abort); // copy A enters
+        assert_eq!(s.pause(t0 + Duration::from_secs(1)), TimerAction::Nothing); // copy B enters
+        assert_eq!(s.hover_count, 2);
+        // Copy A leaves — still held by B, stay paused.
+        assert_eq!(
+            s.resume(t0 + Duration::from_secs(2), MIN_RESUME),
+            TimerAction::Nothing
+        );
+        assert_eq!(s.deadline, None);
+        // Copy B leaves — now the countdown re-arms.
+        assert!(matches!(
+            s.resume(t0 + Duration::from_secs(2), MIN_RESUME),
+            TimerAction::Arm(_)
+        ));
+        assert_eq!(s.hover_count, 0);
+    }
+
+    #[test]
+    fn stray_leave_without_enter_is_clamped_no_op() {
+        // A leave with no matching enter (count already 0) must not underflow
+        // and must not re-arm a fresh task over the live one.
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        let armed_deadline = s.deadline;
+        assert_eq!(
+            s.resume(t0 + Duration::from_secs(1), MIN_RESUME),
+            TimerAction::Nothing
+        );
+        assert_eq!(s.hover_count, 0);
+        assert_eq!(s.deadline, armed_deadline); // unchanged — no re-arm
+    }
+
+    #[test]
+    fn replaces_id_restart_preserves_hover_pause() {
+        // A `replaces_id` re-post while hovered must stay paused (not fire out
+        // from behind the hover) and resume from the NEW full timeout.
+        let mut s = TimerState::new(Duration::from_secs(5));
+        let t0 = Instant::now();
+        s.start(Duration::from_secs(5), t0);
+        s.pause(t0 + Duration::from_secs(1)); // hovered
+        // Re-post with a longer timeout while hovered: stays paused.
+        assert_eq!(
+            s.start(Duration::from_secs(10), t0 + Duration::from_secs(2)),
+            TimerAction::Nothing
+        );
+        assert_eq!(s.deadline, None);
+        assert_eq!(s.hover_count, 1);
+        // Leave: arm from the new full timeout (remaining was reset to it).
+        let leave = t0 + Duration::from_secs(3);
+        assert_eq!(
+            s.resume(leave, MIN_RESUME),
+            TimerAction::Arm(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn clear_timer_removes_only_the_given_id() {
+        // Cleanup on dismiss: the id's bookkeeping is gone, siblings untouched,
+        // no leaked entry. (`abort: None` keeps this runtime-free.)
+        let mut map = TimerMap::new();
+        map.insert(
+            7,
+            TimerEntry {
+                state: TimerState::new(Duration::from_secs(5)),
+                abort: None,
+            },
+        );
+        map.insert(
+            8,
+            TimerEntry {
+                state: TimerState::new(Duration::from_secs(5)),
+                abort: None,
+            },
+        );
+        clear_timer(&mut map, 7);
+        assert!(!map.contains_key(&7));
+        assert!(map.contains_key(&8));
+        // Clearing an unknown id is a no-op.
+        clear_timer(&mut map, 999);
         assert_eq!(map.len(), 1);
     }
 }

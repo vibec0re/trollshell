@@ -1,94 +1,58 @@
-# Builds the `hytte-services` `wifi_probe` example binary for the
-# NetworkManager Wi-Fi nixosTest (checks.wifi-nm-nixos-test). Mirrors
-# probe.nix's crane setup — the deps build still compiles the whole workspace
-# lock (including hytte-ecal which links libecal), so it needs the same full
-# buildInputs + bindgen/pipewire handling — but targets the wifi_probe example
-# instead of the EDS probe binary.
+# Packages the `hytte-services` `wifi_probe` example binary for the
+# NetworkManager Wi-Fi nixosTest (checks.wifi-nm-nixos-test), which boots a VM
+# with NetworkManager and a pair of simulated `mac80211_hwsim` radios and drives
+# `wifi_nm` against the live daemon.
+#
+# THIS FILE RUNS NO CARGO AND NO CRANE (#588, finishing #572's step 4 across the
+# whole tree) — see nix/probe.nix's header for the full rationale; this is the
+# same slice, for the other example binary. Until #588 it carried its own
+# `craneLib.buildDepsOnly` + `buildPackage` pair and its own `src` filter, so a
+# cold `nix flake check` paid a third full dependency compile just for this one
+# binary.
+#
+# `workspace` (nix/package.nix) is the single derivation that compiles the whole
+# workspace, and its `doCheck` test phase builds the example targets too (cargo
+# builds every example during `cargo test` "to ensure they compile"), so
+# `$out/bin/wifi_probe` already exists there.
+#
+# The wrap is preserved from the pre-#588 shape for the same reason as
+# nix/probe.nix: the old derivation had `wrapGAppsHook4` in `nativeBuildInputs`
+# without `dontWrapGApps`, so this binary was GApps-wrapped. `workspace`
+# installs raw ELFs (`dontWrapGApps = true` there), so the wrapping happens here
+# instead, over the *same* `buildInputs` the compile used
+# (`workspace.passthru.devInputs`). This probe is D-Bus-only and would very
+# likely work unwrapped, but #588 is a packaging consolidation, not a behaviour
+# change — keeping the wrapper means the binary the VM runs is byte-for-byte the
+# same shape as before.
 {
   lib,
-  craneLib,
-  rustPlatform,
-  pkg-config,
+  stdenv,
   wrapGAppsHook4,
-  glib,
-  gtk4,
-  libadwaita,
-  gtk4-layer-shell,
-  gsettings-desktop-schemas,
-  adwaita-icon-theme,
-  hicolor-icon-theme,
-  evolution-data-server,
-  libical,
-  gobject-introspection,
-  openssl,
-  pipewire,
+  # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
+  workspace,
 }:
-let
-  src = lib.cleanSourceWith {
-    src = ../.;
-    name = "trollshell-source";
-    filter =
-      path: type:
-      (craneLib.filterCargoSources path type)
-      || (lib.hasSuffix ".css" path)
-      || (lib.hasInfix "/assets/trollshell/icons/" path)
-      || (lib.hasInfix "/tests/fixtures/" path);
+stdenv.mkDerivation {
+  pname = "hytte-services-wifi-probe";
+  version = "0.1.0";
+
+  dontUnpack = true;
+  dontConfigure = true;
+  dontBuild = true;
+
+  nativeBuildInputs = [ wrapGAppsHook4 ];
+  inherit (workspace.passthru.devInputs) buildInputs;
+
+  installPhase = ''
+    runHook preInstall
+    install -Dm755 ${workspace}/bin/wifi_probe "$out/bin/wifi_probe"
+    runHook postInstall
+  '';
+
+  meta = {
+    description = "hytte-services NetworkManager Wi-Fi probe example binary (checks.wifi-nm-nixos-test)";
+    homepage = "https://github.com/vibec0re/trollshell/";
+    license = lib.licenses.mpl20;
+    platforms = lib.platforms.linux;
+    mainProgram = "wifi_probe";
   };
-
-  nativeBuildInputs = [
-    pkg-config
-    wrapGAppsHook4
-    rustPlatform.bindgenHook
-  ];
-
-  buildInputs = [
-    glib
-    gtk4
-    libadwaita
-    gtk4-layer-shell
-    gsettings-desktop-schemas
-    adwaita-icon-theme
-    hicolor-icon-theme
-    evolution-data-server
-    libical
-    gobject-introspection
-    openssl
-    pipewire
-  ];
-
-  commonArgs = {
-    pname = "hytte-services-wifi-probe";
-    version = "0.1.0";
-    inherit src nativeBuildInputs buildInputs;
-    cargoExtraArgs = "-p hytte-services --example wifi_probe";
-    doCheck = false;
-    # Same libspa-bindgen-needs-a-writable-vendor-dir workaround as package.nix.
-    preBuild = ''
-      writableVendor="$NIX_BUILD_TOP/writable-vendor"
-      cp -rL --no-preserve=mode,ownership "$cargoVendorDir" "$writableVendor"
-      chmod -R u+w "$writableVendor"
-      substituteInPlace "$CARGO_HOME/config.toml" \
-        --replace-fail "$cargoVendorDir" "$writableVendor"
-    '';
-  };
-
-  # The deps build runs against crane's stub sources, which have no `examples/`
-  # dir — so scope it to the whole workspace's deps (lib/bin targets) rather
-  # than the `wifi_probe` example target, which only exists in the real source
-  # used by buildPackage below.
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { cargoExtraArgs = "--workspace"; });
-in
-craneLib.buildPackage (
-  commonArgs
-  // {
-    inherit cargoArtifacts;
-    # crane installs declared bins from the build log; an `--example` binary
-    # isn't always picked up, so install it explicitly from the target dir.
-    postInstall = ''
-      if [ ! -e "$out/bin/wifi_probe" ]; then
-        bin="$(find target -type f -name wifi_probe -path '*examples*' | head -1)"
-        install -Dm755 "$bin" "$out/bin/wifi_probe"
-      fi
-    '';
-  }
-)
+}

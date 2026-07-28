@@ -178,10 +178,14 @@ let
   # binary this flake ships (#572, implementing kaesaecracker's plan).
   #
   # Everything downstream (the shell, the control center, the 12 bundled widget
-  # plugins, the hytte-infobroker CLI) is a *slice* of this one output: a
-  # `cp` of one binary out of `$out/bin`, optionally wrapped. There is no second
-  # crane invocation on any package path, so there is no second cargo
-  # fingerprint universe that can drift out of sync with this one.
+  # plugins, the hytte-infobroker CLI, and since #588 the two nixosTest probe
+  # *examples*) is a *slice* of this one output: a `cp` of one binary out of
+  # `$out/bin`, optionally wrapped. There is no second crane invocation anywhere
+  # in the tree that compiles the default feature set, so there is no second
+  # cargo fingerprint universe that can drift out of sync with this one. The
+  # only crane calls left are `checks.{clippy,system-tests}`, which compile
+  # `--features system-tests` — a genuinely different feature union that by
+  # construction cannot be a slice of this build.
   #
   # History: #530 introduced an intermediate `cargoBuild` whose packed `target`
   # dir was inherited as `cargoArtifacts` by a `buildPackage` per binary, on the
@@ -210,6 +214,48 @@ let
       inherit cargoArtifacts;
       pname = "trollshell-workspace";
       dontWrapGApps = true;
+
+      # The two nixosTest probes — `hytte-ecal`'s `probe` and `hytte-services`'
+      # `wifi_probe` (nix/probe.nix, nix/wifi-probe.nix) — are `--example`
+      # targets, and cargo's default `build` target selection is lib + bins, so
+      # crane's installFromCargoBuildLog never sees them: they aren't in the
+      # build phase's JSON log. They are nonetheless already compiled in this
+      # very derivation. `cargo test`'s documented default target selection
+      # builds every example "to ensure they compile", and `doCheck = true`
+      # above runs `cargo test --workspace --locked` in this same target dir
+      # under the same release profile. The check phase runs before
+      # installPhase (stdenv's phase order), so by the time this hook fires both
+      # binaries are sitting in `target/release/examples/`. Copy them into
+      # `$out/bin` alongside the declared bins so nix/{probe,wifi-probe}.nix can
+      # slice them out like every other package output (#588).
+      #
+      # Deliberately NOT `cargoBuildExtraArgs = "--bins --examples"`, which
+      # would be the obvious explicit spelling: selecting an example target
+      # makes cargo unify that package's *dev*-dependencies into the build graph
+      # (resolver v3), producing a THIRD feature configuration that neither the
+      # deps stage's `cargo build --workspace` (no dev-deps) nor its `cargo test
+      # --no-run` (dev-deps of *every* member) cached. hytte-reactive's dev
+      # `tokio = { features = ["test-util"] }` alone is enough to make the two
+      # unions differ, so tokio — and the whole graph beneath it — would
+      # recompile a third time. Riding the check phase costs zero extra
+      # compilation, which is the entire point of #572/#588.
+      # `-print -quit` rather than the usual `… | head -1`: stdenv's setup.sh
+      # runs the build script under `set -eu -o pipefail`, so a `find | head`
+      # pipeline can abort the whole build on SIGPIPE once `head` closes the
+      # pipe. `-quit` stops the traversal at the first hit instead, with no pipe
+      # and no race — and it doesn't walk the rest of a multi-GiB target dir.
+      postInstall = ''
+        for example in probe wifi_probe; do
+          exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name "$example" -path '*/examples/*' -print -quit)"
+          if [ -z "$exampleBin" ]; then
+            echo "ERROR: example binary '$example' was not built." >&2
+            echo "The workspace build installs the nixosTest probe examples out of" >&2
+            echo "the check phase's target dir; that requires doCheck = true." >&2
+            exit 1
+          fi
+          install -Dm755 "$exampleBin" "$out/bin/$example"
+        done
+      '';
 
       passthru = {
         inherit cargoArtifacts commonArgs;
@@ -258,10 +304,11 @@ stdenv.mkDerivation {
     )
   '';
 
-  # `workspace` is what nix/plugin.nix and nix/control-center.nix slice their
-  # own binaries out of; `commonArgs` + `cargoArtifacts` are what the leaf flake
-  # checks (clippy / system-tests) reuse, since they compile a different feature
-  # set (`--features system-tests`) and so cannot be a slice of `workspace`.
+  # `workspace` is what nix/plugin.nix, nix/control-center.nix and (since #588)
+  # nix/{probe,wifi-probe}.nix slice their own binaries out of; `commonArgs` +
+  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests)
+  # reuse, since they compile a different feature set (`--features
+  # system-tests`) and so cannot be a slice of `workspace`.
   passthru = workspace.passthru // {
     inherit workspace assets;
   };

@@ -3,8 +3,9 @@ use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
+use crate::components::diff::{DiffOp, plan_diff};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Per-button live item data.  Click handlers capture this `Rc<RefCell<…>>`
@@ -43,6 +44,11 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 /// 2. For each item in service order: reuse the existing button (update cell +
 ///    visuals) or create a new one.
 /// 3. Reorder the container children to match the service-published order.
+///
+/// The classification itself comes from the shared [`plan_diff`]/[`DiffOp`]
+/// helper in `components::diff` (#198/#229/#578): this widget originated that
+/// shape, `workspaces.rs`/`window_list.rs` generalised it out, and it now
+/// keys on `String` here the same way they key on their own ids.
 ///
 /// Click handlers are wired once at creation via [`create_item_button`].
 /// They capture an `Rc<RefCell<TrayItem>>` and read it at activation time, so
@@ -97,45 +103,6 @@ fn update_tray(
             prev = Some(btn.clone());
         }
     }
-}
-
-/// Classification of an incoming key in a keyed-diff pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffOp {
-    /// The key is new — build a fresh button.
-    Create,
-    /// The key was already present — reuse the existing button.
-    Reuse,
-}
-
-/// Classify each key in `next` as [`DiffOp::Create`] or [`DiffOp::Reuse`].
-///
-/// Returns one op per entry in `next` (same order) and the set of keys present
-/// in `prev` but absent from `next` (to be removed from the container).
-///
-/// Pure function — no GTK state; unit-testable without a display.
-fn plan_diff(prev: &[String], next: &[String]) -> (Vec<DiffOp>, Vec<String>) {
-    let prev_set: HashSet<&str> = prev.iter().map(String::as_str).collect();
-    let next_set: HashSet<&str> = next.iter().map(String::as_str).collect();
-
-    let ops = next
-        .iter()
-        .map(|k| {
-            if prev_set.contains(k.as_str()) {
-                DiffOp::Reuse
-            } else {
-                DiffOp::Create
-            }
-        })
-        .collect();
-
-    let removed = prev
-        .iter()
-        .filter(|k| !next_set.contains(k.as_str()))
-        .cloned()
-        .collect();
-
-    (ops, removed)
 }
 
 /// Create a tray button for `item_cell` and wire up click handlers.
@@ -441,76 +408,5 @@ fn build_menu_item_widget(
         });
 
         btn.upcast()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DiffOp, plan_diff};
-
-    #[test]
-    fn diff_no_change() {
-        let prev = vec!["a".to_string(), "b".to_string()];
-        let next = prev.clone();
-        let (ops, removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse]);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn diff_insert() {
-        let prev = vec!["a".to_string(), "b".to_string()];
-        let next = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let (ops, removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse, DiffOp::Create]);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn diff_remove() {
-        let prev = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let next = vec!["a".to_string(), "c".to_string()];
-        let (ops, mut removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse]);
-        removed.sort();
-        assert_eq!(removed, ["b"]);
-    }
-
-    #[test]
-    fn diff_reorder() {
-        let prev = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let next = vec!["c".to_string(), "b".to_string(), "a".to_string()];
-        let (ops, removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Reuse, DiffOp::Reuse, DiffOp::Reuse]);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn diff_full_replace() {
-        let prev = vec!["a".to_string(), "b".to_string()];
-        let next = vec!["c".to_string(), "d".to_string()];
-        let (ops, mut removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Create, DiffOp::Create]);
-        removed.sort();
-        assert_eq!(removed, ["a", "b"]);
-    }
-
-    #[test]
-    fn diff_empty_prev() {
-        let prev: Vec<String> = vec![];
-        let next = vec!["a".to_string()];
-        let (ops, removed) = plan_diff(&prev, &next);
-        assert_eq!(ops, [DiffOp::Create]);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn diff_empty_next() {
-        let prev = vec!["a".to_string(), "b".to_string()];
-        let next: Vec<String> = vec![];
-        let (ops, mut removed) = plan_diff(&prev, &next);
-        assert!(ops.is_empty());
-        removed.sort();
-        assert_eq!(removed, ["a", "b"]);
     }
 }

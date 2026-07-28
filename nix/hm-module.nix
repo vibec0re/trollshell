@@ -33,19 +33,37 @@ let
     }) cfg.plugins;
   };
 
-  # Night light (#222): the wlsunset user unit's ExecStart. Geo mode needs both
-  # lat and lon; while either is unset the unit is declared but inert (starting
-  # it just prints a hint and exits 0, so the shell's toggle never loops a
-  # misconfigured daemon). Coordinates are stringified with toString — pass them
-  # as strings to avoid the trailing zeros nix renders for floats.
-  # NOTE: geoclue lat/lon seeding is a deferred follow-up; v1 is static coords.
+  # Night light (#222, #577): the wlsunset user unit's ExecStart.
+  #
+  # Coordinates are NOT baked in here any more. Nix-eval time cannot consult a
+  # runtime daemon, which is exactly why the geoclue seeding was deferred and
+  # why the Night light switch was a silent no-op unless you hand-wrote lat/lon.
+  # The shell resolves them at toggle time instead (nightlight.rs: live location
+  # fix -> the static options below -> refuse to start) and writes the argument
+  # vector to ~/.config/trollshell/wlsunset.args, one argument per line — the
+  # same handoff the Appearance picker uses for swaybg.args, read back below.
+  #
+  # Temperatures stay here: they have no runtime source.
+  #
+  # The args file is preferred over the static coordinates rather than merged
+  # with them, so a hand-started unit (no shell running, no args file) still
+  # behaves exactly as it did before #577: configured coords run, and with none
+  # configured the unit prints a hint and exits 0 rather than handing wlsunset
+  # a location it does not have.
   nl = cfg.nightlight;
   nlGeoConfigured = nl.latitude != null && nl.longitude != null;
-  nlExecStart =
+  # Quoted for the inner `sh`; systemd expands the %h specifier and passes the
+  # rest of the single-quoted script through untouched ($a / $@ are not words of
+  # their own, so systemd leaves them for sh — same as the swaybg unit below).
+  nlArgsFile = "\"%h/.config/trollshell/wlsunset.args\"";
+  # Read the args file a line at a time into the positional args.
+  nlReadArgs = "set --; while IFS= read -r a; do set -- \"$@\" \"$a\"; done < ${nlArgsFile}";
+  nlFallback =
     if nlGeoConfigured then
-      "${pkgs.wlsunset}/bin/wlsunset -l ${toString nl.latitude} -L ${toString nl.longitude} -t ${toString nl.nightTemp} -T ${toString nl.dayTemp}"
+      "set -- -l ${toString nl.latitude} -L ${toString nl.longitude}"
     else
-      "${pkgs.bash}/bin/sh -c 'echo \"wlsunset: programs.trollshell.nightlight.{latitude,longitude} are unset — set them to enable the Night light toggle\" >&2; exit 0'";
+      "echo \"wlsunset: no coordinates — start the Night light toggle from trollshell (it seeds them from your location), or set programs.trollshell.nightlight.{latitude,longitude}\" >&2; exit 0";
+  nlExecStart = "${pkgs.bash}/bin/sh -c 'if [ -s ${nlArgsFile} ]; then ${nlReadArgs}; else ${nlFallback}; fi; exec ${pkgs.wlsunset}/bin/wlsunset -t ${toString nl.nightTemp} -T ${toString nl.dayTemp} \"$@\"'";
 
   # The env the option surface renders to, built once and fed to BOTH
   # home.sessionVariables (login shells, `cargo run` from a terminal) and the
@@ -74,6 +92,14 @@ let
     # when opted in — unset reads as off, and the env var is the override,
     # so Settings still flips it live during a session.
     TROLLSHELL_RECORD_AUDIO = "1";
+  })
+  // (lib.optionalAttrs nlGeoConfigured {
+    # Static night-light coordinates (#577). The shell prefers a live location
+    # fix and only falls back to these, so they are the override for a session
+    # with no GeoClue2 — see nightlight.rs. Both are set together or not at all
+    # (nlGeoConfigured); a half-configured pair is useless to wlsunset.
+    TROLLSHELL_NIGHTLIGHT_LATITUDE = toString nl.latitude;
+    TROLLSHELL_NIGHTLIGHT_LONGITUDE = toString nl.longitude;
   });
 in
 {
@@ -341,13 +367,14 @@ in
         };
       })
 
-      # wlsunset — night light (#222). No home-manager module exists, so a plain
-      # user unit mirroring swaybg. The shell toggles it on demand via
+      # wlsunset — night light (#222, #577). No home-manager module exists, so a
+      # plain user unit mirroring swaybg. The shell toggles it on demand via
       # `systemctl --user start|stop wlsunset.service` (nightlight.rs), so there
       # is deliberately NO Install/WantedBy — it defaults to inactive and the
       # Appearance drawer's Night light switch brings it up. Always declared (so
-      # the toggle target exists); inert while lat/lon are unset (see nlExecStart)
-      # rather than hard-failing evaluation. geoclue lat/lon seeding is deferred.
+      # the toggle target exists) and, since #577, always usable: the shell seeds
+      # the coordinates into wlsunset.args before starting it, and only refuses
+      # to start when it could resolve none at all.
       {
         systemd.user.services.wlsunset = {
           Unit = {
@@ -360,9 +387,8 @@ in
           Service = {
             Type = "simple";
             ExecStart = nlExecStart;
-            # Only auto-restart the real daemon; the inert hint exits 0 and must
-            # not loop.
-            Restart = if nlGeoConfigured then "on-failure" else "no";
+            # The no-coordinates branch exits 0, so on-failure never loops it.
+            Restart = "on-failure";
             RestartSec = 2;
           };
           # No Install section — the shell starts/stops it (see comment above).

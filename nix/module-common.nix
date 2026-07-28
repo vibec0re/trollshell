@@ -185,9 +185,13 @@ self:
     # zero-state daemon playbook); these options parameterise the unit's
     # ExecStart. The unit itself is declared home-manager-side (nix/hm-module.nix)
     # alongside the swaybg unit — it is a per-user wlr-gamma-control daemon, not a
-    # system service. lat/lon default to null (unset); the unit stays inert until
-    # both are set. geoclue lat/lon seeding is a deferred follow-up (v1 is static
-    # coordinates only).
+    # system service.
+    #
+    # Since #577 the coordinates are resolved at *toggle* time by the shell, not
+    # at nix-eval time: the live location fix (GeoClue2, which ships with
+    # enableRecommendedServices) is preferred, and lat/lon below are the static
+    # override for a session that has no location service. Leaving both null is
+    # therefore a working configuration, not an inert one.
     nightlight = {
       latitude = lib.mkOption {
         type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
@@ -195,11 +199,12 @@ self:
         example = 52.52;
         description = ''
           Latitude in decimal degrees for wlsunset's geo (sunrise/sunset) mode
-          (`wlsunset -l <latitude>`). Required — together with `longitude` — for
-          the Night light toggle to do anything; while either is null the
-          `wlsunset.service` unit is declared but inert. May be given as a float
-          (52.52) or a string ("52.52"); a string avoids the trailing zeros nix
-          renders for floats.
+          (`wlsunset -l <latitude>`). Optional: the Night light toggle prefers
+          the live location fix and only falls back to this, so set it (together
+          with `longitude`) if you do not run GeoClue2 — or to pin night light
+          to a fixed place. With neither a fix nor these set, the toggle refuses
+          to start the daemon and logs why. May be given as a float (52.52) or a
+          string ("52.52").
         '';
       };
 
@@ -209,9 +214,9 @@ self:
         example = 13.405;
         description = ''
           Longitude in decimal degrees for wlsunset's geo mode
-          (`wlsunset -L <longitude>`). Required — together with `latitude` — for
-          the Night light toggle to do anything. May be a float or a string (see
-          `latitude`).
+          (`wlsunset -L <longitude>`). Optional, and only used together with
+          `latitude` — a half-configured pair is ignored (see `latitude`). May
+          be a float or a string.
         '';
       };
 

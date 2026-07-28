@@ -12,13 +12,22 @@
 //! `known: true` with their connection object path. `forget`
 //! ([`nm_forget`]) deletes that profile via `Settings.Connection.Delete`.
 //!
-//! # Limitations (MVP)
+//! # Joining a network
 //!
-//! * `connect_network` uses `ActivateConnection` with `"/"` for the connection
-//!   path (NM auto-selects the best stored connection). For secured networks
-//!   without stored credentials, NM asks the registered secret agent (see
-//!   [`register_nm_agent`] and the `wifi::nm_agent` module) for the passphrase
-//!   via the same prompt overlay the iwd backend uses.
+//! [`nm_connect`] branches on whether the target SSID already has a saved
+//! profile (the `known` flag [`crate::wifi::connect_network`] threads down from
+//! the scan snapshot):
+//!
+//! * **known** → `ActivateConnection` with `"/"` for the connection path, so NM
+//!   auto-selects the best stored profile for the AP.
+//! * **unknown** → `AddAndActivateConnection` with a freshly-built settings dict
+//!   ([`new_wifi_connection_settings`]). `ActivateConnection` can only *select*
+//!   an existing profile, so it can never join a never-before-seen network.
+//!
+//! Either way the dict/profile carries **no passphrase**: NM therefore asks the
+//! registered secret agent (see [`register_nm_agent`] and the `wifi::nm_agent`
+//! module) for it via `GetSecrets`, which drives the same prompt overlay the iwd
+//! backend uses.
 
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
@@ -203,6 +212,40 @@ fn nm_device_state_to_station_state(state: u32) -> StationState {
     }
 }
 
+/// `NM80211ApFlags` bit 0 — `PRIVACY`. Set when the AP requires *some* form of
+/// encryption; with no WPA/RSN flags alongside it, that means legacy WEP.
+const NM_AP_FLAGS_PRIVACY: u32 = 0x0000_0001;
+
+/// `NM80211ApSecurityFlags` bit 8 — `KEY_MGMT_PSK` (WPA/WPA2 Personal).
+const NM_AP_SEC_KEY_MGMT_PSK: u32 = 0x0000_0100;
+
+/// `NM80211ApSecurityFlags` bit 9 — `KEY_MGMT_802_1X` (WPA/WPA2 Enterprise).
+const NM_AP_SEC_KEY_MGMT_802_1X: u32 = 0x0000_0200;
+
+/// `NM80211ApSecurityFlags` bit 10 — `KEY_MGMT_SAE` (WPA3 Personal).
+const NM_AP_SEC_KEY_MGMT_SAE: u32 = 0x0000_0400;
+
+/// `NM80211ApSecurityFlags` bit 11 — `KEY_MGMT_OWE` (Enhanced Open / WPA3 open).
+const NM_AP_SEC_KEY_MGMT_OWE: u32 = 0x0000_0800;
+
+/// `NM80211ApSecurityFlags` bit 13 — `KEY_MGMT_EAP_SUITE_B_192` (WPA3 Enterprise 192-bit).
+const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
+
+/// Whether the AP advertises an **enterprise** (802.1X/EAP) key management.
+///
+/// [`security_from_flags`] deliberately collapses these onto the `"psk"` chip
+/// label, which is harmless for a label — but it must not carry over into
+/// *profile creation*. An EAP profile needs an `eap` method, an identity,
+/// phase-2 auth and usually a CA certificate; none of that is in the scan, and
+/// none of it can come back from a passphrase prompt. Building a `wpa-psk`
+/// profile for an enterprise AP would pop a dialog that cannot succeed and
+/// leave a junk profile behind, so [`nm_add_and_activate`] refuses up front
+/// instead — see the guard there.
+fn is_enterprise_ap(wpa_flags: u32, rsn_flags: u32) -> bool {
+    const EAP: u32 = NM_AP_SEC_KEY_MGMT_802_1X | NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192;
+    ((wpa_flags | rsn_flags) & EAP) != 0
+}
+
 /// Derive a security string from NM access-point flags.
 ///
 /// * `rsn_flags != 0` → `"psk"` (RSN/WPA2, or `"8021x"` if bit 9 is set but
@@ -213,11 +256,109 @@ fn nm_device_state_to_station_state(state: u32) -> StationState {
 fn security_from_flags(flags: u32, wpa_flags: u32, rsn_flags: u32) -> String {
     if rsn_flags != 0 || wpa_flags != 0 {
         "psk".to_string()
-    } else if (flags & 1) != 0 {
+    } else if (flags & NM_AP_FLAGS_PRIVACY) != 0 {
         "wep".to_string()
     } else {
         "open".to_string()
     }
+}
+
+/// Pick the `802-11-wireless-security.key-mgmt` value for a *new* profile from
+/// the very same AP flags the scan path feeds [`security_from_flags`], or
+/// `None` for an open network (which gets no security setting at all).
+///
+/// * SAE advertised **and not** PSK (WPA3-only) → `"sae"`
+/// * OWE (Enhanced Open) → `"owe"` — encrypted but credential-less, so this
+///   still raises no prompt
+/// * any other WPA/RSN AP → `"wpa-psk"`. WPA2/WPA3 *transition* APs advertise
+///   both key-management types; `wpa-psk` is the compatible pick there, since it
+///   works regardless of whether the radio supports SAE.
+/// * privacy bit only (legacy WEP) → `"none"`, NM's static-WEP key management
+/// * otherwise → `None` (open network)
+///
+/// Enterprise (802.1X/EAP) APs never reach here — [`nm_add_and_activate`]
+/// rejects them via [`is_enterprise_ap`] before a dict is built, because the
+/// `"wpa-psk"` fallback below would be actively wrong for them.
+fn key_mgmt_from_flags(flags: u32, wpa_flags: u32, rsn_flags: u32) -> Option<&'static str> {
+    let advertises = |bit: u32| ((wpa_flags | rsn_flags) & bit) != 0;
+    if advertises(NM_AP_SEC_KEY_MGMT_SAE) && !advertises(NM_AP_SEC_KEY_MGMT_PSK) {
+        Some("sae")
+    } else if advertises(NM_AP_SEC_KEY_MGMT_OWE) {
+        Some("owe")
+    } else if rsn_flags != 0 || wpa_flags != 0 {
+        Some("wpa-psk")
+    } else if (flags & NM_AP_FLAGS_PRIVACY) != 0 {
+        Some("none")
+    } else {
+        None
+    }
+}
+
+/// Build the minimal `a{sa{sv}}` settings dict for joining an AP that has **no
+/// saved profile**, from the scanned AP's SSID bytes and security flags.
+///
+/// Shape (NM fills in everything else — uuid, autoconnect, IP methods — during
+/// `AddAndActivateConnection`'s normalisation):
+///
+/// ```text
+/// connection                { id: <SSID>, type: "802-11-wireless" }
+/// 802-11-wireless           { ssid: <raw bytes>, mode: "infrastructure" }
+/// 802-11-wireless-security  { key-mgmt: … }        // secured APs only
+/// ```
+///
+/// The passphrase is **deliberately absent**. A secured profile with no `psk`
+/// is exactly what makes NM call our registered secret agent's `GetSecrets`
+/// (`crate::wifi::nm_agent`), which raises the existing prompt overlay — so
+/// joining a new network needs no new UI. Open networks get no security setting
+/// and therefore no prompt.
+///
+/// `ssid_bytes` is passed through byte-exact (SSIDs are not required to be
+/// UTF-8); only the human-facing `connection.id` uses the lossy decode.
+fn new_wifi_connection_settings(
+    ssid_bytes: &[u8],
+    flags: u32,
+    wpa_flags: u32,
+    rsn_flags: u32,
+) -> ConnectionSettings {
+    /// Wrap a value for the `sv` slot; the conversions here cannot fail for the
+    /// concrete string/byte-array inputs this builder uses.
+    fn v(value: impl Into<Value<'static>>) -> OwnedValue {
+        value
+            .into()
+            .try_to_owned()
+            .expect("string/byte-array to OwnedValue is infallible")
+    }
+
+    let id = ssid_bytes_to_string(ssid_bytes).trim().to_string();
+    // Never emit a blank `connection.id` — NM rejects a profile without one.
+    let id = if id.is_empty() {
+        "Wi-Fi".to_string()
+    } else {
+        id
+    };
+
+    let mut settings: ConnectionSettings = HashMap::new();
+    settings.insert(
+        "connection".to_string(),
+        HashMap::from([
+            ("id".to_string(), v(id)),
+            ("type".to_string(), v("802-11-wireless".to_string())),
+        ]),
+    );
+    settings.insert(
+        "802-11-wireless".to_string(),
+        HashMap::from([
+            ("ssid".to_string(), v(ssid_bytes.to_vec())),
+            ("mode".to_string(), v("infrastructure".to_string())),
+        ]),
+    );
+    if let Some(key_mgmt) = key_mgmt_from_flags(flags, wpa_flags, rsn_flags) {
+        settings.insert(
+            "802-11-wireless-security".to_string(),
+            HashMap::from([("key-mgmt".to_string(), v(key_mgmt.to_string()))]),
+        );
+    }
+    settings
 }
 
 /// Convert an NM signal-strength percentage (0–100) to an approximate dBm value.
@@ -1028,11 +1169,22 @@ pub(crate) async fn nm_scan(device_path: &str) -> Result<(), hytte_bus::BusError
         .await
 }
 
-/// Attempt to connect to an AP via `ActivateConnection` with auto-selected connection.
+/// Connect to the AP at `ap_path`, creating a profile first when the network
+/// has never been joined before.
 ///
-/// Uses `"/"` for the connection path so NM auto-selects the best stored profile.
-/// This works for previously-connected networks; new WPA networks without stored
-/// credentials will fail silently (passphrase agent is a follow-up).
+/// `known` comes from [`WifiNetwork::known`] on the scan snapshot the user
+/// clicked (threaded down by [`crate::wifi::connect_network`]) and selects the
+/// NM API:
+///
+/// * `true` → `ActivateConnection` with `"/"` for the connection path, letting
+///   NM auto-select the best stored profile for this AP.
+/// * `false` → [`nm_add_and_activate`], because `ActivateConnection` can only
+///   *select* an existing profile — with nothing saved for the SSID there is
+///   nothing for NM to pick and the call just errors out.
+///
+/// A stale `known` can only be wrong in the window between a refresh tick and
+/// the click; the worst case is a second profile for an already-saved SSID,
+/// which NM accepts.
 ///
 /// # Errors
 ///
@@ -1040,31 +1192,87 @@ pub(crate) async fn nm_scan(device_path: &str) -> Result<(), hytte_bus::BusError
 pub(crate) async fn nm_connect(
     device_path: &str,
     ap_path: &str,
+    known: bool,
 ) -> Result<(), hytte_bus::BusError> {
-    let connection_path = zbus::zvariant::ObjectPath::try_from("/")
-        .map_err(|e| hytte_bus::BusError::Permanent {
-            reason: format!("invalid path: {e}"),
-            dbus_name: None,
-        })?
-        .to_owned();
-    let device_obj_path = zbus::zvariant::ObjectPath::try_from(device_path)
-        .map_err(|e| hytte_bus::BusError::Permanent {
-            reason: format!("invalid device path: {e}"),
-            dbus_name: None,
-        })?
-        .to_owned();
-    let ap_obj_path = zbus::zvariant::ObjectPath::try_from(ap_path)
-        .map_err(|e| hytte_bus::BusError::Permanent {
-            reason: format!("invalid AP path: {e}"),
-            dbus_name: None,
-        })?
-        .to_owned();
+    if !known {
+        return nm_add_and_activate(device_path, ap_path).await;
+    }
+    let connection_path = owned_object_path("/", "connection path")?;
+    let device_obj_path = owned_object_path(device_path, "device path")?;
+    let ap_obj_path = owned_object_path(ap_path, "AP path")?;
     hytte_bus::call(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
         .iface(NM_IFACE)
         .method("ActivateConnection")
         .args((connection_path, device_obj_path, ap_obj_path))
         .send::<OwnedObjectPath>()
+        .await
+        .map(|_| ())
+}
+
+/// Create a profile for a never-before-joined AP and bring it up in one call,
+/// via `AddAndActivateConnection(settings, device, specific_object)`.
+///
+/// Re-reads the AP's properties so the profile carries the **byte-exact** SSID
+/// and the real security flags (the `WifiNetwork` snapshot only keeps a lossy,
+/// trimmed SSID string and a collapsed `"psk"`/`"wep"`/`"open"` label, neither
+/// of which is enough to write a correct profile). The dict itself comes from
+/// [`new_wifi_connection_settings`] and carries no passphrase, so NM asks our
+/// secret agent for it.
+///
+/// Enterprise (802.1X/EAP) APs are rejected here rather than profiled — see
+/// [`is_enterprise_ap`].
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the AP properties can't be read, the AP
+/// is enterprise-secured or hides its SSID, either object path is malformed, or
+/// the D-Bus call fails.
+async fn nm_add_and_activate(device_path: &str, ap_path: &str) -> Result<(), hytte_bus::BusError> {
+    let props = get_ap_props(ap_path).await?;
+    let ssid_bytes = prop_bytes(&props, "Ssid").unwrap_or_default();
+    if ssid_bytes.is_empty() {
+        // A hidden AP beacons an empty SSID. Joining one needs the user to type
+        // the name plus `802-11-wireless.hidden = true` on the profile, which
+        // this path has no way to supply — and NM would reject a profile with a
+        // blank ssid anyway, with a much less obvious message than this one.
+        return Err(hytte_bus::BusError::Permanent {
+            reason: "this network does not broadcast its name — hidden networks have to be added \
+                     in NetworkManager first"
+                .to_string(),
+            dbus_name: None,
+        });
+    }
+    let flags = property::<u32>(&props, "Flags").unwrap_or(0);
+    let wpa_flags = property::<u32>(&props, "WpaFlags").unwrap_or(0);
+    let rsn_flags = property::<u32>(&props, "RsnFlags").unwrap_or(0);
+    if is_enterprise_ap(wpa_flags, rsn_flags) {
+        // Refusing beats a passphrase prompt that cannot possibly succeed: the
+        // existing failure toast in `crate::wifi::connect_network` renders this
+        // reason, so the user is told where to go instead of being asked for
+        // the wrong secret. See `is_enterprise_ap`.
+        return Err(hytte_bus::BusError::Permanent {
+            reason: "enterprise (802.1X) networks need an EAP profile — set this one up in \
+                     NetworkManager first, then it will connect from here"
+                .to_string(),
+            dbus_name: None,
+        });
+    }
+    let settings = new_wifi_connection_settings(&ssid_bytes, flags, wpa_flags, rsn_flags);
+
+    let device_obj_path = owned_object_path(device_path, "device path")?;
+    let ap_obj_path = owned_object_path(ap_path, "AP path")?;
+    tracing::info!(
+        ap = ap_path,
+        secured = settings.contains_key("802-11-wireless-security"),
+        "wifi_nm: no saved profile — AddAndActivateConnection",
+    );
+    hytte_bus::call(BusKind::System, NM_NAME)
+        .at_path(NM_PATH)
+        .iface(NM_IFACE)
+        .method("AddAndActivateConnection")
+        .args((settings, device_obj_path, ap_obj_path))
+        .send::<(OwnedObjectPath, OwnedObjectPath)>()
         .await
         .map(|_| ())
 }
@@ -1635,6 +1843,188 @@ mod tests {
             .expect("non-empty SSID yields a network");
         assert!(!net.known);
         assert_eq!(net.known_network_path, None);
+    }
+
+    // -- new_wifi_connection_settings -----------------------------------------
+    //
+    // The dict handed to AddAndActivateConnection when the clicked AP has no
+    // saved profile. NM AP flag values (NM80211ApFlags / NM80211ApSecurityFlags):
+    //   Flags:    0x1 PRIVACY
+    //   Wpa/Rsn:  0x8 PAIR_CCMP, 0x80 GROUP_CCMP, 0x100 KEY_MGMT_PSK,
+    //             0x400 KEY_MGMT_SAE
+
+    /// WPA2-Personal RSN flags: CCMP pairwise + group, PSK key management.
+    const RSN_WPA2_PSK: u32 = 0x0000_0188;
+    /// WPA3-Personal RSN flags: CCMP pairwise + group, SAE key management.
+    const RSN_WPA3_SAE: u32 = 0x0000_0488;
+    /// WPA2/WPA3 transition-mode RSN flags: both PSK and SAE advertised.
+    const RSN_TRANSITION: u32 = 0x0000_0588;
+
+    /// Read a string field out of a built settings dict.
+    fn dict_str(settings: &ConnectionSettings, setting: &str, key: &str) -> Option<String> {
+        settings
+            .get(setting)?
+            .get(key)
+            .and_then(|v| v.try_clone().ok())
+            .and_then(|v| String::try_from(v).ok())
+    }
+
+    /// Read a byte-array field out of a built settings dict.
+    fn dict_bytes(settings: &ConnectionSettings, setting: &str, key: &str) -> Option<Vec<u8>> {
+        settings
+            .get(setting)?
+            .get(key)
+            .and_then(|v| v.try_clone().ok())
+            .and_then(|v| <Vec<u8>>::try_from(v).ok())
+    }
+
+    #[test]
+    fn new_profile_names_ssid_and_wireless_type() {
+        let settings = new_wifi_connection_settings(b"FRITZ!Box", 0, 0, 0);
+        assert_eq!(
+            dict_str(&settings, "connection", "id").as_deref(),
+            Some("FRITZ!Box"),
+        );
+        assert_eq!(
+            dict_str(&settings, "connection", "type").as_deref(),
+            Some("802-11-wireless"),
+        );
+        assert_eq!(
+            dict_bytes(&settings, "802-11-wireless", "ssid").as_deref(),
+            Some(&b"FRITZ!Box"[..]),
+        );
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless", "mode").as_deref(),
+            Some("infrastructure"),
+        );
+    }
+
+    #[test]
+    fn new_profile_open_ap_has_no_security_setting() {
+        let settings = new_wifi_connection_settings(b"Cafe WiFi", 0, 0, 0);
+        assert!(
+            !settings.contains_key("802-11-wireless-security"),
+            "an open AP must not get a security setting — it would prompt for a passphrase",
+        );
+    }
+
+    #[test]
+    fn new_profile_wpa2_psk_uses_wpa_psk_key_mgmt() {
+        let settings = new_wifi_connection_settings(b"FRITZ!Box", 1, 0, RSN_WPA2_PSK);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("wpa-psk"),
+        );
+    }
+
+    #[test]
+    fn new_profile_wpa3_sae_uses_sae_key_mgmt() {
+        let settings = new_wifi_connection_settings(b"FRITZ!Box", 1, 0, RSN_WPA3_SAE);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("sae"),
+        );
+    }
+
+    #[test]
+    fn new_profile_wpa2_wpa3_transition_prefers_wpa_psk() {
+        // Both key-management types advertised: wpa-psk works whether or not the
+        // radio supports SAE, so it's the compatible pick.
+        let settings = new_wifi_connection_settings(b"FRITZ!Box", 1, 0, RSN_TRANSITION);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("wpa-psk"),
+        );
+    }
+
+    #[test]
+    fn new_profile_wpa1_only_uses_wpa_psk_key_mgmt() {
+        let settings = new_wifi_connection_settings(b"Old Router", 1, 0x0000_0144, 0);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("wpa-psk"),
+        );
+    }
+
+    #[test]
+    fn new_profile_wep_uses_static_key_mgmt() {
+        // Privacy bit with no WPA/RSN flags → legacy WEP, NM's `none`.
+        let settings = new_wifi_connection_settings(b"Ancient", 1, 0, 0);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("none"),
+        );
+    }
+
+    #[test]
+    fn new_profile_never_carries_a_passphrase() {
+        // The whole point: an incomplete secured profile is what makes NM ask our
+        // secret agent for the passphrase instead of failing.
+        for rsn in [RSN_WPA2_PSK, RSN_WPA3_SAE, RSN_TRANSITION] {
+            let settings = new_wifi_connection_settings(b"FRITZ!Box", 1, 0, rsn);
+            let security = settings
+                .get("802-11-wireless-security")
+                .expect("secured AP gets a security setting");
+            assert!(!security.contains_key("psk"), "psk must not be pre-filled");
+            assert!(
+                !security.contains_key("wep-key0"),
+                "wep-key0 must not be pre-filled",
+            );
+            assert_eq!(security.len(), 1, "only key-mgmt belongs in the dict");
+        }
+    }
+
+    #[test]
+    fn new_profile_ssid_bytes_survive_non_utf8() {
+        // SSIDs are arbitrary bytes; the profile must carry them verbatim even
+        // though the display id goes through a lossy decode.
+        let raw = [0x46, 0xff, 0x42];
+        let settings = new_wifi_connection_settings(&raw, 0, 0, 0);
+        assert_eq!(
+            dict_bytes(&settings, "802-11-wireless", "ssid").as_deref(),
+            Some(&raw[..]),
+        );
+    }
+
+    /// WPA2-Enterprise RSN flags: CCMP pairwise + group, 802.1X key management.
+    const RSN_WPA2_ENTERPRISE: u32 = 0x0000_0288;
+    /// OWE (Enhanced Open) RSN flags: CCMP pairwise + group, OWE key management.
+    const RSN_OWE: u32 = 0x0000_0888;
+
+    #[test]
+    fn enterprise_ap_is_refused_not_profiled() {
+        // The `wpa-psk` fallback would be actively wrong here: NM would build a
+        // PSK profile, our agent would prompt for a passphrase that cannot work,
+        // and a junk profile would be left behind. `nm_add_and_activate` bails
+        // on this predicate before any dict is built.
+        assert!(is_enterprise_ap(0, RSN_WPA2_ENTERPRISE));
+        assert!(is_enterprise_ap(0, NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192));
+        assert!(!is_enterprise_ap(0, RSN_WPA2_PSK));
+        assert!(!is_enterprise_ap(0, RSN_WPA3_SAE));
+        assert!(!is_enterprise_ap(0, RSN_OWE));
+        assert!(!is_enterprise_ap(0, 0));
+    }
+
+    #[test]
+    fn new_profile_owe_uses_owe_key_mgmt() {
+        // Enhanced Open is encrypted but credential-less — it must not fall
+        // through to `wpa-psk`, which would prompt for a passphrase that the
+        // network does not have.
+        let settings = new_wifi_connection_settings(b"Cafe Secure", 1, 0, RSN_OWE);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("owe"),
+        );
+    }
+
+    #[test]
+    fn new_profile_id_falls_back_when_ssid_is_blank() {
+        // NM rejects a profile with an empty connection.id.
+        let settings = new_wifi_connection_settings(b"   ", 0, 0, 0);
+        assert_eq!(
+            dict_str(&settings, "connection", "id").as_deref(),
+            Some("Wi-Fi"),
+        );
     }
 
     // -- wired_profile_name ---------------------------------------------------

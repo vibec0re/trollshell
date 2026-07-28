@@ -20,6 +20,23 @@ The whole surface is one CLI (this skill's `bin/hytte-infobroker`, a pointer to
 the installed binary). There is no MCP server and no network endpoint — it talks
 to a local Unix socket the desktop owns.
 
+## Installing the CLI
+
+`hytte-infobroker` is its own flake package, `packages.hytte-infobroker`
+(#562) — built via `nix/plugin.nix`, the same warm-artifact derivation the
+bundled widget plugins use. It is **not** shipped by the `trollshell` package
+itself, which prunes `$out/bin` down to just the shell binary (#530), so it
+needs its own line on PATH. Simplest is a `home.packages` entry in your
+home-manager config:
+
+```nix
+home.packages = [ trollshell.packages.${system}.hytte-infobroker ];
+```
+
+(`trollshell` is the flake input, same as wherever `programs.trollshell` is
+already configured from.) Once installed, this skill's `bin/hytte-infobroker`
+finds it on PATH automatically — no per-skill setup needed.
+
 ## The model (read this once)
 
 - **Identity is a token.** You authenticate as an _agent name_ (pick a stable

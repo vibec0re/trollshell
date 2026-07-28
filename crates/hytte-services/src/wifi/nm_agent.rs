@@ -53,6 +53,19 @@ const VPN_SETTING: &str = "vpn";
 /// plugins) keys the credential under `"password"`.
 const VPN_DEFAULT_SECRET_KEY: &str = "password";
 
+/// Default wireless-security secret key when NM's `hints` are absent, empty,
+/// or contain nothing we recognise. WPA/WPA2/WPA3-Personal (`psk`) is the
+/// overwhelmingly common case and today's pre-existing behaviour — an
+/// unrecognised hint must fall back here, never be passed through blindly.
+const WIRELESS_DEFAULT_SECRET_KEY: &str = "psk";
+
+/// Wireless-security secret keys we recognise out of NM's `hints`, each
+/// naming the credential for a different `key-mgmt`:
+///   * `"psk"` — WPA/WPA2/WPA3-Personal (`wpa-psk`, `sae`).
+///   * `"wep-key0"` — static WEP (`key-mgmt = "none"`).
+///   * `"leap-password"` — dynamic WEP / Cisco LEAP (`key-mgmt = "ieee8021x"`).
+const RECOGNISED_WIRELESS_SECRET_KEYS: &[&str] = &["psk", "wep-key0", "leap-password"];
+
 /// `NMSecretAgentGetSecretsFlags` bit 0 — `ALLOW_INTERACTION`. When unset, NM
 /// only wants secrets it can return without prompting the user, so we must not
 /// pop a passphrase dialog.
@@ -121,11 +134,35 @@ fn security_from_connection(connection: &ConnectionDict) -> String {
     }
 }
 
-/// Build the nested reply dict `{ setting_name: { "psk": <passphrase> } }`.
-fn build_secret_reply(setting_name: &str, passphrase: &str) -> ConnectionDict {
+/// Decide which key to nest the wireless-security secret under.
+///
+/// NM names the secret it actually wants in `hints` — mirrors
+/// [`vpn_secret_key_to_prompt`]'s precedent of trusting NM's hint list, but
+/// simpler: wireless has no equivalent of `vpn.secrets` to check off, and NM
+/// doesn't qualify these hints as `"<setting>.<key>"` the way it sometimes
+/// does for VPN, so hints here are always bare candidate secret names.
+///
+/// **Conservative default:** hints absent, empty, or containing nothing in
+/// [`RECOGNISED_WIRELESS_SECRET_KEYS`] all fall back to
+/// [`WIRELESS_DEFAULT_SECRET_KEY`] (`"psk"`) — correct for the overwhelmingly
+/// common WPA/WPA2/WPA3-Personal case and today's pre-existing behaviour, so
+/// an unrecognised hint value is never passed through blindly.
+fn wireless_secret_key_from_hints(hints: &[String]) -> String {
+    hints
+        .iter()
+        .map(String::as_str)
+        .find(|h| RECOGNISED_WIRELESS_SECRET_KEYS.contains(h))
+        .map_or_else(
+            || WIRELESS_DEFAULT_SECRET_KEY.to_string(),
+            ToString::to_string,
+        )
+}
+
+/// Build the nested reply dict `{ setting_name: { <secret_key>: <passphrase> } }`.
+fn build_secret_reply(setting_name: &str, secret_key: &str, passphrase: &str) -> ConnectionDict {
     let mut setting: HashMap<String, OwnedValue> = HashMap::new();
     if let Ok(v) = Value::from(passphrase).try_to_owned() {
-        setting.insert("psk".to_string(), v);
+        setting.insert(secret_key.to_string(), v);
     }
     let mut out: ConnectionDict = HashMap::new();
     out.insert(setting_name.to_string(), setting);
@@ -203,8 +240,11 @@ fn build_vpn_secret_reply(secret_key: &str, secret_value: &str) -> ConnectionDic
 /// two kinds differ in the nested dict NM expects back (see
 /// [`build_secret_reply`] vs [`build_vpn_secret_reply`]).
 enum ReplyShape {
-    /// Wi-Fi: `{ <setting_name>: { "psk": <secret> } }`.
-    WirelessSecurity { setting_name: String },
+    /// Wi-Fi: `{ <setting_name>: { <secret_key>: <secret> } }`.
+    WirelessSecurity {
+        setting_name: String,
+        secret_key: String,
+    },
     /// VPN: `{ "vpn": { "secrets": { <secret_key>: <secret> } } }`.
     Vpn { secret_key: String },
 }
@@ -212,9 +252,10 @@ enum ReplyShape {
 impl ReplyShape {
     fn build(&self, secret: &str) -> ConnectionDict {
         match self {
-            ReplyShape::WirelessSecurity { setting_name } => {
-                build_secret_reply(setting_name, secret)
-            }
+            ReplyShape::WirelessSecurity {
+                setting_name,
+                secret_key,
+            } => build_secret_reply(setting_name, secret_key, secret),
             ReplyShape::Vpn { secret_key } => build_vpn_secret_reply(secret_key, secret),
         }
     }
@@ -292,9 +333,11 @@ impl NmAgent {
         } else {
             let ssid = ssid_from_connection(&connection);
             let security = security_from_connection(&connection);
+            let secret_key = wireless_secret_key_from_hints(&hints);
             tracing::info!(
                 ssid = %ssid,
                 security = %security,
+                secret_key = %secret_key,
                 path = %conn_path,
                 prior_failure,
                 "NM SecretAgent::GetSecrets — requesting passphrase",
@@ -308,7 +351,10 @@ impl NmAgent {
                     kind: PromptKind::WifiPassphrase,
                     prior_failure,
                 },
-                ReplyShape::WirelessSecurity { setting_name },
+                ReplyShape::WirelessSecurity {
+                    setting_name,
+                    secret_key,
+                },
             )
         };
 
@@ -466,7 +512,7 @@ mod tests {
 
     #[test]
     fn reply_nests_psk_under_setting_name() {
-        let reply = build_secret_reply(WIRELESS_SECURITY_SETTING, "hunter2");
+        let reply = build_secret_reply(WIRELESS_SECURITY_SETTING, "psk", "hunter2");
         let inner = reply
             .get(WIRELESS_SECURITY_SETTING)
             .expect("setting present");
@@ -475,6 +521,57 @@ mod tests {
             String::try_from(psk.try_clone().unwrap()).unwrap(),
             "hunter2"
         );
+    }
+
+    #[test]
+    fn reply_nests_under_the_requested_secret_key() {
+        let reply = build_secret_reply(WIRELESS_SECURITY_SETTING, "wep-key0", "abcde");
+        let inner = reply
+            .get(WIRELESS_SECURITY_SETTING)
+            .expect("setting present");
+        assert!(!inner.contains_key("psk"), "must not use the psk key");
+        let wep_key0 = inner.get("wep-key0").expect("wep-key0 present");
+        assert_eq!(
+            String::try_from(wep_key0.try_clone().unwrap()).unwrap(),
+            "abcde"
+        );
+    }
+
+    // -- wireless_secret_key_from_hints ----------------------------------------
+
+    #[test]
+    fn wireless_secret_key_defaults_to_psk_when_hints_absent() {
+        assert_eq!(wireless_secret_key_from_hints(&[]), "psk");
+    }
+
+    #[test]
+    fn wireless_secret_key_defaults_to_psk_when_hints_empty() {
+        let hints = vec![String::new()];
+        assert_eq!(wireless_secret_key_from_hints(&hints), "psk");
+    }
+
+    #[test]
+    fn wireless_secret_key_recognises_psk_hint() {
+        let hints = vec!["psk".to_string()];
+        assert_eq!(wireless_secret_key_from_hints(&hints), "psk");
+    }
+
+    #[test]
+    fn wireless_secret_key_recognises_wep_key0_hint() {
+        let hints = vec!["wep-key0".to_string()];
+        assert_eq!(wireless_secret_key_from_hints(&hints), "wep-key0");
+    }
+
+    #[test]
+    fn wireless_secret_key_recognises_leap_password_hint() {
+        let hints = vec!["leap-password".to_string()];
+        assert_eq!(wireless_secret_key_from_hints(&hints), "leap-password");
+    }
+
+    #[test]
+    fn wireless_secret_key_falls_back_to_psk_on_unrecognised_hint() {
+        let hints = vec!["some-unrecognised-hint".to_string()];
+        assert_eq!(wireless_secret_key_from_hints(&hints), "psk");
     }
 
     // -- VPN secrets ----------------------------------------------------------
@@ -951,6 +1048,73 @@ mod system_tests {
         assert!(
             prompts.get_cloned().is_none(),
             "prompt should be cleared after the VPN secret is returned"
+        );
+    }
+
+    // -- 1c. WEP: a `wep-key0` hint is honoured over the bus -------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wep_hint_returns_secret_under_wep_key0_over_the_bus() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        // Static WEP: key-mgmt "none", and NM names the wanted secret
+        // "wep-key0" in hints instead of "psk".
+        let conn = wpa_connection(b"OldRouter", "none");
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(
+                                "/org/freedesktop/NetworkManager/Connection/3",
+                            )
+                            .unwrap(),
+                            "802-11-wireless-security".to_string(),
+                            vec!["wep-key0".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            });
+
+        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        assert_eq!(req.ssid, "OldRouter");
+        assert_eq!(req.security, "wep");
+
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("waiter registered")
+            .send(Ok("abcde".to_string()))
+            .expect("send WEP key to waiter");
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+            .await
+            .expect("GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("GetSecrets returned a D-Bus error");
+
+        let setting = reply
+            .get("802-11-wireless-security")
+            .expect("security setting present in reply");
+        assert!(
+            !setting.contains_key("psk"),
+            "a wep-key0 hint must not be answered under psk"
+        );
+        let wep_key0 = setting.get("wep-key0").expect("wep-key0 present in reply");
+        assert_eq!(
+            String::try_from(wep_key0.try_clone().unwrap()).unwrap(),
+            "abcde"
+        );
+
+        assert!(
+            prompts.get_cloned().is_none(),
+            "prompt should be cleared after the WEP key is returned"
         );
     }
 

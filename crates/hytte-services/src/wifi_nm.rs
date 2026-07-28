@@ -219,8 +219,32 @@ const NM_AP_FLAGS_PRIVACY: u32 = 0x0000_0001;
 /// `NM80211ApSecurityFlags` bit 8 — `KEY_MGMT_PSK` (WPA/WPA2 Personal).
 const NM_AP_SEC_KEY_MGMT_PSK: u32 = 0x0000_0100;
 
+/// `NM80211ApSecurityFlags` bit 9 — `KEY_MGMT_802_1X` (WPA/WPA2 Enterprise).
+const NM_AP_SEC_KEY_MGMT_802_1X: u32 = 0x0000_0200;
+
 /// `NM80211ApSecurityFlags` bit 10 — `KEY_MGMT_SAE` (WPA3 Personal).
 const NM_AP_SEC_KEY_MGMT_SAE: u32 = 0x0000_0400;
+
+/// `NM80211ApSecurityFlags` bit 11 — `KEY_MGMT_OWE` (Enhanced Open / WPA3 open).
+const NM_AP_SEC_KEY_MGMT_OWE: u32 = 0x0000_0800;
+
+/// `NM80211ApSecurityFlags` bit 13 — `KEY_MGMT_EAP_SUITE_B_192` (WPA3 Enterprise 192-bit).
+const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
+
+/// Whether the AP advertises an **enterprise** (802.1X/EAP) key management.
+///
+/// [`security_from_flags`] deliberately collapses these onto the `"psk"` chip
+/// label, which is harmless for a label — but it must not carry over into
+/// *profile creation*. An EAP profile needs an `eap` method, an identity,
+/// phase-2 auth and usually a CA certificate; none of that is in the scan, and
+/// none of it can come back from a passphrase prompt. Building a `wpa-psk`
+/// profile for an enterprise AP would pop a dialog that cannot succeed and
+/// leave a junk profile behind, so [`nm_add_and_activate`] refuses up front
+/// instead — see the guard there.
+fn is_enterprise_ap(wpa_flags: u32, rsn_flags: u32) -> bool {
+    const EAP: u32 = NM_AP_SEC_KEY_MGMT_802_1X | NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192;
+    ((wpa_flags | rsn_flags) & EAP) != 0
+}
 
 /// Derive a security string from NM access-point flags.
 ///
@@ -243,17 +267,24 @@ fn security_from_flags(flags: u32, wpa_flags: u32, rsn_flags: u32) -> String {
 /// the very same AP flags the scan path feeds [`security_from_flags`], or
 /// `None` for an open network (which gets no security setting at all).
 ///
-/// * RSN advertises SAE **and not** PSK (WPA3-only) → `"sae"`
+/// * SAE advertised **and not** PSK (WPA3-only) → `"sae"`
+/// * OWE (Enhanced Open) → `"owe"` — encrypted but credential-less, so this
+///   still raises no prompt
 /// * any other WPA/RSN AP → `"wpa-psk"`. WPA2/WPA3 *transition* APs advertise
 ///   both key-management types; `wpa-psk` is the compatible pick there, since it
 ///   works regardless of whether the radio supports SAE.
 /// * privacy bit only (legacy WEP) → `"none"`, NM's static-WEP key management
 /// * otherwise → `None` (open network)
+///
+/// Enterprise (802.1X/EAP) APs never reach here — [`nm_add_and_activate`]
+/// rejects them via [`is_enterprise_ap`] before a dict is built, because the
+/// `"wpa-psk"` fallback below would be actively wrong for them.
 fn key_mgmt_from_flags(flags: u32, wpa_flags: u32, rsn_flags: u32) -> Option<&'static str> {
-    let sae_only =
-        (rsn_flags & NM_AP_SEC_KEY_MGMT_SAE) != 0 && (rsn_flags & NM_AP_SEC_KEY_MGMT_PSK) == 0;
-    if sae_only {
+    let advertises = |bit: u32| ((wpa_flags | rsn_flags) & bit) != 0;
+    if advertises(NM_AP_SEC_KEY_MGMT_SAE) && !advertises(NM_AP_SEC_KEY_MGMT_PSK) {
         Some("sae")
+    } else if advertises(NM_AP_SEC_KEY_MGMT_OWE) {
+        Some("owe")
     } else if rsn_flags != 0 || wpa_flags != 0 {
         Some("wpa-psk")
     } else if (flags & NM_AP_FLAGS_PRIVACY) != 0 {
@@ -1189,16 +1220,44 @@ pub(crate) async fn nm_connect(
 /// [`new_wifi_connection_settings`] and carries no passphrase, so NM asks our
 /// secret agent for it.
 ///
+/// Enterprise (802.1X/EAP) APs are rejected here rather than profiled — see
+/// [`is_enterprise_ap`].
+///
 /// # Errors
 ///
-/// Returns a [`hytte_bus::BusError`] if the AP properties can't be read, either
-/// object path is malformed, or the D-Bus call fails.
+/// Returns a [`hytte_bus::BusError`] if the AP properties can't be read, the AP
+/// is enterprise-secured or hides its SSID, either object path is malformed, or
+/// the D-Bus call fails.
 async fn nm_add_and_activate(device_path: &str, ap_path: &str) -> Result<(), hytte_bus::BusError> {
     let props = get_ap_props(ap_path).await?;
     let ssid_bytes = prop_bytes(&props, "Ssid").unwrap_or_default();
+    if ssid_bytes.is_empty() {
+        // A hidden AP beacons an empty SSID. Joining one needs the user to type
+        // the name plus `802-11-wireless.hidden = true` on the profile, which
+        // this path has no way to supply — and NM would reject a profile with a
+        // blank ssid anyway, with a much less obvious message than this one.
+        return Err(hytte_bus::BusError::Permanent {
+            reason: "this network does not broadcast its name — hidden networks have to be added \
+                     in NetworkManager first"
+                .to_string(),
+            dbus_name: None,
+        });
+    }
     let flags = property::<u32>(&props, "Flags").unwrap_or(0);
     let wpa_flags = property::<u32>(&props, "WpaFlags").unwrap_or(0);
     let rsn_flags = property::<u32>(&props, "RsnFlags").unwrap_or(0);
+    if is_enterprise_ap(wpa_flags, rsn_flags) {
+        // Refusing beats a passphrase prompt that cannot possibly succeed: the
+        // existing failure toast in `crate::wifi::connect_network` renders this
+        // reason, so the user is told where to go instead of being asked for
+        // the wrong secret. See `is_enterprise_ap`.
+        return Err(hytte_bus::BusError::Permanent {
+            reason: "enterprise (802.1X) networks need an EAP profile — set this one up in \
+                     NetworkManager first, then it will connect from here"
+                .to_string(),
+            dbus_name: None,
+        });
+    }
     let settings = new_wifi_connection_settings(&ssid_bytes, flags, wpa_flags, rsn_flags);
 
     let device_obj_path = owned_object_path(device_path, "device path")?;
@@ -1924,6 +1983,37 @@ mod tests {
         assert_eq!(
             dict_bytes(&settings, "802-11-wireless", "ssid").as_deref(),
             Some(&raw[..]),
+        );
+    }
+
+    /// WPA2-Enterprise RSN flags: CCMP pairwise + group, 802.1X key management.
+    const RSN_WPA2_ENTERPRISE: u32 = 0x0000_0288;
+    /// OWE (Enhanced Open) RSN flags: CCMP pairwise + group, OWE key management.
+    const RSN_OWE: u32 = 0x0000_0888;
+
+    #[test]
+    fn enterprise_ap_is_refused_not_profiled() {
+        // The `wpa-psk` fallback would be actively wrong here: NM would build a
+        // PSK profile, our agent would prompt for a passphrase that cannot work,
+        // and a junk profile would be left behind. `nm_add_and_activate` bails
+        // on this predicate before any dict is built.
+        assert!(is_enterprise_ap(0, RSN_WPA2_ENTERPRISE));
+        assert!(is_enterprise_ap(0, NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192));
+        assert!(!is_enterprise_ap(0, RSN_WPA2_PSK));
+        assert!(!is_enterprise_ap(0, RSN_WPA3_SAE));
+        assert!(!is_enterprise_ap(0, RSN_OWE));
+        assert!(!is_enterprise_ap(0, 0));
+    }
+
+    #[test]
+    fn new_profile_owe_uses_owe_key_mgmt() {
+        // Enhanced Open is encrypted but credential-less — it must not fall
+        // through to `wpa-psk`, which would prompt for a passphrase that the
+        // network does not have.
+        let settings = new_wifi_connection_settings(b"Cafe Secure", 1, 0, RSN_OWE);
+        assert_eq!(
+            dict_str(&settings, "802-11-wireless-security", "key-mgmt").as_deref(),
+            Some("owe"),
         );
     }
 

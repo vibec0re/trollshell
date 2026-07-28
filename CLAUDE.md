@@ -177,7 +177,7 @@ hytte-plugin-proto → GTK-free wire protocol (node vocab, manifest, MessagePack
 hytte-plugin       → the Rust plugin runtime SDK over the proto: TEA `Plugin` trait + `run()` (dial/backoff, Register handshake, session loop, render dedup). A plugin binary deps THIS crate alone
 hytte-plugin-clock-demo → the reference plugin: pure manifest/init/update/view + one-line main
 hytte-plugin-pet   → the kaomoji cat (#276): clock-driven moods, pokeable, optional llama-server brain (thin ureq client; canned fallback)
-…and 7 more plugin binaries (hytte-plugin-{bar-clock-demo,preem-demo,timer,terminal,caw,departures,weather}) following the same shape
+…and 9 more plugin binaries (hytte-plugin-{audio-widget,bar-clock-demo,preem-demo,timer,terminal,caw,departures,weather,usage}) following the same shape, plus hytte-plugin-infobroker — the count drifts, so trust `ls crates/hytte-plugin-*` over this line
 ```
 
 Shell code uses `use hytte::prelude::*;` (App, Bar, Edge, Monitor, bind*, Service, …) plus `hytte::gtk` / `hytte::adw` / `hytte::services::*`. Don't add direct deps on gtk/adw/futures-signals in the binary — go through the re-exports.

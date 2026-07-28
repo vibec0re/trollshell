@@ -381,10 +381,33 @@ pub fn scan() {
     }
 }
 
+/// Whether the network at `network_path` in the current scan snapshot already
+/// has stored credentials / a saved profile.
+///
+/// Read from the registry on the calling (GTK) thread — same as
+/// [`get_backend`] — so the answer can be moved into the spawned task. Networks
+/// that have dropped out of the snapshot report `false`.
+fn network_is_known(network_path: &str) -> bool {
+    registry::with(|r| {
+        r.get::<WifiHandles>()
+            .expect("wifi::service() not registered")
+            .networks
+            .lock_ref()
+            .iter()
+            .any(|n| n.path == network_path && n.known)
+    })
+}
+
 /// Fire-and-forget: connect to the network at `network_path`.
 ///
 /// For the iwd backend, `network_path` is an iwd `Network` object path.
 /// For the `NetworkManager` backend, `network_path` is an NM `AccessPoint` object path.
+///
+/// The `NetworkManager` backend needs to know whether a profile already exists
+/// for the target: joining a *new* network takes NM's
+/// `AddAndActivateConnection` (which creates one), not `ActivateConnection`
+/// (which can only select one). That flag comes from the scan snapshot the user
+/// clicked — see `crate::wifi_nm::nm_connect`.
 pub fn connect_network(network_path: &str) {
     let path = network_path.to_string();
     match get_backend() {
@@ -402,13 +425,14 @@ pub fn connect_network(network_path: &str) {
             });
         }
         WifiBackend::NetworkManager(store) => {
+            let known = network_is_known(network_path);
             runtime::handle().spawn(async move {
                 let device_path = store.read().await.clone();
                 if device_path.is_empty() {
                     tracing::warn!("wifi::connect_network: NM device path not yet known");
                     return;
                 }
-                if let Err(e) = crate::wifi_nm::nm_connect(&device_path, &path).await {
+                if let Err(e) = crate::wifi_nm::nm_connect(&device_path, &path, known).await {
                     tracing::warn!(error = %e, path, "wifi connect_network (NM) failed");
                     crate::notifications::post_local(
                         "Wi-Fi",

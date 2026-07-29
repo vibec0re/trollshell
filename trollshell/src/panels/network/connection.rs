@@ -5,14 +5,23 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::map_ref;
 use hytte::gtk::{self};
 use hytte::prelude::*;
-use hytte::services::networkd::{self, Link, OperationalState};
+use hytte::services::networkd::{self, Link, LinkSource, OperationalState};
 use hytte::services::resolved;
 
 use super::pill_label;
 use crate::components::layout::boxed_list;
 use crate::components::reactive_list::reactive_list;
+
+/// Accent-coloured pill: a live, routable connection.
+const PILL_CONNECTED: &str = "ts-pill-connected";
+/// Muted pill, used for every non-affirmative state — "Offline" and "Unknown"
+/// alike. No new CSS class was needed for #608's neutral rendering: the two
+/// existing variants are already "accent" and "muted", and offline was always
+/// the muted one. What was dishonest was the *word*, not the colour.
+const PILL_NEUTRAL: &str = "ts-pill-known";
 
 pub(super) fn build_connection_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder().title("Connection").build();
@@ -25,40 +34,29 @@ pub(super) fn build_connection_group() -> adw::PreferencesGroup {
         .activatable(false)
         .selectable(false)
         .build();
-    let state_pill = pill_label("Offline", "ts-pill-known");
+    // Starts at "Unknown", which is what is true before the first emission.
+    let state_pill = pill_label(UNKNOWN_PILL, PILL_NEUTRAL);
     state_row.add_suffix(&state_pill);
 
-    bind(
-        networkd::primary().map(|p| {
-            let subtitle = match p {
-                Some(ref link) => match link.operational {
-                    OperationalState::Routable => format!("Online via {}", link.name),
-                    OperationalState::Carrier | OperationalState::DegradedCarrier => {
-                        format!("Limited connectivity via {}", link.name)
-                    }
-                    other => format!("{} via {}", describe_state(other), link.name),
-                },
-                None => "Offline".to_string(),
-            };
-            let online = p.is_some_and(|l| l.operational == OperationalState::Routable);
-            (subtitle, online)
-        }),
-        &state_row,
-        {
-            let pill = state_pill.clone();
-            move |row, (subtitle, online)| {
-                row.set_subtitle(&subtitle);
-                pill.set_text(if online { "Online" } else { "Offline" });
-                if online {
-                    pill.remove_css_class("ts-pill-known");
-                    pill.add_css_class("ts-pill-connected");
-                } else {
-                    pill.remove_css_class("ts-pill-connected");
-                    pill.add_css_class("ts-pill-known");
-                }
-            }
-        },
-    );
+    // Bound to the link *and* to whether anything answered for it — see
+    // `status_view`. `primary()` alone cannot tell "there is no routable link"
+    // from "there is no link manager", and only the first is Offline (#608).
+    let status = map_ref! {
+        let primary = networkd::primary(),
+        let source = networkd::link_source() => status_view(primary.as_ref(), *source)
+    };
+    bind(status, &state_row, {
+        let pill = state_pill.clone();
+        move |row, view| {
+            row.set_subtitle(&view.subtitle);
+            pill.set_text(view.pill);
+            // Reset to the two variants and re-apply so the class set can't
+            // accumulate across state changes.
+            pill.remove_css_class(PILL_CONNECTED);
+            pill.remove_css_class(PILL_NEUTRAL);
+            pill.add_css_class(view.pill_class);
+        }
+    });
     group.add(&state_row);
 
     // Three expanders in vertical order; placeholder row replaces
@@ -69,6 +67,101 @@ pub(super) fn build_connection_group() -> adw::PreferencesGroup {
     group.add(&build_dns_expander());
 
     group
+}
+
+// ── Honest rendering of an unanswered question (#608) ────────────────────────
+//
+// Every helper below exists because `links()`/`primary()` describe the link
+// picture, not whether anyone drew it. The rule they all follow is the same: a
+// *positive* reading stands on its own (a link we saw is a link, even if the
+// daemon has since gone quiet), but an *absence* is only reportable as a fact
+// when a link manager answered. Otherwise we say we don't know.
+
+/// Pill text for "no link manager answered, so we cannot say".
+const UNKNOWN_PILL: &str = "Unknown";
+
+/// One rendering of the Status row: the subtitle line plus the pill's text and
+/// variant class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatusView {
+    subtitle: String,
+    pill: &'static str,
+    pill_class: &'static str,
+}
+
+/// What the Status row should say for a given primary link and link source.
+///
+/// The `None` arms are the fix: pre-#608 they all read "Offline", so a host with
+/// neither systemd-networkd nor `NetworkManager` was told it was offline while
+/// its interfaces moved traffic. A link we *did* read is reported as before,
+/// even if the source has since stopped answering — that is a positive
+/// observation, and dropping it would trade one falsehood for a blank.
+fn status_view(primary: Option<&Link>, source: LinkSource) -> StatusView {
+    let Some(link) = primary else {
+        return match source {
+            // A manager answered and named no routable link. This — and only
+            // this — is Offline.
+            LinkSource::Networkd | LinkSource::NetworkManager => StatusView {
+                subtitle: "Offline".to_string(),
+                pill: "Offline",
+                pill_class: PILL_NEUTRAL,
+            },
+            LinkSource::Unknown => StatusView {
+                subtitle: "No link manager has answered yet".to_string(),
+                pill: UNKNOWN_PILL,
+                pill_class: PILL_NEUTRAL,
+            },
+            // Note this is *not* "offline" either: interfaces configured outside
+            // a manager (bridges, static config, containers) can be routing
+            // perfectly well — the traffic card next door reads the kernel and
+            // will happily show them.
+            LinkSource::Unavailable => StatusView {
+                subtitle: "No link manager (systemd-networkd or NetworkManager)".to_string(),
+                pill: UNKNOWN_PILL,
+                pill_class: PILL_NEUTRAL,
+            },
+        };
+    };
+
+    let routable = link.operational == OperationalState::Routable;
+    StatusView {
+        subtitle: match link.operational {
+            OperationalState::Routable => format!("Online via {}", link.name),
+            OperationalState::Carrier | OperationalState::DegradedCarrier => {
+                format!("Limited connectivity via {}", link.name)
+            }
+            other => format!("{} via {}", describe_state(other), link.name),
+        },
+        pill: if routable { "Online" } else { "Offline" },
+        pill_class: if routable {
+            PILL_CONNECTED
+        } else {
+            PILL_NEUTRAL
+        },
+    }
+}
+
+/// Whether the "No connection" placeholder row belongs on screen.
+///
+/// Only when a manager actually told us there is no primary link. With nothing
+/// answering, the Status row already says so honestly and this row would just
+/// restate the falsehood in bigger letters ("No connection / No primary network
+/// link").
+fn shows_no_connection(primary: Option<&Link>, source: LinkSource) -> bool {
+    primary.is_none() && source.is_answering()
+}
+
+/// Subtitle for the "All links" expander.
+///
+/// A count we obtained is always reportable, however stale. A count of **zero**
+/// with nothing answering is not a count at all — it is the absence of an
+/// answer, and "0 interface(s)" would make a claim about the host out of it.
+fn all_links_subtitle(count: usize, source: LinkSource) -> String {
+    if count == 0 && !source.is_answering() {
+        UNKNOWN_PILL.to_string()
+    } else {
+        format!("{count} interface(s)")
+    }
 }
 
 fn build_primary_expander() -> adw::ExpanderRow {
@@ -194,7 +287,10 @@ fn build_no_connection_placeholder_row() -> adw::ActionRow {
         .build();
     row.set_subtitle("No primary network link");
     bind(
-        networkd::primary().map(|p| p.is_none()),
+        map_ref! {
+            let primary = networkd::primary(),
+            let source = networkd::link_source() => shows_no_connection(primary.as_ref(), *source)
+        },
         &row,
         gtk::prelude::WidgetExt::set_visible,
     );
@@ -226,10 +322,12 @@ struct LinkRow {
 fn build_all_links_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("All links").build();
     bind(
-        networkd::links().map(|ls| {
-            let count = ls.iter().filter(|l| l.name != "lo").count();
-            format!("{count} interface(s)")
-        }),
+        map_ref! {
+            let links = networkd::links(),
+            let source = networkd::link_source() => {
+                all_links_subtitle(links.iter().filter(|l| l.name != "lo").count(), *source)
+            }
+        },
         &expander,
         |w, sub| w.set_subtitle(&sub),
     );
@@ -372,8 +470,8 @@ fn update_link_row(row: &LinkRow, link: &Link) {
     row.pill.set_text(state_pill_text(link.operational));
     // Reset to the two pill variants and re-apply the current one so the class
     // set doesn't accumulate across state changes.
-    row.pill.remove_css_class("ts-pill-connected");
-    row.pill.remove_css_class("ts-pill-known");
+    row.pill.remove_css_class(PILL_CONNECTED);
+    row.pill.remove_css_class(PILL_NEUTRAL);
     row.pill.add_css_class(state_pill_class(link.operational));
 
     let values = link_detail_values(link);
@@ -398,8 +496,8 @@ fn state_pill_text(state: OperationalState) -> &'static str {
 
 fn state_pill_class(state: OperationalState) -> &'static str {
     match state {
-        OperationalState::Routable => "ts-pill-connected",
-        _ => "ts-pill-known",
+        OperationalState::Routable => PILL_CONNECTED,
+        _ => PILL_NEUTRAL,
     }
 }
 
@@ -447,5 +545,155 @@ fn describe_state(s: OperationalState) -> &'static str {
         OperationalState::Off => "off",
         OperationalState::Missing => "missing",
         OperationalState::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LinkSource, PILL_CONNECTED, PILL_NEUTRAL, UNKNOWN_PILL, all_links_subtitle,
+        shows_no_connection, status_view,
+    };
+    use hytte::services::networkd::{Link, OperationalState};
+
+    fn link(name: &str, operational: OperationalState) -> Link {
+        Link {
+            name: name.to_string(),
+            operational,
+            ..Link::default()
+        }
+    }
+
+    /// The states in which the card may legitimately say "Offline".
+    const ANSWERED: [LinkSource; 2] = [LinkSource::Networkd, LinkSource::NetworkManager];
+    /// The states in which it may not — #608's whole subject.
+    const UNANSWERED: [LinkSource; 2] = [LinkSource::Unknown, LinkSource::Unavailable];
+
+    #[test]
+    fn a_manager_that_reports_no_primary_link_is_still_offline() {
+        // The behaviour that must survive the fix: on a host whose link manager
+        // answers, "no primary link" is a fact and "Offline" is the right word.
+        for source in ANSWERED {
+            let view = status_view(None, source);
+            assert_eq!(view.pill, "Offline", "{source:?}");
+            assert_eq!(view.subtitle, "Offline", "{source:?}");
+            assert_eq!(view.pill_class, PILL_NEUTRAL, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_with_nothing_to_ask_is_never_called_offline() {
+        // The bug: `None` meant both "no routable link" and "no link manager",
+        // and the panel rendered the second as the first.
+        for source in UNANSWERED {
+            let view = status_view(None, source);
+            assert_eq!(view.pill, UNKNOWN_PILL, "{source:?}");
+            assert_eq!(view.pill_class, PILL_NEUTRAL, "{source:?}");
+            assert!(
+                !view.subtitle.contains("Offline"),
+                "{source:?} must not assert offline: {:?}",
+                view.subtitle
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_unanswered_states_are_told_apart_for_the_user() {
+        // Both are "we don't know", but why differs, and the difference is
+        // actionable: one is transient, the other is how this host is built.
+        let waiting = status_view(None, LinkSource::Unknown);
+        let absent = status_view(None, LinkSource::Unavailable);
+        assert_ne!(waiting.subtitle, absent.subtitle);
+        assert!(absent.subtitle.contains("No link manager"));
+    }
+
+    #[test]
+    fn a_routable_link_still_reads_online() {
+        let view = status_view(
+            Some(&link("wlp1s0", OperationalState::Routable)),
+            LinkSource::Networkd,
+        );
+        assert_eq!(view.pill, "Online");
+        assert_eq!(view.pill_class, PILL_CONNECTED);
+        assert_eq!(view.subtitle, "Online via wlp1s0");
+    }
+
+    #[test]
+    fn a_link_we_read_stands_even_after_the_source_goes_quiet() {
+        // Only *absences* need a source to vouch for them. A link we actually saw
+        // is a positive observation; a source that has stopped answering (or was
+        // never confirmed) does not retract it, it just stops adding to it.
+        for source in [LinkSource::Unknown, LinkSource::Unavailable] {
+            let view = status_view(Some(&link("hive-br0", OperationalState::Routable)), source);
+            assert_eq!(view.subtitle, "Online via hive-br0", "{source:?}");
+            assert_eq!(view.pill, "Online", "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_routable_primary_keeps_its_descriptive_subtitle() {
+        let view = status_view(
+            Some(&link("eth0", OperationalState::Carrier)),
+            LinkSource::Networkd,
+        );
+        assert_eq!(view.subtitle, "Limited connectivity via eth0");
+        assert_eq!(view.pill_class, PILL_NEUTRAL);
+    }
+
+    #[test]
+    fn zero_interfaces_is_only_claimed_when_something_answered() {
+        for source in ANSWERED {
+            assert_eq!(
+                all_links_subtitle(0, source),
+                "0 interface(s)",
+                "{source:?}"
+            );
+        }
+        for source in UNANSWERED {
+            assert_eq!(
+                all_links_subtitle(0, source),
+                UNKNOWN_PILL,
+                "{source:?} has no basis for a count of zero"
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_we_obtained_is_reported_whatever_the_source_says_now() {
+        // Six interfaces on screen under "0 interface(s)" was #607's screenshot.
+        // A non-zero count came from somewhere, so it is never suppressed.
+        for source in [
+            LinkSource::Networkd,
+            LinkSource::NetworkManager,
+            LinkSource::Unknown,
+            LinkSource::Unavailable,
+        ] {
+            assert_eq!(
+                all_links_subtitle(6, source),
+                "6 interface(s)",
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_no_connection_placeholder_needs_a_source_to_vouch_for_it() {
+        for source in ANSWERED {
+            assert!(shows_no_connection(None, source), "{source:?}");
+        }
+        for source in UNANSWERED {
+            assert!(
+                !shows_no_connection(None, source),
+                "{source:?} would restate the falsehood the Status row just avoided"
+            );
+        }
+    }
+
+    #[test]
+    fn the_no_connection_placeholder_stays_hidden_while_a_link_is_up() {
+        let up = link("eth0", OperationalState::Routable);
+        for source in [LinkSource::Networkd, LinkSource::Unknown] {
+            assert!(!shows_no_connection(Some(&up), source), "{source:?}");
+        }
     }
 }

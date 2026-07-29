@@ -77,7 +77,7 @@ merge wave.
 ## Plugin host & protocol
 
 - [ ] **(#514)** Interactive consent overlay: run `hytte-infobroker auth
-    --agent claude` with no grant → a focus-grabbing card appears on niri's
+  --agent claude` with no grant → a focus-grabbing card appears on niri's
       **focused output** — _"⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩"_ with
       **Allow once / This session / Always / Deny**. **Always** persists to
       `grants.toml` (next `auth` is silent); **Deny** persists a standing no;

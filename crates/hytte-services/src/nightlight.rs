@@ -58,6 +58,15 @@
 //! one is still parked supersedes it, and the superseded task drops its result
 //! instead of applying it over the newer state (#594).
 //!
+//! Correct is not the same as bearable, though, and up to [`FIX_WAIT`] of
+//! nothing-happening is what provokes that second toggle in the first place. So
+//! the wait is also *announced*: the toggle is a tri-state
+//! ([`NightlightState`]) rather than a bool — `Off`, `On`, and `Resolving`,
+//! "you asked for this and we are parked on a location fix" — and the Appearance
+//! row spins and says so instead of sitting silent (#597). Only the branch that
+//! actually parks publishes `Resolving`, so a toggle with configured
+//! coordinates (or a warm fix) never flickers through it.
+//!
 //! The resolved coordinates reach `wlsunset` through
 //! `~/.config/trollshell/wlsunset.args` — one argument per line, read back by
 //! the unit's `ExecStart` — which is precisely how the Appearance picker hands
@@ -154,7 +163,12 @@ impl Generation {
 
 /// One `set_enabled` request's claim on the toggle. [`Ticket::is_current`] goes
 /// false as soon as a later request claims its own generation.
-#[derive(Debug)]
+///
+/// `Clone` hands out another handle to the **same** claim, not a new one —
+/// [`Generation::claim`] is the only thing that supersedes. That is what lets a
+/// single request keep one ticket for its own guards while lending another to
+/// the `on_wait` callback [`resolve_coords`] fires from deep inside the await.
+#[derive(Clone, Debug)]
 struct Ticket {
     generation: Generation,
     at: u64,
@@ -168,20 +182,103 @@ impl Ticket {
     }
 }
 
+// ── Toggle state ─────────────────────────────────────────────────────────────
+
+/// What the night-light toggle is doing right now.
+///
+/// Three states rather than a bool because the toggle genuinely has three: with
+/// no configured coordinates, turning it **on** parks on a location fix for up
+/// to [`FIX_WAIT`], and during that window the unit is not running but the user
+/// has already asked for it. Publishing `false` there would snap the switch
+/// back out from under their hand — #594's symptom, arrived at from the other
+/// direction — and publishing `true` would be a claim the UI has no way to
+/// qualify. So the wait gets a state of its own, and the row can show it (#597).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NightlightState {
+    /// The unit is stopped.
+    #[default]
+    Off,
+    /// A toggle-on is in flight, parked on a location fix. The unit is *not*
+    /// running yet; the switch reads on because that is what was requested.
+    Resolving,
+    /// The unit is active.
+    On,
+}
+
+impl NightlightState {
+    /// Whether a switch bound to this state should read "on".
+    ///
+    /// `Resolving` is **on**. The user has just flipped the switch and the
+    /// request is being honoured, so moving it back under them would be exactly
+    /// the "switch moves by itself" bug #594 was about. Callers that need "is
+    /// the daemon actually running" want to match the state instead.
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        matches!(self, Self::On | Self::Resolving)
+    }
+
+    /// Whether a toggle-on is parked on a location fix — the cue the Appearance
+    /// row's spinner and "waiting" subtitle hang off.
+    #[must_use]
+    pub fn is_resolving(self) -> bool {
+        matches!(self, Self::Resolving)
+    }
+
+    /// Map a `systemctl` `ActiveState == active` reading onto a state. Never
+    /// yields [`Self::Resolving`]: that is shell-side intent, not something the
+    /// unit can report.
+    fn from_unit_active(active: bool) -> Self {
+        if active { Self::On } else { Self::Off }
+    }
+}
+
+/// What an incoming toggle-**off** should publish immediately, before its
+/// `systemctl stop` has even been spawned.
+///
+/// Only a pending [`NightlightState::Resolving`] notice is retracted, and only
+/// because the shell put that notice up itself: the toggle-off has already
+/// superseded the parked start (it claimed a newer [`Ticket`]), so "waiting for
+/// a location fix" is false the instant it lands, and leaving it on screen for
+/// the length of a `systemctl` round-trip would be precisely the dishonest
+/// feedback #597 exists to remove. `On`/`Off` are the daemon's readings and stay
+/// its to publish — [`apply`] re-publishes the truth right behind this either
+/// way, so nothing here needs to guess at the outcome of the stop.
+fn retraction_for(current: NightlightState) -> Option<NightlightState> {
+    (current == NightlightState::Resolving).then_some(NightlightState::Off)
+}
+
+/// Publish `next` only if `ticket` is still the latest request; returns whether
+/// it did, so the caller can log the drop.
+///
+/// The rule from #594: a superseded task publishes *nothing*. The request that
+/// displaced it owns the signal, so a late write — even an accurate one — only
+/// trades one race for another.
+fn publish_if_current(
+    state: &Mutable<NightlightState>,
+    ticket: &Ticket,
+    next: NightlightState,
+) -> bool {
+    if !ticket.is_current() {
+        return false;
+    }
+    state.set(next);
+    true
+}
+
 // ── Service handle ───────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub struct NightlightHandles {
-    pub(crate) enabled: Mutable<bool>,
+    pub(crate) state: Mutable<NightlightState>,
     /// Supersession counter for in-flight [`set_enabled`] tasks — see
-    /// [`Generation`]. Cloned out on the GTK thread with `enabled` and moved
+    /// [`Generation`]. Cloned out on the GTK thread with `state` and moved
     /// into tokio, like every other handle here.
     generation: Generation,
 }
 
 /// Night-light service marker. Pass to `App::with` to register the service.
 ///
-/// `start()` seeds `enabled` from the unit's `ActiveState` on a blocking
+/// `start()` seeds `state` from the unit's `ActiveState` on a blocking
 /// thread; thereafter `set_enabled` updates it. No polling loop — see the
 /// module docs on the point-in-time read.
 pub struct NightlightService;
@@ -191,13 +288,13 @@ impl Service for NightlightService {
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NightlightHandles {
-            enabled: Mutable::new(false),
+            state: Mutable::new(NightlightState::Off),
             generation: Generation::default(),
         };
         // Seed the initial value off the GTK thread: a point-in-time read of the
         // unit's ActiveState. `Mutable` is `Send + Sync`, so the blocking task
         // writes back the result directly.
-        let writer = handles.enabled.clone();
+        let writer = handles.state.clone();
         rt.spawn_blocking(move || {
             writer.set(read_active_state());
         });
@@ -212,16 +309,29 @@ pub fn service() -> NightlightService {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Signal of whether the night-light unit is enabled (active). Seeded once at
-/// startup from `systemctl --user show -p ActiveState`; updated by
-/// [`set_enabled`] on every toggle attempt.
-pub fn enabled() -> impl Signal<Item = bool> {
+/// Signal of the night-light toggle's full state — see [`NightlightState`].
+///
+/// Seeded once at startup from `systemctl --user show -p ActiveState`; updated
+/// by [`set_enabled`] on every toggle attempt, including the intermediate
+/// [`NightlightState::Resolving`] a start publishes while it waits on a location
+/// fix. This is the accessor a widget that wants to *show* the wait binds to.
+pub fn state() -> impl Signal<Item = NightlightState> {
     registry::with(|r| {
         r.get::<NightlightHandles>()
             .expect("nightlight::service() not registered")
-            .enabled
+            .state
             .signal()
     })
+}
+
+/// Signal of whether the night-light toggle reads "on".
+///
+/// A projection of [`state`] through [`NightlightState::is_on`], so a start that
+/// is still resolving coordinates reports `true` — see that method for why.
+/// Kept for callers that only want the switch position; anything that needs to
+/// *distinguish* the pending case wants [`state`].
+pub fn enabled() -> impl Signal<Item = bool> {
+    state().map(NightlightState::is_on)
 }
 
 /// Toggle the night-light unit. Fire-and-forget.
@@ -238,9 +348,11 @@ pub fn enabled() -> impl Signal<Item = bool> {
 ///
 /// Every call claims a [`Generation`], so a toggle-on that is still parked on a
 /// location fix when the next toggle arrives is superseded and drops out
-/// without starting the unit or touching `enabled` (#594).
+/// without starting the unit or touching `state` (#594). A toggle-on that has
+/// to park first publishes [`NightlightState::Resolving`], so the row can say
+/// what it is waiting for instead of going silent (#597).
 ///
-/// The `enabled` signal is re-published afterwards even when the value does not
+/// The state signal is re-published afterwards even when the value does not
 /// change (`Mutable::set` notifies unconditionally): on success with the
 /// requested state, otherwise with the state the daemon is *actually* in,
 /// re-read from `ActiveState`. That re-publish is what makes the Appearance
@@ -250,9 +362,9 @@ pub fn enabled() -> impl Signal<Item = bool> {
 pub fn set_enabled(on: bool) {
     let handles = registry::with(|r| {
         r.get::<NightlightHandles>()
-            .map(|h| (h.enabled.clone(), h.generation.clone()))
+            .map(|h| (h.state.clone(), h.generation.clone()))
     });
-    let Some((enabled, generation)) = handles else {
+    let Some((state, generation)) = handles else {
         // Service not registered (test harness?) — nothing to toggle.
         tracing::warn!("nightlight: service not registered");
         return;
@@ -263,16 +375,42 @@ pub fn set_enabled(on: bool) {
     let ticket = generation.claim();
 
     if !on {
-        // Deliberately unguarded: the stop is immediate, so it cannot act on
-        // stale intent the way a parked start can. Skipping it when superseded
-        // would be worse — a later toggle-on that fails to resolve coordinates
-        // would leave the unit running under a switch reading "off".
-        runtime::handle().spawn_blocking(move || apply(&enabled, false));
+        // Retract a pending notice the shell put up itself — the claim above
+        // has already superseded whatever was parked, so the "waiting for a
+        // location fix" row is false as of this line. See `retraction_for` for
+        // why only that state, and never an optimistic `Off` over `On`.
+        if let Some(retracted) = retraction_for(state.get()) {
+            tracing::debug!("nightlight: toggle-off retracts the pending coordinate wait");
+            state.set(retracted);
+        }
+        // The stop itself is deliberately unguarded: it is immediate, so it
+        // cannot act on stale intent the way a parked start can. Skipping it
+        // when superseded would be worse — a later toggle-on that fails to
+        // resolve coordinates would leave the unit running under a switch
+        // reading "off".
+        runtime::handle().spawn_blocking(move || apply(&state, false));
         return;
     }
 
     runtime::handle().spawn(async move {
-        let Some(coords) = resolve_coords().await else {
+        // Fired by `resolve_coords` only from the branch that actually parks on
+        // a location fix, so the configured-coordinates and warm-fix paths never
+        // flicker through `Resolving` on their way to `On`. Guarded like every
+        // other publish: a request the user has already overruled announces
+        // nothing.
+        let announce_wait = {
+            let state = state.clone();
+            let ticket = ticket.clone();
+            move || {
+                if publish_if_current(&state, &ticket, NightlightState::Resolving) {
+                    tracing::debug!(
+                        secs = FIX_WAIT.as_secs(),
+                        "nightlight: parked on a location fix; publishing Resolving"
+                    );
+                }
+            }
+        };
+        let Some(coords) = resolve_coords(announce_wait).await else {
             if !ticket.is_current() {
                 tracing::debug!("nightlight: coordinate wait superseded; publishing nothing");
                 return;
@@ -282,7 +420,9 @@ pub fn set_enabled(on: bool) {
                  $TROLLSHELL_WEATHER_CITY), or set \
                  programs.trollshell.nightlight.{{latitude,longitude}}"
             );
-            enabled.set(false);
+            // Also clears any `Resolving` this request published: the switch
+            // snaps back, and the row stops claiming it is still waiting.
+            state.set(NightlightState::Off);
             return;
         };
         tracing::debug!(
@@ -302,15 +442,13 @@ pub fn set_enabled(on: bool) {
             if !config_file::write("nightlight", ARGS_FILE, &args_file_body(coords)) {
                 // No args file means the unit would start inert; don't lie —
                 // unless a newer request has taken over the signal meanwhile.
-                if ticket.is_current() {
-                    enabled.set(read_active_state());
-                }
+                publish_if_current(&state, &ticket, read_active_state());
                 return;
             }
             // Only that write separates this from the check above, but the unit
             // start is the irreversible half, so guard it in its own right.
             if ticket.is_current() {
-                apply(&enabled, true);
+                apply(&state, true);
             } else {
                 tracing::debug!("nightlight: toggle-on superseded before the unit start; dropping");
             }
@@ -350,17 +488,27 @@ impl Coords {
 /// Configured-first is also why a user who set coordinates never pays
 /// [`FIX_WAIT`]: `static_coords()` is a synchronous env read, so it returns
 /// before [`live_coords`] is ever awaited.
-async fn resolve_coords() -> Option<Coords> {
+///
+/// `on_wait` is called at most once, from the one branch that is about to block
+/// for real (see [`live_coords`]). Threading it down here rather than firing it
+/// at the call site is the whole point: only this code knows whether a given
+/// toggle will actually wait, and announcing a wait that never happens would put
+/// a spinner on screen for the few milliseconds a configured toggle takes.
+async fn resolve_coords<F: FnOnce()>(on_wait: F) -> Option<Coords> {
     if let Some(c) = static_coords() {
         return Some(c);
     }
-    live_coords().await
+    live_coords(on_wait).await
 }
 
 /// Coordinates from the live location fix, via the tokio-side `places` handle
 /// (`weather.rs`'s bridge). `None` when `places` isn't registered, the fix is
 /// unavailable, or the first fix hasn't landed within [`FIX_WAIT`].
-async fn live_coords() -> Option<Coords> {
+///
+/// `on_wait` fires immediately before the bounded await and nowhere else — a
+/// handle that is already `Resolved` or `Unavailable` answers synchronously, so
+/// there is nothing to announce.
+async fn live_coords<F: FnOnce()>(on_wait: F) -> Option<Coords> {
     let Some(location) = places::shared_location() else {
         tracing::debug!("nightlight: places not registered; no live fix");
         return None;
@@ -372,6 +520,8 @@ async fn live_coords() -> Option<Coords> {
         // deferral cited. Await it rather than guessing.
         LocationState::Resolving => {}
     }
+    // The only path that can cost the user real time. Say so before parking.
+    on_wait();
     if let Ok(coords) = tokio::time::timeout(FIX_WAIT, first_fix(&location)).await {
         coords
     } else {
@@ -454,9 +604,11 @@ fn args_file_body(coords: Coords) -> String {
 // ── Unit control ─────────────────────────────────────────────────────────────
 
 /// Start or stop the unit, then publish the resulting state: the requested one
-/// on success, else whatever `ActiveState` actually reports. Blocking — call
-/// from `spawn_blocking`.
-fn apply(enabled: &Mutable<bool>, on: bool) {
+/// on success, else whatever `ActiveState` actually reports. Either way the
+/// published value is terminal (`On`/`Off`), so this is also what clears a
+/// [`NightlightState::Resolving`] notice off the row. Blocking — call from
+/// `spawn_blocking`.
+fn apply(state: &Mutable<NightlightState>, on: bool) {
     let verb = if on { "start" } else { "stop" };
     let status = std::process::Command::new("systemctl")
         .args(["--user", verb, UNIT])
@@ -466,7 +618,7 @@ fn apply(enabled: &Mutable<bool>, on: bool) {
         .status();
     match status {
         Ok(s) if s.success() => {
-            enabled.set(on);
+            state.set(NightlightState::from_unit_active(on));
             return;
         }
         Ok(s) => tracing::warn!(
@@ -478,14 +630,15 @@ fn apply(enabled: &Mutable<bool>, on: bool) {
     }
     // The toggle didn't take — re-sync the signal to the daemon's truth so the
     // switch reflects reality instead of the request.
-    enabled.set(read_active_state());
+    state.set(read_active_state());
 }
 
-/// Read the unit's `ActiveState` via `systemctl --user show`. Returns `true`
-/// only when the value is exactly `active`; any other state (`inactive`,
-/// `failed`, `activating`, …), a non-zero exit, or a missing `systemctl` all
-/// map to `false`. A point-in-time read — see the module docs.
-fn read_active_state() -> bool {
+/// Read the unit's `ActiveState` via `systemctl --user show`. Yields
+/// [`NightlightState::On`] only when the value is exactly `active`; any other
+/// state (`inactive`, `failed`, `activating`, …), a non-zero exit, or a missing
+/// `systemctl` all map to [`NightlightState::Off`]. A point-in-time read — see
+/// the module docs.
+fn read_active_state() -> NightlightState {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "show", "-p", "ActiveState", "--value", UNIT])
         .stdin(Stdio::null())
@@ -493,20 +646,138 @@ fn read_active_state() -> bool {
         .output();
     match out {
         Ok(out) if out.status.success() => {
-            let state = String::from_utf8_lossy(&out.stdout);
-            state.trim() == "active"
+            let active = String::from_utf8_lossy(&out.stdout);
+            NightlightState::from_unit_active(active.trim() == "active")
         }
-        Ok(_) => false,
+        Ok(_) => NightlightState::Off,
         Err(e) => {
             tracing::debug!(error = %e, "nightlight: could not read ActiveState (assuming off)");
-            false
+            NightlightState::Off
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Coords, Generation, args_file_body, parse_coord};
+    use super::{
+        Coords, Generation, NightlightState, args_file_body, parse_coord, publish_if_current,
+        retraction_for,
+    };
+    use futures_signals::signal::Mutable;
+
+    // ── Pending state (#597) ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolving_reads_as_on_so_the_switch_never_moves_under_the_user() {
+        // The whole tri-state hinges on this mapping. `Resolving` reporting
+        // `false` would snap the switch back the instant the user flipped it —
+        // #594's symptom, reintroduced from the other direction.
+        assert!(NightlightState::Resolving.is_on());
+        assert!(NightlightState::On.is_on());
+        assert!(!NightlightState::Off.is_on());
+    }
+
+    #[test]
+    fn only_resolving_asks_the_row_for_a_pending_affordance() {
+        assert!(NightlightState::Resolving.is_resolving());
+        assert!(!NightlightState::On.is_resolving());
+        assert!(!NightlightState::Off.is_resolving());
+    }
+
+    #[test]
+    fn the_unit_can_never_report_the_pending_state() {
+        // `Resolving` is shell-side intent; `ActiveState` only ever means on or
+        // off, so the seed and every failure re-sync land on a terminal state.
+        assert_eq!(NightlightState::from_unit_active(true), NightlightState::On);
+        assert_eq!(
+            NightlightState::from_unit_active(false),
+            NightlightState::Off
+        );
+    }
+
+    #[test]
+    fn a_toggle_off_retracts_only_a_pending_notice() {
+        assert_eq!(
+            retraction_for(NightlightState::Resolving),
+            Some(NightlightState::Off),
+            "a pending wait the user just cancelled must come off the row at once"
+        );
+        assert_eq!(
+            retraction_for(NightlightState::On),
+            None,
+            "the daemon's reading is its own to publish; `apply` re-publishes it"
+        );
+        assert_eq!(retraction_for(NightlightState::Off), None);
+    }
+
+    #[test]
+    fn a_toggle_off_during_the_wait_still_supersedes_the_parked_start() {
+        // The #594 sequence, replayed over the #597 state shape through the
+        // real helpers: the pending affordance must not cost the user their
+        // ability to bail out, which is also why the row keeps the switch
+        // sensitive while `Resolving`.
+        let state = Mutable::new(NightlightState::Off);
+        let generation = Generation::default();
+
+        // Toggle on with no configured coordinates: claims, parks on a fix, and
+        // announces the wait.
+        let parked = generation.claim();
+        assert!(publish_if_current(
+            &state,
+            &parked,
+            NightlightState::Resolving
+        ));
+        assert_eq!(state.get(), NightlightState::Resolving);
+        assert!(
+            state.get().is_on(),
+            "the switch stays where the user put it while the fix resolves"
+        );
+
+        // User gives up and flips it back off. The claim supersedes the parked
+        // start; the retraction takes the "waiting" row down immediately.
+        let off = generation.claim();
+        assert_eq!(
+            retraction_for(state.get()),
+            Some(NightlightState::Off),
+            "the pending notice is retracted, not left to the systemctl round-trip"
+        );
+        state.set(NightlightState::Off);
+
+        // The fix finally lands. The parked start must publish nothing at all —
+        // not `On`, and not a `Resolving` it is no longer entitled to.
+        assert!(!publish_if_current(&state, &parked, NightlightState::On));
+        assert!(!publish_if_current(
+            &state,
+            &parked,
+            NightlightState::Resolving
+        ));
+        assert_eq!(
+            state.get(),
+            NightlightState::Off,
+            "the off must stand; this is exactly the #594 regression"
+        );
+        assert!(off.is_current());
+    }
+
+    #[test]
+    fn a_second_toggle_on_takes_over_the_pending_notice() {
+        // Off is not the only thing that can displace a parked start: a rapid
+        // on/off/on leaves the *newest* start owning the signal.
+        let state = Mutable::new(NightlightState::Off);
+        let generation = Generation::default();
+
+        let first = generation.claim();
+        assert!(publish_if_current(
+            &state,
+            &first,
+            NightlightState::Resolving
+        ));
+        let second = generation.claim();
+
+        assert!(!publish_if_current(&state, &first, NightlightState::On));
+        assert!(publish_if_current(&state, &second, NightlightState::On));
+        assert_eq!(state.get(), NightlightState::On);
+    }
 
     // ── Toggle supersession (#594) ───────────────────────────────────────────
     //

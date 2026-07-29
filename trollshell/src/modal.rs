@@ -69,9 +69,12 @@ struct BarGeometry {
     /// [`Monitor::size`]) each time the card is positioned — never snapshotted
     /// — so a resolution/mode switch (kanshi profile change) that resizes the
     /// output without a hot-plug doesn't leave the centering clamp stale (#442).
+    /// Since #600 it is the *fallback* for [`BarGeometry::main_extent`] rather
+    /// than its primary source; the liveness requirement is unchanged.
     monitor: Monitor,
-    /// The bar's layer-shell window, measured at open time for its real
-    /// thickness (height for Top/Bottom, width for Left/Right).
+    /// The bar's layer-shell window, measured live at open time for both its
+    /// real thickness (the perpendicular axis: height for Top/Bottom, width for
+    /// Left/Right) and its main-axis extent (see [`BarGeometry::main_extent`]).
     bar_window: gtk::Window,
 }
 
@@ -96,6 +99,48 @@ impl BarGeometry {
     /// positions along the X axis; false for vertical bars (Left/Right).
     fn horizontal(&self) -> bool {
         matches!(self.edge, Edge::Top | Edge::Bottom)
+    }
+
+    /// Extent of the strip the drawer centers within, along the bar's *main*
+    /// axis: the bar surface's live width (Top/Bottom) or height (Left/Right).
+    ///
+    /// Deliberately the **bar surface**, not the monitor (#600). The chip
+    /// coordinate that drives the centering math comes from [`trigger_center`],
+    /// which is a point *inside the bar's own layer surface* — so the extent it
+    /// is solved against has to be that same surface's, or the two spaces drift
+    /// apart the moment anything reserves an exclusive zone on the bar's
+    /// leading main-axis edge. The sidebar does exactly that (it commits
+    /// `exclusive_zone = SIDEBAR_WIDTH` while open, see `overlays::sidebar`),
+    /// and a bar anchored to *both* main-axis edges gets shifted **and**
+    /// narrowed by it — which put the drawer a sidebar's width to the left of
+    /// its chip. Reading the bar's live extent self-corrects for any surface
+    /// that reserves leading space, without `modal` knowing which one it is.
+    ///
+    /// Still a **live** read on every call, never a value snapshotted at
+    /// install: the bar is anchored to both main-axis edges, so the compositor
+    /// reconfigures it on a resolution/mode switch (kanshi profile change)
+    /// exactly as it does the monitor — #442's staleness fix survives. Falls
+    /// back to the live monitor size when the bar window has no allocation yet
+    /// (belt and braces: the bar maps at startup, long before any drawer opens,
+    /// which is the same assumption [`BarGeometry::thickness`] already makes).
+    ///
+    /// Known limitation: the card is laid out from the *screen's* trailing edge
+    /// (the drawer surface is fullscreen with `exclusive_zone(-1)`), so this
+    /// assumes nothing reserves space on the bar's **trailing** main-axis edge.
+    /// Nothing in trollshell does — the bar reserves on its own perpendicular
+    /// edge and the sidebar on the left — and Wayland gives a client no way to
+    /// learn its surface's absolute position, so the leading/trailing split of
+    /// `monitor - bar` is not recoverable. If a trailing-edge reserving surface
+    /// ever lands, the card would sit flush with the bar's trailing edge rather
+    /// than sliding under it.
+    fn main_extent(&self) -> i32 {
+        let (mon_w, mon_h) = self.monitor.size();
+        let (bar, monitor) = if self.horizontal() {
+            (self.bar_window.width(), mon_w)
+        } else {
+            (self.bar_window.height(), mon_h)
+        };
+        if bar > 0 { bar } else { monitor }
     }
 
     /// Chrome between the surface edge and the card on the side the drawer
@@ -1243,10 +1288,18 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
     });
 }
 
-/// The trigger chip's center along the bar's *main axis*, in screen
-/// coordinates: X for horizontal (Top/Bottom) bars, Y for vertical
-/// (Left/Right) bars. `None` if the chip isn't rooted yet (shouldn't happen
-/// for a mapped bar widget).
+/// The trigger chip's center along the bar's *main axis*, **relative to the
+/// bar's own layer surface** (the chip's root): X for horizontal (Top/Bottom)
+/// bars, Y for vertical (Left/Right) bars. `None` if the chip isn't rooted yet
+/// (shouldn't happen for a mapped bar widget).
+///
+/// This is *not* a screen coordinate, and the two only coincide while the bar
+/// surface starts at the screen origin. An exclusive zone on the bar's leading
+/// main-axis edge (an open sidebar) shifts the surface, and the doc comment
+/// here used to claim "screen coordinates" — which is what hid #600: the
+/// margin math solved this bar-relative point against the full monitor width.
+/// Whatever consumes this must pair it with [`BarGeometry::main_extent`], the
+/// extent of the same surface, never `monitor.size()`.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn trigger_center(panel: &ModalPanel, trigger: &gtk::Widget) -> Option<i32> {
     trigger.root().and_then(|root| {
@@ -1265,32 +1318,37 @@ fn trigger_center(panel: &ModalPanel, trigger: &gtk::Widget) -> Option<i32> {
 
 /// Main-axis margin (distance from the bar's trailing edge — screen right for
 /// horizontal bars, screen top for vertical) so the *visible card* (not the
-/// transparent surface) centers under `center` (a screen-coordinate point on
-/// the main axis).
+/// transparent surface) centers under `center` — the chip midpoint from
+/// [`trigger_center`], a point in the **bar surface's** coordinate space.
 ///
 /// The card is inset from the trailing surface edge by `chrome_main_end`
 /// (`.ts-modal` padding + `.ts-drawer` margin on that side), so the card's
-/// trailing edge sits at `screen_extent - main_margin - chrome_main_end` and
-/// its center at `screen_extent - main_margin - chrome_main_end -
+/// trailing edge sits at `main_extent - main_margin - chrome_main_end` and
+/// its center at `main_extent - main_margin - chrome_main_end -
 /// card_extent/2`. Solving `card_center == center`:
 ///
 /// ```text
-/// main_margin = screen_extent - center - chrome_main_end - card_extent/2
+/// main_margin = main_extent - center - chrome_main_end - card_extent/2
 /// ```
 ///
-/// where `screen_extent` is the monitor's live width (horizontal bars) or
-/// height (vertical), **re-read here** — never a value snapshotted at install —
-/// so a resolution/mode switch (kanshi profile change) that resizes the output
-/// without a hot-plug can't leave the clamp stale (#442). `card_extent` is the
-/// card's real allocated size on the main axis (its border box; CSS borders +
-/// padding included). Clamped to `[0, screen_extent - card_footprint]` so the
-/// card can't fall off either end — near the trailing/leading screen edge it
-/// collapses to flush.
+/// where `main_extent` is [`BarGeometry::main_extent`] — the bar surface's live
+/// main-axis size, i.e. the extent of the very space `center` is measured in.
+/// It used to be the monitor's size, which is #600: with an open sidebar
+/// reserving 320 px on the left, the bar surface starts at x=320 and a chip at
+/// screen x=420 reports `center = 100`, so solving against 1920 instead of 1600
+/// landed the card 320 px left of its chip. Both terms are **re-read here**,
+/// never snapshotted at install, so a resolution/mode switch (kanshi profile
+/// change) that resizes the output without a hot-plug can't leave the clamp
+/// stale (#442). `card_extent` is the card's real allocated size on the main
+/// axis (its border box; CSS borders + padding included). Clamped to
+/// `[0, main_extent - card_footprint]` so the card can't fall off either end —
+/// near the trailing/leading edge it collapses to flush.
 fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
     let geometry = &panel.geometry;
-    // Live monitor size, not a captured snapshot (#442).
-    let (mon_w, mon_h) = geometry.monitor.size();
-    let screen_extent = if geometry.horizontal() { mon_w } else { mon_h };
+    // Live bar-surface extent (monitor size as fallback), not a captured
+    // snapshot (#442) — and the bar's, not the monitor's, so it matches the
+    // space `center` was measured in (#600).
+    let main_extent = geometry.main_extent();
 
     // Card's real allocated main-axis size once mapped (its border box —
     // CSS borders + padding included). The eager call from `toggle` runs
@@ -1323,7 +1381,7 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
     let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH_WIDE));
 
     clamp_main_margin(
-        screen_extent,
+        main_extent,
         center,
         card_extent,
         geometry.chrome_main_start(),
@@ -1332,26 +1390,29 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
 }
 
 /// Pure clamp arithmetic behind [`main_margin_for_center`], split out so the
-/// on-screen centering math is unit-testable without a GTK surface. Given the
-/// live `screen_extent` (the monitor's main-axis size), the trigger `center`,
+/// centering math is unit-testable without a GTK surface. Given the live
+/// `main_extent` (the bar surface's main-axis size, see
+/// [`BarGeometry::main_extent`]), the trigger `center` *in that same space*,
 /// the measured `card_extent`, and the leading/trailing chrome, returns the
 /// main-axis margin that centers the card under `center`, clamped so the card
 /// never falls off either end.
 ///
-/// Isolating this makes the #442 staleness concrete: for a fixed
-/// center/card/chrome, a stale `screen_extent` (the old resolution) yields a
-/// different margin than the live one — which is exactly the misplacement a
-/// snapshotted size caused after a mode switch.
+/// Isolating this makes both failure modes concrete. #442: for a fixed
+/// center/card/chrome, a stale `main_extent` (the old resolution) yields a
+/// different margin than the live one — exactly the misplacement a snapshotted
+/// size caused after a mode switch. #600: feeding the *monitor's* extent while
+/// `center` is bar-surface-relative displaces the card by whatever an open
+/// sidebar reserves on the leading edge.
 fn clamp_main_margin(
-    screen_extent: i32,
+    main_extent: i32,
     center: i32,
     card_extent: i32,
     chrome_start: i32,
     chrome_end: i32,
 ) -> i32 {
     let card_footprint = card_extent + chrome_start + chrome_end;
-    let desired = screen_extent - center - chrome_end - card_extent / 2;
-    let max = (screen_extent - card_footprint).max(0);
+    let desired = main_extent - center - chrome_end - card_extent / 2;
+    let max = (main_extent - card_footprint).max(0);
     desired.clamp(0, max)
 }
 
@@ -1503,21 +1564,69 @@ mod tests {
         assert_eq!(clamp_main_margin(1920, 1920, 680, 20, 15), 0);
     }
 
-    /// The #442 crux: a stale `screen_extent` (the pre-mode-switch resolution)
+    /// The #442 crux: a stale `main_extent` (the pre-mode-switch resolution)
     /// yields a *different* margin than the live one for the same chip and card
     /// — which is exactly the misplacement a size snapshotted at install caused
-    /// after a kanshi mode switch. Re-reading the live monitor size fixes it.
+    /// after a kanshi mode switch. Re-reading it live on every call fixes it;
+    /// #600 only changed *which* live surface it is read from (the bar's, which
+    /// the compositor reconfigures on a mode switch just like the monitor),
+    /// never the liveness itself.
     #[test]
     fn clamp_main_margin_tracks_screen_extent() {
         // Same chip (center = 960) and card (680, chrome 20/15) on two screen
         // widths. The old (1920) and new (2560) resolutions place the card's
         // trailing margin differently — proving the value flows from the live
-        // `screen_extent`, so a stale one misplaces the card.
+        // `main_extent`, so a stale one misplaces the card.
         let at_1920 = clamp_main_margin(1920, 960, 680, 20, 15);
         let at_2560 = clamp_main_margin(2560, 960, 680, 20, 15);
         assert_ne!(at_1920, at_2560);
         // +640 wider screen shifts the margin from the trailing edge by +640.
         assert_eq!(at_2560 - at_1920, 640);
+    }
+
+    /// #600: with the sidebar open, `center` is measured inside a bar surface
+    /// that the 320 px leading exclusive zone has both shifted and narrowed.
+    /// Solving against the *bar's* extent keeps the card under the chip's real
+    /// screen position; solving against the monitor's (the old behaviour) puts
+    /// it a full sidebar width to the left.
+    #[test]
+    fn clamp_main_margin_accounts_for_leading_reservation() {
+        // 1920 monitor, sidebar reserving 320 on the left → the bar surface
+        // spans [320, 1920), 1600 wide. A chip at screen x = 960 therefore
+        // reports center = 640 from `trigger_center`.
+        const MONITOR: i32 = 1920;
+        const BAR: i32 = 1600;
+        const CHIP_SCREEN_X: i32 = 960;
+        const CENTER: i32 = CHIP_SCREEN_X - (MONITOR - BAR);
+        // The card is laid out from the *screen's* trailing edge (the drawer
+        // surface is fullscreen, `exclusive_zone(-1)`), so a margin `m` puts
+        // the card's center here:
+        let card_center = |m: i32| MONITOR - m - 15 - 680 / 2;
+
+        assert_eq!(
+            card_center(clamp_main_margin(BAR, CENTER, 680, 20, 15)),
+            CHIP_SCREEN_X
+        );
+        // Pre-fix: the monitor's extent against a bar-relative center.
+        assert_eq!(
+            card_center(clamp_main_margin(MONITOR, CENTER, 680, 20, 15)),
+            CHIP_SCREEN_X - 320
+        );
+    }
+
+    /// The sidebar-*closed* common case must not regress: with nothing
+    /// reserving leading space the bar surface spans the whole monitor, so
+    /// `main_extent` is the monitor extent and the card centers under the chip
+    /// for every position the clamp doesn't bite at.
+    #[test]
+    fn clamp_main_margin_centers_without_reservation() {
+        const MONITOR: i32 = 1920;
+        const MAX: i32 = MONITOR - (680 + 20 + 15);
+        for center in [400, 640, 960, 1200, 1500] {
+            let margin = clamp_main_margin(MONITOR, center, 680, 20, 15);
+            assert!(margin > 0 && margin < MAX, "clamp bit at center {center}");
+            assert_eq!(MONITOR - margin - 15 - 680 / 2, center);
+        }
     }
 
     /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every

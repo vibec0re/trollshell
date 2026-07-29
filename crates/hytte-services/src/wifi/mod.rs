@@ -153,13 +153,43 @@ pub struct WifiService;
 pub(super) const AGENT_PATH: &str = "/mov/vibec0re/trollshell/iwd_agent";
 const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 
+/// Probe which Wi-Fi backend this host runs, and pick the one to start.
+///
+/// The probe happens exactly once — `Service::start` spawns a *different*
+/// watcher per verdict, so whatever comes back here is latched for the process
+/// lifetime. That makes an **inconclusive** probe ([`crate::wifi_backend::ProbeError`])
+/// dangerous: before #607 it was indistinguishable from "the bus answered and
+/// no daemon is there", and quietly disabled Wi-Fi for the whole session.
+///
+/// We still have to start somewhere, and every non-inert arm commits to a
+/// specific daemon's D-Bus API, so an unknown verdict lands on
+/// [`BackendChoice::None`] — but it is logged at `error` as an *unknown*, never
+/// as a finding that the host has no wireless hardware.
+fn select_backend(rt: &tokio::runtime::Handle) -> BackendChoice {
+    match rt.block_on(crate::wifi_backend::probe_backend()) {
+        Ok(choice) => {
+            tracing::info!(?choice, "wifi: selected backend");
+            choice
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "wifi: backend probe was INCONCLUSIVE — the system bus could not be queried, \
+                 so it is unknown whether a Wi-Fi daemon is running. Starting inert; this is \
+                 NOT a finding that the host has no wireless hardware. The probe is \
+                 startup-only, so run `systemctl --user restart trollshell` once the bus is \
+                 up to re-probe (issue #607)."
+            );
+            BackendChoice::None
+        }
+    }
+}
+
 impl Service for WifiService {
     type Handles = WifiHandles;
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        // Probe which backend is available on this host.
-        let backend_choice = rt.block_on(crate::wifi_backend::probe_backend());
-        tracing::info!(?backend_choice, "wifi: selected backend");
+        let backend_choice = select_backend(rt);
 
         // Initialise the WAITERS map once so public API functions can reach it.
         let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
@@ -253,7 +283,9 @@ impl Service for WifiService {
                 )
             }
             BackendChoice::None => {
-                tracing::warn!("wifi: no Wi-Fi backend detected — service is inactive");
+                // Reached either because the bus positively reported no daemon,
+                // or because the probe was inconclusive (logged above).
+                tracing::warn!("wifi: no Wi-Fi backend selected — service is inactive");
                 (None, None, WifiBackend::None)
             }
         };

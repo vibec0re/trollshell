@@ -387,8 +387,10 @@ pub fn set_enabled(on: bool) {
         // cannot act on stale intent the way a parked start can. Skipping it
         // when superseded would be worse — a later toggle-on that fails to
         // resolve coordinates would leave the unit running under a switch
-        // reading "off".
-        runtime::handle().spawn_blocking(move || apply(&state, false));
+        // reading "off". Its *publish* is guarded all the same: the stop takes a
+        // systemctl round-trip, and a toggle-on landing inside that window has
+        // already put a `Resolving` up that this task must not overwrite.
+        runtime::handle().spawn_blocking(move || apply(&state, &ticket, false));
         return;
     }
 
@@ -448,7 +450,7 @@ pub fn set_enabled(on: bool) {
             // Only that write separates this from the check above, but the unit
             // start is the irreversible half, so guard it in its own right.
             if ticket.is_current() {
-                apply(&state, true);
+                apply(&state, &ticket, true);
             } else {
                 tracing::debug!("nightlight: toggle-on superseded before the unit start; dropping");
             }
@@ -608,7 +610,18 @@ fn args_file_body(coords: Coords) -> String {
 /// published value is terminal (`On`/`Off`), so this is also what clears a
 /// [`NightlightState::Resolving`] notice off the row. Blocking — call from
 /// `spawn_blocking`.
-fn apply(state: &Mutable<NightlightState>, on: bool) {
+///
+/// The `systemctl` call is unconditional — see the toggle-off branch of
+/// [`set_enabled`] for why a stop must run even when superseded — but the
+/// **publish** is ticket-guarded, because those are two different questions.
+/// "Should this stop happen?" is always yes; "does this task still own the
+/// signal?" is not. A `systemctl` round-trip is long enough for the next toggle
+/// to land inside it, and once a wait is *visible* (#597) there is finally
+/// something for a late write to clobber: without the guard, a superseded stop
+/// publishing `Off` over the `Resolving` a newer toggle-on just put up snaps the
+/// switch back under the user's hand — #594's exact symptom, on the one path
+/// #595 deliberately left unguarded when `Resolving` did not yet exist.
+fn apply(state: &Mutable<NightlightState>, ticket: &Ticket, on: bool) {
     let verb = if on { "start" } else { "stop" };
     let status = std::process::Command::new("systemctl")
         .args(["--user", verb, UNIT])
@@ -616,21 +629,29 @@ fn apply(state: &Mutable<NightlightState>, on: bool) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    match status {
-        Ok(s) if s.success() => {
-            state.set(NightlightState::from_unit_active(on));
-            return;
+    let outcome = match status {
+        Ok(s) if s.success() => NightlightState::from_unit_active(on),
+        Ok(s) => {
+            tracing::warn!(
+                ?s,
+                verb,
+                "nightlight: systemctl --user {verb} {UNIT} exited non-zero"
+            );
+            // The toggle didn't take — re-sync the signal to the daemon's truth
+            // so the switch reflects reality instead of the request.
+            read_active_state()
         }
-        Ok(s) => tracing::warn!(
-            ?s,
+        Err(e) => {
+            tracing::warn!(error = %e, verb, "nightlight: failed to spawn systemctl");
+            read_active_state()
+        }
+    };
+    if !publish_if_current(state, ticket, outcome) {
+        tracing::debug!(
             verb,
-            "nightlight: systemctl --user {verb} {UNIT} exited non-zero"
-        ),
-        Err(e) => tracing::warn!(error = %e, verb, "nightlight: failed to spawn systemctl"),
+            "nightlight: unit {verb} superseded before its result landed; publishing nothing"
+        );
     }
-    // The toggle didn't take — re-sync the signal to the daemon's truth so the
-    // switch reflects reality instead of the request.
-    state.set(read_active_state());
 }
 
 /// Read the unit's `ActiveState` via `systemctl --user show`. Yields
@@ -757,6 +778,46 @@ mod tests {
             "the off must stand; this is exactly the #594 regression"
         );
         assert!(off.is_current());
+    }
+
+    #[test]
+    fn a_superseded_stop_cannot_publish_over_a_newer_pending_notice() {
+        // The window the tri-state opened up, and the reason `apply` publishes
+        // through `publish_if_current` rather than writing straight to the
+        // signal. A toggle-off spawns its `systemctl stop` and *then* blocks for
+        // the round-trip; a toggle-on landing inside that window puts up a
+        // `Resolving` the stop knows nothing about. Before the guard, the stop's
+        // `Off` landed last and snapped the switch back mid-wait — #594's
+        // symptom on the one path #595 could safely leave unguarded when `Off`
+        // over `Off` was the worst that could happen.
+        let state = Mutable::new(NightlightState::On);
+        let generation = Generation::default();
+
+        // Toggle off: claims, retracts nothing (state is `On`), spawns the stop.
+        let stopping = generation.claim();
+        assert_eq!(retraction_for(state.get()), None);
+
+        // Toggle on lands while that stop is still inside systemctl, and parks.
+        let restarting = generation.claim();
+        assert!(publish_if_current(
+            &state,
+            &restarting,
+            NightlightState::Resolving
+        ));
+
+        // The stop now returns. Its result is accurate — the unit really is
+        // stopped — but it no longer owns the signal, so it must stay quiet.
+        assert!(
+            !publish_if_current(&state, &stopping, NightlightState::Off),
+            "a superseded stop publishes nothing, however true its reading"
+        );
+        assert_eq!(
+            state.get(),
+            NightlightState::Resolving,
+            "the newer toggle-on keeps its pending notice; the switch does not move"
+        );
+        assert!(state.get().is_on());
+        assert!(restarting.is_current());
     }
 
     #[test]

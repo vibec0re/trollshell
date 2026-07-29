@@ -142,8 +142,13 @@ pub(crate) enum LinkBackend {
 /// `NetworkManager`-managed host `ListLinks` either errors (`ServiceUnknown`)
 /// or returns an empty list, in which case we fall through to `NetworkManager` if
 /// the `org.freedesktop.NetworkManager` bus name is present (mirroring
-/// [`crate::wifi_backend::probe_backend`]). When neither is available we return
-/// [`LinkBackend::None`] and the service stays inert.
+/// [`crate::wifi_backend::probe_backend`]). When the bus confirms neither is
+/// available we return [`LinkBackend::None`] and the service stays inert.
+///
+/// A probe that *fails* is not the same as one reporting no `NetworkManager`
+/// (#607): the selection is made once and never revisited, so an inconclusive
+/// probe falls back to whichever source can still recover on its own rather
+/// than to [`LinkBackend::None`], which would latch an empty link list.
 async fn probe_link_backend() -> LinkBackend {
     // Does networkd have any links to show? `read_networkd_links` errors when
     // the network1 name isn't on the bus; an Ok-but-empty result means networkd
@@ -161,16 +166,43 @@ async fn probe_link_backend() -> LinkBackend {
         }
     };
 
-    if crate::wifi_backend::probe_backend().await == BackendChoice::NetworkManager {
-        LinkBackend::NetworkManager
-    } else if networkd_has_links {
-        // networkd answered (just with no links yet) and NM isn't present —
-        // keep networkd as the source so its listen loop's periodic refresh
-        // picks up interfaces as they enrol.
-        LinkBackend::Networkd
-    } else {
-        // Neither networkd nor NetworkManager is usable.
-        LinkBackend::None
+    match crate::wifi_backend::probe_backend().await {
+        Ok(BackendChoice::NetworkManager) => LinkBackend::NetworkManager,
+        Ok(_) if networkd_has_links => {
+            // networkd answered (just with no links yet) and NM isn't present —
+            // keep networkd as the source so its listen loop's periodic refresh
+            // picks up interfaces as they enrol.
+            LinkBackend::Networkd
+        }
+        // The bus answered: neither networkd nor NetworkManager is usable.
+        Ok(_) => LinkBackend::None,
+        Err(e) if networkd_has_links => {
+            // Inconclusive probe (#607) — we do NOT know that NM is absent, so
+            // we must not read the failure as a negative. networkd at least
+            // answered, and its listen loop re-polls, so prefer it.
+            tracing::warn!(
+                error = %e,
+                "networkd: NetworkManager probe was inconclusive; keeping networkd as the \
+                 link source since it answered"
+            );
+            LinkBackend::Networkd
+        }
+        Err(e) => {
+            // Neither source has been ruled in *or out*. Picking `None` here is
+            // what latched #607: it leaves the link list permanently empty even
+            // once the bus recovers. The NM watcher re-polls every 5s, so it
+            // self-heals if NM does turn up; the cost if NM genuinely never
+            // appears is a periodic `GetDevices failed` warn, which beats an
+            // inert service.
+            tracing::error!(
+                error = %e,
+                "networkd: NetworkManager probe was INCONCLUSIVE and networkd is unreachable \
+                 — this is not evidence that NetworkManager is absent. Sourcing links from \
+                 NetworkManager anyway; its watcher re-polls and will recover if the bus \
+                 comes back (issue #607)."
+            );
+            LinkBackend::NetworkManager
+        }
     }
 }
 

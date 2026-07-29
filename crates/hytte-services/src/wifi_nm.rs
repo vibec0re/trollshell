@@ -1494,15 +1494,25 @@ pub struct ProbeSnapshot {
 ///
 /// # Errors
 ///
-/// Returns a string describing the failure if NM is unreachable or no
-/// Wi-Fi device is found.
+/// Returns a string describing the failure if NM is unreachable, if the
+/// backend probe could not be completed at all, or if no Wi-Fi device is
+/// found. The first two are reported distinctly (#607).
 pub async fn probe_snapshot() -> Result<ProbeSnapshot, String> {
     use crate::wifi_backend::{BackendChoice, probe_backend};
 
-    // Verify NM is the chosen backend on the bus.
-    let backend = probe_backend().await;
-    if backend != BackendChoice::NetworkManager {
-        return Err(format!("backend is not NetworkManager: {backend:?}"));
+    // Verify NM is the chosen backend on the bus. A failed probe is reported
+    // distinctly from a probe that answered "not NM" (#607) — as a diagnostic
+    // this is where the difference between "NM is genuinely absent" and "the
+    // bus could not be asked" most needs to be visible.
+    match probe_backend().await {
+        Ok(BackendChoice::NetworkManager) => {}
+        Ok(other) => return Err(format!("backend is not NetworkManager: {other:?}")),
+        Err(e) => {
+            return Err(format!(
+                "Wi-Fi backend probe was inconclusive, so NetworkManager's absence is \
+                 unproven: {e}"
+            ));
+        }
     }
 
     // Find the Wi-Fi device.

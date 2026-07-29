@@ -53,6 +53,11 @@
 //! still in flight, and we simply *await* it (bounded by [`FIX_WAIT`], so a
 //! wedged `GeoClue` degrades to step 2 rather than hanging the toggle).
 //!
+//! That await can outlast the user's patience, so every toggle is
+//! generation-stamped ([`Generation`]): a request that arrives while an earlier
+//! one is still parked supersedes it, and the superseded task drops its result
+//! instead of applying it over the newer state (#594).
+//!
 //! The resolved coordinates reach `wlsunset` through
 //! `~/.config/trollshell/wlsunset.args` — one argument per line, read back by
 //! the unit's `ExecStart` — which is precisely how the Appearance picker hands
@@ -80,6 +85,8 @@ use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt as _;
 use hytte_reactive::{Service, registry, runtime};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// The user unit the shell toggles. Its `ExecStart` (declared in the
@@ -108,11 +115,68 @@ const LON_ENV: &str = "TROLLSHELL_NIGHTLIGHT_LONGITUDE";
 /// the static coordinates.
 const FIX_WAIT: Duration = Duration::from_secs(10);
 
+// ── Toggle supersession ──────────────────────────────────────────────────────
+
+/// Monotonic counter naming the most recent [`set_enabled`] request.
+///
+/// Turning night light **on** is not instantaneous: with no configured
+/// coordinates it awaits a location fix for up to [`FIX_WAIT`] before doing
+/// anything observable — which is exactly long enough for a user who sees
+/// nothing happen to flip the switch back off. Unguarded, that off would
+/// complete and then be silently undone: the still-parked task would start the
+/// unit and re-publish `enabled = true`, warming the screen and moving the
+/// switch by itself (#594).
+///
+/// So every `set_enabled` claims the next generation, and a task that had to
+/// await re-checks its [`Ticket`] before touching anything. A newer request
+/// owns both the unit and the `enabled` signal from the moment it claims, so a
+/// superseded task's only correct move is to drop its result *entirely* —
+/// including the failure re-publish, which would otherwise stamp a stale
+/// reading over the newer state and turn one race into another.
+///
+/// A counter rather than a cancellation token: the only thing a late task needs
+/// to know is "am I still the latest?", and that is one atomic load.
+#[derive(Clone, Debug, Default)]
+struct Generation(Arc<AtomicU64>);
+
+impl Generation {
+    /// Supersede every outstanding [`Ticket`] and return one for this request.
+    ///
+    /// Starts at 1, so a fresh counter (0) matches no ticket. `u64` at
+    /// human toggle rates never wraps.
+    fn claim(&self) -> Ticket {
+        Ticket {
+            at: self.0.fetch_add(1, Ordering::SeqCst) + 1,
+            generation: self.clone(),
+        }
+    }
+}
+
+/// One `set_enabled` request's claim on the toggle. [`Ticket::is_current`] goes
+/// false as soon as a later request claims its own generation.
+#[derive(Debug)]
+struct Ticket {
+    generation: Generation,
+    at: u64,
+}
+
+impl Ticket {
+    /// Whether this request is still the latest — i.e. whether it may act.
+    /// Cheap and non-consuming, so a task can re-check as late as it likes.
+    fn is_current(&self) -> bool {
+        self.generation.0.load(Ordering::SeqCst) == self.at
+    }
+}
+
 // ── Service handle ───────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub struct NightlightHandles {
     pub(crate) enabled: Mutable<bool>,
+    /// Supersession counter for in-flight [`set_enabled`] tasks — see
+    /// [`Generation`]. Cloned out on the GTK thread with `enabled` and moved
+    /// into tokio, like every other handle here.
+    generation: Generation,
 }
 
 /// Night-light service marker. Pass to `App::with` to register the service.
@@ -128,6 +192,7 @@ impl Service for NightlightService {
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NightlightHandles {
             enabled: Mutable::new(false),
+            generation: Generation::default(),
         };
         // Seed the initial value off the GTK thread: a point-in-time read of the
         // unit's ActiveState. `Mutable` is `Send + Sync`, so the blocking task
@@ -171,27 +236,47 @@ pub fn enabled() -> impl Signal<Item = bool> {
 ///
 /// Turning it **off** is an unconditional `systemctl --user stop`.
 ///
-/// The `enabled` signal is always re-published afterwards, even when the value
-/// does not change (`Mutable::set` notifies unconditionally): on success with
-/// the requested state, otherwise with the state the daemon is *actually* in,
+/// Every call claims a [`Generation`], so a toggle-on that is still parked on a
+/// location fix when the next toggle arrives is superseded and drops out
+/// without starting the unit or touching `enabled` (#594).
+///
+/// The `enabled` signal is re-published afterwards even when the value does not
+/// change (`Mutable::set` notifies unconditionally): on success with the
+/// requested state, otherwise with the state the daemon is *actually* in,
 /// re-read from `ActiveState`. That re-publish is what makes the Appearance
 /// drawer's switch snap back when a toggle could not be honoured, instead of
-/// leaving the widget showing "on" over a stopped daemon.
+/// leaving the widget showing "on" over a stopped daemon. A *superseded* task
+/// publishes nothing at all: the request that displaced it is authoritative.
 pub fn set_enabled(on: bool) {
-    let enabled = registry::with(|r| r.get::<NightlightHandles>().map(|h| h.enabled.clone()));
-    let Some(enabled) = enabled else {
+    let handles = registry::with(|r| {
+        r.get::<NightlightHandles>()
+            .map(|h| (h.enabled.clone(), h.generation.clone()))
+    });
+    let Some((enabled, generation)) = handles else {
         // Service not registered (test harness?) — nothing to toggle.
         tracing::warn!("nightlight: service not registered");
         return;
     };
+    // Claim before branching, on the calling (GTK) thread: from here on this
+    // request owns the unit and the signal, and any task still parked in
+    // `resolve_coords` is superseded.
+    let ticket = generation.claim();
 
     if !on {
+        // Deliberately unguarded: the stop is immediate, so it cannot act on
+        // stale intent the way a parked start can. Skipping it when superseded
+        // would be worse — a later toggle-on that fails to resolve coordinates
+        // would leave the unit running under a switch reading "off".
         runtime::handle().spawn_blocking(move || apply(&enabled, false));
         return;
     }
 
     runtime::handle().spawn(async move {
         let Some(coords) = resolve_coords().await else {
+            if !ticket.is_current() {
+                tracing::debug!("nightlight: coordinate wait superseded; publishing nothing");
+                return;
+            }
             tracing::warn!(
                 "nightlight: no coordinates — {UNIT} not started. Enable GeoClue2 (or set \
                  $TROLLSHELL_WEATHER_CITY), or set \
@@ -207,11 +292,27 @@ pub fn set_enabled(on: bool) {
             "nightlight: resolved coordinates"
         );
         let join = tokio::task::spawn_blocking(move || {
-            if config_file::write("nightlight", ARGS_FILE, &args_file_body(coords)) {
+            // Re-check on the blocking thread, not before the spawn: the later
+            // the check, the narrower the window. Dropping out here also skips
+            // an args-file write nobody will read.
+            if !ticket.is_current() {
+                tracing::debug!("nightlight: toggle-on superseded before the args write; dropping");
+                return;
+            }
+            if !config_file::write("nightlight", ARGS_FILE, &args_file_body(coords)) {
+                // No args file means the unit would start inert; don't lie —
+                // unless a newer request has taken over the signal meanwhile.
+                if ticket.is_current() {
+                    enabled.set(read_active_state());
+                }
+                return;
+            }
+            // Only that write separates this from the check above, but the unit
+            // start is the irreversible half, so guard it in its own right.
+            if ticket.is_current() {
                 apply(&enabled, true);
             } else {
-                // No args file means the unit would start inert; don't lie.
-                enabled.set(read_active_state());
+                tracing::debug!("nightlight: toggle-on superseded before the unit start; dropping");
             }
         })
         .await;
@@ -405,7 +506,62 @@ fn read_active_state() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Coords, args_file_body, parse_coord};
+    use super::{Coords, Generation, args_file_body, parse_coord};
+
+    // ── Toggle supersession (#594) ───────────────────────────────────────────
+    //
+    // These cover the guard's *decision* only. The two things that make the bug
+    // reachable — the up-to-FIX_WAIT real-time park on a location fix, and the
+    // `systemctl --user start|stop` it races — are untestable in CI (one is a
+    // 10 s wall-clock wait, the other needs a live user manager), so they are
+    // verified by hand; see the PR's live-verify notes.
+
+    #[test]
+    fn a_ticket_with_no_intervening_request_is_current() {
+        let counter = Generation::default();
+        let ticket = counter.claim();
+        assert!(ticket.is_current());
+        // Non-consuming: the real path re-checks more than once per request.
+        assert!(ticket.is_current());
+    }
+
+    #[test]
+    fn one_intervening_request_supersedes_the_pending_ticket() {
+        let counter = Generation::default();
+        let parked = counter.claim(); // toggle-on, awaiting a location fix
+        let off = counter.claim(); // user gives up and flips it back off
+        assert!(
+            !parked.is_current(),
+            "the parked toggle-on must drop its result instead of applying it"
+        );
+        assert!(off.is_current(), "the newest request stays authoritative");
+    }
+
+    #[test]
+    fn repeated_toggles_leave_only_the_last_ticket_current() {
+        let counter = Generation::default();
+        let tickets: Vec<_> = (0..5).map(|_| counter.claim()).collect();
+        let (last, earlier) = tickets.split_last().expect("five tickets claimed");
+        assert!(last.is_current());
+        assert!(
+            earlier.iter().all(|t| !t.is_current()),
+            "every superseded toggle must stay dropped, not just the first"
+        );
+        // And the winner loses the moment a sixth request lands.
+        let newest = counter.claim();
+        assert!(!last.is_current());
+        assert!(newest.is_current());
+    }
+
+    #[test]
+    fn a_ticket_is_only_compared_against_its_own_counter() {
+        let a = Generation::default();
+        let b = Generation::default();
+        let ta = a.claim();
+        let tb = b.claim();
+        assert!(ta.is_current());
+        assert!(tb.is_current());
+    }
 
     #[test]
     fn parses_plain_and_padded_coordinates() {

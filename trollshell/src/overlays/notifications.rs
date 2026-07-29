@@ -30,6 +30,15 @@
 //! click. Critical-urgency toasts always render individually and don't
 //! count toward the cap. The notifications service itself does not
 //! queue; it tracks the live set, so the cap is consumer-side only.
+//!
+//! # Card lifetime
+//!
+//! A mounted card is reused across emissions unless the notification it
+//! renders actually changed ([`card_content_eq`]), and a card that must be
+//! swapped carries its hover hold to the replacement ([`replace_card`]).
+//! Both exist because destroying a card releases the hover-pause hold
+//! [`attach_hover_pause`] took, and a pointer that never moves generates no
+//! crossing event to take it again (#593).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -39,7 +48,7 @@ use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::dnd;
-use hytte::services::notifications::{self, Notification, NotificationImage, Urgency};
+use hytte::services::notifications::{self, Action, Notification, NotificationImage, Urgency};
 use hytte::services::notifications_mute;
 use hytte::ui::{Anchor, Margin, layer_window};
 
@@ -70,9 +79,26 @@ struct ToastView {
     window: gtk::Window,
     vbox: gtk::Box,
     monitor: Monitor,
-    card_map: RefCell<HashMap<u32, gtk::Widget>>,
+    card_map: RefCell<HashMap<u32, CardEntry>>,
     overflow_card: RefCell<Option<gtk::Widget>>,
     suppressed_during_dnd: RefCell<HashSet<u32>>,
+}
+
+/// A mounted toast card, the notification snapshot it was built from, and the
+/// hover-hold flag its motion controller drives.
+///
+/// The snapshot is what makes [`apply_emission`]'s "has anything actually
+/// changed?" test possible; the flag is what lets a genuine rebuild carry the
+/// service-side hover hold across the swap. Both are #593.
+struct CardEntry {
+    widget: gtk::Widget,
+    /// The notification this card was rendered from — compared against the
+    /// incoming one by [`card_content_eq`].
+    notif: Notification,
+    /// Shared with the card's `EventControllerMotion` / `connect_unmap`
+    /// handlers: true exactly while this card holds one service-side hover
+    /// hold on `notif.id`. See [`attach_hover_pause`].
+    holds_hover: Rc<Cell<bool>>,
 }
 
 // ── Thread-local window storage ───────────────────────────────────────────────
@@ -210,27 +236,45 @@ fn apply_emission(
     // Remove cards whose notifications have gone.
     for id in &old_ids {
         if !new_ids.contains_key(id)
-            && let Some(card) = map.remove(id)
+            && let Some(entry) = map.remove(id)
         {
-            view.vbox.remove(&card);
+            view.vbox.remove(&entry.widget);
         }
     }
 
-    // Add or rebuild cards for each notification.
+    // Add, rebuild, or KEEP a card for each notification.
+    //
+    // Keeping an unchanged card mounted is load-bearing, not just an
+    // optimisation (#593): destroying it fires `connect_unmap`, which releases
+    // the hover hold `attach_hover_pause` took — and GTK4 only retargets
+    // pointer focus while processing a crossing or motion event, so a
+    // *stationary* pointer produces no `enter` on the replacement and the
+    // pause is never re-established. Rebuilding every card on every emission
+    // therefore let any unrelated notification arriving or expiring silently
+    // resume the countdown under a toast the user was still reading.
     for (id, notif) in &new_ids {
-        // For v0.4.0 we rebuild on replaces_id updates (same id, new
-        // content) — drop the old card and build fresh.
-        if let Some(old_card) = map.remove(id) {
-            view.vbox.remove(&old_card);
+        if map
+            .get(id)
+            .is_some_and(|entry| card_content_eq(&entry.notif, notif))
+        {
+            continue;
         }
-        let card = build_card(notif);
-        view.vbox.append(&card);
-        map.insert(*id, card);
+        let entry = match map.remove(id) {
+            // Same id, new content (a `replaces_id` update) — swap the card.
+            Some(old) => replace_card(&view.vbox, &old, notif),
+            None => mount_card(&view.vbox, notif),
+        };
+        map.insert(*id, entry);
     }
 
     // Manage the overflow "+N more" card. Singleton, lives in
     // `view.overflow_card`. Removed when tail is empty; rebuilt when
     // tail count changes (so the label updates).
+    //
+    // Unlike the notification cards above this one is still rebuilt
+    // unconditionally: it holds no hover state (no timer to strand), and the
+    // remove-then-append is what keeps it pinned below every card the loop
+    // above may have appended this pass.
     {
         let mut slot = view.overflow_card.borrow_mut();
         if tail_noncritical_count == 0 {
@@ -359,7 +403,112 @@ fn clamp_lines(text: &str, n: usize) -> String {
     text.lines().take(n).collect::<Vec<_>>().join("\n")
 }
 
-fn build_card(notif: &Notification) -> gtk::Widget {
+/// Would [`build_card`] render `a` and `b` identically?
+///
+/// `Notification` deliberately isn't `PartialEq` — `NotificationImage::Raw`
+/// carries a decoded pixel buffer, and `created_at` is stamped afresh by every
+/// `replaces_id` re-post even when nothing visible changed — so this compares
+/// exactly the fields [`build_card`] reads, and nothing else. **Keep the two in
+/// sync**: a field newly rendered onto the card must be added here, or an
+/// update that only touches it will leave a stale card mounted.
+///
+/// Deliberately excluded: `timeout` and `created_at` (never rendered on a
+/// toast; the expiry timer is re-armed service-side by `notify` regardless of
+/// what the overlay does with the widget).
+fn card_content_eq(a: &Notification, b: &Notification) -> bool {
+    a.id == b.id
+        && a.app_name == b.app_name
+        && a.app_icon == b.app_icon
+        && a.summary == b.summary
+        && a.body == b.body
+        && a.urgency == b.urgency
+        && actions_eq(&a.actions, &b.actions)
+        && image_eq(a.image.as_ref(), b.image.as_ref())
+}
+
+/// Structural equality for a notification's action list (`Action` isn't
+/// `PartialEq` either). Order matters: the buttons are rendered in list order.
+fn actions_eq(a: &[Action], b: &[Action]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.key == y.key && x.label == y.label)
+}
+
+/// Structural equality for a notification's optional image payload. `Raw`
+/// compares the pixel buffer itself — a memcmp of a thumbnail-sized buffer, at
+/// most once per live toast per emission, which is cheap next to rebuilding
+/// the widget tree it would otherwise gate.
+fn image_eq(a: Option<&NotificationImage>, b: Option<&NotificationImage>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (
+            Some(NotificationImage::Raw {
+                width: aw,
+                height: ah,
+                rowstride: ar,
+                has_alpha: aa,
+                channels: ac,
+                data: ad,
+            }),
+            Some(NotificationImage::Raw {
+                width: bw,
+                height: bh,
+                rowstride: br,
+                has_alpha: ba,
+                channels: bc,
+                data: bd,
+            }),
+        ) => aw == bw && ah == bh && ar == br && aa == ba && ac == bc && ad == bd,
+        (Some(NotificationImage::Path(x)), Some(NotificationImage::Path(y)))
+        | (Some(NotificationImage::IconName(x)), Some(NotificationImage::IconName(y))) => x == y,
+        _ => false,
+    }
+}
+
+/// Build a card for `notif` and append it to `vbox`.
+fn mount_card(vbox: &gtk::Box, notif: &Notification) -> CardEntry {
+    let entry = build_card(notif);
+    vbox.append(&entry.widget);
+    entry
+}
+
+/// Swap `old`'s card out for a freshly built one (same id, new content).
+///
+/// Two things the naive remove-then-append doesn't do:
+///
+/// - **Carries the hover hold** (#593). If `old` holds one, a *second* hold is
+///   taken before `old` is unmapped, so its `connect_unmap` teardown only
+///   drops the service-side count back to one — it never reaches zero, the
+///   countdown never re-arms mid-read, and the fresh card inherits the hold
+///   (seeded into its `holds_hover`, so its eventual `leave`/`unmap` balances
+///   it exactly once). Waiting for a crossing event to re-establish the pause
+///   is precisely what fails under a pointer that doesn't move.
+/// - **Keeps the card's place** in the stack, rather than sending an updated
+///   toast to the bottom on every re-post.
+///
+/// Residual case, deliberately accepted: if the replacement card is small
+/// enough that the pointer no longer lies over it, no `leave` will ever come
+/// and the inherited hold lasts until the card unmaps — i.e. the toast waits
+/// for a dismiss instead of expiring. Bounded (the `connect_unmap` teardown
+/// still balances the count) and strictly the safer failure of the two.
+fn replace_card(vbox: &gtk::Box, old: &CardEntry, notif: &Notification) -> CardEntry {
+    let carried = old.holds_hover.get();
+    if carried {
+        notifications::pause_expiry(notif.id);
+    }
+    let after = old.widget.prev_sibling();
+    // Fires `old`'s `connect_unmap` → `resume_expiry`, balancing the hold
+    // `old` itself took (never the one taken just above).
+    vbox.remove(&old.widget);
+
+    let entry = build_card(notif);
+    entry.holds_hover.set(carried);
+    vbox.insert_child_after(&entry.widget, after.as_ref());
+    entry
+}
+
+fn build_card(notif: &Notification) -> CardEntry {
     // Outer card: horizontal — [image?] [text column]
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     card.add_css_class("ts-toast");
@@ -487,9 +636,13 @@ fn build_card(notif: &Notification) -> gtk::Widget {
     card.add_controller(gesture);
 
     // Hover-pause the auto-expiry countdown while the pointer is over the card.
-    attach_hover_pause(&card, notif.id);
+    let holds_hover = attach_hover_pause(&card, notif.id);
 
-    card.upcast()
+    CardEntry {
+        widget: card.upcast(),
+        notif: notif.clone(),
+        holds_hover,
+    }
 }
 
 /// Wire hover-pause of a toast's auto-expiry onto `card` (#567). While the
@@ -504,7 +657,12 @@ fn build_card(notif: &Notification) -> gtk::Widget {
 /// `leave` on unmap, which would otherwise strand the timer paused forever.
 /// A sticky notification (no service-side timer) makes the pause/resume calls
 /// harmless no-ops.
-fn attach_hover_pause(card: &gtk::Box, id: u32) {
+///
+/// Returns the `holds_enter` flag so a card swap can read it and seed the
+/// successor's — see [`replace_card`] (#593). Setting it to `true` on a fresh
+/// card asserts "this card already owns a hold", which is why the swap takes
+/// that hold explicitly before tearing the old card down.
+fn attach_hover_pause(card: &gtk::Box, id: u32) -> Rc<Cell<bool>> {
     let holds_enter = Rc::new(Cell::new(false));
 
     let motion = gtk::EventControllerMotion::new();
@@ -526,12 +684,16 @@ fn attach_hover_pause(card: &gtk::Box, id: u32) {
     }
     card.add_controller(motion);
 
-    let holds = holds_enter;
-    card.connect_unmap(move |_| {
-        if holds.replace(false) {
-            notifications::resume_expiry(id);
-        }
-    });
+    {
+        let holds = holds_enter.clone();
+        card.connect_unmap(move |_| {
+            if holds.replace(false) {
+                notifications::resume_expiry(id);
+            }
+        });
+    }
+
+    holds_enter
 }
 
 // ── Overflow card builder ─────────────────────────────────────────────────────
@@ -625,7 +787,29 @@ fn build_image(image: &NotificationImage) -> gtk::Image {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_lines;
+    use std::time::Duration;
+
+    use super::{Action, Notification, NotificationImage, Urgency};
+    use super::{actions_eq, card_content_eq, clamp_lines, image_eq};
+
+    /// A plain notification to mutate one field of per test.
+    fn notif() -> Notification {
+        Notification {
+            id: 7,
+            app_name: "Fractal".to_string(),
+            app_icon: "im-message".to_string(),
+            summary: "Mara".to_string(),
+            body: "check how nova-shell did it".to_string(),
+            urgency: Urgency::Normal,
+            timeout: Some(Duration::from_secs(5)),
+            actions: vec![Action {
+                key: "reply".to_string(),
+                label: "Reply".to_string(),
+            }],
+            image: Some(NotificationImage::IconName("avatar".to_string())),
+            created_at: 1_000,
+        }
+    }
 
     #[test]
     fn clamp_lines_passes_short_text_through() {
@@ -654,5 +838,108 @@ mod tests {
     #[test]
     fn clamp_lines_empty_input() {
         assert_eq!(clamp_lines("", 5), "");
+    }
+
+    // ── card_content_eq — the "may this card stay mounted?" test (#593) ──────
+
+    #[test]
+    fn identical_notifications_keep_the_card() {
+        assert!(card_content_eq(&notif(), &notif()));
+    }
+
+    /// A named one-field edit to a [`notif`], for
+    /// [`every_rendered_field_forces_a_rebuild`].
+    type Mutation = (&'static str, fn(&mut Notification));
+
+    #[test]
+    fn every_rendered_field_forces_a_rebuild() {
+        // One case per field `build_card` reads. If a new field starts being
+        // rendered, it belongs both in `card_content_eq` and here.
+        let mutations: Vec<Mutation> = vec![
+            ("id", |n| n.id = 8),
+            ("app_name", |n| n.app_name = "Nheko".to_string()),
+            ("app_icon", |n| n.app_icon = "mail-unread".to_string()),
+            ("summary", |n| n.summary = "Annika".to_string()),
+            ("body", |n| n.body = "ship it".to_string()),
+            ("urgency", |n| n.urgency = Urgency::Critical),
+            ("actions", |n| n.actions.clear()),
+            ("image", |n| n.image = None),
+        ];
+        for (field, mutate) in mutations {
+            let base = notif();
+            let mut changed = notif();
+            mutate(&mut changed);
+            assert!(
+                !card_content_eq(&base, &changed),
+                "changing {field} must rebuild the card"
+            );
+        }
+    }
+
+    #[test]
+    fn unrendered_fields_do_not_force_a_rebuild() {
+        // `created_at` is re-stamped by every `replaces_id` re-post and
+        // `timeout` is the service's business — neither reaches the widget
+        // tree, so neither may cost the card (and with it the hover hold).
+        let base = notif();
+        let mut resent = notif();
+        resent.created_at = 9_999;
+        resent.timeout = Some(Duration::from_secs(30));
+        assert!(card_content_eq(&base, &resent));
+    }
+
+    #[test]
+    fn action_label_and_order_changes_rebuild() {
+        let base = notif();
+
+        let mut relabelled = notif();
+        relabelled.actions[0].label = "Answer".to_string();
+        assert!(!card_content_eq(&base, &relabelled));
+
+        let two = |a: &str, b: &str| {
+            vec![
+                Action {
+                    key: a.to_string(),
+                    label: a.to_string(),
+                },
+                Action {
+                    key: b.to_string(),
+                    label: b.to_string(),
+                },
+            ]
+        };
+        assert!(actions_eq(&two("a", "b"), &two("a", "b")));
+        assert!(!actions_eq(&two("a", "b"), &two("b", "a")));
+        assert!(!actions_eq(&two("a", "b"), &[]));
+    }
+
+    #[test]
+    fn image_equality_covers_variants_and_payload() {
+        let raw = |data: Vec<u8>| NotificationImage::Raw {
+            width: 2,
+            height: 1,
+            rowstride: 8,
+            has_alpha: true,
+            channels: 4,
+            data,
+        };
+        let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+        assert!(image_eq(
+            Some(&raw(bytes.clone())),
+            Some(&raw(bytes.clone()))
+        ));
+        // Same dimensions, different pixels — a progress-bar thumbnail that
+        // only redraws its fill must still rebuild the card.
+        assert!(!image_eq(Some(&raw(bytes.clone())), Some(&raw(vec![9; 8]))));
+        assert!(image_eq(None, None));
+        assert!(!image_eq(Some(&raw(bytes)), None));
+
+        let path = NotificationImage::Path("/tmp/a.png".to_string());
+        let icon = NotificationImage::IconName("/tmp/a.png".to_string());
+        assert!(image_eq(Some(&path), Some(&path.clone())));
+        // Same string, different variant — one is loaded from disk, the other
+        // from the icon theme.
+        assert!(!image_eq(Some(&path), Some(&icon)));
     }
 }

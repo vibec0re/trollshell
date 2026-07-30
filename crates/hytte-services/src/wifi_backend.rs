@@ -8,10 +8,11 @@
 //!
 //! # "Nobody is there" is not "I could not ask" (issue #607)
 //!
-//! The probe runs **once**, inside [`crate::wifi`]'s `Service::start`, and the
-//! service spawns a different watcher per verdict — so the verdict is latched
-//! for the lifetime of the process. That makes it critical that a *failed*
-//! query can never masquerade as a *negative* answer.
+//! The service spawns a different watcher per verdict, so the first
+//! **conclusive** verdict is latched for the lifetime of the process. That makes
+//! it critical that a *failed* query can never masquerade as a *negative*
+//! answer. (Since #613 the caller re-runs the probe while it is inconclusive,
+//! and only commits on a `Ok(_)`; see [`crate::wifi`]'s `probe_until_conclusive`.)
 //!
 //! Before #607 both bus calls collapsed their errors into an empty name list,
 //! so a single transient failure at startup (system bus not reachable yet,
@@ -31,8 +32,10 @@
 //! `ListActivatableNames` names `NetworkManager`, that is a trustworthy yes.
 //! Only a **negative** requires that both queries actually answered.
 //!
-//! Re-probing — picking up a daemon that appears *after* startup — is
-//! deliberately still unsolved; see #607.
+//! Re-probing *after* a conclusive verdict — picking up a daemon that appears
+//! later, or switching between iwd and `NetworkManager` at runtime — is
+//! deliberately still unsolved: it needs a cancellation primitive that does not
+//! exist yet. See #633.
 
 use hytte_bus::BusKind;
 

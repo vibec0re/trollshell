@@ -1,9 +1,12 @@
 //! Wi-Fi station tracking + network list, backed by either iwd or
 //! `NetworkManager` depending on which daemon is running on the host.
 //!
-//! The backend is probed at startup via [`crate::wifi_backend::probe_backend`].
-//! Widgets are backend-agnostic — they only see the public types and signal
-//! accessors exported from this module.
+//! The backend is probed at startup via [`crate::wifi_backend::probe_backend`],
+//! inside the service's own supervised task and retried while the probe is
+//! *inconclusive* (see [`probe_until_conclusive`]), so a system bus that is
+//! still coming up no longer latches "no wireless backend" for the process
+//! lifetime (#613). Widgets are backend-agnostic — they only see the public
+//! types and signal accessors exported from this module.
 //!
 //! # Public API
 //!
@@ -38,9 +41,10 @@ use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-use crate::wifi_backend::BackendChoice;
+use crate::wifi_backend::{BackendChoice, ProbeError};
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -127,13 +131,24 @@ pub struct WifiHandles {
     /// iwd / no-backend (iwd doesn't manage VPNs). Distinct from the poll-only
     /// `vpn::tunnels()` live-tunnel detection — these are NM connection profiles.
     pub(crate) vpn: Mutable<Vec<VpnProfile>>,
-    /// iwd name-ownership signal; `None` when the NM backend is active.
-    _ownership: Option<hytte_bus::OwnNameSignal>,
-    /// NM secret-agent export handle; `None` unless the NM backend is active.
-    /// Held only to keep the exported agent object (and its re-mount task) alive
-    /// for the service's lifetime.
-    _nm_agent: Option<hytte_bus::ExportHandle>,
-    pub(crate) backend: WifiBackend,
+    /// iwd name-ownership signal; stays empty unless the iwd backend is chosen.
+    ///
+    /// A `OnceLock` rather than a plain `Option` because the backend probe now
+    /// concludes *after* `start()` returns (see [`probe_until_conclusive`]), so
+    /// the handle is parked here by the probe task. Set at most once — the
+    /// verdict is still latched for the process lifetime (re-entrant switching
+    /// is #633).
+    _ownership: Arc<OnceLock<hytte_bus::OwnNameSignal>>,
+    /// NM secret-agent export handle; stays empty unless the NM backend is
+    /// chosen. Held only to keep the exported agent object (and its re-mount
+    /// task) alive for the service's lifetime. `OnceLock` for the same reason
+    /// as `_ownership`.
+    _nm_agent: Arc<OnceLock<hytte_bus::ExportHandle>>,
+    /// The committed backend. Starts at [`WifiBackend::None`] and is set once
+    /// the probe reaches a conclusive verdict; commands issued before that see
+    /// no backend, which is the same window that already exists between
+    /// `start()` and the watcher's first discovery.
+    pub(crate) backend: Mutable<WifiBackend>,
 }
 
 impl Default for WifiHandles {
@@ -153,153 +168,344 @@ pub struct WifiService;
 pub(super) const AGENT_PATH: &str = "/mov/vibec0re/trollshell/iwd_agent";
 const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 
-/// Probe which Wi-Fi backend this host runs, and pick the one to start.
+// ── Backend selection: retry while inconclusive, commit once conclusive ───────
+//
+// The verdict is latched for the process lifetime — `Service::start` spawns a
+// *different* watcher per verdict — so committing to a wrong one is expensive.
+// Before #613 an **inconclusive** probe ([`ProbeError`], "I could not ask") was
+// collapsed straight into [`BackendChoice::None`] ("the bus answered and nobody
+// is there"), which disabled Wi-Fi for the whole session; only a shell restart
+// brought it back (#607).
+//
+// The fix is to keep asking until the answer means something. Retrying can't
+// happen on the calling thread — `Service::start` runs on the GTK main thread,
+// so a `block_on` retry loop there would freeze shell startup — so the probe
+// and the per-verdict branch both moved inside the service's own supervised
+// task, the shape `networkd.rs` already uses.
+//
+// Picking up a daemon that appears *after* a conclusive verdict, or switching
+// backends at runtime, is out of scope here: it needs a cancellation primitive
+// that does not exist yet (#633).
+
+/// What to do after one probe attempt.
 ///
-/// The probe happens exactly once — `Service::start` spawns a *different*
-/// watcher per verdict, so whatever comes back here is latched for the process
-/// lifetime. That makes an **inconclusive** probe ([`crate::wifi_backend::ProbeError`])
-/// dangerous: before #607 it was indistinguishable from "the bus answered and
-/// no daemon is there", and quietly disabled Wi-Fi for the whole session.
+/// The whole retry decision lives in [`RetryPolicy::step`] — a pure function —
+/// so it is unit-testable without a bus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeStep {
+    /// The probe answered. Commit to this backend and start it.
+    Commit(BackendChoice),
+    /// The probe was inconclusive and attempts remain: wait, then ask again.
+    Retry {
+        /// How long to wait before the next attempt.
+        after: Duration,
+    },
+    /// Still inconclusive and the attempt budget is spent: log loudly and stay
+    /// inert.
+    GiveUp,
+}
+
+/// Retry schedule for an *inconclusive* backend probe.
+#[derive(Clone, Copy, Debug)]
+struct RetryPolicy {
+    /// Attempt budget, counting the first probe. `None` means "retry forever".
+    max_attempts: Option<u32>,
+    /// Delay before the first retry; doubles with each further attempt.
+    initial: Duration,
+    /// Ceiling the doubling delay is clamped to.
+    max_backoff: Duration,
+}
+
+/// The policy this service runs: **bounded** retry with backoff, then give up
+/// at `error!`.
 ///
-/// We still have to start somewhere, and every non-inert arm commits to a
-/// specific daemon's D-Bus API, so an unknown verdict lands on
-/// [`BackendChoice::None`] — but it is logged at `error` as an *unknown*, never
-/// as a finding that the host has no wireless hardware.
-fn select_backend(rt: &tokio::runtime::Handle) -> BackendChoice {
-    match rt.block_on(crate::wifi_backend::probe_backend()) {
-        Ok(choice) => {
-            tracing::info!(?choice, "wifi: selected backend");
-            choice
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "wifi: backend probe was INCONCLUSIVE — the system bus could not be queried, \
-                 so it is unknown whether a Wi-Fi daemon is running. Starting inert; this is \
-                 NOT a finding that the host has no wireless hardware. The probe is \
-                 startup-only, so run `systemctl --user restart trollshell` once the bus is \
-                 up to re-probe (issue #607)."
-            );
-            BackendChoice::None
+/// 8 attempts at 0.5s doubling to an 8s cap spends ~31.5s of wall clock
+/// (0.5 + 1 + 2 + 4 + 8 + 8 + 8) before giving up. That is sized for the case
+/// this fixes — a user session racing the system bus / `NetworkManager` up at
+/// boot, which resolves in seconds — while still bounding a genuinely dead bus
+/// to half a minute of polling instead of the process lifetime. Giving up is
+/// logged at `error!` precisely so a wrong bound is visible in the journal
+/// rather than silent.
+///
+/// **This is deliberately one edit to swap.** The alternative policy under
+/// discussion (retry forever) is `max_attempts: None` and nothing else; the
+/// same question is open for `networkd`'s startup refresh on #621 and the two
+/// subsystems should end up consistent.
+const PROBE_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: Some(8),
+    initial: Duration::from_millis(500),
+    max_backoff: Duration::from_secs(8),
+};
+
+impl RetryPolicy {
+    /// Delay before the retry that follows `attempt` (1-based): [`Self::initial`]
+    /// doubled once per elapsed attempt, clamped to [`Self::max_backoff`].
+    fn backoff(self, attempt: u32) -> Duration {
+        let factor = 1_u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max_backoff)
+    }
+
+    /// The pure retry/commit decision. `attempt` is 1-based and counts the
+    /// probe that produced `outcome`.
+    ///
+    /// `Ok(_)` always commits — **including `Ok(BackendChoice::None)`**, which
+    /// is a real answer ("the bus replied and neither daemon is present").
+    /// Retrying *that* would be the bug; only "I could not ask"
+    /// ([`ProbeError`]) is retried.
+    fn step(self, outcome: &Result<BackendChoice, ProbeError>, attempt: u32) -> ProbeStep {
+        match outcome {
+            Ok(choice) => ProbeStep::Commit(*choice),
+            Err(_) if self.max_attempts.is_some_and(|max| attempt >= max) => ProbeStep::GiveUp,
+            Err(_) => ProbeStep::Retry {
+                after: self.backoff(attempt),
+            },
         }
     }
+}
+
+/// Probe for the Wi-Fi backend, retrying only while the probe is
+/// *inconclusive*, and return the verdict to commit to.
+///
+/// `None` means the attempt budget ran out without ever reaching the bus — the
+/// service stays inert, and the give-up is logged at `error!`.
+///
+/// Every inconclusive attempt is logged at `error!` and a successful retry logs
+/// a `RECOVERED` line naming the attempt count: #609's diagnostic exists to
+/// *measure* how often this fires, and a retry that healed quietly would trade
+/// a visible permanent bug for an invisible intermittent one.
+async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = crate::wifi_backend::probe_backend().await;
+        // Rendered up front so the log arms below can name the failure. Empty
+        // on `Ok`, which only ever reaches the `Commit` arm.
+        let reason = outcome
+            .as_ref()
+            .err()
+            .map_or_else(String::new, ToString::to_string);
+
+        match policy.step(&outcome, attempt) {
+            ProbeStep::Commit(choice) => {
+                if attempt > 1 {
+                    tracing::warn!(
+                        attempts = attempt,
+                        ?choice,
+                        "wifi: backend probe RECOVERED — an earlier attempt could not reach the \
+                         system bus, and a retry has now returned a real verdict. Wi-Fi is \
+                         coming up without a shell restart (issue #613)."
+                    );
+                } else {
+                    tracing::info!(?choice, "wifi: selected backend");
+                }
+                return Some(choice);
+            }
+            ProbeStep::Retry { after } => {
+                tracing::error!(
+                    attempt,
+                    retry_in_secs = after.as_secs_f64(),
+                    error = %reason,
+                    "wifi: backend probe was INCONCLUSIVE — the system bus could not be queried, \
+                     so it is unknown whether a Wi-Fi daemon is running. This is NOT a finding \
+                     that the host has no wireless hardware. Retrying; grep for \
+                     `backend probe RECOVERED` to see whether it healed (issues #607, #613)."
+                );
+                tokio::time::sleep(after).await;
+                attempt += 1;
+            }
+            ProbeStep::GiveUp => {
+                tracing::error!(
+                    attempts = attempt,
+                    error = %reason,
+                    "wifi: backend probe STILL INCONCLUSIVE after every retry — giving up and \
+                     starting inert. Wi-Fi will not work this session; this is NOT a finding \
+                     that the host has no wireless hardware. Run \
+                     `systemctl --user restart trollshell` once the system bus is up to \
+                     re-probe (issues #607, #613)."
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// The state slots a backend watcher writes into.
+///
+/// Grouped so the per-backend start helpers below take three arguments instead
+/// of eight, and so the probe task can carry all of them across a restart with
+/// one clone.
+#[derive(Clone)]
+struct WatchTargets {
+    station: Mutable<Option<Station>>,
+    networks: Mutable<Vec<WifiNetwork>>,
+    prompts: Mutable<Option<PromptRequest>>,
+    adapter: Mutable<Option<Adapter>>,
+    wired: Mutable<Vec<WiredProfile>>,
+    vpn: Mutable<Vec<VpnProfile>>,
+}
+
+/// Commit to the iwd backend: own the agent name and start the iwd watcher.
+///
+/// Parks the ownership handle in `ownership_out` so it outlives this call (the
+/// probe task returns once it has committed).
+fn start_iwd(
+    targets: WatchTargets,
+    waiters: WaitersMap,
+    ownership_out: &OnceLock<hytte_bus::OwnNameSignal>,
+) -> WifiBackend {
+    // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager). iwd
+    // records our system-bus unique name when we call RegisterAgent, then
+    // issues RequestPassphrase callbacks on the system bus.
+    let agent = agent::IwdAgent {
+        prompts: targets.prompts.clone(),
+        waiters,
+    };
+    let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
+        .at_path(AGENT_PATH, agent)
+        .start();
+    let _ = ownership_out.set(own);
+
+    spawn_supervised("wifi", move || {
+        watcher::run_wifi_watcher(
+            targets.station.clone(),
+            targets.networks.clone(),
+            targets.prompts.clone(),
+            targets.adapter.clone(),
+        )
+    });
+
+    WifiBackend::Iwd
+}
+
+/// Commit to the `NetworkManager` backend: start the NM watcher and export the
+/// secret agent, parking its handle in `nm_agent_out`.
+fn start_network_manager(
+    targets: WatchTargets,
+    waiters: WaitersMap,
+    nm_agent_out: &OnceLock<hytte_bus::ExportHandle>,
+) -> WifiBackend {
+    let device_path_store: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+    let store = Arc::clone(&device_path_store);
+    let prompts = targets.prompts.clone();
+    spawn_supervised("wifi", move || {
+        crate::wifi_nm::run_nm_wifi_watcher(
+            targets.station.clone(),
+            targets.networks.clone(),
+            targets.adapter.clone(),
+            targets.wired.clone(),
+            targets.vpn.clone(),
+            store.clone(),
+        )
+    });
+
+    // Mount the NM SecretAgent on the SYSTEM bus and register it with NM's
+    // AgentManager. Unlike the iwd agent, NM secret agents do NOT own a
+    // well-known name — NM records our system connection's unique name and
+    // calls GetSecrets back on it, so we export the object name-lessly (no
+    // system-bus policy entry needed). Export first, then register, so the
+    // object is present before NM can call back.
+    let nm_agent = nm_agent::NmAgent { prompts, waiters };
+    let export =
+        hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH).start(nm_agent);
+    let _ = nm_agent_out.set(export);
+
+    runtime::handle().spawn(async {
+        // Give the export a moment to mount on the live connection before
+        // registering, so NM never calls back before the object exists.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match crate::wifi_nm::register_nm_agent().await {
+            Ok(()) => tracing::info!("wifi_nm: secret agent registered with NM"),
+            Err(e) => {
+                tracing::warn!(error = %e, "wifi_nm: secret agent registration failed");
+            }
+        }
+    });
+
+    WifiBackend::NetworkManager(device_path_store)
 }
 
 impl Service for WifiService {
     type Handles = WifiHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
-        let backend_choice = select_backend(rt);
-
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         // Initialise the WAITERS map once so public API functions can reach it.
         let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let _ = WAITERS.set(waiters_arc.clone());
 
-        let station_mutable = Mutable::new(None);
-        let networks_mutable = Mutable::new(Vec::new());
-        let prompts_mutable: Mutable<Option<PromptRequest>> = Mutable::new(None);
-        let adapter_mutable = Mutable::new(None);
-        let wired_mutable: Mutable<Vec<WiredProfile>> = Mutable::new(Vec::new());
-        let vpn_mutable: Mutable<Vec<VpnProfile>> = Mutable::new(Vec::new());
-
-        let (ownership, nm_agent, backend) = match backend_choice {
-            BackendChoice::Iwd => {
-                // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
-                // iwd records our system-bus unique name when we call RegisterAgent,
-                // then issues RequestPassphrase callbacks on the system bus.
-                let agent = agent::IwdAgent {
-                    prompts: prompts_mutable.clone(),
-                    waiters: waiters_arc,
-                };
-                let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
-                    .at_path(AGENT_PATH, agent)
-                    .start();
-
-                let station_m = station_mutable.clone();
-                let networks_m = networks_mutable.clone();
-                let prompts_m = prompts_mutable.clone();
-                let adapter_m = adapter_mutable.clone();
-                spawn_supervised("wifi", move || {
-                    watcher::run_wifi_watcher(
-                        station_m.clone(),
-                        networks_m.clone(),
-                        prompts_m.clone(),
-                        adapter_m.clone(),
-                    )
-                });
-
-                (Some(own), None, WifiBackend::Iwd)
-            }
-            BackendChoice::NetworkManager => {
-                let device_path_store: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-                let station_m = station_mutable.clone();
-                let networks_m = networks_mutable.clone();
-                let adapter_m = adapter_mutable.clone();
-                let wired_m = wired_mutable.clone();
-                let vpn_m = vpn_mutable.clone();
-                let store = Arc::clone(&device_path_store);
-                spawn_supervised("wifi", move || {
-                    crate::wifi_nm::run_nm_wifi_watcher(
-                        station_m.clone(),
-                        networks_m.clone(),
-                        adapter_m.clone(),
-                        wired_m.clone(),
-                        vpn_m.clone(),
-                        store.clone(),
-                    )
-                });
-
-                // Mount the NM SecretAgent on the SYSTEM bus and register it
-                // with NM's AgentManager. Unlike the iwd agent, NM secret
-                // agents do NOT own a well-known name — NM records our system
-                // connection's unique name and calls GetSecrets back on it, so
-                // we export the object name-lessly (no system-bus policy entry
-                // needed). Export first, then register, so the object is
-                // present before NM can call back.
-                let nm_agent = nm_agent::NmAgent {
-                    prompts: prompts_mutable.clone(),
-                    waiters: waiters_arc,
-                };
-                let export =
-                    hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH)
-                        .start(nm_agent);
-                rt.spawn(async {
-                    // Give the export a moment to mount on the live connection
-                    // before registering, so NM never calls back before the
-                    // object exists.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    match crate::wifi_nm::register_nm_agent().await {
-                        Ok(()) => tracing::info!("wifi_nm: secret agent registered with NM"),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "wifi_nm: secret agent registration failed");
-                        }
-                    }
-                });
-
-                (
-                    None,
-                    Some(export),
-                    WifiBackend::NetworkManager(device_path_store),
-                )
-            }
-            BackendChoice::None => {
-                // Reached either because the bus positively reported no daemon,
-                // or because the probe was inconclusive (logged above).
-                tracing::warn!("wifi: no Wi-Fi backend selected — service is inactive");
-                (None, None, WifiBackend::None)
-            }
+        let targets = WatchTargets {
+            station: Mutable::new(None),
+            networks: Mutable::new(Vec::new()),
+            prompts: Mutable::new(None),
+            adapter: Mutable::new(None),
+            wired: Mutable::new(Vec::new()),
+            vpn: Mutable::new(Vec::new()),
         };
+        let backend_mutable: Mutable<WifiBackend> = Mutable::new(WifiBackend::None);
+        let ownership_slot: Arc<OnceLock<hytte_bus::OwnNameSignal>> = Arc::new(OnceLock::new());
+        let nm_agent_slot: Arc<OnceLock<hytte_bus::ExportHandle>> = Arc::new(OnceLock::new());
+
+        // One supervised task owns the whole decision: probe (retrying while
+        // inconclusive), then commit to exactly one backend. It runs off the
+        // GTK main thread, so `start()` returns immediately and the shell never
+        // blocks on the bus. Same shape as `networkd::NetworkdService::start`.
+        //
+        // The task returns once it has committed — `spawn_supervised` takes a
+        // clean completion at face value and does not restart it, so a backend
+        // is never started twice. The per-backend watchers keep their own
+        // independent supervision.
+        {
+            let targets = targets.clone();
+            let backend_m = backend_mutable.clone();
+            let waiters_m = waiters_arc;
+            let ownership_out = Arc::clone(&ownership_slot);
+            let nm_agent_out = Arc::clone(&nm_agent_slot);
+
+            spawn_supervised("wifi-backend", move || {
+                let targets = targets.clone();
+                let backend_m = backend_m.clone();
+                let waiters_m = waiters_m.clone();
+                let ownership_out = Arc::clone(&ownership_out);
+                let nm_agent_out = Arc::clone(&nm_agent_out);
+
+                async move {
+                    let Some(choice) = probe_until_conclusive(PROBE_RETRY).await else {
+                        // Give-up already logged at `error!`; stay inert.
+                        return;
+                    };
+
+                    let backend = match choice {
+                        BackendChoice::Iwd => start_iwd(targets, waiters_m, &ownership_out),
+                        BackendChoice::NetworkManager => {
+                            start_network_manager(targets, waiters_m, &nm_agent_out)
+                        }
+                        BackendChoice::None => {
+                            // A positive finding: the bus answered and neither
+                            // daemon is present. An *inconclusive* probe never
+                            // lands here — it either recovered on a retry or gave
+                            // up above (#613).
+                            tracing::warn!("wifi: no Wi-Fi backend present — service is inactive");
+                            WifiBackend::None
+                        }
+                    };
+
+                    // Published last, so a command can never see a backend whose
+                    // watcher has not been spawned yet.
+                    backend_m.set(backend);
+                }
+            });
+        }
 
         WifiHandles {
-            station: station_mutable,
-            networks: networks_mutable,
-            prompts: prompts_mutable,
-            adapter: adapter_mutable,
-            wired: wired_mutable,
-            vpn: vpn_mutable,
-            _ownership: ownership,
-            _nm_agent: nm_agent,
-            backend,
+            station: targets.station,
+            networks: targets.networks,
+            prompts: targets.prompts,
+            adapter: targets.adapter,
+            wired: targets.wired,
+            vpn: targets.vpn,
+            _ownership: ownership_slot,
+            _nm_agent: nm_agent_slot,
+            backend: backend_mutable,
         }
     }
 }
@@ -371,12 +577,17 @@ pub fn vpn_profiles() -> impl Signal<Item = Vec<VpnProfile>> {
 }
 
 /// Read the active [`WifiBackend`] from the registry.
+///
+/// A snapshot of the current value: the backend is committed by the probe task
+/// (see [`probe_until_conclusive`]), so this reports [`WifiBackend::None`] until
+/// the probe concludes — the same window in which the watcher has not yet
+/// discovered a station and every command already no-ops.
 fn get_backend() -> WifiBackend {
     registry::with(|r| {
         r.get::<WifiHandles>()
             .expect("wifi::service() not registered")
             .backend
-            .clone()
+            .get_cloned()
     })
 }
 
@@ -795,4 +1006,145 @@ async fn do_known_network_call(path: &str, method: &str) -> Result<(), hytte_bus
         .args(())
         .send::<()>()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendChoice, Duration, ProbeError, ProbeStep, RetryPolicy};
+
+    /// Test policy: a small, explicit budget so the give-up boundary is easy to
+    /// name. Deliberately not [`super::PROBE_RETRY`] — these tests assert the
+    /// *decision*, not the shipped numbers, so tuning the policy does not
+    /// redden them.
+    fn bounded() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: Some(3),
+            initial: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+        }
+    }
+
+    /// The "I could not ask" outcome: both bus queries failed.
+    fn inconclusive() -> Result<BackendChoice, ProbeError> {
+        Err(ProbeError::Both {
+            list_names: "bus not reachable".to_string(),
+            list_activatable_names: "bus not reachable".to_string(),
+        })
+    }
+
+    // ── A conclusive probe commits, on whatever attempt produced it ───────────
+
+    #[test]
+    fn ok_commits_on_the_first_attempt() {
+        assert_eq!(
+            bounded().step(&Ok(BackendChoice::NetworkManager), 1),
+            ProbeStep::Commit(BackendChoice::NetworkManager)
+        );
+        assert_eq!(
+            bounded().step(&Ok(BackendChoice::Iwd), 1),
+            ProbeStep::Commit(BackendChoice::Iwd)
+        );
+    }
+
+    /// `BackendChoice::None` is a *positive* finding — the bus replied and
+    /// neither daemon is present. Retrying "nobody is there" would be a bug of
+    /// its own (an endless poll on a host that simply has no Wi-Fi daemon), so
+    /// it must commit exactly like the other two verdicts.
+    #[test]
+    fn ok_none_commits_and_does_not_retry() {
+        assert_eq!(
+            bounded().step(&Ok(BackendChoice::None), 1),
+            ProbeStep::Commit(BackendChoice::None)
+        );
+    }
+
+    // ── An inconclusive probe retries, then gives up at the bound ─────────────
+
+    #[test]
+    fn err_retries_while_attempts_remain() {
+        let policy = bounded();
+        assert_eq!(
+            policy.step(&inconclusive(), 1),
+            ProbeStep::Retry {
+                after: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(
+            policy.step(&inconclusive(), 2),
+            ProbeStep::Retry {
+                after: Duration::from_millis(20)
+            }
+        );
+    }
+
+    #[test]
+    fn err_past_the_bound_gives_up() {
+        let policy = bounded();
+        // The budget is 3 attempts: the third inconclusive answer is the last.
+        assert_eq!(policy.step(&inconclusive(), 3), ProbeStep::GiveUp);
+        assert_eq!(policy.step(&inconclusive(), 4), ProbeStep::GiveUp);
+        assert_eq!(policy.step(&inconclusive(), 99), ProbeStep::GiveUp);
+    }
+
+    /// The #613 regression itself: an inconclusive probe must never commit to
+    /// "no backend". That collapse is what latched Wi-Fi off for a whole
+    /// session and made a shell restart the only cure (#607).
+    #[test]
+    fn inconclusive_probe_never_commits_to_no_backend() {
+        let policy = bounded();
+        for attempt in 1..=12_u32 {
+            let step = policy.step(&inconclusive(), attempt);
+            assert_ne!(
+                step,
+                ProbeStep::Commit(BackendChoice::None),
+                "attempt {attempt}: an inconclusive probe was committed as 'no backend'"
+            );
+            assert!(
+                matches!(step, ProbeStep::Retry { .. } | ProbeStep::GiveUp),
+                "attempt {attempt}: expected retry-or-give-up, got {step:?}"
+            );
+        }
+    }
+
+    // ── Policy shape ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn backoff_doubles_and_clamps_to_the_ceiling() {
+        let policy = bounded();
+        assert_eq!(policy.backoff(1), Duration::from_millis(10));
+        assert_eq!(policy.backoff(2), Duration::from_millis(20));
+        assert_eq!(policy.backoff(3), Duration::from_millis(40));
+        // Clamped, and no overflow panic at absurd attempt counts.
+        assert_eq!(policy.backoff(4), Duration::from_millis(40));
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
+    }
+
+    /// The alternative policy (#621) is one field: `max_attempts: None` never
+    /// gives up. Asserted so the swap stays a one-line edit that is known to
+    /// work, rather than a claim in a comment.
+    #[test]
+    fn unbounded_policy_never_gives_up() {
+        let forever = RetryPolicy {
+            max_attempts: None,
+            ..bounded()
+        };
+        for attempt in [1_u32, 3, 100, u32::MAX] {
+            assert_eq!(
+                forever.step(&inconclusive(), attempt),
+                ProbeStep::Retry {
+                    after: forever.backoff(attempt)
+                }
+            );
+        }
+    }
+
+    /// The shipped policy must stay bounded (its give-up is the visible
+    /// `error!`), and its first retry prompt enough to catch a bus that is only
+    /// milliseconds behind the shell.
+    #[test]
+    fn shipped_policy_is_bounded_and_starts_promptly() {
+        assert!(super::PROBE_RETRY.max_attempts.is_some());
+        assert!(super::PROBE_RETRY.backoff(1) <= Duration::from_secs(1));
+        assert!(super::PROBE_RETRY.max_backoff >= super::PROBE_RETRY.initial);
+    }
 }

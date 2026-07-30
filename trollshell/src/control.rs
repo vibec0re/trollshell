@@ -5,7 +5,9 @@
 //! `mov.vibec0re.trollshell.Control` interface so the launch-on-demand
 //! companion app (`trollshell-control-center`) — and its per-tab consumers
 //! (#391 Place · #348 Plugins · #392 AI keys · #393 Display) — have something
-//! to bind to. Beyond the foundation's `Ping`/`Version`, the first real tab
+//! to bind to. Alongside the foundation's `Ping`/`Version` sits `Revision`
+//! (#601), the build's git hash — the deployment identity `Version` (a frozen
+//! `0.1.0`) cannot provide. The first real tab
 //! (#391) adds the **place** methods: `GetPlace` / `SetManualCity` /
 //! `SetAutoLocation`, which round-trip the shell's runtime location override
 //! (see [`hytte::services::geoclue::PlaceOverride`]). The **Plugins** tab (#348)
@@ -113,8 +115,32 @@ impl ControlIface {
 
     /// The running shell's package version (`CARGO_PKG_VERSION`), so the
     /// companion app can surface it and, later, gate on feature availability.
+    ///
+    /// Note this is **not** a deployment identity: it has been `0.1.0` since the
+    /// first commit and never changes. Use [`revision`](Self::revision) to tell
+    /// one build from another.
     async fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_owned()
+    }
+
+    /// The source revision the running shell was **built** from (#601) — a short
+    /// git hash (`34e3d96`), a dirty-tree hash (`34e3d96-dirty`), `"unknown"`
+    /// for a non-git source, or `"dev"` for an unstamped local `cargo build`.
+    ///
+    /// This is the "which commit am I?" answer [`version`](Self::version) cannot
+    /// give, and it exists because two bug reports (#375, #566) turned out to be
+    /// already-fixed-but-not-deployed with no way to check that from the running
+    /// shell. Answerable with no UI at all:
+    ///
+    /// ```text
+    /// busctl --user call mov.vibec0re.trollshell.Control \
+    ///   /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control Revision
+    /// ```
+    ///
+    /// Transport only — where (or whether) this surfaces for a human is still
+    /// open on #601. See [`crate::revision`] for the resolution order.
+    async fn revision(&self) -> String {
+        crate::revision::revision()
     }
 
     // ── Place / location (#391) ─────────────────────────────────────────────

@@ -19,8 +19,9 @@
 # environment the wrapper bakes in (`XDG_DATA_DIRS` / `GSETTINGS_SCHEMA_DIR` /
 # `GI_TYPELIB_PATH`) is exactly what the in-crane wrapping produced before.
 # Without it the GSettings-backed adwaita styling and symbolic icons would be
-# missing. Unlike `trollshell` it reads no bundled assets (no
-# `TROLLSHELL_DATA_DIR`), so there is nothing else to inject.
+# missing. Unlike `trollshell` it reads no bundled assets, so
+# `TROLLSHELL_DATA_DIR` is deliberately absent — the only other thing injected
+# here is the build revision (#601, below).
 {
   lib,
   stdenv,
@@ -28,6 +29,10 @@
   wrapGAppsHook4,
   # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
   workspace,
+  # Source revision string (#601), computed once in flake.nix from
+  # `self.shortRev` / `self.dirtyShortRev`. Defaults so an out-of-flake
+  # `callPackage ./nix/control-center.nix` still evaluates.
+  revision ? "unknown",
 }:
 let
   # A .desktop launcher named after the app-id so the app is startable by name
@@ -68,6 +73,18 @@ stdenv.mkDerivation {
     mkdir -p "$out/share/applications"
     cp ${desktopItem}/share/applications/*.desktop "$out/share/applications/"
     runHook postInstall
+  '';
+
+  # The build revision (#601), on the same wrapper wrapGAppsHook4 already
+  # creates — never as a compile-time env, which would rehash the one expensive
+  # `workspace` compile on every commit (see nix/package.nix). Injected here so
+  # the companion app can report the revision of the tree it was built from
+  # independently of the shell's own `Control.Revision` D-Bus method; which of
+  # the two a future UI surface uses is still open (#601).
+  preFixup = ''
+    gappsWrapperArgs+=(
+      --set TROLLSHELL_REV "${revision}"
+    )
   '';
 
   meta = {

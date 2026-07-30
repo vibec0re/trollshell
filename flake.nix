@@ -53,6 +53,26 @@
         "hytte-plugin-usage"
         "hytte-plugin-weather"
       ];
+      # The source revision this build came from (#601), threaded into the
+      # *wrapped* binaries' runtime environment as `TROLLSHELL_REV` so a running
+      # shell can answer "which commit am I?" — the question that has now cost
+      # two rounds of investigating already-fixed behaviour (#375, #566).
+      #
+      # `self.shortRev` exists only on a CLEAN git tree; a dirty working tree
+      # instead carries `self.dirtyShortRev` (e.g. "34e3d96-dirty"), and a
+      # non-git source (a `path:` flake, a tarball) has neither — hence the
+      # literal fallback. Verified against nix 2.34: the two attributes are
+      # mutually exclusive, never both present.
+      #
+      # Deliberately NOT a compile-time env on the `workspace` derivation: that
+      # would change the one expensive crane compile's hash on every commit and
+      # invalidate the artifact every package output slices from (see
+      # nix/package.nix). It is injected only by the cheap wrapper slices
+      # (nix/package.nix's `preFixup`, nix/control-center.nix), which are a `cp`
+      # plus a makeWrapper call. The Rust side (trollshell/src/revision.rs)
+      # reads it at runtime and falls back to "dev" when unset, which is exactly
+      # what a plain `cargo run` gets.
+      revision = self.shortRev or (self.dirtyShortRev or "unknown");
       forAllSystems =
         fn:
         nixpkgs.lib.genAttrs systems (
@@ -69,7 +89,7 @@
       packages = forAllSystems (
         { pkgs, craneLib, ... }:
         let
-          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib revision; };
           # The single whole-workspace compile (#572). EVERY package output
           # below is a slice of this one derivation — a `cp` of one binary out
           # of its `$out/bin`, optionally wrapped — so there is exactly one
@@ -80,7 +100,7 @@
           # The control-center companion app (#399): the workspace binary, GApps-
           # wrapped, plus a .desktop launcher. No cargo (#572).
           trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
-            inherit workspace;
+            inherit workspace revision;
           };
 
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
@@ -203,7 +223,7 @@
         }:
         let
           system = pkgs.stdenv.hostPlatform.system;
-          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib; };
+          trollshell = pkgs.callPackage ./nix/package.nix { inherit craneLib revision; };
           # The single whole-workspace compile (#572), mirroring the `packages`
           # output above.
           workspace = trollshell.passthru.workspace;
@@ -211,7 +231,7 @@
           # The control-center companion app (#411), mirroring the `packages`
           # output above — a slice of `workspace`, no cargo of its own (#572).
           trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
-            inherit workspace;
+            inherit workspace revision;
           };
 
           # The 12 per-plugin packages (#558), mirroring the `packages` output.

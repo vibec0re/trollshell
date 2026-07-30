@@ -8,6 +8,7 @@ mod overlays;
 mod panels;
 mod plugin_launcher;
 mod plugins;
+mod revision;
 mod scale;
 mod secrets;
 mod widgets;

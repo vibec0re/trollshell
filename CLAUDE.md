@@ -202,6 +202,7 @@ Source layout (each module has a consistent shape — match it when adding):
 - `control.rs` — the `mov.vibec0re.trollshell.Control` D-Bus endpoint that `trollshell-control-center` (and future tabs) bind to; transport only, no UI (#390).
 - `plugins.rs` — the out-of-process widget-plugin **host transport**: the per-user socket listener, the GTK-side clock pump, and the effect broker (#35).
 - `plugin_launcher.rs` — the declarative plugin **launcher** (#419): reads the nix-written `trollshell/plugins.json` (XDG config, rendered from `programs.trollshell.plugins`) and launches each enabled plugin as a transient `trollshell-plugin-<id>` user unit via `systemd-run --user`; the control-center Plugins tab's start/stop (#348) routes through it, and its `extra_env` spawn hook is where #392's key injection rides. Hand-installed static units under `etc/` keep working (legacy fallback).
+- `revision.rs` — resolves the build's git revision via `TROLLSHELL_REV` (runtime env → compile-time env → `"dev"` fallback), the same three-tier shape as `assets.rs` (#601). The nix side injects it **only** through the cheap wrapper slices' `preFixup` (`nix/package.nix`, `nix/control-center.nix`) — never as a compile-time env, which would rehash the single `workspace` crane compile on every commit. Surfaced over D-Bus as `Control.Revision`; whether it also gets a UI surface is still open.
 - `scale.rs` — font-relative pixel scaling (`scale()`) for the handful of Rust-set sizes CSS `em` can't reach (#135).
 
 ### Conventions

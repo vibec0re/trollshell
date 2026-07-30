@@ -27,8 +27,11 @@ types below _are_ the wire types.
 > change. Grown since this was written: `Mount::SidebarLead` (a leading sidebar
 > region); `Capability`/`Effect::{RaiseOsd,Notify}` (transient OSD nudges and
 > shell-posted notifications, alongside `OpenPage`/`Niri`/`Media`/`Audio`/
-> `RunCommand`); and a `Node::Pixels` variant (raw pixel-buffer surfaces, the
-> `preem` widget-kit's render target) in the node vocabulary. Read
+> `RunCommand`); a `Node::Pixels` variant (raw pixel-buffer surfaces, the
+> `preem` widget-kit's render target) in the node vocabulary; and — missed by
+> this note when it was first written, though both predate it —
+> `Node::Slider` (#315, 2026-07-13) with `EventKind::ValueChanged`, and
+> `Node::Entry` (#363, 2026-07-16) with `EventKind::Submitted`. Read
 > `crates/hytte-plugin-proto/src/{manifest,effect,wire}.rs` for the current
 > wire types; treat the `enum`/`struct` bodies below as illustrative of the
 > shape, not an exhaustive variant list.
@@ -121,7 +124,7 @@ they are **not** in scope for the proto crate (PR 1) and are sketched for PR 2+.
   `read_frame`/`write_frame` for streaming. A read-side `MAX_FRAME_LEN` (16 MiB)
   bounds memory against a hostile/buggy peer.
 
-## Node vocabulary (frozen, from #199)
+## Node vocabulary (from #199; `wire.rs` is now the normative, unfrozen source)
 
 The closed 7-node set the reconciler already renders, mirrored GTK-free in
 `wire::Node` (`Box` carries `scroll` explicitly, so `wire::Node → hytte_ui::Node`
@@ -148,6 +151,18 @@ enum EventKind { Click, Scroll { dx: f64, dy: f64 } }   // v1; matches the recon
   stay hand-written Rust. The node set is additive: `Row`/`ListBox` and richer
   props (ellipsize/margins/tooltip) slot in when the first list-y plugin needs
   them.
+
+  > **Retracted, in part (2026-07-30).** Of the three things listed:
+  > **two-way inputs** reversed twice, both with paired push events:
+  > `Node::Slider` (#315, 2026-07-13) + `EventKind::ValueChanged`, and
+  > `Node::Entry` (#363, 2026-07-16) + `EventKind::Submitted`. **Arbitrary
+  > pixels/images** also reversed: `Node::Pixels` (#284, 2026-07-12) carries
+  > an arbitrary `width`/`height` RGBA8 buffer, and `data`/`scale` are mutable
+  > per-`id` — a plugin can push a new frame's worth of bytes on every
+  > re-render (`wire.rs:233-247`), not a one-shot fixed image. Only **custom
+  > drawing** still holds: frontend B plugins are out-of-process, so pixels
+  > arrive as a validated buffer the host paints, never as cairo/snapshot
+  > calls the host executes on the plugin's behalf.
 
 ## Message envelope
 

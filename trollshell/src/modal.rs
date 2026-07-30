@@ -1057,19 +1057,32 @@ pub fn close_all() {
 /// subscribers on the stale `true` permanently:
 ///
 /// * A signal's `MutableSignalState` holds a strong `Arc` to the shared state,
-///   but is **not** counted in `senders` — only live `Mutable` handles are. And
-///   the `PANELS` drain above has already dropped every
-///   `ModalPanel::open_state`, so by the time we run, this map holds the *last*
-///   `Mutable` for each key still in it.
-/// * Dropping that last sender notifies with `has_changed = false` and then
+///   but is **not** counted in `senders` — only live `Mutable` handles are.
+///   Dropping the *last* sender notifies with `has_changed = false` and then
 ///   wipes the waker list, while `poll_change` reads
 ///   `if is_changed() { … } else if senders == 0 { Poll::Ready(None) }` — a
 ///   permanent end-of-stream.
-/// * So pruning first *terminates* every live subscription on that key while
-///   its value is still `true`, unrecoverably: a `set_neq` loop afterwards can
-///   no longer reach an entry that's already out of the map, and its wakers are
-///   gone regardless. Clearing first latches `changed` before the senders reach
+/// * `close_all`'s `PANELS` drain has already dropped every
+///   `ModalPanel::open_state` before this runs, so pruning an entry straight
+///   off the map — #618's rejected ordering, and the shape this function had
+///   before #631 — would drop that key's *only remaining* sender while its
+///   value was still `true`, unrecoverably: a `set_neq` loop afterwards can no
+///   longer reach an entry already out of the map, and its wakers are gone
+///   regardless. Clearing first latches `changed` before the senders reach
 ///   zero, so the last poll delivers `false` and *then* the stream ends.
+///   That's still why clear has to run before prune.
+///
+/// **#631 changed *where* the last-sender drop happens, not whether clear
+/// precedes prune.** The implementation below clones every `Mutable` into a
+/// local `states` `Vec` before touching any of them (to get `set_neq` off the
+/// borrowed map — see the function's own comment). That clone is a second
+/// sender for the rest of the function, so the map's copy is never the last
+/// survivor: `retain` dropping a pruned key's map-entry is now an ordinary
+/// decrement, and the real last-sender drop happens only when `states` itself
+/// goes out of scope at the end of the function — after both the reset and
+/// the prune, with no `DRAWER_OPEN` borrow held at all. That's strictly safer
+/// than the pre-#631 shape, whose last-sender drop happened *at* the `retain`
+/// call, inside the active `borrow_mut()`.
 ///
 /// The fallback keys this prunes do have a live subscriber, so this is not
 /// hypothetical: `main.rs` binds the bar's `drawer-open` class for every
@@ -1572,10 +1585,12 @@ fn apply_stats_scroll(panel: &ModalPanel) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAWER_OPEN, EAGER_PAGES, Page, clamp_main_margin, close_all, drawer_open_state,
+        DRAWER_OPEN, EAGER_PAGES, Page, Signal, clamp_main_margin, close_all, drawer_open_state,
         reset_drawer_open_states,
     };
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
 
     // These are pure-logic guards for the lazy drawer-page registry (#231).
     // The two properties that _cannot_ be regressed silently are covered by the
@@ -1823,6 +1838,91 @@ mod tests {
             !open.get(),
             "close_all left the drawer-open state latched — is it still calling \
              reset_drawer_open_states()?"
+        );
+    }
+
+    /// A `Waker` whose `wake` re-enters `DRAWER_OPEN` exactly the way a real
+    /// subscriber (OSD, bar CSS) would if woken synchronously: it calls
+    /// [`drawer_open_state`], which needs its own `borrow_mut()` of the same
+    /// thread-local `RefCell`. Built via `std::task::Wake` rather than a raw
+    /// `RawWaker`/`RawWakerVTable` — the workspace forbids `unsafe_code`
+    /// project-wide, and `Wake` is the safe, stable way to get a `Waker` from
+    /// an `Arc` since Rust 1.68.
+    struct ReentrantWaker;
+
+    impl Wake for ReentrantWaker {
+        fn wake(self: Arc<Self>) {
+            // The key doesn't matter — any key hits the same `DRAWER_OPEN`
+            // `RefCell`. What matters is that this runs synchronously, from
+            // inside whatever called `Waker::wake`.
+            let _ = drawer_open_state("reentrant-probe");
+        }
+    }
+
+    /// #631, the one site in the sweep with no GTK involved at all: this
+    /// function's reentrancy trigger is `futures-signals`' `Waker::wake()`,
+    /// called synchronously from `Mutable::set_neq`'s internal `notify` when
+    /// a subscriber is registered. That makes it hermetically testable with
+    /// nothing but `std::task` — no display, no `App`, no new dependency —
+    /// unlike the other eight sites in this sweep, which all need a live GTK
+    /// window to prove anything either way.
+    ///
+    /// This is also the one regression in the sweep that would be silent:
+    /// every other test in this module would keep passing while this
+    /// function quietly went back to holding `DRAWER_OPEN` borrowed across
+    /// `set_neq`, reopening the reentrancy hazard (and, transitively,
+    /// weakening the #618 guarantee the surrounding doc comment argues for).
+    ///
+    /// Mechanics: register `ReentrantWaker` on a fresh signal for one key,
+    /// set that key's value so `reset_drawer_open_states`'s own `set_neq`
+    /// call is a real change (a no-op `set_neq` never notifies, so this
+    /// wouldn't trigger anything), then run the function under
+    /// `catch_unwind`. Pre-#631, the outer `borrow_mut()` was still held
+    /// when `set_neq` woke `ReentrantWaker` synchronously, and its nested
+    /// `drawer_open_state` call hit `BorrowMutError`. Post-#631, `set_neq`
+    /// runs with no `DRAWER_OPEN` borrow active at all, so the wake's
+    /// re-borrow succeeds.
+    ///
+    /// Falsified by temporarily reverting `reset_drawer_open_states` to the
+    /// pre-#631 shape and rerunning: this doesn't just fail the one
+    /// `assert!` — `Mutable`'s internal state uses a `std::sync::Mutex`
+    /// alongside the borrow, so the `BorrowMutError` panic unwinds through it
+    /// mid-notify and poisons it. `catch_unwind` still catches that first
+    /// panic, but the poisoned `Mutable` is still sitting in `DRAWER_OPEN`
+    /// afterwards, and when the worker thread later tears down its
+    /// thread-locals, dropping it re-panics on the poison — from inside a
+    /// destructor, where an escaping panic is fatal. The whole test binary
+    /// aborts (`SIGABRT`), not just this test. A stronger falsification than
+    /// a clean assertion failure, and the same class of outcome the rest of
+    /// this sweep guards against by a different route: an inner panic
+    /// escaping through a context that cannot unwind.
+    #[test]
+    fn reset_drawer_open_states_does_not_reenter_the_borrow() {
+        let state = drawer_open_state("reentrant-trigger");
+        state.set(true);
+
+        let waker = Waker::from(Arc::new(ReentrantWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut sig = Box::pin(state.signal());
+        // The first poll of a fresh signal always delivers the current value
+        // regardless of `changed`, so it takes a second poll (which sees no
+        // further change) to actually register the waker for the *next*
+        // notify — the one `reset_drawer_open_states`'s `set_neq` will fire.
+        loop {
+            match sig.as_mut().poll_change(&mut cx) {
+                Poll::Ready(Some(_)) => {}
+                Poll::Ready(None) => panic!("signal ended before the waker could register"),
+                Poll::Pending => break,
+            }
+        }
+
+        let result = std::panic::catch_unwind(reset_drawer_open_states);
+
+        assert!(
+            result.is_ok(),
+            "reset_drawer_open_states panicked — a synchronously-woken subscriber \
+             re-borrowed DRAWER_OPEN while reset_drawer_open_states was still \
+             holding it"
         );
     }
 }

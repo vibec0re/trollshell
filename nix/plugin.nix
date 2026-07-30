@@ -1,5 +1,6 @@
-# Packages a single workspace binary — a bundled widget plugin, or a standalone
-# CLI tool like `hytte-infobroker` (#562) — as its own flake output (#558) so
+# Packages a single workspace binary — a bundled widget plugin, a standalone
+# CLI tool like `hytte-infobroker` (#562), or a standalone GTK-free daemon like
+# `hytte-claude-bridge` (#584) — as its own flake output (#558) so
 # `programs.trollshell.plugins.<id>.package` (for plugins) or a plain
 # `home.packages` entry (for tools) finally has something in THIS flake to
 # point at. Before this the workspace build compiled all 12 `hytte-plugin-*`

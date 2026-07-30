@@ -14,7 +14,7 @@ PR number in parens if you need full context on _why_.
 Checked items are ones Annika has already implicitly verified — noted inline.
 Everything else is unchecked and still wants a pass in a real Niri session.
 
-**Coverage: #458 through #634** (#606, #611, #622, and #628 carry no
+**Coverage: #458 through #668** (#606, #611, #622, and #628 carry no
 live-verify list of their own — noted in the closing section instead).
 Originally created by #507 for the 2026-07 merge wave (#458–#496); refreshed
 by #602 to fold in everything merged since (#497–#596), renaming off the
@@ -22,11 +22,17 @@ month-stamped filename in that pass; refreshed again (parent effort #602) for
 the #598/#604/#606/#609 burst that merged right behind it; folded in #610
 immediately after the 2026-07-30 merge that landed it; folded in
 #616/#622/#623/#624/#625 immediately after the next 2026-07-30 merge burst
-(via #628); and folded in #629/#630/#634 in this pass, which also **corrects**
-two entries #634 made false (the Network panel and Wi-Fi sections below)
-rather than merely adding to them — a wrong verification step is worse than a
-missing one, per #635. This is a living checklist that gets refreshed
-periodically, not a dated snapshot of one merge wave.
+(via #628); folded in #629/#630/#634 in the pass after that, which also
+**corrected** two entries #634 made false (the Network panel and Wi-Fi
+sections below) rather than merely adding to them; and now folds in
+#637/#639/#642 plus the further #644/#645/#662/#663/#664/#666/#668 burst that
+landed right behind them (#660), which also **corrects** the #630 entry
+below: #637 changed `modal::close_all`'s teardown call from `window.close()`
+to `window.destroy()` after #630 had already merged, so the entry's citation
+of `close()` went stale the moment #637 landed, not from later drift. A wrong
+verification step is worse than a missing one, per #635. This is a living
+checklist that gets refreshed periodically, not a dated snapshot of one merge
+wave.
 
 ## Idle & lock
 
@@ -179,6 +185,62 @@ periodically, not a dated snapshot of one merge wave.
       provider plugins instead of the broker's own internal fetch — confirm
       both still resolve under the normal grant flow (see also "Plugin host &
       protocol" above).
+
+## Claude bridge (`hytte-claude-bridge`)
+
+- [ ] **(#666)** New standalone binary + systemd unit: a keyless,
+      loopback-only (`127.0.0.1:8787`) OpenAI-compatible shim over headless
+      `claude`, so an LLM-backed plugin (`pet`, `caw`) can ride a Claude Code
+      subscription instead of a paid API key with a one-line `Environment=`
+      change on _its own_ unit. This is a brand-new service nobody has run
+      live yet, so every check below is genuinely first-run, not a
+      regression check.
+  1. **Starts and refuses correctly.**
+     `systemctl --user start trollshell-claude-bridge`, then
+     `journalctl --user -u trollshell-claude-bridge` — expect
+     `hytte-claude-bridge listening (keyless by design; loopback only)`. Then
+     run it by hand with `ANTHROPIC_API_KEY=x hytte-claude-bridge` — expect a
+     refusal naming the offending variable, exit 1 (the billing guard that
+     stops metered credits leaking in from an inherited env).
+  2. **A round trip:**
+     `curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"system","content":"you are a cat"},{"role":"user","content":"say hi"}]}'`
+     — expect a `chat.completion` body with text in
+     `choices[0].message.content`, inside 8s.
+  3. **Not reachable off-box** — from another host on the LAN,
+     `curl http://<box>:8787/…` must fail to connect. The bridge validates no
+     bearer token at all (it structurally can't — see the PR body), so
+     loopback-only is the entire authorization boundary; the IP is
+     hard-coded, only the port is configurable.
+  4. **The delta rule for real:** send turn 1, then turn 2 carrying
+     `[system, user, assistant(reply), user]`. Check
+     `~/.claude/projects/<slug>/` — there should be **one** `.jsonl` with a
+     `customTitle` starting `hytte-bridge-…`, and turn 2 should have appended
+     only the one new user message, not replayed the whole transcript. A
+     hermetic test only approximates this — it's the one behaviour that
+     needs a real `claude` session to see directly.
+  5. **The riskiest live assumption, flagged by the PR itself:** the
+     resume-then-create fallback depends on `hive-claude` classifying a
+     failed `--resume` as the typed `SessionNotFound`. If that marker ever
+     drifts, **every first turn 502s** instead of creating a session. The
+     journal tell is `claude exited …` with `does not match any session
+title` in the stderr tail — worth a deliberate look on first run, since
+     a silent drift here would read as "the bridge is broken" rather than
+     naming the actual cause.
+  6. **pet end-to-end:** add
+     `Environment=PET_LLM_URL=http://127.0.0.1:8787` and
+     `Environment=OPENROUTER_API_KEY=local-bridge` to
+     `trollshell-plugin-pet.service`, restart, poke the cat. Confirm via
+     `journalctl` that the pet never sends the real OpenRouter key — the
+     dummy env var winning is the whole point (`load_key_from` checks the
+     `OPENROUTER_API_KEY` env override before
+     `~/.config/trollshell/openrouter.key`).
+  7. **caw's briefing** composes calendar + weather + departures into a
+     larger prompt than anything measured against the bridge. If it exceeds
+     the 8s budget it 504s and caw falls back to canned output — that's the
+     designed outcome, not a bug. If it happens routinely on a real briefing,
+     that's a tuning question (raise `CLAUDE_BRIDGE_TIMEOUT_SECS`, staying
+     under 10, or point caw at a faster model via `CLAUDE_BRIDGE_MODEL`), not
+     a regression to file.
 
 ## Caw (morning briefing)
 
@@ -333,6 +395,34 @@ periodically, not a dated snapshot of one merge wave.
       built"/"spectrum capture torn down" pair per cycle). Also worth an
       eyeball: audio keeps working normally across cycles, and the spectrum
       doesn't flash a stale frame on re-open.
+- [ ] **(#664)** The Media panel's **Auto** source chip couldn't stay
+      pressed — clicking it re-pressed then immediately un-pressed itself as
+      soon as any player existed, so "revert to automatic" had no visible
+      feedback — and a **pinned** player was indistinguishable from one
+      merely picked by the automatic heuristic. Needs a real Niri session
+      with **two** MPRIS players running (e.g. `mpv` plus a browser tab or
+      Spotify) — the switcher row hides below 2 players, so testing with one
+      player exercises none of this — and a **shell restart first**, since
+      the new `ts-media-source-pinned` ring/bold-weight styling is CSS and
+      only applies on (re)load:
+  1. Open the Media drawer page — **Auto** should be pressed on open,
+     alongside the heuristically-picked player chip (which is pressed but has
+     no ring).
+  2. Click a player chip → Auto releases, that chip stays pressed and gains
+     the ring + bold weight.
+  3. Click **Auto** → it presses and _stays_ pressed (this is the click that
+     used to undo itself); the ring disappears; the heuristic chip stays lit.
+  4. Click **Auto** again while already pressed → it must stay pressed, not
+     flip released.
+  5. Quit the pinned player → Auto lights back up and the surviving player's
+     chip takes over with no ring (a stale pin reads as automatic).
+  6. Start/stop a third player while pinned → the roster rebuilds and the pin
+     survives with its ring intact.
+
+  Separately, a bare-string (rather than array) `xesam:artist` no longer
+  comes through as an empty artist — needs a player that actually emits the
+  metadata that way to exercise live; otherwise it's covered by hermetic
+  parse tests only.
 
 ## Screen recording
 
@@ -357,13 +447,81 @@ periodically, not a dated snapshot of one merge wave.
       `modal.rs`. Confirm drawer show/hide gating is unchanged (no new
       flicker, no page staying mounted/unmounted incorrectly).
 - [ ] **(#630)** `modal::close_all` no longer holds the `PANELS` `RefCell`
-      borrow across each `window.close()` call — a latent reentrant-borrow
-      hazard fix, not a behavior change. There is no new behavior to click
-      through here, and the honest verification is that **nothing changes**:
-      monitor hot-plug with a drawer open still behaves exactly as before,
-      including mid-retract, and the #624 `reset_drawer_open_states()`
-      ordering still runs after every panel is dropped. Absence of any
-      observable difference is the pass condition, not a ritual to perform.
+      borrow across each `window.destroy()` call — a latent reentrant-borrow
+      hazard fix, not a behavior change. **Corrected (#660):** this entry
+      used to say `window.close()`; #637 (below) changed that teardown call
+      to `destroy()` after #630 had already merged, so the entry cited a call
+      the code no longer makes. There is no new behavior to click through
+      here, and the honest verification is that **nothing changes**: monitor
+      hot-plug with a drawer open still behaves exactly as before, including
+      mid-retract, and the #624 `reset_drawer_open_states()` ordering still
+      runs after every panel is dropped. Absence of any observable
+      difference is the pass condition, not a ritual to perform.
+- [ ] **(#637)** All five per-monitor overlay `close_all` functions
+      (`modal.rs`, `overlays/{sidebar,frame,osd,notifications}.rs`) now tear
+      down with `gtk::Window::destroy()` instead of `close()`. `close()` is a
+      _request_ routed through `close-request` and doesn't drop GTK's
+      internal toplevel reference on a window that was never realized — these
+      layer-shell windows are built but never shown until first opened
+      (`modal.rs`'s `EAGER_PAGES` is empty), so a drawer/overlay never opened
+      on a given monitor survived a hot-plug `close_all` under the old code,
+      leaking its widget tree and (via `plugins/region.rs`'s
+      `connect_destroy`) its plugin-panel reconcile subscription. On a
+      two-monitor Niri session: hold a `glib::WeakRef` to (or otherwise
+      track) a drawer/sidebar/frame/OSD/toast window that has never been
+      opened on the secondary output, force several kanshi profile switches
+      (hot-plug/hot-unplug cycles), and confirm the tracked `WeakRef` no
+      longer upgrades after the corresponding `close_all` — or, short of
+      instrumenting a `WeakRef`, that `gtk::Window::toplevels()`'s count
+      doesn't grow per cycle for surfaces that were never opened. Also
+      confirm plugin panels mounted in the sidebar/drawer still reconcile
+      correctly (respond to plugin state changes) after several such
+      switches.
+- [ ] **(#639)** The three remaining `close()`-teardown sites in `hytte-ui`
+      itself now use `destroy()` too, for the same reason as #637:
+      `bar.rs`'s `BarHandle::close()` and its `Drop` impl, and `popup.rs`'s
+      dismiss-catcher teardown in `close_catchers`. A **lack of change** is
+      the pass condition: bars on removed monitors should still disappear on
+      multi-monitor hot-plug/kanshi switches, rebuilt bars on
+      remaining/re-added monitors should behave normally, and popup
+      dismiss-catchers (click-outside, Escape, autohide, scroll) should still
+      disappear on every output with no leftover invisible click-eater.
+- [ ] **(#644)** Nine more `RefCell` borrows released before the GTK call
+      that could re-enter them, all inside `modal.rs`/`overlays/`: the four
+      sibling `close_all`s (`sidebar.rs`, `frame.rs`, `notifications.rs`,
+      `osd.rs`) now `take()` their map before calling `destroy()` on each
+      entry (same shape #630 fixed for `modal.rs`); `prompt.rs`'s
+      `close_prompt` and `consent.rs`'s `close_all`/supersede-on-`request`
+      bind the taken value before acting on it; and two more in `modal.rs`
+      itself — `reset_drawer_open_states` (no longer holds `DRAWER_OPEN`
+      borrowed across each `Mutable::set_neq`) and `install` (the replaced
+      panel now drops after the `PANELS` borrow ends, not inside it). Same
+      honest verification as #630: **nothing changes**. Hot-plug/kanshi
+      switches with a drawer, sidebar, frame overlay, OSD toast, or
+      notification open (or mid-retract) should behave exactly as before;
+      the consent prompt's Allow/Deny/timeout flow and a second `request()`
+      superseding a pending one should be unaffected.
+- [ ] **(#663)** Twenty-two more sites with the same `RefCell`-across-GTK-call
+      pattern, this time outside `overlays/`: `hytte-ui`'s `popup.rs`
+      catcher teardown, the shared `components/reactive_list.rs` helper
+      (backs `panels/{appearance,vpn,clipboard,displays,stats}.rs` and
+      `panels/network/{wired,wifi,connection}.rs` — eight panels),
+      `components/power_profile.rs`, `panels/stats.rs` (top-apps expander,
+      per-app rows, live per-core bars), `widgets/{calendar,tasks}.rs`
+      (upcoming-list/task-list rebuilds, day-click highlight, create-popover
+      list sync), `panels/connections.rs`, and the control-center's
+      `apply_plugins`/`clear_rows`. Same pass condition as #630/#644:
+      **nothing changes**. Given the breadth, worth an eyeball on more than
+      one panel — open the Appearance/VPN/Clipboard/Displays/Stats drawers
+      and the Wired/Wi-Fi/Connections network sub-pages, add/remove a
+      calendar or task entry, and open the control-center's Plugins tab and
+      toggle a plugin — all list add/remove/rebuild behavior should look
+      identical to before. The one site in this PR with an actual
+      synchronous-reentrancy proof (not just an unverified hazard) is
+      `popup.rs`'s `close_catchers`, confirmed by a new gated test that
+      reproduces the pre-fix `SIGABRT` — nothing extra to click through for
+      that one beyond the regular dismiss-catcher check already covered by
+      #639 above.
 
 ## Stats drawer
 
@@ -449,6 +607,40 @@ periodically, not a dated snapshot of one merge wave.
       the remainder, and two monitors showing the same toast only resume on
       the last leave.
 
+## D-Bus name ownership
+
+- [ ] **(#668)** A contested well-known bus name — another daemon already
+      owns it and refuses replacement, the shape of mako/dunst holding
+      `org.freedesktop.Notifications` — now backs off and logs instead of
+      retrying silently at ~4 `RequestName` calls/second forever. **Nothing
+      changes in the UI yet**; this is `Refs #653`, not `Closes` — the
+      visible bar tell is a separate, still-open follow-up. Verify with:
+
+  ```sh
+  systemctl --user start mako          # or dunst
+  systemctl --user restart trollshell
+  journalctl --user -u trollshell -f | grep -i 'D-Bus name'
+  ```
+
+  Expect exactly **three** warns within the first second or so
+  (`consecutive=1`, `2`, then `3` latching `PermanentlyTaken` with
+  `retry_in_secs=300`), each naming the actual holder (`holder=:1.NN`) via a
+  best-effort `GetNameOwner` lookup — then **one warn every 5 minutes**, not
+  a flood. **The slow cadence is the fix, not a bug**: if you then stop the
+  squatter (`systemctl --user stop mako`) and trollshell doesn't reclaim the
+  name for up to 5 minutes, that is expected — recovery went from ~250ms to
+  up to 5 minutes as the direct cost of cutting `RequestName` calls from
+  ~14,400/hour to 12/hour. Filing that delay as a regression would be
+  exactly backwards. To confirm the call-rate drop itself directly:
+
+  ```sh
+  busctl --user monitor --match \
+    "type='method_call',member='RequestName',arg0='org.freedesktop.Notifications'"
+  ```
+
+  should show 3 calls quickly, then one per 5-minute cooldown — not a
+  continuous stream.
+
 ## Network panel (link status)
 
 - [ ] **(#610)** _Unchanged path_ — on a host with a working NetworkManager or
@@ -494,6 +686,33 @@ periodically, not a dated snapshot of one merge wave.
       bar and panel tooltips must agree there too. On a host with a working
       link manager, online/degraded/carrier/no-route/disconnected should all
       render exactly as before.
+- [ ] **(#645)** A transient failure on the **first** `ListLinks` seed after
+      `probe_link_backend` has already elected `LinkBackend::Networkd` no
+      longer latches the panel at "no link manager has answered yet" for the
+      rest of the process lifetime — previously curable only by
+      `systemctl --user restart trollshell`. This is the networkd-side
+      sibling of #634's wifi-backend-probe retry, not the same code path:
+      #610/#623/#634 above cover the _backend-choice_ probe (NetworkManager
+      vs. networkd vs. neither); this covers the first real `ListLinks` call
+      once networkd has already been chosen. Provoke the race:
+      `systemctl restart systemd-networkd` and, in the same moment,
+      `systemctl --user restart trollshell` (or catch it early in a fresh
+      boot's session, before networkd has settled). Confirm the network
+      panel's link list populates **on its own, without a shell restart**,
+      and that the journal carries both halves:
+
+  ```sh
+  journalctl --user -u trollshell | grep -E 'startup refresh (FAILED|RECOVERED)'
+  ```
+
+  Expect at least one `FAILED` line (`attempt=`, `retry_in_secs=`) followed
+  by a `RECOVERED` line (`attempts=`). Can't be exercised by CI, for the same
+  reason #634's wifi-side retry can't — nothing in `nix flake check` can make
+  `ListLinks` fail and then succeed on demand. Sanity-check the two
+  unchanged paths too: a normal boot where the first refresh succeeds should
+  show **no** `startup refresh` lines at all, and a host with neither daemon
+  should still log `networkd: no link backend available; service inert` once,
+  promptly, with no retry lines.
 
 ## Wi-Fi (NetworkManager)
 
@@ -710,3 +929,12 @@ periodically, not a dated snapshot of one merge wave.
   same reason #611 is — it's the state of this file immediately before the
   #629/#630/#634 burst that this pass folds in, so a future reader can see
   where the handoff was.
+- **(#662)** Docs-only claim-correction sweep across `CLAUDE.md`,
+  `docs/CHOOM-INIT.md`, and the `etc/{calendar,kanshi,niri,systemd}/README.md`
+  deployment docs — stale overlay/module-layout references, a false "CI
+  doesn't run clippy" claim, a dead `blur.kdl` citation, an outdated
+  now-playing/consent-prompt description, and two shipped-feature bullets
+  (recurring-event expansion, per-output wallpaper) still marked as
+  follow-ups. No code changed and no behavior to click through in a Niri
+  session; noted here so its absence from the sections above doesn't read as
+  an oversight.

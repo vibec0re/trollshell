@@ -591,6 +591,11 @@ fn wire_escape(window: &gtk::Window, monitor: Monitor) {
 /// Close every sidebar surface and drop the per-monitor entries. Called
 /// before rebuilding bars on hot-plug, so stale layer-shell windows don't
 /// linger after a monitor disappears.
+///
+/// Tears down with `destroy()`, not `close()` (#632): a sidebar never opened
+/// on this monitor is still unrealized, and `close()` neither destroys an
+/// unrealized window nor drops GTK's internal toplevel reference — only
+/// `destroy()` does, and it can't be vetoed by a `close-request` handler.
 pub fn close_all() {
     PANELS.with(|panels| {
         for (key, panel) in panels.borrow_mut().drain() {
@@ -616,7 +621,7 @@ pub fn close_all() {
                 id.remove();
             }
             panel.open_state.set(false);
-            panel.window.close();
+            panel.window.destroy();
         }
     });
     // SIDEBAR_OPEN is keyed per-monitor and deliberately survives a rebuild

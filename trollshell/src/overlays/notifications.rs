@@ -148,10 +148,16 @@ pub fn install(monitor: &Monitor) {
 /// are left running: they route by connector on each emission, so a fresh
 /// `install` re-keys the map and they self-heal. `SUBS_INSTALLED` therefore
 /// stays set — subscriptions wire exactly once for the process lifetime.
+///
+/// Tears down with `destroy()`, not `close()` (#632): a toast surface that
+/// never showed a notification on this monitor is still unrealized, and
+/// `close()` neither destroys an unrealized window nor drops GTK's internal
+/// toplevel reference — only `destroy()` does, and it can't be vetoed by a
+/// `close-request` handler.
 pub fn close_all() {
     TOAST_WINDOWS.with(|map| {
         for (_, view) in map.borrow_mut().drain() {
-            view.window.close();
+            view.window.destroy();
         }
     });
 }

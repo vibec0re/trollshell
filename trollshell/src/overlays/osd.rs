@@ -189,6 +189,12 @@ pub fn install(monitor: &Monitor) {
 /// focused-output) keep running: they route by connector each emission, so a
 /// fresh `install` re-keys the map and they self-heal. `SUBS_INSTALLED` stays
 /// set so they wire exactly once for the process lifetime.
+///
+/// Tears down with `destroy()`, not `close()` (#632): an OSD that never
+/// popped on this monitor is still unrealized, and `close()` neither
+/// destroys an unrealized window nor drops GTK's internal toplevel
+/// reference — only `destroy()` does, and it can't be vetoed by a
+/// `close-request` handler.
 pub fn close_all() {
     OSDS.with(|map| {
         for (_, view) in map.borrow_mut().drain() {
@@ -196,14 +202,14 @@ pub fn close_all() {
                 sub.abort();
             }
             // Cancel pending timers so they can't fire (holding a live `Rc`
-            // clone of the view) into a closed window after teardown.
+            // clone of the view) into a destroyed window after teardown.
             if let Some(id) = view.timeout.take() {
                 id.remove();
             }
             if let Some(id) = view.fade_out_timeout.take() {
                 id.remove();
             }
-            view.window.close();
+            view.window.destroy();
         }
     });
 }

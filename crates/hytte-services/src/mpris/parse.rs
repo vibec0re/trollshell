@@ -47,7 +47,8 @@ pub(super) fn parse_metadata(
         .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
         .unwrap_or_default();
 
-    // xesam:artist is a string array (as); handle gracefully if absent or malformed.
+    // xesam:artist — a string array (as), or a bare string from players that
+    // ignore the spec; handle gracefully if absent or malformed.
     let artists = parse_artist_array(map.get("xesam:artist"));
 
     // xesam:artUrl — a plain string in most players.
@@ -65,26 +66,31 @@ pub(super) fn parse_metadata(
     (title, artists, album, art_url, length_us, track_id)
 }
 
-/// Parse `xesam:artist` from an `OwnedValue` that should be `as` (array of strings).
+/// Parse `xesam:artist` from an `OwnedValue`. The spec says `as` (array of
+/// strings), but some players send a bare `s` instead, so fall back to reading
+/// the value as a plain String — the same widening the sibling parsers already
+/// do ([`parse_track_id`] accepts `ObjectPath` or `String`, [`parse_length`]
+/// `u64` or `i64`). Anything else yields the empty string.
 fn parse_artist_array(val: Option<&OwnedValue>) -> String {
     let Some(v) = val else { return String::new() };
     let Ok(owned) = v.try_clone() else {
         return String::new();
     };
 
-    let Ok(arr) = zbus::zvariant::Array::try_from(owned) else {
-        return String::new();
-    };
+    // Spec-compliant `as` first.
+    if let Ok(arr) = zbus::zvariant::Array::try_from(owned.clone()) {
+        let parts: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                let cloned = item.try_clone().ok()?;
+                String::try_from(OwnedValue::try_from(cloned).ok()?).ok()
+            })
+            .collect();
+        return parts.join(", ");
+    }
 
-    let parts: Vec<String> = arr
-        .iter()
-        .filter_map(|item| {
-            let cloned = item.try_clone().ok()?;
-            String::try_from(OwnedValue::try_from(cloned).ok()?).ok()
-        })
-        .collect();
-
-    parts.join(", ")
+    // Bare `s` — surface it verbatim rather than dropping the artist.
+    String::try_from(owned).unwrap_or_default()
 }
 
 /// Parse `mpris:length` from an `OwnedValue`. The spec says u64 but some
@@ -217,11 +223,28 @@ mod tests {
     }
 
     /// Some players send `xesam:artist` as a bare string rather than the spec's
-    /// `as` array. `Array::try_from` fails on it, so it currently yields the
-    /// empty string (behaviour-preserving; a candidate for a later widening).
+    /// `as` array. `Array::try_from` fails on it, so we fall back to
+    /// `String::try_from` and surface it verbatim — the same widening
+    /// `parse_track_id` (`ObjectPath` | `String`) and `parse_length`
+    /// (`u64` | `i64`) already do. Before #651 this dropped the artist
+    /// everywhere: bar chip, Media panel, and the `NowPlaying` push to plugins.
     #[test]
-    fn artist_bare_string_currently_yields_empty() {
-        assert_eq!(parse_artist_array(Some(&owned("Bare Artist"))), "");
+    fn artist_bare_string_is_surfaced() {
+        assert_eq!(
+            parse_artist_array(Some(&owned("Bare Artist"))),
+            "Bare Artist"
+        );
+    }
+
+    #[test]
+    fn artist_bare_empty_string_is_empty() {
+        assert_eq!(parse_artist_array(Some(&owned(""))), "");
+    }
+
+    #[test]
+    fn artist_wrong_scalar_type_is_empty() {
+        // Neither an `as` nor an `s` — default rather than panic.
+        assert_eq!(parse_artist_array(Some(&owned(42_u64))), "");
     }
 
     #[test]
@@ -358,5 +381,17 @@ mod tests {
         assert_eq!(art_url, "");
         assert_eq!(length_us, 0);
         assert_eq!(track_id, None);
+    }
+
+    #[test]
+    fn metadata_bare_string_artist_survives_end_to_end() {
+        // The widening has to reach the field the service actually reads, not
+        // just `parse_artist_array` in isolation.
+        let raw = metadata(vec![
+            ("xesam:title", Value::from("Song")),
+            ("xesam:artist", Value::from("Lone Artist")),
+        ]);
+        let (_, artists, ..) = parse_metadata(raw);
+        assert_eq!(artists, "Lone Artist");
     }
 }

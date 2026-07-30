@@ -199,9 +199,12 @@ separate `hytte-infobroker` CLI dials so an agent can `auth` (mint a session
 token) and `get` scoped data. Durable grants persist to
 `$XDG_STATE_HOME/hytte-infobroker/grants.toml` (or `~/.local/state/…`); session
 tokens are in-memory only (12 h TTL, killed by a panel revoke or a restart of
-this unit / trollshell). A denied auth/data request raises one informational
-toast via `Effect::Notify` so the human sees the knock (interactive Allow/Deny
-prompting is a later phase). The agent-facing skill folder lives at
+this unit / trollshell). The first request from an agent with no standing
+grant fires an interactive Allow/Deny consent prompt at the human
+(`Effect::RequestConsent`, rendered by `trollshell/src/overlays/consent.rs`);
+a settled standing **deny** instead answers silently with one informational
+toast via `Effect::Notify` so the knock stays visible without re-prompting.
+The agent-facing skill folder lives at
 `etc/skills/infobroker/` (`SKILL.md` + a `bin/hytte-infobroker` wrapper). No
 environment variables to set.
 
@@ -214,10 +217,10 @@ dot that floats and decays). It runs its own ~20 Hz frame timer for the
 animation and parks it while the sidebar is closed (`StateKey::SlotVisible`).
 The shell only runs the PipeWire monitor tap while at least one spectrum
 subscriber is connected, so an idle desktop with this plugin off pays nothing.
-The marquee currently shows a decorative banner rather than the current track —
-now-playing metadata isn't reachable out-of-process yet (it needs a host
-`StateKey` projecting `hytte_services::mpris`, the way #405 did for the
-spectrum). No environment variables to set.
+The marquee scrolls the current track (`title — artist`) off the
+`StateKey::NowPlaying` push (#528, projecting `hytte_services::mpris` the way
+#405 did for the spectrum), falling back to a decorative banner when nothing
+is playing. No environment variables to set.
 
 ## Required packages
 

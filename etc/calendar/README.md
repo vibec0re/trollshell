@@ -148,12 +148,6 @@ evolution-calendar-factory.service` for sync errors, and confirm the
   the GNOME notification daemon — trollshell's notification widget will
   surface them if `gnome-shell-extension-something` raises them, but the
   calendar service itself never emits notifications.
-- **No recurring-event expansion past the master entry.** The master
-  VEVENT's DTSTART is the only instance considered. A weekly meeting
-  whose master DTSTART was last year won't show up — even though next
-  Monday's instance would. Now that we read via libecal this is _feasible_
-  (`e_cal_client_generate_instances_sync` expands a range server-side), but
-  it needs a new `hytte-ecal` binding — a follow-up, not yet wired.
 - **No GtkCalendar day marking.** The month-grid shows the current month
   as a static reference; days with events aren't visually highlighted.
   v2 task once the bind path is wired.

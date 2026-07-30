@@ -32,9 +32,14 @@ NixOS box, not Arch. `nix` only — no `pacman`. Rust/Python aren't on PATH exce
   (`#![cfg(feature = "system-tests")]`) and never touches `.nix` files — but CI's treefmt checks
   every file on disk. A diff that passes local `cargo fmt --check` can still fail CI formatting.
   `nix fmt <paths>` is the safe superset; run it on every changed file before committing.
-- **CI does NOT run clippy.** CI (`nix flake check`) = treefmt + module-eval + the EDS nixosTest +
-  `cargo test`. A PR can be CI-green and clippy-dirty. The local
-  `cargo clippy --workspace --all-targets` is the _only_ clippy enforcement — always run it.
+- **CI DOES run clippy.** `nix flake check` gates `cargo clippy --workspace --all-targets
+--features system-tests -- -D warnings` (landed 06c47b0, closing #74) — same pedantic-clean bar
+  as local. It also gates treefmt, the `system-tests` cargo bucket, the
+  `nixosModules.default`/`homeModules.default` module-eval checks, both nixosTests
+  (`eds-nixos-test` + `wifi-nm-nixos-test`), the options-doc build (#614), and — since #449 —
+  actually building `packages.{trollshell,trollshell-control-center}`. Full rundown: root
+  `CLAUDE.md`'s "CI (`nix flake check`)" section. Run `cargo clippy --workspace --all-targets`
+  locally anyway — it's faster than a CI round-trip and lets you iterate before pushing.
   (For fast iteration `cargo clippy -p <crate> --lib` beats the full workspace gate.)
 
 Quickref:
@@ -160,8 +165,10 @@ before telling them it's done.
   surface holding a small card frosts the _whole screen_; a persistent never-unmapped surface leaves
   a lingering frosted strip. This is the root cause behind every frosted-glass regression. Don't
   chase CSS alpha — start from surface geometry. niri 26.04 ships `ext-background-effect-v1` with
-  `set_blur_region(wl_region)` to scope blur to a sub-rect. `etc/niri/blur.kdl` is **docs, not
-  loaded** (niri has no `include`) — the live rules are hand-merged into Annika's nixos `config.kdl`.
+  `set_blur_region(wl_region)` to scope blur to a sub-rect. The frosted-glass experiment itself was
+  retired (#312, 86f5720): `hytte-blur` and `etc/niri/blur.kdl` are both gone, shell chrome is
+  opaque, and no layer-rules ship from this repo — the above is background knowledge for if blur
+  gets revisited, not live config.
 - **`adw::PreferencesGroup::add` routes by widget type:** a `GtkListBoxRow`/`AdwActionRow`/etc. goes
   _into_ the boxed list (interleaved, in order); **any non-row child (bare `gtk::Label`/`gtk::Box`)
   renders BELOW the entire list.** It compiles fine; the bug is render-only. To interleave, the child
@@ -182,8 +189,10 @@ default branch). A source change (even CSS) reaches her system only after **merg
 "merge it and I'll test" is a real round-trip; get the PR right first. niri is a **static
 `config.kdl`** deployed by home-manager (editing `~/.config/niri/config.kdl` directly gets clobbered
 on rebuild); niri layer-rules (incl. blur) deploy with the same rebuild. The `etc/` dir holds the
-full session config the shell expects (systemd user units, keybinds, kanshi, PAM file) — see
-`etc/README.md`. The idle → dim → lock → suspend pipeline is native (in-process; #204 retired swayidle).
+full session config the shell expects (systemd user units, keybinds, kanshi) — see
+`etc/README.md`; the PAM file (`/etc/pam.d/swaylock`) is NOT shipped there, it's a manual step the
+deployer does themselves (`etc/README.md:57`). The idle → dim → lock → suspend pipeline is native
+(in-process; #204 retired swayidle).
 
 ## 9. People & references
 

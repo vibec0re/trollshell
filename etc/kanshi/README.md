@@ -154,9 +154,6 @@ would be worse than an honest nudge.
 
 - No GUI editor for kanshi profiles. Edit the config file by hand for now;
   task #41 (Settings page) may add one later.
-- No per-output wallpaper. The shipped wallpaper service paints a single
-  image across every output via `swaybg`; per-output backgrounds are a
-  follow-up.
 - No rotation UI in the trollshell drawer. The drawer's switch only
   toggles the output on/off (via `niri msg output <name> on|off`).
   Rotation is set in the kanshi profile (`transform 90` etc.).

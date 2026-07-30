@@ -27,6 +27,14 @@
 //! interfaces", which on a host with neither daemon is a negative claim built
 //! out of a question nobody answered. [`LinkSource`] carries that distinction
 //! alongside [`links`]/[`primary`], which keep their existing types.
+//!
+//! # A transient startup failure is not an absent daemon (issue #621)
+//!
+//! Once the probe has elected [`LinkBackend::Networkd`], a first `refresh` that
+//! fails cannot mean "networkd isn't here" — the probe just established that it
+//! is. It means the bus hiccuped in the microseconds since. That failure is
+//! therefore retried, unboundedly and audibly, rather than ending the task:
+//! see [`STARTUP_REFRESH_RETRY`].
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -299,6 +307,174 @@ async fn probe_link_backend() -> LinkBackend {
     }
 }
 
+/// What to do after one startup [`refresh`] attempt in the
+/// [`LinkBackend::Networkd`] arm.
+///
+/// The whole retry decision lives in [`RefreshRetry::step`] — a pure function —
+/// so it is unit-testable without a bus. Deliberately the same shape as
+/// `wifi`'s `ProbeStep`/`RetryPolicy` (#634): the two paths retry the same class
+/// of transient system-bus failure, and someone debugging one while reading the
+/// journal of the other must not find two different behaviours.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshStep {
+    /// The refresh landed. Stop retrying and enter the `listen` loop.
+    Proceed,
+    /// It failed and attempts remain: wait, then refresh again.
+    Retry {
+        /// How long to wait before the next attempt.
+        after: Duration,
+    },
+    /// Still failing and the attempt budget is spent: log loudly and stay inert.
+    ///
+    /// **Not reachable under the shipped [`STARTUP_REFRESH_RETRY`]**, which is
+    /// unbounded. Kept expressible (and tested) so a bounded policy stays one
+    /// field away.
+    GiveUp,
+}
+
+/// Retry schedule for a failed startup [`refresh`].
+#[derive(Clone, Copy, Debug)]
+struct RefreshRetry {
+    /// Attempt budget, counting the first refresh. `None` means "retry forever".
+    max_attempts: Option<u32>,
+    /// Delay before the first retry; doubles with each further attempt.
+    initial: Duration,
+    /// Ceiling the doubling delay is clamped to.
+    max_backoff: Duration,
+}
+
+/// The policy the [`LinkBackend::Networkd`] arm runs: **unbounded** retry with
+/// capped backoff.
+///
+/// Attempt 1 is immediate; each retry waits 0.5s doubled per elapsed attempt and
+/// clamped at 8s, so the schedule settles into one refresh every 8s for as long
+/// as networkd stays unreachable. The numbers match `wifi`'s `PROBE_RETRY`
+/// (#634) on purpose — same failure class, same journal cadence.
+///
+/// **Why unbounded.** This file already answered the question just above, in
+/// [`probe_link_backend`]'s inconclusive-probe arm: picking the inert verdict
+/// "leaves the link list permanently empty even once the bus recovers … the cost
+/// if NM genuinely never appears is a periodic warn, which beats an inert
+/// service". The same reasoning applies here, and more directly: a bound means
+/// that whenever networkd takes longer than the bound to come up, the user lands
+/// in exactly the state #621 reports — the panel stuck on "no link manager has
+/// answered yet" with `systemctl --user restart trollshell` the only cure. That
+/// is the bug this closes, reintroduced on a longer fuse. A bound cannot be
+/// justified by its own give-up being logged, either: that argues for having a
+/// bound from the visibility of the bound being wrong.
+///
+/// **Visibility is preserved without the latch.** Every failed attempt logs at
+/// `error!` and a retry that finally lands logs a `RECOVERED` line carrying the
+/// attempt count — a quiet self-heal would trade a visible permanent bug for an
+/// invisible intermittent one, which is worse for exactly the reporter's
+/// situation (nothing in the UI hinted anything had failed). Logging every
+/// attempt rather than every Nth is safe *because* the backoff caps at 8s: a
+/// permanently dead networkd stays loud in the journal instead of degrading into
+/// a silent poll, and it cannot become the 2s flood the old comment feared.
+///
+/// **The policy is one field to change.** A bounded policy is
+/// `max_attempts: Some(n)` and nothing else; `the_shipped_policy_never_goes_inert`
+/// asserts the shipped default is not.
+const STARTUP_REFRESH_RETRY: RefreshRetry = RefreshRetry {
+    max_attempts: None,
+    initial: Duration::from_millis(500),
+    max_backoff: Duration::from_secs(8),
+};
+
+impl RefreshRetry {
+    /// Delay before the retry that follows `attempt` (1-based): [`Self::initial`]
+    /// doubled once per elapsed attempt, clamped to [`Self::max_backoff`].
+    fn backoff(self, attempt: u32) -> Duration {
+        let factor = 1_u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max_backoff)
+    }
+
+    /// The pure retry/proceed decision. `attempt` is 1-based and counts the
+    /// refresh that produced `outcome`.
+    ///
+    /// Unlike `wifi`'s probe there is no verdict to weigh: a `refresh` either
+    /// read the links or could not, and "could not" is never a fact about the
+    /// host here — the backend was already elected.
+    fn step<T, E>(self, outcome: &Result<T, E>, attempt: u32) -> RefreshStep {
+        match outcome {
+            Ok(_) => RefreshStep::Proceed,
+            Err(_) if self.max_attempts.is_some_and(|max| attempt >= max) => RefreshStep::GiveUp,
+            Err(_) => RefreshStep::Retry {
+                after: self.backoff(attempt),
+            },
+        }
+    }
+}
+
+/// Seed the link list from networkd, retrying while [`refresh`] fails.
+///
+/// Returns `true` once a refresh has landed — i.e. once it is worth entering the
+/// `listen` loop. `false` means the policy stopped asking first, which the
+/// shipped unbounded [`STARTUP_REFRESH_RETRY`] never does.
+async fn seed_links(
+    policy: RefreshRetry,
+    links_out: &Mutable<Vec<Link>>,
+    primary_out: &Mutable<Option<Link>>,
+    source_out: &Mutable<LinkSource>,
+) -> bool {
+    let mut attempt: u32 = 1;
+    loop {
+        let outcome = refresh(links_out, primary_out, source_out).await;
+        // Rendered up front so the log arms below can name the failure. Empty on
+        // `Ok`, which only ever reaches the `Proceed` arm.
+        let reason = outcome
+            .as_ref()
+            .err()
+            .map_or_else(String::new, ToString::to_string);
+
+        match policy.step(&outcome, attempt) {
+            RefreshStep::Proceed => {
+                // Only announce a recovery if there was something to recover
+                // from; the ordinary first-try success stays quiet.
+                if attempt > 1 {
+                    tracing::warn!(
+                        attempts = attempt,
+                        "networkd: startup refresh RECOVERED — an earlier attempt could not read \
+                         networkd's links, and a retry has now succeeded. The link panel is \
+                         populating without a shell restart (issue #621)."
+                    );
+                }
+                return true;
+            }
+            RefreshStep::Retry { after } => {
+                // Logged on *every* attempt, not every Nth: the backoff caps at
+                // 8s, so an unreachable networkd stays loud here rather than
+                // degrading into a silent poll. See `STARTUP_REFRESH_RETRY`.
+                tracing::error!(
+                    attempt,
+                    retry_in_secs = after.as_secs_f64(),
+                    error = %reason,
+                    "networkd: startup refresh FAILED — the backend probe already established \
+                     that systemd-networkd is the link source on this host, so this is a \
+                     transient read failure, NOT a finding that networkd is absent. Retrying \
+                     until it answers; this line repeating means networkd is still unreachable, \
+                     and a `startup refresh RECOVERED` line follows once it heals (issue #621)."
+                );
+                tokio::time::sleep(after).await;
+                attempt += 1;
+            }
+            RefreshStep::GiveUp => {
+                tracing::error!(
+                    attempts = attempt,
+                    error = %reason,
+                    "networkd: startup refresh STILL FAILING after every retry — giving up and \
+                     staying inert. The link panel will report that nothing has answered for the \
+                     rest of this session; run `systemctl --user restart trollshell` once \
+                     networkd is up (issue #621)."
+                );
+                return false;
+            }
+        }
+    }
+}
+
 impl Service for NetworkdService {
     type Handles = NetworkdHandles;
 
@@ -331,18 +507,33 @@ impl Service for NetworkdService {
                         .await;
                     }
                     LinkBackend::Networkd => {
-                        // Seed once; if the initial refresh fails outright, networkd
-                        // isn't running on this host and no NM is present either —
-                        // log once at info and stay inert rather than hammering dbus
-                        // in a 2s retry loop for the rest of the process lifetime.
-                        // `source` stays `Unknown`, so nothing downstream reports the
-                        // empty list as a fact about the host.
-                        if let Err(e) =
-                            refresh(&links_writer, &primary_writer, &source_writer).await
+                        // Seed the list, retrying until networkd answers. A failure
+                        // here is NOT evidence that networkd is absent: this arm is
+                        // reached only after `probe_link_backend` established that
+                        // networkd IS the backend, so a refresh failing microseconds
+                        // later is transient by construction — networkd restarting, a
+                        // D-Bus hiccup, `ServiceUnknown` mid `systemctl restart
+                        // systemd-networkd`. The genuinely-absent case is
+                        // `LinkBackend::None`, handled below.
+                        //
+                        // This used to `return` on the first failure, which latched
+                        // `LinkSource::Unknown` — "no link manager has answered yet" —
+                        // for the rest of the process lifetime, curable only by
+                        // restarting the shell (#621). See `STARTUP_REFRESH_RETRY` for
+                        // why the retry is unbounded and why it stays audible.
+                        if !seed_links(
+                            STARTUP_REFRESH_RETRY,
+                            &links_writer,
+                            &primary_writer,
+                            &source_writer,
+                        )
+                        .await
                         {
-                            tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
                             return;
                         }
+                        // The 2s retry below is untouched: it covers a `listen` that
+                        // had been established and dropped, which already retried and
+                        // is not what #621 is about.
                         loop {
                             match listen(&links_writer, &primary_writer, &source_writer).await {
                                 Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
@@ -690,6 +881,111 @@ mod tests {
                 "{backend:?} claimed to be answering before reading anything"
             );
         }
+    }
+
+    // --- startup refresh retry (#621) ---
+
+    /// A *bounded* policy with tiny delays, so the give-up path stays reachable
+    /// and named. Deliberately not [`STARTUP_REFRESH_RETRY`] — these tests
+    /// assert the mechanism; the shipped shape is asserted separately below.
+    fn bounded() -> RefreshRetry {
+        RefreshRetry {
+            max_attempts: Some(3),
+            initial: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+        }
+    }
+
+    fn failed() -> Result<()> {
+        Err(anyhow::anyhow!(
+            "networkd went away between the probe and the seed"
+        ))
+    }
+
+    #[test]
+    fn a_refresh_that_landed_proceeds_immediately() {
+        // A local binding rather than a helper fn: a function that always
+        // returns `Ok` trips `clippy::unnecessary_wraps`, and the wrapper is the
+        // whole point here — `step` decides on the `Result`, not on a bool.
+        let landed: Result<()> = Ok(());
+        assert_eq!(bounded().step(&landed, 1), RefreshStep::Proceed);
+        // Success ends the retrying whenever it arrives, not just first time.
+        assert_eq!(bounded().step(&landed, 3), RefreshStep::Proceed);
+        assert_eq!(bounded().step(&landed, u32::MAX), RefreshStep::Proceed);
+    }
+
+    #[test]
+    fn a_failed_startup_refresh_retries_instead_of_ending_the_task() {
+        // The regression: this used to `return`, latching `LinkSource::Unknown`
+        // for the process lifetime. A failure must schedule another attempt.
+        assert_eq!(
+            bounded().step(&failed(), 1),
+            RefreshStep::Retry {
+                after: Duration::from_millis(10)
+            },
+            "the first failed seed must retry, not go inert (#621)"
+        );
+        assert_eq!(
+            bounded().step(&failed(), 2),
+            RefreshStep::Retry {
+                after: Duration::from_millis(20)
+            }
+        );
+    }
+
+    #[test]
+    fn a_bounded_policy_gives_up_once_its_budget_is_spent() {
+        assert_eq!(bounded().step(&failed(), 3), RefreshStep::GiveUp);
+        assert_eq!(bounded().step(&failed(), 4), RefreshStep::GiveUp);
+        assert_eq!(bounded().step(&failed(), 99), RefreshStep::GiveUp);
+    }
+
+    #[test]
+    fn backoff_doubles_and_clamps_to_the_ceiling() {
+        let policy = bounded();
+        assert_eq!(policy.backoff(1), Duration::from_millis(10));
+        assert_eq!(policy.backoff(2), Duration::from_millis(20));
+        assert_eq!(policy.backoff(3), Duration::from_millis(40));
+        // Clamped, and the shift can't overflow at absurd attempt counts.
+        assert_eq!(policy.backoff(4), Duration::from_millis(40));
+        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn the_shipped_policy_never_goes_inert() {
+        // The decision on #621: unbounded. A bound would put the user back in
+        // the reported state — panel stuck on "nothing has answered", restart
+        // the only cure — whenever the bus takes longer than the bound.
+        assert_eq!(
+            STARTUP_REFRESH_RETRY.max_attempts, None,
+            "the shipped startup-refresh policy must never give up; see \
+             STARTUP_REFRESH_RETRY's docs and #621"
+        );
+        for attempt in [1_u32, 2, 8, 1_000, u32::MAX] {
+            assert_eq!(
+                STARTUP_REFRESH_RETRY.step(&failed(), attempt),
+                RefreshStep::Retry {
+                    after: STARTUP_REFRESH_RETRY.backoff(attempt)
+                },
+                "attempt {attempt}: a failed seed ended the task instead of retrying"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_policy_starts_promptly_and_stays_audible() {
+        // Prompt: the common case is a boot race of well under a second, so the
+        // first retry must not sit behind the ceiling.
+        assert!(STARTUP_REFRESH_RETRY.backoff(1) <= Duration::from_secs(1));
+        assert!(STARTUP_REFRESH_RETRY.max_backoff >= STARTUP_REFRESH_RETRY.initial);
+        // Audible: every attempt logs at `error!`, which is only defensible
+        // because the delay is capped — an uncapped backoff would decay into a
+        // silent poll, the failure mode the observability requirement rules out.
+        assert!(
+            STARTUP_REFRESH_RETRY.max_backoff <= Duration::from_secs(30),
+            "the retry logs every attempt; an unbounded delay would make a dead \
+             networkd silent in the journal"
+        );
     }
 
     // --- parse_describe ---

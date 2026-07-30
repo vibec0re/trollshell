@@ -222,6 +222,53 @@ The marquee scrolls the current track (`title — artist`) off the
 #405 did for the spectrum), falling back to a decorative banner when nothing
 is playing. No environment variables to set.
 
+## The Claude bridge (`trollshell-claude-bridge.service`)
+
+`trollshell-claude-bridge.service` is **not** a plugin — it's a small daemon
+that puts an OpenAI-compatible face on headless Claude Code (#584), so the
+LLM-backed plugins can ride a Claude Code subscription instead of a metered
+cloud key. It serves exactly one route, `POST /v1/chat/completions`, on
+**`127.0.0.1:8787` — loopback only** (8080 is `trollshell-pet-brain.service`'s
+llama-server; the two are meant to be swappable). Each request spawns
+`claude --print` and returns its answer as `choices[0].message.content`.
+
+**Nothing in pet or caw changed for this.** `hytte_ai_providers::Provider` is
+already just a base URL, so opting a plugin in is one line on _its_ unit:
+
+```ini
+# in trollshell-plugin-pet.service
+Environment=PET_LLM_URL=http://127.0.0.1:8787
+Environment=OPENROUTER_API_KEY=local-bridge
+```
+
+That second line is a **security control, not cosmetics**. The bridge is
+_keyless_ — it validates no bearer token at all, because `brain.rs` resolves
+`load_key("openrouter")` _before_ `PET_LLM_API_KEY`, so a bridge demanding its
+own token would 401 every request forever. `load_key` checks the
+`OPENROUTER_API_KEY` env override _before_ `~/.config/trollshell/openrouter.key`,
+so the dummy value is what stops the real cloud key being shipped to a loopback
+port. With no auth, reachability is the authorization boundary — hence the
+loopback bind.
+
+The bridge's own unit carries
+`UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX`,
+because any of those would move billing off the subscription with nothing
+visible to show for it. The binary **refuses to start** if it still finds one
+set (it can't scrub them itself: `std::env::remove_var` is unsafe under edition
+2024 and this workspace forbids unsafe). If the unit fails with "refusing to
+start", that message names the variable to unset.
+
+Prerequisite: the `claude` CLI on the user manager's `PATH`, already logged in.
+Optional knobs — `CLAUDE_BRIDGE_{MODEL,MODE,PORT,TIMEOUT_SECS,STATE_DIR}` — are
+documented in the unit's comments. `CLAUDE_BRIDGE_MODE` picks between the
+default `subscription` path (a persisted claude session, resumed with only the
+newest message so the prompt prefix stays cacheable) and `reprompt` (a one-off
+session per turn, with the bridge holding the transcript and nothing persisted
+to disk).
+
+When it's down, the plugins degrade to their canned output — the same failure
+mode as a missing llama-server — with the cause only in the journal.
+
 ## Required packages
 
 Just niri itself — the components have their own package lists:

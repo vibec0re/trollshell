@@ -1,0 +1,46 @@
+[package]
+name = "hytte-claude-bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A keyless loopback shim that puts an OpenAI-compatible face on headless Claude Code, so the hytte LLM plugins can ride a Claude subscription unchanged (issue #584)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-claude-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# The subprocess driver: spawn `claude --print`, stream-classify its
+# stream-json, and report the turn as a typed `Error`. Depended on rather than
+# reimplemented specifically for `classify.rs` + the `PromptTooLong` /
+# `RateLimited` / `AuthFailed` / `SessionNotFound` sentinels, and for the
+# title-addressed `Attach::{Create,Resume}` this bridge's session identity is
+# built on. Apache-2.0; combining it with this MPL-2.0 tree is fine (#584).
+hive-claude.workspace = true
+# The whole HTTP server. One route does not justify axum/hyper/tower (~20 new
+# lock entries, none of which are in `Cargo.lock` today); `httparse` already is
+# (via `ureq-proto`), so promoting it to a direct dependency costs nothing.
+httparse.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+# `net` for the loopback listener, `io-util` for the request read/response
+# write, `sync` for the load-shed semaphore + single-flight watch channels,
+# `time` for the request budget, `rt-multi-thread`/`macros` for the runtime.
+# (`process` comes in through hive-claude.)
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "env-filter",
+] }

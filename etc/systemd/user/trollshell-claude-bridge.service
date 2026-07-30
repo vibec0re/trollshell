@@ -1,0 +1,63 @@
+# The Claude bridge (#584): a keyless, loopback-only OpenAI-compatible shim in
+# front of headless Claude Code (`claude --print`), so the LLM-backed plugins
+# can ride a Claude Code subscription with NO change to pet or caw —
+# `hytte_ai_providers::Provider` is already just a base URL, so pointing a
+# plugin at http://127.0.0.1:8787 is the whole integration.
+#
+# Prerequisites: the `claude` CLI on the user manager's PATH, already logged in
+# (`claude` → `/login`). The bridge holds no credentials of its own.
+#
+# Port 8787, not 8080 — 8080 belongs to trollshell-pet-brain.service's
+# llama-server, and the two are meant to be swappable, not exclusive.
+[Unit]
+Description=Keyless loopback OpenAI-compatible bridge to headless Claude Code (#584)
+Documentation=file://%h/.config/systemd/user/README.md
+PartOf=niri-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Hand-installed path, matching the other static units here. Under the nix
+# module path this is `lib.getExe trollshell.packages.<system>.hytte-claude-bridge`
+# instead.
+ExecStart=/usr/local/bin/hytte-claude-bridge
+Environment=RUST_LOG=hytte_claude_bridge=info
+
+# ── SECURITY CONTROL — do not drop this line ─────────────────────────────────
+# These four would silently move `claude` off the subscription and onto metered
+# API credits (or Bedrock/Vertex), with nothing in the UI to show for it. The
+# bridge cannot scrub them itself: `std::env::remove_var` is unsafe under
+# edition 2024 and this workspace forbids unsafe, and hive-claude's `Config`
+# exposes no environment hook. So the scrub happens HERE, and the bridge
+# **refuses to start** if it finds any of them still set — belt and braces, and
+# a loud failure rather than a quiet bill.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+
+# The dummy key. Belt-and-braces on THIS unit — nothing in the bridge reads it
+# (the bridge is keyless and validates no bearer at all). The copy that actually
+# prevents a leak is the one on the CONSUMING plugin's unit, because
+# `hytte_ai_providers::load_key` runs in the plugin process: it checks the
+# `OPENROUTER_API_KEY` env override BEFORE ~/.config/trollshell/openrouter.key,
+# so without the override a pet pointed at this bridge would ship the real
+# OpenRouter key to a loopback port. See the opt-in block below.
+Environment=OPENROUTER_API_KEY=local-bridge
+
+Restart=on-failure
+RestartSec=5
+
+# ── Opting a plugin in ───────────────────────────────────────────────────────
+# Nothing here reaches into pet or caw. To point one at the bridge, add to ITS
+# unit (e.g. trollshell-plugin-pet.service):
+#
+#   Environment=PET_LLM_URL=http://127.0.0.1:8787
+#   Environment=OPENROUTER_API_KEY=local-bridge   # keeps the real key at home
+#
+# Other knobs, all optional, all on THIS unit:
+#   Environment=CLAUDE_BRIDGE_MODEL=claude-haiku-4-5   # default: claude's own
+#   Environment=CLAUDE_BRIDGE_MODE=reprompt            # default: subscription
+#   Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=8           # must stay under 10
+#   Environment=CLAUDE_BRIDGE_PORT=8787
+#   Environment=CLAUDE_BRIDGE_STATE_DIR=%h/.local/state/hytte-claude-bridge
+
+[Install]
+WantedBy=niri-session.target

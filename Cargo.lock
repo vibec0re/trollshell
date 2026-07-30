@@ -1052,6 +1052,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hive-claude"
+version = "0.1.0"
+source = "git+https://forge.darkest.space/hyperhive/hive-claude.git?rev=4ee1940e91b0f713f1767fc5ba84426a82d562f8#4ee1940e91b0f713f1767fc5ba84426a82d562f8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,6 +1130,19 @@ dependencies = [
  "tokio",
  "tracing",
  "zbus",
+]
+
+[[package]]
+name = "hytte-claude-bridge"
+version = "0.1.0"
+dependencies = [
+ "hive-claude",
+ "httparse",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -272,8 +272,12 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
       volume/brightness/mic keys. The OSD card must appear as normal and the
       bar's corner must round off again — before this fix, that output's OSD
       stayed silent for the rest of the session and the bar kept its
-      squared-off `drawer-open` seam corner with no drawer attached. Worth
-      trying on a connector-less/virtual output too, if one is handy.
+      squared-off `drawer-open` seam corner with no drawer attached. A
+      connector-less/virtual output is worth trying too, but only for the
+      bar-corner half of this check (`main.rs`'s `drawer-open` class bind is
+      unconditional) — `osd::install` skips any monitor with no connector
+      name by design, so no OSD card is ever expected to appear there, on
+      either side of this fix.
 
 ## Audio & media
 
@@ -620,9 +624,15 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
   is in the header: this file goes stale within minutes of a merge burst, so
   updating it belongs to the burst rather than to a later pass.
 - **(#622)** Docs-only spec-drift retraction sweep: the VPN connect/disconnect
-  non-goal in the network-panel design spec (shipped via #169), two of three
-  "not in v1" plugin-widgets clauses that had since shipped (`Node::Slider`
-  and `Node::Entry` — arbitrary pixels/custom-drawing still holds), a stale
+  non-goal in the network-panel design spec (shipped via #169), a stale
   `overlays/` roster in the src-reorg spec, and one Rust doc-comment line in
-  `overlays/mod.rs` naming overlays that no longer exist. No behavior change
-  anywhere in the diff — nothing to verify in a Niri session.
+  `overlays/mod.rs` naming overlays that no longer exist. Also splits the
+  plugin-widgets design spec's original three-clause "not in v1" non-goal:
+  **both** two-way inputs (`Node::Slider` #315, `Node::Entry` #363) **and**
+  arbitrary pixels/images (`Node::Pixels` #284 — an arbitrary RGBA8 buffer
+  whose `data`/`scale` are mutable per-`id`, not a one-shot fixed image) have
+  shipped. The only clause still standing as a non-goal is custom drawing
+  (cairo/snapshot calls executed in-process) — out-of-process frontend-B
+  plugins structurally can't do that, they only ever ship a validated pixel
+  buffer for the host to paint. No behavior change anywhere in the diff —
+  nothing to verify in a Niri session.

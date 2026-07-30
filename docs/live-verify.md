@@ -14,15 +14,19 @@ PR number in parens if you need full context on _why_.
 Checked items are ones Annika has already implicitly verified — noted inline.
 Everything else is unchecked and still wants a pass in a real Niri session.
 
-**Coverage: #458 through #625** (#606, #611, and #622 carry no live-verify
-list of their own — noted in the closing section instead). Originally created
-by #507 for the 2026-07 merge wave (#458–#496); refreshed by #602 to fold in
-everything merged since (#497–#596), renaming off the month-stamped filename in
-that pass; refreshed again (parent effort #602) for the #598/#604/#606/#609
-burst that merged right behind it; folded in #610 immediately after the
-2026-07-30 merge that landed it; and folded in #616/#622/#623/#624/#625
-immediately after the next 2026-07-30 merge burst — this is a living checklist
-that gets refreshed periodically, not a dated snapshot of one merge wave.
+**Coverage: #458 through #634** (#606, #611, #622, and #628 carry no
+live-verify list of their own — noted in the closing section instead).
+Originally created by #507 for the 2026-07 merge wave (#458–#496); refreshed
+by #602 to fold in everything merged since (#497–#596), renaming off the
+month-stamped filename in that pass; refreshed again (parent effort #602) for
+the #598/#604/#606/#609 burst that merged right behind it; folded in #610
+immediately after the 2026-07-30 merge that landed it; folded in
+#616/#622/#623/#624/#625 immediately after the next 2026-07-30 merge burst
+(via #628); and folded in #629/#630/#634 in this pass, which also **corrects**
+two entries #634 made false (the Network panel and Wi-Fi sections below)
+rather than merely adding to them — a wrong verification step is worse than a
+missing one, per #635. This is a living checklist that gets refreshed
+periodically, not a dated snapshot of one merge wave.
 
 ## Idle & lock
 
@@ -352,6 +356,14 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
       extracted into `components/visibility_gate.rs` and adopted by
       `modal.rs`. Confirm drawer show/hide gating is unchanged (no new
       flicker, no page staying mounted/unmounted incorrectly).
+- [ ] **(#630)** `modal::close_all` no longer holds the `PANELS` `RefCell`
+      borrow across each `window.close()` call — a latent reentrant-borrow
+      hazard fix, not a behavior change. There is no new behavior to click
+      through here, and the honest verification is that **nothing changes**:
+      monitor hot-plug with a drawer open still behaves exactly as before,
+      including mid-retract, and the #624 `reset_drawer_open_states()`
+      ordering still runs after every panel is dropped. Absence of any
+      observable difference is the pass condition, not a ritual to perform.
 
 ## Stats drawer
 
@@ -456,10 +468,16 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
       contradicts it.
 - [ ] **(#610)** Restart NetworkManager and confirm the card promotes to the
       real link and count within ~5 s. Caveat worth knowing before you call
-      this a failure: the _backend probe_ still runs only once at startup, so a
-      manager that appears **after** the shell started is picked up only if the
-      probe had already chosen that backend. That re-probe gap is deliberately
-      untouched here and is tracked as #613.
+      this a failure: as of **#634** the _backend probe_ no longer runs only
+      once at startup — it retries at capped backoff while inconclusive, so a
+      manager that was merely slow to answer (bus still coming up, a
+      transient `ListNames` failure) is picked up without a restart. What is
+      still deliberately untouched: a manager that appears **after** the
+      probe has already committed to a verdict — e.g. installing
+      NetworkManager mid-session on a host that booted with only iwd, or vice
+      versa. That gap is now tracked as **#633**, not #613 — #613 is closed;
+      #633 split off it as the genuinely-deferred half, and is blocked on a
+      cancellation primitive `spawn_supervised` doesn't have yet.
 - [ ] **(#610)** With `RUST_LOG=hytte_services=debug`, confirm no new log noise
       — `link_source()` uses `set_neq`, so it must not re-emit on every 5 s
       poll.
@@ -502,12 +520,42 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
       bus briefly unreachable at shell start) no longer reads as "no wireless
       hardware". Force a transient `ListNames`/`ListActivatableNames` failure
       at startup (or catch it landing naturally on a slow boot) and confirm
-      the logs show a `wifi_backend: probe inconclusive` warning — explicit
-      that this is not the same as "no Wi-Fi daemon present" — followed by an
-      `error!` pointing at `systemctl --user restart trollshell`, instead of
-      the old silent "no Wi-Fi backend detected". The network-panel link list
-      should still attempt NetworkManager rather than going permanently
-      inert.
+      the logs show a `wifi: backend probe was INCONCLUSIVE` line — explicit
+      that this is not the same as "no Wi-Fi daemon present". **Corrected
+      expected outcome after #634:** do not expect a follow-up `error!`
+      pointing at `systemctl --user restart trollshell` — the shipped retry
+      policy is unbounded, so the probe keeps retrying at capped backoff
+      instead of giving up, and a transient failure now self-heals into a
+      `wifi: backend probe RECOVERED` line. Reading that recovery as a
+      regression would be exactly backwards: the give-up-and-restart path
+      still exists in the code (`ProbeStep::GiveUp`) but is unreachable under
+      the shipped policy, so it should never actually fire live. The
+      network-panel link list should still attempt NetworkManager rather
+      than going permanently inert.
+- [ ] **(#634)** The retry itself, end to end: start the shell while the
+      system bus or NetworkManager is still coming up (e.g.
+      `systemctl --user restart trollshell` right after
+      `systemctl restart NetworkManager`, or early in a fresh boot's
+      session). Confirm the Wi-Fi card populates **on its own, without a
+      shell restart**, and that the journal carries both halves of the pair —
+      the log pair is the whole point, not just the UI outcome:
+
+  ```sh
+  journalctl --user -u trollshell | grep -E 'backend probe (was INCONCLUSIVE|RECOVERED)'
+  ```
+
+  Expect at least one `INCONCLUSIVE` line (`attempt=`, `retry_in_secs=`)
+  followed by a `RECOVERED` line (`attempts=`). This can't be exercised by
+  CI — nothing in `nix flake check` can make `ListNames` fail and then
+  succeed on demand — so it's a genuinely manual check. Sanity-check the
+  negative case stays unchanged too: on a host with neither daemon,
+  `Ok(None)` still commits immediately with a `no Wi-Fi backend present`
+  warn and no retry lines. Also worth confirming as a side effect, not the
+  headline fix: shell startup should no longer
+  freeze while the probe works — pre-#634, `select_backend` ran
+  `rt.block_on` on the GTK main thread, so a slow bus blocked the entire
+  shell for the probe's duration (~10 s with the socket down, up to ~50 s
+  against a wedged peer).
 
 ## Night light
 
@@ -605,6 +653,26 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
   — a shell descended from trollshell reports the **deployed** revision, not
   `dev`, even from a dev `cargo run` run inside it.
 
+## Documentation site (GitHub Pages)
+
+- [ ] **(#629)** `docs/plugin-env.md` is now published on the Pages
+      options-doc site (rendered by the `options-doc` derivation via
+      `cmark-gfm`, the same mechanism `options.html` uses), and the site
+      root (`index.html`) is a real landing page linking both documents —
+      it used to be a byte-copy of `options.html`. `nix flake check` now
+      builds `options-doc` as part of `checks`, closing the #449-class gap
+      where a broken derivation here would only surface as a red Pages
+      deploy after merge, but the **deploy step itself** stays outside
+      `nix flake check` by design — the Pages workflow only copies files out
+      of the built derivation, it never runs live in CI. So a human still
+      has to confirm the published site once this reaches `main`:
+      `https://vibec0re.github.io/trollshell/` shows the landing page (not
+      the options doc directly) and both its links work; `plugin-env.html`
+      renders its env-var reference tables as real tables, not literal `|`
+      characters; and `options.html`'s `plugins.<name>.env` option
+      description now links out to the styled `plugin-env.html` page rather
+      than raw Markdown on GitHub.
+
 ## Not carrying a live-verify list, noted for context
 
 - **(#488)** Dependency-hygiene / MSRV PR — bumped the workspace MSRV
@@ -636,3 +704,9 @@ that gets refreshed periodically, not a dated snapshot of one merge wave.
   plugins structurally can't do that, they only ever ship a validated pixel
   buffer for the host to paint. No behavior change anywhere in the diff —
   nothing to verify in a Niri session.
+- **(#628)** A refresh of _this_ document — folded in #616/#622/#623/#624/#625
+  (the burst right behind #611's refresh) and bumped the coverage line to
+  #625. Docs-only, so it carries nothing to verify itself; noted here for the
+  same reason #611 is — it's the state of this file immediately before the
+  #629/#630/#634 burst that this pass folds in, so a future reader can see
+  where the handoff was.

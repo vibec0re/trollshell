@@ -192,7 +192,7 @@ pub struct BarHandle {
 impl BarHandle {
     /// Close the bar immediately.
     pub fn close(self) {
-        self.window.close();
+        self.window.destroy();
     }
 
     /// Access the underlying layer-shell window — useful for binding
@@ -205,7 +205,7 @@ impl BarHandle {
 
 impl Drop for BarHandle {
     fn drop(&mut self) {
-        self.window.close();
+        self.window.destroy();
     }
 }
 
@@ -215,5 +215,46 @@ impl BarHandle {
     /// don't want to track each one individually.
     pub fn into_long_lived(self) {
         std::mem::forget(self);
+    }
+}
+
+// #638: `BarHandle`'s teardown paths (`close()`, `Drop`) call `destroy()`
+// rather than `close()` specifically because `close()` is a *request* that
+// GTK only turns into a real teardown for a *realized* window — see GTK
+// 4.22's own GIR docs for `gtk_window_close` vs. `gtk_window_destroy`. A
+// `BarHandle` dropped before its bar was ever shown (an error path during
+// monitor setup, or a bar built for a monitor that vanished mid-setup) holds
+// an unrealized window, which is exactly the case `close()` cannot dispose
+// of. This needs a live display (`system-tests`, run under `xvfb-run`); it
+// does not need `gtk4-layer-shell` or a compositor, since the
+// realized/unrealized distinction it exercises is a plain-GTK toplevel-list
+// mechanic, not a layer-shell one — a bare `gtk::Window` stands in fine.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::*;
+
+    #[gtk::test]
+    fn drop_destroys_an_unrealized_bar_window() {
+        let window = gtk::Window::new();
+        assert!(
+            !window.is_realized(),
+            "a freshly constructed, never-presented window must start unrealized"
+        );
+        let weak = window.downgrade();
+
+        // `BarHandle`'s `window` field is private, but this test module is a
+        // child of `bar`, so the struct-literal is reachable — no need for a
+        // full `Bar::show()` (which would present the window, realizing it).
+        let handle = BarHandle { window };
+        drop(handle);
+
+        // Let any deferred destroy settle.
+        while gtk::glib::MainContext::default().iteration(false) {}
+
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping a BarHandle must destroy its window even when it was \
+             never realized — a bare close() would silently leave it alive",
+        );
     }
 }

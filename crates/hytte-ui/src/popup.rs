@@ -266,7 +266,7 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
     //   live show — e.g. a bar chip's menu is up when `monitors_changed` tears
     //   the whole bar down on hot-plug. Without an `unmap` hook the catchers'
     //   `Vec` is merely dropped, but a `gtk::Window` toplevel lives in GTK's
-    //   global toplevel list until `close()`d, so each survives as an invisible
+    //   global toplevel list until `destroy()`d, so each survives as an invisible
     //   full-output click-eater with no visible cause.
     //
     // Whichever fires first drains and closes the catchers; the other finds an
@@ -280,11 +280,11 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
 
 /// Idempotently drain and close every catcher window. Called from both the
 /// popover's `closed` and `unmap` handlers; the first to fire takes the windows
-/// out of the shared cell and `close()`s them (removing each toplevel from
+/// out of the shared cell and `destroy()`s them (removing each toplevel from
 /// GTK's window list), leaving the other a harmless no-op.
 fn close_catchers(catchers: &Rc<RefCell<Vec<gtk::Window>>>) {
     for win in catchers.borrow_mut().drain(..) {
-        win.close();
+        win.destroy();
     }
 }
 
@@ -371,9 +371,9 @@ fn map_position(p: Position) -> gtk::PositionType {
 //
 // What *is* exercisable headlessly (needs a display → gated to `system-tests`,
 // run under `xvfb-run`) is the teardown mechanism the fix hinges on: that
-// `close_catchers` idempotently drains the shared cell and that `close()`ing
+// `close_catchers` idempotently drains the shared cell and that `destroy()`ing
 // each window actually removes it from GTK's global toplevel list — the very
-// thing a bare drop does *not* do, which is why an un-`close()`d catcher leaks.
+// thing a bare drop does *not* do, which is why an un-`destroy()`d catcher leaks.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;

@@ -1012,12 +1012,31 @@ pub fn close_all() {
 /// again. Left un-pruned it's a pure leak — one stale `Mutable` per hot-plug
 /// cycle for every connector-less monitor.
 ///
-/// Clear runs *before* the prune, not after: a `Mutable` handed out by
-/// [`drawer_open_state`] outlives its map entry (the signal holds its own
-/// reference), so clearing first means every handle this module ever minted
-/// reads the truth — including a fallback-keyed one whose entry is about to be
-/// dropped — without `close_all` having to reason about which other module's
-/// teardown happens to drop the last subscriber first.
+/// Clear runs *before* the prune, and that ordering is load-bearing. #618
+/// proposed the reverse — prune, then clear the survivors, to save a wake on
+/// entries about to be dropped — but in `futures-signals` 0.3.34 that strands
+/// subscribers on the stale `true` permanently:
+///
+/// * A signal's `MutableSignalState` holds a strong `Arc` to the shared state,
+///   but is **not** counted in `senders` — only live `Mutable` handles are. And
+///   the `PANELS` drain above has already dropped every
+///   `ModalPanel::open_state`, so by the time we run, this map holds the *last*
+///   `Mutable` for each key still in it.
+/// * Dropping that last sender notifies with `has_changed = false` and then
+///   wipes the waker list, while `poll_change` reads
+///   `if is_changed() { … } else if senders == 0 { Poll::Ready(None) }` — a
+///   permanent end-of-stream.
+/// * So pruning first *terminates* every live subscription on that key while
+///   its value is still `true`, unrecoverably: a `set_neq` loop afterwards can
+///   no longer reach an entry that's already out of the map, and its wakers are
+///   gone regardless. Clearing first latches `changed` before the senders reach
+///   zero, so the last poll delivers `false` and *then* the stream ends.
+///
+/// The fallback keys this prunes do have a live subscriber, so this is not
+/// hypothetical: `main.rs` binds the bar's `drawer-open` class for every
+/// monitor, and it's only `overlays::osd::install` that skips the unnamed ones.
+/// It goes unobserved today purely because that bar window is being destroyed
+/// anyway — not because nobody is listening.
 fn reset_drawer_open_states() {
     DRAWER_OPEN.with(|map| {
         let mut map = map.borrow_mut();
@@ -1508,7 +1527,7 @@ fn apply_stats_scroll(panel: &ModalPanel) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAWER_OPEN, EAGER_PAGES, Page, clamp_main_margin, drawer_open_state,
+        DRAWER_OPEN, EAGER_PAGES, Page, clamp_main_margin, close_all, drawer_open_state,
         reset_drawer_open_states,
     };
     use std::collections::HashSet;
@@ -1723,5 +1742,42 @@ mod tests {
         // `Mutable`'s signal re-delivers its current value on subscribe, which
         // is why rebuilding the overlay alone never fixed this.)
         assert!(!drawer_open_state("DP-1").get());
+    }
+
+    /// Companion to the above, pinning [`close_all`] *itself* rather than the
+    /// helper: deleting the `reset_drawer_open_states()` call from `close_all`
+    /// would leave the helper-level test green, since the helper would still be
+    /// correct in isolation. This is the test that actually fails if the fix is
+    /// unwired.
+    ///
+    /// `close_all` can't run to completion off a booted `App` — it reaches
+    /// `plugins::set_active_panel`, which `.expect()`s the plugin service out of
+    /// the thread-local registry. That's an ordinary unwinding panic (no profile
+    /// sets `panic = "abort"`) raised *after* the `DRAWER_OPEN` reset, and
+    /// `PANELS` is empty on a test thread so the drain above it touches no GTK.
+    /// Catching it is therefore enough to observe the reset. The caught panic's
+    /// message shows up in this test's captured output — that's expected, not a
+    /// failure. (No `set_hook` to silence it: the panic hook is process-global
+    /// and would race the other tests running in parallel.)
+    ///
+    /// Degrades gracefully in both directions: if the plugin service ever stops
+    /// panicking here, `catch_unwind` simply returns `Ok` and the assert still
+    /// holds; if the reset is ever reordered *after* the panicking call, this
+    /// fails loudly, which is the point.
+    #[test]
+    fn close_all_resets_drawer_open_state() {
+        // A key of its own, so this can't interact with the helper-level test
+        // above when libtest runs both on one thread (`--test-threads=1`), where
+        // the `DRAWER_OPEN` thread-local is shared.
+        let open = drawer_open_state("DP-9");
+        open.set(true);
+
+        let _ = std::panic::catch_unwind(close_all);
+
+        assert!(
+            !open.get(),
+            "close_all left the drawer-open state latched — is it still calling \
+             reset_drawer_open_states()?"
+        );
     }
 }

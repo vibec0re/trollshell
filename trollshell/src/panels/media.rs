@@ -5,13 +5,14 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use hytte::futures_signals::map_ref;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::mpris;
 
 use crate::components::cast;
 use crate::components::format::fmt_us;
-use crate::components::layout::{finish_page, page_grid, section};
+use crate::components::layout::{finish_page, page_grid, section, toggle_class};
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 use crate::scale::scale;
 
@@ -63,19 +64,53 @@ pub fn panel_media() -> gtk::Widget {
 }
 
 /// Per-render switcher chips: `bus_name` (`None` = the "Auto" chip) paired
-/// with its toggle button, so the active-marking bind can restyle without a
+/// with its toggle button, so the chip-state bind can restyle without a
 /// full rebuild.
 type SwitcherChips = Rc<RefCell<Vec<(Option<String>, gtk::ToggleButton)>>>;
+
+/// CSS class carried by the chip whose player the user explicitly *pinned*
+/// (via `mpris::select_player`), on top of the pressed state every active chip
+/// gets. Lets a deliberate pin read differently from a merely heuristic pick
+/// — see `assets/trollshell/style.css`.
+const PINNED_CLASS: &str = "ts-media-source-pinned";
+
+/// The two bus names the chip styling is a function of, as last emitted.
+///
+/// Kept in an `Rc<RefCell<…>>` shared with the roster-rebuild bind so chips
+/// built by a rebuild get their state applied straight away: the rebuild and
+/// the chip-state bind are independent apply-loops with no ordering guarantee
+/// between them, so a rebuild can't rely on the state bind having painted its
+/// brand-new buttons.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Selection {
+    /// `mpris::selected_player()` — the bus the user pinned, if any.
+    selected: Option<String>,
+    /// `mpris::active_player()`'s bus — the pinned one when the pin is live,
+    /// otherwise whatever the service's heuristic picked.
+    active: Option<String>,
+}
+
+type SelectionCell = Rc<RefCell<Selection>>;
+
+/// How a single source chip should render for a given [`Selection`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ChipState {
+    /// The `gtk::ToggleButton` pressed state.
+    pressed: bool,
+    /// Whether the chip additionally carries [`PINNED_CLASS`].
+    pinned: bool,
+}
 
 /// A horizontal row of selectable source chips: one per live MPRIS player
 /// plus an "Auto" chip to revert to the heuristic. Rebuilt reactively from
 /// `mpris::players()`; the whole row hides unless >=2 players are present.
-/// The chip matching `mpris::active_player()` is marked active.
+/// Chip pressed/pinned state comes from [`chip_state`].
 fn build_switcher() -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.add_css_class("ts-media-switcher");
 
     let chips: SwitcherChips = Rc::new(RefCell::new(Vec::new()));
+    let selection: SelectionCell = Rc::new(RefCell::new(Selection::default()));
 
     // Rebuild the chip set only when the ROSTER (each player's bus_name +
     // display label) actually changes. `mpris::players()` re-emits ~4Hz from
@@ -83,6 +118,7 @@ fn build_switcher() -> gtk::Widget {
     // down and recreate every chip 4x/second. Project to the roster + dedupe
     // so a rebuild fires only on add/remove/relabel.
     let chips_for_build = chips.clone();
+    let selection_for_build = selection.clone();
     bind(
         mpris::players()
             .map(|players| {
@@ -95,27 +131,90 @@ fn build_switcher() -> gtk::Widget {
         &row,
         move |row, roster| {
             rebuild_switcher(row, &roster, &chips_for_build);
+            apply_chip_states(&chips_for_build, &selection_for_build.borrow());
         },
     );
 
-    // Mark whichever chip is currently active (pinned or heuristic).
-    let chips_for_active = chips.clone();
-    bind(
-        mpris::active_player().map(|p| p.map(|p| p.bus_name)),
-        &row,
-        move |_, active_bus| {
-            for (bus, btn) in chips_for_active.borrow().iter() {
-                // The "Auto" chip (bus == None) is never the active *source*;
-                // it only reflects whether we're in automatic mode, which we
-                // can't tell from active_player alone, so leave it unset and
-                // let the matching player chip light up instead.
-                let is_active = bus.as_deref() == active_bus.as_deref();
-                set_toggle_silently(btn, is_active);
-            }
-        },
-    );
+    // Mark the chips. This needs BOTH signals, and until #651 it only had one:
+    // an `active_player()`-only bind can never leave "Auto" pressed, because
+    // Auto's bus is `None` while the active bus is `Some(…)` whenever any
+    // player exists — so every emission cleared Auto and the user watched
+    // their own click pop straight back out. `mpris::selected_player()` is the
+    // missing half; it is not a new capability, it landed in the very commit
+    // that added this panel (0d7d2da) and simply had no subscriber. Combining
+    // the two also separates a pinned source from a heuristically-active one,
+    // which is the distinction #128 asked for.
+    //
+    // Deliberately NOT deduped. The chips are `ToggleButton`s, so a click
+    // flips the pressed state before the model sees it; `select_player` writes
+    // a plain `Mutable::set`, which notifies even when the value is unchanged,
+    // and this re-apply is what puts the button back where the model says it
+    // belongs. Clicking an already-pressed chip (very easy on "Auto") would
+    // otherwise leave it stuck in the flipped state. The apply is a no-op-
+    // guarded walk over at most a handful of chips, so re-running it on every
+    // `players()` tick costs nothing worth optimising away.
+    let combined = map_ref! {
+        let selected = mpris::selected_player(),
+        let active = mpris::active_player().map(|p| p.map(|p| p.bus_name)) => {
+            Selection { selected: selected.clone(), active: active.clone() }
+        }
+    };
+    let chips_for_state = chips.clone();
+    let selection_for_state = selection.clone();
+    bind(combined, &row, move |_, sel| {
+        apply_chip_states(&chips_for_state, &sel);
+        *selection_for_state.borrow_mut() = sel;
+    });
 
     row.upcast()
+}
+
+/// Push `sel` onto every live chip: pressed state on the toggle, and
+/// [`PINNED_CLASS`] on whichever one is actually pinned.
+fn apply_chip_states(chips: &SwitcherChips, sel: &Selection) {
+    for (bus, btn) in chips.borrow().iter() {
+        let state = chip_state(
+            sel.selected.as_deref(),
+            sel.active.as_deref(),
+            bus.as_deref(),
+        );
+        set_toggle_silently(btn, state.pressed);
+        toggle_class(btn, PINNED_CLASS, state.pinned);
+    }
+}
+
+/// Whether the pin in `selected` is actually in force.
+///
+/// `mpris::resolve_active` honours a pin only while that player is still in
+/// the live roster and otherwise falls back to the heuristic, so the pin is in
+/// force exactly when it equals the resolved active bus. A pin left behind by
+/// a player that has since quit therefore reads as automatic — which is what
+/// the service is genuinely doing.
+fn effective_pin<'a>(selected: Option<&'a str>, active: Option<&str>) -> Option<&'a str> {
+    match (selected, active) {
+        (Some(s), Some(a)) if s == a => Some(s),
+        _ => None,
+    }
+}
+
+/// Pure derivation of one chip's visual state from the current selection.
+///
+/// `chip` is the chip's own bus name, `None` for the "Auto" chip. Auto is a
+/// *mode*, not a source: it presses exactly when no pin is in force, and is
+/// never itself "pinned". A player chip presses when it is the active source
+/// and takes [`PINNED_CLASS`] only when it is the pinned one.
+fn chip_state(selected: Option<&str>, active: Option<&str>, chip: Option<&str>) -> ChipState {
+    let pin = effective_pin(selected, active);
+    match chip {
+        None => ChipState {
+            pressed: pin.is_none(),
+            pinned: false,
+        },
+        Some(bus) => ChipState {
+            pressed: active == Some(bus),
+            pinned: pin == Some(bus),
+        },
+    }
 }
 
 /// Tear down and rebuild the switcher chips for the current roster (one
@@ -370,4 +469,92 @@ fn send_seek(scale: &gtk::Scale, state: &PlayerState) {
     let pos_fraction = scale.value().clamp(0.0, 1.0);
     let pos_us = cast::f64_to_i64_trunc(pos_fraction * cast::u64_to_f64(length));
     mpris::set_position(b, t, pos_us);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChipState, chip_state};
+
+    const AUTO: Option<&str> = None;
+    const A: Option<&str> = Some("org.mpris.MediaPlayer2.a");
+    const B: Option<&str> = Some("org.mpris.MediaPlayer2.b");
+
+    fn state(pressed: bool, pinned: bool) -> ChipState {
+        ChipState { pressed, pinned }
+    }
+
+    #[test]
+    fn auto_is_pressed_in_automatic_mode() {
+        // Nothing pinned, `a` merely won the heuristic: Auto owns the pressed
+        // state for the *mode*, and `a` is pressed as the active source.
+        assert_eq!(chip_state(None, A, AUTO), state(true, false));
+        assert_eq!(chip_state(None, A, A), state(true, false));
+        assert_eq!(chip_state(None, A, B), state(false, false));
+    }
+
+    #[test]
+    fn auto_is_pressed_with_no_players_at_all() {
+        assert_eq!(chip_state(None, None, AUTO), state(true, false));
+    }
+
+    #[test]
+    fn pinning_a_player_releases_auto_and_marks_the_pin() {
+        // The mirror image of the automatic case above, and the half the old
+        // `active_player()`-only bind could express. It could not express the
+        // other half — Auto was force-cleared whenever any player existed —
+        // which is what made clicking Auto look like a no-op (#651).
+        assert_eq!(chip_state(A, A, AUTO), state(false, false));
+        assert_eq!(chip_state(A, A, A), state(true, true));
+        assert_eq!(chip_state(A, A, B), state(false, false));
+    }
+
+    #[test]
+    fn only_the_pinned_chip_is_marked_pinned() {
+        // `b` is active *because* it is pinned; `a` is neither.
+        assert_eq!(chip_state(B, B, A), state(false, false));
+        assert_eq!(chip_state(B, B, B), state(true, true));
+    }
+
+    #[test]
+    fn a_stale_pin_reads_as_automatic() {
+        // The pinned player quit, so mpris' `resolve_active` already reverted
+        // to the heuristic (`b`). The chips must say the same thing: Auto
+        // pressed, and `b` active but not pinned.
+        assert_eq!(chip_state(A, B, AUTO), state(true, false));
+        assert_eq!(chip_state(A, B, B), state(true, false));
+        // …and likewise when the last player is gone entirely.
+        assert_eq!(chip_state(A, None, AUTO), state(true, false));
+    }
+
+    #[test]
+    fn auto_and_the_resolved_source_light_up_together() {
+        // Deliberate, and the reason the two states need different visuals:
+        // in automatic mode "Auto" reports the *mode* while the player chip
+        // reports which source that mode resolved to, so both are pressed.
+        // Pinning collapses that to a single pressed chip.
+        assert!(chip_state(None, A, AUTO).pressed && chip_state(None, A, A).pressed);
+        assert!(!chip_state(A, A, AUTO).pressed && chip_state(A, A, A).pressed);
+    }
+
+    #[test]
+    fn at_most_one_chip_is_pinned_and_a_pinned_chip_is_always_pressed() {
+        for selected in [None, A, B] {
+            for active in [None, A, B] {
+                let pinned: Vec<Option<&str>> = [AUTO, A, B]
+                    .into_iter()
+                    .filter(|chip| chip_state(selected, active, *chip).pinned)
+                    .collect();
+                assert!(
+                    pinned.len() <= 1,
+                    "selected={selected:?} active={active:?} pinned {pinned:?}"
+                );
+                for chip in pinned {
+                    assert!(
+                        chip_state(selected, active, chip).pressed,
+                        "pinned chip {chip:?} must also render pressed"
+                    );
+                }
+            }
+        }
+    }
 }

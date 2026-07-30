@@ -14,12 +14,13 @@ PR number in parens if you need full context on _why_.
 Checked items are ones Annika has already implicitly verified — noted inline.
 Everything else is unchecked and still wants a pass in a real Niri session.
 
-**Coverage: #458 through #609** (#606 carries no live-verify list of its own —
-noted in the closing section instead). Originally created by #507 for the
-2026-07 merge wave (#458–#496); refreshed by #602 to fold in everything merged
-since (#497–#596), renaming off the month-stamped filename in that pass;
+**Coverage: #458 through #611** (#606 and #611 carry no live-verify list of
+their own — noted in the closing section instead). Originally created by #507
+for the 2026-07 merge wave (#458–#496); refreshed by #602 to fold in everything
+merged since (#497–#596), renaming off the month-stamped filename in that pass;
 refreshed again (parent effort #602) for the #598/#604/#606/#609 burst that
-merged right behind it — this is a living checklist that gets refreshed
+merged right behind it; and folded in #610 immediately after the 2026-07-30
+merge that landed it — this is a living checklist that gets refreshed
 periodically, not a dated snapshot of one merge wave.
 
 ## Idle & lock
@@ -411,6 +412,33 @@ periodically, not a dated snapshot of one merge wave.
       should update in place (same stack position, not re-appended to the
       bottom) and still not expire.
 
+## Network panel (link status)
+
+- [ ] **(#610)** _Unchanged path_ — on a host with a working NetworkManager or
+      systemd-networkd, open the network drawer: Status reads **Online via
+      `<iface>`** with the accent pill, "All links" shows the real interface
+      count, and there is no "No connection" row. Now take the link down
+      (`ip link set <iface> down`, as root) or unplug it: within ~5 s Status
+      reads **Offline** with the muted pill and the "No connection" row
+      appears — i.e. the word Offline still shows up where it is earned.
+- [ ] **(#610)** _New path_ — on a host with **no link manager at all**
+      (`systemctl stop NetworkManager systemd-networkd`, or a container /
+      bridge-only box like #607's): Status must read **Unknown** with the muted
+      pill and "No link manager (systemd-networkd or NetworkManager)" — **not**
+      Offline. "All links" reads **Unknown**, not "0 interface(s)", and the "No
+      connection" row stays hidden. The traffic card next door should still
+      show the live interfaces, which is the whole point: the panel no longer
+      contradicts it.
+- [ ] **(#610)** Restart NetworkManager and confirm the card promotes to the
+      real link and count within ~5 s. Caveat worth knowing before you call
+      this a failure: the _backend probe_ still runs only once at startup, so a
+      manager that appears **after** the shell started is picked up only if the
+      probe had already chosen that backend. That re-probe gap is deliberately
+      untouched here and is tracked as #613.
+- [ ] **(#610)** With `RUST_LOG=hytte_services=debug`, confirm no new log noise
+      — `link_source()` uses `set_neq`, so it must not re-emit on every 5 s
+      poll.
+
 ## Wi-Fi (NetworkManager)
 
 - [ ] **(#579)** Join a **never-before-seen WPA2 network** from the Wi-Fi
@@ -529,3 +557,9 @@ periodically, not a dated snapshot of one merge wave.
   with nothing to back it. No code, no config, no CI surface — genuinely
   nothing to verify in a Niri session; noted explicitly so a future reader
   doesn't mistake the silence for an oversight.
+- **(#611)** A refresh of _this_ document. Docs-only, so it carries nothing to
+  verify itself. Worth recording that it was written before #610 merged and so
+  shipped without it — #610's entries were folded in immediately afterwards,
+  which is why the coverage line moved twice on 2026-07-30. The general lesson
+  is in the header: this file goes stale within minutes of a merge burst, so
+  updating it belongs to the burst rather than to a later pass.

@@ -973,12 +973,24 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
 }
 
 /// Close and remove all drawers (called before rebuilding bars on hot-plug).
+///
+/// Drains `PANELS` into a local `Vec` and drops the borrow *before* calling
+/// [`gtk::Window::close`] on each entry, rather than closing from inside the
+/// `borrow_mut()` (#627). `wire_retract_finish`'s `child-revealed` handler
+/// takes its own `borrow()` of the same `RefCell`; if a `close()` ever
+/// triggered that signal synchronously, running it under an active
+/// `borrow_mut()` would panic, and a panic unwinding through a glib callback
+/// aborts the process. Believed unreachable today (see
+/// `overlays::sidebar.rs`'s note on a closed window's revealer never
+/// settling), but that's a GTK-internals assumption documented in a
+/// different module — not worth leaving as a load-bearing dependency here
+/// when not holding the borrow is free.
 pub fn close_all() {
-    PANELS.with(|panels| {
-        for (_, panel) in panels.borrow_mut().drain() {
-            panel.window.close();
-        }
-    });
+    let panels: Vec<_> =
+        PANELS.with(|panels| panels.borrow_mut().drain().map(|(_, v)| v).collect());
+    for panel in panels {
+        panel.window.close();
+    }
     reset_drawer_open_states();
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the

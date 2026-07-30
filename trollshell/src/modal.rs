@@ -950,6 +950,15 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         }
         let closed_plugin_panel = PANELS.with(|panels| {
             let panels = panels.borrow();
+            // Post-#627, `close_all` drains every entry out of `PANELS` before
+            // closing any window, so a synchronous `child-revealed` emission
+            // during one of those closes now always lands here (this key is
+            // already gone). Benign: `close_all`'s own tail performs
+            // everything the `Some` arm below would have —
+            // `set_visible(false)` on a window that's being dropped anyway,
+            // `*current = None`, `open_state.set(false)`, and
+            // (unconditionally) `set_active_panel(None)` — so returning
+            // `false` here just skips redundant work, not a missed teardown.
             let Some(panel) = panels.get(&key) else {
                 return false;
             };
@@ -975,16 +984,16 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
 /// Close and remove all drawers (called before rebuilding bars on hot-plug).
 ///
 /// Drains `PANELS` into a local `Vec` and drops the borrow *before* calling
-/// [`gtk::Window::close`] on each entry, rather than closing from inside the
+/// `gtk::Window::close` on each entry, rather than closing from inside the
 /// `borrow_mut()` (#627). `wire_retract_finish`'s `child-revealed` handler
-/// takes its own `borrow()` of the same `RefCell`; if a `close()` ever
+/// takes its own `borrow()` of the same `RefCell`; if `close()` ever
 /// triggered that signal synchronously, running it under an active
 /// `borrow_mut()` would panic, and a panic unwinding through a glib callback
-/// aborts the process. Believed unreachable today (see
-/// `overlays::sidebar.rs`'s note on a closed window's revealer never
-/// settling), but that's a GTK-internals assumption documented in a
-/// different module — not worth leaving as a load-bearing dependency here
-/// when not holding the borrow is free.
+/// aborts the process. Whether `gtk_window_close`/`gtk_revealer_unmap` can
+/// emit `notify::child-revealed` synchronously is not verified either way —
+/// draining first removes the dependency on that question entirely, which is
+/// the point: not holding the borrow is free, so there's no need to resolve
+/// it first.
 pub fn close_all() {
     let panels: Vec<_> =
         PANELS.with(|panels| panels.borrow_mut().drain().map(|(_, v)| v).collect());

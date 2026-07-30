@@ -121,11 +121,20 @@ outright, drop them from the affected lines and re-load.
   hooks off them. A custom IPC channel was considered and rejected
   — `wpctl` and `brightnessctl` already do the right thing.
 - It does NOT bind a power-menu shortcut (lock / logout / suspend / reboot /
-  shutdown). Those actions live on a drawer page (`page_power_menu` in
-  `trollshell/src/widgets/pages.rs`); reaching it from a keybind would need
-  a tiny trollshell IPC channel that doesn't exist yet. For v1 the page is
-  reachable through the existing modal infrastructure only — a follow-up
-  task will add a chip and/or a `Mod+Escape` binding once the IPC lands.
+  shutdown). Those actions live on a drawer page (`panel_power_menu` in
+  `trollshell/src/panels/power_menu.rs`); reaching it from a keybind no
+  longer needs new IPC — `trollshell/src/commands.rs` already registers
+  `open-page`, `power-menu`, `toggle-sidebar`, and `toggle-recording` as
+  `org.gtk.Actions` on the shell's existing session-bus name (#219):
+
+  ```sh
+  busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
+      org.gtk.Actions Activate 'sava{sv}' power-menu 0 0
+  ```
+
+  Whether/how to actually bind this in `binds.kdl` is left to the deployer —
+  this file mirrors Annika's personal chords, and which key (if any) maps to
+  which verb is a preference call, not something this doc should default.
 
 - It does NOT bind the keyboard-backlight keys (`XF86KbdBrightnessUp/Down`).
   Those typically don't have a sysfs uniformity story; add them by hand if

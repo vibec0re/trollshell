@@ -194,13 +194,13 @@ Source layout (each module has a consistent shape — match it when adding):
 
 - `widgets/` — bar chips. Each `pub fn widget(monitor) -> gtk::Widget`, binds to service signals, and on click calls `modal::toggle(monitor, Page::…, &btn)`.
 - `panels/` — drawer pages mounted into `modal.rs`'s per-monitor `gtk::Stack`. Each `pub fn panel_<name>() -> gtk::Widget`.
-- `overlays/` — per-monitor layer-shell overlays (frame, notifications, osd, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
+- `overlays/` — per-monitor layer-shell overlays (consent, frame, notifications, osd, prompt, sidebar). Each `pub fn install(…)` wires the overlay to a signal source.
 - `modal.rs` — the slide-out drawer system (`Page` enum, per-monitor drawer window/revealer).
 - `components/` — cross-cutting `pub(crate)` building blocks reused across panels.
 - `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Asset sources live in the top-level `assets/` dir mirroring the runtime `share/` layout: `assets/trollshell/{style.css,icons/}` and `assets/hytte-ui/style.css`.
 - `commands.rs` — `gio::ActionEntry`s registered on the `adw::Application` (`org.gtk.Actions`) so niri keybinds can drive drawer/power-menu/sidebar actions that are otherwise mouse-only (#219).
 - `control.rs` — the `mov.vibec0re.trollshell.Control` D-Bus endpoint that `trollshell-control-center` (and future tabs) bind to; transport only, no UI (#390).
-- `plugins.rs` — the out-of-process widget-plugin **host transport**: the per-user socket listener, the GTK-side clock pump, and the effect broker (#35).
+- `plugins/` — the out-of-process widget-plugin **host transport** (a module dir since #443, not a single file — `mod.rs` plus `listener.rs`/`session.rs`/`effects.rs`/`pump.rs`/etc.): the per-user socket listener, the GTK-side clock pump, and the effect broker (#35).
 - `plugin_launcher.rs` — the declarative plugin **launcher** (#419): reads the nix-written `trollshell/plugins.json` (XDG config, rendered from `programs.trollshell.plugins`) and launches each enabled plugin as a transient `trollshell-plugin-<id>` user unit via `systemd-run --user`; the control-center Plugins tab's start/stop (#348) routes through it, and its `extra_env` spawn hook is where #392's key injection rides. Hand-installed static units under `etc/` keep working (legacy fallback).
 - `revision.rs` — resolves the build's git revision via `TROLLSHELL_REV` (runtime env → compile-time env → `"dev"` fallback), the same three-tier shape as `assets.rs` (#601). The nix side injects it **only** through the cheap wrapper slices' `preFixup` (`nix/package.nix`, `nix/control-center.nix`) — never as a compile-time env, which would rehash the single `workspace` crane compile on every commit. Surfaced over D-Bus as `Control.Revision`; whether it also gets a UI surface is still open.
 - `scale.rs` — font-relative pixel scaling (`scale()`) for the handful of Rust-set sizes CSS `em` can't reach (#135).

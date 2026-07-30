@@ -326,8 +326,12 @@ self:
                   instead of per-plugin here).
 
                 The full inventory — swept from source, all 12 bundled
-                plugins including the ones with zero knobs — lives in
-                [`docs/plugin-env.md`](https://github.com/vibec0re/trollshell/blob/main/docs/plugin-env.md).
+                plugins including the ones with zero knobs — is published at
+                <https://vibec0re.github.io/trollshell/plugin-env.html>
+                (source: `docs/plugin-env.md`). An absolute URL rather than a
+                relative one because this description is also rendered by
+                `nixos-option` and `man home-configuration.nix`, where a
+                relative `plugin-env.html` link would resolve to nothing.
 
                 Precedence for a plugin that also reads a config file (e.g.
                 usage's `~/.config/trollshell/usage.toml`): environment (this

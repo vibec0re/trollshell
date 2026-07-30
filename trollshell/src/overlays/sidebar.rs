@@ -179,12 +179,21 @@ pub fn is_settled(monitor: &Monitor) -> bool {
 
 /// Internal: keyed lookup used by both the public API and tests.
 fn is_settled_for_key(key: &str) -> bool {
-    PANELS.with(|panels| {
+    // Copy the two handles out and read them with no `PANELS` borrow live
+    // (#643). `is_child_revealed()` is only a property *getter*, so it cannot
+    // emit — but the sweep's definition is "any borrow across a GTK call" and
+    // deliberately does not carve out getters, and this runs from `frame.rs`'s
+    // per-frame tick callback while `install`/`close_all` hold the `borrow_mut()`
+    // counterparties. Cheaper to settle it than to keep the exemption as
+    // folklore. (`current_visible_width_for_key` just above reads
+    // `open_state.get()` — a `Mutable`, not GTK — so it needs nothing.)
+    let handles = PANELS.with(|panels| {
         panels
             .borrow()
             .get(key)
-            .is_none_or(|p| p.revealer.is_child_revealed() == p.open_state.get())
-    })
+            .map(|p| (p.revealer.clone(), p.open_state.get()))
+    });
+    handles.is_none_or(|(revealer, open)| revealer.is_child_revealed() == open)
 }
 
 /// Build the sidebar surface for one monitor, mount it as a layer-shell
@@ -238,7 +247,24 @@ pub fn install(monitor: &Monitor) {
         }))
     };
 
-    PANELS.with(|panels| {
+    // `drop(…with(|…| …insert(…)))`, not a bare `insert(…);` statement (#643,
+    // mirroring the annotated `modal::install` site). `insert` returns the
+    // displaced `SidebarPanel`; as a bare statement that value is a temporary
+    // of the *same* statement as the `borrow_mut()` `RefMut`, and statement
+    // temporaries drop in reverse creation order — so it would run its drop
+    // glue with `PANELS` still borrowed. Tail-expression + outer `drop` moves
+    // that past the borrow.
+    //
+    // Stating the mechanism precisely, because the cluster has muddled it
+    // before: this is a *refcount decrement*, not a widget teardown. GTK holds
+    // its own reference to a mapped toplevel, so dropping the Rust `gtk::Window`
+    // handle does not dispose the window (that needs `destroy()`, which
+    // `close_all` calls). What actually runs here is `JoinHandle`/`Mutable`
+    // drop glue plus two GObject unrefs. Reachable only if `install` ran twice
+    // for one key without an intervening `close_all`, which `main.rs` currently
+    // prevents — weak, like the rest of the `install` group, and converted for
+    // the same reason: not holding the borrow costs nothing.
+    drop(PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key,
             SidebarPanel {
@@ -249,8 +275,8 @@ pub fn install(monitor: &Monitor) {
                 visibility_subscription,
                 zone_tick,
             },
-        );
-    });
+        )
+    }));
 }
 
 /// Layer-shell window anchored Left + Top + Bottom — full screen height,

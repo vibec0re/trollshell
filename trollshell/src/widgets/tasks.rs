@@ -390,8 +390,15 @@ fn build_create_popover(
         if summary.is_empty() {
             return;
         }
-        let lists = lists_for_create.borrow();
+        // Read the dropdown *before* borrowing (#643). The `drop(lists)` below
+        // used to come after `list_picker_for_create.selected()`, so the `Ref`
+        // was live across that call; the sweep's four-spelling definition says
+        // "any borrow across a GTK call" and does not carve out getters, so
+        // rather than lean on `selected()` being a plain property read, the two
+        // statements are simply swapped. `wire_lists_bind` holds the
+        // `borrow_mut()` counterparty on this cell.
         let idx = list_picker_for_create.selected() as usize;
+        let lists = lists_for_create.borrow();
         let Some(list) = lists.get(idx) else {
             return;
         };
@@ -685,7 +692,17 @@ impl DuePicker {
     }
 
     fn refresh_summary(&self) {
-        match *self.mode.borrow() {
+        // Copy both values out first (#643). `match *self.mode.borrow() { … }`
+        // borrows the place expression for the *whole* match, so the `Ref` was
+        // live across every arm's `set_visible`/`set_text` — spelling (3) — with
+        // a second, nested `self.selected.borrow()` inside the `Pick` arm. Three
+        // `borrow_mut()` counterparties sit on `mode` (`set_mode`, `set_value`,
+        // `reset`) and three more on `selected`, and one of them —
+        // `set_mode` — is reached from a `connect_toggled` handler on the chips.
+        // Both cells hold `Copy` payloads, so this is a plain register copy.
+        let mode = *self.mode.borrow();
+        let selected = *self.selected.borrow();
+        match mode {
             DueMode::None => {
                 self.summary_label.set_visible(false);
             }
@@ -698,7 +715,7 @@ impl DuePicker {
                 self.summary_label.set_text("Due tomorrow");
             }
             DueMode::Pick => {
-                let label = self.selected.borrow().map_or_else(
+                let label = selected.map_or_else(
                     || "Pick a date".to_string(),
                     |d| format!("Due {}", short_date(d)),
                 );

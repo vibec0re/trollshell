@@ -106,7 +106,12 @@ struct CardEntry {
 thread_local! {
     /// Mounted toast surfaces keyed by `Monitor.connector()`. Each
     /// entry owns its layer-shell window and the per-window state.
-    static TOAST_WINDOWS: RefCell<HashMap<String, ToastView>> =
+    ///
+    /// `Rc<ToastView>`, not a bare `ToastView` (#643): [`route_emission`] has to
+    /// hand a view to [`apply_emission`], which runs a long stretch of GTK work,
+    /// and the only way to do that without holding this cell borrowed across all
+    /// of it is to clone a handle out. Mirrors `overlays::osd`'s `OSDS`.
+    static TOAST_WINDOWS: RefCell<HashMap<String, Rc<ToastView>>> =
         RefCell::new(HashMap::new());
 
     /// Set after the first `install()` call so module-level
@@ -131,7 +136,17 @@ pub fn install(monitor: &Monitor) {
     };
 
     let view = build_toast_view(monitor);
-    TOAST_WINDOWS.with(|map| map.borrow_mut().insert(connector, view));
+    // **The semicolon rule** (#643). This `insert` returns the displaced
+    // `Rc<ToastView>`, and it is safe *only* because it is the closure's tail
+    // expression: the returned `Option` is moved out to the caller before the
+    // `borrow_mut()` `RefMut` — a temporary of that same expression — drops, so
+    // the displaced view runs its drop glue in the *outer* statement, with
+    // `TOAST_WINDOWS` no longer borrowed. Putting a semicolon after
+    // `insert(...)` inside the closure inverts that: the `Option` becomes a
+    // statement temporary dropped *before* the `RefMut`, i.e. GObject unrefs
+    // under a live borrow. Do not add one. (See the four `install` sites in
+    // `sidebar`/`frame`/`osd`/`consent`, which had exactly that shape.)
+    TOAST_WINDOWS.with(|map| map.borrow_mut().insert(connector, Rc::new(view)));
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));
@@ -199,19 +214,23 @@ fn install_subscriptions() {
 /// trollshell hasn't mounted on).
 fn route_emission(notifs: &[Notification], dnd_on: bool, muted: &HashSet<String>) {
     let target_name = focused_output::current();
-    TOAST_WINDOWS.with(|map| {
+    // Resolve to an owned handle and let the borrow end at this `let` (#643).
+    // `apply_emission` is nothing but GTK work — `remove`/`append`/`set_visible`
+    // on the card stack — and `install`/`close_all` are the `borrow_mut()`
+    // counterparties on this cell. A shared borrow held across all that would
+    // panic on any re-entry, and a `BorrowMutError` unwinding through a glib
+    // callback aborts the process rather than failing the update.
+    let view = TOAST_WINDOWS.with(|map| {
         let map = map.borrow();
-        if map.is_empty() {
-            return;
-        }
-        let view = target_name
+        target_name
             .as_ref()
             .and_then(|n| map.get(n))
-            .or_else(|| map.values().next());
-        if let Some(view) = view {
-            apply_emission(view, notifs, dnd_on, muted);
-        }
+            .or_else(|| map.values().next())
+            .map(Rc::clone)
     });
+    if let Some(view) = view {
+        apply_emission(&view, notifs, dnd_on, muted);
+    }
 }
 
 /// Toast-management logic running against a single per-monitor view.
@@ -224,8 +243,31 @@ fn apply_emission(
     dnd_on: bool,
     muted: &HashSet<String>,
 ) {
-    let mut map = view.card_map.borrow_mut();
-    let mut suppressed = view.suppressed_during_dnd.borrow_mut();
+    // Take both cells for the duration of the rebuild rather than holding a
+    // `RefMut` across it (#643). The named bindings this replaces stayed live
+    // all the way down past `vbox.remove`, `replace_card`/`mount_card`, the
+    // overflow `remove`/`append`, and the closing `set_visible` — spelling (2)
+    // of the sweep, a `let`-bound borrow instead of a chained temporary, but
+    // exactly the same hazard.
+    //
+    // This is the one site in the cluster where the tree *documents* the
+    // emission as synchronous rather than leaving it unverified: the comment on
+    // the card loop below, and `replace_card`'s own comment on
+    // `vbox.remove(&old.widget)`, both state that unmapping a card fires its
+    // `connect_unmap` → `resume_expiry`, and #593's keep-the-card-mounted design
+    // is built on that being immediate. It doesn't panic today only because that
+    // handler reaches for the expiry bookkeeping rather than for `card_map`.
+    //
+    // Trade-off, stated plainly: while this runs, the cells hold empty
+    // `Default`s, so a re-entrant reader would see no cards rather than the live
+    // set. That is the same trade #643's other take-and-restore conversions make
+    // (`panels::stats`'s per-core bars, `panels::connections`' row vecs), and it
+    // is strictly better than the alternative, which is not a wrong answer but a
+    // `BorrowMutError` unwinding through a glib callback — a process abort.
+    // Nothing re-enters via the driver itself: `route_emission` is pumped from a
+    // `spawn_local`ed `for_each`, which cannot re-poll itself synchronously.
+    let mut map = view.card_map.take();
+    let mut suppressed = view.suppressed_during_dnd.take();
 
     let visible = filter_visible(notifs, dnd_on, muted, &mut suppressed);
     gc_suppressed(notifs, &mut suppressed);
@@ -286,25 +328,35 @@ fn apply_emission(
     // unconditionally: it holds no hover state (no timer to strand), and the
     // remove-then-append is what keeps it pinned below every card the loop
     // above may have appended this pass.
-    {
-        let mut slot = view.overflow_card.borrow_mut();
-        if tail_noncritical_count == 0 {
-            if let Some(card) = slot.take() {
-                view.vbox.remove(&card);
-            }
-        } else {
-            if let Some(card) = slot.take() {
-                view.vbox.remove(&card);
-            }
-            let card = build_overflow_card(&view.monitor, tail_noncritical_count);
-            view.vbox.append(&card);
-            *slot = Some(card);
-        }
+    //
+    // Take-then-act here too (#643): the `let mut slot = ….borrow_mut()` this
+    // replaces was held across the `remove()` and the `append()` below. Both
+    // arms started with the same removal, so it is hoisted out.
+    if let Some(card) = view.overflow_card.take() {
+        view.vbox.remove(&card);
     }
+    let overflow = if tail_noncritical_count == 0 {
+        None
+    } else {
+        let card = build_overflow_card(&view.monitor, tail_noncritical_count);
+        view.vbox.append(&card);
+        Some(card)
+    };
 
-    // Show/hide window based on whether any cards are mounted.
-    view.window
-        .set_visible(!map.is_empty() || view.overflow_card.borrow().is_some());
+    // Decide visibility from the locals, *before* handing anything back: the
+    // original spelled this `!map.is_empty() || view.overflow_card.borrow()
+    // .is_some()`, an argument-position `Ref` that is a temporary of the whole
+    // statement and so stayed alive across `set_visible` — spelling (4).
+    let any_mounted = !map.is_empty() || overflow.is_some();
+
+    // Store back. Each cell holds the empty `Default` its `take()` left behind
+    // (`HashMap`/`HashSet`/`Option::None` allocate nothing until first use), so
+    // these assignments drop nothing of consequence inside the borrow.
+    *view.card_map.borrow_mut() = map;
+    *view.suppressed_during_dnd.borrow_mut() = suppressed;
+    *view.overflow_card.borrow_mut() = overflow;
+
+    view.window.set_visible(any_mounted);
 }
 
 struct Partition<'a> {

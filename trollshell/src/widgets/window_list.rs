@@ -46,7 +46,12 @@ fn update_windows(
     button_map: &Rc<RefCell<HashMap<u64, gtk::Button>>>,
     windows: &[Window],
 ) {
-    let mut map = button_map.borrow_mut();
+    // Take the map for the whole diff rather than holding a `RefMut` across it
+    // (#643, spelling (2)): the binding this replaces stayed live past
+    // `container.remove()`, `apply_window_visuals`, `container.append()` and
+    // `insert_after()`. Same shape as `widgets/workspaces.rs`'s and
+    // `widgets/tray.rs`'s diff loops. Stored back at the end.
+    let mut map = button_map.take();
 
     let prev_keys: Vec<u64> = map.keys().copied().collect();
     let new_keys: Vec<u64> = windows.iter().map(|w| w.id).collect();
@@ -86,6 +91,10 @@ fn update_windows(
             prev = Some(btn.clone());
         }
     }
+
+    // The cell holds the empty `HashMap` `take()` left behind, so this
+    // write-back drops nothing inside the borrow (#643).
+    *button_map.borrow_mut() = map;
 }
 
 /// Window's button label: title, falling back to app id, falling back to a

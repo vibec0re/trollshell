@@ -67,9 +67,14 @@ pub fn install(monitor: &Monitor) {
         tracing::debug!("consent::install: monitor has no connector name; skipping");
         return;
     };
-    MONITORS.with(|m| {
-        m.borrow_mut().insert(connector, monitor.clone());
-    });
+    // Tail-expression `insert` + an outer `drop`, for uniformity with the other
+    // three `install` sites in this sweep (#643). **The weakest one:** the
+    // displaced value is a `Monitor`, whose drop is a `GdkMonitor` refcount
+    // decrement — that emits nothing, so unlike `sidebar`/`frame`/`osd` there is
+    // no plausible re-entrant path even in principle. Converted anyway so the
+    // shape is consistent and nobody has to re-derive which of the four were
+    // "the real ones"; the cost is one `drop(…)`.
+    drop(MONITORS.with(|m| m.borrow_mut().insert(connector, monitor.clone())));
 }
 
 /// Close any live prompt and forget the mounted monitors before a hot-plug

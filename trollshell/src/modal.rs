@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use hytte::adw;
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -433,7 +434,15 @@ impl GateId {
 }
 
 thread_local! {
-    static PANELS: RefCell<HashMap<String, ModalPanel>> = RefCell::new(HashMap::new());
+    /// `Rc<ModalPanel>`, not a bare `ModalPanel` (#643): every entry point below
+    /// needs a whole `&ModalPanel` to drive a run of GTK calls
+    /// (`set_stack_page` / `show_panel` / `set_reveal_child` / `on_page_show`),
+    /// and the only way to do that without holding this cell borrowed across all
+    /// of it is to clone a handle out first. `close_all` and `install` are the
+    /// `borrow_mut()` counterparties that make a held shared borrow a hazard;
+    /// a `BorrowMutError` unwinding through a glib callback aborts the process.
+    /// Mirrors `overlays::osd`'s `OSDS`.
+    static PANELS: RefCell<HashMap<String, Rc<ModalPanel>>> = RefCell::new(HashMap::new());
     /// Per-connector drawer-open state, decoupled from `ModalPanel` lifetime
     /// so subscribers (OSD, bar CSS) can wire up before `install` runs and
     /// survive bar rebuilds on hot-plug.
@@ -499,6 +508,21 @@ fn drawer_open_state(key: &str) -> Mutable<bool> {
             .or_insert_with(|| Mutable::new(false))
             .clone()
     })
+}
+
+/// Every mounted drawer, as owned handles with the [`PANELS`] borrow already
+/// released. The read half of the #643 sweep for this module: every caller that
+/// drives GTK over the panel set takes this snapshot instead of iterating
+/// `panels.borrow().values()` across those calls, so no GTK emission can ever
+/// find `PANELS` borrowed. Cloning an `Rc` per drawer is a refcount bump.
+fn live_panels() -> Vec<Rc<ModalPanel>> {
+    PANELS.with(|panels| panels.borrow().values().map(Rc::clone).collect())
+}
+
+/// One mounted drawer by connector key, as an owned handle with the [`PANELS`]
+/// borrow already released. Single-key counterpart to [`live_panels`].
+fn live_panel(key: &str) -> Option<Rc<ModalPanel>> {
+    PANELS.with(|panels| panels.borrow().get(key).map(Rc::clone))
 }
 
 /// Build the drawer for one monitor and mount it as a layer-shell window.
@@ -581,7 +605,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
     drop(PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key.clone(),
-            ModalPanel {
+            Rc::new(ModalPanel {
                 window,
                 revealer,
                 stack,
@@ -591,7 +615,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 geometry,
                 pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
-            },
+            }),
         )
     }));
 }
@@ -959,20 +983,23 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
         if r.is_child_revealed() {
             return;
         }
-        let closed_plugin_panel = PANELS.with(|panels| {
-            let panels = panels.borrow();
-            // Post-#627, `close_all` drains every entry out of `PANELS` before
-            // closing any window, so a synchronous `child-revealed` emission
-            // during one of those closes now always lands here (this key is
-            // already gone). Benign: `close_all`'s own tail performs
-            // everything the `Some` arm below would have —
-            // `set_visible(false)` on a window that's being dropped anyway,
-            // `*current = None`, `open_state.set(false)`, and
-            // (unconditionally) `set_active_panel(None)` — so returning
-            // `false` here just skips redundant work, not a missed teardown.
-            let Some(panel) = panels.get(&key) else {
-                return false;
-            };
+        // Post-#627, `close_all` drains every entry out of `PANELS` before
+        // closing any window, so a synchronous `child-revealed` emission
+        // during one of those closes now always lands on the `None` branch
+        // (this key is already gone). Benign: `close_all`'s own tail performs
+        // everything the `Some` arm below would have — `set_visible(false)`
+        // on a window that's being dropped anyway, `*current = None`,
+        // `open_state.set(false)`, and (unconditionally)
+        // `set_active_panel(None)` — so doing nothing here just skips
+        // redundant work, not a missed teardown.
+        //
+        // The lookup is a `.cloned()` handle rather than a `Ref` held over the
+        // body (#643): `set_visible(false)` is a GTK call, and `open_state
+        // .set(false)` wakes every drawer-open subscriber — `futures-signals`
+        // calls `Waker::wake()` synchronously from `notify`. Both are paths a
+        // re-entrant `PANELS` borrow could arrive on.
+        let panel = PANELS.with(|panels| panels.borrow().get(&key).map(Rc::clone));
+        let closed_plugin_panel = panel.is_some_and(|panel| {
             panel.window.set_visible(false);
             let was_plugin = matches!(&*panel.current.borrow(), Some(Active::Plugin(_)));
             *panel.current.borrow_mut() = None;
@@ -1117,15 +1144,19 @@ fn reset_drawer_open_states() {
 /// Future work could open `target` on the primary monitor in that case;
 /// for v1 we treat the deep-link as "in this drawer, jump there".
 pub fn switch_active(target: Page) {
-    PANELS.with(|panels| {
-        for panel in panels.borrow().values() {
-            if panel.current.borrow().is_some() {
-                set_stack_page(panel, target);
-                *panel.current.borrow_mut() = Some(Active::Builtin(target));
-                on_page_show(panel, target);
-            }
+    // Snapshot the handles first, then act with no `PANELS` borrow live (#643):
+    // `set_stack_page` and `on_page_show` are runs of GTK calls, and holding the
+    // shared borrow across them means any synchronous emission that re-enters
+    // `PANELS` — `close_all`'s and `install`'s `borrow_mut()` are the
+    // counterparties — panics, fatally, from inside a glib callback. Cloning an
+    // `Rc` per open drawer is a refcount bump.
+    for panel in live_panels() {
+        if panel.current.borrow().is_some() {
+            set_stack_page(&panel, target);
+            *panel.current.borrow_mut() = Some(Active::Builtin(target));
+            on_page_show(&panel, target);
         }
-    });
+    }
     recompute_gates();
 }
 
@@ -1133,22 +1164,24 @@ pub fn switch_active(target: Page) {
 /// callbacks (e.g. the power-menu action rows) that don't carry a monitor
 /// handle but want the drawer to close after their action fires.
 pub fn dismiss_all() {
-    PANELS.with(|panels| {
-        for panel in panels.borrow().values() {
-            panel.revealer.set_reveal_child(false);
-        }
-    });
+    // Snapshot before revealing (#643): `set_reveal_child(false)` starts the
+    // retract, and `wire_retract_finish`'s `child-revealed` handler — which
+    // reads `PANELS` itself — is what finishes it.
+    for panel in live_panels() {
+        panel.revealer.set_reveal_child(false);
+    }
 }
 
 /// Begin the retract animation. The notify-child-revealed handler finishes
 /// the teardown (hiding the single surface, catcher and card together) when it
 /// ends.
 fn retract_by_key(key: &str) {
-    PANELS.with(|panels| {
-        if let Some(panel) = panels.borrow().get(key) {
-            panel.revealer.set_reveal_child(false);
-        }
-    });
+    // Bind-then-act (#643): an `if let Some(panel) = panels.borrow().get(key)`
+    // keeps the scrutinee's `Ref` alive for the whole then-block, i.e. across
+    // `set_reveal_child` — whose completion handler re-reads `PANELS`.
+    if let Some(panel) = live_panel(key) {
+        panel.revealer.set_reveal_child(false);
+    }
 }
 
 pub fn open(monitor: &Monitor, page: Page) {
@@ -1161,14 +1194,14 @@ pub fn open(monitor: &Monitor, page: Page) {
 /// anchors flush with the bar's trailing main-axis edge (`pending_center` =
 /// `None`, `main_margin` = 0). No-op if no drawer is mounted for `key`.
 fn open_by_key(key: &str, page: Page) {
-    PANELS.with(|panels| {
-        let panels = panels.borrow();
-        let Some(panel) = panels.get(key) else {
-            return;
-        };
+    // Resolve to an owned handle first (#643): `show_panel` presents the
+    // surface and reveals the card — a long run of GTK calls, plus an
+    // `open_state.set(true)` that wakes subscribers synchronously — none of
+    // which may run under a live `PANELS` borrow.
+    if let Some(panel) = live_panel(key) {
         *panel.pending_center.borrow_mut() = None;
-        show_panel(panel, page, 0);
-    });
+        show_panel(&panel, page, 0);
+    }
     recompute_gates();
 }
 
@@ -1199,17 +1232,15 @@ pub fn open_on_focused(preferred: Option<&str>, page: Page) {
 /// early as possible (risk #1 in the PR: measure-before-show). No-op if no drawer
 /// is mounted for `key`.
 fn open_plugin_by_key(key: &str, plugin_id: &str) {
-    PANELS.with(|panels| {
-        let panels = panels.borrow();
-        let Some(panel) = panels.get(key) else {
-            return;
-        };
+    // Owned handle, no live `PANELS` borrow (#643) — as in [`open_by_key`],
+    // plus `set_active_panel`, which publishes into the plugin host.
+    if let Some(panel) = live_panel(key) {
         *panel.pending_center.borrow_mut() = None;
         // Publish the selection BEFORE presenting so the child reconciles first
         // (`show_panel_active` also publishes it via `on_active_show`; idempotent).
         crate::plugins::set_active_panel(Some(plugin_id));
-        show_panel_active(panel, Active::Plugin(plugin_id.to_owned()), 0);
-    });
+        show_panel_active(&panel, Active::Plugin(plugin_id.to_owned()), 0);
+    }
     recompute_gates();
 }
 
@@ -1262,11 +1293,14 @@ fn toggle_inner(
     retract_on_same: bool,
 ) {
     let key = monitor_key(monitor);
-    PANELS.with(|panels| {
-        let panels = panels.borrow();
-        let Some(panel) = panels.get(&key) else {
-            return;
-        };
+    // Owned handle before any of the three arms run (#643): every one of them
+    // drives GTK — `set_reveal_child`, `set_stack_page`, `on_page_show`,
+    // `trigger_center`'s measure, `show_panel` — and the `Ref` a
+    // `panels.borrow().get(&key)` produces would be live across all of it. This
+    // is the busiest entry point in the module (every bar chip lands here), so
+    // it is also the one most worth not making conditional on whether GTK
+    // happens to emit synchronously today.
+    if let Some(panel) = live_panel(&key) {
         let current = panel.current.borrow().clone();
         match current {
             // Same built-in page already open → retract (`toggle`) or re-run
@@ -1277,30 +1311,30 @@ fn toggle_inner(
                 if retract_on_same {
                     panel.revealer.set_reveal_child(false);
                 } else {
-                    on_page_show(panel, page);
+                    on_page_show(&panel, page);
                 }
             }
             Some(_) => {
-                set_stack_page(panel, page);
+                set_stack_page(&panel, page);
                 *panel.current.borrow_mut() = Some(Active::Builtin(page));
-                on_page_show(panel, page);
+                on_page_show(&panel, page);
             }
             None => {
                 // Build + set the visible child first so `measure` reflects the
                 // target page's natural size, not whatever was last shown, and
                 // so the `main_margin_for_center` measure below sees the real
                 // page. `show_panel` re-sets it (idempotent).
-                set_stack_page(panel, page);
-                let chip_center = trigger_center(panel, trigger.upcast_ref());
+                set_stack_page(&panel, page);
+                let chip_center = trigger_center(&panel, trigger.upcast_ref());
                 *panel.pending_center.borrow_mut() = chip_center;
                 // Best-effort margin now (may use a pre-map measure that
                 // underestimates); the window-map handler recomputes from the
                 // real card allocation once the surface is mapped.
-                let margin = chip_center.map_or(0, |c| main_margin_for_center(panel, c));
-                show_panel(panel, page, margin);
+                let margin = chip_center.map_or(0, |c| main_margin_for_center(&panel, c));
+                show_panel(&panel, page, margin);
             }
         }
-    });
+    }
     // Swap/open may have changed which page is visible; the same-page retract
     // branch is recomputed later by `wire_retract_finish`. Idempotent.
     recompute_gates();
@@ -1382,18 +1416,18 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
     window.connect_map(move |_| {
         let key = key.clone();
         glib::idle_add_local_once(move || {
-            PANELS.with(|panels| {
-                let panels = panels.borrow();
-                let Some(panel) = panels.get(&key) else {
-                    return;
-                };
-                apply_stats_scroll(panel);
-                let Some(center) = *panel.pending_center.borrow() else {
-                    return;
-                };
-                let margin = main_margin_for_center(panel, center);
-                set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
-            });
+            // Owned handle, no live `PANELS` borrow (#643): `apply_stats_scroll`
+            // activates a `GAction`, and `main_margin_for_center` measures the
+            // card — both GTK, both under a shared borrow before this.
+            let Some(panel) = live_panel(&key) else {
+                return;
+            };
+            apply_stats_scroll(&panel);
+            let Some(center) = *panel.pending_center.borrow() else {
+                return;
+            };
+            let margin = main_margin_for_center(&panel, center);
+            set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
         });
     });
 }

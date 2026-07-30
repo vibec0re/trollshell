@@ -14,14 +14,15 @@ PR number in parens if you need full context on _why_.
 Checked items are ones Annika has already implicitly verified — noted inline.
 Everything else is unchecked and still wants a pass in a real Niri session.
 
-**Coverage: #458 through #611** (#606 and #611 carry no live-verify list of
-their own — noted in the closing section instead). Originally created by #507
-for the 2026-07 merge wave (#458–#496); refreshed by #602 to fold in everything
-merged since (#497–#596), renaming off the month-stamped filename in that pass;
-refreshed again (parent effort #602) for the #598/#604/#606/#609 burst that
-merged right behind it; and folded in #610 immediately after the 2026-07-30
-merge that landed it — this is a living checklist that gets refreshed
-periodically, not a dated snapshot of one merge wave.
+**Coverage: #458 through #625** (#606, #611, and #622 carry no live-verify
+list of their own — noted in the closing section instead). Originally created
+by #507 for the 2026-07 merge wave (#458–#496); refreshed by #602 to fold in
+everything merged since (#497–#596), renaming off the month-stamped filename in
+that pass; refreshed again (parent effort #602) for the #598/#604/#606/#609
+burst that merged right behind it; folded in #610 immediately after the
+2026-07-30 merge that landed it; and folded in #616/#622/#623/#624/#625
+immediately after the next 2026-07-30 merge burst — this is a living checklist
+that gets refreshed periodically, not a dated snapshot of one merge wave.
 
 ## Idle & lock
 
@@ -265,6 +266,18 @@ periodically, not a dated snapshot of one merge wave.
       afterward. Worth an eyeball on more than just the Top bar edge if
       convenient — the math is shared across all four edges but only Top gets
       everyday exercise.
+- [ ] **(#624)** OSD silenced by a hot-plug: open a drawer on any monitor and
+      leave it open, then trigger a `monitors_changed` cycle (a kanshi
+      profile switch, or a physical unplug/replug), then press the
+      volume/brightness/mic keys. The OSD card must appear as normal and the
+      bar's corner must round off again — before this fix, that output's OSD
+      stayed silent for the rest of the session and the bar kept its
+      squared-off `drawer-open` seam corner with no drawer attached. A
+      connector-less/virtual output is worth trying too, but only for the
+      bar-corner half of this check (`main.rs`'s `drawer-open` class bind is
+      unconditional) — `osd::install` skips any monitor with no connector
+      name by design, so no OSD card is ever expected to appear there, on
+      either side of this fix.
 
 ## Audio & media
 
@@ -411,6 +424,18 @@ periodically, not a dated snapshot of one merge wave.
       `notify-send -r <id>` update to the toast under a stationary pointer
       should update in place (same stack position, not re-appended to the
       bottom) and still not expire.
+- [ ] **(#625)** The hover hold now survives a sticky/finite re-post — the
+      third defect in this mechanism after #569/#596. `notify-send -t0 hold`,
+      park the pointer on the toast and don't move it, then from another
+      terminal `notify-send -r <id> -t -1 changed` (id from
+      `notify-send -p`). The toast must update in place and **not** expire
+      while the pointer sits on it. Move the pointer off — it expires
+      roughly 5 s after the leave. Check the symmetric direction too (finite
+      to sticky re-post under a parked pointer stays held, not expiring a
+      few seconds later), and the ordinary regressions: an unhovered toast
+      still expires normally, a plain hover still pauses and resumes with
+      the remainder, and two monitors showing the same toast only resume on
+      the last leave.
 
 ## Network panel (link status)
 
@@ -438,6 +463,19 @@ periodically, not a dated snapshot of one merge wave.
 - [ ] **(#610)** With `RUST_LOG=hytte_services=debug`, confirm no new log noise
       — `link_source()` uses `set_neq`, so it must not re-emit on every 5 s
       poll.
+- [ ] **(#623)** The bar's network chip now honors `link_source`, not just
+      `primary` — #610's fix relocated from the panel to the bar. On a host
+      with no link manager at all (or before one has answered), the chip must
+      show the dimmed `network-idle-symbolic` glyph — **not**
+      `network-wired-disconnected-symbolic` — and it must look visibly
+      different from the "no route" glyph. Hover the chip (not just the
+      icon) — the tooltip must read "No link manager has answered yet" or
+      "No link manager (systemd-networkd or NetworkManager)" as appropriate,
+      matching the panel's Status row **verbatim** (both now share
+      `link_status_text`). Also check the ordinary pre-DHCP `Degraded` state:
+      bar and panel tooltips must agree there too. On a host with a working
+      link manager, online/degraded/carrier/no-route/disconnected should all
+      render exactly as before.
 
 ## Wi-Fi (NetworkManager)
 
@@ -544,6 +582,28 @@ periodically, not a dated snapshot of one merge wave.
       within ~2 s the badge flips to "Active but not connected" without
       reopening the tab. A plugin that trips the effect rate cap shows a
       "· N dropped" violation count.
+- [ ] **(#616)** Build revision reachable at runtime (refs #601, which stays
+      **open** — only the surface-agnostic plumbing landed, the UI-surface
+      decision is still pending):
+
+  ```sh
+  busctl --user call mov.vibec0re.trollshell.Control \
+    /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control Revision
+  ```
+
+  Should return the short git hash your `flake.lock` pins trollshell at (a
+  `-dirty` suffix if built from an uncommitted tree), not `dev`/`unknown`.
+  Confirm the payoff by rebuilding (`nix flake update trollshell` + rebuild)
+  and checking the hash actually changes. **Live-verify hazard worth
+  recording:** there are now **two** independent `TROLLSHELL_REV` values —
+  one injected into each of the `trollshell` and `trollshell-control-center`
+  wrapper slices' own `preFixup` — so a consumer that reads its own env
+  instead of calling `Control.Revision` over D-Bus reports _itself_, the
+  exact false conclusion #601 exists to prevent. The wrapper-set env is also
+  inherited by forked children (a terminal opened via
+  `gio::AppInfo::launch_default_for_uri`, or the plugin `RunCommand` effect)
+  — a shell descended from trollshell reports the **deployed** revision, not
+  `dev`, even from a dev `cargo run` run inside it.
 
 ## Not carrying a live-verify list, noted for context
 
@@ -563,3 +623,16 @@ periodically, not a dated snapshot of one merge wave.
   which is why the coverage line moved twice on 2026-07-30. The general lesson
   is in the header: this file goes stale within minutes of a merge burst, so
   updating it belongs to the burst rather than to a later pass.
+- **(#622)** Docs-only spec-drift retraction sweep: the VPN connect/disconnect
+  non-goal in the network-panel design spec (shipped via #169), a stale
+  `overlays/` roster in the src-reorg spec, and one Rust doc-comment line in
+  `overlays/mod.rs` naming overlays that no longer exist. Also splits the
+  plugin-widgets design spec's original three-clause "not in v1" non-goal:
+  **both** two-way inputs (`Node::Slider` #315, `Node::Entry` #363) **and**
+  arbitrary pixels/images (`Node::Pixels` #284 — an arbitrary RGBA8 buffer
+  whose `data`/`scale` are mutable per-`id`, not a one-shot fixed image) have
+  shipped. The only clause still standing as a non-goal is custom drawing
+  (cairo/snapshot calls executed in-process) — out-of-process frontend-B
+  plugins structurally can't do that, they only ever ship a validated pixel
+  buffer for the host to paint. No behavior change anywhere in the diff —
+  nothing to verify in a Niri session.

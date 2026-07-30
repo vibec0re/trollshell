@@ -984,21 +984,28 @@ fn wire_retract_finish(revealer: &gtk::Revealer, key: String) {
 /// Close and remove all drawers (called before rebuilding bars on hot-plug).
 ///
 /// Drains `PANELS` into a local `Vec` and drops the borrow *before* calling
-/// `gtk::Window::close` on each entry, rather than closing from inside the
-/// `borrow_mut()` (#627). `wire_retract_finish`'s `child-revealed` handler
-/// takes its own `borrow()` of the same `RefCell`; if `close()` ever
-/// triggered that signal synchronously, running it under an active
+/// `gtk::Window::destroy` on each entry, rather than destroying from inside
+/// the `borrow_mut()` (#627). `wire_retract_finish`'s `child-revealed`
+/// handler takes its own `borrow()` of the same `RefCell`; if `destroy()`
+/// ever triggered that signal synchronously, running it under an active
 /// `borrow_mut()` would panic, and a panic unwinding through a glib callback
-/// aborts the process. Whether `gtk_window_close`/`gtk_revealer_unmap` can
+/// aborts the process. Whether `gtk_window_destroy`/`gtk_revealer_unmap` can
 /// emit `notify::child-revealed` synchronously is not verified either way —
 /// draining first removes the dependency on that question entirely, which is
 /// the point: not holding the borrow is free, so there's no need to resolve
 /// it first.
+///
+/// Uses `destroy()`, not `close()` (#632): a drawer the user never opened on
+/// this monitor is still unrealized when a hot-plug tears it down, and
+/// `gtk_window_close` is a *request* routed through `close-request` that does
+/// not drop GTK's internal toplevel reference — `gtk_window_destroy` is the
+/// call documented to do that, and unlike `close()` it can't be vetoed by a
+/// future `close-request` handler.
 pub fn close_all() {
     let panels: Vec<_> =
         PANELS.with(|panels| panels.borrow_mut().drain().map(|(_, v)| v).collect());
     for panel in panels {
-        panel.window.close();
+        panel.window.destroy();
     }
     reset_drawer_open_states();
     // A monitor teardown that held the open plugin panel must clear the

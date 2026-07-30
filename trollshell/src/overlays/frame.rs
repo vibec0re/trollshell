@@ -183,15 +183,22 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
 /// a vanished output's frame window + raw subscription don't linger (the
 /// subscription has no `WeakRef` safety net, so it must be aborted explicitly —
 /// mirrors `sidebar::close_all`).
+///
+/// Tears down with `destroy()`, not `close()` (#632): a frame overlay that
+/// never showed a border on this monitor is still unrealized, and `close()`
+/// neither destroys an unrealized window nor drops GTK's internal toplevel
+/// reference — only `destroy()` does, and it can't be vetoed by a
+/// `close-request` handler.
 pub fn close_all() {
     FRAMES.with(|map| {
         for (_, view) in map.borrow_mut().drain() {
             // Abort the raw tick-loop first so it can't queue another draw
-            // into the surface we're about to close, then close the window.
-            // The `bind_visible` apply-loop rides on the #224/#243 WeakRef
-            // fix: it frees itself on its next emission once the window drops.
+            // into the surface we're about to destroy, then destroy the
+            // window. The `bind_visible` apply-loop rides on the #224/#243
+            // WeakRef fix: it frees itself on its next emission once the
+            // window drops.
             view.sidebar_sub.abort();
-            view.window.close();
+            view.window.destroy();
         }
     });
 }

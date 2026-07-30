@@ -9,6 +9,10 @@ mod traffic;
 mod wifi;
 mod wired;
 
+/// Shared with the bar chip (`widgets/network.rs`) — see
+/// `connection::link_status_text`'s doc comment for why.
+pub(crate) use connection::link_status_text;
+
 use hytte::adw::prelude::*;
 use hytte::gtk;
 use hytte::prelude::*;

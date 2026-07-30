@@ -19,7 +19,7 @@ pub use call::{CallBuilder, FdLease, RetryPolicy, call_with};
 pub use connection::BusKind;
 pub use error::BusError;
 pub use export::{ExportBuilder, ExportHandle, export_object_with};
-pub use own::{OwnNameBuilder, OwnNameSignal, OwnState, own_name_with};
+pub use own::{OwnNameBuilder, OwnNameSignal, OwnState, UNKNOWN_HOLDER, own_name_with};
 pub use property::{PropState, PropertyBuilder, PropertySignal, property_with};
 pub use proxy::{BusProxy, ProxyBuilder, ProxyState, proxy_with};
 pub use signals::{SignalEvent, SignalSubscription, SignalsBuilder, signals_with};

@@ -191,6 +191,72 @@ async fn permanently_taken_after_three_losses() {
     );
 }
 
+/// A peer that holds the name and never passed `AllowReplacement` makes every
+/// `RequestName` come back `Exists`, no matter how often we ask — the
+/// mako-already-owns-`org.freedesktop.Notifications` case.
+///
+/// That branch used to set `Lost` with no holder, sleep 250 ms and loop
+/// forever, never touching the consecutive-loss counter, so `permanent_after`
+/// could not trip from it (#653). It must now escalate to `PermanentlyTaken`
+/// and name the squatter.
+///
+/// Deterministic by construction: the squatter takes the name before the
+/// primitive starts and holds it for the whole test, so there is no window in
+/// which the primitive could win the name instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn squatted_name_escalates_to_permanently_taken() {
+    let (conn, guard) = ephemeral_bus().await;
+    let address = guard.address.clone();
+    let shared = SharedConnection::for_test_session(conn);
+    shared.spawn_supervisor_for_test();
+
+    let squatter = Builder::address(address.as_str())
+        .expect("parse ephemeral bus address")
+        .build()
+        .await
+        .expect("squatter connection to ephemeral bus");
+    let squatter_unique = squatter
+        .unique_name()
+        .map(|u| u.as_str().to_string())
+        .expect("squatter unique name");
+    let squatter_dbus = zbus::fdo::DBusProxy::new(&squatter).await.unwrap();
+    // Deliberately WITHOUT AllowReplacement: the primitive's ReplaceExisting
+    // is then refused and, with DoNotQueue, it gets `Exists` every time.
+    let reply = squatter_dbus
+        .request_name(
+            "mov.vibec0re.test.squatted".try_into().unwrap(),
+            RequestNameFlags::DoNotQueue.into(),
+        )
+        .await
+        .expect("squatter RequestName");
+    assert!(
+        matches!(reply, zbus::fdo::RequestNameReply::PrimaryOwner),
+        "squatter must own the name before the primitive starts, got {reply:?}"
+    );
+
+    let state = own_name_with(&shared, "mov.vibec0re.test.squatted")
+        .permanent_after(2)
+        .cooldown_after_permanent(Duration::from_millis(100))
+        .start();
+
+    let final_state = wait_for_state(state.signal_cloned(), Duration::from_secs(5), |s| {
+        matches!(s, OwnState::PermanentlyTaken { .. })
+    })
+    .await;
+
+    match final_state {
+        OwnState::PermanentlyTaken { current_owner } => assert_eq!(
+            current_owner, squatter_unique,
+            "PermanentlyTaken must name the connection actually holding it"
+        ),
+        other => panic!("expected PermanentlyTaken, got {other:?}"),
+    }
+
+    // Keep the squatter alive until the assertion has run.
+    drop(squatter_dbus);
+    drop(squatter);
+}
+
 // Trivial D-Bus interface used by `at_path_mounts_iface_callable`.
 #[derive(Clone)]
 struct Greeter;

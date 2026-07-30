@@ -284,6 +284,7 @@ struct PluginRuntime {
 /// One built plugin row's live widgets, kept keyed by id so the periodic refresh
 /// can update the runtime overlay **in place** (no rebuild → no flicker) while
 /// the plugin set is unchanged.
+#[derive(Clone)]
 struct PluginRow {
     row: adw::SwitchRow,
     badge: gtk::Image,
@@ -424,10 +425,18 @@ fn apply_plugins(
         map.len() == units.len() && units.iter().all(|(id, ..)| map.contains_key(id))
     };
     if same_set {
-        let map = state.by_id.borrow();
         for (id, active_state, enabled) in units {
-            if let Some(prow) = map.get(id) {
-                update_plugin_row(prow, &state.syncing, active_state, *enabled, rt.get(id));
+            // Clone the row handle out and let the borrow end at this `let`.
+            // `update_plugin_row` finishes with `set_active`, and GObject
+            // property notification is synchronous — the row's own
+            // `connect_active_notify` handler runs inside that call. Holding
+            // `by_id` borrowed across it means any path from that handler back
+            // into `by_id` (`clear_rows`, a nested `apply_plugins`) panics with
+            // a `BorrowMutError`, from inside a glib callback, which aborts the
+            // process rather than failing gracefully (#643).
+            let prow = state.by_id.borrow().get(id).cloned();
+            if let Some(prow) = prow {
+                update_plugin_row(&prow, &state.syncing, active_state, *enabled, rt.get(id));
             }
         }
         return;
@@ -438,7 +447,16 @@ fn apply_plugins(
         let prow = build_plugin_row(state, id, active_state, *enabled, rt.get(id));
         state.group.add(&prow.row);
         state.rows.borrow_mut().push(prow.row.clone().upcast());
-        state.by_id.borrow_mut().insert(id.clone(), prow);
+        // The semicolon rule: `insert` returns the displaced entry, and as a
+        // bare statement that `Option<PluginRow>` is a temporary dropped
+        // *before* the `RefMut` (temporaries drop in reverse creation order),
+        // i.e. it would drop two GTK widgets while `by_id` is borrowed. Binding
+        // it moves the drop past the borrow. (The same call is safe as a
+        // closure tail expression, where the value is moved out to the caller —
+        // it is the trailing semicolon that creates the hazard.) `clear_rows`
+        // ran just above, so the displaced value is `None` today.
+        let displaced = state.by_id.borrow_mut().insert(id.clone(), prow);
+        drop(displaced);
     }
     state.view.set(PluginsView::List);
 }
@@ -446,10 +464,17 @@ fn apply_plugins(
 /// Remove every currently-added child (plugin rows or a placeholder) from the
 /// group and forget the keyed rows, before a rebuild.
 fn clear_rows(state: &PluginsState) {
-    for row in state.rows.borrow_mut().drain(..) {
+    // `take()`, not `borrow_mut().drain(..)`: the chained `RefMut` would stay
+    // live across every `group.remove()`, which can emit synchronously into a
+    // handler that re-enters these cells — a `BorrowMutError` inside a glib
+    // callback aborts the process (#643).
+    for row in state.rows.take() {
         state.group.remove(&row);
     }
-    state.by_id.borrow_mut().clear();
+    // Same reason for `by_id`: `clear()` drops each `PluginRow`'s two GTK
+    // widgets *inside* the borrow, whereas `take()`'s borrow is over before the
+    // returned map (and so its widgets) drops.
+    drop(state.by_id.take());
 }
 
 /// Show a single informational/placeholder row (no plugins, or shell

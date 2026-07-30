@@ -64,18 +64,25 @@ pub fn panel_connections() -> gtk::Widget {
         let total_owned = conns.iter().filter(|c| c.pid.is_some()).count();
         let total_other = conns.len() - total_owned;
 
-        let mut owned = owned_for_bind.borrow_mut();
-        for r in owned.drain(..) {
+        // Take each cell instead of holding a `RefMut` across the rebuild. The
+        // named bindings this replaces stayed live all the way down past every
+        // `remove()`/`add()`/`add_row()` below — same hazard as a chained
+        // `borrow_mut().drain(..)`, just spelled with a `let`. A synchronous
+        // emission re-entering one of these cells would panic, and a panic
+        // unwinding through a glib callback aborts the process (#643). The rows
+        // are rebuilt into owned `Vec`s and stored back once, at the end.
+        for r in owned_for_bind.take() {
             group_for_bind.remove(&r);
         }
-        let mut others = other_rows_for_bind.borrow_mut();
-        for r in others.drain(..) {
+        for r in other_rows_for_bind.take() {
             other_for_bind.remove(&r);
         }
-        if let Some(prev) = overflow_for_bind.borrow_mut().take() {
+        if let Some(prev) = overflow_for_bind.take() {
             group_for_bind.remove(&prev);
         }
 
+        let mut owned: Vec<adw::ActionRow> = Vec::new();
+        let mut others: Vec<adw::ActionRow> = Vec::new();
         let mut owned_count = 0usize;
         let mut other_count = 0usize;
         for c in &conns {
@@ -97,6 +104,11 @@ pub fn panel_connections() -> gtk::Widget {
                 other_count += 1;
             }
         }
+        // Safe to write back through a `RefMut`: `take()` above left each cell
+        // holding an empty `Vec`, so the value dropped inside the borrow has no
+        // drop glue to run.
+        *owned_for_bind.borrow_mut() = owned;
+        *other_rows_for_bind.borrow_mut() = others;
 
         if total_owned > owned_count {
             let hint = adw::ActionRow::builder()

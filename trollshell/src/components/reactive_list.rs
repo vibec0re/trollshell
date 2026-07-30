@@ -85,7 +85,13 @@ pub(crate) fn reactive_list<C, T, R, S>(
     let rows_track: Rc<RefCell<Vec<R>>> = Rc::new(RefCell::new(Vec::new()));
     let container_for_bind = container.clone();
     bind(signal, container, move |_, items| {
-        for row in rows_track.borrow_mut().drain(..) {
+        // `take()`, not `borrow_mut().drain(..)`: the `RefMut` of a chained
+        // temporary lives for the whole `for`, so every `remove_row()` below
+        // would run with `rows_track` mutably borrowed. `remove()` can emit
+        // synchronously, and any handler re-entering this cell would panic —
+        // and a panic unwinding through a glib callback aborts the process.
+        // `take()` moves the vec out and ends the borrow before the first call.
+        for row in rows_track.take() {
             container_for_bind.remove_row(&row);
         }
         if items.is_empty() {

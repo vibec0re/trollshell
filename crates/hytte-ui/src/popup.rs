@@ -283,7 +283,14 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
 /// out of the shared cell and `destroy()`s them (removing each toplevel from
 /// GTK's window list), leaving the other a harmless no-op.
 fn close_catchers(catchers: &Rc<RefCell<Vec<gtk::Window>>>) {
-    for win in catchers.borrow_mut().drain(..) {
+    // `take()`, not `borrow_mut().drain(..)`: a chained `RefMut` temporary
+    // lives for the whole `for`, so each `destroy()` would run with the cell
+    // still mutably borrowed. `GtkWidget::destroy` is emitted synchronously
+    // from dispose, and this very cell is what a re-entrant teardown reaches
+    // for — a `BorrowMutError` there unwinds through a glib callback and
+    // aborts the process. Taking first also keeps the idempotence the two
+    // callers rely on: the second teardown finds an empty vec.
+    for win in catchers.take() {
         win.destroy();
     }
 }
@@ -414,6 +421,35 @@ mod tests {
         assert!(
             weak_a.upgrade().is_none() && weak_b.upgrade().is_none(),
             "every catcher window must be destroyed, not left leaking in the toplevel list",
+        );
+    }
+
+    /// The borrow half of the same teardown (#643): `close_catchers` must not
+    /// hold `catchers` borrowed across `destroy()`.
+    ///
+    /// `GtkWidget::destroy` is emitted **synchronously** from dispose, so a
+    /// handler on a catcher runs inside the loop. This test makes that handler
+    /// re-enter `close_catchers` on the same cell — the exact shape a real
+    /// re-entrant teardown would take. Against the pre-fix
+    /// `for win in catchers.borrow_mut().drain(..)`, the inner call hits an
+    /// already-live `RefMut` and panics with `BorrowMutError` from inside a
+    /// glib callback, which aborts the test binary rather than failing one
+    /// test. With `take()` the borrow is over before the first `destroy()`, so
+    /// the inner call simply finds an empty vec.
+    #[gtk::test]
+    fn close_catchers_tolerates_a_reentrant_teardown_from_destroy() {
+        let catchers: Rc<RefCell<Vec<gtk::Window>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let win = gtk::Window::new();
+        win.present();
+        let catchers_for_destroy = catchers.clone();
+        win.connect_destroy(move |_| close_catchers(&catchers_for_destroy));
+        catchers.borrow_mut().push(win);
+
+        close_catchers(&catchers);
+        assert!(
+            catchers.borrow().is_empty(),
+            "a re-entrant teardown must leave the cell drained, not deadlocked or panicking"
         );
     }
 }

@@ -629,7 +629,11 @@ fn build_top_apps_expander(
     let rows_for_bind = rows_track.clone();
     let collapsed_once_for_bind = collapsed_once.clone();
     bind(signal, &expander, move |_, list| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
+        // `take()` ends the borrow before the first `remove()`; a chained
+        // `borrow_mut().drain(..)` would hold it for the whole loop, and a
+        // re-entrant borrow from a synchronous emission panics fatally through
+        // the glib callback (#643).
+        for row in rows_for_bind.take() {
             expander_for_bind.remove(&row);
         }
         // Collapsed summary: the heaviest entry's display name, or an em-dash.
@@ -651,19 +655,24 @@ fn build_top_apps_expander(
             // Markup off: scope ids are untrusted — adversarial names could
             // otherwise inject Pango markup into the title (cf. #30).
             row.set_use_markup(false);
-            row.set_title(&sample_display_name(s, &mut meta_cache.borrow_mut()));
+            // Resolve first, set second: an argument-position `RefMut` is a
+            // temporary of the whole statement, so inlining this would hold
+            // `meta_cache` borrowed across `set_title` (#643).
+            let title = sample_display_name(s, &mut meta_cache.borrow_mut());
+            row.set_title(&title);
             if s.procs > 1 {
                 row.set_subtitle(&format!("{} processes", s.procs));
             }
 
             // Prefix icon: cached from the app-id, or sensible fallbacks.
             let icon: gio::Icon = if let Some(app_id) = s.app_id.as_deref() {
-                resolve_app_meta(app_id, &mut meta_cache.borrow_mut())
-                    .and_then(|m| m.icon)
-                    .unwrap_or_else(|| {
-                        gio::ThemedIcon::new("application-x-executable-symbolic")
-                            .upcast::<gio::Icon>()
-                    })
+                // Same statement-temporary rule: bind the lookup so the
+                // `RefMut` is gone before the fallback icon is constructed.
+                let cached =
+                    resolve_app_meta(app_id, &mut meta_cache.borrow_mut()).and_then(|m| m.icon);
+                cached.unwrap_or_else(|| {
+                    gio::ThemedIcon::new("application-x-executable-symbolic").upcast::<gio::Icon>()
+                })
             } else {
                 // System bucket: generic computer icon.
                 gio::ThemedIcon::new("computer-symbolic").upcast::<gio::Icon>()
@@ -753,7 +762,12 @@ fn build_live_per_core_row() -> adw::ActionRow {
     let cores_row_for_bind = cores_row.clone();
     let bars_for_bind = core_bars.clone();
     bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
-        let mut bars = bars_for_bind.borrow_mut();
+        // Take the bars out for the whole update rather than holding a `RefMut`
+        // across it: the pre-#643 binding stayed live past `remove()`,
+        // `append()`, `set_fraction()` and `set_tooltip_text()`, so any
+        // synchronous emission re-entering this cell would panic — fatally,
+        // from inside a glib callback. Stored back at the end.
+        let mut bars = bars_for_bind.take();
         if bars.len() != c.per_core.len() {
             while let Some(child) = cores_row_for_bind.first_child() {
                 cores_row_for_bind.remove(&child);
@@ -777,6 +791,9 @@ fn build_live_per_core_row() -> adw::ActionRow {
             bar.set_fraction(load.clamp(0.0, 1.0));
             bar.set_tooltip_text(Some(&format!("{:.0}%", load * 100.0)));
         }
+        // The cell holds the empty `Vec` `take()` left behind, so this
+        // assignment drops nothing inside the borrow.
+        *bars_for_bind.borrow_mut() = bars;
     });
 
     row.add_suffix(&cores_row);

@@ -278,9 +278,16 @@ fn on_day_clicked(
     render(state);
     refresh_upcoming_list(state, group, rows_track, placeholder_track);
 
-    let rows = rows_track.borrow();
-    if let Some((_d, row)) = rows.iter().find(|(d, _)| *d == date) {
-        flash_row_highlight(row);
+    // Clone the hit out and drop the borrow before flashing: `rows_track` is
+    // `borrow_mut()`-ed by `rebuild_upcoming_list`, so a shared borrow held
+    // across a GTK call is the same hazard from the other side (#643).
+    let hit = rows_track
+        .borrow()
+        .iter()
+        .find(|(d, _)| *d == date)
+        .map(|(_d, row)| row.clone());
+    if let Some(row) = hit {
+        flash_row_highlight(&row);
     }
 }
 
@@ -325,10 +332,16 @@ fn rebuild_upcoming_list(
     anchor: NaiveDate,
     now: DateTime<Local>,
 ) {
-    for (_d, row) in rows_track.borrow_mut().drain(..) {
+    // Take before removing: both cells must be un-borrowed across `remove()`,
+    // which can emit synchronously into a handler that re-enters them (a
+    // `BorrowMutError` inside a glib callback aborts the process, #643).
+    for (_d, row) in rows_track.take() {
         group.remove(&row);
     }
-    if let Some(p) = placeholder_track.borrow_mut().take() {
+    // `RefCell::take()` rather than `borrow_mut().take()`: the latter's `RefMut`
+    // is a scrutinee temporary that stays alive for the whole `if let` body,
+    // i.e. across `remove()`. `take()`'s own borrow ends before it returns.
+    if let Some(p) = placeholder_track.take() {
         group.remove(&p);
     }
 
@@ -405,7 +418,11 @@ fn refresh_upcoming_list(
     // Anchor the list to the selected day when one is chosen; fall back to
     // today when nothing is selected (or today itself is selected).
     let anchor = state.selected.get().unwrap_or(today);
-    let evs = state.events.borrow();
+    // Clone the snapshot rather than passing a live `Ref`: `rebuild_upcoming_list`
+    // runs a long stretch of `group.remove()`/`group.add()` calls, and this same
+    // cell is `borrow_mut()`-ed by the events bind ([`wire_events_bind`]). A
+    // shared borrow held across all that would panic on any re-entry (#643).
+    let evs = state.events.borrow().clone();
     rebuild_upcoming_list(
         group,
         rows_track,

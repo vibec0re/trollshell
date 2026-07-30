@@ -156,7 +156,12 @@ pub fn install(monitor: &Monitor) {
 /// `close-request` handler.
 pub fn close_all() {
     TOAST_WINDOWS.with(|map| {
-        for (_, view) in map.borrow_mut().drain() {
+        // `take()` moves the whole map out (leaving `Default`) and releases
+        // the borrow inside the call, rather than holding a `drain()` RefMut
+        // across every `destroy()` below (#631) — a borrow held across a GTK
+        // call is a latent reentrancy hazard if any emission it triggers is
+        // ever synchronous.
+        for (_, view) in map.take() {
             view.window.destroy();
         }
     });

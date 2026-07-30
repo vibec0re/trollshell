@@ -191,7 +191,12 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
 /// `close-request` handler.
 pub fn close_all() {
     FRAMES.with(|map| {
-        for (_, view) in map.borrow_mut().drain() {
+        // `take()` moves the whole map out (leaving `Default`) and releases
+        // the borrow inside the call, rather than holding a `drain()` RefMut
+        // across every `destroy()` below (#631) — a borrow held across a GTK
+        // call is a latent reentrancy hazard if any emission it triggers is
+        // ever synchronous.
+        for (_, view) in map.take() {
             // Abort the raw tick-loop first so it can't queue another draw
             // into the surface we're about to destroy, then destroy the
             // window. The `bind_visible` apply-loop rides on the #224/#243

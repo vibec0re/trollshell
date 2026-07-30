@@ -567,7 +567,18 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
 
     window.set_visible(false);
 
-    PANELS.with(|panels| {
+    // `insert` returns the previous `ModalPanel` for this key, if any. As a
+    // bare statement, `panels.borrow_mut().insert(...);` would drop that
+    // returned value as a temporary of the *same* statement as the
+    // `borrow_mut()` RefMut — and statement temporaries drop in reverse
+    // creation order, so the old `ModalPanel` (and its `gtk::Window`) would
+    // be dropped *before* the RefMut, i.e. while `PANELS` is still borrowed
+    // (#631). Wrapping in `drop(...)` moves that drop to after `with`
+    // returns, once the borrow has already ended. Reachable only if
+    // `install` ran twice for one key without an intervening `close_all`,
+    // which `main.rs` currently prevents — weakest of the sweep, kept for
+    // the same reason as the others.
+    drop(PANELS.with(|panels| {
         panels.borrow_mut().insert(
             key.clone(),
             ModalPanel {
@@ -581,8 +592,8 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 pending_center: RefCell::new(None),
                 open_state: drawer_open_state(&key),
             },
-        );
-    });
+        )
+    }));
 }
 
 /// The single fullscreen drawer surface (#109): anchored to all four screen
@@ -1066,13 +1077,19 @@ pub fn close_all() {
 /// It goes unobserved today purely because that bar window is being destroyed
 /// anyway — not because nobody is listening.
 fn reset_drawer_open_states() {
-    DRAWER_OPEN.with(|map| {
-        let mut map = map.borrow_mut();
-        for state in map.values() {
-            state.set_neq(false);
-        }
-        map.retain(|key, _| !is_fallback_key(key));
-    });
+    // Collect the handles before calling `set_neq` on any of them (#631):
+    // `set_neq` notifies via `Waker::wake()`, and holding `DRAWER_OPEN`
+    // borrowed across that call is a latent reentrancy hazard if a woken
+    // subscriber ever runs synchronously and turns around to call
+    // `drawer_open_state`/`drawer_open_signal` — both of which also borrow
+    // `DRAWER_OPEN`. `Mutable` is a cheap cloneable handle, so this is just
+    // moving where the clone happens, not adding real cost.
+    let states: Vec<Mutable<bool>> =
+        DRAWER_OPEN.with(|map| map.borrow().values().cloned().collect());
+    for state in &states {
+        state.set_neq(false);
+    }
+    DRAWER_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages

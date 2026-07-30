@@ -71,11 +71,16 @@ fn abort_subscription() {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn close_prompt() {
-    PROMPT_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| {
-        if let Some(w) = slot.borrow_mut().take() {
-            w.close();
-        }
-    });
+    // Bind the taken window before acting on it: the `if let` scrutinee's
+    // `RefMut` temporary stays alive for the whole then-block (Rust 2024
+    // only changed when it drops relative to an `else` branch, not this),
+    // so a GTK call made directly inside the `if let` would hold the borrow
+    // across it (#631) — a latent reentrancy hazard if `close()` ever
+    // emits synchronously.
+    let taken = PROMPT_WINDOW.with(|slot: &RefCell<Option<gtk::Window>>| slot.borrow_mut().take());
+    if let Some(w) = taken {
+        w.close();
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]

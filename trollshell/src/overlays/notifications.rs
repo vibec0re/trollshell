@@ -490,10 +490,15 @@ fn mount_card(vbox: &gtk::Box, notif: &Notification) -> CardEntry {
 ///   hover count — for the whole life of a notification, sticky or finite
 ///   (#619). It does not hold on its own: before #619 a sticky phase deleted the
 ///   entry, so `old.holds_hover` could be true against a count of zero and this
-///   swap's own `resume` re-armed the countdown under a parked pointer. The only
-///   remaining way the count doesn't come back to one is the notification having
-///   been closed meanwhile, which drops the entry and makes both calls no-ops —
-///   harmless, since there is then nothing left to expire.
+///   swap's own `resume` re-armed the countdown under a parked pointer.
+///
+///   Still open (**#626**): if the notification is *closed and re-posted* under
+///   the same id while this card is mounted and holding, the entry is torn down
+///   and recreated with a count of zero, and the carried hold then runs
+///   0 → 1 → 0 and arms — the #619 symptom by a different route. Closing that
+///   needs the hold to name the entry generation it was taken against, which is
+///   more than this swap can decide locally. A close with no re-post is fine:
+///   the entry stays gone, both calls no-op, and there is nothing left to expire.
 /// - **Keeps the card's place** in the stack, rather than sending an updated
 ///   toast to the bottom on every re-post.
 ///

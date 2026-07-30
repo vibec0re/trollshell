@@ -40,14 +40,14 @@ jobs:
       - name: Assemble Pages site
         run: |
           mkdir -p _site
-          cp result/share/doc/trollshell/options.html _site/options.html
-          cp result/share/doc/trollshell/options.md _site/options.md
-          cp result/share/doc/trollshell/plugin-env.html _site/plugin-env.html
-          cp result/share/doc/trollshell/plugin-env.md _site/plugin-env.md
-          # The derivation renders a small landing page linking both docs
-          # (#614); the Pages root (https://<org>.github.io/trollshell/)
-          # serves that now instead of a byte-copy of options.html.
-          cp result/share/doc/trollshell/index.html _site/index.html
+          # Whatever the derivation puts in share/doc/trollshell/ is what
+          # gets published — a whole-directory copy so a new output file
+          # never silently fails to ship (and the workflow header comment
+          # above stays true without needing to be kept in sync by hand).
+          # The Pages root (https://<org>.github.io/trollshell/) is the
+          # derivation's own generated index.html (#614), linking the other
+          # pages — not a byte-copy of options.html anymore.
+          cp -R result/share/doc/trollshell/. _site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v5
         with:

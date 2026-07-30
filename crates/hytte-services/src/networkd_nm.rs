@@ -37,7 +37,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-use crate::networkd::{Link, LinkAddress, OperationalState};
+use crate::networkd::{Link, LinkAddress, LinkSource, OperationalState};
 
 const NM_NAME: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -217,14 +217,14 @@ async fn link_from_device(device_path: &str) -> Option<Link> {
 }
 
 /// Read every NM device and build the full [`Link`] list.
-async fn read_nm_links() -> Vec<Link> {
-    let devices = match get_devices().await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = %e, "networkd_nm: GetDevices failed");
-            return Vec::new();
-        }
-    };
+///
+/// # Errors
+///
+/// Propagates a failed `GetDevices` rather than collapsing it into an empty
+/// list: "NM answered with no devices" and "NM did not answer" are different
+/// facts, and only the first may be rendered as one (#608).
+async fn read_nm_links() -> Result<Vec<Link>, hytte_bus::BusError> {
+    let devices = get_devices().await?;
 
     let mut out = Vec::with_capacity(devices.len());
     for dev in devices {
@@ -234,7 +234,7 @@ async fn read_nm_links() -> Vec<Link> {
     }
     // Stable ordering by ifindex so the list doesn't churn between refreshes.
     out.sort_by_key(|l| l.idx);
-    out
+    Ok(out)
 }
 
 /// Recompute the primary link (highest operational priority) the same way the
@@ -247,12 +247,35 @@ fn pick_primary(links: &[Link]) -> Option<Link> {
         .cloned()
 }
 
-/// Snapshot all NM links and push them to the shared mutables.
-async fn refresh(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Link>>) {
-    let links = read_nm_links().await;
-    let primary = pick_primary(&links);
-    links_out.set(links);
-    primary_out.set(primary);
+/// Snapshot all NM links and push them to the shared mutables, including whether
+/// NM answered at all ([`LinkSource`]).
+///
+/// A failed read publishes [`LinkSource::Unknown`] and leaves the previous list
+/// **in place**. Before #608 it published an empty list instead, which the panel
+/// rendered as "Offline / 0 interface(s)" — a negative claim assembled out of a
+/// question that failed. This is also the path a host with no NM at all takes,
+/// since the backend probe reaches this watcher optimistically when it cannot
+/// establish whether NM exists (#607).
+async fn refresh(
+    links_out: &Mutable<Vec<Link>>,
+    primary_out: &Mutable<Option<Link>>,
+    source_out: &Mutable<LinkSource>,
+) {
+    match read_nm_links().await {
+        Ok(links) => {
+            let primary = pick_primary(&links);
+            links_out.set(links);
+            primary_out.set(primary);
+            source_out.set_neq(LinkSource::NetworkManager);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "networkd_nm: GetDevices failed; link source reported as unknown"
+            );
+            source_out.set_neq(LinkSource::Unknown);
+        }
+    }
 }
 
 // ── Main watcher task ──────────────────────────────────────────────────────────
@@ -277,6 +300,7 @@ async fn refresh(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Li
 pub(crate) async fn run_nm_links_watcher(
     links_out: Mutable<Vec<Link>>,
     primary_out: Mutable<Option<Link>>,
+    source_out: Mutable<LinkSource>,
 ) {
     let device_added = hytte_bus::signals(BusKind::System, NM_NAME)
         .at_path(NM_PATH)
@@ -299,7 +323,7 @@ pub(crate) async fn run_nm_links_watcher(
     let mut manager_events = manager_props.events();
 
     // Initial snapshot.
-    refresh(&links_out, &primary_out).await;
+    refresh(&links_out, &primary_out, &source_out).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -311,17 +335,17 @@ pub(crate) async fn run_nm_links_watcher(
         tokio::select! {
             Some(_) = added_events.next() => {
                 tracing::debug!("networkd_nm: DeviceAdded; refreshing links");
-                refresh(&links_out, &primary_out).await;
+                refresh(&links_out, &primary_out, &source_out).await;
             }
             Some(_) = removed_events.next() => {
                 tracing::debug!("networkd_nm: DeviceRemoved; refreshing links");
-                refresh(&links_out, &primary_out).await;
+                refresh(&links_out, &primary_out, &source_out).await;
             }
             Some(_) = manager_events.next() => {
-                refresh(&links_out, &primary_out).await;
+                refresh(&links_out, &primary_out, &source_out).await;
             }
             _ = interval.tick() => {
-                refresh(&links_out, &primary_out).await;
+                refresh(&links_out, &primary_out, &source_out).await;
             }
         }
     }

@@ -127,6 +127,15 @@ finish_page(
 | `Some(link)`, anything else              | `{describe_state(op)} via {link.name}` |
 | `None`                                   | `Offline`                              |
 
+> **Amended by #608 (2026-07-29).** `None` was doing double duty: "the link
+> manager answered and there is no routable primary" _and_ "there is no link
+> manager to answer". Only the first is `Offline`. The row is now bound to
+> `networkd::primary()` **and** `networkd::link_source()`; with nothing
+> answering it reads `Unknown` with a neutral pill, and the `"{N} interface(s)"`
+> subtitle below reads `Unknown` rather than `0 interface(s)`. A count or link we
+> did obtain is still shown, however stale — only _absences_ need a source to
+> vouch for them.
+
 **Primary expander row:**
 
 - Title binds to primary link name; when `None`, hide the expander entirely and show a single non-activatable `AdwActionRow` titled `"No connection"` instead.

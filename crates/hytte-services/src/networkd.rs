@@ -18,6 +18,15 @@
 //! sourced from NM over D-Bus instead (see [`crate::networkd_nm`]), feeding the
 //! *same* [`Link`] list the panel already renders. This mirrors the #96 Wi-Fi
 //! `NetworkManager` backend. No `/sys` scraping (rejected on #80/#91).
+//!
+//! # "Nothing to ask" is not "nothing there" (issue #608)
+//!
+//! Because the link list can be sourced from a daemon that isn't running, the
+//! *absence* of a reading needs a representation of its own — otherwise every
+//! consumer reads "no primary link" as "offline" and "no links" as "no
+//! interfaces", which on a host with neither daemon is a negative claim built
+//! out of a question nobody answered. [`LinkSource`] carries that distinction
+//! alongside [`links`]/[`primary`], which keep their existing types.
 
 use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
@@ -105,10 +114,74 @@ pub struct RouteSummary {
     pub family: i32,
 }
 
+/// Whether any link manager is actually answering — the difference between
+/// *unknown* and *known-absent* (issue #608).
+///
+/// [`links`] and [`primary`] cannot carry this themselves. An empty link list
+/// and a `None` primary each mean two different things: "the manager answered
+/// and there is no routable link / no interfaces", and "there is no manager to
+/// answer". Only the first deserves the word *Offline*. #607's screenshot is
+/// what the conflation looks like — the Connection card reporting "Offline / 0
+/// interface(s)" directly above six live interfaces moving traffic, because the
+/// traffic card reads the kernel while this service reads D-Bus.
+///
+/// A **separate signal** rather than a third state on [`primary`], so consumers
+/// that only want the link — the bar chip, the address rows — keep their
+/// `Option<Link>` untouched and only the callers that render an *absence* have
+/// to ask. That is the one difference from `nightlight`'s `NightlightState`,
+/// which folded its pending state into the signal the switch already bound to
+/// because there was exactly one consumer; here there are several, and most of
+/// them do not care.
+///
+/// It is also **not** [`LinkBackend`]. That is the *decision* of which daemon to
+/// run a watcher against, and it is deliberately optimistic: an inconclusive
+/// probe still picks `NetworkManager` so the watcher can self-heal (#607). This
+/// is the *observation*, and it only names a source once that source has
+/// actually produced a reading — so an optimistic guess can never launder itself
+/// into a claim about the host.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LinkSource {
+    /// Nothing has answered (yet). The startup probe may still be running, or
+    /// it may have picked a backend that has produced no reading — including
+    /// the optimistic `NetworkManager` fallback of an inconclusive probe, and a
+    /// manager that has stopped answering since. An empty [`links`] or a `None`
+    /// [`primary`] here means *not asked*, not *not there*.
+    #[default]
+    Unknown,
+    /// systemd-networkd answered; its view of the host is what we render.
+    Networkd,
+    /// `NetworkManager` answered; ditto.
+    NetworkManager,
+    /// The bus answered and neither systemd-networkd nor `NetworkManager` is
+    /// available: this host has no link manager. A *positive* finding, in the
+    /// spirit of [`crate::wifi_backend::BackendChoice::None`] and
+    /// [`crate::geoclue::LocationState::Unavailable`] — though note it is a fact
+    /// about the *managers*, not about the kernel's interfaces, which may well
+    /// be up and routing.
+    Unavailable,
+}
+
+impl LinkSource {
+    /// Whether a link manager is currently answering — i.e. whether an empty
+    /// [`links`] or a `None` [`primary`] may be rendered as a statement about
+    /// the host ("Offline", "0 interfaces") instead of as "we don't know".
+    ///
+    /// [`Self::Unavailable`] answers **false**: knowing that nothing manages the
+    /// links tells you nothing about whether the host is online, which is
+    /// precisely #608's complaint.
+    #[must_use]
+    pub fn is_answering(self) -> bool {
+        matches!(self, Self::Networkd | Self::NetworkManager)
+    }
+}
+
 #[doc(hidden)]
 pub struct NetworkdHandles {
     pub(crate) links: Mutable<Vec<Link>>,
     pub(crate) primary: Mutable<Option<Link>>,
+    /// Whether anything is answering for the two above — see [`LinkSource`].
+    /// Written by the backend probe and promoted/retracted by every refresh.
+    pub(crate) source: Mutable<LinkSource>,
 }
 
 impl Default for NetworkdHandles {
@@ -116,6 +189,8 @@ impl Default for NetworkdHandles {
         Self {
             links: Mutable::new(Vec::new()),
             primary: Mutable::new(None),
+            // Nothing has been asked yet, and that is exactly what this says.
+            source: Mutable::new(LinkSource::Unknown),
         }
     }
 }
@@ -134,6 +209,24 @@ pub(crate) enum LinkBackend {
     /// Neither is usable; the link list stays empty (panel shows nothing, as
     /// it does today).
     None,
+}
+
+impl LinkBackend {
+    /// What is *known* about the link source the moment this verdict is reached,
+    /// before any watcher has read anything.
+    ///
+    /// Only [`LinkBackend::None`] is knowledge — the bus answered and there is
+    /// no manager, so [`LinkSource::Unavailable`] can be published immediately.
+    /// The two named backends are a *plan*, and one of them is reached by an
+    /// explicitly optimistic fallback (#607), so they publish nothing until a
+    /// read actually lands: `refresh` is what promotes them to a named
+    /// [`LinkSource`].
+    fn initial_source(self) -> LinkSource {
+        match self {
+            Self::None => LinkSource::Unavailable,
+            Self::Networkd | Self::NetworkManager => LinkSource::Unknown,
+        }
+    }
 }
 
 /// Decide which backend should source the link list.
@@ -213,30 +306,45 @@ impl Service for NetworkdService {
         let handles = NetworkdHandles::default();
         let links_writer = handles.links.clone();
         let primary_writer = handles.primary.clone();
+        let source_writer = handles.source.clone();
 
         spawn_supervised("networkd", move || {
             let links_writer = links_writer.clone();
             let primary_writer = primary_writer.clone();
+            let source_writer = source_writer.clone();
             async move {
-                match probe_link_backend().await {
+                let backend = probe_link_backend().await;
+                // Publish what the verdict alone establishes — for the two named
+                // backends that is nothing at all, since one of them is an
+                // optimistic fallback. See `LinkBackend::initial_source`.
+                source_writer.set_neq(backend.initial_source());
+                match backend {
                     LinkBackend::NetworkManager => {
                         tracing::info!(
                             "networkd: sourcing link list from NetworkManager (networkd not managing)"
                         );
-                        crate::networkd_nm::run_nm_links_watcher(links_writer, primary_writer)
-                            .await;
+                        crate::networkd_nm::run_nm_links_watcher(
+                            links_writer,
+                            primary_writer,
+                            source_writer,
+                        )
+                        .await;
                     }
                     LinkBackend::Networkd => {
                         // Seed once; if the initial refresh fails outright, networkd
                         // isn't running on this host and no NM is present either —
                         // log once at info and stay inert rather than hammering dbus
                         // in a 2s retry loop for the rest of the process lifetime.
-                        if let Err(e) = refresh(&links_writer, &primary_writer).await {
+                        // `source` stays `Unknown`, so nothing downstream reports the
+                        // empty list as a fact about the host.
+                        if let Err(e) =
+                            refresh(&links_writer, &primary_writer, &source_writer).await
+                        {
                             tracing::info!(error = ?e, "networkd unreachable at startup; service inert");
                             return;
                         }
                         loop {
-                            match listen(&links_writer, &primary_writer).await {
+                            match listen(&links_writer, &primary_writer, &source_writer).await {
                                 Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
                                 Err(e) => {
                                     tracing::warn!(error = ?e, "networkd error, retrying in 2s");
@@ -246,6 +354,9 @@ impl Service for NetworkdService {
                         }
                     }
                     LinkBackend::None => {
+                        // A positive finding, already published above as
+                        // `LinkSource::Unavailable`: consumers can say "no link
+                        // manager" instead of rendering the empty list as "Offline".
                         tracing::info!("networkd: no link backend available; service inert");
                     }
                 }
@@ -256,7 +367,11 @@ impl Service for NetworkdService {
     }
 }
 
-async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Link>>) -> Result<()> {
+async fn listen(
+    links_out: &Mutable<Vec<Link>>,
+    primary_out: &Mutable<Option<Link>>,
+    source_out: &Mutable<LinkSource>,
+) -> Result<()> {
     // Subscribe to StateChanged on the Manager so we react quickly to
     // link state transitions.  Missed-emissions on reconnect trigger a
     // re-poll too, so we never miss a change across a D-Bus restart.
@@ -269,7 +384,7 @@ async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Lin
     let mut events = state_changed.events();
 
     // Initial poll.
-    refresh(links_out, primary_out).await?;
+    refresh(links_out, primary_out, source_out).await?;
 
     // 5-second fallback timer — catches hot-plug when StateChanged is
     // not emitted (e.g. older networkd, or newly added links).
@@ -282,12 +397,12 @@ async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Lin
         tokio::select! {
             _ = events.next() => {
                 tracing::debug!("networkd StateChanged; refreshing links");
-                if let Err(e) = refresh(links_out, primary_out).await {
+                if let Err(e) = refresh(links_out, primary_out, source_out).await {
                     tracing::warn!(error = ?e, "networkd refresh after StateChanged failed");
                 }
             }
             _ = interval.tick() => {
-                if let Err(e) = refresh(links_out, primary_out).await {
+                if let Err(e) = refresh(links_out, primary_out, source_out).await {
                     tracing::warn!(error = ?e, "networkd periodic refresh failed");
                 }
             }
@@ -295,11 +410,26 @@ async fn listen(links_out: &Mutable<Vec<Link>>, primary_out: &Mutable<Option<Lin
     }
 }
 
+/// Poll networkd once and publish the result, including whether networkd
+/// answered at all ([`LinkSource`]).
+///
+/// A failed read **retracts** the source to [`LinkSource::Unknown`] rather than
+/// leaving the last reading looking authoritative: once nothing is answering, a
+/// `None` primary is no longer evidence of being offline (#608). The link list
+/// itself is left as it was — a stale reading is still a reading, and clearing it
+/// would manufacture the "0 interface(s)" this change exists to stop.
 async fn refresh(
     links_out: &Mutable<Vec<Link>>,
     primary_out: &Mutable<Option<Link>>,
+    source_out: &Mutable<LinkSource>,
 ) -> Result<()> {
-    let links = read_networkd_links().await?;
+    let links = match read_networkd_links().await {
+        Ok(links) => links,
+        Err(e) => {
+            source_out.set_neq(LinkSource::Unknown);
+            return Err(e);
+        }
+    };
     let primary = links
         .iter()
         .max_by_key(|l| l.operational.priority())
@@ -308,6 +438,7 @@ async fn refresh(
 
     links_out.set(links);
     primary_out.set(primary);
+    source_out.set_neq(LinkSource::Networkd);
     Ok(())
 }
 
@@ -394,6 +525,20 @@ pub fn primary() -> impl Signal<Item = Option<Link>> {
             .expect("networkd::service() not registered")
             .primary
             .signal_cloned()
+    })
+}
+
+/// Signal of whether any link manager is answering — see [`LinkSource`].
+///
+/// The companion to [`links`] and [`primary`]: those say *what* the link picture
+/// is, this says whether anybody answered the question. Bind to it anywhere an
+/// empty answer would otherwise be rendered as a negative fact (#608).
+pub fn link_source() -> impl Signal<Item = LinkSource> {
+    registry::with(|r| {
+        r.get::<NetworkdHandles>()
+            .expect("networkd::service() not registered")
+            .source
+            .signal()
     })
 }
 
@@ -487,6 +632,65 @@ fn bytes_to_ip(family: i32, bytes: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- LinkSource (#608) ---
+
+    #[test]
+    fn only_a_daemon_that_answered_licenses_a_negative_claim() {
+        // The whole point: `is_answering()` is the permission to render an empty
+        // reading as a fact. Both non-answering states must withhold it.
+        assert!(LinkSource::Networkd.is_answering());
+        assert!(LinkSource::NetworkManager.is_answering());
+        assert!(!LinkSource::Unknown.is_answering());
+        assert!(
+            !LinkSource::Unavailable.is_answering(),
+            "knowing nothing manages the links says nothing about being online"
+        );
+    }
+
+    #[test]
+    fn a_service_that_has_read_nothing_claims_nothing() {
+        // The default a freshly-started (or never-registered) service publishes.
+        // If this were anything but `Unknown`, the panel would assert a state
+        // before the probe had even run.
+        assert_eq!(LinkSource::default(), LinkSource::Unknown);
+        assert!(!LinkSource::default().is_answering());
+        assert_eq!(NetworkdHandles::default().source.get(), LinkSource::Unknown);
+    }
+
+    #[test]
+    fn only_the_no_backend_verdict_is_knowledge_on_its_own() {
+        // `LinkBackend` is a plan, not an observation. Only "the bus answered and
+        // neither daemon is there" can be published before a read lands.
+        assert_eq!(
+            LinkBackend::None.initial_source(),
+            LinkSource::Unavailable,
+            "a confirmed absence of managers is a positive finding"
+        );
+        assert_eq!(LinkBackend::Networkd.initial_source(), LinkSource::Unknown);
+        assert_eq!(
+            LinkBackend::NetworkManager.initial_source(),
+            LinkSource::Unknown,
+            "the NM verdict can come from an inconclusive probe (#607), so it \
+             must not promote itself into a claim about the host"
+        );
+    }
+
+    #[test]
+    fn no_verdict_can_publish_a_named_source_before_a_read() {
+        // Stated as an invariant over every variant, so a future backend added to
+        // `LinkBackend` cannot quietly start claiming to answer at probe time.
+        for backend in [
+            LinkBackend::Networkd,
+            LinkBackend::NetworkManager,
+            LinkBackend::None,
+        ] {
+            assert!(
+                !backend.initial_source().is_answering(),
+                "{backend:?} claimed to be answering before reading anything"
+            );
+        }
+    }
 
     // --- parse_describe ---
 

@@ -152,14 +152,17 @@ enum EventKind { Click, Scroll { dx: f64, dy: f64 } }   // v1; matches the recon
   props (ellipsize/margins/tooltip) slot in when the first list-y plugin needs
   them.
 
-  > **Retracted, in part (2026-07-30).** The "two-way inputs" half of this
-  > non-goal reversed twice, both with paired push events: `Node::Slider`
-  > (#315, 2026-07-13) + `EventKind::ValueChanged`, and `Node::Entry` (#363,
-  > 2026-07-16) + `EventKind::Submitted`. Both are genuinely two-way — the
-  > plugin sets the value/text, the host pushes back on user interaction. The
-  > "arbitrary pixels/images, custom drawing" half stands: `Node::Pixels`
-  > (noted above) is a fixed raster surface for the `preem` widget-kit, not a
-  > general drawing escape hatch.
+  > **Retracted, in part (2026-07-30).** Of the three things listed:
+  > **two-way inputs** reversed twice, both with paired push events:
+  > `Node::Slider` (#315, 2026-07-13) + `EventKind::ValueChanged`, and
+  > `Node::Entry` (#363, 2026-07-16) + `EventKind::Submitted`. **Arbitrary
+  > pixels/images** also reversed: `Node::Pixels` (#284, 2026-07-12) carries
+  > an arbitrary `width`/`height` RGBA8 buffer, and `data`/`scale` are mutable
+  > per-`id` — a plugin can push a new frame's worth of bytes on every
+  > re-render (`wire.rs:233-247`), not a one-shot fixed image. Only **custom
+  > drawing** still holds: frontend B plugins are out-of-process, so pixels
+  > arrive as a validated buffer the host paints, never as cairo/snapshot
+  > calls the host executes on the plugin's behalf.
 
 ## Message envelope
 

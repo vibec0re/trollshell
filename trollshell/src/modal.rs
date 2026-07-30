@@ -979,20 +979,72 @@ pub fn close_all() {
             panel.window.close();
         }
     });
-    // DRAWER_OPEN is keyed per-monitor and deliberately survives a rebuild
-    // for connector-named monitors (so a subscriber wired up before the
-    // rebuild — OSD, bar CSS — keeps working after it). But a
-    // connector-less monitor's fallback key is the now-defunct GdkMonitor
-    // pointer: the next rebuild mints a *different* pointer, so that entry
-    // can never be looked up again. Left un-pruned it's a pure leak — one
-    // stale `Mutable` per hot-plug cycle for every connector-less monitor.
-    DRAWER_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
+    reset_drawer_open_states();
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the
     // drawer" default holds (#349 PR2).
     crate::plugins::set_active_panel(None);
     // No panels left → no netconn/stats page visible; park the pollers.
     recompute_gates();
+}
+
+/// The [`DRAWER_OPEN`] half of [`close_all`]: every drawer window is gone, so
+/// clear each state to `false`, then drop the entries that can never be reused.
+///
+/// **Clear (#618).** `close_all` closes the windows but used to leave the
+/// `Mutable`s alone, so a monitor whose drawer was open when a hot-plug /
+/// kanshi profile switch fired kept reading `true` with no drawer attached.
+/// That silently poisoned every subscriber for the rest of the session:
+/// `overlays::osd` treats `drawer_open` as "the drawer already shows this
+/// control, the OSD would be redundant" and suppressed volume/mic/brightness
+/// feedback on that output, and `main.rs`'s `bind_class` kept the bar's
+/// squared-off `drawer-open` seam corner. The overlay rebuild didn't rescue it:
+/// a fresh `OsdView` starts at `false`, but subscribing to a `Mutable` delivers
+/// its current value immediately, so the new view was handed the stale `true`
+/// right back. Written with `set_neq` so the monitors that were already closed
+/// — every one of them, in the common case — don't emit a redundant tick.
+///
+/// **Prune.** `DRAWER_OPEN` is keyed per-monitor and deliberately survives a
+/// rebuild for connector-named monitors (so a subscriber wired up before the
+/// rebuild — OSD, bar CSS — keeps working after it). But a connector-less
+/// monitor's fallback key is the now-defunct `GdkMonitor` pointer: the next
+/// rebuild mints a *different* pointer, so that entry can never be looked up
+/// again. Left un-pruned it's a pure leak — one stale `Mutable` per hot-plug
+/// cycle for every connector-less monitor.
+///
+/// Clear runs *before* the prune, and that ordering is load-bearing. #618
+/// proposed the reverse — prune, then clear the survivors, to save a wake on
+/// entries about to be dropped — but in `futures-signals` 0.3.34 that strands
+/// subscribers on the stale `true` permanently:
+///
+/// * A signal's `MutableSignalState` holds a strong `Arc` to the shared state,
+///   but is **not** counted in `senders` — only live `Mutable` handles are. And
+///   the `PANELS` drain above has already dropped every
+///   `ModalPanel::open_state`, so by the time we run, this map holds the *last*
+///   `Mutable` for each key still in it.
+/// * Dropping that last sender notifies with `has_changed = false` and then
+///   wipes the waker list, while `poll_change` reads
+///   `if is_changed() { … } else if senders == 0 { Poll::Ready(None) }` — a
+///   permanent end-of-stream.
+/// * So pruning first *terminates* every live subscription on that key while
+///   its value is still `true`, unrecoverably: a `set_neq` loop afterwards can
+///   no longer reach an entry that's already out of the map, and its wakers are
+///   gone regardless. Clearing first latches `changed` before the senders reach
+///   zero, so the last poll delivers `false` and *then* the stream ends.
+///
+/// The fallback keys this prunes do have a live subscriber, so this is not
+/// hypothetical: `main.rs` binds the bar's `drawer-open` class for every
+/// monitor, and it's only `overlays::osd::install` that skips the unnamed ones.
+/// It goes unobserved today purely because that bar window is being destroyed
+/// anyway — not because nobody is listening.
+fn reset_drawer_open_states() {
+    DRAWER_OPEN.with(|map| {
+        let mut map = map.borrow_mut();
+        for state in map.values() {
+            state.set_neq(false);
+        }
+        map.retain(|key, _| !is_fallback_key(key));
+    });
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -1474,7 +1526,10 @@ fn apply_stats_scroll(panel: &ModalPanel) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EAGER_PAGES, Page, clamp_main_margin};
+    use super::{
+        DRAWER_OPEN, EAGER_PAGES, Page, clamp_main_margin, close_all, drawer_open_state,
+        reset_drawer_open_states,
+    };
     use std::collections::HashSet;
 
     // These are pure-logic guards for the lazy drawer-page registry (#231).
@@ -1640,5 +1695,89 @@ mod tests {
     #[test]
     fn eager_pages_is_empty() {
         assert_eq!(EAGER_PAGES, [] as [Page; 0]);
+    }
+
+    /// #618: after a hot-plug teardown no drawer window exists, so every
+    /// surviving `DRAWER_OPEN` state must read `false`. Leaving a connector's
+    /// entry latched at `true` made `overlays::osd` suppress the volume / mic /
+    /// brightness OSD on that output for the rest of the session (it reads the
+    /// state as "the drawer already shows this control"), and kept the bar's
+    /// `drawer-open` seam class applied with no drawer attached.
+    ///
+    /// Drives [`reset_drawer_open_states`] rather than [`close_all`]: the rest
+    /// of `close_all` closes GTK windows and reaches into the plugin service
+    /// registry (`plugins::set_active_panel` panics if `plugins::service()`
+    /// isn't registered), neither of which exists without a display + a booted
+    /// `App`. This is the whole `DRAWER_OPEN` half of it, unchanged.
+    #[test]
+    fn reset_clears_surviving_drawer_open_states() {
+        let open = drawer_open_state("DP-1");
+        let already_closed = drawer_open_state("HDMI-A-1");
+        // A connector-less monitor: keyed by GdkMonitor pointer, so its entry
+        // gets pruned — but a subscriber still holds this handle.
+        let headless = drawer_open_state("monitor:0x1234");
+        open.set(true);
+        headless.set(true);
+
+        reset_drawer_open_states();
+
+        assert!(!open.get(), "connector state stayed latched at true");
+        assert!(!already_closed.get());
+        assert!(
+            !headless.get(),
+            "a pruned entry's live handle stayed latched at true"
+        );
+
+        DRAWER_OPEN.with(|map| {
+            let map = map.borrow();
+            // Connector keys survive the rebuild (subscribers wired up before
+            // it must keep working); the unreusable fallback key is pruned.
+            assert!(map.contains_key("DP-1"));
+            assert!(map.contains_key("HDMI-A-1"));
+            assert!(!map.contains_key("monitor:0x1234"));
+        });
+
+        // The crux of the OSD chain: a fresh subscriber re-minting this key
+        // after the rebuild is handed `false`, not the stale `true`. (A
+        // `Mutable`'s signal re-delivers its current value on subscribe, which
+        // is why rebuilding the overlay alone never fixed this.)
+        assert!(!drawer_open_state("DP-1").get());
+    }
+
+    /// Companion to the above, pinning [`close_all`] *itself* rather than the
+    /// helper: deleting the `reset_drawer_open_states()` call from `close_all`
+    /// would leave the helper-level test green, since the helper would still be
+    /// correct in isolation. This is the test that actually fails if the fix is
+    /// unwired.
+    ///
+    /// `close_all` can't run to completion off a booted `App` — it reaches
+    /// `plugins::set_active_panel`, which `.expect()`s the plugin service out of
+    /// the thread-local registry. That's an ordinary unwinding panic (no profile
+    /// sets `panic = "abort"`) raised *after* the `DRAWER_OPEN` reset, and
+    /// `PANELS` is empty on a test thread so the drain above it touches no GTK.
+    /// Catching it is therefore enough to observe the reset. The caught panic's
+    /// message shows up in this test's captured output — that's expected, not a
+    /// failure. (No `set_hook` to silence it: the panic hook is process-global
+    /// and would race the other tests running in parallel.)
+    ///
+    /// Degrades gracefully in both directions: if the plugin service ever stops
+    /// panicking here, `catch_unwind` simply returns `Ok` and the assert still
+    /// holds; if the reset is ever reordered *after* the panicking call, this
+    /// fails loudly, which is the point.
+    #[test]
+    fn close_all_resets_drawer_open_state() {
+        // A key of its own, so this can't interact with the helper-level test
+        // above when libtest runs both on one thread (`--test-threads=1`), where
+        // the `DRAWER_OPEN` thread-local is shared.
+        let open = drawer_open_state("DP-9");
+        open.set(true);
+
+        let _ = std::panic::catch_unwind(close_all);
+
+        assert!(
+            !open.get(),
+            "close_all left the drawer-open state latched — is it still calling \
+             reset_drawer_open_states()?"
+        );
     }
 }

@@ -144,9 +144,14 @@ match_min = 2
 # GeoClue is city-level; once you've captured a fingerprint it's moot.
 radius_km = 12.0
 
-# Departures here (optional): station id + "toward the centre" filter. Omit a
-# filter axis to allow everything on it.
-station = "900180001"
+# Departures here (optional): a station id, optionally narrowed by a
+# line/direction filter (see below). Verify the id names the same station as
+# `name` above — https://v6.bvg.transport.rest/locations?query=<name> — the
+# two silently drifting apart (#641) is exactly the bug that made this widget
+# never work: the fetch succeeds against a real, nearby, WRONG station, so a
+# populated filter then matches nothing, forever, and the widget just looks
+# like a quiet evening instead of telling you it's misconfigured.
+station = "900192001" # S Schöneweide Bhf (Berlin)
 
 # Walk time from here to the platform, in minutes. With this set, the list
 # shows a leave-by countdown ("leave 7 min") instead of the raw departs-in
@@ -154,8 +159,15 @@ station = "900180001"
 # plain "departs in" label.
 walk_minutes = 10
 
-lines = ["S8", "S85", "S9"]
-directions = ["Spandau", "Birkenwerder", "Hohen Neuendorf", "Waidmannslust"]
+# `lines`/`directions` narrow which departures show; both empty/absent (the
+# default here) means show everything suburban through this station. That's
+# deliberate: a filter that's wrong (station drifted, typo'd line name, …)
+# fails *invisibly* — an empty list forever, indistinguishable from "nothing's
+# running" — while no filter fails *visibly*, since you immediately see
+# unexpected lines/directions and can narrow from there. Uncomment and edit
+# once you've confirmed the unfiltered board works:
+# lines = ["S8", "S85", "S9"]
+# directions = ["Spandau", "Birkenwerder", "Hohen Neuendorf", "Waidmannslust"]
 "#;
 
 /// A configured place: location identity, Wi-Fi fingerprint, and optional
@@ -781,12 +793,40 @@ mod tests {
         let places = default_places();
         assert_eq!(places.len(), 1);
         assert_eq!(places[0].name, "Schöneweide");
-        assert_eq!(places[0].station.as_deref(), Some("900180001"));
+        assert_eq!(places[0].station.as_deref(), Some("900192001"));
         assert_eq!(places[0].match_min, 2);
         assert!(places[0].ssids.is_empty());
         assert_eq!(places[0].walk_minutes, 10);
-        assert_eq!(places[0].lines, ["S8", "S85", "S9"]);
+        // Shipped commented out (#641): a wrong filter fails invisibly (zero
+        // matches, forever), an absent one fails visibly (you see everything
+        // and narrow from there) — so the default leaves both axes open.
+        assert!(places[0].lines.is_empty());
+        assert!(places[0].directions.is_empty());
         assert!((places[0].radius_km - 12.0).abs() < 1e-9);
+    }
+
+    /// Ties the shipped default's station id to the place it's named after —
+    /// #641 shipped `900180001` ("S Köpenick/Parrisiusstr. (Berlin)", live
+    /// BVG API) under the name "Schöneweide", served only by S3, none of
+    /// which passes through Köpenick: a structural, permanent zero-match.
+    /// `900192001` is "S Schöneweide Bhf (Berlin)", the correct id. A bare
+    /// literal comparison (as the pre-#641 tests had) can't catch this class
+    /// of bug — the constant is self-consistently wrong — so this pins the
+    /// id/name *pair* and spells out the real-world station name in the
+    /// failure message.
+    #[test]
+    fn default_station_id_matches_its_place_name() {
+        let places = default_places();
+        assert_eq!(places[0].name, "Schöneweide");
+        assert_eq!(
+            places[0].station.as_deref(),
+            Some("900192001"),
+            "default station id must stay \"900192001\" (\"S Schöneweide Bhf \
+             (Berlin)\" per the live BVG API) — NOT \"900180001\", which is a \
+             DIFFERENT, nearby station (\"S Köpenick/Parrisiusstr. (Berlin)\", \
+             #641). If you're changing this id, verify the new one at \
+             https://v6.bvg.transport.rest/locations?query=Schöneweide first."
+        );
     }
 
     #[test]
@@ -948,7 +988,10 @@ mod tests {
     fn place_transition_silent_on_first_resolution() {
         let mut resolved_once = false;
         let mut last_fired = None;
-        let home = Some(resolved("Home", Some("900180001")));
+        // A fixture id, not a real BVG station — deliberately distinct from
+        // both ids in #641 so this test never looks like it's asserting
+        // anything about the real default config.
+        let home = Some(resolved("Home", Some("900000001")));
 
         assert!(place_transition(home.as_ref(), &mut resolved_once, &mut last_fired).is_none());
         assert!(resolved_once);
@@ -979,7 +1022,9 @@ mod tests {
     fn place_transition_fires_on_genuine_name_change() {
         let mut resolved_once = false;
         let mut last_fired = None;
-        let home = Some(resolved("Home", Some("900180001")));
+        // Fixture ids, not real BVG stations — see the comment on
+        // `place_transition_silent_on_first_resolution`.
+        let home = Some(resolved("Home", Some("900000001")));
         let office = Some(resolved("Office", Some("900008888")));
 
         assert!(place_transition(home.as_ref(), &mut resolved_once, &mut last_fired).is_none()); // first: silent

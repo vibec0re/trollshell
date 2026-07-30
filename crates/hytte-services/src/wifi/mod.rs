@@ -202,6 +202,9 @@ enum ProbeStep {
     },
     /// Still inconclusive and the attempt budget is spent: log loudly and stay
     /// inert.
+    ///
+    /// **Not reachable under the shipped [`PROBE_RETRY`]**, which is unbounded.
+    /// Kept expressible (and tested) so a bounded policy stays one field away.
     GiveUp,
 }
 
@@ -216,23 +219,42 @@ struct RetryPolicy {
     max_backoff: Duration,
 }
 
-/// The policy this service runs: **bounded** retry with backoff, then give up
-/// at `error!`.
+/// The policy this service runs: **unbounded** retry with capped backoff.
 ///
-/// 8 attempts at 0.5s doubling to an 8s cap spends ~31.5s of wall clock
-/// (0.5 + 1 + 2 + 4 + 8 + 8 + 8) before giving up. That is sized for the case
-/// this fixes — a user session racing the system bus / `NetworkManager` up at
-/// boot, which resolves in seconds — while still bounding a genuinely dead bus
-/// to half a minute of polling instead of the process lifetime. Giving up is
-/// logged at `error!` precisely so a wrong bound is visible in the journal
-/// rather than silent.
+/// Attempt 1 is immediate; each retry waits 0.5s doubled per elapsed attempt
+/// and clamped at 8s, so the schedule settles into one probe every 8s forever.
+/// Wall-clock cost per attempt is *not* zero and is not worth predicting: on a
+/// healthy bus a probe is sub-millisecond, but the failure mode being retried
+/// is exactly the one where it is slow — [`crate::wifi_backend::probe_backend`]
+/// makes two sequential `hytte_bus::call`s, each with a 25s timeout and
+/// `RetryPolicy::Once`, so a down socket costs roughly 10s per attempt (fast
+/// fail plus a 5s reconnect wait, twice) and a wedged peer up to ~50s (two full
+/// timeouts, which `is_transient_zbus_error` does not classify as transient, so
+/// there is no retry).
 ///
-/// **This is deliberately one edit to swap.** The alternative policy under
-/// discussion (retry forever) is `max_attempts: None` and nothing else; the
-/// same question is open for `networkd`'s startup refresh on #621 and the two
-/// subsystems should end up consistent.
+/// **Why unbounded.** `networkd.rs` already decided this same question the
+/// other way round and its reasoning transfers wholesale: picking the inert
+/// verdict "leaves the link list permanently empty even once the bus recovers
+/// … the cost if NM genuinely never appears is a periodic warn, which beats an
+/// inert service". Both Wi-Fi watchers self-heal the same way — `wifi_nm.rs`'s
+/// discovery retries every 5s and `watcher.rs` has its `'discovery` loop — so
+/// there is nothing to gain by stopping. A bounded give-up would leave the user
+/// in precisely #607's state (Wi-Fi gone, restart the only cure) whenever the
+/// bus takes longer than the bound: the bug this fix closes, on a longer fuse.
+/// The bound cannot be justified by its own give-up being logged, either — that
+/// argues for a bound from the visibility of the bound being wrong.
+///
+/// Visibility is preserved without the latch: **every** attempt logs at
+/// `error!`, deliberately and not merely every Nth, because the backoff caps at
+/// 8s — so a genuinely dead bus is loud in the journal forever rather than
+/// silently polled.
+///
+/// **The policy is one field to change.** A bounded policy is
+/// `max_attempts: Some(n)` and nothing else; the same question is open for
+/// `networkd`'s startup refresh on #621, and the two subsystems should end up
+/// consistent.
 const PROBE_RETRY: RetryPolicy = RetryPolicy {
-    max_attempts: Some(8),
+    max_attempts: None,
     initial: Duration::from_millis(500),
     max_backoff: Duration::from_secs(8),
 };
@@ -268,8 +290,10 @@ impl RetryPolicy {
 /// Probe for the Wi-Fi backend, retrying only while the probe is
 /// *inconclusive*, and return the verdict to commit to.
 ///
-/// `None` means the attempt budget ran out without ever reaching the bus — the
-/// service stays inert, and the give-up is logged at `error!`.
+/// `None` means the policy told us to stop asking before the bus ever answered
+/// — the service stays inert, and the give-up is logged at `error!`. Under the
+/// shipped unbounded [`PROBE_RETRY`] that cannot happen; this returns only once
+/// it has a real verdict.
 ///
 /// Every inconclusive attempt is logged at `error!` and a successful retry logs
 /// a `RECOVERED` line naming the attempt count: #609's diagnostic exists to
@@ -288,7 +312,22 @@ async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
 
         match policy.step(&outcome, attempt) {
             ProbeStep::Commit(choice) => {
-                if attempt > 1 {
+                // The recovery wording is gated on the *verdict*, not just on
+                // having retried: a host that genuinely runs no Wi-Fi daemon
+                // recovers into `None`, and telling that user "Wi-Fi is coming
+                // up" would be a false line in the very diagnostic this fix
+                // exists to keep trustworthy.
+                if attempt == 1 {
+                    tracing::info!(?choice, "wifi: selected backend");
+                } else if matches!(choice, BackendChoice::None) {
+                    tracing::warn!(
+                        attempts = attempt,
+                        "wifi: backend probe RECOVERED — the system bus is answering again, and \
+                         the verdict is that NO Wi-Fi daemon is present. That is a real finding, \
+                         unlike the earlier 'could not ask'; the service stays inert, correctly \
+                         (issue #613)."
+                    );
+                } else {
                     tracing::warn!(
                         attempts = attempt,
                         ?choice,
@@ -296,20 +335,22 @@ async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
                          system bus, and a retry has now returned a real verdict. Wi-Fi is \
                          coming up without a shell restart (issue #613)."
                     );
-                } else {
-                    tracing::info!(?choice, "wifi: selected backend");
                 }
                 return Some(choice);
             }
             ProbeStep::Retry { after } => {
+                // Logged on *every* attempt, not every Nth: the backoff caps at
+                // 8s, so a permanently dead bus stays loud here rather than
+                // degrading into a silent poll. See `PROBE_RETRY`.
                 tracing::error!(
                     attempt,
                     retry_in_secs = after.as_secs_f64(),
                     error = %reason,
                     "wifi: backend probe was INCONCLUSIVE — the system bus could not be queried, \
                      so it is unknown whether a Wi-Fi daemon is running. This is NOT a finding \
-                     that the host has no wireless hardware. Retrying; grep for \
-                     `backend probe RECOVERED` to see whether it healed (issues #607, #613)."
+                     that the host has no wireless hardware. Retrying until it answers; this \
+                     line repeating means the bus is still unreachable, and a \
+                     `backend probe RECOVERED` line follows once it heals (issues #607, #613)."
                 );
                 tokio::time::sleep(after).await;
                 attempt += 1;
@@ -364,6 +405,11 @@ fn start_iwd(
     let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
         .at_path(AGENT_PATH, agent)
         .start();
+    // Discarding a rejected `OwnNameSignal` is genuinely inert: it has no
+    // `Drop`, so dropping it drops read access to the ownership state and
+    // nothing else — the ownership task it spawned keeps running regardless.
+    // Contrast `ExportHandle` in `start_network_manager`, whose drop is
+    // destructive and is therefore guarded.
     let _ = ownership_out.set(own);
 
     spawn_supervised("wifi", move || {
@@ -408,7 +454,24 @@ fn start_network_manager(
     let nm_agent = nm_agent::NmAgent { prompts, waiters };
     let export =
         hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH).start(nm_agent);
-    let _ = nm_agent_out.set(export);
+    if let Err(duplicate) = nm_agent_out.set(export) {
+        // Not reachable today — the decide-task returns once it has committed
+        // and `spawn_supervised` does not restart a clean completion, so this
+        // runs at most once. Guarded anyway because the failure is silent and
+        // security-adjacent: dropping the rejected handle runs
+        // `ExportHandle::drop`, whose *path-keyed* `unmount(NM_AGENT_PATH)`
+        // takes down the interface the surviving export mounted, while that
+        // surviving handle never notices. NM would still hold our secret-agent
+        // registration, so `GetSecrets` starts failing and Wi-Fi/VPN passphrase
+        // prompts stop appearing — with nothing logged above `debug`.
+        tracing::error!(
+            path = crate::wifi_nm::NM_AGENT_PATH,
+            "wifi_nm: the NM secret agent was exported twice; dropping the duplicate unmounts \
+             the live agent, so passphrase prompts will stop working until the shell is \
+             restarted. This is a bug in the backend-commit path — please report it."
+        );
+        drop(duplicate);
+    }
 
     runtime::handle().spawn(async {
         // Give the export a moment to mount on the live connection before
@@ -1119,9 +1182,10 @@ mod tests {
         assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
     }
 
-    /// The alternative policy (#621) is one field: `max_attempts: None` never
-    /// gives up. Asserted so the swap stays a one-line edit that is known to
-    /// work, rather than a claim in a comment.
+    /// The shipped shape: `max_attempts: None` never gives up, at any attempt
+    /// count. This is the property the fix rests on — a bounded give-up would
+    /// re-create #607 (Wi-Fi gone, restart the only cure) whenever the bus
+    /// takes longer than the bound.
     #[test]
     fn unbounded_policy_never_gives_up() {
         let forever = RetryPolicy {
@@ -1138,12 +1202,23 @@ mod tests {
         }
     }
 
-    /// The shipped policy must stay bounded (its give-up is the visible
-    /// `error!`), and its first retry prompt enough to catch a bus that is only
-    /// milliseconds behind the shell.
+    /// The policy this service actually ships must be the unbounded one, and
+    /// its first retry prompt enough to catch a bus that is only milliseconds
+    /// behind the shell. A bounded policy stays expressible (and tested above),
+    /// but shipping one would put the #613 latch back on a longer fuse.
     #[test]
-    fn shipped_policy_is_bounded_and_starts_promptly() {
-        assert!(super::PROBE_RETRY.max_attempts.is_some());
+    fn shipped_policy_is_unbounded_and_starts_promptly() {
+        assert_eq!(
+            super::PROBE_RETRY.max_attempts,
+            None,
+            "the shipped probe policy must never give up; see PROBE_RETRY's docs and #621"
+        );
+        assert_eq!(
+            super::PROBE_RETRY.step(&inconclusive(), u32::MAX),
+            ProbeStep::Retry {
+                after: super::PROBE_RETRY.max_backoff
+            }
+        );
         assert!(super::PROBE_RETRY.backoff(1) <= Duration::from_secs(1));
         assert!(super::PROBE_RETRY.max_backoff >= super::PROBE_RETRY.initial);
     }

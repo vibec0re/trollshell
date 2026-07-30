@@ -136,13 +136,19 @@ fn rebuild_list(
     ts: &[Task],
     monitor: &Monitor,
 ) {
-    for row in rows_track.borrow_mut().drain(..) {
+    // All three cells are taken, not `borrow_mut()`-ed: a chained `RefMut`
+    // temporary stays alive across the `remove()` calls below (for a `for` it
+    // spans the whole loop; for an `if let` the whole then-block), and a
+    // synchronous emission re-entering any of them panics from inside a glib
+    // callback, which aborts the process. `RefCell::take()` ends its borrow
+    // before it returns (#643).
+    for row in rows_track.take() {
         group.remove(&row);
     }
-    if let Some(p) = placeholder_track.borrow_mut().take() {
+    if let Some(p) = placeholder_track.take() {
         group.remove(&p);
     }
-    if let Some(o) = overflow_track.borrow_mut().take() {
+    if let Some(o) = overflow_track.take() {
         group.remove(&o);
     }
 
@@ -412,7 +418,11 @@ fn build_create_popover(
     popover.connect_show(move |_| {
         entry_for_show.set_text("");
         due_picker_for_show.reset();
-        sync_list_picker(&list_picker_for_show, &lists_for_show.borrow());
+        // Clone out first: an argument-position `Ref` lives for the whole
+        // statement, i.e. across `sync_list_picker`'s GTK work, while
+        // `wire_lists_bind` holds the `borrow_mut()` counterparty (#643).
+        let lists = lists_for_show.borrow().clone();
+        sync_list_picker(&list_picker_for_show, &lists);
         // Re-evaluate the Add button: empty entry but maybe now with
         // lists (or still without).
         create_for_show.set_sensitive(false);

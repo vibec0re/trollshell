@@ -46,7 +46,11 @@ pub(crate) fn build_power_profile_expander() -> adw::ExpanderRow {
     let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
     bind(power_profiles::state(), &expander, move |_, state| {
-        for row in rows_for_bind.borrow_mut().drain(..) {
+        // `take()` ends the borrow before the first `remove()` — a chained
+        // `borrow_mut().drain(..)` would keep the cell borrowed for the whole
+        // loop, and a synchronous emission re-entering it panics (fatally, from
+        // a glib callback).
+        for row in rows_for_bind.take() {
             expander_for_bind.remove(&row);
         }
         let mut new_rows = Vec::with_capacity(state.available.len());

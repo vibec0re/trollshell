@@ -413,8 +413,9 @@ fn clamp_lines(text: &str, n: usize) -> String {
 /// update that only touches it will leave a stale card mounted.
 ///
 /// Deliberately excluded: `timeout` and `created_at` (never rendered on a
-/// toast; the expiry timer is re-armed service-side by `notify` regardless of
-/// what the overlay does with the widget).
+/// toast; a re-post's timeout is handed to the service-side expiry bookkeeping
+/// by `notify` regardless of what the overlay does with the widget — re-arming
+/// it, or leaving it held if this card is hovered, #619).
 fn card_content_eq(a: &Notification, b: &Notification) -> bool {
     a.id == b.id
         && a.app_name == b.app_name
@@ -478,12 +479,26 @@ fn mount_card(vbox: &gtk::Box, notif: &Notification) -> CardEntry {
 /// Two things the naive remove-then-append doesn't do:
 ///
 /// - **Carries the hover hold** (#593). If `old` holds one, a *second* hold is
-///   taken before `old` is unmapped, so its `connect_unmap` teardown only
-///   drops the service-side count back to one — it never reaches zero, the
-///   countdown never re-arms mid-read, and the fresh card inherits the hold
-///   (seeded into its `holds_hover`, so its eventual `leave`/`unmap` balances
-///   it exactly once). Waiting for a crossing event to re-establish the pause
-///   is precisely what fails under a pointer that doesn't move.
+///   taken before `old` is unmapped, so its `connect_unmap` teardown drops the
+///   service-side count from two back to one rather than to zero, the countdown
+///   never re-arms mid-read, and the fresh card inherits the hold (seeded into
+///   its `holds_hover`, so its eventual `leave`/`unmap` balances it exactly
+///   once). Waiting for a crossing event to re-establish the pause is precisely
+///   what fails under a pointer that doesn't move.
+///
+///   That "two, not zero" rests on the service keeping one timer entry — and its
+///   hover count — for the whole life of a notification, sticky or finite
+///   (#619). It does not hold on its own: before #619 a sticky phase deleted the
+///   entry, so `old.holds_hover` could be true against a count of zero and this
+///   swap's own `resume` re-armed the countdown under a parked pointer.
+///
+///   Still open (**#626**): if the notification is *closed and re-posted* under
+///   the same id while this card is mounted and holding, the entry is torn down
+///   and recreated with a count of zero, and the carried hold then runs
+///   0 → 1 → 0 and arms — the #619 symptom by a different route. Closing that
+///   needs the hold to name the entry generation it was taken against, which is
+///   more than this swap can decide locally. A close with no re-post is fine:
+///   the entry stays gone, both calls no-op, and there is nothing left to expire.
 /// - **Keeps the card's place** in the stack, rather than sending an updated
 ///   toast to the bottom on every re-post.
 ///
@@ -655,8 +670,10 @@ fn build_card(notif: &Notification) -> CardEntry {
 /// contribute independently. The `connect_unmap` teardown balances the count
 /// if the card is removed while still hovered — GTK does not guarantee a
 /// `leave` on unmap, which would otherwise strand the timer paused forever.
-/// A sticky notification (no service-side timer) makes the pause/resume calls
-/// harmless no-ops.
+/// A sticky notification takes and releases the hold like any other: there is no
+/// countdown to pause, but the service still records the count, so a `replaces_id`
+/// re-post that turns the notification finite inherits the hold instead of
+/// arming behind a pointer that never moved (#619).
 ///
 /// Returns the `holds_enter` flag so a card swap can read it and seed the
 /// successor's — see [`replace_card`] (#593). Setting it to `true` on a fresh

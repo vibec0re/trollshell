@@ -97,47 +97,60 @@ struct StatusView {
 /// even if the source has since stopped answering — that is a positive
 /// observation, and dropping it would trade one falsehood for a blank.
 fn status_view(primary: Option<&Link>, source: LinkSource) -> StatusView {
+    let subtitle = link_status_text(primary, source);
+
     let Some(link) = primary else {
-        return match source {
-            // A manager answered and named no routable link. This — and only
-            // this — is Offline.
-            LinkSource::Networkd | LinkSource::NetworkManager => StatusView {
-                subtitle: "Offline".to_string(),
-                pill: "Offline",
-                pill_class: PILL_NEUTRAL,
-            },
-            LinkSource::Unknown => StatusView {
-                subtitle: "No link manager has answered yet".to_string(),
-                pill: UNKNOWN_PILL,
-                pill_class: PILL_NEUTRAL,
-            },
-            // Note this is *not* "offline" either: interfaces configured outside
-            // a manager (bridges, static config, containers) can be routing
-            // perfectly well — the traffic card next door reads the kernel and
-            // will happily show them.
-            LinkSource::Unavailable => StatusView {
-                subtitle: "No link manager (systemd-networkd or NetworkManager)".to_string(),
-                pill: UNKNOWN_PILL,
-                pill_class: PILL_NEUTRAL,
-            },
+        // Note the `Unavailable` case is *not* "offline" either: interfaces
+        // configured outside a manager (bridges, static config, containers)
+        // can be routing perfectly well — the traffic card next door reads
+        // the kernel and will happily show them.
+        let pill = match source {
+            LinkSource::Networkd | LinkSource::NetworkManager => "Offline",
+            LinkSource::Unknown | LinkSource::Unavailable => UNKNOWN_PILL,
+        };
+        return StatusView {
+            subtitle,
+            pill,
+            pill_class: PILL_NEUTRAL,
         };
     };
 
     let routable = link.operational == OperationalState::Routable;
     StatusView {
-        subtitle: match link.operational {
-            OperationalState::Routable => format!("Online via {}", link.name),
-            OperationalState::Carrier | OperationalState::DegradedCarrier => {
-                format!("Limited connectivity via {}", link.name)
-            }
-            other => format!("{} via {}", describe_state(other), link.name),
-        },
+        subtitle,
         pill: if routable { "Online" } else { "Offline" },
         pill_class: if routable {
             PILL_CONNECTED
         } else {
             PILL_NEUTRAL
         },
+    }
+}
+
+/// The status text for a primary link / link source pair — shared with the
+/// bar chip's tooltip (`widgets/network.rs`, re-exported as
+/// `panels::network::link_status_text`) so the two surfaces can never
+/// describe the same state with different words. #620 found the chip using
+/// its own, differently-grouped wording for exactly this reason.
+pub(crate) fn link_status_text(primary: Option<&Link>, source: LinkSource) -> String {
+    let Some(link) = primary else {
+        return match source {
+            // A manager answered and named no routable link. This — and only
+            // this — is Offline.
+            LinkSource::Networkd | LinkSource::NetworkManager => "Offline".to_string(),
+            LinkSource::Unknown => "No link manager has answered yet".to_string(),
+            LinkSource::Unavailable => {
+                "No link manager (systemd-networkd or NetworkManager)".to_string()
+            }
+        };
+    };
+
+    match link.operational {
+        OperationalState::Routable => format!("Online via {}", link.name),
+        OperationalState::Carrier | OperationalState::DegradedCarrier => {
+            format!("Limited connectivity via {}", link.name)
+        }
+        other => format!("{} via {}", describe_state(other), link.name),
     }
 }
 

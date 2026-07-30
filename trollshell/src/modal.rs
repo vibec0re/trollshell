@@ -979,20 +979,53 @@ pub fn close_all() {
             panel.window.close();
         }
     });
-    // DRAWER_OPEN is keyed per-monitor and deliberately survives a rebuild
-    // for connector-named monitors (so a subscriber wired up before the
-    // rebuild — OSD, bar CSS — keeps working after it). But a
-    // connector-less monitor's fallback key is the now-defunct GdkMonitor
-    // pointer: the next rebuild mints a *different* pointer, so that entry
-    // can never be looked up again. Left un-pruned it's a pure leak — one
-    // stale `Mutable` per hot-plug cycle for every connector-less monitor.
-    DRAWER_OPEN.with(|map| map.borrow_mut().retain(|key, _| !is_fallback_key(key)));
+    reset_drawer_open_states();
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the
     // drawer" default holds (#349 PR2).
     crate::plugins::set_active_panel(None);
     // No panels left → no netconn/stats page visible; park the pollers.
     recompute_gates();
+}
+
+/// The [`DRAWER_OPEN`] half of [`close_all`]: every drawer window is gone, so
+/// clear each state to `false`, then drop the entries that can never be reused.
+///
+/// **Clear (#618).** `close_all` closes the windows but used to leave the
+/// `Mutable`s alone, so a monitor whose drawer was open when a hot-plug /
+/// kanshi profile switch fired kept reading `true` with no drawer attached.
+/// That silently poisoned every subscriber for the rest of the session:
+/// `overlays::osd` treats `drawer_open` as "the drawer already shows this
+/// control, the OSD would be redundant" and suppressed volume/mic/brightness
+/// feedback on that output, and `main.rs`'s `bind_class` kept the bar's
+/// squared-off `drawer-open` seam corner. The overlay rebuild didn't rescue it:
+/// a fresh `OsdView` starts at `false`, but subscribing to a `Mutable` delivers
+/// its current value immediately, so the new view was handed the stale `true`
+/// right back. Written with `set_neq` so the monitors that were already closed
+/// — every one of them, in the common case — don't emit a redundant tick.
+///
+/// **Prune.** `DRAWER_OPEN` is keyed per-monitor and deliberately survives a
+/// rebuild for connector-named monitors (so a subscriber wired up before the
+/// rebuild — OSD, bar CSS — keeps working after it). But a connector-less
+/// monitor's fallback key is the now-defunct `GdkMonitor` pointer: the next
+/// rebuild mints a *different* pointer, so that entry can never be looked up
+/// again. Left un-pruned it's a pure leak — one stale `Mutable` per hot-plug
+/// cycle for every connector-less monitor.
+///
+/// Clear runs *before* the prune, not after: a `Mutable` handed out by
+/// [`drawer_open_state`] outlives its map entry (the signal holds its own
+/// reference), so clearing first means every handle this module ever minted
+/// reads the truth — including a fallback-keyed one whose entry is about to be
+/// dropped — without `close_all` having to reason about which other module's
+/// teardown happens to drop the last subscriber first.
+fn reset_drawer_open_states() {
+    DRAWER_OPEN.with(|map| {
+        let mut map = map.borrow_mut();
+        for state in map.values() {
+            state.set_neq(false);
+        }
+        map.retain(|key, _| !is_fallback_key(key));
+    });
 }
 
 /// Swap every currently-open panel's visible page to `target`. Drawer pages
@@ -1474,7 +1507,10 @@ fn apply_stats_scroll(panel: &ModalPanel) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EAGER_PAGES, Page, clamp_main_margin};
+    use super::{
+        DRAWER_OPEN, EAGER_PAGES, Page, clamp_main_margin, drawer_open_state,
+        reset_drawer_open_states,
+    };
     use std::collections::HashSet;
 
     // These are pure-logic guards for the lazy drawer-page registry (#231).
@@ -1640,5 +1676,52 @@ mod tests {
     #[test]
     fn eager_pages_is_empty() {
         assert_eq!(EAGER_PAGES, [] as [Page; 0]);
+    }
+
+    /// #618: after a hot-plug teardown no drawer window exists, so every
+    /// surviving `DRAWER_OPEN` state must read `false`. Leaving a connector's
+    /// entry latched at `true` made `overlays::osd` suppress the volume / mic /
+    /// brightness OSD on that output for the rest of the session (it reads the
+    /// state as "the drawer already shows this control"), and kept the bar's
+    /// `drawer-open` seam class applied with no drawer attached.
+    ///
+    /// Drives [`reset_drawer_open_states`] rather than [`close_all`]: the rest
+    /// of `close_all` closes GTK windows and reaches into the plugin service
+    /// registry (`plugins::set_active_panel` panics if `plugins::service()`
+    /// isn't registered), neither of which exists without a display + a booted
+    /// `App`. This is the whole `DRAWER_OPEN` half of it, unchanged.
+    #[test]
+    fn reset_clears_surviving_drawer_open_states() {
+        let open = drawer_open_state("DP-1");
+        let already_closed = drawer_open_state("HDMI-A-1");
+        // A connector-less monitor: keyed by GdkMonitor pointer, so its entry
+        // gets pruned — but a subscriber still holds this handle.
+        let headless = drawer_open_state("monitor:0x1234");
+        open.set(true);
+        headless.set(true);
+
+        reset_drawer_open_states();
+
+        assert!(!open.get(), "connector state stayed latched at true");
+        assert!(!already_closed.get());
+        assert!(
+            !headless.get(),
+            "a pruned entry's live handle stayed latched at true"
+        );
+
+        DRAWER_OPEN.with(|map| {
+            let map = map.borrow();
+            // Connector keys survive the rebuild (subscribers wired up before
+            // it must keep working); the unreusable fallback key is pruned.
+            assert!(map.contains_key("DP-1"));
+            assert!(map.contains_key("HDMI-A-1"));
+            assert!(!map.contains_key("monitor:0x1234"));
+        });
+
+        // The crux of the OSD chain: a fresh subscriber re-minting this key
+        // after the rebuild is handed `false`, not the stale `true`. (A
+        // `Mutable`'s signal re-delivers its current value on subscribe, which
+        // is why rebuilding the overlay alone never fixed this.)
+        assert!(!drawer_open_state("DP-1").get());
     }
 }

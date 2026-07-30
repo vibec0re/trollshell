@@ -15,9 +15,13 @@
 //! **user** unit with a switch that starts/enables or stops/disables it. The
 //! **AI Keys** tab (#392) stores the LLM-backed plugins' API keys in the login
 //! keyring (gnome-keyring/libsecret) — never on disk — and rotates them. All
-//! round-trip over `Control`. The remaining **Display** tab (#393) is still a
-//! "coming soon" `StatusPage` stub. When the shell isn't running the app
-//! degrades gracefully rather than panicking.
+//! round-trip over `Control`. There is deliberately **no Display tab**: #393
+//! re-scoped display management away from a bespoke control-center page and
+//! onto `org.gnome.Mutter.DisplayConfig`, a shim over niri-ipc
+//! (`crates/hytte-services/src/display_config.rs`) that lets
+//! **gnome-control-center's own Display panel** drive niri outputs directly —
+//! compatmaxx: reuse the existing GNOME client, provide the backend. When the
+//! shell isn't running the app degrades gracefully rather than panicking.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -72,13 +76,6 @@ fn build_window(app: &adw::Application) {
         "AI Keys",
         "dialog-password-symbolic",
     );
-    add_placeholder(
-        &stack,
-        "display",
-        "Display",
-        "video-display-symbolic",
-        "Arrange monitors, resolution, and scaling. Coming soon (#393).",
-    );
 
     let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
@@ -119,16 +116,6 @@ fn build_window(app: &adw::Application) {
 
     check_shell_connection(&banner);
     window.present();
-}
-
-/// Add a "coming soon" placeholder tab to `stack`.
-fn add_placeholder(stack: &adw::ViewStack, name: &str, title: &str, icon: &str, description: &str) {
-    let page = adw::StatusPage::builder()
-        .icon_name(icon)
-        .title(title)
-        .description(description)
-        .build();
-    stack.add_titled_with_icon(&page, Some(name), title, icon);
 }
 
 // ── Place tab (#391) ────────────────────────────────────────────────────────

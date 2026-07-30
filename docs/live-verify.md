@@ -14,12 +14,13 @@ PR number in parens if you need full context on _why_.
 Checked items are ones Annika has already implicitly verified — noted inline.
 Everything else is unchecked and still wants a pass in a real Niri session.
 
-**Coverage: #458 through #596**, plus one item flagged pending merge (#598 —
-still open at the time of writing). Originally created by #507 for the 2026-07
-merge wave (#458–#496); refreshed by #602 to fold in everything merged since
-(#497–#596). Renamed off the month-stamped filename in the same pass — this is a
-living checklist that gets refreshed periodically, not a dated snapshot of one
-merge wave.
+**Coverage: #458 through #609** (#606 carries no live-verify list of its own —
+noted in the closing section instead). Originally created by #507 for the
+2026-07 merge wave (#458–#496); refreshed by #602 to fold in everything merged
+since (#497–#596), renaming off the month-stamped filename in that pass;
+refreshed again (parent effort #602) for the #598/#604/#606/#609 burst that
+merged right behind it — this is a living checklist that gets refreshed
+periodically, not a dated snapshot of one merge wave.
 
 ## Idle & lock
 
@@ -252,6 +253,17 @@ merge wave.
       (etc/kanshi/)."_ Let a different Apply's countdown **expire** (or
       **Revert**) instead — no persistence toast fires. Confirm no file under
       `etc/kanshi/` (or niri `config.kdl`) was ever written by the shell.
+- [ ] **(#604)** Drawer centering was solving against the monitor's full
+      extent instead of the bar surface's own live extent, so with the
+      sidebar **expanded** (reserving its exclusive zone) the drawer opened
+      offset from the chip that triggered it. With the sidebar **collapsed**,
+      open a drawer from a bar chip — it still centers under its chip (regression
+      check). **Expand** the sidebar, open a drawer from a bar chip — it now
+      centers correctly (this is the fix). Switch a kanshi mode/resolution
+      (#442) while a drawer is open or between opens — still centers
+      afterward. Worth an eyeball on more than just the Top bar edge if
+      convenient — the math is shared across all four edges but only Top gets
+      everyday exercise.
 
 ## Audio & media
 
@@ -420,6 +432,16 @@ merge wave.
       real WPA3 AP rather than something #579/#586 specifically fixed —
       worth confirming on real hardware, but don't expect it to be explained
       by either PR's diff.
+- [ ] **(#609)** A wireless backend probe that fails outright (e.g. the system
+      bus briefly unreachable at shell start) no longer reads as "no wireless
+      hardware". Force a transient `ListNames`/`ListActivatableNames` failure
+      at startup (or catch it landing naturally on a slow boot) and confirm
+      the logs show a `wifi_backend: probe inconclusive` warning — explicit
+      that this is not the same as "no Wi-Fi daemon present" — followed by an
+      `error!` pointing at `systemctl --user restart trollshell`, instead of
+      the old silent "no Wi-Fi backend detected". The network-panel link list
+      should still attempt NetworkManager rather than going permanently
+      inert.
 
 ## Night light
 
@@ -438,6 +460,28 @@ merge wave.
       must not move again, the screen must never warm, and
       `systemctl --user is-active wlsunset.service` must stay `inactive` past
       the 10 s coordinate-wait deadline.
+- [ ] **(#598)** Night light gains a third `Resolving` state (spinner +
+      "Waiting for a location fix…" subtitle) so the up-to-10s coordinate wait
+      from #585/#595 is visible instead of silent.
+  1. No configured coordinates + a just-restarted (cold) GeoClue → flip Night
+     light on: switch stays **on**, a spinner appears, subtitle reads
+     "Waiting for a location fix…"; both clear when the fix lands and the
+     screen warms.
+  2. Flip **off** during the wait → spinner/subtitle clear immediately (not
+     after a systemctl round-trip), and #595's guarantee still holds (the
+     unit never starts).
+  3. With coordinates configured, or a warm GeoClue → straight to on, no
+     spinner blip.
+  4. No coordinates at all → after the 10 s deadline, the spinner clears and
+     the switch snaps back off with the "no coordinates" warning.
+  5. Multi-monitor: toggling on from one output's Appearance drawer should put
+     **both** drawers into the pending state together.
+  - _(sourced from #602's tracked list, not spelled out as a manual step in
+    the PR body)_ Annika specifically wants: flick the switch **off then back
+    on while the spinner is still up** — it should stay on and keep spinning
+    rather than snapping off. This matches the PR's own
+    `a_second_toggle_on_takes_over_the_pending_notice` unit test, but isn't
+    listed as a live-verify step in the PR body.
 
 ## Widgets (tray / screenshot / screencast)
 
@@ -473,33 +517,6 @@ merge wave.
       reopening the tab. A plugin that trips the effect rate cap shows a
       "· N dropped" violation count.
 
-## Pending merge (not yet on `main`)
-
-- [ ] _(#598 — still OPEN as of this refresh)_ Night light gains a third
-      `Resolving` state (spinner + "Waiting for a location fix…" subtitle) so
-      the up-to-10s coordinate wait from #585/#595 is visible instead of
-      silent. Per the PR body, once merged:
-  1. No configured coordinates + a just-restarted (cold) GeoClue → flip Night
-     light on: switch stays **on**, a spinner appears, subtitle reads
-     "Waiting for a location fix…"; both clear when the fix lands and the
-     screen warms.
-  2. Flip **off** during the wait → spinner/subtitle clear immediately (not
-     after a systemctl round-trip), and #595's guarantee still holds (the
-     unit never starts).
-  3. With coordinates configured, or a warm GeoClue → straight to on, no
-     spinner blip.
-  4. No coordinates at all → after the 10 s deadline, the spinner clears and
-     the switch snaps back off with the "no coordinates" warning.
-  5. Multi-monitor: toggling on from one output's Appearance drawer should put
-     **both** drawers into the pending state together.
-  - _(sourced from #602's tracked list, not spelled out as a manual step in
-    the PR body)_ Annika specifically wants: flick the switch **off then back
-    on while the spinner is still up** — it should stay on and keep spinning
-    rather than snapping off. This matches the PR's own
-    `a_second_toggle_on_takes_over_the_pending_notice` unit test, but isn't
-    listed as a live-verify step in the PR body — call it out explicitly once
-    #598 lands.
-
 ## Not carrying a live-verify list, noted for context
 
 - **(#488)** Dependency-hygiene / MSRV PR — bumped the workspace MSRV
@@ -507,3 +524,8 @@ merge wave.
   `rust-version.workspace = true` was wired up). No live-verify list; flagged
   here only because it's a project-wide toolchain-floor change worth being
   aware of, not something to click through in a Niri session.
+- **(#606)** Adds the `LICENSE` file (verbatim MPL-2.0 text) that
+  `Cargo.toml`'s `[workspace.package] license = "MPL-2.0"` had been declaring
+  with nothing to back it. No code, no config, no CI surface — genuinely
+  nothing to verify in a Niri session; noted explicitly so a future reader
+  doesn't mistake the silence for an oversight.

@@ -5,6 +5,11 @@
 **Author:** Claude (with annika)
 **Predecessors:** `2026-04-29-network-panel-and-vpn-design.md`.
 
+> **Note (2026-07-30):** the predecessor's "VPN connect/disconnect actions"
+> non-goal has since been retracted there — it shipped in #169. Unrelated to
+> this pass: the `vpn` service itself didn't change here (see "Out of scope"
+> below).
+
 ## Goal
 
 Two follow-up adjustments to the network drawer page that landed earlier today:

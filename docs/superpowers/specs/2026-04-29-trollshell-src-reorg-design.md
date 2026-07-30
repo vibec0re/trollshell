@@ -18,7 +18,7 @@ Refactor only — no behavior change, no service layer touches.
 
 ### In scope
 
-- New top-level dir `trollshell/src/panels/` containing one file per drawer page (15 files), with a `mod.rs` re-exporting the `panel_*` builders.
+- New top-level dir `trollshell/src/panels/` containing one file per drawer page (15 files), with a `mod.rs` re-exporting the `panel_*` builders. _(Amended 2026-07-30: two pages have since grown into subdirectories — `panels/network.rs` → `panels/network/{mod,connection,traffic,wifi,wired}.rs`, `panels/audio.rs` → `panels/audio/{mod,endpoint,playback,sinks,sources}.rs`. Healthy organic growth, not a redesign; the one-file-per-page count no longer holds exactly.)_
 - New top-level dir `trollshell/src/components/` containing the cross-cutting helpers extracted from `pages.rs` (layout primitives, `build_history_row`, `deep_link_row`, `build_connection_row` + `CONN_BUCKET_CAP`, formatters).
 - New top-level dir `trollshell/src/overlays/` containing the per-monitor layer-shell overlays moved out of `widgets/`: `lock_screen`, `osd`, `polkit_dialog`, `prompt`, `notifications`. Each becomes `overlays/<name>.rs`.
 - `trollshell/src/widgets/pages.rs` deleted; its contents distributed across `panels/` and `components/`.
@@ -82,6 +82,20 @@ trollshell/src/
     ├── prompt.rs                  (wifi password prompt, was widgets/prompt.rs)
     └── notifications.rs           (toast notifications, was widgets/notifications.rs)
 ```
+
+> **Amended (2026-07-30):** `lock_screen.rs` and `polkit_dialog.rs`, as planned
+> in the layout above and the migration steps below, never landed in
+> `overlays/` — both subsystems were deleted rather than moved. In-shell
+> locking was dropped for `swaylock` (see
+> `crates/hytte-services/src/screensaver.rs:11-18` and the lock-screen spec's
+> own `Historical note (#204)`); polkit moved to a standalone external
+> `polkit-gnome-authentication-agent-1` agent, no in-process dialog. Current
+> `trollshell/src/overlays/` holds `consent`, `frame`, `notifications`, `osd`,
+> `prompt`, `sidebar` (`overlays/mod.rs:6-11`) — a different roster than the
+> layout above planned, populated by unrelated later work (consent prompts, the
+> fullscreen frame indicator, the plugin sidebar). The `panels/` /
+> `components/` / `widgets/` split described in this spec is otherwise still
+> current.
 
 Note the panel-vs-overlay-name disambiguation: `panels/notifications.rs` (drawer history list) and `overlays/notifications.rs` (transient toasts) are distinct concerns — the drawer panel reads notification history, the overlay renders incoming toasts. Same domain, different surfaces, different files.
 

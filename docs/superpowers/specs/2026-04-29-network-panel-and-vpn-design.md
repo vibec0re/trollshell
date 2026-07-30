@@ -40,6 +40,13 @@ UI/service separation is a hard constraint: every fact the UI displays is read f
 
 - **eBPF per-PID byte counts.** Tracked in `docs/FUTURE.md`. Requires `aya`, kernel ≥ 5.13, CAP_BPF on the trollshell binary. Distinct enough to warrant its own spec when the work happens.
 - **VPN connect/disconnect actions.** Read-only panel. Toggling tunnels is vendor- and config-specific (`wg-quick up X`, `nmcli con up X`, `tailscale up`); each takes its own UX work.
+
+  > **Retracted (2026-07-30).** Shipped in #169 (2026-06-23):
+  > `crates/hytte-services/src/wifi/mod.rs`'s `vpn_activate`/`vpn_deactivate`
+  > drive the `Activate`/`Deactivate` buttons in `trollshell/src/panels/vpn.rs`.
+  > The bullet above is kept for history; the code now does exactly what it
+  > says is out of scope. `docs/FUTURE.md`'s matching entry has been removed.
+
 - **Connections filtering / search.** Top-N sorted by program is sufficient for v1. Search box is later if the list proves unwieldy.
 - **Port-name resolution.** Show numeric ports. Resolving via `/etc/services` is cheap but adds noise; defer.
 - **Wi-Fi roaming history, signal-strength graph, hidden-network entry.** User explicitly out-of-scoped Wi-Fi UX work for this pass.

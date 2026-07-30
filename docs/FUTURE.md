@@ -10,11 +10,6 @@ to `docs/superpowers/specs/` and remove the entry.
   Requires CAP_BPF on the trollshell binary; kernel ≥ 5.13. Distinct
   enough to warrant its own spec when scheduled.
 
-## VPN
-
-- **VPN connect/disconnect actions.** Read-only panel only for now;
-  toggling tunnels is vendor- and config-specific.
-
 ## Network drawer
 
 - **Connections search/filter UI.** Defer until top-N sorted-by-program

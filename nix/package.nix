@@ -18,6 +18,11 @@
   gobject-introspection,
   openssl,
   pipewire,
+  # Source revision string (#601), computed once in flake.nix from
+  # `self.shortRev` / `self.dirtyShortRev`. Injected into the *wrapper* below,
+  # never into the compile — see the `preFixup` note. Defaults so an
+  # out-of-flake `callPackage ./nix/package.nix` still evaluates.
+  revision ? "unknown",
 }:
 let
   # crane's default cleanCargoSource keeps only .rs/.toml/.lock; on top of that
@@ -297,10 +302,18 @@ stdenv.mkDerivation {
   # wrapGAppsHook4's fixup wraps $out/bin/trollshell with the GApplication
   # schema/icon/typelib env; append the asset paths to the same wrapper rather
   # than layering a second makeWrapper on top of it.
+  #
+  # TROLLSHELL_REV (#601) rides the SAME wrapper for the same reason the asset
+  # paths do — it must not reach the compile. A compile-time env would rewrite
+  # `workspace`'s derivation hash on every single commit, forcing a full
+  # ~40-minute workspace rebuild per revision and invalidating the artifact
+  # every other package output slices from. Here it costs one `cp` + one
+  # makeWrapper re-run. trollshell/src/revision.rs reads it at runtime.
   preFixup = ''
     gappsWrapperArgs+=(
       --set TROLLSHELL_DATA_DIR "${assets}/share/trollshell"
       --set HYTTE_UI_DATA_DIR "${assets}/share/hytte-ui"
+      --set TROLLSHELL_REV "${revision}"
     )
   '';
 

@@ -77,11 +77,16 @@ pub fn install(monitor: &Monitor) {
 /// focused-output tracker is the host's), so the re-install re-keys cleanly,
 /// mirroring `overlays::osd::close_all`.
 pub fn close_all() {
-    CONSENT_WINDOW.with(|w| {
-        if let Some(window) = w.borrow_mut().take() {
-            window.close();
-        }
-    });
+    // Bind the taken window before acting on it: the `if let` scrutinee's
+    // `RefMut` temporary stays alive for the whole then-block (Rust 2024
+    // only changed when it drops relative to an `else` branch, not this),
+    // so a GTK call made directly inside the `if let` would hold the borrow
+    // across it (#631) — a latent reentrancy hazard if `close()` ever
+    // emits synchronously.
+    let taken = CONSENT_WINDOW.with(|w| w.borrow_mut().take());
+    if let Some(window) = taken {
+        window.close();
+    }
     MONITORS.with(|m| m.borrow_mut().clear());
 }
 
@@ -103,12 +108,14 @@ pub fn request(
     detail: &str,
     outbound: mpsc::Sender<HostMsg>,
 ) {
-    // Supersede any prompt already up (rare — one knock is typically in flight).
-    CONSENT_WINDOW.with(|w| {
-        if let Some(window) = w.borrow_mut().take() {
-            window.close();
-        }
-    });
+    // Supersede any prompt already up (rare — one knock is typically in
+    // flight). Bind-then-act, same as `close_all` above (#631): a GTK call
+    // inside the `if let` would otherwise hold the scrutinee's `RefMut`
+    // across it.
+    let superseded = CONSENT_WINDOW.with(|w| w.borrow_mut().take());
+    if let Some(window) = superseded {
+        window.close();
+    }
 
     let Some(monitor) = focused_monitor() else {
         // No output to prompt on: deny straight away rather than strand the agent.

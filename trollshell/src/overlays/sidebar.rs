@@ -598,7 +598,12 @@ fn wire_escape(window: &gtk::Window, monitor: Monitor) {
 /// `destroy()` does, and it can't be vetoed by a `close-request` handler.
 pub fn close_all() {
     PANELS.with(|panels| {
-        for (key, panel) in panels.borrow_mut().drain() {
+        // `take()` moves the whole map out (leaving `Default`) and releases
+        // the borrow inside the call, rather than holding a `drain()` RefMut
+        // across every `destroy()` below (#631) — a borrow held across a GTK
+        // call is a latent reentrancy hazard if any emission it triggers is
+        // ever synchronous.
+        for (key, panel) in panels.take() {
             // Abort the subscription and drop the refresh timer first so neither
             // can dispatch into the (about to be closed) window. Then reset the
             // bool so any other subscribers see the closed state, and finally

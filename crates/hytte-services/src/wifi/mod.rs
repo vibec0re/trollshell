@@ -44,7 +44,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-use crate::wifi_backend::{BackendChoice, ProbeError};
+use crate::retry;
+// `ProbeError` is no longer named outside the tests: since #646 the policy is
+// generic over the `Result`, so only `probe_backend`'s own signature mentions it.
+use crate::wifi_backend::BackendChoice;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
@@ -186,38 +189,11 @@ const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 // Picking up a daemon that appears *after* a conclusive verdict, or switching
 // backends at runtime, is out of scope here: it needs a cancellation primitive
 // that does not exist yet (#633).
-
-/// What to do after one probe attempt.
-///
-/// The whole retry decision lives in [`RetryPolicy::step`] — a pure function —
-/// so it is unit-testable without a bus.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProbeStep {
-    /// The probe answered. Commit to this backend and start it.
-    Commit(BackendChoice),
-    /// The probe was inconclusive and attempts remain: wait, then ask again.
-    Retry {
-        /// How long to wait before the next attempt.
-        after: Duration,
-    },
-    /// Still inconclusive and the attempt budget is spent: log loudly and stay
-    /// inert.
-    ///
-    /// **Not reachable under the shipped [`PROBE_RETRY`]**, which is unbounded.
-    /// Kept expressible (and tested) so a bounded policy stays one field away.
-    GiveUp,
-}
-
-/// Retry schedule for an *inconclusive* backend probe.
-#[derive(Clone, Copy, Debug)]
-struct RetryPolicy {
-    /// Attempt budget, counting the first probe. `None` means "retry forever".
-    max_attempts: Option<u32>,
-    /// Delay before the first retry; doubles with each further attempt.
-    initial: Duration,
-    /// Ceiling the doubling delay is clamped to.
-    max_backoff: Duration,
-}
+//
+// The retry *mechanism* — schedule, budget, the pure decision — lives in
+// `crate::retry`, shared with `networkd`'s startup seed since #646. What stays
+// here is the *judgement*: which probe outcomes are worth asking again about,
+// and why the shipped budget is unbounded.
 
 /// The policy this service runs: **unbounded** retry with capped backoff.
 ///
@@ -227,7 +203,8 @@ struct RetryPolicy {
 /// healthy bus a probe is sub-millisecond, but the failure mode being retried
 /// is exactly the one where it is slow — [`crate::wifi_backend::probe_backend`]
 /// makes two sequential `hytte_bus::call`s, each with a 25s timeout and
-/// `RetryPolicy::Once`, so a down socket costs roughly 10s per attempt (fast
+/// [`hytte_bus::RetryPolicy::Once`] (a different, per-call policy — not this
+/// one), so a down socket costs roughly 10s per attempt (fast
 /// fail plus a 5s reconnect wait, twice) and a wedged peer up to ~50s (two full
 /// timeouts, which `is_transient_zbus_error` does not classify as transient, so
 /// there is no retry).
@@ -250,42 +227,18 @@ struct RetryPolicy {
 /// silently polled.
 ///
 /// **The policy is one field to change.** A bounded policy is
-/// `max_attempts: Some(n)` and nothing else; the same question is open for
-/// `networkd`'s startup refresh on #621, and the two subsystems should end up
-/// consistent.
-const PROBE_RETRY: RetryPolicy = RetryPolicy {
+/// `max_attempts: Some(n)` and nothing else; `networkd`'s startup refresh
+/// answered the same question the same way on #621, and since #646 the two
+/// subsystems share [`retry::Policy`] rather than a hand-kept cross-reference.
+///
+/// The schedule's invariants — a nonzero first delay, a ceiling that is
+/// actually reached — are asserted over *every* shipped policy in
+/// `retry`'s tests (#665), not here.
+pub(crate) const PROBE_RETRY: retry::Policy = retry::Policy {
     max_attempts: None,
     initial: Duration::from_millis(500),
     max_backoff: Duration::from_secs(8),
 };
-
-impl RetryPolicy {
-    /// Delay before the retry that follows `attempt` (1-based): [`Self::initial`]
-    /// doubled once per elapsed attempt, clamped to [`Self::max_backoff`].
-    fn backoff(self, attempt: u32) -> Duration {
-        let factor = 1_u32
-            .checked_shl(attempt.saturating_sub(1))
-            .unwrap_or(u32::MAX);
-        self.initial.saturating_mul(factor).min(self.max_backoff)
-    }
-
-    /// The pure retry/commit decision. `attempt` is 1-based and counts the
-    /// probe that produced `outcome`.
-    ///
-    /// `Ok(_)` always commits — **including `Ok(BackendChoice::None)`**, which
-    /// is a real answer ("the bus replied and neither daemon is present").
-    /// Retrying *that* would be the bug; only "I could not ask"
-    /// ([`ProbeError`]) is retried.
-    fn step(self, outcome: &Result<BackendChoice, ProbeError>, attempt: u32) -> ProbeStep {
-        match outcome {
-            Ok(choice) => ProbeStep::Commit(*choice),
-            Err(_) if self.max_attempts.is_some_and(|max| attempt >= max) => ProbeStep::GiveUp,
-            Err(_) => ProbeStep::Retry {
-                after: self.backoff(attempt),
-            },
-        }
-    }
-}
 
 /// Probe for the Wi-Fi backend, retrying only while the probe is
 /// *inconclusive*, and return the verdict to commit to.
@@ -299,19 +252,35 @@ impl RetryPolicy {
 /// a `RECOVERED` line naming the attempt count: #609's diagnostic exists to
 /// *measure* how often this fires, and a retry that healed quietly would trade
 /// a visible permanent bug for an invisible intermittent one.
-async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
+async fn probe_until_conclusive(policy: retry::Policy) -> Option<BackendChoice> {
     let mut attempt: u32 = 1;
     loop {
         let outcome = crate::wifi_backend::probe_backend().await;
         // Rendered up front so the log arms below can name the failure. Empty
-        // on `Ok`, which only ever reaches the `Commit` arm.
+        // on `Ok`, which only ever reaches the `Proceed` arm.
         let reason = outcome
             .as_ref()
             .err()
             .map_or_else(String::new, ToString::to_string);
 
-        match policy.step(&outcome, attempt) {
-            ProbeStep::Commit(choice) => {
+        // The verdict is weighed *here*, not inside the policy (#646). All
+        // [`retry::Policy::step`] sees is the `Ok`/`Err` split — and for this
+        // probe that split already is the distinction that matters: any answer
+        // is conclusive and commits, **including `Ok(BackendChoice::None)`**
+        // ("the bus replied and neither daemon is present"), while `ProbeError`
+        // ("I could not ask") is the only retryable outcome. Retrying a real
+        // `None` would be a bug of its own — an endless poll on a host that
+        // simply has no Wi-Fi daemon — and committing an `Err` as `None` was
+        // #613 itself.
+        let step = policy.step(&outcome, attempt);
+        match step {
+            retry::Step::Proceed => {
+                // `Proceed` is returned for `Ok` and nothing else, so the
+                // verdict is right here in the probe's own `Result`. Reading it
+                // off `outcome` rather than out of the step is what keeps the
+                // policy generic — and means no code path can conjure a
+                // `BackendChoice` out of an error.
+                let choice = outcome.expect("retry::Step::Proceed is returned only for Ok");
                 // The recovery wording is gated on the *verdict*, not just on
                 // having retried: a host that genuinely runs no Wi-Fi daemon
                 // recovers into `None`, and telling that user "Wi-Fi is coming
@@ -338,7 +307,7 @@ async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
                 }
                 return Some(choice);
             }
-            ProbeStep::Retry { after } => {
+            retry::Step::Retry { after } => {
                 // Logged on *every* attempt, not every Nth: the backoff caps at
                 // 8s, so a permanently dead bus stays loud here rather than
                 // degrading into a silent poll. See `PROBE_RETRY`.
@@ -355,7 +324,7 @@ async fn probe_until_conclusive(policy: RetryPolicy) -> Option<BackendChoice> {
                 tokio::time::sleep(after).await;
                 attempt += 1;
             }
-            ProbeStep::GiveUp => {
+            retry::Step::GiveUp => {
                 tracing::error!(
                     attempts = attempt,
                     error = %reason,
@@ -1073,14 +1042,21 @@ async fn do_known_network_call(path: &str, method: &str) -> Result<(), hytte_bus
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendChoice, Duration, ProbeError, ProbeStep, RetryPolicy};
+    use super::{BackendChoice, Duration, retry};
+    use crate::wifi_backend::ProbeError;
+
+    // Since #646 the retry *mechanism* — the doubling schedule, the attempt
+    // budget, the give-up boundary — is tested once, in `crate::retry`, over the
+    // shared type; so are the shipped constants' delay invariants (#665), over
+    // *every* shipped policy rather than this one. What is asserted here is the
+    // part that is specific to this probe: which outcomes count as an answer.
 
     /// Test policy: a small, explicit budget so the give-up boundary is easy to
     /// name. Deliberately not [`super::PROBE_RETRY`] — these tests assert the
     /// *decision*, not the shipped numbers, so tuning the policy does not
     /// redden them.
-    fn bounded() -> RetryPolicy {
-        RetryPolicy {
+    fn bounded() -> retry::Policy {
+        retry::Policy {
             max_attempts: Some(3),
             initial: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
@@ -1100,12 +1076,12 @@ mod tests {
     #[test]
     fn ok_commits_on_the_first_attempt() {
         assert_eq!(
-            bounded().step(&Ok(BackendChoice::NetworkManager), 1),
-            ProbeStep::Commit(BackendChoice::NetworkManager)
+            bounded().step(&Ok::<_, ProbeError>(BackendChoice::NetworkManager), 1),
+            retry::Step::Proceed
         );
         assert_eq!(
-            bounded().step(&Ok(BackendChoice::Iwd), 1),
-            ProbeStep::Commit(BackendChoice::Iwd)
+            bounded().step(&Ok::<_, ProbeError>(BackendChoice::Iwd), 1),
+            retry::Step::Proceed
         );
     }
 
@@ -1116,42 +1092,20 @@ mod tests {
     #[test]
     fn ok_none_commits_and_does_not_retry() {
         assert_eq!(
-            bounded().step(&Ok(BackendChoice::None), 1),
-            ProbeStep::Commit(BackendChoice::None)
+            bounded().step(&Ok::<_, ProbeError>(BackendChoice::None), 1),
+            retry::Step::Proceed
         );
-    }
-
-    // ── An inconclusive probe retries, then gives up at the bound ─────────────
-
-    #[test]
-    fn err_retries_while_attempts_remain() {
-        let policy = bounded();
-        assert_eq!(
-            policy.step(&inconclusive(), 1),
-            ProbeStep::Retry {
-                after: Duration::from_millis(10)
-            }
-        );
-        assert_eq!(
-            policy.step(&inconclusive(), 2),
-            ProbeStep::Retry {
-                after: Duration::from_millis(20)
-            }
-        );
-    }
-
-    #[test]
-    fn err_past_the_bound_gives_up() {
-        let policy = bounded();
-        // The budget is 3 attempts: the third inconclusive answer is the last.
-        assert_eq!(policy.step(&inconclusive(), 3), ProbeStep::GiveUp);
-        assert_eq!(policy.step(&inconclusive(), 4), ProbeStep::GiveUp);
-        assert_eq!(policy.step(&inconclusive(), 99), ProbeStep::GiveUp);
     }
 
     /// The #613 regression itself: an inconclusive probe must never commit to
     /// "no backend". That collapse is what latched Wi-Fi off for a whole
     /// session and made a shell restart the only cure (#607).
+    ///
+    /// Since #646 the type system carries half of this: `retry::Step::Proceed`
+    /// has no payload, so `probe_until_conclusive` can only ever return a
+    /// `BackendChoice` it read out of an `Ok` — there is no longer a code path
+    /// that could manufacture `None` from a `ProbeError`. What is left to assert
+    /// is that an inconclusive probe does not reach that arm at all.
     #[test]
     fn inconclusive_probe_never_commits_to_no_backend() {
         let policy = bounded();
@@ -1159,11 +1113,11 @@ mod tests {
             let step = policy.step(&inconclusive(), attempt);
             assert_ne!(
                 step,
-                ProbeStep::Commit(BackendChoice::None),
-                "attempt {attempt}: an inconclusive probe was committed as 'no backend'"
+                retry::Step::Proceed,
+                "attempt {attempt}: an inconclusive probe was treated as an answer"
             );
             assert!(
-                matches!(step, ProbeStep::Retry { .. } | ProbeStep::GiveUp),
+                matches!(step, retry::Step::Retry { .. } | retry::Step::GiveUp),
                 "attempt {attempt}: expected retry-or-give-up, got {step:?}"
             );
         }
@@ -1171,55 +1125,30 @@ mod tests {
 
     // ── Policy shape ─────────────────────────────────────────────────────────
 
+    /// The policy this service actually ships must be the unbounded one: a
+    /// bounded give-up would re-create #607 (Wi-Fi gone, restart the only cure)
+    /// whenever the bus takes longer than the bound. A bounded policy stays
+    /// expressible, and `crate::retry`'s tests keep its give-up path covered.
+    ///
+    /// The delays are asserted in `crate::retry` over every shipped policy —
+    /// deliberately not here, and deliberately never against
+    /// `PROBE_RETRY.backoff(attempt)`, which is the expression `step` computes
+    /// internally and therefore pins nothing (#665).
     #[test]
-    fn backoff_doubles_and_clamps_to_the_ceiling() {
-        let policy = bounded();
-        assert_eq!(policy.backoff(1), Duration::from_millis(10));
-        assert_eq!(policy.backoff(2), Duration::from_millis(20));
-        assert_eq!(policy.backoff(3), Duration::from_millis(40));
-        // Clamped, and no overflow panic at absurd attempt counts.
-        assert_eq!(policy.backoff(4), Duration::from_millis(40));
-        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
-    }
-
-    /// The shipped shape: `max_attempts: None` never gives up, at any attempt
-    /// count. This is the property the fix rests on — a bounded give-up would
-    /// re-create #607 (Wi-Fi gone, restart the only cure) whenever the bus
-    /// takes longer than the bound.
-    #[test]
-    fn unbounded_policy_never_gives_up() {
-        let forever = RetryPolicy {
-            max_attempts: None,
-            ..bounded()
-        };
-        for attempt in [1_u32, 3, 100, u32::MAX] {
-            assert_eq!(
-                forever.step(&inconclusive(), attempt),
-                ProbeStep::Retry {
-                    after: forever.backoff(attempt)
-                }
-            );
-        }
-    }
-
-    /// The policy this service actually ships must be the unbounded one, and
-    /// its first retry prompt enough to catch a bus that is only milliseconds
-    /// behind the shell. A bounded policy stays expressible (and tested above),
-    /// but shipping one would put the #613 latch back on a longer fuse.
-    #[test]
-    fn shipped_policy_is_unbounded_and_starts_promptly() {
+    fn the_shipped_policy_never_goes_inert() {
         assert_eq!(
             super::PROBE_RETRY.max_attempts,
             None,
-            "the shipped probe policy must never give up; see PROBE_RETRY's docs and #621"
+            "the shipped probe policy must never give up; see PROBE_RETRY's docs and #613"
         );
-        assert_eq!(
-            super::PROBE_RETRY.step(&inconclusive(), u32::MAX),
-            ProbeStep::Retry {
-                after: super::PROBE_RETRY.max_backoff
-            }
-        );
-        assert!(super::PROBE_RETRY.backoff(1) <= Duration::from_secs(1));
-        assert!(super::PROBE_RETRY.max_backoff >= super::PROBE_RETRY.initial);
+        for attempt in [1_u32, 3, 100, u32::MAX] {
+            assert!(
+                matches!(
+                    super::PROBE_RETRY.step(&inconclusive(), attempt),
+                    retry::Step::Retry { .. }
+                ),
+                "attempt {attempt}: an inconclusive probe ended the task instead of retrying"
+            );
+        }
     }
 }

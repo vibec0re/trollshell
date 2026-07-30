@@ -33,6 +33,7 @@ pub mod places;
 pub mod power_profiles;
 pub mod recorder;
 pub mod resolved;
+mod retry;
 pub mod screensaver;
 pub mod sensors;
 pub mod systemd;

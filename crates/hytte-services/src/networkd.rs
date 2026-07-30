@@ -44,6 +44,7 @@ use hytte_reactive::{Service, registry, spawn_supervised};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+use crate::retry;
 use crate::wifi_backend::BackendChoice;
 
 const NETWORKD_NAME: &str = "org.freedesktop.network1";
@@ -307,41 +308,17 @@ async fn probe_link_backend() -> LinkBackend {
     }
 }
 
-/// What to do after one startup [`refresh`] attempt in the
-/// [`LinkBackend::Networkd`] arm.
-///
-/// The whole retry decision lives in [`RefreshRetry::step`] — a pure function —
-/// so it is unit-testable without a bus. Deliberately the same shape as
-/// `wifi`'s `ProbeStep`/`RetryPolicy` (#634): the two paths retry the same class
-/// of transient system-bus failure, and someone debugging one while reading the
-/// journal of the other must not find two different behaviours.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RefreshStep {
-    /// The refresh landed. Stop retrying and enter the `listen` loop.
-    Proceed,
-    /// It failed and attempts remain: wait, then refresh again.
-    Retry {
-        /// How long to wait before the next attempt.
-        after: Duration,
-    },
-    /// Still failing and the attempt budget is spent: log loudly and stay inert.
-    ///
-    /// **Not reachable under the shipped [`STARTUP_REFRESH_RETRY`]**, which is
-    /// unbounded. Kept expressible (and tested) so a bounded policy stays one
-    /// field away.
-    GiveUp,
-}
-
-/// Retry schedule for a failed startup [`refresh`].
-#[derive(Clone, Copy, Debug)]
-struct RefreshRetry {
-    /// Attempt budget, counting the first refresh. `None` means "retry forever".
-    max_attempts: Option<u32>,
-    /// Delay before the first retry; doubles with each further attempt.
-    initial: Duration,
-    /// Ceiling the doubling delay is clamped to.
-    max_backoff: Duration,
-}
+// ── Startup refresh retry (issue #621) ───────────────────────────────────────
+//
+// The retry *mechanism* — schedule, attempt budget, the pure `Proceed`/`Retry`/
+// `GiveUp` decision — lives in `crate::retry`, shared with `wifi`'s backend
+// probe since #646. The two paths retry the same class of transient system-bus
+// failure, and someone debugging one while reading the journal of the other must
+// not find two different behaviours; before #646 that was kept true by a pair of
+// doc comments pointing at each other by hand.
+//
+// What stays here is the *judgement*: why this policy is unbounded, and what
+// each attempt logs.
 
 /// The policy the [`LinkBackend::Networkd`] arm runs: **unbounded** retry with
 /// capped backoff.
@@ -375,38 +352,19 @@ struct RefreshRetry {
 /// **The policy is one field to change.** A bounded policy is
 /// `max_attempts: Some(n)` and nothing else; `the_shipped_policy_never_goes_inert`
 /// asserts the shipped default is not.
-const STARTUP_REFRESH_RETRY: RefreshRetry = RefreshRetry {
+///
+/// Unlike `wifi`'s probe this path has no verdict to weigh before consulting the
+/// policy: a `refresh` either read the links or could not, and "could not" is
+/// never a fact about the host here — the backend was already elected.
+///
+/// The schedule's own invariants — a nonzero first delay, a ceiling that is
+/// actually reached — are asserted over *every* shipped policy in `retry`'s
+/// tests (#665), not here.
+pub(crate) const STARTUP_REFRESH_RETRY: retry::Policy = retry::Policy {
     max_attempts: None,
     initial: Duration::from_millis(500),
     max_backoff: Duration::from_secs(8),
 };
-
-impl RefreshRetry {
-    /// Delay before the retry that follows `attempt` (1-based): [`Self::initial`]
-    /// doubled once per elapsed attempt, clamped to [`Self::max_backoff`].
-    fn backoff(self, attempt: u32) -> Duration {
-        let factor = 1_u32
-            .checked_shl(attempt.saturating_sub(1))
-            .unwrap_or(u32::MAX);
-        self.initial.saturating_mul(factor).min(self.max_backoff)
-    }
-
-    /// The pure retry/proceed decision. `attempt` is 1-based and counts the
-    /// refresh that produced `outcome`.
-    ///
-    /// Unlike `wifi`'s probe there is no verdict to weigh: a `refresh` either
-    /// read the links or could not, and "could not" is never a fact about the
-    /// host here — the backend was already elected.
-    fn step<T, E>(self, outcome: &Result<T, E>, attempt: u32) -> RefreshStep {
-        match outcome {
-            Ok(_) => RefreshStep::Proceed,
-            Err(_) if self.max_attempts.is_some_and(|max| attempt >= max) => RefreshStep::GiveUp,
-            Err(_) => RefreshStep::Retry {
-                after: self.backoff(attempt),
-            },
-        }
-    }
-}
 
 /// Seed the link list from networkd, retrying while [`refresh`] fails.
 ///
@@ -414,7 +372,7 @@ impl RefreshRetry {
 /// `listen` loop. `false` means the policy stopped asking first, which the
 /// shipped unbounded [`STARTUP_REFRESH_RETRY`] never does.
 async fn seed_links(
-    policy: RefreshRetry,
+    policy: retry::Policy,
     links_out: &Mutable<Vec<Link>>,
     primary_out: &Mutable<Option<Link>>,
     source_out: &Mutable<LinkSource>,
@@ -430,7 +388,7 @@ async fn seed_links(
             .map_or_else(String::new, ToString::to_string);
 
         match policy.step(&outcome, attempt) {
-            RefreshStep::Proceed => {
+            retry::Step::Proceed => {
                 // Only announce a recovery if there was something to recover
                 // from; the ordinary first-try success stays quiet.
                 if attempt > 1 {
@@ -443,7 +401,7 @@ async fn seed_links(
                 }
                 return true;
             }
-            RefreshStep::Retry { after } => {
+            retry::Step::Retry { after } => {
                 // Logged on *every* attempt, not every Nth: the backoff caps at
                 // 8s, so an unreachable networkd stays loud here rather than
                 // degrading into a silent poll. See `STARTUP_REFRESH_RETRY`.
@@ -460,7 +418,7 @@ async fn seed_links(
                 tokio::time::sleep(after).await;
                 attempt += 1;
             }
-            RefreshStep::GiveUp => {
+            retry::Step::GiveUp => {
                 tracing::error!(
                     attempts = attempt,
                     error = %reason,
@@ -531,9 +489,23 @@ impl Service for NetworkdService {
                         {
                             return;
                         }
-                        // The 2s retry below is untouched: it covers a `listen` that
-                        // had been established and dropped, which already retried and
-                        // is not what #621 is about.
+                        // The 2s retry below is untouched, but not for the reason
+                        // this comment used to give (#665): it does *not* only
+                        // cover a `listen` that had been established and dropped.
+                        // `listen` opens with its own initial `refresh`, so this
+                        // loop also covers a `listen` that was never established
+                        // — i.e. a networkd that died between the seed above and
+                        // the subscription below.
+                        //
+                        // That is still a milder failure than #621: the seed has
+                        // already published `LinkSource::Networkd`, so a later
+                        // death leaves the link list *stale*, not indeterminate,
+                        // and it self-heals when networkd returns. The
+                        // observability gap is real though — a post-seed recovery
+                        // shows up as this loop's `warn!` going quiet, **not** as
+                        // a `startup refresh RECOVERED` line, so grepping for
+                        // that line will not evidence a real self-heal. The
+                        // uncapped 2s cadence here is #646's second half.
                         loop {
                             match listen(&links_writer, &primary_writer, &source_writer).await {
                                 Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
@@ -884,12 +856,19 @@ mod tests {
     }
 
     // --- startup refresh retry (#621) ---
+    //
+    // Since #646 the retry *mechanism* — the doubling schedule, the attempt
+    // budget, the give-up boundary — is tested once, in `crate::retry`, over the
+    // shared type; so are the shipped constants' delay invariants (#665), over
+    // *every* shipped policy rather than just this one. What is asserted here is
+    // this seed's own claim: a failed refresh retries rather than ending the
+    // task.
 
     /// A *bounded* policy with tiny delays, so the give-up path stays reachable
     /// and named. Deliberately not [`STARTUP_REFRESH_RETRY`] — these tests
-    /// assert the mechanism; the shipped shape is asserted separately below.
-    fn bounded() -> RefreshRetry {
-        RefreshRetry {
+    /// assert the decision; the shipped shape is asserted separately below.
+    fn bounded() -> retry::Policy {
+        retry::Policy {
             max_attempts: Some(3),
             initial: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
@@ -908,10 +887,10 @@ mod tests {
         // returns `Ok` trips `clippy::unnecessary_wraps`, and the wrapper is the
         // whole point here — `step` decides on the `Result`, not on a bool.
         let landed: Result<()> = Ok(());
-        assert_eq!(bounded().step(&landed, 1), RefreshStep::Proceed);
+        assert_eq!(bounded().step(&landed, 1), retry::Step::Proceed);
         // Success ends the retrying whenever it arrives, not just first time.
-        assert_eq!(bounded().step(&landed, 3), RefreshStep::Proceed);
-        assert_eq!(bounded().step(&landed, u32::MAX), RefreshStep::Proceed);
+        assert_eq!(bounded().step(&landed, 3), retry::Step::Proceed);
+        assert_eq!(bounded().step(&landed, u32::MAX), retry::Step::Proceed);
     }
 
     #[test]
@@ -920,37 +899,27 @@ mod tests {
         // for the process lifetime. A failure must schedule another attempt.
         assert_eq!(
             bounded().step(&failed(), 1),
-            RefreshStep::Retry {
+            retry::Step::Retry {
                 after: Duration::from_millis(10)
             },
             "the first failed seed must retry, not go inert (#621)"
         );
         assert_eq!(
             bounded().step(&failed(), 2),
-            RefreshStep::Retry {
+            retry::Step::Retry {
                 after: Duration::from_millis(20)
             }
         );
     }
 
-    #[test]
-    fn a_bounded_policy_gives_up_once_its_budget_is_spent() {
-        assert_eq!(bounded().step(&failed(), 3), RefreshStep::GiveUp);
-        assert_eq!(bounded().step(&failed(), 4), RefreshStep::GiveUp);
-        assert_eq!(bounded().step(&failed(), 99), RefreshStep::GiveUp);
-    }
-
-    #[test]
-    fn backoff_doubles_and_clamps_to_the_ceiling() {
-        let policy = bounded();
-        assert_eq!(policy.backoff(1), Duration::from_millis(10));
-        assert_eq!(policy.backoff(2), Duration::from_millis(20));
-        assert_eq!(policy.backoff(3), Duration::from_millis(40));
-        // Clamped, and the shift can't overflow at absurd attempt counts.
-        assert_eq!(policy.backoff(4), Duration::from_millis(40));
-        assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
-    }
-
+    /// The delays are deliberately **not** asserted here, and deliberately never
+    /// against `STARTUP_REFRESH_RETRY.backoff(attempt)` — that is the expression
+    /// `step` computes internally, so comparing against it pins only that `step`
+    /// calls `backoff`, not that `backoff` produces a sane number. That
+    /// tautology is what #665 filed: with it, `initial: Duration::ZERO` kept the
+    /// whole suite green while turning the retry into a tight `error!` flood.
+    /// `crate::retry`'s shipped-policy tests carry the real assertions, for this
+    /// constant and `wifi::PROBE_RETRY` alike.
     #[test]
     fn the_shipped_policy_never_goes_inert() {
         // The decision on #621: unbounded. A bound would put the user back in
@@ -962,30 +931,14 @@ mod tests {
              STARTUP_REFRESH_RETRY's docs and #621"
         );
         for attempt in [1_u32, 2, 8, 1_000, u32::MAX] {
-            assert_eq!(
-                STARTUP_REFRESH_RETRY.step(&failed(), attempt),
-                RefreshStep::Retry {
-                    after: STARTUP_REFRESH_RETRY.backoff(attempt)
-                },
+            assert!(
+                matches!(
+                    STARTUP_REFRESH_RETRY.step(&failed(), attempt),
+                    retry::Step::Retry { .. }
+                ),
                 "attempt {attempt}: a failed seed ended the task instead of retrying"
             );
         }
-    }
-
-    #[test]
-    fn the_shipped_policy_starts_promptly_and_stays_audible() {
-        // Prompt: the common case is a boot race of well under a second, so the
-        // first retry must not sit behind the ceiling.
-        assert!(STARTUP_REFRESH_RETRY.backoff(1) <= Duration::from_secs(1));
-        assert!(STARTUP_REFRESH_RETRY.max_backoff >= STARTUP_REFRESH_RETRY.initial);
-        // Audible: every attempt logs at `error!`, which is only defensible
-        // because the delay is capped — an uncapped backoff would decay into a
-        // silent poll, the failure mode the observability requirement rules out.
-        assert!(
-            STARTUP_REFRESH_RETRY.max_backoff <= Duration::from_secs(30),
-            "the retry logs every attempt; an unbounded delay would make a dead \
-             networkd silent in the journal"
-        );
     }
 
     // --- parse_describe ---

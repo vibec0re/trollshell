@@ -168,9 +168,18 @@ pub fn install(monitor: &Monitor) {
     );
     view.drawer_sub.replace(Some(drawer_sub));
 
-    OSDS.with(|map| {
-        map.borrow_mut().insert(connector.clone(), view);
-    });
+    // Tail-expression `insert` + an outer `drop`, not a bare `insert(…);`
+    // statement (#643): the displaced `Rc<OsdView>` would otherwise be a
+    // temporary of the same statement as the `borrow_mut()` `RefMut`, and
+    // statement temporaries drop in reverse creation order — so it would run
+    // its drop glue with `OSDS` still borrowed. At install time `OSDS` holds
+    // the only strong `Rc` (`route_show`'s clone is short-lived and on the same
+    // thread), so that drop would reach the whole `OsdView`: the `SourceId`
+    // slots, the `drawer_sub` `JoinHandle`, and a `gtk::Window` unref. Still a
+    // refcount decrement rather than a dispose (that needs `destroy()`, which
+    // is `close_all`'s job), and reachable only on a double `install` for one
+    // connector — same weak-but-free standard as the rest of the group.
+    drop(OSDS.with(|map| map.borrow_mut().insert(connector.clone(), view)));
 
     if !SUBS_INSTALLED.with(Cell::get) {
         SUBS_INSTALLED.with(|c| c.set(true));
@@ -413,22 +422,27 @@ fn install_subscriptions() {
 /// map (e.g. niri startup, monitor disconnect).
 fn route_show(state: &State) {
     let target_name: Option<String> = focused_output::current();
-    OSDS.with(|map| {
+    // Clone the `Rc` out and let the borrow end at this `let` (#643). `show()`
+    // is a run of GTK calls (`set_visible`, `present`, label/icon setters, timer
+    // arming), and `install`/`close_all` are the `borrow_mut()` counterparties
+    // on this cell — a shared borrow held across all that panics on any
+    // re-entry, and a `BorrowMutError` through a glib callback aborts the
+    // process. `OSDS` already stores `Rc<OsdView>`, so this is just a refcount
+    // bump.
+    let view = OSDS.with(|map| {
         let map = map.borrow();
-        if map.is_empty() {
-            return;
-        }
-        let view = target_name
+        target_name
             .as_ref()
             .and_then(|name| map.get(name))
-            .or_else(|| map.values().next());
-        if let Some(view) = view {
-            if view.drawer_open.get() {
-                return; // drawer is showing the same control; OSD is redundant
-            }
-            show(view, state);
-        }
+            .or_else(|| map.values().next())
+            .map(Rc::clone)
     });
+    if let Some(view) = view {
+        if view.drawer_open.get() {
+            return; // drawer is showing the same control; OSD is redundant
+        }
+        show(&view, state);
+    }
 }
 
 /// Raise a transient "leave-by" nudge — the public entry point behind the

@@ -96,7 +96,13 @@ fn update_workspaces(
     button_map: &Rc<RefCell<HashMap<u64, gtk::Button>>>,
     workspaces: &[niri::Workspace],
 ) {
-    let mut map = button_map.borrow_mut();
+    // Take the map for the whole diff rather than holding a `RefMut` across it
+    // (#643, spelling (2)): the binding this replaces stayed live past
+    // `container.remove()`, `apply_workspace_visuals`, `container.append()` and
+    // `insert_after()`, so any synchronous emission re-entering this cell would
+    // panic — and a `BorrowMutError` unwinding through a glib callback aborts
+    // the process rather than failing the update. Stored back at the end.
+    let mut map = button_map.take();
 
     let prev_keys: Vec<u64> = map.keys().copied().collect();
     let new_keys: Vec<u64> = workspaces.iter().map(|ws| ws.id).collect();
@@ -136,6 +142,11 @@ fn update_workspaces(
             prev = Some(btn.clone());
         }
     }
+
+    // The cell holds the empty `HashMap` `take()` left behind — which allocates
+    // nothing until first insert — so this write-back drops nothing inside the
+    // borrow (#643).
+    *button_map.borrow_mut() = map;
 }
 
 /// Re-apply the label and the focused/active classes to an existing pill.

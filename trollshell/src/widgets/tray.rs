@@ -60,7 +60,13 @@ fn update_tray(
     items: &[TrayItem],
     monitor: &Monitor,
 ) {
-    let mut map = button_map.borrow_mut();
+    // Take the map for the whole diff rather than holding a `RefMut` across it
+    // (#643, spelling (2)): the binding this replaces stayed live past
+    // `container.remove()`, `apply_item_button_visuals`, `create_item_button`,
+    // `container.append()` and `insert_after()`. A synchronous emission
+    // re-entering this cell would panic, and a `BorrowMutError` unwinding
+    // through a glib callback aborts the process. Stored back at the end.
+    let mut map = button_map.take();
 
     let prev_keys: Vec<String> = map.keys().cloned().collect();
     let new_keys: Vec<String> = items.iter().map(|i| i.key.clone()).collect();
@@ -103,6 +109,10 @@ fn update_tray(
             prev = Some(btn.clone());
         }
     }
+
+    // The cell holds the empty `ButtonMap` `take()` left behind, so this
+    // write-back drops nothing inside the borrow (#643).
+    *button_map.borrow_mut() = map;
 }
 
 /// Create a tray button for `item_cell` and wire up click handlers.
@@ -118,10 +128,12 @@ fn create_item_button(item_cell: &ItemCell, monitor: &Monitor) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-tray-item");
 
-    {
-        let item = item_cell.borrow();
-        apply_item_button_visuals(&btn, &item);
-    }
+    // Clone the snapshot out rather than passing a live `Ref` (#643, spelling
+    // (3)): `apply_item_button_visuals` is a run of GTK calls (icon build,
+    // `set_child`, `set_tooltip_text`), and `update_tray`'s reuse arm holds the
+    // `borrow_mut()` counterparty on this same cell.
+    let item = item_cell.borrow().clone();
+    apply_item_button_visuals(&btn, &item);
 
     // Primary click: Activate or show-menu depending on ItemIsMenu.
     {

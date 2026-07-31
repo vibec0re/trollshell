@@ -167,15 +167,23 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
 
     // Register the surface + its raw subscription so `close_all` can tear
     // both down on the next monitor hot-plug (re-keys cleanly by connector).
-    FRAMES.with(|map| {
+    // Tail-expression `insert` + an outer `drop`, not a bare `insert(…);`
+    // statement (#643): the displaced `FrameView` would otherwise be a
+    // temporary of the same statement as the `borrow_mut()` `RefMut`, and
+    // statement temporaries drop in reverse creation order — so it would run
+    // its drop glue (a `JoinHandle` plus a `gtk::Window` unref) with `FRAMES`
+    // still borrowed. A refcount decrement, not a widget teardown: disposing
+    // the window needs `destroy()`, which is `close_all`'s job. Same shape and
+    // same weak reachability as the annotated `modal::install` site.
+    drop(FRAMES.with(|map| {
         map.borrow_mut().insert(
             connector,
             FrameView {
                 window,
                 sidebar_sub,
             },
-        );
-    });
+        )
+    }));
 }
 
 /// Close every frame overlay and abort its sidebar tick-loop subscription,

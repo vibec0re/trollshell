@@ -10,6 +10,22 @@ let
   cfg = config.programs.trollshell;
   backend = cfg.wallpaper.backend;
 
+  # Night light (#657): the four programs.trollshell.nightlight.* options are
+  # declared in the shared base (module-common.nix) purely so they render in
+  # one options doc, but they are home-manager-only — the wlsunset unit they
+  # parameterise is only declared by nix/hm-module.nix, and this module has no
+  # unit of its own for them to reach. Setting any of them here would
+  # therefore evaluate cleanly and silently do nothing, so rather than let
+  # that happen we assert below (matching the awww-channel assertion in
+  # hm-module.nix — the standard NixOS module-system assertions mechanism,
+  # not something bespoke). Compared against the option defaults declared in
+  # module-common.nix, same idiom as `nlGeoConfigured` in hm-module.nix.
+  nlConfigured =
+    cfg.nightlight.latitude != null
+    || cfg.nightlight.longitude != null
+    || cfg.nightlight.dayTemp != 6500
+    || cfg.nightlight.nightTemp != 4000;
+
   # Declarative plugin launch state (#419; the attr key is the plugin id).
   # programs.trollshell.plugins no longer emits one static
   # trollshell-plugin-<id> unit per entry (#350's original shape): the option
@@ -173,6 +189,29 @@ in
       # you actually run the shell.
       (lib.mkIf (cfg.plugins != { }) {
         environment.etc."xdg/trollshell/plugins.json".text = pluginsState;
+      })
+
+      # Night light (#657): see nlConfigured above. Assert rather than let the
+      # four nightlight.* options evaluate to a no-op — the NixOS module
+      # declares no wlsunset package or unit, so nothing here ever reads
+      # them. A clear failure at eval time beats a bar switch that silently
+      # does nothing at runtime.
+      (lib.mkIf nlConfigured {
+        assertions = [
+          {
+            assertion = false;
+            message = ''
+              programs.trollshell.nightlight.* is set, but night light
+              (wlsunset) is currently implemented only by the home-manager
+              module — nix/nixos-module.nix declares no wlsunset package or
+              systemd user unit, so this setting has no effect here: the
+              shell's Night light switch still renders (the service starts
+              unconditionally) and does nothing when toggled. See #657. Move
+              this configuration to your home-manager
+              programs.trollshell.nightlight config instead, or drop it.
+            '';
+          }
+        ];
       })
 
       # Control-center companion app (#399): the external GTK settings/management

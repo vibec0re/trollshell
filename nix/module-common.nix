@@ -191,7 +191,20 @@ self:
     # at nix-eval time: lat/lon below win when set (configuring them is an
     # explicit statement of where you are), and otherwise the live location fix
     # is used (GeoClue2, which ships with enableRecommendedServices). Leaving
-    # both null is therefore a working configuration, not an inert one.
+    # both null is therefore a working configuration, not an inert one — on
+    # home-manager.
+    #
+    # These four options are declared here, in the shared base, purely so the
+    # generated options doc has one page rather than a fork. They are HOME-
+    # MANAGER-ONLY: the NixOS module (nix/nixos-module.nix) declares no
+    # wlsunset package or unit and has no toggle target to drive, so on a
+    # NixOS-only deployment (no home-manager) setting any of them evaluates
+    # but does nothing — the Appearance panel's Night light switch still
+    # renders (the shell registers the service unconditionally) and silently
+    # no-ops. nixos-module.nix asserts on this rather than letting it happen
+    # quietly (#657); this comment and the four descriptions below say so too,
+    # since the descriptions are what `nixos-option` / the rendered options
+    # doc actually show a NixOS reader.
     nightlight = {
       latitude = lib.mkOption {
         type = lib.types.nullOr (lib.types.either lib.types.float lib.types.str);
@@ -205,6 +218,12 @@ self:
           Leave both null to follow the live fix instead. With neither a fix nor
           these set, the toggle refuses to start the daemon and logs why. May be
           given as a float (52.52) or a string ("52.52").
+
+          Home-manager only (#657): the wlsunset unit this parameterises is
+          declared by the home-manager module (`nix/hm-module.nix`). Setting it
+          through the NixOS module alone has no effect — there is no unit for
+          it to reach — and trips an assertion there rather than silently
+          no-op'ing.
         '';
       };
 
@@ -217,6 +236,9 @@ self:
           (`wlsunset -L <longitude>`). Optional, and only used together with
           `latitude` — a half-configured pair is ignored (see `latitude`). May
           be a float or a string.
+
+          Home-manager only (#657): see `latitude`'s description — the NixOS
+          module has no wlsunset unit for this to reach.
         '';
       };
 
@@ -227,6 +249,9 @@ self:
         description = ''
           Daytime color temperature in kelvin (`wlsunset -T <dayTemp>`). 6500K is
           neutral daylight (wlsunset's own default).
+
+          Home-manager only (#657): see `latitude`'s description — the NixOS
+          module has no wlsunset unit for this to reach.
         '';
       };
 
@@ -237,6 +262,9 @@ self:
         description = ''
           Nighttime color temperature in kelvin (`wlsunset -t <nightTemp>`).
           Lower is warmer; 4000K is a gentle warm-white.
+
+          Home-manager only (#657): see `latitude`'s description — the NixOS
+          module has no wlsunset unit for this to reach.
         '';
       };
     };

@@ -27,6 +27,14 @@ pkgs.mkShell {
     # review workflow spins up frequently. Opt-in (see CLAUDE.md) — not wired
     # via RUSTC_WRAPPER here to keep the default `cargo` path unsurprising.
     sccache
+
+    # `system-tests`-feature deps (CLAUDE.md's "Tests" section): dbus-daemon
+    # for hytte-bus's ephemeral-broker tests, xvfb-run for hytte-ui's
+    # GTK-under-a-headless-display tests. CI's flake.nix `system-tests` check
+    # already needs both (nativeCheckInputs there); listing them here too
+    # just makes the devShell able to run the same commands locally (#684).
+    dbus
+    xvfb-run
   ];
 
   # Fixed (non-prepending) values live as env attrs; only the two vars that

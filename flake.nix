@@ -344,8 +344,10 @@
           # widget-tree & multi-sparkline tests) to have a display.
           # hytte-bus's tests spawn their own ephemeral `dbus-daemon`
           # (crates/hytte-bus/tests/common/mod.rs), so that binary needs to
-          # be on PATH too — neither it nor `xvfb-run` are in the devShell or
-          # the package's buildInputs, so both are supplied explicitly here.
+          # be on PATH too — neither it nor `xvfb-run` are in the package's
+          # buildInputs, so both are supplied explicitly here. (Also in
+          # nix/devshell.nix's `packages`, #684, so the same command works
+          # locally — but this sandboxed check never sees the devShell.)
           # Reuses the same cargoArtifacts as the package build/clippy: the
           # `system-tests` feature is `[]` (no extra deps), so the cached
           # dependency graph is unaffected — only the workspace members

@@ -286,8 +286,9 @@ fn logging_panic_hook(prev: PanicHook) -> PanicHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
 
     /// A zero-delay backoff, so the retry-path tests are fast and
     /// timing-independent.
@@ -297,11 +298,108 @@ mod tests {
         reset_after: Duration::ZERO,
     };
 
+    // ---- capturing what this module logs ---------------------------------
+    //
+    // Two tests below assert that a panic was *logged*. Capturing a `tracing`
+    // event is harder than it looks, and the obvious tool —
+    // `tracing::subscriber::with_default` — is the wrong one here for a reason
+    // that is not the obvious one either. Both are worth stating, because the
+    // first explanation is plausible, wrong, and is what shipped as this
+    // module's original test comment.
+    //
+    // *Not* the reason: "`with_default` is thread-local and the supervisor
+    // logs on a worker thread". `Handle::block_on` really does drive the
+    // supervisor future on the calling thread, so the `error!` really is
+    // emitted on the test thread. Thread-locality alone would have failed
+    // deterministically; this failed intermittently.
+    //
+    // The actual reason: `tracing` caches each callsite's `Interest`
+    // **process-globally**, and the first thread to execute a given `error!`
+    // decides that cache for the whole process. On a thread with no subscriber
+    // the dispatcher resolves to `NoSubscriber`, whose `register_callsite`
+    // returns `Interest::never()` — and from then on the macro short-circuits
+    // on *every* thread, including one sitting inside `with_default`. The
+    // panicking tests in this module reach the supervisor's `error!` from
+    // their own subscriber-less threads, concurrently, so whether the
+    // log-asserting test ever saw its own event came down to which thread got
+    // to that callsite first. Green locally, red in CI, and no amount of
+    // asserting harder on the test thread would have helped.
+    //
+    // So: one **process-global** subscriber, installed once with
+    // `set_global_default`. It is the dispatcher every thread resolves to, so
+    // it both receives the event wherever it is emitted and makes the cached
+    // `Interest` `always` rather than `never`.
+
+    /// The tags the log-asserting tests claim — one per test.
+    ///
+    /// A process-global subscriber sees *every* event in this test binary,
+    /// including those of tests running concurrently on other threads, so it
+    /// cannot be scoped to one test the way `with_default` appeared to be. The
+    /// usual answer is to serialise the log-asserting tests behind a mutex,
+    /// but that only holds off *each other* — the tests that panic without
+    /// asserting anything (`respawns_after_panic_until_clean_completion` and
+    /// its blocking twin) emit this module's `error!` too, and would inflate
+    /// any shared count.
+    ///
+    /// Tagging is what isolates them instead, and needs no serialisation: a
+    /// tag is a string that appears verbatim as a **field value** on the event
+    /// a test expects — the supervisor's `service`, or the panic hook's
+    /// `payload` — and [`ErrorCounter`] keys its counts by tag, so an event
+    /// belonging to another test is counted under that other test's tag.
+    ///
+    /// **The constraint is that no two tests may share a tag**; that is the
+    /// entire isolation mechanism. A tag must also be listed here before a
+    /// test uses it — an unlisted tag is never counted, so the mistake shows
+    /// up as a test reading 0 rather than as one test silently consuming
+    /// another's events.
+    const CAPTURE_TAGS: &[&str] = &[
+        // The `service` name `a_panicking_blocking_task_is_logged_and_restarted`
+        // supervises under.
+        "test-blocking-log",
+        // The payload `the_panic_hook_logs_then_delegates_to_the_previous_hook`
+        // panics with.
+        "supervisor panic-hook test",
+    ];
+
+    /// Per-tag counts of `ERROR` events from this module.
+    ///
+    /// Never reset: a tag belongs to exactly one test, which runs once per
+    /// process, so the cumulative count *is* that test's count.
+    static TAGGED_ERRORS: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
+
+    /// Install the global `ERROR`-counting subscriber, once per process.
+    ///
+    /// **Every test in this module calls this first**, not only the two that
+    /// assert on logs — uniformly, so there is no rule about which ones need
+    /// it. The point is that no supervisor `error!` may execute before the
+    /// global subscriber exists: whichever subscriber-less thread reaches that
+    /// callsite first pins its process-global `Interest` to `never`, and the
+    /// log-asserting tests then read 0 no matter what they do afterwards.
+    fn install_error_counter() {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(ErrorCounter)
+                .expect("nothing else installs a global subscriber in this test binary");
+        });
+    }
+
+    /// How many `ERROR` events from this module have carried `tag`.
+    fn logged_errors(tag: &'static str) -> usize {
+        TAGGED_ERRORS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tag)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// A factory that panics its first three runs then completes cleanly must
     /// be retried until the clean completion — four calls total — and then
     /// stop (no restart on `Ok(())`).
     #[test]
     fn respawns_after_panic_until_clean_completion() {
+        install_error_counter();
+
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_factory = calls.clone();
 
@@ -327,6 +425,8 @@ mod tests {
     /// called exactly once — the supervisor adds no restarts.
     #[test]
     fn clean_completion_runs_exactly_once() {
+        install_error_counter();
+
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_factory = calls.clone();
 
@@ -354,6 +454,8 @@ mod tests {
     /// decision that supervision of a blocking task means *restart it*.
     #[test]
     fn blocking_task_respawns_after_panic_until_clean_completion() {
+        install_error_counter();
+
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_task = Arc::clone(&calls);
 
@@ -369,29 +471,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
-    /// The panic must not vanish: each panicked run of a supervised blocking
+    /// The panic must not vanish: the panicked run of a supervised blocking
     /// task emits exactly one `error!` from this module *and* is re-run.
     ///
-    /// `Handle::block_on` drives the supervisor future on this thread, so the
-    /// thread-local subscriber installed by `with_default` sees the
-    /// supervisor's own log line (the closure runs on a blocking-pool thread;
-    /// its events are not, and need not be, captured).
+    /// The `error!` is captured by the process-global [`ErrorCounter`] rather
+    /// than a thread-local `with_default` subscriber, because the cache that
+    /// decides whether that `error!` runs at all is itself process-global —
+    /// see the note above [`CAPTURE_TAGS`]. Concurrency is handled by keying
+    /// the count on the `service` field: the panics the sibling tests raise at
+    /// the same time carry their own service names and are counted under their
+    /// own tags, so this assertion stays exact without serialising anything.
+    ///
+    /// The closure itself runs on a blocking-pool thread; its panic is not,
+    /// and need not be, captured here — that is the panic *hook*'s job, and
+    /// [`the_panic_hook_logs_then_delegates_to_the_previous_hook`] covers it.
     #[test]
     fn a_panicking_blocking_task_is_logged_and_restarted() {
-        let errors = Arc::new(AtomicUsize::new(0));
+        install_error_counter();
+
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_task = Arc::clone(&calls);
 
-        tracing::subscriber::with_default(ErrorCounter(Arc::clone(&errors)), || {
-            runtime::handle().block_on(supervise_blocking(
-                "test-blocking-log",
-                Arc::new(move || {
-                    let n = calls_task.fetch_add(1, Ordering::SeqCst);
-                    assert!(n >= 1, "panic on the first run only");
-                }),
-                ZERO_BACKOFF,
-            ));
-        });
+        runtime::handle().block_on(supervise_blocking(
+            "test-blocking-log",
+            Arc::new(move || {
+                let n = calls_task.fetch_add(1, Ordering::SeqCst);
+                assert!(n >= 1, "panic on the first run only");
+            }),
+            ZERO_BACKOFF,
+        ));
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -399,7 +507,7 @@ mod tests {
             "the panicked run is re-run"
         );
         assert_eq!(
-            errors.load(Ordering::SeqCst),
+            logged_errors("test-blocking-log"),
             1,
             "the panic is reported once, at error level"
         );
@@ -407,11 +515,21 @@ mod tests {
 
     /// The installed hook logs the panic through `tracing` *and* passes it on:
     /// it must chain to the previous hook, never replace it.
+    ///
+    /// This used a thread-local `with_default` subscriber too, and passed —
+    /// but only by luck, and it carried the same latent flake as its sibling
+    /// (see the note above [`CAPTURE_TAGS`]). The hook's `error!` is a
+    /// callsite like any other, and while this test's hook is installed *any*
+    /// panicking thread in the binary runs it: a sibling test's tokio thread
+    /// reaching it first would have pinned its process-global `Interest` to
+    /// `never` and left this test reading 0 forever after. So it reads the
+    /// global [`ErrorCounter`] too.
     #[test]
     fn the_panic_hook_logs_then_delegates_to_the_previous_hook() {
+        install_error_counter();
+
         let delegated = Arc::new(AtomicUsize::new(0));
         let delegated_hook = Arc::clone(&delegated);
-        let errors = Arc::new(AtomicUsize::new(0));
 
         let sentinel: PanicHook = Box::new(move |_| {
             delegated_hook.fetch_add(1, Ordering::SeqCst);
@@ -424,9 +542,7 @@ mod tests {
         // landing in the sentinel cannot make this flake.
         let saved = std::panic::take_hook();
         std::panic::set_hook(logging_panic_hook(sentinel));
-        let outcome = tracing::subscriber::with_default(ErrorCounter(Arc::clone(&errors)), || {
-            std::panic::catch_unwind(|| panic!("supervisor panic-hook test"))
-        });
+        let outcome = std::panic::catch_unwind(|| panic!("supervisor panic-hook test"));
         std::panic::set_hook(saved);
 
         assert!(outcome.is_err(), "the panic still unwinds");
@@ -434,18 +550,27 @@ mod tests {
             delegated.load(Ordering::SeqCst) >= 1,
             "the previous hook is still called"
         );
-        // Thread-local subscriber: only the panic raised on *this* thread is
-        // counted, so this is exact.
+        // The counter is global, so it also sees the sibling tests' panics
+        // routed through this same hook while it is installed. Those carry
+        // their own payloads; keying on *this* test's payload is what keeps
+        // the count exact.
         assert_eq!(
-            errors.load(Ordering::SeqCst),
+            logged_errors("supervisor panic-hook test"),
             1,
             "the panic is logged through tracing"
         );
     }
 
-    /// Counts `ERROR` events this module emits on the current thread.
-    /// Hand-rolled so the crate needs no `tracing-subscriber` dev-dependency.
-    struct ErrorCounter(Arc<AtomicUsize>);
+    /// Counts this module's `ERROR` events into [`TAGGED_ERRORS`], keyed by
+    /// whichever [`CAPTURE_TAGS`] entry appears among the event's string
+    /// fields. Hand-rolled so the crate needs no `tracing-subscriber`
+    /// dev-dependency.
+    ///
+    /// Installed process-globally by [`install_error_counter`], which is what
+    /// makes it visible from every thread — both as the receiver of the event
+    /// and as the subscriber `tracing` asks when it caches a callsite's
+    /// `Interest`.
+    struct ErrorCounter;
 
     impl tracing::Subscriber for ErrorCounter {
         fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
@@ -462,15 +587,39 @@ mod tests {
 
         fn event(&self, event: &tracing::Event<'_>) {
             let meta = event.metadata();
-            if *meta.level() == tracing::Level::ERROR
-                && meta.target() == "hytte_reactive::supervisor"
+            if *meta.level() != tracing::Level::ERROR
+                || meta.target() != "hytte_reactive::supervisor"
             {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            let mut visitor = TagVisitor(None);
+            event.record(&mut visitor);
+            if let Some(tag) = visitor.0 {
+                *TAGGED_ERRORS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(tag)
+                    .or_default() += 1;
             }
         }
 
         fn enter(&self, _id: &tracing::span::Id) {}
 
         fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// Finds the first [`CAPTURE_TAGS`] entry among an event's `&str` fields.
+    struct TagVisitor(Option<&'static str>);
+
+    impl tracing::field::Visit for TagVisitor {
+        fn record_str(&mut self, _field: &tracing::field::Field, value: &str) {
+            if self.0.is_none() {
+                self.0 = CAPTURE_TAGS.iter().copied().find(|&tag| tag == value);
+            }
+        }
+
+        /// Non-string fields — the supervisor's `ran_secs`/`backoff_secs`, the
+        /// hook's `Display`-formatted `location` — can never carry a tag.
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
     }
 }

@@ -40,6 +40,17 @@
 //! approximated (the Claude Code CLI exposes neither knob). Inventing surface
 //! beyond the one client would be surface nobody has ever exercised.
 //!
+//! # Sessions retire themselves
+//!
+//! On the subscription path a conversation rides one persisted claude session,
+//! which is what keeps its prompt prefix byte-stable and the cache warm — and
+//! which also means it grows every turn and nothing prunes it. When it finally
+//! overflows, the bridge retires that session and continues the conversation in
+//! a fresh one, generation by generation (`hytte-bridge-<hash>`, `…-g1`, `…-g2`)
+//! — see [`session`]'s module docs. It is **logged at `warn`**, because a
+//! rotation is the one event that explains a cache-hit rate falling off a cliff,
+//! and the old session is left on disk rather than deleted.
+//!
 //! # Environment
 //!
 //! | variable | default | meaning |

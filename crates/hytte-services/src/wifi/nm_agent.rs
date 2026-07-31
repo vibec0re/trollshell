@@ -707,10 +707,11 @@ mod tests {
 //   cargo test -p hytte-services --features system-tests --lib nm_agent
 //
 // Every await that could hang on a wrong wire signature is wrapped in
-// `tokio::time::timeout`, so a marshalling regression fails fast instead of
-// hanging the suite. `#[tokio::test(flavor = "multi_thread")]` is mandatory:
-// the bus guard's Drop calls `block_in_place`, which panics on a current-thread
-// runtime.
+// `tokio::time::timeout(DBUS_REPLY_BUDGET, …)`, so a marshalling regression
+// still fails — bounded, not fast; see that const's doc comment for why the
+// budget is deliberately generous — instead of hanging the suite forever.
+// `#[tokio::test(flavor = "multi_thread")]` is mandatory: the bus guard's
+// Drop calls `block_in_place`, which panics on a current-thread runtime.
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
     use super::*;
@@ -725,6 +726,33 @@ mod system_tests {
     use tokio::sync::Mutex as AsyncMutex;
     use zbus::Connection;
     use zbus::connection::Builder;
+
+    /// Upper bound on how long any single D-Bus round trip (or the prompt
+    /// handshake it drives) is allowed to take before a test gives up.
+    ///
+    /// **This is a liveness guard, not a latency assertion.** No test in this
+    /// module claims that a `GetSecrets` call, a `CancelGetSecrets` call, or
+    /// the ephemeral `dbus-daemon`'s startup handshake *should* complete
+    /// within any particular time — that would be a meaningless thing to
+    /// assert about a sandboxed builder under load. The only job of this
+    /// budget is to stop a genuinely hung call from wedging the suite (and
+    /// therefore `nix flake check`) forever; a real regression still fails,
+    /// just later rather than sooner.
+    ///
+    /// These tests run inside `nix flake check`, which in the same
+    /// invocation also builds two `nixosTest` VMs plus the full workspace
+    /// clippy and package builds — CPU contention is the normal condition,
+    /// not an edge case. A tight budget here buys nothing (nobody is
+    /// measuring latency) and costs false reds (#676: a markdown-only PR
+    /// tripped a 3-second budget on an unrelated `GetSecrets` call under
+    /// load). If you're looking at this thinking "30 seconds seems
+    /// excessive for a loopback D-Bus call" — it is, for the happy path, and
+    /// that's the point: this number is sized against worst-case CI
+    /// contention, not typical-case latency. Tightening it does not
+    /// strengthen any assertion in this file; it only makes the suite flake
+    /// more often under load. If you want faster failure signal for a real
+    /// hang, run the test locally — CI's job is to not lie.
+    const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
 
     /// Path the agent is mounted at on the ephemeral bus. NM uses a fixed
     /// well-known path in production; any valid object path works for the test.
@@ -797,7 +825,7 @@ mod system_tests {
         // Read the printed address from stdout to confirm the daemon is up.
         let stdout = child.stdout.take().expect("dbus-daemon stdout");
         let mut lines = BufReader::new(stdout).lines();
-        let printed = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        let printed = tokio::time::timeout(DBUS_REPLY_BUDGET, lines.next_line())
             .await
             .expect("dbus-daemon address timeout")
             .expect("dbus-daemon read address")
@@ -950,7 +978,7 @@ mod system_tests {
             });
 
         // The agent should surface a prompt carrying the SSID + security.
-        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
         assert_eq!(req.ssid, "FRITZ!Box");
         assert_eq!(req.security, "psk");
 
@@ -963,7 +991,7 @@ mod system_tests {
             .send(Ok("hunter2".to_string()))
             .expect("send passphrase to waiter");
 
-        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
             .await
             .expect("GetSecrets did not return in time")
             .expect("GetSecrets task panicked")
@@ -1015,7 +1043,7 @@ mod system_tests {
             });
 
         // The prompt should carry the VPN name and be flagged as a VPN secret.
-        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
         assert_eq!(req.ssid, "Work VPN");
         assert_eq!(req.kind, PromptKind::VpnSecret);
 
@@ -1027,7 +1055,7 @@ mod system_tests {
             .send(Ok("vpnpass".to_string()))
             .expect("send VPN secret to waiter");
 
-        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
             .await
             .expect("GetSecrets did not return in time")
             .expect("GetSecrets task panicked")
@@ -1081,7 +1109,7 @@ mod system_tests {
                     .await
             });
 
-        let req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
         assert_eq!(req.ssid, "OldRouter");
         assert_eq!(req.security, "wep");
 
@@ -1093,7 +1121,7 @@ mod system_tests {
             .send(Ok("abcde".to_string()))
             .expect("send WEP key to waiter");
 
-        let reply = tokio::time::timeout(Duration::from_secs(3), call)
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
             .await
             .expect("GetSecrets did not return in time")
             .expect("GetSecrets task panicked")
@@ -1128,7 +1156,7 @@ mod system_tests {
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
         let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
-            Duration::from_secs(3),
+            DBUS_REPLY_BUDGET,
             proxy.call(
                 "GetSecrets",
                 &(
@@ -1157,7 +1185,7 @@ mod system_tests {
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
         let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
-            Duration::from_secs(3),
+            DBUS_REPLY_BUDGET,
             proxy.call(
                 "GetSecrets",
                 &(
@@ -1211,11 +1239,11 @@ mod system_tests {
             });
 
         // Wait until the agent is parked on the oneshot.
-        let _req = await_prompt(&prompts, Duration::from_secs(3)).await;
+        let _req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
 
         // Cancel over the wire.
         let cancel: Result<(), zbus::Error> = tokio::time::timeout(
-            Duration::from_secs(3),
+            DBUS_REPLY_BUDGET,
             proxy.call(
                 "CancelGetSecrets",
                 &(
@@ -1229,7 +1257,7 @@ mod system_tests {
         .expect("CancelGetSecrets did not return in time");
         cancel.expect("CancelGetSecrets returned a D-Bus error");
 
-        let result = tokio::time::timeout(Duration::from_secs(3), call)
+        let result = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
             .await
             .expect("GetSecrets did not resolve after cancel")
             .expect("GetSecrets task panicked");

@@ -50,6 +50,15 @@ fn main() -> hytte::ui::Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    // Route panics through `tracing` too, so a crash in a GTK callback or an
+    // un-supervised task lands in the journal as a structured record next to
+    // the log lines that led to it, instead of as a bare stderr line (#654).
+    // Must come *after* the subscriber above — an event emitted before one
+    // exists goes nowhere — and it belongs here rather than in the library:
+    // the panic hook is process-global, so installing it is the binary's call.
+    // It chains to the previous hook, so the default backtrace still prints.
+    hytte::reactive::install_panic_hook();
+
     App::new("mov.vibec0re.trollshell")
         .with(clock::service())
         .with(wifiscan::service())

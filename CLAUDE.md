@@ -69,7 +69,7 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
 
 ### Packaging (`nix/package.nix`)
 
-`nix/package.nix` has **one** `craneLib.buildPackage` — `trollshell-workspace`, built `--workspace --locked` — producing every binary the flake ships. It sets `dontWrapGApps = true`, so its `$out/bin` holds raw, unwrapped ELFs. Every package output is a **slice** of that single derivation, not a second crane call: `nix/plugin.nix` is a `runCommand` that `install -Dm755`s one binary out of `${workspace}/bin/<name>` (no wrapping — the bundled widget plugins are GTK-free); the `trollshell` slice (in `nix/package.nix` itself) and `nix/control-center.nix` do the same copy plus a `wrapGAppsHook4` wrap over `workspace.passthru.devInputs.buildInputs`, so the GApps env matches what an in-place compile would have produced.
+`nix/package.nix` has **one** `craneLib.buildPackage` — `trollshell-workspace`, built `--workspace --locked` — producing every binary the flake ships. It sets `dontWrapGApps = true`, so its `$out/bin` holds raw, unwrapped ELFs. Every package output is a **slice** of that single derivation, not a second crane call: `nix/plugin.nix` is a `runCommand` that `install -Dm755`s one binary out of `${workspace}/bin/<name>` with no wrapping — not just the bundled widget plugins, but any GTK-free binary the workspace produces (the `hytte-infobroker` CLI, #562; the `hytte-claude-bridge` daemon, #666); the `trollshell` slice (in `nix/package.nix` itself) and `nix/control-center.nix` do the same copy plus a `wrapGAppsHook4` wrap over `workspace.passthru.devInputs.buildInputs`, so the GApps env matches what an in-place compile would have produced.
 
 **Adding a new binary means adding a slice, not a `buildPackage` call.** Before #587 the package path ran 15 crane compile derivations — 13 of which existed purely to copy one binary out — because each `buildPackage` inherited `workspace`'s packed `target` dir as `cargoArtifacts` and hoped cargo would find everything fresh; measured, it didn't, and every one of them recompiled the workspace. #587 collapsed that to one compile plus plain `cp`s specifically so nobody adds a 16th crane call.
 
@@ -117,7 +117,7 @@ cargo fmt --all
 
 Edition 2024, MSRV 1.91 (`rust-version.workspace = true` in every member since #453 — wiring up the inheritance is what surfaced `clippy::incompatible_msrv` violations against the previously-fictional 1.85 and forced the bump; not independently CI-gated beyond that clippy check — the devShell/crane toolchain floats on nixpkgs' current rustc, ~1.95). The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
 
-Shared dependency versions/feature baselines live in the root `Cargo.toml`'s `[workspace.dependencies]`; members inherit with `dep.workspace = true` rather than hand-repinning (#453). `deny.toml` (repo root) holds a `cargo-deny` advisories+licenses config, run locally — it isn't wired into `nix flake check` (the advisory-db fetch needs network, which sandboxed nix builds don't have):
+Shared dependency versions/feature baselines live in the root `Cargo.toml`'s `[workspace.dependencies]`; members inherit with `dep.workspace = true` rather than hand-repinning (#453). One exception: `hive-claude` (`crates/hytte-claude-bridge` only) is pinned to a git rev rather than a crates.io version — the workspace's **only** external git dependency (#666). Crane resolves it at eval time via `builtins.fetchGit`, which is rev-reproducible but not hash-pinned/substitutable the way a locked flake input is, so a cold `nix flake check` depends on the forge being reachable; #671 is open on that consequence. `deny.toml` (repo root) holds a `cargo-deny` advisories+licenses config, run locally — it isn't wired into `nix flake check` (the advisory-db fetch needs network, which sandboxed nix builds don't have):
 
 ```sh
 nix shell nixpkgs#cargo-deny --command cargo-deny check
@@ -171,6 +171,7 @@ hytte-ai-providers → shared OpenAI-compatible chat client + provider config + 
 hytte             → umbrella: re-exports {bus, reactive, services, ui} + a `prelude`
 trollshell        → the binary; depends on `hytte`
 trollshell-control-center → separate windowed GTK4/libadwaita companion app (#390/#399); talks to the running shell over its own `Control` D-Bus endpoint (trollshell/src/control.rs), never linked into the shell
+hytte-claude-bridge → standalone GTK-free daemon (#666/#584); links nothing in this graph and nothing links it — no arrow in this diagram at all. Serves one loopback HTTP route (`POST /v1/chat/completions` on `127.0.0.1:8787`) that the LLM plugins (pet, caw) consume purely as a `Provider` base URL, so neither needed a code change. The sole consumer of `hive-claude`, the workspace's only external git dependency (see "Lint" above).
 
 — plugin side (#35 frontend B; out-of-process, NEVER links the shell):
 hytte-plugin-proto → GTK-free wire protocol (node vocab, manifest, MessagePack framing, socket_path); language-neutral schema anchor, tokio optional

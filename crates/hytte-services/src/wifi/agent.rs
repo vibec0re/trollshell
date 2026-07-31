@@ -8,6 +8,14 @@ use super::types::PromptRequest;
 use super::{NEXT_ID, WaitersMap};
 use crate::wifi::client::read_network_metadata;
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Placeholder [`PromptRequest::secret_keys`] entry for the iwd backend. iwd's
+/// `RequestPassphrase` takes a bare string with no key name, so this exists
+/// only to keep the prompt's "one value per key" contract well-formed; the
+/// overlay never renders it (a one-key prompt shows a single unlabelled entry).
+const IWD_PASSPHRASE_KEY: &str = "passphrase";
+
 // ── Agent ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -35,7 +43,7 @@ impl IwdAgent {
         let (ssid, security) = read_network_metadata(&path).await;
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel::<Result<String, String>>();
+        let (tx, rx) = oneshot::channel::<Result<Vec<String>, String>>();
         {
             let mut waiters = self.waiters.lock().await;
             waiters.insert(id, tx);
@@ -49,14 +57,24 @@ impl IwdAgent {
             // iwd's RequestPassphrase carries no retry/failure signal (unlike
             // NM's REQUEST_NEW flag) — see the field doc on PromptRequest.
             prior_failure: false,
+            // iwd has no secret-key vocabulary: RequestPassphrase returns one
+            // bare string. One key keeps the overlay on its single-entry,
+            // unlabelled path, so this placeholder is never rendered.
+            secret_keys: vec![IWD_PASSPHRASE_KEY.to_string()],
         }));
 
-        if let Ok(Ok(pass)) = rx.await {
-            self.prompts.set(None);
-            Ok(pass)
-        } else {
-            self.prompts.set(None);
-            Err(zbus::fdo::Error::Failed("agent cancelled".into()))
+        // Exactly one key was requested, so exactly one value comes back. An
+        // empty vector can only mean a malformed submit; treat it as a cancel
+        // rather than handing iwd an empty passphrase it would just reject.
+        match rx.await {
+            Ok(Ok(secrets)) if !secrets.is_empty() => {
+                self.prompts.set(None);
+                Ok(secrets.into_iter().next().unwrap_or_default())
+            }
+            _ => {
+                self.prompts.set(None);
+                Err(zbus::fdo::Error::Failed("agent cancelled".into()))
+            }
         }
     }
 

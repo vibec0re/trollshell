@@ -13,6 +13,7 @@ pub mod focused_output;
 pub mod format;
 pub mod history_row;
 pub mod layout;
+pub mod markup;
 pub mod monitor_key;
 pub mod mpris_controls;
 pub mod notif_actions;

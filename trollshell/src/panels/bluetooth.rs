@@ -14,6 +14,7 @@ use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::markup;
 
 pub fn panel_bluetooth() -> gtk::Widget {
     let column = page_box();
@@ -345,6 +346,11 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
         .subtitle(subtitle)
         .activatable(true)
         .build();
+    // The alias is chosen by whoever is broadcasting, so anyone in radio
+    // range controls this title — and the row is activatable (it is what you
+    // tap to pair). Markup off rather than escaped: nothing in this row wants
+    // markup, and it covers the subtitle too (#753, cf. #30).
+    markup::plain_text(&row);
     row.set_sensitive(!is_busy);
     if !dev.address.is_empty() {
         row.set_tooltip_text(Some(&dev.address));

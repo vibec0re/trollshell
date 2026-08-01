@@ -13,6 +13,7 @@ use hytte::services::resolved;
 
 use super::pill_label;
 use crate::components::layout::boxed_list;
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 /// Accent-coloured pill: a live, routable connection.
@@ -34,6 +35,10 @@ pub(super) fn build_connection_group() -> adw::PreferencesGroup {
         .activatable(false)
         .selectable(false)
         .build();
+    // The subtitle is `link_status_text`, which interpolates the interface
+    // name ("Online via {name}") — markup off so a `&` in it can't blank the
+    // one row that says whether the machine is online (#753).
+    markup::plain_text(&state_row);
     // Starts at "Unknown", which is what is true before the first emission.
     let state_pill = pill_label(UNKNOWN_PILL, PILL_NEUTRAL);
     state_row.add_suffix(&state_pill);
@@ -179,6 +184,9 @@ fn all_links_subtitle(count: usize, source: LinkSource) -> String {
 
 fn build_primary_expander() -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title("Primary").build();
+    // The literal "Primary" is replaced by the link name on the first
+    // emission below, so this row's title is not literal at all (#753).
+    markup::plain_text(&expander);
 
     bind(
         networkd::primary().map(|p| p.map_or(String::new(), |link| link.name)),
@@ -257,6 +265,9 @@ fn addr_row(title: &str, derive: impl Fn(&Link) -> String + 'static) -> adw::Act
 /// by the primary block and the per-link expanders.
 fn build_addr_row(title: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
+    // The title is a literal, but `apply_addr_row` fills the subtitle from
+    // networkd-derived address text (#753).
+    markup::plain_text(&row);
     // Keep the title on a single line; let the subtitle (the value) wrap.
     row.set_title_lines(1);
     row.set_subtitle_lines(0);
@@ -416,6 +427,8 @@ fn build_link_row(parent: &adw::ExpanderRow, link: &Link) -> LinkRow {
         .title(&link.name)
         .activatable(true)
         .build();
+    // Interface names are reported by networkd/NM; markup off (#753).
+    markup::plain_text(&action);
     action.set_title_lines(1);
 
     let pill = pill_label(
@@ -536,6 +549,7 @@ fn build_dns_expander() -> adw::ExpanderRow {
                 .title(ip.to_string())
                 .activatable(false)
                 .build();
+            markup::plain_text(&row);
             row.set_title_lines(1);
             row.add_css_class("ts-mono");
             row

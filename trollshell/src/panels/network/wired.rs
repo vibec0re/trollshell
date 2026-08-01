@@ -11,6 +11,7 @@ use hytte::prelude::*;
 use hytte::services::wifi;
 
 use super::pill_label;
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub(super) fn build_wired_group() -> adw::PreferencesGroup {
@@ -51,6 +52,8 @@ fn build_wired_row(profile: &wifi::WiredProfile) -> adw::ActionRow {
         .subtitle(subtitle)
         .activatable(false)
         .build();
+    // Profile names come from NetworkManager's connection store (#753).
+    markup::plain_text(&row);
 
     let icon = gtk::Image::from_icon_name("network-wired-symbolic");
     row.add_prefix(&icon);

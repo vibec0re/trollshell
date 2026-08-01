@@ -4,6 +4,8 @@
 use hytte::adw::{self, prelude::*};
 use hytte::services::netconn::{ConnState, Connection, Proto};
 
+use crate::components::markup;
+
 /// Top-N cap for each bucket of the active-connections section.
 pub(crate) const CONN_BUCKET_CAP: usize = 30;
 
@@ -18,6 +20,9 @@ pub(crate) fn build_connection_row(c: &Connection) -> adw::ActionRow {
         None => "(unknown)".to_string(),
     };
     let row = adw::ActionRow::builder().title(&title).build();
+    // The program name is read out of `/proc`, so any process on the box
+    // picks it — and the subtitle carries peer addresses (#753).
+    markup::plain_text(&row);
     let proto = match c.proto {
         Proto::Tcp => "tcp",
         Proto::Tcp6 => "tcp6",

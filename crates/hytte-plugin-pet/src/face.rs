@@ -630,6 +630,80 @@ mod tests {
         assert_eq!(buf.len(), SIZE * SIZE * 4);
     }
 
+    /// FNV-1a-64 over raw bytes — a deterministic, version-stable digest
+    /// (unlike `std::hash::DefaultHasher`, whose `SipHash` keys/output are not
+    /// stable across Rust releases), implemented inline so the golden needs no
+    /// hashing dependency.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h
+    }
+
+    /// Golden digests captured from the pre-`preem::Frame` renderer, one per
+    /// combo in the `MOODS` × `0..40` frames sweep (mood outermost, frame
+    /// innermost — the same nesting as [`golden_render_is_byte_identical`]).
+    /// The #650 migration is proven byte-for-byte iff that test stays green
+    /// **without editing this array**.
+    #[rustfmt::skip]
+    const GOLDEN: [u64; 200] = [
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x2927_7dea_40fb_e12a, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0x4ed6_2931_542a_01e8,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8,
+    ];
+
+    /// Byte-for-byte identity guard for the #650 `preem::Frame` migration:
+    /// every mood/frame must still hash to its committed [`GOLDEN`] value. Runs
+    /// on both the pre- and post-refactor renderer, so a green run here *is*
+    /// the pixel-identity proof (enforced in CI, not merely asserted in the PR
+    /// body). Mirrors caw's `golden_render_is_byte_identical` (#365 / PR #378).
+    #[test]
+    fn golden_render_is_byte_identical() {
+        let mut i = 0;
+        for mood in MOODS {
+            for frame in 0..40 {
+                let got = fnv1a_64(&render(mood, frame));
+                assert_eq!(got, GOLDEN[i], "byte drift at mood {mood:?} frame {frame}");
+                i += 1;
+            }
+        }
+        assert_eq!(i, GOLDEN.len(), "sweep length must match the golden array");
+    }
+
     /// Sleepy is drawn eyes-closed regardless of the blink cycle: a blink frame
     /// and a non-blink frame with the same animation step render identically.
     #[test]

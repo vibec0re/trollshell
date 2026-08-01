@@ -496,6 +496,17 @@
           # of the service sets (which still forces every mkIf/mkMerge branch to
           # decide membership) plus the swaybg unit's ExecStart string (the actual
           # body logic) and the assertions.
+          #
+          # Note (#681): this only covers assertions the fixture below actually
+          # triggers. An assertion behind `lib.mkIf <someOption>` (like the
+          # night-light one in nix/nixos-module.nix) only enters `cfg.assertions`
+          # once the fixture sets that option — otherwise it's never even
+          # constructed, so this check would stay green whether it were correct,
+          # inverted, or deleted. See nixos-module-nightlight below, which exists
+          # solely to give that conditional assertion a fixture that sets the
+          # option it depends on. A new conditional assertion needs the same
+          # treatment to be covered at all — don't assume this check already
+          # sees it.
           nixos-module =
             let
               nixos = nixpkgs.lib.nixosSystem {
@@ -577,6 +588,67 @@
                 } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #681: a *separate* nixosModules.default evaluation, deliberately
+          # not folded into the fixture above. The check above asserts every
+          # predicate is true, which is a useful invariant on its own; this one
+          # exists to assert the opposite — that setting a home-manager-only
+          # nightlight.* option makes exactly one predicate false — and
+          # weakening the first fixture to also cover that would lose the
+          # all-true guarantee. This is nix/nixos-module.nix's `nlConfigured`
+          # assertion (#657/#680), committed here as the fixture case its
+          # author validated by hand with a standalone `nix-instantiate`
+          # probe that had nowhere in the repo to live.
+          nixos-module-nightlight =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      # The one thing this fixture exists to set (#657/#680):
+                      # nightlight.* is home-manager-only, so configuring it
+                      # through the NixOS module must trip
+                      # nix/nixos-module.nix's `nlConfigured` assertion.
+                      nightlight.latitude = 52.52;
+                    };
+                    # Same minimal stubs as the nixos-module fixture above, so
+                    # this evaluates without a real machine.
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              # Same forcing idiom as the check above — predicates only, not
+              # every message (see that check's comment on lazily-invalid
+              # messages) — but the shape of what we assert is the mirror
+              # image: exactly one predicate must be false here, not all of
+              # them true. Deliberately not asserting on the total predicate
+              # count (~1385 unconfigured, by hand-count while writing this):
+              # that number drifts with every nixpkgs bump and would turn this
+              # into a maintenance trap unrelated to what it's meant to guard.
+              # Asserting on *what* is false — that it's the night-light one,
+              # by message content — is both narrower and more stable.
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "nightlight" (builtins.head falsePredicates).message;
+                assert pkgs.lib.hasInfix "home-manager" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-nightlight-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

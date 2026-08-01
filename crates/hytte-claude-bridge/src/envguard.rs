@@ -19,6 +19,16 @@
 //! effect. Failing closed is the correct direction for a billing control: a
 //! bridge that will not start is loud, whereas a bridge that quietly bills to
 //! metered credits is not.
+//!
+//! # It is scoped to the modes that spawn `claude` (#730)
+//!
+//! Every variable here redirects **the child**. `CLAUDE_BRIDGE_MODE=api`
+//! spawns no child: it is the mode you pick *because* you want to be billed per
+//! token, and `ANTHROPIC_API_KEY` is the credential it runs on rather than a
+//! silent redirect away from something else. So `main` runs this guard only
+//! when `Mode::spawns_claude()`, and a test there pins that scoping — if it
+//! ever widened back to unconditional, the API backend could not be configured
+//! through its env override at all.
 
 /// Environment variables that would redirect the `claude` child away from the
 /// subscription:

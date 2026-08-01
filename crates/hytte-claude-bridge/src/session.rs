@@ -84,6 +84,11 @@ const KEY_HEX_LEN: usize = 16;
 /// at both ends) so the link between the driver's typed sentinel and the
 /// rotation trigger is one constant, and pinned by a test in `backend.rs`.
 ///
+/// [`crate::messages::map_status`] reports the same status for the API
+/// backend's equivalent condition, so a plugin sees one failure vocabulary
+/// whichever backend answered. Nothing rotates on it there — that backend is
+/// not persisted — so it is a label for the human, not a trigger.
+///
 /// `http.rs` also answers 413 for an oversized *request body*, but that failure
 /// is raised while reading the request and never reaches the turn path, so it
 /// can never be mistaken for a full session.

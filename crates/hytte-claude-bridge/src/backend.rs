@@ -14,9 +14,12 @@
 //!   claude session state touches disk, at the cost of re-sending context.
 //!   Selected with `CLAUDE_BRIDGE_MODE=reprompt`.
 //!
-//! When the bridge eventually grows a real `/v1/messages` API client (the other
-//! half of the thread's cut), it lands inside [`Reprompt`] — the shape is
-//! already the stateless-re-prompt one that path wants.
+//! [`Reprompt`] is where the thread's *other* cut landed too (#730): its
+//! [`Engine`] chooses between the one-off `claude` subprocess and a real
+//! `/v1/messages` API client ([`crate::messages`]), because the record-plus-
+//! re-prompt shape is exactly the stateless one that path wants. Selected with
+//! `CLAUDE_BRIDGE_MODE=api`. The record, the bound, and the head-pinning are
+//! shared by both engines — only "who answers a composed message list" differs.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -26,16 +29,21 @@ use hive_claude::{Attach, Claude, Config, Error as ClaudeError, Sink};
 use serde_json::Value;
 
 use crate::http::Failure;
+use crate::messages::Client as MessagesClient;
 use crate::session::{AttachKind, OVERFLOW_STATUS, prompt_for, render_transcript};
 use crate::wire::Message;
 
 /// Longest error text handed back to the client. `Error::Exit` carries up to
 /// twenty stderr lines, which would swamp the pet's one-line log.
-const MAX_ERROR_CHARS: usize = 300;
+pub const MAX_ERROR_CHARS: usize = 300;
 
 /// Longest conversation the [`Reprompt`] record keeps. Past this the oldest
 /// turns are dropped, but the head (normally the system/persona message) is
 /// pinned so the conversation doesn't lose its instructions.
+///
+/// It is also the **cost** bound on the API engine (#730): a stateless
+/// re-prompt re-sends the whole record every turn, so this is what stops a
+/// long-lived pet conversation growing its per-tick bill without limit.
 const MAX_RECORD_MESSAGES: usize = 64;
 
 /// How many conversations [`Reprompt`] keeps records for.
@@ -51,6 +59,14 @@ pub struct Turn<'a> {
     pub transcript: &'a [Message],
     /// The newest message, i.e. the delta the session has not seen.
     pub delta: &'a Message,
+    /// The client's `max_tokens`, carried down rather than dropped at the HTTP
+    /// layer.
+    ///
+    /// The Claude Code CLI exposes no such flag, so both `claude` arms ignore
+    /// it — that is the "at best approximated" the crate docs promise. The
+    /// Messages API **requires** it, so [`crate::messages`] is the one arm that
+    /// can honour it, and does.
+    pub max_tokens: Option<u32>,
 }
 
 /// The abstraction both backends implement.
@@ -112,12 +128,29 @@ impl Conversation for Subscription {
     }
 }
 
-/// The re-prompting path: the bridge holds the conversation, claude holds
-/// nothing.
+/// The re-prompting path: the bridge holds the conversation, the thing that
+/// answers holds nothing.
+///
+/// Which thing answers is [`Engine`]. Everything *around* it — the bounded,
+/// head-pinned record and the compose/remember cycle — is shared, because that
+/// is the part the stateless shape is made of; swapping a subprocess for an
+/// HTTP call changes nothing about the conversation's identity or its bound.
 #[derive(Debug)]
 pub struct Reprompt {
-    config: Config,
+    engine: Engine,
     records: Mutex<Records>,
+}
+
+/// Who answers one composed message list.
+#[derive(Debug)]
+enum Engine {
+    /// A one-off `claude --print` session per turn — no `--resume`, no
+    /// `--name`, so claude persists no titled session for the bridge to depend
+    /// on. Rides the subscription; holds no key.
+    Cli(Config),
+    /// The Anthropic Messages API, billed to an API key (#730). No subprocess,
+    /// no `claude` CLI, no `hive-claude` session state at all.
+    Api(MessagesClient),
 }
 
 impl Reprompt {
@@ -125,7 +158,17 @@ impl Reprompt {
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
-            config,
+            engine: Engine::Cli(config),
+            records: Mutex::new(Records::default()),
+        }
+    }
+
+    /// A re-prompting backend answering through the Messages API instead of a
+    /// `claude` subprocess (#730).
+    #[must_use]
+    pub fn with_api(client: MessagesClient) -> Self {
+        Self {
+            engine: Engine::Api(client),
             records: Mutex::new(Records::default()),
         }
     }
@@ -137,19 +180,24 @@ impl Conversation for Reprompt {
             let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
             records.compose(turn)
         };
-        let sink = TextSink::default();
-        // `Attach::OneOff` — no `--resume`, no `--name`, so claude persists no
-        // titled session for the bridge to depend on. The record above is the
-        // only continuity.
-        Claude::run(
-            &self.config,
-            &Attach::OneOff,
-            &render_transcript(&messages),
-            &sink,
-        )
-        .await
-        .map_err(|e| map_error(&e))?;
-        let reply = sink.into_text()?;
+        // The guard above is dropped before this await on purpose: a `Mutex`
+        // held across an await point would make this future non-`Send`, which
+        // the `Conversation` trait requires.
+        let reply = match &self.engine {
+            Engine::Cli(config) => {
+                let sink = TextSink::default();
+                Claude::run(
+                    config,
+                    &Attach::OneOff,
+                    &render_transcript(&messages),
+                    &sink,
+                )
+                .await
+                .map_err(|e| map_error(&e))?;
+                sink.into_text()?
+            }
+            Engine::Api(client) => client.respond(&messages, turn.max_tokens).await?,
+        };
         {
             let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
             records.remember(turn.title, messages, &reply);
@@ -353,7 +401,8 @@ fn map_error(e: &ClaudeError) -> Failure {
 }
 
 /// Clamp `text` to `max` chars (never mid-char).
-fn truncate(text: &str, max: usize) -> String {
+#[must_use]
+pub fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }
@@ -372,6 +421,16 @@ mod tests {
         Message {
             role: role.to_owned(),
             content: content.to_owned(),
+        }
+    }
+
+    /// A turn over `transcript` whose delta is its newest message.
+    fn turn<'a>(title: &'a str, transcript: &'a [Message]) -> Turn<'a> {
+        Turn {
+            title,
+            transcript,
+            delta: transcript.last().expect("non-empty"),
+            max_tokens: None,
         }
     }
 
@@ -446,13 +505,24 @@ mod tests {
     }
 
     /// Only the persisted-session backend accumulates state a rotation can
-    /// retire.
+    /// retire. **Both** reprompt engines are non-persisted — the API one holds
+    /// no claude session state at all, so a rotation there would spin the
+    /// generation counter once per request and fix nothing (#667).
     #[test]
     fn only_the_subscription_backend_rotates() {
         use super::{Backend, Reprompt, Subscription};
+        use crate::messages::{Client as MessagesClient, Thinking};
         use hive_claude::Config;
+        use std::time::Duration;
         assert!(Backend::Subscription(Subscription::new(Config::default())).is_persisted());
         assert!(!Backend::Reprompt(Reprompt::new(Config::default())).is_persisted());
+        let api = Reprompt::with_api(MessagesClient::new(
+            "sk-ant-test".to_owned(),
+            "claude-opus-5".to_owned(),
+            Thinking::default(),
+            Duration::from_secs(7),
+        ));
+        assert!(!Backend::Reprompt(api).is_persisted());
     }
 
     /// Each typed sentinel maps to a distinct, actionable status.
@@ -485,12 +555,7 @@ mod tests {
     fn reprompt_falls_back_to_the_client_transcript() {
         let records = Records::default();
         let transcript = vec![msg("system", "persona"), msg("user", "hello")];
-        let turn = Turn {
-            title: "t",
-            transcript: &transcript,
-            delta: &transcript[1],
-        };
-        assert_eq!(records.compose(turn), transcript);
+        assert_eq!(records.compose(turn("t", &transcript)), transcript);
     }
 
     /// With a record, the reprompt path replays it plus the delta — including
@@ -503,11 +568,7 @@ mod tests {
 
         // The client forgot the assistant turn and just appended a new question.
         let transcript = vec![msg("system", "persona"), msg("user", "again")];
-        let composed = records.compose(Turn {
-            title: "t",
-            transcript: &transcript,
-            delta: &transcript[1],
-        });
+        let composed = records.compose(turn("t", &transcript));
         assert_eq!(
             composed,
             vec![

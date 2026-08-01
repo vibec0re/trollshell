@@ -89,17 +89,21 @@ impl Bridge {
         if req.messages.is_empty() {
             return error_response(400, "`messages` must not be empty");
         }
-        // The accepted-but-ignored knobs, named in the journal rather than
-        // silently dropped: `claude` exposes no sampling or token-cap flag, so
-        // tolerating these is the whole of the contract.
+        // The sampling knobs, named in the journal rather than silently
+        // dropped. `max_tokens` now rides down to the backend — the Messages
+        // API requires it and honours it (#730), while both `claude` arms still
+        // ignore it because the CLI exposes no such flag. `temperature` and the
+        // llama-only template kwarg are still accepted-and-ignored everywhere:
+        // the CLI has no sampling knob, and the Messages API *rejects*
+        // `temperature` outright on the current models.
         tracing::debug!(
             max_tokens = ?req.max_tokens,
             temperature = ?req.temperature,
             enable_thinking = ?req.chat_template_kwargs.and_then(|k| k.enable_thinking),
-            "accepted and ignoring the sampling knobs",
+            "accepted the sampling knobs",
         );
 
-        match self.complete(&req.messages).await {
+        match self.complete(&req.messages, req.max_tokens).await {
             Ok(text) => ok_response(text, req.model, &req.messages),
             Err(f) => {
                 tracing::warn!(status = f.status, message = %f.message, "request failed");
@@ -108,12 +112,20 @@ impl Bridge {
         }
     }
 
-    /// Single-flight: identical concurrent transcripts share one `claude` turn.
+    /// Single-flight: identical concurrent transcripts share one backend turn.
     ///
     /// pet's tick and a manual poke can land together on the same prompt, and
-    /// paying twice for the same answer is pure waste of a subscription that is
-    /// rate-limited, not metered.
-    async fn complete(&self, messages: &[Message]) -> Result<String, Failure> {
+    /// paying twice for the same answer is pure waste — of a subscription that
+    /// is rate-limited, and, on the API backend, of real money.
+    ///
+    /// The key is the transcript alone, deliberately: `max_tokens` is a cap on
+    /// the answer, not part of the question, and keying on it would split two
+    /// otherwise-identical in-flight requests into two paid turns.
+    async fn complete(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+    ) -> Result<String, Failure> {
         let key = session::transcript_key(messages);
         let leader = {
             let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
@@ -134,7 +146,7 @@ impl Bridge {
                     inflight: &self.inflight,
                     key,
                 };
-                let outcome = self.run_turn(messages).await;
+                let outcome = self.run_turn(messages, max_tokens).await;
                 let _ = tx.send(Some(Arc::new(outcome.clone())));
                 outcome
             }
@@ -142,11 +154,15 @@ impl Bridge {
     }
 
     /// Run one turn: shed load, derive the identity, spend the budget, record.
-    async fn run_turn(&self, messages: &[Message]) -> Result<String, Failure> {
+    async fn run_turn(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+    ) -> Result<String, Failure> {
         let Ok(_permit) = self.permits.try_acquire() else {
             return Err(Failure::new(
                 503,
-                format!("bridge busy: {PERMITS} claude turns already running"),
+                format!("bridge busy: {PERMITS} turns already running"),
             ));
         };
         let Some((_prefix, delta)) = session::split_delta(messages) else {
@@ -161,7 +177,12 @@ impl Bridge {
 
         // ONE budget for the whole request, rotation included: the client's own
         // global timeout does not restart just because the bridge retried.
-        match tokio::time::timeout(self.budget, self.answer(messages, delta, &title)).await {
+        match tokio::time::timeout(
+            self.budget,
+            self.answer(messages, delta, &title, max_tokens),
+        )
+        .await
+        {
             Ok(reply) => reply,
             Err(_elapsed) => {
                 // The driver's own idle watchdog sits a second under this and
@@ -205,8 +226,9 @@ impl Bridge {
         messages: &[Message],
         delta: &Message,
         title: &str,
+        max_tokens: Option<u32>,
     ) -> Result<String, Failure> {
-        let failure = match self.respond(messages, delta, title).await {
+        let failure = match self.respond(messages, delta, title, max_tokens).await {
             Ok(reply) => return Ok(self.record(title, messages, reply)),
             Err(f) => f,
         };
@@ -233,7 +255,7 @@ impl Bridge {
         let Some(next) = self.retire(messages, title) else {
             return Err(failure);
         };
-        let reply = self.respond(messages, delta, &next).await?;
+        let reply = self.respond(messages, delta, &next, max_tokens).await?;
         Ok(self.record(&next, messages, reply))
     }
 
@@ -243,12 +265,14 @@ impl Bridge {
         messages: &[Message],
         delta: &Message,
         title: &str,
+        max_tokens: Option<u32>,
     ) -> Result<String, Failure> {
         self.backend
             .respond(Turn {
                 title,
                 transcript: messages,
                 delta,
+                max_tokens,
             })
             .await
     }

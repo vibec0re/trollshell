@@ -40,4 +40,12 @@ binds {
     // niri's default config comments Mod+Space out, but some users bind
     // it to switch-layout, so a conflict is on you to resolve.
     Mod+D hotkey-overlay-title="Run an Application: fuzzel" { spawn "fuzzel"; }
+
+    // Clipboard history (#729) — opens the drawer straight to the
+    // Clipboard page via the shell's own `open-page` org.gtk.Actions verb
+    // (#219; trollshell/src/commands.rs), no custom IPC needed. busctl
+    // talks to trollshell's existing session-bus name; see
+    // etc/cliphist/README.md for the full recipe and a manual busctl
+    // one-liner to test the verb without this keybind.
+    Mod+V hotkey-overlay-title="Open Clipboard History" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-page" "1" "s" "clipboard" "0"; }
 }

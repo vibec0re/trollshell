@@ -94,12 +94,20 @@ how many cliphist holds — that's purely a UI cap, not a storage cap.
 
 ## Opening the clipboard page
 
-There is no shipped niri keybind for the clipboard drawer. trollshell
-doesn't expose an IPC channel for "open drawer at page X" yet, so the
-only way in is the bar's drawer chip — open the drawer normally and
-switch to the **Clipboard** page. A `Mod+V`-style binding awaits a
-trollshell IPC follow-up; once that lands, niri can spawn a small
-helper to toggle the page directly.
+`etc/niri/binds.kdl` ships a `Mod+V` keybind that opens the drawer straight
+to the **Clipboard** page, no mouse required. It works through trollshell's
+existing `org.gtk.Actions` command surface (`open-page`, shipped in #219 —
+see `trollshell/src/commands.rs`), not a cliphist-specific IPC channel:
+
+```sh
+busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
+    org.gtk.Actions Activate 'sava{sv}' open-page 1 s clipboard 0
+```
+
+Paste that one-liner to open the Clipboard page by hand — useful for
+confirming the binding works before trusting the keybind, or from a script.
+The bar's drawer chip still works too; `Mod+V` is just a shortcut to the
+same page.
 
 ## How it composes
 
@@ -124,11 +132,15 @@ helper to toggle the page directly.
 - **No rich-format paste.** wl-copy receives whatever bytes `cliphist
 decode` produced — for text, that's text; for images, the original blob
   goes back to the clipboard with cliphist's recorded MIME type.
-- **No delete-from-UI.** cliphist's `delete` reads `<id>\t<preview>` lines
-  on stdin (not an id argument), which makes per-row delete from the
-  drawer awkward. Deferred to a follow-up. Use `cliphist wipe` (clears
-  everything) or shell out manually for now:
+- ~~No delete-from-UI~~ — **this shipped.** Each row's `⋮` menu has a
+  "Delete entry" action (`trollshell/src/panels/clipboard.rs`,
+  `hytte-services`' `clipboard::delete`); it looks up the exact
+  `<id>\t<preview>` line `cliphist list` reports for that id and pipes it
+  into `cliphist delete`, since cliphist's `delete` takes stdin lines, not
+  an id argument. To clear everything at once instead, or to delete from a
+  script:
 
   ```sh
-  cliphist list | grep -F 'something I want gone' | cliphist delete
+  cliphist wipe                                              # clear everything
+  cliphist list | grep -F 'something I want gone' | cliphist delete   # one entry, from the CLI
   ```

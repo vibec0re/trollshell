@@ -23,6 +23,13 @@ Environment=PET_LLM_MODEL=google/gemini-3.5-flash
 # trollshell-pet-brain.service). Leave it empty — Environment=PET_LLM_URL= —
 # for a fully canned-line pet. (PET_LLM_API_KEY overrides the key file.)
 #   Environment=PET_LLM_URL=http://127.0.0.1:8080
+# Call tuning, whole seconds; unset/blank/unparsable/0 keeps the default.
+# PET_LLM_MIN_GAP_SECS (15) throttles real model calls; PET_LLM_TIMEOUT_SECS
+# (10) bounds one call. A slow backend — a cold claude-bridge turn, a big
+# local model — needs the timeout raised FIRST, and any backend-side budget
+# (e.g. CLAUDE_BRIDGE_TIMEOUT_SECS) kept strictly below it.
+#   Environment=PET_LLM_MIN_GAP_SECS=15
+#   Environment=PET_LLM_TIMEOUT_SECS=30
 Restart=on-failure
 RestartSec=2
 

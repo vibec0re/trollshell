@@ -108,6 +108,8 @@ state, not a plugin-launch knob.
 | `PET_LLM_URL`            | unset (→ OpenRouter, only if a key is resolved) | Base URL for the pet's brain. Set to a local `llama-server` URL to self-host; set to `""` explicitly to force canned-only replies with no network call. Unset with no key resolved also falls back to canned-only (`brain.rs::resolve_provider`). |
 | `PET_LLM_MODEL`          | unset                                           | Model id sent when using the OpenRouter path (required by that cloud endpoint — see the SDK-level note below). Ignored by a local `llama-server`.                                                                                                 |
 | `PET_LLM_API_KEY`        | unset                                           | Fallback OpenRouter API key, used only if `hytte_ai_providers::load_key("openrouter")` finds nothing. Prefer `plugins.pet.secrets = [ "openrouter" ];` instead.                                                                                   |
+| `PET_LLM_MIN_GAP_SECS`   | `15`                                            | Whole seconds of throttle between two real model calls; pokes inside the gap get a canned line. Blank, unparsable or `0` → the default (`brain.rs::Cfg::from_env`).                                                                               |
+| `PET_LLM_TIMEOUT_SECS`   | `10`                                            | Whole seconds a single model call may take before the client hangs up (the shared `hytte-ai-providers` request budget). Raise it for a slow backend — and see the ordering note below. Blank, unparsable or `0` → the default.                    |
 | `TROLLSHELL_PET_KAOMOJI` | unset (falsy)                                   | Set to `1` or `true` (case-insensitive) to force the kaomoji fallback face at startup, bypassing whatever the normal render path would pick (`main.rs::init`).                                                                                    |
 
 ### preem-demo (`hytte-plugin-preem-demo`)
@@ -149,7 +151,10 @@ trait + `run()`) reads **no** environment variables — env-based config is a
 plugin-author idiom on top of it, not part of the runtime.
 
 `hytte-ai-providers` (the shared OpenAI-compatible chat client `pet` and
-`caw`'s brains both use) reads two, via `load_key`:
+`caw`'s brains both use) reads no timeout of its own — the per-request budget
+is `ChatOpts::timeout`, which each plugin resolves (`PET_LLM_TIMEOUT_SECS`;
+`caw` has no knob yet and takes the 10s `DEFAULT_TIMEOUT`). It reads two
+variables, both via `load_key`:
 
 | Variable                                     | Default                   | Effect                                                                                                                                                                                                                                             |
 | -------------------------------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -170,3 +175,14 @@ this or supply a default, so an unset model on the cloud path is a
 misconfiguration rather than a supported "use OpenRouter's default" mode.
 Consult `crates/hytte-ai-providers/src/lib.rs` and each plugin's
 `brain.rs`/`briefing.rs` if this needs to change.
+
+**Ordering the two timeouts (client vs. backend):** the client budget
+(`ChatOpts::timeout`, i.e. `PET_LLM_TIMEOUT_SECS`) is the outer bound. A
+backend that enforces its own per-request budget must stay strictly **under**
+it, or a slow turn tears the connection mid-read instead of coming back as an
+error the plugin can fall back from. `hytte-claude-bridge` is the live case:
+its `CLAUDE_BRIDGE_TIMEOUT_SECS` defaults to 8s _because_ the client defaults
+to 10s. So to give a cold `claude --print` turn more room, raise the **client**
+first — e.g. `plugins.pet.env.PET_LLM_TIMEOUT_SECS = "30";` — and only then the
+bridge's budget, to something still below it. Doing it in the other order buys
+nothing: the client hangs up first regardless.

@@ -34,7 +34,9 @@
 //! its own user service; this process is a thin client.
 //!
 //! Environment: `PET_NAME` (default `nisse`), `PET_LLM_URL` (default
-//! `http://127.0.0.1:8080`; set empty to run canned-only).
+//! `http://127.0.0.1:8080`; set empty to run canned-only),
+//! `PET_LLM_MIN_GAP_SECS` (default 15) and `PET_LLM_TIMEOUT_SECS` (default
+//! 10) — see `brain.rs`'s `Cfg::from_env`.
 //!
 //! Note: the pet mounts `SidebarBottom` with `order = -1`, so it perches
 //! **above** the departures board (which mounts the same region unordered,

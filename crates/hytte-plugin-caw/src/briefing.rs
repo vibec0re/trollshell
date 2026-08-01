@@ -305,6 +305,10 @@ pub(crate) fn compose_llm(provider: &Provider, facts: &str) -> Result<String, St
     let opts = ChatOpts {
         max_tokens: 160,
         temperature: 0.8,
+        // The shared client's default budget. Unlike the pet's
+        // `$PET_LLM_TIMEOUT_SECS` (#699), caw has no env knob for this yet —
+        // its briefing is a once-a-morning call, not a poke-latency path.
+        ..ChatOpts::default()
     };
     let raw = hytte_ai_providers::chat(provider, &messages, &opts)?;
     let brief = sanitize(&raw);

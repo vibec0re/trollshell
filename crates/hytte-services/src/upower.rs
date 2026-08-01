@@ -505,6 +505,13 @@ mod tests {
         on_battery.set(false);
         assert!(!on_battery_snapshot());
 
+        // Leave the bag holding `true` right before the reset: if
+        // `reset_for_tests` ever stopped clearing the shared map, the stale
+        // bag would still answer `true` here and the assert below would
+        // catch it. Resetting straight from a `false` bag can't distinguish
+        // "map cleared" from "map intact and still false" — both read as
+        // `false` (#738).
+        on_battery.set(true);
         registry::reset_for_tests();
         assert!(
             !on_battery_snapshot(),

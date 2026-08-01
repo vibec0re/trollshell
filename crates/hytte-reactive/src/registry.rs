@@ -120,7 +120,7 @@ pub fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
+    use super::{REGISTRY, Registry, reset_for_tests, with};
 
     #[test]
     fn insert_then_get_roundtrips() {
@@ -141,5 +141,44 @@ mod tests {
         let mut reg = Registry::default();
         reg.insert::<u32>(1);
         reg.insert::<u32>(2);
+    }
+
+    /// Regression pin for #738: nothing previously called the actual
+    /// `reset_for_tests` free function and checked its effect on the
+    /// thread-local registry — the other tests in this module construct a
+    /// bare `Registry::default()` instead of touching the `REGISTRY`
+    /// thread-local this wrapper clears.
+    ///
+    /// This pins only the thread-local half of the contract on purpose.
+    /// `reset_for_tests` also delegates to
+    /// [`crate::shared::reset_for_tests`] (the process-global mirror), but
+    /// deliberately isn't exercised from *here*: `cargo test` runs a
+    /// crate's unit tests on a shared thread pool, and `shared.rs`'s own
+    /// tests already mutate that same process-global map, serializing
+    /// amongst themselves via a `TEST_LOCK` private to their test module.
+    /// A test in this module that also touched `crate::shared` would race
+    /// them from outside that lock — confirmed empirically (an earlier
+    /// draft of this test flaked shared.rs's tests in roughly 1 of 15
+    /// runs). Fixing that needs `shared.rs`'s `TEST_LOCK` hoisted to
+    /// something this module can join too, which is out of scope here.
+    ///
+    /// The shared-delegation half of the contract *is* covered, race-free,
+    /// by `hytte-services`'s `upower::tests::on_battery_snapshot_contract`:
+    /// it calls this same `reset_for_tests` wrapper and checks the shared
+    /// bag cleared, from a separate crate's test binary (its own process,
+    /// its own instance of `crate::shared`'s static — no race with
+    /// `shared.rs`'s tests here).
+    #[test]
+    fn reset_for_tests_clears_the_thread_local_registry() {
+        REGISTRY.with(|cell| cell.borrow_mut().insert::<u32>(7));
+        assert_eq!(with(|r| r.get::<u32>().copied()), Some(7));
+
+        reset_for_tests();
+
+        assert_eq!(
+            with(|r| r.get::<u32>().copied()),
+            None,
+            "reset_for_tests must clear the thread-local registry"
+        );
     }
 }

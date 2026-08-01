@@ -63,20 +63,14 @@ fn cadence(on_battery: bool) -> Duration {
     }
 }
 
-/// Best-effort on-battery snapshot, read directly off `upower`'s registered
-/// handle rather than the panicking `upower::on_battery()` accessor.
-///
-/// `main.rs` registers `wifiscan::service()` *before* `upower::service()`
-/// today, so calling the panicking accessor here would race upower's startup
-/// (this task is spawned — and may run — before `upower::service()`'s handles
-/// land in the registry). A direct snapshot read degrades to "assume AC"
-/// (`false`) until upower registers, then reflects the real value from then
-/// on (#505).
+/// Best-effort on-battery snapshot — see
+/// [`crate::upower::on_battery_snapshot`] for the full rationale: it reads
+/// upower's cross-thread `shared` bag (this scan loop runs on a tokio worker,
+/// where the thread-local registry is empty), degrades to "assume AC" until
+/// upower registers — `main.rs` starts `wifiscan` first — and never panics
+/// the way `upower::on_battery()` would (#505).
 fn on_battery() -> bool {
-    registry::with(|r| {
-        r.get::<crate::upower::UpowerHandles>()
-            .is_some_and(|h| h.on_battery.get())
-    })
+    crate::upower::on_battery_snapshot()
 }
 
 /// Wait out the current battery-aware cadence, re-checking every [`RECHECK`]

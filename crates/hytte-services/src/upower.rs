@@ -25,7 +25,7 @@
 use crate::notifications::Urgency;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_bus::{BusKind, PropState, PropertySignal, property};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use hytte_reactive::{Service, registry, shared, spawn_supervised};
 use std::time::Duration;
 
 const UPOWER_NAME: &str = "org.freedesktop.UPower";
@@ -120,6 +120,20 @@ pub struct UpowerHandles {
     pub(crate) on_battery: Mutable<bool>,
 }
 
+/// Cross-thread mirror of the `OnBattery` handle, for the background pollers
+/// that pick their cadence from it (#505).
+///
+/// This has to be a [`shared`] bag rather than a thread-local registry read:
+/// the pollers that consume it (`netconn`, `app_usage`, `wifiscan`, `places`)
+/// run their loops inside `spawn_supervised`, i.e. on **tokio worker
+/// threads**, and [`registry`] is a `thread_local!` that only the GTK main
+/// thread ever populates. A `registry::with` from a worker thread sees a
+/// freshly-defaulted empty `Registry` and reports "no upower" forever — which
+/// is exactly the bug #526 shipped (see [`on_battery_snapshot`]).
+pub(crate) struct UpowerShared {
+    pub(crate) on_battery: Mutable<bool>,
+}
+
 impl Default for UpowerHandles {
     fn default() -> Self {
         Self {
@@ -179,6 +193,13 @@ impl Service for UpowerService {
             manager_prop::<bool>("OnBattery"),
             handles.on_battery.clone(),
         );
+
+        // Publish the OnBattery handle on the cross-thread path too — the
+        // cadence pollers read it from tokio workers, where the thread-local
+        // registry is empty. See `UpowerShared`.
+        shared::insert(UpowerShared {
+            on_battery: handles.on_battery.clone(),
+        });
 
         handles
     }
@@ -388,9 +409,108 @@ pub fn on_battery() -> impl Signal<Item = bool> {
     })
 }
 
+/// Best-effort "are we on battery?" snapshot, readable from **any** thread.
+///
+/// This is the one accessor the battery-aware pollers use to pick their
+/// cadence (#505). It reads the [`UpowerShared`] bag rather than the
+/// thread-local registry, because every consumer runs inside
+/// `spawn_supervised` — on a tokio worker thread, where a `registry::with`
+/// read sees an empty registry and would report AC forever regardless of the
+/// real power state.
+///
+/// # Degrades to AC, never to the slow cadence
+///
+/// Returns `false` ("on AC", i.e. **normal** cadence) whenever the true state
+/// isn't known. That covers every degenerate case, and each one is deliberate:
+///
+/// - **`upower::service()` not registered at all** — e.g. a build that leaves
+///   it out, or `enableRecommendedServices = false` so `UPower` isn't running.
+///   `shared::get` returns `None`.
+/// - **`UPower` absent from the bus** — the service is registered but the
+///   `OnBattery` property never resolves, so `bind_on_battery` leaves the
+///   handle at its `false` default (`PropState::Loading` maps to `false`).
+/// - **Desktop with no battery** — `UPower` answers `OnBattery = false`. This is
+///   why the manager property is the right source and `BatteryState::Unknown`
+///   on the display device is not: a batteryless machine reports `Unknown`
+///   state but is unambiguously on AC.
+/// - **Startup ordering** — `main.rs` registers `wifiscan`/`places` *before*
+///   `upower`, so a poll loop can run before upower's handles are published.
+///   Reads before that point say AC, then track the real value.
+///
+/// Biasing the unknown case toward AC means the worst failure is a poller
+/// staying at full rate on battery (a little extra power draw), never a
+/// poller stuck at the stretched cadence on a machine that has no battery at
+/// all — which would be a visible, hard-to-diagnose staleness bug.
+pub(crate) fn on_battery_snapshot() -> bool {
+    shared::get::<UpowerShared>().is_some_and(|s| s.on_battery.get())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Urgency, WarningLevel, is_critical, warning_toast};
+    use super::{
+        UpowerShared, Urgency, WarningLevel, is_critical, on_battery_snapshot, warning_toast,
+    };
+    use futures_signals::signal::Mutable;
+    use hytte_reactive::{registry, shared};
+
+    /// Everything about the battery-aware cadence snapshot (#505), in **one**
+    /// test on purpose: `hytte_reactive::shared` is a process-global map, so
+    /// two `#[test]` fns mutating it would run concurrently on libtest's
+    /// thread pool and flake against each other. One test = one thread = a
+    /// deterministic sequence.
+    #[test]
+    fn on_battery_snapshot_contract() {
+        registry::reset_for_tests();
+
+        // ── Degenerate: upower never registered ──────────────────────────
+        // A desktop with `enableRecommendedServices = false`, or any build
+        // that leaves `upower::service()` out. Must read as AC (`false`) so
+        // pollers stay at their *normal* cadence — never the stretched one.
+        assert!(
+            !on_battery_snapshot(),
+            "no upower registered must degrade to AC, not to the slow cadence"
+        );
+
+        // ── Registered, on AC ────────────────────────────────────────────
+        // Also the batteryless-desktop case: UPower answers OnBattery=false
+        // even though the display device's BatteryState is Unknown.
+        let on_battery = Mutable::new(false);
+        shared::insert(UpowerShared {
+            on_battery: on_battery.clone(),
+        });
+        assert!(!on_battery_snapshot());
+
+        // ── Registered, on battery ───────────────────────────────────────
+        on_battery.set(true);
+        assert!(on_battery_snapshot());
+
+        // ── Reachable from another thread ────────────────────────────────
+        // The regression pin for #526: every consumer of this snapshot runs
+        // its poll loop under `spawn_supervised`, i.e. off the GTK main
+        // thread. The original implementation read the `thread_local!`
+        // registry, which is only ever populated on the main thread — so from
+        // a worker it reported AC forever and the whole feature was a no-op.
+        // `std::thread` rather than a tokio worker here: `thread_local!`
+        // behaves identically for both, and this needs no runtime features.
+        let seen = std::thread::spawn(on_battery_snapshot)
+            .join()
+            .expect("snapshot thread panicked");
+        assert!(
+            seen,
+            "snapshot must be readable off the GTK main thread — the pollers \
+             that consume it all run on tokio workers"
+        );
+
+        // ── Live flip is observed, not latched at startup ─────────────────
+        on_battery.set(false);
+        assert!(!on_battery_snapshot());
+
+        registry::reset_for_tests();
+        assert!(
+            !on_battery_snapshot(),
+            "reset must clear the shared bag back to the AC default"
+        );
+    }
 
     #[test]
     fn is_critical_matches_the_toasts_critical_tier() {

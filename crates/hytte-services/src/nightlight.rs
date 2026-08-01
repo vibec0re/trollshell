@@ -294,6 +294,30 @@ impl Service for NightlightService {
         // Seed the initial value off the GTK thread: a point-in-time read of the
         // unit's ActiveState. `Mutable` is `Send + Sync`, so the blocking task
         // writes back the result directly.
+        //
+        // Deliberately a bare `spawn_blocking` and *not*
+        // `hytte_reactive::spawn_supervised_blocking`, which #654 proposed and
+        // #690/#691 re-examined. Recording the answer here so the question stops
+        // being re-asked from the outside: supervision means "re-run the closure
+        // when it panics", and for this closure that is a no-op at best and a
+        // regression at worst.
+        //
+        // - There is no panic to recover from. `read_active_state` is total:
+        //   every outcome of the `systemctl` call — spawn failure, non-zero
+        //   exit, non-UTF-8 output — is mapped to a `NightlightState`, with no
+        //   unwrap on any path. A supervisor would never fire. Keep it that
+        //   way; adding one would make the next point load-bearing.
+        // - A *retried* seed would land late, and a late unconditional write is
+        //   exactly the #594 bug. This `set` skips the `Generation` guard the
+        //   rest of the module uses precisely because it runs in the
+        //   milliseconds before the bar is drawn, so no toggle can have raced
+        //   it. Retrying on the supervisor's backoff (1s, 2s, …) moves the
+        //   write into a window where a user toggle *can* precede it, and the
+        //   stale seed would then stamp itself over the newer state. Supervising
+        //   this would mean giving it a `Ticket` first.
+        // - It is not silent either way: `install_panic_hook` (#690) routes any
+        //   panic on this thread through `tracing`, which is the visibility half
+        //   of what supervision would have bought — and the half that mattered.
         let writer = handles.state.clone();
         rt.spawn_blocking(move || {
             writer.set(read_active_state());

@@ -16,6 +16,34 @@ use tokio::process::{Child, Command};
 use zbus::Connection;
 use zbus::connection::Builder;
 
+/// Upper bound on how long the ephemeral `dbus-daemon` is allowed to take to
+/// print its listen address before a test gives up on it.
+///
+/// **This is a liveness guard, not a latency assertion.** No test in this
+/// crate claims that `dbus-daemon` *should* start and print its address
+/// within any particular time — that would be a meaningless thing to assert
+/// about a spawned subprocess under load. The only job of this budget is to
+/// stop a broker that never starts from wedging the suite (and therefore
+/// `nix flake check`) forever; a genuinely broken daemon still fails the
+/// test, just later rather than sooner.
+///
+/// This lives in the shared `common` module, so it is the single gate that
+/// every one of `hytte-bus`'s ten `tests/*.rs` files passes through — each
+/// spawns its own broker via [`ephemeral_bus`]. These tests run inside
+/// `nix flake check`, which in the same invocation also builds two
+/// `nixosTest` VMs plus the full workspace clippy and package builds — CPU
+/// contention is the normal condition, not an edge case. A tight budget here
+/// buys nothing (nobody is measuring startup latency) and costs false reds
+/// (#676/#678: a markdown-only PR tripped a 3-second sibling budget in
+/// `hytte-services` under load). If you're looking at this thinking "30
+/// seconds seems excessive for a local subprocess to print a line" — it is,
+/// for the happy path, and that's the point: this number is sized against
+/// worst-case CI contention, not typical-case latency. Tightening it does
+/// not strengthen any assertion in this module; it only makes the suite
+/// flake more often under load. If you want faster failure signal for a
+/// real hang, run the test locally — CI's job is to not lie.
+const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
+
 pub struct BusGuard {
     child: Option<Child>,
     _tmp: TempDir,
@@ -84,7 +112,7 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
     // Read the printed address from stdout to confirm the daemon is up.
     let stdout = child.stdout.take().expect("dbus-daemon stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let printed = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+    let printed = tokio::time::timeout(DBUS_DAEMON_STARTUP_BUDGET, lines.next_line())
         .await
         .expect("dbus-daemon address timeout")
         .expect("dbus-daemon read address")

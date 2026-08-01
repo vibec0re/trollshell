@@ -21,7 +21,10 @@
 //!
 //! Restarting is safe by design: hytte services are thin clients to persistent
 //! system daemons (see the crate-level docs on the registry), so a respawned
-//! task reconnects to the daemon without losing state.
+//! task reconnects to the daemon without losing state. That covers daemon
+//! state; it does not cover a poisoned `Mutable` — see the precondition on
+//! [`spawn_supervised_blocking`] for the one case restarting cannot recover
+//! from.
 //!
 //! Because a `multi_thread` tokio runtime cannot use the runtime-level
 //! `unhandled_panic` policy (that is `current_thread`-only), a per-spawn
@@ -133,16 +136,24 @@ where
 /// a run allocates — sockets, buffers, parser state — is dropped by the unwind,
 /// and the state that matters lives either in the system daemon (which the
 /// restarted run reconnects to) or in the `Mutable`s the closure writes, which
-/// outlive it. Nothing is lost by starting over, and a frozen signal is the
-/// alternative.
+/// outlive it — usually. Nothing is lost by starting over, and a frozen signal
+/// is the alternative, *except* when the panic unwound while a `Mutable`'s
+/// `lock_mut()` write guard was held: `Mutable` is backed by a poisoning
+/// `std::sync::RwLock`, and every accessor (`lock_mut`, `set`, `signal_cloned`,
+/// …) `.unwrap()`s the lock result. The guard's drop during unwind poisons that
+/// `Mutable` permanently, so every later access panics too — not only from the
+/// restarted run, but from any reader, including the GTK main thread. Restart
+/// does not repair that; it turns a silent freeze into a repeating crash.
 ///
 /// The precondition, which is the caller's to honour: `task` must be
 /// **restart-safe** — a panic partway through a run must not leave shared state
 /// a fresh run would misread (a half-updated pair of `Mutable`s that later
-/// reads treat as consistent, say). A closure that cannot promise that should
-/// not be supervised: silently re-running it on corrupt state is worse than
-/// leaving it dead. Restarts are unbounded — there is no give-up count — but
-/// the 30s backoff cap bounds a permanently-panicking task to one run per 30s.
+/// reads treat as consistent, say), and must never unwind while holding a
+/// `Mutable`'s write guard. A closure that cannot promise that should not be
+/// supervised: silently re-running it on corrupt (or poisoned) state is worse
+/// than leaving it dead. Restarts are unbounded — there is no give-up count —
+/// but the 30s backoff cap bounds a permanently-panicking task to one run per
+/// 30s.
 ///
 /// Panics are captured through tokio's `JoinHandle` (`JoinError::is_panic()`),
 /// not `catch_unwind`, so callers are spared an `UnwindSafe` bound. This does

@@ -152,8 +152,10 @@ would be worse than an honest nudge.
 
 ## What this does NOT do
 
-- No GUI editor for kanshi profiles. Edit the config file by hand for now;
-  task #41 (Settings page) may add one later.
+- No GUI editor for kanshi profiles. Edit the config file by hand for now.
+  #375 (Gnome control center compatibility) is the closest live thread if
+  you're tracking where a GUI editor might eventually land, though it's
+  scoped to the g-c-c Displays shim above, not a kanshi-specific editor.
 - No rotation UI in the trollshell drawer. The drawer's switch only
   toggles the output on/off (via `niri msg output <name> on|off`).
   Rotation is set in the kanshi profile (`transform 90` etc.).

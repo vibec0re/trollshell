@@ -1071,6 +1071,15 @@ pub fn save_places(places: Vec<Place>) -> Result<(), PlacesError> {
     })
 }
 
+/// Serializes [`edit`]'s read-modify-write.
+///
+/// Without it, two edits racing (two `Control` calls landing on different
+/// tokio workers) would both read the *same* set and the second write would
+/// silently drop the first's change. The critical section is a validate plus
+/// one small file write with no `.await` inside, so a plain `Mutex` is both
+/// safe here and cheap.
+static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The one write path: apply `f` to the current set, persist the result
 /// atomically, then publish it.
 ///
@@ -1085,6 +1094,9 @@ pub fn save_places(places: Vec<Place>) -> Result<(), PlacesError> {
 fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(), PlacesError> {
     let shared = shared::get::<Shared>().ok_or(PlacesError::NotRunning)?;
     let handle = shared.configured.clone();
+    let _serialized = EDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let current = handle.get_cloned();
     let next = f(current.as_slice())?;
     persist(&next)?;
@@ -2021,6 +2033,46 @@ mod tests {
             // The documented preamble is still there after all of that.
             let text = std::fs::read_to_string(&cfg).expect("readable");
             assert!(text.starts_with("# trollshell places"));
+
+            hytte_reactive::shared::reset_for_tests();
+        });
+    }
+
+    /// Concurrent edits are read-modify-write against one file, so without
+    /// serialization the loser's change is silently written away. Eight
+    /// threads, eight distinct places, all eight must land.
+    #[test]
+    fn concurrent_edits_do_not_lose_each_other() {
+        let _guard = SHARED_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".config/trollshell")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(".config/trollshell/places.toml"),
+            DEFAULT_CONFIG,
+        )
+        .expect("seed");
+
+        temp_env::with_var("HOME", Some(dir.path().as_os_str()), || {
+            let handle = Mutable::new(Arc::new(load_places()));
+            shared::insert(Shared {
+                place: Mutable::default(),
+                location: Mutable::default(),
+                configured: handle.clone(),
+            });
+
+            std::thread::scope(|s| {
+                for i in 0..8 {
+                    s.spawn(move || {
+                        add_place(Place::new(format!("P{i}"), 1.0, 2.0)).expect("adds");
+                    });
+                }
+            });
+
+            let set = handle.get_cloned();
+            assert_eq!(set.len(), 9, "the default + all eight adds must survive");
+            assert_eq!(load_places(), *set, "file and memory must still agree");
 
             hytte_reactive::shared::reset_for_tests();
         });

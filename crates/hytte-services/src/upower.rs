@@ -13,7 +13,10 @@
 //! `WarningLevel` additionally drives a self-toast: [`spawn_warning_level_watcher`]
 //! watches for a rising severity edge (entering `Low` or `Critical`/`Action`)
 //! and posts via [`crate::notifications::post_local`] — see [`warning_toast`]
-//! for the crossing/dedup rules (#237).
+//! for the crossing/dedup rules (#237). [`is_critical`] exposes that same
+//! `Critical`/`Action` severity split so other `WarningLevel` consumers (the
+//! `trollshell` battery chip's emergency pulse) agree with the toast instead
+//! of carrying their own threshold (#656).
 //!
 //! [`on_battery`] tracks a separate property — `OnBattery` on the *manager*
 //! object (`/org/freedesktop/UPower`, `org.freedesktop.UPower`), not the
@@ -287,6 +290,17 @@ fn warning_tier(level: WarningLevel) -> u8 {
     }
 }
 
+/// Whether `level` sits at the same "critical" severity tier that drives the
+/// critical-urgency "Battery critical" toast in [`warning_toast`] (i.e.
+/// `Critical` or `Action`). Exposed so other consumers of `WarningLevel` —
+/// e.g. the battery chip's emergency pulse in `trollshell` — key off the
+/// exact same severity split the toast uses instead of inventing a second,
+/// driftable one (#656).
+#[must_use]
+pub fn is_critical(level: WarningLevel) -> bool {
+    warning_tier(level) >= warning_tier(WarningLevel::Critical)
+}
+
 /// Decide whether moving from `baseline` (the last-observed level, or `None`
 /// if `next` is the very first observation) to `next` should post a toast,
 /// and at what urgency.
@@ -376,7 +390,20 @@ pub fn on_battery() -> impl Signal<Item = bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Urgency, WarningLevel, warning_toast};
+    use super::{Urgency, WarningLevel, is_critical, warning_toast};
+
+    #[test]
+    fn is_critical_matches_the_toasts_critical_tier() {
+        // Pins the exact split `battery.rs`'s emergency pulse relies on
+        // (#656): only Critical/Action count, same as the toast's
+        // `Urgency::Critical` branch in `warning_toast`.
+        assert!(!is_critical(WarningLevel::Unknown));
+        assert!(!is_critical(WarningLevel::None));
+        assert!(!is_critical(WarningLevel::Discharging));
+        assert!(!is_critical(WarningLevel::Low));
+        assert!(is_critical(WarningLevel::Critical));
+        assert!(is_critical(WarningLevel::Action));
+    }
 
     #[test]
     fn first_observation_never_toasts() {

@@ -782,41 +782,67 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 ///
 /// Renders into a scratch file **in the same directory** (so the `rename(2)`
 /// is a same-filesystem, atomic swap — a `/tmp` scratch file would be a
-/// cross-device copy, which is not), `fsync`s it, carries the target's
-/// permissions over, then renames it into place. A crash, a full disk or a
-/// killed shell mid-write therefore leaves either the old config or the new
-/// one, never a half-written file — the failure mode a plain
-/// `File::create` + `write_all` has, which would silently truncate the user's
-/// places to nothing.
+/// cross-device copy, which is not), `fsync`s it, then renames it into place.
+/// A crash, a full disk or a killed shell mid-write therefore leaves either
+/// the old config or the new one, never a half-written file — the failure
+/// mode a plain `File::create` + `write_all` has, which would silently
+/// truncate the user's places to nothing.
+///
+/// Symlink-safe: `path` is resolved with `canonicalize` first (mirroring
+/// `config_file::write`), so the scratch file lands beside — and the rename
+/// replaces — the file a symlinked `places.toml` points at, rather than
+/// clobbering the link itself. A target that doesn't exist yet can't be
+/// canonicalised and needs no resolving.
+///
+/// Permission-safe: an existing target's mode is carried over at `open` time
+/// (via `OpenOptionsExt::mode`), so the scratch file is never briefly more
+/// permissive than the config it replaces while the body is written. A
+/// brand-new file keeps `OpenOptions`' umask default, matching
+/// `config_file::write`.
 ///
 /// On failure the scratch file is cleaned up and the target is untouched.
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let dir = path
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Resolve symlinks: a target that doesn't exist yet can't be
+    // canonicalised (and needs no resolving); an existing one is followed so
+    // the write lands on the real file, not the link, and so the scratch file
+    // shares its filesystem — `rename(2)` is only atomic within one.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target
         .parent()
         .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
-    std::fs::create_dir_all(dir)?;
 
-    let stem = path
+    let stem = target
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
 
+    // The mode the target already carries, if any — applied at `open` below,
+    // before the rename, so a hand-tightened 0600 config never comes back
+    // 0644.
+    let mode = std::fs::metadata(&target)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777);
+
     let swap = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        if let Some(mode) = mode {
+            opts.mode(mode);
+        }
+        let mut file = opts.open(&tmp)?;
         file.write_all(body.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        // Preserve the mode of the file we're replacing (a hand-tightened
-        // 0600 config must not come back as 0644). A brand-new file keeps
-        // `File::create`'s umask default, matching `config_file::write`.
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
-        }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, &target)
     };
 
     if let Err(e) = swap() {
@@ -1989,6 +2015,95 @@ mod tests {
             scratch_files(dir.path()).is_empty(),
             "a failed swap must not leave a scratch file: {:?}",
             scratch_files(dir.path())
+        );
+    }
+
+    /// #739: `write_atomic` must write *through* a symlinked target, not
+    /// replace the link with a regular file — the same guarantee
+    /// `config_file::write_path` already gives its callers. A dotfiles-repo
+    /// `places.toml` (stow/chezmoi/a plain symlink) must survive a
+    /// programmatic save.
+    #[test]
+    fn write_atomic_writes_through_a_symlinked_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).expect("mkdir real");
+        let real_file = real_dir.join("places.toml");
+        std::fs::write(&real_file, "old").expect("seed");
+        let link = dir.path().join("places.toml");
+        std::os::unix::fs::symlink(&real_file, &link).expect("symlink");
+
+        write_atomic(&link, "new").expect("writes");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link still exists")
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the write, not get replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_file).unwrap(),
+            "new",
+            "the real file the symlink points at must receive the new content"
+        );
+        assert!(
+            scratch_files(&real_dir).is_empty(),
+            "no scratch file left in the real file's directory"
+        );
+    }
+
+    /// #739: an existing target's mode must be applied to the scratch file
+    /// *before* the body is written, not after — so a `0600` config's
+    /// contents never sit in a briefly umask-default (typically world- or
+    /// group-readable) file while being written. Racy but never flaky (like
+    /// `config_file`'s `a_reader_never_observes_a_partial_file`): scheduling
+    /// luck decides whether the watcher thread samples the scratch file
+    /// mid-write, so an unlucky run proves less, but a lucky one under the
+    /// old post-write-`chmod` ordering catches the loose window directly.
+    #[test]
+    fn write_atomic_applies_the_targets_mode_before_the_body_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("secretish.toml");
+        std::fs::write(&target, "old").expect("seed");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let violation = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let (dir, stop, violation) = (
+                dir.path().to_path_buf(),
+                Arc::clone(&stop),
+                Arc::clone(&violation),
+            );
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for name in scratch_files(&dir) {
+                        if let Ok(meta) = std::fs::metadata(dir.join(&name)) {
+                            let mode = meta.permissions().mode() & 0o777;
+                            if mode != 0o600 {
+                                violation.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        for i in 0..64 {
+            write_atomic(&target, &format!("body {i}")).expect("writes");
+        }
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("watcher thread");
+
+        assert!(
+            !violation.load(Ordering::Relaxed),
+            "the scratch file must never be observed at other than the target's mode"
         );
     }
 

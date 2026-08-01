@@ -127,6 +127,21 @@ impl PeakHold {
         self.value = (self.value - self.rate).max(0.0);
     }
 
+    /// Drop the held value straight back to rest (`0.0`), keeping the configured
+    /// fall rate. Unlike [`decay`](Self::decay) this is instant, not a fall.
+    ///
+    /// This is the **park** primitive (#422). A meter is only honest while it is
+    /// being fed: when its slot goes off-screen the plugin stops folding pushes,
+    /// so without a reset the value freezes at whatever was playing at the
+    /// hide edge and the card re-appears showing that stale level until the
+    /// next push (and, for a peak-hold, until it has decayed back down). Reset
+    /// on the hide edge instead — the re-shown card starts at rest and
+    /// re-derives from the next real push, which is what an unfed meter
+    /// actually knows.
+    pub fn reset(&mut self) {
+        self.value = 0.0;
+    }
+
     /// The current held value, in `0.0..=1.0` — feed it as `led_strip`'s `peak`.
     #[must_use]
     pub fn value(&self) -> f32 {
@@ -388,6 +403,30 @@ mod tests {
         }
         assert!(h.value() < peak, "the held dot falls during quiet frames");
         assert!(h.value() > 0.0, "but hasn't hit the floor yet");
+    }
+
+    /// `reset` (#422) drops the dot straight to rest without waiting out the
+    /// decay, and keeps the configured rate so the meter behaves identically
+    /// after an unpark.
+    #[test]
+    fn peak_hold_reset_parks_instantly_and_keeps_its_rate() {
+        let mut h = PeakHold::new(0.1);
+        h.push(1.0);
+        h.reset();
+        assert!(h.value() <= 0.0, "reset is instant, not a decay");
+        // The rate survived: one push + one decay still falls by exactly 0.1.
+        h.push(0.5);
+        h.decay();
+        assert!(
+            (h.value() - 0.4).abs() < 1e-6,
+            "the configured fall rate outlives the reset"
+        );
+        h.reset();
+        h.reset();
+        assert!(
+            h.value() <= 0.0,
+            "resetting an already-rested dot is a no-op"
+        );
     }
 
     // ── Renderer ─────────────────────────────────────────────────────────────

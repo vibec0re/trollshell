@@ -22,6 +22,24 @@
 //! sweep; at the demo's 1 Hz heartbeat the lush decay is on full display (you
 //! watch the ghost linger for several seconds).
 //!
+//! # …and so it is the card's one **parked** widget (#422)
+//!
+//! Being stateful is also the only reason this card subscribes
+//! [`SlotVisible`](Input::SlotVisible) at all: the scope is the one widget that
+//! parks. While the sidebar is closed no spectrum push arrives (the shell drops
+//! the `PipeWire` tap once nothing on-screen wants it, #565/#583), yet the
+//! 1 Hz heartbeat keeps coming: left
+//! ungated, every tick would re-stamp the *same* frozen bands, saturating the
+//! phosphor into a solid constant waveform that then needs several sweeps to
+//! decay once the card is looked at again. So the heartbeat's sweep is gated on
+//! visibility and the hide edge [`clear`](Scope::clear)s the phosphor — a
+//! reopened card starts from a dark screen and re-derives from the next sweep.
+//!
+//! Everything else deliberately keeps running while hidden: the clock, ticker,
+//! marquee and skin rotation are pure functions of the snapshot, so parking them
+//! would buy nothing and would make the reopened card show a *stale time* — the
+//! very failure the scope's park exists to avoid.
+//!
 //! # Shape — The Elm Architecture, purely host-driven
 //!
 //! Like `hytte-plugin-clock-demo`, everything below is the pure TEA core.
@@ -97,9 +115,13 @@ struct PreemDemo {
     /// baseline), so the trace shows even on a silent desktop.
     bins: [f32; SPECTRUM_BINS],
     /// The oscilloscope (#556): a stateful widget carrying its phosphor buffer
-    /// across frames. Advanced one sweep per host heartbeat with [`Self::bins`],
-    /// rendered by `view` in the current skin.
+    /// across frames. Advanced one sweep per host heartbeat with [`Self::bins`]
+    /// **while the card is on-screen**, rendered by `view` in the current skin.
     scope: Scope,
+    /// Whether the sidebar (and so this card) is currently shown — the
+    /// [`SlotVisible`](Input::SlotVisible) gate for the scope's sweep (#422).
+    /// Seeded `false`; the host sends the real value at register.
+    visible: bool,
 }
 
 /// The `HH:MM` slice of an RFC 3339 local timestamp
@@ -141,6 +163,16 @@ impl PreemDemo {
         secs.saturating_mul(MARQUEE_STEP_PX)
     }
 
+    /// Park the scope (#422): forget the last bands and wipe the phosphor, so a
+    /// reopened card starts from a dark screen instead of the trace — or, worse,
+    /// the saturated constant waveform an ungated heartbeat would have stamped —
+    /// left over from whenever the sidebar closed. Called on the `SlotVisible`
+    /// falling edge; idempotent, so a repeat while already parked is harmless.
+    fn park(&mut self) {
+        self.bins = [0.0; SPECTRUM_BINS];
+        self.scope.clear();
+    }
+
     /// The textbox's line — names the current skin so the rotation is
     /// legible in all three widgets at once.
     fn textbox_line(style: DisplayStyle) -> String {
@@ -157,13 +189,17 @@ impl Plugin for PreemDemo {
     /// Purely display: no I/O of its own, no commands.
     type Cmd = std::convert::Infallible;
 
-    /// Subscribes to `Clock` (the heartbeat) **and** `AudioSpectrum` (the scope
-    /// tile's input, #405), mounts `SidebarTop` under the clock demo (`order = 1`;
-    /// unordered co-mounts sort as 0 — #303). No capabilities: the demo asks
-    /// nothing of the shell.
+    /// Subscribes to `Clock` (the heartbeat), `AudioSpectrum` (the scope tile's
+    /// input, #405) and `SlotVisible` (the scope's park gate, #422), mounts
+    /// `SidebarTop` under the clock demo (`order = 1`; unordered co-mounts sort
+    /// as 0 — #303). No capabilities: the demo asks nothing of the shell.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(1);
-        m.subscribes = vec![StateKey::Clock, StateKey::AudioSpectrum];
+        m.subscribes = vec![
+            StateKey::Clock,
+            StateKey::AudioSpectrum,
+            StateKey::SlotVisible,
+        ];
         m
     }
 
@@ -176,6 +212,7 @@ impl Plugin for PreemDemo {
             style_bump: 0,
             bins: [0.0; SPECTRUM_BINS],
             scope: Scope::new(),
+            visible: false,
         }
     }
 
@@ -194,8 +231,12 @@ impl Plugin for PreemDemo {
                 }
                 // The heartbeat is the scope's sweep tick: advance the phosphor
                 // one frame with the latest bands (silence flatlines on the axis
-                // while the old trail decays — the honest ghost).
-                self.scope.advance(&self.bins);
+                // while the old trail decays — the honest ghost). Gated on
+                // visibility (#422): hidden, no fresh bands arrive, so sweeping
+                // would just re-stamp the frozen ones into a saturated trace.
+                if self.visible {
+                    self.scope.advance(&self.bins);
+                }
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
@@ -204,15 +245,27 @@ impl Plugin for PreemDemo {
                 }
             }
             // The audio-spectrum push (#405): store the latest bands; the scope
-            // sweeps them on the next heartbeat tick.
+            // sweeps them on the next heartbeat tick. Ignored while parked —
+            // the tap is refcounted across every subscriber (#559), so another
+            // on-screen one can keep frames arriving at this hidden card.
             Input::AudioSpectrum(spectrum) => {
-                self.bins = spectrum.bins;
+                if self.visible {
+                    self.bins = spectrum.bins;
+                }
             }
-            // No RunCommand is issued, and the card keeps cycling whether
-            // or not anyone is looking (rendering is snapshot-driven and
-            // cheap) — both pushes are no-ops.
+            // The scope's park gate (#422): going off-screen wipes the phosphor
+            // so the reopen isn't a stale (or saturated) trace. The rest of the
+            // card is a pure function of the snapshot and keeps cycling whether
+            // or not anyone is looking — see the crate docs.
+            Input::SlotVisible(v) => {
+                if self.visible && !v {
+                    self.park();
+                }
+                self.visible = v;
+            }
+            // No RunCommand is issued and nothing else is subscribed — the
+            // remaining pushes are no-ops.
             Input::EffectResult { .. }
-            | Input::SlotVisible(_)
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
             | Input::SessionLocked(_)
@@ -286,6 +339,14 @@ mod tests {
 
     fn fresh() -> PreemDemo {
         PreemDemo::init(hytte_plugin::cmd_channel().0)
+    }
+
+    /// An on-screen card (the register-time `SlotVisible` seed already
+    /// delivered) — the state the scope actually sweeps in (#422).
+    fn shown() -> PreemDemo {
+        let mut m = fresh();
+        let _ = m.update(Input::SlotVisible(true));
+        m
     }
 
     fn snapshot(iso: &str, unix: i64) -> Input<std::convert::Infallible> {
@@ -492,7 +553,7 @@ mod tests {
         );
 
         // The push folds into the model, so the next heartbeat sweeps those bands.
-        let mut m = fresh();
+        let mut m = shown();
         let fx = m.update(spectrum(loud_bins));
         assert!(fx.is_empty(), "the demo asks nothing of the shell");
         assert!((m.bins[8] - 1.0).abs() < 1e-6, "band 8 stored");
@@ -506,7 +567,7 @@ mod tests {
     #[test]
     fn scope_sweeps_on_the_heartbeat_with_a_decay_ghost() {
         use hytte_plugin::preem::DisplayStyle;
-        let mut m = fresh();
+        let mut m = shown();
         // A loud band, then the heartbeat draws it.
         let mut loud = [0.0_f32; super::SPECTRUM_BINS];
         loud[2] = 1.0;
@@ -523,12 +584,83 @@ mod tests {
         assert_ne!(ghost2, ghost, "the ghost keeps fading each heartbeat");
     }
 
-    /// The manifest opts into both the clock heartbeat and the audio spectrum.
+    /// The manifest opts into the clock heartbeat, the audio spectrum, and the
+    /// slot-visibility gate the scope parks on (#422).
     #[test]
-    fn manifest_subscribes_clock_and_spectrum() {
+    fn manifest_subscribes_clock_spectrum_and_visibility() {
         let m = PreemDemo::manifest();
         assert!(m.subscribes.contains(&StateKey::Clock));
         assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
+        assert!(
+            m.subscribes.contains(&StateKey::SlotVisible),
+            "the scope's park gate is opt-in per #305"
+        );
+    }
+
+    /// A hidden card parks the scope (#422): the heartbeat stops sweeping, so a
+    /// frozen band set can't saturate the phosphor, and the hide edge wipes what
+    /// was already drawn — a reopen starts from a dark screen, not the trace from
+    /// whenever the sidebar closed.
+    #[test]
+    fn a_hidden_card_parks_the_scope() {
+        use hytte_plugin::preem::{DisplayStyle, Scope};
+        let dark = Scope::new().render(DisplayStyle::Vfd);
+
+        let mut m = shown();
+        let mut loud = [0.0_f32; super::SPECTRUM_BINS];
+        loud[2] = 1.0;
+        let _ = m.update(spectrum(loud));
+        let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", 1));
+        assert_ne!(m.scope.render(DisplayStyle::Vfd), dark, "a trace is drawn");
+
+        // Hide: the phosphor is wiped and the bands forgotten.
+        let _ = m.update(Input::SlotVisible(false));
+        assert_eq!(
+            m.scope.render(DisplayStyle::Vfd),
+            dark,
+            "hiding wipes the trace"
+        );
+        assert!(m.bins.iter().all(|&b| b <= 0.0), "and forgets the bands");
+
+        // Hidden: heartbeats no longer sweep, and a late push (another
+        // subscriber may hold the tap up) doesn't re-arm the bands.
+        let _ = m.update(spectrum(loud));
+        for s in 2..8 {
+            let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", s));
+        }
+        assert_eq!(
+            m.scope.render(DisplayStyle::Vfd),
+            dark,
+            "a parked scope stays dark across heartbeats"
+        );
+
+        // Reopen: still dark until real data sweeps again.
+        let _ = m.update(Input::SlotVisible(true));
+        assert_eq!(
+            m.scope.render(DisplayStyle::Vfd),
+            dark,
+            "the reopened card starts from a dark screen"
+        );
+        let _ = m.update(spectrum(loud));
+        let _ = m.update(snapshot("2026-07-16T00:00:09+02:00", 9));
+        assert_ne!(
+            m.scope.render(DisplayStyle::Vfd),
+            dark,
+            "and re-derives from the next sweep"
+        );
+    }
+
+    /// The rest of the card deliberately does **not** park: the clock, ticker,
+    /// marquee and skin rotation are pure functions of the snapshot, so a hidden
+    /// card keeps them current and a reopen never shows a stale time (#422).
+    #[test]
+    fn a_hidden_card_still_tracks_the_clock() {
+        let mut m = shown();
+        let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
+        let _ = m.update(Input::SlotVisible(false));
+        let _ = m.update(snapshot("2026-07-16T15:50:00+02:00", 1_752_672_600));
+        assert_eq!(m.hhmm, "15:50", "the readout stays current while hidden");
+        assert_eq!(m.unix, 1_752_672_600, "and so does the rotation clock");
     }
 
     /// The frames built from this plugin's data are valid on the wire.

@@ -395,6 +395,18 @@ title` in the stderr tail — worth a deliberate look on first run, since
       built"/"spectrum capture torn down" pair per cycle). Also worth an
       eyeball: audio keeps working normally across cycles, and the spectrum
       doesn't flash a stale frame on re-open.
+- [ ] **(#422)** Plugin-side park on the hide edge — the consumer half of the
+      previous two items. With music playing and the sidebar **open**, let the
+      audio-widget's bars/LEDs get loud and the preem-demo's scope draw a
+      strong trace, then **close** the sidebar, **pause the music**, wait a few
+      seconds and **reopen**. Both cards should come back at rest — flat
+      spectrum bars, LEDs and peak dot at zero, a dark scope face — and then
+      light up again from live audio, rather than re-appearing frozen on the
+      loud frame from before the close (the scope previously re-appeared as a
+      saturated constant waveform, since its 1 Hz heartbeat kept re-stamping
+      the last-known bands while hidden). The preem-demo's **clock/ticker/
+      marquee must _not_ park**: reopening should show the current time, not
+      the time at which you closed it.
 - [ ] **(#664)** The Media panel's **Auto** source chip couldn't stay
       pressed — clicking it re-pressed then immediately un-pressed itself as
       soon as any player existed, so "revert to automatic" had no visible

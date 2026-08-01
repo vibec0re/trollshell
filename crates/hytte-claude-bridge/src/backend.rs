@@ -26,7 +26,7 @@ use hive_claude::{Attach, Claude, Config, Error as ClaudeError, Sink};
 use serde_json::Value;
 
 use crate::http::Failure;
-use crate::session::{AttachKind, prompt_for, render_transcript};
+use crate::session::{AttachKind, OVERFLOW_STATUS, prompt_for, render_transcript};
 use crate::wire::Message;
 
 /// Longest error text handed back to the client. `Error::Exit` carries up to
@@ -214,6 +214,22 @@ pub enum Backend {
     Reprompt(Reprompt),
 }
 
+impl Backend {
+    /// Whether this backend's conversations accumulate in **claude's** own
+    /// on-disk session state — the thing that grows without bound and that only
+    /// a fresh title can retire (#667).
+    ///
+    /// [`Reprompt`]'s conversation lives in the bridge's own record, which is
+    /// already bounded and head-pinned ([`MAX_RECORD_MESSAGES`]), so an
+    /// overflow there means the *client's* transcript does not fit — which no
+    /// rotation can fix, and which would spin the generation counter once per
+    /// request if it were allowed to try.
+    #[must_use]
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, Self::Subscription(_))
+    }
+}
+
 impl Conversation for Backend {
     async fn respond(&self, turn: Turn<'_>) -> Result<String, Failure> {
         match self {
@@ -306,8 +322,11 @@ fn map_error(e: &ClaudeError) -> Failure {
             429,
             "claude: rate-limited or a usage/credit cap was reached".to_owned(),
         ),
+        // The one failure a session rotation can fix (#667) — `bridge.rs`
+        // triggers on exactly this status, so the constant is shared rather
+        // than the number written twice.
         ClaudeError::PromptTooLong => (
-            413,
+            OVERFLOW_STATUS,
             "claude: the conversation exceeds the model's context window".to_owned(),
         ),
         ClaudeError::AuthFailed => (
@@ -399,6 +418,41 @@ mod tests {
         let sink = TextSink::default();
         sink.on_event(&json!({"type": "system", "subtype": "init"}));
         assert_eq!(sink.into_text().expect_err("no text").status, 502);
+    }
+
+    /// The rotation trigger, pinned end to end: the driver's typed overflow
+    /// sentinel is the thing — and, of the statuses reachable from a turn, the
+    /// only thing — that `bridge.rs` retires a session for (#667). If a second
+    /// `ClaudeError` ever maps to this status it would start rotating sessions
+    /// that are not full, so the exclusivity is asserted too.
+    #[test]
+    fn only_the_overflow_sentinel_triggers_a_rotation() {
+        assert_eq!(
+            map_error(&ClaudeError::PromptTooLong).status,
+            crate::session::OVERFLOW_STATUS
+        );
+        for other in [
+            ClaudeError::RateLimited,
+            ClaudeError::AuthFailed,
+            ClaudeError::IdleTimeout,
+            ClaudeError::SessionNotFound,
+        ] {
+            assert_ne!(
+                map_error(&other).status,
+                crate::session::OVERFLOW_STATUS,
+                "{other} would trigger a rotation"
+            );
+        }
+    }
+
+    /// Only the persisted-session backend accumulates state a rotation can
+    /// retire.
+    #[test]
+    fn only_the_subscription_backend_rotates() {
+        use super::{Backend, Reprompt, Subscription};
+        use hive_claude::Config;
+        assert!(Backend::Subscription(Subscription::new(Config::default())).is_persisted());
+        assert!(!Backend::Reprompt(Reprompt::new(Config::default())).is_persisted());
     }
 
     /// Each typed sentinel maps to a distinct, actionable status.

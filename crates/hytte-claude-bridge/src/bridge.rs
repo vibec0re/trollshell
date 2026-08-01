@@ -10,7 +10,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::backend::{Backend, Conversation as _, Turn};
 use crate::http::{self, Failure, Head};
-use crate::session::{self, Titles};
+use crate::session::{self, Rotation, Titles};
 use crate::wire::{ChatRequest, ChatResponse, ErrorBody, Message};
 
 /// Concurrent `claude` turns. Two, because this is one person's desktop and a
@@ -29,6 +29,19 @@ pub struct Bridge {
     titles: Mutex<Titles>,
     permits: Semaphore,
     inflight: Mutex<HashMap<u64, watch::Receiver<Shared>>>,
+    /// Serialises the session-rotation path (#667) — the decision **and** the
+    /// turn that mints the replacement.
+    ///
+    /// Never taken on the healthy path, and a rotation happens about once per
+    /// context window (~10³ turns), so it costs nothing. It exists because two
+    /// requests really can overflow the same session at once: [`PERMITS`] is 2,
+    /// and single-flight only collapses *identical* transcripts, so pet's tick
+    /// and a manual poke are two different keys resolving to one title. Without
+    /// the lock both would compute the same successor, both find it missing,
+    /// and both `Attach::Create` it — two rival sessions under one title, which
+    /// `--resume` would then pick between arbitrarily. Under it, the second one
+    /// re-resolves, sees the replacement already recorded, and joins it.
+    rotation: tokio::sync::Mutex<()>,
     budget: Duration,
 }
 
@@ -46,6 +59,7 @@ impl Bridge {
             titles: Mutex::new(Titles::new(TITLE_CAPACITY)),
             permits: Semaphore::new(PERMITS),
             inflight: Mutex::new(HashMap::new()),
+            rotation: tokio::sync::Mutex::new(()),
             budget,
         }
     }
@@ -145,13 +159,10 @@ impl Bridge {
             .resolve(messages);
         tracing::debug!(title = %title, turns = messages.len(), "answering");
 
-        let turn = Turn {
-            title: &title,
-            transcript: messages,
-            delta,
-        };
-        let reply = match tokio::time::timeout(self.budget, self.backend.respond(turn)).await {
-            Ok(reply) => reply?,
+        // ONE budget for the whole request, rotation included: the client's own
+        // global timeout does not restart just because the bridge retried.
+        match tokio::time::timeout(self.budget, self.answer(messages, delta, &title)).await {
+            Ok(reply) => reply,
             Err(_elapsed) => {
                 // The driver's own idle watchdog sits a second under this and
                 // kills the child on silence, so reaching here means the turn
@@ -163,20 +174,130 @@ impl Bridge {
                     budget_s = self.budget.as_secs(),
                     "budget expired while claude was still streaming; the child may still be running",
                 );
-                return Err(Failure::new(
+                Err(Failure::new(
                     504,
                     format!(
                         "no answer within the bridge's {}s budget",
                         self.budget.as_secs()
                     ),
-                ));
+                ))
             }
+        }
+    }
+
+    /// Answer one turn, retiring the session first if it has filled up (#667).
+    ///
+    /// **Which path sends what** — the delta rule is untouched, and both arms
+    /// of it are reached through the same `respond`:
+    ///
+    /// - the ordinary turn resumes `title` and sends **only the delta**;
+    /// - a rotation names a session that has never been resumed, so the
+    ///   backend's resume misses with `SessionNotFound` and its create arm
+    ///   replays the **whole transcript** — the persona prefix the fresh
+    ///   session needs in order to be the same character as the old one.
+    ///
+    /// At most **one** rotation per request, by construction: the retry calls
+    /// `respond` and not this function. An overflow on the *replacement* means
+    /// the client's own transcript does not fit, which no further rotation can
+    /// fix, so it is reported.
+    async fn answer(
+        &self,
+        messages: &[Message],
+        delta: &Message,
+        title: &str,
+    ) -> Result<String, Failure> {
+        let failure = match self.respond(messages, delta, title).await {
+            Ok(reply) => return Ok(self.record(title, messages, reply)),
+            Err(f) => f,
         };
+        if !self.backend.is_persisted() {
+            return Err(failure);
+        }
+        // Pure, cheap, and the only outcome worth taking the rotation lock for.
+        match session::rotation_for(&failure, title) {
+            Rotation::Keep => return Err(failure),
+            Rotation::Stuck => {
+                tracing::error!(
+                    title = %title,
+                    "this session is past the context window and its title carries no generation \
+                     the bridge can rotate; the conversation is stuck until it is deleted by hand",
+                );
+                return Err(failure);
+            }
+            Rotation::To(_) => {}
+        }
+
+        // Held across the replacement's first turn, not merely across the
+        // decision — see the field docs. Only ever reached on an overflow.
+        let _rotating = self.rotation.lock().await;
+        let Some(next) = self.retire(messages, title) else {
+            return Err(failure);
+        };
+        let reply = self.respond(messages, delta, &next).await?;
+        Ok(self.record(&next, messages, reply))
+    }
+
+    /// One backend turn under `title`.
+    async fn respond(
+        &self,
+        messages: &[Message],
+        delta: &Message,
+        title: &str,
+    ) -> Result<String, Failure> {
+        self.backend
+            .respond(Turn {
+                title,
+                transcript: messages,
+                delta,
+            })
+            .await
+    }
+
+    /// Record that `title`'s session is retired, and return the title this
+    /// conversation continues under. `None` if it turned out not to be
+    /// rotatable after all.
+    ///
+    /// Callers must hold [`Bridge::rotation`]. Synchronous on purpose: the
+    /// retirement lands **before** the replacement turn runs, so a request
+    /// whose budget expires mid-retry — the likely outcome, since an overflow
+    /// is only discovered after claude has posted the oversized prompt — still
+    /// leaves the *next* request pointed at the fresh session instead of back
+    /// at the full one. A rotation that only became durable on success would
+    /// leave the bridge exactly as stuck as it is today.
+    fn retire(&self, messages: &[Message], title: &str) -> Option<String> {
+        let mut titles = self.titles.lock().unwrap_or_else(PoisonError::into_inner);
+        // Re-resolve under the lock: a request that raced us into the same
+        // overflow may already have retired this session, and riding its
+        // replacement is exactly what stops us minting a rival.
+        let current = titles.resolve(messages);
+        if current != title {
+            tracing::info!(
+                from = %title,
+                to = %current,
+                "session already retired by a concurrent request; joining its replacement",
+            );
+            return Some(current);
+        }
+        let next = session::next_title(&current)?;
+        titles.rotate_to(messages, &next);
+        tracing::warn!(
+            from = %title,
+            to = %next,
+            turns = messages.len(),
+            "claude session is past the context window: retiring it and continuing in a fresh \
+             session, which replays the transcript (its prompt cache starts cold)",
+        );
+        Some(next)
+    }
+
+    /// Remember the title this conversation answered under, so its next turn
+    /// resolves to the same session.
+    fn record(&self, title: &str, messages: &[Message], reply: String) -> String {
         self.titles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remember(&title, messages, &reply);
-        Ok(reply)
+            .remember(title, messages, &reply);
+        reply
     }
 }
 
@@ -306,6 +427,56 @@ mod tests {
             .await;
         assert_eq!(status, 400);
         assert!(String::from_utf8_lossy(&body).contains("must not be empty"));
+    }
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_owned(),
+            content: content.to_owned(),
+        }
+    }
+
+    /// Retiring a full session points the conversation at a successor and makes
+    /// that stick — the recovery from #667's permanent 413. Driven directly
+    /// because nothing hermetic can push a real claude session over its context
+    /// window; `session.rs` pins the decision itself.
+    #[test]
+    fn retiring_a_full_session_points_the_conversation_at_a_successor() {
+        let bridge = bridge();
+        let convo = vec![msg("system", "you are a cat"), msg("user", "poke")];
+        let title = bridge.titles.lock().expect("unpoisoned").resolve(&convo);
+
+        let next = bridge.retire(&convo, &title).expect("rotatable");
+        assert_eq!(next, format!("{title}-g1"));
+        // The next poke — a different newest message, same conversation — must
+        // land in the replacement rather than back in the session that just
+        // overflowed.
+        let later = vec![msg("system", "you are a cat"), msg("user", "poke again")];
+        assert_eq!(
+            bridge.titles.lock().expect("unpoisoned").resolve(&later),
+            next
+        );
+    }
+
+    /// Two requests racing into the same overflow must end up in **one**
+    /// replacement session: the second retirement joins the first rather than
+    /// minting a rival that `--resume` would then pick between arbitrarily.
+    /// (In the running bridge both calls are serialised by `Bridge::rotation`;
+    /// this asserts the decision they make once serialised.)
+    #[test]
+    fn a_concurrent_retirement_joins_the_replacement_instead_of_minting_a_rival() {
+        let bridge = bridge();
+        let convo = vec![msg("system", "persona"), msg("user", "one")];
+        let title = bridge.titles.lock().expect("unpoisoned").resolve(&convo);
+
+        let first = bridge.retire(&convo, &title).expect("rotatable");
+        // The loser of the race still holds the pre-rotation title.
+        let second = bridge.retire(&convo, &title).expect("rotatable");
+        assert_eq!(second, first, "the race minted a second session");
+        assert_eq!(
+            bridge.titles.lock().expect("unpoisoned").resolve(&convo),
+            first
+        );
     }
 
     /// Error bodies are the `OpenAI` error shape, so a client that parses errors

@@ -121,6 +121,8 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::{REGISTRY, Registry, reset_for_tests, with};
+    use crate::test_lock::TEST_LOCK;
+    use std::sync::PoisonError;
 
     #[test]
     fn insert_then_get_roundtrips() {
@@ -149,27 +151,19 @@ mod tests {
     /// bare `Registry::default()` instead of touching the `REGISTRY`
     /// thread-local this wrapper clears.
     ///
-    /// This pins only the thread-local half of the contract on purpose.
-    /// `reset_for_tests` also delegates to
-    /// [`crate::shared::reset_for_tests`] (the process-global mirror), but
-    /// deliberately isn't exercised from *here*: `cargo test` runs a
-    /// crate's unit tests on a shared thread pool, and `shared.rs`'s own
-    /// tests already mutate that same process-global map, serializing
-    /// amongst themselves via a `TEST_LOCK` private to their test module.
-    /// A test in this module that also touched `crate::shared` would race
-    /// them from outside that lock — confirmed empirically (an earlier
-    /// draft of this test flaked shared.rs's tests in roughly 1 of 15
-    /// runs). Fixing that needs `shared.rs`'s `TEST_LOCK` hoisted to
-    /// something this module can join too, which is out of scope here.
-    ///
-    /// The shared-delegation half of the contract *is* covered, race-free,
-    /// by `hytte-services`'s `upower::tests::on_battery_snapshot_contract`:
-    /// it calls this same `reset_for_tests` wrapper and checks the shared
-    /// bag cleared, from a separate crate's test binary (its own process,
-    /// its own instance of `crate::shared`'s static — no race with
-    /// `shared.rs`'s tests here).
+    /// `reset_for_tests` also delegates to [`crate::shared::reset_for_tests`]
+    /// (the process-global mirror), which `shared.rs`'s own tests mutate
+    /// too. `cargo test` runs a crate's unit tests on a shared thread pool
+    /// in one process, so any test touching that process-global map must
+    /// serialize against every other one — this test takes the same
+    /// crate-level `TEST_LOCK` (`crate::test_lock`) that `shared.rs`'s tests
+    /// take, rather than a lock private to either module (#743: an earlier
+    /// version of this test called `reset_for_tests` without holding it and
+    /// flaked `shared.rs`'s tests in roughly 1 of 20 runs).
     #[test]
     fn reset_for_tests_clears_the_thread_local_registry() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
         REGISTRY.with(|cell| cell.borrow_mut().insert::<u32>(7));
         assert_eq!(with(|r| r.get::<u32>().copied()), Some(7));
 

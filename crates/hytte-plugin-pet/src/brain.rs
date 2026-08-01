@@ -96,6 +96,14 @@ struct Cfg {
     /// `$PET_LLM_TIMEOUT_SECS` — how long one model call may take before the
     /// client hangs up. Default: [`hytte_ai_providers::DEFAULT_TIMEOUT`].
     llm_timeout: Duration,
+    /// `$PET_PERSONA` — a style/tone clause spliced into [`persona`]'s
+    /// `Style:` line, replacing the default `"playful, a little sassy"`.
+    /// The `{name}`/`{hour}`/`{mood}` interpolation and the trailing
+    /// `Format:` rules (including [`PROMPT_MAX_WORDS`]) are **not**
+    /// overridable through this knob — see [`persona`]'s doc comment for
+    /// why. Default: `None` (the built-in style clause). Unset, empty, or
+    /// whitespace-only all resolve to `None`.
+    persona: Option<String>,
 }
 
 impl Cfg {
@@ -132,11 +140,13 @@ impl Cfg {
             std::env::var("PET_LLM_TIMEOUT_SECS").ok().as_deref(),
             hytte_ai_providers::DEFAULT_TIMEOUT,
         );
+        let persona = persona_or_none(std::env::var("PET_PERSONA").ok().as_deref());
         Self {
             provider,
             name,
             min_llm_gap,
             llm_timeout,
+            persona,
         }
     }
 }
@@ -150,6 +160,15 @@ fn secs_or(raw: Option<&str>, default: Duration) -> Duration {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
         .map_or(default, Duration::from_secs)
+}
+
+/// Resolve `$PET_PERSONA` into the spliced style clause, or `None` when
+/// unset, empty, or whitespace-only (same "blank is unset" treatment as
+/// [`secs_or`], split out for the same unit-testability reason). The
+/// returned string is trimmed, since it's spliced directly into a sentence.
+fn persona_or_none(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
@@ -210,8 +229,9 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
                 let provider = provider.clone();
                 let name = cfg.name.clone();
                 let timeout = cfg.llm_timeout;
+                let persona_style = cfg.persona.clone();
                 let asked = hytte_plugin::tokio::task::spawn_blocking(move || {
-                    ask_llm(&provider, &name, req, timeout)
+                    ask_llm(&provider, &name, req, timeout, persona_style.as_deref())
                 })
                 .await;
                 // Stamp at completion: the gap is between calls, so a slow
@@ -250,9 +270,10 @@ fn ask_llm(
     name: &str,
     req: ThinkReq,
     timeout: Duration,
+    persona_style: Option<&str>,
 ) -> Result<String, String> {
     let messages = [
-        Message::system(persona(name, req)),
+        Message::system(persona(name, req, persona_style)),
         Message::user(event(name, req)),
     ];
     let opts = ChatOpts {
@@ -273,13 +294,26 @@ fn ask_llm(
 /// concrete, format stated as rules. The word budget is [`PROMPT_MAX_WORDS`],
 /// which is derived from the [`MAX_LINE`] clamp — asking for more words than
 /// fit only guarantees [`sanitize`] truncates the answer (#700).
-fn persona(name: &str, req: ThinkReq) -> String {
+///
+/// `style` is `$PET_PERSONA` (see [`Cfg::persona`]) — it splices in as the
+/// `Style:` clause only, replacing the default `"playful, a little sassy"`.
+/// The `{name}`/`{hour}`/`{mood}` interpolation and the trailing `Format:`
+/// rules stay fixed regardless of `style`: they're what keeps a reply inside
+/// [`PROMPT_MAX_WORDS`], and a persona that could drop them would silently
+/// produce lines [`sanitize`] then chops mid-word (#698's decision — a
+/// full-template override was considered and rejected for exactly this).
+///
+/// The desktop-owner reference used to be hardcoded as `"Annika's Linux
+/// desktop"` (#696 — not every deployment's owner is named Annika); dropped
+/// rather than replaced with another env knob, since nothing else in this
+/// prompt needs a possessive owner name to make sense.
+fn persona(name: &str, req: ThinkReq, style: Option<&str>) -> String {
+    let style = style.unwrap_or("playful, a little sassy");
     format!(
-        "You are {name}, a tiny cat who lives in the sidebar of Annika's \
-         Linux desktop. It is around {hour}:00 and you feel {mood}. Always \
-         answer as {name} the cat. Style: playful, a little sassy. Format: \
-         exactly one line, at most {words} words, plain text, no quotes, \
-         no emoji.",
+        "You are {name}, a tiny cat who lives in the sidebar of a Linux \
+         desktop. It is around {hour}:00 and you feel {mood}. Always \
+         answer as {name} the cat. Style: {style}. Format: exactly one \
+         line, at most {words} words, plain text, no quotes, no emoji.",
         hour = req.hour,
         mood = req.mood,
         words = PROMPT_MAX_WORDS,
@@ -441,6 +475,65 @@ mod tests {
         );
     }
 
+    /// #698: `$PET_PERSONA` resolution — unset/empty/whitespace-only all
+    /// mean "no override", and a real value comes back trimmed.
+    #[test]
+    fn persona_or_none_treats_blank_as_unset() {
+        assert_eq!(persona_or_none(None), None);
+        assert_eq!(persona_or_none(Some("")), None);
+        assert_eq!(persona_or_none(Some("   ")), None);
+        assert_eq!(persona_or_none(Some("\t\n")), None);
+        assert_eq!(
+            persona_or_none(Some("gentle and philosophical")),
+            Some("gentle and philosophical".to_owned()),
+        );
+        assert_eq!(
+            persona_or_none(Some("  grumpy and terse  ")),
+            Some("grumpy and terse".to_owned()),
+            "spliced into a sentence, so the value is trimmed",
+        );
+    }
+
+    /// #698: with no override the prompt keeps the built-in style clause;
+    /// with one set, that clause — and only that clause — changes. The
+    /// `{name}`/`{hour}`/`{mood}` interpolation and the `Format:` rules
+    /// (including the derived [`PROMPT_MAX_WORDS`]) must survive either way.
+    #[test]
+    fn persona_splices_style_but_keeps_format_rules_fixed() {
+        let req = ThinkReq {
+            kind: ThinkKind::Idle,
+            hour: 9,
+            mood: "happy",
+            pokes: 0,
+        };
+        let default_prompt = persona("nisse", req, None);
+        assert!(default_prompt.contains("Style: playful, a little sassy."));
+
+        let custom_prompt = persona("nisse", req, Some("gentle and philosophical"));
+        assert!(custom_prompt.contains("Style: gentle and philosophical."));
+        assert!(
+            !custom_prompt.contains("playful, a little sassy"),
+            "the override replaces the default clause, it doesn't append to it",
+        );
+
+        // Everything outside the `Style:` clause is identical — in
+        // particular the format rules a custom persona cannot touch.
+        let format_rules = format!(
+            "Format: exactly one line, at most {PROMPT_MAX_WORDS} words, \
+             plain text, no quotes, no emoji."
+        );
+        assert!(default_prompt.contains(&format_rules));
+        assert!(custom_prompt.contains(&format_rules));
+        assert!(default_prompt.contains("You are nisse, a tiny cat"));
+        assert!(custom_prompt.contains("You are nisse, a tiny cat"));
+
+        // #696: the default no longer names a specific owner.
+        assert!(
+            !default_prompt.contains("Annika"),
+            "the default persona must not hardcode an owner name: {default_prompt}",
+        );
+    }
+
     /// #700: the persona's word budget has to fit the [`MAX_LINE`] clamp, or
     /// an obedient model's reply is truncated with an ellipsis every time.
     #[test]
@@ -453,6 +546,7 @@ mod tests {
                 mood: "happy",
                 pokes: 0,
             },
+            None,
         );
         assert!(
             prompt.contains(&format!("at most {PROMPT_MAX_WORDS} words")),
@@ -603,6 +697,7 @@ mod tests {
                 pokes: 0,
             },
             hytte_ai_providers::DEFAULT_TIMEOUT,
+            None,
         )
         .expect("parses + sanitizes the completion");
         assert_eq!(line, "purring at your service");
@@ -624,6 +719,7 @@ mod tests {
                 pokes: 1,
             },
             hytte_ai_providers::DEFAULT_TIMEOUT,
+            None,
         )
         .expect_err("a blank line is treated as offline");
         assert!(err.contains("empty line"), "{err}");
@@ -647,6 +743,7 @@ mod tests {
                 pokes: 1,
             },
             hytte_ai_providers::DEFAULT_TIMEOUT,
+            None,
         )
         .expect_err("nothing listens there");
         assert!(err.starts_with("http:"), "{err}");
@@ -672,6 +769,7 @@ mod tests {
                 pokes: 1,
             },
             Duration::from_millis(200),
+            None,
         )
         .expect_err("the server never answers");
         assert!(err.starts_with("http:"), "{err}");
@@ -708,6 +806,7 @@ mod live_tests {
                 pokes: 2,
             },
             hytte_ai_providers::DEFAULT_TIMEOUT,
+            None,
         )
         .expect("the model answers a poke");
         eprintln!("[live] poke reaction: {poke}");
@@ -723,6 +822,7 @@ mod live_tests {
                 pokes: 0,
             },
             hytte_ai_providers::DEFAULT_TIMEOUT,
+            None,
         )
         .expect("the model muses");
         eprintln!("[live] idle thought: {idle}");

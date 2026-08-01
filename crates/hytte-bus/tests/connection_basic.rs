@@ -9,15 +9,11 @@ use hytte_bus::test_support::SharedConnection;
 #[tokio::test(flavor = "multi_thread")]
 async fn with_conn_returns_connection_on_healthy_bus() {
     let (test_conn, _guard) = ephemeral_bus().await;
-    // Inject the ephemeral bus address as DBUS_SESSION_BUS_ADDRESS so
-    // SharedConnection::session() (which calls Connection::session()) hits it.
-    // The address printed by dbus-daemon is captured inside ephemeral_bus;
-    // for tests we'd ideally inject via a test-only constructor — but for
-    // this first test we use the env-var path that production uses too.
-    //
-    // The harness sets DBUS_SESSION_BUS_ADDRESS via `for_test` injection
-    // in Task 6; for now this test asserts the API shape only.
-
+    // Wraps the ephemeral connection directly via the test-only
+    // `for_test_session` constructor — no `DBUS_SESSION_BUS_ADDRESS` mutation
+    // (which `unsafe_code = "forbid"` rules out; see `connection.rs`'s note
+    // by `simulate_disconnect_for_test`) — then asserts `with_conn` sees that
+    // same connection (matching unique names).
     let shared = SharedConnection::for_test_session(test_conn.clone());
     let unique_name_via_shared: Option<String> = shared
         .with_conn(

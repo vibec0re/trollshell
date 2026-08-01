@@ -1,18 +1,22 @@
 //! caw's **morning briefing** — trigger, composition, and voice (#407).
 //!
 //! Once a day caw caws the news: the day's shape (weather, the first useful
-//! departure, and — once the host shares them — calendar events) composed into
-//! two or three short sentences and delivered sticky in her speech bubble,
-//! mirrored as a toast.
+//! departure, and the host-pushed calendar events) composed into two or three
+//! short sentences and delivered sticky in her speech bubble, mirrored as a
+//! toast.
 //!
-//! - **Trigger** ([`is_due`]): at/after a configured local time
-//!   (`$CAW_BRIEFING_TIME`, default 07:00; `off` disables), checked on the
-//!   plugin's 2 s heartbeat, at most once per local date (persisted via
-//!   [`Stamp`] so a plugin/session restart never re-caws). The check only runs
-//!   while the box is awake, so a machine suspended across the hour briefs on
-//!   wake — the practical stand-in for "first unlock" until the host pushes
-//!   logind state to plugins. A same-day window ([`WINDOW_MINS`]) keeps an
-//!   evening cold-start from cawing "morning news" at 22:00.
+//! - **Trigger** ([`should_brief`], [`is_due`] plus a lock gate): due
+//!   at/after a configured local time (`$CAW_BRIEFING_TIME`, default 07:00;
+//!   `off` disables), checked on the plugin's 2 s heartbeat, at most once per
+//!   local date (persisted via [`Stamp`] so a plugin/session restart never
+//!   re-caws). The heartbeat only ticks while the box is awake, so a machine
+//!   suspended across the hour catches up and briefs on wake, inside the
+//!   same-day window ([`WINDOW_MINS`], which also keeps an evening cold-start
+//!   from cawing "morning news" at 22:00). [`should_brief`] additionally
+//!   requires the session to be **unlocked**, gated on the host-pushed
+//!   `SessionLocked` state (#484): a due-but-locked box holds and fires on the
+//!   very next heartbeat after the first unlock, rather than announcing to an
+//!   empty chair.
 //! - **Composition**: [`compose_plain`] is the deterministic, canned template —
 //!   the keyless path *and* the fallback. With a provider configured
 //!   ([`Cfg::from_env`], the pet-brain pattern: `$CAW_LLM_URL` for a local
@@ -623,8 +627,10 @@ mod tests {
 
     #[test]
     fn compose_plain_events_fold_in_when_present() {
-        // The calendar slot is compose-ready even though gather() leaves it
-        // empty today (the (c) StateKey follow-up only touches the I/O side).
+        // `ingredients::gather()` always leaves `events` empty (see its
+        // module docs) — the host-pushed list is folded in by `brief_now`
+        // before composing, so exercising the compose path just sets it
+        // directly.
         let mut ing = full();
         ing.events = vec![
             EventBrief {

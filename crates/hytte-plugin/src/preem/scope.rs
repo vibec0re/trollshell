@@ -241,6 +241,37 @@ impl Scope {
         frame.upscale(self.scale)
     }
 
+    /// Wipe the phosphor back to a dark screen, keeping the geometry, the
+    /// [`scale`](Self::scale) and the [`persistence`](Self::persistence).
+    ///
+    /// This is the **park** primitive (#422) for the kit's one cross-frame
+    /// widget. A scope whose slot goes off-screen stops being fed fresh samples,
+    /// and neither option is honest: stop advancing it and the last trace hangs
+    /// frozen on the buffer until it is re-shown; keep advancing it with the
+    /// last-known samples and the beam re-stamps the *same* polyline every tick,
+    /// saturating the phosphor into a solid constant waveform that then takes
+    /// several sweeps to decay once real data resumes. Clear on the hide edge
+    /// instead: the re-shown scope starts from black and re-derives from the
+    /// next sweep.
+    ///
+    /// Prefer this over rebuilding with [`new`](Self::new), which silently drops
+    /// a [`with_size`](Self::with_size) / [`scale`](Self::scale) /
+    /// [`persistence`](Self::persistence) configuration.
+    ///
+    /// ```
+    /// use hytte_plugin::preem::{DisplayStyle, Scope};
+    ///
+    /// let mut scope = Scope::new();
+    /// let dark = scope.render(DisplayStyle::Vfd);
+    /// scope.advance(&[1.0, -1.0, 1.0, -1.0]);
+    /// assert_ne!(scope.render(DisplayStyle::Vfd), dark, "a trace is drawn");
+    /// scope.clear();
+    /// assert_eq!(scope.render(DisplayStyle::Vfd), dark, "back to a dark screen");
+    /// ```
+    pub fn clear(&mut self) {
+        self.phosphor.fill(0);
+    }
+
     /// [`advance`](Self::advance) then [`render`](Self::render) in one call — the
     /// convenience for a plugin that advances and re-renders on the same tick.
     #[must_use]
@@ -466,6 +497,39 @@ mod tests {
             prev = now;
         }
         assert!(prev < CORE, "the trail is a ghost of the original beam");
+    }
+
+    /// `clear` (#422) wipes the phosphor to black in one call — the park edge —
+    /// while keeping the geometry/scale/persistence a rebuilt `Scope::new()`
+    /// would have thrown away, and a cleared scope draws the next trace exactly
+    /// like a brand-new one (no residue biasing the first sweep).
+    #[test]
+    fn clear_wipes_the_phosphor_but_keeps_the_configuration() {
+        let mut s = Scope::with_size(48, 48).scale(3).persistence(200);
+        s.advance(&[1.0, -1.0, 1.0]);
+        assert!(
+            s.phosphor.iter().any(|&v| v > 0),
+            "a trace lit the phosphor"
+        );
+
+        s.clear();
+        assert!(
+            s.phosphor.iter().all(|&v| v == 0),
+            "clear wipes the whole buffer to a dark screen"
+        );
+        assert_eq!((s.width(), s.height()), (48 * 3, 48 * 3), "geometry kept");
+        assert_eq!(s.persistence, 200, "persistence kept");
+
+        // A cleared scope is indistinguishable from a fresh one of the same
+        // configuration — the next sweep carries no residue from before the park.
+        let mut fresh = Scope::with_size(48, 48).scale(3).persistence(200);
+        s.advance(&[0.5, 0.0, -0.5]);
+        fresh.advance(&[0.5, 0.0, -0.5]);
+        assert_eq!(
+            s.render(DisplayStyle::Vfd),
+            fresh.render(DisplayStyle::Vfd),
+            "a cleared scope sweeps like a brand-new one"
+        );
     }
 
     // ── Glow trace ───────────────────────────────────────────────────────────

@@ -33,7 +33,19 @@
 //! gated on it: while the sidebar is hidden, ticks and pushes are no-ops, so the
 //! view never changes and the runtime's render dedup sends nothing — the card
 //! parks while nobody is looking, exactly the pattern the SDK documents for a
-//! sidebar-mounted poller. It re-derives from the next push on reopen.
+//! sidebar-mounted poller.
+//!
+//! The hide edge additionally **resets the meters to rest** (#422). Gating alone
+//! freezes them at whatever was playing when the sidebar closed, and because the
+//! release lives on the (also gated) tick, nothing walks them back down while
+//! parked — so the card would re-appear showing a loud spectrum from minutes ago
+//! and only crawl out of it over the ~1 s release once ticks resume. That stale
+//! first frame is exactly what the shell's own tap gating makes *likelier*: the
+//! host tears the `PipeWire` capture down while nothing on-screen wants it
+//! (#565/#583), so a reopen waits on a node rebuild plus a format renegotiation
+//! before the first real push lands. Parking at rest makes the reopened card
+//! honest — all-zero is what an unfed meter actually knows — and it re-derives
+//! from the next push, exactly as a fresh (re)connect does.
 //!
 //! # Dot-matrix data source — the live track (#528), with a banner fallback
 //!
@@ -207,6 +219,23 @@ impl AudioWidget {
         self.peak.push(peak);
     }
 
+    /// Park the meters (#422): drop every displayed value straight back to rest,
+    /// so the card re-appears at its `init` baseline instead of frozen on the
+    /// last frame before the sidebar closed. Called on the `SlotVisible` falling
+    /// edge only — a repeat while already parked is a no-op anyway, but keeping
+    /// it to the edge says what it means.
+    ///
+    /// The marquee's [`now_playing`](Self::now_playing) is deliberately *not*
+    /// reset: the host re-seeds the current track right after `SlotVisibility(true)`
+    /// on the unpark edge (#542), so clearing it here would only insert one
+    /// frame of "- SILENCE -" between the reopen and that re-seed. The meters
+    /// have no such re-seed — they can only be re-derived from live audio.
+    fn park(&mut self) {
+        self.bins = [0.0; SPECTRUM_BINS];
+        self.level.reset();
+        self.peak.reset();
+    }
+
     /// One frame: advance the scroll and release every meter toward rest.
     fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
@@ -297,12 +326,24 @@ impl Plugin for AudioWidget {
 
     /// Fold one input. Pure and panic-free over any host-sent value; re-rendering
     /// is the runtime's problem (identical trees are deduped). Ticks and pushes
-    /// are gated on visibility so the card parks while the sidebar is closed.
+    /// are gated on visibility so the card parks while the sidebar is closed, and
+    /// the hide edge resets the meters so the reopen isn't a stale frame (#422).
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
-            Input::SlotVisible(v) => self.visible = v,
+            // The visibility gate (#288), with the #422 park: going off-screen
+            // drops the meters to rest rather than freezing them mid-bar.
+            Input::SlotVisible(v) => {
+                if self.visible && !v {
+                    self.park();
+                }
+                self.visible = v;
+            }
             // The audio-spectrum push (#405): fold it while visible; ignore it
             // while parked (the display re-derives from the next push on reopen).
+            // Not dead code even though the host tears the tap down when nothing
+            // on-screen wants it: the tap is refcounted across *all* subscribers
+            // (#559), so another on-screen one — a bar-mounted plugin, say — keeps
+            // frames flowing to this hidden card too.
             Input::AudioSpectrum(s) => {
                 if self.visible {
                     self.fold(s.peak, &s.bins);
@@ -505,6 +546,55 @@ mod tests {
         m.update(Input::SlotVisible(true));
         let _ = m.update(spectrum(1.0, 8, 1.0));
         assert_ne!(m.view(), before, "a shown card folds the push");
+    }
+
+    /// Hiding the card parks the meters **at rest** (#422), so a reopen renders
+    /// the baseline card rather than the loud frame it froze on — the stale first
+    /// frame this issue is about. Gating alone wouldn't do it: the release lives
+    /// on the (also gated) tick, so a frozen meter never walks itself down.
+    #[test]
+    fn hiding_parks_the_meters_at_rest() {
+        let mut m = shown();
+        let _ = m.update(spectrum(1.0, 8, 1.0));
+        assert!(m.peak.value() > 0.5, "loud before the hide");
+        let loud_view = m.view();
+
+        m.update(Input::SlotVisible(false));
+        assert!(m.bins.iter().all(|&b| b <= 0.0), "every band drops to rest");
+        assert!(m.level.value() <= 0.0, "the LED bar drops to rest");
+        assert!(m.peak.value() <= 0.0, "the peak-hold dot drops to rest");
+
+        // Re-showing renders the baseline card, not the frozen loud one.
+        m.update(Input::SlotVisible(true));
+        assert_ne!(
+            m.view(),
+            loud_view,
+            "a reopened card does not replay the pre-hide frame"
+        );
+        assert_eq!(
+            m.view(),
+            shown().view(),
+            "it reopens exactly where a fresh card starts"
+        );
+
+        // And it still comes back to life on the next real push.
+        let _ = m.update(spectrum(1.0, 8, 1.0));
+        assert_eq!(m.view(), loud_view, "the next push re-derives the display");
+    }
+
+    /// The park is edge-driven but idempotent: a redundant `SlotVisible(false)`
+    /// while already hidden changes nothing, and a hide that never saw audio is
+    /// a no-op rather than a spurious re-render.
+    #[test]
+    fn parking_is_idempotent() {
+        let mut m = fresh(); // never shown → already parked
+        let before = m.view();
+        m.update(Input::SlotVisible(false));
+        assert_eq!(m.view(), before, "hiding an already-hidden card is a no-op");
+        m.update(Input::SlotVisible(true));
+        m.update(Input::SlotVisible(false));
+        m.update(Input::SlotVisible(false));
+        assert_eq!(m.view(), before, "repeated hides stay at rest");
     }
 
     /// The marquee falls back to the decorative banner on the audio-active state

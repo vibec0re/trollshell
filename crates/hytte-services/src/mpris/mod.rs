@@ -19,6 +19,9 @@
 //! mpris::players()         -> impl Signal<Item = Vec<Player>>
 //! mpris::selected_player() -> impl Signal<Item = Option<String>>
 //!
+//! // Snapshot (for a command that must resolve a target, not re-render):
+//! mpris::active_bus_name() -> Option<String>
+//!
 //! // Fire-and-forget commands:
 //! mpris::play_pause(bus_name);
 //! mpris::next(bus_name);
@@ -241,6 +244,34 @@ pub fn selected_player() -> impl Signal<Item = Option<String>> {
             .expect("mpris::service() not registered")
             .selected
             .signal_cloned()
+    })
+}
+
+/// The `bus_name` [`active_player`] currently resolves to, **sampled once**
+/// rather than subscribed (#648).
+///
+/// The signal accessors are what a *widget* wants: it re-renders whenever the
+/// active player changes, and holds the latest bus name in its own closure to
+/// address a transport call. A **command** that has to act on "whatever is
+/// playing right now" has no such closure — the plugin host's `Effect::Media`
+/// broker is handed a bus-name-less transport action and must resolve a target
+/// at the instant of the call. This is that lookup, and it resolves exactly as
+/// [`active_player`] does (a live manual pin wins, else the Playing > Paused >
+/// first heuristic), so a plugin's play/pause drives the same player the bar
+/// chip's button does.
+///
+/// GTK-main-thread only, like every registry read. `None` when no player is
+/// tracked — and, unlike the signal accessors, also when [`service`] was never
+/// registered rather than a panic: this is a fire-and-forget command's target
+/// lookup, and "there is nothing to send this to" is the caller's branch in
+/// both cases.
+#[must_use]
+pub fn active_bus_name() -> Option<String> {
+    registry::with(|r| {
+        let handles = r.get::<MprisHandles>()?;
+        let players = handles.players.lock_ref();
+        let selected = handles.selected.lock_ref();
+        resolve_active(&players, selected.as_deref()).map(|p| p.bus_name)
     })
 }
 

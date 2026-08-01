@@ -110,11 +110,17 @@
 //!   (#288), [`StateKey::Accent`] (#376), and [`StateKey::AudioSpectrum`] (the
 //!   ~20 Hz audio tap, #405; its capture is demand-gated on the subscriber's
 //!   card being on-screen since #559).
-//! - **Effects:** [`Effect::OpenPage`] (→ the modal drawer, incl. `PluginSelf`
-//!   → the plugin's own panel, #349 PR2), [`Effect::RaiseOsd`] (→ the transient
-//!   OSD nudge, #236), and [`Effect::Notify`] (→ a local notification toast
-//!   through the shell's own daemon, #406) are brokered; every other effect is
-//!   logged "unsupported in v1" and skipped. Capability **enforcement** is host
+//! - **Effects:** the **whole** wire vocabulary is brokered — [`Effect::OpenPage`]
+//!   (→ the modal drawer, incl. `PluginSelf` → the plugin's own panel, #349 PR2),
+//!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236), [`Effect::Notify`]
+//!   (→ a local notification toast through the shell's own daemon, #406),
+//!   [`Effect::RunCommand`] (→ a spawned `argv`, its outcome routed back, #510),
+//!   [`Effect::RequestConsent`] (→ the consent overlay, #487), the two datasource
+//!   legs (#509), and, since #648, [`Effect::Niri`] / [`Effect::Media`] /
+//!   [`Effect::Audio`] (→ niri IPC / MPRIS transport on the active player /
+//!   the default sink). The broker's match carries no catch-all, so a *new*
+//!   effect variant is a compile error there rather than a silent drop.
+//!   Capability **enforcement** is host
 //!   policy (#436): an effect whose [`Capability`] the plugin didn't declare in
 //!   its manifest is dropped with a warn in the connection reader
 //!   ([`enforce_capabilities`](session)) before it ever reaches the broker,

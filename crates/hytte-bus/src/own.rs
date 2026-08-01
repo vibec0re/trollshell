@@ -4,7 +4,6 @@
 
 use crate::BusError;
 use crate::connection::SharedConnection;
-use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
 use futures_util::{Stream, StreamExt};
 use std::future::Future;
@@ -36,6 +35,22 @@ pub const UNKNOWN_HOLDER: &str = "<unknown>";
 /// How long to wait before re-requesting a name we just lost (or failed to
 /// take) while still below the `permanent_after` threshold.
 const RETRY_AFTER_LOSS: Duration = Duration::from_millis(250);
+
+/// First delay of the acquisition-error ramp (see [`acquire_backoff`]).
+const ACQUIRE_BACKOFF_BASE: Duration = Duration::from_millis(250);
+
+/// Ceiling of that ramp. Deliberately seconds, not minutes: this path has no
+/// event to wake on — a broken bus emits no `NameOwnerChanged` — so the cap is
+/// also the worst-case time to notice the bus came back. Thirty seconds is
+/// three orders of magnitude cheaper than the flat 250 ms it replaces while
+/// still recovering well inside a human's attention span.
+const ACQUIRE_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// A failure streak shorter than this is still consistent with "the bus
+/// blipped", which `connection.rs` already warns about; from here on it is
+/// consistent only with "this is not working", which nothing else reports.
+/// At the [`acquire_backoff`] ramp this is ~4 s of consecutive failures.
+const STREAK_IS_NO_LONGER_A_BLIP: u32 = 5;
 
 /// Lifecycle of an owned name as observed from outside.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,6 +254,146 @@ pub fn own_name_with(shared: &SharedConnection, name: impl Into<String>) -> OwnN
     }
 }
 
+/// Delay before the `attempt`-th consecutive *acquisition error* retry
+/// (1-based): the connection or subscription could not be built, the
+/// `DBusProxy` could not be constructed, or `RequestName` itself errored.
+///
+/// 250 ms doubling, capped at [`ACQUIRE_BACKOFF_CAP`]: 250 ms, 500 ms, 1 s,
+/// 2 s, 4 s, 8 s, 16 s, then 30 s for as long as it keeps failing.
+///
+/// The two constants deliberately match `connection.rs`'s private `Backoff`
+/// (250 ms → 30 s), which supervises reconnects one layer down: two retry
+/// ladders stacked on the same connection should not disagree about how long a
+/// bus outage is worth waiting out. They are *not* shared code — that one is
+/// indexed by duration and has no attempt counter, so it cannot drive
+/// [`logs_at`] — and unifying them is a job for the shared-backoff-helper
+/// cleanup in #646 rather than for this fix.
+///
+/// This is deliberately **not** the contention path. Losing a race for a name
+/// somebody else holds is bounded by `permanent_after` and then by an
+/// event-driven wait on `NameOwnerChanged` (see
+/// [`wait_for_release_or_cooldown`]); it needs no timer ramp because the broker
+/// tells us when the situation changes. An *error* has no such event — a bus
+/// that is down publishes nothing — so it is the one place left in this file
+/// where the retry rate is set by us alone, and before this it was a flat
+/// 250 ms forever, which is the 4 Hz spin of #653 surviving in the arm nobody
+/// looked at.
+fn acquire_backoff(attempt: u32) -> Duration {
+    // `min(16)` keeps the shift in range; 250 ms << 16 is ~4.5 h, already far
+    // past the cap, so clamping there cannot change the answer.
+    let doublings = attempt.saturating_sub(1).min(16);
+    ACQUIRE_BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(ACQUIRE_BACKOFF_CAP)
+}
+
+/// Whether the `attempt`-th consecutive failure earns a log line (1-based).
+///
+/// True at every doubling — 1, 2, 4, 8, 16, … — and nowhere else. Pairing a
+/// geometric log cadence with the geometric delay of [`acquire_backoff`] is
+/// what gives the *logging* a ceiling as well as the retry: a bus that is down
+/// for a day costs ~11 lines rather than one per attempt. Without this the
+/// non-transient arm emitted a `warn!` on every retry forever, which is the
+/// uncapped-retry-logging #646 objects to, and the transient arm emitted
+/// nothing at all, which is the silence #653 objects to.
+fn logs_at(attempt: u32) -> bool {
+    attempt.is_power_of_two()
+}
+
+/// How to react to one failure in a streak: how long to wait, and whether to
+/// say anything about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryStep {
+    /// 1-based position in the current streak.
+    attempt: u32,
+    /// How long to wait before the next attempt.
+    delay: Duration,
+    /// Whether this failure earns a log line (see [`logs_at`]).
+    log: bool,
+}
+
+impl RetryStep {
+    /// Whether a streak this long has stopped being explicable as a bus blip.
+    ///
+    /// Below the line it gets `debug!` — `connection.rs` already warns about
+    /// the disconnect itself and a single failure here is only its echo. At or
+    /// above it, the name is not owned and is not about to be, which is the
+    /// same "this feature is inert" report [`log_give_up`] makes, so it takes
+    /// the same level for the same reason (see that function's doc: the
+    /// deployed shell's filter drops everything below `error!`).
+    fn is_serious(self) -> bool {
+        self.attempt >= STREAK_IS_NO_LONGER_A_BLIP
+    }
+}
+
+/// A run of consecutive failures on the **acquisition** path.
+///
+/// Lives in `run_ownership` and therefore spans reconnects: a bus that refuses
+/// to connect must not reset its own ramp just because the outer loop went
+/// round again. It is cleared the moment `RequestName` produces a *reply* of
+/// any kind — including "somebody else has it", which proves the broker is
+/// answering and hands the situation over to the contention accounting. That
+/// reset is what keeps the ramp from turning a busy-loop into a stall: a blip
+/// costs at most one extra 250 ms, never the 30 s cap.
+#[derive(Debug, Default)]
+struct FailureStreak {
+    attempts: u32,
+}
+
+impl FailureStreak {
+    /// Record one failure and say how to back off from it.
+    fn record(&mut self) -> RetryStep {
+        self.attempts = self.attempts.saturating_add(1);
+        RetryStep {
+            attempt: self.attempts,
+            delay: acquire_backoff(self.attempts),
+            log: logs_at(self.attempts),
+        }
+    }
+
+    /// Forget the streak — something worked.
+    fn reset(&mut self) {
+        self.attempts = 0;
+    }
+}
+
+/// Emit the log line for one acquisition failure, at the level its streak has
+/// earned (see [`RetryStep::is_serious`]). Shared by all four error arms so they
+/// cannot drift on level, cadence, or wording.
+fn log_acquire_failure(name: &str, stage: &str, error: &dyn std::fmt::Display, backoff: RetryStep) {
+    if !backoff.log {
+        return;
+    }
+    if backoff.is_serious() {
+        tracing::error!(
+            %name,
+            %stage,
+            %error,
+            attempt = backoff.attempt,
+            retry_in = ?backoff.delay,
+            "cannot acquire D-Bus name; whatever this name backs stays inert until it succeeds"
+        );
+    } else {
+        tracing::debug!(
+            %name,
+            %stage,
+            %error,
+            attempt = backoff.attempt,
+            retry_in = ?backoff.delay,
+            "cannot acquire D-Bus name yet; retrying"
+        );
+    }
+}
+
+/// Why [`run_inner_loop`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopExit {
+    /// Drop this connection, build a fresh one, and try again.
+    Reconnect,
+    /// Stop the ownership task entirely — retrying cannot ever help.
+    Fatal,
+}
+
 async fn run_ownership(
     shared: SharedConnection,
     name: String,
@@ -253,6 +408,10 @@ async fn run_ownership(
     // name to the same peer three times running is a replacement war whether or
     // not we won it back in between.
     let mut consecutive_losses_to: Option<(String, u32)> = None;
+    // Consecutive *errors* on the way to a `RequestName` reply. Distinct from
+    // `consecutive_losses_to`, which counts the times we got an answer and the
+    // answer was "no". See `FailureStreak`.
+    let mut acquire_failures = FailureStreak::default();
 
     loop {
         // ── Connect and set up the NameOwnerChanged subscription ─────────────
@@ -294,14 +453,21 @@ async fn run_ownership(
 
         let (conn, mut stream) = match connect_result {
             Ok(v) => v,
-            Err(ref e) if e.is_transient() => {
-                writer.set(OwnState::Acquiring);
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
+            // Transient and permanent used to differ here (a silent 250 ms vs
+            // a `warn!` every 5 s). Neither had a ceiling, and the *shape* of
+            // the failure matters far less than how long it has been going on,
+            // which is what `FailureStreak` now decides — so both arms take the
+            // same ramp and differ only in the `stage` they report.
             Err(e) => {
-                tracing::warn!(error = %e, name = %name, "failed to subscribe to NameOwnerChanged");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let stage = if e.is_transient() {
+                    "connect"
+                } else {
+                    "subscribe to NameOwnerChanged"
+                };
+                let backoff = acquire_failures.record();
+                log_acquire_failure(&name, stage, &e, backoff);
+                writer.set(OwnState::Acquiring);
+                tokio::time::sleep(backoff.delay).await;
                 continue;
             }
         };
@@ -309,7 +475,7 @@ async fn run_ownership(
         let unique = conn.unique_name().map(|u| u.as_str().to_string());
 
         // ── Inner retry loop: reuse the same connection + subscription ────────
-        run_inner_loop(InnerCtx {
+        let exit = run_inner_loop(InnerCtx {
             conn: &conn,
             stream: &mut stream,
             name: &name,
@@ -318,8 +484,12 @@ async fn run_ownership(
             cooldown,
             writer: &writer,
             consecutive_losses_to: &mut consecutive_losses_to,
+            acquire_failures: &mut acquire_failures,
         })
         .await;
+        if exit == LoopExit::Fatal {
+            return;
+        }
     }
 }
 
@@ -333,6 +503,9 @@ struct InnerCtx<'a> {
     cooldown: Duration,
     writer: &'a Mutable<OwnState>,
     consecutive_losses_to: &'a mut Option<(String, u32)>,
+    /// Consecutive failures to reach a `RequestName` reply at all, carried in
+    /// from `run_ownership` so the ramp survives a reconnect.
+    acquire_failures: &'a mut FailureStreak,
 }
 
 /// What to do about one observation of the name being in someone else's hands.
@@ -419,6 +592,19 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 
 /// Log the give-up transition into [`OwnState::PermanentlyTaken`].
 ///
+/// **Level: `error!`, and that is the whole point of #653's first half.** The
+/// deployed shell calls `tracing_subscriber::fmt::init()` with no `RUST_LOG` in
+/// `etc/systemd/user/trollshell.service`, and `fmt::init()` builds
+/// `EnvFilter::from_default_env()`, whose default directive is
+/// `LevelFilter::ERROR`. A `warn!` here — which is what #668 shipped — is
+/// therefore *dropped before it reaches the journal* on every real install.
+/// #653 says a contested name "produces no user-visible signal at all"; the
+/// signal existed, at a level the binary does not print. `error!` is also the
+/// honest level: past `permanent_after` this is not a warning about something
+/// that might resolve, it is a report that a whole subsystem (notifications,
+/// the tray, `DisplayConfig`, the screensaver, the `Control` endpoint) is dead
+/// until a human removes the other owner.
+///
 /// **Cadence.** This fires at most once per `cooldown` — one line every 5
 /// minutes by default — for as long as the name stays taken *and nothing
 /// happens to it*, because `record_loss` deliberately keeps the tally latched
@@ -439,7 +625,7 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 /// both, and the live [`OwnState`] signal carries the condition continuously
 /// for any consumer that wants it without costing a log line at all.
 fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
-    tracing::warn!(
+    tracing::error!(
         %name,
         %holder,
         consecutive,
@@ -452,10 +638,13 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
 /// held name released, so we are re-requesting it without waiting out the
 /// cooldown.
 ///
-/// At `warn!`, deliberately — the same level as [`log_give_up`], so anyone
-/// filtering at `warn` sees both halves of the story instead of just
-/// "notifications are inert" with no line ever following up. This fires once
-/// per release actually observed, not on a timer.
+/// At the **same level as [`log_give_up`]**, deliberately, so anyone whose
+/// filter shows the give-up sees both halves of the story instead of just
+/// "notifications are inert" with no line ever following up. That invariant is
+/// what moved this to `error!` alongside it: leaving it at `warn!` while the
+/// give-up went to `error!` would have made the default `RUST_LOG`-less filter
+/// show every death and no recovery — strictly worse than either level chosen
+/// consistently. This fires once per release actually observed, not on a timer.
 ///
 /// The message deliberately does NOT say the name was recovered: this line
 /// fires the instant the release is *observed*, before the `RequestName` it
@@ -467,10 +656,46 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
 /// changes we were unable to attribute (see [`record_loss`]); it names who we
 /// were waiting out, not a confirmed actor.
 fn log_release_wake(name: &str, holder: &str) {
-    tracing::warn!(
+    tracing::error!(
         %name,
         holder_at_giveup = %holder,
         "D-Bus name held by another connection was released — re-requesting now, woken by NameOwnerChanged rather than by the retry cooldown, so whatever this name backs comes back within milliseconds instead of minutes if the re-request wins"
+    );
+}
+
+/// Whether taking the name right now *closes* a give-up incident — i.e. the
+/// tally is currently latched at or past `permanent_after`, so a
+/// [`log_give_up`] line is already in the journal claiming this name's
+/// subsystem is inert.
+///
+/// Split out as a pure function because it is the whole condition for the
+/// recovery line and the only part of it worth testing without a broker.
+fn closes_a_give_up(tally: Option<&(String, u32)>, permanent_after: u32) -> bool {
+    tally.is_some_and(|(_, consecutive)| *consecutive >= permanent_after)
+}
+
+/// Log that a name we had given up on is *actually* ours again.
+///
+/// #720 removed a "RECOVERED" line from [`log_release_wake`] because it fired
+/// when the release was merely *observed*, before the `RequestName` it triggers
+/// had been sent, let alone won — it could and did claim a recovery that a
+/// third contender then stole. That was the right removal, but it left the
+/// incident permanently open: the journal said the subsystem was dead and never
+/// said otherwise. This line makes the claim at the only moment it is true —
+/// after `RequestName` returned `PrimaryOwner`/`AlreadyOwner` — and only when
+/// there is an incident to close ([`closes_a_give_up`]), so a first acquisition
+/// at startup and an ordinary sub-threshold retry stay silent.
+///
+/// Same level as [`log_give_up`], for the same reason [`log_release_wake`] is.
+/// Its cadence is bounded the same way too: one line per *real* ownership
+/// transition of this one name, of which the broker emits exactly one per
+/// change.
+fn log_recovered(name: &str, holder: &str, consecutive: u32) {
+    tracing::error!(
+        %name,
+        holder_at_giveup = %holder,
+        consecutive,
+        "D-Bus name reacquired — whatever this name backs is live again; the earlier report that it was inert is now closed"
     );
 }
 
@@ -692,6 +917,16 @@ where
         tally,
     } = ctx;
 
+    // Close the incident before announcing `Owned`: if a `log_give_up` line is
+    // outstanding for this name, the journal currently says this subsystem is
+    // dead, and it is not. See `log_recovered` for why this is here rather than
+    // on the release-observed path #720 took it off.
+    if closes_a_give_up(tally.as_ref(), permanent_after)
+        && let Some((holder, consecutive)) = tally.as_ref()
+    {
+        log_recovered(name, holder, *consecutive);
+    }
+
     writer.set(OwnState::Owned);
 
     // Drain any buffered NameOwnerChanged signals that arrived before we set
@@ -833,39 +1068,49 @@ where
 /// surface a distinct [`OwnState::Denied`] and retry on the long `cooldown`
 /// interval — a later policy install is then picked up without a restart. The
 /// long interval keeps this from becoming the warn-storm / FD-storm a tight
-/// retry would cause.
+/// retry would cause, so `AccessDenied` keeps `cooldown` as its delay rather
+/// than joining the [`acquire_backoff`] ramp, which would *shorten* it from 5
+/// minutes to 30 seconds.
+///
+/// Its **level** stays `info!` for the same reason: `enableRecommendedServices
+/// = false` is a supported configuration under which the bluez and iwd agent
+/// names are expected to be denied (CLAUDE.md documents exactly that), so this
+/// is a deliberate config outcome, not a fault. Only its *cadence* changes:
+/// routed through the streak, it stops repeating once per cooldown forever.
 async fn on_request_name_error(
     e: fdo::Error,
     name: &str,
     cooldown: Duration,
     writer: &Mutable<OwnState>,
+    streak: &mut FailureStreak,
 ) {
+    let backoff = streak.record();
     if matches!(e, fdo::Error::AccessDenied(_)) {
-        tracing::info!(
-            %name,
-            retry_in_secs = cooldown.as_secs(),
-            "DBus name ownership refused by policy; service inert (install a /etc/dbus-1/system.d/ rule granting it); will retry"
-        );
+        if backoff.log {
+            tracing::info!(
+                %name,
+                attempt = backoff.attempt,
+                retry_in_secs = cooldown.as_secs(),
+                "DBus name ownership refused by policy; service inert (install a /etc/dbus-1/system.d/ rule granting it); will retry"
+            );
+        }
         writer.set(OwnState::Denied);
         tokio::time::sleep(cooldown).await;
         writer.set(OwnState::Acquiring);
         return;
     }
     let as_zbus = zbus::Error::FDO(Box::new(e));
-    if is_transient_zbus_error(&as_zbus) {
-        writer.set(OwnState::Acquiring);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    } else {
-        tracing::warn!(error = %as_zbus, %name, "RequestName failed");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
+    log_acquire_failure(name, "RequestName", &as_zbus, backoff);
+    writer.set(OwnState::Acquiring);
+    tokio::time::sleep(backoff.delay).await;
 }
 
 /// Inner retry loop: reuse one connection and one `NameOwnerChanged`
 /// subscription across multiple `RequestName` attempts.
 ///
-/// Returns when the connection should be dropped and re-established.
-async fn run_inner_loop(ctx: InnerCtx<'_>) {
+/// Returns when the connection should be dropped and re-established, or
+/// [`LoopExit::Fatal`] when no amount of retrying can help.
+async fn run_inner_loop(ctx: InnerCtx<'_>) -> LoopExit {
     let InnerCtx {
         conn,
         stream,
@@ -875,13 +1120,19 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
         cooldown,
         writer,
         consecutive_losses_to,
+        acquire_failures,
     } = ctx;
     loop {
-        let Ok(dbus) = fdo::DBusProxy::new(conn).await else {
-            // DBusProxy construction failures are transient; reconnect.
-            writer.set(OwnState::Acquiring);
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            return;
+        let dbus = match fdo::DBusProxy::new(conn).await {
+            Ok(dbus) => dbus,
+            Err(e) => {
+                // DBusProxy construction failures are transient; reconnect.
+                let backoff = acquire_failures.record();
+                log_acquire_failure(name, "build DBusProxy", &e, backoff);
+                writer.set(OwnState::Acquiring);
+                tokio::time::sleep(backoff.delay).await;
+                return LoopExit::Reconnect;
+            }
         };
 
         let well_known = match name
@@ -890,9 +1141,19 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
         {
             Ok(w) => w,
             Err(e) => {
-                tracing::error!(error = %e, %name, "invalid well-known name");
-                tokio::time::sleep(Duration::from_mins(1)).await;
-                return;
+                // Not retryable, ever: `name` is fixed for the life of this
+                // task and this is pure string validation, so the next thousand
+                // attempts fail identically. It used to sleep a minute and
+                // return, which had the outer loop rebuild a connection and
+                // re-log this same `error!` every 60 s for the process
+                // lifetime — an uncapped log storm over a caller bug. Say it
+                // once, loudly, and stop.
+                tracing::error!(
+                    error = %e,
+                    %name,
+                    "invalid well-known D-Bus name; giving up on owning it — whatever this name backs will stay inert for the life of the process"
+                );
+                return LoopExit::Fatal;
             }
         };
 
@@ -905,12 +1166,21 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
             )
             .await
         {
-            Ok(r) => r,
+            // Any reply at all — including "somebody else has it" — proves the
+            // broker is answering, so the acquisition-error streak is over and
+            // the situation belongs to the contention accounting from here.
+            // Resetting here rather than on `PrimaryOwner` is what stops a
+            // contended name from also climbing the error ramp and inheriting a
+            // 30 s floor it does not need.
+            Ok(r) => {
+                acquire_failures.reset();
+                r
+            }
             Err(e) => {
-                on_request_name_error(e, name, cooldown, writer).await;
+                on_request_name_error(e, name, cooldown, writer, acquire_failures).await;
                 // Return to reconnect with a fresh connection + subscription
                 // and re-attempt RequestName.
-                return;
+                return LoopExit::Reconnect;
             }
         };
 
@@ -927,7 +1197,7 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
                 })
                 .await;
                 if next == NextAttempt::Reconnect {
-                    return;
+                    return LoopExit::Reconnect;
                 }
             }
             fdo::RequestNameReply::Exists | fdo::RequestNameReply::InQueue => {
@@ -942,7 +1212,7 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
                 })
                 .await;
                 if next == NextAttempt::Reconnect {
-                    return;
+                    return LoopExit::Reconnect;
                 }
             }
         }
@@ -1014,8 +1284,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        Contention, NextAttempt, OwnState, Wake, attributed_holder, is_release_of,
-        next_attempt_after, on_request_name_error, record_loss, wait_for_release_or_cooldown,
+        ACQUIRE_BACKOFF_BASE, ACQUIRE_BACKOFF_CAP, Contention, FailureStreak, NextAttempt,
+        OwnState, Wake, acquire_backoff, attributed_holder, closes_a_give_up, is_release_of,
+        logs_at, next_attempt_after, on_request_name_error, record_loss,
+        wait_for_release_or_cooldown,
     };
     use futures_signals::signal::{Mutable, SignalExt as _};
     use futures_util::StreamExt as _;
@@ -1076,6 +1348,7 @@ mod tests {
 
         let w = writer.clone();
         let task = tokio::spawn(async move {
+            let mut failures = FailureStreak::default();
             on_request_name_error(
                 fdo::Error::AccessDenied("policy refuses ownership".into()),
                 "mov.vibec0re.test.denied",
@@ -1084,6 +1357,7 @@ mod tests {
                 // latest-value coalescing).
                 Duration::from_millis(150),
                 &w,
+                &mut failures,
             )
             .await;
         });
@@ -1331,6 +1605,244 @@ mod tests {
         .build(&42u32)
         .expect("build malformed NameOwnerChanged");
         assert!(!is_release_of(&msg, NAME));
+    }
+
+    // ── #653: the acquisition-error ramp ────────────────────────────────────
+
+    /// The backoff progression, pinned exactly. 250 ms doubling to a 30 s
+    /// ceiling: the flat `Duration::from_millis(250)` this replaces would fail
+    /// every assertion from the second onwards.
+    #[test]
+    fn acquire_backoff_doubles_then_caps() {
+        let expected_ms = [250u64, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
+        for (i, ms) in expected_ms.iter().enumerate() {
+            let attempt = u32::try_from(i).expect("index fits u32") + 1;
+            assert_eq!(
+                acquire_backoff(attempt),
+                Duration::from_millis(*ms),
+                "attempt {attempt} must double the previous delay"
+            );
+        }
+        // Attempt 8 would be 32 s, past the ceiling, and everything after it
+        // pins there rather than growing without bound.
+        for attempt in [8u32, 9, 100, 10_000, u32::MAX] {
+            assert_eq!(
+                acquire_backoff(attempt),
+                ACQUIRE_BACKOFF_CAP,
+                "attempt {attempt} must be clamped to the ceiling"
+            );
+        }
+    }
+
+    /// The ceiling is seconds, not minutes: this path has no `NameOwnerChanged`
+    /// to wake it, so the cap is also the worst case for noticing the bus came
+    /// back. A regression that "fixed" the busy-loop by reaching for the
+    /// 5-minute give-up cooldown would trade #653's spin for the stall the
+    /// issue explicitly does not want.
+    #[test]
+    fn the_ceiling_recovers_within_seconds_not_minutes() {
+        assert!(
+            ACQUIRE_BACKOFF_CAP <= Duration::from_mins(1),
+            "a name that becomes acquirable must be retried within a minute"
+        );
+        assert!(
+            ACQUIRE_BACKOFF_BASE < ACQUIRE_BACKOFF_CAP,
+            "the ramp must actually ramp"
+        );
+    }
+
+    /// The log cadence is geometric, so the *logging* has a ceiling too — not
+    /// just the retry. Before #653 the non-transient arm logged on every
+    /// attempt forever and the transient arm logged nothing at all.
+    #[test]
+    fn logs_only_at_each_doubling() {
+        let logged: Vec<u32> = (1..=1024u32).filter(|a| logs_at(*a)).collect();
+        assert_eq!(logged, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]);
+    }
+
+    /// The whole point of the ramp, stated as the budget it buys: an hour of
+    /// unbroken failure must cost a bounded number of `RequestName` attempts
+    /// and a handful of log lines.
+    ///
+    /// The flat 250 ms retry it replaces would spend 14 400 attempts in the
+    /// same hour, so this fails loudly if `acquire_backoff` is flattened back.
+    #[test]
+    fn an_hour_of_failure_is_bounded_in_attempts_and_lines() {
+        let mut streak = FailureStreak::default();
+        let mut elapsed = Duration::ZERO;
+        let mut attempts = 0u32;
+        let mut lines = 0u32;
+        while elapsed < Duration::from_hours(1) {
+            let backoff = streak.record();
+            attempts += 1;
+            if backoff.log {
+                lines += 1;
+            }
+            elapsed += backoff.delay;
+        }
+        assert!(
+            attempts <= 130,
+            "an hour of failure must not cost more than ~2 attempts a minute, got {attempts}"
+        );
+        assert!(
+            lines <= 8,
+            "an hour of failure must not cost more than a handful of log lines, got {lines}"
+        );
+        // And it must not have gone so quiet that it is no longer retrying.
+        assert!(
+            attempts >= 100,
+            "the 30 s cap implies ~120 attempts an hour"
+        );
+    }
+
+    /// The other half of the trade: anything that works clears the streak, so
+    /// a blip costs one 250 ms wait and never leaves a 30 s delay armed for the
+    /// *next* unrelated failure.
+    #[test]
+    fn a_success_resets_the_ramp_to_the_base_delay() {
+        let mut streak = FailureStreak::default();
+        for _ in 0..12 {
+            let _ = streak.record();
+        }
+        assert_eq!(
+            streak.record().delay,
+            ACQUIRE_BACKOFF_CAP,
+            "a long streak must be at the ceiling before the reset means anything"
+        );
+
+        streak.reset();
+
+        let after = streak.record();
+        assert_eq!(after.attempt, 1);
+        assert_eq!(
+            after.delay, ACQUIRE_BACKOFF_BASE,
+            "a success must put the next failure back at the base delay"
+        );
+        assert!(
+            after.log,
+            "the first failure of a fresh streak is always worth a line"
+        );
+    }
+
+    /// The first few failures stay at `debug!` (a reconnect blip is already
+    /// reported by `connection.rs`); a streak that outlives that explanation
+    /// escalates to `warn!` and stays there.
+    #[test]
+    fn a_streak_escalates_from_blip_to_serious() {
+        let mut streak = FailureStreak::default();
+        let mut first_serious = None;
+        for _ in 0..64 {
+            let backoff = streak.record();
+            if backoff.is_serious() && first_serious.is_none() {
+                first_serious = Some(backoff.attempt);
+            }
+        }
+        let first = first_serious.expect("a 64-failure streak must become serious");
+        assert!(
+            (2..=8).contains(&first),
+            "escalation must happen within seconds, not attempts later; got {first}"
+        );
+    }
+
+    // ── #653: closing the give-up incident ──────────────────────────────────
+
+    /// The recovery line fires only when there is an incident to close. A first
+    /// acquisition and an ordinary sub-threshold retry must stay silent, or the
+    /// line becomes noise on every reconnect.
+    #[test]
+    fn only_a_latched_tally_closes_a_give_up() {
+        assert!(
+            !closes_a_give_up(None, 3),
+            "a first acquisition has no incident to close"
+        );
+        assert!(
+            !closes_a_give_up(Some(&(":1.7".to_owned(), 1)), 3),
+            "a sub-threshold retry never logged a give-up"
+        );
+        assert!(
+            !closes_a_give_up(Some(&(":1.7".to_owned(), 2)), 3),
+            "still below the threshold"
+        );
+        assert!(
+            closes_a_give_up(Some(&(":1.7".to_owned(), 3)), 3),
+            "the tally that produced a give-up must produce its close"
+        );
+        assert!(
+            closes_a_give_up(Some(&(":1.7".to_owned(), 9)), 3),
+            "a re-latched tally is still an open incident"
+        );
+    }
+
+    /// Every `record_loss` verdict that gives up must also read as an open
+    /// incident, and every verdict that retries must not. Ties the two pure
+    /// functions together so a change to one cannot silently desync the
+    /// give-up line from the line that closes it.
+    #[test]
+    fn give_up_and_its_close_agree_on_every_verdict() {
+        let mut tally = None;
+        for _ in 0..8 {
+            let gave_up = matches!(
+                record_loss(&mut tally, Some(":1.7"), 3),
+                Contention::GiveUp { .. }
+            );
+            assert_eq!(
+                gave_up,
+                closes_a_give_up(tally.as_ref(), 3),
+                "a give-up must be exactly the state a recovery would close"
+            );
+        }
+    }
+
+    // ── #653: state transitions on the error path ───────────────────────────
+
+    /// A `RequestName` error that is *not* `AccessDenied` must not latch the
+    /// `Denied` state — that state means "policy refuses", and mislabelling a
+    /// transport failure as one would tell a consumer to go install a D-Bus
+    /// policy rule that is already fine.
+    #[tokio::test]
+    async fn a_non_policy_request_name_error_does_not_latch_denied() {
+        let writer = Mutable::new(OwnState::Owned);
+        let mut streak = FailureStreak::default();
+        on_request_name_error(
+            fdo::Error::Disconnected("broker went away".into()),
+            NAME,
+            // Long enough that a wrongly-taken `AccessDenied` branch would
+            // blow the test's own timeout rather than pass by accident.
+            LONG_COOLDOWN,
+            &writer,
+            &mut streak,
+        )
+        .await;
+        assert_eq!(
+            writer.get_cloned(),
+            OwnState::Acquiring,
+            "a transport error must leave us acquiring, not denied"
+        );
+    }
+
+    /// Consecutive `RequestName` errors advance the ramp, so a broker that
+    /// keeps erroring is asked less and less often instead of at a flat rate
+    /// forever.
+    #[tokio::test]
+    async fn repeated_request_name_errors_advance_the_ramp() {
+        let writer = Mutable::new(OwnState::Acquiring);
+        let mut streak = FailureStreak::default();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            on_request_name_error(
+                fdo::Error::Disconnected("broker went away".into()),
+                NAME,
+                LONG_COOLDOWN,
+                &writer,
+                &mut streak,
+            )
+            .await;
+        }
+        // 250 ms + 500 ms + 1 s: a flat 250 ms ramp would finish in ~750 ms.
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_700),
+            "three consecutive errors must have backed off, not retried flat"
+        );
     }
 
     /// The select-arm decision, pinned: the two wakes take deliberately

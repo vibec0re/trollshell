@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -9,7 +9,7 @@ use hytte::prelude::*;
 use hytte::services::calendar;
 use hytte::services::clipboard;
 use hytte::services::notifications;
-use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window};
+use hytte::ui::{Anchor, Edge, Layer, LayerEdge, LayerShell, layer_window, on_surface_ready};
 
 use crate::components::layout::DRAWER_MAX_WIDTH_WIDE;
 use crate::components::monitor_key::{is_fallback_key, monitor_key};
@@ -395,15 +395,37 @@ struct ModalPanel {
     /// The bar this drawer hangs off — its edge/offset/thickness drive the
     /// drawer's anchoring and perpendicular margin.
     geometry: BarGeometry,
-    /// Main-axis center (X for horizontal bars, Y for vertical) of the chip
-    /// that opened the drawer, in screen coordinates. Stashed at open time so
-    /// the window-map handler can recompute the margin once the card has a
-    /// real allocation (`measure` can return 0 before the surface is mapped).
-    pending_center: RefCell<Option<i32>>,
+    /// The chip the drawer was opened from, or `None` for the chipless entry
+    /// points (`open_by_key` / `open_plugin_by_key`), which anchor the card
+    /// flush with the bar's trailing edge. See [`TriggerAnchor`].
+    anchor: RefCell<Option<TriggerAnchor>>,
     /// Emits `true` while the drawer is open (between `show_panel` and the
     /// retract animation finishing). Consumers — e.g. the bar — bind CSS
     /// classes to this so the seam between bar and drawer can restyle.
     open_state: Mutable<bool>,
+}
+
+/// What the open drawer's card is centered on: the bar chip that opened it,
+/// plus the last main-axis center that chip resolved to.
+///
+/// Holding the **widget**, not just the number, is what makes the card
+/// re-centerable (#612). The center from [`trigger_center`] is a point in the
+/// *bar surface's* coordinate space (#600), and that space is not stable while
+/// the drawer is open: anything that reserves leading main-axis space — the
+/// sidebar's `exclusive_zone`, see `overlays::sidebar` — both shifts and
+/// narrows the bar, moving every chip inside it. So the recorded number goes
+/// stale on a zone change even though the chip never moved on screen, and only
+/// a re-measure against the live bar recovers the truth. Weak so a hot-plug
+/// that tears the bar down isn't kept alive by a drawer handle; `center` is the
+/// last successful measure, used as the fallback if the chip is gone (a bar
+/// teardown takes the drawer with it via `close_all`, so that is close to
+/// unreachable — but a stale number still beats none).
+struct TriggerAnchor {
+    /// The chip, weakly. `None` on upgrade → fall back to `center`.
+    widget: glib::WeakRef<gtk::Widget>,
+    /// Last main-axis center this chip measured to, in the bar surface's
+    /// coordinate space. Refreshed by [`live_center`] on every re-measure.
+    center: i32,
 }
 
 /// Identifies one global "is a matching drawer page visible on any monitor"
@@ -588,6 +610,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
 
     wire_retract_finish(&revealer, key.clone());
     wire_recenter_on_map(&window, key.clone());
+    wire_recenter_on_bar_geometry(&geometry.bar_window, key.clone());
 
     window.set_visible(false);
 
@@ -613,7 +636,7 @@ pub fn install(monitor: &Monitor, bar: &BarHandle, edge: Edge, offset: i32) {
                 current: RefCell::new(None),
                 positioner,
                 geometry,
-                pending_center: RefCell::new(None),
+                anchor: RefCell::new(None),
                 open_state: drawer_open_state(&key),
             }),
         )
@@ -1191,16 +1214,16 @@ pub fn open(monitor: &Monitor, page: Page) {
 /// Open the drawer to `page` on the monitor whose connector is `key`. Shared
 /// by [`open`] (the monitor-driven notification/toast path) and the
 /// command-surface helpers below. No bar-chip context here, so the drawer
-/// anchors flush with the bar's trailing main-axis edge (`pending_center` =
-/// `None`, `main_margin` = 0). No-op if no drawer is mounted for `key`.
+/// anchors flush with the bar's trailing main-axis edge (`anchor` = `None`,
+/// main margin = 0). No-op if no drawer is mounted for `key`.
 fn open_by_key(key: &str, page: Page) {
     // Resolve to an owned handle first (#643): `show_panel` presents the
     // surface and reveals the card — a long run of GTK calls, plus an
     // `open_state.set(true)` that wakes subscribers synchronously — none of
     // which may run under a live `PANELS` borrow.
     if let Some(panel) = live_panel(key) {
-        *panel.pending_center.borrow_mut() = None;
-        show_panel(&panel, page, 0);
+        *panel.anchor.borrow_mut() = None;
+        show_panel(&panel, page);
     }
     recompute_gates();
 }
@@ -1226,8 +1249,8 @@ pub fn open_on_focused(preferred: Option<&str>, page: Page) {
 
 /// Open the drawer to a plugin's **own** panel on the monitor whose connector is
 /// `key` (#349 PR2). The plugin analogue of [`open_by_key`]: no bar-chip context,
-/// so the drawer anchors flush with the bar's trailing edge (`pending_center` =
-/// `None`, `main_margin` = 0). The active selection is published *before*
+/// so the drawer anchors flush with the bar's trailing edge (`anchor` = `None`,
+/// main margin = 0). The active selection is published *before*
 /// presenting so the per-monitor plugin drawer child reconciles the panel tree as
 /// early as possible (risk #1 in the PR: measure-before-show). No-op if no drawer
 /// is mounted for `key`.
@@ -1235,11 +1258,11 @@ fn open_plugin_by_key(key: &str, plugin_id: &str) {
     // Owned handle, no live `PANELS` borrow (#643) — as in [`open_by_key`],
     // plus `set_active_panel`, which publishes into the plugin host.
     if let Some(panel) = live_panel(key) {
-        *panel.pending_center.borrow_mut() = None;
+        *panel.anchor.borrow_mut() = None;
         // Publish the selection BEFORE presenting so the child reconciles first
         // (`show_panel_active` also publishes it via `on_active_show`; idempotent).
         crate::plugins::set_active_panel(Some(plugin_id));
-        show_panel_active(&panel, Active::Plugin(plugin_id.to_owned()), 0);
+        show_panel_active(&panel, Active::Plugin(plugin_id.to_owned()));
     }
     recompute_gates();
 }
@@ -1322,16 +1345,15 @@ fn toggle_inner(
             None => {
                 // Build + set the visible child first so `measure` reflects the
                 // target page's natural size, not whatever was last shown, and
-                // so the `main_margin_for_center` measure below sees the real
-                // page. `show_panel` re-sets it (idempotent).
+                // so `show_panel`'s margin measure below sees the real page.
+                // `show_panel` re-sets it (idempotent).
                 set_stack_page(&panel, page);
-                let chip_center = trigger_center(&panel, trigger.upcast_ref());
-                *panel.pending_center.borrow_mut() = chip_center;
-                // Best-effort margin now (may use a pre-map measure that
-                // underestimates); the window-map handler recomputes from the
-                // real card allocation once the surface is mapped.
-                let margin = chip_center.map_or(0, |c| main_margin_for_center(&panel, c));
-                show_panel(&panel, page, margin);
+                // Record the chip, then let `show_panel` place the card off it.
+                // The placement is best-effort at this point (a pre-map measure
+                // can underestimate the card); the window-map handler recomputes
+                // from the real allocation once the surface is mapped.
+                set_anchor(&panel, trigger.upcast_ref());
+                show_panel(&panel, page);
             }
         }
     }
@@ -1340,43 +1362,108 @@ fn toggle_inner(
     recompute_gates();
 }
 
-/// Present the drawer on `page` at `main_margin` pixels from the bar's
-/// trailing main-axis edge (screen right for horizontal bars, screen top for
-/// vertical). Also sets the perpendicular margin live from the bar's real
-/// offset + thickness. The margins now sink onto the `positioner` box (the
-/// fullscreen surface no longer moves) — because the overlay is fullscreen, a
-/// GTK margin on the trailing-aligned positioner is equivalent to the old
-/// layer-shell `set_margin` on the content-sized drawer surface.
-fn show_panel(panel: &ModalPanel, page: Page, main_margin: i32) {
-    show_panel_active(panel, Active::Builtin(page), main_margin);
+/// Present the drawer on `page`, positioned off whatever [`ModalPanel::anchor`]
+/// currently holds (set by the caller — a chip for [`toggle_inner`], `None` for
+/// the chipless entry points, which land the card flush with the bar's trailing
+/// main-axis edge).
+fn show_panel(panel: &ModalPanel, page: Page) {
+    show_panel_active(panel, Active::Builtin(page));
 }
 
 /// The generalized present path (#349 PR2): show `active` — a built-in [`Page`]
-/// or a plugin panel — at `main_margin`. Identical to the old `show_panel`
-/// except it routes through [`set_stack_active`]/[`on_active_show`], so it needs
-/// only `stack_name` + on-show + margins, none of which are `Page`-specific.
-fn show_panel_active(panel: &ModalPanel, active: Active, main_margin: i32) {
+/// or a plugin panel. Identical to the old `show_panel` except it routes through
+/// [`set_stack_active`]/[`on_active_show`], so it needs only `stack_name` +
+/// on-show + margins, none of which are `Page`-specific.
+fn show_panel_active(panel: &ModalPanel, active: Active) {
     set_stack_active(panel, &active);
     on_active_show(panel, &active);
     *panel.current.borrow_mut() = Some(active);
     panel.open_state.set(true);
 
-    // Perpendicular margin: bar offset + live-measured thickness, replacing
-    // the old hardcoded 59. The bar window is mapped by open time.
+    reposition_card(panel);
+
+    panel.window.set_visible(true);
+    panel.window.present();
+    panel.revealer.set_reveal_child(true);
+}
+
+/// Place the card for the drawer's current [`ModalPanel::anchor`], from live
+/// geometry only. The single positioning path: [`show_panel_active`] runs it at
+/// open, [`wire_recenter_on_map`] re-runs it once the surface has a real
+/// allocation, and [`wire_recenter_on_bar_geometry`] re-runs it whenever the bar
+/// surface is reconfigured under an open drawer (#612).
+///
+/// Both margins sink onto the `positioner` box (the fullscreen surface no longer
+/// moves) — because the overlay is fullscreen, a GTK margin on the
+/// perpendicular+trailing-aligned positioner is equivalent to the old
+/// layer-shell `set_margin` on the content-sized drawer surface.
+///
+/// * Perpendicular: bar offset + live-measured thickness, replacing the old
+///   hardcoded 59. The bar window is mapped by open time.
+/// * Main axis: [`main_margin_for_center`] off the anchor's *re-measured*
+///   center, or 0 (flush with the bar's trailing edge) with no anchor.
+///
+/// Nothing here is cached between calls, which is the whole point: every input
+/// — bar extent, bar thickness, chip position, card allocation — is re-read, so
+/// repeating the call is how a geometry change is absorbed.
+fn reposition_card(panel: &ModalPanel) {
     set_widget_margin(
         &panel.positioner,
         panel.geometry.perpendicular_layer_edge(),
         panel.geometry.perpendicular_margin(),
     );
+    let main_margin = live_center(panel).map_or(0, |center| main_margin_for_center(panel, center));
     set_widget_margin(
         &panel.positioner,
         panel.geometry.main_layer_edge(),
         main_margin,
     );
+}
 
-    panel.window.set_visible(true);
-    panel.window.present();
-    panel.revealer.set_reveal_child(true);
+/// Record `trigger` as the chip this drawer is centered on. `None` (clearing any
+/// previous anchor) if the chip isn't rooted, which preserves the pre-#612
+/// behaviour of that case: no center, so the card lands flush with the bar's
+/// trailing edge rather than being centered on a made-up coordinate.
+fn set_anchor(panel: &ModalPanel, trigger: &gtk::Widget) {
+    // Measure before borrowing (#643) — `trigger_center` is a run of GTK calls.
+    let anchor = trigger_center(panel, trigger).map(|center| TriggerAnchor {
+        widget: trigger.downgrade(),
+        center,
+    });
+    *panel.anchor.borrow_mut() = anchor;
+}
+
+/// The anchor chip's main-axis center, **re-measured against the live bar**, or
+/// `None` when the drawer has no anchor at all.
+///
+/// The re-measure is what #612 turns on: [`trigger_center`] returns a
+/// bar-surface-relative coordinate, and the bar surface moves and resizes under
+/// an open drawer whenever something reserves leading main-axis space (the
+/// sidebar's exclusive zone). A chip pinned to the bar's *trailing* end doesn't
+/// move on screen when that happens, but its bar-relative center does — so
+/// re-solving the old number against the new extent would slide the card off the
+/// chip in the opposite direction. Re-measuring both halves in the same pass is
+/// the only combination that holds for leading-, center- and trailing-placed
+/// chips alike.
+///
+/// Falls back to the recorded center if the chip is gone or unrooted, and
+/// refreshes the record on every successful measure.
+fn live_center(panel: &ModalPanel) -> Option<i32> {
+    // Copy both halves out before touching GTK (#643): `trigger_center` is a run
+    // of GTK calls and the refresh below needs the cell mutably, so neither may
+    // run under a borrow taken for the other.
+    let (trigger, recorded) = {
+        let anchor = panel.anchor.borrow();
+        let anchor = anchor.as_ref()?;
+        (anchor.widget.upgrade(), anchor.center)
+    };
+    let measured = trigger.and_then(|widget| trigger_center(panel, &widget));
+    if let Some(center) = measured
+        && let Some(anchor) = panel.anchor.borrow_mut().as_mut()
+    {
+        anchor.center = center;
+    }
+    Some(measured.unwrap_or(recorded))
 }
 
 /// Set a GTK margin on `widget` corresponding to a layer-shell [`LayerEdge`].
@@ -1423,11 +1510,79 @@ fn wire_recenter_on_map(window: &gtk::Window, key: String) {
                 return;
             };
             apply_stats_scroll(&panel);
-            let Some(center) = *panel.pending_center.borrow() else {
+            reposition_card(&panel);
+        });
+    });
+}
+
+/// Re-place the card when the **bar's** surface geometry changes underneath an
+/// already-open drawer (#612, the deferred half of #604).
+///
+/// The drawer's own surface can't notice: it is anchored to all four screen
+/// edges with `exclusive_zone(-1)` precisely so nothing reserving space moves
+/// it, so it is never reconfigured. The bar is the surface that *does* move —
+/// [`BarGeometry::main_extent`] already leans on that, reading the bar's live
+/// extent so the centering math self-corrects for whatever reserves leading
+/// space (#600). This is the same observation applied one step earlier: watch
+/// that extent for *changes*, not just sample it at open.
+///
+/// Reachable in practice only through a non-pointer trigger — the drawer's
+/// fullscreen click-catcher retracts on any click, so no ordinary pointer path
+/// toggles the sidebar with the drawer still up. `commands.rs`'s
+/// `toggle-sidebar` `GAction` on a niri keybind is that trigger, and it is why
+/// this is wired at all rather than left as a shrug.
+///
+/// **Deliberately not a sidebar subscription.** #604 avoided a `modal` →
+/// sidebar coupling and #612 asked that the fix keep avoiding it; hooking the
+/// bar's own `GdkSurface::layout` keeps `modal` ignorant of *which* surface
+/// reserved space, exactly as `main_extent` is. Any future leading-edge
+/// reserver gets the same treatment for free.
+///
+/// Mechanics, since the signal choice is load-bearing:
+/// * `GdkSurface::layout` is emitted from the frame clock's layout phase, and
+///   for a Wayland toplevel the backend's `compute_size` always returns FALSE,
+///   so the emission is never skipped — a compositor configure (which is what an
+///   exclusive-zone change delivers) always reaches it. `GdkSurface::width` is
+///   *not* a notifying property, so `notify::width` would silently never fire.
+/// * `GtkNative` connects its own `layout` handler at realize, i.e. before this
+///   one, so GTK has already re-allocated the bar by the time we run. The idle
+///   deferral is belt-and-braces on top of that (and mirrors
+///   [`wire_recenter_on_map`], which needs it for the same settled-frame
+///   reason).
+/// * The signal also fires for plain relayouts at unchanged size (a clock label
+///   growing a digit), so the reported size is diffed and unchanged sizes cost
+///   one integer compare.
+fn wire_recenter_on_bar_geometry(bar_window: &gtk::Window, key: String) {
+    // `on_surface_ready` runs on every map, and the bar's layer surface maps
+    // exactly once — but latch anyway rather than rely on that, since a second
+    // run would stack a second `layout` handler on the same surface.
+    let wired = Cell::new(false);
+    let last_size = Rc::new(Cell::new((0, 0)));
+    on_surface_ready(bar_window, move |surface| {
+        if wired.replace(true) {
+            return;
+        }
+        let key = key.clone();
+        let last_size = Rc::clone(&last_size);
+        surface.connect_layout(move |_, width, height| {
+            if last_size.replace((width, height)) == (width, height) {
                 return;
-            };
-            let margin = main_margin_for_center(&panel, center);
-            set_widget_margin(&panel.positioner, panel.geometry.main_layer_edge(), margin);
+            }
+            let key = key.clone();
+            glib::idle_add_local_once(move || {
+                // Owned handle, no live `PANELS` borrow (#643) — `reposition_card`
+                // measures the card and the chip.
+                let Some(panel) = live_panel(&key) else {
+                    return;
+                };
+                // Read-then-act, no `current` borrow held across the GTK below.
+                // A closed drawer needs nothing: the next open positions from
+                // scratch off the live geometry anyway.
+                let is_open = panel.current.borrow().is_some();
+                if is_open {
+                    reposition_card(&panel);
+                }
+            });
         });
     });
 }
@@ -1776,6 +1931,83 @@ mod tests {
             assert!(margin > 0 && margin < MAX, "clamp bit at center {center}");
             assert_eq!(MONITOR - margin - 15 - 680 / 2, center);
         }
+    }
+
+    /// Screen-space center of the card for a given main-axis margin, at the
+    /// 1920 px / 680 px card / 15 px trailing-chrome geometry the two #612 tests
+    /// below share. The card is laid out from the *screen's* trailing edge (the
+    /// drawer surface is fullscreen with `exclusive_zone(-1)`), so this is what
+    /// a margin actually means on screen.
+    fn card_center_at(margin: i32) -> i32 {
+        1920 - margin - 15 - 680 / 2
+    }
+
+    /// #612, the trailing-chip case — the one a "just re-run the math with the
+    /// new extent" fix gets wrong.
+    ///
+    /// The drawer can stay open across a sidebar toggle (only via the
+    /// `toggle-sidebar` keybind: the fullscreen click-catcher eats every pointer
+    /// path), so the card has to be re-placed. The crux is *which* inputs get
+    /// refreshed. A chip pinned near the bar's trailing end does not move on
+    /// screen when a 320 px leading zone shifts and narrows the bar — but its
+    /// bar-relative center, which is what `trigger_center` reports, drops by
+    /// exactly that 320. Re-solving the *recorded* center against the *new*
+    /// extent therefore moves a card that should have stayed put; only
+    /// re-measuring the chip too (what `live_center` does) holds.
+    #[test]
+    fn recenter_on_zone_change_remeasures_the_trigger() {
+        const MONITOR: i32 = 1920;
+        const SIDEBAR: i32 = 320;
+        const BAR_OPEN: i32 = MONITOR - SIDEBAR;
+        // 420 px in from the screen's right edge, in both sidebar states.
+        const CHIP_SCREEN_X: i32 = MONITOR - 420;
+
+        // Sidebar closed: the bar spans the monitor, so bar-relative == screen.
+        let before = clamp_main_margin(MONITOR, CHIP_SCREEN_X, 680, 20, 15);
+        assert_eq!(card_center_at(before), CHIP_SCREEN_X);
+
+        // Sidebar open: bar surface is [320, 1920), so the unmoved chip now
+        // reports a center 320 lower. Same card, same screen position.
+        let remeasured = clamp_main_margin(BAR_OPEN, CHIP_SCREEN_X - SIDEBAR, 680, 20, 15);
+        assert_eq!(card_center_at(remeasured), CHIP_SCREEN_X);
+        assert_eq!(
+            remeasured, before,
+            "the card must not move when the chip didn't"
+        );
+
+        // The half-fix: fresh extent, stale center. Lands 320 px of chip
+        // displacement onto the card — here clamped flush, 65 px off the chip.
+        let stale = clamp_main_margin(BAR_OPEN, CHIP_SCREEN_X, 680, 20, 15);
+        assert_ne!(stale, before);
+        assert_ne!(card_center_at(stale), CHIP_SCREEN_X);
+    }
+
+    /// #612, the leading-chip case — the one that proves the *extent* still has
+    /// to be re-read as well, so the fix is "re-measure both", not "re-measure
+    /// the chip instead".
+    ///
+    /// A chip pinned near the bar's leading end keeps the same bar-relative
+    /// center across the zone change (the bar's own layout doesn't move it) but
+    /// slides 320 px right on screen with the surface. The card has to follow,
+    /// and it is the narrowed extent that carries it there.
+    #[test]
+    fn recenter_on_zone_change_tracks_the_bar_extent() {
+        const MONITOR: i32 = 1920;
+        const SIDEBAR: i32 = 320;
+        const BAR_OPEN: i32 = MONITOR - SIDEBAR;
+        // 400 px in from the bar's leading edge, in both sidebar states.
+        const CHIP_BAR_X: i32 = 400;
+
+        let before = clamp_main_margin(MONITOR, CHIP_BAR_X, 680, 20, 15);
+        assert_eq!(card_center_at(before), CHIP_BAR_X);
+
+        let after = clamp_main_margin(BAR_OPEN, CHIP_BAR_X, 680, 20, 15);
+        assert_eq!(card_center_at(after), CHIP_BAR_X + SIDEBAR);
+        assert_eq!(
+            after - before,
+            -SIDEBAR,
+            "the card must follow the chip's new screen position"
+        );
     }
 
     /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every

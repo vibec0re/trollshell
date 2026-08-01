@@ -21,10 +21,27 @@
 //! for CI/testing.
 //!
 //! HTTP is the house idiom: blocking `ureq`, meant to run on a
-//! `spawn_blocking` thread (same as `hytte-services`' weather fetcher).
+//! `spawn_blocking` thread (same as `hytte-services`' weather fetcher). The
+//! whole request is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
+//! unless the caller raises it) — read that constant before wiring a backend
+//! that has a per-request budget of its own; the two have to be ordered.
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Default global budget for one [`chat`] round trip — connect, send **and**
+/// read, not just the read.
+///
+/// **Ordering invariant:** a *server*-side per-request budget must stay
+/// strictly **under** whatever [`ChatOpts::timeout`] the calling plugin
+/// resolves to, so a slow turn reaches the caller as a clean
+/// application-level error it can fall back from rather than as a connection
+/// torn mid-read. `hytte-claude-bridge` is the live example: its
+/// `CLAUDE_BRIDGE_TIMEOUT_SECS` (default 8s) is documented against this 10s
+/// default, so widening the bridge's budget means raising the **client's**
+/// timeout first (`PET_LLM_TIMEOUT_SECS` and friends) and only then the
+/// bridge's — never the other way round.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An OpenAI-compatible chat provider: where to POST and how to authenticate.
 #[derive(Debug, Clone)]
@@ -96,13 +113,21 @@ impl Message {
     }
 }
 
-/// Sampling knobs for [`chat`].
+/// Sampling knobs for [`chat`], plus the request budget.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatOpts {
     /// Upper bound on generated tokens.
     pub max_tokens: u32,
     /// Sampling temperature.
     pub temperature: f32,
+    /// Global budget for the whole request (ureq's `timeout_global`: connect +
+    /// send + read), [`DEFAULT_TIMEOUT`] by default. Raise it for a backend
+    /// whose latency legitimately exceeds it — a cold `claude --print` turn
+    /// through `hytte-claude-bridge`, a large local model — and mind the
+    /// ordering invariant on [`DEFAULT_TIMEOUT`]. The 2s connect timeout is
+    /// separate and not configurable: that's the TCP handshake, never model
+    /// latency.
+    pub timeout: Duration,
 }
 
 impl Default for ChatOpts {
@@ -110,6 +135,7 @@ impl Default for ChatOpts {
         Self {
             max_tokens: 256,
             temperature: 0.7,
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 }
@@ -163,12 +189,13 @@ struct ChatChoiceMessage {
 /// the `enable_thinking:false` template kwarg only when it's `None` (local
 /// `llama-server`). `provider.model` is sent in the body when set.
 ///
-/// Blocking — run it on a `spawn_blocking` thread. 2s connect / 10s global
-/// timeout.
+/// Blocking — run it on a `spawn_blocking` thread. 2s connect timeout; the
+/// whole round trip is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
+/// by default).
 pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Result<String, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_global(Some(opts.timeout))
         // Don't collapse a 4xx/5xx into a bare status error — we want to read
         // the endpoint's JSON error body (OpenRouter explains *why*: an invalid
         // or restricted model, an auth problem…) and surface it in the message.
@@ -389,6 +416,7 @@ mod tests {
             &ChatOpts {
                 max_tokens: 8,
                 temperature: 0.5,
+                ..ChatOpts::default()
             },
         )
         .expect("chat succeeds");
@@ -476,6 +504,44 @@ mod tests {
         )
         .expect_err("nothing listens there");
         assert!(err.starts_with("http:"), "{err}");
+    }
+
+    /// The default budget is the number every server-side budget is written
+    /// against — `hytte-claude-bridge`'s `DEFAULT_BUDGET` (8s) and its
+    /// `the_default_budget_is_under_the_clients_global_timeout` test both
+    /// hardcode this 10s. Moving it here silently would break that ordering.
+    #[test]
+    fn the_default_request_budget_is_ten_seconds() {
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(ChatOpts::default().timeout, DEFAULT_TIMEOUT);
+    }
+
+    /// `ChatOpts::timeout` is really wired to the agent, not just carried:
+    /// a server that accepts the connection (kernel backlog) and never answers
+    /// must trip the *global* budget, not hang for the 10s default.
+    #[test]
+    fn chat_honours_the_configured_request_timeout() {
+        // Bound but never accepted: the handshake completes from the backlog,
+        // so this is a read stall, not a connect failure.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let started = std::time::Instant::now();
+        let err = chat(
+            &Provider::llama(format!("http://{addr}")),
+            &[Message::user("x")],
+            &ChatOpts {
+                timeout: Duration::from_millis(200),
+                ..ChatOpts::default()
+            },
+        )
+        .expect_err("the server never answers");
+        assert!(err.starts_with("http:"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?} — the configured 200ms budget wasn't applied",
+            started.elapsed(),
+        );
+        drop(listener);
     }
 
     #[test]

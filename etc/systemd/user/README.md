@@ -266,6 +266,22 @@ newest message so the prompt prefix stays cacheable) and `reprompt` (a one-off
 session per turn, with the bridge holding the transcript and nothing persisted
 to disk).
 
+**Two timeouts, and their order matters.** `CLAUDE_BRIDGE_TIMEOUT_SECS` (8s by
+default) is the bridge's per-request budget; the _client_'s budget is the pet's
+`PET_LLM_TIMEOUT_SECS` (10s by default, #699 — before that it was a hardcoded
+10s in `hytte-ai-providers`). The bridge's has to stay strictly **under** the
+client's, or the client hangs up mid-read and the plugin sees a torn connection
+instead of a clean 504 it can fall back from. A cold `claude --print` turn on a
+fresh session routinely runs past 10s, so the fix is to raise **both, in that
+order**:
+
+```ini
+# in trollshell-plugin-pet.service — the client's ceiling goes up first
+Environment=PET_LLM_TIMEOUT_SECS=30
+# in trollshell-claude-bridge.service — then the bridge, still below it
+Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=25
+```
+
 When it's down, the plugins degrade to their canned output — the same failure
 mode as a missing llama-server — with the cause only in the journal.
 

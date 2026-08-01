@@ -20,10 +20,19 @@
 //! replies from a configured backend all fall back to the **canned pools** too,
 //! so the pet stays fully alive with no model configured at all.
 //!
+//! Two more knobs tune the call itself, both whole seconds and both falling
+//! back to their compiled default when unset/blank/unparsable/`0`:
+//! `$PET_LLM_MIN_GAP_SECS` (throttle between real calls, default 15) and
+//! `$PET_LLM_TIMEOUT_SECS` (how long one call may take, default
+//! [`hytte_ai_providers::DEFAULT_TIMEOUT`]). See [`Cfg::from_env`] — in
+//! particular for the ordering a server-side budget like
+//! `CLAUDE_BRIDGE_TIMEOUT_SECS` has to respect.
+//!
 //! The shared client owns the HTTP + provider config; the pet keeps the
 //! persona, the [`sanitize`] step, and the "empty line ⇒ offline ⇒ canned"
 //! policy. The prompt asks for one plain line; [`sanitize`] enforces it
-//! whatever the model does.
+//! whatever the model does — and its word budget is *derived* from that
+//! character clamp ([`PROMPT_MAX_WORDS`]), not chosen separately.
 
 use std::time::Duration;
 
@@ -33,8 +42,9 @@ use hytte_plugin::tokio::time::Instant;
 
 use crate::{GRUMPY_AT, PetMsg};
 
-/// Minimum gap between two real model calls; requests inside the gap get a
-/// canned line instead. Keeps a poke-happy user from melting the CPU.
+/// Default minimum gap between two real model calls; requests inside the gap
+/// get a canned line instead. Keeps a poke-happy user from melting the CPU.
+/// Override with `$PET_LLM_MIN_GAP_SECS` (see [`Cfg::from_env`]).
 const MIN_LLM_GAP: Duration = Duration::from_secs(15);
 
 /// Bubble budget: one line, at most this many characters. Kept at the
@@ -42,6 +52,15 @@ const MIN_LLM_GAP: Duration = Duration::from_secs(15);
 /// no wrap/ellipsize yet, so a long label's *minimum* width would push the
 /// whole layer surface past the sidebar (overlapping niri tiles).
 const MAX_LINE: usize = 30;
+
+/// Word budget stated in the persona prompt. It has to be derivable from
+/// [`MAX_LINE`], not picked independently: [`sanitize`] hard-clamps at
+/// [`MAX_LINE`] *characters*, so a prompt asking for more words than fit
+/// makes an obedient model's reply reliably end in an ellipsis (#700 — the
+/// prompt said 8 words against a 30-char clamp, ~45 chars of English). The
+/// tests keep the two honest: a sentence of this many average-length English
+/// words has to come back out of [`sanitize`] unclamped.
+const PROMPT_MAX_WORDS: usize = 5;
 
 /// What the reducer wants a line about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +90,26 @@ struct Cfg {
     provider: Option<Provider>,
     /// `$PET_NAME` — the pet's name in its persona. Default: `nisse`.
     name: String,
+    /// `$PET_LLM_MIN_GAP_SECS` — throttle between two real model calls.
+    /// Default: [`MIN_LLM_GAP`].
+    min_llm_gap: Duration,
+    /// `$PET_LLM_TIMEOUT_SECS` — how long one model call may take before the
+    /// client hangs up. Default: [`hytte_ai_providers::DEFAULT_TIMEOUT`].
+    llm_timeout: Duration,
 }
 
 impl Cfg {
+    /// Read the brain's knobs off the process environment.
+    ///
+    /// `$PET_LLM_MIN_GAP_SECS` and `$PET_LLM_TIMEOUT_SECS` are whole seconds;
+    /// unset, blank, unparsable or `0` falls back to the compiled default
+    /// (same shape as `hytte-claude-bridge`'s `CLAUDE_BRIDGE_TIMEOUT_SECS`).
+    ///
+    /// Raising `$PET_LLM_TIMEOUT_SECS` is what makes room for a slow backend —
+    /// notably `hytte-claude-bridge`, whose own `CLAUDE_BRIDGE_TIMEOUT_SECS`
+    /// must stay strictly **under** this value or a slow turn tears the
+    /// connection instead of returning a 504 the pet can fall back from. See
+    /// [`hytte_ai_providers::DEFAULT_TIMEOUT`] for that ordering invariant.
     fn from_env() -> Self {
         // The pet's OpenRouter key: the shared key file (`openrouter.key`, or
         // its `OPENROUTER_API_KEY` override) first, then the pet-specific
@@ -88,8 +124,32 @@ impl Cfg {
             .filter(|s| !s.is_empty());
         let provider = resolve_provider(std::env::var("PET_LLM_URL").ok().as_deref(), key, model);
         let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
-        Self { provider, name }
+        let min_llm_gap = secs_or(
+            std::env::var("PET_LLM_MIN_GAP_SECS").ok().as_deref(),
+            MIN_LLM_GAP,
+        );
+        let llm_timeout = secs_or(
+            std::env::var("PET_LLM_TIMEOUT_SECS").ok().as_deref(),
+            hytte_ai_providers::DEFAULT_TIMEOUT,
+        );
+        Self {
+            provider,
+            name,
+            min_llm_gap,
+            llm_timeout,
+        }
     }
+}
+
+/// Parse a whole-seconds env value into a [`Duration`], falling back to
+/// `default` when it's absent, blank, unparsable, or zero. Split out of
+/// [`Cfg::from_env`] so the parse is unit-testable without mutating the
+/// process environment (`unsafe` under edition 2024, which this crate
+/// forbids) — same split as `hytte_ai_providers::load_key`'s.
+fn secs_or(raw: Option<&str>, default: Duration) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(default, Duration::from_secs)
 }
 
 /// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
@@ -146,11 +206,12 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
         }
         canned_step = canned_step.wrapping_add(1);
         let line = match &cfg.provider {
-            Some(provider) if last_llm.is_none_or(|t| t.elapsed() >= MIN_LLM_GAP) => {
+            Some(provider) if last_llm.is_none_or(|t| t.elapsed() >= cfg.min_llm_gap) => {
                 let provider = provider.clone();
                 let name = cfg.name.clone();
+                let timeout = cfg.llm_timeout;
                 let asked = hytte_plugin::tokio::task::spawn_blocking(move || {
-                    ask_llm(&provider, &name, req)
+                    ask_llm(&provider, &name, req, timeout)
                 })
                 .await;
                 // Stamp at completion: the gap is between calls, so a slow
@@ -179,12 +240,17 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
 // ── The model path ───────────────────────────────────────────────────────────
 
 /// One blocking chat-completion call (runs on a `spawn_blocking` thread):
-/// build the persona/event messages, ask the shared client, then [`sanitize`]
-/// the raw reply. An **empty** line is treated as "offline" so the caller
-/// falls back to a canned line — a reasoning model that spends its whole
-/// budget on hidden reasoning returns nothing, and that shouldn't surface as a
-/// blank bubble.
-fn ask_llm(provider: &Provider, name: &str, req: ThinkReq) -> Result<String, String> {
+/// build the persona/event messages, ask the shared client — giving it up to
+/// `timeout` for the whole round trip — then [`sanitize`] the raw reply. An
+/// **empty** line is treated as "offline" so the caller falls back to a canned
+/// line — a reasoning model that spends its whole budget on hidden reasoning
+/// returns nothing, and that shouldn't surface as a blank bubble.
+fn ask_llm(
+    provider: &Provider,
+    name: &str,
+    req: ThinkReq,
+    timeout: Duration,
+) -> Result<String, String> {
     let messages = [
         Message::system(persona(name, req)),
         Message::user(event(name, req)),
@@ -192,6 +258,7 @@ fn ask_llm(provider: &Provider, name: &str, req: ThinkReq) -> Result<String, Str
     let opts = ChatOpts {
         max_tokens: 32,
         temperature: 0.9,
+        timeout,
     };
     let raw = hytte_ai_providers::chat(provider, &messages, &opts)?;
     let line = sanitize(&raw, name);
@@ -203,15 +270,19 @@ fn ask_llm(provider: &Provider, name: &str, req: ThinkReq) -> Result<String, Str
 }
 
 /// The pet's standing persona, tuned live against MiniCPM5-1B: short,
-/// concrete, format stated as rules.
+/// concrete, format stated as rules. The word budget is [`PROMPT_MAX_WORDS`],
+/// which is derived from the [`MAX_LINE`] clamp — asking for more words than
+/// fit only guarantees [`sanitize`] truncates the answer (#700).
 fn persona(name: &str, req: ThinkReq) -> String {
     format!(
         "You are {name}, a tiny cat who lives in the sidebar of Annika's \
          Linux desktop. It is around {hour}:00 and you feel {mood}. Always \
          answer as {name} the cat. Style: playful, a little sassy. Format: \
-         exactly one line, at most 8 words, plain text, no quotes, no emoji.",
+         exactly one line, at most {words} words, plain text, no quotes, \
+         no emoji.",
         hour = req.hour,
         mood = req.mood,
+        words = PROMPT_MAX_WORDS,
     )
 }
 
@@ -334,6 +405,74 @@ pub fn canned(req: ThinkReq, step: u64) -> String {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Working estimate of one English word plus its trailing space, used to
+    /// keep [`PROMPT_MAX_WORDS`] and [`MAX_LINE`] honest with each other.
+    const AVG_WORD_LEN: usize = 6;
+
+    /// The two env knobs (#697 gap, #699 timeout): the compiled defaults, and
+    /// that only a sane positive whole-seconds override displaces them.
+    #[test]
+    fn secs_or_pins_defaults_and_parses_overrides() {
+        // Defaults: unset, blank, unparsable, negative, or zero → compiled value.
+        assert_eq!(secs_or(None, MIN_LLM_GAP), Duration::from_secs(15));
+        assert_eq!(secs_or(Some(""), MIN_LLM_GAP), MIN_LLM_GAP);
+        assert_eq!(secs_or(Some("   "), MIN_LLM_GAP), MIN_LLM_GAP);
+        assert_eq!(secs_or(Some("soon"), MIN_LLM_GAP), MIN_LLM_GAP);
+        assert_eq!(secs_or(Some("-5"), MIN_LLM_GAP), MIN_LLM_GAP);
+        assert_eq!(secs_or(Some("2.5"), MIN_LLM_GAP), MIN_LLM_GAP);
+        assert_eq!(
+            secs_or(Some("0"), MIN_LLM_GAP),
+            MIN_LLM_GAP,
+            "0 is nonsense for both knobs → the default, not an instant timeout",
+        );
+        // Overrides parse, whitespace and all.
+        assert_eq!(secs_or(Some("45"), MIN_LLM_GAP), Duration::from_secs(45));
+        assert_eq!(secs_or(Some(" 45 "), MIN_LLM_GAP), Duration::from_secs(45));
+        // The timeout knob shares the parse and defaults to the client's own
+        // budget — the value hytte-claude-bridge's budget is ordered against.
+        assert_eq!(
+            secs_or(None, hytte_ai_providers::DEFAULT_TIMEOUT),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            secs_or(Some("30"), hytte_ai_providers::DEFAULT_TIMEOUT),
+            Duration::from_secs(30),
+        );
+    }
+
+    /// #700: the persona's word budget has to fit the [`MAX_LINE`] clamp, or
+    /// an obedient model's reply is truncated with an ellipsis every time.
+    #[test]
+    fn prompt_word_budget_fits_the_line_clamp() {
+        let prompt = persona(
+            "nisse",
+            ThinkReq {
+                kind: ThinkKind::Idle,
+                hour: 9,
+                mood: "happy",
+                pokes: 0,
+            },
+        );
+        assert!(
+            prompt.contains(&format!("at most {PROMPT_MAX_WORDS} words")),
+            "the prompt states the derived budget: {prompt}",
+        );
+        // A reply that obeys the prompt survives sanitize intact; the 8 words
+        // the prompt used to ask for did not — that was the bug.
+        let words = |n: usize| vec!["a".repeat(AVG_WORD_LEN - 1); n].join(" ");
+        let obedient = words(PROMPT_MAX_WORDS);
+        assert!(
+            obedient.chars().count() <= MAX_LINE,
+            "{PROMPT_MAX_WORDS} words at ~{AVG_WORD_LEN} chars is {} — over the {MAX_LINE}-char bubble",
+            obedient.chars().count(),
+        );
+        assert_eq!(sanitize(&obedient, "nisse"), obedient, "no ellipsis");
+        assert!(
+            sanitize(&words(8), "nisse").ends_with('…'),
+            "8 words is what #700 reported as always truncated",
+        );
+    }
 
     #[test]
     fn sanitize_takes_first_line_strips_quotes_and_clamps() {
@@ -463,6 +602,7 @@ mod tests {
                 mood: "happy",
                 pokes: 0,
             },
+            hytte_ai_providers::DEFAULT_TIMEOUT,
         )
         .expect("parses + sanitizes the completion");
         assert_eq!(line, "purring at your service");
@@ -483,6 +623,7 @@ mod tests {
                 mood: "happy",
                 pokes: 1,
             },
+            hytte_ai_providers::DEFAULT_TIMEOUT,
         )
         .expect_err("a blank line is treated as offline");
         assert!(err.contains("empty line"), "{err}");
@@ -505,9 +646,41 @@ mod tests {
                 mood: "happy",
                 pokes: 1,
             },
+            hytte_ai_providers::DEFAULT_TIMEOUT,
         )
         .expect_err("nothing listens there");
         assert!(err.starts_with("http:"), "{err}");
+    }
+
+    /// #699: the resolved `$PET_LLM_TIMEOUT_SECS` really reaches the HTTP
+    /// client — a server that accepts and never answers must be abandoned on
+    /// the pet's budget, not the shared client's 10s default.
+    #[test]
+    fn ask_llm_passes_the_timeout_through_to_the_client() {
+        // Bound but never accepted: the handshake completes from the kernel
+        // backlog, so this stalls on the read, not the connect.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let started = std::time::Instant::now();
+        let err = ask_llm(
+            &Provider::llama(format!("http://{addr}")),
+            "nisse",
+            ThinkReq {
+                kind: ThinkKind::Poke,
+                hour: 15,
+                mood: "happy",
+                pokes: 1,
+            },
+            Duration::from_millis(200),
+        )
+        .expect_err("the server never answers");
+        assert!(err.starts_with("http:"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?} — the 200ms budget wasn't applied",
+            started.elapsed(),
+        );
+        drop(listener);
     }
 }
 
@@ -534,6 +707,7 @@ mod live_tests {
                 mood: "excited",
                 pokes: 2,
             },
+            hytte_ai_providers::DEFAULT_TIMEOUT,
         )
         .expect("the model answers a poke");
         eprintln!("[live] poke reaction: {poke}");
@@ -548,6 +722,7 @@ mod live_tests {
                 mood: "sleepy",
                 pokes: 0,
             },
+            hytte_ai_providers::DEFAULT_TIMEOUT,
         )
         .expect("the model muses");
         eprintln!("[live] idle thought: {idle}");

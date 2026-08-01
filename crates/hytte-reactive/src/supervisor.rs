@@ -27,6 +27,30 @@
 //! `unhandled_panic` policy (that is `current_thread`-only), a per-spawn
 //! wrapper like this is the right seam for catching task panics.
 //!
+//! # Health
+//!
+//! Every supervisor publishes what it knows about its task — runs, panics,
+//! current backoff — to [`crate::health`], which is where a diagnostics view
+//! reads "the niri connection has panicked four times in the last minute" from.
+//! The bookkeeping lives in [`supervise_runs`], the one loop both spawn
+//! functions funnel through, so it covers both variants and any future entry
+//! point that reuses that loop (#238, #690, #691).
+//!
+//! # Extending this API
+//!
+//! Both spawn functions return `()` on purpose, and it is worth keeping that
+//! way until something actually needs otherwise: ~35 call sites invoke them in
+//! statement position, so **the return type can still be widened to a handle
+//! without touching a single one** — as long as the handle is neither
+//! `#[must_use]` nor `Drop`-cancelling. That is the seam #633 wants for
+//! cancellation, and the constraint it has to respect: an `ExportHandle`-style
+//! "dropping the last clone stops the task" guard cannot be bolted onto these
+//! two, because every existing caller drops it immediately. #633 should add a
+//! *separate* cancellable entry point (`spawn_supervised_handle`, per its own
+//! recommendation) that funnels through [`supervise_runs`] — which is also how
+//! it inherits health tracking for free, and where it must call
+//! [`crate::health::stopped`] when a cancelled supervisor unwinds.
+//!
 //! # The process panic hook
 //!
 //! The supervisor only sees panics on tasks it spawned. [`install_panic_hook`]
@@ -37,7 +61,7 @@
 //! process-global hook is the *binary's* decision, never a library's: hytte
 //! never calls it for you.
 
-use crate::runtime;
+use crate::{health, runtime};
 use std::future::Future;
 use std::panic::PanicHookInfo;
 use std::sync::{Arc, Once};
@@ -169,15 +193,21 @@ where
 /// The one supervision loop both variants run.
 ///
 /// `spawn_run` starts a single run and hands back its `JoinHandle`; everything
-/// above it — restart policy, backoff schedule, log lines — is shared, which is
-/// what keeps the async and blocking supervisors from drifting apart.
+/// above it — restart policy, backoff schedule, log lines, [`crate::health`]
+/// bookkeeping — is shared, which is what keeps the async and blocking
+/// supervisors from drifting apart.
 async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff)
 where
     S: Fn() -> JoinHandle<()> + Send + 'static,
 {
+    // The health entry is this supervisor's, and lives exactly as long as this
+    // loop: every `return` below drops it. See `health`'s module docs on why
+    // nothing is retained for a supervisor that has stopped.
+    let id = health::register(name);
     let mut delay = cfg.initial;
     loop {
         let started = Instant::now();
+        health::run_started(id);
         // Spawn onto the shared runtime so tokio catches a panic and surfaces
         // it as `JoinError::is_panic()` on the handle we await here.
         let join = spawn_run();
@@ -186,19 +216,29 @@ where
             // The task returned on its own — it finished its job. Do not
             // restart (restarting a completed task is the caller's bug, not a
             // failure to recover from).
-            Ok(()) => return,
+            Ok(()) => {
+                health::stopped(id);
+                return;
+            }
 
             Err(err) if err.is_panic() => {
                 let ran = started.elapsed();
                 // A healthy run resets the backoff so an isolated panic after
                 // a long healthy stretch restarts promptly.
-                if ran >= cfg.reset_after {
+                let after_healthy_run = ran >= cfg.reset_after;
+                if after_healthy_run {
                     delay = cfg.initial;
                 }
+                // Same verdict feeds the streak counter, so the published
+                // `consecutive_panics` and the backoff can never disagree about
+                // what counts as a healthy run.
+                let counts = health::panicked(id, delay, after_healthy_run);
                 tracing::error!(
                     service = name,
                     ran_secs = ran.as_secs_f64(),
                     backoff_secs = delay.as_secs_f64(),
+                    panics = counts.total,
+                    consecutive_panics = counts.consecutive,
                     "supervised task panicked; restarting after backoff"
                 );
                 if !delay.is_zero() {
@@ -210,6 +250,7 @@ where
             // Not a panic: the join handle was cancelled/aborted. There is no
             // work to resume, so stop supervising.
             Err(err) => {
+                health::stopped(id);
                 tracing::debug!(
                     service = name,
                     error = %err,
@@ -296,6 +337,17 @@ mod tests {
         initial: Duration::ZERO,
         max: Duration::ZERO,
         reset_after: Duration::ZERO,
+    };
+
+    /// Zero-delay like [`ZERO_BACKOFF`], but with a `reset_after` no run can
+    /// ever reach — so a panic streak *accumulates*.
+    ///
+    /// `ZERO_BACKOFF` cannot show that: its `reset_after` is zero, which makes
+    /// every run healthy by definition and pins `consecutive_panics` at 1.
+    const NEVER_RESET: Backoff = Backoff {
+        initial: Duration::ZERO,
+        max: Duration::ZERO,
+        reset_after: Duration::MAX,
     };
 
     // ---- capturing what this module logs ---------------------------------
@@ -510,6 +562,66 @@ mod tests {
             logged_errors("test-blocking-log"),
             1,
             "the panic is reported once, at error level"
+        );
+    }
+
+    /// The supervisor publishes what it knows to [`crate::health`]: a run
+    /// counter that ticks before each run, panic counters that tick after each
+    /// panic, and an entry that is gone once supervision ends.
+    ///
+    /// Observed *from inside the supervised closure*, because that is the only
+    /// vantage point where the entry is live — `block_on` returns only after
+    /// the supervisor has stopped and dropped it. Which is itself the last
+    /// assertion here: the table tracks what is being supervised now, not a
+    /// history (`mpris-player`/`tray-item` supervise one task per discovered
+    /// item, so retaining finished entries would leak).
+    #[test]
+    fn the_supervisor_publishes_its_task_health() {
+        const NAME: &str = "test-health-supervised";
+
+        install_error_counter();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+
+        runtime::handle().block_on(supervise_blocking(
+            NAME,
+            Arc::new(move || {
+                let mine = health::snapshot()
+                    .into_iter()
+                    .find(|task| task.name == NAME)
+                    .expect("the supervisor registers before it starts a run");
+                seen_task
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(mine);
+                assert!(mine.runs >= 3, "panic on the first two runs");
+            }),
+            NEVER_RESET,
+        ));
+
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let progression: Vec<_> = seen
+            .iter()
+            .map(|task| (task.runs, task.panics, task.consecutive_panics))
+            .collect();
+        assert_eq!(
+            progression,
+            vec![(1, 0, 0), (2, 1, 1), (3, 2, 2)],
+            "runs tick before each run; panics and the streak tick after each panic"
+        );
+        assert!(
+            seen[0].last_panic.is_none() && seen[2].last_panic.is_some(),
+            "the panic timestamp appears only once there has been a panic"
+        );
+        assert!(
+            seen.iter()
+                .all(|task| task.state == crate::health::TaskState::Running),
+            "a run in flight always reads Running"
+        );
+        assert!(
+            !health::snapshot().iter().any(|task| task.name == NAME),
+            "the entry is dropped when the supervisor stops"
         );
     }
 

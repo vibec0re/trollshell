@@ -202,19 +202,13 @@ fn cadence(on_battery: bool) -> Duration {
     if on_battery { BATTERY_POLL } else { POLL }
 }
 
-/// Best-effort on-battery snapshot, read directly off `upower`'s registered
-/// handle rather than the panicking `upower::on_battery()` accessor.
-///
-/// `netconn::service()` happens to register after `upower::service()` in
-/// `main.rs` today, but this poller shouldn't depend on that ordering — a
-/// snapshot read degrades to "assume AC" (`false`) if upower isn't registered
-/// yet, rather than panicking, and starts reflecting the real value the
-/// moment it is (#505).
+/// Best-effort on-battery snapshot. Delegates to
+/// [`crate::upower::on_battery_snapshot`], which reads the cross-thread
+/// `shared` bag — this loop runs on a tokio worker, where the thread-local
+/// registry is empty — and degrades to "assume AC" when upower is absent or
+/// hasn't started yet, rather than panicking like `upower::on_battery()`.
 fn on_battery() -> bool {
-    registry::with(|r| {
-        r.get::<crate::upower::UpowerHandles>()
-            .is_some_and(|h| h.on_battery.get())
-    })
+    crate::upower::on_battery_snapshot()
 }
 
 async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {

@@ -77,14 +77,11 @@ fn cadence(on_battery: bool) -> Duration {
     if on_battery { BATTERY_POLL } else { POLL }
 }
 
-/// Best-effort on-battery snapshot, read directly off `upower`'s registered
-/// handle rather than the panicking `upower::on_battery()` accessor — see the
-/// identical helper (and rationale) in `crate::netconn` (#505).
+/// Best-effort on-battery snapshot — see
+/// [`crate::upower::on_battery_snapshot`] for why this reads the cross-thread
+/// `shared` bag rather than the thread-local registry (#505).
 fn on_battery() -> bool {
-    registry::with(|r| {
-        r.get::<crate::upower::UpowerHandles>()
-            .is_some_and(|h| h.on_battery.get())
-    })
+    crate::upower::on_battery_snapshot()
 }
 
 /// Synthetic group key for all pids that don't belong to a recognised app scope

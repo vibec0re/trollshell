@@ -40,6 +40,13 @@
 //! immediately, with no shell restart and no wait for the mtime poll. Nothing
 //! on this path panics on bad input; every rejection is a [`PlacesError`].
 //!
+//! A save also **re-reads and reparses the file first** and refuses if it no
+//! longer parses, or parses to something other than what the shell has in
+//! memory. The set in memory is the user's config only when the file could be
+//! read: a malformed one leaves memory on the built-in default indefinitely
+//! (the load happens once, the watcher is mtime-gated), and re-rendering that
+//! would replace a hand-written config with one default place. See [`edit`].
+//!
 //! **Known limitation:** serialising is a *re-render*, not a textual patch. The
 //! file's leading comment block (the documented preamble written on first run)
 //! is carried forward verbatim, but comments attached to individual keys — and
@@ -338,18 +345,24 @@ fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
         .collect())
 }
 
-/// Load places, writing the documented default on first run. Returns the
-/// default for a missing/empty/malformed user config. (The built-in default is
-/// parse-tested, so in practice this is non-empty; if a malformed
-/// `DEFAULT_CONFIG` ever shipped it degrades to an empty list — logged loudly —
-/// rather than crashing the whole shell on cold start.)
+/// [`DEFAULT_CONFIG`] parsed — the set every "can't use the user's config"
+/// path falls back to, and (since a config that renders to zero places reads
+/// back as this) the set an emptied file means.
+///
+/// The built-in default is parse-tested, so in practice this is non-empty; if
+/// a malformed `DEFAULT_CONFIG` ever shipped it degrades to an empty list —
+/// logged loudly — rather than crashing the whole shell on cold start.
+fn builtin_default() -> Vec<Place> {
+    parse_places(DEFAULT_CONFIG).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "built-in default places config failed to parse");
+        Vec::new()
+    })
+}
+
+/// Load places, writing the documented default on first run. Returns
+/// [`builtin_default`] for a missing/empty/malformed user config.
 fn load_places() -> Vec<Place> {
-    let default = || {
-        parse_places(DEFAULT_CONFIG).unwrap_or_else(|e| {
-            tracing::error!(error = %e, "built-in default places config failed to parse");
-            Vec::new()
-        })
-    };
+    let default = builtin_default;
     let Some(path) = config_path() else {
         return default();
     };
@@ -514,6 +527,16 @@ pub enum PlacesError {
     NotRunning,
     /// `$HOME` is unset — nowhere to write `places.toml`.
     NoConfigPath,
+    /// `places.toml` exists but its contents can't be established: unreadable
+    /// (permissions), non-UTF-8, or not valid TOML. Refusing rather than
+    /// overwriting bytes we can't account for — see [`edit`] for why this is a
+    /// data-loss guard and not just tidiness.
+    Unreadable(String),
+    /// `places.toml` parses, but to a *different* set than the one in memory —
+    /// something edited it since we last loaded it. Refusing, because the edit
+    /// was computed against a stale base and applying it would write the
+    /// out-of-process change away. See [`edit`].
+    ChangedOnDisk,
     /// The set could not be rendered as TOML.
     Encode(String),
     /// The atomic write failed; the previous config is untouched.
@@ -539,6 +562,14 @@ impl std::fmt::Display for PlacesError {
             Self::NotFound(name) => write!(f, "no place named \"{name}\""),
             Self::NotRunning => write!(f, "the places service is not registered"),
             Self::NoConfigPath => write!(f, "cannot locate places.toml: $HOME is unset"),
+            Self::Unreadable(e) => write!(
+                f,
+                "places.toml could not be read back ({e}); refusing to overwrite it — fix or move the file, then retry"
+            ),
+            Self::ChangedOnDisk => write!(
+                f,
+                "places.toml changed on disk since it was loaded; refusing to overwrite it — the change is picked up within a few seconds, then retry"
+            ),
             Self::Encode(e) => write!(f, "could not render places.toml: {e}"),
             Self::Write(e) => {
                 write!(
@@ -798,14 +829,43 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Render + atomically write `places` to `places.toml`.
-fn persist(places: &[Place]) -> Result<(), PlacesError> {
-    let path = config_path().ok_or(PlacesError::NoConfigPath)?;
-    persist_to(&path, places)
+/// What `places.toml` currently holds, from the point of view of a writer that
+/// is about to replace it.
+///
+/// This is [`load_places`]'s classification with its two "can't tell" arms
+/// split back out. `load_places` folds an unreadable and an unparseable file
+/// into the same silent fallback as a missing one — correct for a *reader*
+/// (the shell still needs somewhere to be), catastrophic for a *writer*, which
+/// would then render that fallback over the bytes it couldn't read.
+#[derive(Debug)]
+enum OnDisk {
+    /// No file yet: a save creates it, and there is nothing to lose.
+    Absent,
+    /// A parseable file. A config that yields zero places is reported as
+    /// [`builtin_default`], because that is what [`load_places`] makes of it —
+    /// so "disk" and "memory" are compared in the same units.
+    Places(Vec<Place>),
+    /// The file is there but its contents can't be established. Never write
+    /// over this.
+    Unknown(String),
 }
 
-/// [`persist`] against an explicit path, so tests can drive it into a tempdir
-/// instead of the user's real config.
+/// Classify the current `places.toml` for a writer — see [`OnDisk`].
+fn read_on_disk(path: &Path) -> OnDisk {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OnDisk::Absent,
+        Err(e) => return OnDisk::Unknown(e.to_string()),
+    };
+    match parse_places(&text) {
+        Ok(places) if places.is_empty() => OnDisk::Places(builtin_default()),
+        Ok(places) => OnDisk::Places(places),
+        Err(e) => OnDisk::Unknown(e),
+    }
+}
+
+/// Render + atomically write `places` to `path`, so tests can drive it into a
+/// tempdir instead of the user's real config.
 ///
 /// Carries the existing file's leading comment block forward; when there is no
 /// file yet (or it can't be read) the built-in default's header is used, so a
@@ -1054,8 +1114,11 @@ pub fn rename_place(from: &str, to: &str) -> Result<(), PlacesError> {
 
 /// Delete the place named `name`.
 ///
-/// Deleting the last place is allowed: `load_places` then falls back to the
-/// built-in default, exactly as it does for a hand-emptied file.
+/// Deleting the last place is allowed, and round-trips to the built-in default
+/// exactly as a hand-emptied file does: the file is written with an empty
+/// `place = []`, which `load_places` reads back as the default — so that is
+/// also what [`configured`] republishes, immediately rather than one config
+/// poll later.
 pub fn remove_place(name: &str) -> Result<(), PlacesError> {
     edit(|current| removed(current, name))
 }
@@ -1080,29 +1143,70 @@ pub fn save_places(places: Vec<Place>) -> Result<(), PlacesError> {
 /// safe here and cheap.
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The one write path: apply `f` to the current set, persist the result
-/// atomically, then publish it.
+/// The one write path: check the file still says what memory says, apply `f`
+/// to the current set, persist the result atomically, then publish it.
 ///
-/// Order matters. The file is written **first**, so a failed write leaves the
-/// in-memory set untouched and the two still agree. Publishing second is what
-/// makes an edit visible immediately: `resolve_loop` subscribes to this very
-/// handle, so departures/weather/place-detection re-resolve on the spot rather
-/// than waiting up to [`BATTERY_CONFIG_POLL_INTERVAL`] for the mtime poll to
-/// notice our own write. That poll still runs, and finds nothing to do — it
-/// content-compares the reparse against what we published, and
+/// **The re-read is a data-loss guard, not a nicety.** The set in memory is
+/// only the user's config when [`load_places`] managed to read one; for an
+/// unreadable or malformed `places.toml` it is the *built-in default*, and
+/// nothing ever corrects that — `PlacesService::start` loads once and
+/// [`ConfigWatcher::poll`] is mtime-gated, so a broken file that nobody
+/// touches keeps memory on the default indefinitely. Writing memory back
+/// would then render one built-in place over however many the user had
+/// hand-configured, atomically and without a backup. So the file is read and
+/// reparsed here, inside the lock, and the edit is refused
+/// ([`PlacesError::Unreadable`]) unless we can account for what we are about
+/// to replace.
+///
+/// The same read covers the out-of-process editor: a file that parses to a
+/// different set than the one in memory was edited behind our back since the
+/// last poll, so the edit was computed against a stale base and is refused
+/// ([`PlacesError::ChangedOnDisk`]). The mtime watcher republishes the new
+/// contents within a poll tick, after which the same edit succeeds. (It is a
+/// *narrowing*, not a cure: nothing stops a write landing between this read
+/// and the `rename(2)` a few microseconds later. Closing that needs an
+/// `O_EXCL` lock file the editor also honours, which no editor does.)
+///
+/// Order then matters. The file is written **first**, so a failed write leaves
+/// the in-memory set untouched and the two still agree. Publishing second is
+/// what makes an edit visible immediately: `resolve_loop` subscribes to this
+/// very handle, so departures/weather/place-detection re-resolve on the spot
+/// rather than waiting up to [`BATTERY_CONFIG_POLL_INTERVAL`] for the mtime
+/// poll to notice our own write. That poll still runs, and finds nothing to do
+/// — it content-compares the reparse against what we published, and
 /// [`normalize`] guarantees they match.
 fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(), PlacesError> {
     let shared = shared::get::<Shared>().ok_or(PlacesError::NotRunning)?;
     let handle = shared.configured.clone();
+    let path = config_path().ok_or(PlacesError::NoConfigPath)?;
     let _serialized = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let current = handle.get_cloned();
+    match read_on_disk(&path) {
+        // Nothing on disk to lose, or it says exactly what we think it says.
+        OnDisk::Absent => {}
+        OnDisk::Places(disk) if disk == *current => {}
+        OnDisk::Places(_) => return Err(PlacesError::ChangedOnDisk),
+        OnDisk::Unknown(why) => {
+            tracing::warn!(path = %path.display(), reason = %why, "places: refusing to save over a config we can't read back");
+            return Err(PlacesError::Unreadable(why));
+        }
+    }
     let next = f(current.as_slice())?;
-    persist(&next)?;
+    persist_to(&path, &next)?;
     warn_unsatisfiable_fingerprints(&next);
     tracing::info!(count = next.len(), "places: config saved");
-    handle.set(Arc::new(next));
+    // An emptied config reads back as the built-in default (documented at
+    // `remove_place`), so publish what a reload of what we just wrote would
+    // give. Publishing the literal empty set instead would put memory and file
+    // in disagreement until the next config poll — a visible empty-then-default
+    // flicker, and a base the very next `edit` would reject as stale.
+    handle.set(Arc::new(if next.is_empty() {
+        builtin_default()
+    } else {
+        next
+    }));
     Ok(())
 }
 
@@ -1952,23 +2056,26 @@ mod tests {
     // ── Write path: the public API, end to end (#640) ───────────────────────
 
     /// The `shared` map is process-global and `reset_for_tests` clears *all* of
-    /// it, so the two cases that publish into (and clear) it are serialized —
+    /// it, so the cases that publish into (and clear) it are serialized —
     /// cargo runs tests in parallel threads of one process.
     static SHARED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The requirement that makes the write path usable from a running shell:
-    /// after an edit the published handle and the file on disk agree, so
-    /// `resolve_loop` (and through it departures/weather) sees the new set
-    /// immediately and the mtime watcher finds nothing to churn.
-    #[test]
-    fn editing_api_writes_the_file_and_republishes_the_set() {
+    /// Seed `$HOME/.config/trollshell/places.toml` with `seed`, publish the
+    /// shared handles the editing API writes through — seeded exactly the way
+    /// `PlacesService::start` seeds them, via `load_places`, so a config the
+    /// loader can't read leaves memory on the built-in default just as it does
+    /// in a running shell — and run `f` with the config path and that handle.
+    ///
+    /// Bytes rather than `&str` because two of the cases are files that aren't
+    /// valid UTF-8.
+    fn with_seeded_config(seed: &[u8], f: impl FnOnce(&Path, &Mutable<Arc<Vec<Place>>>)) {
         let _guard = SHARED_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join(".config/trollshell")).expect("mkdir");
         let cfg = dir.path().join(".config/trollshell/places.toml");
-        std::fs::write(&cfg, DEFAULT_CONFIG).expect("seed");
+        std::fs::write(&cfg, seed).expect("seed");
 
         // `temp_env` serializes $HOME mutation across tests and restores it.
         temp_env::with_var("HOME", Some(dir.path().as_os_str()), || {
@@ -1978,7 +2085,18 @@ mod tests {
                 location: Mutable::default(),
                 configured: handle.clone(),
             });
+            f(&cfg, &handle);
+            hytte_reactive::shared::reset_for_tests();
+        });
+    }
 
+    /// The requirement that makes the write path usable from a running shell:
+    /// after an edit the published handle and the file on disk agree, so
+    /// `resolve_loop` (and through it departures/weather) sees the new set
+    /// immediately and the mtime watcher finds nothing to churn.
+    #[test]
+    fn editing_api_writes_the_file_and_republishes_the_set() {
+        with_seeded_config(DEFAULT_CONFIG.as_bytes(), |cfg, handle| {
             // Both sides agree after every mutation, and the watcher's
             // content-compare (reparse vs. published) finds them identical.
             let agree = |step: &str| {
@@ -2031,10 +2149,8 @@ mod tests {
             );
 
             // The documented preamble is still there after all of that.
-            let text = std::fs::read_to_string(&cfg).expect("readable");
+            let text = std::fs::read_to_string(cfg).expect("readable");
             assert!(text.starts_with("# trollshell places"));
-
-            hytte_reactive::shared::reset_for_tests();
         });
     }
 
@@ -2043,25 +2159,7 @@ mod tests {
     /// threads, eight distinct places, all eight must land.
     #[test]
     fn concurrent_edits_do_not_lose_each_other() {
-        let _guard = SHARED_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join(".config/trollshell")).expect("mkdir");
-        std::fs::write(
-            dir.path().join(".config/trollshell/places.toml"),
-            DEFAULT_CONFIG,
-        )
-        .expect("seed");
-
-        temp_env::with_var("HOME", Some(dir.path().as_os_str()), || {
-            let handle = Mutable::new(Arc::new(load_places()));
-            shared::insert(Shared {
-                place: Mutable::default(),
-                location: Mutable::default(),
-                configured: handle.clone(),
-            });
-
+        with_seeded_config(DEFAULT_CONFIG.as_bytes(), |_cfg, handle| {
             std::thread::scope(|s| {
                 for i in 0..8 {
                     s.spawn(move || {
@@ -2073,8 +2171,177 @@ mod tests {
             let set = handle.get_cloned();
             assert_eq!(set.len(), 9, "the default + all eight adds must survive");
             assert_eq!(load_places(), *set, "file and memory must still agree");
+        });
+    }
 
-            hytte_reactive::shared::reset_for_tests();
+    // ── Write path: never write over a config we can't account for (#640) ───
+
+    #[test]
+    fn read_on_disk_splits_out_the_two_arms_load_places_papers_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("places.toml");
+
+        assert!(matches!(read_on_disk(&target), OnDisk::Absent));
+
+        // A config that yields no places is reported in the same units memory
+        // holds it in — what `load_places` makes of it, i.e. the default.
+        std::fs::write(&target, "place = []\n").expect("seed");
+        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
+        std::fs::write(&target, "# only comments\n").expect("seed");
+        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
+
+        // A real config comes back as itself.
+        std::fs::write(
+            &target,
+            "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n",
+        )
+        .expect("seed");
+        assert!(
+            matches!(read_on_disk(&target), OnDisk::Places(p) if p.len() == 1 && p[0].name == "Home")
+        );
+
+        // And the two `load_places` collapses into a silent fallback stay
+        // distinguishable here: unparseable, and undecodable.
+        std::fs::write(&target, "[[place]]\nname = \"Home\"\nlat = \n").expect("seed");
+        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
+        std::fs::write(&target, [0xff, 0xfe]).expect("seed");
+        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
+    }
+
+    /// Four hand-configured places and a typo. `load_places` can't parse it, so
+    /// it deliberately leaves the bytes alone and memory holds the *built-in
+    /// default* — and nothing ever corrects that, because the load happens once
+    /// and the watcher is mtime-gated. A read-memory-modify-write save would
+    /// therefore render one default place over the four, atomically and with no
+    /// backup. It must refuse instead.
+    #[test]
+    fn a_save_refuses_to_overwrite_a_config_that_no_longer_parses() {
+        let broken = concat!(
+            "# my places\n",
+            "[[place]]\nname = \"Home\"\nlat = 52.5\nlon = 13.4\n",
+            "[[place]]\nname = \"Office\"\nlat = 52.6\nlon = 13.5\n",
+            "[[place]]\nname = \"Gym\"\nlat = 52.7\nlon = 13.6\n",
+            "[[place]]\nname = \"Cabin\"\nlat = \nlon = 13.7\n",
+        );
+        with_seeded_config(broken.as_bytes(), |cfg, handle| {
+            // The precondition that makes this dangerous.
+            assert_eq!(
+                *handle.get_cloned(),
+                builtin_default(),
+                "memory should be the built-in default, not the file's four places"
+            );
+
+            let err = add_place(Place::new("Office", 52.5, 13.4)).expect_err("must refuse");
+            assert!(matches!(err, PlacesError::Unreadable(_)), "got {err:?}");
+            // …including the path that ignores the current set entirely, which
+            // is the one an editor's "save my model" button lands on.
+            let err = save_places(vec![Place::new("Office", 52.5, 13.4)]).expect_err("must refuse");
+            assert!(matches!(err, PlacesError::Unreadable(_)), "got {err:?}");
+            assert!(matches!(
+                remove_place("Schöneweide"),
+                Err(PlacesError::Unreadable(_))
+            ));
+
+            assert_eq!(
+                std::fs::read_to_string(cfg).expect("readable"),
+                broken,
+                "the user's four places must survive byte for byte"
+            );
+            assert_eq!(
+                *handle.get_cloned(),
+                builtin_default(),
+                "a refused edit must not move memory either"
+            );
+        });
+    }
+
+    /// The other half of the guard, and the case `load_places`' comment calls
+    /// out by name: a file we can't even decode (permissions, non-UTF-8). It
+    /// doesn't overwrite it; neither may a save.
+    #[test]
+    fn a_save_refuses_to_overwrite_a_config_it_cannot_decode() {
+        let bytes: &[u8] = &[
+            0xff, 0xfe, b'[', b'[', b'p', b'l', b'a', b'c', b'e', b']', b']',
+        ];
+        with_seeded_config(bytes, |cfg, handle| {
+            assert_eq!(*handle.get_cloned(), builtin_default());
+            assert!(matches!(
+                add_place(Place::new("Office", 52.5, 13.4)),
+                Err(PlacesError::Unreadable(_))
+            ));
+            assert_eq!(std::fs::read(cfg).expect("readable"), bytes);
+            assert_eq!(*handle.get_cloned(), builtin_default());
+        });
+    }
+
+    /// An `$EDITOR` save landing between two config polls: the file parses, but
+    /// to a different set than the edit was computed against. Applying it would
+    /// write the hand edit away, so it is refused; once the watcher republishes
+    /// (simulated here) the same edit lands.
+    #[test]
+    fn a_save_refuses_a_base_the_file_has_moved_on_from() {
+        with_seeded_config(DEFAULT_CONFIG.as_bytes(), |cfg, handle| {
+            let hand_edited = "[[place]]\nname = \"Cabin\"\nlat = 1.0\nlon = 2.0\n";
+            std::fs::write(cfg, hand_edited).expect("out-of-process edit");
+
+            assert_eq!(
+                add_place(Place::new("Office", 52.5, 13.4)),
+                Err(PlacesError::ChangedOnDisk)
+            );
+            assert_eq!(
+                std::fs::read_to_string(cfg).expect("readable"),
+                hand_edited,
+                "the hand edit must survive"
+            );
+
+            // What `watch_config` does a tick later. The retry then lands, on
+            // the hand-edited base rather than over it.
+            handle.set(Arc::new(load_places()));
+            add_place(Place::new("Office", 52.5, 13.4)).expect("retry lands");
+            let set = handle.get_cloned();
+            assert_eq!(set.len(), 2);
+            assert_eq!(set[0].name, "Cabin");
+            assert_eq!(load_places(), *set, "file and memory must agree again");
+        });
+    }
+
+    /// The empty-set edge the `agree()` case above never reaches (it removes
+    /// down to one place, never zero). On-disk semantics are unchanged — the
+    /// file is emptied, and an emptied file has always read back as the
+    /// built-in default — so that is what gets published, immediately, instead
+    /// of an empty list the next config poll would have to correct.
+    #[test]
+    fn removing_the_last_place_publishes_the_default_the_file_reads_back_as() {
+        with_seeded_config(DEFAULT_CONFIG.as_bytes(), |cfg, handle| {
+            let only = handle.get_cloned()[0].name.clone();
+            remove_place(&only).expect("removes");
+
+            let text = std::fs::read_to_string(cfg).expect("readable");
+            assert!(
+                parse_places(&text).expect("still parses").is_empty(),
+                "the file is emptied, not re-defaulted: {text}"
+            );
+            assert!(
+                text.starts_with("# trollshell places"),
+                "…and keeps its documented preamble"
+            );
+            assert_eq!(
+                *handle.get_cloned(),
+                builtin_default(),
+                "memory must hold what a reload of that file gives"
+            );
+            assert_eq!(
+                load_places(),
+                *handle.get_cloned(),
+                "file and memory must agree at zero places too"
+            );
+
+            // And the published set is a usable base again: the next edit isn't
+            // rejected as stale, and builds on the default the file means.
+            add_place(Place::new("Office", 52.5, 13.4)).expect("adds");
+            let set = handle.get_cloned();
+            assert_eq!(set.len(), 2);
+            assert_eq!(load_places(), *set);
         });
     }
 

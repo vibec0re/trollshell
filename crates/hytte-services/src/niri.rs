@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised_blocking};
 use niri_ipc::{Action, Event, Request, Response, WorkspaceReferenceArg, socket::Socket};
 use std::thread;
 use std::time::Duration;
@@ -65,7 +65,7 @@ impl Default for NiriHandles {
 impl Service for NiriService {
     type Handles = NiriHandles;
 
-    fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
+    fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NiriHandles::default();
         let ws_writer = handles.workspaces.clone();
         let win_list_writer = handles.windows.clone();
@@ -73,7 +73,15 @@ impl Service for NiriService {
         let casts_writer = handles.casts.clone();
         let screenshot_writer = handles.screenshot_captured.clone();
 
-        rt.spawn_blocking(move || {
+        // Supervised, not a bare `spawn_blocking` (#654). The reconnect loop
+        // below only covers the `Err` arm: a *panic* anywhere under
+        // `listen_once` — `apply_event` parses compositor-supplied data — kills
+        // the thread and takes the retry with it, freezing `workspaces`,
+        // `windows`, `focused_window`, `casts` and `screenshot_captured` for
+        // the rest of the session with nothing to restart them. The loop is
+        // restart-safe: every run reconnects from scratch and the compositor,
+        // not this process, holds the state it republishes.
+        spawn_supervised_blocking("niri", move || {
             loop {
                 match listen_once(
                     &ws_writer,

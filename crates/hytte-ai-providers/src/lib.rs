@@ -297,6 +297,20 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, PoisonError};
+
+    /// Every test that binds an ephemeral port (`fake_server`,
+    /// `fake_server_status`, or the bind-then-drop dead-port trick) takes this
+    /// for its whole body. `TcpListener::bind("127.0.0.1:0")` hands out
+    /// whatever port the kernel currently considers free; cargo runs these
+    /// tests as parallel threads in one process, so without serialization a
+    /// port one test just released can be recycled straight into another
+    /// test's listener while both are mid-flight — see #716. A poisoned
+    /// guard (some *other* test panicked while holding it) must not cascade
+    /// into every later socket test failing on a misleading poison error, so
+    /// unwrap through the poison rather than propagating it — mirrors
+    /// `hytte_reactive::shared`'s `TEST_LOCK`.
+    static TEST_SOCKETS: Mutex<()> = Mutex::new(());
 
     /// Find `needle` in `buf`.
     fn window_pos(buf: &[u8], needle: &[u8]) -> Option<usize> {
@@ -379,6 +393,7 @@ mod tests {
 
     #[test]
     fn chat_surfaces_endpoint_error_body_on_non_2xx() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         // A bad/restricted model 400s with a JSON error body; `chat` must return
         // that cause, not a bare status code (the OpenRouter debugging story).
         let (base, handle) = fake_server_status(
@@ -402,6 +417,7 @@ mod tests {
 
     #[test]
     fn chat_keyed_sends_bearer_model_title_and_drops_kwarg() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         let (base, handle) = fake_server(r#"{"choices":[{"message":{"content":"hi there"}}]}"#);
         let provider = Provider {
             // Trailing slash → also asserts the `/v1/...` path stays clean.
@@ -451,6 +467,7 @@ mod tests {
 
     #[test]
     fn chat_local_sends_kwarg_and_no_auth_no_model() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         let (base, handle) = fake_server(r#"{"choices":[{"message":{"content":"purr"}}]}"#);
         let provider = Provider::llama(base);
         let out =
@@ -476,6 +493,7 @@ mod tests {
 
     #[test]
     fn chat_returns_raw_content_even_when_empty() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         let (base, handle) = fake_server(r#"{"choices":[{"message":{"content":""}}]}"#);
         let out = chat(
             &Provider::llama(base),
@@ -492,6 +510,7 @@ mod tests {
 
     #[test]
     fn chat_reports_unreachable_server() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         // A port nothing listens on (bind-then-drop reserves then frees it).
         let addr = {
             let l = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -521,6 +540,7 @@ mod tests {
     /// must trip the *global* budget, not hang for the 10s default.
     #[test]
     fn chat_honours_the_configured_request_timeout() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
         // Bound but never accepted: the handshake completes from the backlog,
         // so this is a read stall, not a connect failure.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

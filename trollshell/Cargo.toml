@@ -10,6 +10,14 @@ description = "Personal Wayland desktop shell built on hytte"
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the tests that need a real display server (GTK). Off by
+# default so `cargo test` stays hermetic. Mirrors hytte-bus / hytte-reactive /
+# hytte-services / hytte-ui (#674) — this crate had no such bucket at all
+# until #674, so ~50 RefCell-across-a-GTK-call fixes (#627/#630/#631/#632/
+# #638/#643) shipped with zero regression coverage.
+system-tests = []
+
 [dependencies]
 # Error context for the declarative plugin launcher's fallible paths (#419) —
 # the same error vocabulary hytte-services' systemd helpers already return.

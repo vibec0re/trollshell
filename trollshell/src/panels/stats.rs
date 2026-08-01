@@ -416,12 +416,13 @@ fn scroll_card_to_top_when_ready(
     });
 }
 
-/// Wrap a bare history-sparkline `gtk::Box` in a `gtk::ListBoxRow` so it joins
-/// an `AdwPreferencesGroup`'s boxed-list in source order with the standard
+/// Wrap a bare full-width widget — a history-sparkline `gtk::Box`, or the
+/// per-core bar `gtk::FlowBox` — in a `gtk::ListBoxRow` so it joins an
+/// `AdwPreferencesGroup`'s boxed-list in source order with the standard
 /// separators. A non-`GtkListBoxRow` child added to a group otherwise renders
 /// *below* the boxed-list and out of order (cf. the adw-routing gotcha; the
 /// same fix PR #149 used for the per-interface network rows).
-fn history_row_wrapper(child: &gtk::Box) -> gtk::ListBoxRow {
+fn history_row_wrapper(child: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_activatable(false);
     row.set_selectable(false);
@@ -438,6 +439,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
 
     group.add(&build_live_cpu_row());
     group.add(&build_live_per_core_row());
+    group.add(&history_row_wrapper(&build_per_core_bars_row()));
     group.add(&build_live_processes_row());
     group.add(&build_expandable_cpu_history_row());
     group.add(&build_expandable_cpu_clock_row());
@@ -741,6 +743,11 @@ fn build_live_cpu_row() -> adw::ActionRow {
     row
 }
 
+/// Per-core header row: title and live core count only. The bar strip is a
+/// *separate* full-width row ([`build_per_core_bars_row`]) rather than this
+/// row's suffix, because a suffix cannot be shrunk below its minimum and the
+/// strip's minimum grows with the core count — see that function for the
+/// numbers (#702).
 fn build_live_per_core_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder().title("Per-core").build();
     row.set_activatable(false);
@@ -750,11 +757,47 @@ fn build_live_per_core_row() -> adw::ActionRow {
         &row,
         |r, t| r.set_subtitle(&t),
     );
+    row
+}
 
-    let cores_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+/// Soft cap on how many core bars a single [`gtk::FlowBox`] line may hold.
+const CORE_BARS_MAX_PER_LINE: u32 = 16;
+
+/// How many core bars to allow per `FlowBox` line for `cores` cores.
+///
+/// A `GtkFlowBox` packs each line right up to `max-children-per-line`, so a
+/// flat cap leaves a ragged tail (20 cores → 16 + 4). Instead take the fewest
+/// lines that keep every line at or under [`CORE_BARS_MAX_PER_LINE`], then
+/// spread the cores evenly over them (20 → 10 + 10, 64 → 4 × 16). The result
+/// is a *maximum*: a narrow card still wraps earlier, it just never packs more
+/// than this many bars into one line. Never returns 0 — `min-children-per-line`
+/// is 1 and a 0 maximum would make the two bounds inconsistent.
+fn core_bars_per_line(cores: usize) -> u32 {
+    let cores = u32::try_from(cores).unwrap_or(u32::MAX);
+    let lines = cores.div_ceil(CORE_BARS_MAX_PER_LINE).max(1);
+    cores.div_ceil(lines).max(1)
+}
+
+/// The per-core strip: one vertical `ProgressBar` per core, in a **wrapping**
+/// `gtk::FlowBox`.
+///
+/// Every bar carries a hard `min-width: 8px` CSS floor, so in the old
+/// single-line `gtk::Box` the strip's *minimum* width was `n·8 + (n−1)·4` —
+/// 764 px at 64 cores, which no container could negotiate down. Hung off the
+/// `AdwActionRow` suffix that made the title/subtitle the only shrinkable
+/// thing in the row (hence the one-glyph-per-line ladder), and via
+/// `page_grid`'s homogeneous columns it doubled the whole drawer's minimum
+/// width. A `FlowBox` with `min-children-per-line = 1` has a one-bar minimum
+/// and reflows the rest onto further lines instead (#702).
+fn build_per_core_bars_row() -> gtk::FlowBox {
+    let cores_row = gtk::FlowBox::new();
     cores_row.add_css_class("ts-cores-row");
-    cores_row.set_margin_top(4);
-    cores_row.set_margin_bottom(4);
+    cores_row.set_selection_mode(gtk::SelectionMode::None);
+    cores_row.set_homogeneous(true);
+    cores_row.set_min_children_per_line(1);
+    cores_row.set_max_children_per_line(CORE_BARS_MAX_PER_LINE);
+    cores_row.set_row_spacing(4);
+    cores_row.set_column_spacing(4);
     cores_row.set_hexpand(true);
     cores_row.set_valign(gtk::Align::Center);
 
@@ -764,26 +807,37 @@ fn build_live_per_core_row() -> adw::ActionRow {
     bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
         // Take the bars out for the whole update rather than holding a `RefMut`
         // across it: the pre-#643 binding stayed live past `remove()`,
-        // `append()`, `set_fraction()` and `set_tooltip_text()`, so any
+        // `insert()`, `set_fraction()` and `set_tooltip_text()`, so any
         // synchronous emission re-entering this cell would panic — fatally,
         // from inside a glib callback. Stored back at the end.
         let mut bars = bars_for_bind.take();
         if bars.len() != c.per_core.len() {
+            // Drain by hand: `FlowBox::remove_all` is `v4_12`-gated and gtk4 is
+            // pinned without version features. `first_child` yields the
+            // implicit `GtkFlowBoxChild`, which is what `remove` wants.
             while let Some(child) = cores_row_for_bind.first_child() {
                 cores_row_for_bind.remove(&child);
             }
             bars.clear();
+            cores_row_for_bind.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
             for _ in 0..c.per_core.len() {
-                let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                col.set_hexpand(true);
-                col.set_halign(gtk::Align::Center);
                 let bar = gtk::ProgressBar::new();
                 bar.add_css_class("ts-core-bar");
                 bar.set_orientation(gtk::Orientation::Vertical);
                 bar.set_inverted(true);
                 bar.set_valign(gtk::Align::End);
-                col.append(&bar);
-                cores_row_for_bind.append(&col);
+                // The FlowBox is homogeneous, so each cell is already an equal
+                // share of the width; centre the fixed-width bar inside it.
+                // (This is what the old per-bar `hexpand` wrapper `gtk::Box`
+                // hand-rolled, so it's gone.)
+                bar.set_halign(gtk::Align::Center);
+                cores_row_for_bind.insert(&bar, -1);
+                // `insert` wraps the bar in a `GtkFlowBoxChild`, which is
+                // focusable by default — 64 decorative bars would otherwise add
+                // 64 tab stops to the drawer.
+                if let Some(cell) = bar.parent() {
+                    cell.set_focusable(false);
+                }
                 bars.push(bar);
             }
         }
@@ -796,8 +850,7 @@ fn build_live_per_core_row() -> adw::ActionRow {
         *bars_for_bind.borrow_mut() = bars;
     });
 
-    row.add_suffix(&cores_row);
-    row
+    cores_row
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -1515,7 +1568,9 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatsLayout, StatsSection, parse_stats_layout};
+    use super::{
+        CORE_BARS_MAX_PER_LINE, StatsLayout, StatsSection, core_bars_per_line, parse_stats_layout,
+    };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
     /// resource order and must agree with the always-visible bar chip order
@@ -1566,5 +1621,58 @@ mod tests {
         assert_eq!(parse_stats_layout(Some("Combined")), Err("Combined"));
         assert_eq!(parse_stats_layout(Some("grid")), Err("grid"));
         assert_eq!(parse_stats_layout(Some("")), Err(""));
+    }
+
+    /// `min-children-per-line` is 1, so the maximum handed to the `FlowBox`
+    /// must never be 0 — including on the degenerate zero-cores path, which is
+    /// what a `sensors::cpu()` sample carrying no per-core loads would produce.
+    #[test]
+    fn core_bars_per_line_is_never_zero() {
+        assert_eq!(core_bars_per_line(0), 1);
+        assert_eq!(core_bars_per_line(1), 1);
+    }
+
+    /// Anything that fits under the cap stays on one line — the small-machine
+    /// case must look exactly like the pre-#702 single-row strip.
+    #[test]
+    fn core_bars_per_line_keeps_small_counts_on_one_line() {
+        for cores in 1..=CORE_BARS_MAX_PER_LINE {
+            let n = usize::try_from(cores).expect("u32 fits usize");
+            assert_eq!(core_bars_per_line(n), cores, "{cores} cores");
+        }
+    }
+
+    /// Past the cap the wrap is *balanced*, not ragged: a flat cap would give
+    /// 20 cores a 16 + 4 split, which looks broken next to 10 + 10.
+    #[test]
+    fn core_bars_per_line_balances_the_wrap() {
+        assert_eq!(core_bars_per_line(17), 9); // 9 + 8, not 16 + 1
+        assert_eq!(core_bars_per_line(20), 10); // 10 + 10, not 16 + 4
+        assert_eq!(core_bars_per_line(24), 12); // 12 + 12
+        assert_eq!(core_bars_per_line(32), 16); // 2 x 16, already even
+        assert_eq!(core_bars_per_line(64), 16); // the #702 machine: 4 x 16
+        assert_eq!(core_bars_per_line(65), 13); // 5 x 13
+        assert_eq!(core_bars_per_line(128), 16); // 8 x 16
+    }
+
+    /// Whatever the core count: the cap is honoured, every core has a slot,
+    /// and balancing never costs an extra line versus a flat cap.
+    #[test]
+    fn core_bars_per_line_respects_cap_and_covers_every_core() {
+        let cap = usize::try_from(CORE_BARS_MAX_PER_LINE).expect("u32 fits usize");
+        for cores in 0..=512usize {
+            let per_line_u32 = core_bars_per_line(cores);
+            assert!(
+                (1..=CORE_BARS_MAX_PER_LINE).contains(&per_line_u32),
+                "{cores} cores gave {per_line_u32} per line"
+            );
+            let per_line = usize::try_from(per_line_u32).expect("u32 fits usize");
+            let lines = cores.div_ceil(per_line);
+            assert!(lines * per_line >= cores, "{cores} cores do not all fit");
+            assert!(
+                lines <= cores.div_ceil(cap).max(1),
+                "{cores} cores wrapped onto {lines} lines, more than a flat cap would"
+            );
+        }
     }
 }

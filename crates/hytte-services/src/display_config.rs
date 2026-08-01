@@ -77,10 +77,16 @@
 //! # Poll note
 //!
 //! niri-ipc 26.4 emits no output-change event on its event stream (only
-//! workspace/window/cast events). To fire `MonitorsChanged` we poll
-//! `Request::Outputs` every [`POLL_INTERVAL`] and diff a cheap fingerprint —
-//! the same shape [`crate::displays`] uses. A transient empty read (niri socket
-//! blip) is ignored so it can't flip-flop the serial.
+//! workspace/window/cast events), so `MonitorsChanged` rides on a poll. That
+//! poll is **not ours**: since #655 there is exactly one `Request::Outputs`
+//! poller in the process, owned by [`crate::displays`], and this shim
+//! subscribes to its snapshot and diffs a cheap fingerprint. (Before #655 both
+//! modules ran their own 2 s loop against the same daemon.) A transient empty
+//! read (niri socket blip) is ignored so it can't flip-flop the serial.
+//!
+//! The two request-driven paths — `GetCurrentState` and `ApplyMonitorsConfig` —
+//! still do their own [`crate::displays::query_outputs_raw`] round-trip: they
+//! must answer from niri's state *now*, not from an up-to-2 s-old snapshot.
 //!
 //! # Live-verify
 //!
@@ -90,27 +96,26 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
+use futures_signals::signal::{Mutable, SignalExt};
+use futures_util::StreamExt;
 use hytte_bus::{OwnNameSignal, own_name};
 use hytte_reactive::{Service, spawn_supervised};
 use niri_ipc::socket::Socket;
 use niri_ipc::{
     ConfiguredMode, ConfiguredPosition, Mode as NiriMode, ModeToSet, Output as NiriOutput,
-    OutputAction, PositionToSet, Request, Response, ScaleToSet, Transform as NiriTransform,
+    OutputAction, PositionToSet, Request, ScaleToSet, Transform as NiriTransform,
 };
 use serde::{Deserialize, Serialize};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Value};
 
+use crate::displays::{OutputMap, niri_outputs_source, query_outputs_raw};
+
 /// Well-known bus name we own on the session bus — the exact name g-c-c binds.
 const DISPLAY_CONFIG_NAME: &str = "org.gnome.Mutter.DisplayConfig";
 /// Object path the interface is mounted at (also the `MonitorsChanged` sender).
 const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
-
-/// How often the background loop re-reads niri outputs to detect topology
-/// changes and emit `MonitorsChanged`. Mirrors [`crate::displays`].
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 // ── Mutter scale model ────────────────────────────────────────────────────────
 
@@ -606,33 +611,6 @@ fn apply_error_to_fdo(e: &ApplyError) -> zbus::fdo::Error {
 
 // ── Blocking niri IPC (run on the blocking pool) ──────────────────────────────
 
-/// Query niri for the current outputs, sorted by connector. Returns empty on
-/// any IPC failure (caller treats empty as "transient, skip").
-fn query_outputs_raw() -> BTreeMap<String, NiriOutput> {
-    let mut socket = match Socket::connect() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(error = %e, "display_config: niri socket connect failed");
-            return BTreeMap::new();
-        }
-    };
-    match socket.send(Request::Outputs) {
-        Ok(Ok(Response::Outputs(map))) => map.into_iter().collect(),
-        Ok(Ok(other)) => {
-            tracing::warn!(?other, "display_config: unexpected reply for Outputs");
-            BTreeMap::new()
-        }
-        Ok(Err(msg)) => {
-            tracing::warn!(error = %msg, "display_config: niri returned error for Outputs");
-            BTreeMap::new()
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "display_config: send Outputs failed");
-            BTreeMap::new()
-        }
-    }
-}
-
 /// Send a plan to niri, one fresh short-lived socket per action (niri's IPC is
 /// one-request-per-connection). Stops at the first hard failure.
 fn apply_plan_blocking(plan: Vec<(String, Vec<PlannedAction>)>) -> Result<(), String> {
@@ -713,31 +691,42 @@ async fn emit_monitors_changed(ownership: &OwnNameSignal) {
     }
 }
 
-/// Background loop: poll niri outputs, bump the serial and emit
-/// `MonitorsChanged` whenever the fingerprint changes.
-async fn monitor_loop(serial: Arc<AtomicU32>, ownership: OwnNameSignal) {
+/// Fold one snapshot's fingerprint into the change-detection state, returning
+/// whether it is a *change* worth bumping the serial and signalling for.
+///
+/// The very first fingerprint is only adopted as the baseline: at that point no
+/// client has read `GetCurrentState` yet, so there is nothing for them to
+/// re-read and a signal would be noise.
+fn note_fingerprint(last: &mut Option<String>, fp: String) -> bool {
+    let changed = last.as_deref().is_some_and(|prev| prev != fp.as_str());
+    if changed || last.is_none() {
+        *last = Some(fp);
+    }
+    changed
+}
+
+/// Background loop: follow [`crate::displays`]' shared outputs snapshot, bump
+/// the serial and emit `MonitorsChanged` whenever the fingerprint changes.
+///
+/// Since #655 this subscribes rather than polling — one `Request::Outputs`
+/// round-trip serves the whole process.
+async fn monitor_loop(
+    serial: Arc<AtomicU32>,
+    ownership: OwnNameSignal,
+    snapshots: Mutable<Arc<OutputMap>>,
+) {
     let mut last: Option<String> = None;
-    loop {
-        let outputs = tokio::task::spawn_blocking(query_outputs_raw)
-            .await
-            .unwrap_or_default();
+    let mut stream = snapshots.signal_cloned().to_stream();
+    while let Some(outputs) = stream.next().await {
         // Empty ⇒ niri unreachable this tick (a real session always has ≥1
         // output). Skip so a blip can't flip-flop the serial.
         if outputs.is_empty() {
-            tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
-        let fp = fingerprint(&outputs);
-        match &last {
-            Some(prev) if *prev == fp => {}
-            None => last = Some(fp),
-            Some(_) => {
-                serial.fetch_add(1, Ordering::SeqCst);
-                last = Some(fp);
-                emit_monitors_changed(&ownership).await;
-            }
+        if note_fingerprint(&mut last, fingerprint(&outputs)) {
+            serial.fetch_add(1, Ordering::SeqCst);
+            emit_monitors_changed(&ownership).await;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -771,11 +760,15 @@ impl Service for DisplayConfigService {
 
         let serial_loop = serial.clone();
         let ownership_loop = ownership.clone();
+        // Starts the process-wide niri Outputs poller if `displays::service()`
+        // hasn't already; otherwise reuses the running one (#655).
+        let source = niri_outputs_source();
         spawn_supervised("display_config", move || {
             let serial_loop = serial_loop.clone();
             let ownership_loop = ownership_loop.clone();
+            let snapshots = source.snapshot.clone();
             async move {
-                monitor_loop(serial_loop, ownership_loop).await;
+                monitor_loop(serial_loop, ownership_loop, snapshots).await;
             }
         });
 
@@ -1189,6 +1182,36 @@ mod tests {
         assert_ne!(fp, fingerprint(&moved));
         assert_ne!(fp, fingerprint(&off));
         assert_eq!(fp, fingerprint(&base), "stable for identical state");
+    }
+
+    // ── Change detection ──────────────────────────────────────────────────────
+
+    /// The shared source (#655) republishes a snapshot every tick without
+    /// deduping, so the fold — not the poll cadence — is what keeps
+    /// `MonitorsChanged` quiet. First snapshot: baseline only. Repeats: silent.
+    /// A real change: signal, and re-baseline so it fires once, not forever.
+    #[test]
+    fn fingerprint_fold_signals_only_on_change() {
+        let mut last: Option<String> = None;
+        assert!(
+            !note_fingerprint(&mut last, "a".to_owned()),
+            "first snapshot is a baseline, not a change"
+        );
+        assert!(!note_fingerprint(&mut last, "a".to_owned()));
+        assert!(!note_fingerprint(&mut last, "a".to_owned()));
+        assert!(
+            note_fingerprint(&mut last, "b".to_owned()),
+            "a differing fingerprint is a change"
+        );
+        assert!(
+            !note_fingerprint(&mut last, "b".to_owned()),
+            "the change re-baselines, so it signals once"
+        );
+        assert!(
+            note_fingerprint(&mut last, "a".to_owned()),
+            "and back again"
+        );
+        assert_eq!(last.as_deref(), Some("a"));
     }
 
     // ── Apply method ──────────────────────────────────────────────────────────

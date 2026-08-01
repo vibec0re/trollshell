@@ -348,17 +348,21 @@
     background: #ffffff;
     border: none;
 }
+/* The per-core strip is its own full-width boxed-list row and wraps onto as
+   many lines as the core count needs (#702), so the bars are sized for a
+   stack: 56px tall × 4 lines made the CPU card taller than the drawer. Pad
+   like `.ts-history-row` so the bars line up under the row text above. */
 .ts-cores-row {
-    margin-top: 4px;
-    min-height: 56px;
+    padding: 0.615em 0.923em;
+    min-height: 28px;
 }
 .ts-core-bar {
     min-width: 8px;
-    min-height: 56px;
+    min-height: 28px;
 }
 .ts-core-bar > trough {
     min-width: 8px;
-    min-height: 56px;
+    min-height: 28px;
     border-radius: 3px;
     background: alpha(@accent_color, 0.1);
     border: none;

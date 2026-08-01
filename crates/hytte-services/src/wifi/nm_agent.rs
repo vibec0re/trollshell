@@ -191,40 +191,73 @@ fn existing_vpn_secret_keys(connection: &ConnectionDict) -> std::collections::Ha
         .unwrap_or_default()
 }
 
-/// Decide which VPN secret key to prompt for.
+/// Decide which VPN secret keys to prompt for, in the order NM hinted them.
 ///
-/// Preference: the first `hints` entry NM passed (NM names the wanted secret in
-/// the hints, e.g. `["password"]` or `["Gateway Password"]`) that isn't already
-/// present in the connection's stored `vpn.secrets`; otherwise
-/// [`VPN_DEFAULT_SECRET_KEY`] (`"password"`) — the common single-secret case.
+/// NM names the secrets it wants in `hints` — usually one (`["password"]`,
+/// `["Gateway Password"]`), but a VPN plugin is free to ask for several in a
+/// single round (a static password *and* a one-time code, say). Every hint is
+/// normalised (NM sometimes qualifies one as `"<setting>.<key>"`), stripped of
+/// blanks, de-duplicated with order preserved, and — on a first ask — filtered
+/// against the secrets the connection already carries, so we only prompt for
+/// what is genuinely missing.
 ///
-/// **Limitation:** when NM asks for *several* missing VPN secrets at once we
-/// only prompt for one and return that single key. The common case (a single
-/// user password) is fully covered; multi-secret VPNs (e.g. password + OTP in
-/// one round) would need a multi-field dialog, which is out of scope here.
-fn vpn_secret_key_to_prompt(connection: &ConnectionDict, hints: &[String]) -> String {
-    let existing = existing_vpn_secret_keys(connection);
-    hints
+/// **`prior_failure` (NM's `REQUEST_NEW`) disables that filter.** NM sets it to
+/// say the secrets it holds were *rejected*, so a stored value is precisely
+/// what must be re-collected rather than skipped. Without this, a re-ask over
+/// hints `["password", "otp"]` with a stale `password` still in `vpn.secrets`
+/// would silently prompt for `otp` alone and hand back the wrong half.
+///
+/// Falls back to a lone [`VPN_DEFAULT_SECRET_KEY`] (`"password"`) when that
+/// leaves nothing — no usable hints, or every hinted key already stored — which
+/// is the common single-secret case (`OpenVPN` / PPTP / L2TP user auth). The
+/// returned vector is therefore never empty.
+fn vpn_secret_keys_to_prompt(
+    connection: &ConnectionDict,
+    hints: &[String],
+    prior_failure: bool,
+) -> Vec<String> {
+    let existing = if prior_failure {
+        std::collections::HashSet::new()
+    } else {
+        existing_vpn_secret_keys(connection)
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let keys: Vec<String> = hints
         .iter()
-        .map(|h| {
-            // NM sometimes qualifies a hint as "<setting>.<key>"; take the key.
-            h.rsplit_once('.').map_or(h.as_str(), |(_, k)| k)
-        })
-        .find(|key| !existing.contains(*key))
-        .map_or_else(|| VPN_DEFAULT_SECRET_KEY.to_string(), ToString::to_string)
+        // NM sometimes qualifies a hint as "<setting>.<key>"; take the key.
+        .map(|h| h.rsplit_once('.').map_or(h.as_str(), |(_, k)| k))
+        .filter(|key| !key.is_empty() && !existing.contains(*key))
+        .filter(|key| seen.insert((*key).to_string()))
+        .map(ToString::to_string)
+        .collect();
+
+    if keys.is_empty() {
+        vec![VPN_DEFAULT_SECRET_KEY.to_string()]
+    } else {
+        keys
+    }
 }
 
-/// Build the VPN reply dict `{ "vpn": { "secrets": { <key>: <value> } } }`.
+/// Build the VPN reply dict `{ "vpn": { "secrets": { <key>: <value>, … } } }`.
 ///
 /// This is the exact shape NM expects back from `GetSecrets` for the `vpn`
 /// setting: the `vpn` setting carries a single `"secrets"` key whose value is an
 /// `a{ss}` (string→string) sub-dict of the credential(s). It is **distinct**
 /// from the Wi-Fi PSK shape (`{ "802-11-wireless-security": { "psk": … } }`),
 /// where the secret sits directly under the setting.
-fn build_vpn_secret_reply(secret_key: &str, secret_value: &str) -> ConnectionDict {
+///
+/// Takes *every* collected pair, not one: NM re-asks (or fails the activation)
+/// for any key it requested and did not get back, so a round that asked for
+/// two secrets must answer with both in the same `a{ss}`.
+fn build_vpn_secret_reply<'a>(
+    secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> ConnectionDict {
     // Inner a{ss}: the secret key → value map.
-    let mut secrets: HashMap<String, String> = HashMap::new();
-    secrets.insert(secret_key.to_string(), secret_value.to_string());
+    let secrets: HashMap<String, String> = secrets
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
     let mut vpn_setting: HashMap<String, OwnedValue> = HashMap::new();
     if let Ok(v) = Value::from(secrets).try_to_owned() {
@@ -236,27 +269,41 @@ fn build_vpn_secret_reply(secret_key: &str, secret_value: &str) -> ConnectionDic
     out
 }
 
-/// How to shape the `GetSecrets` reply once the user supplies the secret. The
-/// two kinds differ in the nested dict NM expects back (see
+/// How to shape the `GetSecrets` reply once the user supplies the secret(s).
+/// The two kinds differ in the nested dict NM expects back (see
 /// [`build_secret_reply`] vs [`build_vpn_secret_reply`]).
+///
+/// Neither variant stores the secret *keys* — those live on the
+/// [`PromptRequest`] the overlay answered, which is the single source of truth
+/// for both what was asked and what order the values come back in.
 enum ReplyShape {
-    /// Wi-Fi: `{ <setting_name>: { <secret_key>: <secret> } }`.
-    WirelessSecurity {
-        setting_name: String,
-        secret_key: String,
-    },
-    /// VPN: `{ "vpn": { "secrets": { <secret_key>: <secret> } } }`.
-    Vpn { secret_key: String },
+    /// Wi-Fi: `{ <setting_name>: { <secret_key>: <secret> } }`. Exactly one
+    /// key; NM's wireless-security hints name one credential per `key-mgmt`.
+    WirelessSecurity { setting_name: String },
+    /// VPN: `{ "vpn": { "secrets": { <key>: <secret>, … } } }`. Every key.
+    Vpn,
 }
 
 impl ReplyShape {
-    fn build(&self, secret: &str) -> ConnectionDict {
+    /// Pair `keys` (what we asked for) with `secrets` (what the user typed,
+    /// same order) and nest them the way NM expects.
+    ///
+    /// A length mismatch can only be a shell-side bug; `zip` truncates rather
+    /// than panicking, so the worst case degrades to today's behaviour — a
+    /// partial answer NM re-asks for — and the caller logs it.
+    fn build(&self, keys: &[String], secrets: &[String]) -> ConnectionDict {
         match self {
-            ReplyShape::WirelessSecurity {
+            ReplyShape::WirelessSecurity { setting_name } => build_secret_reply(
                 setting_name,
-                secret_key,
-            } => build_secret_reply(setting_name, secret_key, secret),
-            ReplyShape::Vpn { secret_key } => build_vpn_secret_reply(secret_key, secret),
+                keys.first()
+                    .map_or(WIRELESS_DEFAULT_SECRET_KEY, String::as_str),
+                secrets.first().map_or("", String::as_str),
+            ),
+            ReplyShape::Vpn => build_vpn_secret_reply(
+                keys.iter()
+                    .zip(secrets)
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            ),
         }
     }
 }
@@ -306,29 +353,34 @@ impl NmAgent {
 
         let conn_path = connection_path.as_str().to_string();
         let prior_failure = flags & FLAG_REQUEST_NEW != 0;
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
         // Build the prompt request and remember how to shape the reply, branching
         // on the setting kind. Both kinds share the waiter/oneshot plumbing.
-        let (prompt, reply_key): (PromptRequest, ReplyShape) = if wants_vpn {
+        let (prompt, reply_shape): (PromptRequest, ReplyShape) = if wants_vpn {
             let name = vpn_name_from_connection(&connection);
-            let secret_key = vpn_secret_key_to_prompt(&connection, &hints);
+            // Every missing secret NM hinted, not just the first — a partial
+            // reply is a failed round, since NM re-asks or fails activation
+            // for anything it requested and did not get back.
+            let secret_keys = vpn_secret_keys_to_prompt(&connection, &hints, prior_failure);
             tracing::info!(
                 name = %name,
-                secret_key = %secret_key,
+                secret_keys = ?secret_keys,
                 path = %conn_path,
                 prior_failure,
-                "NM SecretAgent::GetSecrets — requesting VPN secret",
+                "NM SecretAgent::GetSecrets — requesting VPN secret(s)",
             );
             (
                 PromptRequest {
-                    id: 0, // filled in below
-                    network_path: conn_path.clone(),
+                    id,
+                    network_path: conn_path,
                     ssid: name,
                     security: String::new(),
                     kind: PromptKind::VpnSecret,
                     prior_failure,
+                    secret_keys,
                 },
-                ReplyShape::Vpn { secret_key },
+                ReplyShape::Vpn,
             )
         } else {
             let ssid = ssid_from_connection(&connection);
@@ -344,31 +396,42 @@ impl NmAgent {
             );
             (
                 PromptRequest {
-                    id: 0, // filled in below
+                    id,
                     network_path: conn_path,
                     ssid,
                     security,
                     kind: PromptKind::WifiPassphrase,
                     prior_failure,
+                    secret_keys: vec![secret_key],
                 },
-                ReplyShape::WirelessSecurity {
-                    setting_name,
-                    secret_key,
-                },
+                ReplyShape::WirelessSecurity { setting_name },
             )
         };
 
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel::<Result<String, String>>();
+        let (tx, rx) = oneshot::channel::<Result<Vec<String>, String>>();
         {
             let mut waiters = self.waiters.lock().await;
             waiters.insert(id, tx);
         }
-        self.prompts.set(Some(PromptRequest { id, ..prompt }));
+        // Keep the key list: the prompt itself is moved into the signal, but
+        // the reply has to be nested under exactly the keys we asked for.
+        let secret_keys = prompt.secret_keys.clone();
+        self.prompts.set(Some(prompt));
 
-        if let Ok(Ok(secret)) = rx.await {
+        if let Ok(Ok(secrets)) = rx.await {
             self.prompts.set(None);
-            Ok(reply_key.build(&secret))
+            if secrets.len() != secret_keys.len() {
+                // The overlay's contract is one value per requested key, so a
+                // mismatch is a shell-side bug. Answer what we can (the zip in
+                // `ReplyShape::build` truncates) and leave a trace — a partial
+                // reply is what NM re-asks for, not a crash.
+                tracing::warn!(
+                    requested = secret_keys.len(),
+                    returned = secrets.len(),
+                    "secret prompt returned a different number of values than keys requested",
+                );
+            }
+            Ok(reply_shape.build(&secret_keys, &secrets))
         } else {
             self.prompts.set(None);
             Err(NmAgentError::UserCanceled("user dismissed prompt".into()))
@@ -591,9 +654,20 @@ mod tests {
         secrets.get(key).cloned().expect("secret key present")
     }
 
+    /// Decode the whole `vpn.secrets` `a{ss}` sub-dict out of a reply.
+    fn vpn_reply_secrets(reply: &ConnectionDict) -> HashMap<String, String> {
+        let vpn = reply.get("vpn").expect("vpn setting present in reply");
+        let secrets_val = vpn
+            .get("secrets")
+            .expect("secrets sub-dict present")
+            .try_clone()
+            .expect("clone secrets value");
+        <HashMap<String, String>>::try_from(secrets_val).expect("secrets decodes as a{ss}")
+    }
+
     #[test]
     fn vpn_reply_nests_secret_under_vpn_secrets() {
-        let reply = build_vpn_secret_reply("password", "s3cr3t");
+        let reply = build_vpn_secret_reply([("password", "s3cr3t")]);
         // The top-level setting must be exactly "vpn" — not the bare key.
         assert!(reply.contains_key("vpn"), "vpn setting present");
         assert!(
@@ -606,8 +680,29 @@ mod tests {
     #[test]
     fn vpn_reply_uses_requested_secret_key() {
         // A non-default key (e.g. a per-gateway password) is preserved verbatim.
-        let reply = build_vpn_secret_reply("Gateway Password", "abc");
+        let reply = build_vpn_secret_reply([("Gateway Password", "abc")]);
         assert_eq!(vpn_reply_secret(&reply, "Gateway Password"), "abc");
+    }
+
+    #[test]
+    fn vpn_reply_carries_every_secret_in_one_dict() {
+        // The #652 defect: a round that collected several secrets must answer
+        // with all of them nested under the single `vpn.secrets` a{ss}.
+        let reply = build_vpn_secret_reply([("password", "pw"), ("otp", "123456")]);
+        let secrets = vpn_reply_secrets(&reply);
+        assert_eq!(secrets.len(), 2, "both secrets present: {secrets:?}");
+        assert_eq!(secrets.get("password").map(String::as_str), Some("pw"));
+        assert_eq!(secrets.get("otp").map(String::as_str), Some("123456"));
+    }
+
+    #[test]
+    fn vpn_reply_is_empty_dict_when_no_secrets_collected() {
+        // Degenerate but well-formed: still the `vpn` → `secrets` nesting, just
+        // with nothing in it. NM treats this as "no secrets", not a protocol
+        // error, so it must not panic or produce a differently-shaped dict.
+        let reply = build_vpn_secret_reply([]);
+        assert!(reply.contains_key("vpn"));
+        assert!(vpn_reply_secrets(&reply).is_empty());
     }
 
     /// Build a minimal VPN connection dict: a `connection.id` plus an optional
@@ -642,33 +737,162 @@ mod tests {
         assert_eq!(vpn_name_from_connection(&conn), "");
     }
 
-    #[test]
-    fn vpn_secret_key_defaults_to_password_without_hints() {
-        let conn = vpn_connection("Work VPN", &[]);
-        assert_eq!(vpn_secret_key_to_prompt(&conn, &[]), "password");
+    /// `vpn_secret_keys_to_prompt` with `prior_failure = false` (a first ask).
+    fn keys_to_prompt(conn: &ConnectionDict, hints: &[&str]) -> Vec<String> {
+        let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
+        vpn_secret_keys_to_prompt(conn, &hints, false)
     }
 
     #[test]
-    fn vpn_secret_key_uses_first_hint() {
+    fn vpn_secret_key_defaults_to_password_without_hints() {
         let conn = vpn_connection("Work VPN", &[]);
-        let hints = vec!["Gateway Password".to_string()];
-        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "Gateway Password",);
+        assert_eq!(keys_to_prompt(&conn, &[]), vec!["password".to_string()]);
+    }
+
+    #[test]
+    fn vpn_secret_key_uses_the_hint() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["Gateway Password"]),
+            vec!["Gateway Password".to_string()],
+        );
     }
 
     #[test]
     fn vpn_secret_key_strips_setting_prefix_from_hint() {
         // NM sometimes qualifies the hint as "<setting>.<key>".
         let conn = vpn_connection("Work VPN", &[]);
-        let hints = vec!["vpn.password".to_string()];
-        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "password");
+        assert_eq!(
+            keys_to_prompt(&conn, &["vpn.password"]),
+            vec!["password".to_string()],
+        );
     }
 
     #[test]
     fn vpn_secret_key_skips_already_stored_secret() {
-        // The first hint is already present → prompt for the next missing one.
+        // The first hint is already present → prompt only for the missing one.
         let conn = vpn_connection("Work VPN", &[("password", "stored")]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["password", "otp"]),
+            vec!["otp".to_string()],
+        );
+    }
+
+    // -- #652: every missing secret in one round -------------------------------
+
+    #[test]
+    fn vpn_secret_keys_returns_every_missing_hint_in_order() {
+        // The #652 defect: NM asks for two secrets in one GetSecrets round, so
+        // both must be collected — previously only the first was.
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["password", "otp"]),
+            vec!["password".to_string(), "otp".to_string()],
+        );
+    }
+
+    #[test]
+    fn vpn_secret_keys_preserve_hint_order() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["otp", "password", "Group Password"]),
+            vec![
+                "otp".to_string(),
+                "password".to_string(),
+                "Group Password".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn vpn_secret_keys_dedup_repeated_hints() {
+        // A qualified and an unqualified hint normalise to the same key; the
+        // user must not be shown the same field twice.
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["password", "vpn.password", "password"]),
+            vec!["password".to_string()],
+        );
+    }
+
+    #[test]
+    fn vpn_secret_keys_drop_blank_hints() {
+        let conn = vpn_connection("Work VPN", &[]);
+        assert_eq!(keys_to_prompt(&conn, &["", "otp"]), vec!["otp".to_string()],);
+    }
+
+    #[test]
+    fn vpn_secret_keys_fall_back_when_every_hint_is_stored() {
+        // Nothing missing, yet NM still asked → re-collect the default rather
+        // than returning an empty key list (which would answer nothing).
+        let conn = vpn_connection("Work VPN", &[("password", "stored"), ("otp", "123")]);
+        assert_eq!(
+            keys_to_prompt(&conn, &["password", "otp"]),
+            vec!["password".to_string()],
+        );
+    }
+
+    #[test]
+    fn vpn_secret_keys_ignore_stored_secrets_on_request_new() {
+        // REQUEST_NEW means the stored secrets were *rejected*. Filtering them
+        // out would prompt for `otp` alone and re-submit the bad `password`.
+        let conn = vpn_connection("Work VPN", &[("password", "rejected")]);
         let hints = vec!["password".to_string(), "otp".to_string()];
-        assert_eq!(vpn_secret_key_to_prompt(&conn, &hints), "otp");
+        assert_eq!(
+            vpn_secret_keys_to_prompt(&conn, &hints, true),
+            vec!["password".to_string(), "otp".to_string()],
+        );
+    }
+
+    #[test]
+    fn vpn_secret_keys_are_never_empty() {
+        // The overlay and the reply builder both rely on this.
+        let conn = vpn_connection("Work VPN", &[("password", "stored")]);
+        assert!(!keys_to_prompt(&conn, &["password"]).is_empty());
+        assert!(!keys_to_prompt(&conn, &[""]).is_empty());
+        assert!(!vpn_secret_keys_to_prompt(&ConnectionDict::new(), &[], false).is_empty());
+    }
+
+    // -- ReplyShape ------------------------------------------------------------
+
+    #[test]
+    fn reply_shape_vpn_pairs_every_key_with_its_value() {
+        let shape = ReplyShape::Vpn;
+        let keys = vec!["password".to_string(), "otp".to_string()];
+        let secrets = vec!["pw".to_string(), "123456".to_string()];
+        let reply = shape.build(&keys, &secrets);
+        let got = vpn_reply_secrets(&reply);
+        assert_eq!(got.get("password").map(String::as_str), Some("pw"));
+        assert_eq!(got.get("otp").map(String::as_str), Some("123456"));
+    }
+
+    #[test]
+    fn reply_shape_wireless_uses_the_single_key() {
+        let shape = ReplyShape::WirelessSecurity {
+            setting_name: WIRELESS_SECURITY_SETTING.to_string(),
+        };
+        let keys = vec!["wep-key0".to_string()];
+        let secrets = vec!["abcde".to_string()];
+        let reply = shape.build(&keys, &secrets);
+        let inner = reply
+            .get(WIRELESS_SECURITY_SETTING)
+            .expect("setting present");
+        assert_eq!(
+            String::try_from(inner.get("wep-key0").unwrap().try_clone().unwrap()).unwrap(),
+            "abcde",
+        );
+    }
+
+    #[test]
+    fn reply_shape_truncates_rather_than_panicking_on_a_short_value_list() {
+        // A shell-side bug (fewer values than keys) must degrade to a partial
+        // reply NM re-asks for — never a panic inside the D-Bus method.
+        let shape = ReplyShape::Vpn;
+        let keys = vec!["password".to_string(), "otp".to_string()];
+        let secrets = vec!["pw".to_string()];
+        let got = vpn_reply_secrets(&shape.build(&keys, &secrets));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get("password").map(String::as_str), Some("pw"));
     }
 
     #[test]
@@ -981,14 +1205,18 @@ mod system_tests {
         let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
         assert_eq!(req.ssid, "FRITZ!Box");
         assert_eq!(req.security, "psk");
+        // Wireless asks for exactly one secret, so the overlay stays on its
+        // single-entry path.
+        assert_eq!(req.secret_keys, vec!["psk".to_string()]);
 
-        // Resolve the waiter as the prompt overlay would on submit.
+        // Resolve the waiter as the prompt overlay would on submit: one value
+        // per requested key.
         waiters
             .lock()
             .await
             .remove(&req.id)
             .expect("waiter registered")
-            .send(Ok("hunter2".to_string()))
+            .send(Ok(vec!["hunter2".to_string()]))
             .expect("send passphrase to waiter");
 
         let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
@@ -1052,7 +1280,7 @@ mod system_tests {
             .await
             .remove(&req.id)
             .expect("waiter registered")
-            .send(Ok("vpnpass".to_string()))
+            .send(Ok(vec!["vpnpass".to_string()]))
             .expect("send VPN secret to waiter");
 
         let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
@@ -1076,6 +1304,93 @@ mod system_tests {
         assert!(
             prompts.get_cloned().is_none(),
             "prompt should be cleared after the VPN secret is returned"
+        );
+    }
+
+    // -- 1b-ii. #652: several VPN secrets in ONE GetSecrets round --------------
+
+    /// The regression test for the #652 multi-secret defect, driven over the
+    /// wire rather than through the pure helpers.
+    ///
+    /// NM asks for `password` **and** `otp` in a single `GetSecrets` call. The
+    /// agent must surface *both* keys on the prompt (so the overlay can collect
+    /// both) and nest *both* values into the one `vpn.secrets` `a{ss}` it
+    /// replies with. Before the fix the agent prompted for `password` only and
+    /// answered with a one-entry dict, leaving `otp` unfilled — NM then either
+    /// re-asks or fails the activation, which is the hard block the issue
+    /// describes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vpn_multi_secret_round_answers_every_requested_key() {
+        let (server, guard) = ephemeral_bus().await;
+        let (agent, prompts, waiters) = fresh_agent();
+        let proxy = mount_and_proxy(&server, &guard, agent).await;
+
+        let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openconnect");
+        let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
+            tokio::spawn(async move {
+                proxy
+                    .call(
+                        "GetSecrets",
+                        &(
+                            conn,
+                            OwnedObjectPath::try_from(
+                                "/org/freedesktop/NetworkManager/Connection/4",
+                            )
+                            .unwrap(),
+                            "vpn".to_string(),
+                            // Two secrets, one round.
+                            vec!["password".to_string(), "otp".to_string()],
+                            FLAG_ALLOW_INTERACTION,
+                        ),
+                    )
+                    .await
+            });
+
+        // The prompt must carry BOTH keys, in hint order, so the overlay knows
+        // to render two fields.
+        let req = await_prompt(&prompts, DBUS_REPLY_BUDGET).await;
+        assert_eq!(req.kind, PromptKind::VpnSecret);
+        assert_eq!(
+            req.secret_keys,
+            vec!["password".to_string(), "otp".to_string()],
+            "both requested secrets must reach the prompt",
+        );
+
+        // Answer as a two-field overlay would: one value per key, in order.
+        waiters
+            .lock()
+            .await
+            .remove(&req.id)
+            .expect("waiter registered")
+            .send(Ok(vec!["pw".to_string(), "123456".to_string()]))
+            .expect("send VPN secrets to waiter");
+
+        let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)
+            .await
+            .expect("GetSecrets did not return in time")
+            .expect("GetSecrets task panicked")
+            .expect("GetSecrets returned a D-Bus error");
+
+        // Both secrets must survive the round trip inside the single a{ss}.
+        let vpn = reply.get("vpn").expect("vpn setting present in reply");
+        let secrets_val = vpn
+            .get("secrets")
+            .expect("secrets sub-dict present")
+            .try_clone()
+            .expect("clone secrets");
+        let secrets = <HashMap<String, String>>::try_from(secrets_val)
+            .expect("secrets decodes as a{ss} over the wire");
+        assert_eq!(
+            secrets.len(),
+            2,
+            "every requested secret must come back in one reply, got {secrets:?}",
+        );
+        assert_eq!(secrets.get("password").map(String::as_str), Some("pw"));
+        assert_eq!(secrets.get("otp").map(String::as_str), Some("123456"));
+
+        assert!(
+            prompts.get_cloned().is_none(),
+            "prompt should be cleared after the VPN secrets are returned"
         );
     }
 
@@ -1118,7 +1433,7 @@ mod system_tests {
             .await
             .remove(&req.id)
             .expect("waiter registered")
-            .send(Ok("abcde".to_string()))
+            .send(Ok(vec!["abcde".to_string()]))
             .expect("send WEP key to waiter");
 
         let reply = tokio::time::timeout(DBUS_REPLY_BUDGET, call)

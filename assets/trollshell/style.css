@@ -820,6 +820,16 @@
     font-size: 0.923em;
     font-weight: 600;
 }
+/* Per-field label, shown only when one GetSecrets round asks for several
+   secrets (#652) — a single-secret prompt keeps its bare, unlabelled entry.
+   Slightly tighter than the subtitle since it sits directly above its box.
+   The in-flight state deliberately has no class of its own: it is a plain
+   gtk::Spinner plus set_sensitive(false), matching panels/bluetooth.rs. */
+.ts-prompt-field-label {
+    opacity: 0.65;
+    font-size: 0.923em;
+    margin-top: 2px;
+}
 
 /* ─── Consent prompt (#487) ─────────────────────────────────────── */
 

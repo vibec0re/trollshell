@@ -85,6 +85,26 @@ pub struct PromptRequest {
     pub security: String,
     /// Which kind of secret is being requested — drives the overlay's wording.
     pub kind: PromptKind,
+    /// The secret keys this prompt must collect, in the order the daemon named
+    /// them. **Always non-empty**, and the overlay must return exactly one
+    /// value per entry (in this order) to `submit_prompt`.
+    ///
+    /// Length 1 is the overwhelmingly common case — a Wi-Fi passphrase, or a
+    /// VPN with a single password — and renders as one unlabelled entry, the
+    /// pre-existing look. A `GetSecrets` round that needs several secrets at
+    /// once (e.g. a VPN wanting a password *and* a one-time code) lists them
+    /// all here, so the overlay can collect the whole set in one dialog and
+    /// the agent can answer `NetworkManager`'s request in a single reply. NM
+    /// re-asks (or fails the activation) for any key it requested and did not
+    /// get back, so a partial answer is not a degraded success — it is a
+    /// failed round.
+    ///
+    /// The keys are daemon vocabulary (`"psk"`, `"wep-key0"`, `"password"`,
+    /// whatever a VPN plugin hinted); turning them into human labels is the
+    /// overlay's job. The iwd backend has no key vocabulary at all — its
+    /// `RequestPassphrase` returns a bare string — so it uses a single
+    /// placeholder key that is never rendered.
+    pub secret_keys: Vec<String>,
     /// `true` when this prompt is a reopen after a previously-submitted secret
     /// was rejected. Only the NM backend can populate this reliably — it maps
     /// `NM_SECRET_AGENT_GET_SECRETS_FLAG_REQUEST_NEW` on `GetSecrets` (a

@@ -23,7 +23,7 @@
 //! wifi::scan();
 //! wifi::connect_network(path);
 //! wifi::disconnect();
-//! wifi::submit_prompt(id, passphrase);
+//! wifi::submit_prompt(id, &secrets);   // one value per PromptRequest::secret_keys
 //! wifi::cancel_prompt(id);
 //! ```
 
@@ -89,7 +89,15 @@ pub(super) async fn set_current_adapter_path(path: &str) {
 
 // ── Agent waiter map (module-level OnceLock for public API access) ────────────
 
-pub(super) type WaitersMap = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>;
+/// Pending prompt waiters: request id → the oneshot the overlay resolves.
+///
+/// The payload is a `Vec<String>` — **one value per
+/// [`PromptRequest::secret_keys`] entry, in that order** — not a single
+/// string, because a `GetSecrets` round can ask for several secrets at once
+/// and NM expects them all back in one reply. The single-secret case is simply
+/// a one-element vector.
+pub(super) type WaitersMap =
+    Arc<AsyncMutex<HashMap<u64, oneshot::Sender<Result<Vec<String>, String>>>>>;
 
 static WAITERS: OnceLock<WaitersMap> = OnceLock::new();
 
@@ -967,15 +975,25 @@ pub fn active_prompt() -> impl Signal<Item = Option<PromptRequest>> {
     })
 }
 
-/// Submit a passphrase for the prompt with `id`.
-pub fn submit_prompt(id: u64, passphrase: &str) {
-    let pass = passphrase.to_string();
+/// Submit the secret(s) for the prompt with `id`.
+///
+/// `secrets` carries **one value per [`PromptRequest::secret_keys`] entry, in
+/// the same order**. A Wi-Fi passphrase is a one-element slice; a VPN round
+/// that asked for several secrets returns all of them here, so the agent can
+/// answer `NetworkManager`'s whole `GetSecrets` request in a single reply
+/// instead of leaving the rest unfilled for NM to re-ask or fail on.
+///
+/// Resolving the waiter *removes* it, so a second submit for the same `id` is
+/// a silent no-op — the overlay's in-flight latch is the first line of defence
+/// against a double submit, this is the second.
+pub fn submit_prompt(id: u64, secrets: &[String]) {
+    let secrets = secrets.to_vec();
     let Some(arc) = waiters() else { return };
     let arc = arc.clone();
     runtime::handle().spawn(async move {
         let mut map = arc.lock().await;
         if let Some(tx) = map.remove(&id) {
-            let _ = tx.send(Ok(pass));
+            let _ = tx.send(Ok(secrets));
         }
     });
 }

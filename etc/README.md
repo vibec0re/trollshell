@@ -25,10 +25,10 @@ socket; see its "Out-of-process widget plugins" section.
 
 `skills/infobroker/` is the agent-facing half of the **infobroker** (#487) — the
 consent-gated broker that lets a local AI agent read _scoped_ desktop data
-(public-transport departures today; more later) without touching Annika's files
-or daemons. It follows Annika's "mcp is dead" shape: **a skill folder, not an MCP
-server** — a `SKILL.md` teaching the flow plus a `bin/hytte-infobroker` wrapper
-the agent shells out to.
+(public-transport departures today; more later) without touching the desktop
+owner's files or daemons. It follows the "mcp is dead" shape: **a skill folder,
+not an MCP server** — a `SKILL.md` teaching the flow plus a `bin/hytte-infobroker`
+wrapper the agent shells out to.
 
 The broker itself is an ordinary out-of-process trollshell plugin
 (`trollshell-plugin-infobroker.service`, see
@@ -39,7 +39,8 @@ a live audit trail. An agent authenticates with
 into its environment (`HYTTE_INFOBROKER_TOKEN`) → scoped
 `hytte-infobroker get departures`. Access is
 **denied until a human grants it** (in the panel or by editing
-`grants.toml`); a denied knock pops a desktop toast so Annika sees it.
+`grants.toml`); a denied knock pops a desktop toast so the desktop's owner
+sees it.
 
 ## Idle & screen locking
 

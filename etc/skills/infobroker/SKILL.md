@@ -1,9 +1,9 @@
 ---
 name: infobroker
 description: >-
-  Read scoped data from Annika's trollshell desktop (public-transport
+  Read scoped data from the trollshell desktop (public-transport
   departures, weather, calendar) through the consent-gated infobroker. Use when a
-  task needs live data from her machine — "when's my next train", "what's the
+  task needs live data from the desktop owner's machine — "when's my next train", "what's the
   weather", "what's on my calendar" — that only the desktop can source. Every
   datasource is behind an explicit human grant; ask for the minimum and handle a
   denial gracefully.
@@ -12,8 +12,8 @@ description: >-
 # infobroker — the trollshell data broker
 
 `hytte-infobroker` is a small CLI that lets you read **scoped, consent-gated**
-data from the running trollshell desktop. A human (Annika) decides, per agent and
-per datasource, whether you may read it. You never touch her files or daemons
+data from the running trollshell desktop. Its owner — a human — decides, per agent and
+per datasource, whether you may read it. You never touch their files or daemons
 directly — you ask the broker, and it answers only what you've been granted.
 
 The whole surface is one CLI (this skill's `bin/hytte-infobroker`, a pointer to
@@ -84,8 +84,8 @@ stderr. **Do not** keep re-running it — a denial is a standing "not yet".
 Fetches scoped data as JSON on stdout, authenticated by
 `$HYTTE_INFOBROKER_TOKEN`. Three datasources are served:
 
-- **`departures`** — the next catchable S-Bahn departures from Annika's
-  configured home station. Each row: `{ line, direction, hhmm, in_minutes,
+- **`departures`** — the next catchable S-Bahn departures from the desktop
+  owner's configured home station. Each row: `{ line, direction, hhmm, in_minutes,
 delay_minutes, cancelled }`. Example:
 
   ```json

@@ -20,7 +20,9 @@
 //!   [`compose_llm`] asks for the same facts in caw's own voice — one
 //!   `chat()` call through [`hytte_ai_providers`]. Keyless and URL-less
 //!   resolves to the plain path up front: no doomed network round-trips
-//!   (the #438/#472 rule).
+//!   (the #438/#472 rule). The voiced [`persona`] names the desktop's owner
+//!   from `$TROLLSHELL_OWNER`, falling back to a neutral phrase rather than a
+//!   hardcoded third party (#706).
 //! - The reducer side (sticky-until-poked, the toast) lives in `main.rs`.
 
 use std::path::PathBuf;
@@ -44,14 +46,44 @@ const WINDOW_MINS: u16 = 6 * 60;
 /// whatever the model does.
 const MAX_BRIEF: usize = 220;
 
-/// caw's standing news-desk persona. Facts-only by instruction; [`sanitize`]
+/// Neutral fallback for the persona's owner mention when `$TROLLSHELL_OWNER`
+/// is unset — caw doesn't guess a name for whoever is actually running the
+/// shell (#706). The identical bug in the pet's persona is tracked separately
+/// as #696; once that settles on a shared resolver, both plugins can read the
+/// same env var through it.
+const DEFAULT_OWNER: &str = "your human";
+
+/// caw's standing news-desk persona: facts-only by instruction, with the
+/// desktop owner's name resolved from `$TROLLSHELL_OWNER` (falling back to
+/// [`DEFAULT_OWNER`]) rather than a hardcoded third party (#706). [`sanitize`]
 /// still enforces the format mechanically.
-const PERSONA: &str = "You are caw, a sardonic cybercrow who lives in the sidebar of Annika's \
-     Linux desktop and delivers the morning news. Compose one tiny briefing \
-     from the facts given. Style: dry, lowercase, cyberpunk corvid snark. \
-     Format: 2-3 short sentences, under 200 characters total, plain text, no \
-     emoji, no quotes, no lists. Mention only facts you were given; never \
-     invent events, weather, or trains.";
+fn persona() -> String {
+    persona_for(&owner_or(std::env::var("TROLLSHELL_OWNER").ok().as_deref()))
+}
+
+/// Core of [`persona`] with the resolved owner name injected, so it's
+/// unit-testable without mutating the process environment (`unsafe` under
+/// edition 2024, which this crate forbids) — same split as
+/// [`resolve_provider`]/[`parse_time`] below.
+fn persona_for(owner: &str) -> String {
+    format!(
+        "You are caw, a sardonic cybercrow who lives in the sidebar of {owner}'s \
+         Linux desktop and delivers the morning news. Compose one tiny briefing \
+         from the facts given. Style: dry, lowercase, cyberpunk corvid snark. \
+         Format: 2-3 short sentences, under 200 characters total, plain text, no \
+         emoji, no quotes, no lists. Mention only facts you were given; never \
+         invent events, weather, or trains."
+    )
+}
+
+/// Resolve `$TROLLSHELL_OWNER`: trimmed and non-empty wins, else
+/// [`DEFAULT_OWNER`]. Blank/whitespace-only counts as unset — same
+/// trim-then-check-empty shape as `hytte_ai_providers::load_key_from`.
+fn owner_or(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| DEFAULT_OWNER.to_owned(), str::to_owned)
+}
 
 /// Canned openers, cycled by day-of-year so consecutive mornings differ.
 const GREETINGS: &[&str] = &[
@@ -299,7 +331,7 @@ pub(crate) fn facts(ing: &Ingredients, now_stamp: &str) -> String {
 /// result is an error so the caller falls back to [`compose_plain`].
 pub(crate) fn compose_llm(provider: &Provider, facts: &str) -> Result<String, String> {
     let messages = [
-        Message::system(PERSONA),
+        Message::system(persona()),
         Message::user(format!("{facts}\n\ncaw the morning news now:")),
     ];
     let opts = ChatOpts {
@@ -454,6 +486,29 @@ mod tests {
         // No URL, no key → plain-only; no doomed 401 round-trips (#438/#472).
         assert!(resolve_provider(None, None, None).is_none());
         assert!(resolve_provider(None, None, Some("m".to_owned())).is_none());
+    }
+
+    #[test]
+    fn owner_or_prefers_the_explicit_env_value_falling_back_when_unset_or_blank() {
+        // Explicit, non-blank `$TROLLSHELL_OWNER` wins, trimmed.
+        assert_eq!(owner_or(Some("kaesaecracker")), "kaesaecracker");
+        assert_eq!(owner_or(Some("  Mara  ")), "Mara", "trimmed");
+        // Unset, empty, or whitespace-only all fall back to the neutral default —
+        // never a hardcoded third party's name (#706).
+        assert_eq!(owner_or(None), DEFAULT_OWNER);
+        assert_eq!(owner_or(Some("")), DEFAULT_OWNER);
+        assert_eq!(owner_or(Some("   ")), DEFAULT_OWNER);
+    }
+
+    #[test]
+    fn persona_for_embeds_the_resolved_owner_and_never_a_hardcoded_name() {
+        assert!(persona_for("kaesaecracker").contains("kaesaecracker's Linux desktop"));
+        let neutral = persona_for(DEFAULT_OWNER);
+        assert!(neutral.contains("your human's Linux desktop"));
+        assert!(
+            !neutral.to_lowercase().contains("annika"),
+            "the default persona must not name a specific person: {neutral}"
+        );
     }
 
     // ── Time windowing ───────────────────────────────────────────────────────

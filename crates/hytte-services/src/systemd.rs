@@ -210,6 +210,16 @@ pub struct PluginUnit {
     pub active_state: String,
     /// Whether the unit file is enabled (persisted to auto-start at login).
     pub enabled: bool,
+    /// The unit's `Description=`, verbatim (empty for a unit systemd hasn't
+    /// loaded — enumerating unit *files* doesn't report one).
+    ///
+    /// Carried because it is the only per-unit string the launcher gets for
+    /// free: `ListUnitsByPatterns` already returns it, so the declarative
+    /// launcher (#419) can stamp a spec fingerprint into the description of the
+    /// transient units it creates and read it back here to tell a unit running
+    /// the *current* declared spec from a stale one (#695) — without a single
+    /// extra D-Bus call.
+    pub description: String,
 }
 
 /// `ListUnitFilesByPatterns` reply tuple: (`unit_file_path_or_name`, `state`),
@@ -260,21 +270,23 @@ pub(crate) fn is_enabled_state(state: &str) -> bool {
 }
 
 /// Merge the *installed* plugin unit files (enablement) with the currently
-/// *loaded* units (runtime `ActiveState`) into one `Vec<PluginUnit>` sorted by
-/// id. `files` enumerates every installed `trollshell-plugin-*` unit (running or
-/// not); `loaded` carries live `ActiveState` for those systemd has loaded. A
-/// unit file with no loaded entry is reported `inactive` (systemd GCs loaded
-/// state for a long-stopped unit); a loaded unit with no file is still surfaced
+/// *loaded* units (runtime `ActiveState` + `Description`) into one
+/// `Vec<PluginUnit>` sorted by id. `files` enumerates every installed
+/// `trollshell-plugin-*` unit (running or not); `loaded` carries live
+/// `ActiveState`/`Description` for those systemd has loaded. A unit file with no
+/// loaded entry is reported `inactive` with an empty description (systemd GCs
+/// loaded state for a long-stopped unit, and unit-file enumeration carries no
+/// description); a loaded unit with no file is still surfaced
 /// (`enabled = false`). Pure, so the merge is unit-testable without a bus.
 pub(crate) fn merge_plugin_units(
     files: Vec<UnitFileTuple>,
     loaded: Vec<UnitTuple>,
 ) -> Vec<PluginUnit> {
-    // id → active_state from the loaded set.
-    let active_by_id: std::collections::HashMap<String, String> = loaded
+    // id → (active_state, description) from the loaded set.
+    let loaded_by_id: std::collections::HashMap<String, (String, String)> = loaded
         .into_iter()
-        .filter_map(|(name, _desc, _load, active, ..)| {
-            parse_plugin_id(&name).map(|id| (id, active))
+        .filter_map(|(name, desc, _load, active, ..)| {
+            parse_plugin_id(&name).map(|id| (id, (active, desc)))
         })
         .collect();
     // BTreeMap keeps the output sorted by id and dedups a unit reported under
@@ -283,27 +295,30 @@ pub(crate) fn merge_plugin_units(
         std::collections::BTreeMap::new();
     for (path, enable_state) in files {
         if let Some(id) = parse_plugin_id(&path) {
-            let active_state = active_by_id
+            let (active_state, description) = loaded_by_id
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| "inactive".to_owned());
+                .unwrap_or_else(|| ("inactive".to_owned(), String::new()));
             by_id.insert(
                 id.clone(),
                 PluginUnit {
                     id,
                     active_state,
                     enabled: is_enabled_state(&enable_state),
+                    description,
                 },
             );
         }
     }
     // Union in any loaded plugin unit that has no unit file (transient / linked
     // without a persistent [Install]) so a running-but-file-less plugin shows.
-    for (id, active_state) in active_by_id {
+    // This is the normal case for the declarative launcher's transient units.
+    for (id, (active_state, description)) in loaded_by_id {
         by_id.entry(id.clone()).or_insert(PluginUnit {
             id,
             active_state,
             enabled: false,
+            description,
         });
     }
     by_id.into_values().collect()
@@ -312,8 +327,8 @@ pub(crate) fn merge_plugin_units(
 /// Enumerate the installed `trollshell-plugin-*` **user** units with their
 /// runtime + enablement state (#348). Two one-shot calls to the *user* manager
 /// (`systemd --user`, session bus): `ListUnitFilesByPatterns` for the installed
-/// set + enablement, `ListUnitsByPatterns` for live `ActiveState`, merged by
-/// [`merge_plugin_units`].
+/// set + enablement, `ListUnitsByPatterns` for live `ActiveState` +
+/// `Description`, merged by [`merge_plugin_units`].
 ///
 /// # Errors
 /// Propagates any `hytte_bus` call error (e.g. no user manager reachable).
@@ -460,11 +475,18 @@ mod tests {
     // ── Plugin unit management (#348) ────────────────────────────────────────
 
     /// A loaded `ListUnitsByPatterns` tuple for a plugin unit with a given
-    /// `ActiveState`.
+    /// `ActiveState` (and the launcher-shaped description [`plugin_tuple_desc`]
+    /// lets a test pin explicitly).
     fn plugin_tuple(name: &str, active: &str) -> UnitTuple {
+        plugin_tuple_desc(name, active, &format!("{name} description"))
+    }
+
+    /// As [`plugin_tuple`], with an explicit `Description=` — the field the
+    /// declarative launcher stamps its spec fingerprint into (#695).
+    fn plugin_tuple_desc(name: &str, active: &str, desc: &str) -> UnitTuple {
         (
             name.to_string(),
-            format!("{name} description"),
+            desc.to_string(),
             "loaded".to_string(),
             active.to_string(),
             "running".to_string(),
@@ -559,6 +581,8 @@ mod tests {
         // No loaded entry for weather → reported inactive.
         assert_eq!(out[1].active_state, "inactive");
         assert!(out[1].enabled);
+        // …and with no loaded entry there is no description to report.
+        assert_eq!(out[1].description, "");
     }
 
     #[test]
@@ -572,6 +596,39 @@ mod tests {
         assert_eq!(out[0].id, "terminal");
         assert_eq!(out[0].active_state, "active");
         assert!(!out[0].enabled);
+    }
+
+    #[test]
+    fn merge_carries_the_loaded_units_description() {
+        // The launcher's reconcile (#695) reads its spec fingerprint back out of
+        // the transient unit's Description=, so the merge must carry it through
+        // verbatim — for a file-less transient unit and a unit-file one alike.
+        let out = merge_plugin_units(
+            vec![(
+                "trollshell-plugin-pet.service".to_string(),
+                "disabled".to_string(),
+            )],
+            vec![
+                plugin_tuple_desc(
+                    "trollshell-plugin-pet.service",
+                    "active",
+                    "trollshell plugin: pet [cfg:0123456789abcdef]",
+                ),
+                plugin_tuple_desc(
+                    "trollshell-plugin-timer.service",
+                    "active",
+                    "trollshell plugin: timer [cfg:fedcba9876543210]",
+                ),
+            ],
+        );
+        assert_eq!(
+            out[0].description,
+            "trollshell plugin: pet [cfg:0123456789abcdef]"
+        );
+        assert_eq!(
+            out[1].description,
+            "trollshell plugin: timer [cfg:fedcba9876543210]"
+        );
     }
 
     #[test]

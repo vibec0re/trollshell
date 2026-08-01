@@ -421,6 +421,18 @@ self:
         (#348) starts/stops the transient units live, while *enablement*
         stays declared here.
 
+        Changes apply to a **running** session (#695): the shell reconciles
+        the live plugins against this file — starting what was added or
+        enabled, stopping what was disabled or removed, and restarting any
+        plugin whose `package`, `env` or `secrets` changed. Under
+        home-manager that happens during activation (the module calls the
+        shell's `Control.ReloadPlugins` after writing the file, and no-ops
+        when no shell is running); with the NixOS module it happens the next
+        time the shell starts, because root activation has no user session
+        bus to reach the shell through. Note that a reconcile also stops a
+        plugin you started by hand from the Plugins tab but left
+        `enable = false` here — declared state wins.
+
         Each bundled plugin ships as its own package in this flake (#558), so
         `package` points straight at a `hytte-plugin-<id>` output — no
         out-of-tree derivation needed:

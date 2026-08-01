@@ -243,8 +243,30 @@ in
       # (Restart=on-failure) and session lifetime (PartOf=graphical-session
       # .target) ride on the transient unit. Only written when any plugin is
       # declared, so a plugin-less config grows no config file.
+      #
+      # Writing the file is only half of "declarative", though (#695): the units
+      # are *transient*, created by the shell at runtime, so there is no unit
+      # file for home-manager to diff or restart — activation used to stop here
+      # and a changed env/package/enable stayed frozen in the running plugin
+      # until the next login, silently. So after the write, poke the running
+      # shell's Control endpoint to reconcile (ReloadPlugins re-reads
+      # plugins.json and starts/stops/restarts to match). Notes:
+      #   * run as a NixOS module, activation happens in home-manager-<user>
+      #     .service, which has no DBUS_SESSION_BUS_ADDRESS — hence the same
+      #     XDG_RUNTIME_DIR prelude home-manager's own startServices uses.
+      #   * it must be a hard no-op at boot / on a non-graphical switch, hence
+      #     `|| true`: no shell running is the normal case, not an error (the
+      #     shell reconciles on its own next start).
       (lib.mkIf (cfg.plugins != { }) {
         xdg.configFile."trollshell/plugins.json".text = pluginsState;
+
+        home.activation.trollshellReloadPlugins = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+          export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          export DBUS_SESSION_BUS_ADDRESS="''${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+          ''${DRY_RUN_CMD:-} ${pkgs.systemd}/bin/busctl --user --quiet \
+            call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control \
+            mov.vibec0re.trollshell.Control ReloadPlugins || true
+        '';
       })
 
       # Control-center companion app (#399): the external GTK settings/management

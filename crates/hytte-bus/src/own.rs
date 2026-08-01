@@ -425,10 +425,11 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 /// so each wake makes exactly one attempt. The event-driven wake (#669) adds
 /// one further line per *observed release that we then still fail to win*,
 /// which is a real ownership transition on the bus rather than a timer tick, so
-/// it cannot become a flood on its own — and in the overwhelmingly common case
-/// the release is followed by a win, which logs the recovery instead
-/// ([`log_release_wake`]). That is the middle ground between the two positions
-/// this repo has
+/// it cannot become a flood on its own — and every observed release, win or
+/// not, already got its own line from [`log_release_wake`] the instant it was
+/// seen, so the overwhelmingly common case (release then win) costs exactly
+/// that one line and no second give-up line. That is the middle ground between
+/// the two positions this repo has
 /// argued: #634 kept a *self-healing* condition loud on every attempt precisely
 /// because its backoff capped the rate, while #646 objects to flat, uncapped
 /// retry logging with no ceiling. A contested well-known name is a *static*
@@ -447,22 +448,29 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
     );
 }
 
-/// Log the event-driven recovery from a give-up: the holder released the name
-/// and we are re-requesting it without waiting out the cooldown.
+/// Log the event-driven wake from a give-up: `NameOwnerChanged` reported the
+/// held name released, so we are re-requesting it without waiting out the
+/// cooldown.
 ///
-/// At `warn!`, deliberately, and with `RECOVERED` in the message — the same
-/// shape `networkd`'s startup refresh and `wifi`'s backend probe use for the
-/// resolution of a condition they warned about (#609/#613/#634). A recovery
-/// logged quieter than the problem is invisible to exactly the person who saw
-/// the problem: [`log_give_up`] is a `warn!`, so anyone filtering at `warn`
-/// would otherwise read "notifications are inert" with no line ever saying it
-/// stopped being true. This fires once per release actually observed, not on a
-/// timer.
+/// At `warn!`, deliberately — the same level as [`log_give_up`], so anyone
+/// filtering at `warn` sees both halves of the story instead of just
+/// "notifications are inert" with no line ever following up. This fires once
+/// per release actually observed, not on a timer.
+///
+/// The message deliberately does NOT say the name was recovered: this line
+/// fires the instant the release is *observed*, before the `RequestName` it
+/// triggers has even been sent, let alone won. If a third contender takes the
+/// now-free name first, we did not get it back, and a line claiming
+/// otherwise would be lying to the journal. `holder` is likewise not
+/// necessarily who just released it — it is the peer the tally was
+/// attributed to at give-up time, which can predate intervening ownership
+/// changes we were unable to attribute (see [`record_loss`]); it names who we
+/// were waiting out, not a confirmed actor.
 fn log_release_wake(name: &str, holder: &str) {
     tracing::warn!(
         %name,
-        previous_holder = %holder,
-        "D-Bus name RECOVERED — the connection that was holding it has released it. Re-requesting now, woken by NameOwnerChanged rather than by the retry cooldown, so whatever this name backs comes back within milliseconds instead of minutes"
+        holder_at_giveup = %holder,
+        "D-Bus name held by another connection was released — re-requesting now, woken by NameOwnerChanged rather than by the retry cooldown, so whatever this name backs comes back within milliseconds instead of minutes if the re-request wins"
     );
 }
 
@@ -499,10 +507,15 @@ enum NextAttempt {
 ///   racy, for nothing.
 /// * A **cooldown** wake reconnects, exactly as before #669. The timer firing
 ///   with no signal is also the one observation consistent with a *wedged*
-///   subscription — a `NameOwnerChanged` dropped because the shared
-///   connection's broadcast queue overflowed while we waited, say — so the
-///   backstop rebuilds the thing that might have failed. That is what makes it
-///   a real backstop rather than a slower copy of the fast path.
+///   subscription — the match rule itself failing to (re)register after a
+///   broker hiccup, say. (Not a signal silently dropped from a full queue:
+///   zbus 5.14 never calls `set_overflow`, and the socket reader publishes
+///   with `broadcast_direct(...).await`, so a full queue on the shared
+///   connection stalls the whole connection rather than discarding from it —
+///   that mechanism cannot drop a `NameOwnerChanged` out from under us.)
+///   Whichever way a subscription actually wedges, the backstop rebuilds the
+///   thing that might have failed. That is what makes it a real backstop
+///   rather than a slower copy of the fast path.
 fn next_attempt_after(wake: Wake) -> NextAttempt {
     match wake {
         Wake::Released => NextAttempt::SameConnection,
@@ -544,10 +557,9 @@ fn is_release_of(msg: &zbus::Message, name: &str) -> bool {
 /// transitions of this one name*, of which the broker emits exactly one per
 /// change, rather than by how short a sleep we dared to use.
 ///
-/// The timer is not optional. A signal can be missed — the shared connection's
-/// message queue can overflow during a long wait, a rule can fail to register
-/// on a broker restart — and a missed signal must degrade to "recovers in five
-/// minutes", never to "stranded forever".
+/// The timer is not optional. A signal can be missed — the match rule can
+/// fail to register on a broker restart, say — and a missed signal must
+/// degrade to "recovers in five minutes", never to "stranded forever".
 ///
 /// Generic over the stream so the select and the filtering are exercised
 /// hermetically, with hand-built messages and no `dbus-daemon`.

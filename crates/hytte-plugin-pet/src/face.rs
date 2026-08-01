@@ -1,10 +1,15 @@
 //! Procedural color-LCD face for the pet (issue #284).
 //!
-//! Renders the cat's head straight into a 128×128 RGBA8 buffer — no sprite
+//! Renders the cat's head straight into a 128×128 RGBA8 [`Frame`] — no sprite
 //! assets — for the [`Node::Pixels`](hytte_plugin::proto::Node::Pixels) node the
 //! host materializes with **nearest-neighbor** upscaling. That upscale is what
 //! gives the chunky-pixel LCD look; this module only needs to draw hard-edged
 //! (never anti-aliased) shapes at native resolution.
+//!
+//! The buffer and its leaf primitives are the preem kit's [`Frame`] (#650): the
+//! kit promoted `plot`/`fill`/`hline` out of *this* file back in #284, and the
+//! sibling caw face moved onto them in #365 / PR #378, which named this half.
+//! Only the cat-shaped helpers (discs, triangles, arcs) stay local.
 //!
 //! # Palette — a warm lilac LCD
 //!
@@ -43,21 +48,26 @@
 //! (`.pet-face`) carry the LCD read instead.
 
 use crate::Mood;
+use hytte_plugin::preem::{Frame, Rgba};
 
 /// LCD buffer edge length in device pixels (square).
 pub(crate) const SIZE: usize = 128;
-/// The same edge as the `u32` the wire's `Pixels { width, height }` wants.
-pub(crate) const SIZE_U32: u32 = 128;
 /// The same edge as `i32`, for signed geometry math.
 const DIM: i32 = 128;
 /// Radius of the baked rounded-corner cut (screen glass edge).
 const CORNER_R: i32 = 12;
 
-// The three views of the edge length must agree; pin them at compile time.
-const _: () = assert!(SIZE == 128 && SIZE_U32 == 128 && DIM == 128 && CORNER_R < DIM / 2);
+// The two views of the edge length must agree; pin them at compile time.
+const _: () = assert!(SIZE == 128 && DIM == 128 && CORNER_R < DIM / 2);
 
 /// An opaque RGB color; alpha is always `0xff` on the screen.
 type Rgb = [u8; 3];
+
+/// Widen an opaque [`Rgb`] to the [`Rgba`] the [`Frame`] primitives take —
+/// the LCD is fully lit, so alpha is always `0xff`.
+const fn rgba(c: Rgb) -> Rgba {
+    [c[0], c[1], c[2], 0xff]
+}
 
 // ── Palette ──────────────────────────────────────────────────────────────
 const SCREEN_BG: Rgb = [0x2a, 0x18, 0x3e]; // warm dark purple (screen field)
@@ -77,22 +87,22 @@ const SPARKLE: Rgb = [0xff, 0x92, 0xcb]; // excited sparkle pink
 const SWEAT: Rgb = [0x8f, 0xc9, 0xff]; // pale-blue grumpy sweat
 
 /// Render the LCD face for `mood` at animation `frame` into a fresh
-/// `SIZE`×`SIZE` RGBA8 buffer (`SIZE*SIZE*4` bytes exactly — the host's
-/// validation invariant).
-pub(crate) fn render(mood: Mood, frame: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; SIZE * SIZE * 4];
+/// `SIZE`×`SIZE` [`Frame`] — its `data()` is `SIZE*SIZE*4` bytes exactly (the
+/// host's validation invariant, upheld by the [`Frame`] type itself). Wrap it
+/// for the wire with [`Frame::into_node`].
+pub(crate) fn render(mood: Mood, frame: usize) -> Frame {
+    let mut f = Frame::filled(SIZE, SIZE, rgba(SCREEN_BG));
     let face = face_params(mood, frame);
-    fill(&mut buf, SCREEN_BG);
-    draw_ears(&mut buf, face.ears);
-    draw_head(&mut buf);
-    draw_blush(&mut buf, face.blush);
-    draw_whiskers(&mut buf);
-    draw_nose(&mut buf);
-    draw_mouth(&mut buf, face.mouth);
-    draw_eyes(&mut buf, face.eyes, face.look);
-    draw_extra(&mut buf, face.extra, frame);
-    round_corners(&mut buf);
-    buf
+    draw_ears(&mut f, face.ears);
+    draw_head(&mut f);
+    draw_blush(&mut f, face.blush);
+    draw_whiskers(&mut f);
+    draw_nose(&mut f);
+    draw_mouth(&mut f, face.mouth);
+    draw_eyes(&mut f, face.eyes, face.look);
+    draw_extra(&mut f, face.extra, frame);
+    round_corners(&mut f);
+    f
 }
 
 /// One in ~six frames is a blink; a cheap integer hash jitters the cadence so
@@ -220,56 +230,35 @@ fn face_params(mood: Mood, frame: usize) -> Face {
 }
 
 // ── Drawing primitives (pure buffer functions, trivially testable) ─────────
-
-/// Paint one opaque pixel, silently clipping anything outside the buffer (so
-/// edge-straddling shapes never panic or wrap).
-fn plot(buf: &mut [u8], x: i32, y: i32, col: Rgb) {
-    let (Ok(px), Ok(py)) = (usize::try_from(x), usize::try_from(y)) else {
-        return;
-    };
-    if px >= SIZE || py >= SIZE {
-        return;
-    }
-    let i = (py * SIZE + px) * 4;
-    buf[i..i + 3].copy_from_slice(&col);
-    buf[i + 3] = 0xff;
-}
-
-/// Flood the whole buffer with one opaque color.
-fn fill(buf: &mut [u8], col: Rgb) {
-    for px in buf.chunks_exact_mut(4) {
-        px[0..3].copy_from_slice(&col);
-        px[3] = 0xff;
-    }
-}
-
-/// Horizontal run, inclusive of both ends.
-fn hline(buf: &mut [u8], x0: i32, x1: i32, y: i32, col: Rgb) {
-    for x in x0.min(x1)..=x0.max(x1) {
-        plot(buf, x, y, col);
-    }
-}
+//
+// The leaf primitives (`plot`/`fill`/`hline`) come from [`Frame`] — the kit
+// promoted them out of *this* file in #284, and they clip silently exactly as
+// the hand-rolled originals did. The shape helpers below — discs, triangles,
+// arcs, Bresenham segments — aren't in `Frame`'s vocabulary, so they stay
+// pet-local, built on `Frame::plot`/`hline`.
 
 /// A filled disc of radius `r` centered at (`cx`, `cy`).
-fn disc(buf: &mut [u8], cx: i32, cy: i32, r: i32, col: Rgb) {
+fn disc(f: &mut Frame, cx: i32, cy: i32, r: i32, col: Rgb) {
+    let c = rgba(col);
     for dy in -r..=r {
         for dx in -r..=r {
             if dx * dx + dy * dy <= r * r {
-                plot(buf, cx + dx, cy + dy, col);
+                f.plot(cx + dx, cy + dy, c);
             }
         }
     }
 }
 
 /// A 1px Bresenham segment.
-fn line(buf: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
+fn line(f: &mut Frame, mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
+    let c = rgba(col);
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
     loop {
-        plot(buf, x0, y0, col);
+        f.plot(x0, y0, c);
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -286,14 +275,15 @@ fn line(buf: &mut [u8], mut x0: i32, mut y0: i32, x1: i32, y1: i32, col: Rgb) {
 }
 
 /// A 2px-thick segment (the LCD look wants strokes wider than one pixel).
-fn stroke(buf: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, col: Rgb) {
-    line(buf, x0, y0, x1, y1, col);
-    line(buf, x0, y0 + 1, x1, y1 + 1, col);
+fn stroke(f: &mut Frame, x0: i32, y0: i32, x1: i32, y1: i32, col: Rgb) {
+    line(f, x0, y0, x1, y1, col);
+    line(f, x0, y0 + 1, x1, y1 + 1, col);
 }
 
 /// A filled triangle, either winding order (edge-sign test over the bbox).
 #[allow(clippy::many_single_char_names)]
-fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col: Rgb) {
+fn fill_tri(f: &mut Frame, p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col: Rgb) {
+    let c = rgba(col);
     let edge = |a: (i32, i32), b: (i32, i32), px: i32, py: i32| {
         (b.0 - a.0) * (py - a.1) - (b.1 - a.1) * (px - a.0)
     };
@@ -308,7 +298,7 @@ fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col:
             let w2 = edge(p0, p1, px, py);
             let inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
             if inside {
-                plot(buf, px, py, col);
+                f.plot(px, py, c);
             }
         }
     }
@@ -316,20 +306,22 @@ fn fill_tri(buf: &mut [u8], p0: (i32, i32), p1: (i32, i32), p2: (i32, i32), col:
 
 /// A shallow 2px arc across `±hw` about (`cx`, `cy`). Positive `depth` bows the
 /// middle **down** (a ‿ smile); negative bows it **up** (a ∩ frown).
-fn arc(buf: &mut [u8], cx: i32, cy: i32, hw: i32, depth: i32, col: Rgb) {
+fn arc(f: &mut Frame, cx: i32, cy: i32, hw: i32, depth: i32, col: Rgb) {
     if hw == 0 {
         return;
     }
+    let c = rgba(col);
     for dx in -hw..=hw {
         let y = cy + depth - depth * dx * dx / (hw * hw);
-        plot(buf, cx + dx, y, col);
-        plot(buf, cx + dx, y + 1, col);
+        f.plot(cx + dx, y, c);
+        f.plot(cx + dx, y + 1, c);
     }
 }
 
 /// Round off the four screen corners into the bezel color, so the square
 /// texture reads as an inset LCD panel.
-fn round_corners(buf: &mut [u8]) {
+fn round_corners(f: &mut Frame) {
+    let edge_col = rgba(SCREEN_EDGE);
     let last = DIM - 1;
     for py in 0..DIM {
         for px in 0..DIM {
@@ -348,7 +340,7 @@ fn round_corners(buf: &mut [u8]) {
                 0
             };
             if dx * dx + dy * dy > CORNER_R * CORNER_R {
-                plot(buf, px, py, SCREEN_EDGE);
+                f.plot(px, py, edge_col);
             }
         }
     }
@@ -364,34 +356,34 @@ const EYE_Y: i32 = 66;
 const EYE_LX: i32 = 50;
 const EYE_RX: i32 = 78;
 
-fn draw_head(buf: &mut [u8]) {
-    disc(buf, HEAD_CX, HEAD_CY, HEAD_R + 2, OUTLINE);
-    disc(buf, HEAD_CX, HEAD_CY, HEAD_R, HEAD);
+fn draw_head(f: &mut Frame) {
+    disc(f, HEAD_CX, HEAD_CY, HEAD_R + 2, OUTLINE);
+    disc(f, HEAD_CX, HEAD_CY, HEAD_R, HEAD);
 }
 
-fn draw_ears(buf: &mut [u8], ears: Ears) {
+fn draw_ears(f: &mut Frame, ears: Ears) {
     // Bases sit on the head's upper arc; the tip moves with the mood.
     let (l_tip, r_tip) = match ears {
         Ears::Up => ((38, 20), (90, 20)),
         Ears::Droop => ((28, 34), (100, 34)),
         Ears::Back => ((24, 44), (104, 44)),
     };
-    draw_ear(buf, (32, 52), (56, 46), l_tip);
-    draw_ear(buf, (72, 46), (96, 52), r_tip);
+    draw_ear(f, (32, 52), (56, 46), l_tip);
+    draw_ear(f, (72, 46), (96, 52), r_tip);
 }
 
 /// One ear: outlined outer triangle, lilac fill, pink inner.
-fn draw_ear(buf: &mut [u8], base_a: (i32, i32), base_b: (i32, i32), tip: (i32, i32)) {
-    fill_tri(buf, base_a, base_b, tip, OUTLINE);
+fn draw_ear(f: &mut Frame, base_a: (i32, i32), base_b: (i32, i32), tip: (i32, i32)) {
+    fill_tri(f, base_a, base_b, tip, OUTLINE);
     fill_tri(
-        buf,
+        f,
         shrink(base_a, tip, 2),
         shrink(base_b, tip, 2),
         shrink(tip, base_a, 2),
         HEAD,
     );
     fill_tri(
-        buf,
+        f,
         shrink(base_a, tip, 6),
         shrink(base_b, tip, 6),
         shrink(tip, base_a, 3),
@@ -407,126 +399,126 @@ fn shrink(p: (i32, i32), q: (i32, i32), n: i32) -> (i32, i32) {
     )
 }
 
-fn draw_blush(buf: &mut [u8], level: u8) {
+fn draw_blush(f: &mut Frame, level: u8) {
     let (col, r) = match level {
         1 => (BLUSH, 5),
         2 => (BLUSH_HOT, 6),
         _ => return,
     };
-    disc(buf, 40, 80, r, col);
-    disc(buf, 88, 80, r, col);
+    disc(f, 40, 80, r, col);
+    disc(f, 88, 80, r, col);
 }
 
-fn draw_whiskers(buf: &mut [u8]) {
+fn draw_whiskers(f: &mut Frame) {
     for (ys, ye) in [(78, 79), (84, 84), (90, 88)] {
-        line(buf, 18, ys, 40, ye, WHISKER);
-        line(buf, DIM - 1 - 18, ys, DIM - 1 - 40, ye, WHISKER);
+        line(f, 18, ys, 40, ye, WHISKER);
+        line(f, DIM - 1 - 18, ys, DIM - 1 - 40, ye, WHISKER);
     }
 }
 
-fn draw_nose(buf: &mut [u8]) {
-    fill_tri(buf, (60, 78), (68, 78), (64, 83), NOSE);
+fn draw_nose(f: &mut Frame) {
+    fill_tri(f, (60, 78), (68, 78), (64, 83), NOSE);
 }
 
-fn draw_mouth(buf: &mut [u8], mouth: MouthShape) {
+fn draw_mouth(f: &mut Frame, mouth: MouthShape) {
     let (mx, my) = (64, 86);
     match mouth {
         MouthShape::Cat => {
-            arc(buf, mx - 5, my, 5, 3, INK);
-            arc(buf, mx + 5, my, 5, 3, INK);
+            arc(f, mx - 5, my, 5, 3, INK);
+            arc(f, mx + 5, my, 5, 3, INK);
         }
         MouthShape::Open => {
-            disc(buf, mx, my + 1, 5, INK);
-            disc(buf, mx, my + 3, 2, NOSE);
+            disc(f, mx, my + 1, 5, INK);
+            disc(f, mx, my + 3, 2, NOSE);
         }
-        MouthShape::Frown => arc(buf, mx, my + 3, 7, -3, INK),
-        MouthShape::Tiny => disc(buf, mx, my, 2, INK),
+        MouthShape::Frown => arc(f, mx, my + 3, 7, -3, INK),
+        MouthShape::Tiny => disc(f, mx, my, 2, INK),
     }
 }
 
-fn draw_eyes(buf: &mut [u8], eyes: EyeShape, look: i32) {
+fn draw_eyes(f: &mut Frame, eyes: EyeShape, look: i32) {
     match eyes {
         EyeShape::Round => {
-            round_eye(buf, EYE_LX, EYE_Y, 6, look);
-            round_eye(buf, EYE_RX, EYE_Y, 6, look);
+            round_eye(f, EYE_LX, EYE_Y, 6, look);
+            round_eye(f, EYE_RX, EYE_Y, 6, look);
         }
         EyeShape::Wide => {
-            round_eye(buf, EYE_LX, EYE_Y, 8, 0);
-            round_eye(buf, EYE_RX, EYE_Y, 8, 0);
+            round_eye(f, EYE_LX, EYE_Y, 8, 0);
+            round_eye(f, EYE_RX, EYE_Y, 8, 0);
         }
         EyeShape::Closed => {
-            arc(buf, EYE_LX, EYE_Y, 6, 3, INK);
-            arc(buf, EYE_RX, EYE_Y, 6, 3, INK);
+            arc(f, EYE_LX, EYE_Y, 6, 3, INK);
+            arc(f, EYE_RX, EYE_Y, 6, 3, INK);
         }
         EyeShape::Narrow => {
-            round_eye(buf, EYE_LX, EYE_Y + 2, 5, 0);
-            round_eye(buf, EYE_RX, EYE_Y + 2, 5, 0);
+            round_eye(f, EYE_LX, EYE_Y + 2, 5, 0);
+            round_eye(f, EYE_RX, EYE_Y + 2, 5, 0);
             // Angry brows: \  /  slanting down toward the nose.
-            stroke(buf, EYE_LX - 7, EYE_Y - 8, EYE_LX + 5, EYE_Y - 3, INK);
-            stroke(buf, EYE_RX - 5, EYE_Y - 3, EYE_RX + 7, EYE_Y - 8, INK);
+            stroke(f, EYE_LX - 7, EYE_Y - 8, EYE_LX + 5, EYE_Y - 3, INK);
+            stroke(f, EYE_RX - 5, EYE_Y - 3, EYE_RX + 7, EYE_Y - 8, INK);
         }
     }
 }
 
 /// A round eye with a pupil glint offset by the horizontal `look`.
-fn round_eye(buf: &mut [u8], cx: i32, cy: i32, r: i32, look: i32) {
-    disc(buf, cx, cy, r, INK);
-    disc(buf, cx - 2 + look, cy - 2, r / 3, HIGHLIGHT);
+fn round_eye(f: &mut Frame, cx: i32, cy: i32, r: i32, look: i32) {
+    disc(f, cx, cy, r, INK);
+    disc(f, cx - 2 + look, cy - 2, r / 3, HIGHLIGHT);
 }
 
-fn draw_extra(buf: &mut [u8], extra: Extra, frame: usize) {
+fn draw_extra(f: &mut Frame, extra: Extra, frame: usize) {
     match extra {
         Extra::None => {}
-        Extra::Zzz(n) => draw_zzz(buf, n),
-        Extra::Sparkle => draw_sparkles(buf, frame),
-        Extra::Sweat => draw_sweat(buf, frame),
-        Extra::Dots(n) => draw_dots(buf, n),
+        Extra::Zzz(n) => draw_zzz(f, n),
+        Extra::Sparkle => draw_sparkles(f, frame),
+        Extra::Sweat => draw_sweat(f, frame),
+        Extra::Dots(n) => draw_dots(f, n),
     }
 }
 
 /// A rising `z z Z` above the right ear; higher z's are larger.
-fn draw_zzz(buf: &mut [u8], n: usize) {
+fn draw_zzz(f: &mut Frame, n: usize) {
     let zs = [(96, 40, 5), (106, 28, 7), (116, 14, 9)];
+    let c = rgba(ZZZ);
     for &(x, y, s) in zs.iter().take(n) {
-        hline(buf, x, x + s, y, ZZZ);
-        line(buf, x + s, y, x, y + s, ZZZ);
-        hline(buf, x, x + s, y + s, ZZZ);
+        f.hline(x, x + s, y, c);
+        line(f, x + s, y, x, y + s, ZZZ);
+        f.hline(x, x + s, y + s, c);
     }
 }
 
 /// Four-point sparkles that twinkle: each toggles size with the frame.
-fn draw_sparkles(buf: &mut [u8], frame: usize) {
+fn draw_sparkles(f: &mut Frame, frame: usize) {
     let stars = [(24, 40), (104, 44), (96, 100)];
+    let (spark, glint) = (rgba(SPARKLE), rgba(HIGHLIGHT));
     for (i, &(cx, cy)) in stars.iter().enumerate() {
         let s = 3 + i32::from(frame.wrapping_add(i).is_multiple_of(2)) * 2;
-        hline(buf, cx - s, cx + s, cy, SPARKLE);
-        for dy in -s..=s {
-            plot(buf, cx, cy + dy, SPARKLE);
-        }
-        plot(buf, cx, cy, HIGHLIGHT);
+        f.hline(cx - s, cx + s, cy, spark);
+        f.vline(cx, cy - s, cy + s, spark);
+        f.plot(cx, cy, glint);
     }
 }
 
 /// A pale-blue sweat drop by the left ear, dripping with the frame.
-fn draw_sweat(buf: &mut [u8], frame: usize) {
+fn draw_sweat(f: &mut Frame, frame: usize) {
     let cx = 30;
     let cy = 40 + i32::try_from(frame % 3).unwrap_or(0);
-    disc(buf, cx, cy, 4, SWEAT);
-    fill_tri(buf, (cx - 4, cy), (cx + 4, cy), (cx, cy - 8), SWEAT);
-    plot(buf, cx - 1, cy - 1, HIGHLIGHT);
+    disc(f, cx, cy, 4, SWEAT);
+    fill_tri(f, (cx - 4, cy), (cx + 4, cy), (cx, cy - 8), SWEAT);
+    f.plot(cx - 1, cy - 1, rgba(HIGHLIGHT));
 }
 
 /// Thinking `. .. ...` — the first `n` of three dots light up.
-fn draw_dots(buf: &mut [u8], n: usize) {
+fn draw_dots(f: &mut Frame, n: usize) {
     let dots = [(98, 28), (108, 28), (118, 28)];
     for &(cx, cy) in dots.iter().take(n) {
-        disc(buf, cx, cy, 2, DOT);
+        disc(f, cx, cy, 2, DOT);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SIZE, is_blink, render};
+    use super::{Frame, SIZE, is_blink, render};
     use crate::Mood;
 
     const MOODS: [Mood; 5] = [
@@ -545,7 +537,7 @@ mod tests {
             for frame in 0..40 {
                 let buf = render(mood, frame);
                 assert_eq!(
-                    buf.len(),
+                    buf.data().len(),
                     SIZE * SIZE * 4,
                     "{mood:?} frame {frame} must be a full 128x128 RGBA8 buffer"
                 );
@@ -557,7 +549,7 @@ mod tests {
     #[test]
     fn every_pixel_is_opaque() {
         let buf = render(Mood::Happy, 0);
-        assert!(buf.chunks_exact(4).all(|px| px[3] == 0xff));
+        assert!(buf.data().chunks_exact(4).all(|px| px[3] == 0xff));
     }
 
     /// Distinct moods must be visibly different (buffer inequality), so the
@@ -610,24 +602,98 @@ mod tests {
         );
     }
 
-    /// Drawing helpers clip: a shape centered off the edge must not panic or
-    /// wrap into the opposite side.
+    /// The pet-local shape helpers clip: a shape centered off the edge must not
+    /// panic or wrap into the opposite side. (`Frame`'s own leaf primitives are
+    /// covered by the kit's tests; this guards the helpers layered on top.)
     #[test]
     fn edge_shapes_stay_in_bounds() {
-        let mut buf = vec![0u8; SIZE * SIZE * 4];
-        super::fill(&mut buf, [0, 0, 0]);
+        let mut f = Frame::filled(SIZE, SIZE, [0, 0, 0, 0xff]);
         // Discs, arcs, lines, and triangles straddling every edge/corner.
-        super::disc(&mut buf, 0, 0, 20, [1, 2, 3]);
-        super::disc(&mut buf, 127, 127, 20, [1, 2, 3]);
-        super::disc(&mut buf, -10, 64, 20, [1, 2, 3]);
-        super::arc(&mut buf, 2, 1, 10, 5, [1, 2, 3]);
-        super::line(&mut buf, -5, -5, 140, 140, [1, 2, 3]);
-        super::fill_tri(&mut buf, (-8, -8), (140, 4), (4, 140), [1, 2, 3]);
+        super::disc(&mut f, 0, 0, 20, [1, 2, 3]);
+        super::disc(&mut f, 127, 127, 20, [1, 2, 3]);
+        super::disc(&mut f, -10, 64, 20, [1, 2, 3]);
+        super::arc(&mut f, 2, 1, 10, 5, [1, 2, 3]);
+        super::line(&mut f, -5, -5, 140, 140, [1, 2, 3]);
+        super::fill_tri(&mut f, (-8, -8), (140, 4), (4, 140), [1, 2, 3]);
         // Every mood at an extreme frame likewise must not panic.
         for mood in MOODS {
             let _ = render(mood, usize::MAX);
         }
-        assert_eq!(buf.len(), SIZE * SIZE * 4);
+        assert_eq!(f.data().len(), SIZE * SIZE * 4);
+    }
+
+    /// FNV-1a-64 over raw bytes — a deterministic, version-stable digest
+    /// (unlike `std::hash::DefaultHasher`, whose `SipHash` keys/output are not
+    /// stable across Rust releases), implemented inline so the golden needs no
+    /// hashing dependency.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h
+    }
+
+    /// Golden digests captured from the pre-`preem::Frame` renderer, one per
+    /// combo in the `MOODS` × `0..40` frames sweep (mood outermost, frame
+    /// innermost — the same nesting as [`golden_render_is_byte_identical`]).
+    /// The #650 migration is proven byte-for-byte iff that test stays green
+    /// **without editing this array**.
+    #[rustfmt::skip]
+    const GOLDEN: [u64; 200] = [
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x2927_7dea_40fb_e12a, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x2927_7dea_40fb_e12a, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe,
+        0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe,
+        0x7b08_6f27_19c0_bd76, 0x9b47_262e_d3a8_99fe, 0x4c3b_1fd7_9768_07a6, 0x9b47_262e_d3a8_99fe, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1, 0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0x76b8_da4a_ef05_36c1,
+        0xbafa_86ff_642f_1311, 0xfc60_c0b3_4ea3_96f5, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0x4ed6_2931_542a_01e8,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0xf894_1fca_23b6_17e4, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c, 0x952c_e894_6887_a868, 0xd38a_c721_3ba3_8c1c,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0x1b12_b6ac_131c_7fe9, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891,
+        0xc7c7_88f6_fb1d_03ad, 0x3ea5_036f_9e18_76f3, 0xe3f1_d337_b21f_4891, 0xc7c7_88f6_fb1d_03ad, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0x4700_3aab_6cb5_c1f4, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706, 0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8, 0xefd7_bd7b_46f5_1706,
+        0xa38f_987c_b550_70b8, 0xfbb7_4ca5_93b6_1fb8,
+    ];
+
+    /// Byte-for-byte identity guard for the #650 `preem::Frame` migration:
+    /// every mood/frame must still hash to its committed [`GOLDEN`] value. Runs
+    /// on both the pre- and post-refactor renderer, so a green run here *is*
+    /// the pixel-identity proof (enforced in CI, not merely asserted in the PR
+    /// body). Mirrors caw's `golden_render_is_byte_identical` (#365 / PR #378).
+    #[test]
+    fn golden_render_is_byte_identical() {
+        let mut i = 0;
+        for mood in MOODS {
+            for frame in 0..40 {
+                let got = fnv1a_64(render(mood, frame).data());
+                assert_eq!(got, GOLDEN[i], "byte drift at mood {mood:?} frame {frame}");
+                i += 1;
+            }
+        }
+        assert_eq!(i, GOLDEN.len(), "sweep length must match the golden array");
     }
 
     /// Sleepy is drawn eyes-closed regardless of the blink cycle: a blink frame

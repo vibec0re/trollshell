@@ -9,18 +9,32 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hytte::services::notifications;
-use hytte_plugin_proto::{Effect, EffectOutcome, HostMsg, Page};
+use hytte::services::{mpris, niri, notifications, pipewire};
+use hytte_plugin_proto::{
+    AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, NiriAction, Page,
+};
 use tokio::sync::mpsc;
 
 use super::datasource::DatasourceRouter;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
-/// (→ the modal drawer), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
+/// (→ the modal drawer), [`Effect::Niri`] (→ niri's IPC actions), [`Effect::Media`]
+/// (→ MPRIS transport on the active player), [`Effect::Audio`] (→ the default
+/// sink's volume/mute), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// [`Effect::Notify`] (→ a local notification toast, #406), [`Effect::RunCommand`]
 /// (→ a spawned `argv`, its outcome routed back as [`HostMsg::EffectResult`], #510),
-/// and [`Effect::RequestConsent`] (→ the interactive consent overlay, #487);
-/// anything else is logged and skipped. Capability enforcement happens
+/// [`Effect::RequestConsent`] (→ the interactive consent overlay, #487) and the two
+/// datasource legs (#509).
+///
+/// The match is **exhaustive over the effect vocabulary** — there is no catch-all
+/// (#648). The three compositor/media/audio variants were declared, cap-gated and
+/// audited as `allowed` while this broker quietly dropped them into a
+/// `warn!("unsupported in v1")`, which the plugin author never sees; the way that
+/// class of gap stops recurring is for a new [`Effect`] variant to be a compile
+/// error here, exactly as it already is in [`effect_kind`] and
+/// [`effect_capability`](super::session::effect_capability).
+///
+/// Capability enforcement happens
 /// **upstream** of here, per connection: [`super::session::enforce_capabilities`]
 /// drops any effect whose [`Capability`](hytte_plugin_proto::Capability) the plugin
 /// didn't declare before it ever reaches this broker (#436), so an effect arriving
@@ -67,6 +81,34 @@ pub(super) fn broker_effect(
                     crate::modal::open_plugin_on_focused(focused.as_deref(), plugin_id);
                 }
             }
+        }
+        Effect::Niri(action) => {
+            // #648: the compositor leg, onto niri's existing fire-and-forget IPC
+            // commands — the `Effect` → `do_thing` mapping the frontend-B spec
+            // sprinted at. Reaching here means the plugin holds
+            // `Capability::Niri`. Both actions address niri's own object ids; a
+            // plugin that guesses one wrong gets niri's own no-op, so the host
+            // does not second-guess the id (it has no cheaper truth than niri).
+            tracing::info!(plugin = %plugin_id, ?action, "plugin effect: Niri");
+            match *action {
+                NiriAction::FocusWorkspace { id } => niri::focus_workspace(id),
+                NiriAction::FocusWindow { id } => niri::focus_window(id),
+            }
+        }
+        Effect::Media(action) => {
+            // #648: the transport leg. The wire action carries no player — the
+            // vocabulary is deliberately player-agnostic — so the host resolves
+            // the target, and resolves it the same way the bar chip does.
+            // Reaching here means the plugin holds `Capability::Media`.
+            broker_media(plugin_id, *action);
+        }
+        Effect::Audio(action) => {
+            // #648: the audio leg, onto the *default sink* (the same target the
+            // volume chip drives), never a plugin-named device: the wire action
+            // names no sink, and picking one for the plugin would be host policy
+            // invented out of nothing. Reaching here means the plugin holds
+            // `Capability::Audio`.
+            broker_audio(plugin_id, *action);
         }
         Effect::RaiseOsd { title, body, icon } => {
             tracing::info!(plugin = %plugin_id, title = %title, "plugin effect: RaiseOsd");
@@ -152,10 +194,84 @@ pub(super) fn broker_effect(
             tracing::info!(plugin = %plugin_id, request_id = *request_id, "plugin effect: DatasourceResult");
             datasource.deliver_result(*request_id, plugin_id.to_owned(), outcome.clone());
         }
-        other => {
-            tracing::warn!(plugin = %plugin_id, ?other, "plugin effect unsupported in v1; skipped");
+    }
+}
+
+// ── Media / audio legs (#648) ────────────────────────────────────────────────
+
+/// Send one wire [`MediaAction`] to the MPRIS player the shell currently treats
+/// as active (#648).
+///
+/// The target is [`mpris::active_bus_name`] — a live manual pin if the user made
+/// one, else the Playing > Paused > first heuristic — so a plugin's transport
+/// action and a click on the bar chip's own buttons always drive the same
+/// player. With **no** player tracked there is nothing to address: the action is
+/// skipped with a `warn`, never silently. It is a fire-and-forget effect (no
+/// `EffectResult` leg in the vocabulary), so the host log is the only signal
+/// there is — which is precisely why it has to be a loud one.
+fn broker_media(plugin_id: &str, action: MediaAction) {
+    let Some(bus) = mpris::active_bus_name() else {
+        tracing::warn!(
+            plugin = %plugin_id, ?action,
+            "plugin effect: Media with no active player; skipped",
+        );
+        return;
+    };
+    tracing::info!(plugin = %plugin_id, ?action, player = %bus, "plugin effect: Media");
+    match action {
+        MediaAction::PlayPause => mpris::play_pause(&bus),
+        MediaAction::Next => mpris::next(&bus),
+        MediaAction::Previous => mpris::previous(&bus),
+    }
+}
+
+/// Apply one wire [`AudioAction`] to the default sink (#648). `SetVolume` is
+/// bounds-checked through [`clamp_volume`] before it reaches the audio service;
+/// `ToggleMute` needs no argument validation.
+fn broker_audio(plugin_id: &str, action: AudioAction) {
+    match action {
+        AudioAction::SetVolume(requested) => {
+            let Some(linear) = clamp_volume(requested) else {
+                tracing::warn!(
+                    plugin = %plugin_id, requested,
+                    "plugin effect: Audio SetVolume with a non-finite level; skipped",
+                );
+                return;
+            };
+            if !(MIN_VOLUME..=MAX_VOLUME).contains(&requested) {
+                tracing::warn!(
+                    plugin = %plugin_id, requested, applied = linear,
+                    "plugin effect: Audio SetVolume outside the wire-documented range; clamped",
+                );
+            }
+            tracing::info!(plugin = %plugin_id, linear, "plugin effect: Audio SetVolume");
+            pipewire::set_volume(linear);
+        }
+        AudioAction::ToggleMute => {
+            tracing::info!(plugin = %plugin_id, "plugin effect: Audio ToggleMute");
+            pipewire::toggle_mute();
         }
     }
+}
+
+/// The wire-documented bounds of [`AudioAction::SetVolume`] ("`0.0..=1.0`").
+const MIN_VOLUME: f64 = 0.0;
+const MAX_VOLUME: f64 = 1.0;
+
+/// Bounds-check a plugin-requested linear volume (#648). Pure, so the host's
+/// policy on a hostile or buggy level is unit-testable without an audio daemon.
+///
+/// The host is the chokepoint between an arbitrary same-user process and the
+/// default sink, and the `f64` off the wire can be anything. The audio service
+/// writes it through as a per-channel **linear gain** in the SPA pod without
+/// re-checking it, so this is where it gets checked: a level outside the
+/// documented `0.0..=1.0` is **clamped** (the plugin asked for "as loud as
+/// possible" and gets exactly that, not a 5× blast), and a non-finite one is
+/// **rejected** — `NaN`/`inf` has no defensible clamp and nothing sane to send.
+fn clamp_volume(requested: f64) -> Option<f64> {
+    requested
+        .is_finite()
+        .then(|| requested.clamp(MIN_VOLUME, MAX_VOLUME))
 }
 
 /// Map a wire [`Page`] onto the host's `modal::Page`, reading the runtime Stats
@@ -544,10 +660,10 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditDecision, AuditLog, EffectOutcome, RUN_COMMAND_MAX_OUTPUT, command_outcome,
-        effect_kind, format_audit_line, truncate_on_char_boundary,
+        AuditDecision, AuditLog, EffectOutcome, MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT,
+        clamp_volume, command_outcome, effect_kind, format_audit_line, truncate_on_char_boundary,
     };
-    use hytte_plugin_proto::{Effect, NiriAction, Page};
+    use hytte_plugin_proto::{AudioAction, Effect, MediaAction, NiriAction, Page};
 
     #[test]
     fn command_outcome_maps_success_and_stdout() {
@@ -625,12 +741,36 @@ mod tests {
         );
     }
 
+    /// #648: the host clamps a plugin-requested level into the wire-documented
+    /// `0.0..=1.0` and refuses a non-finite one outright, so an arbitrary `f64`
+    /// off the socket can never reach the audio graph as-is.
+    #[test]
+    fn clamp_volume_bounds_the_level_and_rejects_non_finite() {
+        // In range: applied verbatim.
+        assert_eq!(clamp_volume(0.42), Some(0.42));
+        assert_eq!(clamp_volume(MIN_VOLUME), Some(MIN_VOLUME));
+        assert_eq!(clamp_volume(MAX_VOLUME), Some(MAX_VOLUME));
+        // Out of range: clamped to the nearest bound, not dropped — the plugin
+        // asked to go as loud/quiet as possible and gets exactly that.
+        assert_eq!(clamp_volume(5.0), Some(MAX_VOLUME));
+        assert_eq!(clamp_volume(-2.0), Some(MIN_VOLUME));
+        // Non-finite: no defensible clamp, so refused.
+        assert_eq!(clamp_volume(f64::NAN), None);
+        assert_eq!(clamp_volume(f64::INFINITY), None);
+        assert_eq!(clamp_volume(f64::NEG_INFINITY), None);
+    }
+
     #[test]
     fn effect_kind_names_the_variants() {
         assert_eq!(effect_kind(&Effect::OpenPage(Page::Media)), "OpenPage");
         assert_eq!(
             effect_kind(&Effect::Niri(NiriAction::FocusWindow { id: 1 })),
             "Niri"
+        );
+        assert_eq!(effect_kind(&Effect::Media(MediaAction::PlayPause)), "Media");
+        assert_eq!(
+            effect_kind(&Effect::Audio(AudioAction::ToggleMute)),
+            "Audio"
         );
         assert_eq!(
             effect_kind(&Effect::RunCommand {

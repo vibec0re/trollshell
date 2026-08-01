@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_bus::{BusKind, OwnNameSignal, ProxyState, call, proxy, signals};
+use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, call, proxy, signals};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -108,6 +108,12 @@ pub struct TrayHandles {
     /// Kept alive so the `own_name` task continues owning
     /// `org.kde.StatusNotifierWatcher` for the process lifetime.
     _ownership: OwnNameSignal,
+    /// Mirror of the `own_name` task's [`OwnState`], published by
+    /// [`ownership()`] so a lost name race is visible in the UI rather than
+    /// presenting as a permanently empty tray (#747, #653). See
+    /// [`crate::notifications::mirror_own_state`] for why this is a mirror and
+    /// not the [`OwnNameSignal`] itself.
+    own_state: Mutable<OwnState>,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -169,6 +175,7 @@ impl Service for TrayService {
 
         TrayHandles {
             items,
+            own_state: crate::notifications::mirror_own_state(&ownership),
             _ownership: ownership,
         }
     }
@@ -188,6 +195,26 @@ pub fn items() -> impl Signal<Item = Vec<TrayItem>> {
         r.get::<TrayHandles>()
             .expect("tray::service() not registered")
             .items
+            .signal_cloned()
+    })
+}
+
+/// Signal of the shell's hold on the `org.kde.StatusNotifierWatcher` bus name.
+///
+/// The watcher name is a session singleton in the same way
+/// `org.freedesktop.Notifications` is: tray apps look it up once and register
+/// with whoever answers. Lose it to a second bar, plasmashell, or a leftover
+/// `snixembed`, and no item ever registers with us — [`items()`] stays empty
+/// and, from the UI, that is indistinguishable from "no app has a tray icon".
+///
+/// See [`crate::notifications::ownership`] for how to read the individual
+/// states; the rules are identical (`Acquiring`/`Lost` are in-flight and must
+/// not be surfaced, `PermanentlyTaken`/`Denied` mean inert).
+pub fn ownership() -> impl Signal<Item = OwnState> {
+    registry::with(|r| {
+        r.get::<TrayHandles>()
+            .expect("tray::service() not registered")
+            .own_state
             .signal_cloned()
     })
 }

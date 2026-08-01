@@ -7,9 +7,14 @@
 //! at a time. Disable mako, dunst, or any other notification daemon before
 //! starting trollshell, otherwise the name acquisition will fail and the
 //! service will keep retrying.
+//!
+//! That failure is otherwise entirely silent from the shell's point of view —
+//! `Notify` calls simply land in the other daemon and nothing ever reaches
+//! [`active()`]. [`ownership()`] exposes the live [`OwnState`] so a consumer
+//! can say so; `trollshell`'s bell chip binds it (#747).
 
-use futures_signals::signal::{Mutable, Signal};
-use hytte_bus::OwnNameSignal;
+use futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte_bus::{OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -179,6 +184,51 @@ pub struct NotificationsHandles {
     /// Kept alive so the `own_name` task continues owning
     /// `org.freedesktop.Notifications` for the process lifetime.
     _ownership: OwnNameSignal,
+    /// Mirror of the `own_name` task's [`OwnState`], published by
+    /// [`ownership()`] so a lost name race is visible in the UI rather than
+    /// presenting as "notifications just stopped working" (#747, #653).
+    ///
+    /// A mirror rather than the [`OwnNameSignal`] itself because
+    /// `OwnNameSignal::signal_cloned` returns an `impl Signal` that captures
+    /// `&self` under Rust 2024's lifetime-capture rules, so it can never
+    /// satisfy `bind`'s `S: 'static` bound — see [`mirror_own_state`].
+    own_state: Mutable<OwnState>,
+}
+
+/// Forward an [`OwnNameSignal`]'s state into a plain `Mutable<OwnState>` that
+/// the registry can hand out as a `'static` signal.
+///
+/// `OwnNameSignal::signal_cloned(&self)` returns `impl Signal` and, under Rust
+/// 2024's lifetime-capture rules, that opaque type captures `&self`. It is
+/// therefore only ever usable while the handle it came from is still borrowed
+/// — fine for `hytte-bus`'s own tests, useless to `hytte_reactive::bind`,
+/// which requires `S: Signal + 'static`. Forwarding through a `Mutable` costs
+/// one parked task per owned name and lands the state in exactly the
+/// `Mutable<T>`-field shape every other service's `Handles` already uses.
+///
+/// (The tidier fix is `-> impl Signal<Item = OwnState> + use<>` on
+/// `OwnNameSignal::signal_cloned` — the concrete `MutableSignalCloned` it
+/// returns is already `'static`. That is a one-line change in
+/// `hytte-bus/src/own.rs`, which #745 owns; filed as follow-up rather than
+/// edited from here.)
+///
+/// Lives in this module because `org.freedesktop.Notifications` is the
+/// load-bearing case; [`crate::tray`] is the only other caller. Hoist it to a
+/// module of its own if a third owned name ever needs it.
+pub(crate) fn mirror_own_state(source: &OwnNameSignal) -> Mutable<OwnState> {
+    let mirror = Mutable::new(OwnState::Acquiring);
+    let writer = mirror.clone();
+    let source = source.clone();
+    runtime::handle().spawn(async move {
+        source
+            .signal_cloned()
+            .for_each(|state| {
+                writer.set_neq(state);
+                std::future::ready(())
+            })
+            .await;
+    });
+    mirror
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -229,6 +279,7 @@ impl Service for NotificationsService {
             active,
             _next_id: next_id,
             history,
+            own_state: mirror_own_state(&ownership),
             _ownership: ownership,
         }
     }
@@ -259,6 +310,39 @@ pub fn history() -> impl Signal<Item = Vec<HistoryEntry>> {
         r.get::<NotificationsHandles>()
             .expect("notifications::service() not registered")
             .history
+            .signal_cloned()
+    })
+}
+
+/// Signal of the shell's hold on the `org.freedesktop.Notifications` bus name.
+///
+/// `org.freedesktop.Notifications` is a **session singleton**: exactly one
+/// process may own it. Lose that race to mako, dunst, or a second copy of the
+/// shell and every `Notify` on the session goes to the winner — [`active()`]
+/// stays empty forever and no error is ever raised at us. Nothing about that is
+/// distinguishable, from the UI, from "nobody sent a notification", which is
+/// what made #653 worth filing: the condition was observable only in the
+/// journal, and only at a log level the deployed shell filters out (#746).
+///
+/// Consumers should read the states as:
+///
+/// * [`OwnState::Owned`] — working.
+/// * [`OwnState::Acquiring`] / [`OwnState::Lost`] — **in flight, say nothing**.
+///   `own_name` re-requests 250 ms after a loss and only latches
+///   `PermanentlyTaken` after several consecutive losses to the *same* holder,
+///   so a bus blip or a reconnect passes through these two routinely. Warning
+///   on them would flap.
+/// * [`OwnState::PermanentlyTaken`] / [`OwnState::Denied`] — the service is
+///   **inert**; this is the pair worth telling the user about.
+///
+/// Self-clearing: the ownership task re-attempts the moment `NameOwnerChanged`
+/// reports the name released, so quitting the rival daemon flips this back to
+/// `Owned` without a shell restart.
+pub fn ownership() -> impl Signal<Item = OwnState> {
+    registry::with(|r| {
+        r.get::<NotificationsHandles>()
+            .expect("notifications::service() not registered")
+            .own_state
             .signal_cloned()
     })
 }

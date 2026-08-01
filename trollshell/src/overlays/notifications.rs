@@ -39,6 +39,15 @@
 //! Both exist because destroying a card releases the hover-pause hold
 //! [`attach_hover_pause`] took, and a pointer that never moves generates no
 //! crossing event to take it again (#593).
+//!
+//! # Hover holds
+//!
+//! Which toast is hovered is a fact the overlay observes (GTK crossing events)
+//! and the service records (a per-id hover count). [`HoldState`] is the whole of
+//! the overlay's half, and the rule that keeps the two from drifting is stated
+//! there: a card's claim on the count is **renewed against the entry as it
+//! stands now** at the end of every emission, so entry identity never enters the
+//! correctness argument (#626).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -85,20 +94,21 @@ struct ToastView {
 }
 
 /// A mounted toast card, the notification snapshot it was built from, and the
-/// hover-hold flag its motion controller drives.
+/// hover claim its motion controller drives.
 ///
 /// The snapshot is what makes [`apply_emission`]'s "has anything actually
-/// changed?" test possible; the flag is what lets a genuine rebuild carry the
-/// service-side hover hold across the swap. Both are #593.
+/// changed?" test possible (#593); the claim is what lets a genuine rebuild
+/// carry the service-side hover hold across the swap (#593) and what
+/// [`apply_emission`] renews at the end of every pass (#626).
 struct CardEntry {
     widget: gtk::Widget,
     /// The notification this card was rendered from — compared against the
     /// incoming one by [`card_content_eq`].
     notif: Notification,
-    /// Shared with the card's `EventControllerMotion` / `connect_unmap`
-    /// handlers: true exactly while this card holds one service-side hover
-    /// hold on `notif.id`. See [`attach_hover_pause`].
-    holds_hover: Rc<Cell<bool>>,
+    /// This card's claim on the service-side hover count for `notif.id`,
+    /// shared with its `EventControllerMotion` / `connect_unmap` handlers.
+    /// See [`HoldState`].
+    hold: CardHold,
 }
 
 // ── Thread-local window storage ───────────────────────────────────────────────
@@ -318,6 +328,21 @@ fn apply_emission(
             None => mount_card(&view.vbox, notif),
         };
         map.insert(*id, entry);
+    }
+
+    // Renew every live hover claim against the timer entries **as they stand
+    // now** (#626). This is the step that makes the widget-side record
+    // un-losable rather than merely well-behaved: the loop above cannot tell a
+    // surviving timer entry from one that was torn down and re-created with a
+    // zero hover count since the last emission (a `CloseNotification` followed
+    // by a re-post of the same id, both landing before GTK polled), and
+    // `HoldState::resync` is what makes it not have to. See [`HoldState`].
+    //
+    // Runs over every mounted card, not just the ones this pass rebuilt: an
+    // identical re-post keeps its card via `card_content_eq` above and so takes
+    // the `continue` branch, yet its entry is just as replaceable.
+    for entry in map.values() {
+        entry.hold.resync();
     }
 
     // Manage the overflow "+N more" card. Singleton, lives in
@@ -541,47 +566,41 @@ fn mount_card(vbox: &gtk::Box, notif: &Notification) -> CardEntry {
 ///
 /// Two things the naive remove-then-append doesn't do:
 ///
-/// - **Carries the hover hold** (#593). If `old` holds one, a *second* hold is
-///   taken before `old` is unmapped, so its `connect_unmap` teardown drops the
-///   service-side count from two back to one rather than to zero, the countdown
-///   never re-arms mid-read, and the fresh card inherits the hold (seeded into
-///   its `holds_hover`, so its eventual `leave`/`unmap` balances it exactly
-///   once). Waiting for a crossing event to re-establish the pause is precisely
+/// - **Carries the hover claim** (#593). If `old` holds one, it is *moved* onto
+///   the replacement before `old` is unmapped, so `old`'s `connect_unmap`
+///   teardown finds nothing to release and the swap makes **no service call at
+///   all**. Waiting for a crossing event to re-establish the pause is precisely
 ///   what fails under a pointer that doesn't move.
 ///
-///   That "two, not zero" rests on the service keeping one timer entry — and its
-///   hover count — for the whole life of a notification, sticky or finite
-///   (#619). It does not hold on its own: before #619 a sticky phase deleted the
-///   entry, so `old.holds_hover` could be true against a count of zero and this
-///   swap's own `resume` re-armed the countdown under a parked pointer.
+///   A move, not the release/re-take pair this used to do (#626). That pair was
+///   ordered take-then-release specifically so the service-side count went
+///   1 → 2 → 1 instead of 1 → 0 → 1, since reaching zero with a finite timeout
+///   arms a fresh countdown. But it only went 1 → 2 → 1 while the entry the
+///   count lives in survived the swap; a `CloseNotification` plus a re-post of
+///   the same id, both landing before GTK polled, replaced it with a fresh
+///   `hover_count: 0` entry, and then the very same pair ran 0 → 1 → 0 and armed
+///   under a parked pointer. Moving the claim removes the pair, and with it
+///   every ordering question about an entry this function cannot see.
 ///
-///   Still open (**#626**): if the notification is *closed and re-posted* under
-///   the same id while this card is mounted and holding, the entry is torn down
-///   and recreated with a count of zero, and the carried hold then runs
-///   0 → 1 → 0 and arms — the #619 symptom by a different route. Closing that
-///   needs the hold to name the entry generation it was taken against, which is
-///   more than this swap can decide locally. A close with no re-post is fine:
-///   the entry stays gone, both calls no-op, and there is nothing left to expire.
+///   The claim the replacement inherits is then renewed against whatever entry
+///   exists by [`apply_emission`]'s closing `resync` pass — which is what
+///   actually re-establishes the hold when the entry *was* replaced. This
+///   function deliberately decides nothing about that; see [`HoldState`].
 /// - **Keeps the card's place** in the stack, rather than sending an updated
 ///   toast to the bottom on every re-post.
 ///
 /// Residual case, deliberately accepted: if the replacement card is small
 /// enough that the pointer no longer lies over it, no `leave` will ever come
-/// and the inherited hold lasts until the card unmaps — i.e. the toast waits
+/// and the inherited claim lasts until the card unmaps — i.e. the toast waits
 /// for a dismiss instead of expiring. Bounded (the `connect_unmap` teardown
 /// still balances the count) and strictly the safer failure of the two.
 fn replace_card(vbox: &gtk::Box, old: &CardEntry, notif: &Notification) -> CardEntry {
-    let carried = old.holds_hover.get();
-    if carried {
-        notifications::pause_expiry(notif.id);
-    }
     let after = old.widget.prev_sibling();
-    // Fires `old`'s `connect_unmap` → `resume_expiry`, balancing the hold
-    // `old` itself took (never the one taken just above).
-    vbox.remove(&old.widget);
-
     let entry = build_card(notif);
-    entry.holds_hover.set(carried);
+    // Before the teardown, so the `connect_unmap` that `remove` fires below
+    // sees a card with no claim left and stands down.
+    entry.hold.adopt_from(&old.hold);
+    vbox.remove(&old.widget);
     vbox.insert_child_after(&entry.widget, after.as_ref());
     entry
 }
@@ -714,66 +733,258 @@ fn build_card(notif: &Notification) -> CardEntry {
     card.add_controller(gesture);
 
     // Hover-pause the auto-expiry countdown while the pointer is over the card.
-    let holds_hover = attach_hover_pause(&card, notif.id);
+    let hold = attach_hover_pause(&card, notif.id);
 
     CardEntry {
         widget: card.upcast(),
         notif: notif.clone(),
-        holds_hover,
+        hold,
+    }
+}
+
+// ── Hover hold ────────────────────────────────────────────────────────────────
+
+/// One service-side call the overlay makes on behalf of a hover claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldCall {
+    /// [`notifications::pause_expiry`].
+    Pause,
+    /// [`notifications::resume_expiry`].
+    Resume,
+}
+
+/// What a [`HoldState`] transition asks the effect layer to do. Split out from
+/// the transition so the transitions stay pure — testable with no display
+/// server, no notifications service, and no tokio runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldAction {
+    /// Claim a hold this card did not have.
+    Take,
+    /// Give up the hold this card had.
+    Release,
+    /// Give the hold up and immediately re-claim it, within one GTK main-loop
+    /// iteration. See [`HoldState::resync`].
+    Renew,
+    /// Nothing to do.
+    Nothing,
+}
+
+impl HoldAction {
+    /// The exact call sequence this action performs, in order.
+    ///
+    /// Both [`CardHold::apply`] and the state-machine tests drive this one list,
+    /// so a test that pins an ordering pins the ordering the shell emits rather
+    /// than a paraphrase of it.
+    fn calls(self) -> &'static [HoldCall] {
+        match self {
+            Self::Take => &[HoldCall::Pause],
+            Self::Release => &[HoldCall::Resume],
+            Self::Renew => &[HoldCall::Resume, HoldCall::Pause],
+            Self::Nothing => &[],
+        }
+    }
+}
+
+/// One toast card's claim on the service-side hover count for its notification
+/// id — the entirety of the overlay's hover bookkeeping.
+///
+/// # Why a claim rather than a mirror
+///
+/// "This toast is hovered" is observed here (GTK crossing events) and recorded
+/// there (`TimerState::hover_count`, one entry per live notification). Five
+/// defects in a row (#567 → #593 → #596 → #619 → #626) were the same shape: the
+/// two records had different lifetimes, so a widget-side `true` outlived — or
+/// out-*lived-through* — the service-side entry it was taken against, and the
+/// release it eventually issued landed somewhere it did not belong. The
+/// arithmetic was never wrong; the addressing was.
+///
+/// So this type does not mirror the count. It records only that **this card
+/// claims one unit of it**, and the overlay discharges that claim by
+/// *renewing* it — [`resync`](Self::resync), run over every mounted card at the
+/// end of every emission — rather than by remembering where it was first taken.
+///
+/// # Why renewal cannot lose the hold
+///
+/// [`HoldAction::Renew`] is `resume_expiry` immediately followed by
+/// `pause_expiry`, and its postcondition is *"hover count ≥ 1 for this id and
+/// nothing armed"* under **every** state the entry can be in, because:
+///
+/// - **Entry re-created since the claim was taken** (the #626 case: a
+///   `CloseNotification` dropped it and a re-post minted a fresh
+///   `hover_count: 0` one that armed). The `resume` is clamped to a no-op —
+///   `TimerState::resume` returns `Nothing` at a count of zero — and the
+///   `pause` then takes that fresh entry 0 → 1, aborting the countdown it
+///   armed.
+/// - **Entry survived, this is its only claim.** 1 → 0 arms, 0 → 1 aborts it
+///   again. Observationally neutral: the re-armed duration is
+///   `max(remaining, MIN_RESUME)`, the pause records that back as `remaining`,
+///   and the eventual real leave arms `max(remaining, MIN_RESUME)` either way.
+///   (The recorded remainder loses the microseconds between the two calls each
+///   time, and the sleep task spawned by the first is aborted by the second
+///   before it can tick — both bounded by that same `MIN_RESUME` floor.)
+/// - **Entry survived, another monitor's copy also claims it.** 2 → 1 → 2, no
+///   edge crossed, no effect whatsoever.
+/// - **Entry gone and not re-posted.** Both calls find no entry and no-op.
+///
+/// None of those four cases needs to be distinguished, and the overlay could
+/// not distinguish them anyway. That is the point: *entry identity is not part
+/// of the correctness argument*, so it cannot be got wrong. The order is
+/// load-bearing and is the only ordering that works — `pause`-then-`resume`
+/// would take a fresh entry 0 → 1 → 0 and arm, which is exactly the bug.
+///
+/// A card swap ([`replace_card`]) correspondingly makes *no* service call: the
+/// claim is moved with [`transfer`](Self::transfer), so no count edge is crossed
+/// during the teardown, and the renewal pass re-establishes the hold afterwards.
+///
+/// # Residual
+///
+/// The window between the service arming a re-created entry (on the D-Bus
+/// worker) and the renewal pass running (on the GTK main thread, next poll) is
+/// not closed — a notification whose timeout is shorter than one main-loop
+/// iteration could still expire inside it. Closing that needs the service to
+/// carry the count across the close/re-post, which is not something the overlay
+/// can decide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HoldState {
+    /// True exactly while this card claims one unit of the service-side hover
+    /// count for its notification id.
+    held: bool,
+}
+
+impl HoldState {
+    /// The pointer entered this card. Idempotent, so repeated `enter`s — or an
+    /// `enter` on a card that inherited a claim via [`transfer`](Self::transfer)
+    /// — never take a second hold.
+    fn enter(self) -> (Self, HoldAction) {
+        if self.held {
+            (self, HoldAction::Nothing)
+        } else {
+            (Self { held: true }, HoldAction::Take)
+        }
+    }
+
+    /// The pointer left this card, or the card unmapped. Both wire here and
+    /// exactly one of them may act: GTK does not guarantee a `leave` before an
+    /// unmap (which would strand the timer paused forever), nor an unmap
+    /// without a preceding `leave` (which would drift the count).
+    fn leave(self) -> (Self, HoldAction) {
+        if self.held {
+            (Self { held: false }, HoldAction::Release)
+        } else {
+            (self, HoldAction::Nothing)
+        }
+    }
+
+    /// Renew a live claim against the timer entry as it stands *now*. The state
+    /// is unchanged — this card still claims exactly one unit either way; only
+    /// the entry that unit sits in may have been swapped out from under it. See
+    /// the type doc for why this is total.
+    fn resync(self) -> (Self, HoldAction) {
+        let action = if self.held {
+            HoldAction::Renew
+        } else {
+            HoldAction::Nothing
+        };
+        (self, action)
+    }
+
+    /// Move this claim from a card about to be torn down onto its replacement,
+    /// returning `(predecessor, successor)`.
+    ///
+    /// One operation returning both halves, deliberately: a transfer that only
+    /// cleared the predecessor would drop the claim, and one that only seeded
+    /// the successor would double it — and both were expressible when this was
+    /// a bare `Cell<bool>` read by [`replace_card`]. It emits no [`HoldAction`]
+    /// because a move crosses no count edge.
+    fn transfer(self) -> (Self, Self) {
+        (Self { held: false }, self)
+    }
+}
+
+/// Runtime handle to one card's [`HoldState`].
+///
+/// `Rc<Cell<…>>` because the card's motion controller, its `connect_unmap`
+/// handler, and the [`CardEntry`] all drive the same claim; `id` rides along so
+/// no caller has to re-supply it and mis-address a release.
+#[derive(Clone)]
+struct CardHold {
+    id: u32,
+    state: Rc<Cell<HoldState>>,
+}
+
+impl CardHold {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            state: Rc::new(Cell::new(HoldState::default())),
+        }
+    }
+
+    /// Run one pure transition and perform the calls it asks for.
+    fn apply(&self, transition: fn(HoldState) -> (HoldState, HoldAction)) {
+        let (next, action) = transition(self.state.get());
+        self.state.set(next);
+        for call in action.calls() {
+            match call {
+                HoldCall::Pause => notifications::pause_expiry(self.id),
+                HoldCall::Resume => notifications::resume_expiry(self.id),
+            }
+        }
+    }
+
+    fn enter(&self) {
+        self.apply(HoldState::enter);
+    }
+
+    fn leave(&self) {
+        self.apply(HoldState::leave);
+    }
+
+    fn resync(&self) {
+        self.apply(HoldState::resync);
+    }
+
+    /// Adopt `old`'s claim onto this (freshly built) card — see
+    /// [`HoldState::transfer`]. Makes no service call by construction.
+    fn adopt_from(&self, old: &Self) {
+        let (cleared, mine) = old.state.get().transfer();
+        old.state.set(cleared);
+        self.state.set(mine);
     }
 }
 
 /// Wire hover-pause of a toast's auto-expiry onto `card` (#567). While the
 /// pointer is over the card, the service holds the expiry timer; on leave it
-/// resumes with the remaining time.
+/// resumes with the remaining time. A sticky notification takes and releases the
+/// claim like any other: there is no countdown to pause, but the service still
+/// records the count, so a `replaces_id` re-post that turns the notification
+/// finite inherits the hold instead of arming behind a pointer that never
+/// moved (#619).
 ///
-/// `holds_enter` clamps THIS card's contribution to the service-side
-/// hover-count to at most one, so repeated enter/leave signals (or a stray
-/// leave) can't drift the count, and multiple per-monitor toast copies each
-/// contribute independently. The `connect_unmap` teardown balances the count
-/// if the card is removed while still hovered — GTK does not guarantee a
-/// `leave` on unmap, which would otherwise strand the timer paused forever.
-/// A sticky notification takes and releases the hold like any other: there is no
-/// countdown to pause, but the service still records the count, so a `replaces_id`
-/// re-post that turns the notification finite inherits the hold instead of
-/// arming behind a pointer that never moved (#619).
-///
-/// Returns the `holds_enter` flag so a card swap can read it and seed the
-/// successor's — see [`replace_card`] (#593). Setting it to `true` on a fresh
-/// card asserts "this card already owns a hold", which is why the swap takes
-/// that hold explicitly before tearing the old card down.
-fn attach_hover_pause(card: &gtk::Box, id: u32) -> Rc<Cell<bool>> {
-    let holds_enter = Rc::new(Cell::new(false));
+/// Returns the claim so a card swap can move it to the successor
+/// ([`replace_card`], #593) and so [`apply_emission`] can renew it (#626). All
+/// three of the handlers wired here, and both of those callers, go through
+/// [`HoldState`] — there is no other way to touch the count from the overlay.
+fn attach_hover_pause(card: &gtk::Box, id: u32) -> CardHold {
+    let hold = CardHold::new(id);
 
     let motion = gtk::EventControllerMotion::new();
     {
-        let holds = holds_enter.clone();
-        motion.connect_enter(move |_, _, _| {
-            if !holds.replace(true) {
-                notifications::pause_expiry(id);
-            }
-        });
+        let hold = hold.clone();
+        motion.connect_enter(move |_, _, _| hold.enter());
     }
     {
-        let holds = holds_enter.clone();
-        motion.connect_leave(move |_| {
-            if holds.replace(false) {
-                notifications::resume_expiry(id);
-            }
-        });
+        let hold = hold.clone();
+        motion.connect_leave(move |_| hold.leave());
     }
     card.add_controller(motion);
 
     {
-        let holds = holds_enter.clone();
-        card.connect_unmap(move |_| {
-            if holds.replace(false) {
-                notifications::resume_expiry(id);
-            }
-        });
+        let hold = hold.clone();
+        card.connect_unmap(move |_| hold.leave());
     }
 
-    holds_enter
+    hold
 }
 
 // ── Overflow card builder ─────────────────────────────────────────────────────
@@ -870,6 +1081,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{Action, Notification, NotificationImage, Urgency};
+    use super::{HoldAction, HoldCall, HoldState};
     use super::{actions_eq, card_content_eq, clamp_lines, image_eq};
 
     /// A plain notification to mutate one field of per test.
@@ -1021,5 +1233,374 @@ mod tests {
         // Same string, different variant — one is loaded from disk, the other
         // from the icon theme.
         assert!(!image_eq(Some(&path), Some(&icon)));
+    }
+
+    // ── The hover-claim state machine (#567/#593/#596/#619/#626) ─────────────
+
+    /// A model of the service-side timer entry for **one** notification id.
+    ///
+    /// Not a copy of `hytte_services::notifications::TimerState`, and not an
+    /// attempt to re-test it — the service's own hermetic bucket pins its
+    /// arithmetic. This models exactly the clauses of that type's documented
+    /// contract the overlay's call *ordering* rests on, so a regression in the
+    /// ordering fails here:
+    ///
+    /// 1. `resume` at a hover count of zero is clamped to a no-op.
+    /// 2. Only the *last* leave (the count reaching zero) arms, and only while
+    ///    the notification is finite.
+    /// 3. The *first* hover (the count reaching one) aborts whatever is armed.
+    /// 4. A post creates the entry if absent and arms iff finite and unhovered;
+    ///    a close removes it outright, hover count and all.
+    ///
+    /// Clause 4 is the whole of #626: the entry under a live claim can be
+    /// destroyed and re-created with a zero count while the card holding that
+    /// claim stays mounted and the pointer never moves.
+    #[derive(Debug, Default)]
+    struct TimerModel {
+        entry: Option<ModelEntry>,
+    }
+
+    #[derive(Debug)]
+    struct ModelEntry {
+        finite: bool,
+        hover_count: u32,
+        armed: bool,
+    }
+
+    impl TimerModel {
+        /// `Notify` → `set_expiry` → `apply_expiry`.
+        fn post(&mut self, finite: bool) {
+            let entry = self.entry.get_or_insert(ModelEntry {
+                finite,
+                hover_count: 0,
+                armed: false,
+            });
+            entry.finite = finite;
+            entry.armed = finite && entry.hover_count == 0;
+        }
+
+        /// `CloseNotification` (or an expiry firing) → `dismiss` →
+        /// `clear_timer`.
+        fn close(&mut self) {
+            self.entry = None;
+        }
+
+        fn call(&mut self, call: HoldCall) {
+            match call {
+                HoldCall::Pause => {
+                    if let Some(e) = &mut self.entry {
+                        e.hover_count += 1;
+                        if e.hover_count == 1 {
+                            e.armed = false;
+                        }
+                    }
+                }
+                HoldCall::Resume => {
+                    if let Some(e) = &mut self.entry {
+                        if e.hover_count == 0 {
+                            return; // clause 1
+                        }
+                        e.hover_count -= 1;
+                        if e.hover_count == 0 && e.finite {
+                            e.armed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Will this notification expire on its own from here? The single
+        /// user-visible question behind all five defects.
+        fn armed(&self) -> bool {
+            self.entry.as_ref().is_some_and(|e| e.armed)
+        }
+
+        fn hover_count(&self) -> u32 {
+            self.entry.as_ref().map_or(0, |e| e.hover_count)
+        }
+    }
+
+    /// A mounted card, driving a [`TimerModel`] through the real
+    /// [`HoldState`] transitions and the real [`HoldAction::calls`] mapping —
+    /// nothing about the effects is paraphrased here.
+    #[derive(Debug, Default)]
+    struct Card {
+        hold: HoldState,
+    }
+
+    impl Card {
+        fn apply(
+            &mut self,
+            timers: &mut TimerModel,
+            transition: fn(HoldState) -> (HoldState, HoldAction),
+        ) {
+            let (next, action) = transition(self.hold);
+            self.hold = next;
+            for call in action.calls() {
+                timers.call(*call);
+            }
+        }
+
+        fn enter(&mut self, timers: &mut TimerModel) {
+            self.apply(timers, HoldState::enter);
+        }
+
+        fn leave(&mut self, timers: &mut TimerModel) {
+            self.apply(timers, HoldState::leave);
+        }
+
+        fn resync(&mut self, timers: &mut TimerModel) {
+            self.apply(timers, HoldState::resync);
+        }
+
+        /// `replace_card`: build the successor, move the claim onto it, then
+        /// unmap the predecessor — whose `connect_unmap` runs `leave`.
+        fn rebuild(&mut self, timers: &mut TimerModel) -> Self {
+            let (cleared, mine) = self.hold.transfer();
+            self.hold = cleared;
+            let successor = Self { hold: mine };
+            self.leave(timers);
+            successor
+        }
+    }
+
+    #[test]
+    fn enter_takes_exactly_one_hold() {
+        let (held, action) = HoldState::default().enter();
+        assert_eq!(action, HoldAction::Take);
+        assert_eq!(held.enter(), (held, HoldAction::Nothing));
+    }
+
+    #[test]
+    fn leave_releases_once_then_stands_down() {
+        let (held, _) = HoldState::default().enter();
+        let (idle, action) = held.leave();
+        assert_eq!(action, HoldAction::Release);
+        // The `connect_unmap` teardown following a `leave` — and a stray
+        // `leave` with no matching `enter` — must not drift the count.
+        assert_eq!(idle.leave(), (idle, HoldAction::Nothing));
+    }
+
+    #[test]
+    fn resync_renews_only_a_live_claim() {
+        let idle = HoldState::default();
+        assert_eq!(idle.resync(), (idle, HoldAction::Nothing));
+        let (held, _) = idle.enter();
+        assert_eq!(held.resync(), (held, HoldAction::Renew));
+    }
+
+    #[test]
+    fn transfer_moves_the_claim_whole() {
+        let (held, _) = HoldState::default().enter();
+        let (predecessor, successor) = held.transfer();
+        assert_eq!(predecessor, HoldState::default());
+        assert_eq!(successor, held);
+        // The predecessor's `connect_unmap` now finds nothing to release, so
+        // the swap crosses no count edge at all.
+        assert_eq!(predecessor.leave().1, HoldAction::Nothing);
+
+        // Transferring an unheld claim is just as total.
+        let (predecessor, successor) = HoldState::default().transfer();
+        assert_eq!(predecessor, HoldState::default());
+        assert_eq!(successor, HoldState::default());
+    }
+
+    #[test]
+    fn action_call_sequences_are_fixed() {
+        assert_eq!(HoldAction::Take.calls(), &[HoldCall::Pause]);
+        assert_eq!(HoldAction::Release.calls(), &[HoldCall::Resume]);
+        // Order is load-bearing — see `renewing_pause_first_would_arm`.
+        assert_eq!(
+            HoldAction::Renew.calls(),
+            &[HoldCall::Resume, HoldCall::Pause]
+        );
+        assert!(HoldAction::Nothing.calls().is_empty());
+    }
+
+    #[test]
+    fn renewing_pause_first_would_arm() {
+        // The negative control for `HoldAction::Renew`'s order. Against a
+        // freshly re-created entry (hover count zero, counting down), pausing
+        // before resuming runs 0 → 1 → 0 and re-arms — #626's exact failure,
+        // and what the pre-#626 `replace_card` did.
+        let mut timers = TimerModel::default();
+        timers.post(true);
+        timers.call(HoldCall::Pause);
+        timers.call(HoldCall::Resume);
+        assert!(timers.armed(), "pause-then-resume arms a fresh entry");
+
+        // The shipped order, from the same state.
+        let mut timers = TimerModel::default();
+        timers.post(true);
+        for call in HoldAction::Renew.calls() {
+            timers.call(*call);
+        }
+        assert!(!timers.armed());
+        assert_eq!(timers.hover_count(), 1);
+    }
+
+    #[test]
+    fn close_and_repost_under_a_parked_pointer_keeps_the_toast() {
+        // #626 itself. Finite post; the pointer parks on the toast.
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(true);
+        card.enter(&mut timers);
+        assert!(!timers.armed(), "a hovered toast must not count down");
+
+        // `CloseNotification(id)` immediately followed by
+        // `Notify(replaces_id = id)`, both handled on the D-Bus worker before
+        // GTK polls: the entry the claim was taken against is gone, and a fresh
+        // one is counting down in its place under a pointer that never moved.
+        timers.close();
+        timers.post(true);
+        assert!(timers.armed());
+        assert_eq!(
+            timers.hover_count(),
+            0,
+            "the re-created entry knows nothing of the mounted card"
+        );
+
+        // GTK polls. Content changed, so the card is swapped...
+        let mut card = card.rebuild(&mut timers);
+        assert_eq!(
+            timers.hover_count(),
+            0,
+            "a swap moves the claim and must make no service call"
+        );
+        // ...and `apply_emission`'s closing pass renews the claim.
+        card.resync(&mut timers);
+
+        assert!(
+            !timers.armed(),
+            "#626: the toast must not expire under a parked pointer"
+        );
+        assert_eq!(timers.hover_count(), 1);
+    }
+
+    #[test]
+    fn close_and_identical_repost_keeps_the_toast() {
+        // The variant `replace_card` alone would never see: `card_content_eq`
+        // ignores `timeout` and `created_at`, so a close plus a byte-identical
+        // re-post keeps the card mounted and takes `apply_emission`'s
+        // `continue` branch — while the entry underneath is replaced just the
+        // same. Only the emission-wide renewal pass covers this.
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(true);
+        card.enter(&mut timers);
+
+        timers.close();
+        timers.post(true);
+        assert!(timers.armed());
+
+        card.resync(&mut timers);
+        assert!(!timers.armed());
+        assert_eq!(timers.hover_count(), 1);
+    }
+
+    #[test]
+    fn plain_rebuild_under_a_parked_pointer_keeps_the_toast() {
+        // #593, unchanged: a `replaces_id` re-post that changes the rendered
+        // content rebuilds the card, and a stationary pointer sends no `enter`
+        // to the successor.
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(true);
+        card.enter(&mut timers);
+
+        timers.post(true); // re-post; still hovered, so it stays paused
+        assert!(!timers.armed());
+
+        let mut card = card.rebuild(&mut timers);
+        assert!(!timers.armed(), "the swap crosses no count edge");
+        assert_eq!(timers.hover_count(), 1);
+
+        card.resync(&mut timers);
+        assert!(!timers.armed());
+        assert_eq!(timers.hover_count(), 1, "renewal nets to zero on the count");
+    }
+
+    #[test]
+    fn sticky_then_finite_repost_keeps_the_toast() {
+        // #619: the notification is sticky while hovered, then a re-post turns
+        // it finite. The entry — and its count — survives, so the re-post
+        // inherits the hold rather than arming behind the pointer.
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(false);
+        card.enter(&mut timers);
+        assert!(!timers.armed(), "a sticky notification has nothing to arm");
+
+        timers.post(true);
+        card.resync(&mut timers);
+        assert!(!timers.armed());
+        assert_eq!(timers.hover_count(), 1);
+
+        card.leave(&mut timers);
+        assert!(timers.armed(), "the real leave is what finally arms it");
+    }
+
+    #[test]
+    fn leaving_after_renewals_arms_exactly_once() {
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(true);
+        card.enter(&mut timers);
+        for _ in 0..5 {
+            card.resync(&mut timers);
+        }
+        assert_eq!(
+            timers.hover_count(),
+            1,
+            "renewal is idempotent on the count"
+        );
+
+        card.leave(&mut timers);
+        assert!(timers.armed());
+        assert_eq!(timers.hover_count(), 0);
+        // The `connect_unmap` that follows the pointer leaving must not
+        // double-release and strand a second countdown.
+        card.leave(&mut timers);
+        assert_eq!(timers.hover_count(), 0);
+    }
+
+    #[test]
+    fn a_second_monitors_copy_renews_without_crossing_an_edge() {
+        // Two per-monitor toast copies of one id: `hover_count` is the "is ANY
+        // copy hovered" aggregate, so a renewal by one of them runs 2 → 1 → 2
+        // and is a complete no-op.
+        let mut timers = TimerModel::default();
+        let (mut a, mut b) = (Card::default(), Card::default());
+        timers.post(true);
+        a.enter(&mut timers);
+        b.enter(&mut timers);
+        assert_eq!(timers.hover_count(), 2);
+
+        a.resync(&mut timers);
+        b.resync(&mut timers);
+        assert_eq!(timers.hover_count(), 2);
+        assert!(!timers.armed());
+
+        a.leave(&mut timers);
+        assert!(!timers.armed(), "one copy is still hovered");
+        b.leave(&mut timers);
+        assert!(timers.armed());
+    }
+
+    #[test]
+    fn renewal_on_a_closed_notification_is_inert() {
+        // A close with no re-post: there is no entry, both calls find nothing,
+        // and the card's eventual unmap is equally harmless.
+        let mut timers = TimerModel::default();
+        let mut card = Card::default();
+        timers.post(true);
+        card.enter(&mut timers);
+        timers.close();
+
+        card.resync(&mut timers);
+        card.leave(&mut timers);
+        assert!(!timers.armed());
+        assert_eq!(timers.hover_count(), 0);
     }
 }

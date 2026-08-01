@@ -77,14 +77,35 @@ pub(crate) fn finish_page_clamped(content: &impl IsA<gtk::Widget>, max_width: i3
 }
 
 /// Two-column (or more) grid for rich modal pages. Sections attach via
-/// `grid.attach(&section, col, row, 1, 1)`.
+/// `grid.attach(&section, col, row, 1, 1)`. Columns are homogeneous (equal
+/// width) — the right default for most pages, where sections are meant to
+/// line up evenly. A page that wants asymmetric columns instead should use
+/// [`page_grid_non_homogeneous`] rather than flipping the flag after
+/// construction, which — pre-#708 — was how `panel_media` opted out: a
+/// homogeneous grid propagates one child's minimum natural width to every
+/// column (`#702`'s blown-out CPU card mirroring its width onto Memory was
+/// exactly this), so a page that legitimately wants unequal columns needs
+/// that stated at construction, not patched on after the fact.
 pub(crate) fn page_grid() -> gtk::Grid {
+    page_grid_with_homogeneous(true)
+}
+
+/// [`page_grid`] with column homogeneity turned off — for pages whose
+/// columns are deliberately asymmetric (e.g. `panel_media`'s art column vs.
+/// its info column). See [`page_grid`]'s doc comment for why this is a
+/// separate constructor rather than a post-construction
+/// `set_column_homogeneous(false)` call.
+pub(crate) fn page_grid_non_homogeneous() -> gtk::Grid {
+    page_grid_with_homogeneous(false)
+}
+
+fn page_grid_with_homogeneous(column_homogeneous: bool) -> gtk::Grid {
     let g = gtk::Grid::new();
     g.add_css_class("ts-modal-page");
     g.add_css_class("ts-page-grid");
     g.set_row_spacing(12);
     g.set_column_spacing(12);
-    g.set_column_homogeneous(true);
+    g.set_column_homogeneous(column_homogeneous);
     g
 }
 

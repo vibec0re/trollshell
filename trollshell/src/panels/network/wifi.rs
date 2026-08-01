@@ -38,7 +38,9 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_height(true);
-    scrolled.set_max_content_height(240);
+    // Design-baseline px, routed through `scale()` so the cap tracks font size
+    // / text-scaling the same way `stats.rs`'s scroll wrapper does (#708).
+    scrolled.set_max_content_height(crate::scale::scale(240));
     scrolled.set_hexpand(true);
     scrolled.add_css_class("ts-wifi-list");
     let networks_group = adw::PreferencesGroup::new();

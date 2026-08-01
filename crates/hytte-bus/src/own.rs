@@ -6,7 +6,7 @@ use crate::BusError;
 use crate::connection::SharedConnection;
 use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,8 +51,9 @@ pub enum OwnState {
         /// Who holds the name now, if known.
         prev_owner: Option<String>,
     },
-    /// Gave up after N consecutive losses to the same owner. The
-    /// supervisor still retries every 5 minutes; consumers should render
+    /// Gave up after N consecutive losses to the same owner. The supervisor
+    /// re-attempts the moment `NameOwnerChanged` reports the name released,
+    /// and every 5 minutes regardless as a backstop; consumers should render
     /// this state distinctly (e.g. a tray indicator).
     PermanentlyTaken {
         /// The unique name of the connection that currently holds the name,
@@ -168,8 +169,9 @@ impl OwnNameBuilder {
     }
 
     /// Override the consecutive-losses threshold (default 3) after which the
-    /// name latches [`OwnState::PermanentlyTaken`] and the retry drops to one
-    /// attempt per cooldown.
+    /// name latches [`OwnState::PermanentlyTaken`] and the retry stops being
+    /// timer-driven: one attempt per observed release of the name, plus one
+    /// per cooldown as a backstop.
     ///
     /// Counts both ways of not having the name: being displaced after owning
     /// it, and `RequestName` coming back "already taken" because the current
@@ -182,6 +184,11 @@ impl OwnNameBuilder {
 
     /// Override the cooldown after a `PermanentlyTaken` transition before
     /// re-attempting acquisition. Default: 5 minutes.
+    ///
+    /// This is the **backstop**, not the normal recovery path: a give-up waits
+    /// on `NameOwnerChanged` and re-attempts as soon as the holder releases the
+    /// name, so the cooldown only ever fires when no release was observed (or
+    /// one was missed). See `wait_for_release_or_cooldown`.
     ///
     /// Test-only — consumers should not shorten this in production. The 5-minute
     /// cooldown is what prevents PermanentlyTaken from degrading into a tight
@@ -254,6 +261,17 @@ async fn run_ownership(
         // avoids a race between an old `RemoveMatch` (queued async on drop) and
         // a new `AddMatch` for the next retry: the D-Bus daemon would decrement
         // the reference count and silently stop delivering signals.
+        //
+        // Subscribing here — strictly BEFORE the first `RequestName` below —
+        // is also what closes the observe-then-subscribe window of #429 for
+        // this primitive (that issue cites this ordering as the reference the
+        // property path failed to follow). It matters twice over now that a
+        // give-up waits on this stream for the name to be released: a holder
+        // that exits between the `RequestName` that told us the name was taken
+        // and the start of that wait has already had its `NameOwnerChanged`
+        // buffered into the stream, so the wait returns on it immediately
+        // instead of falling through to the 5-minute backstop. Nothing between
+        // here and `run_inner_loop` may re-subscribe, or that window reopens.
         //
         // Interface mounts are also applied here, on the fresh connection,
         // before RequestName so callers racing NameAcquired find the objects
@@ -401,10 +419,16 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 
 /// Log the give-up transition into [`OwnState::PermanentlyTaken`].
 ///
-/// **Cadence.** This fires once per `cooldown` — one line every 5 minutes by
-/// default — for as long as the name stays taken, because `record_loss`
-/// deliberately keeps the tally latched so each cooldown wake makes exactly one
-/// attempt. That is the middle ground between the two positions this repo has
+/// **Cadence.** This fires at most once per `cooldown` — one line every 5
+/// minutes by default — for as long as the name stays taken *and nothing
+/// happens to it*, because `record_loss` deliberately keeps the tally latched
+/// so each wake makes exactly one attempt. The event-driven wake (#669) adds
+/// one further line per *observed release that we then still fail to win*,
+/// which is a real ownership transition on the bus rather than a timer tick, so
+/// it cannot become a flood on its own — and in the overwhelmingly common case
+/// the release is followed by a win, which logs the recovery instead
+/// ([`log_release_wake`]). That is the middle ground between the two positions
+/// this repo has
 /// argued: #634 kept a *self-healing* condition loud on every attempt precisely
 /// because its backoff capped the rate, while #646 objects to flat, uncapped
 /// retry logging with no ceiling. A contested well-known name is a *static*
@@ -419,8 +443,189 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
         %holder,
         consecutive,
         retry_in_secs = cooldown.as_secs(),
-        "D-Bus name is held by another connection that refuses to be replaced; whatever this name backs is inert until that owner exits. Still re-checking periodically"
+        "D-Bus name is held by another connection that refuses to be replaced; whatever this name backs is inert until that owner exits. Watching for that owner to release it, and re-checking periodically regardless"
     );
+}
+
+/// Log the event-driven recovery from a give-up: the holder released the name
+/// and we are re-requesting it without waiting out the cooldown.
+///
+/// At `warn!`, deliberately, and with `RECOVERED` in the message — the same
+/// shape `networkd`'s startup refresh and `wifi`'s backend probe use for the
+/// resolution of a condition they warned about (#609/#613/#634). A recovery
+/// logged quieter than the problem is invisible to exactly the person who saw
+/// the problem: [`log_give_up`] is a `warn!`, so anyone filtering at `warn`
+/// would otherwise read "notifications are inert" with no line ever saying it
+/// stopped being true. This fires once per release actually observed, not on a
+/// timer.
+fn log_release_wake(name: &str, holder: &str) {
+    tracing::warn!(
+        %name,
+        previous_holder = %holder,
+        "D-Bus name RECOVERED — the connection that was holding it has released it. Re-requesting now, woken by NameOwnerChanged rather than by the retry cooldown, so whatever this name backs comes back within milliseconds instead of minutes"
+    );
+}
+
+/// Why [`wait_for_release_or_cooldown`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// `NameOwnerChanged` reported the name unowned — it is free right now.
+    Released,
+    /// The cooldown expired with no such signal. The backstop, not the
+    /// expected path.
+    Cooldown,
+}
+
+/// What the inner loop should do for the next `RequestName` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextAttempt {
+    /// Ask again on the connection and subscription we already have.
+    SameConnection,
+    /// Return, so the outer loop reconnects with a fresh connection and a
+    /// fresh `NameOwnerChanged` subscription, and re-attempts there.
+    Reconnect,
+}
+
+/// Map a wake to the next move. Split out from the `select!` so the decision is
+/// a pure function with its rationale attached, and testable without a broker.
+///
+/// The asymmetry is the point:
+///
+/// * A **signal** wake reuses the connection. The name is free *now* — every
+///   millisecond spent tearing down and rebuilding the subscription is a
+///   millisecond another contender can take it in, and the subscription is
+///   demonstrably live because it just delivered. Re-subscribing would also
+///   re-run the `RemoveMatch`/`AddMatch` churn `run_ownership` documents as
+///   racy, for nothing.
+/// * A **cooldown** wake reconnects, exactly as before #669. The timer firing
+///   with no signal is also the one observation consistent with a *wedged*
+///   subscription — a `NameOwnerChanged` dropped because the shared
+///   connection's broadcast queue overflowed while we waited, say — so the
+///   backstop rebuilds the thing that might have failed. That is what makes it
+///   a real backstop rather than a slower copy of the fast path.
+fn next_attempt_after(wake: Wake) -> NextAttempt {
+    match wake {
+        Wake::Released => NextAttempt::SameConnection,
+        Wake::Cooldown => NextAttempt::Reconnect,
+    }
+}
+
+/// Whether `msg` is a `NameOwnerChanged` saying `name` has become unowned.
+///
+/// `NameOwnerChanged` carries `(name, old_owner, new_owner)`; an empty
+/// `new_owner` means the name was released rather than handed to someone else.
+/// An ownership *transfer* is deliberately not a wake: the name is not free, so
+/// re-requesting it would just earn another `Exists` — the tally has already
+/// latched by the time we get here, and the new holder gets its own budget on
+/// the next real attempt.
+///
+/// The name check is a second line of defence. The broker already filters by
+/// `arg0` (see [`build_name_owner_changed_rule`]), which is what keeps six
+/// concurrently-owned names from waking each other's waiters; this re-check
+/// costs one string compare and means a mis-built rule degrades into a missed
+/// wake rather than a wrong one.
+fn is_release_of(msg: &zbus::Message, name: &str) -> bool {
+    let Ok((sig_name, _old_owner, new_owner)) =
+        msg.body().deserialize::<(String, String, String)>()
+    else {
+        return false;
+    };
+    sig_name == name && new_owner.is_empty()
+}
+
+/// Wait for `name` to be released, or for `cooldown` to elapse — whichever
+/// happens first.
+///
+/// This is the whole of #669: a give-up used to `sleep(cooldown)`, so when the
+/// squatter exited we noticed up to five minutes later. D-Bus already pushes
+/// that event, so the timer becomes the backstop and the signal becomes the
+/// fast path, and "recover instantly" stops being in tension with "do not poll
+/// at 4 Hz" (#653) — the attempt rate is now bounded by *real ownership
+/// transitions of this one name*, of which the broker emits exactly one per
+/// change, rather than by how short a sleep we dared to use.
+///
+/// The timer is not optional. A signal can be missed — the shared connection's
+/// message queue can overflow during a long wait, a rule can fail to register
+/// on a broker restart — and a missed signal must degrade to "recovers in five
+/// minutes", never to "stranded forever".
+///
+/// Generic over the stream so the select and the filtering are exercised
+/// hermetically, with hand-built messages and no `dbus-daemon`.
+async fn wait_for_release_or_cooldown<S>(stream: &mut S, name: &str, cooldown: Duration) -> Wake
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
+    let timer = tokio::time::sleep(cooldown);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            () = &mut timer => return Wake::Cooldown,
+            msg = stream.next() => match msg {
+                Some(Ok(msg)) if is_release_of(&msg, name) => return Wake::Released,
+                // A signal for another name, an ownership transfer, or a body
+                // we could not decode: keep waiting on the same timer.
+                Some(_) => {}
+                // The stream ended, so no signal can ever arrive on it. Serve
+                // out the rest of the cooldown instead of spinning on a dead
+                // stream (`next()` on a finished stream returns `None`
+                // immediately, forever) — the caller then reconnects, which is
+                // what a dead stream needs anyway.
+                None => {
+                    timer.as_mut().await;
+                    return Wake::Cooldown;
+                }
+            },
+        }
+    }
+}
+
+/// Arguments for [`give_up_and_wait`], kept in a struct to match the local
+/// convention (see [`InnerCtx`]) rather than a long positional list.
+struct GiveUpCtx<'a, S> {
+    stream: &'a mut S,
+    name: &'a str,
+    /// The holder the tally is attributed to — reported in both log lines and
+    /// carried in [`OwnState::PermanentlyTaken`].
+    holder: String,
+    consecutive: u32,
+    cooldown: Duration,
+    writer: &'a Mutable<OwnState>,
+}
+
+/// Latch [`OwnState::PermanentlyTaken`] and wait for the situation to change,
+/// then say how to make the next attempt.
+///
+/// Shared by both routes into a give-up — losing a name we held, and being
+/// refused one we asked for — so the two cannot drift on the thing that matters
+/// here: which wake happened and what it is worth logging.
+async fn give_up_and_wait<S>(ctx: GiveUpCtx<'_, S>) -> NextAttempt
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
+    let GiveUpCtx {
+        stream,
+        name,
+        holder,
+        consecutive,
+        cooldown,
+        writer,
+    } = ctx;
+
+    log_give_up(name, &holder, consecutive, cooldown);
+    writer.set(OwnState::PermanentlyTaken {
+        current_owner: holder.clone(),
+    });
+
+    let wake = wait_for_release_or_cooldown(stream, name, cooldown).await;
+    if wake == Wake::Released {
+        log_release_wake(name, &holder);
+    }
+    // The tally is deliberately NOT cleared here (#668): a re-acquisition does
+    // not earn a fresh `permanent_after` budget against the same peer. Staying
+    // latched is cheap now that the latch is event-driven — it costs one
+    // attempt per release, not one per 250 ms.
+    writer.set(OwnState::Acquiring);
+    next_attempt_after(wake)
 }
 
 /// Ask the broker who currently holds `name`, for the log line and for the
@@ -439,10 +644,99 @@ async fn current_holder_of(dbus: &fdo::DBusProxy<'_>, name: &str) -> Option<Stri
         .map(|owner| owner.as_str().to_string())
 }
 
+/// Arguments for [`on_name_held`], kept in a struct to match the local
+/// convention (see [`InnerCtx`]) rather than a long positional list.
+struct HeldCtx<'a, S> {
+    stream: &'a mut S,
+    name: &'a str,
+    /// Our own unique name, so a `NameOwnerChanged` can be told apart from the
+    /// buffered ones that predate our acquisition.
+    unique: Option<&'a str>,
+    permanent_after: u32,
+    cooldown: Duration,
+    writer: &'a Mutable<OwnState>,
+    tally: &'a mut Option<(String, u32)>,
+}
+
+/// Hold the name until we are displaced, then decide how to get it back.
+///
+/// Extracted from `run_inner_loop`'s `PrimaryOwner`/`AlreadyOwner` arm so it
+/// sits alongside [`on_name_taken`] — the two arms of the same decision (we
+/// have the name and lost it; we asked and were refused) now read the same way
+/// and share [`give_up_and_wait`].
+///
+/// Returns how the caller should make the next attempt.
+async fn on_name_held<S>(ctx: HeldCtx<'_, S>) -> NextAttempt
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
+    let HeldCtx {
+        stream,
+        name,
+        unique,
+        permanent_after,
+        cooldown,
+        writer,
+        tally,
+    } = ctx;
+
+    writer.set(OwnState::Owned);
+
+    // Drain any buffered NameOwnerChanged signals that arrived before we set
+    // Owned, then block until we are displaced.
+    let new_owner = watch_for_loss(stream, name, unique).await;
+
+    writer.set(OwnState::Lost {
+        transient: new_owner.is_none(),
+        prev_owner: new_owner.clone(),
+    });
+
+    let Some(holder) = new_owner else {
+        // Transient loss (bus blip / stream ended) — nobody took the name from
+        // us, so the tally resets and we reconnect. Logged at debug because
+        // `connection.rs` already warns about the disconnect itself; this is
+        // its consequence.
+        tracing::debug!(%name, "D-Bus name dropped with the connection; reconnecting");
+        *tally = None;
+        writer.set(OwnState::Acquiring);
+        return NextAttempt::Reconnect;
+    };
+
+    match record_loss(tally, Some(&holder), permanent_after) {
+        Contention::Retry { consecutive } => {
+            tracing::warn!(
+                %name,
+                %holder,
+                consecutive,
+                permanent_after,
+                "lost D-Bus name to another connection; re-requesting it"
+            );
+            // Retry RequestName on the same connection + subscription.
+            writer.set(OwnState::Acquiring);
+            NextAttempt::SameConnection
+        }
+        Contention::GiveUp { consecutive } => {
+            give_up_and_wait(GiveUpCtx {
+                stream,
+                name,
+                holder,
+                consecutive,
+                cooldown,
+                writer,
+            })
+            .await
+        }
+    }
+}
+
 /// Arguments for [`on_name_taken`], kept in a struct to match the local
 /// convention (see [`InnerCtx`]) rather than a long positional list.
-struct TakenCtx<'a> {
+struct TakenCtx<'a, S> {
     dbus: &'a fdo::DBusProxy<'a>,
+    /// The live `NameOwnerChanged` subscription, subscribed before the
+    /// `RequestName` that got us here — handed down so a give-up can wait on
+    /// the holder releasing the name instead of sleeping out the cooldown.
+    stream: &'a mut S,
     name: &'a str,
     permanent_after: u32,
     cooldown: Duration,
@@ -459,10 +753,14 @@ struct TakenCtx<'a> {
 /// this path fed the tally it retried at 4 Hz for the whole process lifetime
 /// without ever logging or escalating.
 ///
-/// Returns `true` when the caller should drop the connection and reconnect.
-async fn on_name_taken(ctx: TakenCtx<'_>) -> bool {
+/// Returns how the caller should make the next attempt.
+async fn on_name_taken<S>(ctx: TakenCtx<'_, S>) -> NextAttempt
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
     let TakenCtx {
         dbus,
+        stream,
         name,
         permanent_after,
         cooldown,
@@ -497,16 +795,18 @@ async fn on_name_taken(ctx: TakenCtx<'_>) -> bool {
             // ramp, is what actually bounds the retry rate.
             tokio::time::sleep(RETRY_AFTER_LOSS * consecutive).await;
             writer.set(OwnState::Acquiring);
-            false
+            NextAttempt::SameConnection
         }
         Contention::GiveUp { consecutive } => {
-            log_give_up(name, &holder, consecutive, cooldown);
-            writer.set(OwnState::PermanentlyTaken {
-                current_owner: holder,
-            });
-            tokio::time::sleep(cooldown).await;
-            writer.set(OwnState::Acquiring);
-            true
+            give_up_and_wait(GiveUpCtx {
+                stream,
+                name,
+                holder,
+                consecutive,
+                cooldown,
+                writer,
+            })
+            .await
         }
     }
 }
@@ -604,64 +904,32 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
 
         match reply {
             fdo::RequestNameReply::PrimaryOwner | fdo::RequestNameReply::AlreadyOwner => {
-                writer.set(OwnState::Owned);
-
-                // Drain any buffered NameOwnerChanged signals that arrived
-                // before we set Owned, then block until we are displaced.
-                let new_owner = watch_for_loss(stream, name, unique).await;
-
-                writer.set(OwnState::Lost {
-                    transient: new_owner.is_none(),
-                    prev_owner: new_owner.clone(),
-                });
-
-                let Some(holder) = new_owner else {
-                    // Transient loss (bus blip / stream ended) — nobody took
-                    // the name from us, so the tally resets and we reconnect.
-                    // Logged at debug because `connection.rs` already warns
-                    // about the disconnect itself; this is its consequence.
-                    tracing::debug!(%name, "D-Bus name dropped with the connection; reconnecting");
-                    *consecutive_losses_to = None;
-                    writer.set(OwnState::Acquiring);
+                let next = on_name_held(HeldCtx {
+                    stream: &mut *stream,
+                    name,
+                    unique,
+                    permanent_after,
+                    cooldown,
+                    writer,
+                    tally: &mut *consecutive_losses_to,
+                })
+                .await;
+                if next == NextAttempt::Reconnect {
                     return;
-                };
-
-                match record_loss(consecutive_losses_to, Some(&holder), permanent_after) {
-                    Contention::Retry { consecutive } => {
-                        tracing::warn!(
-                            %name,
-                            %holder,
-                            consecutive,
-                            permanent_after,
-                            "lost D-Bus name to another connection; re-requesting it"
-                        );
-                        // Retry RequestName on the same connection +
-                        // subscription.
-                        writer.set(OwnState::Acquiring);
-                    }
-                    Contention::GiveUp { consecutive } => {
-                        log_give_up(name, &holder, consecutive, cooldown);
-                        writer.set(OwnState::PermanentlyTaken {
-                            current_owner: holder,
-                        });
-                        tokio::time::sleep(cooldown).await;
-                        writer.set(OwnState::Acquiring);
-                        // Break to reconnect with a fresh subscription.
-                        return;
-                    }
                 }
             }
             fdo::RequestNameReply::Exists | fdo::RequestNameReply::InQueue => {
-                if on_name_taken(TakenCtx {
+                let next = on_name_taken(TakenCtx {
                     dbus: &dbus,
+                    stream: &mut *stream,
                     name,
                     permanent_after,
                     cooldown,
                     writer,
                     tally: &mut *consecutive_losses_to,
                 })
-                .await
-                {
+                .await;
+                if next == NextAttempt::Reconnect {
                     return;
                 }
             }
@@ -670,6 +938,13 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) {
 }
 
 /// Build the `NameOwnerChanged` match rule for the named service (arg0 filter).
+///
+/// The `arg0` filter is what makes this subscription *this name's*. Six
+/// well-known names are owned concurrently in the shell (`notifications`, the
+/// tray, `DisplayConfig`, the screensaver, bluetooth, `Control`), each with its
+/// own instance of this task; without the filter, every release on the bus
+/// would wake all six waiters (and the broker would ship us every ownership
+/// change on the session bus to boot).
 ///
 /// Using a raw `MessageStream` (rather than `DBusProxy::receive_name_owner_changed`)
 /// avoids the `SignalStream` proxy-ownership filter, which tracks the daemon's
@@ -695,11 +970,10 @@ fn build_name_owner_changed_rule(name: &str) -> Result<zbus::OwnedMatchRule, zbu
 /// Poll `stream` until a `NameOwnerChanged` signal shows that `name` was taken
 /// from `unique` (our unique name). Returns the new owner's unique name, or
 /// `None` if the stream ended (bus error / connection dropped).
-async fn watch_for_loss(
-    stream: &mut MessageStream,
-    name: &str,
-    unique: Option<&str>,
-) -> Option<String> {
+async fn watch_for_loss<S>(stream: &mut S, name: &str, unique: Option<&str>) -> Option<String>
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
     while let Some(msg) = stream.next().await {
         let Ok(msg) = msg else { continue };
         let Ok((sig_name, old_owner, new_owner)) =
@@ -727,11 +1001,55 @@ async fn watch_for_loss(
 
 #[cfg(test)]
 mod tests {
-    use super::{Contention, OwnState, attributed_holder, on_request_name_error, record_loss};
+    use super::{
+        Contention, NextAttempt, OwnState, Wake, attributed_holder, is_release_of,
+        next_attempt_after, on_request_name_error, record_loss, wait_for_release_or_cooldown,
+    };
     use futures_signals::signal::{Mutable, SignalExt as _};
     use futures_util::StreamExt as _;
     use std::time::Duration;
     use zbus::fdo;
+
+    /// The name under test. Two distinct names are used throughout so the
+    /// filtering assertions cannot pass by accident.
+    const NAME: &str = "mov.vibec0re.test.wanted";
+    const OTHER: &str = "mov.vibec0re.test.someone-else";
+
+    /// Cooldown for the tests that mean to *reach* the backstop. Short enough
+    /// that serving it out costs nothing, long enough that the timer arm cannot
+    /// win a race it should lose.
+    const SHORT_COOLDOWN: Duration = Duration::from_millis(60);
+
+    /// Cooldown for the tests that must NOT reach the backstop. Not virtual
+    /// time — `tokio`'s `test-util` feature is not enabled here — so this is
+    /// sized as a trap instead: the streams are in-memory and resolve in
+    /// microseconds, so a regression that falls through to the timer is caught
+    /// by [`FAST_PATH_BUDGET`] with three orders of magnitude of margin, and
+    /// fails in 30 s rather than hanging.
+    const LONG_COOLDOWN: Duration = Duration::from_secs(30);
+
+    /// How long an in-memory stream is allowed to take to deliver a wake before
+    /// we call it "waited on the cooldown".
+    const FAST_PATH_BUDGET: Duration = Duration::from_secs(5);
+
+    /// A hand-built `NameOwnerChanged` — body `(name, old_owner, new_owner)`,
+    /// with an empty `new_owner` meaning "released". No broker involved.
+    fn name_owner_changed(name: &str, old_owner: &str, new_owner: &str) -> zbus::Message {
+        zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("NameOwnerChanged signal builder")
+        .build(&(name, old_owner, new_owner))
+        .expect("build NameOwnerChanged")
+    }
+
+    fn feed(
+        msgs: Vec<zbus::Message>,
+    ) -> impl futures_util::Stream<Item = zbus::Result<zbus::Message>> + Unpin {
+        futures_util::stream::iter(msgs.into_iter().map(Ok))
+    }
 
     /// A `RequestName` `AccessDenied` must surface the distinct `Denied` state
     /// and then return to `Acquiring` after the cooldown, so the outer loop
@@ -903,6 +1221,121 @@ mod tests {
         assert_eq!(
             record_loss(&mut tally, Some(":1.9"), 2),
             Contention::Retry { consecutive: 1 }
+        );
+    }
+
+    /// The fast path (#669): a `NameOwnerChanged` saying the name we want is
+    /// now unowned ends the wait at once, without the cooldown elapsing.
+    #[tokio::test]
+    async fn a_release_of_the_wanted_name_ends_the_wait_at_once() {
+        let started = std::time::Instant::now();
+        let mut stream = feed(vec![name_owner_changed(NAME, ":1.6", "")]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
+            Wake::Released
+        );
+        assert!(
+            started.elapsed() < FAST_PATH_BUDGET,
+            "the release must be acted on immediately, not after the cooldown"
+        );
+    }
+
+    /// Requirement 3 of #669: all six owned names share this path, so the wait
+    /// must key on *its* name. A release of somebody else's name — and every
+    /// other kind of `NameOwnerChanged` traffic — must be stepped over, not
+    /// treated as our wake.
+    #[tokio::test]
+    async fn only_a_release_of_our_own_name_wakes_us() {
+        let mut stream = feed(vec![
+            // Someone else's name being acquired…
+            name_owner_changed(OTHER, "", ":1.5"),
+            // …and someone else's name being *released*: the exact shape of
+            // our wake, on the wrong name.
+            name_owner_changed(OTHER, ":1.5", ""),
+            // Our name changing hands is not our name becoming free.
+            name_owner_changed(NAME, ":1.6", ":1.7"),
+            // Finally, ours.
+            name_owner_changed(NAME, ":1.7", ""),
+        ]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
+            Wake::Released
+        );
+    }
+
+    /// An ownership *transfer* is not a release: the name is not free, so
+    /// waking on it would only earn another `Exists`. With nothing else to
+    /// come, the wait falls through to the backstop.
+    #[tokio::test]
+    async fn an_ownership_transfer_is_not_a_release() {
+        let mut stream = feed(vec![name_owner_changed(NAME, ":1.6", ":1.7")]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, SHORT_COOLDOWN).await,
+            Wake::Cooldown
+        );
+    }
+
+    /// The backstop, on the arm that matters most: a subscription that never
+    /// delivers (a missed signal, a dropped match rule) must strand us for one
+    /// cooldown, not forever. Asserts the full cooldown was served — a wait
+    /// that returned `Cooldown` early would be a busy-poll wearing the right
+    /// label.
+    #[tokio::test]
+    async fn a_silent_subscription_falls_through_to_the_cooldown_backstop() {
+        let started = std::time::Instant::now();
+        let mut stream = futures_util::stream::pending::<zbus::Result<zbus::Message>>();
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, SHORT_COOLDOWN).await,
+            Wake::Cooldown
+        );
+        assert!(started.elapsed() >= SHORT_COOLDOWN);
+    }
+
+    /// A stream that has *ended* (the connection went away) still serves out
+    /// the cooldown rather than returning instantly — `next()` on a finished
+    /// stream yields `None` forever, so an early return here would spin the
+    /// retry loop as fast as the CPU allows.
+    #[tokio::test]
+    async fn an_ended_stream_still_serves_out_the_cooldown() {
+        let started = std::time::Instant::now();
+        let mut stream = feed(Vec::new());
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, SHORT_COOLDOWN).await,
+            Wake::Cooldown
+        );
+        assert!(started.elapsed() >= SHORT_COOLDOWN);
+    }
+
+    /// A `NameOwnerChanged` whose body will not decode as `(s, s, s)` is
+    /// ignored rather than trusted or panicked on.
+    #[test]
+    fn an_undecodable_body_is_not_a_release() {
+        let msg = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("signal builder")
+        .build(&42u32)
+        .expect("build malformed NameOwnerChanged");
+        assert!(!is_release_of(&msg, NAME));
+    }
+
+    /// The select-arm decision, pinned: the two wakes take deliberately
+    /// different next moves — the signal path reuses the live subscription it
+    /// was just woken by, the backstop rebuilds the subscription that may be
+    /// the reason it had to fire.
+    #[test]
+    fn the_wake_decides_whether_the_subscription_is_reused() {
+        assert_eq!(
+            next_attempt_after(Wake::Released),
+            NextAttempt::SameConnection,
+            "a release must be acted on without a resubscribe round-trip"
+        );
+        assert_eq!(
+            next_attempt_after(Wake::Cooldown),
+            NextAttempt::Reconnect,
+            "the backstop must rebuild the connection and subscription"
         );
     }
 }

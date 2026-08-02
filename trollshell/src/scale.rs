@@ -205,16 +205,22 @@ mod tests {
         assert_eq!(scale_with_factor(0, 3.0), 0);
     }
 
-    /// Pins that the three in-card scroll-height literals (#708) grow
-    /// proportionally with the font-scaling factor, the same way any other
-    /// `scale()` call site does — `connections.rs`'s `set_max_content_height`
-    /// cap (480), `network/wifi.rs`'s network-list cap (240), and
+    /// Pins the arithmetic at the three design-baseline literals #708 routed
+    /// through [`scale`] — `connections.rs`'s `set_max_content_height` cap
+    /// (480), `network/wifi.rs`'s network-list cap (240), and
     /// `notifications.rs`'s history-list *floor* (380, a
     /// `set_min_content_height` rather than a max — the direction doesn't
     /// change the math). At 1× each is a no-op (matching the module's no-op
-    /// guarantee); above 1× each grows with the same factor CSS `em`s use, so
-    /// none of the three can drift back to a raw, non-tracking pixel value
-    /// without this test's expected numbers moving too.
+    /// guarantee); at 1.5× each lands exactly on 720/360/570, with no rounding
+    /// drift at the sizes actually in use — which [`factor_scales_linearly`]'s
+    /// 16/15/0 cases don't reach.
+    ///
+    /// **What this does not do:** it is a pure-math test and holds no reference
+    /// to the call sites. Reverting `scale(480)` back to a bare `480` in
+    /// `connections.rs` would leave it green. Coupling it for real would need a
+    /// display server and accessors the panels don't expose, so treat the file
+    /// names below as documentation of *where* these numbers live, not as a
+    /// tripwire guarding them.
     #[test]
     fn three_scroll_heights_scale_with_factor() {
         // 1× — identity, same guarantee `no_op_at_default` pins for `scale()`.

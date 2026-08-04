@@ -120,7 +120,9 @@ pub fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
+    use super::{REGISTRY, Registry, reset_for_tests, with};
+    use crate::test_lock::TEST_LOCK;
+    use std::sync::PoisonError;
 
     #[test]
     fn insert_then_get_roundtrips() {
@@ -141,5 +143,36 @@ mod tests {
         let mut reg = Registry::default();
         reg.insert::<u32>(1);
         reg.insert::<u32>(2);
+    }
+
+    /// Regression pin for #738: nothing previously called the actual
+    /// `reset_for_tests` free function and checked its effect on the
+    /// thread-local registry — the other tests in this module construct a
+    /// bare `Registry::default()` instead of touching the `REGISTRY`
+    /// thread-local this wrapper clears.
+    ///
+    /// `reset_for_tests` also delegates to [`crate::shared::reset_for_tests`]
+    /// (the process-global mirror), which `shared.rs`'s own tests mutate
+    /// too. `cargo test` runs a crate's unit tests on a shared thread pool
+    /// in one process, so any test touching that process-global map must
+    /// serialize against every other one — this test takes the same
+    /// crate-level `TEST_LOCK` (`crate::test_lock`) that `shared.rs`'s tests
+    /// take, rather than a lock private to either module (#743: an earlier
+    /// version of this test called `reset_for_tests` without holding it and
+    /// flaked `shared.rs`'s tests in roughly 1 of 20 runs).
+    #[test]
+    fn reset_for_tests_clears_the_thread_local_registry() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        REGISTRY.with(|cell| cell.borrow_mut().insert::<u32>(7));
+        assert_eq!(with(|r| r.get::<u32>().copied()), Some(7));
+
+        reset_for_tests();
+
+        assert_eq!(
+            with(|r| r.get::<u32>().copied()),
+            None,
+            "reset_for_tests must clear the thread-local registry"
+        );
     }
 }

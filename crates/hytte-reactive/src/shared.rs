@@ -96,7 +96,8 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::{get, insert, reset_for_tests};
-    use std::sync::{Arc, Mutex, PoisonError};
+    use crate::test_lock::TEST_LOCK;
+    use std::sync::{Arc, PoisonError};
 
     #[derive(Debug, PartialEq, Eq)]
     struct Alpha(u32);
@@ -106,7 +107,9 @@ mod tests {
     // The shared map is process-global; cargo runs tests in parallel threads of
     // one process, so serialize the cases that assert on `reset_for_tests`
     // (which clears the *whole* map) to keep them from clobbering each other.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // `TEST_LOCK` is hoisted to `crate::test_lock` (rather than private here)
+    // so `registry.rs`'s tests can join it too — see that module's
+    // `reset_for_tests_clears_the_thread_local_registry` (#743).
 
     #[test]
     fn insert_get_roundtrip_and_type_isolation() {

@@ -1,3 +1,9 @@
+// `lib.rs` re-declares a subset of this module tree (assets, components,
+// modal, overlays, panels, plugins, scale, widgets) as a `[lib]` target so
+// `tests/*.rs` has something to link against (#674/#732). Adding, removing,
+// or renaming a module here — or widening one of the mirrored modules'
+// transitive `crate::` closure — can silently drift out of sync with that
+// list; see `lib.rs`'s module doc for what it covers and why (#738).
 mod assets;
 mod commands;
 mod components;

@@ -937,9 +937,10 @@ mod tests {
 // `#[tokio::test(flavor = "multi_thread")]` is mandatory: the bus guard's
 // Drop calls `block_in_place`, which panics on a current-thread runtime.
 //
-// Setup goes through `mount_and_proxy`, which does not hand back a proxy until
-// the mounted object has answered a round trip — see
-// `wait_until_agent_is_reachable` for the zbus object-server race that
+// Setup goes through `mount_and_proxy`, which stages the agent on the
+// *connection builder* rather than mounting it on an already-built connection.
+// That is not a style choice: see that function's doc comment for the zbus
+// object-server startup race the builder path closes by construction, and which
 // otherwise swallows a test's first method call outright (#756).
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
@@ -983,23 +984,6 @@ mod system_tests {
     /// hang, run the test locally — CI's job is to not lie.
     const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
 
-    /// Total time [`mount_and_proxy`]'s readiness probe will spend waiting for
-    /// a freshly-mounted agent object to become *reachable*.
-    ///
-    /// Deliberately a separate constant from [`DBUS_REPLY_BUDGET`]: that one
-    /// bounds the calls a test makes once setup is finished, this one bounds
-    /// setup itself. Keeping them apart means tuning one never silently
-    /// re-opens the window the other closes (#756).
-    const AGENT_READY_BUDGET: Duration = Duration::from_secs(30);
-
-    /// How long one readiness probe waits before another is sent.
-    ///
-    /// Short on purpose. A probe that is going to be answered is answered in
-    /// microseconds; a probe that lost the race described in
-    /// [`wait_until_agent_is_reachable`] is *never* answered, so the only way
-    /// to make progress is to send a fresh one.
-    const AGENT_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-
     /// Path the agent is mounted at on the ephemeral bus. NM uses a fixed
     /// well-known path in production; any valid object path works for the test.
     const AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
@@ -1026,11 +1010,15 @@ mod system_tests {
         }
     }
 
-    /// Spawn a fresh `dbus-daemon`, return a connected `zbus::Connection` plus a
-    /// guard that kills the daemon on drop. Replicates
-    /// `hytte-bus/tests/common/mod.rs::ephemeral_bus` (we can't import that
-    /// crate's test-only module across crate boundaries).
-    async fn ephemeral_bus() -> (Connection, BusGuard) {
+    /// Spawn a fresh `dbus-daemon` and return a guard that kills it on drop.
+    /// Replicates `hytte-bus/tests/common/mod.rs::ephemeral_bus` (we can't
+    /// import that crate's test-only module across crate boundaries).
+    ///
+    /// Deliberately hands back only the guard, *not* a ready-made connection:
+    /// the connection that hosts the agent has to be built by
+    /// [`mount_and_proxy`] with the interface staged on the builder, so there
+    /// is nothing useful to pre-build here (#756).
+    async fn ephemeral_bus() -> BusGuard {
         let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
         let socket: PathBuf = tmp.path().join("bus");
         let address = format!("unix:path={}", socket.display());
@@ -1081,20 +1069,11 @@ mod system_tests {
             "unexpected dbus-daemon address: {printed}"
         );
 
-        let conn = Builder::address(address.as_str())
-            .expect("parse bus address")
-            .build()
-            .await
-            .expect("connect to ephemeral bus");
-
-        (
-            conn,
-            BusGuard {
-                child: Some(child),
-                _tmp: tmp,
-                address,
-            },
-        )
+        BusGuard {
+            child: Some(child),
+            _tmp: tmp,
+            address,
+        }
     }
 
     /// Build a fresh `NmAgent` with empty handles; return it plus clones of its
@@ -1110,25 +1089,71 @@ mod system_tests {
         (agent, prompts, waiters)
     }
 
-    /// Mount `agent` on `server`, open a second connection to the same bus
-    /// acting as "`NetworkManager`", and return a proxy targeting the agent by the
-    /// server's unique name. Uses `Builder::address` (NOT the clippy-banned
+    /// Build the connection that hosts `agent`, open a second connection to the
+    /// same bus acting as "`NetworkManager`", and return both: the host
+    /// connection and a proxy targeting the agent by that connection's unique
+    /// name. Uses `Builder::address` (NOT the clippy-banned
     /// `Connection::session`/`::system`).
     ///
-    /// The returned proxy is *known reachable* — see
-    /// [`wait_until_agent_is_reachable`], which every caller gets for free
-    /// precisely because the wait lives here and not in a helper each test has
-    /// to remember to call.
+    /// **Bind the returned connection, don't discard it** — `let (_server,
+    /// proxy) = …`, never `let (_, proxy) = …`. It is the only thing keeping
+    /// the agent mounted; a bare `_` pattern drops it on the spot and the
+    /// proxy's destination stops existing. Nothing else is done with it.
+    ///
+    /// # The agent is staged on the *builder*, and that is load-bearing (#756)
+    ///
+    /// `.serve_at(AGENT_PATH, agent)` before `.build()` is **not**
+    /// interchangeable with the more obvious
+    /// `conn.object_server().at(AGENT_PATH, agent)` after it. The latter races,
+    /// and the race is what reddened #714 and #743.
+    ///
+    /// All line numbers below are zbus 5.14.0, the version this workspace pins.
+    ///
+    /// `Connection::object_server()` builds the object server *on demand*: it
+    /// spawns a dispatch task and returns without waiting for it
+    /// (`connection/mod.rs:941-966`). That task's first act is
+    /// `Connection::add_match` for a `msg_type = MethodCall` rule — and for a
+    /// `MethodCall` rule zbus issues **no** `AddMatch` to the broker (it only
+    /// does that for `Signal` rules: `mod.rs:1068`); the subscription is purely
+    /// local bookkeeping in the connection's sender map, so nothing externally
+    /// observable orders it against anything the caller does next. Meanwhile
+    /// `SocketReader::receive_msg` (`socket_reader.rs:48-57`) fans each inbound
+    /// message out exactly once, to whichever senders are registered at that
+    /// instant, and never replays for a late subscriber — and the catch-all
+    /// channel is created deactivated (`mod.rs:1157-1169`), so an unclaimed
+    /// message is dropped, not buffered. A method call that reaches the socket
+    /// before the dispatch task has registered is therefore lost
+    /// *permanently*, even though the subscription lands microseconds later:
+    /// the handler never runs, no reply is ever generated, and the caller waits
+    /// out its entire timeout. That is why #756 looked like a 30-second hang on
+    /// a `get_secrets` path that contains no `await` at all, and why widening
+    /// `DBUS_REPLY_BUDGET` twice (#676) never helped.
+    ///
+    /// The builder path has an explicit barrier against exactly this.
+    /// `Builder::serve_at` (`connection/builder.rs:345`) only populates
+    /// `self.interfaces`; `Builder::build_` then, *because* that map is
+    /// non-empty, registers the interfaces, creates a `started_event`, passes
+    /// it into `start_object_server`, and `listener.await`s it — and only
+    /// afterwards calls `init_socket_reader` (`builder.rs:464-481` then
+    /// `:485`). The event is notified by the dispatch task itself,
+    /// on the line immediately after its `add_match` returns (`mod.rs:991`),
+    /// and `add_match`'s "socket reader has errored out" early-return cannot
+    /// misfire here because `Connection::new` seeds `msg_senders` with three
+    /// entries before any of this (`mod.rs:1166-1181`). So the socket reader
+    /// does not exist until the `MethodCall` subscription does, and there is no
+    /// window for a message to arrive into. No probe, no retry, no extra
+    /// budget, no assumption about round-trip latency.
     async fn mount_and_proxy(
-        server: &Connection,
         guard: &BusGuard,
         agent: NmAgent,
-    ) -> zbus::Proxy<'static> {
-        server
-            .object_server()
-            .at(AGENT_PATH, agent)
+    ) -> (Connection, zbus::Proxy<'static>) {
+        let server = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .serve_at(AGENT_PATH, agent)
+            .expect("stage NmAgent at AGENT_PATH")
+            .build()
             .await
-            .expect("mount NmAgent on object server");
+            .expect("connect agent host to ephemeral bus");
 
         let dest = server
             .unique_name()
@@ -1145,76 +1170,7 @@ mod system_tests {
             .await
             .expect("build SecretAgent proxy");
 
-        wait_until_agent_is_reachable(&proxy).await;
-
-        proxy
-    }
-
-    /// Block until the just-mounted agent answers a round trip, so that no test
-    /// ever fires its first real call into the setup race below.
-    ///
-    /// **Why this is needed** (#756). `Connection::object_server()` builds the
-    /// object server *on demand*: it `tokio::spawn`s a dispatch task and
-    /// returns immediately, without waiting for it. That task's first act is
-    /// `Connection::add_match` for a `msg_type = MethodCall` rule — and for a
-    /// `MethodCall` rule zbus does **no** `AddMatch` round trip to the broker
-    /// (it only calls the broker for `Signal` rules); the subscription is
-    /// purely local bookkeeping in the connection's sender map. So nothing
-    /// externally observable orders it against anything the caller does next.
-    ///
-    /// Meanwhile `SocketReader::receive_msg` fans each inbound message out
-    /// exactly once, to whichever senders are registered at that instant, and
-    /// never replays for a late subscriber. A method call that reaches the
-    /// socket before the dispatch task has registered is therefore dropped on
-    /// the floor: the handler never runs, no reply is ever generated, and the
-    /// caller waits out its entire timeout. Note the failure is *permanent for
-    /// that one message* even though the subscription lands microseconds
-    /// later — which is why #756 looked like a 30-second hang on a
-    /// `get_secrets` path that contains no `await` at all.
-    ///
-    /// zbus guards exactly this in its *builder* path: `Builder::build` passes
-    /// a `started_event` into `start_object_server` and awaits it before it
-    /// starts the socket reader, so no message can arrive first. The on-demand
-    /// `object_server()` path has no such barrier and exposes no readiness
-    /// signal, so the only handle a caller has is to keep knocking.
-    ///
-    /// Hence: `Introspect` on [`AGENT_PATH`] until it answers. It is dispatched
-    /// by the same `ObjectServer` task as `GetSecrets`, so a reply proves the
-    /// subscription is installed — and the subscription then lives as long as
-    /// the connection, so the race is paid once, here, instead of lurking in
-    /// front of every call every test in this module makes.
-    ///
-    /// A *single* probe would not be enough: the probe races the dispatch task
-    /// exactly the way the real call does, and a dropped probe is never
-    /// answered, so it has to be retried. The returned XML is checked for the
-    /// agent interface, which additionally catches a mount that silently did
-    /// not take.
-    async fn wait_until_agent_is_reachable(proxy: &zbus::Proxy<'static>) {
-        let deadline = tokio::time::Instant::now() + AGENT_READY_BUDGET;
-        let mut probes: u32 = 0;
-        loop {
-            probes += 1;
-            match tokio::time::timeout(AGENT_READY_PROBE_TIMEOUT, proxy.introspect()).await {
-                Ok(Ok(xml)) => {
-                    assert!(
-                        xml.contains(AGENT_IFACE),
-                        "{AGENT_PATH} answered Introspect but does not carry {AGENT_IFACE} — the \
-                         mount did not take. XML: {xml}"
-                    );
-                    return;
-                }
-                // A D-Bus *error* is still a reply, so the dispatch path is
-                // live and this is a real failure rather than the startup
-                // race. Fail now instead of burning the whole budget on it.
-                Ok(Err(e)) => panic!("Introspect on {AGENT_PATH} failed: {e}"),
-                Err(_elapsed) => assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "{AGENT_PATH} never became reachable: {probes} Introspect probes went \
-                     unanswered in {AGENT_READY_BUDGET:?}. Either the object server's dispatch \
-                     task never subscribed, or the ephemeral bus is wedged."
-                ),
-            }
-        }
+        (server, proxy)
     }
 
     /// A realistic `a{sa{sv}}` connection dict for a WPA-PSK network, with the
@@ -1273,9 +1229,9 @@ mod system_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn happy_path_returns_psk_over_the_bus() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, prompts, waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         // Fire the GetSecrets call as a task — it blocks inside the agent
         // awaiting the oneshot, so we must drive the handshake concurrently.
@@ -1344,9 +1300,9 @@ mod system_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn vpn_happy_path_returns_nested_secret_over_the_bus() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, prompts, waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openvpn");
         let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
@@ -1419,9 +1375,9 @@ mod system_tests {
     /// describes.
     #[tokio::test(flavor = "multi_thread")]
     async fn vpn_multi_secret_round_answers_every_requested_key() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, prompts, waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = vpn_connection_dict("Work VPN", "org.freedesktop.NetworkManager.openconnect");
         let call: tokio::task::JoinHandle<Result<ConnectionDict, zbus::Error>> =
@@ -1496,9 +1452,9 @@ mod system_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn wep_hint_returns_secret_under_wep_key0_over_the_bus() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, prompts, waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         // Static WEP: key-mgmt "none", and NM names the wanted secret
         // "wep-key0" in hints instead of "psk".
@@ -1563,9 +1519,9 @@ mod system_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn no_interaction_flag_is_rejected() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, _prompts, _waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
         let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
@@ -1592,9 +1548,9 @@ mod system_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn non_wireless_setting_is_rejected() {
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, _prompts, _waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");
         let result: Result<ConnectionDict, zbus::Error> = tokio::time::timeout(
@@ -1626,9 +1582,9 @@ mod system_tests {
         // the prompt, then call CancelGetSecrets over the wire. The agent drains
         // its waiters with Err, so the in-flight GetSecrets resolves to the
         // UserCanceled error name.
-        let (server, guard) = ephemeral_bus().await;
+        let guard = ephemeral_bus().await;
         let (agent, prompts, _waiters) = fresh_agent();
-        let proxy = mount_and_proxy(&server, &guard, agent).await;
+        let (_server, proxy) = mount_and_proxy(&guard, agent).await;
         let proxy_for_call = proxy.clone();
 
         let conn = wpa_connection(b"FRITZ!Box", "wpa-psk");

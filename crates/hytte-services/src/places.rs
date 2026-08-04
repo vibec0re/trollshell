@@ -1887,10 +1887,15 @@ mod tests {
     // ── Write path: atomic file replacement (#640 / #739) ───────────────────
     //
     // #739 folded `places`' own copy of this algorithm into
-    // `config_file::write_atomic`. These cases stayed here because they are the
-    // crate's only coverage of `Durability::FsyncParent` — the variant
-    // `persist_to` picks — where `config_file`'s own tests all run the
-    // `FileOnly` side.
+    // `config_file::write_atomic`. These cases stayed here because they assert
+    // through a `persist_to`-shaped local helper (`write_atomic` below, not to
+    // be confused with `config_file::write_atomic`) against `places.toml`-
+    // flavoured paths and bodies, and two of them drive the real `persist_to`
+    // directly. `config_file`'s own suite covers the algorithm in the
+    // abstract, including both `Durability` arms
+    // (`both_durability_choices_write_the_same_file`); what pins that
+    // `persist_to` actually takes the `FsyncParent` branch is
+    // `persist_to_pins_the_fsync_parent_durability_choice`, further down.
 
     /// Leftover scratch files (they're dotfiles named after their target).
     fn scratch_files(dir: &Path) -> Vec<String> {
@@ -2059,6 +2064,30 @@ mod tests {
         assert!(
             !violation.load(Ordering::Relaxed),
             "the scratch file must never be observed at other than the target's mode"
+        );
+    }
+
+    /// Pins that [`persist_to`] actually takes the [`Durability::FsyncParent`]
+    /// branch inside `config_file::write_atomic`, not just that it *compiles*
+    /// against that variant. The `fsync` itself can't be observed in-process
+    /// (see [`config_file::fsync_parent_attempts`]'s doc), but whether the
+    /// branch fired can: this fails if the `matches!` guard in `write_atomic`
+    /// is inverted, and it fails just as surely if `persist_to` is edited to
+    /// pass `Durability::FileOnly`. Neither of those trips any other test —
+    /// see #767's review thread.
+    #[test]
+    fn persist_to_pins_the_fsync_parent_durability_choice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("places.toml");
+        let before = config_file::fsync_parent_attempts();
+
+        persist_to(&target, &[full_place("Home")]).expect("persists");
+
+        assert_eq!(
+            config_file::fsync_parent_attempts(),
+            before + 1,
+            "persist_to must take the Durability::FsyncParent branch in \
+             write_atomic exactly once per call"
         );
     }
 

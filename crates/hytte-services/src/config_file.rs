@@ -44,6 +44,38 @@ const CONFIG_SUBDIR: &str = ".config/trollshell";
 /// this prevents is two writers sharing one temp file and interleaving into it.
 static TMP_TICKET: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only tripwire for the [`Durability::FsyncParent`] branch inside
+    /// [`write_atomic`].
+    ///
+    /// The `fsync` itself is unobservable in-process (its only effect is
+    /// durability across a power cut), so nothing here can assert *that* it
+    /// ran. What this pins instead is that the branch *fired at all* for a
+    /// given call — [`fsync_parent_attempts`] lets a test read the count
+    /// before and after a call and assert it moved. That is what
+    /// `places::tests::persist_to_pins_the_fsync_parent_durability_choice`
+    /// does against the real `places::persist_to`: it fails if the guard
+    /// below is inverted (so `FileOnly` writes take the branch instead of
+    /// `FsyncParent` ones) just as surely as it fails if `persist_to` is
+    /// edited to pass `FileOnly`.
+    ///
+    /// `thread_local` rather than a shared static: `cargo test` runs test
+    /// functions concurrently on a thread pool, and `write_atomic` itself
+    /// never spawns, so a plain shared counter would let an unrelated test's
+    /// calls on another thread mask a regression on this one (a false pass,
+    /// not a flake — the direction that matters least visibly). Confined to
+    /// this thread, the only calls that can move the count between a test's
+    /// own "before" and "after" reads are that test's own.
+    static FSYNC_PARENT_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of the tripwire counter above, for this thread.
+#[cfg(test)]
+pub(crate) fn fsync_parent_attempts() -> u64 {
+    FSYNC_PARENT_ATTEMPTS.with(std::cell::Cell::get)
+}
+
 /// Whether [`write_atomic`] also `fsync`s the parent **directory** after the
 /// `rename(2)`.
 ///
@@ -137,9 +169,15 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// Atomically replace `path`'s contents with `body`, creating the parent dir.
 ///
 /// The workspace's single copy of tmp + `fsync` + `rename(2)` + cleanup (#739);
-/// every persisted config file goes through here, whether via [`write`] or via
-/// `places`' own writer. No logging and no service scope — the caller decides
+/// every config file written through [`write`], plus `places`' own writer,
+/// goes through here. No logging and no service scope — the caller decides
 /// what a failure means and how to report it.
+///
+/// Not literally every persisted config file: `fullscreen_inhibit`'s
+/// `~/.config/trollshell/fullscreen-inhibit.toml` still writes with a bare,
+/// non-atomic `std::fs::write` plus a hand-rolled `create_dir_all`, so it
+/// still carries the #733 tearing bug for that one file. Known, out of #739's
+/// lane, tracked separately.
 ///
 /// The body lands in a temp file in the same directory as the target, is
 /// `fsync`ed, and is then `rename(2)`d over it, so no reader ever observes a
@@ -206,6 +244,8 @@ pub(crate) fn write_atomic(path: &Path, body: &str, durability: Durability) -> s
     }
 
     if matches!(durability, Durability::FsyncParent) {
+        #[cfg(test)]
+        FSYNC_PARENT_ATTEMPTS.with(|c| c.set(c.get() + 1));
         let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
     Ok(())
@@ -358,9 +398,12 @@ mod tests {
 
     /// Both [`Durability`] arms produce the same file — they differ only in
     /// whether the *rename* is flushed, which no in-process test can observe.
-    /// The `FsyncParent` arm is what `places::persist_to` picks (#739); this is
-    /// the local proof it isn't a dead branch. Its real coverage is the
-    /// `persist_to` suite in `places`.
+    /// That is all this proves; it is not a guard against the `FsyncParent`
+    /// branch going dead (inverting the `matches!` in [`write_atomic`], or
+    /// swapping which variant `places::persist_to` passes, both leave this
+    /// test green). The actual tripwire for that is
+    /// `places::tests::persist_to_pins_the_fsync_parent_durability_choice`,
+    /// via [`fsync_parent_attempts`].
     #[test]
     fn both_durability_choices_write_the_same_file() {
         let dir = tempfile::tempdir().unwrap();

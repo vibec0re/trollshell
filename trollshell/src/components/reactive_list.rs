@@ -344,12 +344,17 @@ mod tests {
     /// itself, exactly like the #224 contract `bind` documents at
     /// `hytte-reactive/src/bind.rs:16-22`.
     ///
-    /// This is the *contrast* to that module's own
-    /// `dropping_bound_widget_frees_it_on_next_emission`, not a copy of it:
-    /// that test drives a further `set()` to observe the free, because it is
-    /// the upgrade-on-emission that drops `bind`'s last handle. Here no
-    /// emission is needed — once the strong clone is gone, `GObject`
-    /// refcounting frees the container synchronously with the `drop` below.
+    /// Same shape as that module's own
+    /// `dropping_bound_widget_frees_it_on_next_emission`, one layer up.
+    ///
+    /// No emission is needed after the drop, in either test: `bind`
+    /// downgrades at `bind.rs:38` and its future captures only the weak ref,
+    /// so once `reactive_list` stops capturing a strong clone of its own, the
+    /// caller holds the last strong ref and `GObject` frees the container
+    /// synchronously with the `drop` below. The further `set()` in `bind`'s
+    /// version exercises a different thing — waking the parked loop so its
+    /// upgrade returns `None` and it breaks, releasing the task and its
+    /// signal subscription.
     #[gtk::test]
     fn dropping_the_container_frees_it_without_a_further_emission() {
         adw::init().expect("libadwaita init");

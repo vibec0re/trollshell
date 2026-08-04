@@ -137,7 +137,7 @@ fn security_from_connection(connection: &ConnectionDict) -> String {
 /// Decide which key to nest the wireless-security secret under.
 ///
 /// NM names the secret it actually wants in `hints` — mirrors
-/// [`vpn_secret_key_to_prompt`]'s precedent of trusting NM's hint list, but
+/// [`vpn_secret_keys_to_prompt`]'s precedent of trusting NM's hint list, but
 /// simpler: wireless has no equivalent of `vpn.secrets` to check off, and NM
 /// doesn't qualify these hints as `"<setting>.<key>"` the way it sometimes
 /// does for VPN, so hints here are always bare candidate secret names.

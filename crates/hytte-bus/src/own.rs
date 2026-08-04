@@ -853,22 +853,41 @@ where
 /// silently lost: nothing is lost precisely because everything stalls instead.
 /// Both readings were verified against the pinned zbus 5.14.0 source.
 ///
-/// The `arg0` filter ([`build_name_owner_changed_rule`]) keeps everything but
-/// this one name's ownership changes out of that queue, so filling it takes 64
-/// transitions inside a single window — remote, but the window on the
-/// [`OwnState::Denied`] path is a whole `cooldown`, and under
-/// `enableRecommendedServices = false` the bluez and iwd agent names sit on that
-/// path indefinitely, on the *system* connection every other service shares.
-/// Cheap insurance against an expensive shape of failure (#688 item 4).
+/// This is held as a flat invariant — *no wait in this file leaves a live
+/// subscription unpolled* — rather than argued from a motivating scenario,
+/// because the scenarios are all weak. The `arg0` filter
+/// ([`build_name_owner_changed_rule`]) keeps everything but this one name's
+/// ownership changes out of the queue, so filling 64 slots inside a single
+/// window is remote to begin with; and the [`OwnState::Denied`] window that
+/// prompted the fix, though it is the longest in the file, is if anything the
+/// *quietest* one — a name the broker's policy refuses us (the bluez and iwd
+/// agent names under `enableRecommendedServices = false`) is typically a name
+/// nobody owns, so there are no ownership changes of it to emit. The invariant
+/// earns its keep without any of that: it costs one `select!` arm, it does not
+/// need re-deriving every time the traffic estimate changes, and what it
+/// forecloses is a stall of the *system* connection every other service shares
+/// (#688 item 4).
 ///
 /// Discarding is correct **only because every caller reconnects immediately
 /// afterwards**, dropping this stream and building a fresh subscription, so
-/// nothing discarded here was going to be read. Do not reuse it on the
-/// contention-retry path: that one keeps the stream, and a release buffered
-/// during its wait is exactly what lets [`wait_for_release_or_cooldown`] return
-/// without serving out the backstop (see `run_ownership`'s subscription
-/// comment). Those retries are sub-second anyway, three orders of magnitude
-/// short of filling 64 slots.
+/// nothing discarded here was going to be read.
+///
+/// [`on_name_taken`]'s contention retry keeps its bare
+/// `sleep(RETRY_AFTER_LOSS * consecutive)` — 250 ms, then 500 ms — and the
+/// reason is simply that length: three orders of magnitude short of the traffic
+/// it would take to fill 64 slots, so the hazard cannot arise there. It is
+/// **not** that a release buffered during that sleep is load-bearing. It cannot
+/// be: that retry always sends another `RequestName` before any wait, and
+/// reaching [`wait_for_release_or_cooldown`] at all requires that request to
+/// have come back `Exists` — the name taken again — so a release buffered
+/// during the sleep is stale by the time the wait sees it, and
+/// [`is_release_of`] has no recency check with which to notice. It would return
+/// a spurious `Wake::Released` and short-circuit the cooldown. In the other
+/// outcome, where the re-request wins, [`watch_for_loss`] steps over that same
+/// message (its `old_owner` is not ours) and it is dropped there. The window
+/// `run_ownership`'s subscription comment actually protects is the one with
+/// *no* sleep in it: the method-call gap from a `RequestName` reply of `Exists`,
+/// through [`current_holder_of`], to the start of the wait.
 async fn sleep_draining<S>(stream: &mut S, dur: Duration)
 where
     S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
@@ -1397,6 +1416,15 @@ mod tests {
     /// hanging.
     const LONG_COOLDOWN: Duration = Duration::from_secs(30);
 
+    /// The wait under test in the [`sleep_draining`] tests. Long enough that a
+    /// whole [`trickle`] sequence lands inside it with an order of magnitude to
+    /// spare, short enough not to be felt in the suite.
+    const DRAIN_WINDOW: Duration = Duration::from_millis(300);
+
+    /// Spacing between [`trickle`]'s messages: three of them land at 20/40/60 ms
+    /// inside [`DRAIN_WINDOW`].
+    const TRICKLE_GAP: Duration = Duration::from_millis(20);
+
     /// A hand-built `NameOwnerChanged` — body `(name, old_owner, new_owner)`,
     /// with an empty `new_owner` meaning "released". No broker involved.
     fn name_owner_changed(name: &str, old_owner: &str, new_owner: &str) -> zbus::Message {
@@ -1414,6 +1442,28 @@ mod tests {
         msgs: Vec<zbus::Message>,
     ) -> impl futures_util::Stream<Item = zbus::Result<zbus::Message>> + Unpin {
         futures_util::stream::iter(msgs.into_iter().map(Ok))
+    }
+
+    /// A boxed message stream, so [`trickle`] can name a concrete `Unpin` type.
+    type BoxedMsgStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = zbus::Result<zbus::Message>>>>;
+
+    /// Like [`feed`], but the messages arrive *over time* — one every `gap`,
+    /// then the stream ends.
+    ///
+    /// [`feed`]'s `stream::iter` cannot tell a real drain from a
+    /// drain-once-then-`sleep(dur)`: it is ready on the first poll and finished
+    /// on the next, so both implementations empty it before the timer is ever
+    /// awaited, and both leave it exhausted. Only a stream that produces
+    /// something *after* the first poll separates the two, which is why the
+    /// [`sleep_draining`] tests use this and not `feed` (#688 review).
+    fn trickle(msgs: Vec<zbus::Message>, gap: Duration) -> BoxedMsgStream {
+        Box::pin(async_stream::stream! {
+            for msg in msgs {
+                tokio::time::sleep(gap).await;
+                yield Ok(msg);
+            }
+        })
     }
 
     /// A `RequestName` `AccessDenied` must surface the distinct `Denied` state
@@ -1598,10 +1648,11 @@ mod tests {
     ///
     /// The returned [`Wake`] is the whole assertion. `Released` is reachable
     /// only from the stream arm of the `select!`, so it *is* the proof that the
-    /// 30 s timer never won; an elapsed-time check on top (this test carried a
-    /// 5 s one until #688) could not fail for any reason the `Wake` does not
-    /// already catch, and could go red under scheduler pressure while the
-    /// property held — the #676/#678 pattern.
+    /// 30 s timer never won; the elapsed-time check this test carried until
+    /// #688 could not fail for any reason the `Wake` does not already catch,
+    /// and — being an *upper* bound, unlike the two that survive elsewhere in
+    /// this module — was the one shape of timing assertion a loaded machine can
+    /// turn red while the property still holds.
     #[tokio::test]
     async fn a_release_of_the_wanted_name_ends_the_wait_at_once() {
         let mut stream = feed(vec![name_owner_changed(NAME, ":1.6", "")]);
@@ -1694,46 +1745,58 @@ mod tests {
 
     // ── #688 item 4: no unpolled subscription on the error path ─────────────
 
-    /// A draining wait must consume everything that arrives *and* still serve
-    /// its full duration. An implementation that stopped reading would let the
-    /// subscription's 64-slot broadcast queue fill and block zbus's socket
-    /// reader — see [`sleep_draining`] — and one that returned when the stream
-    /// ended would turn the wait into a spin.
+    /// A draining wait must keep consuming for the *whole* wait, and still
+    /// serve its full duration. An implementation that stopped reading would
+    /// let the subscription's 64-slot broadcast queue fill and block zbus's
+    /// socket reader — see [`sleep_draining`] — and one that returned when the
+    /// stream ended would turn the wait into a spin.
+    ///
+    /// The stream [`trickle`]s on purpose. A backlog that is all present up
+    /// front is drained by `drain-once-then-sleep(dur)` just as completely as
+    /// by the real thing; messages that arrive at 20/40/60 ms into a 300 ms
+    /// wait are not, and leave that implementation holding the last two.
     #[tokio::test]
     async fn a_draining_wait_consumes_the_backlog_and_still_serves_its_time() {
-        let mut stream = feed(vec![
-            name_owner_changed(NAME, ":1.6", ""),
-            name_owner_changed(OTHER, ":1.5", ""),
-            name_owner_changed(NAME, "", ":1.7"),
-        ]);
+        let mut stream = trickle(
+            vec![
+                name_owner_changed(NAME, ":1.6", ""),
+                name_owner_changed(OTHER, ":1.5", ""),
+                name_owner_changed(NAME, "", ":1.7"),
+            ],
+            TRICKLE_GAP,
+        );
         let started = std::time::Instant::now();
-        sleep_draining(&mut stream, SHORT_COOLDOWN).await;
+        sleep_draining(&mut stream, DRAIN_WINDOW).await;
         assert!(
-            started.elapsed() >= SHORT_COOLDOWN,
+            started.elapsed() >= DRAIN_WINDOW,
             "the wait must serve its full duration, not end when the stream does"
         );
         assert!(
             stream.next().await.is_none(),
-            "everything that arrived during the wait must have been consumed"
+            "every message that arrived during the wait must have been consumed"
         );
     }
 
     /// The `Denied` wait is the longest window in this file — a whole
-    /// `cooldown`, and under `enableRecommendedServices = false` the bluez and
-    /// iwd agent names sit in it indefinitely — so it is the one that must not
-    /// leave the live `NameOwnerChanged` subscription unpolled.
+    /// `cooldown` — so it is the one that must not leave the live
+    /// `NameOwnerChanged` subscription unpolled. Same [`trickle`]d stream as
+    /// above, for the same reason: a drain-once implementation has to fail
+    /// here too, not just on the helper in isolation.
     #[tokio::test]
     async fn the_denied_wait_keeps_the_subscription_drained() {
         let writer = Mutable::new(OwnState::Acquiring);
         let mut failures = FailureStreak::default();
-        let mut stream = feed(vec![
-            name_owner_changed(NAME, ":1.6", ""),
-            name_owner_changed(OTHER, ":1.5", ""),
-        ]);
+        let mut stream = trickle(
+            vec![
+                name_owner_changed(NAME, ":1.6", ""),
+                name_owner_changed(OTHER, ":1.5", ""),
+            ],
+            TRICKLE_GAP,
+        );
         on_request_name_error(
             fdo::Error::AccessDenied("policy refuses ownership".into()),
             NAME,
-            SHORT_COOLDOWN,
+            DRAIN_WINDOW,
             &writer,
             &mut failures,
             &mut stream,

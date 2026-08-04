@@ -61,9 +61,11 @@ impl RowContainer for adw::ExpanderRow {
 /// On each emission the previously-added rows (and any placeholder) are removed,
 /// then: if the `Vec` is empty and `empty_placeholder` is `Some`, the
 /// placeholder row is built and added; otherwise one row per item is built via
-/// `build_row` and added. The container is cloned (cheap — GTK widgets are
-/// reference-counted) and the bind future lives as long as the signal source,
-/// matching [`hytte::prelude::bind`].
+/// `build_row` and added. The container is held only weakly, exactly like
+/// [`hytte::prelude::bind`] (#224): the apply closure takes its container
+/// argument from `bind` itself rather than capturing a strong clone, so
+/// dropping the container's last strong ref frees it instead of pinning it
+/// alive for the life of the binding (#761).
 ///
 /// `R` is generic so both `adw::ActionRow` and `adw::ExpanderRow` row widgets
 /// work; it must be a `GtkListBoxRow` descendant or libadwaita renders it below
@@ -83,8 +85,7 @@ pub(crate) fn reactive_list<C, T, R, S>(
     // row-traversal API). The placeholder, when shown, is tracked here too —
     // it's removed before the next rebuild exactly like a data row.
     let rows_track: Rc<RefCell<Vec<R>>> = Rc::new(RefCell::new(Vec::new()));
-    let container_for_bind = container.clone();
-    bind(signal, container, move |_, items| {
+    bind(signal, container, move |container, items| {
         // `take()`, not `borrow_mut().drain(..)`: the `RefMut` of a chained
         // temporary lives for the whole `for`, so every `remove_row()` below
         // would run with `rows_track` mutably borrowed. `remove()` can emit
@@ -92,12 +93,12 @@ pub(crate) fn reactive_list<C, T, R, S>(
         // and a panic unwinding through a glib callback aborts the process.
         // `take()` moves the vec out and ends the borrow before the first call.
         for row in rows_track.take() {
-            container_for_bind.remove_row(&row);
+            container.remove_row(&row);
         }
         if items.is_empty() {
             if let Some(make_placeholder) = empty_placeholder.as_ref() {
                 let placeholder = make_placeholder();
-                container_for_bind.add_row(&placeholder);
+                container.add_row(&placeholder);
                 rows_track.borrow_mut().push(placeholder);
             }
             return;
@@ -105,7 +106,7 @@ pub(crate) fn reactive_list<C, T, R, S>(
         let mut new_rows = Vec::with_capacity(items.len());
         for item in &items {
             let row = build_row(item);
-            container_for_bind.add_row(&row);
+            container.add_row(&row);
             new_rows.push(row);
         }
         *rows_track.borrow_mut() = new_rows;
@@ -336,6 +337,40 @@ mod tests {
             row_titles(&group),
             ["c"],
             "the re-emission is applied after the outer rebuild returns, leaving the last value"
+        );
+    }
+
+    /// #761 regression: `reactive_list` must not keep its container alive by
+    /// itself, exactly like the #224 contract `bind` documents at
+    /// `hytte-reactive/src/bind.rs:16-22`.
+    ///
+    /// This is the *contrast* to that module's own
+    /// `dropping_bound_widget_frees_it_on_next_emission`, not a copy of it:
+    /// that test drives a further `set()` to observe the free, because it is
+    /// the upgrade-on-emission that drops `bind`'s last handle. Here no
+    /// emission is needed — once the strong clone is gone, `GObject`
+    /// refcounting frees the container synchronously with the `drop` below.
+    #[gtk::test]
+    fn dropping_the_container_frees_it_without_a_further_emission() {
+        adw::init().expect("libadwaita init");
+        let group = adw::PreferencesGroup::new();
+        let weak = group.downgrade();
+        let items = Mutable::new(vec!["a".to_owned()]);
+        reactive_list(
+            &group,
+            items.signal_cloned(),
+            |t: &String| adw::ActionRow::builder().title(t.as_str()).build(),
+            None::<fn() -> adw::ActionRow>,
+        );
+        pump();
+
+        drop(group);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "reactive_list must not pin its container: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `container` argument from `bind`) \
+             would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
     }
 }

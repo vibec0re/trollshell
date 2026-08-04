@@ -886,15 +886,17 @@ fn month(m: u32) -> &'static str {
 ///   (so `set_value` reaches the `else` branch that calls `select_day` at all)
 ///   and it can never share today's day-of-month, since that would need a
 ///   five-day month. "A month out" or "same day next year" both emit zero.
-/// * **The `set_active_chip` edge exists only on a real flip.** The doc
-///   comment on [`DuePicker::set_active_chip`] describes re-running `set_mode`
-///   redundantly; measured, that redundancy happens only when the chip is not
-///   already active. `set_active(true)` on the already-active member of a
-///   group short-circuits before emitting anything — so the *idempotent*
-///   case the comment calls harmless is not merely harmless, it does not
-///   happen. The re-entry is real for the case that matters here: a fresh
-///   picker seeded with a Pick-mode date, where the "No date" chip is active
-///   and `set_active_chip` genuinely moves the group.
+/// * **The `set_active_chip` edge exists only on a real flip — and that is
+///   what bounds it.** [`DuePicker::set_active_chip`]'s doc comment is
+///   accurate: on a genuine flip the arriving chip's `toggled` handler does
+///   re-run `set_mode`, which does re-store the mode it already holds. What
+///   the measurement adds is why that redundancy stops at one hop. The
+///   re-entrant `set_mode` calls `set_active_chip` again, and by then the chip
+///   *is* active — so `set_active(true)` short-circuits and emits nothing.
+///   The already-active zero in the table above is the recursion's
+///   termination condition, not a refutation of the comment. Hence the
+///   emission log asserted below is exactly `["none:off", "pick:on"]`: one
+///   hop, not an unbounded chain.
 ///
 /// Also measured directly rather than inferred: holding a `RefMut` across
 /// either call and `try_borrow_mut`-ing the same cell from the handler reports
@@ -1059,9 +1061,10 @@ mod tests {
         assert!(
             redundant.is_empty(),
             "measured: set_active(true) on the already-active member of a group emits nothing on \
-             any member. If this ever fires, set_active_chip's doc comment about a harmless \
-             redundant set_mode becomes literally true and every set_value call gains a second \
-             re-entry: {redundant:?}"
+             any member. This zero is what bounds the re-entry above to a single hop — the \
+             re-entrant set_mode calls set_active_chip on a chip that is already active. If this \
+             ever fires, that bound is gone and the redundant set_mode chain no longer \
+             terminates here: {redundant:?}"
         );
         assert_eq!(
             mode_free_inside.get(),

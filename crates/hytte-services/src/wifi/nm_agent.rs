@@ -936,6 +936,11 @@ mod tests {
 // budget is deliberately generous — instead of hanging the suite forever.
 // `#[tokio::test(flavor = "multi_thread")]` is mandatory: the bus guard's
 // Drop calls `block_in_place`, which panics on a current-thread runtime.
+//
+// Setup goes through `mount_and_proxy`, which does not hand back a proxy until
+// the mounted object has answered a round trip — see
+// `wait_until_agent_is_reachable` for the zbus object-server race that
+// otherwise swallows a test's first method call outright (#756).
 #[cfg(all(test, feature = "system-tests"))]
 mod system_tests {
     use super::*;
@@ -977,6 +982,23 @@ mod system_tests {
     /// more often under load. If you want faster failure signal for a real
     /// hang, run the test locally — CI's job is to not lie.
     const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Total time [`mount_and_proxy`]'s readiness probe will spend waiting for
+    /// a freshly-mounted agent object to become *reachable*.
+    ///
+    /// Deliberately a separate constant from [`DBUS_REPLY_BUDGET`]: that one
+    /// bounds the calls a test makes once setup is finished, this one bounds
+    /// setup itself. Keeping them apart means tuning one never silently
+    /// re-opens the window the other closes (#756).
+    const AGENT_READY_BUDGET: Duration = Duration::from_secs(30);
+
+    /// How long one readiness probe waits before another is sent.
+    ///
+    /// Short on purpose. A probe that is going to be answered is answered in
+    /// microseconds; a probe that lost the race described in
+    /// [`wait_until_agent_is_reachable`] is *never* answered, so the only way
+    /// to make progress is to send a fresh one.
+    const AGENT_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
     /// Path the agent is mounted at on the ephemeral bus. NM uses a fixed
     /// well-known path in production; any valid object path works for the test.
@@ -1092,6 +1114,11 @@ mod system_tests {
     /// acting as "`NetworkManager`", and return a proxy targeting the agent by the
     /// server's unique name. Uses `Builder::address` (NOT the clippy-banned
     /// `Connection::session`/`::system`).
+    ///
+    /// The returned proxy is *known reachable* — see
+    /// [`wait_until_agent_is_reachable`], which every caller gets for free
+    /// precisely because the wait lives here and not in a helper each test has
+    /// to remember to call.
     async fn mount_and_proxy(
         server: &Connection,
         guard: &BusGuard,
@@ -1114,9 +1141,80 @@ mod system_tests {
             .await
             .expect("connect client (NetworkManager) to ephemeral bus");
 
-        zbus::Proxy::new(&client, dest, AGENT_PATH, AGENT_IFACE)
+        let proxy = zbus::Proxy::new(&client, dest, AGENT_PATH, AGENT_IFACE)
             .await
-            .expect("build SecretAgent proxy")
+            .expect("build SecretAgent proxy");
+
+        wait_until_agent_is_reachable(&proxy).await;
+
+        proxy
+    }
+
+    /// Block until the just-mounted agent answers a round trip, so that no test
+    /// ever fires its first real call into the setup race below.
+    ///
+    /// **Why this is needed** (#756). `Connection::object_server()` builds the
+    /// object server *on demand*: it `tokio::spawn`s a dispatch task and
+    /// returns immediately, without waiting for it. That task's first act is
+    /// `Connection::add_match` for a `msg_type = MethodCall` rule — and for a
+    /// `MethodCall` rule zbus does **no** `AddMatch` round trip to the broker
+    /// (it only calls the broker for `Signal` rules); the subscription is
+    /// purely local bookkeeping in the connection's sender map. So nothing
+    /// externally observable orders it against anything the caller does next.
+    ///
+    /// Meanwhile `SocketReader::receive_msg` fans each inbound message out
+    /// exactly once, to whichever senders are registered at that instant, and
+    /// never replays for a late subscriber. A method call that reaches the
+    /// socket before the dispatch task has registered is therefore dropped on
+    /// the floor: the handler never runs, no reply is ever generated, and the
+    /// caller waits out its entire timeout. Note the failure is *permanent for
+    /// that one message* even though the subscription lands microseconds
+    /// later — which is why #756 looked like a 30-second hang on a
+    /// `get_secrets` path that contains no `await` at all.
+    ///
+    /// zbus guards exactly this in its *builder* path: `Builder::build` passes
+    /// a `started_event` into `start_object_server` and awaits it before it
+    /// starts the socket reader, so no message can arrive first. The on-demand
+    /// `object_server()` path has no such barrier and exposes no readiness
+    /// signal, so the only handle a caller has is to keep knocking.
+    ///
+    /// Hence: `Introspect` on [`AGENT_PATH`] until it answers. It is dispatched
+    /// by the same `ObjectServer` task as `GetSecrets`, so a reply proves the
+    /// subscription is installed — and the subscription then lives as long as
+    /// the connection, so the race is paid once, here, instead of lurking in
+    /// front of every call every test in this module makes.
+    ///
+    /// A *single* probe would not be enough: the probe races the dispatch task
+    /// exactly the way the real call does, and a dropped probe is never
+    /// answered, so it has to be retried. The returned XML is checked for the
+    /// agent interface, which additionally catches a mount that silently did
+    /// not take.
+    async fn wait_until_agent_is_reachable(proxy: &zbus::Proxy<'static>) {
+        let deadline = tokio::time::Instant::now() + AGENT_READY_BUDGET;
+        let mut probes: u32 = 0;
+        loop {
+            probes += 1;
+            match tokio::time::timeout(AGENT_READY_PROBE_TIMEOUT, proxy.introspect()).await {
+                Ok(Ok(xml)) => {
+                    assert!(
+                        xml.contains(AGENT_IFACE),
+                        "{AGENT_PATH} answered Introspect but does not carry {AGENT_IFACE} — the \
+                         mount did not take. XML: {xml}"
+                    );
+                    return;
+                }
+                // A D-Bus *error* is still a reply, so the dispatch path is
+                // live and this is a real failure rather than the startup
+                // race. Fail now instead of burning the whole budget on it.
+                Ok(Err(e)) => panic!("Introspect on {AGENT_PATH} failed: {e}"),
+                Err(_elapsed) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{AGENT_PATH} never became reachable: {probes} Introspect probes went \
+                     unanswered in {AGENT_READY_BUDGET:?}. Either the object server's dispatch \
+                     task never subscribed, or the ephemeral bus is wedged."
+                ),
+            }
+        }
     }
 
     /// A realistic `a{sa{sv}}` connection dict for a WPA-PSK network, with the

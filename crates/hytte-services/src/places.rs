@@ -774,87 +774,6 @@ fn leading_comments(text: &str) -> String {
     header
 }
 
-/// Scratch-file counter, so two saves racing inside one process can't pick the
-/// same temporary path.
-static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Write `body` to `path` crash-safely.
-///
-/// Renders into a scratch file **in the same directory** (so the `rename(2)`
-/// is a same-filesystem, atomic swap — a `/tmp` scratch file would be a
-/// cross-device copy, which is not), `fsync`s it, then renames it into place.
-/// A crash, a full disk or a killed shell mid-write therefore leaves either
-/// the old config or the new one, never a half-written file — the failure
-/// mode a plain `File::create` + `write_all` has, which would silently
-/// truncate the user's places to nothing.
-///
-/// Symlink-safe: `path` is resolved with `canonicalize` first (mirroring
-/// `config_file::write`), so the scratch file lands beside — and the rename
-/// replaces — the file a symlinked `places.toml` points at, rather than
-/// clobbering the link itself. A target that doesn't exist yet can't be
-/// canonicalised and needs no resolving.
-///
-/// Permission-safe: an existing target's mode is carried over at `open` time
-/// (via `OpenOptionsExt::mode`), so the scratch file is never briefly more
-/// permissive than the config it replaces while the body is written. A
-/// brand-new file keeps `OpenOptions`' umask default, matching
-/// `config_file::write`.
-///
-/// On failure the scratch file is cleaned up and the target is untouched.
-fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Resolve symlinks: a target that doesn't exist yet can't be
-    // canonicalised (and needs no resolving); an existing one is followed so
-    // the write lands on the real file, not the link, and so the scratch file
-    // shares its filesystem — `rename(2)` is only atomic within one.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let dir = target
-        .parent()
-        .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
-
-    let stem = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("config");
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
-
-    // The mode the target already carries, if any — applied at `open` below,
-    // before the rename, so a hand-tightened 0600 config never comes back
-    // 0644.
-    let mode = std::fs::metadata(&target)
-        .ok()
-        .map(|m| m.permissions().mode() & 0o7777);
-
-    let swap = || -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        if let Some(mode) = mode {
-            opts.mode(mode);
-        }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(body.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, &target)
-    };
-
-    if let Err(e) = swap() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    // The rename itself is only durable once the *directory* entry is synced.
-    // Best-effort: some filesystems refuse an fsync on a read-only dir handle.
-    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-    Ok(())
-}
-
 /// What `places.toml` currently holds, from the point of view of a writer that
 /// is about to replace it.
 ///
@@ -896,13 +815,27 @@ fn read_on_disk(path: &Path) -> OnDisk {
 /// Carries the existing file's leading comment block forward; when there is no
 /// file yet (or it can't be read) the built-in default's header is used, so a
 /// config this API creates is as self-documenting as the one first run writes.
+///
+/// The write itself is [`config_file::write_atomic`] — the crate's one copy of
+/// the scratch-file + `fsync` + `rename(2)` algorithm (#739), which is also
+/// what makes it symlink- and permission-safe. `places.toml` picks
+/// [`config_file::Durability::FsyncParent`], unlike the click-driven toggles
+/// behind `config_file::write`: it is user-authored data, saved rarely and
+/// deliberately through an API that reports success, so an acknowledged save
+/// must survive a power cut. `config_file` gives us the real `io::Error` here,
+/// which is what [`PlacesError::Write`] needs to carry.
 fn persist_to(path: &Path, places: &[Place]) -> Result<(), PlacesError> {
     let header = match std::fs::read_to_string(path) {
         Ok(text) => leading_comments(&text),
         Err(_) => leading_comments(DEFAULT_CONFIG),
     };
     let body = serialize_places(places)?;
-    write_atomic(path, &format!("{header}{body}")).map_err(|e| PlacesError::Write(e.to_string()))
+    config_file::write_atomic(
+        path,
+        &format!("{header}{body}"),
+        config_file::Durability::FsyncParent,
+    )
+    .map_err(|e| PlacesError::Write(e.to_string()))
 }
 
 // ── Resolution ──────────────────────────────────────────────────────────────
@@ -1951,7 +1884,13 @@ mod tests {
         assert_eq!(removed(&set, "Home"), Ok(Vec::new()));
     }
 
-    // ── Write path: atomic file replacement (#640) ──────────────────────────
+    // ── Write path: atomic file replacement (#640 / #739) ───────────────────
+    //
+    // #739 folded `places`' own copy of this algorithm into
+    // `config_file::write_atomic`. These cases stayed here because they are the
+    // crate's only coverage of `Durability::FsyncParent` — the variant
+    // `persist_to` picks — where `config_file`'s own tests all run the
+    // `FileOnly` side.
 
     /// Leftover scratch files (they're dotfiles named after their target).
     fn scratch_files(dir: &Path) -> Vec<String> {
@@ -1961,6 +1900,13 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with('.'))
             .collect()
+    }
+
+    /// Exactly the call [`persist_to`] makes, minus the TOML rendering, so the
+    /// cases below can assert on a body they chose. The two #739 regressions go
+    /// through the real `persist_to` instead — see further down.
+    fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+        config_file::write_atomic(path, body, config_file::Durability::FsyncParent)
     }
 
     #[test]
@@ -2018,34 +1964,42 @@ mod tests {
         );
     }
 
-    /// #739: `write_atomic` must write *through* a symlinked target, not
-    /// replace the link with a regular file — the same guarantee
-    /// `config_file::write_path` already gives its callers. A dotfiles-repo
-    /// `places.toml` (stow/chezmoi/a plain symlink) must survive a
-    /// programmatic save.
+    /// #739: a save must write *through* a symlinked target, not replace the
+    /// link with a regular file. A dotfiles-repo `places.toml`
+    /// (stow/chezmoi/a plain symlink) must survive a programmatic save.
+    ///
+    /// Driven through the real [`persist_to`] rather than the shared core
+    /// directly, so it also pins that `places` keeps *using* the safe path —
+    /// the original defect was a private copy of the algorithm that skipped the
+    /// `canonicalize`, and a future one would look the same from here.
     #[test]
-    fn write_atomic_writes_through_a_symlinked_target() {
+    fn persist_to_writes_through_a_symlinked_target() {
         let dir = tempfile::tempdir().expect("tempdir");
         let real_dir = dir.path().join("real");
         std::fs::create_dir(&real_dir).expect("mkdir real");
         let real_file = real_dir.join("places.toml");
-        std::fs::write(&real_file, "old").expect("seed");
+        std::fs::write(&real_file, "# kept\n\n").expect("seed");
         let link = dir.path().join("places.toml");
         std::os::unix::fs::symlink(&real_file, &link).expect("symlink");
 
-        write_atomic(&link, "new").expect("writes");
+        persist_to(&link, &[full_place("Home")]).expect("persists");
 
         assert!(
             std::fs::symlink_metadata(&link)
                 .expect("link still exists")
                 .file_type()
                 .is_symlink(),
-            "the symlink must survive the write, not get replaced by a regular file"
+            "the symlink must survive the save, not get replaced by a regular file"
+        );
+        let text = std::fs::read_to_string(&real_file).expect("real file readable");
+        assert!(
+            text.starts_with("# kept\n"),
+            "the real file the symlink points at must receive the save: {text:?}"
         );
         assert_eq!(
-            std::fs::read_to_string(&real_file).unwrap(),
-            "new",
-            "the real file the symlink points at must receive the new content"
+            parse_places(&text).expect("reparses"),
+            vec![full_place("Home")],
+            "the real file the symlink points at must receive the new set"
         );
         assert!(
             scratch_files(&real_dir).is_empty(),
@@ -2061,10 +2015,11 @@ mod tests {
     /// luck decides whether the watcher thread samples the scratch file
     /// mid-write, so an unlucky run proves less, but a lucky one under the
     /// old post-write-`chmod` ordering catches the loose window directly.
+    ///
+    /// Through [`persist_to`] for the same reason as the symlink case above.
     #[test]
-    fn write_atomic_applies_the_targets_mode_before_the_body_is_written() {
+    fn persist_to_applies_the_targets_mode_before_the_body_is_written() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2096,7 +2051,7 @@ mod tests {
         });
 
         for i in 0..64 {
-            write_atomic(&target, &format!("body {i}")).expect("writes");
+            persist_to(&target, &[Place::new(format!("P{i}"), 1.0, 2.0)]).expect("persists");
         }
         stop.store(true, Ordering::Relaxed);
         watcher.join().expect("watcher thread");

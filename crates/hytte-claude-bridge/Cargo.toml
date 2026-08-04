@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "A keyless loopback shim that puts an OpenAI-compatible face on headless Claude Code, so the hytte LLM plugins can ride a Claude subscription unchanged (issue #584)"
+description = "A loopback shim that puts an OpenAI-compatible face on either headless Claude Code (keyless, rides a subscription) or the Anthropic Messages API (keyed, metered), so the hytte LLM plugins can use either unchanged (issues #584, #730)"
 
 [lints]
 workspace = true
@@ -44,3 +44,9 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, default-features = true, features = [
   "env-filter",
 ] }
+# The `/v1/messages` client for the API-key backend (#730): blocking `ureq` on a
+# `spawn_blocking` thread, the same idiom as `hytte_ai_providers::chat` and
+# hytte-services' weather fetcher rather than a second HTTP stack. `rustls` +
+# `json` is the feature pair every other ureq consumer here already resolves, so
+# this adds no lock entries.
+ureq = { workspace = true, features = ["json", "rustls"] }

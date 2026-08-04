@@ -42,10 +42,27 @@ use hytte::services::{
 /// bare `fmt::init()` silently discards every `warn!`/`info!` in the
 /// workspace on every real install — including `config_file::write`'s
 /// entire error-reporting strategy, which *is* a `warn!`. `INFO` was chosen
-/// over `WARN` after auditing every `info!` call site for hot-path spam
-/// (clock tick, audio/spectrum push, sensor pollers, the plugin clock pump):
-/// none of those files log at any level, so nothing needed demoting to
-/// `debug!` to make `INFO` safe as the default.
+/// over `WARN` after auditing every `info!` call site for hot-path spam:
+/// the clock tick, the audio/spectrum push, and the plugin clock pump have
+/// zero `tracing::*` calls at any level; the sensors poller
+/// (`crates/hytte-services/src/sensors/mod.rs`) logs only at `warn!`, never
+/// `info!`, so it needed no `info!` demotion either — nothing in the `info!`
+/// set needed demoting to `debug!` to make `INFO` safe.
+///
+/// That audit covered `info!` only. Raising the floor from `ERROR` to
+/// `INFO` also un-mutes `WARN`, which was not swept with the same rigor —
+/// worth naming honestly rather than leaving implicit. `sensors/mod.rs`
+/// runs an unconditional `loop { … sleep(1s) }`, and several of its
+/// per-tick `/proc`-read failure branches (`apply_cpu_load`,
+/// `apply_memory`, `apply_network`, the panicked-blocking-task arm) each
+/// `warn!` uncapped — unlike `hytte_bus::own::log_give_up`, which
+/// deliberately rate-caps the same class of repeating-failure signal to one
+/// line per 5-minute cooldown. A persistent `/proc` read failure would now
+/// log multiple lines per second, indefinitely. Not rate-capped here: the
+/// shipped `etc/systemd/user/trollshell.service` has no
+/// `ProcSubset=`/`ProtectProc=` hardening, so a healthy host never takes
+/// those branches today, and fixing it would expand this PR beyond
+/// `main.rs` into `hytte-services` — tracked instead as #770.
 const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
     tracing_subscriber::filter::LevelFilter::INFO;
 
@@ -649,6 +666,23 @@ mod tests {
 
     use super::{DEFAULT_LOG_LEVEL, build_env_filter};
 
+    // Known gap: both tests below drive `build_env_filter` through its
+    // `Some(_)` arm; `build_env_filter(None)` — the arm `main` actually
+    // calls — is never exercised directly. The equivalence this file's docs
+    // lean on (`from_env_lossy()` ==
+    // `parse_lossy(env::var("RUST_LOG").unwrap_or_default())`,
+    // `tracing-subscriber-0.3.23/src/filter/env/builder.rs:188-191`) is
+    // verified against the vendored source, so `Some("")` is a faithful
+    // mirror of an unset `RUST_LOG` today — but it is a mirror, not the real
+    // arm, and an edit to the `None` arm alone (e.g. reverting it to
+    // `EnvFilter::from_default_env()`) would reintroduce #746 with both
+    // tests below still green. Closing this gap for real needs a subprocess
+    // with a controlled environment (`std::process::Command::env` on a
+    // child, since mutating *this* process's env needs `std::env::set_var`/
+    // `remove_var`, both `unsafe` fns that `unsafe_code = "forbid"` blocks)
+    // — judged not worth the added machinery here; left as an acknowledged
+    // gap rather than silently assumed away.
+    //
     // #746: with `RUST_LOG` unset, the effective filter must default to
     // `DEFAULT_LOG_LEVEL` (currently `INFO`), not `tracing-subscriber`'s own
     // hard-coded `ERROR` fallback (what a bare `fmt::init()` /

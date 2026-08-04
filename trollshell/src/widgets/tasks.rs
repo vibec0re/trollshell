@@ -835,3 +835,278 @@ fn month(m: u32) -> &'static str {
         _ => "?",
     }
 }
+
+/// Regression coverage for [`DuePicker`]'s two synchronous re-entry edges
+/// (#762, split out of #759, part of #674's `RefCell`-across-a-GTK-call
+/// sweep). A `BorrowMutError` unwinding out of a GTK signal handler is a
+/// **process abort**, not a test failure — that is the class #627/#630/#631/
+/// #632/#638/#643/#644/#663/#673 fixed at roughly 50 sites, and here the fix
+/// is invisible: it is *the semicolons*.
+///
+/// [`DuePicker`] is `#[derive(Clone)]` and clones itself into five of its own
+/// widget handlers (four `connect_toggled`, one `connect_day_selected`), so
+/// `mode` and `selected` are anything but closure-private. Two of the calls
+/// [`DuePicker::set_value`] makes re-enter those handlers **synchronously**:
+///
+/// 1. `self.calendar.select_day(&gdt)` re-enters the `connect_day_selected`
+///    handler, which does `*p.selected.borrow_mut() = Some(date)`.
+/// 2. `self.set_active_chip(mode)` → `ToggleButton::set_active(true)`
+///    re-enters the chip's `connect_toggled` handler, which calls
+///    [`DuePicker::set_mode`] → `*self.mode.borrow_mut() = mode`.
+///
+/// Both survive only because the counterpart write in `set_value` is a
+/// **statement-scoped temporary** (`*self.selected.borrow_mut() = …;`) whose
+/// `RefMut` is already dropped when the emitting call runs. Written the
+/// obvious way — `let mut sel = self.selected.borrow_mut();` and then
+/// `select_day` inside that binding's scope — both abort. Verified: see the
+/// PR for #762.
+///
+/// ## Measured, not argued (gtk4 crate 0.11.2 / GTK 4.22.4, under `xvfb-run`)
+///
+/// Both edges were probed with throwaway harnesses before this module was
+/// written, because reasoning about which GTK setters emit is unreliable:
+///
+/// | call | emissions |
+/// |---|---|
+/// | `Calendar::select_day` onto a different **day-of-month** | 1 |
+/// | `Calendar::select_day` onto a different month, same day-of-month | **0** |
+/// | `Calendar::select_day` onto a different year, same day-of-month | **0** |
+/// | `Calendar::select_day` onto the already-selected date | **0** |
+/// | `ToggleButton::set_active(true)` on an **inactive** grouped member | 1 on the arriving chip + 1 on the leaving sibling |
+/// | `ToggleButton::set_active(true)` on the **already-active** member | **0**, on every member of the group |
+///
+/// Two consequences that the tests below encode, and that anyone editing them
+/// must not "simplify" away:
+///
+/// * **`day-selected` tracks the day-of-month only.** `gtk_calendar_select_day`
+///   sets year, month and day through three change-guarded setters and only
+///   the day setter emits. So the test date must differ from today *in its
+///   day-of-month*, or the test silently covers nothing. `Local::now() +
+///   5 days` satisfies this unconditionally: it is neither today nor tomorrow
+///   (so `set_value` reaches the `else` branch that calls `select_day` at all)
+///   and it can never share today's day-of-month, since that would need a
+///   five-day month. "A month out" or "same day next year" both emit zero.
+/// * **The `set_active_chip` edge exists only on a real flip.** The doc
+///   comment on [`DuePicker::set_active_chip`] describes re-running `set_mode`
+///   redundantly; measured, that redundancy happens only when the chip is not
+///   already active. `set_active(true)` on the already-active member of a
+///   group short-circuits before emitting anything — so the *idempotent*
+///   case the comment calls harmless is not merely harmless, it does not
+///   happen. The re-entry is real for the case that matters here: a fresh
+///   picker seeded with a Pick-mode date, where the "No date" chip is active
+///   and `set_active_chip` genuinely moves the group.
+///
+/// Also measured directly rather than inferred: holding a `RefMut` across
+/// either call and `try_borrow_mut`-ing the same cell from the handler reports
+/// `RefCell already borrowed`. The hazard is reachable; the statement scoping
+/// is load-bearing.
+///
+/// ## Deliberately **not** covered
+///
+/// [`DuePicker::set_mode`]'s own `select_day` (the "seed the calendar with
+/// today if nothing selected yet" branch) is **dead as a test target**: it
+/// seeds *today* onto a `gtk::Calendar` that is already sitting on today, i.e.
+/// row 4 of the table above — zero emissions, no re-entry, nothing to falsify.
+///
+/// [`DuePicker::refresh_summary`]'s pre-#643 shape (`match *self.mode.borrow()`
+/// holding the `Ref` across every arm) is likewise unfalsifiable: every arm
+/// touches only `self.summary_label`, and nothing is connected to that label,
+/// so reverting it emits nothing and panics nowhere.
+///
+/// Needs a real display server (a `gtk::Calendar` has to be constructible and
+/// actually run its setters), so this sits in the `system-tests` bucket and
+/// runs under `xvfb-run`, like the rest of this bug class.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{DueMode, DuePicker};
+    use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// `set_value` reads only `dt.date_naive()`, so the wall-clock time is
+    /// irrelevant to the code under test — but local *midnight* does not exist
+    /// on a spring-forward day in some zones, and `.single()` returns `None`
+    /// there. Noon exists everywhere.
+    fn at_noon(date: NaiveDate) -> DateTime<Local> {
+        let noon = NaiveTime::from_hms_opt(12, 0, 0).expect("12:00:00 is a valid wall-clock time");
+        Local
+            .from_local_datetime(&date.and_time(noon))
+            .single()
+            .expect("local noon is unambiguous in every real time zone")
+    }
+
+    /// A Pick-mode date whose **day-of-month** is guaranteed to differ from
+    /// today's — see the module doc. `+5 days` is neither today nor tomorrow
+    /// (so `set_value` takes the branch that calls `select_day`) and cannot
+    /// land on today's day-of-month, since that would need a five-day month.
+    fn pick_date() -> NaiveDate {
+        Local::now().date_naive() + Duration::days(5)
+    }
+
+    /// Count `day-selected` emissions on the picker's own calendar, and record
+    /// whether `selected` was free at the moment the handler chain ran.
+    fn watch_calendar(picker: &DuePicker) -> (Rc<Cell<u32>>, Rc<Cell<Option<bool>>>) {
+        let emissions = Rc::new(Cell::new(0_u32));
+        let free_inside = Rc::new(Cell::new(None));
+        let n = Rc::clone(&emissions);
+        let free = Rc::clone(&free_inside);
+        let selected = Rc::clone(&picker.selected);
+        picker.calendar.connect_day_selected(move |_| {
+            n.set(n.get() + 1);
+            free.set(Some(selected.try_borrow_mut().is_ok()));
+        });
+        (emissions, free_inside)
+    }
+
+    /// Leg 1: `set_value` → `Calendar::select_day` → `day-selected` →
+    /// `*p.selected.borrow_mut()`.
+    ///
+    /// The emission count is asserted rather than assumed: if a future GTK
+    /// stops emitting here, this test would otherwise keep passing while
+    /// covering nothing at all.
+    #[gtk::test]
+    fn set_value_does_not_hold_selected_across_select_day() {
+        adw::init().expect("libadwaita init");
+        let picker = DuePicker::new();
+        let (emissions, free_inside) = watch_calendar(&picker);
+
+        let date = pick_date();
+        picker.set_value(Some(at_noon(date)), false);
+
+        assert_eq!(
+            emissions.get(),
+            1,
+            "select_day must emit day-selected synchronously inside set_value — the count is read \
+             with no main-loop pump. A zero here means this test covers nothing: check that the \
+             date still differs from today in its day-of-month (see the module doc)."
+        );
+        assert_eq!(
+            free_inside.get(),
+            Some(true),
+            "the `selected` cell must not be borrowed while the day-selected handler chain runs; \
+             the handler's own `borrow_mut()` would abort the process, not fail this assertion"
+        );
+        assert_eq!(*picker.selected.borrow(), Some(date));
+        assert_eq!(*picker.mode.borrow(), DueMode::Pick);
+        assert!(picker.chip_pick.is_active());
+
+        emissions.set(0);
+        picker.set_value(Some(at_noon(date)), false);
+        assert_eq!(
+            emissions.get(),
+            0,
+            "re-seeding the same date must be silent — without this control the assertion above \
+             could be satisfied by a calendar that emits on every select_day call"
+        );
+    }
+
+    /// Leg 2: `set_value` → `set_active_chip` → `ToggleButton::set_active` →
+    /// `toggled` → `set_mode` → `*self.mode.borrow_mut()`.
+    ///
+    /// Also pins the measured shape of the edge: the leaving sibling emits
+    /// first, the arriving chip second, and a redundant `set_active(true)` on
+    /// the already-active member emits nothing at all.
+    #[gtk::test]
+    fn set_value_does_not_hold_mode_across_set_active_chip() {
+        adw::init().expect("libadwaita init");
+        let picker = DuePicker::new();
+        assert!(
+            picker.chip_none.is_active(),
+            "a fresh picker starts on \"No date\"; the flip this test needs depends on it"
+        );
+
+        let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let mode_free_inside = Rc::new(Cell::new(None));
+
+        let log = Rc::clone(&order);
+        picker.chip_none.connect_toggled(move |b| {
+            log.borrow_mut()
+                .push(if b.is_active() { "none:on" } else { "none:off" });
+        });
+        let log = Rc::clone(&order);
+        let free = Rc::clone(&mode_free_inside);
+        let mode = Rc::clone(&picker.mode);
+        picker.chip_pick.connect_toggled(move |b| {
+            log.borrow_mut()
+                .push(if b.is_active() { "pick:on" } else { "pick:off" });
+            if b.is_active() {
+                free.set(Some(mode.try_borrow_mut().is_ok()));
+            }
+        });
+
+        picker.set_value(Some(at_noon(pick_date())), false);
+
+        assert_eq!(
+            *order.borrow(),
+            ["none:off", "pick:on"],
+            "set_active_chip must move the group synchronously inside set_value, leaving chip \
+             first then arriving chip. An empty log means this test covers nothing."
+        );
+        assert_eq!(
+            mode_free_inside.get(),
+            Some(true),
+            "the `mode` cell must not be borrowed while the toggled handler chain runs; the \
+             chip's own handler re-runs set_mode, whose `borrow_mut()` would abort the process"
+        );
+        assert_eq!(*picker.mode.borrow(), DueMode::Pick);
+
+        drop(order.take());
+        mode_free_inside.set(None);
+        picker.set_active_chip(DueMode::Pick);
+        let redundant = order.take();
+        assert!(
+            redundant.is_empty(),
+            "measured: set_active(true) on the already-active member of a group emits nothing on \
+             any member. If this ever fires, set_active_chip's doc comment about a harmless \
+             redundant set_mode becomes literally true and every set_value call gains a second \
+             re-entry: {redundant:?}"
+        );
+        assert_eq!(
+            mode_free_inside.get(),
+            None,
+            "no toggled emission means the handler never ran, so the witness stays unset"
+        );
+    }
+
+    /// The tripwire under both tests' choice of date: `day-selected` follows
+    /// the **day-of-month**, not the date. A month-only or year-only move is
+    /// silent, which is exactly how this coverage would rot into a false pass.
+    ///
+    /// If a future GTK emits on any field change these zeros flip and this
+    /// test fails — that is a behaviour change to record, not a defect: the
+    /// `+5 days` date the other tests use stays correct under either rule.
+    #[gtk::test]
+    fn day_selected_tracks_the_day_of_month_only() {
+        adw::init().expect("libadwaita init");
+        let picker = DuePicker::new();
+        let (emissions, _) = watch_calendar(&picker);
+
+        // A fresh gtk::Calendar sits on *today*, so the first move has to
+        // differ from today's day-of-month to emit at all. Anchor on a day
+        // that exists in every month and is never today's.
+        let anchor = if Local::now().date_naive().day() == 15 {
+            14
+        } else {
+            15
+        };
+        let on = |y, m, d| {
+            NaiveDate::from_ymd_opt(y, m, d).expect("hand-written calendar date is valid")
+        };
+        let take = || {
+            let n = emissions.get();
+            emissions.set(0);
+            n
+        };
+
+        picker.set_value(Some(at_noon(on(2020, 3, anchor))), false);
+        assert_eq!(take(), 1, "a first move to a new day-of-month emits");
+        picker.set_value(Some(at_noon(on(2020, 4, anchor))), false);
+        assert_eq!(take(), 0, "month-only change is silent (measured)");
+        picker.set_value(Some(at_noon(on(2021, 4, anchor))), false);
+        assert_eq!(take(), 0, "year-only change is silent (measured)");
+        picker.set_value(Some(at_noon(on(2021, 4, anchor + 1))), false);
+        assert_eq!(take(), 1, "day-of-month change emits");
+    }
+}

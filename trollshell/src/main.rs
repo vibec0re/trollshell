@@ -33,6 +33,43 @@ use hytte::services::{
     wallpaper, weather, wifi, wifiscan,
 };
 
+/// Default `tracing` level when `RUST_LOG` is unset (#746).
+///
+/// `tracing_subscriber::fmt::init()`'s own env-unset fallback
+/// (`EnvFilter::from_default_env`) is hard-coded to `ERROR`, and no
+/// deployment path sets `RUST_LOG` (no `Environment=` line in
+/// `etc/systemd/user/trollshell.service`, none injected by `nix/`), so a
+/// bare `fmt::init()` silently discards every `warn!`/`info!` in the
+/// workspace on every real install — including `config_file::write`'s
+/// entire error-reporting strategy, which *is* a `warn!`. `INFO` was chosen
+/// over `WARN` after auditing every `info!` call site for hot-path spam
+/// (clock tick, audio/spectrum push, sensor pollers, the plugin clock pump):
+/// none of those files log at any level, so nothing needed demoting to
+/// `debug!` to make `INFO` safe as the default.
+const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
+    tracing_subscriber::filter::LevelFilter::INFO;
+
+/// Builds the `EnvFilter` that gates the global `tracing` subscriber.
+///
+/// `rust_log`, when `Some`, is parsed directly as the filter's directive
+/// string instead of reading the process's real `RUST_LOG` — this is what
+/// lets a test exercise the default-directive and override paths in
+/// isolation, without mutating process env (which `unsafe_code = "forbid"`
+/// rules out here anyway: `std::env::set_var`/`remove_var` are `unsafe` fns).
+/// `main` always passes `None`, so `RUST_LOG` still overrides
+/// [`DEFAULT_LOG_LEVEL`] exactly as before — `EnvFilter::Builder::from_env_lossy`
+/// is `parse_lossy(env::var("RUST_LOG").unwrap_or_default())` under the hood,
+/// so passing the same string through `parse_lossy` directly runs the
+/// identical code path for a given `RUST_LOG` value.
+fn build_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let builder =
+        tracing_subscriber::EnvFilter::builder().with_default_directive(DEFAULT_LOG_LEVEL.into());
+    match rust_log {
+        Some(dirs) => builder.parse_lossy(dirs),
+        None => builder.from_env_lossy(),
+    }
+}
+
 // The service-registration builder chain + body closure make `main` one long
 // flat sequence; registering the control service (#390) tips it past the
 // 100-line pedantic limit. Splitting it would only obscure the linear wiring.
@@ -54,7 +91,9 @@ fn main() -> hytte::ui::Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(build_env_filter(None))
+        .init();
 
     // Route panics through `tracing` too, so a crash in a GTK callback or an
     // un-supervised task lands in the journal as a structured record next to
@@ -602,4 +641,45 @@ fn group<const N: usize>(widgets: [gtk::Widget; N]) -> gtk::Widget {
         b.append(&w);
     }
     b.upcast()
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_subscriber::filter::LevelFilter;
+
+    use super::{DEFAULT_LOG_LEVEL, build_env_filter};
+
+    // #746: with `RUST_LOG` unset, the effective filter must default to
+    // `DEFAULT_LOG_LEVEL` (currently `INFO`), not `tracing-subscriber`'s own
+    // hard-coded `ERROR` fallback (what a bare `fmt::init()` /
+    // `EnvFilter::from_default_env()` produces). `Some("")` mirrors what
+    // `from_env_lossy()` does with an *unset* `RUST_LOG` — its own source is
+    // `parse_lossy(env::var("RUST_LOG").unwrap_or_default())`, so an unset
+    // var and an explicit empty string take the identical fallback branch —
+    // which keeps this test hermetic against ambient env instead of
+    // mutating process env (unavailable anyway: `unsafe_code = "forbid"`
+    // blocks `std::env::set_var`/`remove_var`, both `unsafe` fns).
+    //
+    // Falsified against the pre-#746 code path: swapping this test's
+    // `build_env_filter(Some(""))` for
+    // `tracing_subscriber::EnvFilter::from_default_env()` (the exact
+    // expression `fmt::init()` runs internally) reports
+    // `max_level_hint() == Some(LevelFilter::ERROR)`, failing both
+    // assertions below and confirming the test distinguishes the two paths.
+    #[test]
+    fn default_log_level_is_not_error() {
+        let filter = build_env_filter(Some(""));
+        assert_eq!(filter.max_level_hint(), Some(DEFAULT_LOG_LEVEL));
+        assert_ne!(filter.max_level_hint(), Some(LevelFilter::ERROR));
+    }
+
+    // `RUST_LOG` must still win over the default when set — the documented
+    // dev workflow (`RUST_LOG=hytte_services=debug,trollshell=debug cargo
+    // run`) depends on it. A directive naming this crate at `trace` should
+    // raise the hint above `DEFAULT_LOG_LEVEL` (`INFO`).
+    #[test]
+    fn rust_log_override_still_wins() {
+        let filter = build_env_filter(Some("trollshell=trace"));
+        assert_eq!(filter.max_level_hint(), Some(LevelFilter::TRACE));
+    }
 }

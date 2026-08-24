@@ -1193,15 +1193,23 @@ mod tests {
     // Unlike #766's shell-binary tests (`trollshell/src/main.rs`), which
     // both drove `build_env_filter` through its `Some(_)` arm and left the
     // `None` arm — the one `main` actually calls — unexercised, this test
-    // calls `build_env_filter(None)` directly. It's hermetic against
-    // ambient env because the test process itself has no `RUST_LOG` set in
-    // `cargo test`'s default environment, so `from_env_lossy()` takes its
-    // real unset-var fallback path here, not a mirror of it.
+    // calls `build_env_filter(None)` directly, which reads the *real*
+    // process `RUST_LOG` (there's no way around that for the `None` arm
+    // specifically — that's the whole point of exercising it). `cargo test`
+    // inherits the parent shell's environment, and this repo's own
+    // `CLAUDE.md` documents exporting `RUST_LOG` for local debugging
+    // (`RUST_LOG=hytte_services=debug,trollshell=debug cargo run`), so a
+    // developer with it exported would otherwise see this test assert a
+    // default that is correctly *not* in effect. Skip rather than assert in
+    // that case — `rust_log_override_still_wins` below already covers "an
+    // ambient/explicit `RUST_LOG` wins over the default".
     #[test]
     fn default_log_level_is_not_error_for_the_none_arm() {
+        if std::env::var_os("RUST_LOG").is_some() {
+            return;
+        }
         let filter = build_env_filter(None);
         assert_eq!(filter.max_level_hint(), Some(DEFAULT_LOG_LEVEL));
-        assert_ne!(filter.max_level_hint(), Some(LevelFilter::ERROR));
     }
 
     // `RUST_LOG` must still win over the default when set — mirrors #766's

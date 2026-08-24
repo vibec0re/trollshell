@@ -29,6 +29,7 @@ mod hwmon;
 mod meminfo;
 mod net;
 mod proc_stat;
+mod warn_latch;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
@@ -48,6 +49,7 @@ use hwmon::read_cpu_temp;
 use meminfo::read_proc_meminfo;
 use net::{read_net_connections, read_proc_net_dev};
 use proc_stat::{compute_cpu_load, read_proc_stat};
+use warn_latch::{WARN_COOLDOWN, WarnLatch};
 
 // ── Blocking-read bundle ───────────────────────────────────────────────────────
 
@@ -702,6 +704,13 @@ struct PollState {
     gpu_cache: GpuCache,
     /// Tick counter for rate-limiting slower polls.
     tick: u64,
+    /// Rate-caps for the four uncapped per-tick `warn!` sites (#770): a
+    /// persistent failure logs at most once per [`WARN_COOLDOWN`] instead of
+    /// once per second. See the `warn_latch` module docs.
+    warn_blocking_io: WarnLatch,
+    warn_cpu_stat: WarnLatch,
+    warn_memory: WarnLatch,
+    warn_network: WarnLatch,
 }
 
 impl PollState {
@@ -713,6 +722,10 @@ impl PollState {
             cpu_temp_chip: None,
             gpu_cache: GpuCache::default(),
             tick: 0,
+            warn_blocking_io: WarnLatch::new(),
+            warn_cpu_stat: WarnLatch::new(),
+            warn_memory: WarnLatch::new(),
+            warn_network: WarnLatch::new(),
         }
     }
 }
@@ -831,11 +844,12 @@ async fn poll_loop(w: PollWriters) {
         .await;
 
         let Ok((data, new_gpu_cache)) = data else {
-            tracing::warn!("sensors: blocking I/O task panicked; skipping tick");
+            log_blocking_io_panic(&mut state.warn_blocking_io, now);
             state.tick = state.tick.wrapping_add(1);
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
+        log_blocking_io_recovery(&mut state.warn_blocking_io);
 
         // Thread the chip cache back.
         state.cpu_temp_chip = data.cpu_temp_chip;
@@ -845,10 +859,10 @@ async fn poll_loop(w: PollWriters) {
             state.gpu_cache = cache;
         }
 
-        apply_cpu_load(&mut state.cpu_prev, data.cpu_stat, &cpu_writer);
+        apply_cpu_load(&mut state, data.cpu_stat, &cpu_writer, now);
         apply_cpu_freq(data.cpu_freq, &cpu_freq_writer);
-        apply_memory(data.mem, &mem_writer);
-        apply_network(&mut state.net_prev, data.net_dev, now, &net_writer);
+        apply_memory(&mut state, data.mem, &mem_writer, now);
+        apply_network(&mut state, data.net_dev, now, &net_writer);
         apply_disk_io(&mut state.disk_io_prev, data.disk_io, now, &disk_io_writer);
         apply_cpu_temp(data.cpu_temp, &cpu_temp_writer);
         apply_gpu(data.gpu_tick, data.gpu_state, &gpu_writer);
@@ -863,20 +877,56 @@ async fn poll_loop(w: PollWriters) {
 
 // ── Per-concern publish helpers ───────────────────────────────────────────────
 
+/// Log the blocking-I/O-task-panicked failure, rate-capped (#770). Split out
+/// of `poll_loop` to keep it under `clippy::too_many_lines` — see the
+/// `warn_latch` module docs for the cadence.
+fn log_blocking_io_panic(latch: &mut WarnLatch, now: Instant) {
+    if let Some(suppressed) = latch.on_failure(now, WARN_COOLDOWN) {
+        tracing::warn!(
+            suppressed,
+            "sensors: blocking I/O task panicked; skipping tick"
+        );
+    }
+}
+
+/// Log recovery from a blocking-I/O-task-panic streak, if anything was
+/// suppressed while it was failing (#770). Counterpart to
+/// [`log_blocking_io_panic`].
+fn log_blocking_io_recovery(latch: &mut WarnLatch) {
+    if let Some(suppressed) = latch.on_success() {
+        tracing::warn!(
+            suppressed,
+            "sensors: blocking I/O task recovered; no longer panicking"
+        );
+    }
+}
+
 /// Compute and publish CPU load; update the rolling `cpu_prev` cache.
+///
+/// Takes `&mut PollState` (rather than just `cpu_prev`) because it also owns
+/// the failure latch for #770's rate-capped `warn!` — see the `warn_latch`
+/// module docs — and threading both `&mut` pieces separately through
+/// `poll_loop`'s call site is what pushed that function over
+/// `clippy::too_many_lines`.
 fn apply_cpu_load(
-    cpu_prev: &mut Vec<(u64, u64)>,
+    state: &mut PollState,
     cpu_stat: Option<Vec<(u64, u64)>>,
     writer: &Mutable<CpuLoad>,
+    now: Instant,
 ) {
     match cpu_stat {
         Some(cpu_now) => {
-            let load = compute_cpu_load(cpu_prev, &cpu_now);
-            *cpu_prev = cpu_now;
+            let load = compute_cpu_load(&state.cpu_prev, &cpu_now);
+            state.cpu_prev = cpu_now;
             writer.set(load);
+            if let Some(suppressed) = state.warn_cpu_stat.on_success() {
+                tracing::warn!(suppressed, "sensors: /proc/stat reads recovered");
+            }
         }
         None => {
-            tracing::warn!("sensors: failed to read /proc/stat");
+            if let Some(suppressed) = state.warn_cpu_stat.on_failure(now, WARN_COOLDOWN) {
+                tracing::warn!(suppressed, "sensors: failed to read /proc/stat");
+            }
         }
     }
 }
@@ -890,21 +940,38 @@ fn apply_cpu_freq(cpu_freq: CpuFreq, writer: &Mutable<CpuFreq>) {
 }
 
 /// Publish memory usage, or warn on read failure.
-fn apply_memory(mem: Option<Memory>, writer: &Mutable<Memory>) {
+///
+/// Takes `&mut PollState` for the same reason as [`apply_cpu_load`]: it owns
+/// the #770 failure latch, and this keeps `poll_loop`'s call site to one
+/// line instead of threading the latch through separately.
+fn apply_memory(
+    state: &mut PollState,
+    mem: Option<Memory>,
+    writer: &Mutable<Memory>,
+    now: Instant,
+) {
     match mem {
         Some(mem) => {
             writer.set(mem);
+            if let Some(suppressed) = state.warn_memory.on_success() {
+                tracing::warn!(suppressed, "sensors: /proc/meminfo reads recovered");
+            }
         }
         None => {
-            tracing::warn!("sensors: failed to read /proc/meminfo");
+            if let Some(suppressed) = state.warn_memory.on_failure(now, WARN_COOLDOWN) {
+                tracing::warn!(suppressed, "sensors: failed to read /proc/meminfo");
+            }
         }
     }
 }
 
 /// Compute per-interface byte rates from the new `/proc/net/dev` snapshot,
 /// update the rolling `net_prev` cache, and publish the `NetIo` snapshot.
+///
+/// Takes `&mut PollState` for the same reason as [`apply_cpu_load`]: it owns
+/// the #770 failure latch alongside `net_prev`.
 fn apply_network(
-    net_prev: &mut HashMap<String, (u64, u64, Instant)>,
+    state: &mut PollState,
     net_dev: Option<Vec<(String, u64, u64)>>,
     now: Instant,
     writer: &Mutable<NetIo>,
@@ -915,7 +982,7 @@ fn apply_network(
             let mut next_net_prev = HashMap::new();
 
             for (name, rx, tx) in net_now {
-                let (rx_rate, tx_rate) = match net_prev.get(&name) {
+                let (rx_rate, tx_rate) = match state.net_prev.get(&name) {
                     Some((prev_rx, prev_tx, prev_when)) => {
                         let dt = now.duration_since(*prev_when).as_secs_f64().max(0.1);
                         let rx_r = u64_to_f64_bytes(rx.saturating_sub(*prev_rx)) / dt;
@@ -934,11 +1001,16 @@ fn apply_network(
                 next_net_prev.insert(name, (rx, tx, now));
             }
 
-            *net_prev = next_net_prev;
+            state.net_prev = next_net_prev;
             writer.set(NetIo { interfaces });
+            if let Some(suppressed) = state.warn_network.on_success() {
+                tracing::warn!(suppressed, "sensors: /proc/net/dev reads recovered");
+            }
         }
         None => {
-            tracing::warn!("sensors: failed to read /proc/net/dev");
+            if let Some(suppressed) = state.warn_network.on_failure(now, WARN_COOLDOWN) {
+                tracing::warn!(suppressed, "sensors: failed to read /proc/net/dev");
+            }
         }
     }
 }

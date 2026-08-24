@@ -5,7 +5,10 @@
 # plugin at http://127.0.0.1:8787 is the whole integration.
 #
 # Prerequisites: the `claude` CLI on the user manager's PATH, already logged in
-# (`claude` → `/login`). The bridge holds no credentials of its own.
+# (`claude` → `/login`). The bridge holds no credentials of its own — with one
+# exception, CLAUDE_BRIDGE_MODE=api (#730), which swaps the subscription for a
+# metered API key and needs neither the CLI nor a login. See the api-mode block
+# at the bottom of this file.
 #
 # Port 8787, not 8080 — 8080 belongs to trollshell-pet-brain.service's
 # llama-server, and the two are meant to be swappable, not exclusive.
@@ -31,6 +34,14 @@ Environment=RUST_LOG=hytte_claude_bridge=info
 # exposes no environment hook. So the scrub happens HERE, and the bridge
 # **refuses to start** if it finds any of them still set — belt and braces, and
 # a loud failure rather than a quiet bill.
+#
+# The startup refusal is mode-scoped (#730): it guards the `claude` CHILD, and
+# CLAUDE_BRIDGE_MODE=api spawns none, so there ANTHROPIC_API_KEY is the
+# credential rather than the offence. The scrub below is NOT mode-scoped —
+# `UnsetEnvironment=` is static per-unit — and that is the deliberate call
+# (#752): an inherited key that quietly starts billing is a worse failure than
+# a mode that has to read its key from a file. See the api-mode block below for
+# where that key goes.
 UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
 
 # The dummy key. Belt-and-braces on THIS unit — nothing in the bridge reads it
@@ -53,11 +64,44 @@ RestartSec=5
 #   Environment=OPENROUTER_API_KEY=local-bridge   # keeps the real key at home
 #
 # Other knobs, all optional, all on THIS unit:
-#   Environment=CLAUDE_BRIDGE_MODEL=claude-haiku-4-5   # default: claude's own
-#   Environment=CLAUDE_BRIDGE_MODE=reprompt            # default: subscription
+#
+#   Environment=CLAUDE_BRIDGE_MODE=reprompt   # default: subscription. One of:
+#       #   subscription — one persisted `claude` session per conversation
+#       #   reprompt     — a one-off `claude --print` per turn, whole record resent
+#       #   api          — no `claude` child at all: POST /v1/messages with an
+#       #                  Anthropic API key, billed per token (#730). See below.
+#   Environment=CLAUDE_BRIDGE_MODEL=claude-haiku-4-5
+#       # default: claude's own — except in api mode, which needs an explicit id
+#       # and falls back to claude-opus-5.
+#   Environment=CLAUDE_BRIDGE_THINKING=disabled
+#       # api mode only; one of disabled (default) | adaptive | auto. `disabled`
+#       # is load-bearing: max_tokens bounds thinking PLUS answer text, and the
+#       # consumers here ask for ~256 tokens of kaomoji. Use `auto` on a model
+#       # that rejects an explicit disabled (Fable 5).
 #   Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=8           # must stay under 10
 #   Environment=CLAUDE_BRIDGE_PORT=8787
 #   Environment=CLAUDE_BRIDGE_STATE_DIR=%h/.local/state/hytte-claude-bridge
+#       # `claude` modes only — it is the child's cwd, which is what scopes
+#       # claude's on-disk sessions. api mode spawns no child and ignores it.
+
+# ── CLAUDE_BRIDGE_MODE=api: the key goes in a FILE, not the environment ───────
+# api mode holds a real Anthropic API key and bills metered credits, so it is
+# the one mode where reaching the loopback port spends money. Put the key in
+#
+#   ~/.config/trollshell/anthropic.key        # chmod 600; trimmed, empty == unset
+#
+# — the same convention `hytte_ai_providers::load_key` uses for the other
+# providers, and honoured via $XDG_CONFIG_HOME when that is set.
+#
+# Do NOT add `Environment=ANTHROPIC_API_KEY=…` here. The bridge does read that
+# variable, and it outranks the file, but the SECURITY CONTROL block above
+# strips it from this unit on purpose, so setting it here is a no-op: the
+# bridge starts, finds no key, and refuses (#752). The env override is for
+# `cargo run`, not for systemd.
+#
+# With no key at all, api mode refuses to start rather than binding 8787 and
+# answering every request with a 502 — check `systemctl --user status
+# trollshell-claude-bridge` for the refusal, which names this path.
 
 [Install]
 WantedBy=niri-session.target

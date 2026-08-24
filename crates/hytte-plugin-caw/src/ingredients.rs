@@ -6,29 +6,30 @@
 //! per briefing — this module is *not* a poller; the always-on pollers stay
 //! where they live (the weather/departures plugins, the native services).
 //!
-//! # Data path (the #407 design question)
+//! # Data path
 //!
-//! There are **no** domain `StateKey`s yet (the proto carries only
-//! clock/visibility/accent/spectrum), so nothing host-pushed exists to
-//! subscribe to. Until the host grows briefing-shaped keys (the issue's option
-//! (c) — see the spec note in `docs/superpowers/specs/`), caw sources the two
-//! HTTPS-reachable ingredients herself, exactly the way the weather and
-//! departures plugins already do:
+//! [`gather`] fetches only weather and departures — the two ingredients with
+//! no host-pushed equivalent. Calendar events are **not** fetched here: the
+//! proto grew domain `StateKey`s (`CalendarUpcoming`, `SessionLocked`,
+//! `NowPlaying`) in #484 (shipped in PR #539), `main.rs` subscribes
+//! `StateKey::CalendarUpcoming` and relays each push through
+//! [`EventBrief::from_upcoming`], and [`crate::briefing::brief_now`]
+//! overwrites [`Ingredients::events`] with the latest host-pushed list right
+//! before composing. `gather()` itself never touches the calendar:
 //!
 //! - **Weather** — open-meteo, located by the first `[[place]]`'s `lat`/`lon`
 //!   in `~/.config/trollshell/places.toml` (home), falling back to a forward
 //!   geocode of `$TROLLSHELL_WEATHER_CITY` (the same env the weather stack
 //!   honors). No `GeoClue`: a once-a-day briefing doesn't warrant a D-Bus
 //!   dependency, and "weather at home in the morning" is the right semantic
-//!   anyway.
+//!   anyway. No host `StateKey` carries weather, so this stays a direct fetch.
 //! - **Departures** — the HAFAS endpoint (`v6.bvg.transport.rest`), for the
 //!   same first place's `station`, filtered by its `lines`/`directions` and
-//!   walk budget; the *first catchable* row wins.
-//! - **Calendar** — [`Ingredients::events`] stays **empty** for now:
-//!   evolution-data-server sits behind the shell's libecal/D-Bus service and an
-//!   out-of-process plugin can't reach it without linking half the shell. The
-//!   composition ([`crate::briefing`]) already folds events in, so the day the
-//!   host shares them (option (c)) only the gather side changes.
+//!   walk budget; the *first catchable* row wins. Same story: no host
+//!   `StateKey` for departures either.
+//! - **Calendar** — sourced entirely from the host push described above.
+//!   [`gather`] leaves [`Ingredients::events`] empty; the caller
+//!   ([`crate::briefing::brief_now`]) fills it in from the command lane.
 //!
 //! Everything here is best-effort: a missing config or a failed fetch just
 //! leaves that ingredient absent and the composer degrades gracefully — caw
@@ -57,9 +58,10 @@ const FETCH_COUNT: usize = 20;
 pub(crate) struct Ingredients {
     pub weather: Option<WeatherBrief>,
     pub departure: Option<DepartureBrief>,
-    /// Upcoming calendar events. Always empty today (no host `StateKey` for
-    /// the native calendar service yet — see the module docs); the composer is
-    /// already event-aware so the (c) hookup only touches the gather side.
+    /// Upcoming calendar events. [`gather`] always leaves this empty — the
+    /// host-pushed `CalendarUpcoming` list (#484) is filled in by
+    /// [`crate::briefing::brief_now`], not by this struct's own gather path
+    /// (see the module docs).
     pub events: Vec<EventBrief>,
 }
 

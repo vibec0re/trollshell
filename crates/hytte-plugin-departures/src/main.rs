@@ -663,8 +663,9 @@ fn status_text(text: &str, class: &str) -> Node {
         id: None,
         text: text.to_owned(),
         max_width_chars: None,
-        // Vocabulary gained `ellipsize` (#297); keep this line wrapping exactly as
-        // before. Adopting single-line ellipsis for the destination is a follow-up.
+        // Status/error lines always wrap rather than truncate — unlike the
+        // destination cell below (`row_node`), a status message shouldn't
+        // lose its tail to an ellipsis.
         ellipsize: false,
         classes: vec![class.to_owned()],
     }
@@ -705,9 +706,15 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
             id: None,
             text: r.direction.clone(),
             max_width_chars: Some(DIRECTION_MAX_CHARS),
-            // Behaviour-preserving compile-fix for the #297 `ellipsize` field.
-            // Switching this to `true` (single-line ellipsis, native-board parity)
-            // is the adoption follow-up (#296) — not this vocabulary-only PR.
+            // Stays `ellipsize: false` (wraps at DIRECTION_MAX_CHARS) rather
+            // than the sibling weather plugin's `ellipsize: true` (#299).
+            // #297 originally filed the wrap-vs-ellipsize mismatch against
+            // this and the weather card, comparing both to the native board;
+            // that board is gone (retired in PR #298), so there's nothing
+            // left to match against, and no tracking issue for flipping this
+            // one — it's an open call, not a scheduled follow-up. (#296,
+            // previously cited here, is the PR that ported this plugin in
+            // the first place, not an adoption follow-up.)
             ellipsize: false,
             classes: vec!["ts-departure-direction".to_owned()],
         },

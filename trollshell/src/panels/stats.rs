@@ -152,16 +152,17 @@ pub fn set_scroll_target(monitor: &Monitor, section: StatsSection) {
 ///
 /// Wrapped in a `gtk::ScrolledWindow` (mirroring `connections.rs`/`wifi.rs`'s
 /// #84 pattern) so five stacked cards can't push the drawer past screen
-/// height. A `"stats"`-prefixed `gio::SimpleActionGroup` carrying one
-/// `"scroll"` action is inserted on the returned page widget by
-/// [`install_scroll_action`]: activating it re-applies the [`StatsSection`]
-/// pending in [`PENDING_SCROLL`] for the monitor named by the action's string
-/// parameter (#542). Routing the trigger through a widget-local action (rather
-/// than a cross-module registry keyed by monitor) is what lets `crate::modal`
-/// poke *this specific monitor's* built page instance armed with only the
-/// `gtk::Widget` it already gets back from `gtk::Stack::child_by_name` — this
-/// page never needs to know which monitor it's on, only which key it was handed
-/// at activation.
+/// height. A `"stats"`-prefixed `gio::SimpleActionGroup` carrying a `"scroll"`
+/// and a `"max-height"` action is inserted on the returned page widget by
+/// [`install_stats_actions`]: `"scroll"` re-applies the [`StatsSection`]
+/// pending in [`PENDING_SCROLL`] for the monitor named by its string parameter
+/// (#542), and `"max-height"` sets the viewport cap from the live per-monitor
+/// budget `crate::modal` measures (#701). Routing both through widget-local
+/// actions (rather than a cross-module registry keyed by monitor) is what lets
+/// `crate::modal` poke *this specific monitor's* built page instance armed with
+/// only the `gtk::Widget` it already gets back from
+/// `gtk::Stack::child_by_name` — this page never needs to know which monitor
+/// it's on, only what it was handed at activation.
 pub fn panel_stats() -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
@@ -179,12 +180,14 @@ pub fn panel_stats() -> gtk::Widget {
     column.append(disks_card.upcast_ref::<gtk::Widget>());
     column.append(services_card.upcast_ref::<gtk::Widget>());
 
-    // Soft default (flagged for review, same spirit as the disk-I/O row's
-    // own "soft defaults" caveat further down this file): 560 leaves a
-    // couple of cards visible on a typical laptop panel while still
-    // requiring a scroll to reach the rest, the same trade-off
-    // connections.rs's 480 and wifi.rs's 240 caps make.
-    let scrolled = stats_scrolled(&column, 560);
+    // No cap here (#701): the viewport ceiling is whatever room this monitor
+    // actually has, pushed in by `crate::modal` on every show via the
+    // `"max-height"` action. The old 560 was a "soft default (flagged for
+    // review)" in the same spirit as the disk-I/O row's own soft-defaults
+    // caveat further down this file — and it was flagged for exactly the right
+    // reason: five stacked cards clear 560 comfortably, so the drawer scrolled
+    // permanently while the bottom half of the screen sat empty.
+    let scrolled = stats_scrolled(&column);
 
     let sections: Vec<(StatsSection, gtk::Widget)> = vec![
         (StatsSection::Cpu, cpu_card.upcast()),
@@ -195,7 +198,7 @@ pub fn panel_stats() -> gtk::Widget {
     ];
 
     let page = finish_page(&scrolled);
-    install_scroll_action(
+    install_stats_actions(
         &page,
         &scrolled,
         column.upcast_ref::<gtk::Widget>(),
@@ -217,7 +220,7 @@ pub fn panel_stats() -> gtk::Widget {
 /// width instead of squeezing to ~330px inside the global `DRAWER_MAX_WIDTH`
 /// (680) cap — the answer to #508's "the panel got *smaller*" complaint.
 ///
-/// The #516 scroll-to-section deep-links survive: [`install_scroll_action`]
+/// The #516 scroll-to-section deep-links survive: [`install_stats_actions`]
 /// takes the `gtk::Grid` as its `compute_bounds` coordinate parent (the
 /// mechanism is container-agnostic), so a chip click still lands its card at the
 /// top of the shared `ScrolledWindow`.
@@ -262,11 +265,14 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     reflow_disks_column(gpu_card.is_visible());
     gpu_card.connect_visible_notify(move |gpu| reflow_disks_column(gpu.is_visible()));
 
-    // Two columns roughly halve the stacked height versus the combined page, so
-    // this 560 cap is usually slack — everything fits without a scrollbar. It
-    // stays as the same safety net the combined page's cap is, for a very tall
-    // failed-units list or a small panel.
-    let scrolled = stats_scrolled(&grid, 560);
+    // Same live per-monitor cap as the combined page (#701) — see
+    // [`panel_stats`]. Two columns roughly halve the stacked height, so on any
+    // normal output this layout should now never scroll at all; the cap stays
+    // as the safety net it was always meant to be, for a very tall failed-units
+    // list or a genuinely small panel. The old 560 claimed to be "usually
+    // slack", which was simply false: the CPU card alone eats most of that
+    // budget, and this grid stacks three rows.
+    let scrolled = stats_scrolled(&grid);
 
     let sections: Vec<(StatsSection, gtk::Widget)> = vec![
         (StatsSection::Cpu, cpu_card.upcast()),
@@ -277,34 +283,53 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     ];
 
     let page = finish_page_clamped(&scrolled, DRAWER_MAX_WIDTH_WIDE);
-    install_scroll_action(&page, &scrolled, grid.upcast_ref::<gtk::Widget>(), sections);
+    install_stats_actions(&page, &scrolled, grid.upcast_ref::<gtk::Widget>(), sections);
     page
 }
 
 /// The vertically-scrolling wrapper shared by the combined and multicolumn
-/// Stats pages (#508). `max_content_height` caps the viewport in CSS px
-/// (scaled) so a tall card stack can't push the drawer past screen height;
-/// `propagate_natural_height` lets a short stack report its own size so the
-/// drawer isn't padded to the cap when it doesn't need to be.
-fn stats_scrolled(child: &impl IsA<gtk::Widget>, max_content_height: i32) -> gtk::ScrolledWindow {
+/// Stats pages (#508). `propagate_natural_height` lets a short stack report its
+/// own size so the drawer isn't padded out to the cap when it doesn't need to
+/// be.
+///
+/// Deliberately built **uncapped** (#701). The viewport ceiling is not a
+/// property of the page — it's a property of the monitor the drawer happens to
+/// be on — so it arrives later, through the `"max-height"` action
+/// [`install_stats_actions`] installs, which `crate::modal` activates from
+/// `on_page_show` with that monitor's live budget. Every route that makes this
+/// page visible runs `on_page_show` synchronously before the surface is
+/// presented, so the cap is in place by the first frame; until then this
+/// behaves like the uncapped `single_card_page`, i.e. content-sized inside a
+/// fullscreen surface.
+fn stats_scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_height(true);
-    scrolled.set_max_content_height(crate::scale::scale(max_content_height));
     scrolled.set_child(Some(child));
     scrolled
 }
 
-/// Install the `"stats"`-prefixed `gio::SimpleActionGroup` (one `"scroll"`
-/// action) on `page`, shared by the combined and multicolumn Stats pages
-/// (#508/#516/#542). `coord_parent` is the widget the cards' `compute_bounds`
-/// is taken relative to — the combined page's column `gtk::Box`, or the
-/// multicolumn `gtk::Grid`; deep-link scroll is container-agnostic, so either
-/// works. The activation carries the target monitor's key as its string
-/// parameter (#542): `PENDING_SCROLL` is keyed per monitor, and `crate::modal`
-/// hands in the key of whichever monitor's drawer is (re)showing this page.
-fn install_scroll_action(
+/// Install the `"stats"`-prefixed `gio::SimpleActionGroup` on `page`, shared by
+/// the combined and multicolumn Stats pages (#508/#516/#542/#701). Two actions,
+/// both driven by `crate::modal` from `on_page_show` because both depend on
+/// *which monitor's* drawer is showing this monitor-agnostically built page:
+///
+/// - `"scroll"` (string param) — re-apply the [`StatsSection`] pending in
+///   [`PENDING_SCROLL`] for the monitor named by the parameter (#542).
+///   `coord_parent` is the widget the cards' `compute_bounds` is taken
+///   relative to: the combined page's column `gtk::Box`, or the multicolumn
+///   `gtk::Grid`. The deep-link scroll is container-agnostic, so either works.
+/// - `"max-height"` (int32 param) — set the `ScrolledWindow` viewport cap to
+///   the vertical room that monitor actually has (#701).
+///
+/// The `"max-height"` parameter is applied **verbatim**, with no
+/// `crate::scale::scale` call. It arrives as live logical pixels measured off
+/// `gdk::Monitor::geometry` (see `modal::BarGeometry::available_card_height`),
+/// not as a design-baseline constant, and the page content it caps already
+/// rides the font factor — scaling here would double-count it, which is the
+/// mistake that made the old hardcoded 560 unfixable by tuning.
+fn install_stats_actions(
     page: &gtk::Widget,
     scrolled: &gtk::ScrolledWindow,
     coord_parent: &gtk::Widget,
@@ -313,6 +338,7 @@ fn install_scroll_action(
     let scrolled_for_action = scrolled.clone();
     let parent_for_action = coord_parent.clone();
     let action_group = gio::SimpleActionGroup::new();
+
     let scroll_action = gio::SimpleAction::new("scroll", Some(glib::VariantTy::STRING));
     scroll_action.connect_activate(move |_, param| {
         let Some(key) = param.and_then(glib::Variant::str) else {
@@ -321,6 +347,17 @@ fn install_scroll_action(
         apply_scroll(&scrolled_for_action, &parent_for_action, &sections, key);
     });
     action_group.add_action(&scroll_action);
+
+    let scrolled_for_height = scrolled.clone();
+    let height_action = gio::SimpleAction::new("max-height", Some(glib::VariantTy::INT32));
+    height_action.connect_activate(move |_, param| {
+        let Some(height) = param.and_then(glib::Variant::get::<i32>) else {
+            return;
+        };
+        scrolled_for_height.set_max_content_height(height);
+    });
+    action_group.add_action(&height_action);
+
     page.insert_action_group("stats", Some(&action_group));
 }
 

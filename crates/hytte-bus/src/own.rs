@@ -782,6 +782,29 @@ fn is_release_of(msg: &zbus::Message, name: &str) -> bool {
 /// transitions of this one name*, of which the broker emits exactly one per
 /// change, rather than by how short a sleep we dared to use.
 ///
+/// **That bound is peer-imposed, and #668's was not.** #668 shipped a ceiling
+/// we set ourselves: one attempt per `cooldown` — twelve an hour, and twelve
+/// log lines with them — whatever the rest of the bus did. Waking on the signal
+/// trades it for a bound the *contender* sets. A peer that flaps the name
+/// (takes it, releases it, repeats) costs one `RequestName` and two or three
+/// lines per flap ([`log_release_wake`] on the observed release, then
+/// [`log_recovered`] or [`log_give_up`] on the outcome, plus [`log_give_up`]
+/// again when it takes the name back), and nothing in this file bounds the flap
+/// rate. Note that [`logs_at`]'s geometric cadence does **not** cover this: that
+/// ramp belongs to the acquisition-*error* streak, which a contended name resets
+/// on every `RequestName` reply.
+///
+/// The trade is still worth it, and the new bound is a real one — a *static*
+/// squatter, which is every case this primitive was written for, still costs
+/// exactly one attempt and one line per cooldown, and no peer can push the rate
+/// above the bus's own count of genuine ownership changes. But the guarantee
+/// changed shape, from "we promise twelve an hour" to "we promise one per real
+/// transition", and that is worth writing down (#688 item 2). Recorded rather
+/// than rate-limited on purpose: a token bucket over the recovery line would
+/// suppress exactly the transitions worth reading, and the only workload that
+/// can trip it is a peer already misbehaving loudly enough to be the thing you
+/// opened the journal to find.
+///
 /// The timer is not optional. A signal can be missed — the match rule can
 /// fail to register on a broker restart, say — and a missed signal must
 /// degrade to "recovers in five minutes", never to "stranded forever".
@@ -811,6 +834,78 @@ where
                     timer.as_mut().await;
                     return Wake::Cooldown;
                 }
+            },
+        }
+    }
+}
+
+/// Sleep for `dur` while keeping `stream` drained, discarding whatever arrives.
+///
+/// An unpolled `MessageStream` is not merely stale, it is back-pressure. zbus
+/// 5.14 builds each match-rule subscription as a bounded `async_broadcast`
+/// channel (`Connection::add_match` → `broadcast(max_queued)`, defaulting to
+/// `DEFAULT_MAX_QUEUED` = 64) and the socket reader publishes into it with
+/// `broadcast_direct(...).await`, with `set_overflow` never called anywhere in
+/// the crate. A subscription whose queue fills therefore **blocks the socket
+/// reader** — the single task feeding every other stream and every method reply
+/// on that connection — rather than dropping anything. It is the same mechanism
+/// [`next_attempt_after`] cites as the reason a `NameOwnerChanged` cannot be
+/// silently lost: nothing is lost precisely because everything stalls instead.
+/// Both readings were verified against the pinned zbus 5.14.0 source.
+///
+/// This is held as a flat invariant — *no wait in this file leaves a live
+/// subscription unpolled* — rather than argued from a motivating scenario,
+/// because the scenarios are all weak. The `arg0` filter
+/// ([`build_name_owner_changed_rule`]) keeps everything but this one name's
+/// ownership changes out of the queue, so filling 64 slots inside a single
+/// window is remote to begin with; and the [`OwnState::Denied`] window that
+/// prompted the fix, though it is the longest in the file, is if anything the
+/// *quietest* one — a name the broker's policy refuses us (the bluez and iwd
+/// agent names under `enableRecommendedServices = false`) is typically a name
+/// nobody owns, so there are no ownership changes of it to emit. The invariant
+/// earns its keep without any of that: it costs one `select!` arm, it does not
+/// need re-deriving every time the traffic estimate changes, and what it
+/// forecloses is a stall of the *system* connection every other service shares
+/// (#688 item 4).
+///
+/// Discarding is correct **only because every caller reconnects immediately
+/// afterwards**, dropping this stream and building a fresh subscription, so
+/// nothing discarded here was going to be read.
+///
+/// [`on_name_taken`]'s contention retry keeps its bare
+/// `sleep(RETRY_AFTER_LOSS * consecutive)` — 250 ms, then 500 ms — and the
+/// reason is simply that length: three orders of magnitude short of the traffic
+/// it would take to fill 64 slots, so the hazard cannot arise there. It is
+/// **not** that a release buffered during that sleep is load-bearing. It cannot
+/// be: that retry always sends another `RequestName` before any wait, and
+/// reaching [`wait_for_release_or_cooldown`] at all requires that request to
+/// have come back `Exists` — the name taken again — so a release buffered
+/// during the sleep is stale by the time the wait sees it, and
+/// [`is_release_of`] has no recency check with which to notice. It would return
+/// a spurious `Wake::Released` and short-circuit the cooldown. In the other
+/// outcome, where the re-request wins, [`watch_for_loss`] steps over that same
+/// message (its `old_owner` is not ours) and it is dropped there. The window
+/// `run_ownership`'s subscription comment actually protects is the one with
+/// *no* sleep in it: the method-call gap from a `RequestName` reply of `Exists`,
+/// through [`current_holder_of`], to the start of the wait.
+async fn sleep_draining<S>(stream: &mut S, dur: Duration)
+where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
+    let timer = tokio::time::sleep(dur);
+    tokio::pin!(timer);
+    loop {
+        tokio::select! {
+            () = &mut timer => return,
+            // A message is read and dropped on purpose — see above. `None`
+            // means the stream ended, so nothing more can fill its queue:
+            // serve out the rest of the wait rather than spinning on a
+            // finished stream (`next()` returns `None` immediately, forever) —
+            // the same guard `wait_for_release_or_cooldown` needs, for the
+            // same reason.
+            msg = stream.next() => if msg.is_none() {
+                timer.as_mut().await;
+                return;
             },
         }
     }
@@ -1077,14 +1172,23 @@ where
 /// names are expected to be denied (CLAUDE.md documents exactly that), so this
 /// is a deliberate config outcome, not a fault. Only its *cadence* changes:
 /// routed through the streak, it stops repeating once per cooldown forever.
-async fn on_request_name_error(
+///
+/// Both waits here go through [`sleep_draining`] rather than a bare sleep: the
+/// `NameOwnerChanged` subscription is live for their whole duration, and the
+/// `Denied` one is the longest window in the file. See that function for why an
+/// unpolled subscription is a hazard to the shared connection and why
+/// discarding is safe on this path specifically.
+async fn on_request_name_error<S>(
     e: fdo::Error,
     name: &str,
     cooldown: Duration,
     writer: &Mutable<OwnState>,
-    streak: &mut FailureStreak,
-) {
-    let backoff = streak.record();
+    failures: &mut FailureStreak,
+    stream: &mut S,
+) where
+    S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+{
+    let backoff = failures.record();
     if matches!(e, fdo::Error::AccessDenied(_)) {
         if backoff.log {
             tracing::info!(
@@ -1095,14 +1199,14 @@ async fn on_request_name_error(
             );
         }
         writer.set(OwnState::Denied);
-        tokio::time::sleep(cooldown).await;
+        sleep_draining(stream, cooldown).await;
         writer.set(OwnState::Acquiring);
         return;
     }
     let as_zbus = zbus::Error::FDO(Box::new(e));
     log_acquire_failure(name, "RequestName", &as_zbus, backoff);
     writer.set(OwnState::Acquiring);
-    tokio::time::sleep(backoff.delay).await;
+    sleep_draining(stream, backoff.delay).await;
 }
 
 /// Inner retry loop: reuse one connection and one `NameOwnerChanged`
@@ -1130,7 +1234,7 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) -> LoopExit {
                 let backoff = acquire_failures.record();
                 log_acquire_failure(name, "build DBusProxy", &e, backoff);
                 writer.set(OwnState::Acquiring);
-                tokio::time::sleep(backoff.delay).await;
+                sleep_draining(&mut *stream, backoff.delay).await;
                 return LoopExit::Reconnect;
             }
         };
@@ -1177,7 +1281,8 @@ async fn run_inner_loop(ctx: InnerCtx<'_>) -> LoopExit {
                 r
             }
             Err(e) => {
-                on_request_name_error(e, name, cooldown, writer, acquire_failures).await;
+                on_request_name_error(e, name, cooldown, writer, acquire_failures, &mut *stream)
+                    .await;
                 // Return to reconnect with a fresh connection + subscription
                 // and re-attempt RequestName.
                 return LoopExit::Reconnect;
@@ -1286,7 +1391,7 @@ mod tests {
     use super::{
         ACQUIRE_BACKOFF_BASE, ACQUIRE_BACKOFF_CAP, Contention, FailureStreak, NextAttempt,
         OwnState, Wake, acquire_backoff, attributed_holder, closes_a_give_up, is_release_of,
-        logs_at, next_attempt_after, on_request_name_error, record_loss,
+        logs_at, next_attempt_after, on_request_name_error, record_loss, sleep_draining,
         wait_for_release_or_cooldown,
     };
     use futures_signals::signal::{Mutable, SignalExt as _};
@@ -1306,15 +1411,19 @@ mod tests {
 
     /// Cooldown for the tests that must NOT reach the backstop. Not virtual
     /// time — `tokio`'s `test-util` feature is not enabled here — so this is
-    /// sized as a trap instead: the streams are in-memory and resolve in
-    /// microseconds, so a regression that falls through to the timer is caught
-    /// by [`FAST_PATH_BUDGET`] with three orders of magnitude of margin, and
-    /// fails in 30 s rather than hanging.
+    /// sized as a trap instead: a regression that falls through to the timer
+    /// returns `Wake::Cooldown` and fails its assertion in 30 s rather than
+    /// hanging.
     const LONG_COOLDOWN: Duration = Duration::from_secs(30);
 
-    /// How long an in-memory stream is allowed to take to deliver a wake before
-    /// we call it "waited on the cooldown".
-    const FAST_PATH_BUDGET: Duration = Duration::from_secs(5);
+    /// The wait under test in the [`sleep_draining`] tests. Long enough that a
+    /// whole [`trickle`] sequence lands inside it with an order of magnitude to
+    /// spare, short enough not to be felt in the suite.
+    const DRAIN_WINDOW: Duration = Duration::from_millis(300);
+
+    /// Spacing between [`trickle`]'s messages: three of them land at 20/40/60 ms
+    /// inside [`DRAIN_WINDOW`].
+    const TRICKLE_GAP: Duration = Duration::from_millis(20);
 
     /// A hand-built `NameOwnerChanged` — body `(name, old_owner, new_owner)`,
     /// with an empty `new_owner` meaning "released". No broker involved.
@@ -1335,6 +1444,28 @@ mod tests {
         futures_util::stream::iter(msgs.into_iter().map(Ok))
     }
 
+    /// A boxed message stream, so [`trickle`] can name a concrete `Unpin` type.
+    type BoxedMsgStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = zbus::Result<zbus::Message>>>>;
+
+    /// Like [`feed`], but the messages arrive *over time* — one every `gap`,
+    /// then the stream ends.
+    ///
+    /// [`feed`]'s `stream::iter` cannot tell a real drain from a
+    /// drain-once-then-`sleep(dur)`: it is ready on the first poll and finished
+    /// on the next, so both implementations empty it before the timer is ever
+    /// awaited, and both leave it exhausted. Only a stream that produces
+    /// something *after* the first poll separates the two, which is why the
+    /// [`sleep_draining`] tests use this and not `feed` (#688 review).
+    fn trickle(msgs: Vec<zbus::Message>, gap: Duration) -> BoxedMsgStream {
+        Box::pin(async_stream::stream! {
+            for msg in msgs {
+                tokio::time::sleep(gap).await;
+                yield Ok(msg);
+            }
+        })
+    }
+
     /// A `RequestName` `AccessDenied` must surface the distinct `Denied` state
     /// and then return to `Acquiring` after the cooldown, so the outer loop
     /// retries (a later policy install is picked up without a restart) — rather
@@ -1349,6 +1480,7 @@ mod tests {
         let w = writer.clone();
         let task = tokio::spawn(async move {
             let mut failures = FailureStreak::default();
+            let mut subscription = futures_util::stream::pending::<zbus::Result<zbus::Message>>();
             on_request_name_error(
                 fdo::Error::AccessDenied("policy refuses ownership".into()),
                 "mov.vibec0re.test.denied",
@@ -1358,6 +1490,7 @@ mod tests {
                 Duration::from_millis(150),
                 &w,
                 &mut failures,
+                &mut subscription,
             )
             .await;
         });
@@ -1512,17 +1645,20 @@ mod tests {
 
     /// The fast path (#669): a `NameOwnerChanged` saying the name we want is
     /// now unowned ends the wait at once, without the cooldown elapsing.
+    ///
+    /// The returned [`Wake`] is the whole assertion. `Released` is reachable
+    /// only from the stream arm of the `select!`, so it *is* the proof that the
+    /// 30 s timer never won; the elapsed-time check this test carried until
+    /// #688 could not fail for any reason the `Wake` does not already catch,
+    /// and — being an *upper* bound, unlike the two that survive elsewhere in
+    /// this module — was the one shape of timing assertion a loaded machine can
+    /// turn red while the property still holds.
     #[tokio::test]
     async fn a_release_of_the_wanted_name_ends_the_wait_at_once() {
-        let started = std::time::Instant::now();
         let mut stream = feed(vec![name_owner_changed(NAME, ":1.6", "")]);
         assert_eq!(
             wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
             Wake::Released
-        );
-        assert!(
-            started.elapsed() < FAST_PATH_BUDGET,
-            "the release must be acted on immediately, not after the cooldown"
         );
     }
 
@@ -1605,6 +1741,76 @@ mod tests {
         .build(&42u32)
         .expect("build malformed NameOwnerChanged");
         assert!(!is_release_of(&msg, NAME));
+    }
+
+    // ── #688 item 4: no unpolled subscription on the error path ─────────────
+
+    /// A draining wait must keep consuming for the *whole* wait, and still
+    /// serve its full duration. An implementation that stopped reading would
+    /// let the subscription's 64-slot broadcast queue fill and block zbus's
+    /// socket reader — see [`sleep_draining`] — and one that returned when the
+    /// stream ended would turn the wait into a spin.
+    ///
+    /// The stream [`trickle`]s on purpose. A backlog that is all present up
+    /// front is drained by `drain-once-then-sleep(dur)` just as completely as
+    /// by the real thing; messages that arrive at 20/40/60 ms into a 300 ms
+    /// wait are not, and leave that implementation holding the last two.
+    #[tokio::test]
+    async fn a_draining_wait_consumes_the_backlog_and_still_serves_its_time() {
+        let mut stream = trickle(
+            vec![
+                name_owner_changed(NAME, ":1.6", ""),
+                name_owner_changed(OTHER, ":1.5", ""),
+                name_owner_changed(NAME, "", ":1.7"),
+            ],
+            TRICKLE_GAP,
+        );
+        let started = std::time::Instant::now();
+        sleep_draining(&mut stream, DRAIN_WINDOW).await;
+        assert!(
+            started.elapsed() >= DRAIN_WINDOW,
+            "the wait must serve its full duration, not end when the stream does"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "every message that arrived during the wait must have been consumed"
+        );
+    }
+
+    /// The `Denied` wait is the longest window in this file — a whole
+    /// `cooldown` — so it is the one that must not leave the live
+    /// `NameOwnerChanged` subscription unpolled. Same [`trickle`]d stream as
+    /// above, for the same reason: a drain-once implementation has to fail
+    /// here too, not just on the helper in isolation.
+    #[tokio::test]
+    async fn the_denied_wait_keeps_the_subscription_drained() {
+        let writer = Mutable::new(OwnState::Acquiring);
+        let mut failures = FailureStreak::default();
+        let mut stream = trickle(
+            vec![
+                name_owner_changed(NAME, ":1.6", ""),
+                name_owner_changed(OTHER, ":1.5", ""),
+            ],
+            TRICKLE_GAP,
+        );
+        on_request_name_error(
+            fdo::Error::AccessDenied("policy refuses ownership".into()),
+            NAME,
+            DRAIN_WINDOW,
+            &writer,
+            &mut failures,
+            &mut stream,
+        )
+        .await;
+        assert_eq!(
+            writer.get_cloned(),
+            OwnState::Acquiring,
+            "the Denied wait must still end in Acquiring so the outer loop retries"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the Denied wait must consume what arrives, not leave it filling the broadcast queue"
+        );
     }
 
     // ── #653: the acquisition-error ramp ────────────────────────────────────
@@ -1803,6 +2009,7 @@ mod tests {
     async fn a_non_policy_request_name_error_does_not_latch_denied() {
         let writer = Mutable::new(OwnState::Owned);
         let mut streak = FailureStreak::default();
+        let mut subscription = futures_util::stream::pending::<zbus::Result<zbus::Message>>();
         on_request_name_error(
             fdo::Error::Disconnected("broker went away".into()),
             NAME,
@@ -1811,6 +2018,7 @@ mod tests {
             LONG_COOLDOWN,
             &writer,
             &mut streak,
+            &mut subscription,
         )
         .await;
         assert_eq!(
@@ -1827,6 +2035,7 @@ mod tests {
     async fn repeated_request_name_errors_advance_the_ramp() {
         let writer = Mutable::new(OwnState::Acquiring);
         let mut streak = FailureStreak::default();
+        let mut subscription = futures_util::stream::pending::<zbus::Result<zbus::Message>>();
         let started = std::time::Instant::now();
         for _ in 0..3 {
             on_request_name_error(
@@ -1835,6 +2044,7 @@ mod tests {
                 LONG_COOLDOWN,
                 &writer,
                 &mut streak,
+                &mut subscription,
             )
             .await;
         }

@@ -4,8 +4,8 @@
 //! `cpuinfo_max_freq` (the static hardware ceiling, kHz), converts to Hz, and
 //! folds them into a [`CpuFreq`] snapshot. The aggregate `max_hz` is the highest
 //! current frequency across cores (the reporter chose max, not mean); the
-//! `max_ceiling_hz` is the highest ceiling across cores, used by a future graph
-//! for a fixed 0→max axis.
+//! `max_ceiling_hz` is the highest ceiling across cores, used by the
+//! `trollshell` stats panel's clock graph for a fixed 0→max axis.
 //!
 //! Graceful degrade: on hosts without a cpufreq governor (many VMs), the
 //! `/sys/devices/system/cpu/cpu0/cpufreq` directory is absent — we publish an

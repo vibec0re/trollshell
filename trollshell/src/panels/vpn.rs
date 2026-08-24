@@ -25,6 +25,7 @@ use hytte::services::wifi;
 
 use crate::components::format::{fmt_bytes, humanize_since};
 use crate::components::layout::{finish_page, page_box};
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub fn panel_vpn() -> gtk::Widget {
@@ -144,6 +145,9 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
         .subtitle(subtitle)
         .activatable(false)
         .build();
+    // Profile names come from NetworkManager's connection store; markup is
+    // never wanted here (#753).
+    markup::plain_text(&row);
 
     let icon = gtk::Image::from_icon_name("network-vpn-symbolic");
     row.add_prefix(&icon);
@@ -211,8 +215,11 @@ fn build_tunnel_group(tunnel: &vpn::Tunnel) -> adw::PreferencesGroup {
         vpn::TunnelKind::Tun => "tun",
         vpn::TunnelKind::Tap => "tap",
     };
+    // `AdwPreferencesGroup` has no `use-markup` property to turn off — its
+    // title and description labels are hardcoded `use-markup="True"` in
+    // libadwaita's template — so escaping is the only fix here (#753).
     let g = adw::PreferencesGroup::builder()
-        .title(&tunnel.name)
+        .title(markup::escape(&tunnel.name))
         .description(kind_label)
         .build();
 
@@ -252,6 +259,9 @@ fn build_tunnel_group(tunnel: &vpn::Tunnel) -> adw::PreferencesGroup {
 fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
     let key_short: String = peer.public_key.chars().take(8).collect();
     let row = adw::ActionRow::builder().title(&key_short).build();
+    // Key, endpoint and allowed-IPs all come off the wire; the subtitle is
+    // assembled from them below, and `plain_text` covers it too (#753).
+    markup::plain_text(&row);
     row.add_css_class("ts-mono");
     let mut subtitle_parts: Vec<String> = Vec::new();
     if let Some(ep) = peer.endpoint.as_deref() {

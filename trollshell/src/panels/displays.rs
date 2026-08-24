@@ -19,6 +19,7 @@ use hytte::gtk::{self, glib};
 use hytte::services::displays::{self, Output};
 
 use crate::components::layout::{finish_page, page_box};
+use crate::components::markup;
 use crate::components::reactive_list::reactive_list;
 
 pub fn panel_displays() -> gtk::Widget {
@@ -82,6 +83,8 @@ fn build_display_row(o: &Output, pending: &Rc<RefCell<HashMap<String, bool>>>) -
         .title(&title)
         .subtitle(&subtitle)
         .build();
+    // Make/model come straight out of the monitor's EDID (#753).
+    markup::plain_text(&row);
     // Long-form titles or driver-injected EDIDs can blow the modal width;
     // let title and subtitle wrap rather than push the surface.
     row.set_subtitle_lines(0);

@@ -46,6 +46,7 @@ use crate::components::history_row::build_history_row;
 use crate::components::layout::{
     DRAWER_MAX_WIDTH_WIDE, finish_page, finish_page_clamped, page_box, page_grid,
 };
+use crate::components::markup;
 use crate::components::monitor_key::monitor_key;
 use crate::components::reactive_list::reactive_list;
 
@@ -614,6 +615,10 @@ fn build_top_apps_expander(
     value: fn(&ProcSample) -> String,
 ) -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder().title(title).build();
+    // The child rows below have had markup off since #30, but the expander's
+    // *own* collapsed subtitle is built from the same untrusted display name
+    // and was left unguarded (#753).
+    markup::plain_text(&expander);
     expander.set_expanded(false);
 
     // Metadata cache: app-id → AppMeta (None = no desktop file found).
@@ -656,7 +661,7 @@ fn build_top_apps_expander(
             let row = adw::ActionRow::builder().activatable(false).build();
             // Markup off: scope ids are untrusted — adversarial names could
             // otherwise inject Pango markup into the title (cf. #30).
-            row.set_use_markup(false);
+            markup::plain_text(&row);
             // Resolve first, set second: an argument-position `RefMut` is a
             // temporary of the whole statement, so inlining this would hold
             // `meta_cache` borrowed across `set_title` (#643).
@@ -1007,6 +1012,9 @@ fn build_live_disk_expander() -> adw::ExpanderRow {
                 .title(&m.path)
                 .activatable(false)
                 .build();
+            // A mount path is whatever the filesystem is mounted at, `&`
+            // included (#753).
+            markup::plain_text(&row);
             let frac = if m.total_bytes > 0 {
                 cast::u64_to_f64(m.used_bytes) / cast::u64_to_f64(m.total_bytes)
             } else {
@@ -1546,6 +1554,10 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
                 .title(&unit.name)
                 .activatable(false)
                 .build();
+            // Unit names and, especially, free-form `Description=` text are
+            // arbitrary — an `&` there would blank the row this flyout exists
+            // to show (#753).
+            markup::plain_text(&row);
             let subtitle = if unit.description.is_empty() {
                 unit.sub_state.clone()
             } else {

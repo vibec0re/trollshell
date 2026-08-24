@@ -18,6 +18,15 @@
 //! `wlsunset` / `swaybg` systemd units read `wlsunset.args` / `swaybg.args`
 //! from a `sh -c` wrapper whose `-s` guard catches an empty file but not a
 //! partial one.
+//!
+//! [`write_atomic`] is that algorithm on its own — explicit path, real
+//! `io::Error`, no logging — and is the workspace's only copy of it (#739).
+//! [`write`] and [`write_path`] are the `$HOME`-resolving, `warn!`-logging,
+//! `bool`-returning wrapper the UI-state services want; [`crate::places`] calls
+//! the core directly because it needs the `io::Error` to build a
+//! `PlacesError::Write`. The one axis on which those two callers genuinely
+//! differ is [`Durability`], which is therefore a stated parameter rather than
+//! a house default — see that type for which caller picks what, and why.
 
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -35,6 +44,81 @@ const CONFIG_SUBDIR: &str = ".config/trollshell";
 /// this prevents is two writers sharing one temp file and interleaving into it.
 static TMP_TICKET: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only tripwire for the [`Durability::FsyncParent`] branch inside
+    /// [`write_atomic`].
+    ///
+    /// The `fsync` itself is unobservable in-process (its only effect is
+    /// durability across a power cut), so nothing here can assert *that* it
+    /// ran. What this pins instead is that the branch *fired at all* for a
+    /// given call — [`fsync_parent_attempts`] lets a test read the count
+    /// before and after a call and assert it moved. That is what
+    /// `places::tests::persist_to_pins_the_fsync_parent_durability_choice`
+    /// does against the real `places::persist_to`: it fails if the guard
+    /// below is inverted (so `FileOnly` writes take the branch instead of
+    /// `FsyncParent` ones) just as surely as it fails if `persist_to` is
+    /// edited to pass `FileOnly`.
+    ///
+    /// `thread_local` rather than a shared static: `cargo test` runs test
+    /// functions concurrently on a thread pool, and `write_atomic` itself
+    /// never spawns, so a plain shared counter would let an unrelated test's
+    /// calls on another thread mask a regression on this one (a false pass,
+    /// not a flake — the direction that matters least visibly). Confined to
+    /// this thread, the only calls that can move the count between a test's
+    /// own "before" and "after" reads are that test's own.
+    static FSYNC_PARENT_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of the tripwire counter above, for this thread.
+#[cfg(test)]
+pub(crate) fn fsync_parent_attempts() -> u64 {
+    FSYNC_PARENT_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+/// Whether [`write_atomic`] also `fsync`s the parent **directory** after the
+/// `rename(2)`.
+///
+/// The *file's* own `fsync` is unconditional (see [`fill`]) — without it the
+/// rename can be durable while the data isn't, which on a delayed-allocation
+/// filesystem resurrects exactly the zero-length file this whole path exists to
+/// prevent. Syncing the *directory* on top of that buys something strictly
+/// narrower: durability of the rename itself, i.e. "did the write that already
+/// returned `Ok` survive a power cut". It costs a second journal commit per
+/// write, and losing it leaves the whole *previous* file in place — a state
+/// every reader here already handles.
+///
+/// #739 folded two copies of this algorithm into one, and they disagreed on
+/// exactly this call. Making it a named parameter settles the question
+/// explicitly instead of inheriting whichever copy happened to survive: both
+/// callers keep precisely the behaviour they shipped with, and the next caller
+/// has to state its choice rather than get one by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// `fsync` the parent directory after the rename.
+    ///
+    /// For user-authored data written rarely and deliberately: `places.toml`,
+    /// which a person edits by hand or through the editor UI. A save there is
+    /// acknowledged to the user, so silently losing an acknowledged one to a
+    /// power cut is a data-loss bug rather than a lost toggle, and the extra
+    /// commit is amortised over a handful of writes a week.
+    ///
+    /// Best-effort: some filesystems refuse an `fsync` on a read-only directory
+    /// handle, so a failure is ignored — the data is already on disk either
+    /// way, only the rename's durability is at stake.
+    FsyncParent,
+    /// Sync the file's contents only; let the directory entry reach disk
+    /// whenever the filesystem gets to it.
+    ///
+    /// For the click-driven `~/.config/trollshell/*` toggles behind [`write`]:
+    /// they are rewritten constantly, several straight out of a click handler,
+    /// and they are explicitly a convenience for the *next* launch — the
+    /// in-memory `Mutable` is the source of truth for the running process. A
+    /// power cut that costs the last toggle leaves the previous config intact,
+    /// so the second journal commit per click isn't worth it.
+    FileOnly,
+}
+
 /// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is unset.
 pub(crate) fn path(file: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -49,12 +133,10 @@ pub(crate) fn read(file: &str) -> Option<String> {
 
 /// Write `body` to `~/.config/trollshell/<file>`, creating the parent dir.
 ///
-/// Atomic: the body lands in a temp file in the same directory, is `fsync`ed,
-/// and is then `rename(2)`d over the target, so no reader ever observes a
-/// zero-length or partially-written config. An existing target's permissions
-/// are carried over (a `0600` config does not come back `0644`); a brand-new
-/// file gets the platform default, as before. Any failure removes the temp
-/// file rather than leaving litter behind.
+/// Atomic, symlink-safe and permission-preserving — see [`write_atomic`], which
+/// does the actual work. These files take [`Durability::FileOnly`]: they are
+/// click-driven toggles, and the rationale for not paying a directory `fsync`
+/// per click is on that variant.
 ///
 /// Best-effort: on a `$HOME`-unset / mkdir / write failure it logs a `warn!`
 /// scoped to `service` and returns `false`; `true` on success. Simple callers
@@ -71,12 +153,57 @@ pub(crate) fn write(service: &str, file: &str, body: &str) -> bool {
 /// [`write`] against an already-resolved absolute path — the whole of `write`
 /// except the `$HOME` lookup, split out so the tests can drive it against a
 /// tempdir without mutating the process environment.
+///
+/// The algorithm itself is [`write_atomic`]; this is only its
+/// `service`-scoped-logging, `bool`-returning skin.
 fn write_path(service: &str, path: &Path, body: &str) -> bool {
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(service, error = %e, path = %parent.display(), "config mkdir failed");
-        return false;
+    match write_atomic(path, body, Durability::FileOnly) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(service, error = %e, path = %path.display(), "config write failed");
+            false
+        }
+    }
+}
+
+/// Atomically replace `path`'s contents with `body`, creating the parent dir.
+///
+/// The workspace's single copy of tmp + `fsync` + `rename(2)` + cleanup (#739);
+/// every config file written through [`write`], plus `places`' own writer,
+/// goes through here. No logging and no service scope — the caller decides
+/// what a failure means and how to report it.
+///
+/// Not literally every persisted config file: `fullscreen_inhibit`'s
+/// `~/.config/trollshell/fullscreen-inhibit.toml` still writes with a bare,
+/// non-atomic `std::fs::write` plus a hand-rolled `create_dir_all`, so it
+/// still carries the #733 tearing bug for that one file. Known, out of #739's
+/// lane, tracked separately.
+///
+/// The body lands in a temp file in the same directory as the target, is
+/// `fsync`ed, and is then `rename(2)`d over it, so no reader ever observes a
+/// zero-length or partially-written config, and a crash mid-write leaves the
+/// old file whole rather than a truncated one.
+///
+/// **Symlink-safe:** `path` is `canonicalize`d first, so a `places.toml`
+/// symlinked into a dotfiles repo is written *through* rather than replaced by
+/// a regular file (#739). That is also what keeps the temp file on the target's
+/// own filesystem — `rename(2)` is only atomic within one. A target that
+/// doesn't exist yet can't be canonicalised, and needs no resolving.
+///
+/// **Permission-safe:** an existing target's mode is carried over at `open`
+/// time, before the body is written, so a hand-tightened `0600` config's
+/// contents never sit in a briefly umask-default temp file, and the file does
+/// not come back `0644` (#739). A brand-new file gets the platform default,
+/// exactly as `std::fs::write` would have given it.
+///
+/// **Durability** of the rename itself is the caller's call — see
+/// [`Durability`].
+///
+/// Any failure removes the temp file rather than leaving litter behind, and
+/// leaves the target untouched.
+pub(crate) fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
     // Resolve symlinks: `std::fs::write` wrote *through* a symlinked target, so
@@ -85,10 +212,9 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
     // within one filesystem. A target that doesn't exist yet can't be
     // canonicalised, and needs no resolving.
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let Some(dir) = target.parent() else {
-        tracing::warn!(service, path = %target.display(), "config write failed: no parent directory");
-        return false;
-    };
+    let dir = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
     let tmp = dir.join(tmp_name(&target));
 
     // The mode the target already carries, if any. Applied at `open` so the
@@ -97,33 +223,32 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
         .ok()
         .map(|m| m.permissions().mode() & 0o7777);
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    if let Some(mode) = mode {
-        opts.mode(mode);
-    }
-    let mut file = match opts.open(&tmp) {
-        Ok(file) => file,
-        Err(e) => {
-            tracing::warn!(service, error = %e, path = %tmp.display(), "config write failed");
-            return false;
+    let swap = || -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        if let Some(mode) = mode {
+            opts.mode(mode);
         }
+        let mut file = opts.open(&tmp)?;
+        let written = fill(&mut file, body, mode);
+        drop(file);
+        written?;
+        std::fs::rename(&tmp, &target)
     };
 
-    let written = fill(&mut file, body, mode);
-    drop(file);
-    if let Err(e) = written {
-        tracing::warn!(service, error = %e, path = %tmp.display(), "config write failed");
-        discard(service, &tmp);
-        return false;
+    if let Err(e) = swap() {
+        // Best-effort: a failed write must not leave litter, but the write's
+        // own error is what the caller needs to see.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        tracing::warn!(service, error = %e, path = %target.display(), "config write failed");
-        discard(service, &tmp);
-        return false;
+    if matches!(durability, Durability::FsyncParent) {
+        #[cfg(test)]
+        FSYNC_PARENT_ATTEMPTS.with(|c| c.set(c.get() + 1));
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
-    true
+    Ok(())
 }
 
 /// Fill the freshly-opened temp file: fix up its mode, write the body, `fsync`.
@@ -131,13 +256,8 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// The `fsync` is what makes the rename meaningful across a crash — without it
 /// the rename can be durable while the data isn't, which on a delayed-
 /// allocation filesystem resurrects exactly the zero-length file this is here
-/// to prevent. We deliberately do *not* `fsync` the parent directory
-/// afterwards: that would only buy durability of the rename itself (i.e.
-/// "did the last toggle survive a power cut"), not atomicity, and losing it
-/// leaves the whole *previous* config in place — which is a state every reader
-/// already handles. These files are explicitly a convenience for the next
-/// launch, and some are written straight from a click handler, so the second
-/// journal commit per toggle isn't worth it.
+/// to prevent. Whether the *directory entry* is synced too is the caller's
+/// choice — see [`Durability`].
 fn fill(file: &mut std::fs::File, body: &str, mode: Option<u32>) -> std::io::Result<()> {
     // `OpenOptions::mode` only applies when `open` actually creates the file;
     // it is silently ignored if a temp file from a crashed earlier run happened
@@ -160,15 +280,6 @@ fn tmp_name(target: &Path) -> String {
     let pid = std::process::id();
     let ticket = TMP_TICKET.fetch_add(1, Ordering::Relaxed);
     format!(".{stem}.{pid}.{ticket}.tmp")
-}
-
-/// Remove the temp file after a failed write, so a failure can't leave litter.
-fn discard(service: &str, tmp: &Path) {
-    if let Err(e) = std::fs::remove_file(tmp)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(service, error = %e, path = %tmp.display(), "config write: temp file left behind");
-    }
 }
 
 /// Delete `~/.config/trollshell/<file>` if it exists.
@@ -283,6 +394,32 @@ mod tests {
         assert!(write_path("test", &path, "body\n"));
 
         assert_eq!(mode_of(&path), mode_of(&reference));
+    }
+
+    /// Both [`Durability`] arms produce the same file — they differ only in
+    /// whether the *rename* is flushed, which no in-process test can observe.
+    /// That is all this proves; it is not a guard against the `FsyncParent`
+    /// branch going dead (inverting the `matches!` in [`write_atomic`], or
+    /// swapping which variant `places::persist_to` passes, both leave this
+    /// test green). The actual tripwire for that is
+    /// `places::tests::persist_to_pins_the_fsync_parent_durability_choice`,
+    /// via [`fsync_parent_attempts`].
+    #[test]
+    fn both_durability_choices_write_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (durability, name) in [
+            (Durability::FileOnly, "toggle.toml"),
+            (Durability::FsyncParent, "places.toml"),
+        ] {
+            let path = dir.path().join(name);
+            write_atomic(&path, "body\n", durability).expect("writes");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "body\n");
+        }
+        assert_eq!(
+            entries(dir.path()),
+            vec!["places.toml".to_string(), "toggle.toml".to_string()],
+            "neither arm may leave a temp file behind"
+        );
     }
 
     #[test]

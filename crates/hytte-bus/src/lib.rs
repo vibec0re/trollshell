@@ -5,6 +5,7 @@
 
 #![doc(html_no_source)]
 
+mod backoff;
 mod call;
 mod connection;
 mod error;

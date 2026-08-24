@@ -9,12 +9,12 @@
 // Task 6; they are wired up in Task 12.
 
 use crate::BusError;
+use crate::backoff::FailureStreak;
 use crate::error::is_transient_zbus_error;
 use futures_signals::signal::Mutable;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
@@ -54,30 +54,6 @@ pub struct SharedConnection {
     inner: Arc<Mutex<Inner>>,
     epoch: Arc<AtomicU64>,
     epoch_signal: Mutable<u64>,
-}
-
-// ── Exponential backoff ───────────────────────────────────────────────────────
-
-/// Exponential backoff with cap. State is the next sleep duration to use.
-#[derive(Clone, Copy)]
-struct Backoff {
-    next_ms: u64,
-}
-
-impl Backoff {
-    const fn new() -> Self {
-        Self { next_ms: 250 }
-    }
-
-    fn reset(&mut self) {
-        self.next_ms = 250;
-    }
-
-    fn next(&mut self) -> Duration {
-        let d = Duration::from_millis(self.next_ms);
-        self.next_ms = (self.next_ms * 2).min(30_000);
-        d
-    }
 }
 
 // ── Supervisor notify side-table ──────────────────────────────────────────────
@@ -400,7 +376,13 @@ async fn supervisor_loop(
     signal: Mutable<u64>,
     notify: Arc<tokio::sync::Notify>,
 ) {
-    let mut backoff = Backoff::new();
+    // The crate's shared retry ramp (`backoff.rs`), which this loop used to
+    // carry a private duration-cursor copy of. `record().delay` is the call
+    // that was `next()`; the walk is identical (250 ms → 30 s, cleared on a
+    // successful connect). What the shared type adds here is the attempt
+    // number: this loop's `warn!` is still per-attempt, and `RetryStep::log`
+    // is now sitting right there whenever somebody wants to cap it (#795).
+    let mut backoff = FailureStreak::default();
     loop {
         // 1. If inner.conn is None, open a fresh connection.
         let needs_connect = {
@@ -428,7 +410,7 @@ async fn supervisor_loop(
                     tracing::info!(?kind, epoch = new_epoch, "bus connected");
                 }
                 Err(e) => {
-                    let d = backoff.next();
+                    let d = backoff.record().delay;
                     tracing::warn!(
                         ?kind,
                         error = %e,
@@ -453,53 +435,5 @@ async fn open_connection(kind: BusKind) -> Result<Connection, zbus::Error> {
     match kind {
         BusKind::Session => Connection::session().await,
         BusKind::System => Connection::system().await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_starts_at_250ms() {
-        let mut b = Backoff::new();
-        assert_eq!(b.next(), Duration::from_millis(250));
-    }
-
-    #[test]
-    fn backoff_doubles_each_call() {
-        let mut b = Backoff::new();
-        assert_eq!(b.next(), Duration::from_millis(250));
-        assert_eq!(b.next(), Duration::from_millis(500));
-        assert_eq!(b.next(), Duration::from_secs(1));
-        assert_eq!(b.next(), Duration::from_secs(2));
-        assert_eq!(b.next(), Duration::from_secs(4));
-    }
-
-    #[test]
-    fn backoff_clamps_at_30s_cap() {
-        let mut b = Backoff::new();
-        // 250 -> 500 -> 1000 -> 2000 -> 4000 -> 8000 -> 16000 -> (32000 clamped to) 30000.
-        let mut last = Duration::default();
-        for _ in 0..7 {
-            last = b.next();
-        }
-        assert_eq!(last, Duration::from_secs(16));
-        // The next call is the first to clamp: 16000 * 2 = 32000 > cap, so the
-        // *following* returned duration is capped at 30s.
-        assert_eq!(b.next(), Duration::from_secs(30));
-        // And it stays capped — doubling a capped value only re-clamps.
-        assert_eq!(b.next(), Duration::from_secs(30));
-        assert_eq!(b.next(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn backoff_reset_returns_to_initial_value() {
-        let mut b = Backoff::new();
-        b.next();
-        b.next();
-        b.next();
-        b.reset();
-        assert_eq!(b.next(), Duration::from_millis(250));
     }
 }

@@ -41,33 +41,26 @@
 //! `enabled = true|false`, mirroring `dnd`), so turning the policy off sticks
 //! across restarts.
 
+use crate::config_file;
 use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::FdLease;
 use hytte_reactive::{Service, registry, runtime};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ── Persistence ────────────────────────────────────────────────────────────
 
-const CONFIG_REL_PATH: &str = ".config/trollshell/fullscreen-inhibit.toml";
-
-fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(CONFIG_REL_PATH))
-}
+/// Config file under `~/.config/trollshell/`.
+const CONFIG_FILE: &str = "fullscreen-inhibit.toml";
 
 /// Load the policy flag. **Default `true`** (unlike `dnd`) — the whole point is
 /// to keep the box awake during fullscreen out of the box; a missing or
 /// malformed file leaves the policy on.
 fn load_enabled_from_disk() -> bool {
-    let Some(path) = config_path() else {
+    let Some(text) = config_file::read(CONFIG_FILE) else {
         return true;
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_enabled(&text),
-        Err(_) => true,
-    }
+    parse_enabled(&text)
 }
 
 /// Parse the flat `enabled = true|false` config body. Permissive: an explicit
@@ -91,19 +84,11 @@ fn parse_enabled(text: &str) -> bool {
 }
 
 fn save_enabled_to_disk(enabled: bool) {
-    let Some(path) = config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(error = %e, path = %parent.display(), "fullscreen-inhibit: mkdir failed");
-        return;
-    }
-    let body = format!("enabled = {enabled}\n");
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::warn!(error = %e, path = %path.display(), "fullscreen-inhibit: write failed");
-    }
+    config_file::write(
+        "fullscreen-inhibit",
+        CONFIG_FILE,
+        &format!("enabled = {enabled}\n"),
+    );
 }
 
 // ── Screensaver visibility inhibitor identity ──────────────────────────────
@@ -381,5 +366,81 @@ mod tests {
         // Tolerant of spacing / case, like the dnd parser it mirrors.
         assert!(!parse_enabled("enabled=FALSE"));
         assert!(parse_enabled("  enabled  =  True  "));
+    }
+
+    // ── Disk round-trip (#769) ──────────────────────────────────────────────
+    //
+    // These drive `save_enabled_to_disk`/`load_enabled_from_disk` — i.e. that
+    // this module's calls land on / read back the right file — not
+    // `config_file::write`'s atomicity mechanics (temp file + fsync +
+    // rename), which are already exhaustively covered where that mechanism
+    // actually lives (`config_file::tests::{a_reader_never_observes_a_partial_file,
+    // concurrent_writers_do_not_corrupt_each_other, overwrites_an_existing_file_exactly}`,
+    // all exercised against the same `write_path` core `config_file::write`
+    // delegates to). A single-line payload written synchronously by one
+    // writer with no crash can't demonstrate a tear either way — see the
+    // note on `save_replaces_a_longer_pre_existing_file_exactly` below for
+    // the falsification that confirms this.
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "hytte-fullscreen-inhibit-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `temp_env` serializes $HOME mutation across tests and restores it
+        // after (mirrors `places`'s config-watcher tests).
+        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+            save_enabled_to_disk(false);
+            assert!(!load_enabled_from_disk(), "false must round-trip as false");
+
+            save_enabled_to_disk(true);
+            assert!(load_enabled_from_disk(), "true must round-trip as true");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn save_replaces_a_longer_pre_existing_file_exactly() {
+        // Seed a stale file bigger than any real payload, then confirm the
+        // replacement is exact, not just "starts with the right bytes".
+        //
+        // NOTE this does NOT falsify the non-atomic defect #769 fixes: verified
+        // by hand (reverted `save_enabled_to_disk` to the old bare
+        // `std::fs::write(&path, body)`, reran this test, restored) that it
+        // passes unchanged either way. `std::fs::write` opens with `O_TRUNC`,
+        // so in a synchronous, single-writer, no-crash run the file is already
+        // zero-length before the new bytes land — no tail survives regardless
+        // of which implementation writes them. The actual defect (a reader or
+        // a crash observing a torn/zero-length file mid-write) is only
+        // observable via a concurrent reader or an injected crash, and is
+        // already covered where the atomicity mechanism lives:
+        // `config_file::tests::{a_reader_never_observes_a_partial_file,
+        // concurrent_writers_do_not_corrupt_each_other}`. This test is kept as
+        // a plain correctness regression guard, not an atomicity proof.
+        let root = std::env::temp_dir().join(format!(
+            "hytte-fullscreen-inhibit-replace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
+        let cfg = root.join(".config/trollshell/fullscreen-inhibit.toml");
+        std::fs::write(&cfg, "x".repeat(4096)).unwrap();
+
+        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+            save_enabled_to_disk(false);
+            assert_eq!(
+                std::fs::read_to_string(&cfg).unwrap(),
+                "enabled = false\n",
+                "no tail of the old, longer content may survive the replace"
+            );
+            assert!(!load_enabled_from_disk());
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

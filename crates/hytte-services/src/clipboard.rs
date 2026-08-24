@@ -25,7 +25,11 @@
 //! Delete by id is supported via [`delete`]. Implementation runs
 //! `cliphist list` to get the exact line cliphist recognises, then
 //! pipes that line into `cliphist delete`. Two subprocess calls per
-//! delete; acceptable since deletion is user-initiated.
+//! delete; acceptable since deletion is user-initiated. (`cliphist
+//! delete` reads lines on stdin and extracts each line's id prefix, so a
+//! bare id would also work — verified against 0.7.0. The full line is
+//! kept because it's the idiomatic `cliphist list | grep … | cliphist
+//! delete` form; collapsing to one subprocess is a live simplification.)
 //!
 //! No clip pinning, no search/filter UI, no multi-select, no rich-format
 //! paste. The page is a plain history list with click-to-paste.
@@ -123,18 +127,25 @@ pub fn refresh() {
         return;
     };
 
-    runtime::handle().spawn_blocking(move || {
-        let entries = run_cliphist_list();
-        // PartialEq dedup: only write when the snapshot actually differs
-        // so signal subscribers don't rebuild rows for an identical list.
-        let changed = {
-            let cur = writer.lock_ref();
-            *cur != entries
-        };
-        if changed {
-            writer.set(entries);
-        }
-    });
+    runtime::handle().spawn_blocking(move || reload_into(&writer));
+}
+
+/// Re-read `cliphist list` and publish it if it differs from the cached
+/// snapshot. Blocking — always call from `spawn_blocking`.
+///
+/// Shared by [`refresh()`] and [`delete()`]'s post-delete reconcile so both
+/// paths dedup identically.
+fn reload_into(writer: &Mutable<Vec<ClipEntry>>) {
+    let entries = run_cliphist_list();
+    // PartialEq dedup: only write when the snapshot actually differs
+    // so signal subscribers don't rebuild rows for an identical list.
+    let changed = {
+        let cur = writer.lock_ref();
+        *cur != entries
+    };
+    if changed {
+        writer.set(entries);
+    }
 }
 
 /// Re-paste a history entry by id. Pipes `cliphist decode <id>` into
@@ -149,22 +160,69 @@ pub fn paste_entry(id: u64) {
 
 /// Delete a history entry by id. Re-runs `cliphist list` to obtain the
 /// exact line cliphist will recognize, then pipes that line into
-/// `cliphist delete`. Triggers a [`refresh()`] so the [`history()`]
-/// signal updates.
+/// `cliphist delete`, and updates the [`history()`] signal so the row
+/// disappears from an open drawer.
 ///
-/// The refresh is best-effort: it runs concurrently with the delete
-/// subprocess, so the first emit may still contain the doomed entry.
-/// The next refresh trigger reconciles it. Acceptable because deletion
-/// is rare and the drawer page also refreshes on next open.
+/// # Why this doesn't just call [`refresh()`]
+///
+/// It used to, and that was a bug: `refresh()` spawns its own blocking
+/// task, so a single `cliphist list` raced the delete task's *two*
+/// subprocesses (`list` then `delete`). The one-subprocess task
+/// essentially always won, so the emitted snapshot was the pre-delete
+/// one and the deleted row stayed on screen until the drawer was closed
+/// and reopened. Measured against real cliphist 0.7.0 it lost 20/20.
+///
+/// So the update is now two-phase:
+///
+/// 1. **Optimistic** — prune `id` from the cached snapshot synchronously,
+///    on the caller's (GTK) thread, so the row vanishes on click.
+/// 2. **Authoritative** — after the delete subprocess exits, re-read
+///    `cliphist list` *in the same blocking task* and publish that. This
+///    reflects ground truth, and self-heals: if the delete actually
+///    failed, the entry reappears rather than staying optimistically gone.
+///
+/// Phase 1 is safe to do from a GTK callback: [`bind`](hytte_reactive::bind)
+/// drives subscribers from a `glib::MainContext` task, so `set()` wakes the
+/// apply-loop rather than polling it inline — the row rebuild lands on a
+/// later main-loop iteration, after the click handler has returned.
 ///
 /// Fire-and-forget; failures are logged at warn.
 pub fn delete(id: u64) {
+    // The registry is thread-local to the GTK thread. If it's somehow absent
+    // the delete must still happen — only the snapshot updates are skipped —
+    // so this is deliberately not an early return.
+    let writer = registry::with(|r| r.get::<ClipboardHandles>().map(|h| h.history.clone()));
+    if writer.is_none() {
+        tracing::warn!("clipboard::delete: service not registered; deleting without a UI update");
+    }
+
+    // Phase 1: optimistic prune. Only emit when the id was actually present,
+    // so a stale/duplicate delete doesn't rebuild every row for nothing.
+    if let Some(writer) = writer.as_ref() {
+        let pruned = {
+            let cur = writer.lock_ref();
+            cur.iter().any(|e| e.id == id).then(|| without_id(&cur, id))
+        };
+        if let Some(pruned) = pruned {
+            writer.set(pruned);
+        }
+    }
+
+    // Phase 2: authoritative reload, sequenced *after* the delete subprocess.
     runtime::handle().spawn_blocking(move || {
         if let Err(e) = run_delete_by_id(id) {
             tracing::warn!(id, error = %e, "clipboard: delete failed");
         }
+        if let Some(writer) = writer {
+            reload_into(&writer);
+        }
     });
-    refresh();
+}
+
+/// The snapshot to show immediately after the user deletes `id`, before
+/// cliphist has been re-read: every other entry, in order.
+fn without_id(entries: &[ClipEntry], id: u64) -> Vec<ClipEntry> {
+    entries.iter().filter(|e| e.id != id).cloned().collect()
 }
 
 // ── Subprocess helpers ───────────────────────────────────────────────────────
@@ -464,5 +522,85 @@ mod tests {
     fn select_delete_line_skips_garbage_rows() {
         let raw = "garbage-line\n42\ttarget\n";
         assert_eq!(select_delete_line(raw, 42), Some("42\ttarget".to_string()));
+    }
+
+    // ── Optimistic post-delete reconciliation (phase 1 of `delete`) ──────────
+
+    fn entries(ids: &[u64]) -> Vec<ClipEntry> {
+        ids.iter()
+            .map(|&id| ClipEntry {
+                id,
+                preview: format!("clip {id}"),
+                kind: ClipKind::Text,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_id_drops_only_the_target() {
+        let v = without_id(&entries(&[3, 2, 1]), 2);
+        assert_eq!(v.iter().map(|e| e.id).collect::<Vec<_>>(), vec![3, 1]);
+    }
+
+    #[test]
+    fn without_id_preserves_order_and_payload() {
+        // The optimistic snapshot must not reshuffle surviving rows — cliphist
+        // lists newest-first and the drawer renders in emit order.
+        let v = without_id(&entries(&[9, 8, 7, 6]), 8);
+        assert_eq!(v.iter().map(|e| e.id).collect::<Vec<_>>(), vec![9, 7, 6]);
+        assert_eq!(v[0].preview, "clip 9");
+        assert_eq!(v[0].kind, ClipKind::Text);
+    }
+
+    #[test]
+    fn without_id_is_a_noop_for_a_missing_id() {
+        let src = entries(&[3, 2, 1]);
+        assert_eq!(without_id(&src, 42), src);
+    }
+
+    #[test]
+    fn without_id_removes_the_head_and_the_tail() {
+        assert_eq!(
+            without_id(&entries(&[3, 2, 1]), 3)
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            without_id(&entries(&[3, 2, 1]), 1)
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    #[test]
+    fn without_id_on_the_last_entry_yields_the_empty_state() {
+        // Draining the list must produce an empty Vec, which is what drives
+        // `reactive_list`'s empty placeholder ("No clipboard history").
+        assert!(without_id(&entries(&[7]), 7).is_empty());
+    }
+
+    /// Regression for the delete/refresh race: the optimistic prune is the
+    /// only reason an open drawer reflects a delete without being reopened.
+    /// `delete()` used to fire a concurrent `refresh()` instead, whose single
+    /// `cliphist list` beat the delete task's `list`+`delete` pair 20/20 —
+    /// so the emitted snapshot still contained the doomed entry.
+    ///
+    /// This asserts the shape that fixed it: pruning is what makes the
+    /// post-delete snapshot differ from the pre-delete one.
+    #[test]
+    fn optimistic_prune_differs_from_the_pre_delete_snapshot() {
+        let before = entries(&[3, 2, 1]);
+        let after = without_id(&before, 2);
+        assert_ne!(
+            before, after,
+            "a pruned snapshot must differ from the pre-delete list, or the \
+             PartialEq dedup in reload_into/refresh suppresses the emit and \
+             the deleted row stays on screen"
+        );
+        assert!(!after.iter().any(|e| e.id == 2));
     }
 }

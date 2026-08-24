@@ -11,6 +11,12 @@
 //! `cliphist decode <id> | wl-copy`, then we dismiss the drawer so the
 //! next Ctrl-V lands in whatever app the user was in.
 //!
+//! Each row's `⋮` menu carries a destructive "Delete entry" action wired to
+//! `clipboard::delete(id)`. That service call prunes the entry from the
+//! cached snapshot synchronously before it shells out, so the row leaves an
+//! open drawer on click rather than on the next reopen — see `delete`'s docs
+//! for why a plain `refresh()` was not enough.
+//!
 //! v1 caps the visible list at ~50 entries (enforced upstream in
 //! `clipboard::refresh`). No pinning, search, or multi-select.
 

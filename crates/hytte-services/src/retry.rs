@@ -22,6 +22,14 @@
 //! handing the `Result` over, while for `networkd` a refresh simply either read
 //! the links or did not.
 //!
+//! #646's second half — `RECONNECT_RETRY` / `RECONNECT_RESET_AFTER` — reuses
+//! [`Policy::backoff`] for a different shape of caller: `networkd`'s post-seed
+//! listen loop, `mpris`, and `bluetooth` don't have a verdict to weigh at all
+//! (a `listen()` stream ending is itself the reconnect signal, whatever it
+//! returned), so they call `backoff` directly rather than going through
+//! `step`, and layer on a caller-side reset threshold `step`'s callers don't
+//! need. See both constants' docs.
+//!
 //! **Deliberately not folded in** — so nobody re-opens these as oversights:
 //!
 //! - `hytte_bus`'s `Backoff` (`hytte-bus/src/connection.rs`) is a stateful
@@ -30,6 +38,13 @@
 //! - `crate::eds_retry` is the EDS worker threads' resilience kit — blocking,
 //!   `std::sync::mpsc`-shaped, and it carries a failure-streak detector rather
 //!   than an attempt budget.
+//! - `hytte_reactive::spawn_supervised`'s private `Backoff` and
+//!   `idle_notify::RetryBackoff` are the same reset-after-a-healthy-run idea as
+//!   `RECONNECT_RESET_AFTER` below, but answer a different question each
+//!   (restart-on-*panic*, and a `std::thread` observer loop's own reconnect)
+//!   and are already stateful cursors rather than a pure schedule plus an
+//!   external attempt count. Three independent shipped instances of the same
+//!   30s judgement is itself worth a future look, but is not #646's scope.
 //! - `wifi/watcher.rs`'s 2s sleep is a one-shot debounce before a `return`, not
 //!   a retry loop. #646 names it explicitly so nobody "fixes" it into one.
 //!
@@ -85,7 +100,13 @@ impl Policy {
     /// Saturating throughout, so an absurd `attempt` clamps to the ceiling
     /// rather than overflowing: `checked_shl` returns `None` once the shift
     /// reaches 32, and the multiply saturates before the `min`.
-    fn backoff(self, attempt: u32) -> Duration {
+    ///
+    /// `pub(crate)`, not just used internally by [`Self::step`]: the crate's
+    /// `listen()`-style reconnect loops (`RECONNECT_RETRY`, below) have no
+    /// `Ok`/`Err`-shaped verdict to weigh — the stream ending is itself the
+    /// signal to reconnect, whatever it returned — so those callers compute a
+    /// delay directly rather than going through `step`.
+    pub(crate) fn backoff(self, attempt: u32) -> Duration {
         let factor = 1_u32
             .checked_shl(attempt.saturating_sub(1))
             .unwrap_or(u32::MAX);
@@ -112,6 +133,50 @@ impl Policy {
     }
 }
 
+/// Backoff for the crate's `listen()`-style reconnect loops — #646's second
+/// half: `networkd`'s post-seed listen loop, `mpris`, and `bluetooth`. Same
+/// 500ms floor as [`crate::wifi::PROBE_RETRY`] /
+/// [`crate::networkd::STARTUP_REFRESH_RETRY`], but a 30s ceiling rather than
+/// 8s — those two exist for a boot race that should resolve in seconds; a
+/// daemon vanishing mid-session is a slower-moving problem, and a longer
+/// ceiling means fewer `warn!` lines in an already-long-lived process when it
+/// stays down. 30s also matches [`RECONNECT_RESET_AFTER`], and
+/// `hytte_reactive::spawn_supervised`'s own panic-restart backoff, which caps
+/// at the same 30s for the same "how long is too long to keep the journal
+/// noisy" judgement — not reused directly here (that type answers "did the
+/// task *panic*", a different question from "did `listen` return"), but not
+/// re-derived either.
+///
+/// Callers own the reconnect-forever `loop`; there is no `Ok` verdict to
+/// commit to here the way [`Step::Proceed`] means for [`Policy::step`]'s other
+/// callers; delay is [`Policy::backoff`] directly. See `RECONNECT_RESET_AFTER`
+/// for why every caller must also track how long the run that just ended
+/// stayed up.
+pub(crate) const RECONNECT_RETRY: Policy = Policy {
+    max_attempts: None,
+    initial: Duration::from_millis(500),
+    max_backoff: Duration::from_secs(30),
+};
+
+/// How long a `listen()` run must have stayed up before its caller treats the
+/// *next* failure as a fresh problem — attempt count back to 1 — rather than a
+/// continuation of the same outage.
+///
+/// [`Policy::backoff`] is pure and stateless; it does not know how long
+/// anything ran, so this is a plain caller-side threshold, not a `Policy`
+/// field — nothing about [`RECONNECT_RETRY`] not reset. Without a reset, a
+/// daemon that is merely flaky — reconnecting cleanly every few minutes —
+/// ratchets its caller's attempt counter to the 30s ceiling and stays there,
+/// because nothing ever brings it back down: strictly worse than the flat 2s
+/// cadence this replaces, for exactly the peer the change is meant to help.
+///
+/// 30s is not a fresh number: it is the same threshold
+/// `hytte_reactive::spawn_supervised`'s `Backoff::reset_after` and
+/// `idle_notify::RetryBackoff::reset_after` already use for the identical
+/// "was that run healthy" judgement. Matching them here means a reader who
+/// has seen either does not need to learn a third answer.
+pub(crate) const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(30);
+
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
 ///
@@ -124,6 +189,7 @@ impl Policy {
 #[cfg(test)]
 const SHIPPED: &[(&str, Policy)] = &[
     ("wifi::PROBE_RETRY", crate::wifi::PROBE_RETRY),
+    ("retry::RECONNECT_RETRY", RECONNECT_RETRY),
     (
         "networkd::STARTUP_REFRESH_RETRY",
         crate::networkd::STARTUP_REFRESH_RETRY,

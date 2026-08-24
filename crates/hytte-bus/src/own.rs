@@ -317,10 +317,14 @@ impl RetryStep {
     ///
     /// Below the line it gets `debug!` — `connection.rs` already warns about
     /// the disconnect itself and a single failure here is only its echo. At or
-    /// above it, the name is not owned and is not about to be, which is the
-    /// same "this feature is inert" report [`log_give_up`] makes, so it takes
-    /// the same level for the same reason (see that function's doc: the
-    /// deployed shell's filter drops everything below `error!`).
+    /// above it, the bus is not answering at all: unlike the contended name
+    /// [`log_give_up`] reports, no configuration change fixes this and this
+    /// primitive cannot work around it, so it earns `error!` on its own
+    /// merits rather than by borrowing the give-up's level. That borrowing is
+    /// what #765 undid: three lines in this file were at `error!` only to
+    /// clear the shell's then-`ERROR`-only default filter, which #766 fixed at
+    /// the source. This is one of the two `error!` sites left, and the only one
+    /// on a path that retries.
     fn is_serious(self) -> bool {
         self.attempt >= STREAK_IS_NO_LONGER_A_BLIP
     }
@@ -592,18 +596,28 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 
 /// Log the give-up transition into [`OwnState::PermanentlyTaken`].
 ///
-/// **Level: `error!`, and that is the whole point of #653's first half.** The
-/// deployed shell calls `tracing_subscriber::fmt::init()` with no `RUST_LOG` in
+/// **Level: `warn!`.** It was `error!` between #653 and #765, and the reason
+/// was the *filter*, not the severity: the deployed shell called
+/// `tracing_subscriber::fmt::init()` with no `RUST_LOG` in
 /// `etc/systemd/user/trollshell.service`, and `fmt::init()` builds
 /// `EnvFilter::from_default_env()`, whose default directive is
-/// `LevelFilter::ERROR`. A `warn!` here — which is what #668 shipped — is
-/// therefore *dropped before it reaches the journal* on every real install.
-/// #653 says a contested name "produces no user-visible signal at all"; the
-/// signal existed, at a level the binary does not print. `error!` is also the
-/// honest level: past `permanent_after` this is not a warning about something
-/// that might resolve, it is a report that a whole subsystem (notifications,
-/// the tray, `DisplayConfig`, the screensaver, the `Control` endpoint) is dead
-/// until a human removes the other owner.
+/// `LevelFilter::ERROR`, so the `warn!` #668 shipped was dropped before it
+/// reached the journal on every real install. #653 said a contested name
+/// "produces no user-visible signal at all"; the signal existed, at a level the
+/// binary did not print. #766 fixed that at the source — the shell now defaults
+/// to `INFO` — which retires the only argument `error!` ever had here and
+/// leaves the honest level. This *is* a warning in the ordinary sense: a whole
+/// subsystem (notifications, the tray, `DisplayConfig`, the screensaver, the
+/// `Control` endpoint) is inert until a human removes the other owner, but
+/// nothing in this process failed, the condition is a property of the machine's
+/// configuration, and the primitive goes on working on it — on every observed
+/// release and once per cooldown regardless. `error!` in this file is reserved
+/// for the two conditions no retry can help: a bus that will not answer
+/// ([`log_acquire_failure`]'s streak arm) and a name that can never be valid.
+///
+/// Its **pair** is [`log_recovered`], which retracts this claim and therefore
+/// takes this same level; see there. [`log_release_wake`], which sits between
+/// the two and claims nothing, does not.
 ///
 /// **Cadence.** This fires at most once per `cooldown` — one line every 5
 /// minutes by default — for as long as the name stays taken *and nothing
@@ -625,7 +639,7 @@ fn attributed_holder(tally: Option<&(String, u32)>) -> &str {
 /// both, and the live [`OwnState`] signal carries the condition continuously
 /// for any consumer that wants it without costing a log line at all.
 fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
-    tracing::error!(
+    tracing::warn!(
         %name,
         %holder,
         consecutive,
@@ -638,13 +652,16 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
 /// held name released, so we are re-requesting it without waiting out the
 /// cooldown.
 ///
-/// At the **same level as [`log_give_up`]**, deliberately, so anyone whose
-/// filter shows the give-up sees both halves of the story instead of just
-/// "notifications are inert" with no line ever following up. That invariant is
-/// what moved this to `error!` alongside it: leaving it at `warn!` while the
-/// give-up went to `error!` would have made the default `RUST_LOG`-less filter
-/// show every death and no recovery — strictly worse than either level chosen
-/// consistently. This fires once per release actually observed, not on a timer.
+/// **Level: `info!`** — the one of these three lines that does *not* have to
+/// match [`log_give_up`]'s. The both-halves invariant that put it at `error!`
+/// alongside the give-up is about an incident being **opened** and **closed**:
+/// a filter that shows "this subsystem is inert" must also show the line
+/// retracting that, or it reports every death and no recovery. That obligation
+/// belongs to [`log_recovered`], which is why *that* line keeps the give-up's
+/// level (#765). This one opens and closes nothing — #720 stripped its recovery
+/// claim for exactly that reason (see below) — so it is a progress note on a
+/// story whose two load-bearing beats are already paired, and it belongs at the
+/// routine level. It fires once per release actually observed, not on a timer.
 ///
 /// The message deliberately does NOT say the name was recovered: this line
 /// fires the instant the release is *observed*, before the `RequestName` it
@@ -656,7 +673,7 @@ fn log_give_up(name: &str, holder: &str, consecutive: u32, cooldown: Duration) {
 /// changes we were unable to attribute (see [`record_loss`]); it names who we
 /// were waiting out, not a confirmed actor.
 fn log_release_wake(name: &str, holder: &str) {
-    tracing::error!(
+    tracing::info!(
         %name,
         holder_at_giveup = %holder,
         "D-Bus name held by another connection was released — re-requesting now, woken by NameOwnerChanged rather than by the retry cooldown, so whatever this name backs comes back within milliseconds instead of minutes if the re-request wins"
@@ -686,12 +703,19 @@ fn closes_a_give_up(tally: Option<&(String, u32)>, permanent_after: u32) -> bool
 /// there is an incident to close ([`closes_a_give_up`]), so a first acquisition
 /// at startup and an ordinary sub-threshold retry stay silent.
 ///
-/// Same level as [`log_give_up`], for the same reason [`log_release_wake`] is.
-/// Its cadence is bounded the same way too: one line per *real* ownership
-/// transition of this one name, of which the broker emits exactly one per
-/// change.
+/// **Same level as [`log_give_up`]** (`warn!`), and this pairing is what the
+/// both-halves invariant is actually about: this is the line that retracts the
+/// give-up's claim that the subsystem is dead, so every filter that shows the
+/// claim must show the retraction. Dropping it to `info!` when #765 moved the
+/// give-up to `warn!` would leave a `RUST_LOG=warn` journal asserting
+/// "notifications are inert" with nothing ever following up — the same
+/// asymmetry #653 objected to, one level down. A retraction is not "good news
+/// logged at `warn!`"; it is the second half of a `warn!`, and a level is a
+/// filter salience, not a sentiment. Its cadence is bounded the same way too:
+/// one line per *real* ownership transition of this one name, of which the
+/// broker emits exactly one per change.
 fn log_recovered(name: &str, holder: &str, consecutive: u32) {
-    tracing::error!(
+    tracing::warn!(
         %name,
         holder_at_giveup = %holder,
         consecutive,

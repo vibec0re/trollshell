@@ -2156,9 +2156,15 @@ mod tests {
 
     /// The `shared` map is process-global and `reset_for_tests` clears *all* of
     /// it, so the cases that publish into (and clear) it are serialized —
-    /// cargo runs tests in parallel threads of one process.
-    static SHARED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// cargo runs tests in parallel threads of one process. This used to be a
+    /// private `static SHARED_LOCK` local to this module, which raced
+    /// `upower::tests` (a different module in this same crate, clearing the
+    /// same process-global map through `registry::reset_for_tests()` with no
+    /// lock at all) and produced the `NotRunning` flake CI caught on #775.
+    /// `hytte_reactive::test_lock::TEST_LOCK` is the crate-spanning fix
+    /// (#777): the one lock every test that touches this map takes, in this
+    /// crate and its dependency `hytte-reactive` alike.
+    ///
     /// Seed `$HOME/.config/trollshell/places.toml` with `seed`, publish the
     /// shared handles the editing API writes through — seeded exactly the way
     /// `PlacesService::start` seeds them, via `load_places`, so a config the
@@ -2168,7 +2174,7 @@ mod tests {
     /// Bytes rather than `&str` because two of the cases are files that aren't
     /// valid UTF-8.
     fn with_seeded_config(seed: &[u8], f: impl FnOnce(&Path, &Mutable<Arc<Vec<Place>>>)) {
-        let _guard = SHARED_LOCK
+        let _guard = hytte_reactive::test_lock::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2446,7 +2452,7 @@ mod tests {
 
     #[test]
     fn editing_api_reports_a_missing_service_instead_of_panicking() {
-        let _guard = SHARED_LOCK
+        let _guard = hytte_reactive::test_lock::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hytte_reactive::shared::reset_for_tests();

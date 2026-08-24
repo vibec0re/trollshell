@@ -8,8 +8,7 @@ pub mod registry;
 pub mod runtime;
 pub mod shared;
 pub mod supervisor;
-#[cfg(test)]
-mod test_lock;
+pub mod test_lock;
 
 pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_two_way_drag_safe, bind_visible};
 pub use health::{TaskHealth, TaskId, TaskState};

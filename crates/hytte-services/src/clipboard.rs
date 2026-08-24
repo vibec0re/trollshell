@@ -22,14 +22,10 @@
 //!
 //! # Scope (v1)
 //!
-//! Delete by id is supported via [`delete`]. Implementation runs
-//! `cliphist list` to get the exact line cliphist recognises, then
-//! pipes that line into `cliphist delete`. Two subprocess calls per
-//! delete; acceptable since deletion is user-initiated. (`cliphist
-//! delete` reads lines on stdin and extracts each line's id prefix, so a
-//! bare id would also work — verified against 0.7.0. The full line is
-//! kept because it's the idiomatic `cliphist list | grep … | cliphist
-//! delete` form; collapsing to one subprocess is a live simplification.)
+//! Delete by id is supported via [`delete`]. Implementation pipes the
+//! bare id into `cliphist delete` — one subprocess call per delete (see
+//! [`run_delete_by_id`] for why a bare id is sufficient; #742 has the
+//! full writeup).
 //!
 //! No clip pinning, no search/filter UI, no multi-select, no rich-format
 //! paste. The page is a plain history list with click-to-paste.
@@ -158,19 +154,23 @@ pub fn paste_entry(id: u64) {
     });
 }
 
-/// Delete a history entry by id. Re-runs `cliphist list` to obtain the
-/// exact line cliphist will recognize, then pipes that line into
-/// `cliphist delete`, and updates the [`history()`] signal so the row
-/// disappears from an open drawer.
+/// Delete a history entry by id. Pipes the bare id into `cliphist
+/// delete` (see [`run_delete_by_id`]), and updates the [`history()`]
+/// signal so the row disappears from an open drawer.
 ///
 /// # Why this doesn't just call [`refresh()`]
 ///
 /// It used to, and that was a bug: `refresh()` spawns its own blocking
-/// task, so a single `cliphist list` raced the delete task's *two*
-/// subprocesses (`list` then `delete`). The one-subprocess task
-/// essentially always won, so the emitted snapshot was the pre-delete
-/// one and the deleted row stayed on screen until the drawer was closed
-/// and reopened. Measured against real cliphist 0.7.0 it lost 20/20.
+/// task, so a single `cliphist list` raced the delete task's
+/// subprocess(es). At the time this was fixed, deleting still ran
+/// `list` *then* `delete` (#742 later collapsed that to the single
+/// `delete` call `run_delete_by_id` makes today), and the shorter
+/// one-subprocess `refresh()` task essentially always won that race, so
+/// the emitted snapshot was the pre-delete one and the deleted row
+/// stayed on screen until the drawer was closed and reopened. Measured
+/// against real cliphist 0.7.0 it lost 20/20. The two-phase design below
+/// doesn't depend on delete's subprocess count — it fixes the race by
+/// not running a concurrent `refresh()` at all.
 ///
 /// So the update is now two-phase:
 ///
@@ -355,47 +355,55 @@ fn run_decode_to_wlcopy(id: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Find the `<id>\t<preview>` line in `cliphist list` output whose
-/// integer prefix equals `id`. Returns the line trimmed of the trailing
-/// newline (suitable for piping into `cliphist delete` with an explicit
-/// `\n` appended).
-fn select_delete_line(list_output: &str, id: u64) -> Option<String> {
-    for line in list_output.lines() {
-        let Some((id_part, _)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(parsed) = id_part.trim().parse::<u64>() else {
-            continue;
-        };
-        if parsed == id {
-            return Some(line.to_string());
-        }
-    }
-    None
-}
-
+/// Delete `id` from cliphist by piping its bare id into `cliphist
+/// delete` — one subprocess, no `cliphist list` round-trip.
+///
+/// # Why a bare id is enough
+///
+/// `cliphist delete` reads stdin line-by-line and, per each line, calls
+/// its internal `extractID`: cut on the first tab, parse whatever's
+/// before it (the whole line, if there's no tab) as an integer. That is
+/// the *same* `extractID` cliphist's `decode` subcommand uses on its
+/// bare CLI-arg id — and this file already drives `decode` with a bare
+/// id in [`run_decode_to_wlcopy`] (`.arg("decode").arg(id.to_string())`,
+/// no tab, no preview text). So piping a bare id into `delete`'s stdin
+/// isn't new coupling to an undocumented cliphist internal; it's reusing
+/// a dependency this file already has on `extractID`'s shape via the
+/// paste path, just for a second subcommand.
+///
+/// Verified against real cliphist 0.7.0 (see #742's repro transcript)
+/// and against upstream's source (`sentriz/cliphist`, `cliphist.go`):
+/// `extractID` and the line-scanning `delete` loop have been in place
+/// since the `delete-stdin` command was added (upstream #18) and made
+/// multi-line (#63) — this isn't a recent or unstable code path.
+///
+/// Deleting an id cliphist doesn't currently hold (stale/already-gone)
+/// is a silent no-op: `BoltDB`'s `Bucket.Delete` doesn't error on a
+/// missing key, confirmed empirically too. So this still exits `Ok`
+/// for a stale id, same as the old list-then-delete form did by
+/// treating a list-miss as success — just via cliphist's own
+/// idempotency instead of a pre-check on our side.
+///
+/// # Residual risk
+///
+/// The full `<id>\t<preview>` line `cliphist list | … | cliphist
+/// delete` form is the form cliphist's own docs and `etc/cliphist/README.md`
+/// show, and always carries a tab. If a future cliphist ever tightens
+/// `extractID` to *require* the tab (moving from "id prefix, tab
+/// optional" to "must look like a full list record"), a bare-id write
+/// here would start failing while that idiomatic form kept working —
+/// and nothing in this workspace's CI would catch it, since cliphist
+/// isn't in the devShell. That failure is loud and self-healing, not
+/// silent: `cliphist delete` would exit non-zero, this function returns
+/// `Err`, [`delete`]'s caller logs a `tracing::warn!`, and the phase-2
+/// authoritative [`reload_into`] that always runs afterward re-reads
+/// `cliphist list`, sees the entry is still there, and the optimistically
+/// pruned row reappears. No permanent data loss, no silent divergence
+/// between the UI and cliphist's actual state — just a delete that
+/// visibly didn't take, at which point the shared `extractID` behind
+/// [`run_decode_to_wlcopy`] would almost certainly be failing too.
 fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
     use std::io::Write as _;
-
-    let list = std::process::Command::new("cliphist")
-        .arg("list")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| anyhow::anyhow!("spawn cliphist list (for delete): {e}"))?;
-    if !list.status.success() {
-        return Err(anyhow::anyhow!(
-            "cliphist list (for delete) exited {:?}",
-            list.status
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&list.stdout);
-    let Some(line) = select_delete_line(&stdout, id) else {
-        // Entry already gone (concurrent delete, or id stale). Treat as
-        // success so the caller's refresh still runs.
-        return Ok(());
-    };
 
     let mut delete = std::process::Command::new("cliphist")
         .arg("delete")
@@ -410,11 +418,8 @@ fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
             .take()
             .ok_or_else(|| anyhow::anyhow!("cliphist delete: no stdin pipe"))?;
         stdin
-            .write_all(line.as_bytes())
+            .write_all(&delete_stdin_payload(id))
             .map_err(|e| anyhow::anyhow!("write cliphist delete stdin: {e}"))?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|e| anyhow::anyhow!("write cliphist delete newline: {e}"))?;
     }
     let status = delete
         .wait()
@@ -423,6 +428,14 @@ fn run_delete_by_id(id: u64) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("cliphist delete exited {status:?}"));
     }
     Ok(())
+}
+
+/// The exact stdin payload [`run_delete_by_id`] writes to `cliphist
+/// delete`: the bare id, newline-terminated — no tab, no preview text.
+/// Pulled out as its own function so the wire format is unit-testable
+/// without a real cliphist binary (see the `tests` module).
+fn delete_stdin_payload(id: u64) -> Vec<u8> {
+    format!("{id}\n").into_bytes()
 }
 
 #[cfg(test)]
@@ -506,22 +519,34 @@ mod tests {
         assert!(t.ends_with('\u{2026}'));
     }
 
+    // ── cliphist-delete stdin wire format (run_delete_by_id's new, smaller
+    // surface after #742 dropped the cliphist-list round-trip) ─────────────
+
     #[test]
-    fn select_delete_line_finds_matching_id() {
-        let raw = "1\thello\n42\ttarget\n3\tnope\n";
-        assert_eq!(select_delete_line(raw, 42), Some("42\ttarget".to_string()));
+    fn delete_stdin_payload_is_bare_id_plus_newline() {
+        // No tab, no preview text — this is the exact contract #742 leans
+        // on: `cliphist delete` extracts an id prefix cutting on the first
+        // tab (or the whole line, absent one), so a bare id is sufficient.
+        assert_eq!(delete_stdin_payload(42), b"42\n");
     }
 
     #[test]
-    fn select_delete_line_returns_none_when_id_missing() {
-        let raw = "1\thello\n3\tnope\n";
-        assert_eq!(select_delete_line(raw, 42), None);
+    fn delete_stdin_payload_has_no_tab() {
+        // Guards against accidentally reintroducing a `<id>\t<preview>`
+        // shaped payload, which is what the pre-#742 implementation sent.
+        assert!(!delete_stdin_payload(7).contains(&b'\t'));
     }
 
     #[test]
-    fn select_delete_line_skips_garbage_rows() {
-        let raw = "garbage-line\n42\ttarget\n";
-        assert_eq!(select_delete_line(raw, 42), Some("42\ttarget".to_string()));
+    fn delete_stdin_payload_formats_plain_decimal() {
+        // Rust's `{}` formatting for u64 is already plain decimal (no
+        // grouping, no sign, no exponent), but this pins that down: a
+        // non-decimal rendering would break cliphist's Go `strconv.Atoi`
+        // parse on the other end.
+        assert_eq!(
+            delete_stdin_payload(u64::MAX),
+            format!("{}\n", u64::MAX).into_bytes()
+        );
     }
 
     // ── Optimistic post-delete reconciliation (phase 1 of `delete`) ──────────

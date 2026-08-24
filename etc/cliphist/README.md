@@ -134,11 +134,11 @@ decode` produced — for text, that's text; for images, the original blob
   goes back to the clipboard with cliphist's recorded MIME type.
 - ~~No delete-from-UI~~ — **this shipped.** Each row's `⋮` menu has a
   "Delete entry" action (`trollshell/src/panels/clipboard.rs`,
-  `hytte-services`' `clipboard::delete`); it looks up the exact
-  `<id>\t<preview>` line `cliphist list` reports for that id and pipes it
-  into `cliphist delete`, since cliphist's `delete` takes stdin lines, not
-  an id argument. To clear everything at once instead, or to delete from a
-  script:
+  `hytte-services`' `clipboard::delete`); it pipes the entry's bare id
+  into `cliphist delete`, since cliphist's `delete` takes stdin lines,
+  not an id argument — and reads each line's id prefix, so a bare id
+  (no preview text) is enough. To clear everything at once instead, or
+  to delete from a script:
 
   ```sh
   cliphist wipe                                              # clear everything

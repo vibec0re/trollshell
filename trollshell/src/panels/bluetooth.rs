@@ -6,8 +6,11 @@
 //! prompts surface inline as a banner above the device list while
 //! `BlueZ`'s `Agent1` callback is awaiting user response.
 
+use std::collections::HashSet;
+
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
@@ -165,7 +168,6 @@ fn build_bluetooth_controls() -> gtk::Widget {
 /// dangling section headers.
 fn build_bluetooth_device_groups() -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let outer_for_bind = outer.clone();
 
     let combined = map_ref! {
         let devs = bluetooth::devices(),
@@ -174,9 +176,23 @@ fn build_bluetooth_device_groups() -> gtk::Widget {
         }
     };
 
-    bind(combined, &outer, move |_, (devs, actions)| {
-        while let Some(child) = outer_for_bind.first_child() {
-            outer_for_bind.remove(&child);
+    bind_device_groups(&outer, combined);
+
+    outer.upcast()
+}
+
+/// Rebuild the Connected/Paired/Available boxed-list groups from `combined`
+/// (device list + in-flight action paths) into `outer`. Split out of
+/// [`build_bluetooth_device_groups`] so this `bind` call site's `WeakRef`
+/// contract (#772) can be driven with a synthetic signal in tests, the same
+/// way `reactive_list` is (#761/#771).
+fn bind_device_groups<S>(outer: &gtk::Box, combined: S)
+where
+    S: Signal<Item = (Vec<Device>, HashSet<String>)> + 'static,
+{
+    bind(combined, outer, move |outer, (devs, actions)| {
+        while let Some(child) = outer.first_child() {
+            outer.remove(&child);
         }
         let mut connected = Vec::new();
         let mut paired = Vec::new();
@@ -204,11 +220,9 @@ fn build_bluetooth_device_groups() -> gtk::Widget {
                 let row = build_device_row(dev, is_busy);
                 group.add(&row);
             }
-            outer_for_bind.append(&group);
+            outer.append(&group);
         }
     });
-
-    outer.upcast()
 }
 
 /// Banner shown above the device list while `BlueZ`'s `Agent1` callback is
@@ -217,23 +231,32 @@ fn build_pair_prompt_banner() -> gtk::Widget {
     let prompt_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     prompt_box.add_css_class("ts-bluetooth-prompt");
     prompt_box.set_visible(false);
-    let prompt_box_for_bind = prompt_box.clone();
+    bind_pair_prompt_banner(&prompt_box, bluetooth::pair_prompts());
+    prompt_box.upcast()
+}
+
+/// Show/hide/populate the pairing-prompt banner from `signal`. Split out of
+/// [`build_pair_prompt_banner`] so this `bind` call site's `WeakRef` contract
+/// (#772) can be driven with a synthetic signal in tests.
+fn bind_pair_prompt_banner<S>(prompt_box: &gtk::Box, signal: S)
+where
+    S: Signal<Item = Option<PairPrompt>> + 'static,
+{
     bind(
-        bluetooth::pair_prompts(),
-        &prompt_box,
-        move |_, prompt: Option<PairPrompt>| {
-            while let Some(child) = prompt_box_for_bind.first_child() {
-                prompt_box_for_bind.remove(&child);
+        signal,
+        prompt_box,
+        move |prompt_box, prompt: Option<PairPrompt>| {
+            while let Some(child) = prompt_box.first_child() {
+                prompt_box.remove(&child);
             }
             let Some(p) = prompt else {
-                prompt_box_for_bind.set_visible(false);
+                prompt_box.set_visible(false);
                 return;
             };
-            prompt_box_for_bind.set_visible(true);
-            populate_pair_prompt(&prompt_box_for_bind, &p);
+            prompt_box.set_visible(true);
+            populate_pair_prompt(prompt_box, &p);
         },
     );
-    prompt_box.upcast()
 }
 
 fn populate_pair_prompt(container: &gtk::Box, p: &PairPrompt) {
@@ -457,4 +480,68 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
     popover.set_child(Some(&pop_box));
     menu_btn.set_popover(Some(&popover));
     menu_btn
+}
+
+/// #772 regression coverage: the two hand-rolled `bind` call sites in this
+/// file (device groups, pair-prompt banner) must hold their container only
+/// weakly, exactly like `reactive_list`'s own #761/#771 regression test.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner};
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use std::collections::HashSet;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// `bind_device_groups` must not keep its `outer` container alive by
+    /// itself, per the #224 `WeakRef` contract at
+    /// `hytte-reactive/src/bind.rs:16-22`. Falsified by reintroducing the
+    /// `outer_for_bind` strong clone the apply closure used to capture.
+    #[gtk::test]
+    fn device_groups_binding_does_not_pin_outer() {
+        adw::init().expect("libadwaita init");
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let weak = outer.downgrade();
+        let combined: Mutable<(Vec<Device>, HashSet<String>)> =
+            Mutable::new((Vec::new(), HashSet::new()));
+        bind_device_groups(&outer, combined.signal_cloned());
+        pump();
+
+        drop(outer);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_device_groups must not pin its outer container: a strong clone captured by \
+             the apply closure (rather than taking the closure's own `outer` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's \
+             WeakRef contract"
+        );
+    }
+
+    /// Same contract for `bind_pair_prompt_banner`'s `prompt_box`. Falsified
+    /// by reintroducing the `prompt_box_for_bind` strong clone.
+    #[gtk::test]
+    fn pair_prompt_banner_binding_does_not_pin_prompt_box() {
+        adw::init().expect("libadwaita init");
+        let prompt_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let weak = prompt_box.downgrade();
+        let prompts: Mutable<Option<PairPrompt>> = Mutable::new(None);
+        bind_pair_prompt_banner(&prompt_box, prompts.signal_cloned());
+        pump();
+
+        drop(prompt_box);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_pair_prompt_banner must not pin its prompt_box: a strong clone captured by \
+             the apply closure (rather than taking the closure's own `prompt_box` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's \
+             WeakRef contract"
+        );
+    }
 }

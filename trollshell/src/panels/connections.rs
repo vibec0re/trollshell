@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::netconn;
@@ -39,17 +40,51 @@ pub fn panel_connections() -> gtk::Widget {
     // Top-level rows: own-user sockets sorted by program. Other users
     // (where ss can't see PID) collapse into a single expander at the
     // bottom so they don't dominate.
+    let other_expander = adw::ExpanderRow::builder().title("Other users").build();
+    bind_connections_group(&conn_group, &other_expander, netconn::connections());
+    conn_group.add(&other_expander);
+
+    // Wrap the connections list in a ScrolledWindow so that when many
+    // sockets are open the panel scrolls instead of growing past the
+    // screen height and clipping (#84).
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scrolled.set_propagate_natural_height(true);
+    // Design-baseline px, routed through `scale()` so the cap tracks font size
+    // / text-scaling the same way `stats.rs`'s scroll wrapper does (#708).
+    scrolled.set_max_content_height(crate::scale::scale(480));
+    scrolled.set_child(Some(&conn_group));
+    column.append(&scrolled);
+
+    finish_page(&column)
+}
+
+/// Drain-rebuild the own-user rows into `conn_group` and the other-users
+/// rows into `other_expander`'s own row list, from `signal`. Split out of
+/// [`panel_connections`] so this `bind` call site's `WeakRef` contract (#772)
+/// can be driven with a synthetic signal in tests, the same way
+/// `reactive_list` is (#761/#771).
+///
+/// `other_expander` is a second widget the closure also writes to — not the
+/// `bind` target — so it stays a captured clone; see #772's note on
+/// `other_for_bind` for why that clone is a separate design question.
+fn bind_connections_group<S>(
+    conn_group: &adw::PreferencesGroup,
+    other_expander: &adw::ExpanderRow,
+    signal: S,
+) where
+    S: Signal<Item = Vec<netconn::Connection>> + 'static,
+{
     let owned_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let owned_overflow_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
-    let other_expander = adw::ExpanderRow::builder().title("Other users").build();
     let other_rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let group_for_bind = conn_group.clone();
-    let owned_for_bind = owned_track.clone();
-    let overflow_for_bind = owned_overflow_track.clone();
+    let owned_for_bind = owned_track;
+    let overflow_for_bind = owned_overflow_track;
     let other_for_bind = other_expander.clone();
-    let other_rows_for_bind = other_rows_track.clone();
-    bind(netconn::connections(), &conn_group, move |_g, mut conns| {
+    let other_rows_for_bind = other_rows_track;
+    bind(signal, conn_group, move |conn_group, mut conns| {
         conns.sort_by(|a, b| match (a.pid.is_some(), b.pid.is_some()) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
@@ -72,13 +107,13 @@ pub fn panel_connections() -> gtk::Widget {
         // unwinding through a glib callback aborts the process (#643). The rows
         // are rebuilt into owned `Vec`s and stored back once, at the end.
         for r in owned_for_bind.take() {
-            group_for_bind.remove(&r);
+            conn_group.remove(&r);
         }
         for r in other_rows_for_bind.take() {
             other_for_bind.remove(&r);
         }
         if let Some(prev) = overflow_for_bind.take() {
-            group_for_bind.remove(&prev);
+            conn_group.remove(&prev);
         }
 
         let mut owned: Vec<adw::ActionRow> = Vec::new();
@@ -91,7 +126,7 @@ pub fn panel_connections() -> gtk::Widget {
                     continue;
                 }
                 let row = build_connection_row(c);
-                group_for_bind.add(&row);
+                conn_group.add(&row);
                 owned.push(row);
                 owned_count += 1;
             } else {
@@ -117,7 +152,7 @@ pub fn panel_connections() -> gtk::Widget {
                 .selectable(false)
                 .build();
             hint.set_subtitle("Top sockets shown.");
-            group_for_bind.add(&hint);
+            conn_group.add(&hint);
             *overflow_for_bind.borrow_mut() = Some(hint);
         }
 
@@ -128,20 +163,48 @@ pub fn panel_connections() -> gtk::Widget {
         }
         other_for_bind.set_visible(total_other > 0);
     });
-    conn_group.add(&other_expander);
+}
 
-    // Wrap the connections list in a ScrolledWindow so that when many
-    // sockets are open the panel scrolls instead of growing past the
-    // screen height and clipping (#84).
-    let scrolled = gtk::ScrolledWindow::new();
-    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
-    scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-    scrolled.set_propagate_natural_height(true);
-    // Design-baseline px, routed through `scale()` so the cap tracks font size
-    // / text-scaling the same way `stats.rs`'s scroll wrapper does (#708).
-    scrolled.set_max_content_height(crate::scale::scale(480));
-    scrolled.set_child(Some(&conn_group));
-    column.append(&scrolled);
+/// #772 regression coverage: the hand-rolled `bind` call site behind
+/// [`bind_connections_group`] must hold its `conn_group` container only
+/// weakly, exactly like `reactive_list`'s own #761/#771 regression test.
+/// (`other_expander` is a *second* widget the closure also writes to, not
+/// the `bind` target — out of scope for #772, see the note on
+/// `bind_connections_group` above.)
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{bind_connections_group, netconn};
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
 
-    finish_page(&column)
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// `bind_connections_group` must not keep its `conn_group` container
+    /// alive by itself, per the #224 `WeakRef` contract at
+    /// `hytte-reactive/src/bind.rs:16-22`. Falsified by reintroducing the
+    /// `group_for_bind` strong clone the apply closure used to capture.
+    #[gtk::test]
+    fn connections_group_binding_does_not_pin_conn_group() {
+        adw::init().expect("libadwaita init");
+        let conn_group = adw::PreferencesGroup::new();
+        let weak = conn_group.downgrade();
+        let other_expander = adw::ExpanderRow::builder().title("Other users").build();
+        let conns: Mutable<Vec<netconn::Connection>> = Mutable::new(Vec::new());
+        bind_connections_group(&conn_group, &other_expander, conns.signal_cloned());
+        pump();
+
+        drop(conn_group);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_connections_group must not pin its conn_group: a strong clone captured by \
+             the apply closure (rather than taking the closure's own `conn_group` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's \
+             WeakRef contract"
+        );
+    }
 }

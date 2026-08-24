@@ -54,7 +54,12 @@ pub fn panel_notifications() -> gtk::Widget {
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_vexpand(true);
-    scrolled.set_min_content_height(380);
+    // Design-baseline px, routed through `scale()` so this floor tracks font
+    // size / text-scaling too (#708) — unlike the two `set_max_content_height`
+    // siblings above, this is a *minimum*, so leaving it raw was the more
+    // annoying bypass: at large text scale it can force the history list
+    // taller than its content actually needs.
+    scrolled.set_min_content_height(crate::scale::scale(380));
     scrolled.add_css_class("ts-notif-history");
 
     // Group entries by app_name into per-app AdwExpanderRows. Each app row's

@@ -137,7 +137,9 @@ pub fn panel_connections() -> gtk::Widget {
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_height(true);
-    scrolled.set_max_content_height(480);
+    // Design-baseline px, routed through `scale()` so the cap tracks font size
+    // / text-scaling the same way `stats.rs`'s scroll wrapper does (#708).
+    scrolled.set_max_content_height(crate::scale::scale(480));
     scrolled.set_child(Some(&conn_group));
     column.append(&scrolled);
 

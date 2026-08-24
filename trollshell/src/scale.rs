@@ -205,6 +205,35 @@ mod tests {
         assert_eq!(scale_with_factor(0, 3.0), 0);
     }
 
+    /// Pins the arithmetic at the three design-baseline literals #708 routed
+    /// through [`scale`] — `connections.rs`'s `set_max_content_height` cap
+    /// (480), `network/wifi.rs`'s network-list cap (240), and
+    /// `notifications.rs`'s history-list *floor* (380, a
+    /// `set_min_content_height` rather than a max — the direction doesn't
+    /// change the math). At 1× each is a no-op (matching the module's no-op
+    /// guarantee); at 1.5× each lands exactly on 720/360/570, with no rounding
+    /// drift at the sizes actually in use — which [`factor_scales_linearly`]'s
+    /// 16/15/0 cases don't reach.
+    ///
+    /// **What this does not do:** it is a pure-math test and holds no reference
+    /// to the call sites. Reverting `scale(480)` back to a bare `480` in
+    /// `connections.rs` would leave it green. Coupling it for real would need a
+    /// display server and accessors the panels don't expose, so treat the file
+    /// names below as documentation of *where* these numbers live, not as a
+    /// tripwire guarding them.
+    #[test]
+    fn three_scroll_heights_scale_with_factor() {
+        // 1× — identity, same guarantee `no_op_at_default` pins for `scale()`.
+        assert_eq!(scale_with_factor(480, 1.0), 480); // connections.rs cap
+        assert_eq!(scale_with_factor(240, 1.0), 240); // network/wifi.rs cap
+        assert_eq!(scale_with_factor(380, 1.0), 380); // notifications.rs floor
+
+        // 1.5× — a plausible large-text-scaling-factor bump.
+        assert_eq!(scale_with_factor(480, 1.5), 720);
+        assert_eq!(scale_with_factor(240, 1.5), 360);
+        assert_eq!(scale_with_factor(380, 1.5), 570);
+    }
+
     #[test]
     fn baseline_em_is_default() {
         // Sanity-check the documented baseline arithmetic.

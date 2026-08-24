@@ -12,7 +12,7 @@ use hytte::services::mpris;
 
 use crate::components::cast;
 use crate::components::format::fmt_us;
-use crate::components::layout::{finish_page, page_grid, section, toggle_class};
+use crate::components::layout::{finish_page, page_grid_non_homogeneous, section, toggle_class};
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 use crate::scale::scale;
 
@@ -43,8 +43,7 @@ struct PlayerState {
 }
 
 pub fn panel_media() -> gtk::Widget {
-    let grid = page_grid();
-    grid.set_column_homogeneous(false);
+    let grid = page_grid_non_homogeneous();
 
     // Source switcher spans both columns at the top; shown only with >=2
     // players (it wires its own reactive visibility).

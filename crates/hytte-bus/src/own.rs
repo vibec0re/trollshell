@@ -103,7 +103,21 @@ pub struct OwnNameSignal {
 impl OwnNameSignal {
     /// Returns a fresh [`Signal`](futures_signals::signal::Signal) that
     /// delivers the current state immediately and then on every change.
-    pub fn signal_cloned(&self) -> impl futures_signals::signal::Signal<Item = OwnState> {
+    ///
+    /// The `+ use<>` is load-bearing, not decoration. Under Rust 2024's
+    /// lifetime-capture rules (RFC 3617) an `-> impl Trait` in an inherent
+    /// method captures **every** in-scope lifetime, `&self` included, so
+    /// without the opt-out the returned signal borrows this handle and is
+    /// never `'static` — which makes it unusable to `hytte_reactive::bind`,
+    /// whose bound is `S: Signal + 'static`, i.e. unusable for the one thing
+    /// #653 asked this signal for. The body returns a concrete
+    /// `MutableSignalCloned<OwnState>`, which owns an `Arc` and already *is*
+    /// `'static`, so opting out costs nothing. #750 is what this cost before
+    /// it was opted out of: each consumer laundered the state through a
+    /// `Mutable<OwnState>` and one parked task per owned name. Keep it on any
+    /// accessor here that hands out a value meant to outlive the borrow — see
+    /// `SharedConnection::epoch_signal` for the same annotation.
+    pub fn signal_cloned(&self) -> impl futures_signals::signal::Signal<Item = OwnState> + use<> {
         self.inner.signal_cloned()
     }
 

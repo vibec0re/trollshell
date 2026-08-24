@@ -13,7 +13,7 @@
 //! [`active()`]. [`ownership()`] exposes the live [`OwnState`] so a consumer
 //! can say so; `trollshell`'s bell chip binds it (#747).
 
-use futures_signals::signal::{Mutable, Signal, SignalExt};
+use futures_signals::signal::{Mutable, Signal};
 use hytte_bus::{OwnNameSignal, OwnState};
 use hytte_reactive::{Service, registry, runtime, shared};
 use std::collections::HashMap;
@@ -181,54 +181,17 @@ pub struct NotificationsHandles {
     /// `NotificationsIface` clones across reconnects share the same sequence.
     pub(crate) _next_id: Arc<AtomicU32>,
     pub(crate) history: Mutable<Vec<HistoryEntry>>,
-    /// Kept alive so the `own_name` task continues owning
-    /// `org.freedesktop.Notifications` for the process lifetime.
-    _ownership: OwnNameSignal,
-    /// Mirror of the `own_name` task's [`OwnState`], published by
-    /// [`ownership()`] so a lost name race is visible in the UI rather than
-    /// presenting as "notifications just stopped working" (#747, #653).
+    /// The `own_name` task's live [`OwnState`], published by [`ownership()`]
+    /// so a lost name race is visible in the UI rather than presenting as
+    /// "notifications just stopped working" (#747, #653). Also what keeps the
+    /// `own_name` task owning `org.freedesktop.Notifications` for the process
+    /// lifetime — dropping the last handle would end it.
     ///
-    /// A mirror rather than the [`OwnNameSignal`] itself because
-    /// `OwnNameSignal::signal_cloned` returns an `impl Signal` that captures
-    /// `&self` under Rust 2024's lifetime-capture rules, so it can never
-    /// satisfy `bind`'s `S: 'static` bound — see [`mirror_own_state`].
-    own_state: Mutable<OwnState>,
-}
-
-/// Forward an [`OwnNameSignal`]'s state into a plain `Mutable<OwnState>` that
-/// the registry can hand out as a `'static` signal.
-///
-/// `OwnNameSignal::signal_cloned(&self)` returns `impl Signal` and, under Rust
-/// 2024's lifetime-capture rules, that opaque type captures `&self`. It is
-/// therefore only ever usable while the handle it came from is still borrowed
-/// — fine for `hytte-bus`'s own tests, useless to `hytte_reactive::bind`,
-/// which requires `S: Signal + 'static`. Forwarding through a `Mutable` costs
-/// one parked task per owned name and lands the state in exactly the
-/// `Mutable<T>`-field shape every other service's `Handles` already uses.
-///
-/// (The tidier fix is `-> impl Signal<Item = OwnState> + use<>` on
-/// `OwnNameSignal::signal_cloned` — the concrete `MutableSignalCloned` it
-/// returns is already `'static`. That is a one-line change in
-/// `hytte-bus/src/own.rs`, which #745 owns; filed as follow-up rather than
-/// edited from here.)
-///
-/// Lives in this module because `org.freedesktop.Notifications` is the
-/// load-bearing case; [`crate::tray`] is the only other caller. Hoist it to a
-/// module of its own if a third owned name ever needs it.
-pub(crate) fn mirror_own_state(source: &OwnNameSignal) -> Mutable<OwnState> {
-    let mirror = Mutable::new(OwnState::Acquiring);
-    let writer = mirror.clone();
-    let source = source.clone();
-    runtime::handle().spawn(async move {
-        source
-            .signal_cloned()
-            .for_each(|state| {
-                writer.set_neq(state);
-                std::future::ready(())
-            })
-            .await;
-    });
-    mirror
+    /// Held as the [`OwnNameSignal`] itself since #750; before that it was a
+    /// `Mutable<OwnState>` mirror plus a parked forwarding task, because
+    /// `OwnNameSignal::signal_cloned` captured `&self` and so could not
+    /// satisfy `bind`'s `S: 'static` bound. It carries `+ use<>` now.
+    ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -279,8 +242,7 @@ impl Service for NotificationsService {
             active,
             _next_id: next_id,
             history,
-            own_state: mirror_own_state(&ownership),
-            _ownership: ownership,
+            ownership,
         }
     }
 }
@@ -342,7 +304,7 @@ pub fn ownership() -> impl Signal<Item = OwnState> {
     registry::with(|r| {
         r.get::<NotificationsHandles>()
             .expect("notifications::service() not registered")
-            .own_state
+            .ownership
             .signal_cloned()
     })
 }

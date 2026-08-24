@@ -105,15 +105,15 @@ pub struct TrayItem {
 #[doc(hidden)]
 pub struct TrayHandles {
     pub(crate) items: Mutable<Vec<TrayItem>>,
-    /// Kept alive so the `own_name` task continues owning
-    /// `org.kde.StatusNotifierWatcher` for the process lifetime.
-    _ownership: OwnNameSignal,
-    /// Mirror of the `own_name` task's [`OwnState`], published by
-    /// [`ownership()`] so a lost name race is visible in the UI rather than
-    /// presenting as a permanently empty tray (#747, #653). See
-    /// [`crate::notifications::mirror_own_state`] for why this is a mirror and
-    /// not the [`OwnNameSignal`] itself.
-    own_state: Mutable<OwnState>,
+    /// The `own_name` task's live [`OwnState`], published by [`ownership()`]
+    /// so a lost name race is visible in the UI rather than presenting as a
+    /// permanently empty tray (#747, #653). Also what keeps the `own_name`
+    /// task owning `org.kde.StatusNotifierWatcher` for the process lifetime.
+    ///
+    /// Held as the [`OwnNameSignal`] itself since #750 — see the equivalent
+    /// field on `notifications`' handles for the `Mutable` mirror this
+    /// replaced and why it existed.
+    ownership: OwnNameSignal,
 }
 
 // ── Service entry-point ───────────────────────────────────────────────────────
@@ -173,11 +173,7 @@ impl Service for TrayService {
             }
         });
 
-        TrayHandles {
-            items,
-            own_state: crate::notifications::mirror_own_state(&ownership),
-            _ownership: ownership,
-        }
+        TrayHandles { items, ownership }
     }
 }
 
@@ -214,7 +210,7 @@ pub fn ownership() -> impl Signal<Item = OwnState> {
     registry::with(|r| {
         r.get::<TrayHandles>()
             .expect("tray::service() not registered")
-            .own_state
+            .ownership
             .signal_cloned()
     })
 }

@@ -515,7 +515,7 @@ mod tests {
     fn truncate_cuts_long() {
         let long = "a".repeat(200);
         let t = truncate(&long, 10);
-        assert!(t.chars().count() == 11);
+        assert_eq!(t.chars().count(), 11);
         assert!(t.ends_with('\u{2026}'));
     }
 

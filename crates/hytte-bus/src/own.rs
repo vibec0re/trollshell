@@ -5,7 +5,7 @@
 use crate::BusError;
 use crate::connection::SharedConnection;
 use futures_signals::signal::Mutable;
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -786,27 +786,51 @@ fn next_attempt_after(wake: Wake) -> NextAttempt {
     }
 }
 
-/// Whether `msg` is a `NameOwnerChanged` saying `name` has become unowned.
+/// What the most recent `NameOwnerChanged` seen for a name says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// Somebody holds it.
+    Taken,
+    /// Nobody holds it — it can be requested right now.
+    Free,
+}
+
+/// What `msg` says about who holds `name`, or `None` when it says nothing
+/// about it: a signal for some other name, or a body that will not decode as
+/// `(s, s, s)`.
 ///
 /// `NameOwnerChanged` carries `(name, old_owner, new_owner)`; an empty
 /// `new_owner` means the name was released rather than handed to someone else.
-/// An ownership *transfer* is deliberately not a wake: the name is not free, so
-/// re-requesting it would just earn another `Exists` — the tally has already
-/// latched by the time we get here, and the new holder gets its own budget on
-/// the next real attempt.
+/// An ownership *transfer* therefore reads as [`Ownership::Taken`] and is
+/// deliberately not a wake: the name is not free, so re-requesting it would
+/// just earn another `Exists` — the tally has already latched by the time we
+/// get here, and the new holder gets its own budget on the next real attempt.
+///
+/// This says what the message *says*, not what to do about it. Deciding that
+/// is [`wait_for_release_or_cooldown`]'s job, and the difference is the whole
+/// of #776: the predicate this replaced answered "is this a release?" per
+/// message, with nothing tying the answer to the present, so a release that a
+/// later queued message had already superseded still read as one.
 ///
 /// The name check is a second line of defence. The broker already filters by
 /// `arg0` (see [`build_name_owner_changed_rule`]), which is what keeps six
 /// concurrently-owned names from waking each other's waiters; this re-check
 /// costs one string compare and means a mis-built rule degrades into a missed
 /// wake rather than a wrong one.
-fn is_release_of(msg: &zbus::Message, name: &str) -> bool {
+fn ownership_after(msg: &zbus::Message, name: &str) -> Option<Ownership> {
     let Ok((sig_name, _old_owner, new_owner)) =
         msg.body().deserialize::<(String, String, String)>()
     else {
-        return false;
+        return None;
     };
-    sig_name == name && new_owner.is_empty()
+    if sig_name != name {
+        return None;
+    }
+    Some(if new_owner.is_empty() {
+        Ownership::Free
+    } else {
+        Ownership::Taken
+    })
 }
 
 /// Wait for `name` to be released, or for `cooldown` to elapse — whichever
@@ -847,6 +871,40 @@ fn is_release_of(msg: &zbus::Message, name: &str) -> bool {
 /// fail to register on a broker restart, say — and a missed signal must
 /// degrade to "recovers in five minutes", never to "stranded forever".
 ///
+/// **Only the latest ownership fact can wake this wait (#776).** The wait
+/// tracks who holds the name as [`Ownership`], seeded `Taken` because every
+/// route in here is a give-up and a give-up is only reached from a
+/// `RequestName` reply of `Exists` or from losing the name to a peer — the
+/// name is held as of the message that sent us here. Each `NameOwnerChanged`
+/// updates that view, and before acting on a `Free` view the wait folds in
+/// **everything else already queued** on the subscription. A release with a
+/// re-acquisition sitting behind it in the queue therefore nets out to "still
+/// taken" and is not a wake.
+///
+/// That is the recency check the old per-message predicate could not express.
+/// Without it, a release buffered earlier — during the contention retry sleep,
+/// most obviously, but any un-drained window would do — satisfied the wait the
+/// moment it was reached, costing a spurious `RequestName`, a spurious
+/// [`log_release_wake`], another [`log_give_up`] when it failed again, and the
+/// five-minute pacing #669 built the cooldown to provide. #775 already drains
+/// the acquisition-error waits and [`on_name_taken`]'s retry drains as of #776,
+/// so the buffering has no ordinary entrance left; the fold is what makes that
+/// a property of this function rather than of every caller remembering to
+/// drain.
+///
+/// The fold is **not** a settle delay. It consumes only what a poll finds
+/// already ready, so the fast path — a live release arriving on an empty queue
+/// — still returns on the same poll it woke on, one extra non-blocking poll
+/// later. Messages still in flight when the fold runs cannot be seen by it; the
+/// backstop against a *live* flapping peer is the tally, which re-latches and
+/// gives up again, not this.
+///
+/// It also does not discard the window that buffering is load-bearing for:
+/// the method-call gap from a `RequestName` reply of `Exists`, through
+/// [`current_holder_of`], to the start of this wait. A release that lands there
+/// is the newest fact about the name, so the fold keeps it and the wait returns
+/// on it, exactly as before.
+///
 /// Generic over the stream so the select and the filtering are exercised
 /// hermetically, with hand-built messages and no `dbus-daemon`.
 async fn wait_for_release_or_cooldown<S>(stream: &mut S, name: &str, cooldown: Duration) -> Wake
@@ -855,14 +913,34 @@ where
 {
     let timer = tokio::time::sleep(cooldown);
     tokio::pin!(timer);
+    let mut held = Ownership::Taken;
     loop {
         tokio::select! {
             () = &mut timer => return Wake::Cooldown,
             msg = stream.next() => match msg {
-                Some(Ok(msg)) if is_release_of(&msg, name) => return Wake::Released,
-                // A signal for another name, an ownership transfer, or a body
-                // we could not decode: keep waiting on the same timer.
-                Some(_) => {}
+                Some(Ok(msg)) => {
+                    if let Some(now) = ownership_after(&msg, name) {
+                        held = now;
+                    }
+                    // Fold in whatever is already queued behind it before
+                    // acting — see the doc above. `now_or_never` polls once
+                    // and never blocks; a `Pending` (nothing more ready) or a
+                    // `Some(None)` (stream finished) both end the fold, and
+                    // the finished case is then handled by the `None` arm on
+                    // the next turn of the loop.
+                    while let Some(Some(queued)) = stream.next().now_or_never() {
+                        if let Ok(queued) = queued
+                            && let Some(now) = ownership_after(&queued, name)
+                        {
+                            held = now;
+                        }
+                    }
+                    if held == Ownership::Free {
+                        return Wake::Released;
+                    }
+                }
+                // A stream error: keep waiting on the same timer.
+                Some(Err(_)) => {}
                 // The stream ended, so no signal can ever arrive on it. Serve
                 // out the rest of the cooldown instead of spinning on a dead
                 // stream (`next()` on a finished stream returns `None`
@@ -910,22 +988,29 @@ where
 /// afterwards**, dropping this stream and building a fresh subscription, so
 /// nothing discarded here was going to be read.
 ///
-/// [`on_name_taken`]'s contention retry keeps its bare
-/// `sleep(RETRY_AFTER_LOSS * consecutive)` — 250 ms, then 500 ms — and the
-/// reason is simply that length: three orders of magnitude short of the traffic
-/// it would take to fill 64 slots, so the hazard cannot arise there. It is
-/// **not** that a release buffered during that sleep is load-bearing. It cannot
-/// be: that retry always sends another `RequestName` before any wait, and
-/// reaching [`wait_for_release_or_cooldown`] at all requires that request to
-/// have come back `Exists` — the name taken again — so a release buffered
-/// during the sleep is stale by the time the wait sees it, and
-/// [`is_release_of`] has no recency check with which to notice. It would return
-/// a spurious `Wake::Released` and short-circuit the cooldown. In the other
-/// outcome, where the re-request wins, [`watch_for_loss`] steps over that same
-/// message (its `old_owner` is not ours) and it is dropped there. The window
-/// `run_ownership`'s subscription comment actually protects is the one with
-/// *no* sleep in it: the method-call gap from a `RequestName` reply of `Exists`,
-/// through [`current_holder_of`], to the start of the wait.
+/// [`on_name_taken`]'s contention retry drains through here too, since #776.
+/// Its 250 ms / 500 ms sleeps are three orders of magnitude short of the
+/// traffic it would take to fill 64 slots, so back-pressure is not the reason:
+/// the reason is that a release buffered during that sleep is stale *by
+/// construction* and used to be actionable anyway. That retry always sends
+/// another `RequestName` before any wait, and reaching
+/// [`wait_for_release_or_cooldown`] at all requires that request to have come
+/// back `Exists` — the name taken again — so a release from before it cannot
+/// describe the present, yet the old per-message predicate had no recency check
+/// with which to notice, and returned a spurious `Wake::Released` that
+/// short-circuited the cooldown. In the other outcome, where the re-request
+/// wins, [`watch_for_loss`] would have stepped over the same message anyway
+/// (its `old_owner` is not ours) and dropped it there.
+///
+/// Draining here and folding in [`wait_for_release_or_cooldown`] are
+/// deliberately *both* applied. The drain closes one entrance; the fold makes
+/// staleness unactionable wherever it comes from, so the guarantee does not
+/// rest on every future wait in this file remembering to drain. Neither
+/// touches the window `run_ownership`'s subscription comment protects — the
+/// method-call gap from a `RequestName` reply of `Exists`, through
+/// [`current_holder_of`], to the start of the wait. That window has no sleep
+/// in it, so no drain reaches it, and a release landing there is the newest
+/// fact about the name, so the fold keeps it.
 async fn sleep_draining<S>(stream: &mut S, dur: Duration)
 where
     S: Stream<Item = zbus::Result<zbus::Message>> + Unpin,
@@ -1173,7 +1258,18 @@ where
             // Deliberately a multiple of one constant rather than a fourth
             // hand-rolled backoff type (#646) — the give-up cooldown, not this
             // ramp, is what actually bounds the retry rate.
-            tokio::time::sleep(RETRY_AFTER_LOSS * consecutive).await;
+            //
+            // Drained (#776), completing the flat invariant that no wait in
+            // this file leaves a live subscription unpolled. Not for the
+            // back-pressure reason `sleep_draining` was written for — 250 ms
+            // is far too short to fill a 64-slot queue — but because anything
+            // this sleep buffers is stale by the time it could be read: the
+            // next `RequestName` always intervenes, and reaching
+            // `wait_for_release_or_cooldown` at all requires that request to
+            // have come back `Exists`. Discarding here is safe for the same
+            // reason it is safe on the error path: nothing dropped was going
+            // to be acted on. See `sleep_draining`.
+            sleep_draining(&mut *stream, RETRY_AFTER_LOSS * consecutive).await;
             writer.set(OwnState::Acquiring);
             NextAttempt::SameConnection
         }
@@ -1428,8 +1524,8 @@ where
 mod tests {
     use super::{
         ACQUIRE_BACKOFF_BASE, ACQUIRE_BACKOFF_CAP, Contention, FailureStreak, NextAttempt,
-        OwnState, Wake, acquire_backoff, attributed_holder, closes_a_give_up, is_release_of,
-        logs_at, next_attempt_after, on_request_name_error, record_loss, sleep_draining,
+        OwnState, Ownership, Wake, acquire_backoff, attributed_holder, closes_a_give_up, logs_at,
+        next_attempt_after, on_request_name_error, ownership_after, record_loss, sleep_draining,
         wait_for_release_or_cooldown,
     };
     use futures_signals::signal::{Mutable, SignalExt as _};
@@ -1766,10 +1862,11 @@ mod tests {
         assert!(started.elapsed() >= SHORT_COOLDOWN);
     }
 
-    /// A `NameOwnerChanged` whose body will not decode as `(s, s, s)` is
-    /// ignored rather than trusted or panicked on.
+    /// A `NameOwnerChanged` whose body will not decode as `(s, s, s)` says
+    /// nothing about who holds the name — it must leave the running view
+    /// alone rather than being trusted, defaulted, or panicked on.
     #[test]
-    fn an_undecodable_body_is_not_a_release() {
+    fn an_undecodable_body_says_nothing_about_ownership() {
         let msg = zbus::Message::signal(
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
@@ -1778,7 +1875,134 @@ mod tests {
         .expect("signal builder")
         .build(&42u32)
         .expect("build malformed NameOwnerChanged");
-        assert!(!is_release_of(&msg, NAME));
+        assert_eq!(ownership_after(&msg, NAME), None);
+    }
+
+    /// Nor does a well-formed signal about somebody else's name. The broker's
+    /// `arg0` filter should already have kept it out; this is the second line
+    /// of defence that turns a mis-built rule into a missed wake rather than a
+    /// wrong one.
+    #[test]
+    fn another_names_signal_says_nothing_about_ours() {
+        assert_eq!(
+            ownership_after(&name_owner_changed(OTHER, ":1.5", ""), NAME),
+            None
+        );
+    }
+
+    /// The two shapes that *do* say something, pinned: an empty `new_owner` is
+    /// a release, anything else leaves the name held.
+    #[test]
+    fn an_empty_new_owner_is_free_and_anything_else_is_taken() {
+        assert_eq!(
+            ownership_after(&name_owner_changed(NAME, ":1.6", ""), NAME),
+            Some(Ownership::Free)
+        );
+        assert_eq!(
+            ownership_after(&name_owner_changed(NAME, ":1.6", ":1.7"), NAME),
+            Some(Ownership::Taken)
+        );
+        assert_eq!(
+            ownership_after(&name_owner_changed(NAME, "", ":1.7"), NAME),
+            Some(Ownership::Taken)
+        );
+    }
+
+    // ── #776: a stale release is not a wake ─────────────────────────────────
+
+    /// **The regression test for #776.** A release that a re-acquisition is
+    /// already sitting behind in the queue describes the past, not the
+    /// present, and must not end the wait.
+    ///
+    /// This is the flap the issue is about, in the smallest form that
+    /// reproduces it: the contention retry used to sleep without draining, so
+    /// a peer that released and immediately retook the name left both signals
+    /// buffered; the next give-up then found the release still in the stream
+    /// and returned `Wake::Released` for a name that was demonstrably taken —
+    /// `RequestName` had just said `Exists` — costing a spurious attempt, a
+    /// spurious [`super::log_release_wake`], and the whole five-minute pacing
+    /// #669 added the cooldown for.
+    ///
+    /// Against the per-message predicate this replaced, the first message
+    /// alone decided it and this assertion fails.
+    #[tokio::test]
+    async fn a_release_superseded_by_a_reacquisition_is_not_a_wake() {
+        let mut stream = feed(vec![
+            // The squatter releases the name…
+            name_owner_changed(NAME, ":1.5", ""),
+            // …and takes it straight back. By the time anything reads either
+            // message, the second one is the truth.
+            name_owner_changed(NAME, "", ":1.5"),
+        ]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, SHORT_COOLDOWN).await,
+            Wake::Cooldown,
+            "a release with a re-acquisition queued behind it is not a release now"
+        );
+    }
+
+    /// The same, when a *different* contender takes the freed name: still not
+    /// our wake, and for the same reason [`super::ownership_after`] reads a
+    /// transfer as taken — re-requesting would only earn another `Exists`.
+    #[tokio::test]
+    async fn a_release_superseded_by_a_third_contender_is_not_a_wake() {
+        let mut stream = feed(vec![
+            name_owner_changed(NAME, ":1.5", ""),
+            name_owner_changed(NAME, "", ":1.9"),
+        ]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, SHORT_COOLDOWN).await,
+            Wake::Cooldown
+        );
+    }
+
+    /// The fold is "latest wins", not "any acquisition vetoes". A backlog that
+    /// *ends* on a release is a name that is free right now, however much
+    /// churn preceded it, and must still wake the wait at once — otherwise the
+    /// #776 fix would have bought its recency by reintroducing the five-minute
+    /// stall #669 removed.
+    #[tokio::test]
+    async fn a_backlog_that_ends_in_a_release_still_wakes_us() {
+        let mut stream = feed(vec![
+            name_owner_changed(NAME, ":1.5", ""),
+            name_owner_changed(NAME, "", ":1.9"),
+            name_owner_changed(OTHER, ":1.2", ""),
+            name_owner_changed(NAME, ":1.9", ""),
+        ]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
+            Wake::Released
+        );
+    }
+
+    /// Traffic about other names cannot supersede a release of ours. The fold
+    /// keeps one view per *this* name, so a busy bus does not turn a genuine
+    /// release into a missed wake.
+    #[tokio::test]
+    async fn other_names_in_the_backlog_do_not_supersede_our_release() {
+        let mut stream = feed(vec![
+            name_owner_changed(NAME, ":1.5", ""),
+            name_owner_changed(OTHER, "", ":1.9"),
+            name_owner_changed(OTHER, ":1.9", ":1.4"),
+        ]);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
+            Wake::Released
+        );
+    }
+
+    /// A release that arrives on its own, *after* the wait has started and
+    /// with nothing queued behind it, is the ordinary fast path and must not
+    /// be delayed or folded away by #776's recency check. [`trickle`] rather
+    /// than [`feed`] on purpose: the message is not present on the first poll,
+    /// so this exercises the arrival path rather than a pre-loaded backlog.
+    #[tokio::test]
+    async fn a_release_arriving_during_the_wait_still_wakes_us_at_once() {
+        let mut stream = trickle(vec![name_owner_changed(NAME, ":1.5", "")], TRICKLE_GAP);
+        assert_eq!(
+            wait_for_release_or_cooldown(&mut stream, NAME, LONG_COOLDOWN).await,
+            Wake::Released
+        );
     }
 
     // ── #688 item 4: no unpolled subscription on the error path ─────────────

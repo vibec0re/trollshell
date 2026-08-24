@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::vpn;
@@ -74,22 +75,31 @@ pub fn panel_vpn() -> gtk::Widget {
     column.append(&empty_group);
 
     // Per-tunnel groups. Set is dynamic; drain & rebuild on each emission.
-    let groups_track: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
-    let column_for_bind = column.clone();
-    let groups_for_bind = groups_track.clone();
-    bind(vpn::tunnels(), &column, move |_col, tunnels| {
-        let mut tracked = groups_for_bind.borrow_mut();
+    bind_tunnel_groups(&column, vpn::tunnels());
+
+    finish_page(&column)
+}
+
+/// Drain-rebuild the per-tunnel `PreferencesGroup`s into `column` from
+/// `signal`. Split out of [`panel_vpn`] so this `bind` call site's `WeakRef`
+/// contract (#772) can be driven with a synthetic signal in tests, the same
+/// way `reactive_list` is (#761/#771).
+fn bind_tunnel_groups<S>(column: &gtk::Box, signal: S)
+where
+    S: Signal<Item = Vec<vpn::Tunnel>> + 'static,
+{
+    let groups: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
+    bind(signal, column, move |column, tunnels| {
+        let mut tracked = groups.borrow_mut();
         for g in tracked.drain(..) {
-            column_for_bind.remove(&g);
+            column.remove(&g);
         }
         for tunnel in &tunnels {
             let g = build_tunnel_group(tunnel);
-            column_for_bind.append(&g);
+            column.append(&g);
             tracked.push(g);
         }
     });
-
-    finish_page(&column)
 }
 
 // ── Saved NM VPN profiles ──────────────────────────────────────────────────────
@@ -282,4 +292,43 @@ fn build_peer_row(peer: &vpn::Peer) -> adw::ActionRow {
     ));
     row.set_subtitle(&subtitle_parts.join(" \u{00b7} "));
     row
+}
+
+/// #772 regression coverage: the hand-rolled `bind` call site behind
+/// [`bind_tunnel_groups`] must hold its container only weakly, exactly like
+/// `reactive_list`'s own #761/#771 regression test.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{bind_tunnel_groups, vpn};
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// `bind_tunnel_groups` must not keep its `column` container alive by
+    /// itself, per the #224 `WeakRef` contract at
+    /// `hytte-reactive/src/bind.rs:16-22`. Falsified by reintroducing the
+    /// `column_for_bind` strong clone the apply closure used to capture.
+    #[gtk::test]
+    fn tunnel_groups_binding_does_not_pin_column() {
+        adw::init().expect("libadwaita init");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let weak = column.downgrade();
+        let tunnels: Mutable<Vec<vpn::Tunnel>> = Mutable::new(Vec::new());
+        bind_tunnel_groups(&column, tunnels.signal_cloned());
+        pump();
+
+        drop(column);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_tunnel_groups must not pin its column: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `column` argument from `bind`) would \
+             keep this alive for the life of the binding, defeating #224's WeakRef contract"
+        );
+    }
 }

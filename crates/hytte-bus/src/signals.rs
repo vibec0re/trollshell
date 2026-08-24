@@ -56,7 +56,12 @@ impl SignalSubscription {
     /// Stream of signal emissions. Each call to `events()` returns an
     /// independent receiver; backpressure is handled by zbus' broadcast
     /// channel (slow consumers may lag).
-    pub fn events(&self) -> impl futures_util::Stream<Item = SignalEvent> + Unpin {
+    ///
+    /// `+ use<>` for the reason `OwnNameSignal::signal_cloned` carries it
+    /// (#750): without it the opaque type captures `&self` under Rust 2024's
+    /// rules and is never `'static`, so it could not be spawned onto a task or
+    /// stored. The stream owns its `broadcast::Receiver` and borrows nothing.
+    pub fn events(&self) -> impl futures_util::Stream<Item = SignalEvent> + Unpin + use<> {
         use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.sender.subscribe();
         Box::pin(async_stream::stream! {

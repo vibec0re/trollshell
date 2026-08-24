@@ -3,6 +3,9 @@ pub mod bluetooth;
 pub mod brightness;
 pub mod calendar;
 pub mod clock;
+/// Not a chip: the shared pure "this bus name is taken" mapping that
+/// `notif_indicator` and `tray` both render (#747).
+pub mod contention;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;

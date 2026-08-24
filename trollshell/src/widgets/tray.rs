@@ -1,9 +1,11 @@
+use hytte::bus::OwnState;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
 
 use crate::components::cast;
 use crate::components::diff::{DiffOp, plan_diff};
+use crate::widgets::contention::{self, Subject};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,9 +19,41 @@ type ItemCell = Rc<RefCell<TrayItem>>;
 /// key → (button widget, live item cell).
 type ButtonMap = HashMap<String, (gtk::Button, ItemCell)>;
 
+/// The words this widget's contended states are rendered with (#747).
+const SUBJECT: Subject = Subject {
+    headline: "The system tray is not receiving items",
+    bus_name: "org.kde.StatusNotifierWatcher",
+    rival: "another status-notifier host (a second bar, plasmashell, …)",
+};
+
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     container.add_css_class("ts-tray");
+
+    // #747: tray apps look `org.kde.StatusNotifierWatcher` up once and
+    // register with whoever answers, so losing that name to a second bar means
+    // no item ever reaches us and the tray is simply empty — which looks
+    // exactly like "no app has a tray icon". This glyph is the only thing in
+    // the group that can tell the two apart; its tooltip carries the reason.
+    //
+    // Appended before any item button and never touched by `update_tray`,
+    // which only ever removes keys it owns. Step 3 of the diff reorders the
+    // item buttons ahead of it, so it settles at the trailing edge of the
+    // group — beside the tray rather than inside it, which is where a
+    // meta-complaint about the tray belongs.
+    let contended = gtk::Image::from_icon_name(contention::WARN_ICON);
+    contended.set_pixel_size(crate::scale::scale(16));
+    contended.set_visible(false);
+    container.append(&contended);
+    bind(tray::ownership(), &contended, |img, state: OwnState| {
+        if let Some(msg) = contention::notice(&state, &SUBJECT) {
+            img.set_tooltip_text(Some(&msg));
+            img.set_visible(true);
+        } else {
+            img.set_tooltip_text(None);
+            img.set_visible(false);
+        }
+    });
 
     // The map persists across signal emits on the GTK main thread.
     // Rc is fine here — bind() drives the closure via spawn_local.

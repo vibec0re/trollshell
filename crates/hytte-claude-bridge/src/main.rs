@@ -73,7 +73,12 @@
 //! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; must stay under the client's 10s |
 //! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only) |
 //! | `CLAUDE_BRIDGE_THINKING` | `disabled` | `api` mode only: `disabled`, `adaptive`, or `auto` — see [`messages::Thinking`] |
-//! | `ANTHROPIC_API_KEY` | unset | `api` mode only: overrides `~/.config/trollshell/anthropic.key`. In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
+//! | `ANTHROPIC_API_KEY` | unset | `api` mode only, and a **development** override: it outranks `~/.config/trollshell/anthropic.key`, but the shipped unit scrubs it with `UnsetEnvironment=`, so under systemd the file is the only source that works (#752). In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
+//!
+//! The key itself is **not** an environment knob under the shipped unit — see
+//! `etc/systemd/user/trollshell-claude-bridge.service`, which documents
+//! `~/.config/trollshell/anthropic.key` as the configuration surface for `api`
+//! mode and says why the variable is stripped there.
 
 mod backend;
 mod bridge;

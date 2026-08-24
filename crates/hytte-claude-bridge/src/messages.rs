@@ -431,11 +431,17 @@ pub fn map_status(status: u16, body: &str) -> Failure {
             400,
             format!("the Anthropic API rejected the request: {detail}"),
         ),
+        // Lead with the file, not the variable: the shipped unit's
+        // `UnsetEnvironment=` scrubs ANTHROPIC_API_KEY on purpose (#752), so
+        // "set ANTHROPIC_API_KEY" is advice that provably cannot work there.
+        // It is still named, because when it *is* set it silently outranks the
+        // file — which is the other way to stare at a stale key.
         401 => (
             502,
             format!(
-                "the Anthropic API rejected the key — put a working one in {KEY_PATH_HINT} \
-                 (or set ANTHROPIC_API_KEY): {detail}"
+                "the Anthropic API rejected the key — replace the one in {KEY_PATH_HINT} \
+                 (an ANTHROPIC_API_KEY in the environment overrides that file, but the \
+                 shipped unit strips it): {detail}"
             ),
         ),
         403 => (
@@ -501,8 +507,15 @@ fn api_error_message(body: &str) -> String {
 /// [`crate::envguard`] refuses to start on — because it would silently move the
 /// `claude` **child** onto metered credits. In this mode there is no child and
 /// metered billing is the whole point, so the guard does not run and the same
-/// variable becomes a legitimate override. The key **file** is the primary
-/// path: the shipped unit's `UnsetEnvironment=` scrubs the env var.
+/// variable becomes a legitimate override.
+///
+/// The key **file** is nonetheless the primary path, and the messages say so
+/// (#752): the shipped unit's `UnsetEnvironment=` scrubs the env var
+/// deliberately — an inherited key redirecting the `claude` modes onto metered
+/// billing is the worse failure — so under systemd the override is not merely
+/// secondary, it is *absent*. Treat it as a `cargo run` convenience rather than
+/// a way to configure the unit, and keep every operator-facing string pointed
+/// at the file first.
 #[must_use]
 pub fn load_key() -> Option<String> {
     load_key_from(std::env::var("ANTHROPIC_API_KEY").ok(), config_dir())
@@ -537,12 +550,22 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
 /// Fail closed, matching [`crate::envguard`]: a bridge that will not start is
 /// loud, whereas one that binds 8787 and 502s every request looks like the
 /// plugin is broken.
+///
+/// Loud is only worth anything if the remedy works. This is the string an
+/// operator reads in `systemctl status`, i.e. read *under the shipped unit*,
+/// which scrubs `ANTHROPIC_API_KEY` — so it leads with the key file and demotes
+/// the env override to what it is (#752).
 #[must_use]
 pub fn missing_key_refusal() -> String {
     format!(
         "refusing to start: CLAUDE_BRIDGE_MODE=api needs an Anthropic API key and there is none.\n\
-         Put one in {KEY_PATH_HINT} (or set ANTHROPIC_API_KEY), or drop the mode to run the \
-         keyless subscription path instead.\n\
+         Put one in {KEY_PATH_HINT} — under the shipped systemd unit that is the path that \
+         works, because its UnsetEnvironment= line scrubs ANTHROPIC_API_KEY from this process \
+         on purpose, so an inherited key can never quietly redirect the claude modes onto \
+         metered billing. ANTHROPIC_API_KEY still overrides the file when it survives (a \
+         cargo run, say), but it is a development convenience, not a way to configure the \
+         unit.\n\
+         Or drop CLAUDE_BRIDGE_MODE=api to run the keyless subscription path instead.\n\
          Binding the port without a key would advertise a backend that answers every request \
          with a 502."
     )
@@ -988,5 +1011,31 @@ mod tests {
         assert!(msg.contains("anthropic.key"), "{msg}");
         assert!(msg.contains("ANTHROPIC_API_KEY"), "{msg}");
         assert!(msg.contains("CLAUDE_BRIDGE_MODE=api"), "{msg}");
+    }
+
+    /// …and it names them in the order that works (#752).
+    ///
+    /// The shipped unit carries `UnsetEnvironment=ANTHROPIC_API_KEY`, so an
+    /// operator who follows "set `ANTHROPIC_API_KEY`" restarts into the identical
+    /// refusal with nothing to go on. Both operator-facing key strings must
+    /// therefore reach the **file** first, and mention the variable only as the
+    /// thing the unit strips.
+    #[test]
+    fn the_key_advice_leads_with_the_source_the_shipped_unit_honours() {
+        let refusal = super::missing_key_refusal();
+        let rejected = map_status(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        )
+        .message;
+        for msg in [&refusal, &rejected] {
+            let file = msg.find("anthropic.key").expect("names the key file");
+            let var = msg.find("ANTHROPIC_API_KEY").expect("names the variable");
+            assert!(file < var, "the file must come first: {msg}");
+            assert!(
+                msg.contains("strips") || msg.contains("scrubs"),
+                "the variable must be flagged as stripped, not offered as a fix: {msg}",
+            );
+        }
     }
 }

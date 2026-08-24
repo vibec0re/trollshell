@@ -44,9 +44,9 @@ up config changes automatically; otherwise `niri msg action reload-config`).
 
 ### You already have a `binds { }` block
 
-Copy the nine binding lines (everything between `binds {` and the closing
-`}`) into your existing `binds { }` block. Don't nest `binds` inside
-`binds` — niri parses one block per name.
+Copy every binding line (everything between `binds {` and the closing `}`)
+into your existing `binds { }` block. Don't nest `binds` inside `binds` —
+niri parses one block per name.
 
 A quick way to view the bindings without leaving the repo:
 

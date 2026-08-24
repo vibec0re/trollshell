@@ -39,8 +39,44 @@ const CONTROL_NAME: &str = "mov.vibec0re.trollshell.Control";
 const CONTROL_PATH: &str = "/mov/vibec0re/trollshell/Control";
 const CONTROL_IFACE: &str = "mov.vibec0re.trollshell.Control";
 
+/// Default `tracing` level when `RUST_LOG` is unset (#780, mirroring #746's
+/// fix for the shell binary in `trollshell/src/main.rs`, #766).
+///
+/// `tracing_subscriber::fmt::init()`'s own env-unset fallback
+/// (`EnvFilter::from_default_env`) is hard-coded to `ERROR`, and no
+/// deployment path sets `RUST_LOG` for this companion app either, so a bare
+/// `fmt::init()` silently discards every non-error log line on a normal
+/// launch — currently 9 `info!` sites and no `warn!`/`debug!`/`trace!` (#780's
+/// audit). `INFO` matches the shell binary's `DEFAULT_LOG_LEVEL` for
+/// consistency between the two binaries.
+const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
+    tracing_subscriber::filter::LevelFilter::INFO;
+
+/// Builds the `EnvFilter` that gates the global `tracing` subscriber.
+///
+/// `rust_log`, when `Some`, is parsed directly as the filter's directive
+/// string instead of reading the process's real `RUST_LOG` — this is what
+/// lets a test exercise the default-directive and override paths in
+/// isolation, without mutating process env (which `unsafe_code = "forbid"`
+/// rules out here anyway: `std::env::set_var`/`remove_var` are `unsafe` fns).
+/// `main` always passes `None`, so `RUST_LOG` still overrides
+/// [`DEFAULT_LOG_LEVEL`] exactly as before — `EnvFilter::Builder::from_env_lossy`
+/// is `parse_lossy(env::var("RUST_LOG").unwrap_or_default())` under the hood,
+/// so passing the same string through `parse_lossy` directly runs the
+/// identical code path for a given `RUST_LOG` value.
+fn build_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let builder =
+        tracing_subscriber::EnvFilter::builder().with_default_directive(DEFAULT_LOG_LEVEL.into());
+    match rust_log {
+        Some(dirs) => builder.parse_lossy(dirs),
+        None => builder.from_env_lossy(),
+    }
+}
+
 fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(build_env_filter(None))
+        .init();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_window);
@@ -1041,9 +1077,11 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 
 #[cfg(test)]
 mod tests {
+    use tracing_subscriber::filter::LevelFilter;
+
     use super::{
-        PluginRuntime, is_running, mount_or_unknown, plugin_subtitle, runtime_overlay, seen_suffix,
-        violations_suffix,
+        DEFAULT_LOG_LEVEL, PluginRuntime, build_env_filter, is_running, mount_or_unknown,
+        plugin_subtitle, runtime_overlay, seen_suffix, violations_suffix,
     };
 
     /// A connected plugin's runtime state, for the overlay tests.
@@ -1145,5 +1183,32 @@ mod tests {
         assert_eq!(seen_suffix(30), " · seen 30s ago");
         assert_eq!(seen_suffix(600), " · seen 10m ago");
         assert_eq!(seen_suffix(7200), " · seen 2h ago");
+    }
+
+    // #780: with `RUST_LOG` unset, the effective filter must default to
+    // `DEFAULT_LOG_LEVEL` (currently `INFO`), not `tracing-subscriber`'s own
+    // hard-coded `ERROR` fallback (what a bare `fmt::init()` /
+    // `EnvFilter::from_default_env()` produces).
+    //
+    // Unlike #766's shell-binary tests (`trollshell/src/main.rs`), which
+    // both drove `build_env_filter` through its `Some(_)` arm and left the
+    // `None` arm — the one `main` actually calls — unexercised, this test
+    // calls `build_env_filter(None)` directly. It's hermetic against
+    // ambient env because the test process itself has no `RUST_LOG` set in
+    // `cargo test`'s default environment, so `from_env_lossy()` takes its
+    // real unset-var fallback path here, not a mirror of it.
+    #[test]
+    fn default_log_level_is_not_error_for_the_none_arm() {
+        let filter = build_env_filter(None);
+        assert_eq!(filter.max_level_hint(), Some(DEFAULT_LOG_LEVEL));
+        assert_ne!(filter.max_level_hint(), Some(LevelFilter::ERROR));
+    }
+
+    // `RUST_LOG` must still win over the default when set — mirrors #766's
+    // override-path test for the shell binary.
+    #[test]
+    fn rust_log_override_still_wins() {
+        let filter = build_env_filter(Some("trollshell_control_center=trace"));
+        assert_eq!(filter.max_level_hint(), Some(LevelFilter::TRACE));
     }
 }

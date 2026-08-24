@@ -84,7 +84,12 @@ impl Drop for BusProxy {
 impl BusProxy {
     /// Returns a [`Signal`] that emits [`ProxyState`] transitions as the
     /// proxy's connection and peer-presence state changes.
-    pub fn liveness(&self) -> impl Signal<Item = ProxyState> {
+    ///
+    /// `+ use<>` for the reason `OwnNameSignal::signal_cloned` carries it
+    /// (#750): without it the opaque type captures `&self` under Rust 2024's
+    /// rules and can never be `'static`, so `hytte_reactive::bind` cannot take
+    /// it. The body returns a `MutableSignalCloned`, which already is.
+    pub fn liveness(&self) -> impl Signal<Item = ProxyState> + use<> {
         self.inner.liveness.signal_cloned()
     }
 

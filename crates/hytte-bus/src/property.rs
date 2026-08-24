@@ -63,7 +63,13 @@ impl<T> Drop for PropertySignal<T> {
 impl<T: Clone + Send + Sync + 'static> PropertySignal<T> {
     /// Returns a signal that emits [`PropState`] transitions as the tracked
     /// D-Bus property changes.
-    pub fn signal(&self) -> impl Signal<Item = PropState<T>> {
+    ///
+    /// `+ use<T>` for the reason `OwnNameSignal::signal_cloned` carries
+    /// `+ use<>` (#750): without an opt-out the opaque type captures `&self`
+    /// under Rust 2024's rules and can never be `'static`, so
+    /// `hytte_reactive::bind` cannot take it. `T` still has to be captured —
+    /// it is in the item type — but the borrow does not.
+    pub fn signal(&self) -> impl Signal<Item = PropState<T>> + use<T> {
         self.inner.state.signal_cloned()
     }
 

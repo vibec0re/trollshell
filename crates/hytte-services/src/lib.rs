@@ -1,5 +1,16 @@
 //! Async clients to system daemons exposed as hytte services.
 
+/// The shared `~/.config/trollshell/*` persistence boilerplate — including the
+/// workspace's one copy of the atomic tmp + `fsync` + `rename(2)` replacement
+/// (#733/#739).
+///
+/// It moved to the GTK-free `hytte-config` leaf crate in #640, so
+/// `trollshell-control-center`'s places editor could share this crate's
+/// `places.toml` writer without linking `hytte-services` (and with it
+/// libpipewire and evolution-data-server). Aliased here so every in-crate call
+/// site still reads `config_file::…`.
+pub(crate) use hytte_config::file as config_file;
+
 pub mod app_usage;
 pub mod audio_native;
 pub mod bluetooth;
@@ -9,7 +20,6 @@ pub mod calendar;
 mod cast;
 pub mod clipboard;
 pub mod clock;
-mod config_file;
 pub mod departures;
 pub mod display_config;
 pub mod displays;

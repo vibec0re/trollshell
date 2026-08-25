@@ -24,6 +24,13 @@ gtk = { workspace = true, features = ["v4_14"] }
 # hytte_bus (raw zbus connections are clippy-banned); the call runs on the
 # shared hytte tokio runtime (hytte-reactive).
 hytte-bus = { path = "../hytte-bus" }
+# The `places.toml` model + its format-preserving writer (#640). This is the
+# *same* code the shell writes through — `hytte-services::places` re-exports it
+# — which is the point: two editors over one file have to agree byte for byte
+# on how it is validated and rendered. It is a GTK-free leaf crate precisely so
+# this app can share it without linking `hytte-services` (and with it
+# libpipewire and evolution-data-server).
+hytte-config = { path = "../hytte-config" }
 hytte-reactive = { path = "../hytte-reactive" }
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
 # GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).

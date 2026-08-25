@@ -9,12 +9,16 @@
 //! `control.rs`).
 //!
 //! An `adw::ViewStack` of tabs plus a banner that reports whether the shell
-//! answered `Ping`/`Version`. The **Place** tab (#391) manages the location that
-//! feeds the weather widget — automatic (`GeoClue`) vs. a manual, forward-geocoded
-//! city. The **Plugins** tab (#348) lists each `trollshell-plugin-<id>` systemd
-//! **user** unit with a switch that starts/enables or stops/disables it. The
-//! **AI Keys** tab (#392) stores the LLM-backed plugins' API keys in the login
-//! keyring (gnome-keyring/libsecret) — never on disk — and rotates them. All
+//! answered `Ping`/`Version`. The **Places** tab ([`places_tab`], #640/#703) is
+//! a full editor for `~/.config/trollshell/places.toml` — the named places that
+//! drive departures, Wi-Fi-fingerprint place detection and walk time — plus the
+//! session-only weather-location override this tab used to be (#391). It is the
+//! one tab that does **not** go through `Control`: it reads and writes the file
+//! directly, so it keeps working while the shell is down. The **Plugins** tab
+//! (#348) lists each `trollshell-plugin-<id>` systemd **user** unit with a
+//! switch that starts/enables or stops/disables it. The **AI Keys** tab (#392)
+//! stores the LLM-backed plugins' API keys in the login keyring
+//! (gnome-keyring/libsecret) — never on disk — and rotates them. Those
 //! round-trip over `Control`. There is deliberately **no Display tab**: #393
 //! re-scoped display management away from a bespoke control-center page and
 //! onto `org.gnome.Mutter.DisplayConfig`, a shim over niri-ipc
@@ -31,6 +35,8 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
+
+mod places_tab;
 
 /// Distinct app-id — this is its own application, not the shell.
 const APP_ID: &str = "mov.vibec0re.trollshell.ControlCenter";
@@ -95,12 +101,13 @@ fn build_window(app: &adw::Application) {
         "Plugins",
         "application-x-addon-symbolic",
     );
-    // The Place tab (#391): location management, round-tripped over Control.
-    let place_page = build_place_page();
+    // The Places tab (#640/#703): the places.toml editor, plus the #391
+    // weather-location override demoted into a group of its own.
+    let (places_page, places_poll) = places_tab::build_page();
     stack.add_titled_with_icon(
-        &place_page,
-        Some("place"),
-        "Place",
+        &places_page,
+        Some("places"),
+        "Places",
         "mark-location-symbolic",
     );
     // The AI Keys tab (#392): store/rotate the LLM-backed plugins' API keys in
@@ -137,14 +144,15 @@ fn build_window(app: &adw::Application) {
         .content(&toolbar)
         .build();
 
-    // The Plugins tab's 2 s poll timer is scoped to this window: drop it on
-    // close so a dismissed window stops polling `Control`, and a re-launch while
-    // another window is still resident can't leave the first window's timer
-    // double-polling behind it (#542). Wrapped in a cell + `.take()` so the
-    // one-shot removal is clean under the `Fn` close handler.
-    let plugins_poll = RefCell::new(Some(plugins_poll));
+    // The tab poll timers are scoped to this window: drop them on close so a
+    // dismissed window stops polling `Control` (Plugins) and stat'ing
+    // `places.toml` (Places), and a re-launch while another window is still
+    // resident can't leave the first window's timers double-polling behind it
+    // (#542). Wrapped in a cell + `.take()` so the one-shot removal is clean
+    // under the `Fn` close handler.
+    let polls = RefCell::new(vec![plugins_poll, places_poll]);
     window.connect_close_request(move |_| {
-        if let Some(source) = plugins_poll.borrow_mut().take() {
+        for source in polls.take() {
             source.remove();
         }
         glib::Propagation::Proceed
@@ -152,131 +160,6 @@ fn build_window(app: &adw::Application) {
 
     check_shell_connection(&banner);
     window.present();
-}
-
-// ── Place tab (#391) ────────────────────────────────────────────────────────
-
-/// Build the real **Place** tab: the resolved place, an auto(`GeoClue`)/manual
-/// switch, and a manual-city entry, all round-tripping over `Control`
-/// (`GetPlace` / `SetAutoLocation` / `SetManualCity`). When the shell isn't
-/// running the calls fail and the row shows an "unavailable" hint — no panic.
-fn build_place_page() -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::builder()
-        .title("Location")
-        .description(
-            "The location that feeds the weather widget. Automatic uses GeoClue; \
-             manual forward-geocodes a city you name.",
-        )
-        .build();
-
-    let place_row = adw::ActionRow::builder()
-        .title("Current place")
-        .subtitle("Resolving…")
-        .build();
-    // Default to "auto" so the pre-connection state matches the shell default;
-    // GetPlace corrects it once the shell answers.
-    let auto_switch = adw::SwitchRow::builder()
-        .title("Automatic location")
-        .subtitle("Detect your location automatically (GeoClue)")
-        .active(true)
-        .build();
-    let city_entry = adw::EntryRow::builder()
-        .title("Set city manually")
-        .show_apply_button(true)
-        .build();
-
-    group.add(&place_row);
-    group.add(&auto_switch);
-    group.add(&city_entry);
-    page.add(&group);
-
-    // Guard so programmatically syncing the switch from GetPlace (which fires
-    // `active-notify`) doesn't loop back into a `SetAutoLocation` call.
-    let syncing = Rc::new(Cell::new(false));
-
-    refresh_place(&place_row, &auto_switch, &syncing);
-
-    // Auto/manual toggle → SetAutoLocation, then re-read the resolved place.
-    {
-        let place_row = place_row.clone();
-        let syncing = syncing.clone();
-        auto_switch.connect_active_notify(move |sw| {
-            if syncing.get() {
-                return;
-            }
-            let (place_row, sw, syncing) = (place_row.clone(), sw.clone(), syncing.clone());
-            spawn_on_runtime(set_auto_location(sw.is_active()), move |res| {
-                if let Err(err) = res {
-                    tracing::info!(%err, "SetAutoLocation failed");
-                }
-                refresh_place_soon(&place_row, &sw, &syncing);
-            });
-        });
-    }
-
-    // Manual city applied → SetManualCity (switch flips to manual on re-read).
-    {
-        let place_row = place_row.clone();
-        let auto_switch = auto_switch.clone();
-        let syncing = syncing.clone();
-        city_entry.connect_apply(move |entry| {
-            let city = entry.text().trim().to_owned();
-            if city.is_empty() {
-                return;
-            }
-            let (place_row, auto_switch, syncing) =
-                (place_row.clone(), auto_switch.clone(), syncing.clone());
-            spawn_on_runtime(set_manual_city(city), move |res| {
-                if let Err(err) = res {
-                    tracing::info!(%err, "SetManualCity failed");
-                }
-                refresh_place_soon(&place_row, &auto_switch, &syncing);
-            });
-        });
-    }
-
-    page
-}
-
-/// Read the current place over `Control` and reflect it into the widgets. On
-/// failure (shell not running) the row shows an unavailable hint.
-fn refresh_place(
-    place_row: &adw::ActionRow,
-    auto_switch: &adw::SwitchRow,
-    syncing: &Rc<Cell<bool>>,
-) {
-    let (place_row, auto_switch, syncing) =
-        (place_row.clone(), auto_switch.clone(), syncing.clone());
-    spawn_on_runtime(get_place(), move |res| match res {
-        Ok((label, auto)) => {
-            // Suppress the switch's notify handler during the programmatic sync.
-            syncing.set(true);
-            place_row.set_subtitle(&label);
-            auto_switch.set_active(auto);
-            syncing.set(false);
-        }
-        Err(err) => {
-            tracing::info!(%err, "GetPlace failed");
-            place_row.set_subtitle("Unavailable — is trollshell running?");
-        }
-    });
-}
-
-/// Re-read the place now and once more after the shell's resolve lag (a
-/// forward-geocode + re-resolve takes a beat), so the label catches up to a
-/// just-applied change without the user refreshing.
-fn refresh_place_soon(
-    place_row: &adw::ActionRow,
-    auto_switch: &adw::SwitchRow,
-    syncing: &Rc<Cell<bool>>,
-) {
-    refresh_place(place_row, auto_switch, syncing);
-    let (place_row, auto_switch, syncing) =
-        (place_row.clone(), auto_switch.clone(), syncing.clone());
-    glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-        refresh_place(&place_row, &auto_switch, &syncing);
-    });
 }
 
 // ── Plugins tab (#348) · live connected/rendering overlay (#423) ─────────────
@@ -359,8 +242,13 @@ fn build_plugins_page() -> (adw::PreferencesPage, glib::SourceId) {
     let page = adw::PreferencesPage::new();
     let group = adw::PreferencesGroup::builder()
         .title("Plugins")
+        // `&lt;id&gt;`, not `<id>`: a group description is parsed as Pango
+        // markup, and the raw form made the *whole* description fail to render
+        // (`Element "markup" was closed, but the currently open element is
+        // "id"`) — so this group has shipped with no description at all since
+        // #348. Drive-by fix, spotted running the app for #640's Places tab.
         .description(
-            "Widget plugins run as trollshell-plugin-<id> systemd user units. \
+            "Widget plugins run as trollshell-plugin-&lt;id&gt; systemd user units. \
              Toggle one to start and enable it, or stop and disable it. The badge \
              shows the host's live view — connected and rendering, connected but \
              not yet drawing, or a unit that's active yet never connected.",
@@ -936,7 +824,7 @@ async fn control_call(method: &str) -> Result<String, hytte_bus::BusError> {
 /// `on_done` back on the GTK main thread. The D-Bus work stays off the UI
 /// thread; the reply crosses back over a oneshot glib's executor awaits. If the
 /// receiver is dropped first (window closed), `on_done` simply never runs.
-fn spawn_on_runtime<T, Fut, F>(fut: Fut, on_done: F)
+pub(crate) fn spawn_on_runtime<T, Fut, F>(fut: Fut, on_done: F)
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
@@ -955,7 +843,7 @@ where
 
 /// `GetPlace` → `(label, auto)`: the resolved place label and whether
 /// auto-location is in force.
-async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
+pub(crate) async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
@@ -969,7 +857,7 @@ async fn get_place() -> Result<(String, bool), hytte_bus::BusError> {
 /// `SetManualCity(city)`: switch to manual location and forward-geocode `city`
 /// shell-side. A slightly longer timeout than the others — the shell does a
 /// network geocode as part of applying it.
-async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
+pub(crate) async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
@@ -982,7 +870,7 @@ async fn set_manual_city(city: String) -> Result<(), hytte_bus::BusError> {
 }
 
 /// `SetAutoLocation(auto)`: toggle auto (`GeoClue`) vs. manual location.
-async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
+pub(crate) async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)

@@ -29,6 +29,11 @@ futures-signals.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 gtk.workspace = true
 hytte-bus = { path = "../hytte-bus" }
+# The GTK-free config layer (#640): the `~/.config/trollshell` atomic-write
+# boilerplate, plus the `places.toml` model and its format-preserving writer.
+# Split out so `trollshell-control-center`'s places editor can share the one
+# writer without linking this crate (and with it libpipewire and libecal).
+hytte-config = { path = "../hytte-config" }
 hytte-ecal = { path = "../hytte-ecal" }
 hytte-reactive = { path = "../hytte-reactive" }
 niri-ipc = "26.4.0"
@@ -63,7 +68,10 @@ icalendar = { version = "0.17", default-features = false, features = [
 zbus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
+# NOTE: no `toml`/`toml_edit` here — #640 moved the only TOML this crate
+# handled (`places.toml`) into `hytte-config`, which owns both the reader and
+# the format-preserving writer. Everything left in this crate persists through
+# `config_file`'s plain string read/write.
 # NOTE: no `zeroize` here — #453 removed it (declared, zero src hits; Wi-Fi
 # secret zeroization, if wanted, is its own issue).
 ureq = { workspace = true, features = ["rustls"] }

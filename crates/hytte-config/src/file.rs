@@ -10,7 +10,7 @@
 //! than erroring, because the in-memory `Mutable` is the source of truth for the
 //! running process; persistence is a convenience for the *next* launch.
 //!
-//! Writes are also **atomic** (#733): [`write`] renders into a temp file beside
+//! Writes are also **atomic** (#733): [`write()`] renders into a temp file beside
 //! the target and `rename(2)`s over it, so a concurrent reader sees either the
 //! whole old file or the whole new one — never a truncated or half-written one.
 //! That matters because these files have readers outside this process: the
@@ -21,7 +21,7 @@
 //!
 //! [`write_atomic`] is that algorithm on its own — explicit path, real
 //! `io::Error`, no logging — and is the workspace's only copy of it (#739).
-//! [`write`] and [`write_path`] are the `$HOME`-resolving, `warn!`-logging,
+//! [`write()`] and `write_path` are the `$HOME`-resolving, `warn!`-logging,
 //! `bool`-returning wrapper the UI-state services want; [`crate::places`] calls
 //! the core directly because it needs the `io::Error` to build a
 //! `PlacesError::Write`. The one axis on which those two callers genuinely
@@ -72,14 +72,14 @@ thread_local! {
 
 /// Current value of the tripwire counter above, for this thread.
 #[cfg(test)]
-pub(crate) fn fsync_parent_attempts() -> u64 {
+pub fn fsync_parent_attempts() -> u64 {
     FSYNC_PARENT_ATTEMPTS.with(std::cell::Cell::get)
 }
 
 /// Whether [`write_atomic`] also `fsync`s the parent **directory** after the
 /// `rename(2)`.
 ///
-/// The *file's* own `fsync` is unconditional (see [`fill`]) — without it the
+/// The *file's* own `fsync` is unconditional (see `fill`) — without it the
 /// rename can be durable while the data isn't, which on a delayed-allocation
 /// filesystem resurrects exactly the zero-length file this whole path exists to
 /// prevent. Syncing the *directory* on top of that buys something strictly
@@ -94,7 +94,7 @@ pub(crate) fn fsync_parent_attempts() -> u64 {
 /// callers keep precisely the behaviour they shipped with, and the next caller
 /// has to state its choice rather than get one by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Durability {
+pub enum Durability {
     /// `fsync` the parent directory after the rename.
     ///
     /// For user-authored data written rarely and deliberately: `places.toml`,
@@ -110,7 +110,7 @@ pub(crate) enum Durability {
     /// Sync the file's contents only; let the directory entry reach disk
     /// whenever the filesystem gets to it.
     ///
-    /// For the click-driven `~/.config/trollshell/*` toggles behind [`write`]:
+    /// For the click-driven `~/.config/trollshell/*` toggles behind [`write()`]:
     /// they are rewritten constantly, several straight out of a click handler,
     /// and they are explicitly a convenience for the *next* launch — the
     /// in-memory `Mutable` is the source of truth for the running process. A
@@ -120,14 +120,16 @@ pub(crate) enum Durability {
 }
 
 /// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is unset.
-pub(crate) fn path(file: &str) -> Option<PathBuf> {
+#[must_use]
+pub fn path(file: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(CONFIG_SUBDIR).join(file))
 }
 
 /// Read `~/.config/trollshell/<file>` as a string, or `None` on any error
 /// (missing, unreadable, non-UTF-8) — callers fall back to their default.
-pub(crate) fn read(file: &str) -> Option<String> {
+#[must_use]
+pub fn read(file: &str) -> Option<String> {
     std::fs::read_to_string(path(file)?).ok()
 }
 
@@ -142,7 +144,7 @@ pub(crate) fn read(file: &str) -> Option<String> {
 /// scoped to `service` and returns `false`; `true` on success. Simple callers
 /// ignore the result (the `Mutable` is authoritative); callers that log their
 /// own success line (e.g. `places`' default-config write) read it.
-pub(crate) fn write(service: &str, file: &str, body: &str) -> bool {
+pub fn write(service: &str, file: &str, body: &str) -> bool {
     let Some(path) = path(file) else {
         tracing::warn!(service, file, "config write skipped: $HOME unset");
         return false;
@@ -150,7 +152,7 @@ pub(crate) fn write(service: &str, file: &str, body: &str) -> bool {
     write_path(service, &path, body)
 }
 
-/// [`write`] against an already-resolved absolute path — the whole of `write`
+/// [`write()`] against an already-resolved absolute path — the whole of `write`
 /// except the `$HOME` lookup, split out so the tests can drive it against a
 /// tempdir without mutating the process environment.
 ///
@@ -169,7 +171,7 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// Atomically replace `path`'s contents with `body`, creating the parent dir.
 ///
 /// The workspace's single copy of tmp + `fsync` + `rename(2)` + cleanup (#739);
-/// every config file written through [`write`], plus `places`' own writer,
+/// every config file written through [`write()`], plus `places`' own writer,
 /// goes through here. No logging and no service scope — the caller decides
 /// what a failure means and how to report it.
 ///
@@ -201,7 +203,7 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 ///
 /// Any failure removes the temp file rather than leaving litter behind, and
 /// leaves the target untouched.
-pub(crate) fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -284,11 +286,11 @@ fn tmp_name(target: &Path) -> String {
 
 /// Delete `~/.config/trollshell/<file>` if it exists.
 ///
-/// Best-effort, like [`write`]: a missing file is success (nothing to do); a
+/// Best-effort, like [`write()`]: a missing file is success (nothing to do); a
 /// `$HOME`-unset or non-`NotFound` I/O error logs a `warn!` scoped to
 /// `service`. Callers use it to return a persisted UI-state toggle to its
 /// zero-state (e.g. the wallpaper picker's "Clear" clearing the render files).
-pub(crate) fn remove(service: &str, file: &str) {
+pub fn remove(service: &str, file: &str) {
     let Some(path) = path(file) else {
         tracing::warn!(service, file, "config remove skipped: $HOME unset");
         return;

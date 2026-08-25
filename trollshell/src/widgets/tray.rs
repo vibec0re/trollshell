@@ -456,3 +456,229 @@ fn build_menu_item_widget(
         btn.upcast()
     }
 }
+
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{ButtonMap, update_tray};
+    use hytte::gtk::{self, prelude::*};
+    use hytte::prelude::*;
+    use hytte::services::tray::{ItemStatus, TrayItem};
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    /// The live map `update_tray` diffs against, exactly as `widget()` builds
+    /// it: `ButtonMap` (this file's own private alias, keyed by `String`) is
+    /// the *inner* map — this wraps it in the same `Rc<RefCell<…>>` `widget()`
+    /// uses.
+    type SharedMap = Rc<RefCell<ButtonMap>>;
+
+    /// A `TrayItem` distinguished only by `key` — the diff keys on it, and no
+    /// other field matters to either test below. Every field is `pub` (see
+    /// `hytte_services::tray::TrayItem`), so a struct literal needs no
+    /// constructor of its own, exactly like `workspaces.rs`'s local `ws()`
+    /// builds a `niri::Workspace` directly.
+    fn item(key: &str) -> TrayItem {
+        TrayItem {
+            key: key.to_owned(),
+            bus_name: String::new(),
+            object_path: String::new(),
+            title: String::new(),
+            icon_name: String::new(),
+            status: ItemStatus::Passive,
+            icon_pixmap: None,
+            tooltip_title: String::new(),
+            tooltip_description: String::new(),
+            menu_path: None,
+            item_is_menu: false,
+        }
+    }
+
+    /// Sorted key set of the shared cell, i.e. what the last write-back left.
+    fn keys(map: &SharedMap) -> Vec<String> {
+        let mut k: Vec<String> = map.borrow().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// One connected output — the one parameter `update_tray` needs that
+    /// `workspaces.rs`'s/`window_list.rs`'s equivalents don't take at all.
+    ///
+    /// `hytte_ui::monitor::Monitor::new` is `pub(crate)` to `hytte-ui`, so
+    /// nothing outside that crate can build a `Monitor` directly — a fake or
+    /// mock one is not on the table. The only public source is
+    /// [`App::monitors`]/[`App::monitors_changed`], which means a real
+    /// `adw::Application` actually has to activate. Built once per process
+    /// and cached in a thread-local: `#[gtk::test]` (`gtk4-macros`'
+    /// `test_synced`) funnels *every* `#[gtk::test]` in this binary onto one
+    /// dedicated, shared worker thread, so caching here is safe and avoids
+    /// standing up a second `adw::Application` for the second test.
+    fn test_monitor() -> Monitor {
+        thread_local! {
+            static CACHED: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+        }
+        if let Some(m) = CACHED.with(|c| c.borrow().clone()) {
+            return m;
+        }
+        let captured: Rc<RefCell<Option<Monitor>>> = Rc::new(RefCell::new(None));
+        let captured_for_body = Rc::clone(&captured);
+        App::new("mov.vibec0re.trollshell.test.tray-reentrancy")
+            .run(move |app| {
+                *captured_for_body.borrow_mut() = app.monitors().into_iter().next();
+                app.quit();
+            })
+            .expect("App::run");
+        let monitor = captured.borrow_mut().take().expect(
+            "no output under this display server — not expected under xvfb-run \
+             (modal_reentrancy.rs verified exactly one), but this helper is about \
+             getting a Monitor for the reentrancy tests below, not about environment \
+             monitor discovery",
+        );
+        CACHED.with(|c| *c.borrow_mut() = Some(monitor.clone()));
+        monitor
+    }
+
+    /// A fresh strip seeded with `initial`, as the first signal emission would.
+    fn strip(monitor: &Monitor, initial: &[TrayItem]) -> (gtk::Box, SharedMap) {
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let map: SharedMap = Rc::new(RefCell::new(HashMap::new()));
+        update_tray(&container, &map, initial, monitor);
+        (container, map)
+    }
+
+    /// Step 1 of the diff: `container.remove()` drops the last strong ref to
+    /// an obsolete button, so `GtkWidget::destroy` is emitted
+    /// **synchronously** from dispose, inside the removal loop — the same
+    /// measured fact `workspaces.rs`'s and `components::reactive_list`'s
+    /// tripwires rest on.
+    ///
+    /// This test makes that handler re-enter `update_tray` on the same cell,
+    /// which is exactly the shape this function's own #643 comment claims to
+    /// be safe against. Against the pre-#673
+    /// `let mut map = button_map.borrow_mut();` the inner call hits a live
+    /// `RefMut` and panics with `BorrowMutError` from inside a glib
+    /// callback — which **aborts the process** rather than failing one test
+    /// (#663's SIGABRT, the failure mode #674 exists for). With `take()` the
+    /// cell is free for the whole diff, so the inner call simply finds an
+    /// empty map.
+    ///
+    /// The guarantee under test is "no `BorrowMutError` abort", *not* that
+    /// re-entrant updates compose: the outer call's closing write-back
+    /// deliberately clobbers whatever the inner one stored, and the inner
+    /// call's freshly-created button is left orphaned in the container. That
+    /// is fine — `bind` does not recurse into an in-call source, so
+    /// production never re-enters here; the borrow discipline is defence in
+    /// depth against a *new* synchronous emission being introduced into the
+    /// loop.
+    #[gtk::test]
+    fn update_tray_tolerates_a_reentrant_update_from_a_removed_button_destroy() {
+        let monitor = test_monitor();
+        let (container, map) = strip(&monitor, &[item("a"), item("b")]);
+        assert_eq!(
+            keys(&map),
+            ["a".to_owned(), "b".to_owned()],
+            "both buttons tracked after the first pass"
+        );
+
+        // True only while the outer `update_tray` is on the stack, so the
+        // handler can record whether it ran inside the diff or was deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        // Arm button "b"'s destroy to re-enter the diff on the same cell.
+        let btn_b = map.borrow()["b"].0.clone();
+        {
+            let container = container.clone();
+            let map = Rc::clone(&map);
+            let monitor = monitor.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            btn_b.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                update_tray(&container, &map, &[item("a")], &monitor);
+            });
+        }
+        // Drop our clone before the removing pass: while it lives the button
+        // has a second strong ref, `container.remove()` won't dispose it, and
+        // `destroy` never fires — the test would pass vacuously.
+        drop(btn_b);
+
+        in_outer.set(true);
+        update_tray(&container, &map, &[item("a")], &monitor);
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed button's `destroy` must fire synchronously inside `update_tray`; if \
+             GTK ever defers it, or the button outlives the removal loop, this test proves \
+             nothing about the borrow discipline"
+        );
+        assert_eq!(
+            keys(&map),
+            ["a".to_owned()],
+            "the outer call's write-back must still land: re-entry may not leave the cell \
+             holding the inner diff's map or an empty one"
+        );
+    }
+
+    /// Step 2 of the diff, the *reuse* path: `apply_item_button_visuals`
+    /// always builds a brand-new `gtk::Image` and calls `GtkButton::set_child`
+    /// on it, which emits `notify::child` synchronously — the button's
+    /// `child` property genuinely changes on every call (a fresh `gtk::Image`
+    /// object each time), so unlike `workspaces.rs`'s `notify::label` hook
+    /// this doesn't depend on any particular `TrayItem` field actually
+    /// differing between passes. The pre-#673 `RefMut` stayed live across
+    /// that call too, so this covers a second of the four emission points
+    /// the function's own #643 comment names — a surviving button, no
+    /// destroy involved.
+    ///
+    /// Same falsification as above: with `borrow_mut()` held, the re-entrant
+    /// call aborts on `BorrowMutError`.
+    #[gtk::test]
+    fn update_tray_does_not_hold_the_button_map_across_apply_item_button_visuals() {
+        let monitor = test_monitor();
+        let (container, map) = strip(&monitor, &[item("a")]);
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let btn = map.borrow()["a"].0.clone();
+        {
+            let container = container.clone();
+            let map = Rc::clone(&map);
+            let monitor = monitor.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            btn.connect_child_notify(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                update_tray(&container, &map, &[item("a")], &monitor);
+            });
+        }
+        drop(btn);
+
+        in_outer.set(true);
+        update_tray(&container, &map, &[item("a")], &monitor);
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "`set_child` must emit `notify::child` synchronously inside the reuse arm; if it \
+             stops doing so this test no longer exercises the borrow at all"
+        );
+        assert_eq!(
+            keys(&map),
+            ["a".to_owned()],
+            "the reused button must still be tracked after a re-entrant pass"
+        );
+    }
+}

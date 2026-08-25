@@ -177,7 +177,7 @@ fn build_header(vbox: &gtk::Box, req: &wifi::PromptRequest) {
         // For a VPN the `ssid` field carries the connection name.
         wifi::PromptKind::VpnSecret => Some(req.ssid.clone()).filter(|s| !s.is_empty()),
         wifi::PromptKind::WifiPassphrase => {
-            Some(format!("Security: {}", req.security)).filter(|_| !req.security.is_empty())
+            (!req.security.is_empty()).then(|| format!("Security: {}", req.security))
         }
     };
     if let Some(subtitle_text) = subtitle_text {

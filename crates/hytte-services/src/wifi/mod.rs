@@ -274,6 +274,23 @@ struct LiveBackend {
     nm_agent: Option<hytte_bus::ExportHandle>,
 }
 
+impl Drop for LiveBackend {
+    fn drop(&mut self) {
+        // Backstop for the one path that does not go through `tear_down`: a
+        // panic unwinding a switch, which drops the outgoing backend without
+        // ever having cancelled it. Its watcher would then keep running and
+        // race the replacement the restarted supervisor is about to start —
+        // the exact failure #633 exists to prevent, arrived at sideways.
+        //
+        // A `Drop` cannot await, so this only ends the restart loop; the
+        // *waiting* stays in `tear_down`, which takes the handle out first and
+        // leaves this a no-op on the ordinary path.
+        if let Some(watcher) = &self.watcher {
+            watcher.cancel();
+        }
+    }
+}
+
 /// The one committed backend, shared between the supervising task and
 /// [`WifiHandles`].
 ///
@@ -674,14 +691,11 @@ fn start_backend(
 /// ("a naive switch leaves the old watcher running and racing the new one to
 /// write the same `Mutable`s"). Only then does the NM registration go, then the
 /// export, then the backend value itself — which is what drops the path caches.
-async fn tear_down(live: LiveBackend, targets: &WatchTargets) {
-    let LiveBackend {
-        backend,
-        watcher,
-        nm_agent,
-    } = live;
-
-    if let Some(watcher) = watcher {
+async fn tear_down(mut live: LiveBackend, targets: &WatchTargets) {
+    // Taken out rather than destructured: `LiveBackend` has a `Drop` backstop
+    // (which forbids a partial move), and taking the handle here is also what
+    // makes that backstop a no-op once this function has done the job properly.
+    if let Some(watcher) = live.watcher.take() {
         watcher.cancel();
         if tokio::time::timeout(TEARDOWN_GRACE, watcher.stopped())
             .await
@@ -696,7 +710,7 @@ async fn tear_down(live: LiveBackend, targets: &WatchTargets) {
         }
     }
 
-    if nm_agent.is_some() {
+    if live.nm_agent.is_some() {
         // Withdraw the registration *before* the object goes away: NM calls
         // `GetSecrets` back on the unique name of the connection the agent
         // registered from, and that connection is `hytte_bus`'s pooled system
@@ -708,11 +722,13 @@ async fn tear_down(live: LiveBackend, targets: &WatchTargets) {
         }
     }
     // `ExportHandle::drop` unmounts the interface; explicit so the ordering
-    // above is visible rather than incidental to where the binding falls.
-    drop(nm_agent);
-    // Drops the path caches with it — the whole point of moving them into the
-    // payload (see `IwdPaths`).
-    drop(backend);
+    // relative to the `Unregister` above is visible rather than incidental to
+    // where a binding happens to fall.
+    drop(live.nm_agent.take());
+    // `live` — and with it the `WifiBackend` holding this backend's object-path
+    // caches — is dropped when this returns, which is the whole point of moving
+    // those caches into the payload (see `IwdPaths`).
+    drop(live);
 
     // Safe now, and only now: nothing is left to race these writes.
     targets.station.set(None);
@@ -833,7 +849,9 @@ async fn watch_for_daemon_changes(ctx: &BackendCtx) {
         tokio::time::sleep(CHANGE_SETTLE).await;
         recheck(ctx).await;
     }
-    tracing::warn!("wifi: the NameOwnerChanged subscription ended; runtime backend switching is off until this task restarts");
+    tracing::warn!(
+        "wifi: the NameOwnerChanged subscription ended; runtime backend switching is off until this task restarts"
+    );
 }
 
 impl Service for WifiService {

@@ -43,9 +43,9 @@
 //! Every supervisor publishes what it knows about its task — runs, panics,
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
-//! The bookkeeping lives in [`supervise_runs`], the one loop both spawn
-//! functions funnel through, so it covers both variants and any future entry
-//! point that reuses that loop (#238, #690, #691).
+//! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
+//! function funnels through, so it covers all three variants and any future
+//! entry point that reuses that loop (#238, #690, #691).
 //!
 //! # Extending this API
 //!
@@ -450,12 +450,8 @@ where
 /// starting a run, while awaiting one, and while sleeping out a backoff — so a
 /// cancel is never left waiting on a 30 s backoff or on a run that has no reason
 /// to end.
-async fn supervise_runs<S>(
-    name: &'static str,
-    spawn_run: S,
-    cfg: Backoff,
-    mut stop: Option<Stop>,
-) where
+async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff, mut stop: Option<Stop>)
+where
     S: Fn() -> JoinHandle<()> + Send + 'static,
 {
     // The health entry is this supervisor's, and lives exactly as long as this

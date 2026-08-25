@@ -41,6 +41,13 @@ use std::time::Duration;
 use chrono::DateTime;
 use serde::Deserialize;
 
+// Same BVG fetch as `hytte-services/src/departures.rs` and
+// `hytte-plugin-departures/src/feed.rs` (30 / 5s / 10s, independently
+// implemented — plugins can't link `hytte-services`). This module's
+// numbers differ on purpose: `FETCH_COUNT` is 20 (see its own comment
+// below); the read timeout is 15s because this is a once-a-day briefing
+// fetch, not a live panel, so a slow reply delays that day's briefing
+// instead of stalling something on screen. #826
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 

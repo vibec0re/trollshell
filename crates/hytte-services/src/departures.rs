@@ -38,6 +38,14 @@ pub const STALE_DROP_AFTER: Duration = Duration::from_mins(30);
 /// so it can be compared against age deltas without a runtime conversion.
 const STALE_DROP_AFTER_CHRONO: chrono::Duration = chrono::Duration::seconds(30 * 60);
 
+// `FETCH_COUNT`/`HTTP_CONNECT_TIMEOUT`/`HTTP_READ_TIMEOUT` below are
+// duplicated — not shared — in `hytte-plugin-departures/src/feed.rs` and
+// `hytte-plugin-caw/src/ingredients.rs`, which implement this same BVG
+// fetch but can't link this crate (it would drag libpipewire +
+// evolution-data-server into a plugin process). `feed.rs` matches these
+// values; caw's differ deliberately (20 / 5s / 15s) — see its own
+// comment for why. #826
+
 /// How many departures to request from the API. Larger than the display
 /// count so a direction/line filter still has enough rows left to fill the
 /// list after dropping the outbound ones.

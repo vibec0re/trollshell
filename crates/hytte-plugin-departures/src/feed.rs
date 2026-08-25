@@ -44,6 +44,12 @@ use crate::{BoardMsg, Cmd};
 /// no-op while closed).
 pub(crate) const REFRESH_WHILE_OPEN: Duration = Duration::from_secs(30);
 
+// Also duplicated in `hytte-services/src/departures.rs` (matches these
+// values) and `hytte-plugin-caw/src/ingredients.rs` (differs on purpose:
+// 20 / 5s / 15s). Three independent implementations of the same BVG
+// fetch, because the plugin crates can't link `hytte-services` — that
+// would drag libpipewire + evolution-data-server into a plugin. #826
+
 /// How many departures to request. Larger than the display count so a
 /// direction/line filter still has enough rows to fill the list. Native
 /// `FETCH_COUNT`.

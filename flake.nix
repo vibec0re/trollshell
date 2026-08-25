@@ -340,6 +340,39 @@
             }
           );
 
+          # The static counterpart to `clippy`, for a defect clippy cannot see
+          # (#831): a `bind*` call site that discards the closure's own widget
+          # parameter and uses a captured strong clone of the same widget
+          # instead, pinning it for the binding's lifetime and defeating the
+          # `WeakRef` contract in crates/hytte-reactive/src/bind.rs:16-22
+          # (#224).
+          #
+          # This exists because the defect has already recurred once by the
+          # only other means available: #772 fixed four sites and closed on a
+          # hand-read inventory of four; #831 re-derived the list and found
+          # twelve, so two thirds of it had been missed. #834 fixed all twelve
+          # with the scanner this check now runs. A unit test can only cover one
+          # site at a time and only where the widget is constructible without a
+          # registered `Registry` — ten of the twelve are not — whereas the bug
+          # is purely *syntactic*, which is exactly what a scanner sees.
+          #
+          # Deliberately not a crane derivation: it needs no compile, no
+          # cargoArtifacts and no target dir, so it goes red in seconds on a
+          # cold checkout instead of behind a full workspace build.
+          #
+          # `cd ${self}` rather than staging the three scanned trees into a
+          # sandbox: it keeps the scanned-root list in one place (the script's
+          # `DEFAULT_ROOTS`), makes every reported `file:line` a path a
+          # developer can open as-is, and costs nothing extra — `formatting`
+          # already realises `self` on every flake check. A root that goes
+          # missing (a renamed tree) exits 2 rather than passing vacuously, as
+          # does a scan that sees implausibly few call sites.
+          bind-pins = pkgs.runCommand "trollshell-bind-pin-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            cd ${self}
+            python3 nix/lint-bind-pins.py
+            touch $out
+          '';
+
           # Run the `system-tests` cargo-feature bucket (#232): the
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,

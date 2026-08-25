@@ -208,8 +208,8 @@ pub fn panel_stats() -> gtk::Widget {
 }
 
 /// The multicolumn stats flyout (#508) — the same five cards as [`panel_stats`]
-/// laid out in a 2-column [`page_grid`]: CPU | Memory on the first row,
-/// GPU | Disks on the second, and Services spanning both columns on the third.
+/// laid out in a 2-column [`page_grid`]: CPU spanning both columns on the first
+/// row, GPU | Disks on the second, and Memory | Services on the third (#702).
 /// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT` is
 /// `multicolumn` (default) or unset; the chips still target the single
 /// `Page::Stats` (this replaces [`panel_stats`] for that page in multicolumn
@@ -233,26 +233,37 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_group();
 
-    grid.attach(cpu_card.upcast_ref::<gtk::Widget>(), 0, 0, 1, 1);
-    grid.attach(memory_card.upcast_ref::<gtk::Widget>(), 1, 0, 1, 1);
+    // CPU spans both columns (#702). It's the one card whose content is a
+    // *strip* rather than a stack — the per-core bars — so it's the one that
+    // actually wants the page width; everything else is fine half-width. When
+    // CPU vacates column 1, Memory is the orphan and Services is the card that
+    // was only spanning for want of a partner, so they pair up and the grid
+    // stays **three** rows: the drawer gets no taller than the pre-#702 layout.
+    // Reading order therefore becomes CPU, GPU, Disks, Memory, Services rather
+    // than #582's bar-chip order — a deliberate trade annikahannig picked on
+    // #702 (option A), not drift; the chip deep-links are coordinate-based
+    // (`apply_scroll`) so they follow the cards wherever they sit.
+    grid.attach(cpu_card.upcast_ref::<gtk::Widget>(), 0, 0, 2, 1);
     grid.attach(gpu_card.upcast_ref::<gtk::Widget>(), 0, 1, 1, 1);
     grid.attach(disks_card.upcast_ref::<gtk::Widget>(), 1, 1, 1, 1);
-    // Services spans both columns on its own row: the failed-units list can grow
-    // tall and has no natural column partner.
-    grid.attach(services_card.upcast_ref::<gtk::Widget>(), 0, 2, 2, 1);
+    grid.attach(memory_card.upcast_ref::<gtk::Widget>(), 0, 2, 1, 1);
+    grid.attach(services_card.upcast_ref::<gtk::Widget>(), 1, 2, 1, 1);
 
     // GPU can self-hide entirely when no GPU is present (`build_stats_gpu_card`'s
     // own bind to `sensors::gpu()`'s presence signal). Left as the fixed attach
     // above, that self-hide would leave row 1's column 0 empty with Disks
-    // stranded in column 1 — GtkGrid keeps column 0 at CPU's width (row 0 still
-    // occupies it), so the gap doesn't collapse, it just sits there as a hole
-    // (#571). Reflow Disks into column 0 whenever GPU is hidden, and back to
+    // stranded in column 1 — the grid is column-homogeneous and rows 0 and 2
+    // still occupy column 0, so the gap doesn't collapse, it just sits there as
+    // a hole (#571). Reflow Disks into column 0 whenever GPU is hidden, and back to
     // column 1 when it reappears, by moving its `GtkGridLayoutChild` rather
     // than re-attaching. Tracks the GPU card's own `visible` property directly
     // (rather than re-deriving the same condition from `sensors::gpu()`) so
     // this can never drift from whatever actually controls the card's
     // presence; applied once immediately for the first render, then kept live
-    // via `notify::visible`.
+    // via `notify::visible`. Deliberately only ever touches the *column* —
+    // never `set_row` — so it needs nothing from #702's row renumbering: all it
+    // requires is that GPU and Disks share a row in columns 0 and 1, whichever
+    // row that happens to be.
     let disks_layout_child = grid
         .layout_manager()
         .expect("gtk::Grid always installs a GtkGridLayout")
@@ -803,14 +814,25 @@ fn build_live_per_core_row() -> adw::ActionRow {
 }
 
 /// Soft cap on how many core bars a single [`gtk::FlowBox`] line may hold.
-const CORE_BARS_MAX_PER_LINE: u32 = 16;
+///
+/// Raised 16 → 32 with the full-width CPU card (#702). A `GtkFlowBox` never
+/// puts more children on a line than `max-children-per-line`, so the cap — not
+/// the available width — is what decides the line count on a many-core box: at
+/// 16 a 64-core machine sat on 4 lines at *every* card width, and spanning the
+/// card across both grid columns spent all that extra width on gaps between
+/// fixed-8px bars instead of on fewer lines (~28px cells → ~61px cells). At 32
+/// the same 64 cores fold onto 2 lines at roughly the old cell pitch. The
+/// `FlowBox` still wraps earlier when the card is genuinely narrow, so this only
+/// bites where there's room for more bars. Accepted side effect (#702): a
+/// 17–32 core machine now fits on one line again instead of two.
+const CORE_BARS_MAX_PER_LINE: u32 = 32;
 
 /// How many core bars to allow per `FlowBox` line for `cores` cores.
 ///
 /// A `GtkFlowBox` packs each line right up to `max-children-per-line`, so a
-/// flat cap leaves a ragged tail (20 cores → 16 + 4). Instead take the fewest
+/// flat cap leaves a ragged tail (40 cores → 32 + 8). Instead take the fewest
 /// lines that keep every line at or under [`CORE_BARS_MAX_PER_LINE`], then
-/// spread the cores evenly over them (20 → 10 + 10, 64 → 4 × 16). The result
+/// spread the cores evenly over them (40 → 20 + 20, 64 → 2 × 32). The result
 /// is a *maximum*: a narrow card still wraps earlier, it just never packs more
 /// than this many bars into one line. Never returns 0 — `min-children-per-line`
 /// is 1 and a 0 maximum would make the two bounds inconsistent.
@@ -1682,7 +1704,10 @@ mod tests {
     }
 
     /// Anything that fits under the cap stays on one line — the small-machine
-    /// case must look exactly like the pre-#702 single-row strip.
+    /// case must look exactly like the pre-#702 single-row strip. Since the cap
+    /// went 16 → 32 for the full-width CPU card, that band now reaches 32: a
+    /// 17–32 core machine is back on one line (the side effect annikahannig
+    /// accepted when she picked S1 on #702).
     #[test]
     fn core_bars_per_line_keeps_small_counts_on_one_line() {
         for cores in 1..=CORE_BARS_MAX_PER_LINE {
@@ -1692,16 +1717,15 @@ mod tests {
     }
 
     /// Past the cap the wrap is *balanced*, not ragged: a flat cap would give
-    /// 20 cores a 16 + 4 split, which looks broken next to 10 + 10.
+    /// 40 cores a 32 + 8 split, which looks broken next to 20 + 20.
     #[test]
     fn core_bars_per_line_balances_the_wrap() {
-        assert_eq!(core_bars_per_line(17), 9); // 9 + 8, not 16 + 1
-        assert_eq!(core_bars_per_line(20), 10); // 10 + 10, not 16 + 4
-        assert_eq!(core_bars_per_line(24), 12); // 12 + 12
-        assert_eq!(core_bars_per_line(32), 16); // 2 x 16, already even
-        assert_eq!(core_bars_per_line(64), 16); // the #702 machine: 4 x 16
-        assert_eq!(core_bars_per_line(65), 13); // 5 x 13
-        assert_eq!(core_bars_per_line(128), 16); // 8 x 16
+        assert_eq!(core_bars_per_line(33), 17); // 17 + 16, not 32 + 1
+        assert_eq!(core_bars_per_line(40), 20); // 20 + 20, not 32 + 8
+        assert_eq!(core_bars_per_line(48), 24); // 24 + 24
+        assert_eq!(core_bars_per_line(64), 32); // the #702 machine: 2 x 32
+        assert_eq!(core_bars_per_line(65), 22); // 3 x 22
+        assert_eq!(core_bars_per_line(128), 32); // 4 x 32
     }
 
     /// Whatever the core count: the cap is honoured, every core has a slot,

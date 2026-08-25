@@ -25,15 +25,54 @@
 //! deduplicating. Pairing a geometric log cadence with the geometric delay
 //! bounds a permanently-failing path's *log volume* as well as its retry
 //! rate: a bus that is down for a day costs ~11 lines instead of one per
-//! attempt. A caller opts into that by testing [`RetryStep::log`]; it is not
-//! automatic, and the supervisor deliberately does not yet take it (see
-//! [`FailureStreak`]).
+//! attempt. A caller opts into that by testing [`RetryStep::log`] — it is not
+//! automatic — and since #798 both loops above do, so the cadence is now the
+//! crate's actual behaviour rather than an available primitive.
 //!
-//! **Not to be folded into anything else.** `hytte_services`' `retry::Policy`
-//! is a different shape (an attempt *budget* with a give-up, weighing a
-//! `Result` per step) and #646 settled that two is the right number. The
-//! public [`RetryPolicy`](crate::RetryPolicy) in [`call`](mod@crate::call) is a
-//! third, unrelated concept — a per-call `Never`/`Once`/`Backoff` selector.
+//! ## Not to be folded into `hytte_services`' `retry::Policy`
+//!
+//! #646 settled that two is the right number, and #795 records that it is not
+//! to be relitigated. The *reason* needs stating carefully, though, because
+//! #794 changed what is on the other side of the comparison: `retry::Policy` is
+//! now two shapes wearing one type.
+//!
+//! - A **budgeted, verdict-weighing** policy — `wifi::PROBE_RETRY` and
+//!   `networkd::STARTUP_REFRESH_RETRY` — driven through `Policy::step`, which is
+//!   handed a `Result` per attempt and can answer `GiveUp`. Nothing here has
+//!   either half: this module never sees an outcome and never stops. **That
+//!   shape is what justifies the crate split**, and it is the one the older
+//!   wording of this paragraph described as if it were the whole type.
+//! - An **unbounded reconnect ramp** — `retry::RECONNECT_RETRY`
+//!   (`max_attempts: None`, 500 ms → 30 s), added by #794 for `networkd`'s
+//!   post-seed listen loop, `mpris`, and `bluetooth`. Its callers skip `step`
+//!   entirely and call `Policy::backoff` directly, because a `listen()` stream
+//!   ending is itself the signal to reconnect. So it is unbounded, weighs no
+//!   verdict, and never gives up — very nearly this module's object, differing
+//!   from it only in base delay.
+//!
+//! `RECONNECT_RETRY` is nonetheless kept in `hytte-services` on purpose, and
+//! not because it is a different kind of thing:
+//!
+//! - **It retries a different layer.** This ramp retries the socket to the
+//!   broker; `RECONNECT_RETRY` retries a *subscription* on top of a connection
+//!   this supervisor is separately keeping alive. During a bus outage both run
+//!   at once, deliberately, and their numbers answer different questions — the
+//!   cap here is the worst case for noticing the bus came back at all, while
+//!   `RECONNECT_RETRY`'s is per-service journal-noise tuning. Sharing one
+//!   constant would couple two knobs that want to move independently.
+//! - **Its companion has no counterpart here.** `RECONNECT_RESET_AFTER` resets
+//!   a caller's attempt count after a run that stayed *up* for 30 s, keyed off
+//!   wall-clock uptime. [`FailureStreak`] resets on a success instead, which is
+//!   the right rule for a connect (it either opened or it did not) and the wrong
+//!   one for a stream that can open and then die a second later.
+//! - **Everything here is `pub(crate)`.** Sharing it would promote a transport
+//!   crate's internal retry constants to public API, and `retry::Policy`'s
+//!   `SHIPPED` table — the tests that assert the invariants across every policy
+//!   the services crate ships — would lose one of its three entries.
+//!
+//! The public [`RetryPolicy`](crate::RetryPolicy) in [`call`](mod@crate::call)
+//! is a third, unrelated concept — a per-call `Never`/`Once`/`Backoff`
+//! selector.
 
 use std::time::Duration;
 
@@ -48,9 +87,12 @@ pub(crate) const RAMP_BASE: Duration = Duration::from_millis(250);
 pub(crate) const RAMP_CAP: Duration = Duration::from_secs(30);
 
 /// A failure streak shorter than this is still consistent with "the bus
-/// blipped", which `connection.rs` already warns about; from here on it is
-/// consistent only with "this is not working", which nothing else reports.
-/// At the [`delay_for`] ramp this is ~4 s of consecutive failures.
+/// blipped", which `connection.rs` already warns about — see its
+/// `log_connection_lost`, which #798 added precisely so this sentence is true
+/// of a blip that reconnects on the first attempt and not only of a failed
+/// reconnect. From here on the streak is consistent only with "this is not
+/// working", which nothing else reports. At the [`delay_for`] ramp this is
+/// ~4 s of consecutive failures.
 pub(crate) const STREAK_IS_NO_LONGER_A_BLIP: u32 = 5;
 
 /// Delay before the `attempt`-th consecutive retry (1-based).
@@ -125,12 +167,14 @@ impl RetryStep {
 /// turning a busy-loop into a stall: a blip costs at most one extra 250 ms,
 /// never the 30 s cap.
 ///
-/// The `connection` supervisor uses it purely as the delay cursor it replaced
-/// (`record().delay` where it used to say `next()`, `reset()` unchanged) and
-/// still emits its `warn!` on every attempt. Adopting [`RetryStep::log`]
-/// there would bound that line's volume too, but it is a behaviour change and
-/// not part of the #795 dedup — the attempt counter it needs now exists,
-/// which is the point.
+/// The `connection` supervisor took it over in #797 as the delay cursor it
+/// replaced (`record().delay` where it used to say `next()`, `reset()`
+/// unchanged) and, since #798, reads [`RetryStep::log`] as well — so both
+/// loops in the crate now cost O(log n) lines over an outage rather than one
+/// per attempt. What the supervisor deliberately does *not* take is
+/// [`RetryStep::is_serious`]: every line it emits is the primary report of the
+/// bus being unreachable, so `warn!` is already its honest level and there is
+/// no `debug!` floor to escalate out of (see `connection::log_connect_failure`).
 #[derive(Debug, Default)]
 pub(crate) struct FailureStreak {
     attempts: u32,

@@ -50,6 +50,32 @@ const CARD_CHROME_MAIN_START_VERTICAL: i32 = 0;
 const CARD_CHROME_MAIN_END_HORIZONTAL: i32 = 15;
 const CARD_CHROME_MAIN_END_VERTICAL: i32 = 20;
 
+/// Chrome between the surface edge and the visible `.ts-drawer` card along the
+/// **vertical** axis, summed over both ends — what a card *height* budget has
+/// to hand back to the stylesheet. Derived from
+/// `assets/trollshell/style.css`: `.ts-drawer` `margin-top: 0px` +
+/// `margin-bottom: 20px`. `.ts-modal` carries no vertical padding (only
+/// `padding-left`/`padding-right`), and `.ts-drawer-content`'s
+/// [`DRAWER_FLARE_RADIUS`] inset is a start/end margin, so neither adds to the
+/// vertical total.
+///
+/// These are the same two CSS properties whichever edge the bar sits on — for
+/// a Top/Bottom bar the vertical axis happens to be the *perpendicular* one
+/// (the axis [`BarGeometry::perpendicular_margin`] also eats into), for a
+/// Left/Right bar it is the *main* one. See
+/// [`BarGeometry::available_card_height`]. Keep in sync with the stylesheet,
+/// exactly like the `CARD_CHROME_MAIN_*` constants above.
+const CARD_CHROME_VERTICAL: i32 = 20;
+
+/// Floor for [`BarGeometry::available_card_height`], in logical pixels.
+///
+/// Deliberately *not* run through [`scale`]: the budget it floors is measured
+/// in live logical pixels off the monitor, not in design-baseline units, and
+/// mixing the two spaces is the exact double-counting mistake #701 was about.
+/// Chosen to match the smallest scroller cap the shell ships (`wifi.rs`'s 240),
+/// i.e. the smallest viewport anyone has judged usable here.
+const MIN_CARD_HEIGHT: i32 = 240;
+
 /// Where the bar sits, so the drawer can anchor to the bar's *actual* edge
 /// with a perpendicular margin derived from the bar's real offset + measured
 /// thickness — instead of the old hardcoded `Anchor::Top` + `margin.top = 59`
@@ -94,6 +120,45 @@ impl BarGeometry {
     /// Replaces the literal `59`.
     fn perpendicular_margin(&self) -> i32 {
         self.offset + self.thickness()
+    }
+
+    /// Vertical room a drawer card actually has on this monitor, in live
+    /// logical pixels: the screen height, less whatever the bar reserves on
+    /// that axis, less the card's own vertical chrome
+    /// ([`CARD_CHROME_VERTICAL`]).
+    ///
+    /// This is what the Stats page's `ScrolledWindow` cap is derived from
+    /// (#701). It used to be a hardcoded 560 design-baseline px pushed through
+    /// [`scale`] — a number derived from nothing on the actual screen, so the
+    /// drawer scrolled on a 1440-px-tall output with half the screen below the
+    /// card sitting empty. Scaling can't rescue such a constant either:
+    /// [`scale`] tracks font size and the page *content* rides the very same
+    /// factor, so the ratio content-height ÷ cap is font-invariant.
+    ///
+    /// Only a Top/Bottom bar eats into the vertical axis —
+    /// [`BarGeometry::perpendicular_margin`] is a *width* reservation for a
+    /// Left/Right bar, where the vertical axis is instead the main one — hence
+    /// the [`BarGeometry::horizontal`] split. The drawer surface itself is
+    /// fullscreen with `exclusive_zone(-1)` (see [`build_drawer_window`]), so
+    /// the monitor's own height is the right starting point in both cases: no
+    /// other exclusive zone shrinks it.
+    ///
+    /// Both terms are read **live** on every call, never snapshotted at
+    /// install — the same #442 rule [`BarGeometry::main_extent`] already
+    /// follows. A kanshi profile change resizes the output in place without a
+    /// hot-plug, and the bar's CSS-driven thickness can change under us too.
+    /// That liveness is why the value is *pushed into* the already-built page
+    /// on show (see [`apply_stats_max_height`]) instead of being handed to
+    /// [`build_page`], which builds once and could only ever capture a stale
+    /// number.
+    fn available_card_height(&self) -> i32 {
+        let (_, monitor_height) = self.monitor.size();
+        let bar_reserved = if self.horizontal() {
+            self.perpendicular_margin()
+        } else {
+            0
+        };
+        clamp_card_height(monitor_height, bar_reserved, CARD_CHROME_VERTICAL)
     }
 
     /// True when the bar runs horizontally (Top/Bottom) so the drawer
@@ -1715,6 +1780,32 @@ fn clamp_main_margin(
     desired.clamp(0, max)
 }
 
+/// Pure arithmetic behind [`BarGeometry::available_card_height`] (#701), split
+/// out so the budget is unit-testable without a live monitor or a mapped bar
+/// surface — the same reason [`clamp_main_margin`] is split out.
+///
+/// `bar_reserved` is what the bar takes off the vertical axis (its offset plus
+/// its measured thickness for a Top/Bottom bar, zero for a Left/Right one) and
+/// `chrome` is the card's own vertical margin total
+/// ([`CARD_CHROME_VERTICAL`]).
+///
+/// Floors at [`MIN_CARD_HEIGHT`] so degenerate inputs can't yield a nonsense
+/// cap. Two of them are reachable: `Monitor::size` reports `(0, 0)` for a
+/// monitor GDK hasn't configured yet, and a bar thick enough to swallow the
+/// screen would otherwise hand `gtk::ScrolledWindow::set_max_content_height` a
+/// zero or negative value (where negative means "no maximum" — the silent
+/// opposite of what a shrinking screen should do). Below the floor a cap has
+/// stopped being a useful safety net anyway, so this clamps *up*; the
+/// fullscreen drawer surface clips whatever still doesn't fit, exactly as it
+/// did before. Subtraction is saturating so a pathological `bar_reserved`
+/// can't wrap in a debug build.
+fn clamp_card_height(monitor_height: i32, bar_reserved: i32, chrome: i32) -> i32 {
+    monitor_height
+        .saturating_sub(bar_reserved)
+        .saturating_sub(chrome)
+        .max(MIN_CARD_HEIGHT)
+}
+
 /// Signal that emits `true` while the drawer on `monitor` is open (the
 /// retract animation hasn't completed yet), and `false` when it's closed.
 /// Backed by [`DRAWER_OPEN`] so callers can subscribe before `install` has
@@ -1736,12 +1827,20 @@ fn on_page_show(panel: &ModalPanel, page: Page) {
         // Dismiss all active toasts (move to history); the bell counter
         // bound to active.len() drops to zero.
         Page::Notifications => notifications::dismiss_all(),
-        // #516: (re)land the combined Stats page on whichever resource
-        // chip's card is currently pending. Fires here on every open/swap/
-        // re-show of the page — including the "already open" `toggle_keep_open`
-        // path, which is exactly the case that needs it (the stack's visible
-        // child doesn't change, so nothing else would trigger a rescroll).
-        Page::Stats => apply_stats_scroll(panel),
+        // #701 then #516, in that order. First re-derive the Stats page's
+        // scroll cap from *this* monitor's live geometry — every show is the
+        // point where a kanshi mode switch or a bar-thickness change would
+        // have invalidated the last value, and the viewport has to be sized
+        // before the deep-link scroll below decides where the target card
+        // lands. Then (re)land the page on whichever resource chip's card is
+        // currently pending. Both fire on every open/swap/re-show of the page
+        // — including the "already open" `toggle_keep_open` path, which is
+        // exactly the case that needs it (the stack's visible child doesn't
+        // change, so nothing else would trigger a rescroll).
+        Page::Stats => {
+            apply_stats_max_height(panel);
+            apply_stats_scroll(panel);
+        }
         _ => {}
     }
 }
@@ -1771,10 +1870,47 @@ fn apply_stats_scroll(panel: &ModalPanel) {
     }
 }
 
+/// Push this monitor's live [`BarGeometry::available_card_height`] into
+/// `panel`'s built Stats page as its `ScrolledWindow` cap (#701). A no-op if
+/// the page was never opened on this monitor yet, exactly like
+/// [`apply_stats_scroll`].
+///
+/// Rides the same `"stats"` action group `apply_stats_scroll` uses, for the
+/// same reason: `crate::panels::stats` builds its pages monitor-agnostically
+/// and hands back only a `gtk::Widget`, so a per-monitor number has to travel
+/// as an action parameter rather than a `build_page` argument. Doing it *here*
+/// — on every show — is what keeps the cap correct across monitors, kanshi
+/// mode switches and bar-thickness changes without anything having to
+/// invalidate a cached value.
+///
+/// The parameter is plain logical pixels; the receiving side must **not** run
+/// it through [`scale`]. That was the #701 bug in miniature — the old constant
+/// was a design-baseline number that legitimately needed scaling, this one is
+/// already measured on the real screen, and scaling it again would double-count
+/// the font factor.
+///
+/// Refresh granularity is deliberately per-*show*, not per-frame: a geometry
+/// change while the Stats drawer is already open (a kanshi mode switch mid-
+/// drawer — [`wire_recenter_on_bar_geometry`] re-*places* the card there, but
+/// does not re-push this) leaves the previous cap standing until the next
+/// show. Bounded and self-healing, and the cap is a safety net rather than the
+/// layout, so it isn't worth a second trigger; if that window ever matters,
+/// the fix is one call to this from that handler's `is_open` branch.
+fn apply_stats_max_height(panel: &ModalPanel) {
+    let Some(widget) = panel.stack.child_by_name(Page::Stats.stack_name()) else {
+        return;
+    };
+    let height = panel.geometry.available_card_height();
+    if let Err(e) = widget.activate_action("stats.max-height", Some(&height.to_variant())) {
+        tracing::debug!(error = %e, "modal: stats max-height action activation failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAWER_OPEN, EAGER_PAGES, Page, Signal, clamp_main_margin, close_all, drawer_open_state,
+        CARD_CHROME_VERTICAL, DRAWER_OPEN, EAGER_PAGES, MIN_CARD_HEIGHT, Page, Signal,
+        clamp_card_height, clamp_main_margin, close_all, drawer_open_state,
         reset_drawer_open_states,
     };
     use std::collections::HashSet;
@@ -2008,6 +2144,127 @@ mod tests {
             -SIDEBAR,
             "the card must follow the chip's new screen position"
         );
+    }
+
+    /// The old hardcoded Stats scroll cap (`stats_scrolled(&grid, 560)`),
+    /// kept here only as the number the #701 tests measure against. It is not
+    /// referenced by any non-test code any more.
+    const OLD_STATS_CAP: i32 = 560;
+
+    /// A typical top bar: 0 offset, ~34 logical px thick. The bar's own
+    /// `thickness()` is a live measure, so this stands in for it.
+    const TOP_BAR: i32 = 34;
+
+    /// #701, the headline case: on a real output the budget is the screen, not
+    /// a constant. A 1440-tall panel gives the card ~1386 px — two and a half
+    /// times the 560 the page used to clamp itself to, which is why the drawer
+    /// scrolled permanently with the bottom half of the screen empty.
+    #[test]
+    fn clamp_card_height_uses_the_whole_screen() {
+        assert_eq!(
+            clamp_card_height(1440, TOP_BAR, CARD_CHROME_VERTICAL),
+            1440 - TOP_BAR - CARD_CHROME_VERTICAL
+        );
+        assert!(clamp_card_height(1440, TOP_BAR, CARD_CHROME_VERTICAL) > OLD_STATS_CAP * 2);
+    }
+
+    /// Every output the shell plausibly runs on clears the old cap by a wide
+    /// margin — including a 768-px netbook panel. That is the bug in one
+    /// assertion: no supported screen ever *wanted* 560.
+    #[test]
+    fn clamp_card_height_beats_the_old_cap_on_every_real_output() {
+        for height in [768, 800, 900, 1080, 1200, 1440, 1600, 2160] {
+            let budget = clamp_card_height(height, TOP_BAR, CARD_CHROME_VERTICAL);
+            assert!(
+                budget > OLD_STATS_CAP,
+                "{height}px output still capped below the old constant ({budget})"
+            );
+        }
+    }
+
+    /// The #442 liveness crux, restated for the height axis: a stale monitor
+    /// height yields a different budget than the live one, so the value has to
+    /// be re-read per show (which is what `apply_stats_max_height` does) rather
+    /// than captured at `build_page` time. The budget tracks the screen 1:1.
+    #[test]
+    fn clamp_card_height_tracks_monitor_height() {
+        let at_1080 = clamp_card_height(1080, TOP_BAR, CARD_CHROME_VERTICAL);
+        let at_1440 = clamp_card_height(1440, TOP_BAR, CARD_CHROME_VERTICAL);
+        assert_ne!(at_1080, at_1440);
+        assert_eq!(at_1440 - at_1080, 360);
+    }
+
+    /// …and the bar's live thickness the same way: a fatter bar (a CSS change,
+    /// or a bar inset from the screen edge) gives the card exactly that much
+    /// less room.
+    #[test]
+    fn clamp_card_height_tracks_bar_thickness() {
+        let thin = clamp_card_height(1440, 34, CARD_CHROME_VERTICAL);
+        let thick = clamp_card_height(1440, 74, CARD_CHROME_VERTICAL);
+        assert_eq!(thin - thick, 40);
+    }
+
+    /// A Left/Right bar reserves *width*, not height, so `bar_reserved` is 0
+    /// there and the card gets the full screen minus chrome. Subtracting the
+    /// perpendicular margin on that axis too would silently short the budget by
+    /// a bar's width.
+    #[test]
+    fn clamp_card_height_ignores_a_vertical_bar() {
+        assert_eq!(
+            clamp_card_height(1440, 0, CARD_CHROME_VERTICAL),
+            1440 - CARD_CHROME_VERTICAL
+        );
+    }
+
+    /// Degenerate input #1: `Monitor::size` reports `(0, 0)` for a monitor GDK
+    /// hasn't configured yet. Without the floor this hands
+    /// `set_max_content_height` a *negative* value, which GTK reads as "no
+    /// maximum" — the silent opposite of a safety net.
+    #[test]
+    fn clamp_card_height_floors_on_unconfigured_monitor() {
+        assert_eq!(
+            clamp_card_height(0, TOP_BAR, CARD_CHROME_VERTICAL),
+            MIN_CARD_HEIGHT
+        );
+    }
+
+    /// Degenerate input #2: a bar thick enough to swallow the screen (a tiny
+    /// output, or a bar mid-reconfigure reporting a nonsense allocation).
+    /// Clamps up to the floor rather than to 0 or below.
+    #[test]
+    fn clamp_card_height_floors_on_a_screen_swallowing_bar() {
+        assert_eq!(
+            clamp_card_height(400, 600, CARD_CHROME_VERTICAL),
+            MIN_CARD_HEIGHT
+        );
+        assert_eq!(
+            clamp_card_height(240, TOP_BAR, CARD_CHROME_VERTICAL),
+            MIN_CARD_HEIGHT
+        );
+    }
+
+    /// The floor is a floor, never a ceiling: it may only ever raise a budget,
+    /// and the result is always a usable positive cap. Swept across the whole
+    /// plausible input space plus both saturating extremes, so no combination
+    /// can produce a zero, a negative, or an overflow panic in a debug build.
+    #[test]
+    fn clamp_card_height_is_always_a_usable_positive_cap() {
+        for height in [i32::MIN, -1, 0, 1, 100, 240, 300, 768, 1440, 4320, i32::MAX] {
+            for reserved in [i32::MIN, 0, 34, 200, 5000, i32::MAX] {
+                let budget = clamp_card_height(height, reserved, CARD_CHROME_VERTICAL);
+                assert!(
+                    budget >= MIN_CARD_HEIGHT,
+                    "budget {budget} fell below the floor at ({height}, {reserved})"
+                );
+                let raw = height
+                    .saturating_sub(reserved)
+                    .saturating_sub(CARD_CHROME_VERTICAL);
+                assert!(
+                    budget == raw.max(MIN_CARD_HEIGHT),
+                    "floor changed a budget it shouldn't have at ({height}, {reserved})"
+                );
+            }
+        }
     }
 
     /// Tripwire for `build_pages_stack`'s eager set (#231): as of #338 every

@@ -17,7 +17,12 @@
 //! manage the `trollshell-plugin-<id>` **user** units through the declarative
 //! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
 //! *transient* units the host launches via `systemd-run --user`, with a
-//! `StartUnit`/unit-file fallback for legacy static units. `ReloadPlugins`
+//! `StartUnit`/unit-file fallback for legacy static units. Those three **report
+//! failure** (`zbus::fdo::Result<()>`, #707) rather than swallowing it into a
+//! log line, so the tab can tell a start that worked from one whose unit never
+//! came up. That is wire-compatible: a `Result<()>` handler introspects with the
+//! same (empty) out-args as a void one and replies identically on success — only
+//! the failure path changes, from an empty reply to an error reply. `ReloadPlugins`
 //! (#695) is the same launcher's convergence entry point, called from the
 //! home-manager module's activation script so a switch applies to the running
 //! session — no tab of its own, it is machine-facing. The **AI Keys** tab
@@ -209,18 +214,25 @@ impl ControlIface {
     /// `StartUnit`. Does not change its enabled state (see
     /// [`set_plugin_enabled`](Self::set_plugin_enabled)). Re-query
     /// [`list_plugins`](Self::list_plugins) shortly after to read back the state.
-    async fn start_plugin(&self, id: String) {
-        if let Err(err) = plugin_launcher::start(&id).await {
-            tracing::warn!(%err, plugin = %id, "StartPlugin failed");
-        }
+    ///
+    /// # Errors
+    /// Unknown/invalid id, a unit that is already running, or an unreachable
+    /// user manager — see [`plugin_launcher::start`].
+    async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
+        plugin_launcher::start(&id)
+            .await
+            .map_err(|err| fail(&id, err, "StartPlugin"))
     }
 
     /// Stop plugin `id`'s user unit now (transient or static alike). Does not
     /// change its enabled state.
-    async fn stop_plugin(&self, id: String) {
-        if let Err(err) = plugin_launcher::stop(&id).await {
-            tracing::warn!(%err, plugin = %id, "StopPlugin failed");
-        }
+    ///
+    /// # Errors
+    /// Invalid id, no such unit, or an unreachable user manager.
+    async fn stop_plugin(&self, id: String) -> zbus::fdo::Result<()> {
+        plugin_launcher::stop(&id)
+            .await
+            .map_err(|err| fail(&id, err, "StopPlugin"))
     }
 
     /// Enable or disable plugin `id` for persistence across logins. For a
@@ -228,10 +240,14 @@ impl ControlIface {
     /// this is a logged no-op (persist by flipping
     /// `programs.trollshell.plugins.<id>.enable`); runtime start/stop still
     /// applies live. Legacy static units keep unit-file enable/disable.
-    async fn set_plugin_enabled(&self, id: String, enabled: bool) {
-        if let Err(err) = plugin_launcher::set_enabled(&id, enabled).await {
-            tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
-        }
+    ///
+    /// # Errors
+    /// Invalid id, or an unreachable user manager (legacy static-unit path
+    /// only — the declarative path can't fail).
+    async fn set_plugin_enabled(&self, id: String, enabled: bool) -> zbus::fdo::Result<()> {
+        plugin_launcher::set_enabled(&id, enabled)
+            .await
+            .map_err(|err| fail(&id, err, "SetPluginEnabled"))
     }
 
     /// Re-read `plugins.json` and converge the running plugins onto it (#695):
@@ -341,6 +357,25 @@ impl ControlIface {
         hytte::reactive::runtime::handle()
             .spawn(async move { plugin_launcher::relaunch_for_secret(&slot).await });
     }
+}
+
+/// Log a failed plugin control call and map it to the D-Bus error the caller
+/// gets back (#707).
+///
+/// Before this the three plugin methods were **void**: a failed start was logged
+/// shell-side and the caller got an ordinary empty reply, so the control-center's
+/// Plugins tab (#348) showed a start as having worked when the unit never came
+/// up, and a scripted caller had no signal at all. The log line stays — the
+/// journal is where the *cause* lives — and the error now travels too.
+///
+/// `fdo::Error::Failed` rather than a bespoke `#[zbus::DBusError]` enum: the
+/// launcher's failures are already flattened into one `anyhow` chain (bad id,
+/// unit already up, no user manager), so there is nothing for a caller to
+/// usefully switch on that the message doesn't say better. `{err:#}` renders the
+/// whole `anyhow` context chain, not just the outermost frame.
+fn fail(id: &str, err: anyhow::Error, method: &str) -> zbus::fdo::Error {
+    tracing::warn!(%err, plugin = %id, "{method} failed");
+    zbus::fdo::Error::Failed(format!("{method} for plugin {id} failed: {err:#}"))
 }
 
 /// The label to surface for the current place. Prefers the effective resolved

@@ -24,8 +24,19 @@ let
   # including enable = false ones ("enabled": false — declared but not
   # auto-launched), so a disabled plugin still lists in the control-center's
   # Plugins tab and can be started manually.
+  #
+  # `target` (#707) is the systemd user target each launched plugin unit binds
+  # to (`PartOf=`) — the SAME value the shell's own unit below binds to. The
+  # launcher used to hardcode graphical-session.target, so any session that set
+  # `systemd.target` (the documented niri-session.target example, which is what
+  # etc/ ships) had the shell on one target and its plugins on another, and
+  # session teardown reached them out of step. The key is optional on the shell
+  # side: a plugins.json without it falls back to graphical-session.target, so
+  # an older module's file (and the NixOS module's, which has no shell unit and
+  # so no such option) keeps working unchanged.
   pluginsState = builtins.toJSON {
     version = 1;
+    target = cfg.systemd.target;
     plugins = lib.mapAttrs (_: plugin: {
       exec = lib.getExe plugin.package;
       inherit (plugin) env secrets;

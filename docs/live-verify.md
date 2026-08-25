@@ -32,7 +32,9 @@ to `window.destroy()` after #630 had already merged, so the entry's citation
 of `close()` went stale the moment #637 landed, not from later drift. A wrong
 verification step is worse than a missing one, per #635. This is a living
 checklist that gets refreshed periodically, not a dated snapshot of one merge
-wave.
+wave — #707's entries under "Plugins & launcher" were added by the PR that
+shipped them rather than waiting for the next refresh pass, so the coverage
+range above is a floor, not a ceiling.
 
 ## Idle & lock
 
@@ -139,6 +141,45 @@ wave.
       show only the enabled set as transient units; stop/start from the
       control-center Plugins tab should work; a disabled plugin should stay
       down across a shell restart.
+- [ ] **(#707)** Config recycle end to end — the "how a config change reaches a
+      running plugin" chain (#419 → #695 → #707), which nothing in CI can
+      exercise because it needs a live user manager and a live session bus.
+      With the shell running and a declared plugin up, change one visible knob:
+      `programs.trollshell.plugins.pet.env.PET_NAME = "nisse";` →
+      `home-manager switch`. Without touching anything else: `cat
+    ~/.config/trollshell/plugins.json` shows the new value; the journal
+      (`journalctl --user -u trollshell -f`) logs "declared spec changed;
+      restarting"; `systemctl --user show -p ExecMainStartTimestamp
+    trollshell-plugin-pet` shows a fresh start; and `tr '\0' '\n' <
+    /proc/$(systemctl --user show -p MainPID --value
+    trollshell-plugin-pet)/environ | grep PET_NAME` shows the new value. The
+      card should re-render with it. Then verify the manual path works with the
+      shell running but no switch: `busctl --user call
+    mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control
+    mov.vibec0re.trollshell.Control ReloadPlugins` is a clean no-op when
+      nothing changed.
+- [ ] **(#707)** Session target — the plugin units now bind `PartOf=` the same
+      target the shell does, instead of a hardcoded `graphical-session.target`.
+      With `programs.trollshell.systemd.target = "niri-session.target";` (what
+      `etc/` ships), switch and confirm `systemctl --user show -p PartOf
+    trollshell-plugin-<id>` reports `niri-session.target` — matching
+      `systemctl --user show -p PartOf trollshell`. Then confirm the recycle:
+      the **first** reconcile after upgrading a session that was already using a
+      non-default target should restart each plugin exactly once (the old units
+      digest without the target), and reconciles after that should be no-ops. On
+      a session that never set `systemd.target`, the upgrade must restart
+      **nothing** — the default canonicalizes as absent in the fingerprint on
+      purpose. Finally `systemctl --user stop niri-session.target` should take
+      the plugins down with the shell rather than leaving them orphaned.
+- [ ] **(#707)** Plugin control errors — `StartPlugin` / `StopPlugin` /
+      `SetPluginEnabled` now return a D-Bus error instead of an empty reply on
+      failure. Start a plugin that is already running:
+      `busctl --user call mov.vibec0re.trollshell.Control
+    /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control
+    StartPlugin s pet` should now print an error naming the plugin (it printed
+      nothing before). A successful call must still print nothing — the wire
+      shape is unchanged for the success path, and the control-center's Plugins
+      tab must keep working exactly as it did.
 - [ ] **(#495)** Socket single-instancing — run the deployed shell, then
       `cargo run -p trollshell` beside it: the dev instance should log
       "not taking it over" and the running shell should keep its plugins

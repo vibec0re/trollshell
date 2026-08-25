@@ -1113,3 +1113,402 @@ mod tests {
         assert_eq!(take(), 1, "day-of-month change emits");
     }
 }
+
+// ── Reentrancy regression tests ───────────────────────────────────────────────
+
+/// The `RefCell`-across-a-GTK-call abort class (#674) for this file.
+///
+/// ## Why there is no production change alongside these tests
+///
+/// `rebuild_list` is already a private free function taking its three cells,
+/// the task slice, and a `&Monitor` as explicit parameters — no seam needed to
+/// reach it from a colocated test, by module privacy alone. Nothing was
+/// extracted, reordered, or reshaped to make this module compile; see
+/// `rebuild_list`'s own doc comment above for why all three cells are
+/// `take()`n rather than `borrow_mut()`-ed (#643).
+///
+/// Unlike `workspaces.rs`'s `update_workspaces` or `window_list.rs`'s
+/// `update_windows`, `rebuild_list` never diffs by identity — every call
+/// unconditionally tears down whatever the last call left in all three cells
+/// and rebuilds fresh from `ts`. That means a test doesn't need to change the
+/// task set between calls to force a removal; calling twice with the *same*
+/// tasks still exercises the full take/remove/rebuild path each time.
+///
+/// ## Why this needs `App::run`
+///
+/// `rebuild_list` threads its `&Monitor` down into `build_task_row` (for the
+/// edit popover's dismiss-catcher target). `Monitor`'s only constructor is
+/// `pub(crate)` to `hytte-ui`, so the sole way to obtain one from this crate
+/// is `App::monitors` — which exists only inside a running `App::run` body.
+/// `test_monitor` does that once, lazily, and caches the result. None of the
+/// tests below ever activate a row (so the monitor is never read past the
+/// type-check), but the signature still demands a real one.
+///
+/// ## Why the probe is `destroy`, not `unmap`
+///
+/// PR #817's first attempt at this bug class (`overlays/notifications.rs`)
+/// found that a removed widget's `destroy` can be silently deferred when the
+/// widget is still referenced by something outside the cell under test — its
+/// toast cards held a focusable dismiss button, and with the toast window
+/// actually mapped, that kept the card alive past `vbox.remove()`, so
+/// `destroy` never fired *inside* the call and the probe had to switch to
+/// `unmap` instead.
+///
+/// That trap doesn't apply here: `group` in these tests is a bare
+/// `adw::PreferencesGroup`, never added to any shown window (production only
+/// ever calls `rebuild_list` on a group some other function has already
+/// mounted; these tests don't need it mounted at all). With no `GtkRoot`
+/// there is no focus-widget chain to retain a removed row, placeholder, or
+/// overflow row past `group.remove()` — `destroy` fires off pure refcounting,
+/// the same signal `workspaces.rs`'s #814 and `window_list.rs`'s regression
+/// tests rest on. Each test below asserts this rather than assuming it: the
+/// anti-vacuity check on `fired_inside` is what would catch it if it were
+/// ever untrue.
+///
+/// Needs a real display server (a `Monitor` has to come from a live GDK
+/// backend), hence the `system-tests` gate, like the `DuePicker` tests above.
+#[cfg(all(test, feature = "system-tests"))]
+mod reentrancy_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::prelude::*;
+    use hytte::services::tasks::{Task, TaskStatus};
+
+    use super::{MAX_VISIBLE_TASKS, rebuild_list};
+
+    thread_local! {
+        /// The output every `Monitor` in this module is built from, captured
+        /// once by [`test_monitor`]. `Monitor` is `!Send` and this binary's
+        /// `#[gtk::test]`s all share one thread, so a `thread_local!` needs no
+        /// synchronisation.
+        static TEST_MONITOR: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+    }
+
+    /// A real `Monitor`, captured from a one-shot `App::run`.
+    ///
+    /// Cached, because `App::run` has process-global side effects (`adw::init`,
+    /// the dark colour scheme, the default stylesheet, a leaked application
+    /// hold) and this is a unit-test binary shared with several hundred other
+    /// tests — running it per test would repeat all of that per test.
+    /// `#[gtk::test]` runs every test in this binary on one thread, so the
+    /// cache needs no locking and cannot be raced regardless of test order.
+    fn test_monitor() -> Monitor {
+        if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
+            return monitor;
+        }
+        App::new("mov.vibec0re.trollshell.test.tasks-reentrancy")
+            .run(|app| {
+                let first = app.monitors().first().cloned();
+                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+                app.quit();
+            })
+            .expect("App::run");
+        TEST_MONITOR
+            .with(|cell| cell.borrow().clone())
+            .expect("the display server must report at least one output; `xvfb-run` provides one")
+    }
+
+    /// A task identified by `uid`/`summary` alone. `rebuild_list` never diffs
+    /// by identity, so no other field matters to these tests — `format_due`
+    /// on a `None` due renders an empty chip, and `list_name` only feeds a
+    /// label nothing here inspects.
+    fn task(uid: &str, summary: &str) -> Task {
+        Task {
+            uid: uid.to_owned(),
+            summary: summary.to_owned(),
+            description: None,
+            due: None,
+            due_all_day: false,
+            status: TaskStatus::NeedsAction,
+            list_uid: "list-1".to_owned(),
+            list_name: "Personal".to_owned(),
+        }
+    }
+
+    /// `task("t{n}", "{n}")` for `n` in `1..=count` — the shape the overflow
+    /// test needs to push past `MAX_VISIBLE_TASKS`.
+    fn tasks(count: usize) -> Vec<Task> {
+        (1..=count)
+            .map(|n| task(&format!("t{n}"), &n.to_string()))
+            .collect()
+    }
+
+    type RowsTrack = Rc<RefCell<Vec<adw::PreferencesRow>>>;
+    type OptRow = Rc<RefCell<Option<adw::ActionRow>>>;
+
+    /// The three cells `rebuild_list` takes, exactly as `build_block` builds
+    /// them, plus a fresh group and a real `Monitor`.
+    fn fresh() -> (adw::PreferencesGroup, RowsTrack, OptRow, OptRow, Monitor) {
+        (
+            adw::PreferencesGroup::new(),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(RefCell::new(None)),
+            Rc::new(RefCell::new(None)),
+            test_monitor(),
+        )
+    }
+
+    /// Cell 1, the row list: `group.remove(&row)` drops the group's
+    /// reference, and the loop-owned `row` binding drops its own at the end
+    /// of that iteration — the last strong ref, so `GtkWidget::destroy` fires
+    /// **synchronously** from dispose (see the module doc for why no focus
+    /// chain defers it here).
+    ///
+    /// The handler re-enters `rebuild_list` on the same three cells. Against
+    /// the pre-#643 `let mut rows = rows_track.borrow_mut();` (closing
+    /// write-back dropped) the inner call hits a live `RefMut` and aborts the
+    /// binary with `BorrowMutError` rather than failing one test — #663's
+    /// SIGABRT, the failure mode #674 exists for. With `take()` the cell is
+    /// free for the whole call, so the inner call simply finds an empty `Vec`.
+    #[gtk::test]
+    fn rebuild_list_tolerates_a_reentrant_rebuild_from_a_removed_rows_destroy() {
+        let (group, rows_track, placeholder_track, overflow_track, monitor) = fresh();
+        let seed = tasks(2);
+
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &seed,
+            &monitor,
+        );
+        assert_eq!(
+            rows_track.borrow().len(),
+            2,
+            "both tasks must be rendered after the seeding call"
+        );
+
+        // True only while the outer `rebuild_list` is on the stack, so the
+        // handler can record whether it ran inside the call or was deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        // Arm the second row's destroy to re-enter rebuild_list.
+        let row2 = rows_track.borrow()[1].clone();
+        {
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let overflow_track = Rc::clone(&overflow_track);
+            let monitor = monitor.clone();
+            let seed = seed.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            row2.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_list(
+                    &group,
+                    &rows_track,
+                    &placeholder_track,
+                    &overflow_track,
+                    &seed,
+                    &monitor,
+                );
+            });
+        }
+        // Drop our clone before the removing pass: while it lives the row has
+        // a second strong ref, `group.remove()` won't dispose it, and
+        // `destroy` never fires — the test would pass vacuously.
+        drop(row2);
+
+        in_outer.set(true);
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &seed,
+            &monitor,
+        );
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed row's `destroy` must fire synchronously inside `rebuild_list`; if GTK \
+             ever defers it, or the row outlives the removal loop, this test proves nothing about \
+             the borrow discipline"
+        );
+        assert_eq!(
+            rows_track.borrow().len(),
+            2,
+            "the outer call's write-back must still land: re-entry may not leave the cell holding \
+             the inner call's rows or an empty Vec"
+        );
+    }
+
+    /// Cell 2, the placeholder: an empty `ts` renders "No tasks", torn down
+    /// and rebuilt on every call that stays empty — there is no reuse arm
+    /// here either. Falsifiable independently of the row-list test above:
+    /// reverting only `placeholder_track`'s `take()` to a held `borrow_mut()`
+    /// makes the abort name `placeholder_track` and no other cell.
+    #[gtk::test]
+    fn rebuild_list_tolerates_a_reentrant_rebuild_from_a_removed_placeholder_destroy() {
+        let (group, rows_track, placeholder_track, overflow_track, monitor) = fresh();
+
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &[],
+            &monitor,
+        );
+        assert!(
+            placeholder_track.borrow().is_some(),
+            "an empty task list must render the placeholder after the seeding call"
+        );
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let placeholder = placeholder_track
+            .borrow()
+            .clone()
+            .expect("just asserted Some above");
+        {
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let overflow_track = Rc::clone(&overflow_track);
+            let monitor = monitor.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            placeholder.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_list(
+                    &group,
+                    &rows_track,
+                    &placeholder_track,
+                    &overflow_track,
+                    &[],
+                    &monitor,
+                );
+            });
+        }
+        // Drop our clone before the removing pass, same reasoning as the row
+        // test: a second strong ref would keep it alive past `group.remove()`.
+        drop(placeholder);
+
+        in_outer.set(true);
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &[],
+            &monitor,
+        );
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the retired placeholder's `destroy` must fire synchronously inside `rebuild_list`; \
+             if it does not, this test proves nothing about the borrow discipline"
+        );
+        assert!(
+            placeholder_track.borrow().is_some(),
+            "the outer call's write-back must still land: re-entry may not leave the cell empty \
+             or holding the inner call's placeholder"
+        );
+    }
+
+    /// Cell 3, the overflow row: one more task than `MAX_VISIBLE_TASKS`
+    /// collapses the tail into a "+N more" row, torn down and rebuilt on
+    /// every call whose tail still overflows. Falsifiable independently of
+    /// the two tests above: reverting only `overflow_track`'s `take()` names
+    /// that cell and no other.
+    #[gtk::test]
+    fn rebuild_list_tolerates_a_reentrant_rebuild_from_a_removed_overflow_destroy() {
+        let (group, rows_track, placeholder_track, overflow_track, monitor) = fresh();
+        let over = tasks(MAX_VISIBLE_TASKS + 1);
+
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &over,
+            &monitor,
+        );
+        assert!(
+            overflow_track.borrow().is_some(),
+            "one task past the cap must collapse into an overflow row after the seeding call"
+        );
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let overflow = overflow_track
+            .borrow()
+            .clone()
+            .expect("just asserted Some above");
+        {
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let overflow_track = Rc::clone(&overflow_track);
+            let monitor = monitor.clone();
+            let over = over.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            overflow.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_list(
+                    &group,
+                    &rows_track,
+                    &placeholder_track,
+                    &overflow_track,
+                    &over,
+                    &monitor,
+                );
+            });
+        }
+        drop(overflow);
+
+        in_outer.set(true);
+        rebuild_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &overflow_track,
+            &over,
+            &monitor,
+        );
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the retired overflow row's `destroy` must fire synchronously inside `rebuild_list`; \
+             if it does not, this test proves nothing about the borrow discipline"
+        );
+        assert!(
+            overflow_track.borrow().is_some(),
+            "the outer call's write-back must still land: re-entry may not leave the cell empty \
+             or holding the inner call's overflow row"
+        );
+        assert_eq!(
+            rows_track.borrow().len(),
+            MAX_VISIBLE_TASKS,
+            "the outer call's row write-back must also land, not just the overflow row's"
+        );
+    }
+}

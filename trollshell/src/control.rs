@@ -221,7 +221,7 @@ impl ControlIface {
     async fn start_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::start(&id)
             .await
-            .map_err(|err| fail(&id, err, "StartPlugin"))
+            .map_err(|err| fail(&id, &err, "StartPlugin"))
     }
 
     /// Stop plugin `id`'s user unit now (transient or static alike). Does not
@@ -232,7 +232,7 @@ impl ControlIface {
     async fn stop_plugin(&self, id: String) -> zbus::fdo::Result<()> {
         plugin_launcher::stop(&id)
             .await
-            .map_err(|err| fail(&id, err, "StopPlugin"))
+            .map_err(|err| fail(&id, &err, "StopPlugin"))
     }
 
     /// Enable or disable plugin `id` for persistence across logins. For a
@@ -247,7 +247,7 @@ impl ControlIface {
     async fn set_plugin_enabled(&self, id: String, enabled: bool) -> zbus::fdo::Result<()> {
         plugin_launcher::set_enabled(&id, enabled)
             .await
-            .map_err(|err| fail(&id, err, "SetPluginEnabled"))
+            .map_err(|err| fail(&id, &err, "SetPluginEnabled"))
     }
 
     /// Re-read `plugins.json` and converge the running plugins onto it (#695):
@@ -373,7 +373,7 @@ impl ControlIface {
 /// unit already up, no user manager), so there is nothing for a caller to
 /// usefully switch on that the message doesn't say better. `{err:#}` renders the
 /// whole `anyhow` context chain, not just the outermost frame.
-fn fail(id: &str, err: anyhow::Error, method: &str) -> zbus::fdo::Error {
+fn fail(id: &str, err: &anyhow::Error, method: &str) -> zbus::fdo::Error {
     tracing::warn!(%err, plugin = %id, "{method} failed");
     zbus::fdo::Error::Failed(format!("{method} for plugin {id} failed: {err:#}"))
 }

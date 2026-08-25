@@ -52,16 +52,25 @@ pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
     use super::TEST_LOCK;
 
-    /// Deterministic proof that `TEST_LOCK` actually excludes a second
-    /// holder while the first is live — the property #777's whole fix
-    /// depends on ("both `upower::tests` and `places::tests` take it" only
-    /// closes the race if taking it actually serializes them). No sleeps,
-    /// no timing thresholds, no scheduler race to get unlucky on: while this
-    /// thread holds the guard, `try_lock` from another thread is `Mutex`'s
-    /// own guarantee to return `Err`, not a probabilistic outcome, so this
-    /// either passes every run or the standard library is broken. Once
-    /// released, the same static is immediately acquirable again, ruling out
-    /// a permanently-poisoned or single-use lock.
+    /// Proof that `TEST_LOCK` actually excludes a second holder while the
+    /// first is live — the property #777's whole fix depends on ("both
+    /// `upower::tests` and `places::tests` take it" only closes the race if
+    /// taking it actually serializes them).
+    ///
+    /// Phase 1 is deterministic: while this thread holds the guard, a
+    /// `try_lock` from another thread is `Mutex`'s own guarantee to return
+    /// `Err`, not a probabilistic outcome.
+    ///
+    /// Phase 2 deliberately uses a **blocking** `lock()`, not `try_lock()`.
+    /// `std::sync::Mutex` is unfair, so once this test shares the process
+    /// with other `TEST_LOCK` users — which is precisely what #777's fix
+    /// arranges — a peer already blocked in `lock()` is woken by the futex
+    /// and can win the lock during the microseconds the racer thread takes
+    /// to spawn. A `try_lock().is_ok()` assertion would then fail on a
+    /// perfectly healthy lock, and would do so more often the more tests
+    /// join it. Blocking waits for the handoff instead, which is the
+    /// property actually under test: the lock is not permanently poisoned
+    /// or single-use. A hang here would mean the guard was never released.
     #[test]
     fn test_lock_excludes_a_second_holder_and_releases_cleanly() {
         let guard = TEST_LOCK
@@ -77,11 +86,16 @@ mod tests {
 
         drop(guard);
 
-        let reacquired = std::thread::scope(|s| s.spawn(|| TEST_LOCK.try_lock().is_ok()).join())
-            .expect("spawned thread panicked");
-        assert!(
-            reacquired,
-            "TEST_LOCK must be acquirable again once the holder releases it"
-        );
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                drop(
+                    TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+            })
+            .join()
+        })
+        .expect("spawned thread panicked: TEST_LOCK was not acquirable after release");
     }
 }

@@ -3,6 +3,7 @@
 
 pub mod bind;
 pub mod health;
+pub mod pending;
 pub mod poll;
 pub mod registry;
 pub mod runtime;
@@ -12,6 +13,7 @@ pub mod test_lock;
 
 pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_two_way_drag_safe, bind_visible};
 pub use health::{TaskHealth, TaskId, TaskState};
+pub use pending::Pending;
 pub use poll::gated_poll;
 pub use registry::{Registry, Service, ServiceErased};
 pub use supervisor::{

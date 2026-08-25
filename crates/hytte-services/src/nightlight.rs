@@ -60,12 +60,18 @@
 //!
 //! Correct is not the same as bearable, though, and up to [`FIX_WAIT`] of
 //! nothing-happening is what provokes that second toggle in the first place. So
-//! the wait is also *announced*: the toggle is a tri-state
-//! ([`NightlightState`]) rather than a bool — `Off`, `On`, and `Resolving`,
-//! "you asked for this and we are parked on a location fix" — and the Appearance
-//! row spins and says so instead of sitting silent (#597). Only the branch that
-//! actually parks publishes `Resolving`, so a toggle with configured
-//! coordinates (or a warm fix) never flickers through it.
+//! the wait is also *announced*: the toggle publishes a [`Pending<bool>`]
+//! rather than a bare bool — the unit's `ActiveState` plus, while a start is
+//! parked on a location fix, the user's not-yet-honoured intent — and the
+//! Appearance row spins and says so instead of sitting silent (#597). Only the
+//! branch that actually parks calls [`Pending::request`], so a toggle with
+//! configured coordinates (or a warm fix) never flickers through a spinner.
+//!
+//! That state used to be a nightlight-private `NightlightState` tri-state.
+//! #599 replaced it with [`Pending`], the shared model in `hytte-reactive`, so
+//! this module and `displays` answer "a write is in flight" the same way — see
+//! that module's docs for the argument and for the widget-local model it
+//! retired.
 //!
 //! The resolved coordinates reach `wlsunset` through
 //! `~/.config/trollshell/wlsunset.args` — one argument per line, read back by
@@ -92,7 +98,7 @@ use crate::geoclue::LocationState;
 use crate::{config_file, places};
 use futures_signals::signal::{Mutable, Signal, SignalExt as _};
 use futures_util::StreamExt as _;
-use hytte_reactive::{Service, registry, runtime};
+use hytte_reactive::{Pending, Service, registry, runtime};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -184,67 +190,50 @@ impl Ticket {
 
 // ── Toggle state ─────────────────────────────────────────────────────────────
 
-/// What the night-light toggle is doing right now.
+/// The toggle's state: the unit's `ActiveState` as [`Pending::confirmed`], plus
+/// the user's request as [`Pending::intent`] while a start is parked on a
+/// location fix.
 ///
-/// Three states rather than a bool because the toggle genuinely has three: with
-/// no configured coordinates, turning it **on** parks on a location fix for up
-/// to [`FIX_WAIT`], and during that window the unit is not running but the user
-/// has already asked for it. Publishing `false` there would snap the switch
-/// back out from under their hand — #594's symptom, arrived at from the other
-/// direction — and publishing `true` would be a claim the UI has no way to
-/// qualify. So the wait gets a state of its own, and the row can show it (#597).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum NightlightState {
-    /// The unit is stopped.
-    #[default]
-    Off,
-    /// A toggle-on is in flight, parked on a location fix. The unit is *not*
-    /// running yet; the switch reads on because that is what was requested.
-    Resolving,
-    /// The unit is active.
-    On,
-}
+/// A bool would not do. With no configured coordinates, turning it **on** parks
+/// for up to [`FIX_WAIT`], and during that window the unit is not running but
+/// the user has already asked for it. Publishing `false` there would snap the
+/// switch back out from under their hand — #594's symptom, arrived at from the
+/// other direction — and publishing `true` would be a claim the UI has no way to
+/// qualify. [`Pending`] carries both halves in one value, so the row can show
+/// the wait (#597) without the switch ever moving on its own.
+///
+/// Only the `Resolving` branch of the location lookup ever calls
+/// [`Pending::request`]; `ActiveState` itself can only ever say on or off, so
+/// the seed and every failure re-sync land on a plain [`Pending::settled`].
+///
+/// The grace handed to [`Pending::request`] is [`FIX_WAIT`] — the same bound the
+/// coordinate lookup itself is wrapped in, so the deadline the value advertises
+/// and the `tokio::time::timeout` that actually fires are one number. This
+/// module's [`Pending::expire`] is that timeout: when it trips, the fall-through
+/// publishes a settled `false` and the switch snaps back.
+type State = Pending<bool>;
 
-impl NightlightState {
-    /// Whether a switch bound to this state should read "on".
-    ///
-    /// `Resolving` is **on**. The user has just flipped the switch and the
-    /// request is being honoured, so moving it back under them would be exactly
-    /// the "switch moves by itself" bug #594 was about. Callers that need "is
-    /// the daemon actually running" want to match the state instead.
-    #[must_use]
-    pub fn is_on(self) -> bool {
-        matches!(self, Self::On | Self::Resolving)
-    }
-
-    /// Whether a toggle-on is parked on a location fix — the cue the Appearance
-    /// row's spinner and "waiting" subtitle hang off.
-    #[must_use]
-    pub fn is_resolving(self) -> bool {
-        matches!(self, Self::Resolving)
-    }
-
-    /// Map a `systemctl` `ActiveState == active` reading onto a state. Never
-    /// yields [`Self::Resolving`]: that is shell-side intent, not something the
-    /// unit can report.
-    fn from_unit_active(active: bool) -> Self {
-        if active { Self::On } else { Self::Off }
-    }
+/// Read `ActiveState == active` as a settled state — the unit's own reading,
+/// with nothing in flight.
+fn from_unit_active(active: bool) -> State {
+    State::settled(active)
 }
 
 /// What an incoming toggle-**off** should publish immediately, before its
 /// `systemctl stop` has even been spawned.
 ///
-/// Only a pending [`NightlightState::Resolving`] notice is retracted, and only
-/// because the shell put that notice up itself: the toggle-off has already
-/// superseded the parked start (it claimed a newer [`Ticket`]), so "waiting for
-/// a location fix" is false the instant it lands, and leaving it on screen for
-/// the length of a `systemctl` round-trip would be precisely the dishonest
-/// feedback #597 exists to remove. `On`/`Off` are the daemon's readings and stay
-/// its to publish — [`apply`] re-publishes the truth right behind this either
-/// way, so nothing here needs to guess at the outcome of the stop.
-fn retraction_for(current: NightlightState) -> Option<NightlightState> {
-    (current == NightlightState::Resolving).then_some(NightlightState::Off)
+/// Only a pending notice is retracted, and only because the shell put that
+/// notice up itself: the toggle-off has already superseded the parked start (it
+/// claimed a newer [`Ticket`]), so "waiting for a location fix" is false the
+/// instant it lands, and leaving it on screen for the length of a `systemctl`
+/// round-trip would be precisely the dishonest feedback #597 exists to remove.
+/// The `confirmed` half is the daemon's reading and stays its to publish —
+/// [`apply`] re-publishes the truth right behind this either way, so nothing
+/// here needs to guess at the outcome of the stop.
+fn retraction_for(current: State) -> Option<State> {
+    current
+        .is_pending()
+        .then(|| State::settled(*current.confirmed()))
 }
 
 /// Publish `next` only if `ticket` is still the latest request; returns whether
@@ -253,11 +242,7 @@ fn retraction_for(current: NightlightState) -> Option<NightlightState> {
 /// The rule from #594: a superseded task publishes *nothing*. The request that
 /// displaced it owns the signal, so a late write — even an accurate one — only
 /// trades one race for another.
-fn publish_if_current(
-    state: &Mutable<NightlightState>,
-    ticket: &Ticket,
-    next: NightlightState,
-) -> bool {
+fn publish_if_current(state: &Mutable<State>, ticket: &Ticket, next: State) -> bool {
     if !ticket.is_current() {
         return false;
     }
@@ -269,7 +254,7 @@ fn publish_if_current(
 
 #[doc(hidden)]
 pub struct NightlightHandles {
-    pub(crate) state: Mutable<NightlightState>,
+    pub(crate) state: Mutable<State>,
     /// Supersession counter for in-flight [`set_enabled`] tasks — see
     /// [`Generation`]. Cloned out on the GTK thread with `state` and moved
     /// into tokio, like every other handle here.
@@ -288,7 +273,7 @@ impl Service for NightlightService {
 
     fn start(self, rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = NightlightHandles {
-            state: Mutable::new(NightlightState::Off),
+            state: Mutable::new(State::settled(false)),
             generation: Generation::default(),
         };
         // Seed the initial value off the GTK thread: a point-in-time read of the
@@ -304,7 +289,7 @@ impl Service for NightlightService {
         //
         // - There is no panic to recover from. `read_active_state` is total:
         //   every outcome of the `systemctl` call — spawn failure, non-zero
-        //   exit, non-UTF-8 output — is mapped to a `NightlightState`, with no
+        //   exit, non-UTF-8 output — is mapped to a settled `State`, with no
         //   unwrap on any path. A supervisor would never fire. Keep it that
         //   way; adding one would make the next point load-bearing.
         // - A *retried* seed would land late, and a late unconditional write is
@@ -333,13 +318,16 @@ pub fn service() -> NightlightService {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Signal of the night-light toggle's full state — see [`NightlightState`].
+/// Signal of the night-light toggle's full state — the unit's reading plus any
+/// in-flight request; see [`Pending`].
 ///
 /// Seeded once at startup from `systemctl --user show -p ActiveState`; updated
 /// by [`set_enabled`] on every toggle attempt, including the intermediate
-/// [`NightlightState::Resolving`] a start publishes while it waits on a location
-/// fix. This is the accessor a widget that wants to *show* the wait binds to.
-pub fn state() -> impl Signal<Item = NightlightState> {
+/// pending value a start publishes while it waits on a location fix. This is the
+/// accessor a widget that wants to *show* the wait binds to:
+/// [`Pending::displayed`] drives the switch, [`Pending::is_pending`] drives the
+/// spinner.
+pub fn state() -> impl Signal<Item = Pending<bool>> {
     registry::with(|r| {
         r.get::<NightlightHandles>()
             .expect("nightlight::service() not registered")
@@ -350,12 +338,12 @@ pub fn state() -> impl Signal<Item = NightlightState> {
 
 /// Signal of whether the night-light toggle reads "on".
 ///
-/// A projection of [`state`] through [`NightlightState::is_on`], so a start that
-/// is still resolving coordinates reports `true` — see that method for why.
-/// Kept for callers that only want the switch position; anything that needs to
+/// A projection of [`state`] through [`Pending::displayed`], so a start that is
+/// still resolving coordinates reports `true` — see that method for why. Kept
+/// for callers that only want the switch position; anything that needs to
 /// *distinguish* the pending case wants [`state`].
 pub fn enabled() -> impl Signal<Item = bool> {
-    state().map(NightlightState::is_on)
+    state().map(|s| *s.displayed())
 }
 
 /// Toggle the night-light unit. Fire-and-forget.
@@ -373,8 +361,8 @@ pub fn enabled() -> impl Signal<Item = bool> {
 /// Every call claims a [`Generation`], so a toggle-on that is still parked on a
 /// location fix when the next toggle arrives is superseded and drops out
 /// without starting the unit or touching `state` (#594). A toggle-on that has
-/// to park first publishes [`NightlightState::Resolving`], so the row can say
-/// what it is waiting for instead of going silent (#597).
+/// to park first publishes a pending state, so the row can say what it is
+/// waiting for instead of going silent (#597).
 ///
 /// The state signal is re-published afterwards even when the value does not
 /// change (`Mutable::set` notifies unconditionally): on success with the
@@ -428,10 +416,15 @@ pub fn set_enabled(on: bool) {
             let state = state.clone();
             let ticket = ticket.clone();
             move || {
-                if publish_if_current(&state, &ticket, NightlightState::Resolving) {
+                // `request` is a no-op when the unit is already running, so a
+                // start over a live unit never puts a spinner up for a wait
+                // that has nothing left to wait for.
+                let mut next = state.get();
+                next.request(true, FIX_WAIT);
+                if next.is_pending() && publish_if_current(&state, &ticket, next) {
                     tracing::debug!(
                         secs = FIX_WAIT.as_secs(),
-                        "nightlight: parked on a location fix; publishing Resolving"
+                        "nightlight: parked on a location fix; publishing the pending state"
                     );
                 }
             }
@@ -446,9 +439,9 @@ pub fn set_enabled(on: bool) {
                  $TROLLSHELL_WEATHER_CITY), or set \
                  programs.trollshell.nightlight.{{latitude,longitude}}"
             );
-            // Also clears any `Resolving` this request published: the switch
+            // Also clears any pending notice this request published: the switch
             // snaps back, and the row stops claiming it is still waiting.
-            state.set(NightlightState::Off);
+            state.set(State::settled(false));
             return;
         };
         tracing::debug!(
@@ -631,9 +624,8 @@ fn args_file_body(coords: Coords) -> String {
 
 /// Start or stop the unit, then publish the resulting state: the requested one
 /// on success, else whatever `ActiveState` actually reports. Either way the
-/// published value is terminal (`On`/`Off`), so this is also what clears a
-/// [`NightlightState::Resolving`] notice off the row. Blocking — call from
-/// `spawn_blocking`.
+/// published value is settled, so this is also what clears a pending notice off
+/// the row. Blocking — call from `spawn_blocking`.
 ///
 /// The `systemctl` call is unconditional — see the toggle-off branch of
 /// [`set_enabled`] for why a stop must run even when superseded — but the
@@ -644,8 +636,8 @@ fn args_file_body(coords: Coords) -> String {
 /// something for a late write to clobber: without the guard, a superseded stop
 /// publishing `Off` over the `Resolving` a newer toggle-on just put up snaps the
 /// switch back under the user's hand — #594's exact symptom, on the one path
-/// #595 deliberately left unguarded when `Resolving` did not yet exist.
-fn apply(state: &Mutable<NightlightState>, ticket: &Ticket, on: bool) {
+/// #595 deliberately left unguarded when the pending state did not yet exist.
+fn apply(state: &Mutable<State>, ticket: &Ticket, on: bool) {
     let verb = if on { "start" } else { "stop" };
     let status = std::process::Command::new("systemctl")
         .args(["--user", verb, UNIT])
@@ -654,7 +646,7 @@ fn apply(state: &Mutable<NightlightState>, ticket: &Ticket, on: bool) {
         .stderr(Stdio::null())
         .status();
     let outcome = match status {
-        Ok(s) if s.success() => NightlightState::from_unit_active(on),
+        Ok(s) if s.success() => from_unit_active(on),
         Ok(s) => {
             tracing::warn!(
                 ?s,
@@ -678,12 +670,11 @@ fn apply(state: &Mutable<NightlightState>, ticket: &Ticket, on: bool) {
     }
 }
 
-/// Read the unit's `ActiveState` via `systemctl --user show`. Yields
-/// [`NightlightState::On`] only when the value is exactly `active`; any other
-/// state (`inactive`, `failed`, `activating`, …), a non-zero exit, or a missing
-/// `systemctl` all map to [`NightlightState::Off`]. A point-in-time read — see
-/// the module docs.
-fn read_active_state() -> NightlightState {
+/// Read the unit's `ActiveState` via `systemctl --user show`. Yields a settled
+/// `true` only when the value is exactly `active`; any other state (`inactive`,
+/// `failed`, `activating`, …), a non-zero exit, or a missing `systemctl` all map
+/// to a settled `false`. A point-in-time read — see the module docs.
+fn read_active_state() -> State {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "show", "-p", "ActiveState", "--value", UNIT])
         .stdin(Stdio::null())
@@ -692,12 +683,12 @@ fn read_active_state() -> NightlightState {
     match out {
         Ok(out) if out.status.success() => {
             let active = String::from_utf8_lossy(&out.stdout);
-            NightlightState::from_unit_active(active.trim() == "active")
+            from_unit_active(active.trim() == "active")
         }
-        Ok(_) => NightlightState::Off,
+        Ok(_) => State::settled(false),
         Err(e) => {
             tracing::debug!(error = %e, "nightlight: could not read ActiveState (assuming off)");
-            NightlightState::Off
+            State::settled(false)
         }
     }
 }
@@ -705,54 +696,100 @@ fn read_active_state() -> NightlightState {
 #[cfg(test)]
 mod tests {
     use super::{
-        Coords, Generation, NightlightState, args_file_body, parse_coord, publish_if_current,
-        retraction_for,
+        Coords, FIX_WAIT, Generation, State, args_file_body, from_unit_active, parse_coord,
+        publish_if_current, retraction_for,
     };
     use futures_signals::signal::Mutable;
+    use std::time::Instant;
 
-    // ── Pending state (#597) ─────────────────────────────────────────────────
+    /// The unit is stopped and nothing is in flight.
+    const OFF: State = State::settled(false);
+    /// The unit is running.
+    const ON: State = State::settled(true);
+
+    /// A toggle-on parked on a location fix: the unit is *not* running, but the
+    /// user has asked for it (the old `NightlightState::Resolving`). Pinned to a
+    /// caller-chosen deadline so equality comparisons don't race a clock.
+    fn resolving(deadline: Instant) -> State {
+        let mut state = OFF;
+        state.request_until(true, deadline);
+        state
+    }
+
+    /// A deadline far enough out that only an explicit retirement can fire.
+    fn far() -> Instant {
+        Instant::now() + FIX_WAIT * 1000
+    }
+
+    // ── Pending state (#597, converged onto `Pending` by #599) ───────────────
 
     #[test]
-    fn resolving_reads_as_on_so_the_switch_never_moves_under_the_user() {
-        // The whole tri-state hinges on this mapping. `Resolving` reporting
-        // `false` would snap the switch back the instant the user flipped it —
-        // #594's symptom, reintroduced from the other direction.
-        assert!(NightlightState::Resolving.is_on());
-        assert!(NightlightState::On.is_on());
-        assert!(!NightlightState::Off.is_on());
+    fn a_parked_start_reads_as_on_so_the_switch_never_moves_under_the_user() {
+        // The whole state shape hinges on this mapping. A parked start
+        // displaying `false` would snap the switch back the instant the user
+        // flipped it — #594's symptom, reintroduced from the other direction.
+        let parked = resolving(far());
+        assert!(*parked.displayed());
+        assert!(*ON.displayed());
+        assert!(!*OFF.displayed());
+        assert!(
+            !*parked.confirmed(),
+            "the unit is genuinely not running yet; only the intent says on"
+        );
     }
 
     #[test]
-    fn only_resolving_asks_the_row_for_a_pending_affordance() {
-        assert!(NightlightState::Resolving.is_resolving());
-        assert!(!NightlightState::On.is_resolving());
-        assert!(!NightlightState::Off.is_resolving());
+    fn only_a_parked_start_asks_the_row_for_a_pending_affordance() {
+        assert!(resolving(far()).is_pending());
+        assert!(!ON.is_pending());
+        assert!(!OFF.is_pending());
+    }
+
+    #[test]
+    fn the_announced_wait_gives_up_exactly_when_the_coordinate_lookup_does() {
+        // The give-up is part of the value (#599). It has to name the same bound
+        // the lookup is actually wrapped in, or the row would advertise a
+        // deadline nothing enforces.
+        let before = Instant::now();
+        let mut state = OFF;
+        state.request(true, FIX_WAIT);
+        let deadline = state.deadline().expect("a parked start carries a deadline");
+        assert!(deadline >= before + FIX_WAIT);
+        assert!(deadline <= Instant::now() + FIX_WAIT);
+        assert!(
+            !state.expire(before + FIX_WAIT / 2),
+            "the switch holds for the whole wait"
+        );
+        assert!(state.expire(deadline));
+        assert_eq!(
+            state, OFF,
+            "and gives up onto the daemon's reading, which is what the timeout path publishes"
+        );
     }
 
     #[test]
     fn the_unit_can_never_report_the_pending_state() {
-        // `Resolving` is shell-side intent; `ActiveState` only ever means on or
-        // off, so the seed and every failure re-sync land on a terminal state.
-        assert_eq!(NightlightState::from_unit_active(true), NightlightState::On);
-        assert_eq!(
-            NightlightState::from_unit_active(false),
-            NightlightState::Off
-        );
+        // The intent is shell-side; `ActiveState` only ever means on or off, so
+        // the seed and every failure re-sync land on a settled state.
+        assert_eq!(from_unit_active(true), ON);
+        assert_eq!(from_unit_active(false), OFF);
+        assert!(!from_unit_active(true).is_pending());
+        assert!(!from_unit_active(false).is_pending());
     }
 
     #[test]
     fn a_toggle_off_retracts_only_a_pending_notice() {
         assert_eq!(
-            retraction_for(NightlightState::Resolving),
-            Some(NightlightState::Off),
+            retraction_for(resolving(far())),
+            Some(OFF),
             "a pending wait the user just cancelled must come off the row at once"
         );
         assert_eq!(
-            retraction_for(NightlightState::On),
+            retraction_for(ON),
             None,
             "the daemon's reading is its own to publish; `apply` re-publishes it"
         );
-        assert_eq!(retraction_for(NightlightState::Off), None);
+        assert_eq!(retraction_for(OFF), None);
     }
 
     #[test]
@@ -760,21 +797,20 @@ mod tests {
         // The #594 sequence, replayed over the #597 state shape through the
         // real helpers: the pending affordance must not cost the user their
         // ability to bail out, which is also why the row keeps the switch
-        // sensitive while `Resolving`.
-        let state = Mutable::new(NightlightState::Off);
+        // sensitive while a start is parked.
+        let state = Mutable::new(OFF);
         let generation = Generation::default();
 
         // Toggle on with no configured coordinates: claims, parks on a fix, and
-        // announces the wait.
+        // announces the wait exactly as `announce_wait` does.
+        let deadline = far();
         let parked = generation.claim();
-        assert!(publish_if_current(
-            &state,
-            &parked,
-            NightlightState::Resolving
-        ));
-        assert_eq!(state.get(), NightlightState::Resolving);
+        let mut announced = state.get();
+        announced.request_until(true, deadline);
+        assert!(publish_if_current(&state, &parked, announced));
+        assert_eq!(state.get(), resolving(deadline));
         assert!(
-            state.get().is_on(),
+            *state.get().displayed(),
             "the switch stays where the user put it while the fix resolves"
         );
 
@@ -783,22 +819,18 @@ mod tests {
         let off = generation.claim();
         assert_eq!(
             retraction_for(state.get()),
-            Some(NightlightState::Off),
+            Some(OFF),
             "the pending notice is retracted, not left to the systemctl round-trip"
         );
-        state.set(NightlightState::Off);
+        state.set(OFF);
 
         // The fix finally lands. The parked start must publish nothing at all —
-        // not `On`, and not a `Resolving` it is no longer entitled to.
-        assert!(!publish_if_current(&state, &parked, NightlightState::On));
-        assert!(!publish_if_current(
-            &state,
-            &parked,
-            NightlightState::Resolving
-        ));
+        // not `ON`, and not a pending notice it is no longer entitled to.
+        assert!(!publish_if_current(&state, &parked, ON));
+        assert!(!publish_if_current(&state, &parked, resolving(deadline)));
         assert_eq!(
             state.get(),
-            NightlightState::Off,
+            OFF,
             "the off must stand; this is exactly the #594 regression"
         );
         assert!(off.is_current());
@@ -806,41 +838,39 @@ mod tests {
 
     #[test]
     fn a_superseded_stop_cannot_publish_over_a_newer_pending_notice() {
-        // The window the tri-state opened up, and the reason `apply` publishes
-        // through `publish_if_current` rather than writing straight to the
-        // signal. A toggle-off spawns its `systemctl stop` and *then* blocks for
-        // the round-trip; a toggle-on landing inside that window puts up a
-        // `Resolving` the stop knows nothing about. Before the guard, the stop's
-        // `Off` landed last and snapped the switch back mid-wait — #594's
-        // symptom on the one path #595 could safely leave unguarded when `Off`
-        // over `Off` was the worst that could happen.
-        let state = Mutable::new(NightlightState::On);
+        // The window the pending state opened up, and the reason `apply`
+        // publishes through `publish_if_current` rather than writing straight to
+        // the signal. A toggle-off spawns its `systemctl stop` and *then* blocks
+        // for the round-trip; a toggle-on landing inside that window puts up a
+        // pending notice the stop knows nothing about. Before the guard, the
+        // stop's `OFF` landed last and snapped the switch back mid-wait —
+        // #594's symptom on the one path #595 could safely leave unguarded when
+        // `OFF` over `OFF` was the worst that could happen.
+        let state = Mutable::new(ON);
         let generation = Generation::default();
 
-        // Toggle off: claims, retracts nothing (state is `On`), spawns the stop.
+        // Toggle off: claims, retracts nothing (the unit is running), spawns
+        // the stop.
         let stopping = generation.claim();
         assert_eq!(retraction_for(state.get()), None);
 
         // Toggle on lands while that stop is still inside systemctl, and parks.
+        let deadline = far();
         let restarting = generation.claim();
-        assert!(publish_if_current(
-            &state,
-            &restarting,
-            NightlightState::Resolving
-        ));
+        assert!(publish_if_current(&state, &restarting, resolving(deadline)));
 
         // The stop now returns. Its result is accurate — the unit really is
         // stopped — but it no longer owns the signal, so it must stay quiet.
         assert!(
-            !publish_if_current(&state, &stopping, NightlightState::Off),
+            !publish_if_current(&state, &stopping, OFF),
             "a superseded stop publishes nothing, however true its reading"
         );
         assert_eq!(
             state.get(),
-            NightlightState::Resolving,
+            resolving(deadline),
             "the newer toggle-on keeps its pending notice; the switch does not move"
         );
-        assert!(state.get().is_on());
+        assert!(*state.get().displayed());
         assert!(restarting.is_current());
     }
 
@@ -848,20 +878,27 @@ mod tests {
     fn a_second_toggle_on_takes_over_the_pending_notice() {
         // Off is not the only thing that can displace a parked start: a rapid
         // on/off/on leaves the *newest* start owning the signal.
-        let state = Mutable::new(NightlightState::Off);
+        let state = Mutable::new(OFF);
         let generation = Generation::default();
 
         let first = generation.claim();
-        assert!(publish_if_current(
-            &state,
-            &first,
-            NightlightState::Resolving
-        ));
+        assert!(publish_if_current(&state, &first, resolving(far())));
         let second = generation.claim();
 
-        assert!(!publish_if_current(&state, &first, NightlightState::On));
-        assert!(publish_if_current(&state, &second, NightlightState::On));
-        assert_eq!(state.get(), NightlightState::On);
+        assert!(!publish_if_current(&state, &first, ON));
+        assert!(publish_if_current(&state, &second, ON));
+        assert_eq!(state.get(), ON);
+    }
+
+    #[test]
+    fn a_start_over_an_already_running_unit_announces_no_wait() {
+        // `announce_wait`'s guard: `Pending::request` drops an intent that
+        // matches the daemon's reading, so a start issued while the unit is
+        // already active puts no spinner on the row.
+        let mut state = ON;
+        state.request(true, FIX_WAIT);
+        assert!(!state.is_pending());
+        assert_eq!(state, ON);
     }
 
     // ── Toggle supersession (#594) ───────────────────────────────────────────

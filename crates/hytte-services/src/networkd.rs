@@ -137,10 +137,10 @@ pub struct RouteSummary {
 /// A **separate signal** rather than a third state on [`primary`], so consumers
 /// that only want the link — the bar chip, the address rows — keep their
 /// `Option<Link>` untouched and only the callers that render an *absence* have
-/// to ask. That is the one difference from `nightlight`'s `NightlightState`,
-/// which folded its pending state into the signal the switch already bound to
-/// because there was exactly one consumer; here there are several, and most of
-/// them do not care.
+/// to ask. That is the one difference from `nightlight`'s pending toggle state
+/// ([`hytte_reactive::Pending`], #599), which folds its in-flight request into
+/// the signal the switch already bound to because there was exactly one
+/// consumer; here there are several, and most of them do not care.
 ///
 /// It is also **not** [`LinkBackend`]. That is the *decision* of which daemon to
 /// run a watcher against, and it is deliberately optimistic: an inconclusive

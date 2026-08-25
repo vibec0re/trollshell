@@ -28,6 +28,12 @@
 //! particular for the ordering a server-side budget like
 //! `CLAUDE_BRIDGE_TIMEOUT_SECS` has to respect.
 //!
+//! How the prompts refer to the person at the keyboard is *not* a pet knob:
+//! both the persona and the poke stimulus take the desktop owner from the
+//! session-wide `$TROLLSHELL_OWNER`, resolved once per session through the
+//! shared [`hytte_ai_providers::owner`] (neutral fallback, never a guess from
+//! `$USER`) — the same resolver `caw` reads (#696/#706).
+//!
 //! The shared client owns the HTTP + provider config; the pet keeps the
 //! persona, the [`sanitize`] step, and the "empty line ⇒ offline ⇒ canned"
 //! policy. The prompt asks for one plain line; [`sanitize`] enforces it
@@ -90,6 +96,12 @@ struct Cfg {
     provider: Option<Provider>,
     /// `$PET_NAME` — the pet's name in its persona. Default: `nisse`.
     name: String,
+    /// `$TROLLSHELL_OWNER` — how the persona and the poke stimulus refer to
+    /// whoever is running the shell, resolved through the shared
+    /// [`hytte_ai_providers::owner`] (so `caw` reads the same variable, with
+    /// the same neutral [`hytte_ai_providers::DEFAULT_OWNER`] fallback).
+    /// Resolved **once** per session here rather than per prompt.
+    owner: String,
     /// `$PET_LLM_MIN_GAP_SECS` — throttle between two real model calls.
     /// Default: [`MIN_LLM_GAP`].
     min_llm_gap: Duration,
@@ -132,6 +144,7 @@ impl Cfg {
             .filter(|s| !s.is_empty());
         let provider = resolve_provider(std::env::var("PET_LLM_URL").ok().as_deref(), key, model);
         let name = std::env::var("PET_NAME").unwrap_or_else(|_| "nisse".to_owned());
+        let owner = hytte_ai_providers::owner();
         let min_llm_gap = secs_or(
             std::env::var("PET_LLM_MIN_GAP_SECS").ok().as_deref(),
             MIN_LLM_GAP,
@@ -144,6 +157,7 @@ impl Cfg {
         Self {
             provider,
             name,
+            owner,
             min_llm_gap,
             llm_timeout,
             persona,
@@ -228,10 +242,18 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
             Some(provider) if last_llm.is_none_or(|t| t.elapsed() >= cfg.min_llm_gap) => {
                 let provider = provider.clone();
                 let name = cfg.name.clone();
+                let owner = cfg.owner.clone();
                 let timeout = cfg.llm_timeout;
                 let persona_style = cfg.persona.clone();
                 let asked = hytte_plugin::tokio::task::spawn_blocking(move || {
-                    ask_llm(&provider, &name, req, timeout, persona_style.as_deref())
+                    ask_llm(
+                        &provider,
+                        &name,
+                        &owner,
+                        req,
+                        timeout,
+                        persona_style.as_deref(),
+                    )
                 })
                 .await;
                 // Stamp at completion: the gap is between calls, so a slow
@@ -268,13 +290,14 @@ pub async fn brain(mut rx: mpsc::UnboundedReceiver<ThinkReq>, tx: mpsc::Unbounde
 fn ask_llm(
     provider: &Provider,
     name: &str,
+    owner: &str,
     req: ThinkReq,
     timeout: Duration,
     persona_style: Option<&str>,
 ) -> Result<String, String> {
     let messages = [
-        Message::system(persona(name, req, persona_style)),
-        Message::user(event(name, req)),
+        Message::system(persona(name, owner, req, persona_style)),
+        Message::user(event(name, owner, req)),
     ];
     let opts = ChatOpts {
         max_tokens: 32,
@@ -303,14 +326,14 @@ fn ask_llm(
 /// produce lines [`sanitize`] then chops mid-word (#698's decision — a
 /// full-template override was considered and rejected for exactly this).
 ///
-/// The desktop-owner reference used to be hardcoded as `"Annika's Linux
-/// desktop"` (#696 — not every deployment's owner is named Annika); dropped
-/// rather than replaced with another env knob, since nothing else in this
-/// prompt needs a possessive owner name to make sense.
-fn persona(name: &str, req: ThinkReq, style: Option<&str>) -> String {
+/// `owner` is the desktop owner, resolved once per session from
+/// `$TROLLSHELL_OWNER` via the shared [`hytte_ai_providers::owner`] (see
+/// [`Cfg::owner`]). It used to be hardcoded here as `"Annika's Linux
+/// desktop"` — not every deployment's owner is named Annika (#696).
+fn persona(name: &str, owner: &str, req: ThinkReq, style: Option<&str>) -> String {
     let style = style.unwrap_or("playful, a little sassy");
     format!(
-        "You are {name}, a tiny cat who lives in the sidebar of a Linux \
+        "You are {name}, a tiny cat who lives in the sidebar of {owner}'s Linux \
          desktop. It is around {hour}:00 and you feel {mood}. Always \
          answer as {name} the cat. Style: {style}. Format: exactly one \
          line, at most {words} words, plain text, no quotes, no emoji.",
@@ -322,10 +345,17 @@ fn persona(name: &str, req: ThinkReq, style: Option<&str>) -> String {
 
 /// The stimulus, phrased so a tiny model can't just parrot an instruction,
 /// with the format re-anchored at the end (1B models follow the tail best).
-fn event(name: &str, req: ThinkReq) -> String {
+///
+/// This is the **user** message on every request, so the poke branch is the
+/// other half of #696: below [`GRUMPY_AT`] it names the person doing the
+/// poking, and it named a hardcoded `"Annika"` until the shared
+/// [`hytte_ai_providers::owner`] resolver landed. Above [`GRUMPY_AT`] the
+/// stimulus counts pokes instead and mentions nobody — the bug only ever
+/// showed on the first few clicks.
+fn event(name: &str, owner: &str, req: ThinkReq) -> String {
     let stim = match req.kind {
         ThinkKind::Poke if req.pokes >= GRUMPY_AT => format!("*poke #{} in a row*", req.pokes),
-        ThinkKind::Poke => "*Annika pokes you*".to_owned(),
+        ThinkKind::Poke => format!("*{owner} pokes you*"),
         ThinkKind::Idle if req.mood == "sleepy" => {
             "(late night, everything is quiet, you are sleepy)".to_owned()
         }
@@ -438,6 +468,7 @@ pub fn canned(req: ThinkReq, step: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hytte_ai_providers::DEFAULT_OWNER;
     use std::io::{Read, Write};
 
     /// Working estimate of one English word plus its trailing space, used to
@@ -506,10 +537,15 @@ mod tests {
             mood: "happy",
             pokes: 0,
         };
-        let default_prompt = persona("nisse", req, None);
+        let default_prompt = persona("nisse", DEFAULT_OWNER, req, None);
         assert!(default_prompt.contains("Style: playful, a little sassy."));
 
-        let custom_prompt = persona("nisse", req, Some("gentle and philosophical"));
+        let custom_prompt = persona(
+            "nisse",
+            DEFAULT_OWNER,
+            req,
+            Some("gentle and philosophical"),
+        );
         assert!(custom_prompt.contains("Style: gentle and philosophical."));
         assert!(
             !custom_prompt.contains("playful, a little sassy"),
@@ -534,12 +570,96 @@ mod tests {
         );
     }
 
+    /// #696, persona half: the owner possessive comes from the resolved owner,
+    /// and the neutral default names nobody in particular.
+    #[test]
+    fn persona_embeds_the_resolved_owner_and_never_a_hardcoded_name() {
+        let req = ThinkReq {
+            kind: ThinkKind::Idle,
+            hour: 9,
+            mood: "happy",
+            pokes: 0,
+        };
+        assert!(
+            persona("nisse", "kaesaecracker", req, None).contains("kaesaecracker's Linux desktop"),
+        );
+        let neutral = persona("nisse", DEFAULT_OWNER, req, None);
+        assert!(neutral.contains("your human's Linux desktop"), "{neutral}");
+        assert!(
+            !neutral.to_lowercase().contains("annika"),
+            "the default persona must not name a specific person: {neutral}",
+        );
+    }
+
+    /// #696, the half [`persona`]'s test could never have caught: the poke
+    /// stimulus is the **user** message on every request, and below
+    /// [`GRUMPY_AT`] it hardcoded `"*Annika pokes you*"` — so a configured
+    /// brain was told the wrong person's name on every early click. It now
+    /// carries the resolved owner; the grumpy branch counts pokes and names
+    /// nobody, and neither idle branch mentions an owner at all.
+    #[test]
+    fn event_poke_names_the_resolved_owner_and_never_a_hardcoded_name() {
+        let poke = |pokes| ThinkReq {
+            kind: ThinkKind::Poke,
+            hour: 14,
+            mood: "happy",
+            pokes,
+        };
+
+        let named = event("nisse", "kaesaecracker", poke(1));
+        assert!(
+            named.contains("*kaesaecracker pokes you*"),
+            "the poker is the resolved owner: {named}",
+        );
+        let neutral = event("nisse", DEFAULT_OWNER, poke(1));
+        assert!(
+            neutral.contains("*your human pokes you*"),
+            "unset `$TROLLSHELL_OWNER` → the neutral phrase: {neutral}",
+        );
+        assert!(
+            !neutral.to_lowercase().contains("annika"),
+            "the poke stimulus must not hardcode an owner name: {neutral}",
+        );
+        // The tail anchor the prompt relies on survives either way.
+        assert!(
+            named.ends_with("— say your one line now, as nisse:"),
+            "{named}"
+        );
+
+        // Grumpy branch: pokes are counted, nobody is named.
+        let grumpy = event("nisse", "kaesaecracker", poke(GRUMPY_AT));
+        assert!(
+            grumpy.contains(&format!("*poke #{GRUMPY_AT} in a row*")),
+            "{grumpy}",
+        );
+        assert!(
+            !grumpy.contains("kaesaecracker"),
+            "the grumpy stimulus names nobody: {grumpy}",
+        );
+
+        // Idle branches carry no owner mention either.
+        for mood in ["sleepy", "happy"] {
+            let idle = event(
+                "nisse",
+                "kaesaecracker",
+                ThinkReq {
+                    kind: ThinkKind::Idle,
+                    hour: 2,
+                    mood,
+                    pokes: 0,
+                },
+            );
+            assert!(!idle.contains("kaesaecracker pokes"), "{idle}");
+        }
+    }
+
     /// #700: the persona's word budget has to fit the [`MAX_LINE`] clamp, or
     /// an obedient model's reply is truncated with an ellipsis every time.
     #[test]
     fn prompt_word_budget_fits_the_line_clamp() {
         let prompt = persona(
             "nisse",
+            DEFAULT_OWNER,
             ThinkReq {
                 kind: ThinkKind::Idle,
                 hour: 9,
@@ -690,6 +810,7 @@ mod tests {
         let line = ask_llm(
             &Provider::llama(base),
             "nisse",
+            "kaesaecracker",
             ThinkReq {
                 kind: ThinkKind::Idle,
                 hour: 15,
@@ -712,6 +833,7 @@ mod tests {
         let err = ask_llm(
             &Provider::llama(base),
             "nisse",
+            "kaesaecracker",
             ThinkReq {
                 kind: ThinkKind::Poke,
                 hour: 15,
@@ -736,6 +858,7 @@ mod tests {
         let err = ask_llm(
             &Provider::llama(format!("http://{addr}")),
             "nisse",
+            "kaesaecracker",
             ThinkReq {
                 kind: ThinkKind::Poke,
                 hour: 15,
@@ -762,6 +885,7 @@ mod tests {
         let err = ask_llm(
             &Provider::llama(format!("http://{addr}")),
             "nisse",
+            "kaesaecracker",
             ThinkReq {
                 kind: ThinkKind::Poke,
                 hour: 15,
@@ -795,10 +919,12 @@ mod live_tests {
         let base =
             std::env::var("PET_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
         let provider = Provider::llama(base);
+        let owner = hytte_ai_providers::owner();
 
         let poke = ask_llm(
             &provider,
             "nisse",
+            &owner,
             ThinkReq {
                 kind: ThinkKind::Poke,
                 hour: 21,
@@ -815,6 +941,7 @@ mod live_tests {
         let idle = ask_llm(
             &provider,
             "nisse",
+            &owner,
             ThinkReq {
                 kind: ThinkKind::Idle,
                 hour: 2,

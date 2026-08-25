@@ -25,14 +25,16 @@
 //!   `chat()` call through [`hytte_ai_providers`]. Keyless and URL-less
 //!   resolves to the plain path up front: no doomed network round-trips
 //!   (the #438/#472 rule). The voiced [`persona`] names the desktop's owner
-//!   from `$TROLLSHELL_OWNER`, falling back to a neutral phrase rather than a
-//!   hardcoded third party (#706).
+//!   from `$TROLLSHELL_OWNER` — through the shared
+//!   [`hytte_ai_providers::owner`] resolver, so caw and the pet agree on the
+//!   variable and on its neutral fallback — rather than a hardcoded third
+//!   party (#706/#696).
 //! - The reducer side (sticky-until-poked, the toast) lives in `main.rs`.
 
 use std::path::PathBuf;
 
 use chrono::{Datelike, NaiveDate, Timelike};
-use hytte_ai_providers::{ChatOpts, Message, Provider};
+use hytte_ai_providers::{ChatOpts, Message, Provider, owner};
 
 use crate::ingredients::{self, EventBrief, Ingredients};
 
@@ -50,25 +52,24 @@ const WINDOW_MINS: u16 = 6 * 60;
 /// whatever the model does.
 const MAX_BRIEF: usize = 220;
 
-/// Neutral fallback for the persona's owner mention when `$TROLLSHELL_OWNER`
-/// is unset — caw doesn't guess a name for whoever is actually running the
-/// shell (#706). The identical bug in the pet's persona is tracked separately
-/// as #696; once that settles on a shared resolver, both plugins can read the
-/// same env var through it.
-const DEFAULT_OWNER: &str = "your human";
-
 /// caw's standing news-desk persona: facts-only by instruction, with the
-/// desktop owner's name resolved from `$TROLLSHELL_OWNER` (falling back to
-/// [`DEFAULT_OWNER`]) rather than a hardcoded third party (#706). [`sanitize`]
-/// still enforces the format mechanically.
+/// desktop owner's name resolved from `$TROLLSHELL_OWNER` rather than a
+/// hardcoded third party (#706). [`sanitize`] still enforces the format
+/// mechanically.
+///
+/// The resolver and its neutral fallback moved to
+/// [`hytte_ai_providers::owner`]/[`hytte_ai_providers::DEFAULT_OWNER`] when
+/// #696 fixed the same bug in the pet — that's the shared resolver this
+/// comment used to say both plugins should end up reading through.
 fn persona() -> String {
-    persona_for(&owner_or(std::env::var("TROLLSHELL_OWNER").ok().as_deref()))
+    persona_for(&owner())
 }
 
 /// Core of [`persona`] with the resolved owner name injected, so it's
 /// unit-testable without mutating the process environment (`unsafe` under
 /// edition 2024, which this crate forbids) — same split as
-/// [`resolve_provider`]/[`parse_time`] below.
+/// [`resolve_provider`]/[`parse_time`] below, and as
+/// [`hytte_ai_providers::owner`]/[`hytte_ai_providers::owner_or`].
 fn persona_for(owner: &str) -> String {
     format!(
         "You are caw, a sardonic cybercrow who lives in the sidebar of {owner}'s \
@@ -78,15 +79,6 @@ fn persona_for(owner: &str) -> String {
          emoji, no quotes, no lists. Mention only facts you were given; never \
          invent events, weather, or trains."
     )
-}
-
-/// Resolve `$TROLLSHELL_OWNER`: trimmed and non-empty wins, else
-/// [`DEFAULT_OWNER`]. Blank/whitespace-only counts as unset — same
-/// trim-then-check-empty shape as `hytte_ai_providers::load_key_from`.
-fn owner_or(raw: Option<&str>) -> String {
-    raw.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| DEFAULT_OWNER.to_owned(), str::to_owned)
 }
 
 /// Canned openers, cycled by day-of-year so consecutive mornings differ.
@@ -433,6 +425,9 @@ pub(crate) fn brief_now(provider: Option<&Provider>, events: Vec<EventBrief>) ->
 mod tests {
     use super::*;
     use crate::ingredients::{DepartureBrief, EventBrief, WeatherBrief};
+    // The owner resolver moved to `hytte-ai-providers` (#696); caw's own
+    // coverage of it stays here unchanged, now pointed at the shared items.
+    use hytte_ai_providers::{DEFAULT_OWNER, owner_or};
     use std::io::{Read, Write};
 
     fn date(s: &str) -> NaiveDate {

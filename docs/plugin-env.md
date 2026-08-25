@@ -43,6 +43,35 @@ systemd, not something you set per-plugin — they're omitted from the tables
 below and noted inline only where a plugin's behavior depends on them in a
 non-obvious way.
 
+## New-install checklist
+
+Most of what's below is already owner-neutral out of the box — unset, or a
+documented neutral fallback. A couple of things default instead to values
+that only ever fit this project's own first deployment, and won't fit
+anyone else's. Check these on a fresh install:
+
+- **Departures' home station.** `hytte-services::places` seeds
+  `~/.config/trollshell/places.toml` on first run with one `[[place]]` for
+  Berlin-Schöneweide (`station = "900192001"`, the BVG id for S Schöneweide
+  Bhf) — see the `departures` section below, which reads this file's station
+  config directly. Past just being the wrong city for you, the departures
+  fetch itself talks straight to `v6.bvg.transport.rest`, Berlin's own
+  transit API, with no alternate backend configurable anywhere — so today
+  the whole `departures` plugin (and caw's departures ingredient, which
+  shares the same feed and file) only works for stations inside BVG's
+  transit network. Outside that network there's currently no station id
+  that will work; disable the plugin rather than hunting for one. That
+  backend coupling is a code constraint, not a config knob, so it's out of
+  this doc's scope to fix — flag it if you hit it.
+- **Weather's fallback city**, `TROLLSHELL_WEATHER_CITY` — genuinely global
+  (open-meteo, not BVG-scoped), unset by default, and GeoClue2 is tried
+  first regardless. Only needs setting if GeoClue2 isn't available on your
+  box; see the `weather` section below and
+  `programs.trollshell.weather.fallbackCity`.
+- **caw's owner mention**, `TROLLSHELL_OWNER` — see the `caw` section
+  below. Already owner-neutral by default (falls back to "your human"), so
+  this one is optional polish, not something a fresh install must set.
+
 ## Bundled plugins
 
 Sections below follow `bundledPluginNames`' order in `flake.nix` (12 total).
@@ -58,14 +87,15 @@ No runtime knobs — configuration is entirely via the shell/wire protocol.
 
 ### caw (`hytte-plugin-caw`)
 
-| Variable                  | Default                                                                        | Effect                                                                                                                                                                                                                                                                                                                              |
-| ------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CAW_BRIEFING_TIME`       | `07:00`                                                                        | Local trigger time for the once-daily morning briefing, as `H` or `H:MM`. `off`/`none` disables the briefing entirely. An unparseable value silently falls back to the default rather than erroring (`briefing.rs::parse_time`).                                                                                                    |
-| `CAW_LLM_URL`             | unset (→ OpenRouter, only if a key is resolved)                                | Base URL for the briefing's voiced-composition backend. Set to a local `llama-server` URL (e.g. `http://127.0.0.1:8080`) to self-host; set to `""` explicitly to force the plain canned-template composer with no network call. Unset with no key resolved also falls back to the plain composer (`briefing.rs::resolve_provider`). |
-| `CAW_LLM_MODEL`           | unset                                                                          | Model id sent in the chat request body when using the OpenRouter path (cloud endpoints require a model id — see the SDK-level note below on what happens if it's left unset). Ignored by a local `llama-server`, which uses its own loaded model.                                                                                   |
-| `CAW_LLM_API_KEY`         | unset                                                                          | Fallback OpenRouter API key, used only if `hytte_ai_providers::load_key("openrouter")` (see "Shared" below) finds nothing. Prefer `plugins.caw.secrets = [ "openrouter" ];` instead — this direct env path exists but isn't the recommended one (world-readable launch-state file).                                                 |
-| `CAW_EXPRESSION_PATH`     | `$XDG_STATE_HOME/caw/expression.json` (→ `~/.local/state/caw/expression.json`) | Overrides the path to the expression file caw's own `opencaw` `caw_express` tool writes and this plugin polls read-only. The default matches `opencaw`'s own default, so the two ends agree with no configuration (`expression.rs::expression_path`).                                                                               |
-| `TROLLSHELL_WEATHER_CITY` | unset                                                                          | Briefing-only fallback: when the first `[[place]]` in `~/.config/trollshell/places.toml` has no `lat`/`lon`, the briefing forward-geocodes this city name for its weather ingredient (`ingredients.rs::coords`) — the same var the weather plugin itself reads (see below). Not documented anywhere for `caw` prior to this sweep.  |
+| Variable                  | Default                                                                        | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CAW_BRIEFING_TIME`       | `07:00`                                                                        | Local trigger time for the once-daily morning briefing, as `H` or `H:MM`. `off`/`none` disables the briefing entirely. An unparseable value silently falls back to the default rather than erroring (`briefing.rs::parse_time`).                                                                                                                                                                                                                |
+| `CAW_LLM_URL`             | unset (→ OpenRouter, only if a key is resolved)                                | Base URL for the briefing's voiced-composition backend. Set to a local `llama-server` URL (e.g. `http://127.0.0.1:8080`) to self-host; set to `""` explicitly to force the plain canned-template composer with no network call. Unset with no key resolved also falls back to the plain composer (`briefing.rs::resolve_provider`).                                                                                                             |
+| `CAW_LLM_MODEL`           | unset                                                                          | Model id sent in the chat request body when using the OpenRouter path (cloud endpoints require a model id — see the SDK-level note below on what happens if it's left unset). Ignored by a local `llama-server`, which uses its own loaded model.                                                                                                                                                                                               |
+| `CAW_LLM_API_KEY`         | unset                                                                          | Fallback OpenRouter API key, used only if `hytte_ai_providers::load_key("openrouter")` (see "Shared" below) finds nothing. Prefer `plugins.caw.secrets = [ "openrouter" ];` instead — this direct env path exists but isn't the recommended one (world-readable launch-state file).                                                                                                                                                             |
+| `CAW_EXPRESSION_PATH`     | `$XDG_STATE_HOME/caw/expression.json` (→ `~/.local/state/caw/expression.json`) | Overrides the path to the expression file caw's own `opencaw` `caw_express` tool writes and this plugin polls read-only. The default matches `opencaw`'s own default, so the two ends agree with no configuration (`expression.rs::expression_path`).                                                                                                                                                                                           |
+| `TROLLSHELL_OWNER`        | unset (→ `"your human"`)                                                       | Name (or descriptor) caw's persona uses for the desktop owner in the morning briefing, e.g. `Jordan` or `the household`. Trimmed; blank counts as unset. Never guesses a name from `$USER`/GECOS — falls back to the neutral default instead (`briefing.rs::owner_or`, #706). The identical case for the pet's own persona is `PET_NAME` below, which names the _pet_, not the owner — pet's persona doesn't reference the owner at all (#696). |
+| `TROLLSHELL_WEATHER_CITY` | unset                                                                          | Briefing-only fallback: when the first `[[place]]` in `~/.config/trollshell/places.toml` has no `lat`/`lon`, the briefing forward-geocodes this city name for its weather ingredient (`ingredients.rs::coords`) — the same var the weather plugin itself reads (see below). Not documented anywhere for `caw` prior to this sweep.                                                                                                              |
 
 Also reads `$HOME` (to locate `places.toml`) and `$XDG_STATE_HOME`/`$HOME`
 (for the expression/briefing-stamp state dir) — standard XDG paths, not

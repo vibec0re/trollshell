@@ -1228,9 +1228,35 @@ fn reset_drawer_open_states() {
 ///   the stack child to `target` (crossfade + height) without retracting.
 /// - For closed panels, does nothing — we only switch what's actually open.
 ///
-/// If the user has no drawer open when this fires, the call is a no-op.
-/// Future work could open `target` on the primary monitor in that case;
-/// for v1 we treat the deep-link as "in this drawer, jump there".
+/// If no drawer is open on *any* monitor, the deep-link falls back to
+/// **opening** `target` on niri's focused output rather than doing nothing
+/// (#799). The v1 behaviour here was a documented no-op — fine while the only
+/// caller was [`crate::components::deep_link_row`], a row that by construction
+/// lives inside an already-open drawer, but wrong for every monitor-less caller
+/// the command surface keeps growing (#219): a silent no-op is indistinguishable
+/// from a broken keybind, so it gets reported against the binding rather than
+/// against this.
+///
+/// **Why niri's focused output, and not a "primary" monitor.** The issue framed
+/// the choice as primary-vs-pointer-focus; the codebase settles it. GTK4 has no
+/// primary monitor to ask for — `gdk_display_get_primary_monitor` did not
+/// survive GTK3 — so "primary" would have to be *invented* here, as the first
+/// entry of `app.monitors()` or the first key of [`PANELS`] (i.e. `HashMap`
+/// iteration order). Both are arbitrary and neither is stable across a hot-plug.
+/// niri, by contrast, *tells us* which output is focused, and
+/// [`crate::components::focused_output`] is already the shell's single cache of
+/// it — the same routing every other monitor-less entry point uses (`commands`'
+/// `open-page`/`power-menu` verbs, `plugins::effects`' `Effect::OpenPage`, the
+/// OSD and the notification toasts). Pointer focus is the weaker tie-break for
+/// this caller: it needs its own GDK tracking, and it disagrees with keyboard
+/// focus exactly when the user has parked the mouse on a screen they are *not*
+/// working on — the wrong answer for a keybind-driven verb.
+///
+/// The fallback inherits [`open_on_focused`]'s own degradation: an unknown
+/// focused output (niri startup, no focused workspace, or the cache never
+/// installed) or one with no drawer mounted still opens *a* mounted drawer, so
+/// the deep-link lands somewhere instead of going quiet again. It is a genuine
+/// no-op only when no drawer is mounted anywhere — i.e. no bars exist at all.
 pub fn switch_active(target: Page) {
     // Snapshot the handles first, then act with no `PANELS` borrow live (#643):
     // `set_stack_page` and `on_page_show` are runs of GTK calls, and holding the
@@ -1238,14 +1264,25 @@ pub fn switch_active(target: Page) {
     // `PANELS` — `close_all`'s and `install`'s `borrow_mut()` are the
     // counterparties — panics, fatally, from inside a glib callback. Cloning an
     // `Rc` per open drawer is a refcount bump.
+    let mut switched = false;
     for panel in live_panels() {
         if panel.current.borrow().is_some() {
             set_stack_page(&panel, target);
             *panel.current.borrow_mut() = Some(Active::Builtin(target));
             on_page_show(&panel, target);
+            switched = true;
         }
     }
     recompute_gates();
+    if switched {
+        return;
+    }
+    // Nothing was open to jump within → open `target` instead. `open_by_key`
+    // recomputes the gates itself once the page is showing, so the call above
+    // stays exactly where it was for the common (switched) path rather than
+    // moving into a branch.
+    let focused = crate::components::focused_output::current();
+    open_on_focused(focused.as_deref(), target);
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content

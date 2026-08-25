@@ -36,11 +36,13 @@ use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, call, proxy, signa
 use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Structure, Value};
+
+use crate::retry;
 
 // ── Public data shapes ────────────────────────────────────────────────────────
 
@@ -155,20 +157,35 @@ impl Service for TrayService {
         // name disappears. Supervised so a panic in the watcher restarts the
         // reconnect loop rather than leaving pruning dead for the process
         // lifetime; the inner `loop` still drives the ordinary reconnect.
+        //
+        // The reconnect delay used to be an uncapped flat 2s; #795's first
+        // half moved it onto `retry::RECONNECT_RETRY`, resetting the attempt
+        // count after a `watch_name_owner_changes` run that stayed up at
+        // least `retry::RECONNECT_RESET_AFTER` so a merely-flaky session bus
+        // doesn't ratchet to the 30s ceiling and stay there.
         let state2 = state;
         spawn_supervised("tray", move || {
             let state = state2.clone();
             async move {
+                let mut attempt: u32 = 1;
                 loop {
-                    match watch_name_owner_changes(&state).await {
+                    let started = std::time::Instant::now();
+                    let outcome = watch_name_owner_changes(&state).await;
+                    let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                    match outcome {
                         Ok(()) => {
-                            tracing::warn!("tray NOC stream closed, reconnecting in 2s");
+                            tracing::warn!(?delay, "tray NOC stream closed, reconnecting");
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "tray NOC watcher error, reconnecting in 2s");
+                            tracing::warn!(?delay, error = %e, "tray NOC watcher error, reconnecting");
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
+                        1
+                    } else {
+                        attempt.saturating_add(1)
+                    };
+                    tokio::time::sleep(delay).await;
                 }
             }
         });

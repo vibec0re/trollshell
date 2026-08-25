@@ -36,7 +36,12 @@ let
   # including enable = false ones ("enabled": false — declared but not
   # auto-launched), so a disabled plugin still lists in the control-center's
   # Plugins tab and can be started manually. Same JSON as the home-manager
-  # module builds; keep the two in sync.
+  # module builds, minus its top-level "target" key (#707): that renders
+  # `programs.trollshell.systemd.target`, a home-manager-only option — this
+  # module ships no shell user unit of its own, so it has no session target to
+  # bind plugins to. The key is optional on the shell side and its absence means
+  # graphical-session.target, which is exactly what this module wants. Keep the
+  # rest of the two in sync.
   pluginsState = builtins.toJSON {
     version = 1;
     plugins = lib.mapAttrs (_: plugin: {

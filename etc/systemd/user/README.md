@@ -82,21 +82,66 @@ unit per plugin binary on the same pattern.
 > launches each enabled plugin itself as a **transient** user unit of the same
 > `trollshell-plugin-<id>.service` name via `systemd-run --user`
 > (`trollshell/src/plugin_launcher.rs`). Supervision is still systemd's
-> (`Restart=on-failure`, `PartOf=graphical-session.target`), and the static
+> (`Restart=on-failure`, and `PartOf=` the session target), and the static
 > units below keep working as the manual path — the socket doesn't care who
 > spawned the plugin.
 >
-> Since #695 that launch step is a **reconcile**, not a one-shot spawn: at
-> startup (and whenever something calls `Control.ReloadPlugins`) the shell
-> diffs the live units against the state file and starts / stops / restarts to
-> match. It tells them apart by a spec fingerprint stamped into each unit's
-> `Description=`, so `systemctl --user show -p Description
-trollshell-plugin-<id>` shows which config a running plugin was launched
-> from. Units it didn't stamp — the static ones below — are never touched. The
-> **home-manager** module calls `ReloadPlugins` from its activation script, so
-> a `home-manager switch` applies live; the **NixOS** module can't (root
-> activation has no user session bus), so there a changed `env`/`package` lands
-> on the next `systemctl --user restart trollshell` or login.
+> Since #707 that `PartOf=` is the state file's top-level `"target"`, which
+> home-manager renders from `programs.trollshell.systemd.target` — **the same
+> target the shell's own unit binds to**. It used to be hardcoded to
+> `graphical-session.target`, so a session using the documented
+> `niri-session.target` (what this directory ships) had the shell on one target
+> and its plugins on another, and teardown reached them out of step. A
+> `plugins.json` with no `"target"` still means `graphical-session.target`, so
+> nothing older breaks. Check what a running plugin actually got with
+> `systemctl --user show -p PartOf trollshell-plugin-<id>`.
+>
+> ### How a config change reaches a running plugin (#419 → #695 → #707)
+>
+> The units are **transient** — created by the shell at runtime — so there is no
+> unit file on disk for activation to diff or `systemctl daemon-reload` to pick
+> up. Editing `programs.trollshell.plugins.<id>.env` and switching therefore
+> can't reach the running process the way a normal unit change would. The chain
+> that makes it work instead:
+>
+> 1. **nix rewrites the state file.** A switch renders
+>    `~/.config/trollshell/plugins.json` afresh from the option — every plugin's
+>    `exec` (a store path, so a rebuilt `package` is a new value), `env`,
+>    `secrets`, `enabled`, plus the session `target`.
+> 2. **something pokes `Control.ReloadPlugins`.** The home-manager module does
+>    it from its activation script (`busctl --user call … ReloadPlugins`, with a
+>    `|| true` so a switch outside a graphical session is a no-op). The shell
+>    also reconciles on its own at startup, which is the only path a
+>    NixOS-module deployment gets — root activation has no user session bus.
+> 3. **the shell reconciles** (#695): it lists the live `trollshell-plugin-*`
+>    units, diffs them against the freshly read file, and starts what was added
+>    or enabled, stops what was disabled or removed, and **restarts** anything
+>    whose declared spec changed.
+> 4. **the diff runs on a fingerprint** stamped into each unit's `Description=`
+>    at spawn, covering `exec` + `env` + `secrets` + a non-default `target`.
+>    `systemctl --user show -p Description trollshell-plugin-pet` reads it
+>    back; a unit the shell never stamped — the static ones below — is never
+>    touched.
+>
+> So: **under home-manager a `switch` applies live.** Under the NixOS module,
+> or if the shell wasn't running when you switched, a changed `env`/`package`
+> lands on the next `systemctl --user restart trollshell` or login. To force it
+> by hand at any time:
+>
+> ```sh
+> busctl --user call mov.vibec0re.trollshell.Control \
+>   /mov/vibec0re/trollshell/Control \
+>   mov.vibec0re.trollshell.Control ReloadPlugins
+> ```
+>
+> Two things deliberately do **not** ride this path: a **secret** rotated in the
+> control-center's AI Keys tab (that has its own precise relaunch, #392 — the
+> values never enter `plugins.json`), and the control-center Plugins tab's
+> start/stop, which is a runtime action rather than a declaration. Since #707
+> that tab's `StartPlugin`/`StopPlugin`/`SetPluginEnabled` **report failure**
+> back over D-Bus instead of only logging it, so a start whose unit never came
+> up surfaces as an error rather than as apparent success — check the journal
+> for the cause either way.
 >
 > Since #558 each bundled plugin also ships as its own flake package
 > (`hytte-plugin-<id>`), so the declarative path needs no out-of-tree
@@ -268,18 +313,42 @@ loopback bind.
 The bridge's own unit carries
 `UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX`,
 because any of those would move billing off the subscription with nothing
-visible to show for it. The binary **refuses to start** if it still finds one
-set (it can't scrub them itself: `std::env::remove_var` is unsafe under edition
-2024 and this workspace forbids unsafe). If the unit fails with "refusing to
-start", that message names the variable to unset.
+visible to show for it. In the two `claude` modes the binary **refuses to
+start** if it still finds one set (it can't scrub them itself:
+`std::env::remove_var` is unsafe under edition 2024 and this workspace forbids
+unsafe). If the unit fails with "refusing to start", that message names the
+variable to unset. The refusal is **mode-scoped** (#730): it guards the `claude`
+child, and `api` mode spawns none — see below.
 
-Prerequisite: the `claude` CLI on the user manager's `PATH`, already logged in.
-Optional knobs — `CLAUDE_BRIDGE_{MODEL,MODE,PORT,TIMEOUT_SECS,STATE_DIR}` — are
-documented in the unit's comments. `CLAUDE_BRIDGE_MODE` picks between the
-default `subscription` path (a persisted claude session, resumed with only the
-newest message so the prompt prefix stays cacheable) and `reprompt` (a one-off
-session per turn, with the bridge holding the transcript and nothing persisted
-to disk).
+Prerequisite: the `claude` CLI on the user manager's `PATH`, already logged in
+(`api` mode excepted — it spawns no `claude` at all). Optional knobs —
+`CLAUDE_BRIDGE_{MODEL,MODE,PORT,TIMEOUT_SECS,STATE_DIR,THINKING}` — are
+documented in the unit's comments. `CLAUDE_BRIDGE_MODE` picks between **three**
+backends:
+
+| `CLAUDE_BRIDGE_MODE`               | what it runs                                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `subscription` (default)           | a persisted `claude` session per conversation, resumed with only the newest message so the prompt prefix stays cacheable |
+| `reprompt`                         | a one-off `claude` session per turn, with the bridge holding the transcript and nothing persisted to disk                |
+| `api` (also `api-key`, `messages`) | no `claude` child at all: `POST /v1/messages` against the Anthropic API, **billed per token** (#730/#751)                |
+
+`api` mode is the reason the `UnsetEnvironment=` line above is worth
+understanding rather than just keeping. That mode needs an Anthropic key, and
+the shipped unit strips `ANTHROPIC_API_KEY` from its environment — deliberately
+(#752): an inherited key that quietly starts billing is a worse failure than a
+mode that has to read its key from a file. So under this unit the **only** place
+the key can come from is
+
+```
+~/.config/trollshell/anthropic.key      # chmod 600; trimmed, empty == unset
+```
+
+Adding `Environment=ANTHROPIC_API_KEY=…` to the unit is a no-op — the scrub runs
+after it, the bridge finds no key, and refuses to start. The env override exists
+for `cargo run`, not for systemd. `CLAUDE_BRIDGE_THINKING` (`disabled` by
+default, or `adaptive` / `auto`) is `api`-mode-only and load-bearing there:
+`max_tokens` bounds thinking _plus_ answer text, and these consumers ask for
+only a couple of hundred tokens of kaomoji.
 
 **Two timeouts, and their order matters.** `CLAUDE_BRIDGE_TIMEOUT_SECS` (8s by
 default) is the bridge's per-request budget; the _client_'s budget is the pet's

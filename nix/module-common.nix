@@ -630,10 +630,14 @@ self:
         home-manager, /etc/xdg via the NixOS module) that the running shell
         reads at startup, launching each enabled entry as a *transient*
         `trollshell-plugin-<id>` user unit via `systemd-run --user`
-        (trollshell/src/plugin_launcher.rs; Restart=on-failure,
-        PartOf=graphical-session.target — supervision and session lifetime
+        (trollshell/src/plugin_launcher.rs; Restart=on-failure, and
+        `PartOf=` the session target — supervision and session lifetime
         stay systemd's job, and the launch env is where #392's key
-        injection hooks in). Being an attrset of submodules (the standard
+        injection hooks in). Under home-manager that `PartOf=` is
+        `programs.trollshell.systemd.target`, the same target the shell's
+        own unit binds to (#707); the NixOS module declares no such option,
+        so its plugins bind to graphical-session.target. Being an attrset
+        of submodules (the standard
         named-instance pattern), entries merge per-field across modules —
         a second module can override one field of one plugin
         (`plugins.pet.env.PET_NAME = lib.mkForce "nisse";`) or disable it

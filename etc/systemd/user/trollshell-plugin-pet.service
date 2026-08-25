@@ -15,6 +15,11 @@ ExecStart=/usr/local/bin/hytte-plugin-pet
 # LLM) — drop a key in ~/.config/trollshell/openrouter.key (never in git or
 # this unit; it's read via hytte-ai-providers::load_key) and pick a model.
 Environment=PET_NAME=nisse
+# Desktop owner's name, session-wide (read via hytte_ai_providers::owner by
+# both this plugin and caw). Managed declaratively by
+# programs.trollshell.ownerName under Nix; set it here directly on the
+# non-Nix path. Leave unset for the neutral "your human" fallback.
+#   Environment=TROLLSHELL_OWNER=Jordan
 # A small, cheap chat model. OpenRouter's `:free` variants are gated (they need
 # a privacy opt-in / are heavily rate-limited), so the default is a paid one —
 # the pet calls it at most once per 15s, so it's pennies. Swap freely.

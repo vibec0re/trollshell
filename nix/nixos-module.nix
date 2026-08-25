@@ -135,6 +135,15 @@ in
           cfg.weather.fallbackCity != null
         ) cfg.weather.fallbackCity;
 
+        # Desktop owner's name (#696/#813), session-wide so pet and caw's LLM
+        # personas both pick it up without per-plugin env wiring. null means
+        # "unset entirely" — both plugins fall back to their neutral "your
+        # human" default (`hytte_ai_providers::owner()`), and an empty string
+        # would be noise (owner_or treats blank the same as unset anyway).
+        environment.sessionVariables.TROLLSHELL_OWNER = lib.mkIf (
+          cfg.ownerName != null
+        ) cfg.ownerName;
+
         # Wallpaper reload command for the Appearance picker. Defaults follow
         # wallpaper.backend: null for swaybg (restart swaybg.service — the
         # shell's built-in default) and none; `awww img {}` for awww. The chosen

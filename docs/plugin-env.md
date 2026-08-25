@@ -73,7 +73,8 @@ anyone else's. Check these on a fresh install:
   today `caw`'s morning briefing and `pet`'s cat (both through the shared
   `hytte_ai_providers::owner`). See those two sections below. Already
   owner-neutral by default (falls back to "your human"), so this one is
-  optional polish, not something a fresh install must set.
+  optional polish, not something a fresh install must set. Set it once via
+  `programs.trollshell.ownerName` rather than per-plugin `env`.
 
 ## Bundled plugins
 
@@ -195,7 +196,7 @@ variables — two via `load_key`, one via `owner`:
 | -------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<NAME>_API_KEY` (e.g. `OPENROUTER_API_KEY`) | unset                     | Overrides the on-disk key file for provider `<name>` (upper-cased). This is exactly the variable `plugins.<id>.secrets = [ "<name>" ]` injects at spawn from the login keyring — the recommended way to supply a key. Wins over the file when set.                                                        |
 | `XDG_CONFIG_HOME`                            | unset (→ `$HOME/.config`) | Base directory `load_key` reads the `<name>.key` file from: `$XDG_CONFIG_HOME/trollshell/<name>.key`, e.g. `openrouter.key`. Standard XDG var, not plugin-specific.                                                                                                                                       |
-| `TROLLSHELL_OWNER`                           | unset (→ `"your human"`)  | How a plugin persona refers to whoever is running the shell. Resolved by `hytte_ai_providers::owner` (trimmed, blank counts as unset, neutral `DEFAULT_OWNER` fallback, **never** guessed from `$USER`/GECOS) and read by both `caw` and `pet` — set it once for the session, not per plugin (#696/#706). |
+| `TROLLSHELL_OWNER`                           | unset (→ `"your human"`)  | How a plugin persona refers to whoever is running the shell. Resolved by `hytte_ai_providers::owner` (trimmed, blank counts as unset, neutral `DEFAULT_OWNER` fallback, **never** guessed from `$USER`/GECOS) and read by both `caw` and `pet` — set it once for the session, not per plugin (#696/#706). Usually set session-wide via `programs.trollshell.ownerName` rather than per-plugin here — that Nix option is what actually sets this var for both plugins' launch (null, the default, leaves it unset entirely). |
 
 For pet/caw specifically, the OpenRouter key precedence is therefore:
 `OPENROUTER_API_KEY` env → `~/.config/trollshell/openrouter.key` file →

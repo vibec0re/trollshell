@@ -75,6 +75,19 @@ self:
       '';
     };
 
+    ownerName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "Jordan";
+      description = ''
+        Name (or descriptor) the desktop owner goes by, for LLM plugin
+        personas (pet, caw) to refer to. Sets TROLLSHELL_OWNER for the
+        session, read by both through the shared
+        `hytte_ai_providers::owner()` resolver. Leave null to fall back to
+        each plugin's neutral default ("your human").
+      '';
+    };
+
     stats.layout = lib.mkOption {
       type = lib.types.enum [
         "combined"

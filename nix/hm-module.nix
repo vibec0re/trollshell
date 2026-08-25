@@ -33,16 +33,25 @@ let
   # session teardown reached them out of step. The key is optional on the shell
   # side: a plugins.json without it falls back to graphical-session.target, so
   # an older module's file (and the NixOS module's, which has no shell unit and
-  # so no such option) keeps working unchanged.
-  pluginsState = builtins.toJSON {
-    version = 1;
-    target = cfg.systemd.target;
-    plugins = lib.mapAttrs (_: plugin: {
-      exec = lib.getExe plugin.package;
-      inherit (plugin) env secrets;
-      enabled = plugin.enable;
-    }) cfg.plugins;
-  };
+  # so no such option) keeps working unchanged. It is only emitted here when it
+  # differs from that same fallback (optionalAttrs, mirroring
+  # trollshellSessionEnv below) — a default-configured session's plugins.json
+  # therefore stays byte-identical to the pre-#707 one, so upgrading recycles
+  # no already-running plugin (#813 item 2 fixed this key being emitted
+  # unconditionally, which silently defeated that invariant).
+  pluginsState = builtins.toJSON (
+    {
+      version = 1;
+      plugins = lib.mapAttrs (_: plugin: {
+        exec = lib.getExe plugin.package;
+        inherit (plugin) env secrets;
+        enabled = plugin.enable;
+      }) cfg.plugins;
+    }
+    // (lib.optionalAttrs (cfg.systemd.target != "graphical-session.target") {
+      target = cfg.systemd.target;
+    })
+  );
 
   # Night light (#222, #577): the wlsunset user unit's ExecStart.
   #
@@ -130,6 +139,13 @@ let
   }
   // (lib.optionalAttrs (cfg.weather.fallbackCity != null) {
     TROLLSHELL_WEATHER_CITY = cfg.weather.fallbackCity;
+  })
+  // (lib.optionalAttrs (cfg.ownerName != null) {
+    # Desktop owner's name (#696/#813), read by pet and caw's LLM personas
+    # through the shared hytte_ai_providers::owner() resolver. Unset (not an
+    # empty string) means both fall back to their neutral "your human"
+    # default.
+    TROLLSHELL_OWNER = cfg.ownerName;
   })
   // (lib.optionalAttrs (cfg.wallpaper.reloadCommand != null) {
     # Appearance picker reload command; null = the shell's swaybg default.

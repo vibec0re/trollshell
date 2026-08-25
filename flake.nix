@@ -519,6 +519,16 @@
                 assert pluginsState.plugins.demo.env.DEMO_TOKEN == "hunter2";
                 assert pluginsState.plugins.demo.env.DEMO_EXTRA == "1";
                 assert !pluginsState.plugins.off.enabled;
+                # #813 item 2: the fixture above sets systemd.target =
+                # "niri-session.target", so the rendered launch state must carry
+                # that same value as its top-level "target" key (#707) — the
+                # plugin units and the shell's own unit have to bind to the
+                # same session target, or teardown comes apart again. The
+                # complementary "absent when left at the default" half of this
+                # invariant needs its own fixture (this one already forces a
+                # non-default target for the LLM-unit assertions below) — see
+                # hm-module-plugin-target-default.
+                assert pluginsState.target == "niri-session.target";
                 # The two LLM backend units (#694) render, and the bridge keeps
                 # the load-bearing bits of etc/systemd/user/trollshell-claude-
                 # bridge.service: the four-variable scrub that stops `claude`
@@ -559,6 +569,59 @@
                 } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #813 item 2's other half: a *separate* homeManagerConfiguration
+          # evaluation, deliberately not folded into the hm-module fixture
+          # above. That fixture always sets systemd.target =
+          # "niri-session.target" (needed to exercise the LLM-backend-unit
+          # assertions), so it can only prove the "target" key is emitted
+          # when set — never that it's OMITTED when left at the default. The
+          # omission is the half that actually protects the #707 fingerprint
+          # invariant: a default-configured session's rendered plugins.json
+          # must stay byte-identical to the pre-#707 file, so upgrading
+          # recycles no already-running plugin (see the pluginsState comment
+          # in nix/hm-module.nix). It is also the half a later refactor
+          # breaks silently — the plugins would keep launching, just bound to
+          # the wrong target, which is the original #707 defect returning by
+          # the back door. This check exists solely to give that invariant a
+          # fixture, the same idiom nixos-module-nightlight below uses for a
+          # different conditional.
+          hm-module-plugin-target-default =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      # systemd.target deliberately left unset (defaults to
+                      # graphical-session.target) — the one thing this fixture
+                      # exists to cover.
+                      plugins.demo.package = stubPlugin;
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
+              probe =
+                assert !(pluginsState ? target);
+                builtins.deepSeq { inherit pluginsState; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-plugin-target-default-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

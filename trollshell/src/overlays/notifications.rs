@@ -1604,3 +1604,336 @@ mod tests {
         assert_eq!(timers.hover_count(), 0);
     }
 }
+
+// ── Reentrancy regression tests ───────────────────────────────────────────────
+
+/// The `RefCell`-across-a-GTK-call abort class (#674) for this file — #673's
+/// headline site.
+///
+/// ## Why there is no production change alongside these tests
+///
+/// #758's survey recorded `apply_emission`/`route_emission` as unreachable
+/// because their loop bodies lived inline inside `bind(…)` closures. That is no
+/// longer true: both are plain private free functions taking their inputs
+/// explicitly, in exactly the shape `widgets/workspaces.rs`'s
+/// `update_workspaces` has, so a colocated test reaches them by module privacy
+/// alone. Nothing in `apply_emission` was extracted, reordered, or reshaped to
+/// make this file compile.
+///
+/// ## Why this needs `App::run` when `workspaces.rs`'s equivalent does not
+///
+/// `apply_emission` takes a `&ToastView`, and `ToastView` carries a `Monitor`
+/// (`build_overflow_card`'s click target). `Monitor`'s only constructor is
+/// `pub(crate)` to `hytte-ui`, so the sole way to obtain one from this crate is
+/// `App::monitors` — which exists only inside a running `App::run` body.
+/// `test_monitor` does that once, lazily, and caches the result; see its doc.
+///
+/// ## Why the probe is `unmap` and not `destroy`
+///
+/// `apply_emission`'s own comment names the synchronous emission this site
+/// actually has: unmapping a card fires its `connect_unmap` → `resume_expiry`,
+/// and #593's keep-the-card-mounted design is built on that being immediate.
+/// So the probe rides `unmap`, fired from inside `vbox.remove()` itself —
+/// earlier in the take window than any dispose, and the real pairing rather
+/// than a contrived one.
+///
+/// A `destroy` probe was tried first and is *not* usable here: with the toast
+/// window mapped, a notification card is still referenced after
+/// `vbox.remove()` (it holds the focusable dismiss button), so it is not
+/// disposed inside the loop and the handler never fires — the test would have
+/// been green while covering nothing. Hence the explicit `is_mapped` assertion
+/// in `seeded`: a card that never mapped emits no `unmap` either.
+///
+/// ## The guarantee, stated narrowly
+///
+/// Each test asserts one thing: a synchronous GTK emission that re-enters
+/// `apply_emission` on the same view does **not** raise `BorrowMutError`.
+/// That is *not* a claim that re-entrant emissions compose — they do not, and
+/// deliberately so. The outer pass's closing write-back clobbers whatever the
+/// inner pass stored, and the inner pass renders against cells holding empty
+/// `Default`s (the trade-off `apply_emission`'s own comment states). What is
+/// under test is only that the process survives, because the pre-#673 spelling
+/// did not: a `BorrowMutError` unwinding out of a glib signal emission is a
+/// "panic in a function that cannot unwind", i.e. `SIGABRT`, which takes the
+/// whole shell down rather than dropping one toast (#663 hit this for real).
+///
+/// Production does not re-enter here today — `route_emission` is pumped from a
+/// `spawn_local`ed `for_each`, which cannot re-poll itself synchronously — so
+/// this is defence in depth against a *new* synchronous emission being
+/// introduced into one of the loops, which is precisely the regression #674
+/// wants caught.
+///
+/// Needs a real display server (`xvfb-run`), hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod reentrancy_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use hytte::gtk::{self, glib, prelude::*};
+    use hytte::prelude::*;
+    use hytte::services::notifications::{Notification, Urgency};
+
+    use super::{MAX_VISIBLE_NONCRITICAL, ToastView, apply_emission, build_toast_view};
+
+    thread_local! {
+        /// The output every view in this module is built for, captured once by
+        /// [`test_monitor`]. `Monitor` is `!Send` and this binary's
+        /// `#[gtk::test]`s all share one thread, so a `thread_local!` is the
+        /// natural home and needs no synchronisation.
+        static TEST_MONITOR: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+    }
+
+    /// A real `Monitor`, captured from a one-shot `App::run`.
+    ///
+    /// **Once, lazily, and cached** for two reasons. `App::run` has
+    /// process-global side effects (`adw::init`, the dark colour scheme, the
+    /// default stylesheet, a leaked application hold), and this is a unit-test
+    /// binary shared with several hundred other tests — running it per test
+    /// would repeat all of that per test. And `tests/overlay_reentrancy.rs`
+    /// documents that a second `App::run` in one binary panics on duplicate
+    /// service registration; that constraint does not bite here (this builder
+    /// registers no services at all), but there is no reason to lean on it.
+    ///
+    /// `#[gtk::test]` runs every test in this binary on one thread, so the
+    /// cache needs no locking and cannot be raced regardless of test order.
+    fn test_monitor() -> Monitor {
+        if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
+            return monitor;
+        }
+        App::new("mov.vibec0re.trollshell.test.notifications-reentrancy")
+            .run(|app| {
+                let first = app.monitors().first().cloned();
+                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+                app.quit();
+            })
+            .expect("App::run");
+        TEST_MONITOR
+            .with(|cell| cell.borrow().clone())
+            .expect("the display server must report at least one output; `xvfb-run` provides one")
+    }
+
+    /// A notification whose rendered fields are a pure function of `id` and
+    /// `body`, so two calls with the same arguments compare equal under
+    /// `card_content_eq` and the card is *kept* rather than rebuilt. Passing a
+    /// different `body` for the same `id` is how a test reaches the rebuild arm.
+    fn notif(id: u32, body: &str) -> Notification {
+        Notification {
+            id,
+            app_name: "Fractal".to_owned(),
+            app_icon: String::new(),
+            summary: format!("toast {id}"),
+            body: body.to_owned(),
+            urgency: Urgency::Normal,
+            timeout: Some(Duration::from_secs(5)),
+            actions: Vec::new(),
+            image: None,
+            created_at: 1_000,
+        }
+    }
+
+    /// No per-app mutes, DND off — every test here is about the borrow
+    /// discipline, not the visibility gates.
+    fn unmuted() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// `notif(1..=n, "a")`, the shape the overflow test needs on both sides of
+    /// the cap.
+    fn toasts(n: u32) -> Vec<Notification> {
+        (1..=n).map(|id| notif(id, "a")).collect()
+    }
+
+    /// A view seeded by a real first emission, pumped until its cards are
+    /// actually mapped.
+    ///
+    /// The pump is load-bearing, not hygiene: `apply_emission`'s closing
+    /// `set_visible(true)` only *starts* the toplevel's realize/map, and a card
+    /// that never mapped emits no `unmap` when it is removed — every test here
+    /// would go green while exercising nothing. `Rc` because the reentrant
+    /// handlers need a second handle, and because that is what `TOAST_WINDOWS`
+    /// stores in production.
+    fn seeded(initial: &[Notification]) -> Rc<ToastView> {
+        let view = Rc::new(build_toast_view(&test_monitor()));
+        apply_emission(&view, initial, false, &unmuted());
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+        view
+    }
+
+    /// The mounted card for `id`, asserted mapped so a test cannot pass
+    /// vacuously on a probe that could never fire. See [`seeded`].
+    fn mapped_card(view: &ToastView, id: u32) -> gtk::Widget {
+        let card = view.card_map.borrow()[&id].widget.clone();
+        assert!(
+            card.is_mapped(),
+            "toast {id}'s card must be mapped before the pass under test; an unmapped card emits \
+             no `unmap` when it is removed, so the probe below would never fire"
+        );
+        card
+    }
+
+    /// Sorted ids currently tracked in `card_map`, i.e. what the last
+    /// write-back left behind.
+    fn card_ids(view: &ToastView) -> Vec<u32> {
+        let mut ids: Vec<u32> = view.card_map.borrow().keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Arm `card`'s `unmap` to re-enter `apply_emission` on `view` exactly
+    /// once, recording whether it fired while `in_outer` was set — i.e. while
+    /// the outer pass was still on the stack.
+    ///
+    /// Once, because the reentrant pass unmaps cards of its own and an
+    /// unguarded probe would recurse without bound.
+    fn arm_reentry(
+        card: &gtk::Widget,
+        view: &Rc<ToastView>,
+        in_outer: &Rc<Cell<bool>>,
+        reentrant: Vec<Notification>,
+    ) -> Rc<Cell<Option<bool>>> {
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+        let view = Rc::clone(view);
+        let in_outer = Rc::clone(in_outer);
+        let recorder = Rc::clone(&fired_inside);
+        let armed = Cell::new(true);
+        card.connect_unmap(move |_| {
+            if !armed.replace(false) {
+                return;
+            }
+            recorder.set(Some(in_outer.get()));
+            apply_emission(&view, &reentrant, false, &unmuted());
+        });
+        fired_inside
+    }
+
+    /// Step 1 of the emission, the *removal* loop: `map.remove(id)` hands the
+    /// entry out and `vbox.remove(&entry.widget)` unparents it, which unmaps
+    /// the card and fires its `unmap` handlers **synchronously**, inside the
+    /// loop and inside the window in which both cells are taken.
+    ///
+    /// Reverting `let mut map = view.card_map.take();` to the pre-#673
+    /// `view.card_map.borrow_mut()` makes the reentrant call below hit a live
+    /// `RefMut` and abort the binary. With `take()` the cell is free for the
+    /// whole pass, so the inner call simply finds an empty map.
+    #[gtk::test]
+    fn apply_emission_tolerates_a_reentrant_pass_from_a_removed_cards_unmap() {
+        let view = seeded(&[notif(1, "a"), notif(2, "b")]);
+        assert_eq!(
+            card_ids(&view),
+            [1, 2],
+            "both toasts must be mounted after the seeding pass"
+        );
+
+        // True only while the outer `apply_emission` is on the stack, so the
+        // probe can record whether it ran inside the pass or was deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let card2 = mapped_card(&view, 2);
+        let fired_inside = arm_reentry(&card2, &view, &in_outer, vec![notif(1, "a")]);
+
+        in_outer.set(true);
+        apply_emission(&view, &[notif(1, "a")], false, &unmuted());
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed card's `unmap` must fire synchronously inside `apply_emission`; if GTK \
+             ever defers it this test proves nothing about the borrow discipline — and #593's \
+             hover-hold design would be broken too"
+        );
+        assert_eq!(
+            card_ids(&view),
+            [1],
+            "the outer pass's write-back must still land: re-entry may not leave the cell holding \
+             the inner pass's map or an empty one"
+        );
+    }
+
+    /// Step 2 of the emission, the *rebuild* arm: a same-id notification whose
+    /// rendered content changed takes `replace_card`, and `replace_card`'s own
+    /// comment on `vbox.remove(&old.widget)` is where this site's
+    /// synchronous-unmap claim is written down. The emission lands before the
+    /// loop's `map.insert` has put the replacement back, so the reentrant pass
+    /// sees the cell mid-diff.
+    ///
+    /// Same falsification as above: with `borrow_mut()` held the inner call
+    /// aborts on `BorrowMutError`.
+    #[gtk::test]
+    fn apply_emission_does_not_hold_the_card_map_across_replace_card() {
+        let view = seeded(&[notif(1, "before")]);
+
+        let in_outer = Rc::new(Cell::new(false));
+        let card1 = mapped_card(&view, 1);
+        let fired_inside = arm_reentry(&card1, &view, &in_outer, vec![notif(1, "reentrant")]);
+
+        // Same id (so the card is replaced, not removed), different body (so
+        // `card_content_eq` fails and the rebuild arm actually runs).
+        in_outer.set(true);
+        apply_emission(&view, &[notif(1, "after")], false, &unmuted());
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the superseded card's `unmap` must fire synchronously inside `replace_card`'s \
+             removal; without it this test does not exercise the borrow at all"
+        );
+        assert_eq!(
+            card_ids(&view),
+            [1],
+            "the replacement must still be tracked after a reentrant pass"
+        );
+    }
+
+    /// The overflow slot — a *different cell*, with the same pre-#673 spelling:
+    /// `let mut slot = view.overflow_card.borrow_mut();` held across the
+    /// `vbox.remove()` that retires the old "+N more" card and the
+    /// `vbox.append()` that would mount its replacement.
+    ///
+    /// Falsifiable independently of the two above: revert only the
+    /// `view.overflow_card.take()` at the head of the overflow block and leave
+    /// `card_map` on `take()`, and the reentrant pass gets all the way down to
+    /// `view.overflow_card.take()` before it hits the live `RefMut` — so the
+    /// `BorrowMutError` names this cell and no other.
+    #[gtk::test]
+    fn apply_emission_does_not_hold_the_overflow_slot_across_its_own_teardown() {
+        // One more non-critical toast than renders individually, so the tail
+        // collapses into an overflow card.
+        let cap = u32::try_from(MAX_VISIBLE_NONCRITICAL).expect("the cap fits in a u32");
+        let view = seeded(&toasts(cap + 1));
+        let overflow = view
+            .overflow_card
+            .borrow()
+            .clone()
+            .expect("one toast over the cap must collapse into an overflow card");
+        assert!(
+            overflow.is_mapped(),
+            "the overflow card must be mapped before the pass under test; an unmapped card emits \
+             no `unmap` when it is removed"
+        );
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = arm_reentry(&overflow, &view, &in_outer, vec![notif(1, "a")]);
+        drop(overflow);
+
+        // Back under the cap: the tail empties, so the overflow card is retired
+        // and not rebuilt.
+        in_outer.set(true);
+        apply_emission(&view, &toasts(cap), false, &unmuted());
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the retired overflow card's `unmap` must fire synchronously inside \
+             `apply_emission`'s overflow block; if it does not, this test covers nothing"
+        );
+        assert!(
+            view.overflow_card.borrow().is_none(),
+            "the outer pass's write-back must still land: with the tail empty the slot ends None"
+        );
+    }
+}

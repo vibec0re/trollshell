@@ -14,12 +14,27 @@
 //! ## Animation + exclusive zone
 //!
 //! `GtkRevealer` (`SlideRight`) animates the card's allocated width between 0
-//! and `SIDEBAR_WIDTH` on open/close. The exclusive zone is set **explicitly**
-//! from the open-state subscription (`SIDEBAR_WIDTH` open, `0` closed) rather
-//! than driven by `auto_exclusive_zone_enable()` — the auto path failed to
-//! reclaim space cleanly on close (the bar stayed pushed even after the
-//! revealer settled at 0 width), so we drive it directly. Niri snaps tiles +
+//! and the card's open width on open/close. The exclusive zone is set
+//! **explicitly** from the open-state subscription ([`open_width`] open, `0`
+//! closed) rather than driven by `auto_exclusive_zone_enable()` — the auto path
+//! failed to reclaim space cleanly on close (the bar stayed pushed even after
+//! the revealer settled at 0 width), so we drive it directly. Niri snaps tiles +
 //! the bar to the new value immediately; the revealer's slide is cosmetic.
+//!
+//! The open zone is **measured, not assumed** (#737). [`SIDEBAR_WIDTH`] is a
+//! design-baseline literal; what the surface actually paints is the revealer
+//! child's natural width, floored at `scale(SIDEBAR_WIDTH)`. The card's padding
+//! is `em`-based and its children's minimum widths are too, and
+//! `set_size_request` only sets a *minimum* — so above the 1x baseline the card
+//! measures wider than 320. Committing a hardcoded 320 then reserves a narrower
+//! strip than the surface paints: the sidebar overhangs the tile niri put beside
+//! it and swallows the window's left border and rounded corners, which niri
+//! draws just outside the window geometry in the 8 px strut gap
+//! (`etc/niri/frame.kdl`). [`open_width`] reads the live measurement instead —
+//! the same "read live, not once" rule `frame.rs` applies to the bar's height
+//! (#441), and what this subsystem's own design spec asked for in the first
+//! place ("read revealer allocation",
+//! `docs/superpowers/specs/2026-05-14-sidebar-design.md`).
 //!
 //! `set_exclusive_zone` only mutates gtk4-layer-shell's *pending* state — it
 //! applies on the surface's next `wl_surface.commit`, which GTK only issues
@@ -52,8 +67,8 @@
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
 //! [`current_visible_width`] each animation tick and shifts its cutout's
 //! left edge to match — the sidebar surface (below the frame) shows
-//! through the cutout. `SIDEBAR_WIDTH` is the authoritative width on both
-//! sides.
+//! through the cutout. [`open_width`] is the authority on both sides, so the
+//! cutout's left edge can't disagree with the strip niri reserved.
 //!
 //! State is per-connector, mirroring `modal::DRAWER_OPEN`. Subscribers (the
 //! sidebar surface, the frame draw, future bar-CSS bindings) read
@@ -72,11 +87,20 @@ use hytte::ui::{Anchor, Layer, LayerShell, layer_window};
 
 use super::frame;
 use crate::components::monitor_key::{is_fallback_key, monitor_key};
+use crate::scale::scale;
 
-/// Width of the sidebar surface when fully open, in CSS px. Matches the
-/// "frame border ~320px" geometry from the spec; the frame's cutout left
-/// edge animates from [`frame::FRAME_THICKNESS_I32`] (8) up to this value
-/// while the sidebar reveals.
+/// **Design-baseline** width of the sidebar surface when fully open, in CSS px,
+/// authored at the 1x baseline `crate::scale` documents (font 11pt @ 96 DPI).
+/// Matches the "frame border ~320px" geometry from the spec; the frame's cutout
+/// left edge animates from [`frame::FRAME_THICKNESS_I32`] (8) up to the open
+/// width while the sidebar reveals.
+///
+/// This is the **floor**, not the final width: it is `scale()`d into the card's
+/// `set_size_request` and the `AdwClamp` bounds, and the surface still measures
+/// wider than that floor whenever a child's minimum width demands it. Everything
+/// that has to agree with what the surface *paints* — the exclusive zone and the
+/// frame's cutout left edge — goes through [`open_width`], never through this
+/// constant (#737).
 pub const SIDEBAR_WIDTH: i32 = 320;
 
 thread_local! {
@@ -151,23 +175,81 @@ pub fn toggle_on_focused(preferred: Option<&str>) {
     }
 }
 
-/// Currently visible width of the sidebar card on `monitor`, in CSS px.
-/// Returns `frame::FRAME_THICKNESS_I32` when the sidebar is closed, hasn't been
-/// installed yet, or the per-monitor panel is missing. The frame uses
-/// this to compute its cutout's left edge each animation tick.
+/// The sidebar's real open width on one surface, in logical px: the natural
+/// width of the revealer's child (the `AdwClamp` wrapping the card), floored at
+/// the scaled design baseline.
+///
+/// Measured rather than assumed (#737). The card's padding is `em`-based, its
+/// children's minimum widths grow with the effective font too, and
+/// `set_size_request` only sets a *minimum* — so above the 1x baseline the card
+/// measures wider than [`SIDEBAR_WIDTH`], and committing the bare constant as
+/// the exclusive zone reserves a narrower strip than the surface paints.
+///
+/// Deliberately measures the revealer's **child**, not the revealer and not the
+/// window:
+///
+/// * `GtkRevealer`'s measure multiplies the sliding orientation by the animation
+///   position, so measuring the revealer would under-report mid-slide.
+/// * `window.width()` is the size the compositor last configured us at: it lags
+///   the content by at least a frame, and — per the module note on the surface
+///   never re-measuring below a prior allocation — it stays at the widest value
+///   this session ever reached, so it over-reports after a wide card goes away.
+///
+/// The child's natural width is what the toplevel asks for, and (the surface
+/// being anchored Left+Top+Bottom, so niri leaves the width to the client) that
+/// is what the surface settles at. It is also stable across the whole slide,
+/// which is what lets the zone be committed at the *start* of the open
+/// transition rather than a frame after it finishes.
+///
+/// The `max` floor keeps the value monotone: before the first layout pass (where
+/// `measure` can report 0) it is the scaled baseline. It never *masks* a wider
+/// card — GTK guarantees `natural >= minimum`, so a card whose minimum exceeds
+/// the `AdwClamp`'s maximum is still reported at its true width.
+fn open_width(revealer: &gtk::Revealer) -> i32 {
+    let natural = revealer.child().map_or(0, |child| {
+        let (minimum, natural, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+        // `natural.max(minimum)`, not a bare `natural`: GTK is meant to guarantee
+        // `natural >= minimum`, but this child is an `AdwClamp` whose entire job
+        // is to cap the natural width at `maximum_size` — and a card whose own
+        // minimum exceeds that cap is still allocated, and paints, at its
+        // minimum. Taking the max keeps the answer on the side of what is
+        // actually painted regardless of which of the two the clamp reports.
+        natural.max(minimum)
+    });
+    open_width_from_natural(natural)
+}
+
+/// The floor half of [`open_width`], split out so it is unit-testable without a
+/// live widget tree (mirroring `scale::scale_with_factor`).
+fn open_width_from_natural(natural: i32) -> i32 {
+    natural.max(scale(SIDEBAR_WIDTH))
+}
+
+/// Currently visible width of the sidebar card on `monitor`, in CSS px — the
+/// measured [`open_width`] while open. Returns `frame::FRAME_THICKNESS_I32` when
+/// the sidebar is closed, hasn't been installed yet, or the per-monitor panel is
+/// missing. The frame uses this to compute its cutout's left edge each animation
+/// tick.
 pub fn current_visible_width(monitor: &Monitor) -> i32 {
     current_visible_width_for_key(&monitor_key(monitor))
 }
 
 /// Internal: keyed lookup used by both the public API and tests.
 fn current_visible_width_for_key(key: &str) -> i32 {
-    PANELS.with(|panels| {
+    // Copy the revealer out and measure with no `PANELS` borrow live (#643) —
+    // same shape, and the same reason, as `is_settled_for_key` just below:
+    // `open_width` walks a whole widget subtree's measure vfuncs, and this runs
+    // from `frame.rs`'s per-frame draw while `install`/`close_all` hold the
+    // `borrow_mut()` counterparties. (The `open_state.get()` filter reads a
+    // `Mutable`, not GTK, so it is fine inside the borrow.)
+    let revealer = PANELS.with(|panels| {
         panels
             .borrow()
             .get(key)
             .filter(|p| p.open_state.get())
-            .map_or(frame::FRAME_THICKNESS_I32, |_| SIDEBAR_WIDTH)
-    })
+            .map(|p| p.revealer.clone())
+    });
+    revealer.map_or(frame::FRAME_THICKNESS_I32, |r| open_width(&r))
 }
 
 /// True when the sidebar's revealer animation is at rest on `monitor`
@@ -208,9 +290,13 @@ pub fn install(monitor: &Monitor) {
     let window = build_sidebar_window(monitor, &key);
     let revealer = build_revealer();
     let card = build_card(monitor);
+    // Scaled, like the card's own floor in `build_card`: an unscaled 320 cap
+    // over a card whose `em` padding and children grew with the font would try
+    // to tighten the card below its own minimum every time text-scaling is above
+    // the 1x baseline (#737). At 1x `scale` is a no-op, so this is the same 320.
     let clamp = adw::Clamp::builder()
-        .maximum_size(SIDEBAR_WIDTH)
-        .tightening_threshold(SIDEBAR_WIDTH)
+        .maximum_size(scale(SIDEBAR_WIDTH))
+        .tightening_threshold(scale(SIDEBAR_WIDTH))
         .child(&card)
         .build();
     revealer.set_child(Some(&clamp));
@@ -325,19 +411,30 @@ fn build_revealer() -> gtk::Revealer {
 /// card — and the layer-shell surface above it — past `SIDEBAR_WIDTH`,
 /// visually overlapping niri tiles, the bar, and the frame. The
 /// `AdwClamp` wrapping this card in `install` caps the natural width at
-/// `SIDEBAR_WIDTH`; see also `components::layout::finish_page` for the
+/// `scale(SIDEBAR_WIDTH)`; see also `components::layout::finish_page` for the
 /// same belt-and-suspenders pattern in the drawer.
 ///
-/// This `SIDEBAR_WIDTH` floor is the **open-state** floor and is set here only
-/// as the initial value: [`drive_exclusive_zone_on_settle`] relaxes it to `0`
-/// once the sidebar settles closed (and [`wire_open_subscription`] restores it
-/// on open). Without that, the 320px minimum pins the *persistent* layer-shell
-/// surface at full width even when the revealer is collapsed, so the closed
-/// surface keeps covering the left edge and niri never reflows the tile (#194).
+/// That cap binds the **natural** width only. A child whose *minimum* width
+/// exceeds it still widens the card — no clamp can allocate a child below its
+/// own minimum — which is exactly why the exclusive zone is measured rather than
+/// assumed (#737): the belt-and-suspenders pair caps the common case, and
+/// [`open_width`] makes the reserved strip match whatever gets through anyway.
+///
+/// This `scale(SIDEBAR_WIDTH)` floor is the **open-state** floor and is set here
+/// only as the initial value: [`drive_exclusive_zone_on_settle`] relaxes it to
+/// `0` once the sidebar settles closed (and [`wire_open_subscription`] restores
+/// it on open). Without that, the 320px minimum pins the *persistent*
+/// layer-shell surface at full width even when the revealer is collapsed, so the
+/// closed surface keeps covering the left edge and niri never reflows the tile
+/// (#194). It is `scale`d (#737) because `set_size_request` is exactly the
+/// imperative-pixel case `crate::scale` exists for — an unscaled 320 shrinks
+/// relative to the `em`-based card padding as the font grows. What the surface
+/// ends up painting is still the *measured* width ([`open_width`]), which the
+/// floor only bounds from below.
 fn build_card(monitor: &Monitor) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("ts-sidebar");
-    card.set_size_request(SIDEBAR_WIDTH, -1);
+    card.set_size_request(scale(SIDEBAR_WIDTH), -1);
     card.set_halign(gtk::Align::Fill);
     card.set_hexpand(false);
     card.set_valign(gtk::Align::Fill);
@@ -399,16 +496,23 @@ fn wire_open_subscription(
     let zone_tick = zone_tick.clone();
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
-        window.set_exclusive_zone(if open { SIDEBAR_WIDTH } else { 0 });
         // Restore the card's full-width floor the moment we start opening, so the
-        // revealer slides a SIDEBAR_WIDTH card in. The floor is relaxed to 0 on
+        // revealer slides a full-width card in. The floor is relaxed to 0 on
         // each settled-close (see `drive_exclusive_zone_on_settle`) so the closed
-        // toplevel can re-measure below SIDEBAR_WIDTH and the wl_surface deflates;
-        // we only relax on *settle*, so the close slide still shows a full-width
-        // card sliding out. (#194)
+        // toplevel can re-measure below it and the wl_surface deflates; we only
+        // relax on *settle*, so the close slide still shows a full-width card
+        // sliding out. (#194)
+        //
+        // Ordered *before* the zone: `open_width` measures the card, so the floor
+        // has to be back in place for that measurement to describe the open
+        // surface rather than the relaxed-closed one (#737).
         if open {
-            card.set_size_request(SIDEBAR_WIDTH, -1);
+            card.set_size_request(scale(SIDEBAR_WIDTH), -1);
         }
+        // Reserve exactly what the surface will paint, measured now — not the
+        // bare `SIDEBAR_WIDTH` literal, which under-reserves above the 1x
+        // baseline and lets the sidebar overhang the tile (#737).
+        window.set_exclusive_zone(if open { open_width(&revealer) } else { 0 });
         // Push the layer-shell request to niri NOW. gtk4-layer-shell enqueues the
         // `set_exclusive_zone` request on GTK's wayland connection but the bytes
         // only leave the process on GTK's next flush; a sidebar settling closed
@@ -483,14 +587,20 @@ where
 /// `set_exclusive_zone` (called once in [`wire_open_subscription`]) only mutates
 /// gtk4-layer-shell's *pending* state — it applies on the surface's next
 /// `wl_surface.commit`, which GTK only issues when it draws a frame. On OPEN the
-/// revealer's slide and the now-visible card keep GTK drawing, so the
-/// `SIDEBAR_WIDTH` zone commits naturally.
+/// revealer's slide and the now-visible card keep GTK drawing, so the open zone
+/// commits naturally.
+///
+/// The re-assert also re-*measures* ([`open_width`], #737) rather than replaying
+/// the value [`wire_open_subscription`] committed at the start of the slide, so
+/// a card that grew while the sidebar was opening (a plugin card dialling in, a
+/// long calendar title arriving) still ends up with a zone that matches what the
+/// settled surface paints.
 ///
 /// The card-floor relax is a vestige of an earlier (disproven) hypothesis. A
 /// live `RUST_LOG` capture showed the closed toplevel + `wl_surface` staying at
 /// `win_width=320 / surface_width=320` once opened (vs. `0 / 1` never-opened),
-/// and the theory was that `build_card`'s `set_size_request(SIDEBAR_WIDTH, -1)`
-/// floor pinned the surface full-width so it covered a grey strip. Relaxing that
+/// and the theory was that `build_card`'s `set_size_request` floor pinned the
+/// surface full-width so it covered a grey strip. Relaxing that
 /// floor to `0` on settled-close did **not** shrink the surface (a GTK toplevel
 /// won't re-measure under a prior allocation); the strip was actually a niri
 /// `background-effect` frost of the whole still-mapped surface, since retired
@@ -528,14 +638,20 @@ fn drive_exclusive_zone_on_settle(
         if revealer.is_child_revealed() != open {
             return false;
         }
-        let zone = if open { SIDEBAR_WIDTH } else { 0 };
         // Relax the card's min-width floor to 0 when settled-closed so the
-        // collapsed revealer can let the toplevel re-measure below SIDEBAR_WIDTH
-        // and the persistent Top surface deflates to ~0 width; restore the
-        // SIDEBAR_WIDTH floor when open (the AdwClamp still caps the ceiling).
-        // The `zone` value and the floor coincide (SIDEBAR_WIDTH open / 0 closed),
-        // so reuse it. (#194)
-        card.set_size_request(zone, -1);
+        // collapsed revealer can let the toplevel re-measure below the floor and
+        // the persistent Top surface deflates to ~0 width; restore the
+        // `scale(SIDEBAR_WIDTH)` floor when open (the AdwClamp still caps the
+        // ceiling). (#194)
+        let floor = if open { scale(SIDEBAR_WIDTH) } else { 0 };
+        card.set_size_request(floor, -1);
+        // The zone and the floor used to be one value; they are not the same
+        // number any more (#737). The floor is the scaled *baseline*; the zone is
+        // what the card actually measures with that floor applied, which is
+        // larger whenever a child's minimum demands more. Reusing the floor here
+        // is what reserved a 320 strip under a wider surface. Measured after the
+        // `set_size_request` above so it sees the restored floor.
+        let zone = if open { open_width(revealer) } else { 0 };
         // DIAGNOSTIC (#194): logs the settled surface geometry once per settle
         // (the re-assert), not per animation frame. NOTE: the persistent toplevel
         // stays at win_width=320 / surface_width=320 once opened (a GTK toplevel
@@ -546,6 +662,7 @@ fn drive_exclusive_zone_on_settle(
         tracing::debug!(
             open,
             set_exclusive_zone = zone,
+            card_floor = floor,
             revealed = revealer.is_child_revealed(),
             win_width = window.width(),
             surface_width = ?window.surface().map(|s| s.width()),
@@ -671,9 +788,35 @@ mod tests {
 
     #[test]
     fn sidebar_width_is_320() {
-        // Frame integration assumes this exact value when computing how
-        // much the cutout's left edge moves. Guard against accidental edits.
+        // The design baseline the card floor, the AdwClamp cap and `frame.rs`'s
+        // `cutout_rect_with_sidebar_open` case are all authored against. Guard
+        // against accidental edits. (What the surface *paints* is the measured
+        // `open_width`, which this only bounds from below — see #737.)
         assert_eq!(SIDEBAR_WIDTH, 320);
+    }
+
+    /// The floor half of [`open_width`]: a card that measures narrower than the
+    /// scaled baseline (or hasn't been laid out yet, where `measure` reports 0)
+    /// still reserves the full baseline strip.
+    #[test]
+    fn open_width_floors_at_the_scaled_baseline() {
+        // Headless: GTK isn't initialized, so `scale` is an exact no-op and the
+        // floor is the bare literal (see `scale::no_op_at_default`).
+        assert_eq!(open_width_from_natural(0), SIDEBAR_WIDTH);
+        assert_eq!(open_width_from_natural(120), SIDEBAR_WIDTH);
+        assert_eq!(open_width_from_natural(SIDEBAR_WIDTH), SIDEBAR_WIDTH);
+    }
+
+    /// The half #737 is actually about: when the card measures **wider** than the
+    /// baseline — `em` padding and child minimums both grow with the effective
+    /// font, and `set_size_request` only sets a minimum — the reserved zone must
+    /// follow the measurement, not the literal. Falsified by the pre-#737 code,
+    /// which committed `SIDEBAR_WIDTH` unconditionally and so reserved a 320 px
+    /// strip under a surface painting 344, overhanging the tile beside it by 24.
+    #[test]
+    fn open_width_follows_a_card_wider_than_the_baseline() {
+        assert_eq!(open_width_from_natural(344), 344);
+        assert!(open_width_from_natural(SIDEBAR_WIDTH + 1) > SIDEBAR_WIDTH);
     }
 
     #[test]
@@ -706,5 +849,94 @@ mod tests {
     fn is_settled_defaults_to_true_when_no_panel() {
         // Same situation: no panel installed → nothing animating → settled.
         assert!(is_settled_for_key("nonexistent"));
+    }
+}
+
+// ── GTK integration tests (need a display → gated to `system-tests`) ─────────
+
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{SIDEBAR_WIDTH, open_width};
+    use crate::scale::scale;
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+
+    /// The revealer → `AdwClamp` → card tree `install` builds, minus the parts
+    /// that need a live `Monitor` and the service registry (`build_card`'s
+    /// calendar/tasks/plugin slots). `content_min` is the minimum width of a
+    /// stand-in child, standing for whatever a real card's contents demand — an
+    /// `em`-padded calendar grid, a plugin card, a long event title.
+    fn tree(content_min: i32) -> gtk::Revealer {
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("ts-sidebar");
+        card.set_size_request(scale(SIDEBAR_WIDTH), -1);
+        if content_min > 0 {
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.set_size_request(content_min, -1);
+            card.append(&content);
+        }
+        let clamp = adw::Clamp::builder()
+            .maximum_size(scale(SIDEBAR_WIDTH))
+            .tightening_threshold(scale(SIDEBAR_WIDTH))
+            .child(&card)
+            .build();
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        revealer.set_child(Some(&clamp));
+        revealer
+    }
+
+    /// A card whose contents fit inside the baseline reserves exactly the
+    /// baseline — the 1x case, which stays pixel-identical to the constant this
+    /// replaced. Compared against `scale(SIDEBAR_WIDTH)` rather than the bare
+    /// literal because `#[gtk::test]` *does* initialize GTK, so `scale` is only
+    /// a no-op if the harness' font happens to sit at the baseline.
+    #[gtk::test]
+    fn narrow_card_reserves_the_baseline() {
+        adw::init().expect("libadwaita init");
+        let revealer = tree(0);
+        revealer.set_reveal_child(true);
+        assert_eq!(open_width(&revealer), scale(SIDEBAR_WIDTH));
+    }
+
+    /// #737's regression: a card whose contents demand more than the baseline
+    /// paints wider than the baseline (`set_size_request` is a *minimum*, and
+    /// `AdwClamp` cannot tighten a child below its own minimum), so the zone
+    /// derived from it has to be wider too. The pre-#737 code committed
+    /// `SIDEBAR_WIDTH` here — reserving a 320 px strip under a surface painting
+    /// 100 px more, which overhung the tile beside it and covered that window's
+    /// left border and rounded corners.
+    #[gtk::test]
+    fn wide_card_reserves_what_it_paints() {
+        adw::init().expect("libadwaita init");
+        // Authored relative to the floor so the case stays meaningful (rather
+        // than trivially satisfied) whatever font the harness runs with.
+        let wide = scale(SIDEBAR_WIDTH) + 100;
+        let revealer = tree(wide);
+        revealer.set_reveal_child(true);
+        let got = open_width(&revealer);
+        assert!(
+            got >= wide,
+            "a card whose contents demand {wide} px paints {wide} px; the exclusive zone must \
+             reserve at least that, not the {} px baseline (got {got})",
+            scale(SIDEBAR_WIDTH)
+        );
+    }
+
+    /// [`open_width`] measures the revealer's **child**, so it is the same
+    /// number before, during and after the slide. Measuring the revealer itself
+    /// would multiply by the animation position and report the baseline floor
+    /// here — precisely the stale 320 this fix exists to stop committing, and it
+    /// would make the zone depend on *when* during the transition it was read.
+    #[gtk::test]
+    fn open_width_is_independent_of_the_slide_position() {
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 100;
+        let revealer = tree(wide);
+        // Never revealed: the revealer's own horizontal measure is 0 here.
+        let collapsed = open_width(&revealer);
+        revealer.set_reveal_child(true);
+        assert_eq!(collapsed, open_width(&revealer));
+        assert!(collapsed >= wide, "got {collapsed}");
     }
 }

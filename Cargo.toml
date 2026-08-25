@@ -6,6 +6,7 @@ members = [
   "crates/hytte-services",
   "crates/hytte",
   "crates/hytte-bus",
+  "crates/hytte-config",
   "crates/hytte-ecal",
   "crates/hytte-ai-providers",
   "crates/hytte-claude-bridge",
@@ -134,6 +135,16 @@ tempfile = "3"
 tokio = { version = "1.52.1", default-features = false }
 tokio-stream = { version = "0.1", default-features = false }
 toml = "1"
+# Format-preserving TOML editor, used by `hytte-services`' `places.toml` write
+# path (#640). Settled on the issue: `places.toml` has two permanent authors —
+# the operator editing it by hand (#703: "I should be able to fully edit the
+# places from toml") and the control-center editor writing it back — so a save
+# must patch the document rather than re-render it, or the first programmatic
+# save silently eats every per-key comment and hand-chosen key ordering.
+# Same project as the `toml` crate above (and what `cargo add` itself is built
+# on); already resolved in `Cargo.lock` at this version via `proc-macro-crate`,
+# so promoting it to a direct dependency pulls in no new crate.
+toml_edit = "0.25.11"
 tracing = "0.1.44"
 # false because hytte-services' dev-dependency use wants it off (+
 # "registry" only); trollshell/trollshell-control-center widen back to

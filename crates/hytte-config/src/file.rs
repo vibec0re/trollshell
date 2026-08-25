@@ -72,7 +72,7 @@ thread_local! {
 
 /// Current value of the tripwire counter above, for this thread.
 #[cfg(test)]
-pub(crate) fn fsync_parent_attempts() -> u64 {
+pub fn fsync_parent_attempts() -> u64 {
     FSYNC_PARENT_ATTEMPTS.with(std::cell::Cell::get)
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn fsync_parent_attempts() -> u64 {
 /// callers keep precisely the behaviour they shipped with, and the next caller
 /// has to state its choice rather than get one by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Durability {
+pub enum Durability {
     /// `fsync` the parent directory after the rename.
     ///
     /// For user-authored data written rarely and deliberately: `places.toml`,
@@ -120,14 +120,16 @@ pub(crate) enum Durability {
 }
 
 /// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is unset.
-pub(crate) fn path(file: &str) -> Option<PathBuf> {
+#[must_use]
+pub fn path(file: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(CONFIG_SUBDIR).join(file))
 }
 
 /// Read `~/.config/trollshell/<file>` as a string, or `None` on any error
 /// (missing, unreadable, non-UTF-8) — callers fall back to their default.
-pub(crate) fn read(file: &str) -> Option<String> {
+#[must_use]
+pub fn read(file: &str) -> Option<String> {
     std::fs::read_to_string(path(file)?).ok()
 }
 
@@ -142,7 +144,7 @@ pub(crate) fn read(file: &str) -> Option<String> {
 /// scoped to `service` and returns `false`; `true` on success. Simple callers
 /// ignore the result (the `Mutable` is authoritative); callers that log their
 /// own success line (e.g. `places`' default-config write) read it.
-pub(crate) fn write(service: &str, file: &str, body: &str) -> bool {
+pub fn write(service: &str, file: &str, body: &str) -> bool {
     let Some(path) = path(file) else {
         tracing::warn!(service, file, "config write skipped: $HOME unset");
         return false;
@@ -201,7 +203,7 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 ///
 /// Any failure removes the temp file rather than leaving litter behind, and
 /// leaves the target untouched.
-pub(crate) fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -288,7 +290,7 @@ fn tmp_name(target: &Path) -> String {
 /// `$HOME`-unset or non-`NotFound` I/O error logs a `warn!` scoped to
 /// `service`. Callers use it to return a persisted UI-state toggle to its
 /// zero-state (e.g. the wallpaper picker's "Clear" clearing the render files).
-pub(crate) fn remove(service: &str, file: &str) {
+pub fn remove(service: &str, file: &str) {
     let Some(path) = path(file) else {
         tracing::warn!(service, file, "config remove skipped: $HOME unset");
         return;

@@ -33,7 +33,7 @@
 //!
 //! The set is also *writable*: [`add_place`], [`update_place`],
 //! [`rename_place`], [`remove_place`] and [`save_places`] validate an edit,
-//! render the whole set back to `places.toml` **atomically** (scratch file in
+//! write the whole set back to `places.toml` **atomically** (scratch file in
 //! the same directory + `rename(2)`, so an interrupted save can never truncate
 //! the config), and then publish the new set on the same handle the live
 //! reload uses — so departures, weather and place detection pick the edit up
@@ -44,34 +44,46 @@
 //! longer parses, or parses to something other than what the shell has in
 //! memory. The set in memory is the user's config only when the file could be
 //! read: a malformed one leaves memory on the built-in default indefinitely
-//! (the load happens once, the watcher is mtime-gated), and re-rendering that
+//! (the load happens once, the watcher is mtime-gated), and rewriting that
 //! would replace a hand-written config with one default place. See [`edit`].
 //!
-//! **Known limitation:** serialising is a *re-render*, not a textual patch. The
-//! file's leading comment block (the documented preamble written on first run)
-//! is carried forward verbatim, but comments attached to individual keys — and
-//! any hand-chosen key ordering inside a `[[place]]` — are lost on the first
-//! programmatic save. Preserving those needs a format-preserving parser
-//! (`toml_edit`), which is not a workspace dependency today.
+//! A save is a **format-preserving patch, not a re-render**: `places.toml` has
+//! two permanent authors (the operator editing it by hand, which #703 asked to
+//! keep, and the control-center editor writing it back), so a save touches only
+//! the keys whose values actually moved. The documented preamble, per-key
+//! comments inside a `[[place]]`, hand-chosen key ordering, keys the model
+//! doesn't know about and unrelated tables all survive it byte for byte. See
+//! [`hytte_config::places::render_places`].
+//!
+//! # Where the model lives
+//!
+//! Everything with no runtime attached — the schema, [`Place`],
+//! [`PlacesError`], validation, and the writer itself — lives in the GTK-free
+//! [`hytte_config::places`] leaf crate and is re-exported here, because
+//! `trollshell-control-center` is the *other* editor and cannot link this crate
+//! (it pulls `gtk`, `pipewire` and `hytte-ecal`). Two editors over one file have
+//! to agree byte for byte on how it is validated and written, so they share one
+//! copy rather than each keeping their own (#640). What stays here is the part
+//! that needs a runtime: resolution, the service, the live-reload task, and
+//! [`edit`]'s republish-under-lock.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte_reactive::{Service, registry, shared, spawn_supervised};
 use tokio::sync::Notify;
 
-use crate::config_file;
 use crate::geoclue::{self, LocationSnapshot, LocationSource, LocationState};
 use crate::hooks;
 use crate::wifiscan::{self, AccessPoint};
 
-// ── Config ────────────────────────────────────────────────────────────────--
+/// The GTK-free half of this module — schema, validation, writer.
+use hytte_config::places as model;
+pub use hytte_config::places::{Place, PlacesError, ResolvedPlace};
 
-/// Config file under `~/.config/trollshell/`.
-const CONFIG_FILE: &str = "places.toml";
+// ── Config ────────────────────────────────────────────────────────────────--
 
 /// How often the running shell re-checks `places.toml` for live reload on AC
 /// power. Each tick is a single `stat` on a cached inode, so it stays snappy
@@ -121,721 +133,6 @@ async fn wait_cadence() {
         tokio::time::sleep(step).await;
         waited += step;
     }
-}
-
-/// Documented default, written on first run and used as the fallback for a
-/// missing/empty/malformed config. Kept *as TOML* so the loader has one parse
-/// path and the written file matches behaviour.
-const DEFAULT_CONFIG: &str = r#"# trollshell places — where you frequent, how the shell recognises each, and
-# (optionally) which departures to show there. Edits are picked up live: save
-# the file and the shell re-resolves within a few seconds, no restart needed.
-#
-# Current place is resolved in order:
-#   1. Wi-Fi fingerprint — at least `match_min` of a place's listed SSIDs are
-#      visible. Capture them by standing there and running:
-#          trollshell --scan-aps
-#      then pasting the block below. (SSIDs, not BSSIDs, so it survives router
-#      swaps; lean on neighbouring networks to tell your places apart.)
-#   2. GeoClue2 / beaconDB location, nearest place within `radius_km`.
-#   3. Otherwise "away": weather uses your raw location; departures shows the
-#      nearest station. Before the first fix at startup the FIRST [[place]] is
-#      used as home.
-#
-# Station ids: https://v6.bvg.transport.rest/locations?query=Schöneweide
-#
-# Moving between named places fires the `place-changed` hook — drop a script
-# at ~/.config/trollshell/hooks/place-changed and it runs with
-# $TROLLSHELL_PLACE (the place name) and $TROLLSHELL_PLACE_STATION (its
-# station id, empty when unset). Transitions are deduped by name, and the
-# very first resolution after login/startup never fires — only actual
-# changes do. See docs/superpowers/specs/2026-05-05-settings-hooks-design.md.
-
-[[place]]
-name = "Schöneweide"
-lat = 52.4556
-lon = 13.5085
-
-# Wi-Fi fingerprint — paste from `trollshell --scan-aps`. List a few SSIDs you
-# reliably see HERE but not at your other places (usually neighbours). Empty =
-# never matches (falls through to GeoClue). `match_min` = how many must be seen.
-ssids = []
-match_min = 2
-
-# GeoClue fallback radius (km) when no fingerprint matches. Generous because
-# GeoClue is city-level; once you've captured a fingerprint it's moot.
-radius_km = 12.0
-
-# Departures here (optional): a station id, optionally narrowed by a
-# line/direction filter (see below). Verify the id names the same station as
-# `name` above — https://v6.bvg.transport.rest/locations?query=<name> — the
-# two silently drifting apart (#641) is exactly the bug that made this widget
-# never work: the fetch succeeds against a real, nearby, WRONG station, so a
-# populated filter then matches nothing, forever, and the widget just looks
-# like a quiet evening instead of telling you it's misconfigured.
-station = "900192001" # S Schöneweide Bhf (Berlin)
-
-# Walk time from here to the platform, in minutes. With this set, the list
-# shows a leave-by countdown ("leave 7 min") instead of the raw departs-in
-# time, and fades trains you can no longer make. 0 (the default) keeps the
-# plain "departs in" label.
-walk_minutes = 10
-
-# `lines`/`directions` narrow which departures show; both empty/absent (the
-# default here) means show everything suburban through this station. That's
-# deliberate: a filter that's wrong (station drifted, typo'd line name, …)
-# fails *invisibly* — an empty list forever, indistinguishable from "nothing's
-# running" — while no filter fails *visibly*, since you immediately see
-# unexpected lines/directions and can narrow from there. Uncomment and edit
-# once you've confirmed the unfiltered board works:
-# lines = ["S8", "S85", "S9"]
-# directions = ["Spandau", "Birkenwerder", "Hohen Neuendorf", "Waidmannslust"]
-"#;
-
-/// A configured place: location identity, Wi-Fi fingerprint, and optional
-/// transit config. One `[[place]]` block in `places.toml`.
-///
-/// Public (and field-public) since #640: it is both what [`configured`] hands
-/// out and what the editing API takes back, so an editor round-trips this type
-/// rather than a parallel wire struct.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Place {
-    /// Display name, and this place's identity: the editing API addresses
-    /// places by it, and the `place-changed` hook dedups on it. Unique
-    /// case-insensitively across the set.
-    pub name: String,
-    /// Latitude in degrees, `-90..=90`.
-    pub lat: f64,
-    /// Longitude in degrees, `-180..=180`.
-    pub lon: f64,
-    /// `GeoClue` fallback radius in kilometres; must be positive.
-    pub radius_km: f64,
-    /// Network SSIDs forming this place's fingerprint (matched verbatim).
-    pub ssids: Vec<String>,
-    /// How many of `ssids` must be visible to call it a match.
-    pub match_min: usize,
-    /// Transit station id for departures here, if any.
-    pub station: Option<String>,
-    /// Walking minutes from here to the platform; drives departures'
-    /// leave-by countdown. `0` = no walk budget (plain departs-in label).
-    pub walk_minutes: u32,
-    /// Allowed line names. Empty = all lines.
-    pub lines: Vec<String>,
-    /// Allowed destination substrings. Empty = all.
-    pub directions: Vec<String>,
-}
-
-impl Place {
-    /// A place with only an identity: the same defaults the config schema
-    /// applies to an omitted key (`radius_km` 12, `match_min` 2), no
-    /// fingerprint and no transit config. The starting point for "add a
-    /// place" in an editor.
-    #[must_use]
-    pub fn new(name: impl Into<String>, lat: f64, lon: f64) -> Self {
-        Self {
-            name: name.into(),
-            lat,
-            lon,
-            radius_km: default_radius_km(),
-            ssids: Vec::new(),
-            match_min: default_match_min(),
-            station: None,
-            walk_minutes: 0,
-            lines: Vec::new(),
-            directions: Vec::new(),
-        }
-    }
-
-    fn resolved(&self) -> ResolvedPlace {
-        ResolvedPlace {
-            name: self.name.clone(),
-            lat: self.lat,
-            lon: self.lon,
-            station: self.station.clone(),
-            walk_minutes: self.walk_minutes,
-            lines: self.lines.clone(),
-            directions: self.directions.clone(),
-        }
-    }
-}
-
-/// The resolved current place, observed by consumers. In the "away" case this
-/// carries the raw location coordinates with `station: None` (departures then
-/// looks up the nearest station).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedPlace {
-    pub name: String,
-    pub lat: f64,
-    pub lon: f64,
-    /// Transit station id when this place has one; `None` means "away / look
-    /// up the nearest station for `(lat, lon)`".
-    pub station: Option<String>,
-    /// Walking minutes from here to the platform; `0` = no walk budget. The
-    /// departures widget renders a leave-by countdown when this is positive.
-    pub walk_minutes: u32,
-    /// Allowed line names (case-insensitive). Empty = all lines.
-    pub lines: Vec<String>,
-    /// Allowed destination substrings (case-insensitive). Empty = all.
-    pub directions: Vec<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct ConfigFile {
-    #[serde(default)]
-    place: Vec<PlaceCfg>,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaceCfg {
-    name: String,
-    lat: f64,
-    lon: f64,
-    #[serde(default = "default_radius_km")]
-    radius_km: f64,
-    #[serde(default)]
-    ssids: Vec<String>,
-    #[serde(default = "default_match_min")]
-    match_min: usize,
-    #[serde(default)]
-    station: Option<String>,
-    #[serde(default)]
-    walk_minutes: u32,
-    #[serde(default)]
-    lines: Vec<String>,
-    #[serde(default)]
-    directions: Vec<String>,
-}
-
-fn default_radius_km() -> f64 {
-    12.0
-}
-
-fn default_match_min() -> usize {
-    2
-}
-
-fn config_path() -> Option<PathBuf> {
-    config_file::path(CONFIG_FILE)
-}
-
-/// Drop empty/whitespace-only entries (a stray `""` would otherwise become an
-/// accidental allow-all, since an empty needle is a substring of everything).
-fn nonblank(items: Vec<String>) -> Vec<String> {
-    items.into_iter().filter(|s| !s.trim().is_empty()).collect()
-}
-
-/// Parse a config body into places. Pure, so the schema is unit-testable.
-fn parse_places(toml_text: &str) -> Result<Vec<Place>, String> {
-    let cfg: ConfigFile = toml::from_str(toml_text).map_err(|e| format!("config: {e}"))?;
-    Ok(cfg
-        .place
-        .into_iter()
-        .map(|p| Place {
-            name: p.name,
-            lat: p.lat,
-            lon: p.lon,
-            radius_km: p.radius_km,
-            // SSIDs are matched verbatim (case-sensitive); just drop blanks.
-            ssids: nonblank(p.ssids),
-            match_min: p.match_min,
-            station: p.station,
-            walk_minutes: p.walk_minutes,
-            lines: nonblank(p.lines),
-            directions: nonblank(p.directions),
-        })
-        .collect())
-}
-
-/// [`DEFAULT_CONFIG`] parsed — the set every "can't use the user's config"
-/// path falls back to, and (since a config that renders to zero places reads
-/// back as this) the set an emptied file means.
-///
-/// The built-in default is parse-tested, so in practice this is non-empty; if
-/// a malformed `DEFAULT_CONFIG` ever shipped it degrades to an empty list —
-/// logged loudly — rather than crashing the whole shell on cold start.
-fn builtin_default() -> Vec<Place> {
-    parse_places(DEFAULT_CONFIG).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "built-in default places config failed to parse");
-        Vec::new()
-    })
-}
-
-/// Load places, writing the documented default on first run. Returns
-/// [`builtin_default`] for a missing/empty/malformed user config.
-fn load_places() -> Vec<Place> {
-    let default = builtin_default;
-    let Some(path) = config_path() else {
-        return default();
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // No places.toml yet. One-time: carry forward a pre-rename
-            // departures.toml if present; otherwise write the documented
-            // default so the schema is discoverable.
-            if let Some(migrated) = migrate_legacy_departures(&path) {
-                return migrated;
-            }
-            write_default_config();
-            return default();
-        }
-        Err(e) => {
-            // Exists but unreadable (permissions, non-UTF-8, …): use the default
-            // but DON'T overwrite — the bytes may be a config we just can't read.
-            tracing::warn!(error = %e, path = %path.display(), "places: config unreadable; using built-in default (not overwriting)");
-            return default();
-        }
-    };
-    match parse_places(&text) {
-        Ok(places) if !places.is_empty() => places,
-        Ok(_) => {
-            tracing::warn!(path = %path.display(), "places: config has no [[place]]; using default");
-            default()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "places: config parse failed; using default");
-            default()
-        }
-    }
-}
-
-fn write_default_config() {
-    if config_file::write("places", CONFIG_FILE, DEFAULT_CONFIG) {
-        tracing::info!(file = CONFIG_FILE, "places: wrote default config");
-    }
-}
-
-/// One-time migration of the pre-rename `departures.toml` (whose schema is a
-/// forward-compatible subset of `places.toml`). When `places.toml` is absent
-/// but a parseable `departures.toml` exists, rename it forward so the user's
-/// station/lines/directions survive the rename. Returns its places on success.
-fn migrate_legacy_departures(places_path: &Path) -> Option<Vec<Place>> {
-    let home = std::env::var("HOME").ok()?;
-    let legacy = PathBuf::from(home).join(".config/trollshell/departures.toml");
-    let text = std::fs::read_to_string(&legacy).ok()?;
-    let places = parse_places(&text).ok()?;
-    if places.is_empty() {
-        return None;
-    }
-    match std::fs::rename(&legacy, places_path) {
-        Ok(()) => {
-            tracing::info!(from = %legacy.display(), to = %places_path.display(), "places: migrated departures.toml → places.toml");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "places: parsed legacy departures.toml but rename failed; using it as-is");
-        }
-    }
-    Some(places)
-}
-
-/// Warn (once, at load) about places whose `match_min` exceeds their number of
-/// listed `ssids` — an unsatisfiable fingerprint that silently never matches.
-fn warn_unsatisfiable_fingerprints(places: &[Place]) {
-    for p in places {
-        if !p.ssids.is_empty() && p.match_min > p.ssids.len() {
-            tracing::warn!(
-                place = %p.name,
-                match_min = p.match_min,
-                ssids = p.ssids.len(),
-                "places: match_min exceeds listed ssids; this fingerprint can never match (falling back to GeoClue radius)"
-            );
-        }
-    }
-}
-
-/// File modification time, or `None` when it can't be stat'd (missing or
-/// unreadable). [`ConfigWatcher`] compares this across polls to detect edits.
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Watches `places.toml` for live reload by polling its mtime. Remembers the
-/// last-seen mtime so a poll only re-reads the file when it actually moved, and
-/// content-checks the reparse so a `touch` or no-op save doesn't churn a
-/// re-resolve.
-struct ConfigWatcher {
-    path: Option<PathBuf>,
-    last: Option<SystemTime>,
-}
-
-impl ConfigWatcher {
-    fn new() -> Self {
-        let path = config_path();
-        let last = path.as_deref().and_then(mtime);
-        Self { path, last }
-    }
-
-    /// Reload and return the fresh places when the file's mtime has moved since
-    /// the previous poll *and* the parsed list differs from `current`; otherwise
-    /// `None` (unchanged mtime, no config path, or an identical reparse).
-    fn poll(&mut self, current: &[Place]) -> Option<Vec<Place>> {
-        let path = self.path.as_deref()?;
-        let now = mtime(path);
-        if now == self.last {
-            return None;
-        }
-        self.last = now;
-        let reloaded = load_places();
-        (reloaded.as_slice() != current).then_some(reloaded)
-    }
-}
-
-// ── Editing (#640 / #703) ───────────────────────────────────────────────────
-
-/// Latitude bound, in degrees (`±MAX_LAT`).
-const MAX_LAT: f64 = 90.0;
-
-/// Longitude bound, in degrees (`±MAX_LON`).
-const MAX_LON: f64 = 180.0;
-
-/// Why an edit to the place set was rejected, or why persisting it failed.
-///
-/// Every way user input can be wrong is a variant here — the editing API never
-/// panics on it, and never writes a file it would refuse to accept back.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PlacesError {
-    /// A place name was empty or whitespace-only. Names are the identity the
-    /// rest of the system addresses a place by, so a blank one is unusable.
-    EmptyName,
-    /// Two places would share a name (compared trimmed + case-insensitively).
-    DuplicateName(String),
-    /// Latitude outside `-90..=90` (or not a finite number).
-    Latitude {
-        /// The offending place's name.
-        place: String,
-        /// The rejected value.
-        lat: f64,
-    },
-    /// Longitude outside `-180..=180` (or not a finite number).
-    Longitude {
-        /// The offending place's name.
-        place: String,
-        /// The rejected value.
-        lon: f64,
-    },
-    /// `radius_km` was zero, negative, or not a finite number — such a place
-    /// could never match by [`GeoClue`](crate::geoclue) radius.
-    Radius {
-        /// The offending place's name.
-        place: String,
-        /// The rejected value.
-        radius_km: f64,
-    },
-    /// No place in the set carries this name.
-    NotFound(String),
-    /// `places::service()` isn't registered in this process, so there is no
-    /// set to edit.
-    NotRunning,
-    /// `$HOME` is unset — nowhere to write `places.toml`.
-    NoConfigPath,
-    /// `places.toml` exists but its contents can't be established: unreadable
-    /// (permissions), non-UTF-8, or not valid TOML. Refusing rather than
-    /// overwriting bytes we can't account for — see [`edit`] for why this is a
-    /// data-loss guard and not just tidiness.
-    Unreadable(String),
-    /// `places.toml` parses, but to a *different* set than the one in memory —
-    /// something edited it since we last loaded it. Refusing, because the edit
-    /// was computed against a stale base and applying it would write the
-    /// out-of-process change away. See [`edit`].
-    ChangedOnDisk,
-    /// The set could not be rendered as TOML.
-    Encode(String),
-    /// The atomic write failed; the previous config is untouched.
-    Write(String),
-}
-
-impl std::fmt::Display for PlacesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EmptyName => write!(f, "a place needs a name"),
-            Self::DuplicateName(name) => {
-                write!(f, "a place named \"{name}\" already exists")
-            }
-            Self::Latitude { place, lat } => {
-                write!(f, "\"{place}\": latitude {lat} is outside -90..=90")
-            }
-            Self::Longitude { place, lon } => {
-                write!(f, "\"{place}\": longitude {lon} is outside -180..=180")
-            }
-            Self::Radius { place, radius_km } => {
-                write!(f, "\"{place}\": radius_km {radius_km} must be positive")
-            }
-            Self::NotFound(name) => write!(f, "no place named \"{name}\""),
-            Self::NotRunning => write!(f, "the places service is not registered"),
-            Self::NoConfigPath => write!(f, "cannot locate places.toml: $HOME is unset"),
-            Self::Unreadable(e) => write!(
-                f,
-                "places.toml could not be read back ({e}); refusing to overwrite it — fix or move the file, then retry"
-            ),
-            Self::ChangedOnDisk => write!(
-                f,
-                "places.toml changed on disk since it was loaded; refusing to overwrite it — the change is picked up within a few seconds, then retry"
-            ),
-            Self::Encode(e) => write!(f, "could not render places.toml: {e}"),
-            Self::Write(e) => {
-                write!(
-                    f,
-                    "could not write places.toml ({e}); the previous config is unchanged"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for PlacesError {}
-
-/// Trimmed, case-folded key for a place name. A name is a place's identity —
-/// the editing API addresses places by it and the `place-changed` hook dedups
-/// on it — so `"home"`, `"Home"` and `" Home "` must not coexist.
-fn name_key(name: &str) -> String {
-    name.trim().to_lowercase()
-}
-
-/// Position of the place named `name` (see [`name_key`] for the comparison).
-fn index_of(places: &[Place], name: &str) -> Option<usize> {
-    let key = name_key(name);
-    places.iter().position(|p| name_key(&p.name) == key)
-}
-
-/// Canonicalise an incoming place exactly the way [`parse_places`] would after
-/// a reload: trim the name, drop a blank station, drop blank list entries.
-///
-/// This is what keeps memory and file in agreement (#640) — without it a UI
-/// could hand us `ssids = ["", "x"]`, we'd write it, the reparse would drop the
-/// blank, and the mtime watcher would then see a *different* set than the one
-/// we published and churn a spurious reload.
-fn normalize(mut place: Place) -> Place {
-    place.name = place.name.trim().to_string();
-    place.station = place.station.and_then(|s| {
-        let trimmed = s.trim().to_string();
-        (!trimmed.is_empty()).then_some(trimmed)
-    });
-    place.ssids = nonblank(place.ssids);
-    place.lines = nonblank(place.lines);
-    place.directions = nonblank(place.directions);
-    place
-}
-
-/// Validate a whole place set before it is written.
-///
-/// Deliberately checks the **result** of an edit, not just the part that
-/// changed: whatever we are about to put on disk has to be something we'd
-/// accept back. The practical consequence is that an already-invalid file
-/// (say, a hand-edited `lat = 500`) has to be repaired before unrelated edits
-/// go through — which is the safe direction: a save can never make the file
-/// worse than it already is.
-fn validate(places: &[Place]) -> Result<(), PlacesError> {
-    let mut seen: HashSet<String> = HashSet::new();
-    for p in places {
-        let key = name_key(&p.name);
-        if key.is_empty() {
-            return Err(PlacesError::EmptyName);
-        }
-        if !seen.insert(key) {
-            return Err(PlacesError::DuplicateName(p.name.clone()));
-        }
-        // `contains` is false for NaN/±inf too, so this is the whole check.
-        if !(-MAX_LAT..=MAX_LAT).contains(&p.lat) {
-            return Err(PlacesError::Latitude {
-                place: p.name.clone(),
-                lat: p.lat,
-            });
-        }
-        if !(-MAX_LON..=MAX_LON).contains(&p.lon) {
-            return Err(PlacesError::Longitude {
-                place: p.name.clone(),
-                lon: p.lon,
-            });
-        }
-        if !(p.radius_km.is_finite() && p.radius_km > 0.0) {
-            return Err(PlacesError::Radius {
-                place: p.name.clone(),
-                radius_km: p.radius_km,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `places` with `place` appended. Pure, so each rule is unit-testable.
-fn added(places: &[Place], place: Place) -> Result<Vec<Place>, PlacesError> {
-    let mut next = places.to_vec();
-    next.push(normalize(place));
-    validate(&next)?;
-    Ok(next)
-}
-
-/// `places` with the place named `target` replaced by `place` (in place, so
-/// ordering — and therefore the "first place is provisional home" rule —
-/// survives an edit). `place.name` may differ, i.e. this also renames.
-fn updated(places: &[Place], target: &str, place: Place) -> Result<Vec<Place>, PlacesError> {
-    let idx = index_of(places, target).ok_or_else(|| PlacesError::NotFound(target.to_string()))?;
-    let mut next = places.to_vec();
-    next[idx] = normalize(place);
-    validate(&next)?;
-    Ok(next)
-}
-
-/// `places` with the place named `from` renamed to `to`, keeping its position.
-fn renamed(places: &[Place], from: &str, to: &str) -> Result<Vec<Place>, PlacesError> {
-    let idx = index_of(places, from).ok_or_else(|| PlacesError::NotFound(from.to_string()))?;
-    let mut next = places.to_vec();
-    next[idx].name = to.trim().to_string();
-    validate(&next)?;
-    Ok(next)
-}
-
-/// `places` without the place named `name`.
-fn removed(places: &[Place], name: &str) -> Result<Vec<Place>, PlacesError> {
-    let idx = index_of(places, name).ok_or_else(|| PlacesError::NotFound(name.to_string()))?;
-    let mut next = places.to_vec();
-    next.remove(idx);
-    validate(&next)?;
-    Ok(next)
-}
-
-/// Serialisation mirror of [`ConfigFile`]. Separate from the `Deserialize`
-/// side because the two are not symmetric: reading tolerates omitted keys (the
-/// `#[serde(default)]`s), writing spells every one of them out so a reparse of
-/// what we wrote yields exactly the set we published — no default-drift.
-#[derive(serde::Serialize)]
-struct ConfigOut<'a> {
-    place: Vec<PlaceOut<'a>>,
-}
-
-#[derive(serde::Serialize)]
-struct PlaceOut<'a> {
-    name: &'a str,
-    lat: f64,
-    lon: f64,
-    radius_km: f64,
-    ssids: &'a [String],
-    match_min: usize,
-    /// Omitted entirely when unset, which is how the schema spells "no
-    /// departures here" (`Option<String>` + `#[serde(default)]` on the way in).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    station: Option<&'a str>,
-    walk_minutes: u32,
-    lines: &'a [String],
-    directions: &'a [String],
-}
-
-impl<'a> From<&'a Place> for PlaceOut<'a> {
-    fn from(p: &'a Place) -> Self {
-        Self {
-            name: &p.name,
-            lat: p.lat,
-            lon: p.lon,
-            radius_km: p.radius_km,
-            ssids: &p.ssids,
-            match_min: p.match_min,
-            station: p.station.as_deref(),
-            walk_minutes: p.walk_minutes,
-            lines: &p.lines,
-            directions: &p.directions,
-        }
-    }
-}
-
-/// Render a place set as the body of a `places.toml`. Pure, so round-trip
-/// fidelity is unit-testable.
-fn serialize_places(places: &[Place]) -> Result<String, PlacesError> {
-    let out = ConfigOut {
-        place: places.iter().map(PlaceOut::from).collect(),
-    };
-    toml::to_string(&out).map_err(|e| PlacesError::Encode(e.to_string()))
-}
-
-/// The file's leading comment block — every line up to (not including) the
-/// first line that is neither blank nor a `#` comment — normalised to end in
-/// exactly one blank line, or empty when the file opens with content.
-///
-/// This is the half of the user's formatting a re-render *can* preserve, and
-/// it's the valuable half: it's where the shipped default puts the whole
-/// documented schema (how to capture a fingerprint, what `match_min` means,
-/// the station-id lookup URL). Per-key comments inside a `[[place]]` are lost
-/// — see the module docs.
-fn leading_comments(text: &str) -> String {
-    let block: Vec<&str> = text
-        .lines()
-        .take_while(|l| {
-            let t = l.trim_start();
-            t.is_empty() || t.starts_with('#')
-        })
-        .collect();
-    let end = block
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map_or(0, |i| i + 1);
-    if end == 0 {
-        return String::new();
-    }
-    let mut header = block[..end].join("\n");
-    header.push_str("\n\n");
-    header
-}
-
-/// What `places.toml` currently holds, from the point of view of a writer that
-/// is about to replace it.
-///
-/// This is [`load_places`]'s classification with its two "can't tell" arms
-/// split back out. `load_places` folds an unreadable and an unparseable file
-/// into the same silent fallback as a missing one — correct for a *reader*
-/// (the shell still needs somewhere to be), catastrophic for a *writer*, which
-/// would then render that fallback over the bytes it couldn't read.
-#[derive(Debug)]
-enum OnDisk {
-    /// No file yet: a save creates it, and there is nothing to lose.
-    Absent,
-    /// A parseable file. A config that yields zero places is reported as
-    /// [`builtin_default`], because that is what [`load_places`] makes of it —
-    /// so "disk" and "memory" are compared in the same units.
-    Places(Vec<Place>),
-    /// The file is there but its contents can't be established. Never write
-    /// over this.
-    Unknown(String),
-}
-
-/// Classify the current `places.toml` for a writer — see [`OnDisk`].
-fn read_on_disk(path: &Path) -> OnDisk {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OnDisk::Absent,
-        Err(e) => return OnDisk::Unknown(e.to_string()),
-    };
-    match parse_places(&text) {
-        Ok(places) if places.is_empty() => OnDisk::Places(builtin_default()),
-        Ok(places) => OnDisk::Places(places),
-        Err(e) => OnDisk::Unknown(e),
-    }
-}
-
-/// Render + atomically write `places` to `path`, so tests can drive it into a
-/// tempdir instead of the user's real config.
-///
-/// Carries the existing file's leading comment block forward; when there is no
-/// file yet (or it can't be read) the built-in default's header is used, so a
-/// config this API creates is as self-documenting as the one first run writes.
-///
-/// The write itself is [`config_file::write_atomic`] — the crate's one copy of
-/// the scratch-file + `fsync` + `rename(2)` algorithm (#739), which is also
-/// what makes it symlink- and permission-safe. `places.toml` picks
-/// [`config_file::Durability::FsyncParent`], unlike the click-driven toggles
-/// behind `config_file::write`: it is user-authored data, saved rarely and
-/// deliberately through an API that reports success, so an acknowledged save
-/// must survive a power cut. `config_file` gives us the real `io::Error` here,
-/// which is what [`PlacesError::Write`] needs to carry.
-fn persist_to(path: &Path, places: &[Place]) -> Result<(), PlacesError> {
-    let header = match std::fs::read_to_string(path) {
-        Ok(text) => leading_comments(&text),
-        Err(_) => leading_comments(DEFAULT_CONFIG),
-    };
-    let body = serialize_places(places)?;
-    config_file::write_atomic(
-        path,
-        &format!("{header}{body}"),
-        config_file::Durability::FsyncParent,
-    )
-    .map_err(|e| PlacesError::Write(e.to_string()))
 }
 
 // ── Resolution ──────────────────────────────────────────────────────────────
@@ -964,8 +261,8 @@ impl Service for PlacesService {
     type Handles = PlacesHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        let loaded = load_places();
-        warn_unsatisfiable_fingerprints(&loaded);
+        let loaded = model::load_places();
+        model::warn_unsatisfiable_fingerprints(&loaded);
         let handles = PlacesHandles {
             configured: Mutable::new(Arc::new(loaded)),
             ..PlacesHandles::default()
@@ -1056,19 +353,19 @@ pub fn configured_snapshot() -> Vec<Place> {
 /// Rejects a blank name, a name already taken (trimmed, case-insensitively),
 /// coordinates outside `±90`/`±180`, and a non-positive `radius_km`.
 pub fn add_place(place: Place) -> Result<(), PlacesError> {
-    edit(|current| added(current, place))
+    edit(|current| model::added(current, place))
 }
 
 /// Replace the place named `target` — keeping its position in the file — with
 /// `place`. `place.name` may differ from `target`, so this covers a rename
 /// bundled with other edits.
 pub fn update_place(target: &str, place: Place) -> Result<(), PlacesError> {
-    edit(|current| updated(current, target, place))
+    edit(|current| model::updated(current, target, place))
 }
 
 /// Rename the place named `from` to `to`, leaving everything else alone.
 pub fn rename_place(from: &str, to: &str) -> Result<(), PlacesError> {
-    edit(|current| renamed(current, from, to))
+    edit(|current| model::renamed(current, from, to))
 }
 
 /// Delete the place named `name`.
@@ -1079,7 +376,7 @@ pub fn rename_place(from: &str, to: &str) -> Result<(), PlacesError> {
 /// also what [`configured`] republishes, immediately rather than one config
 /// poll later.
 pub fn remove_place(name: &str) -> Result<(), PlacesError> {
-    edit(|current| removed(current, name))
+    edit(|current| model::removed(current, name))
 }
 
 /// Replace the whole set in one write — the "the editor sent us its model
@@ -1087,8 +384,8 @@ pub fn remove_place(name: &str) -> Result<(), PlacesError> {
 /// first `[[place]]` is the provisional home before the first location fix).
 pub fn save_places(places: Vec<Place>) -> Result<(), PlacesError> {
     edit(move |_| {
-        let next: Vec<Place> = places.into_iter().map(normalize).collect();
-        validate(&next)?;
+        let next: Vec<Place> = places.into_iter().map(model::normalize).collect();
+        model::validate(&next)?;
         Ok(next)
     })
 }
@@ -1102,29 +399,22 @@ pub fn save_places(places: Vec<Place>) -> Result<(), PlacesError> {
 /// safe here and cheap.
 static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The one write path: check the file still says what memory says, apply `f`
-/// to the current set, persist the result atomically, then publish it.
+/// The shell's write path: check the file still says what memory says, apply
+/// `f` to the current set, persist the result atomically, then publish it.
 ///
-/// **The re-read is a data-loss guard, not a nicety.** The set in memory is
-/// only the user's config when [`load_places`] managed to read one; for an
-/// unreadable or malformed `places.toml` it is the *built-in default*, and
-/// nothing ever corrects that — `PlacesService::start` loads once and
-/// [`ConfigWatcher::poll`] is mtime-gated, so a broken file that nobody
-/// touches keeps memory on the default indefinitely. Writing memory back
-/// would then render one built-in place over however many the user had
-/// hand-configured, atomically and without a backup. So the file is read and
-/// reparsed here, inside the lock, and the edit is refused
-/// ([`PlacesError::Unreadable`]) unless we can account for what we are about
-/// to replace.
+/// The check and the write are [`hytte_config::places::check_base`] and
+/// [`hytte_config::places::persist_to`] — the same two the control center's
+/// editor composes through
+/// [`hytte_config::places::save_to`]. This can't just call `save_to`, because
+/// what makes the shell's version different is the third step: publishing on
+/// the reactive handle *inside the same critical section*, so no other edit
+/// can interleave between the write and the republish.
 ///
-/// The same read covers the out-of-process editor: a file that parses to a
-/// different set than the one in memory was edited behind our back since the
-/// last poll, so the edit was computed against a stale base and is refused
-/// ([`PlacesError::ChangedOnDisk`]). The mtime watcher republishes the new
-/// contents within a poll tick, after which the same edit succeeds. (It is a
-/// *narrowing*, not a cure: nothing stops a write landing between this read
-/// and the `rename(2)` a few microseconds later. Closing that needs an
-/// `O_EXCL` lock file the editor also honours, which no editor does.)
+/// **The re-read is a data-loss guard, not a nicety** — see `check_base` for
+/// the two ways the in-memory set can be a lie about what's on disk. It matters
+/// especially here because the shell reads the file exactly once at startup and
+/// its watcher is mtime-gated, so a malformed config leaves memory on the
+/// built-in default indefinitely.
 ///
 /// Order then matters. The file is written **first**, so a failed write leaves
 /// the in-memory set untouched and the two still agree. Publishing second is
@@ -1133,28 +423,19 @@ static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// rather than waiting up to [`BATTERY_CONFIG_POLL_INTERVAL`] for the mtime
 /// poll to notice our own write. That poll still runs, and finds nothing to do
 /// — it content-compares the reparse against what we published, and
-/// [`normalize`] guarantees they match.
+/// `normalize` guarantees they match.
 fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(), PlacesError> {
     let shared = shared::get::<Shared>().ok_or(PlacesError::NotRunning)?;
     let handle = shared.configured.clone();
-    let path = config_path().ok_or(PlacesError::NoConfigPath)?;
+    let path = model::config_path().ok_or(PlacesError::NoConfigPath)?;
     let _serialized = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let current = handle.get_cloned();
-    match read_on_disk(&path) {
-        // Nothing on disk to lose, or it says exactly what we think it says.
-        OnDisk::Absent => {}
-        OnDisk::Places(disk) if disk == *current => {}
-        OnDisk::Places(_) => return Err(PlacesError::ChangedOnDisk),
-        OnDisk::Unknown(why) => {
-            tracing::warn!(path = %path.display(), reason = %why, "places: refusing to save over a config we can't read back");
-            return Err(PlacesError::Unreadable(why));
-        }
-    }
+    model::check_base(&path, &current)?;
     let next = f(current.as_slice())?;
-    persist_to(&path, &next)?;
-    warn_unsatisfiable_fingerprints(&next);
+    model::persist_to(&path, &next)?;
+    model::warn_unsatisfiable_fingerprints(&next);
     tracing::info!(count = next.len(), "places: config saved");
     // An emptied config reads back as the built-in default (documented at
     // `remove_place`), so publish what a reload of what we just wrote would
@@ -1162,7 +443,7 @@ fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(
     // in disagreement until the next config poll — a visible empty-then-default
     // flicker, and a base the very next `edit` would reject as stale.
     handle.set(Arc::new(if next.is_empty() {
-        builtin_default()
+        model::builtin_default()
     } else {
         next
     }));
@@ -1175,12 +456,12 @@ fn edit(f: impl FnOnce(&[Place]) -> Result<Vec<Place>, PlacesError>) -> Result<(
 /// shell. [`resolve_loop`] subscribes to the same handle and re-resolves on
 /// each swap, exactly as it does for the Wi-Fi and `GeoClue` sensors.
 async fn watch_config(places: Mutable<Arc<Vec<Place>>>) {
-    let mut watcher = ConfigWatcher::new();
+    let mut watcher = model::ConfigWatcher::new();
     loop {
         wait_cadence().await;
         let current = places.get_cloned();
         if let Some(reloaded) = watcher.poll(&current) {
-            warn_unsatisfiable_fingerprints(&reloaded);
+            model::warn_unsatisfiable_fingerprints(&reloaded);
             tracing::info!(count = reloaded.len(), "places: config changed; reloaded");
             places.set(Arc::new(reloaded));
         }
@@ -1313,7 +594,10 @@ async fn resolve_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use hytte_config::places::{DEFAULT_CONFIG, builtin_default, load_places, parse_places};
 
     fn ap(ssid: &str) -> AccessPoint {
         AccessPoint {
@@ -1322,9 +606,56 @@ mod tests {
         }
     }
 
-    fn default_places() -> Vec<Place> {
-        parse_places(DEFAULT_CONFIG).expect("default config parses")
+    /// A place with *every* field non-default — the same fixture the model
+    /// crate's write-path tests use, so a field silently dropped somewhere in
+    /// the shell's editing API can't hide behind a coincidental default.
+    fn full_place(name: &str) -> Place {
+        Place {
+            name: name.to_string(),
+            lat: 52.4556,
+            lon: 13.5085,
+            radius_km: 3.25,
+            ssids: vec!["FRITZ!Box 7590".into(), "Telekom-ABC".into()],
+            match_min: 2,
+            station: Some("900192001".into()),
+            walk_minutes: 10,
+            lines: vec!["S8".into(), "S85".into()],
+            directions: vec!["Spandau".into(), "Birkenwerder".into()],
+        }
     }
+
+    /// A hand-written `places.toml` carrying every kind of formatting the
+    /// editing API has to leave alone: a preamble, per-key comment blocks, a
+    /// trailing comment beside a value, non-canonical key ordering, an
+    /// unmodelled key, and an unrelated top-level table.
+    /// `hytte_config::places` proves the *writer* preserves these; the test
+    /// below proves they survive the shell's public API end to end.
+    const HAND_WRITTEN: &str = "\
+# my places file
+# station ids: https://v6.bvg.transport.rest/locations?query=
+
+[[place]]
+# the pretty name, shown in the bar
+name = \"Home\"
+# picked off the neighbours — I never see these at the office
+ssids = [\"FRITZ!Box 7590\", \"Telekom-ABC\"]
+match_min = 2
+lat = 52.4556
+lon = 13.5085
+station = \"900192001\" # S Schöneweide Bhf
+walk_minutes = 10
+notes = \"the balcony one\"
+
+[[place]]
+# work — no fingerprint captured yet
+name = \"Office\"
+lat = 52.5200
+lon = 13.4050
+radius_km = 4.0
+
+[scratch]
+mine = true
+";
 
     fn place(name: &str, lat: f64, lon: f64, ssids: &[&str], match_min: usize) -> Place {
         Place {
@@ -1357,47 +688,6 @@ mod tests {
     // ── Config ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn default_config_parses() {
-        let places = default_places();
-        assert_eq!(places.len(), 1);
-        assert_eq!(places[0].name, "Schöneweide");
-        assert_eq!(places[0].station.as_deref(), Some("900192001"));
-        assert_eq!(places[0].match_min, 2);
-        assert!(places[0].ssids.is_empty());
-        assert_eq!(places[0].walk_minutes, 10);
-        // Shipped commented out (#641): a wrong filter fails invisibly (zero
-        // matches, forever), an absent one fails visibly (you see everything
-        // and narrow from there) — so the default leaves both axes open.
-        assert!(places[0].lines.is_empty());
-        assert!(places[0].directions.is_empty());
-        assert!((places[0].radius_km - 12.0).abs() < 1e-9);
-    }
-
-    /// Ties the shipped default's station id to the place it's named after —
-    /// #641 shipped `900180001` ("S Köpenick/Parrisiusstr. (Berlin)", live
-    /// BVG API) under the name "Schöneweide", served only by S3, none of
-    /// which passes through Köpenick: a structural, permanent zero-match.
-    /// `900192001` is "S Schöneweide Bhf (Berlin)", the correct id. A bare
-    /// literal comparison (as the pre-#641 tests had) can't catch this class
-    /// of bug — the constant is self-consistently wrong — so this pins the
-    /// id/name *pair* and spells out the real-world station name in the
-    /// failure message.
-    #[test]
-    fn default_station_id_matches_its_place_name() {
-        let places = default_places();
-        assert_eq!(places[0].name, "Schöneweide");
-        assert_eq!(
-            places[0].station.as_deref(),
-            Some("900192001"),
-            "default station id must stay \"900192001\" (\"S Schöneweide Bhf \
-             (Berlin)\" per the live BVG API) — NOT \"900180001\", which is a \
-             DIFFERENT, nearby station (\"S Köpenick/Parrisiusstr. (Berlin)\", \
-             #641). If you're changing this id, verify the new one at \
-             https://v6.bvg.transport.rest/locations?query=Schöneweide first."
-        );
-    }
-
-    #[test]
     fn walk_minutes_defaults_to_zero_and_survives_resolve() {
         // Absent in config → 0; present → carried through to ResolvedPlace.
         let toml = "\
@@ -1414,25 +704,6 @@ mod tests {
         assert_eq!(places[0].walk_minutes, 0); // omitted → default
         assert_eq!(places[1].walk_minutes, 7);
         assert_eq!(places[1].resolved().walk_minutes, 7);
-    }
-
-    #[test]
-    fn parse_keeps_ssids_verbatim_and_drops_blanks() {
-        let toml = "\
-            [[place]]\n\
-            name = \"T\"\n\
-            lat = 1.0\n\
-            lon = 2.0\n\
-            ssids = [\"FRITZ!Box 7590\", \"\", \"  \"]\n";
-        let places = parse_places(toml).expect("parses");
-        assert_eq!(places[0].ssids, ["FRITZ!Box 7590"]); // case kept, blanks dropped
-        assert!(places[0].station.is_none()); // optional
-        assert_eq!(places[0].match_min, 2); // default
-    }
-
-    #[test]
-    fn parse_malformed_is_err() {
-        assert!(parse_places("[[place]]\nname = ").is_err());
     }
 
     // ── Fingerprint ──────────────────────────────────────────────────────────
@@ -1626,532 +897,6 @@ mod tests {
         assert_eq!(fired.name, "Home");
     }
 
-    // ── Live reload ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn config_watcher_reloads_only_on_changed_content() {
-        use std::time::UNIX_EPOCH;
-
-        let root = std::env::temp_dir().join(format!("hytte-places-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
-
-        // `temp_env` serializes $HOME mutation across tests and restores it after.
-        temp_env::with_var("HOME", Some(root.as_os_str()), || {
-            let cfg = root.join(".config/trollshell/places.toml");
-            let one = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n";
-            let two = "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n\
-                       [[place]]\nname = \"Office\"\nlat = 3.0\nlon = 4.0\n";
-            // Set the file's mtime to a fixed instant so change-detection is
-            // deterministic (no sleeps, no filesystem-granularity flakiness).
-            let set_mtime = |secs: u64| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&cfg)
-                    .unwrap()
-                    .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
-                    .unwrap();
-            };
-
-            // One place on disk; the watcher records its mtime at construction.
-            std::fs::write(&cfg, one).unwrap();
-            set_mtime(1);
-            let mut watcher = ConfigWatcher::new();
-            let current = load_places();
-            assert_eq!(current.len(), 1);
-
-            // Unchanged mtime → no reload.
-            assert!(watcher.poll(&current).is_none());
-
-            // Add a place and move the mtime → reload sees both.
-            std::fs::write(&cfg, two).unwrap();
-            set_mtime(2);
-            let reloaded = watcher.poll(&current).expect("changed → reload");
-            assert_eq!(reloaded.len(), 2);
-
-            // mtime moves but content is identical → no spurious republish.
-            set_mtime(3);
-            assert!(watcher.poll(&reloaded).is_none());
-        });
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // ── Write path: serialisation round-trip (#640) ─────────────────────────
-
-    /// A place with *every* field non-default, so a dropped field in the
-    /// serialiser can't hide behind a coincidental default on reparse.
-    fn full_place(name: &str) -> Place {
-        Place {
-            name: name.to_string(),
-            lat: 52.4556,
-            lon: 13.5085,
-            radius_km: 3.25,
-            ssids: vec!["FRITZ!Box 7590".into(), "Telekom-ABC".into()],
-            match_min: 2,
-            station: Some("900192001".into()),
-            walk_minutes: 10,
-            lines: vec!["S8".into(), "S85".into()],
-            directions: vec!["Spandau".into(), "Birkenwerder".into()],
-        }
-    }
-
-    #[test]
-    fn serialize_round_trips_every_field() {
-        let places = vec![
-            full_place("Schöneweide"),
-            Place::new("Office", -33.87, 151.21),
-        ];
-        let text = serialize_places(&places).expect("renders");
-        assert_eq!(parse_places(&text).expect("reparses"), places);
-    }
-
-    #[test]
-    fn serialize_omits_station_when_unset() {
-        let places = vec![Place::new("Nowhere", 0.0, 0.0)];
-        let text = serialize_places(&places).expect("renders");
-        assert!(
-            !text.contains("station"),
-            "an unset station must be absent, not empty: {text}"
-        );
-        assert_eq!(parse_places(&text).expect("reparses")[0].station, None);
-    }
-
-    #[test]
-    fn default_config_round_trips() {
-        let places = default_places();
-        let text = serialize_places(&places).expect("renders");
-        assert_eq!(parse_places(&text).expect("reparses"), places);
-    }
-
-    /// The headline guarantee: parse → mutate → serialize → parse is the set
-    /// we asked for, field for field, ordering included.
-    #[test]
-    fn parse_mutate_serialize_parse_is_stable() {
-        let start = default_places();
-
-        let with_office = added(&start, full_place("Office")).expect("adds");
-        let renamed_home = renamed(&with_office, "schöneweide", "Home").expect("renames");
-        let retuned = updated(
-            &renamed_home,
-            "Office",
-            Place {
-                walk_minutes: 4,
-                station: None,
-                ..full_place("Office")
-            },
-        )
-        .expect("updates");
-
-        let text = serialize_places(&retuned).expect("renders");
-        let reparsed = parse_places(&text).expect("reparses");
-        assert_eq!(reparsed, retuned);
-        assert_eq!(reparsed[0].name, "Home", "rename keeps position");
-        assert_eq!(reparsed[1].walk_minutes, 4);
-        assert_eq!(reparsed[1].station, None);
-
-        let without_office = removed(&reparsed, "OFFICE").expect("removes");
-        assert_eq!(
-            parse_places(&serialize_places(&without_office).expect("renders")).expect("reparses"),
-            start
-                .iter()
-                .cloned()
-                .map(|p| Place {
-                    name: "Home".into(),
-                    ..p
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn normalize_matches_what_a_reparse_would_yield() {
-        // Exactly the input a UI can produce: padded name, blank list entries,
-        // a whitespace-only station.
-        let messy = Place {
-            name: "  Office  ".into(),
-            station: Some("   ".into()),
-            ssids: vec![String::new(), "wifi".into(), "  ".into()],
-            lines: vec!["S8".into(), " ".into()],
-            directions: vec![String::new()],
-            ..full_place("ignored")
-        };
-        let clean = normalize(messy);
-        assert_eq!(clean.name, "Office");
-        assert_eq!(clean.station, None);
-        assert_eq!(clean.ssids, ["wifi"]);
-        assert_eq!(clean.lines, ["S8"]);
-        assert!(clean.directions.is_empty());
-        // …and the file agrees with memory: a reparse is a no-op on it.
-        let text = serialize_places(std::slice::from_ref(&clean)).expect("renders");
-        assert_eq!(parse_places(&text).expect("reparses"), vec![clean]);
-    }
-
-    // ── Write path: validation (#640) ───────────────────────────────────────
-
-    #[test]
-    fn validate_accepts_the_shipped_default() {
-        assert_eq!(validate(&default_places()), Ok(()));
-    }
-
-    #[test]
-    fn validate_rejects_blank_names() {
-        for name in ["", "   ", "\t\n"] {
-            assert_eq!(
-                validate(&[Place::new(name, 0.0, 0.0)]),
-                Err(PlacesError::EmptyName),
-                "{name:?} must be rejected"
-            );
-        }
-        assert_eq!(
-            added(&[], Place::new("  ", 1.0, 2.0)),
-            Err(PlacesError::EmptyName)
-        );
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_names_ignoring_case_and_padding() {
-        let home = Place::new("Home", 1.0, 2.0);
-        for clash in ["Home", "home", "  HOME  "] {
-            let err = added(std::slice::from_ref(&home), Place::new(clash, 3.0, 4.0));
-            assert_eq!(
-                err,
-                Err(PlacesError::DuplicateName(clash.trim().to_string())),
-                "{clash:?} must collide with \"Home\""
-            );
-        }
-        // A rename onto an existing name collides too.
-        let set = vec![home, Place::new("Office", 3.0, 4.0)];
-        assert_eq!(
-            renamed(&set, "Office", "home"),
-            Err(PlacesError::DuplicateName("home".to_string()))
-        );
-    }
-
-    #[test]
-    fn validate_rejects_out_of_range_latitude() {
-        for lat in [90.5, -90.5, f64::NAN, f64::INFINITY] {
-            let place = Place::new("P", lat, 0.0);
-            match validate(std::slice::from_ref(&place)) {
-                Err(PlacesError::Latitude { place, .. }) => assert_eq!(place, "P"),
-                other => panic!("lat {lat} must be rejected, got {other:?}"),
-            }
-        }
-        // The bounds themselves are valid.
-        assert_eq!(validate(&[Place::new("P", 90.0, 0.0)]), Ok(()));
-        assert_eq!(validate(&[Place::new("P", -90.0, 0.0)]), Ok(()));
-    }
-
-    #[test]
-    fn validate_rejects_out_of_range_longitude() {
-        for lon in [180.5, -180.5, f64::NAN, f64::NEG_INFINITY] {
-            let place = Place::new("P", 0.0, lon);
-            match validate(std::slice::from_ref(&place)) {
-                Err(PlacesError::Longitude { place, .. }) => assert_eq!(place, "P"),
-                other => panic!("lon {lon} must be rejected, got {other:?}"),
-            }
-        }
-        assert_eq!(validate(&[Place::new("P", 0.0, 180.0)]), Ok(()));
-        assert_eq!(validate(&[Place::new("P", 0.0, -180.0)]), Ok(()));
-    }
-
-    #[test]
-    fn validate_rejects_non_positive_radius() {
-        for radius_km in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let place = Place {
-                radius_km,
-                ..Place::new("P", 0.0, 0.0)
-            };
-            match validate(std::slice::from_ref(&place)) {
-                Err(PlacesError::Radius { place, .. }) => assert_eq!(place, "P"),
-                other => panic!("radius {radius_km} must be rejected, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn edits_of_an_unknown_place_are_not_found() {
-        let set = vec![Place::new("Home", 1.0, 2.0)];
-        let missing = || Err(PlacesError::NotFound("Ghost".to_string()));
-        assert_eq!(updated(&set, "Ghost", Place::new("G", 1.0, 2.0)), missing());
-        assert_eq!(renamed(&set, "Ghost", "G"), missing());
-        assert_eq!(removed(&set, "Ghost"), missing());
-    }
-
-    #[test]
-    fn removing_the_last_place_is_allowed() {
-        let set = vec![Place::new("Home", 1.0, 2.0)];
-        assert_eq!(removed(&set, "Home"), Ok(Vec::new()));
-    }
-
-    // ── Write path: atomic file replacement (#640 / #739) ───────────────────
-    //
-    // #739 folded `places`' own copy of this algorithm into
-    // `config_file::write_atomic`. These cases stayed here because they assert
-    // through a `persist_to`-shaped local helper (`write_atomic` below, not to
-    // be confused with `config_file::write_atomic`) against `places.toml`-
-    // flavoured paths and bodies, and two of them drive the real `persist_to`
-    // directly. `config_file`'s own suite covers the algorithm in the
-    // abstract, including both `Durability` arms
-    // (`both_durability_choices_write_the_same_file`); what pins that
-    // `persist_to` actually takes the `FsyncParent` branch is
-    // `persist_to_pins_the_fsync_parent_durability_choice`, further down.
-
-    /// Leftover scratch files (they're dotfiles named after their target).
-    fn scratch_files(dir: &Path) -> Vec<String> {
-        std::fs::read_dir(dir)
-            .expect("dir readable")
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('.'))
-            .collect()
-    }
-
-    /// Exactly the call [`persist_to`] makes, minus the TOML rendering, so the
-    /// cases below can assert on a body they chose. The two #739 regressions go
-    /// through the real `persist_to` instead — see further down.
-    fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-        config_file::write_atomic(path, body, config_file::Durability::FsyncParent)
-    }
-
-    #[test]
-    fn write_atomic_replaces_content_and_leaves_no_scratch_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        write_atomic(&target, "first").expect("writes");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
-        write_atomic(&target, "second").expect("overwrites");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
-        assert!(
-            scratch_files(dir.path()).is_empty(),
-            "scratch files must be renamed away, not left behind"
-        );
-    }
-
-    #[test]
-    fn write_atomic_preserves_the_targets_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        std::fs::write(&target, "old").expect("seed");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-
-        write_atomic(&target, "new").expect("writes");
-
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a hand-tightened config must stay tightened");
-    }
-
-    #[test]
-    fn write_atomic_creates_the_parent_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("nested/deeper/places.toml");
-        write_atomic(&target, "body").expect("writes");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "body");
-    }
-
-    #[test]
-    fn write_atomic_failure_leaves_the_target_and_no_scratch_behind() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // A directory can't be replaced by `rename(2)` from a file: the swap
-        // fails *after* the scratch file exists, which is the case that must
-        // clean up after itself.
-        let target = dir.path().join("victim");
-        std::fs::create_dir(&target).expect("mkdir");
-
-        assert!(write_atomic(&target, "body").is_err());
-        assert!(target.is_dir(), "the target must be untouched");
-        assert!(
-            scratch_files(dir.path()).is_empty(),
-            "a failed swap must not leave a scratch file: {:?}",
-            scratch_files(dir.path())
-        );
-    }
-
-    /// #739: a save must write *through* a symlinked target, not replace the
-    /// link with a regular file. A dotfiles-repo `places.toml`
-    /// (stow/chezmoi/a plain symlink) must survive a programmatic save.
-    ///
-    /// Driven through the real [`persist_to`] rather than the shared core
-    /// directly, so it also pins that `places` keeps *using* the safe path —
-    /// the original defect was a private copy of the algorithm that skipped the
-    /// `canonicalize`, and a future one would look the same from here.
-    #[test]
-    fn persist_to_writes_through_a_symlinked_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real_dir = dir.path().join("real");
-        std::fs::create_dir(&real_dir).expect("mkdir real");
-        let real_file = real_dir.join("places.toml");
-        std::fs::write(&real_file, "# kept\n\n").expect("seed");
-        let link = dir.path().join("places.toml");
-        std::os::unix::fs::symlink(&real_file, &link).expect("symlink");
-
-        persist_to(&link, &[full_place("Home")]).expect("persists");
-
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .expect("link still exists")
-                .file_type()
-                .is_symlink(),
-            "the symlink must survive the save, not get replaced by a regular file"
-        );
-        let text = std::fs::read_to_string(&real_file).expect("real file readable");
-        assert!(
-            text.starts_with("# kept\n"),
-            "the real file the symlink points at must receive the save: {text:?}"
-        );
-        assert_eq!(
-            parse_places(&text).expect("reparses"),
-            vec![full_place("Home")],
-            "the real file the symlink points at must receive the new set"
-        );
-        assert!(
-            scratch_files(&real_dir).is_empty(),
-            "no scratch file left in the real file's directory"
-        );
-    }
-
-    /// #739: an existing target's mode must be applied to the scratch file
-    /// *before* the body is written, not after — so a `0600` config's
-    /// contents never sit in a briefly umask-default (typically world- or
-    /// group-readable) file while being written. Racy but never flaky (like
-    /// `config_file`'s `a_reader_never_observes_a_partial_file`): scheduling
-    /// luck decides whether the watcher thread samples the scratch file
-    /// mid-write, so an unlucky run proves less, but a lucky one under the
-    /// old post-write-`chmod` ordering catches the loose window directly.
-    ///
-    /// Through [`persist_to`] for the same reason as the symlink case above.
-    #[test]
-    fn persist_to_applies_the_targets_mode_before_the_body_is_written() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("secretish.toml");
-        std::fs::write(&target, "old").expect("seed");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let violation = Arc::new(AtomicBool::new(false));
-        let watcher = std::thread::spawn({
-            let (dir, stop, violation) = (
-                dir.path().to_path_buf(),
-                Arc::clone(&stop),
-                Arc::clone(&violation),
-            );
-            move || {
-                while !stop.load(Ordering::Relaxed) {
-                    for name in scratch_files(&dir) {
-                        if let Ok(meta) = std::fs::metadata(dir.join(&name)) {
-                            let mode = meta.permissions().mode() & 0o777;
-                            if mode != 0o600 {
-                                violation.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-            }
-        });
-
-        for i in 0..64 {
-            persist_to(&target, &[Place::new(format!("P{i}"), 1.0, 2.0)]).expect("persists");
-        }
-        stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("watcher thread");
-
-        assert!(
-            !violation.load(Ordering::Relaxed),
-            "the scratch file must never be observed at other than the target's mode"
-        );
-    }
-
-    /// Pins that [`persist_to`] actually takes the [`Durability::FsyncParent`]
-    /// branch inside `config_file::write_atomic`, not just that it *compiles*
-    /// against that variant. The `fsync` itself can't be observed in-process
-    /// (see [`config_file::fsync_parent_attempts`]'s doc), but whether the
-    /// branch fired can: this fails if the `matches!` guard in `write_atomic`
-    /// is inverted, and it fails just as surely if `persist_to` is edited to
-    /// pass `Durability::FileOnly`. Neither of those trips any other test —
-    /// see #767's review thread.
-    #[test]
-    fn persist_to_pins_the_fsync_parent_durability_choice() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        let before = config_file::fsync_parent_attempts();
-
-        persist_to(&target, &[full_place("Home")]).expect("persists");
-
-        assert_eq!(
-            config_file::fsync_parent_attempts(),
-            before + 1,
-            "persist_to must take the Durability::FsyncParent branch in \
-             write_atomic exactly once per call"
-        );
-    }
-
-    // ── Write path: comment preservation + persist (#640) ───────────────────
-
-    #[test]
-    fn leading_comments_stops_at_the_first_content_line() {
-        let text = "# one\n\n# two\n\n[[place]]\nname = \"x\"\n# trailing\n";
-        assert_eq!(leading_comments(text), "# one\n\n# two\n\n");
-        assert_eq!(leading_comments("[[place]]\n# after\n"), "");
-        assert_eq!(leading_comments(""), "");
-        assert_eq!(leading_comments("\n\n\n"), "");
-        // The shipped default's whole documented preamble survives.
-        let header = leading_comments(DEFAULT_CONFIG);
-        assert!(header.starts_with("# trollshell places"));
-        assert!(header.contains("trollshell --scan-aps"));
-        assert!(header.ends_with("\n\n"));
-    }
-
-    #[test]
-    fn persist_to_keeps_the_header_and_reparses_to_the_saved_set() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        std::fs::write(&target, DEFAULT_CONFIG).expect("seed");
-
-        let next = added(&default_places(), full_place("Office")).expect("adds");
-        persist_to(&target, &next).expect("persists");
-
-        let text = std::fs::read_to_string(&target).expect("readable");
-        assert!(
-            text.starts_with("# trollshell places"),
-            "the documented preamble must survive a save"
-        );
-        assert!(text.contains("trollshell --scan-aps"));
-        assert_eq!(parse_places(&text).expect("reparses"), next);
-    }
-
-    #[test]
-    fn persist_to_seeds_the_default_header_for_a_brand_new_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        persist_to(&target, &[full_place("Home")]).expect("persists");
-        let text = std::fs::read_to_string(&target).expect("readable");
-        assert!(text.starts_with("# trollshell places"));
-        assert_eq!(parse_places(&text).expect("reparses").len(), 1);
-    }
-
-    #[test]
-    fn persist_to_respects_a_header_the_user_deleted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-        std::fs::write(
-            &target,
-            "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n",
-        )
-        .expect("seed");
-        persist_to(&target, &[Place::new("Home", 1.0, 2.0)]).expect("persists");
-        let text = std::fs::read_to_string(&target).expect("readable");
-        assert!(
-            text.starts_with("[[place]]"),
-            "a save must not re-add comments the user removed: {text}"
-        );
-    }
-
     // ── Write path: the public API, end to end (#640) ───────────────────────
 
     /// The `shared` map is process-global and `reset_for_tests` clears *all* of
@@ -2259,6 +1004,47 @@ mod tests {
         });
     }
 
+    /// #640's settlement, end to end through the public API: a hand-annotated
+    /// `places.toml` edited from the shell (as the control-center editor does)
+    /// keeps every annotation its operator wrote. This is the assertion the
+    /// live-verify repeats by hand.
+    #[test]
+    fn the_editing_api_keeps_a_hand_annotated_config_annotated() {
+        with_seeded_config(HAND_WRITTEN.as_bytes(), |cfg, handle| {
+            let before = handle.get_cloned();
+            assert_eq!(before.len(), 2, "the fixture must load as itself");
+
+            update_place(
+                "Home",
+                Place {
+                    walk_minutes: 4,
+                    ..before[0].clone()
+                },
+            )
+            .expect("updates");
+            add_place(Place::new("Gym", 52.49, 13.42)).expect("adds");
+            rename_place("Office", "Werk").expect("renames");
+
+            let text = std::fs::read_to_string(cfg).expect("readable");
+            for kept in [
+                "# my places file",
+                "# station ids: https://v6.bvg.transport.rest/locations?query=",
+                "# the pretty name, shown in the bar",
+                "# picked off the neighbours",
+                "station = \"900192001\" # S Schöneweide Bhf",
+                "notes = \"the balcony one\"",
+                "# work — no fingerprint captured yet",
+                "[scratch]",
+            ] {
+                assert!(text.contains(kept), "{kept:?} must survive: {text}");
+            }
+            assert!(text.contains("walk_minutes = 4"));
+            assert!(text.contains("name = \"Werk\""));
+            assert_eq!(load_places(), *handle.get_cloned());
+            assert_eq!(handle.get_cloned().len(), 3);
+        });
+    }
+
     /// Concurrent edits are read-modify-write against one file, so without
     /// serialization the loser's change is silently written away. Eight
     /// threads, eight distinct places, all eight must land.
@@ -2280,38 +1066,10 @@ mod tests {
     }
 
     // ── Write path: never write over a config we can't account for (#640) ───
-
-    #[test]
-    fn read_on_disk_splits_out_the_two_arms_load_places_papers_over() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("places.toml");
-
-        assert!(matches!(read_on_disk(&target), OnDisk::Absent));
-
-        // A config that yields no places is reported in the same units memory
-        // holds it in — what `load_places` makes of it, i.e. the default.
-        std::fs::write(&target, "place = []\n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
-        std::fs::write(&target, "# only comments\n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Places(p) if p == builtin_default()));
-
-        // A real config comes back as itself.
-        std::fs::write(
-            &target,
-            "[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n",
-        )
-        .expect("seed");
-        assert!(
-            matches!(read_on_disk(&target), OnDisk::Places(p) if p.len() == 1 && p[0].name == "Home")
-        );
-
-        // And the two `load_places` collapses into a silent fallback stay
-        // distinguishable here: unparseable, and undecodable.
-        std::fs::write(&target, "[[place]]\nname = \"Home\"\nlat = \n").expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
-        std::fs::write(&target, [0xff, 0xfe]).expect("seed");
-        assert!(matches!(read_on_disk(&target), OnDisk::Unknown(_)));
-    }
+    //
+    // `hytte_config::places` owns the guard itself (and its own tests); these
+    // pin that the *public editing API* actually reaches it, through the shared
+    // handle and the edit lock, on every one of its entry points.
 
     /// Four hand-configured places and a typo. `load_places` can't parse it, so
     /// it deliberately leaves the bytes alone and memory holds the *built-in

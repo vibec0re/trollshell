@@ -1148,6 +1148,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "temp-env",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "tracing",
+]
+
+[[package]]
 name = "hytte-ecal"
 version = "0.1.0"
 dependencies = [
@@ -1318,6 +1330,7 @@ dependencies = [
  "futures-util",
  "gtk4",
  "hytte-bus",
+ "hytte-config",
  "hytte-ecal",
  "hytte-reactive",
  "icalendar",
@@ -1329,7 +1342,6 @@ dependencies = [
  "temp-env",
  "tempfile",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -2752,6 +2764,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.2",
 ]
 

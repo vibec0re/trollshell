@@ -21,8 +21,9 @@
 //! concern that flips the zero-state `wlsunset` user unit via the `nightlight`
 //! service. Config (lat/lon + day/night temps) lives in the nix module. With no
 //! configured coordinates the toggle resolves them from a live location fix,
-//! which can take seconds, so the row renders the service's tri-state
-//! (`nightlight::state()`) rather than a bool: see [`build_display_group`].
+//! which can take seconds, so the row renders the service's `Pending<bool>`
+//! (`nightlight::state()`) rather than a bare bool: see
+//! [`build_display_group`].
 
 use std::rc::Rc;
 
@@ -246,8 +247,8 @@ where
 /// The Night light row's resting subtitle — what the toggle is *for*.
 const NIGHT_LIGHT_SUBTITLE: &str = "Warm the screen's color temperature after sunset";
 
-/// Subtitle while a toggle-on is parked on a location fix
-/// (`NightlightState::Resolving`). Zero-config night light resolves coordinates
+/// Subtitle while a toggle-on is parked on a location fix (the service's state
+/// is `Pending` there). Zero-config night light resolves coordinates
 /// from `GeoClue` at toggle time, and a cold fix can take several seconds during
 /// which nothing on screen changes — long enough that "flip it on, see nothing,
 /// flip it back off" is the reasonable reaction rather than an unusual one
@@ -261,17 +262,18 @@ const NIGHT_LIGHT_RESOLVING_SUBTITLE: &str = "Waiting for a location fix\u{2026}
 /// reflects the same toggle and a drawer rebuild never loses track. Flipping it
 /// starts/stops the `wlsunset` user unit.
 ///
-/// The state is a tri-state, and the row spends all three of it:
+/// The state is a `Pending<bool>` (#599's shared model), and the row spends both
+/// halves of it:
 ///
-/// - the switch shows `is_on()`, which folds `Resolving` into **on** — the user
-///   just put it there and pulling it back would be the "switch moves by itself"
-///   bug (#594) in reverse;
-/// - the spinner and subtitle show `is_resolving()`, which is the part that
-///   makes the wait legible at all;
+/// - the switch shows `displayed()`, which prefers the in-flight intent over the
+///   daemon's reading — the user just put the switch there and pulling it back
+///   would be the "switch moves by itself" bug (#594) in reverse;
+/// - the spinner and subtitle show `is_pending()`, which is the part that makes
+///   the wait legible at all;
 /// - the switch deliberately stays **sensitive** throughout. Greying it out
 ///   during the wait would swap a ten-second silent stall for a ten-second
 ///   locked one, and it would take away the escape hatch #595 exists to make
-///   work: a toggle-off during `Resolving` supersedes the parked start.
+///   work: a toggle-off during the wait supersedes the parked start.
 ///
 /// Built as `ActionRow` + explicit `gtk::Switch` rather than `adw::SwitchRow`
 /// for one reason: `AdwSwitchRow` adds its own switch as the first suffix, so
@@ -298,11 +300,11 @@ fn build_display_group() -> adw::PreferencesGroup {
     // Two-way: the authoritative signal drives `active` (the block prevents the
     // programmatic set_active from re-entering the handler); a user flip calls
     // set_enabled, which toggles the user unit off the GTK thread. The explicit
-    // `is_on()` is the tri-state → bool mapping — see the fn docs.
+    // `displayed()` is the `Pending<bool>` → bool mapping — see the fn docs.
     bind_two_way(
         nightlight::state(),
         &switch,
-        |w, state| w.set_active(state.is_on()),
+        |w, state| w.set_active(*state.displayed()),
         |w| w.connect_active_notify(|w| nightlight::set_enabled(w.is_active())),
     );
     row.add_suffix(&switch);
@@ -313,7 +315,7 @@ fn build_display_group() -> adw::PreferencesGroup {
     // closure holds the spinner strongly, but only the row holds the closure's
     // task alive, and the row owns the spinner — so teardown frees both.
     bind(nightlight::state(), &row, move |row, state| {
-        let resolving = state.is_resolving();
+        let resolving = state.is_pending();
         row.set_subtitle(if resolving {
             NIGHT_LIGHT_RESOLVING_SUBTITLE
         } else {

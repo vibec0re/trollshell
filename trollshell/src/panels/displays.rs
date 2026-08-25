@@ -4,18 +4,25 @@
 //! (plug/unplug) are picked up by the displays service's 2 s polling loop
 //! and trigger a full row-list rebuild here.
 //!
+//! The rows are **stateless**: everything a row renders, including whether a
+//! toggle is still in flight, comes out of the `Output` the service emitted.
+//! This page used to keep its own `Rc<RefCell<HashMap<String, bool>>>` of
+//! in-flight intent plus a 3 s `glib` timeout to disarm it, which is the model
+//! #599 retired — clearing that map re-rendered nothing, so a toggle niri never
+//! honoured left the switch pinned in the user's position with no way back, and
+//! two quick toggles of one connector had the first one's timer disarm the
+//! second's intent early. The service owns it now (`displays::Output::enabled`
+//! is a `Pending<bool>`), which also means every monitor's drawer agrees and a
+//! drawer rebuild loses nothing.
+//!
 //! v1 is read-only beyond the on/off switch — there's no mode picker, no
 //! scale editor, no rotation UI, and no position editor. Persistent
 //! multi-monitor layouts live in `~/.config/kanshi/config` (see
 //! `etc/kanshi/`); this page reflects whatever the running compositor +
 //! kanshi have already decided.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use hytte::adw::{self, prelude::*};
-use hytte::gtk::{self, glib};
+use hytte::gtk;
 use hytte::services::displays::{self, Output};
 
 use crate::components::layout::{finish_page, page_box};
@@ -27,20 +34,13 @@ pub fn panel_displays() -> gtk::Widget {
     column.add_css_class("ts-popup-column");
 
     let group = adw::PreferencesGroup::builder().title("Displays").build();
-    // In-flight set_output_enabled calls. The displays service polls niri
-    // every 2 s; if niri's ack lags the next poll, the rebuilt row would
-    // briefly flip the Switch back to the stale state. While a name is in
-    // this map, the row build uses the stored intent instead of the
-    // service snapshot, so the user's last toggle stands until niri
-    // catches up.
-    let pending: Rc<RefCell<HashMap<String, bool>>> = Rc::new(RefCell::new(HashMap::new()));
 
     column.append(&group);
 
     reactive_list(
         &group,
         displays::outputs(),
-        move |output: &Output| build_display_row(output, &pending),
+        build_display_row,
         // Show a single placeholder row when niri reports nothing yet — typically
         // the first poll hasn't completed, or niri's IPC socket isn't reachable.
         Some(|| {
@@ -55,7 +55,7 @@ pub fn panel_displays() -> gtk::Widget {
     finish_page(&column)
 }
 
-fn build_display_row(o: &Output, pending: &Rc<RefCell<HashMap<String, bool>>>) -> adw::ActionRow {
+fn build_display_row(o: &Output) -> adw::ActionRow {
     // Title prefers make+model when EDID is informative; falls back to the
     // bare connector name (e.g. virtual outputs, generic displays).
     let trimmed = format!("{} {}", o.make.trim(), o.model.trim());
@@ -65,7 +65,17 @@ fn build_display_row(o: &Output, pending: &Rc<RefCell<HashMap<String, bool>>>) -
         trimmed.trim().to_string()
     };
 
-    let subtitle = if !o.enabled {
+    // While a toggle is un-echoed the mode/scale line describes the state the
+    // user is leaving, so say what is happening instead — the same "name the
+    // wait" move the Night light row makes (#597/#599). niri normally acks
+    // within a poll, so this is a beat, not a screen.
+    let subtitle = if o.enabled.is_pending() {
+        if *o.enabled.displayed() {
+            "Turning on\u{2026}".to_string()
+        } else {
+            "Turning off\u{2026}".to_string()
+        }
+    } else if !*o.enabled.confirmed() {
         "Disabled".to_string()
     } else if let Some(mode) = o.mode {
         let hz = f64::from(mode.refresh_mhz) / 1000.0;
@@ -95,32 +105,28 @@ fn build_display_row(o: &Output, pending: &Rc<RefCell<HashMap<String, bool>>>) -
     prefix.set_valign(gtk::Align::Center);
     row.add_prefix(&prefix);
 
+    // The spinner goes before the switch: `add_suffix` appends, and the
+    // progress cue belongs between the title and the control (the Night light
+    // row's shape). No binding — the row is rebuilt from scratch on every
+    // emission, so the state it was built from is the current one.
+    if o.enabled.is_pending() {
+        let spinner = gtk::Spinner::new();
+        spinner.set_valign(gtk::Align::Center);
+        spinner.set_spinning(true);
+        row.add_suffix(&spinner);
+    }
+
     let switch = gtk::Switch::new();
     switch.set_valign(gtk::Align::Center);
-    // Skip the active-state restore while a toggle for this output is
-    // in-flight: the next poll's row rebuild may carry the pre-toggle
-    // state if niri's ack hasn't landed yet, which would visually flip
-    // the switch back until the t+2 s poll catches up. When pending,
-    // honor the user's last intent instead of the (possibly stale)
-    // service snapshot.
-    let pending_state = pending.borrow().get(&o.name).copied();
-    switch.set_active(pending_state.unwrap_or(o.enabled));
-    let name_for_toggle = o.name.clone();
-    let pending_for_toggle = pending.clone();
+    // `displayed()`, not `confirmed()`: while a toggle is un-echoed this is the
+    // position the user put the switch in, and rebuilding the row from niri's
+    // not-yet-updated reading is exactly how the switch used to flip back on
+    // its own. Set before connecting, so it can't re-enter the handler below.
+    switch.set_active(*o.enabled.displayed());
+    let name = o.name.clone();
     switch.connect_active_notify(move |sw| {
-        let on = sw.is_active();
-        pending_for_toggle
-            .borrow_mut()
-            .insert(name_for_toggle.clone(), on);
-        displays::set_output_enabled(&name_for_toggle, on);
-        // Disarm after 3 s — long enough for niri to ack and one or two
-        // polls to land carrying the new state. After the timeout the
-        // service's snapshot is treated as truth again.
-        let pending_for_clear = pending_for_toggle.clone();
-        let name_for_clear = name_for_toggle.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
-            pending_for_clear.borrow_mut().remove(&name_for_clear);
-        });
+        // Fire-and-forget; the service records the intent and owns retiring it.
+        displays::set_output_enabled(&name, sw.is_active());
     });
     row.add_suffix(&switch);
     row.set_activatable_widget(Some(&switch));

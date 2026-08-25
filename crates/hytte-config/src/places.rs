@@ -109,7 +109,7 @@ walk_minutes = 10
 /// A configured place: location identity, Wi-Fi fingerprint, and optional
 /// transit config. One `[[place]]` block in `places.toml`.
 ///
-/// Public (and field-public) since #640: it is both what [`configured`] hands
+/// Public (and field-public) since #640: it is both what `hytte_services::places::configured` hands
 /// out and what the editing API takes back, so an editor round-trips this type
 /// rather than a parallel wire struct.
 #[derive(Clone, Debug, PartialEq)]
@@ -444,7 +444,7 @@ pub enum PlacesError {
         lon: f64,
     },
     /// `radius_km` was zero, negative, or not a finite number — such a place
-    /// could never match by [`GeoClue`](crate::geoclue) radius.
+    /// could never match by `GeoClue` radius.
     Radius {
         /// The offending place's name.
         place: String,
@@ -460,13 +460,13 @@ pub enum PlacesError {
     NoConfigPath,
     /// `places.toml` exists but its contents can't be established: unreadable
     /// (permissions), non-UTF-8, or not valid TOML. Refusing rather than
-    /// overwriting bytes we can't account for — see [`edit`] for why this is a
+    /// overwriting bytes we can't account for — see [`check_base`] for why this is a
     /// data-loss guard and not just tidiness.
     Unreadable(String),
     /// `places.toml` parses, but to a *different* set than the one in memory —
     /// something edited it since we last loaded it. Refusing, because the edit
     /// was computed against a stale base and applying it would write the
-    /// out-of-process change away. See [`edit`].
+    /// out-of-process change away. See [`check_base`].
     ChangedOnDisk,
     /// The set could not be rendered as TOML.
     Encode(String),
@@ -651,10 +651,10 @@ pub fn removed(places: &[Place], name: &str) -> Result<Vec<Place>, PlacesError> 
 /// are unit-testable.
 ///
 /// Each wanted place is matched to an existing `[[place]]` table (see
-/// [`align`]) and patched in place ([`patch_table`]); entries with no match are
-/// appended as freshly built tables ([`new_table`]); tables nothing matched are
+/// `align`) and patched in place (`patch_table`); entries with no match are
+/// appended as freshly built tables (`new_table`); tables nothing matched are
 /// dropped. The file's opening comment block is carried across the rebuild by
-/// [`take_header`]/[`put_header`], because `toml_edit` glues it to whichever
+/// `take_header`/`put_header`, because `toml_edit` glues it to whichever
 /// table happens to come first and removing or reordering places would
 /// otherwise take it along.
 ///
@@ -665,7 +665,7 @@ pub fn removed(places: &[Place], name: &str) -> Result<Vec<Place>, PlacesError> 
 /// # Errors
 /// [`PlacesError::Encode`] when `existing` isn't valid TOML — refusing rather
 /// than replacing bytes we couldn't account for, the same instinct as
-/// [`read_on_disk`]. Callers arriving through [`edit`] have already parsed the
+/// `read_on_disk`. Callers arriving through [`check_base`] have already parsed the
 /// file, so this is unreachable there.
 pub fn render_places(existing: &str, places: &[Place]) -> Result<String, PlacesError> {
     let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e: toml_edit::TomlError| {
@@ -805,7 +805,7 @@ fn patch_table(table: &mut toml_edit::Table, was: &Place, want: &Place) {
 
 /// Build a `[[place]]` table from scratch, for a place with no table to patch.
 ///
-/// Unlike [`patch_table`] this spells every key out (bar an unset `station`,
+/// Unlike `patch_table` this spells every key out (bar an unset `station`,
 /// which the schema writes by omission), so an entry the editor added is as
 /// discoverable in `$EDITOR` as one from the shipped default, and a reparse
 /// yields exactly what was published with no reliance on the defaults.
@@ -930,7 +930,7 @@ fn decor_prefix(decor: &toml_edit::Decor) -> String {
 /// the document's trailing decor when it holds nothing but comments. Either
 /// way the preamble belongs to the *file*, not to whichever place happens to
 /// be listed first, so deleting or reordering places must not carry it off.
-/// [`put_header`] puts it back at the top afterwards.
+/// `put_header` puts it back at the top afterwards.
 fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
     if let Some(first) = doc
         .get_mut("place")
@@ -946,7 +946,7 @@ fn take_header(doc: &mut toml_edit::DocumentMut) -> String {
     header
 }
 
-/// Put back what [`take_header`] detached, in front of whatever now sits at the
+/// Put back what `take_header` detached, in front of whatever now sits at the
 /// top — the first `[[place]]` table, or (when the edit left no places at all)
 /// the document's trailing decor, which is the only place a comment can live in
 /// a file with no tables.
@@ -1024,7 +1024,7 @@ fn read_on_disk(path: &Path) -> OnDisk {
 /// # Errors
 /// [`PlacesError::Encode`] when the file that is there doesn't parse — a patch
 /// has nothing to patch, and replacing bytes we can't account for is precisely
-/// what [`edit`]'s guard exists to prevent. Reaching this through [`edit`] is
+/// what [`check_base`] exists to prevent. Reaching this through [`save_to`] is
 /// impossible (it refuses first, with the more specific
 /// [`PlacesError::Unreadable`]). [`PlacesError::Write`] when the atomic write
 /// itself fails; the previous config is then untouched.

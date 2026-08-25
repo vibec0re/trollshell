@@ -18,10 +18,10 @@
 //! wraps this with the reactive/service layer, and the control center calls it
 //! directly. One model, one validator, one writer.
 //!
-//! - [`file`] — the `~/.config/trollshell/<name>` path/read/write boilerplate,
+//! - [`file`](mod@file) — the `~/.config/trollshell/<name>` path/read/write boilerplate,
 //!   including the workspace's single copy of the atomic tmp + `fsync` +
 //!   `rename(2)` replacement (#733/#739).
-//! - [`places`] — the `places.toml` schema, its validation rules, and the
+//! - [`places`](mod@places) — the `places.toml` schema, its validation rules, and the
 //!   format-preserving writer.
 
 pub mod file;

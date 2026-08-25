@@ -20,6 +20,13 @@
 //! `$HOME/.config/trollshell/{name}.key`), with a `{NAME}_API_KEY` env override
 //! for CI/testing.
 //!
+//! One prompt-shaped thing does live here rather than in a plugin: [`owner`],
+//! the session-wide `$TROLLSHELL_OWNER` resolver every persona uses to refer to
+//! whoever is running the shell, with the neutral [`DEFAULT_OWNER`] fallback.
+//! It sits next to [`load_key`] because both of the LLM plugins (`pet`, `caw`)
+//! already depend on this crate and both need exactly one spelling of that var
+//! and one fallback (#696/#706).
+//!
 //! HTTP is the house idiom: blocking `ureq`, meant to run on a
 //! `spawn_blocking` thread (same as `hytte-services`' weather fetcher). The
 //! whole request is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
@@ -290,6 +297,43 @@ fn load_key_from(
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+// ── The desktop owner ────────────────────────────────────────────────────────
+
+/// Neutral stand-in for the desktop owner when `$TROLLSHELL_OWNER` is unset.
+///
+/// A persona that needs a possessive ("…lives in the sidebar of X's Linux
+/// desktop") must have *something* to say, and the two wrong answers are both
+/// on record: hardcoding a specific person's name (#696/#706 — not every
+/// deployment's owner is named Annika) and guessing one from `$USER`/GECOS
+/// (a login name is not what a human wants to be called). So: a neutral
+/// phrase, and the owner opts in to a real one.
+pub const DEFAULT_OWNER: &str = "your human";
+
+/// Resolve the desktop owner's name from `$TROLLSHELL_OWNER`, falling back to
+/// [`DEFAULT_OWNER`].
+///
+/// One session-wide variable shared by every plugin persona that refers to
+/// whoever is running the shell — `pet`'s cat and `caw`'s crow both read it
+/// through here, so there is exactly one spelling of the knob and one
+/// fallback. Reads the process environment, so resolve it **once** at config
+/// time (`Cfg::from_env` and friends), not per prompt.
+#[must_use]
+pub fn owner() -> String {
+    owner_or(std::env::var("TROLLSHELL_OWNER").ok().as_deref())
+}
+
+/// Core of [`owner`] with the raw env value injected, so a caller can unit-test
+/// its prompts against a chosen owner without mutating the process environment
+/// (`unsafe` under edition 2024, which this crate forbids) — the same split as
+/// [`load_key`]/`load_key_from`. Trimmed, and blank or whitespace-only counts
+/// as unset.
+#[must_use]
+pub fn owner_or(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| DEFAULT_OWNER.to_owned(), str::to_owned)
 }
 
 #[cfg(test)]
@@ -600,5 +644,21 @@ mod tests {
         assert!(load_key_from("blank", None, Some(dir.clone())).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shared owner resolver (#696/#706): an explicit `$TROLLSHELL_OWNER`
+    /// wins after trimming, anything blank counts as unset, and the fallback
+    /// is neutral rather than a specific person.
+    #[test]
+    fn owner_or_prefers_the_explicit_value_and_falls_back_when_unset_or_blank() {
+        assert_eq!(owner_or(Some("kaesaecracker")), "kaesaecracker");
+        assert_eq!(owner_or(Some("  Mara  ")), "Mara", "trimmed");
+        assert_eq!(owner_or(None), DEFAULT_OWNER);
+        assert_eq!(owner_or(Some("")), DEFAULT_OWNER);
+        assert_eq!(owner_or(Some("   ")), DEFAULT_OWNER);
+        assert!(
+            !DEFAULT_OWNER.to_lowercase().contains("annika"),
+            "the shared fallback must never be one particular person: {DEFAULT_OWNER}",
+        );
     }
 }

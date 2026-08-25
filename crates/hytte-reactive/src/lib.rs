@@ -14,7 +14,10 @@ pub use bind::{bind, bind_class, bind_text, bind_two_way, bind_two_way_drag_safe
 pub use health::{TaskHealth, TaskId, TaskState};
 pub use poll::gated_poll;
 pub use registry::{Registry, Service, ServiceErased};
-pub use supervisor::{install_panic_hook, spawn_supervised, spawn_supervised_blocking};
+pub use supervisor::{
+    SupervisorHandle, install_panic_hook, spawn_supervised, spawn_supervised_blocking,
+    spawn_supervised_handle,
+};
 
 // Re-export so consumers don't need their own dep on futures-signals.
 pub use ::futures_signals;

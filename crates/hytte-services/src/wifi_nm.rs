@@ -1469,6 +1469,36 @@ pub(crate) async fn register_nm_agent() -> Result<(), hytte_bus::BusError> {
         .await
 }
 
+/// Withdraw our secret-agent registration from NM's `AgentManager`.
+///
+/// The counterpart to [`register_nm_agent`], and necessary because the two
+/// halves of an agent have different lifetimes. Dropping the
+/// [`hytte_bus::ExportHandle`] unmounts the object, but NM does not track the
+/// object — it recorded the *unique connection name* the registration arrived
+/// on, and that is `hytte_bus`'s pooled system connection, which outlives any
+/// one backend. Unmounting without unregistering therefore leaves NM issuing
+/// `GetSecrets` at a connection that no longer serves the interface, so
+/// passphrase prompts stop appearing with nothing but a failed method call to
+/// show for it.
+///
+/// Called on the #633 backend-switch teardown path, before the export is
+/// dropped.
+///
+/// # Errors
+///
+/// Returns a [`hytte_bus::BusError`] if the D-Bus call fails — including the
+/// benign case where NM has already gone away, which is often exactly why the
+/// switch is happening.
+pub(crate) async fn unregister_nm_agent() -> Result<(), hytte_bus::BusError> {
+    hytte_bus::call(BusKind::System, NM_NAME)
+        .at_path(NM_AGENT_MANAGER_PATH)
+        .iface(NM_AGENT_MANAGER_IFACE)
+        .method("Unregister")
+        .args(())
+        .send::<()>()
+        .await
+}
+
 // ── Integration-test probe ─────────────────────────────────────────────────────
 
 /// Machine-readable snapshot returned by [`probe_snapshot`].

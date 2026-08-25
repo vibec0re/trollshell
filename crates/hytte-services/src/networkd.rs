@@ -504,16 +504,33 @@ impl Service for NetworkdService {
                         // observability gap is real though — a post-seed recovery
                         // shows up as this loop's `warn!` going quiet, **not** as
                         // a `startup refresh RECOVERED` line, so grepping for
-                        // that line will not evidence a real self-heal. The
-                        // uncapped 2s cadence here is #646's second half.
+                        // that line will not evidence a real self-heal. This
+                        // used to be an uncapped flat 2s cadence; #646's second
+                        // half moved it onto `retry::RECONNECT_RETRY`, resetting
+                        // the attempt count after a `listen` that stayed up at
+                        // least `retry::RECONNECT_RESET_AFTER` so a merely-flaky
+                        // networkd doesn't ratchet to the 30s ceiling and stay
+                        // there.
+                        let mut attempt: u32 = 1;
                         loop {
-                            match listen(&links_writer, &primary_writer, &source_writer).await {
-                                Ok(()) => tracing::warn!("networkd stream ended, retrying in 2s"),
+                            let started = std::time::Instant::now();
+                            let outcome =
+                                listen(&links_writer, &primary_writer, &source_writer).await;
+                            let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                            match outcome {
+                                Ok(()) => {
+                                    tracing::warn!(?delay, "networkd stream ended, reconnecting");
+                                }
                                 Err(e) => {
-                                    tracing::warn!(error = ?e, "networkd error, retrying in 2s");
+                                    tracing::warn!(?delay, error = ?e, "networkd error, reconnecting");
                                 }
                             }
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
+                                1
+                            } else {
+                                attempt.saturating_add(1)
+                            };
+                            tokio::time::sleep(delay).await;
                         }
                     }
                     LinkBackend::None => {

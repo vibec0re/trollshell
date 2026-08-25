@@ -58,6 +58,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use zbus::zvariant::OwnedValue;
 
+use crate::retry;
+
 // ── Public data shapes ────────────────────────────────────────────────────────
 
 /// Playback status of an MPRIS player.
@@ -168,20 +170,35 @@ impl Service for MprisService {
         // `players` signal forever. The inner `loop` still handles the ordinary
         // stream-closed / error reconnect; the supervisor only re-runs the
         // whole factory on an actual panic.
+        //
+        // The reconnect delay used to be an uncapped flat 2s; #646's second
+        // half moved it onto `retry::RECONNECT_RETRY`, resetting the attempt
+        // count after a `listen` that stayed up at least
+        // `retry::RECONNECT_RESET_AFTER` so a merely-flaky session bus doesn't
+        // ratchet to the 30s ceiling and stay there.
         spawn_supervised("mpris", move || {
             let players = players_mutable.clone();
             let active = active_mutable.clone();
             async move {
+                let mut attempt: u32 = 1;
                 loop {
-                    match listen(&players, &active).await {
+                    let started = std::time::Instant::now();
+                    let outcome = listen(&players, &active).await;
+                    let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                    match outcome {
                         Ok(()) => {
-                            tracing::warn!("mpris watcher stream closed, reconnecting in 2s");
+                            tracing::warn!(?delay, "mpris watcher stream closed, reconnecting");
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "mpris watcher error, reconnecting in 2s");
+                            tracing::warn!(?delay, error = %e, "mpris watcher error, reconnecting");
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
+                        1
+                    } else {
+                        attempt.saturating_add(1)
+                    };
+                    tokio::time::sleep(delay).await;
                 }
             }
         });

@@ -41,9 +41,10 @@ use hytte_bus::BusKind;
 use hytte_reactive::{Service, registry, runtime, spawn_supervised};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
+
+use crate::retry;
 
 // ── Cross-thread shared handle ────────────────────────────────────────────────
 //
@@ -163,20 +164,34 @@ impl Service for BluetoothService {
         let devices_mutable = handles.devices.clone();
         let path_store = adapter_path_store().clone();
 
+        // The reconnect delay used to be an uncapped flat 2s; #646's second
+        // half moved it onto `retry::RECONNECT_RETRY`, resetting the attempt
+        // count after a `listen` that stayed up at least
+        // `retry::RECONNECT_RESET_AFTER` so a merely-flaky adapter doesn't
+        // ratchet to the 30s ceiling and stay there.
         spawn_supervised("bluetooth", move || {
             let adapter_mutable = adapter_mutable.clone();
             let devices_mutable = devices_mutable.clone();
             let path_store = path_store.clone();
             async move {
+                let mut attempt: u32 = 1;
                 loop {
-                    match listen(&adapter_mutable, &devices_mutable, &path_store).await {
+                    let started = std::time::Instant::now();
+                    let outcome = listen(&adapter_mutable, &devices_mutable, &path_store).await;
+                    let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                    match outcome {
                         Ok(()) => {
-                            tracing::warn!("bluetooth watcher closed, reconnecting in 2s");
+                            tracing::warn!(?delay, "bluetooth watcher closed, reconnecting");
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "bluetooth watcher error, reconnecting in 2s");
+                            tracing::warn!(?delay, error = %e, "bluetooth watcher error, reconnecting");
                         }
                     }
+                    attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
+                        1
+                    } else {
+                        attempt.saturating_add(1)
+                    };
                     // Clear state when the adapter disappears: the device list,
                     // any in-flight action markers, the active pair prompt, and
                     // the pending agent reply (so the agent method handler that's
@@ -198,7 +213,7 @@ impl Service for BluetoothService {
                     // Also reset the adapter path store so the next listen()
                     // call starts fresh.
                     set_adapter_path_local("").await;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         });

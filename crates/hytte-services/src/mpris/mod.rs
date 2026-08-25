@@ -175,16 +175,21 @@ impl Service for MprisService {
         // half moved it onto `retry::RECONNECT_RETRY`, resetting the attempt
         // count after a `listen` that stayed up at least
         // `retry::RECONNECT_RESET_AFTER` so a merely-flaky session bus doesn't
-        // ratchet to the 30s ceiling and stay there.
+        // ratchet to the 30s ceiling and stay there. #806 moved the counter
+        // itself into `retry::ReconnectBackoff`: the reset/read/advance
+        // ordering it encodes was hand-rolled here (and in three sibling
+        // loops), and hand-rolled wrong — the reset landed a cycle late, so a
+        // run that stayed healthy for hours still reconnected at the ratcheted
+        // delay. All this loop owns now is the clock and the `warn!`.
         spawn_supervised("mpris", move || {
             let players = players_mutable.clone();
             let active = active_mutable.clone();
             async move {
-                let mut attempt: u32 = 1;
+                let mut backoff = retry::ReconnectBackoff::new();
                 loop {
                     let started = std::time::Instant::now();
                     let outcome = listen(&players, &active).await;
-                    let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                    let delay = backoff.delay_after_run(started.elapsed());
                     match outcome {
                         Ok(()) => {
                             tracing::warn!(?delay, "mpris watcher stream closed, reconnecting");
@@ -193,11 +198,6 @@ impl Service for MprisService {
                             tracing::warn!(?delay, error = %e, "mpris watcher error, reconnecting");
                         }
                     }
-                    attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
-                        1
-                    } else {
-                        attempt.saturating_add(1)
-                    };
                     tokio::time::sleep(delay).await;
                 }
             }

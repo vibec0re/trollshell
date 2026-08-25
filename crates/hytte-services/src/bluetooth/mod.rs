@@ -168,17 +168,22 @@ impl Service for BluetoothService {
         // half moved it onto `retry::RECONNECT_RETRY`, resetting the attempt
         // count after a `listen` that stayed up at least
         // `retry::RECONNECT_RESET_AFTER` so a merely-flaky adapter doesn't
-        // ratchet to the 30s ceiling and stay there.
+        // ratchet to the 30s ceiling and stay there. #806 moved the counter
+        // itself into `retry::ReconnectBackoff`: the reset/read/advance
+        // ordering it encodes was hand-rolled here (and in three sibling
+        // loops), and hand-rolled wrong — the reset landed a cycle late, so a
+        // run that stayed healthy for hours still reconnected at the ratcheted
+        // delay. All this loop owns now is the clock and the `warn!`.
         spawn_supervised("bluetooth", move || {
             let adapter_mutable = adapter_mutable.clone();
             let devices_mutable = devices_mutable.clone();
             let path_store = path_store.clone();
             async move {
-                let mut attempt: u32 = 1;
+                let mut backoff = retry::ReconnectBackoff::new();
                 loop {
                     let started = std::time::Instant::now();
                     let outcome = listen(&adapter_mutable, &devices_mutable, &path_store).await;
-                    let delay = retry::RECONNECT_RETRY.backoff(attempt);
+                    let delay = backoff.delay_after_run(started.elapsed());
                     match outcome {
                         Ok(()) => {
                             tracing::warn!(?delay, "bluetooth watcher closed, reconnecting");
@@ -187,11 +192,6 @@ impl Service for BluetoothService {
                             tracing::warn!(?delay, error = %e, "bluetooth watcher error, reconnecting");
                         }
                     }
-                    attempt = if started.elapsed() >= retry::RECONNECT_RESET_AFTER {
-                        1
-                    } else {
-                        attempt.saturating_add(1)
-                    };
                     // Clear state when the adapter disappears: the device list,
                     // any in-flight action markers, the active pair prompt, and
                     // the pending agent reply (so the agent method handler that's

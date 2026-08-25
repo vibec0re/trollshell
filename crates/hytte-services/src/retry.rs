@@ -22,13 +22,19 @@
 //! handing the `Result` over, while for `networkd` a refresh simply either read
 //! the links or did not.
 //!
-//! #646's second half — `RECONNECT_RETRY` / `RECONNECT_RESET_AFTER` — reuses
-//! [`Policy::backoff`] for a different shape of caller: `networkd`'s post-seed
-//! listen loop, `mpris`, and `bluetooth` don't have a verdict to weigh at all
-//! (a `listen()` stream ending is itself the reconnect signal, whatever it
-//! returned), so they call `backoff` directly rather than going through
-//! `step`, and layer on a caller-side reset threshold `step`'s callers don't
-//! need. See both constants' docs.
+//! #646's second half — [`RECONNECT_RETRY`] / [`RECONNECT_RESET_AFTER`] —
+//! reuses [`Policy::backoff`] for a different shape of caller: `networkd`'s
+//! post-seed listen loop, `mpris`, `bluetooth` and `tray` don't have a verdict
+//! to weigh at all (a `listen()` stream ending is itself the reconnect signal,
+//! whatever it returned), so they never go through `step`, and layer on a
+//! reset threshold `step`'s callers don't need. See both constants' docs.
+//!
+//! Those four reach the ramp through [`ReconnectBackoff`] rather than reading
+//! the schedule themselves. They used to compute `backoff(attempt)` inline and
+//! keep their own counter, and #806 found that all four had hand-rolled the
+//! reset/use/increment ordering — and all four had it wrong the same way, the
+//! copied-pattern drift #646 exists to stop. [`Policy::backoff`] and both
+//! constants are therefore private to this file: the cursor is the only way in.
 //!
 //! So one `Policy` type now carries **two shapes**: a budgeted, verdict-weighing
 //! policy (`PROBE_RETRY`, `STARTUP_REFRESH_RETRY`) and an unbounded reconnect
@@ -132,12 +138,15 @@ impl Policy {
     /// rather than overflowing: `checked_shl` returns `None` once the shift
     /// reaches 32, and the multiply saturates before the `min`.
     ///
-    /// `pub(crate)`, not just used internally by [`Self::step`]: the crate's
-    /// `listen()`-style reconnect loops (`RECONNECT_RETRY`, below) have no
-    /// `Ok`/`Err`-shaped verdict to weigh — the stream ending is itself the
-    /// signal to reconnect, whatever it returned — so those callers compute a
-    /// delay directly rather than going through `step`.
-    pub(crate) fn backoff(self, attempt: u32) -> Duration {
+    /// Private, and deliberately: the schedule is read either through
+    /// [`Self::step`] (budgeted, verdict-weighing callers) or through
+    /// [`ReconnectBackoff`] (the `listen()`-style reconnect loops, which have
+    /// no `Ok`/`Err`-shaped verdict to weigh — the stream ending is itself the
+    /// signal to reconnect, whatever it returned). Those four loops did read it
+    /// directly until #806, pairing it with a hand-rolled attempt counter that
+    /// every one of them sequenced wrong; keeping `backoff` in this file is what
+    /// makes that unrepeatable.
+    fn backoff(self, attempt: u32) -> Duration {
         let factor = 1_u32
             .checked_shl(attempt.saturating_sub(1))
             .unwrap_or(u32::MAX);
@@ -180,9 +189,10 @@ impl Policy {
 ///
 /// Callers own the reconnect-forever `loop`; there is no `Ok` verdict to
 /// commit to here the way [`Step::Proceed`] means for [`Policy::step`]'s other
-/// callers; delay is [`Policy::backoff`] directly. See `RECONNECT_RESET_AFTER`
-/// for why every caller must also track how long the run that just ended
-/// stayed up.
+/// callers. They reach this ramp through [`ReconnectBackoff`], which also
+/// applies [`RECONNECT_RESET_AFTER`] — see that constant for why every caller
+/// must track how long the run that just ended stayed up, and the cursor for
+/// why the two are applied together rather than at each call site.
 ///
 /// **This is the one shipped policy that is not a budget.** Unbounded, no
 /// verdict, no give-up — the same object `hytte_bus::backoff` is, at 500 ms
@@ -191,21 +201,26 @@ impl Policy {
 /// `hytte_bus` bullet argues it. Do not read the resemblance as an invitation
 /// to merge them (#646, #795), and do not read the module's "different shape"
 /// framing as covering this constant — it does not.
-pub(crate) const RECONNECT_RETRY: Policy = Policy {
+const RECONNECT_RETRY: Policy = Policy {
     max_attempts: None,
     initial: Duration::from_millis(500),
     max_backoff: Duration::from_secs(30),
 };
 
-/// How long a `listen()` run must have stayed up before its caller treats the
-/// *next* failure as a fresh problem — attempt count back to 1 — rather than a
+/// How long a `listen()` run must have stayed up before the failure that ended
+/// it counts as a fresh problem — attempt count back to 1 — rather than a
 /// continuation of the same outage.
 ///
+/// The reset applies to the reconnect that *this* run's failure triggers, not
+/// the one after it: see [`ReconnectBackoff::delay_after_run`], which is where
+/// the ordering lives and where #806 is pinned.
+///
 /// [`Policy::backoff`] is pure and stateless; it does not know how long
-/// anything ran, so this is a plain caller-side threshold, not a `Policy`
-/// field — nothing about [`RECONNECT_RETRY`] not reset. Without a reset, a
-/// daemon that is merely flaky — reconnecting cleanly every few minutes —
-/// ratchets its caller's attempt counter to the 30s ceiling and stays there,
+/// anything ran, so this is a threshold applied outside the schedule, not a
+/// `Policy` field — nothing about [`RECONNECT_RETRY`] itself resets. Without a
+/// reset, a daemon that is merely flaky — reconnecting cleanly every few
+/// minutes — ratchets its caller's attempt counter to the 30s ceiling and
+/// stays there,
 /// because nothing ever brings it back down: strictly worse than the flat 2s
 /// cadence this replaces, for exactly the peer the change is meant to help.
 ///
@@ -214,7 +229,76 @@ pub(crate) const RECONNECT_RETRY: Policy = Policy {
 /// `idle_notify::RetryBackoff::reset_after` already use for the identical
 /// "was that run healthy" judgement. Matching them here means a reader who
 /// has seen either does not need to learn a third answer.
-pub(crate) const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(30);
+const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(30);
+
+/// A reconnect loop's place on the [`RECONNECT_RETRY`] ramp.
+///
+/// Every `listen()`-style loop in this crate — `bluetooth`, `mpris`,
+/// `networkd`'s post-seed loop, `tray` — has to do the same three things when
+/// a run ends: reset the attempt count if the run stayed up at least
+/// [`RECONNECT_RESET_AFTER`], read *this* reconnect's delay off the ramp, then
+/// advance the count for the next one. **Ordering is the entire content of
+/// that dance**, and all four had it wrong in the same way (#806): they read
+/// the delay first and reset afterwards, so a run that stayed healthy for
+/// hours still reconnected at the stale attempt's delay — up to the full 30s
+/// ceiling — and only the reconnect *after* that saw `backoff(1)`. That is the
+/// exact outcome [`RECONNECT_RESET_AFTER`] was added to prevent, and the
+/// in-loop comments all claimed it was already prevented.
+///
+/// The obvious repair is also wrong. Hoisting a call site's whole
+/// `attempt = if healthy { 1 } else { attempt + 1 }` block above the read fixes
+/// the reset but hoists the *increment* with it, shifting the ramp by one and
+/// losing the 500ms first step: a first-ever fast failure would wait
+/// `backoff(2)`. Only reset → read → advance is right, which is a poor thing to
+/// ask four call sites to re-derive; here it is written once and pinned by the
+/// `#806` tests below.
+///
+/// Mechanism only, per this module's split. The cursor knows the schedule and
+/// the threshold; the caller keeps the `loop`, what each reconnect logs, and —
+/// deliberately — the clock: [`Self::delay_after_run`] is *handed* the elapsed
+/// time rather than reading it, so this file stays free of a clock and its
+/// tests stay hermetic.
+pub(crate) struct ReconnectBackoff {
+    policy: Policy,
+    reset_after: Duration,
+    /// 1-based, and points at the attempt the *next* [`Self::delay_after_run`]
+    /// will price — not the one it just priced.
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    /// A cursor on the shipped reconnect ramp, positioned at the bottom of it.
+    pub(crate) const fn new() -> Self {
+        Self::with(RECONNECT_RETRY, RECONNECT_RESET_AFTER)
+    }
+
+    /// The same over an arbitrary schedule, so the ordering tests can assert
+    /// the mechanism against a test-local policy and tuning a shipped number
+    /// cannot redden them — the split the `every_shipped_policy_*` tests at the
+    /// bottom of this file exist to keep.
+    const fn with(policy: Policy, reset_after: Duration) -> Self {
+        Self {
+            policy,
+            reset_after,
+            attempt: 1,
+        }
+    }
+
+    /// How long to wait before reconnecting, given how long the run that just
+    /// ended stayed up.
+    ///
+    /// A run of at least [`RECONNECT_RESET_AFTER`] counts as healthy, so the
+    /// failure that ended it is a fresh problem and **this** reconnect — not
+    /// the one after it — is priced at the bottom of the ramp.
+    pub(crate) fn delay_after_run(&mut self, ran_for: Duration) -> Duration {
+        if ran_for >= self.reset_after {
+            self.attempt = 1;
+        }
+        let delay = self.policy.backoff(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
+        delay
+    }
+}
 
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
@@ -237,7 +321,7 @@ const SHIPPED: &[(&str, Policy)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{Policy, SHIPPED, Step};
+    use super::{Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff, SHIPPED, Step};
     use std::time::Duration;
 
     /// A *bounded* policy with tiny delays, so the give-up path stays reachable
@@ -317,6 +401,113 @@ mod tests {
         // Clamped, and the shift can't overflow at absurd attempt counts.
         assert_eq!(policy.backoff(4), Duration::from_millis(40));
         assert_eq!(policy.backoff(u32::MAX), Duration::from_millis(40));
+    }
+
+    // ── The reconnect cursor's ordering (#806) ───────────────────────────────
+    //
+    // `delay_after_run` is three statements and its whole content is the order
+    // they run in. Two of the three orderings you can write compile, read
+    // plausibly, and are wrong — the one that shipped and the obvious repair
+    // for it — so each test below names the one it rules out. `bounded()`'s
+    // schedule stands in for the shipped ramp (10/20/40ms for 0.5/1/2s…), with
+    // a 100ms stand-in threshold; the shipped numbers get their own test at the
+    // end.
+
+    /// A short run leaves the ramp climbing, one step per reconnect — and the
+    /// *first* reconnect of a process's life is priced at the ramp's first
+    /// step, not its second.
+    ///
+    /// **Rules out the naive repair for #806**: hoisting a call site's whole
+    /// `attempt = if healthy { 1 } else { attempt + 1 }` block above the
+    /// `backoff` read. That resets in time but increments in time too, shifting
+    /// every delay one step up and losing the 500ms floor the ramp exists for.
+    #[test]
+    fn a_short_run_climbs_the_ramp_starting_at_its_first_step() {
+        let mut ramp = ReconnectBackoff::with(bounded(), Duration::from_millis(100));
+        let fast = Duration::from_millis(1);
+        assert_eq!(
+            ramp.delay_after_run(fast),
+            bounded().initial,
+            "the first-ever reconnect skipped the ramp's first step — the increment is being \
+             applied before the delay is read, not after (#806)"
+        );
+        assert_eq!(ramp.delay_after_run(fast), Duration::from_millis(20));
+        assert_eq!(ramp.delay_after_run(fast), bounded().max_backoff);
+    }
+
+    /// The #806 defect itself: a healthy run resets the reconnect it *causes*,
+    /// not the one after that.
+    ///
+    /// **Rules out the ordering that shipped** (read the delay, then reset).
+    /// Under it the first assertion sees the ceiling: hours of health followed
+    /// by one daemon restart left the panel dead for the full ceiling, the
+    /// precise outcome `RECONNECT_RESET_AFTER` was added to prevent.
+    #[test]
+    fn a_healthy_run_resets_the_reconnect_it_causes_not_the_one_after() {
+        let mut ramp = ReconnectBackoff::with(bounded(), Duration::from_millis(100));
+        let fast = Duration::from_millis(1);
+        for _ in 0..5 {
+            assert!(ramp.delay_after_run(fast) > Duration::ZERO);
+        }
+        assert_eq!(
+            ramp.delay_after_run(Duration::from_millis(100)),
+            bounded().initial,
+            "a healthy run's own reconnect still paid the stale attempt's delay (#806)"
+        );
+        // …and it is a reset, not a latch: the ramp resumes from the bottom
+        // rather than staying pinned there.
+        assert_eq!(ramp.delay_after_run(fast), Duration::from_millis(20));
+    }
+
+    /// The threshold is `>=`, and one tick under it is not healthy. Pins the
+    /// comparison so a later `>` typo can't quietly make the reset unreachable
+    /// for a run that lasted exactly the threshold.
+    #[test]
+    fn the_reset_threshold_is_inclusive() {
+        let threshold = Duration::from_millis(100);
+        for (ran_for, expected, note) in [
+            (
+                threshold,
+                bounded().initial,
+                "exactly the threshold must reset",
+            ),
+            (
+                threshold
+                    .checked_sub(Duration::from_nanos(1))
+                    .expect("the threshold is many nanoseconds wide"),
+                Duration::from_millis(20),
+                "a hair under the threshold must not reset",
+            ),
+        ] {
+            let mut ramp = ReconnectBackoff::with(bounded(), threshold);
+            assert!(ramp.delay_after_run(Duration::ZERO) > Duration::ZERO);
+            assert_eq!(ramp.delay_after_run(ran_for), expected, "{note}");
+        }
+    }
+
+    /// #806's concrete report, on the shipped numbers rather than a stand-in
+    /// schedule: the boot race ratchets the counter to the 30s ceiling, the
+    /// daemon then runs healthy for a long while, and the first failure after
+    /// that must redial at 500ms — not sit out the ceiling it inherited from a
+    /// startup race that resolved hours ago.
+    #[test]
+    fn the_shipped_reconnect_ramp_redials_promptly_after_a_healthy_run() {
+        let mut ramp = ReconnectBackoff::new();
+        let mut ratcheted = Duration::ZERO;
+        for _ in 0..8 {
+            ratcheted = ramp.delay_after_run(Duration::from_millis(5));
+        }
+        assert_eq!(
+            ratcheted, RECONNECT_RETRY.max_backoff,
+            "a boot race of fast failures no longer reaches the ceiling, so the rest of this test \
+             proves nothing"
+        );
+        assert_eq!(
+            ramp.delay_after_run(RECONNECT_RESET_AFTER),
+            RECONNECT_RETRY.initial,
+            "a daemon restart after a long healthy run left the panel dead for the full ceiling \
+             (#806)"
+        );
     }
 
     // ── The shipped constants (#665) ─────────────────────────────────────────

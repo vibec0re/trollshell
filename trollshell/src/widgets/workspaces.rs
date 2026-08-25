@@ -184,3 +184,177 @@ fn create_workspace_button(ws: &niri::Workspace) -> gtk::Button {
     });
     btn
 }
+
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::update_workspaces;
+    use hytte::gtk::{self, prelude::*};
+    use hytte::services::niri;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    /// The pill map `update_workspaces` diffs against, exactly as `widget()`
+    /// builds it. No `App`, no registry, no niri socket: every piece of state
+    /// this function touches arrives through its own parameters, which is why
+    /// this site needs no test-only seam at all (#674).
+    type ButtonMap = Rc<RefCell<HashMap<u64, gtk::Button>>>;
+
+    /// A `Workspace` on this test's single output. Only `id` and `idx` vary —
+    /// the diff keys on `id`, and `apply_workspace_visuals` renders `idx` into
+    /// the pill label, which is the emission the second test hangs off.
+    fn ws(id: u64, idx: u8) -> niri::Workspace {
+        niri::Workspace {
+            id,
+            idx,
+            name: None,
+            output: Some("DP-1".to_owned()),
+            is_urgent: false,
+            is_active: false,
+            is_focused: false,
+            active_window_id: None,
+        }
+    }
+
+    /// Sorted key set of the shared cell, i.e. what the last write-back left.
+    fn keys(map: &ButtonMap) -> Vec<u64> {
+        let mut k: Vec<u64> = map.borrow().keys().copied().collect();
+        k.sort_unstable();
+        k
+    }
+
+    /// A fresh strip seeded with `initial`, as the first signal emission would.
+    fn strip(initial: &[niri::Workspace]) -> (gtk::Box, ButtonMap) {
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
+        update_workspaces(&container, &map, initial);
+        (container, map)
+    }
+
+    /// Step 1 of the diff: `container.remove()` drops the last strong ref to an
+    /// obsolete pill, so `GtkWidget::destroy` is emitted **synchronously** from
+    /// dispose, inside the removal loop — the same measured fact
+    /// `components::reactive_list`'s tripwire rests on.
+    ///
+    /// This test makes that handler re-enter `update_workspaces` on the same
+    /// cell, which is exactly the shape this function's own comment claims to
+    /// be safe against. Against the pre-#673
+    /// `let mut map = button_map.borrow_mut();` the inner call hits a live
+    /// `RefMut` and panics with `BorrowMutError` from inside a glib callback —
+    /// which **aborts the test binary** rather than failing one test (#663's
+    /// SIGABRT, the failure mode #674 exists for). With `take()` the cell is
+    /// free for the whole diff, so the inner call simply finds an empty map.
+    ///
+    /// The guarantee under test is "no `BorrowMutError` abort", *not* that
+    /// re-entrant updates compose: the outer call's closing write-back
+    /// deliberately clobbers whatever the inner one stored, and the inner
+    /// call's freshly-created pill is left orphaned in the container. That is
+    /// fine — `bind` does not recurse into an in-call source, so production
+    /// never re-enters here; the borrow discipline is defence in depth against
+    /// a *new* synchronous emission being introduced into the loop.
+    #[gtk::test]
+    fn update_workspaces_tolerates_a_reentrant_update_from_a_removed_pill_destroy() {
+        let (container, map) = strip(&[ws(1, 1), ws(2, 2)]);
+        assert_eq!(
+            keys(&map),
+            [1, 2],
+            "both pills tracked after the first pass"
+        );
+
+        // True only while the outer `update_workspaces` is on the stack, so the
+        // handler can record whether it ran inside the diff or was deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        // Arm pill 2's destroy to re-enter the diff on the same cell.
+        let btn2 = map.borrow()[&2].clone();
+        {
+            let container = container.clone();
+            let map = Rc::clone(&map);
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            btn2.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                update_workspaces(&container, &map, &[ws(1, 1)]);
+            });
+        }
+        // Drop our clone before the removing pass: while it lives the button
+        // has a second strong ref, `container.remove()` won't dispose it, and
+        // `destroy` never fires — the test would pass vacuously.
+        drop(btn2);
+
+        in_outer.set(true);
+        update_workspaces(&container, &map, &[ws(1, 1)]);
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed pill's `destroy` must fire synchronously inside `update_workspaces`; if \
+             GTK ever defers it, or the pill outlives the removal loop, this test proves nothing \
+             about the borrow discipline"
+        );
+        assert_eq!(
+            keys(&map),
+            [1],
+            "the outer call's write-back must still land: re-entry may not leave the cell holding \
+             the inner diff's map or an empty one"
+        );
+    }
+
+    /// Step 2 of the diff, the *reuse* path: `apply_workspace_visuals` calls
+    /// `GtkButton::set_label`, which emits `notify::label` synchronously (it is
+    /// queued under the freeze/thaw pair inside `gtk_button_set_label`, not
+    /// deferred to an idle). The pre-#673 `RefMut` stayed live across that call
+    /// too, so this covers a second of the four emission points the function's
+    /// comment names — a surviving pill, no destroy involved.
+    ///
+    /// Same falsification as above: with `borrow_mut()` held, the re-entrant
+    /// call aborts on `BorrowMutError`.
+    #[gtk::test]
+    fn update_workspaces_does_not_hold_the_button_map_across_apply_workspace_visuals() {
+        let (container, map) = strip(&[ws(1, 1)]);
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let btn = map.borrow()[&1].clone();
+        {
+            let container = container.clone();
+            let map = Rc::clone(&map);
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            btn.connect_label_notify(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                update_workspaces(&container, &map, &[ws(1, 9)]);
+            });
+        }
+        drop(btn);
+
+        // Same id (so the pill is reused, not rebuilt), different idx (so the
+        // label actually changes and `notify::label` fires).
+        in_outer.set(true);
+        update_workspaces(&container, &map, &[ws(1, 2)]);
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "`set_label` must emit `notify::label` synchronously inside the reuse arm; if it stops \
+             doing so this test no longer exercises the borrow at all"
+        );
+        assert_eq!(
+            keys(&map),
+            [1],
+            "the reused pill must still be tracked after a re-entrant pass"
+        );
+    }
+}

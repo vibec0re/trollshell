@@ -36,18 +36,21 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 
     btn.set_child(Some(&row));
 
-    let mounts_for_signal = mounts_container.clone();
-    bind(sensors::disk(), &mounts_container, move |_, disk| {
-        while let Some(c) = mounts_for_signal.first_child() {
-            mounts_for_signal.remove(&c);
-        }
-        for m in &disk.mounts {
-            let bar = crate::components::chip::vertical_bar();
-            bar.set_fraction(m.usage.clamp(0.0, 1.0));
-            bar.set_tooltip_text(Some(&format!("{}: {:.0}%", m.path, m.usage * 100.0)));
-            mounts_for_signal.append(&bar);
-        }
-    });
+    bind(
+        sensors::disk(),
+        &mounts_container,
+        move |mounts_container, disk| {
+            while let Some(c) = mounts_container.first_child() {
+                mounts_container.remove(&c);
+            }
+            for m in &disk.mounts {
+                let bar = crate::components::chip::vertical_bar();
+                bar.set_fraction(m.usage.clamp(0.0, 1.0));
+                bar.set_tooltip_text(Some(&format!("{}: {:.0}%", m.path, m.usage * 100.0)));
+                mounts_container.append(&bar);
+            }
+        },
+    );
 
     btn.upcast()
 }

@@ -29,9 +29,8 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // pill in place instead of tearing the whole strip down (#229).
     let button_map: Rc<RefCell<HashMap<u64, gtk::Button>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    let container_for_signal = container.clone();
-    bind(signal, &container, move |_, windows| {
-        update_windows(&container_for_signal, &button_map, &windows);
+    bind(signal, &container, move |container, windows| {
+        update_windows(container, &button_map, &windows);
     });
 
     container.upcast()

@@ -56,10 +56,9 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
     // keys changes (hot-plug, VPN tunnels coming/going) and which bucket a
     // row sits in (active ↔ idle).
     let cache: Rc<RefCell<HashMap<String, IfaceRow>>> = Rc::new(RefCell::new(HashMap::new()));
-    let iface_group_for_bind = iface_group.clone();
     let idle_expander_for_bind = idle_expander.clone();
     let cache_for_bind = cache.clone();
-    bind(sensors::network(), &iface_group, move |_g, net| {
+    bind(sensors::network(), &iface_group, move |iface_group, net| {
         let mut cache_mut = cache_for_bind.borrow_mut();
 
         // Whether the bucket layout needs rebuilding this tick (a row was
@@ -80,7 +79,7 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
                 return true;
             }
             match entry.attached {
-                Some(Bucket::Active) => iface_group_for_bind.remove(&entry.container),
+                Some(Bucket::Active) => iface_group.remove(&entry.container),
                 Some(Bucket::Idle) => idle_expander_for_bind.remove(&entry.container),
                 None => {}
             }
@@ -134,11 +133,7 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
         }
 
         if structure_changed {
-            relayout(
-                &iface_group_for_bind,
-                &idle_expander_for_bind,
-                &mut cache_mut,
-            );
+            relayout(iface_group, &idle_expander_for_bind, &mut cache_mut);
         }
     });
 

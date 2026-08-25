@@ -43,36 +43,39 @@ pub(crate) fn build_power_profile_expander() -> adw::ExpanderRow {
     expander.add_prefix(&icon);
 
     let rows_track: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
-    let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
-    bind(power_profiles::state(), &expander, move |_, state| {
-        // `take()` ends the borrow before the first `remove()` — a chained
-        // `borrow_mut().drain(..)` would keep the cell borrowed for the whole
-        // loop, and a synchronous emission re-entering it panics (fatally, from
-        // a glib callback).
-        for row in rows_for_bind.take() {
-            expander_for_bind.remove(&row);
-        }
-        let mut new_rows = Vec::with_capacity(state.available.len());
-        for profile in &state.available {
-            let row = adw::ActionRow::builder()
-                .title(humanize_profile(profile))
-                .activatable(true)
-                .build();
-            if profile == &state.active {
-                let check = gtk::Image::from_icon_name("object-select-symbolic");
-                check.set_valign(gtk::Align::Center);
-                row.add_suffix(&check);
+    bind(
+        power_profiles::state(),
+        &expander,
+        move |expander, state| {
+            // `take()` ends the borrow before the first `remove()` — a chained
+            // `borrow_mut().drain(..)` would keep the cell borrowed for the whole
+            // loop, and a synchronous emission re-entering it panics (fatally, from
+            // a glib callback).
+            for row in rows_for_bind.take() {
+                expander.remove(&row);
             }
-            let profile_owned = profile.clone();
-            row.connect_activated(move |_| {
-                power_profiles::set_active(&profile_owned);
-            });
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-    });
+            let mut new_rows = Vec::with_capacity(state.available.len());
+            for profile in &state.available {
+                let row = adw::ActionRow::builder()
+                    .title(humanize_profile(profile))
+                    .activatable(true)
+                    .build();
+                if profile == &state.active {
+                    let check = gtk::Image::from_icon_name("object-select-symbolic");
+                    check.set_valign(gtk::Align::Center);
+                    row.add_suffix(&check);
+                }
+                let profile_owned = profile.clone();
+                row.connect_activated(move |_| {
+                    power_profiles::set_active(&profile_owned);
+                });
+                expander.add_row(&row);
+                new_rows.push(row);
+            }
+            *rows_for_bind.borrow_mut() = new_rows;
+        },
+    );
 
     expander
 }

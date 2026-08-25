@@ -682,12 +682,11 @@ fn build_top_apps_expander(
     // user's manual expand/collapse.  The build-time set_expanded(false) above
     // covers the empty-expander case; this guard fires once on first population.
     let collapsed_once: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
     let collapsed_once_for_bind = collapsed_once.clone();
-    bind(signal, &expander, move |_, list| {
+    bind(signal, &expander, move |expander, list| {
         rebuild_top_apps(
-            &expander_for_bind,
+            expander,
             &rows_for_bind,
             &meta_cache,
             &collapsed_once_for_bind,
@@ -716,14 +715,14 @@ fn build_top_apps_expander(
 /// reproduce the synchronous re-entry this borrow discipline exists for
 /// (#674).
 ///
-/// `expander` is still fed the captured `expander_for_bind` clone at the call
-/// site, not the `&adw::ExpanderRow` that `bind` hands its apply closure — a
-/// strong capture that pins the expander for the life of the binding and so
-/// defeats `bind`'s `WeakRef` contract (`hytte-reactive/src/bind.rs:16-22`),
-/// the same defect #772 fixed in `panels/connections.rs`. That is a **separate
-/// bug from #674** and is left exactly as it was here: this extract is
-/// strictly behaviour-preserving, and switching the closure to its own
-/// argument would change what the binding keeps alive.
+/// `expander` is fed the `&adw::ExpanderRow` that `bind` hands its apply
+/// closure, **not** a strong clone captured from the enclosing scope. The
+/// captured-clone form pinned the expander for the life of the binding and so
+/// defeated `bind`'s `WeakRef` contract (`hytte-reactive/src/bind.rs:16-22`);
+/// #830 recorded it here as a separate bug from #674 (it had to stay put for
+/// that PR's byte-identical-extract argument to hold), and #831 fixed it here
+/// along with the other eleven sites of the same shape. The colocated
+/// `top_apps_binding_does_not_pin_expander` test is the regression guard.
 fn rebuild_top_apps(
     expander: &adw::ExpanderRow,
     rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
@@ -743,11 +742,18 @@ fn rebuild_top_apps(
     let subtitle = list.first().map_or_else(
         || "\u{2014}".to_string(),
         |s| {
-            format!(
-                "{} \u{00b7} {}",
-                sample_display_name(s, &mut meta_cache.borrow_mut()),
-                value(s)
-            )
+            // Resolve first, format second. An argument-position `RefMut` is a
+            // temporary of the whole *enclosing expression*, not of the
+            // sub-expression that made it, so inlining this back into the
+            // `format!` would leave `meta_cache` borrowed while the
+            // caller-supplied `value(s)` runs — #643's spelling 4, at the one
+            // site in this function #663 did not rewrite (#832). Latent rather
+            // than live (`value` is a capture-free `fn` pointer and both
+            // production instantiations are pure formatters), but a `value`
+            // that ever reached back into this cell would abort the process
+            // through the glib callback rather than fail a render.
+            let name = sample_display_name(s, &mut meta_cache.borrow_mut());
+            format!("{name} \u{00b7} {}", value(s))
         },
     );
     expander.set_subtitle(&subtitle);
@@ -911,9 +917,8 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
     cores_row.set_valign(gtk::Align::Center);
 
     let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
-    let cores_row_for_bind = cores_row.clone();
     let bars_for_bind = core_bars.clone();
-    bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
+    bind(sensors::cpu(), &cores_row, move |cores_row, c: CpuLoad| {
         // Take the bars out for the whole update rather than holding a `RefMut`
         // across it: the pre-#643 binding stayed live past `remove()`,
         // `insert()`, `set_fraction()` and `set_tooltip_text()`, so any
@@ -924,11 +929,11 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
             // Drain by hand: `FlowBox::remove_all` is `v4_12`-gated and gtk4 is
             // pinned without version features. `first_child` yields the
             // implicit `GtkFlowBoxChild`, which is what `remove` wants.
-            while let Some(child) = cores_row_for_bind.first_child() {
-                cores_row_for_bind.remove(&child);
+            while let Some(child) = cores_row.first_child() {
+                cores_row.remove(&child);
             }
             bars.clear();
-            cores_row_for_bind.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
+            cores_row.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
             for _ in 0..c.per_core.len() {
                 let bar = gtk::ProgressBar::new();
                 bar.add_css_class("ts-core-bar");
@@ -940,7 +945,7 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
                 // (This is what the old per-bar `hexpand` wrapper `gtk::Box`
                 // hand-rolled, so it's gone.)
                 bar.set_halign(gtk::Align::Center);
-                cores_row_for_bind.insert(&bar, -1);
+                cores_row.insert(&bar, -1);
                 // `insert` wraps the bar in a `GtkFlowBoxChild`, which is
                 // focusable by default — 64 decorative bars would otherwise add
                 // 64 tab stops to the drawer.
@@ -2061,12 +2066,12 @@ mod tests {
 /// guard, and it is the only reason a probe that never re-enters would be
 /// caught instead of shipping a decorative green.
 ///
-/// ## The second cell, `meta_cache`: investigated and NOT covered
+/// ## The second cell, `meta_cache`: two of its three sites are NOT covered
 ///
-/// [`rebuild_top_apps`] holds two cells, and only one of them is testable.
 /// `meta_cache` is a different hazard shape from `rows_track` — short borrows
 /// *inside* the loop rather than a take/write-back — and #663 fixed it at two
-/// sites. Both were worked through for a test here and dropped, for reasons
+/// sites (the third is #832's, covered; see the section below). Both of
+/// #663's were worked through for a test here and dropped, for reasons
 /// specific to each rather than a blanket "looks safe":
 ///
 /// - **`row.set_title(&title)`.** Pre-#663 this was
@@ -2099,29 +2104,34 @@ mod tests {
 /// feeds have `app_id: None`, but `borrow_mut()` is taken either way), and
 /// nothing re-enters it. Uncovered, not accidentally covered.
 ///
-/// ## A live call-out inside a `meta_cache` borrow that #663 missed
+/// ## The third `meta_cache` site — #663 missed it, #832 fixed it, and it *is*
+/// covered
 ///
-/// Recorded here because it is the same defect class and this is where the
-/// next reader will look. The collapsed-summary expression in
-/// [`rebuild_top_apps`] is
+/// The collapsed-summary expression in [`rebuild_top_apps`] used to be
 ///
 /// ```text
 /// format!("{} · {}", sample_display_name(s, &mut meta_cache.borrow_mut()), value(s))
 /// ```
 ///
 /// An argument-position `RefMut` is a temporary of the whole enclosing
-/// expression, so it is **still alive when `value(s)` is called** — #643's
-/// spelling 4, at a site #663 did not rewrite. Verified with a standalone
-/// `rustc` probe: the argument-position form reports the cell borrowed during
-/// `value(s)`; a `let`-bound form does not.
+/// expression, so it was **still alive when `value(s)` was called** — #643's
+/// spelling 4, at a site #663 did not rewrite. #830 recorded it here rather
+/// than fixing it, because that PR's whole argument rested on the extracted
+/// body being byte-identical to the closure it came from; #832 fixed it, and
+/// it is now `let`-bound like its two siblings.
 ///
-/// It is not exploitable today and is deliberately **not** fixed here (that
-/// would break the byte-identical equivalence this extract rests on):
-/// `value` is a capture-free `fn` pointer, and both production instantiations
-/// (`|s| format!("{:.0}%", s.cpu_frac * 100.0)` and `|s| fmt_bytes(s.mem_bytes)`)
-/// are pure formatters that touch no `RefCell`. It is a latent hazard that
-/// only bites if someone ever passes a `value` that reaches back into this
-/// module's state.
+/// Unlike those two siblings this one **is** falsifiable, and that is the
+/// difference worth naming: the call-out is `value`, a *caller-supplied*
+/// `fn(&ProcSample) -> String` parameter, so a test can pass its own. It
+/// cannot capture (bare `fn` pointer, which is exactly why the production
+/// instantiations are safe), so
+/// [`top_apps_summary_releases_meta_cache_before_calling_value`] hands the
+/// cell over through a thread-local and has the probe report
+/// `try_borrow_mut().is_ok()`. Against the argument-position form the first
+/// observation is `false`; against the `let`-bound form every observation is
+/// `true`. The probe reports rather than panics on purpose — a real
+/// `borrow_mut()` there would abort the test binary instead of failing one
+/// test, which is the production failure mode but a poor assertion.
 ///
 /// Needs a real display server (`adw::ExpanderRow`/`adw::ActionRow` have to be
 /// constructible and actually run GTK's dispose machinery), hence the
@@ -2140,6 +2150,34 @@ mod reentrancy_tests {
 
     type Rows = Rc<RefCell<Vec<adw::ActionRow>>>;
     type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
+
+    thread_local! {
+        /// The cell [`probing_value`] inspects, and what it saw on each call.
+        /// A thread-local rather than a capture because `value` is a bare
+        /// `fn` pointer — see [`probing_value`].
+        static PROBE_CACHE: RefCell<Option<MetaCache>> = const { RefCell::new(None) };
+        static PROBE_SAW: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A `value` formatter that reaches back into `meta_cache` — the thing
+    /// #832 says the argument-position `RefMut` would have aborted on.
+    ///
+    /// `value` is `fn(&ProcSample) -> String`, so it cannot capture the cell;
+    /// production is safe for exactly that reason. The cell is handed over
+    /// through [`PROBE_CACHE`] instead. It *reports*
+    /// `try_borrow_mut().is_ok()` rather than taking a real `borrow_mut()`:
+    /// the latter is the production failure mode (a `BorrowMutError` panic
+    /// unwinding through a glib callback aborts the process) but would take
+    /// the whole test binary down instead of failing this one test.
+    fn probing_value(s: &ProcSample) -> String {
+        PROBE_CACHE.with_borrow(|slot| {
+            if let Some(cache) = slot.as_ref() {
+                let free = cache.try_borrow_mut().is_ok();
+                PROBE_SAW.with_borrow_mut(|seen| seen.push(free));
+            }
+        });
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
 
     /// The formatter `build_stats_cpu_card` passes for the "Top apps · CPU"
     /// expander, copied verbatim so the test drives a real production `value`
@@ -2259,6 +2297,105 @@ mod reentrancy_tests {
             2,
             "the outer call's write-back must still land: re-entry may not leave the cell holding \
              the inner call's rows or an empty Vec"
+        );
+    }
+
+    /// #832: the collapsed-summary line must resolve the display name into a
+    /// local *before* calling `value`, so `meta_cache` is no longer borrowed
+    /// when the caller-supplied formatter runs.
+    ///
+    /// One sample means [`probing_value`] is called exactly twice — once for
+    /// the collapsed summary, once for the row's suffix label — and both must
+    /// find the cell free. Against the pre-#832 argument-position form the
+    /// *first* observation is `false`, because an argument-position `RefMut`
+    /// is a temporary of the whole enclosing `format!`. `saw.len() >= 2` is
+    /// the anti-vacuity guard: a probe that never ran would otherwise satisfy
+    /// `all()` trivially.
+    #[gtk::test]
+    fn top_apps_summary_releases_meta_cache_before_calling_value() {
+        let (expander, rows, meta, collapsed) = fresh();
+        PROBE_SAW.with_borrow_mut(Vec::clear);
+        PROBE_CACHE.with_borrow_mut(|slot| *slot = Some(Rc::clone(&meta)));
+
+        rebuild_top_apps(
+            &expander,
+            &rows,
+            &meta,
+            &collapsed,
+            probing_value,
+            &samples(1),
+        );
+
+        // Unhook before asserting: a later test in this module driving
+        // `cpu_value` must not keep appending to `PROBE_SAW`.
+        PROBE_CACHE.with_borrow_mut(|slot| *slot = None);
+        let saw = PROBE_SAW.with_borrow(Clone::clone);
+
+        assert!(
+            saw.len() >= 2,
+            "the probing `value` must have run for both the collapsed summary and the row label; \
+             got {} observation(s), so this test proves nothing",
+            saw.len()
+        );
+        assert!(
+            saw.iter().all(|&free| free),
+            "`meta_cache` must be free whenever `value` runs, but the observations were {saw:?}; \
+             a `false` means the summary's `RefMut` was still live across `value(s)` (#832) — in \
+             production that is a `BorrowMutError` through a glib callback, i.e. a process abort"
+        );
+    }
+}
+
+/// #831 regression coverage for this file's two widget-pinning `bind` call
+/// sites, in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&W` `bind` hands it rather than a strong clone
+/// captured from the enclosing scope, or the binding keeps the widget alive
+/// for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+///
+/// Only `build_top_apps_expander` is reachable from a test: it takes its
+/// signal as a parameter, so a `Mutable` stands in for the service. The other
+/// site in this file, `build_per_core_bars_row`, reads `sensors::cpu()`
+/// inline and would need a registered `Registry` (or an extraction into a
+/// `bind_*` helper, a production restructure this work does not make), so it
+/// is fixed but uncovered — as are the nine sites in the other ten files.
+#[cfg(all(test, feature = "system-tests"))]
+mod pin_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+
+    use super::build_top_apps_expander;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// Falsified by reintroducing the `expander_for_bind` strong clone the
+    /// apply closure used to capture: with it, `drop(expander)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn top_apps_binding_does_not_pin_expander() {
+        adw::init().expect("libadwaita init");
+        let samples: Mutable<Vec<ProcSample>> = Mutable::new(Vec::new());
+        let expander = build_top_apps_expander("Top apps", samples.signal_cloned(), cpu_value);
+        let weak = expander.downgrade();
+        pump();
+
+        drop(expander);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "build_top_apps_expander must not pin its expander: a strong clone captured by the \
+             apply closure (rather than taking the closure's own `&adw::ExpanderRow` argument \
+             from `bind`) would keep this alive for the life of the binding, defeating #224's \
+             WeakRef contract"
         );
     }
 }

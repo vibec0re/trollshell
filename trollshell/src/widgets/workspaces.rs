@@ -42,14 +42,13 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // of tearing the whole strip down and rebuilding it (#229).
     let button_map: Rc<RefCell<HashMap<u64, gtk::Button>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    let container_for_signal = container.clone();
     let current_workspaces_for_bind = Rc::clone(&current_workspaces);
-    bind(signal, &container, move |_, workspaces| {
+    bind(signal, &container, move |container, workspaces| {
         current_workspaces_for_bind
             .borrow_mut()
             .clone_from(&workspaces);
 
-        update_workspaces(&container_for_signal, &button_map, &workspaces);
+        update_workspaces(container, &button_map, &workspaces);
     });
 
     // Scroll over the pill strip to cycle the active workspace on this

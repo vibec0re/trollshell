@@ -56,15 +56,18 @@
 //! `Control.ReloadPlugins` D-Bus method, which the home-manager module calls
 //! from its activation script so a switch fully applies live.
 //!
-//! ## Secret-injection hook (#392)
+//! ## Secret injection (#392)
 //!
 //! [`launch`] takes `extra_env`, appended after the spec's declared `env` as
 //! additional `--setenv=<VAR>=<value>` arguments. That is the hook #392 (AI
-//! API-key management) rides on: the control-center writes a key to
-//! gnome-keyring/libsecret, and the launcher will read the slot and pass it
-//! here at spawn — the secret never lands in the state file, a unit file, or
-//! the plugin's own config, and rotating a key is just stop + relaunch. Today
-//! every caller passes `&[]`; the key *management* itself is out of scope here.
+//! API-key management) rides on: [`resolve_secret_env`] reads each slot in
+//! [`PluginSpec::secrets`] from the login keyring (via [`crate::secrets`])
+//! and maps it to its injected `(<SLOT>_API_KEY, value)` pair; every
+//! `launch` call site builds `extra_env` this way before calling in — the
+//! secret never lands in the state file, a unit file, or the plugin's own
+//! config, and rotating a key is just stop + relaunch. Key *management*
+//! (writing/rotating/deleting the stored key itself) is [`crate::secrets`]
+//! and the control-center's AI Keys tab, not this module.
 //!
 //! ## Legacy static units
 //!
@@ -370,7 +373,7 @@ fn systemd_run_args(id: &str, spec: &PluginSpec, extra_env: &[(String, String)])
 
 /// Launch one declared plugin as a transient `trollshell-plugin-<id>.service`
 /// user unit. `extra_env` is the #392 secret-injection hook (see the module
-/// docs); every current caller passes `&[]`.
+/// docs); every current caller builds it via [`resolve_secret_env`].
 ///
 /// Fails if the unit already exists (the plugin is running — `systemd-run`
 /// refuses to replace a live unit) or if there's no reachable user manager;

@@ -39,7 +39,13 @@ pub(super) fn build_wifi_group() -> adw::PreferencesGroup {
     scrolled.set_vscrollbar_policy(gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_height(true);
     // Design-baseline px, routed through `scale()` so the cap tracks font size
-    // / text-scaling the same way `stats.rs`'s scroll wrapper does (#708).
+    // / text-scaling (#708) — this is an inside-card list scroller, so it's
+    // legitimately meant to grow with the font. That's *not* true of the Stats
+    // drawer's viewport cap: #787 deliberately pulled that one off `scale()`
+    // because it's a live screen-space budget measured off the monitor, and
+    // scaling an already-real-pixel number again would double-count the font
+    // factor. Pinned alongside `connections.rs`'s and `notifications.rs`'s
+    // siblings by `scale::tests::three_scroll_heights_scale_with_factor`.
     scrolled.set_max_content_height(crate::scale::scale(240));
     scrolled.set_hexpand(true);
     scrolled.add_css_class("ts-wifi-list");

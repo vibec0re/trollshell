@@ -117,11 +117,10 @@ unit per plugin binary on the same pattern.
 >    units, diffs them against the freshly read file, and starts what was added
 >    or enabled, stops what was disabled or removed, and **restarts** anything
 >    whose declared spec changed.
-> 4. **the diff runs on a fingerprint** stamped into each unit's
->    `Description=` at spawn, covering `exec` + `env` + `secrets` + a
->    non-default `target`. `systemctl --user show -p Description
-trollshell-plugin-<id>` shows which config a running plugin was launched
->    from; a unit the shell never stamped — the static ones below — is never
+> 4. **the diff runs on a fingerprint** stamped into each unit's `Description=`
+>    at spawn, covering `exec` + `env` + `secrets` + a non-default `target`.
+>    `systemctl --user show -p Description trollshell-plugin-pet` reads it
+>    back; a unit the shell never stamped — the static ones below — is never
 >    touched.
 >
 > So: **under home-manager a `switch` applies live.** Under the NixOS module,

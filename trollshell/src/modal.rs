@@ -123,8 +123,8 @@ impl BarGeometry {
     }
 
     /// Vertical room a drawer card actually has on this monitor, in live
-    /// logical pixels: the screen height, less whatever the bar reserves on
-    /// that axis, less the card's own vertical chrome
+    /// logical pixels: the screen height, less whatever this drawer's geometry
+    /// reserves on that axis, less the card's own vertical chrome
     /// ([`CARD_CHROME_VERTICAL`]).
     ///
     /// This is what the Stats page's `ScrolledWindow` cap is derived from
@@ -135,13 +135,40 @@ impl BarGeometry {
     /// [`scale`] tracks font size and the page *content* rides the very same
     /// factor, so the ratio content-height ÷ cap is font-invariant.
     ///
-    /// Only a Top/Bottom bar eats into the vertical axis —
-    /// [`BarGeometry::perpendicular_margin`] is a *width* reservation for a
-    /// Left/Right bar, where the vertical axis is instead the main one — hence
-    /// the [`BarGeometry::horizontal`] split. The drawer surface itself is
-    /// fullscreen with `exclusive_zone(-1)` (see [`build_drawer_window`]), so
-    /// the monitor's own height is the right starting point in both cases: no
-    /// other exclusive zone shrinks it.
+    /// Which term is reserved depends on the axis the bar runs along, hence
+    /// the [`BarGeometry::horizontal`] split:
+    ///
+    /// * **Top/Bottom bar** — the vertical axis is the *perpendicular* one, so
+    ///   [`BarGeometry::perpendicular_margin`] (the bar's offset plus its
+    ///   measured thickness) is the reservation. The main-axis margin runs
+    ///   left↔right there and is correctly no part of it.
+    /// * **Left/Right bar** — the vertical axis is instead the *main* one. The
+    ///   bar's own thickness is a *width* reservation and rightly contributes
+    ///   nothing, but `main_margin` does: [`BarGeometry::main_layer_edge`]
+    ///   resolves to `Bottom` for a vertical bar, so the centering margin
+    ///   [`reposition_card`] applies there lifts the card off the screen bottom
+    ///   and is a genuine height reservation. This branch used to reserve zero,
+    ///   returning a budget too large by exactly that margin (#793 item 2).
+    ///
+    /// That second case is unreachable while `main.rs`'s `BAR_EDGE` is
+    /// `Edge::Top`. It is fixed anyway because the arithmetic's own tests would
+    /// otherwise stand as a passing assertion of the wrong number for whoever
+    /// first ships a left/right bar — see
+    /// [`tests::clamp_card_height_reserves_a_vertical_bars_main_margin_not_its_thickness`].
+    ///
+    /// `main_margin` comes from [`live_main_margin`], the same expression
+    /// [`reposition_card`] solves, so the budget and the placement cannot
+    /// disagree about it. It reflects the card's allocation from the previous
+    /// pass rather than the one this cap is about to produce — the caller runs
+    /// before `reposition_card`, and `set_max_content_height` only *queues* a
+    /// resize regardless — which is the same converging loop
+    /// [`wire_recenter_on_map`]'s post-map recompute already drives. On the
+    /// unanchored path (`open_by_key`) it is 0: the card sits flush with the
+    /// bar's trailing edge and nothing is reserved.
+    ///
+    /// The drawer surface itself is fullscreen with `exclusive_zone(-1)` (see
+    /// [`build_drawer_window`]), so the monitor's own height is the right
+    /// starting point in both cases: no other exclusive zone shrinks it.
     ///
     /// Both terms are read **live** on every call, never snapshotted at
     /// install — the same #442 rule [`BarGeometry::main_extent`] already
@@ -151,14 +178,14 @@ impl BarGeometry {
     /// on show (see [`apply_stats_max_height`]) instead of being handed to
     /// [`build_page`], which builds once and could only ever capture a stale
     /// number.
-    fn available_card_height(&self) -> i32 {
+    fn available_card_height(&self, main_margin: i32) -> i32 {
         let (_, monitor_height) = self.monitor.size();
-        let bar_reserved = if self.horizontal() {
+        let reserved = if self.horizontal() {
             self.perpendicular_margin()
         } else {
-            0
+            main_margin
         };
-        clamp_card_height(monitor_height, bar_reserved, CARD_CHROME_VERTICAL)
+        clamp_card_height(monitor_height, reserved, CARD_CHROME_VERTICAL)
     }
 
     /// True when the bar runs horizontally (Top/Bottom) so the drawer
@@ -1514,12 +1541,24 @@ fn reposition_card(panel: &ModalPanel) {
         panel.geometry.perpendicular_layer_edge(),
         panel.geometry.perpendicular_margin(),
     );
-    let main_margin = live_center(panel).map_or(0, |center| main_margin_for_center(panel, center));
     set_widget_margin(
         &panel.positioner,
         panel.geometry.main_layer_edge(),
-        main_margin,
+        live_main_margin(panel),
     );
+}
+
+/// The main-axis margin the card should carry right now: solved from the anchor
+/// chip's live center, or 0 when the drawer has no anchor at all (the
+/// `open_by_key` path, where the card sits flush with the bar's trailing edge).
+///
+/// Extracted so [`reposition_card`] and [`apply_stats_max_height`] share one
+/// expression (#793 item 2). For a Left/Right bar this margin is applied to
+/// `Bottom`, which makes it a height reservation as well as a placement — and a
+/// height budget solved from a *different* number than the placement uses is
+/// precisely the bug that shows up as a card overflowing the screen.
+fn live_main_margin(panel: &ModalPanel) -> i32 {
+    live_center(panel).map_or(0, |center| main_margin_for_center(panel, center))
 }
 
 /// Record `trigger` as the chip this drawer is centered on. `None` (clearing any
@@ -1821,10 +1860,12 @@ fn clamp_main_margin(
 /// out so the budget is unit-testable without a live monitor or a mapped bar
 /// surface — the same reason [`clamp_main_margin`] is split out.
 ///
-/// `bar_reserved` is what the bar takes off the vertical axis (its offset plus
-/// its measured thickness for a Top/Bottom bar, zero for a Left/Right one) and
-/// `chrome` is the card's own vertical margin total
-/// ([`CARD_CHROME_VERTICAL`]).
+/// `bar_reserved` is what the drawer's geometry takes off the vertical axis:
+/// the bar's offset plus its measured thickness for a Top/Bottom bar, and the
+/// card's main-axis centering margin for a Left/Right one — whose
+/// [`BarGeometry::main_layer_edge`] is `Bottom`, making that margin a *height*
+/// reservation rather than the zero this used to document (#793 item 2).
+/// `chrome` is the card's own vertical margin total ([`CARD_CHROME_VERTICAL`]).
 ///
 /// Floors at [`MIN_CARD_HEIGHT`] so degenerate inputs can't yield a nonsense
 /// cap. Two of them are reachable: `Monitor::size` reports `(0, 0)` for a
@@ -1867,13 +1908,24 @@ fn on_page_show(panel: &ModalPanel, page: Page) {
         // #701 then #516, in that order. First re-derive the Stats page's
         // scroll cap from *this* monitor's live geometry — every show is the
         // point where a kanshi mode switch or a bar-thickness change would
-        // have invalidated the last value, and the viewport has to be sized
-        // before the deep-link scroll below decides where the target card
-        // lands. Then (re)land the page on whichever resource chip's card is
-        // currently pending. Both fire on every open/swap/re-show of the page
-        // — including the "already open" `toggle_keep_open` path, which is
-        // exactly the case that needs it (the stack's visible child doesn't
-        // change, so nothing else would trigger a rescroll).
+        // have invalidated the last value. Then (re)land the page on whichever
+        // resource chip's card is currently pending. Both fire on every
+        // open/swap/re-show of the page — including the "already open"
+        // `toggle_keep_open` path, which is exactly the case that needs it (the
+        // stack's visible child doesn't change, so nothing else would trigger a
+        // rescroll).
+        //
+        // What lets the scroll see the new cap is the *defer*, not this
+        // ordering (#793 item 3). This comment used to claim the viewport "has
+        // to be sized before the deep-link scroll decides where the target card
+        // lands", which is not how GTK works: `set_max_content_height` only
+        // queues a resize, so a synchronous `apply_stats_scroll` would read the
+        // pre-cap layout no matter which of the two ran first. It is safe
+        // because `panels::stats`'s `apply_scroll` defers a full main-loop idle
+        // tick (`glib::idle_add_local_once`) plus one bounded retry (#542), by
+        // which point the queued resize has been laid out. So: do not delete
+        // that idle on the strength of this ordering. The ordering buys nothing
+        // on its own, and dropping the defer silently breaks the deep link.
         Page::Stats => {
             apply_stats_max_height(panel);
             apply_stats_scroll(panel);
@@ -1937,7 +1989,16 @@ fn apply_stats_max_height(panel: &ModalPanel) {
     let Some(widget) = panel.stack.child_by_name(Page::Stats.stack_name()) else {
         return;
     };
-    let height = panel.geometry.available_card_height();
+    // Only a Left/Right bar's main-axis margin lands on the vertical axis, and
+    // `available_card_height` ignores this argument for a Top/Bottom bar — so
+    // skip the solve there rather than pay `live_main_margin`'s GTK measure on
+    // the one bar edge the shell actually ships (`main.rs`'s `BAR_EDGE`).
+    let main_margin = if panel.geometry.horizontal() {
+        0
+    } else {
+        live_main_margin(panel)
+    };
+    let height = panel.geometry.available_card_height(main_margin);
     if let Err(e) = widget.activate_action("stats.max-height", Some(&height.to_variant())) {
         tracing::debug!(error = %e, "modal: stats max-height action activation failed");
     }
@@ -2241,16 +2302,39 @@ mod tests {
         assert_eq!(thin - thick, 40);
     }
 
-    /// A Left/Right bar reserves *width*, not height, so `bar_reserved` is 0
-    /// there and the card gets the full screen minus chrome. Subtracting the
-    /// perpendicular margin on that axis too would silently short the budget by
-    /// a bar's width.
+    /// A Left/Right bar's *thickness* is a width reservation and must never
+    /// come off the height — subtracting the perpendicular margin on that axis
+    /// too would silently short the budget by a bar's width. What *does* come
+    /// off is the card's main-axis centering margin, because
+    /// `BarGeometry::main_layer_edge` resolves to `Bottom` for a vertical bar.
+    ///
+    /// This test previously asserted only the `bar_reserved == 0` case and
+    /// described it as the whole rule for a vertical bar, matching the shape
+    /// `available_card_height` had. That is the number #793 item 2 objected to:
+    /// it passes, and it stands as a green assertion that a left/right bar's
+    /// card may use the full screen height — a cap that overflows by the
+    /// centering margin for whoever first ships one.
     #[test]
-    fn clamp_card_height_ignores_a_vertical_bar() {
+    fn clamp_card_height_reserves_a_vertical_bars_main_margin_not_its_thickness() {
+        // Unanchored drawer (the `open_by_key` path): margin 0, so the card
+        // really does get the whole screen minus chrome. The one case the old
+        // assertion was right about, kept.
         assert_eq!(
             clamp_card_height(1440, 0, CARD_CHROME_VERTICAL),
             1440 - CARD_CHROME_VERTICAL
         );
+        // Anchored under a chip partway along the bar: that margin lifts the
+        // card off the screen bottom, so it is height the card cannot use.
+        let main_margin = 300;
+        assert_eq!(
+            clamp_card_height(1440, main_margin, CARD_CHROME_VERTICAL),
+            1440 - main_margin - CARD_CHROME_VERTICAL
+        );
+        // Which of the two numbers a vertical bar actually passes is decided in
+        // `available_card_height`, and that needs a live monitor plus a mapped
+        // bar surface, so it can't be reached from here. This pins the
+        // arithmetic it feeds; `clamp_card_height_tracks_bar_thickness` pins
+        // the Top/Bottom side of the same choice.
     }
 
     /// Degenerate input #1: `Monitor::size` reports `(0, 0)` for a monitor GDK
@@ -2280,26 +2364,79 @@ mod tests {
         );
     }
 
-    /// The floor is a floor, never a ceiling: it may only ever raise a budget,
-    /// and the result is always a usable positive cap. Swept across the whole
-    /// plausible input space plus both saturating extremes, so no combination
-    /// can produce a zero, a negative, or an overflow panic in a debug build.
+    /// The floor is a floor, never a ceiling, and the result is always a
+    /// usable positive cap. Swept across the whole plausible input space plus
+    /// both saturating extremes, so no combination can produce a zero, a
+    /// negative, or an overflow panic in a debug build.
+    ///
+    /// The second assertion here used to be `budget == raw.max(MIN_CARD_HEIGHT)`
+    /// with `raw` recomputed from the same two `saturating_sub`s — the function
+    /// body restated character for character, so it could not fail for any
+    /// input (#793 item 4). It is replaced rather than deleted, by properties
+    /// that are *consequences* of the implementation instead of a copy of it,
+    /// each falsified by a different plausible regression:
+    ///
+    /// * **Never below the floor** — catches a dropped `.max(MIN_CARD_HEIGHT)`.
+    /// * **Never larger than the screen it caps** — the "floor is not a
+    ///   ceiling" half. Above the floor the budget must not exceed
+    ///   `monitor_height`; a `+` where a `-` belongs fails here and nowhere
+    ///   else. Asserted only for `bar_reserved >= 0`: a negative reservation
+    ///   would mean the bar handing height *back*, which is not a physically
+    ///   meaningful input, and `saturating_sub` legitimately grows the budget
+    ///   past the screen for one.
+    /// * **Monotone in both arguments** — more screen never yields a smaller
+    ///   cap, more reservation never yields a larger one. A swapped
+    ///   `saturating_sub` operand order satisfies both assertions above on the
+    ///   swept inputs and fails only this one.
     #[test]
     fn clamp_card_height_is_always_a_usable_positive_cap() {
-        for height in [i32::MIN, -1, 0, 1, 100, 240, 300, 768, 1440, 4320, i32::MAX] {
-            for reserved in [i32::MIN, 0, 34, 200, 5000, i32::MAX] {
+        const HEIGHTS: [i32; 11] = [i32::MIN, -1, 0, 1, 100, 240, 300, 768, 1440, 4320, i32::MAX];
+        const RESERVATIONS: [i32; 6] = [i32::MIN, 0, 34, 200, 5000, i32::MAX];
+
+        for height in HEIGHTS {
+            for reserved in RESERVATIONS {
                 let budget = clamp_card_height(height, reserved, CARD_CHROME_VERTICAL);
                 assert!(
                     budget >= MIN_CARD_HEIGHT,
                     "budget {budget} fell below the floor at ({height}, {reserved})"
                 );
-                let raw = height
-                    .saturating_sub(reserved)
-                    .saturating_sub(CARD_CHROME_VERTICAL);
                 assert!(
-                    budget == raw.max(MIN_CARD_HEIGHT),
-                    "floor changed a budget it shouldn't have at ({height}, {reserved})"
+                    reserved < 0 || budget <= height.max(MIN_CARD_HEIGHT),
+                    "budget {budget} exceeds the {height}px screen it is a cap \
+                     for, and the floor is not what raised it (reserved {reserved})"
                 );
+            }
+        }
+
+        // Monotone in the screen height. Compares two real outputs against each
+        // other rather than either against a recomputed expectation, which is
+        // what keeps this independent of the function body.
+        for a in HEIGHTS {
+            for b in HEIGHTS {
+                let (lo, hi) = (a.min(b), a.max(b));
+                for reserved in RESERVATIONS {
+                    assert!(
+                        clamp_card_height(lo, reserved, CARD_CHROME_VERTICAL)
+                            <= clamp_card_height(hi, reserved, CARD_CHROME_VERTICAL),
+                        "a taller screen ({hi} over {lo}) shrank the cap at \
+                         reserved {reserved}"
+                    );
+                }
+            }
+        }
+
+        // …and monotone (non-increasing) in what the geometry reserves.
+        for a in RESERVATIONS {
+            for b in RESERVATIONS {
+                let (lo, hi) = (a.min(b), a.max(b));
+                for height in HEIGHTS {
+                    assert!(
+                        clamp_card_height(height, hi, CARD_CHROME_VERTICAL)
+                            <= clamp_card_height(height, lo, CARD_CHROME_VERTICAL),
+                        "reserving more ({hi} over {lo}) grew the cap at \
+                         height {height}"
+                    );
+                }
             }
         }
     }

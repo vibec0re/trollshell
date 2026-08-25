@@ -283,7 +283,12 @@ impl Editor {
                 editor.status_row.set_subtitle(
                     "trollshell isn't running — edits here apply the next time it starts",
                 );
-                if editor.resolved.borrow_mut().take().is_some() {
+                // Bound the `RefMut` rather than leaving it a temporary in the
+                // condition: `rebuild` borrows the same cell, and "when exactly
+                // does this drop" is not a question to leave to the reader
+                // inside a glib callback (#643).
+                let was_badged = editor.resolved.borrow_mut().take().is_some();
+                if was_badged {
                     editor.rebuild();
                 }
             }
@@ -341,7 +346,14 @@ impl Editor {
             .build();
         add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
         let editor = self.clone();
-        add.connect_activated(move |_| editor.add());
+        // Deferred to an idle tick, unlike the place rows above. `add` saves,
+        // and a save rebuilds this group — which would mean removing *this row*
+        // from inside its own `row-activated` emission. The place rows only
+        // push a page, so they can run inline.
+        add.connect_activated(move |_| {
+            let editor = editor.clone();
+            glib::idle_add_local_once(move || editor.add());
+        });
         self.list.add(&add);
         rows.push(add.upcast::<gtk::Widget>());
 
@@ -678,13 +690,21 @@ impl Editor {
         group
     }
 
-    /// Rebuild the open detail page in place. Adding or removing a list entry
-    /// changes how many rows the page has, and `match_min`'s ceiling with it,
-    /// so the page is re-derived from the saved set rather than patched.
+    /// Rebuild the open detail page. Adding or removing a list entry changes
+    /// how many rows the page has, and `match_min`'s ceiling with it, so the
+    /// page is re-derived from the saved set rather than patched.
+    ///
+    /// Deferred to an idle tick because every caller is a widget *on* that
+    /// page: popping it inline would tear the page down inside its own button's
+    /// `clicked` (or entry's `apply`) emission, and it would race the push that
+    /// immediately follows.
     fn reopen(&self, index: usize) {
-        if self.nav.pop() {
-            self.open(index);
-        }
+        let editor = self.clone();
+        glib::idle_add_local_once(move || {
+            if editor.nav.pop() {
+                editor.open(index);
+            }
+        });
     }
 
     /// Re-title the open detail page after a rename, so the header and the back

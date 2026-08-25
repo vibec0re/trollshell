@@ -214,6 +214,54 @@ in
         ];
       })
 
+      # The two LLM backend units (#694): programs.trollshell.claudeBridge.* and
+      # .petBrain.* are declared in the shared base (module-common.nix) so they
+      # render in one options doc, but — like nightlight above — they are
+      # home-manager-only. nix/hm-module.nix declares both user units; this
+      # module declares neither, and a NixOS-only deployment has no per-user
+      # `claude` login state (nor a per-user model download) for them to drive.
+      # So assert rather than let `enable = true` evaluate cleanly and start
+      # nothing.
+      #
+      # Unconditional, not behind an `lib.mkIf`, so the flake's `nixos-module`
+      # check forces both predicates on every run — see the note at that check
+      # about `mkIf`-guarded assertions being invisible to it (#681). Only
+      # `enable` is inspected: setting `port` or `model` without enabling is
+      # inert here the same way it is anywhere else.
+      {
+        assertions = [
+          {
+            assertion = !cfg.claudeBridge.enable;
+            message = ''
+              programs.trollshell.claudeBridge.enable is set, but the
+              hytte-claude-bridge user service is currently implemented only by
+              the home-manager module — nix/nixos-module.nix declares no unit
+              for it, so this setting has no effect here and nothing would
+              listen on the loopback port your plugins point at. The bridge
+              drives a per-user, already-logged-in `claude` CLI, which a
+              system-level module has no handle on. See #694. Move this to your
+              home-manager programs.trollshell.claudeBridge config, or install
+              the unit by hand from
+              etc/systemd/user/trollshell-claude-bridge.service.
+            '';
+          }
+          {
+            assertion = !cfg.petBrain.enable;
+            message = ''
+              programs.trollshell.petBrain.enable is set, but the
+              trollshell-pet-brain user service (llama-server) is currently
+              implemented only by the home-manager module —
+              nix/nixos-module.nix declares no unit for it, so this setting has
+              no effect here. The brain loads a GGUF out of a per-user
+              directory, which is home-manager's half of the world. See #694.
+              Move this to your home-manager programs.trollshell.petBrain
+              config, or install the unit by hand from
+              etc/systemd/user/trollshell-pet-brain.service.
+            '';
+          }
+        ];
+      }
+
       # Control-center companion app (#399): the external GTK settings/management
       # window (app-id mov.vibec0re.trollshell.ControlCenter) that speaks to the
       # shell's mov.vibec0re.trollshell.Control endpoint. Installed by default

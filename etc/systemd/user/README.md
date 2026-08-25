@@ -113,7 +113,10 @@ so the two **coexist** — the old `Conflicts=` is gone; enable either or both.
 Its optional brain is `trollshell-pet-brain.service`, a local `llama-server`
 (nixpkgs `llama-cpp`) holding a small chat model — the unit's comments cover
 fetching one; without it the pet falls back to canned lines and loses no
-function beyond variety.
+function beyond variety. Under home-manager that unit is
+`programs.trollshell.petBrain.enable` (#694) rather than a hand-install; see
+["The declarative path"](#the-declarative-path-home-manager) below, which covers
+it alongside the Claude bridge — the other backend `PET_LLM_URL` can point at.
 
 `trollshell-plugin-weather.service` is the weather card, migrated
 out-of-process (#290): it mounts `SidebarLead` — the leading region above the
@@ -296,6 +299,64 @@ Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=25
 
 When it's down, the plugins degrade to their canned output — the same failure
 mode as a missing llama-server — with the cause only in the journal.
+
+### The declarative path (home-manager)
+
+Since #694 both this unit and `trollshell-pet-brain.service` have a module
+surface, so home-manager users don't hand-install either:
+
+```nix
+programs.trollshell.claudeBridge = {
+  enable = true;
+  # Worth pinning: left null the child runs on whatever ~/.claude/settings.json
+  # picks — usually Opus — which routinely overruns the 8s budget below and
+  # comes back to the plugin as a 504.
+  model = "claude-haiku-4-5";
+  # port = 8787;          # default; must match the plugin's *_LLM_URL
+  # timeoutSeconds = 8;   # default; see "Two timeouts" above
+};
+
+# The client half, on the plugin that talks to it.
+programs.trollshell.plugins.pet.env = {
+  PET_LLM_URL = "http://127.0.0.1:8787";
+  OPENROUTER_API_KEY = "local-bridge";
+};
+```
+
+The generated unit carries the same `UnsetEnvironment=` scrub as the file in
+this directory, and the module **asserts the two-timeout ordering** at
+evaluation time whenever both halves are declared — so a `timeoutSeconds` that
+isn't strictly below the pet's `PET_LLM_TIMEOUT_SECS` fails the build instead of
+the request.
+
+`programs.trollshell.petBrain.{enable,package,port,model,extraArgs}` is the same
+deal for the llama-server brain. Its `model` is the path to a GGUF you fetch
+yourself (the option's description carries the download snippet); the unit is
+`ConditionPathExists`-gated on it, so declaring it before downloading is inert
+rather than a crash loop.
+
+Anything not promoted to an option stays reachable the ordinary home-manager
+way — the list is concatenated onto the one the module already sets, and
+systemd lets the later assignment win:
+
+```nix
+systemd.user.services.trollshell-claude-bridge.Service.Environment = [
+  "CLAUDE_BRIDGE_MODE=reprompt"
+  # …and PATH, if your `claude` lives somewhere the systemd user manager's PATH
+  # doesn't reach. The module deliberately sets no PATH= of its own: it would
+  # *replace* the inherited one, which on NixOS already covers the system and
+  # per-user profiles.
+];
+```
+
+llama-server reads no environment configuration at all, so `petBrain.extraArgs`
+(rather than a `Service.Environment` override) is that unit's escape hatch.
+
+Both option groups are **home-manager only**, the same call `nightlight` made in
+#657: a NixOS-only deployment has no per-user `claude` login — or per-user model
+download — for these to drive, so the NixOS module asserts rather than accepting
+the setting and starting nothing. The static units in this directory remain the
+supported path for a hand-installed (non-home-manager) deployment.
 
 ## Required packages
 

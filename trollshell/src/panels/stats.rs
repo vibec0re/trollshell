@@ -686,79 +686,122 @@ fn build_top_apps_expander(
     let rows_for_bind = rows_track.clone();
     let collapsed_once_for_bind = collapsed_once.clone();
     bind(signal, &expander, move |_, list| {
-        // `take()` ends the borrow before the first `remove()`; a chained
-        // `borrow_mut().drain(..)` would hold it for the whole loop, and a
-        // re-entrant borrow from a synchronous emission panics fatally through
-        // the glib callback (#643).
-        for row in rows_for_bind.take() {
-            expander_for_bind.remove(&row);
-        }
-        // Collapsed summary: the heaviest entry's display name, or an em-dash.
-        let subtitle = list.first().map_or_else(
-            || "\u{2014}".to_string(),
-            |s| {
-                format!(
-                    "{} \u{00b7} {}",
-                    sample_display_name(s, &mut meta_cache.borrow_mut()),
-                    value(s)
-                )
-            },
+        rebuild_top_apps(
+            &expander_for_bind,
+            &rows_for_bind,
+            &meta_cache,
+            &collapsed_once_for_bind,
+            value,
+            &list,
         );
-        expander_for_bind.set_subtitle(&subtitle);
-
-        let mut new_rows = Vec::with_capacity(list.len());
-        for s in &list {
-            let row = adw::ActionRow::builder().activatable(false).build();
-            // Markup off: scope ids are untrusted — adversarial names could
-            // otherwise inject Pango markup into the title (cf. #30).
-            markup::plain_text(&row);
-            // Resolve first, set second: an argument-position `RefMut` is a
-            // temporary of the whole statement, so inlining this would hold
-            // `meta_cache` borrowed across `set_title` (#643).
-            let title = sample_display_name(s, &mut meta_cache.borrow_mut());
-            row.set_title(&title);
-            if s.procs > 1 {
-                row.set_subtitle(&format!("{} processes", s.procs));
-            }
-
-            // Prefix icon: cached from the app-id, or sensible fallbacks.
-            let icon: gio::Icon = if let Some(app_id) = s.app_id.as_deref() {
-                // Same statement-temporary rule: bind the lookup so the
-                // `RefMut` is gone before the fallback icon is constructed.
-                let cached =
-                    resolve_app_meta(app_id, &mut meta_cache.borrow_mut()).and_then(|m| m.icon);
-                cached.unwrap_or_else(|| {
-                    gio::ThemedIcon::new("application-x-executable-symbolic").upcast::<gio::Icon>()
-                })
-            } else {
-                // System bucket: generic computer icon.
-                gio::ThemedIcon::new("computer-symbolic").upcast::<gio::Icon>()
-            };
-            let img = gtk::Image::from_gicon(&icon);
-            img.set_icon_size(gtk::IconSize::Normal);
-            img.set_valign(gtk::Align::Center);
-            row.add_prefix(&img);
-
-            let label = gtk::Label::new(Some(&value(s)));
-            label.set_valign(gtk::Align::Center);
-            row.add_suffix(&label);
-            expander_for_bind.add_row(&row);
-            new_rows.push(row);
-        }
-        *rows_for_bind.borrow_mut() = new_rows;
-
-        // Re-assert collapsed state once on first non-empty population.
-        // libadwaita can render the expander open when rows arrive after the
-        // initial set_expanded(false) on an empty widget (async row-population
-        // race — #131).  We fire exactly once so the user's subsequent
-        // manual expand/collapse is never overridden.
-        if !collapsed_once_for_bind.get() && !list.is_empty() {
-            expander_for_bind.set_expanded(false);
-            collapsed_once_for_bind.set(true);
-        }
     });
 
     expander
+}
+
+/// One rebuild pass of a "Top apps" expander: tear down whatever the previous
+/// pass left in `rows_track`, refresh the collapsed summary, and rebuild one
+/// [`adw::ActionRow`] per entry of `list`.
+///
+/// A free function taking its two cells, the one-shot `collapsed_once` guard
+/// and the `value` formatter explicitly, mirroring `panels/connections.rs`'s
+/// `bind_connections_group`/`rebuild_connections` pair (#828) — the body used
+/// to sit inline inside [`build_top_apps_expander`]'s apply closure, where
+/// nothing could call it and nothing could reach the cells to observe them.
+/// Extracting it changes no behaviour (the closure is now a single forwarding
+/// call) and is what lets the colocated `#[gtk::test]` at the bottom of this
+/// file drive the cells directly: re-entering through the bound `Mutable`
+/// instead would be *deferred* to the next main-context iteration, because
+/// `bind` polls its signal from a `glib::MainContext` task, so it could never
+/// reproduce the synchronous re-entry this borrow discipline exists for
+/// (#674).
+///
+/// `expander` is still fed the captured `expander_for_bind` clone at the call
+/// site, not the `&adw::ExpanderRow` that `bind` hands its apply closure — a
+/// strong capture that pins the expander for the life of the binding and so
+/// defeats `bind`'s `WeakRef` contract (`hytte-reactive/src/bind.rs:16-22`),
+/// the same defect #772 fixed in `panels/connections.rs`. That is a **separate
+/// bug from #674** and is left exactly as it was here: this extract is
+/// strictly behaviour-preserving, and switching the closure to its own
+/// argument would change what the binding keeps alive.
+fn rebuild_top_apps(
+    expander: &adw::ExpanderRow,
+    rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    meta_cache: &Rc<RefCell<HashMap<String, Option<AppMeta>>>>,
+    collapsed_once: &Rc<Cell<bool>>,
+    value: fn(&ProcSample) -> String,
+    list: &[ProcSample],
+) {
+    // `take()` ends the borrow before the first `remove()`; a chained
+    // `borrow_mut().drain(..)` would hold it for the whole loop, and a
+    // re-entrant borrow from a synchronous emission panics fatally through
+    // the glib callback (#643).
+    for row in rows_track.take() {
+        expander.remove(&row);
+    }
+    // Collapsed summary: the heaviest entry's display name, or an em-dash.
+    let subtitle = list.first().map_or_else(
+        || "\u{2014}".to_string(),
+        |s| {
+            format!(
+                "{} \u{00b7} {}",
+                sample_display_name(s, &mut meta_cache.borrow_mut()),
+                value(s)
+            )
+        },
+    );
+    expander.set_subtitle(&subtitle);
+
+    let mut new_rows = Vec::with_capacity(list.len());
+    for s in list {
+        let row = adw::ActionRow::builder().activatable(false).build();
+        // Markup off: scope ids are untrusted — adversarial names could
+        // otherwise inject Pango markup into the title (cf. #30).
+        markup::plain_text(&row);
+        // Resolve first, set second: an argument-position `RefMut` is a
+        // temporary of the whole statement, so inlining this would hold
+        // `meta_cache` borrowed across `set_title` (#643).
+        let title = sample_display_name(s, &mut meta_cache.borrow_mut());
+        row.set_title(&title);
+        if s.procs > 1 {
+            row.set_subtitle(&format!("{} processes", s.procs));
+        }
+
+        // Prefix icon: cached from the app-id, or sensible fallbacks.
+        let icon: gio::Icon = if let Some(app_id) = s.app_id.as_deref() {
+            // Same statement-temporary rule: bind the lookup so the
+            // `RefMut` is gone before the fallback icon is constructed.
+            let cached =
+                resolve_app_meta(app_id, &mut meta_cache.borrow_mut()).and_then(|m| m.icon);
+            cached.unwrap_or_else(|| {
+                gio::ThemedIcon::new("application-x-executable-symbolic").upcast::<gio::Icon>()
+            })
+        } else {
+            // System bucket: generic computer icon.
+            gio::ThemedIcon::new("computer-symbolic").upcast::<gio::Icon>()
+        };
+        let img = gtk::Image::from_gicon(&icon);
+        img.set_icon_size(gtk::IconSize::Normal);
+        img.set_valign(gtk::Align::Center);
+        row.add_prefix(&img);
+
+        let label = gtk::Label::new(Some(&value(s)));
+        label.set_valign(gtk::Align::Center);
+        row.add_suffix(&label);
+        expander.add_row(&row);
+        new_rows.push(row);
+    }
+    *rows_track.borrow_mut() = new_rows;
+
+    // Re-assert collapsed state once on first non-empty population.
+    // libadwaita can render the expander open when rows arrive after the
+    // initial set_expanded(false) on an empty widget (async row-population
+    // race — #131).  We fire exactly once so the user's subsequent
+    // manual expand/collapse is never overridden.
+    if !collapsed_once.get() && !list.is_empty() {
+        expander.set_expanded(false);
+        collapsed_once.set(true);
+    }
 }
 
 /// Human-readable display name for a sample. If an app-id is set, looks up
@@ -1975,5 +2018,247 @@ mod tests {
                 "{cores} cores wrapped onto {lines} lines, more than a flat cap would"
             );
         }
+    }
+}
+
+/// The `RefCell`-across-a-GTK-call abort class (#674) for this file.
+///
+/// ## Why there *is* a production change alongside this test
+///
+/// Unlike `widgets/workspaces.rs`'s `update_workspaces` or `widgets/tasks.rs`'s
+/// `rebuild_list`, this file's rebuild pass used to live **inline inside
+/// [`build_top_apps_expander`]'s `bind` apply closure**, with both of its cells
+/// created as closure captures. Nothing could call it and nothing could reach
+/// the cells. So the body was hoisted into [`rebuild_top_apps`] and the closure
+/// became a single forwarding call — a mechanical extract, provable as such:
+/// diffing the moved body against `origin/main`'s closure body after
+/// normalising one indentation level, the three capture→parameter renames and
+/// `for s in &list` → `for s in list` yields **nothing**. The exact command is
+/// in the PR that landed this.
+///
+/// Driving the loop through the bound signal instead would not have worked:
+/// `bind` polls its signal from a `glib::MainContext` task, so a
+/// `Mutable::set` issued from inside an apply wakes that task for the *next*
+/// main-context iteration. The re-entry would be deferred, no borrow would
+/// still be live, and the test would pass against the unfixed code too (#828's
+/// finding).
+///
+/// ## Why the probe is `destroy`
+///
+/// PR #817 (`overlays/notifications.rs`) found that a removed widget's
+/// `destroy` can be silently deferred when something outside the cell under
+/// test still holds it — its toast cards kept a focusable dismiss button alive
+/// past `vbox.remove()`, so `destroy` never fired *inside* the call and the
+/// probe had to become `unmap`. Probe choice is per-site and empirical.
+///
+/// That trap does not apply here, and it was checked rather than assumed: the
+/// `adw::ExpanderRow` this test builds is never added to any window, so there
+/// is no `GtkRoot` and no focus-widget chain to retain a removed row past
+/// `expander.remove()` — `destroy` fires off pure refcounting, as it does for
+/// `panels/connections.rs`'s other-users bucket, which uses the same
+/// `add_row`/`remove` pair on an `adw::ExpanderRow`. The test asserts this
+/// rather than trusting it: `fired_inside == Some(true)` is the anti-vacuity
+/// guard, and it is the only reason a probe that never re-enters would be
+/// caught instead of shipping a decorative green.
+///
+/// ## The second cell, `meta_cache`: investigated and NOT covered
+///
+/// [`rebuild_top_apps`] holds two cells, and only one of them is testable.
+/// `meta_cache` is a different hazard shape from `rows_track` — short borrows
+/// *inside* the loop rather than a take/write-back — and #663 fixed it at two
+/// sites. Both were worked through for a test here and dropped, for reasons
+/// specific to each rather than a blanket "looks safe":
+///
+/// - **`row.set_title(&title)`.** Pre-#663 this was
+///   `row.set_title(&sample_display_name(s, &mut meta_cache.borrow_mut()))`,
+///   holding the `RefMut` across a real GTK setter. `set_title` on an
+///   `AdwPreferencesRow` *does* emit `notify::title` synchronously, so that
+///   would be a usable probe **if** the row were a widget a test could attach
+///   a handler to beforehand. It isn't: the row is `build`-ed a few lines
+///   earlier in the *same* call, never reused across calls (every pass tears
+///   the previous rows down and builds fresh ones), and it is not parented to
+///   `expander` until after `set_title` has already returned. There is no
+///   point at which an external caller can hold that exact widget and arm a
+///   probe on it. This is the identical structural wall `widgets/calendar.rs`
+///   hit with `on_day_clicked`'s `flash_row_highlight` (see its own note);
+///   reaching it would need `rebuild_top_apps` restructured so row
+///   construction and row population are separately callable — a production
+///   change this work deliberately does not make.
+///
+/// - **The icon fallback.** Pre-#663 this was
+///   `resolve_app_meta(app_id, &mut meta_cache.borrow_mut()).and_then(…).unwrap_or_else(…)`,
+///   holding the `RefMut` across `gio::ThemedIcon::new(…)`. That is a plain
+///   `GObject` constructor: it emits no signal, invokes no callback, and
+///   cannot re-enter anything. Reverting it is unobservable by construction,
+///   so a test would be theatre — the same verdict #758 reached for the four
+///   revealer `close_all`s.
+///
+/// Confirmed by measurement, not just by reading: with the `set_title` site
+/// reverted to its pre-#663 inlined form, the test below still passes. That is
+/// the point — the borrow *is* live across `set_title` (the samples this test
+/// feeds have `app_id: None`, but `borrow_mut()` is taken either way), and
+/// nothing re-enters it. Uncovered, not accidentally covered.
+///
+/// ## A live call-out inside a `meta_cache` borrow that #663 missed
+///
+/// Recorded here because it is the same defect class and this is where the
+/// next reader will look. The collapsed-summary expression in
+/// [`rebuild_top_apps`] is
+///
+/// ```text
+/// format!("{} · {}", sample_display_name(s, &mut meta_cache.borrow_mut()), value(s))
+/// ```
+///
+/// An argument-position `RefMut` is a temporary of the whole enclosing
+/// expression, so it is **still alive when `value(s)` is called** — #643's
+/// spelling 4, at a site #663 did not rewrite. Verified with a standalone
+/// `rustc` probe: the argument-position form reports the cell borrowed during
+/// `value(s)`; a `let`-bound form does not.
+///
+/// It is not exploitable today and is deliberately **not** fixed here (that
+/// would break the byte-identical equivalence this extract rests on):
+/// `value` is a capture-free `fn` pointer, and both production instantiations
+/// (`|s| format!("{:.0}%", s.cpu_frac * 100.0)` and `|s| fmt_bytes(s.mem_bytes)`)
+/// are pure formatters that touch no `RefCell`. It is a latent hazard that
+/// only bites if someone ever passes a `value` that reaches back into this
+/// module's state.
+///
+/// Needs a real display server (`adw::ExpanderRow`/`adw::ActionRow` have to be
+/// constructible and actually run GTK's dispose machinery), hence the
+/// `system-tests` gate, like the rest of this bug class.
+#[cfg(all(test, feature = "system-tests"))]
+mod reentrancy_tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+
+    use super::{AppMeta, rebuild_top_apps};
+
+    type Rows = Rc<RefCell<Vec<adw::ActionRow>>>;
+    type MetaCache = Rc<RefCell<HashMap<String, Option<AppMeta>>>>;
+
+    /// The formatter `build_stats_cpu_card` passes for the "Top apps · CPU"
+    /// expander, copied verbatim so the test drives a real production `value`
+    /// rather than a stub. Must be a plain `fn` — the parameter is a bare
+    /// function pointer, which is exactly why it can't smuggle test state in.
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// `count` "System"-bucket samples (`app_id: None`).
+    ///
+    /// No app-id on purpose: an `app_id: Some(_)` sample sends
+    /// `resolve_app_meta` through `gio::AppInfo::all()`, making the test's
+    /// result depend on which desktop files the host happens to have
+    /// installed. `sample_display_name`/`resolve_app_meta` still take
+    /// `meta_cache.borrow_mut()` on the `None` path — the borrow is taken
+    /// before the callee looks at `app_id` — so the cell's borrow discipline
+    /// is still exercised, it just stays empty.
+    ///
+    /// The second sample carries `procs: 2`, which is the branch that also
+    /// sets a row subtitle.
+    fn samples(count: u32) -> Vec<ProcSample> {
+        (1..=count)
+            .map(|n| ProcSample {
+                name: format!("proc{n:03}"),
+                app_id: None,
+                cpu_frac: f64::from(n) / 100.0,
+                mem_bytes: u64::from(n) * 1024,
+                procs: n,
+            })
+            .collect()
+    }
+
+    /// The expander and the two cells `build_top_apps_expander` builds,
+    /// exactly as it builds them, plus the one-shot collapse guard. No
+    /// registry, no `App`, no `/proc` poller: every piece of state
+    /// `rebuild_top_apps` touches now arrives through its own parameters.
+    fn fresh() -> (adw::ExpanderRow, Rows, MetaCache, Rc<Cell<bool>>) {
+        adw::init().expect("libadwaita init");
+        (
+            adw::ExpanderRow::builder().title("Top apps").build(),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(Cell::new(false)),
+        )
+    }
+
+    /// `rows_track`: `expander.remove(&row)` drops the expander's reference
+    /// and the loop-owned `row` binding drops its own at the end of that
+    /// iteration — the last strong ref, so `GtkWidget::destroy` fires
+    /// **synchronously** from dispose.
+    ///
+    /// The handler re-enters `rebuild_top_apps` on the same cells. Against the
+    /// pre-#663 `for row in rows_track.borrow_mut().drain(..)` the inner call
+    /// hits a live `RefMut` and aborts the whole test binary with
+    /// `BorrowMutError` rather than failing one test — #663's SIGABRT, the
+    /// failure mode #674 exists for. With `take()` the cell is free for the
+    /// whole call, so the inner call finds an empty `Vec`.
+    ///
+    /// `rebuild_top_apps` never diffs by identity — every call unconditionally
+    /// tears down whatever the last call left in `rows_track` and rebuilds
+    /// fresh from `list` — so passing the *same* samples twice still exercises
+    /// the full take/remove/rebuild path.
+    #[gtk::test]
+    fn rebuild_top_apps_tolerates_a_reentrant_rebuild_from_a_removed_row_destroy() {
+        let (expander, rows, meta, collapsed) = fresh();
+        let seed = samples(2);
+        rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+        assert_eq!(
+            rows.borrow().len(),
+            2,
+            "both samples must be rendered after the seeding call"
+        );
+
+        // True only while the outer `rebuild_top_apps` is on the stack, so the
+        // handler can record whether it ran inside the call or was deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let row2 = rows.borrow()[1].clone();
+        {
+            let expander = expander.clone();
+            let rows = Rc::clone(&rows);
+            let meta = Rc::clone(&meta);
+            let collapsed = Rc::clone(&collapsed);
+            let seed = seed.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            row2.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+            });
+        }
+        // Drop our clone before the removing pass: while it lives the row has
+        // a second strong ref, `remove()` won't dispose it, and `destroy`
+        // never fires — the test would pass vacuously.
+        drop(row2);
+
+        in_outer.set(true);
+        rebuild_top_apps(&expander, &rows, &meta, &collapsed, cpu_value, &seed);
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed row's `destroy` must fire synchronously inside `rebuild_top_apps`; \
+             `adw::ExpanderRow` holds its rows in an internal list box, so if that keeps one \
+             alive past the removal loop — or if GTK ever defers the emission — this test proves \
+             nothing about the borrow discipline"
+        );
+        assert_eq!(
+            rows.borrow().len(),
+            2,
+            "the outer call's write-back must still land: re-entry may not leave the cell holding \
+             the inner call's rows or an empty Vec"
+        );
     }
 }

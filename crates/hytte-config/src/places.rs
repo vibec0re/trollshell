@@ -87,6 +87,11 @@ radius_km = 12.0
 # never work: the fetch succeeds against a real, nearby, WRONG station, so a
 # populated filter then matches nothing, forever, and the widget just looks
 # like a quiet evening instead of telling you it's misconfigured.
+#
+# That URL is not just where ids come from — it is the ONLY network the fetch
+# will ever read: endpoint, product filter and id space are BVG (Berlin) by
+# construction (#789), so no station id outside that network resolves.
+# Outside Berlin, disable the departures plugin rather than hunting for one.
 station = "900192001" # S Schöneweide Bhf (Berlin)
 
 # Walk time from here to the platform, in minutes. With this set, the list

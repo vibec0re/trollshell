@@ -477,7 +477,7 @@ impl Plugin for Board {
                 let mut kids = Vec::new();
                 if items.is_empty() {
                     kids.push(status_text(
-                        "no matching S-Bahn departures right now",
+                        "no matching S-Bahn departures right now (BVG Berlin)",
                         "ts-departures-empty",
                     ));
                 } else {

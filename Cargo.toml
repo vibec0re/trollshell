@@ -100,14 +100,13 @@ futures-signals = "0.3.34"
 futures-util = { version = "0.3.32", default-features = false }
 gtk = { version = "0.11.2", package = "gtk4" }
 # @kaesaecracker's headless-`claude --print` driver (#584), consumed by
-# `hytte-claude-bridge` alone. A git dependency pinned to a rev — the crate
-# isn't on crates.io yet. Apache-2.0 with a committed LICENSE and Cargo.lock;
-# combining it into this MPL-2.0 tree is what MPL-2.0's "Larger Work" clause
-# contemplates, and Apache-2.0's NOTICE-propagation clause doesn't bite (there
-# is no NOTICE file). Pin the STANDALONE extract, never the hyperhive monorepo
-# copy: that one has no LICENSE and uses `version.workspace = true`, which
-# doesn't resolve outside its workspace.
-hive-claude = { git = "https://forge.darkest.space/hyperhive/hive-claude.git", rev = "4ee1940e91b0f713f1767fc5ba84426a82d562f8" }
+# `hytte-claude-bridge` alone. The crates.io release (0.1.0 is upstream
+# `c98f81e`); it was a forge git rev pin until #757, which is what made every
+# nix eval reach forge.darkest.space through `builtins.fetchGit` (#666, #671).
+# Apache-2.0 with a committed LICENSE; combining it into this MPL-2.0 tree is
+# what MPL-2.0's "Larger Work" clause contemplates, and Apache-2.0's
+# NOTICE-propagation clause doesn't bite (there is no NOTICE file).
+hive-claude = "0.1.0"
 # Already in `Cargo.lock` transitively (via `ureq-proto`), so `hytte-claude-
 # bridge` promoting it to a direct dependency adds no new resolved package —
 # which is precisely why the bridge hand-rolls its one HTTP route instead of

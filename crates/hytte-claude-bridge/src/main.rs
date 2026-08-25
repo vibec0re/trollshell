@@ -205,16 +205,30 @@ impl Settings {
     /// the child running, which is logged rather than papered over.
     fn claude_config(&self) -> hive_claude::Config {
         hive_claude::Config {
-            model: self.model.clone(),
+            model: self.model_arg(),
             cwd: Some(self.state_dir.clone()),
             idle_timeout: Some(self.inner_budget()),
             ..hive_claude::Config::default()
         }
     }
 
-    /// The model id the `api` mode asks for. Unlike the CLI paths, an empty
-    /// `$CLAUDE_BRIDGE_MODEL` cannot mean "the callee's default" — the Messages
-    /// API requires the field.
+    /// The `--model` flag for the CLI paths, or `None` to omit it and let
+    /// `claude` pick its own default.
+    ///
+    /// An **empty** `$CLAUDE_BRIDGE_MODEL` has always meant "omit the flag":
+    /// before #757 the driver itself keyed on `if !config.model.is_empty()`,
+    /// so a `String` carried both the id and the absence. `hive-claude` 0.1.0
+    /// moved that distinction into the type (`Option<String>`), which puts the
+    /// contract here instead. `Some(self.model.clone())` would type-check and
+    /// pass `--model ""` to the CLI — hence the emptiness check, and the test
+    /// that pins it.
+    fn model_arg(&self) -> Option<String> {
+        (!self.model.is_empty()).then(|| self.model.clone())
+    }
+
+    /// The model id the `api` mode asks for. Unlike the CLI paths
+    /// ([`Settings::model_arg`]), an empty `$CLAUDE_BRIDGE_MODEL` cannot mean
+    /// "the callee's default" — the Messages API requires the field.
     fn api_model(&self) -> String {
         if self.model.is_empty() {
             messages::DEFAULT_MODEL.to_owned()
@@ -419,6 +433,29 @@ mod tests {
         assert_eq!(settings.api_model(), crate::messages::DEFAULT_MODEL);
         settings.model = "claude-haiku-4-5".to_owned();
         assert_eq!(settings.api_model(), "claude-haiku-4-5");
+    }
+
+    /// **The CLI `--model` contract**, which #757's `hive-claude` upgrade moved
+    /// out of the driver and into this crate. An empty `$CLAUDE_BRIDGE_MODEL`
+    /// means "omit the flag and let `claude` choose" — the driver used to
+    /// enforce that itself with `if !config.model.is_empty()`, and its
+    /// `Option<String>` successor makes `Some("")`, i.e. a literal `--model ""`,
+    /// expressible for the first time. This is the sibling of
+    /// [`Settings::api_model`], which resolves the same empty value the other
+    /// way because the Messages API has no such default.
+    #[test]
+    fn an_empty_model_omits_the_cli_flag() {
+        let mut settings = Settings {
+            port: 8787,
+            mode: Mode::Subscription,
+            model: String::new(),
+            thinking: crate::messages::Thinking::default(),
+            budget: DEFAULT_BUDGET,
+            state_dir: std::path::PathBuf::from("/tmp"),
+        };
+        assert_eq!(settings.model_arg(), None);
+        settings.model = "haiku".to_owned();
+        assert_eq!(settings.model_arg(), Some("haiku".to_owned()));
     }
 
     /// The inner client's budget must be strictly under the outer one, or the

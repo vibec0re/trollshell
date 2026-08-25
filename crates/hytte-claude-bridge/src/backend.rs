@@ -147,7 +147,12 @@ enum Engine {
     /// A one-off `claude --print` session per turn — no `--resume`, no
     /// `--name`, so claude persists no titled session for the bridge to depend
     /// on. Rides the subscription; holds no key.
-    Cli(Config),
+    ///
+    /// Boxed because `hive-claude` 0.1.0's `Config` grew past the point where
+    /// `clippy::large_enum_variant` tolerates inlining it (288 bytes against
+    /// [`Engine::Api`]'s 72). One `Engine` exists per process, so the
+    /// indirection costs nothing that matters.
+    Cli(Box<Config>),
     /// The Anthropic Messages API, billed to an API key (#730). No subprocess,
     /// no `claude` CLI, no `hive-claude` session state at all.
     Api(MessagesClient),
@@ -158,7 +163,7 @@ impl Reprompt {
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
-            engine: Engine::Cli(config),
+            engine: Engine::Cli(Box::new(config)),
             records: Mutex::new(Records::default()),
         }
     }
@@ -391,9 +396,15 @@ fn map_error(e: &ClaudeError) -> Failure {
             502,
             "claude could not resolve the session title even after creating it".to_owned(),
         ),
+        // `program` is a `PathBuf` since #757's `hive-claude` upgrade: it may be
+        // an absolute path rather than a `PATH`-resolved name, so it is
+        // `.display()`ed rather than formatted directly.
         ClaudeError::Spawn { program, source } => (
             502,
-            format!("could not spawn `{program}`: {source} (is the Claude Code CLI on PATH?)"),
+            format!(
+                "could not spawn `{}`: {source} (is the Claude Code CLI on PATH?)",
+                program.display()
+            ),
         ),
         other => (502, format!("claude: {other}")),
     };

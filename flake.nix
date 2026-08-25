@@ -217,10 +217,12 @@
           # The `hytte-claude-bridge` daemon package (#584), mirroring the
           # `packages` output above and wired into `checks` below for the same
           # #449 reason: without it, `nix flake check` could stay green while
-          # `nix build .#hytte-claude-bridge` was broken. It is also the cheapest
-          # place the git-dependency vendoring (hive-claude, pinned by rev) gets
-          # exercised in CI — crane resolves git sources at eval via
-          # `builtins.fetchGit`, which a sandboxed build phase could not do.
+          # `nix build .#hytte-claude-bridge` was broken. Until #757 it was also
+          # the one place crane's *git*-dependency vendoring got exercised in CI:
+          # `hive-claude` was a rev pin that `builtins.fetchGit` resolved at
+          # eval, which a sandboxed build phase could not have done. It comes
+          # from crates.io now, so nothing in this flake reaches a third-party
+          # forge to evaluate any more (#671).
           hytte-claude-bridge = pkgs.callPackage ./nix/plugin.nix {
             inherit workspace;
             name = "hytte-claude-bridge";

@@ -65,6 +65,43 @@ let
       "echo \"wlsunset: no coordinates — start the Night light toggle from trollshell (it seeds them from your location), or set programs.trollshell.nightlight.{latitude,longitude}\" >&2; exit 0";
   nlExecStart = "${pkgs.bash}/bin/sh -c 'if [ -s ${nlArgsFile} ]; then ${nlReadArgs}; else ${nlFallback}; fi; exec ${pkgs.wlsunset}/bin/wlsunset -t ${toString nl.nightTemp} -T ${toString nl.dayTemp} \"$@\"'";
 
+  # ── The two LLM backend units (#694) ────────────────────────────────────────
+  # Both are per-user daemons with no upstream home-manager module, so both get
+  # a plain user unit below — the same treatment swaybg and wlsunset get, and
+  # the reason neither has a NixOS half (nix/nixos-module.nix asserts instead).
+  cb = cfg.claudeBridge;
+  pb = cfg.petBrain;
+
+  # Where the pet brain's GGUF lives. Resolved here rather than as the option's
+  # own default because module-common.nix is shared with the NixOS module, where
+  # `config.home` does not exist to point at.
+  pbModel =
+    if pb.model != null then
+      pb.model
+    else
+      "${config.home.homeDirectory}/.local/share/trollshell-pet/brain.gguf";
+
+  # The ordering invariant between the bridge's per-request budget and its
+  # client's global request timeout: the bridge's has to expire FIRST, so a slow
+  # turn reaches the plugin as a clean 504 it can fall back from rather than as a
+  # connection torn mid-read. It is documented at
+  # crates/hytte-claude-bridge/src/bridge.rs:38-39 and
+  # crates/hytte-ai-providers/src/lib.rs's DEFAULT_TIMEOUT, i.e. as prose in two
+  # crates that nobody re-reads while editing their nix config. With both halves
+  # declared in one config we can check it at eval time instead (#694).
+  #
+  # Only the pet has a client-side knob (#699, landed in #711). It parses exactly
+  # like the bridge's own: unset, blank, unparsable or 0 all fall back to the
+  # compiled default — so the regex match below mirrors that rather than
+  # `lib.toInt`-ing a value that would throw on "" or "soon".
+  aiProvidersDefaultTimeoutSecs = 10;
+  petTimeoutRaw = cfg.plugins.pet.env.PET_LLM_TIMEOUT_SECS or null;
+  petTimeoutSecs =
+    if petTimeoutRaw != null && builtins.match "[1-9][0-9]*" petTimeoutRaw != null then
+      lib.toInt petTimeoutRaw
+    else
+      aiProvidersDefaultTimeoutSecs;
+
   # The env the option surface renders to, built once and fed to BOTH
   # home.sessionVariables (login shells, `cargo run` from a terminal) and the
   # trollshell unit's Environment= below. The systemd user manager never
@@ -416,6 +453,146 @@ in
           # No Install section — the shell starts/stops it (see comment above).
         };
       }
+
+      # hytte-claude-bridge (#584/#694) — the keyless loopback OpenAI-compatible
+      # shim over headless Claude Code. No upstream home-manager module exists,
+      # so a plain user unit mirroring swaybg/wlsunset above. Ported from
+      # etc/systemd/user/trollshell-claude-bridge.service, which stays the
+      # reference for hand-installed (non-home-manager) deployments — keep the
+      # two in sync.
+      #
+      # PartOf + After but no Requisite, unlike swaybg/wlsunset: that matches the
+      # reference unit, and the bridge is a plain loopback HTTP server with no
+      # Wayland connection, so it has nothing to refuse to start without.
+      (lib.mkIf cb.enable {
+        systemd.user.services.trollshell-claude-bridge = {
+          Unit = {
+            Description = "Keyless loopback OpenAI-compatible bridge to headless Claude Code (#584)";
+            PartOf = [ cfg.systemd.target ];
+            After = [ cfg.systemd.target ];
+          };
+          Service = {
+            Type = "simple";
+            ExecStart = lib.getExe cb.package;
+            Restart = "on-failure";
+            RestartSec = 5;
+
+            # ── SECURITY CONTROL — do not drop this line ──────────────────────
+            # Copied verbatim from the reference unit. These four would silently
+            # move `claude` off the subscription and onto metered API credits (or
+            # Bedrock/Vertex), with nothing in the UI to show for it. The bridge
+            # cannot scrub them itself — `std::env::remove_var` is unsafe under
+            # edition 2024 and this workspace forbids unsafe — so the scrub
+            # happens HERE and the bridge *refuses to start* if it finds any of
+            # them still set: belt and braces, and a loud failure rather than a
+            # quiet bill.
+            #
+            # Deliberately not gated on anything (#752). `UnsetEnvironment=` is
+            # static per-unit, and an inherited key that quietly starts billing is
+            # a worse failure than CLAUDE_BRIDGE_MODE=api having to read its key
+            # from ~/.config/trollshell/anthropic.key.
+            UnsetEnvironment = "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX";
+
+            # No PATH= here, on purpose — the bridge shells out to `claude`, but
+            # `Environment=PATH=…` *replaces* the user manager's PATH rather than
+            # extending it. On NixOS that inherited PATH already covers the system
+            # profile plus the per-user profile, which is where a `claude` in
+            # home.packages lands; hardcoding one would break the layouts it does
+            # not happen to describe (npm-global, ~/.local/bin) while helping
+            # none. A `claude` somewhere else is the override case:
+            #
+            #   systemd.user.services.trollshell-claude-bridge.Service.Environment =
+            #     [ "PATH=%h/.local/bin:/run/current-system/sw/bin" ];
+            #
+            # home-manager concatenates that onto the list below, and systemd
+            # lets the later assignment win. Same escape hatch carries the env
+            # knobs not promoted to options: CLAUDE_BRIDGE_MODE (#730),
+            # CLAUDE_BRIDGE_THINKING, CLAUDE_BRIDGE_STATE_DIR, RUST_LOG.
+            Environment = [
+              "RUST_LOG=hytte_claude_bridge=info"
+              "CLAUDE_BRIDGE_PORT=${toString cb.port}"
+              "CLAUDE_BRIDGE_TIMEOUT_SECS=${toString cb.timeoutSeconds}"
+              # Belt-and-braces dummy key. Nothing in the bridge reads it (it is
+              # keyless and validates no bearer at all); the copy that actually
+              # prevents a leak is the one on the CONSUMING plugin, because
+              # `hytte_ai_providers::load_key` runs in the plugin's process and
+              # checks $OPENROUTER_API_KEY before ~/.config/trollshell/
+              # openrouter.key. Set it there too:
+              # `plugins.pet.env.OPENROUTER_API_KEY = "local-bridge";`.
+              "OPENROUTER_API_KEY=local-bridge"
+            ]
+            ++ lib.optional (cb.model != null) "CLAUDE_BRIDGE_MODEL=${cb.model}";
+          };
+          Install.WantedBy = [ cfg.systemd.target ];
+        };
+
+        # See petTimeoutSecs in the `let` above. Only asserted when a `pet` is
+        # declared in the same config — with no pet there is no client budget for
+        # nix to compare against, and asserting against the compiled 10s default
+        # would be a false positive for a bridge consumed by something else.
+        assertions = [
+          {
+            assertion = !(cfg.plugins ? pet) || cb.timeoutSeconds < petTimeoutSecs;
+            message = ''
+              programs.trollshell.claudeBridge.timeoutSeconds is
+              ${toString cb.timeoutSeconds}, which is not strictly less than the
+              pet plugin's own request timeout (${toString petTimeoutSecs}s, from
+              programs.trollshell.plugins.pet.env.PET_LLM_TIMEOUT_SECS — or
+              hytte_ai_providers::DEFAULT_TIMEOUT when that is unset, blank or
+              unparsable). The bridge's per-request budget has to expire first,
+              so a slow turn comes back to the pet as a 504 it can fall back
+              from instead of tearing the connection mid-read
+              (crates/hytte-claude-bridge/src/bridge.rs). Either lower
+              claudeBridge.timeoutSeconds, or raise
+              programs.trollshell.plugins.pet.env.PET_LLM_TIMEOUT_SECS above it
+              (#699/#711).
+            '';
+          }
+        ];
+      })
+
+      # trollshell-pet-brain (#276/#694) — the local llama-server the pet talks
+      # to when its PET_LLM_URL points here instead of at the claude bridge.
+      # Ported from etc/systemd/user/trollshell-pet-brain.service, which stays
+      # the reference for hand-installed deployments.
+      (lib.mkIf pb.enable {
+        systemd.user.services.trollshell-pet-brain = {
+          Unit = {
+            Description = "llama-server brain for the trollshell pet plugin";
+            PartOf = [ cfg.systemd.target ];
+            After = [ cfg.systemd.target ];
+            # The GGUF is a runtime download, not part of the closure (see the
+            # petBrain.enable description) — gate the unit on the file existing
+            # instead of letting llama-server crash-loop against Restart=
+            # on-failure until it is fetched. Same idiom as swaybg's args file.
+            ConditionPathExists = pbModel;
+          };
+          Service = {
+            Type = "simple";
+            # `getExe'` by binary name, not `getExe`: llama-cpp's mainProgram is
+            # the CLI, not the server. The model path is shell-escaped because
+            # systemd splits ExecStart on whitespace and it is the one component
+            # a user can point at a directory with a space in it; the store path
+            # and the numbers cannot contain one.
+            ExecStart = lib.concatStringsSep " " (
+              [
+                (lib.getExe' pb.package "llama-server")
+                "--model"
+                (lib.escapeShellArg pbModel)
+                "--port"
+                (toString pb.port)
+              ]
+              # One list entry is one argv token — escaped, so an entry with a
+              # space stays a single argument instead of being re-split by
+              # systemd into two.
+              ++ map lib.escapeShellArg pb.extraArgs
+            );
+            Restart = "on-failure";
+            RestartSec = 5;
+          };
+          Install.WantedBy = [ cfg.systemd.target ];
+        };
+      })
 
       # cliphist — clipboard history via home-manager's module. allowImages
       # defaults true, so this starts both the text and image wl-paste watchers.

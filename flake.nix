@@ -237,6 +237,15 @@
           # coverage in the two module-eval checks below (#350/#355).
           stubPlugin = pkgs.writeShellScriptBin "hytte-plugin-demo" "";
 
+          # Stand-ins for the two LLM backend daemons (#694), so the hm-module
+          # check below can turn both units on and force their bodies without
+          # pulling a full workspace compile (hytte-claude-bridge) or llama-cpp
+          # into the check's closure. Named after the binary each unit actually
+          # invokes, so `lib.getExe` (bridge, via meta.mainProgram) and
+          # `lib.getExe' … "llama-server"` (pet brain, by name) both resolve.
+          stubClaudeBridge = pkgs.writeShellScriptBin "hytte-claude-bridge" "";
+          stubLlamaCpp = pkgs.writeShellScriptBin "llama-server" "";
+
           # The hytte-ecal `probe` example binary + fixture sources (a
           # task-list and a calendar), for the eds-nixos-test below. Since #588
           # this is a slice of `workspace` — a `cp` + a GApps wrap, no cargo and
@@ -426,6 +435,26 @@
                       enableSessionExtras = true;
                       weather.fallbackCity = "Berlin";
                       systemd.target = "niri-session.target";
+                      # The two LLM backend units (#694). Both on, so their unit
+                      # bodies are forced rather than left behind an unevaluated
+                      # `lib.mkIf false`, and so the bridge's timeout-ordering
+                      # assertion is *constructed* (it lives inside the
+                      # claudeBridge mkIf, which the note on the nixos-module
+                      # check below explains would otherwise be invisible).
+                      claudeBridge = {
+                        enable = true;
+                        package = stubClaudeBridge;
+                        model = "claude-haiku-4-5";
+                        # 15 < the pet's 20 below: the ordering invariant the
+                        # module asserts, exercised with a raised client budget
+                        # rather than the compiled 10s fallback.
+                        timeoutSeconds = 15;
+                      };
+                      petBrain = {
+                        enable = true;
+                        package = stubLlamaCpp;
+                        model = "/var/empty/brain.gguf";
+                      };
                       # plugins (#350/#355, attrsOf keyed by id): `demo` gets a
                       # unit; `off` must be filtered out by enable = false.
                       plugins = {
@@ -436,6 +465,18 @@
                         off = {
                           package = stubPlugin;
                           enable = false;
+                        };
+                        # The client half of the bridge's timeout invariant
+                        # (#694): a declared `pet` is what switches that
+                        # assertion from vacuously true to a real comparison,
+                        # and PET_LLM_TIMEOUT_SECS is the string the module has
+                        # to parse the way the plugin does (#699/#711).
+                        pet = {
+                          package = stubPlugin;
+                          env = {
+                            PET_LLM_URL = "http://127.0.0.1:8787";
+                            PET_LLM_TIMEOUT_SECS = "20";
+                          };
                         };
                       };
                     };
@@ -476,6 +517,39 @@
                 assert pluginsState.plugins.demo.env.DEMO_TOKEN == "hunter2";
                 assert pluginsState.plugins.demo.env.DEMO_EXTRA == "1";
                 assert !pluginsState.plugins.off.enabled;
+                # The two LLM backend units (#694) render, and the bridge keeps
+                # the load-bearing bits of etc/systemd/user/trollshell-claude-
+                # bridge.service: the four-variable scrub that stops `claude`
+                # being silently moved onto metered credits, and the port/model
+                # the options are there to set. Asserted by content, not just by
+                # membership — a unit that renders without UnsetEnvironment is
+                # exactly the regression worth failing the build over.
+                assert units ? trollshell-claude-bridge;
+                assert units ? trollshell-pet-brain;
+                # `builtins.toString` because home-manager's unitOption merge
+                # hands some of these back list-wrapped (ExecStart below is
+                # `[ "…" ]`, not `"…"`) — toString is identity on a plain string
+                # and space-joins the one-element list, so the assertions hold
+                # whichever shape the merge produces.
+                assert
+                  builtins.toString units.trollshell-claude-bridge.Service.UnsetEnvironment
+                  == "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX";
+                assert builtins.elem "CLAUDE_BRIDGE_PORT=8787" units.trollshell-claude-bridge.Service.Environment;
+                assert builtins.elem "CLAUDE_BRIDGE_MODEL=claude-haiku-4-5"
+                  units.trollshell-claude-bridge.Service.Environment;
+                assert builtins.elem "CLAUDE_BRIDGE_TIMEOUT_SECS=15"
+                  units.trollshell-claude-bridge.Service.Environment;
+                # petBrain.model is a runtime path, so it gates the unit rather
+                # than entering the closure, and lands in llama-server's argv.
+                assert
+                  builtins.toString units.trollshell-pet-brain.Unit.ConditionPathExists == "/var/empty/brain.gguf";
+                assert
+                  let
+                    exec = builtins.toString units.trollshell-pet-brain.Service.ExecStart;
+                  in
+                  pkgs.lib.hasInfix "--model /var/empty/brain.gguf" exec
+                  && pkgs.lib.hasInfix "--port 8080" exec
+                  && pkgs.lib.hasSuffix "--ctx-size 1024 --threads 4" exec;
                 builtins.deepSeq {
                   userUnits = units;
                   sessionVars = cfg.home.sessionVariables;

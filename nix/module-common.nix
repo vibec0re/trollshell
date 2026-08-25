@@ -269,6 +269,227 @@ self:
       };
     };
 
+    # The Claude bridge (#584/#694): a keyless, loopback-only OpenAI-compatible
+    # shim in front of headless Claude Code (`claude --print`), so the
+    # LLM-backed plugins can ride a Claude Code subscription instead of a
+    # metered provider — `hytte_ai_providers::Provider` is just a base URL, so
+    # pointing a plugin at http://127.0.0.1:<port> is the whole integration.
+    #
+    # HOME-MANAGER-ONLY, same reasoning nightlight documents above (#657): the
+    # unit lives in nix/hm-module.nix, and a NixOS-only deployment has no
+    # per-user `claude` login state for the bridge to drive. Setting these
+    # through the NixOS module alone trips an assertion there rather than
+    # silently no-op'ing.
+    #
+    # Option granularity follows @kaesaecracker's rule on #694 — "anything that
+    # should be an option should get an option; everything that is not obviously
+    # user defined could be overridden in the service cfg". So `port` (two
+    # things must agree on one number), `model` and `timeoutSeconds` (both
+    # documented footguns, see below) are first class; the remaining env knobs —
+    # CLAUDE_BRIDGE_MODE, CLAUDE_BRIDGE_THINKING, CLAUDE_BRIDGE_STATE_DIR,
+    # RUST_LOG — stay reachable the ordinary home-manager way:
+    #
+    #   systemd.user.services.trollshell-claude-bridge.Service.Environment =
+    #     [ "CLAUDE_BRIDGE_MODE=reprompt" ];
+    #
+    # (home-manager concatenates that with the list the unit already sets, and
+    # systemd lets the later assignment win.) The full inventory is the table in
+    # crates/hytte-claude-bridge/src/main.rs and the comment block in
+    # etc/systemd/user/trollshell-claude-bridge.service.
+    claudeBridge = {
+      enable = lib.mkEnableOption ''
+        the hytte-claude-bridge user service (#584): a keyless loopback
+        OpenAI-compatible shim over headless Claude Code, so the LLM-backed
+        plugins (pet, caw) can ride a Claude Code subscription with no code
+        change — point one at it with
+        `plugins.pet.env.PET_LLM_URL = "http://127.0.0.1:8787"`.
+
+        Prerequisites the module cannot provide for you: the `claude` CLI must
+        be resolvable on the *systemd user manager's* PATH (on NixOS that is the
+        system profile plus your per-user profile — so a `claude` in
+        `home.packages` is found, one installed by npm into `~/.local/bin` is
+        not), and it must already be logged in (`claude` → `/login`). The bridge
+        holds no credentials of its own.
+
+        Home-manager only (#657 precedent): the NixOS module declares no unit
+        for this and asserts rather than silently ignoring it
+      '';
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.hytte-claude-bridge;
+        defaultText = lib.literalExpression "trollshell.packages.\${system}.hytte-claude-bridge";
+        description = "The hytte-claude-bridge package the user service runs.";
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8787;
+        example = 8788;
+        description = ''
+          Loopback port the bridge listens on (`CLAUDE_BRIDGE_PORT`). The
+          address is not configurable — it is always 127.0.0.1.
+
+          A first-class option rather than an env line because two things have
+          to agree on one number: this, and the `*_LLM_URL` of every plugin
+          pointed at the bridge (`plugins.pet.env.PET_LLM_URL`).
+
+          8787, not 8080 — 8080 belongs to `petBrain` below (the llama-server
+          brain), and the two backends are meant to be swappable, not exclusive.
+        '';
+      };
+
+      model = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "claude-haiku-4-5";
+        description = ''
+          The model the bridge asks `claude` for (`CLAUDE_BRIDGE_MODEL`, i.e.
+          `claude --model`). Null leaves it unset, which is *not* neutral: the
+          child then runs on whatever `~/.claude/settings.json` picks — usually
+          Opus — while the bridge's own per-request budget is only
+          `timeoutSeconds` (8s by default, and it must stay under the client's
+          10s global timeout). An Opus turn will routinely blow that budget and
+          come back to the plugin as a 504.
+
+          So pin something fast here if you want replies rather than fallbacks:
+          `claude-haiku-4-5` is the value #694's reporter settled on for the pet.
+          Leave it null only if you have deliberately raised `timeoutSeconds`
+          (and the consuming plugin's own timeout with it — see
+          `timeoutSeconds`).
+        '';
+      };
+
+      timeoutSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 8;
+        example = 20;
+        description = ''
+          The bridge's per-request budget in whole seconds
+          (`CLAUDE_BRIDGE_TIMEOUT_SECS`, #699). A turn that overruns it comes
+          back as a clean 504 the caller can fall back from.
+
+          **Ordering invariant**: this must stay strictly *under* the consuming
+          plugin's own global request timeout, or a slow turn tears the
+          connection mid-read instead of returning a 504. That client budget is
+          `hytte_ai_providers::DEFAULT_TIMEOUT` — 10 seconds — unless the plugin
+          raises it; today only the pet has a knob for that
+          (`plugins.pet.env.PET_LLM_TIMEOUT_SECS`, #711). The default 8 < 10
+          satisfies it out of the box, and the home-manager module asserts the
+          pair at evaluation time when both are declared, so raising this
+          without raising the pet's fails the build rather than the request.
+        '';
+      };
+    };
+
+    # The pet's brain (#276): a local llama-server from nixpkgs' `llama-cpp`,
+    # holding a small chat model resident. The pet plugin is a thin HTTP client
+    # to it — the shell's daemon-as-state-store stance applied to a cat. It is
+    # the other thing `plugins.pet.env.PET_LLM_URL` can point at, and the
+    # alternative to `claudeBridge` above rather than a companion to it.
+    #
+    # Same home-manager-only caveat as claudeBridge: the unit is declared in
+    # nix/hm-module.nix and the NixOS module asserts instead of ignoring these.
+    #
+    # llama-server takes no environment configuration at all, so the escape
+    # hatch for everything not promoted to an option here is `extraArgs` below
+    # rather than a `Service.Environment` override.
+    petBrain = {
+      enable = lib.mkEnableOption ''
+        the trollshell-pet-brain user service (#276): a local `llama-server`
+        (nixpkgs' llama-cpp) holding a small chat model resident for the pet
+        plugin to talk to. Point the pet at it with
+        `plugins.pet.env.PET_LLM_URL = "http://127.0.0.1:8080"`.
+
+        You still have to fetch the model yourself — it is a multi-hundred-MB
+        GGUF, not something to bake into a nix closure. Any chat-tuned GGUF
+        works (the pet only ever sends /v1/chat/completions):
+
+        ```
+        mkdir -p ~/.local/share/trollshell-pet
+        curl -L -o ~/.local/share/trollshell-pet/brain.gguf \
+          'https://huggingface.co/openbmb/MiniCPM5-1B-GGUF/resolve/main/MiniCPM5-1B-Q4_K_M.gguf'
+        ```
+
+        Home-manager only (#657 precedent), like `claudeBridge` above
+      '';
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs.llama-cpp;
+        defaultText = lib.literalExpression "pkgs.llama-cpp";
+        description = ''
+          The package providing `llama-server`. Swap it for a build with the
+          acceleration you actually have (e.g.
+          `pkgs.llama-cpp.override { cudaSupport = true; }`) — the unit calls
+          the `llama-server` binary out of this package by name, not
+          `meta.mainProgram`.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8080;
+        example = 8081;
+        description = ''
+          Port llama-server listens on (`--port`). First class for the same
+          reason `claudeBridge.port` is: the pet's `PET_LLM_URL` has to name the
+          same number. 8080 is llama-server's own default and is deliberately
+          distinct from `claudeBridge.port` (8787) so both backends can be
+          declared at once and swapped by editing one URL.
+        '';
+      };
+
+      model = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        defaultText = lib.literalExpression ''"''${config.home.homeDirectory}/.local/share/trollshell-pet/brain.gguf"'';
+        example = "/srv/models/qwen3-1.7b-q4.gguf";
+        description = ''
+          Absolute path to the GGUF the brain loads (`--model`). A plain string,
+          not a nix path: the file is fetched at runtime into your home
+          directory (see `enable`), and making it a path would copy hundreds of
+          megabytes into the nix store on every rebuild.
+
+          Null means `$HOME/.local/share/trollshell-pet/brain.gguf`, the
+          location the download snippet in `enable` writes to and the one
+          `etc/systemd/user/trollshell-pet-brain.service` has always used. The
+          unit refuses to start (rather than crash-looping) while the file is
+          absent, so declaring this before downloading the model is safe.
+        '';
+      };
+
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [
+          "--ctx-size"
+          "1024"
+          "--threads"
+          "4"
+        ];
+        example = [
+          "--ctx-size"
+          "4096"
+          "--threads"
+          "8"
+          "--n-gpu-layers"
+          "99"
+        ];
+        description = ''
+          The rest of `llama-server`'s argument vector, appended after
+          `--model` and `--port`. This is the escape hatch for this unit —
+          llama-server reads no environment configuration, so unlike
+          `claudeBridge` there is no `Service.Environment` override to fall back
+          on and the knobs have to come through here.
+
+          The default mirrors
+          `etc/systemd/user/trollshell-pet-brain.service`: a 1024-token context
+          on 4 threads, sized for a ~1B Q4 model on a laptop. Setting this
+          replaces the default outright rather than adding to it.
+        '';
+      };
+    };
+
     recorder.audioByDefault = lib.mkOption {
       type = lib.types.bool;
       default = false;

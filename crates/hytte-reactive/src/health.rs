@@ -151,10 +151,10 @@ pub(crate) struct PanicCounts {
 
 /// Start tracking a supervisor. Returns the id its later updates quote.
 ///
-/// Called by `supervise_runs` — the single loop both `spawn_supervised` and
-/// `spawn_supervised_blocking` funnel through — so every supervision entry
-/// point is covered by construction, including ones that do not exist yet
-/// (#633's cancellable variant).
+/// Called by `supervise_runs` — the single loop `spawn_supervised`,
+/// `spawn_supervised_blocking` and `spawn_supervised_handle` all funnel
+/// through — so every supervision entry point is covered by construction,
+/// including ones that do not exist yet.
 pub(crate) fn register(name: &'static str) -> TaskId {
     let id = TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
     TASKS.lock_mut().push(TaskHealth {

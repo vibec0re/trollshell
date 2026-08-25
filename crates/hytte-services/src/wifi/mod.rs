@@ -8,6 +8,29 @@
 //! lifetime (#613). Widgets are backend-agnostic — they only see the public
 //! types and signal accessors exported from this module.
 //!
+//! # Switching backend at runtime (#633)
+//!
+//! The verdict is no longer latched at all. The same task then subscribes to
+//! `NameOwnerChanged` for the two daemon bus names and re-probes whenever
+//! either starts or stops, so a `NetworkManager` installed and started
+//! mid-session, or a host moving between iwd and NM, is picked up without
+//! `systemctl --user restart trollshell`.
+//!
+//! Three things had to exist for that to be safe, and they are worth finding
+//! quickly when reading this module:
+//!
+//! - **A way to stop a supervised task.** `spawn_supervised` returns `()`, so
+//!   the outgoing watcher could not be stopped and would race the incoming one
+//!   to write the same `Mutable`s. [`hytte_reactive::spawn_supervised_handle`]
+//!   is the primitive #633 added for this; [`tear_down`] uses it and *waits*
+//!   for the watcher to unwind before clearing anything.
+//! - **One place to reset per-backend state.** See [`IwdPaths`] on why the iwd
+//!   path caches moved out of process-global `OnceLock`s and into the
+//!   [`WifiBackend`] payload, where NM's device path already lived.
+//! - **A rule for when to switch at all.** See [`switch_needed`]; the short
+//!   version is that only a verdict naming a *different* daemon acts, so a
+//!   daemon restart is not mistaken for a backend change.
+//!
 //! # Public API
 //!
 //! ```ignore
@@ -36,8 +59,9 @@ mod watcher;
 
 use futures_channel::oneshot;
 use futures_signals::signal::{Mutable, Signal};
+use futures_util::StreamExt as _;
 use hytte_bus::BusKind;
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_handle};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
@@ -54,37 +78,55 @@ use crate::wifi_backend::BackendChoice;
 pub use crate::wifi_nm::{VpnProfile, WiredProfile};
 pub use types::{Adapter, PromptKind, PromptRequest, Station, StationState, WifiNetwork};
 
-// ── Station path cache ────────────────────────────────────────────────────────
+// ── iwd path cache ────────────────────────────────────────────────────────────
 
-/// Filled by the watcher on station discovery; read by command helpers.
-/// Uses an `RwLock` so a new station path (USB dongle swap) can be written.
-static STATION_PATH: OnceLock<Arc<tokio::sync::RwLock<String>>> = OnceLock::new();
-
-fn station_path_store() -> &'static Arc<tokio::sync::RwLock<String>> {
-    STATION_PATH.get_or_init(|| Arc::new(tokio::sync::RwLock::new(String::new())))
+/// The iwd object paths the watcher discovered, which the iwd command arms need
+/// in order to address anything.
+///
+/// **Owned by the committed backend, not by the process.** Until #633 these were
+/// two process-global `OnceLock<Arc<RwLock<String>>>` statics, which was fine
+/// while the backend verdict was latched for the process lifetime and fatal the
+/// moment it was not: a `OnceLock` is initialised once and has no clear path, so
+/// an iwd → NM → iwd cycle would leave the second iwd backend reading the first
+/// one's station path — addressing an object that no longer exists, with nothing
+/// able to invalidate it.
+///
+/// Living in [`WifiBackend::Iwd`]'s payload makes teardown structural instead:
+/// dropping the outgoing `WifiBackend` drops its paths, and the incoming one
+/// starts from empty. That also makes the two backends symmetric — `NM` already
+/// threaded its device path through [`WifiBackend::NetworkManager`]'s payload,
+/// and the asymmetry was the whole of the "two mechanisms for the same job"
+/// obstacle.
+///
+/// An `RwLock` rather than a plain `String` because the watcher rewrites it
+/// whenever the station changes *within* one backend's lifetime (a USB dongle
+/// swap), which is a different event from a backend switch.
+#[derive(Clone, Default)]
+pub(crate) struct IwdPaths {
+    station: Arc<RwLock<String>>,
+    adapter: Arc<RwLock<String>>,
 }
 
-pub(super) async fn get_station_path() -> String {
-    station_path_store().read().await.clone()
-}
+impl IwdPaths {
+    /// The current `net.connman.iwd.Station` object path, or empty before
+    /// discovery.
+    pub(super) async fn station_path(&self) -> String {
+        self.station.read().await.clone()
+    }
 
-pub(super) async fn set_station_path(path: &str) {
-    *station_path_store().write().await = path.to_string();
-}
+    /// The current `net.connman.iwd.Adapter1` object path, or empty before
+    /// discovery.
+    pub(super) async fn adapter_path(&self) -> String {
+        self.adapter.read().await.clone()
+    }
 
-/// Filled by the watcher on adapter discovery; read by command helpers.
-static ADAPTER_PATH: OnceLock<Arc<tokio::sync::RwLock<String>>> = OnceLock::new();
+    pub(super) async fn set_station_path(&self, path: &str) {
+        *self.station.write().await = path.to_string();
+    }
 
-fn adapter_path_store() -> &'static Arc<tokio::sync::RwLock<String>> {
-    ADAPTER_PATH.get_or_init(|| Arc::new(tokio::sync::RwLock::new(String::new())))
-}
-
-pub(super) async fn current_adapter_path() -> String {
-    adapter_path_store().read().await.clone()
-}
-
-pub(super) async fn set_current_adapter_path(path: &str) {
-    *adapter_path_store().write().await = path.to_string();
+    pub(super) async fn set_adapter_path(&self, path: &str) {
+        *self.adapter.write().await = path.to_string();
+    }
 }
 
 // ── Agent waiter map (module-level OnceLock for public API access) ────────────
@@ -113,10 +155,15 @@ pub(super) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// Cloneable so command functions can read it from the registry (GTK thread)
 /// and then use it inside a spawned tokio task.
+///
+/// Both daemon variants carry the object paths their command arms address, so
+/// that retiring a backend is a `drop` rather than a list of caches to
+/// remember to clear (#633).
 #[derive(Clone)]
 pub(crate) enum WifiBackend {
-    /// iwd is managing the radio. Commands use iwd D-Bus paths.
-    Iwd,
+    /// iwd is managing the radio. Commands use the iwd D-Bus paths its watcher
+    /// discovered — see [`IwdPaths`].
+    Iwd(IwdPaths),
     /// `NetworkManager` is managing the radio.
     /// The inner `Arc<RwLock<String>>` stores the current NM Wi-Fi device path
     /// (e.g. `/org/freedesktop/NetworkManager/Devices/3`), written by the
@@ -124,6 +171,37 @@ pub(crate) enum WifiBackend {
     NetworkManager(Arc<RwLock<String>>),
     /// Neither backend was detected; commands are no-ops.
     None,
+}
+
+impl WifiBackend {
+    /// The payload-free discriminant, for comparing a committed backend against
+    /// a fresh probe verdict.
+    fn kind(&self) -> BackendKind {
+        match self {
+            Self::Iwd(_) => BackendKind::Iwd,
+            Self::NetworkManager(_) => BackendKind::NetworkManager,
+            Self::None => BackendKind::None,
+        }
+    }
+}
+
+/// [`WifiBackend`] and [`BackendChoice`] reduced to the one thing a switch
+/// decision compares: *which daemon*, with no handles attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendKind {
+    Iwd,
+    NetworkManager,
+    None,
+}
+
+impl From<BackendChoice> for BackendKind {
+    fn from(choice: BackendChoice) -> Self {
+        match choice {
+            BackendChoice::Iwd => Self::Iwd,
+            BackendChoice::NetworkManager => Self::NetworkManager,
+            BackendChoice::None => Self::None,
+        }
+    }
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
@@ -142,24 +220,132 @@ pub struct WifiHandles {
     /// iwd / no-backend (iwd doesn't manage VPNs). Distinct from the poll-only
     /// `vpn::tunnels()` live-tunnel detection — these are NM connection profiles.
     pub(crate) vpn: Mutable<Vec<VpnProfile>>,
-    /// iwd name-ownership signal; stays empty unless the iwd backend is chosen.
+    /// iwd name-ownership signal; stays empty unless the iwd backend is chosen
+    /// at least once.
     ///
-    /// A `OnceLock` rather than a plain `Option` because the backend probe now
+    /// A `OnceLock` rather than a plain `Option` because the backend probe
     /// concludes *after* `start()` returns (see [`probe_until_conclusive`]), so
-    /// the handle is parked here by the probe task. Set at most once — the
-    /// verdict is still latched for the process lifetime (re-entrant switching
-    /// is #633).
+    /// the handle is parked here by the probe task.
+    ///
+    /// **Set at most once, and never released** — including across the backend
+    /// switches #633 added. `own_name(…).start()` discards its `JoinHandle` and
+    /// `OwnNameSignal` has no `Drop`, so there is nothing here to cancel; #633's
+    /// plan allowed for either giving it a teardown handle or documenting why
+    /// the ownership task is intentionally immortal, and this is that
+    /// documentation. Keeping `mov.vibec0re.trollshell.iwd-agent` owned while NM
+    /// is the live backend costs one bus name and inconveniences nobody: the
+    /// object it serves answers iwd's `RequestPassphrase` callbacks, and iwd is
+    /// by definition not the backend then. Re-owning it on the way back to iwd
+    /// would be the actual hazard — a second export at [`AGENT_PATH`] whose
+    /// eventual drop unmounts the live one — so [`start_iwd`] reuses the
+    /// existing ownership instead. The agent it exported closes over the same
+    /// process-lifetime `prompts`/`waiters` handles either way.
     _ownership: Arc<OnceLock<hytte_bus::OwnNameSignal>>,
-    /// NM secret-agent export handle; stays empty unless the NM backend is
-    /// chosen. Held only to keep the exported agent object (and its re-mount
-    /// task) alive for the service's lifetime. `OnceLock` for the same reason
-    /// as `_ownership`.
-    _nm_agent: Arc<OnceLock<hytte_bus::ExportHandle>>,
+    /// The committed backend and the resources it owns, or `None` before the
+    /// first commit. Shared with the supervising task, which is what makes a
+    /// switch — and a restart of that task — reconcile against what is already
+    /// running rather than start a second copy of it.
+    _live: LiveSlot,
     /// The committed backend. Starts at [`WifiBackend::None`] and is set once
     /// the probe reaches a conclusive verdict; commands issued before that see
     /// no backend, which is the same window that already exists between
     /// `start()` and the watcher's first discovery.
+    ///
+    /// Re-set on every backend switch, and set back to [`WifiBackend::None`]
+    /// for the duration of a teardown, so a command can never dispatch against
+    /// a backend whose watcher is being stopped.
     pub(crate) backend: Mutable<WifiBackend>,
+}
+
+// ── The live backend, and switching it ───────────────────────────────────────
+
+/// Everything one committed backend started, gathered so that retiring it is a
+/// single move rather than a checklist.
+struct LiveBackend {
+    /// What commands dispatch against; mirrored into
+    /// [`WifiHandles::backend`] for the registry.
+    backend: WifiBackend,
+    /// Cancellation for the backend's watcher task. `None` for
+    /// [`WifiBackend::None`], which starts no watcher.
+    watcher: Option<hytte_reactive::SupervisorHandle>,
+    /// The NM secret-agent export; `None` for the other two backends. Dropping
+    /// it unmounts the agent object — see [`hytte_bus::ExportHandle`], whose
+    /// `Drop` is destructive by design.
+    nm_agent: Option<hytte_bus::ExportHandle>,
+}
+
+impl Drop for LiveBackend {
+    fn drop(&mut self) {
+        // Backstop for the one path that does not go through `tear_down`: a
+        // panic unwinding a switch, which drops the outgoing backend without
+        // ever having cancelled it. Its watcher would then keep running and
+        // race the replacement the restarted supervisor is about to start —
+        // the exact failure #633 exists to prevent, arrived at sideways.
+        //
+        // A `Drop` cannot await, so this only ends the restart loop; the
+        // *waiting* stays in `tear_down`, which takes the handle out first and
+        // leaves this a no-op on the ordinary path.
+        if let Some(watcher) = &self.watcher {
+            watcher.cancel();
+        }
+    }
+}
+
+/// The one committed backend, shared between the supervising task and
+/// [`WifiHandles`].
+///
+/// An async mutex because teardown awaits (cancelling a watcher waits for its
+/// run to unwind, and unregistering the NM agent is a bus call), and because
+/// holding it for the whole of a switch is what serialises two changes arriving
+/// back to back.
+type LiveSlot = Arc<AsyncMutex<Option<LiveBackend>>>;
+
+/// How long a switch waits for the outgoing watcher to stop before giving up on
+/// it and proceeding.
+///
+/// The wait exists so the outgoing watcher cannot write `station`/`networks`
+/// after the switch has cleared them; the bound exists because
+/// [`hytte_reactive::SupervisorHandle::stopped`] is only as prompt as the run's
+/// next `await`, and a wedged watcher must not take the whole service down with
+/// it. Overshooting the bound is logged and then tolerated: a stale write from a
+/// watcher that eventually unwinds is a cosmetic glitch, a hung switch is not.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long to let the bus settle after a name-ownership change before
+/// re-probing.
+///
+/// A daemon *restart* is two `NameOwnerChanged` events — the name lost, then
+/// re-acquired — and probing between them reads a host that momentarily has no
+/// Wi-Fi daemon. [`switch_needed`] already refuses to act on that verdict, so
+/// this is the second line of defence rather than the first; it mostly saves a
+/// pair of pointless bus round-trips.
+const CHANGE_SETTLE: Duration = Duration::from_secs(1);
+
+/// Whether a fresh probe verdict should replace the committed backend.
+///
+/// Two rules, and the second is the interesting one:
+///
+/// 1. Nothing committed yet — the start-up path — always commits, including
+///    committing [`BackendChoice::None`] on a host that genuinely runs no Wi-Fi
+///    daemon. That is the pre-#633 behaviour, unchanged.
+/// 2. Afterwards, only a verdict naming a *different daemon* switches. A
+///    conclusive `None` while a daemon is committed is explicitly **not** a
+///    switch: that is what `systemctl restart NetworkManager` looks like from
+///    the bus, and both watchers already reconnect across a daemon restart on
+///    their own (`wifi_nm`'s discovery retries every 5 s, `watcher.rs` has its
+///    `'discovery` loop). Tearing down there would trade a self-healing blip
+///    for a guaranteed one — watcher down, panel emptied, an identical watcher
+///    back up — and would do it every time the daemon is restarted.
+///
+/// The cost of rule 2 is that a host whose only Wi-Fi daemon is uninstalled
+/// mid-session keeps a watcher looking for something that will not return,
+/// which is what it already did before any of this and is cheap (a retry loop
+/// on a bus name that never appears).
+fn switch_needed(committed: Option<BackendKind>, probed: BackendKind) -> bool {
+    match committed {
+        None => true,
+        Some(kind) => probed != kind && probed != BackendKind::None,
+    }
 }
 
 impl Default for WifiHandles {
@@ -181,12 +367,11 @@ const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 
 // ── Backend selection: retry while inconclusive, commit once conclusive ───────
 //
-// The verdict is latched for the process lifetime — `Service::start` spawns a
-// *different* watcher per verdict — so committing to a wrong one is expensive.
-// Before #613 an **inconclusive** probe ([`ProbeError`], "I could not ask") was
-// collapsed straight into [`BackendChoice::None`] ("the bus answered and nobody
-// is there"), which disabled Wi-Fi for the whole session; only a shell restart
-// brought it back (#607).
+// Committing to the wrong backend is expensive — a *different* watcher runs per
+// verdict — so before #613 an **inconclusive** probe ([`ProbeError`], "I could
+// not ask") being collapsed straight into [`BackendChoice::None`] ("the bus
+// answered and nobody is there") disabled Wi-Fi for the whole session; only a
+// shell restart brought it back (#607).
 //
 // The fix is to keep asking until the answer means something. Retrying can't
 // happen on the calling thread — `Service::start` runs on the GTK main thread,
@@ -194,9 +379,10 @@ const ANCHOR_NAME: &str = "mov.vibec0re.trollshell.iwd-agent";
 // and the per-verdict branch both moved inside the service's own supervised
 // task, the shape `networkd.rs` already uses.
 //
-// Picking up a daemon that appears *after* a conclusive verdict, or switching
-// backends at runtime, is out of scope here: it needs a cancellation primitive
-// that does not exist yet (#633).
+// What follows is the **start-up** path specifically. Since #633 a commit is no
+// longer final: `recheck` re-runs the probe when a daemon starts or stops, and
+// deliberately does *not* reuse this policy — see its docs for why the two
+// paths want opposite things from an unanswerable bus.
 //
 // The retry *mechanism* — schedule, budget, the pure decision — lives in
 // `crate::retry`, shared with `networkd`'s startup seed since #646. What stays
@@ -363,64 +549,76 @@ struct WatchTargets {
     vpn: Mutable<Vec<VpnProfile>>,
 }
 
-/// Commit to the iwd backend: own the agent name and start the iwd watcher.
+/// Commit to the iwd backend: own the agent name (once per process) and start
+/// the iwd watcher.
 ///
-/// Parks the ownership handle in `ownership_out` so it outlives this call (the
-/// probe task returns once it has committed).
+/// Parks the ownership handle in `ownership_out` so it outlives this call, and
+/// so a later switch back to iwd finds it already there — see the field's docs
+/// on why that ownership is deliberately never released.
 fn start_iwd(
-    targets: WatchTargets,
+    targets: &WatchTargets,
     waiters: WaitersMap,
     ownership_out: &OnceLock<hytte_bus::OwnNameSignal>,
-) -> WifiBackend {
-    // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager). iwd
-    // records our system-bus unique name when we call RegisterAgent, then
-    // issues RequestPassphrase callbacks on the system bus.
-    let agent = agent::IwdAgent {
-        prompts: targets.prompts.clone(),
-        waiters,
+) -> LiveBackend {
+    if ownership_out.get().is_none() {
+        // Mount the iwd Agent on the SYSTEM bus (same as iwd's AgentManager).
+        // iwd records our system-bus unique name when we call RegisterAgent,
+        // then issues RequestPassphrase callbacks on the system bus.
+        let agent = agent::IwdAgent {
+            prompts: targets.prompts.clone(),
+            waiters,
+        };
+        let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
+            .at_path(AGENT_PATH, agent)
+            .start();
+        // Discarding a rejected `OwnNameSignal` is genuinely inert: it has no
+        // `Drop`, so dropping it drops read access to the ownership state and
+        // nothing else — the ownership task it spawned keeps running regardless.
+        // Contrast `ExportHandle` in `start_network_manager`, whose drop is
+        // destructive and is therefore guarded.
+        let _ = ownership_out.set(own);
+    }
+
+    let paths = IwdPaths::default();
+    let watcher = {
+        let targets = targets.clone();
+        let paths = paths.clone();
+        spawn_supervised_handle("wifi", move || {
+            watcher::run_wifi_watcher(
+                targets.station.clone(),
+                targets.networks.clone(),
+                targets.prompts.clone(),
+                targets.adapter.clone(),
+                paths.clone(),
+            )
+        })
     };
-    let own = hytte_bus::own_name(BusKind::System, ANCHOR_NAME)
-        .at_path(AGENT_PATH, agent)
-        .start();
-    // Discarding a rejected `OwnNameSignal` is genuinely inert: it has no
-    // `Drop`, so dropping it drops read access to the ownership state and
-    // nothing else — the ownership task it spawned keeps running regardless.
-    // Contrast `ExportHandle` in `start_network_manager`, whose drop is
-    // destructive and is therefore guarded.
-    let _ = ownership_out.set(own);
 
-    spawn_supervised("wifi", move || {
-        watcher::run_wifi_watcher(
-            targets.station.clone(),
-            targets.networks.clone(),
-            targets.prompts.clone(),
-            targets.adapter.clone(),
-        )
-    });
-
-    WifiBackend::Iwd
+    LiveBackend {
+        backend: WifiBackend::Iwd(paths),
+        watcher: Some(watcher),
+        nm_agent: None,
+    }
 }
 
 /// Commit to the `NetworkManager` backend: start the NM watcher and export the
-/// secret agent, parking its handle in `nm_agent_out`.
-fn start_network_manager(
-    targets: WatchTargets,
-    waiters: WaitersMap,
-    nm_agent_out: &OnceLock<hytte_bus::ExportHandle>,
-) -> WifiBackend {
+/// secret agent.
+fn start_network_manager(targets: &WatchTargets, waiters: WaitersMap) -> LiveBackend {
     let device_path_store: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-    let store = Arc::clone(&device_path_store);
-    let prompts = targets.prompts.clone();
-    spawn_supervised("wifi", move || {
-        crate::wifi_nm::run_nm_wifi_watcher(
-            targets.station.clone(),
-            targets.networks.clone(),
-            targets.adapter.clone(),
-            targets.wired.clone(),
-            targets.vpn.clone(),
-            store.clone(),
-        )
-    });
+    let watcher = {
+        let targets = targets.clone();
+        let store = Arc::clone(&device_path_store);
+        spawn_supervised_handle("wifi", move || {
+            crate::wifi_nm::run_nm_wifi_watcher(
+                targets.station.clone(),
+                targets.networks.clone(),
+                targets.adapter.clone(),
+                targets.wired.clone(),
+                targets.vpn.clone(),
+                store.clone(),
+            )
+        })
+    };
 
     // Mount the NM SecretAgent on the SYSTEM bus and register it with NM's
     // AgentManager. Unlike the iwd agent, NM secret agents do NOT own a
@@ -428,27 +626,19 @@ fn start_network_manager(
     // calls GetSecrets back on it, so we export the object name-lessly (no
     // system-bus policy entry needed). Export first, then register, so the
     // object is present before NM can call back.
-    let nm_agent = nm_agent::NmAgent { prompts, waiters };
+    //
+    // The handle goes into the returned `LiveBackend` rather than a `OnceLock`
+    // that only the first commit could fill: this export is *per commit*, and
+    // switching away from NM drops it, which is what unmounts the agent. That
+    // also retires the "exported twice" hazard the `OnceLock` was guarding —
+    // there is exactly one live export because there is exactly one live
+    // backend, and `tear_down` runs before the next `start_network_manager`.
+    let nm_agent = nm_agent::NmAgent {
+        prompts: targets.prompts.clone(),
+        waiters,
+    };
     let export =
         hytte_bus::export_object(BusKind::System, crate::wifi_nm::NM_AGENT_PATH).start(nm_agent);
-    if let Err(duplicate) = nm_agent_out.set(export) {
-        // Not reachable today — the decide-task returns once it has committed
-        // and `spawn_supervised` does not restart a clean completion, so this
-        // runs at most once. Guarded anyway because the failure is silent and
-        // security-adjacent: dropping the rejected handle runs
-        // `ExportHandle::drop`, whose *path-keyed* `unmount(NM_AGENT_PATH)`
-        // takes down the interface the surviving export mounted, while that
-        // surviving handle never notices. NM would still hold our secret-agent
-        // registration, so `GetSecrets` starts failing and Wi-Fi/VPN passphrase
-        // prompts stop appearing — with nothing logged above `debug`.
-        tracing::error!(
-            path = crate::wifi_nm::NM_AGENT_PATH,
-            "wifi_nm: the NM secret agent was exported twice; dropping the duplicate unmounts \
-             the live agent, so passphrase prompts will stop working until the shell is \
-             restarted. This is a bug in the backend-commit path — please report it."
-        );
-        drop(duplicate);
-    }
 
     runtime::handle().spawn(async {
         // Give the export a moment to mount on the live connection before
@@ -462,7 +652,206 @@ fn start_network_manager(
         }
     });
 
-    WifiBackend::NetworkManager(device_path_store)
+    LiveBackend {
+        backend: WifiBackend::NetworkManager(device_path_store),
+        watcher: Some(watcher),
+        nm_agent: Some(export),
+    }
+}
+
+/// Start whichever backend `choice` names, and everything that backend owns.
+fn start_backend(
+    choice: BackendChoice,
+    targets: &WatchTargets,
+    waiters: WaitersMap,
+    ownership_out: &OnceLock<hytte_bus::OwnNameSignal>,
+) -> LiveBackend {
+    match choice {
+        BackendChoice::Iwd => start_iwd(targets, waiters, ownership_out),
+        BackendChoice::NetworkManager => start_network_manager(targets, waiters),
+        BackendChoice::None => {
+            // A positive finding: the bus answered and neither daemon is
+            // present. An *inconclusive* probe never lands here — it either
+            // recovered on a retry or gave up before this (#613).
+            tracing::warn!("wifi: no Wi-Fi backend present — service is inactive");
+            LiveBackend {
+                backend: WifiBackend::None,
+                watcher: None,
+                nm_agent: None,
+            }
+        }
+    }
+}
+
+/// Stop everything a committed backend started, and clear what it published.
+///
+/// The order is the contract. The watcher is cancelled and **waited for** first,
+/// so that by the time the `Mutable`s are reset there is no task left that could
+/// repopulate them — the race #633 named as the reason a naive switch is wrong
+/// ("a naive switch leaves the old watcher running and racing the new one to
+/// write the same `Mutable`s"). Only then does the NM registration go, then the
+/// export, then the backend value itself — which is what drops the path caches.
+async fn tear_down(mut live: LiveBackend, targets: &WatchTargets) {
+    // Taken out rather than destructured: `LiveBackend` has a `Drop` backstop
+    // (which forbids a partial move), and taking the handle here is also what
+    // makes that backstop a no-op once this function has done the job properly.
+    if let Some(watcher) = live.watcher.take() {
+        watcher.cancel();
+        if tokio::time::timeout(TEARDOWN_GRACE, watcher.stopped())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                grace_secs = TEARDOWN_GRACE.as_secs_f64(),
+                "wifi: the outgoing backend's watcher did not stop within the teardown grace \
+                 period; continuing the switch anyway. It may briefly write stale station or \
+                 network state over the incoming backend's."
+            );
+        }
+    }
+
+    if live.nm_agent.is_some() {
+        // Withdraw the registration *before* the object goes away: NM calls
+        // `GetSecrets` back on the unique name of the connection the agent
+        // registered from, and that connection is `hytte_bus`'s pooled system
+        // connection, which outlives this backend. Unmounting the object
+        // without unregistering would leave NM calling into nothing, and
+        // passphrase prompts silently failing.
+        if let Err(e) = crate::wifi_nm::unregister_nm_agent().await {
+            tracing::warn!(error = %e, "wifi_nm: unregistering the secret agent failed");
+        }
+    }
+    // `ExportHandle::drop` unmounts the interface; explicit so the ordering
+    // relative to the `Unregister` above is visible rather than incidental to
+    // where a binding happens to fall.
+    drop(live.nm_agent.take());
+    // `live` — and with it the `WifiBackend` holding this backend's object-path
+    // caches — is dropped when this returns, which is the whole point of moving
+    // those caches into the payload (see `IwdPaths`).
+    drop(live);
+
+    // Safe now, and only now: nothing is left to race these writes.
+    targets.station.set(None);
+    targets.networks.set(Vec::new());
+    targets.prompts.set(None);
+    targets.adapter.set(None);
+    targets.wired.set(Vec::new());
+    targets.vpn.set(Vec::new());
+}
+
+/// What a reconcile needs. Bundled because it is carried across every restart
+/// of the supervising task and rebuilt on each one.
+#[derive(Clone)]
+struct BackendCtx {
+    targets: WatchTargets,
+    waiters: WaitersMap,
+    ownership: Arc<OnceLock<hytte_bus::OwnNameSignal>>,
+    live: LiveSlot,
+    published: Mutable<WifiBackend>,
+}
+
+/// Bring the committed backend in line with `choice`, doing nothing if it
+/// already is.
+///
+/// Holds the [`LiveSlot`] for the whole switch, so two changes arriving back to
+/// back cannot interleave a teardown with a commit.
+async fn apply(ctx: &BackendCtx, choice: BackendChoice) {
+    let mut slot = ctx.live.lock().await;
+    let committed = slot.as_ref().map(|live| live.backend.kind());
+    if !switch_needed(committed, choice.into()) {
+        return;
+    }
+
+    if let Some(outgoing) = slot.take() {
+        tracing::info!(
+            from = ?outgoing.backend.kind(),
+            to = ?choice,
+            "wifi: switching wireless backend at runtime (#633)"
+        );
+        // Stop dispatching commands at the outgoing backend before its watcher
+        // is torn down, so nothing addresses a path that is about to be
+        // dropped. `None` is the same inert state the service starts in.
+        ctx.published.set(WifiBackend::None);
+        tear_down(outgoing, &ctx.targets).await;
+    }
+
+    let incoming = start_backend(choice, &ctx.targets, ctx.waiters.clone(), &ctx.ownership);
+    // Published last, so a command can never see a backend whose watcher has
+    // not been spawned yet.
+    ctx.published.set(incoming.backend.clone());
+    *slot = Some(incoming);
+}
+
+/// Re-probe after the daemon set changed, and switch if the verdict moved.
+///
+/// Unlike the start-up path this does **not** retry an inconclusive probe. The
+/// two paths want opposite things from a failure: at start-up giving up means
+/// Wi-Fi is dead for the session, which is #607/#613 and why [`PROBE_RETRY`] is
+/// unbounded. Here a backend is already committed and working, so an
+/// unanswerable bus just means "ask again next time" — and there will be a next
+/// time, because every daemon start and stop produces another
+/// `NameOwnerChanged`. Retrying here would instead pin this task on a dead bus
+/// while further events pile up behind it in a bounded channel.
+///
+/// `probe_backend` already logs an inconclusive result at `error!`, so
+/// declining to act on it stays visible without a line of its own.
+async fn recheck(ctx: &BackendCtx) {
+    let Ok(choice) = crate::wifi_backend::probe_backend().await else {
+        tracing::debug!(
+            "wifi: re-probe after a daemon change was inconclusive; keeping the committed backend"
+        );
+        return;
+    };
+    apply(ctx, choice).await;
+}
+
+/// Does this `NameOwnerChanged` concern one of the two Wi-Fi daemons?
+///
+/// Filtered in-process because [`hytte_bus::signals`] builds no `arg0=` match
+/// rule, so the subscription receives every name-ownership change on the system
+/// bus. That is one tuple decode and two string compares per event against
+/// traffic that is a handful of events a minute on an idle session — cheaper
+/// than the alternative of polling the bus for a change that usually never
+/// comes.
+fn names_a_wifi_daemon(evt: &hytte_bus::SignalEvent) -> bool {
+    evt.body
+        .body()
+        .deserialize::<(String, String, String)>()
+        .is_ok_and(|(name, _old_owner, _new_owner)| {
+            name == crate::wifi_backend::NM_BUS_NAME || name == crate::wifi_backend::IWD_BUS_NAME
+        })
+}
+
+/// Watch the system bus for either Wi-Fi daemon appearing or disappearing, and
+/// reconcile the committed backend when one does.
+///
+/// `NameOwnerChanged` rather than a poll: it is the event that actually
+/// corresponds to "a wireless daemon started or stopped", and it costs nothing
+/// while nothing happens. The gap it leaves is a daemon that is *installed* but
+/// never started — that produces no bus traffic at all, so it is picked up on
+/// the next event or the next shell start, which for a daemon nobody has
+/// launched is the right amount of urgency.
+///
+/// Returns only if the subscription ends, which it does not in practice; the
+/// caller is a supervised task, so a panic here is restarted and re-reconciled.
+async fn watch_for_daemon_changes(ctx: &BackendCtx) {
+    let sub = hytte_bus::signals(BusKind::System, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
+    let mut events = sub.events();
+
+    while let Some(evt) = events.next().await {
+        if !names_a_wifi_daemon(&evt) {
+            continue;
+        }
+        tokio::time::sleep(CHANGE_SETTLE).await;
+        recheck(ctx).await;
+    }
+    tracing::warn!(
+        "wifi: the NameOwnerChanged subscription ended; runtime backend switching is off until this task restarts"
+    );
 }
 
 impl Service for WifiService {
@@ -473,79 +862,60 @@ impl Service for WifiService {
         let waiters_arc: WaitersMap = Arc::new(AsyncMutex::new(HashMap::new()));
         let _ = WAITERS.set(waiters_arc.clone());
 
-        let targets = WatchTargets {
-            station: Mutable::new(None),
-            networks: Mutable::new(Vec::new()),
-            prompts: Mutable::new(None),
-            adapter: Mutable::new(None),
-            wired: Mutable::new(Vec::new()),
-            vpn: Mutable::new(Vec::new()),
+        let ctx = BackendCtx {
+            targets: WatchTargets {
+                station: Mutable::new(None),
+                networks: Mutable::new(Vec::new()),
+                prompts: Mutable::new(None),
+                adapter: Mutable::new(None),
+                wired: Mutable::new(Vec::new()),
+                vpn: Mutable::new(Vec::new()),
+            },
+            waiters: waiters_arc,
+            ownership: Arc::new(OnceLock::new()),
+            live: Arc::new(AsyncMutex::new(None)),
+            published: Mutable::new(WifiBackend::None),
         };
-        let backend_mutable: Mutable<WifiBackend> = Mutable::new(WifiBackend::None);
-        let ownership_slot: Arc<OnceLock<hytte_bus::OwnNameSignal>> = Arc::new(OnceLock::new());
-        let nm_agent_slot: Arc<OnceLock<hytte_bus::ExportHandle>> = Arc::new(OnceLock::new());
 
         // One supervised task owns the whole decision: probe (retrying while
-        // inconclusive), then commit to exactly one backend. It runs off the
-        // GTK main thread, so `start()` returns immediately and the shell never
-        // blocks on the bus. Same shape as `networkd::NetworkdService::start`.
+        // inconclusive), commit to exactly one backend, then keep watching in
+        // case the answer changes. It runs off the GTK main thread, so
+        // `start()` returns immediately and the shell never blocks on the bus.
+        // Same shape as `networkd::NetworkdService::start`.
         //
-        // The task returns once it has committed — `spawn_supervised` takes a
-        // clean completion at face value and does not restart it, so a backend
-        // is never started twice. The per-backend watchers keep their own
-        // independent supervision.
+        // Before #633 this task *returned* once it had committed, which is what
+        // made a double-start impossible. It no longer returns, so that
+        // guarantee moved into the `LiveSlot`: a restart after a panic
+        // re-probes, finds the same backend already committed, and
+        // `switch_needed` says no. Only a verdict that genuinely names a
+        // different daemon starts anything.
         {
-            let targets = targets.clone();
-            let backend_m = backend_mutable.clone();
-            let waiters_m = waiters_arc;
-            let ownership_out = Arc::clone(&ownership_slot);
-            let nm_agent_out = Arc::clone(&nm_agent_slot);
-
+            let ctx = ctx.clone();
             spawn_supervised("wifi-backend", move || {
-                let targets = targets.clone();
-                let backend_m = backend_m.clone();
-                let waiters_m = waiters_m.clone();
-                let ownership_out = Arc::clone(&ownership_out);
-                let nm_agent_out = Arc::clone(&nm_agent_out);
-
+                let ctx = ctx.clone();
                 async move {
-                    let Some(choice) = probe_until_conclusive(PROBE_RETRY).await else {
-                        // Give-up already logged at `error!`; stay inert.
-                        return;
-                    };
-
-                    let backend = match choice {
-                        BackendChoice::Iwd => start_iwd(targets, waiters_m, &ownership_out),
-                        BackendChoice::NetworkManager => {
-                            start_network_manager(targets, waiters_m, &nm_agent_out)
-                        }
-                        BackendChoice::None => {
-                            // A positive finding: the bus answered and neither
-                            // daemon is present. An *inconclusive* probe never
-                            // lands here — it either recovered on a retry or gave
-                            // up above (#613).
-                            tracing::warn!("wifi: no Wi-Fi backend present — service is inactive");
-                            WifiBackend::None
-                        }
-                    };
-
-                    // Published last, so a command can never see a backend whose
-                    // watcher has not been spawned yet.
-                    backend_m.set(backend);
+                    // The start-up probe keeps #613's unbounded retry: until
+                    // something is committed, giving up means no Wi-Fi at all.
+                    if let Some(choice) = probe_until_conclusive(PROBE_RETRY).await {
+                        apply(&ctx, choice).await;
+                    }
+                    // …and then stay up for the switching case, whether or not
+                    // the start-up probe ever produced a verdict.
+                    watch_for_daemon_changes(&ctx).await;
                 }
             });
         }
 
         WifiHandles {
-            station: targets.station,
-            networks: targets.networks,
-            prompts: targets.prompts,
-            adapter: targets.adapter,
-            wired: targets.wired,
-            vpn: targets.vpn,
-            _ownership: ownership_slot,
-            _nm_agent: nm_agent_slot,
-            backend: backend_mutable,
+            station: ctx.targets.station,
+            networks: ctx.targets.networks,
+            prompts: ctx.targets.prompts,
+            adapter: ctx.targets.adapter,
+            wired: ctx.targets.wired,
+            vpn: ctx.targets.vpn,
+            _ownership: ctx.ownership,
+            _live: ctx.live,
+            backend: ctx.published,
         }
     }
 }
@@ -634,9 +1004,9 @@ fn get_backend() -> WifiBackend {
 /// Fire-and-forget: trigger a Wi-Fi scan on the station.
 pub fn scan() {
     match get_backend() {
-        WifiBackend::Iwd => {
+        WifiBackend::Iwd(paths) => {
             runtime::handle().spawn(async move {
-                let path = get_station_path().await;
+                let path = paths.station_path().await;
                 if path.is_empty() {
                     tracing::warn!("wifi::scan: no station path known");
                     return;
@@ -694,7 +1064,7 @@ fn network_is_known(network_path: &str) -> bool {
 pub fn connect_network(network_path: &str) {
     let path = network_path.to_string();
     match get_backend() {
-        WifiBackend::Iwd => {
+        WifiBackend::Iwd(_) => {
             runtime::handle().spawn(async move {
                 if let Err(e) = do_network_call(&path, "Connect").await {
                     tracing::warn!(error = %e, path, "wifi connect_network failed (may need agent)");
@@ -735,9 +1105,9 @@ pub fn connect_network(network_path: &str) {
 /// Fire-and-forget: disconnect from the current network.
 pub fn disconnect() {
     match get_backend() {
-        WifiBackend::Iwd => {
+        WifiBackend::Iwd(paths) => {
             runtime::handle().spawn(async move {
-                let path = get_station_path().await;
+                let path = paths.station_path().await;
                 if path.is_empty() {
                     tracing::warn!("wifi::disconnect: no station path known");
                     return;
@@ -783,9 +1153,9 @@ pub fn disconnect() {
 /// For `NetworkManager`, sets `WirelessEnabled` on the manager.
 pub fn set_powered(on: bool) {
     match get_backend() {
-        WifiBackend::Iwd => {
+        WifiBackend::Iwd(paths) => {
             runtime::handle().spawn(async move {
-                let path = current_adapter_path().await;
+                let path = paths.adapter_path().await;
                 if path.is_empty() {
                     tracing::warn!("wifi::set_powered: no adapter path known");
                     return;
@@ -817,7 +1187,7 @@ pub fn set_powered(on: bool) {
 pub fn forget(known_network_path: &str) {
     let path = known_network_path.to_string();
     match get_backend() {
-        WifiBackend::Iwd => {
+        WifiBackend::Iwd(_) => {
             runtime::handle().spawn(async move {
                 if let Err(e) = do_known_network_call(&path, "Forget").await {
                     tracing::warn!(error = %e, path, "wifi forget failed");
@@ -1060,7 +1430,7 @@ async fn do_known_network_call(path: &str, method: &str) -> Result<(), hytte_bus
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendChoice, Duration, retry};
+    use super::{BackendChoice, BackendKind, Duration, retry, switch_needed};
     use crate::wifi_backend::ProbeError;
 
     // Since #646 the retry *mechanism* — the doubling schedule, the attempt
@@ -1168,5 +1538,94 @@ mod tests {
                 "attempt {attempt}: an inconclusive probe ended the task instead of retrying"
             );
         }
+    }
+
+    // ── Switching backend at runtime (#633) ──────────────────────────────────
+    //
+    // `switch_needed` is the whole of the switch *decision*; everything around
+    // it is teardown and start-up mechanics that need a live system bus. So it
+    // is the piece worth pinning hermetically, and the table below is the
+    // policy in full.
+
+    /// Nothing is committed only at start-up, and then every verdict commits —
+    /// including `None` on a host that genuinely has no Wi-Fi daemon, which is
+    /// what puts the service into its documented inert state rather than
+    /// leaving it undecided.
+    #[test]
+    fn the_first_verdict_always_commits() {
+        for probed in [
+            BackendKind::Iwd,
+            BackendKind::NetworkManager,
+            BackendKind::None,
+        ] {
+            assert!(
+                switch_needed(None, probed),
+                "{probed:?}: the start-up path must commit whatever the probe concluded"
+            );
+        }
+    }
+
+    /// Re-probing the same answer must be a no-op. `NameOwnerChanged` fires for
+    /// plenty of reasons that leave the verdict unchanged, and each one reaches
+    /// this decision.
+    #[test]
+    fn an_unchanged_verdict_does_not_switch() {
+        for kind in [
+            BackendKind::Iwd,
+            BackendKind::NetworkManager,
+            BackendKind::None,
+        ] {
+            assert!(
+                !switch_needed(Some(kind), kind),
+                "{kind:?}: re-committing the backend already running would restart it for nothing"
+            );
+        }
+    }
+
+    /// The feature itself: a daemon appearing where there was none, and a host
+    /// moving from one daemon to the other, both switch.
+    #[test]
+    fn a_different_daemon_switches() {
+        assert!(switch_needed(Some(BackendKind::None), BackendKind::Iwd));
+        assert!(switch_needed(
+            Some(BackendKind::None),
+            BackendKind::NetworkManager
+        ));
+        assert!(switch_needed(
+            Some(BackendKind::Iwd),
+            BackendKind::NetworkManager
+        ));
+        assert!(switch_needed(
+            Some(BackendKind::NetworkManager),
+            BackendKind::Iwd
+        ));
+    }
+
+    /// The rule that keeps a daemon *restart* from looking like a backend
+    /// change. `systemctl restart NetworkManager` momentarily owns no bus name,
+    /// so a probe landing in that window concludes `None` — conclusively and
+    /// correctly, which is exactly why the verdict cannot be trusted as a
+    /// teardown trigger. Both watchers already reconnect on their own, so
+    /// switching here would guarantee the blip it was meant to avoid.
+    #[test]
+    fn a_vanished_daemon_does_not_tear_down_the_running_backend() {
+        assert!(!switch_needed(Some(BackendKind::Iwd), BackendKind::None));
+        assert!(!switch_needed(
+            Some(BackendKind::NetworkManager),
+            BackendKind::None
+        ));
+    }
+
+    /// The verdict and the committed backend are compared through
+    /// [`BackendKind`], so the mapping from a probe result must be exact — a
+    /// wrong arm here would read as "unchanged" and silently disable switching.
+    #[test]
+    fn every_probe_verdict_maps_to_its_own_kind() {
+        assert_eq!(BackendKind::from(BackendChoice::Iwd), BackendKind::Iwd);
+        assert_eq!(
+            BackendKind::from(BackendChoice::NetworkManager),
+            BackendKind::NetworkManager
+        );
+        assert_eq!(BackendKind::from(BackendChoice::None), BackendKind::None);
     }
 }

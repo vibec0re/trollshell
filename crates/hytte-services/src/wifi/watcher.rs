@@ -13,7 +13,7 @@ use super::parse::{
     refresh_adapter_from_managed, refresh_station_from_managed, station_removed_from_event,
 };
 use super::types::{Adapter, PromptRequest, Station, WifiNetwork};
-use super::{AGENT_PATH, set_current_adapter_path, set_station_path};
+use super::{AGENT_PATH, IwdPaths};
 
 // ── Subscription bundle ───────────────────────────────────────────────────────
 
@@ -48,21 +48,25 @@ fn subscribe_iwd_events(station_path: &zbus::zvariant::OwnedObjectPath) -> IwdSu
 
 // ── Main watcher task ─────────────────────────────────────────────────────────
 
+/// `paths` is the committed iwd backend's own path cache — passed in rather than
+/// reached for through a process-global, so that a backend switch retires this
+/// watcher's paths along with the watcher (#633; see [`IwdPaths`]).
 pub(super) async fn run_wifi_watcher(
     station_mutable: Mutable<Option<Station>>,
     networks_mutable: Mutable<Vec<WifiNetwork>>,
     prompts_mutable: Mutable<Option<PromptRequest>>,
     adapter_mutable: Mutable<Option<Adapter>>,
+    paths: IwdPaths,
 ) {
     'discovery: loop {
         let Some((managed, station_path)) = discover_station().await else {
             continue 'discovery;
         };
 
-        set_station_path(station_path.as_str()).await;
+        paths.set_station_path(station_path.as_str()).await;
         let adapter_path = adapter_path_from_station(station_path.as_str());
         if !adapter_path.is_empty() {
-            set_current_adapter_path(&adapter_path).await;
+            paths.set_adapter_path(&adapter_path).await;
         }
         tracing::info!(path = station_path.as_str(), "wifi station found");
 

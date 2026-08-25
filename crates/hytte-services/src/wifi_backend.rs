@@ -33,14 +33,20 @@
 //! Only a **negative** requires that both queries actually answered.
 //!
 //! Re-probing *after* a conclusive verdict — picking up a daemon that appears
-//! later, or switching between iwd and `NetworkManager` at runtime — is
-//! deliberately still unsolved: it needs a cancellation primitive that does not
-//! exist yet. See #633.
+//! later, or switching between iwd and `NetworkManager` at runtime — is solved
+//! since #633: [`crate::wifi`] watches `NameOwnerChanged` for these two names
+//! and re-runs this probe when either daemon starts or stops, switching only
+//! when the verdict names a *different* daemon. What made that possible was
+//! `hytte_reactive::spawn_supervised_handle`, without which the outgoing
+//! backend's watcher could not be stopped.
 
 use hytte_bus::BusKind;
 
-const NM_BUS_NAME: &str = "org.freedesktop.NetworkManager";
-const IWD_BUS_NAME: &str = "net.connman.iwd";
+/// The `NetworkManager` bus name. Also what [`crate::wifi`]'s
+/// `NameOwnerChanged` watcher matches on, hence `pub(crate)`.
+pub(crate) const NM_BUS_NAME: &str = "org.freedesktop.NetworkManager";
+/// The iwd bus name; `pub(crate)` for the same reason as [`NM_BUS_NAME`].
+pub(crate) const IWD_BUS_NAME: &str = "net.connman.iwd";
 
 const DBUS_NAME: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";

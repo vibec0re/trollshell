@@ -19,6 +19,14 @@
 //! schedule, the log line, and the restart/stop rules with the async variant —
 //! there is deliberately only *one* supervision policy in this crate.
 //!
+//! [`spawn_supervised_handle`] is [`spawn_supervised`] plus a way to stop it:
+//! it returns a [`SupervisorHandle`] whose [`cancel`](SupervisorHandle::cancel)
+//! aborts the run in flight and ends the restart loop. Reach for it only when
+//! something genuinely has to be torn down — swapping the Wi-Fi service's
+//! wireless backend at runtime is the case it was added for (#633) — and for
+//! everything else prefer the plain [`spawn_supervised`], whose task lives as
+//! long as the process.
+//!
 //! Restarting is safe by design: hytte services are thin clients to persistent
 //! system daemons (see the crate-level docs on the registry), so a respawned
 //! task reconnects to the daemon without losing state. That covers daemon
@@ -35,24 +43,32 @@
 //! Every supervisor publishes what it knows about its task — runs, panics,
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
-//! The bookkeeping lives in [`supervise_runs`], the one loop both spawn
-//! functions funnel through, so it covers both variants and any future entry
-//! point that reuses that loop (#238, #690, #691).
+//! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
+//! function funnels through, so it covers all three variants and any future
+//! entry point that reuses that loop (#238, #690, #691).
 //!
 //! # Extending this API
 //!
-//! Both spawn functions return `()` on purpose, and it is worth keeping that
-//! way until something actually needs otherwise: ~35 call sites invoke them in
+//! [`spawn_supervised`] and [`spawn_supervised_blocking`] return `()` on
+//! purpose, and it is worth keeping that way: ~40 call sites invoke them in
 //! statement position, so **the return type can still be widened to a handle
 //! without touching a single one** — as long as the handle is neither
-//! `#[must_use]` nor `Drop`-cancelling. That is the seam #633 wants for
-//! cancellation, and the constraint it has to respect: an `ExportHandle`-style
-//! "dropping the last clone stops the task" guard cannot be bolted onto these
-//! two, because every existing caller drops it immediately. #633 should add a
-//! *separate* cancellable entry point (`spawn_supervised_handle`, per its own
-//! recommendation) that funnels through [`supervise_runs`] — which is also how
-//! it inherits health tracking for free, and where it must call
-//! [`crate::health::stopped`] when a cancelled supervisor unwinds.
+//! `#[must_use]` nor `Drop`-cancelling. An `ExportHandle`-style "dropping the
+//! last clone stops the task" guard cannot be bolted onto these two, because
+//! every existing caller drops it on the same line and would silently cancel
+//! every supervised task in the shell.
+//!
+//! That is why #633 added [`spawn_supervised_handle`] as a *separate* entry
+//! point rather than changing these two, and why [`SupervisorHandle`] is
+//! deliberately neither `#[must_use]` nor `Drop`-cancelling: keeping it inert
+//! on drop is what leaves the widening above open, so the two older entry
+//! points could one day hand back the same type without a single call site
+//! changing meaning. Do not add either property to it.
+//!
+//! All three funnel through [`supervise_runs`], which is how the cancellable
+//! variant inherits [`crate::health`] tracking for free — including releasing
+//! its row via [`crate::health::stopped`] when a cancelled supervisor unwinds,
+//! without which every backend switch would leak one.
 //!
 //! # The process panic hook
 //!
@@ -69,6 +85,7 @@ use std::future::Future;
 use std::panic::PanicHookInfo;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// Capped-exponential-backoff schedule for [`spawn_supervised`] restarts.
@@ -114,7 +131,9 @@ where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    runtime::handle().spawn(supervise(name, factory, Backoff::default()));
+    // No `Stop`: this entry point hands back nothing, so nothing can ever ask
+    // the supervisor to stop. `spawn_supervised_handle` is the one that can.
+    runtime::handle().spawn(supervise(name, factory, Backoff::default(), None));
 }
 
 /// Spawn a supervised **blocking** task on the shared hytte runtime.
@@ -173,15 +192,229 @@ where
     runtime::handle().spawn(supervise_blocking(name, Arc::new(task), Backoff::default()));
 }
 
-/// The async supervision loop. Split out from [`spawn_supervised`] so the
-/// backoff schedule is injectable for hermetic tests (a zero-delay `Backoff`
-/// keeps the retry-path test fast and non-flaky).
-async fn supervise<F, Fut>(name: &'static str, factory: F, cfg: Backoff)
+// ── Cancellable supervision ──────────────────────────────────────────────────
+
+/// A handle that can stop a supervisor started by [`spawn_supervised_handle`].
+///
+/// Cheap to clone; every clone can cancel, and cancelling is idempotent.
+///
+/// # What cancellation guarantees
+///
+/// [`cancel`](Self::cancel) asks the supervisor to stop and returns
+/// immediately. The supervisor then, in order: aborts the run in flight (or
+/// abandons the backoff sleep it was in, or declines to start the next run —
+/// whichever it was doing), **waits for that run to finish unwinding**,
+/// releases its [`crate::health`] row, and returns. [`stopped`](Self::stopped)
+/// resolves at that point, so `cancel(); stopped().await;` is the way to know
+/// nothing the task owned is still writing.
+///
+/// A cancelled supervisor never runs the factory again. There is no resume; a
+/// new supervisor is a new [`spawn_supervised_handle`] call.
+///
+/// # What cancellation cannot corrupt, and what it can
+///
+/// A run is aborted at an `await` point, which is the reason cancellation is
+/// safe where a panic is not. The [`spawn_supervised_blocking`] docs describe
+/// how a panic that unwinds while a `Mutable`'s `lock_mut()` guard is held
+/// poisons that `Mutable` for the whole process; an abort cannot do that,
+/// because a write guard is `!Send` and so cannot be held across the `await`
+/// where the abort lands — a future that tried would not compile.
+///
+/// What cancellation *does* share with a restart is the partial-update hazard:
+/// a run stopped between two related writes leaves them inconsistent, exactly
+/// as a panicked-and-restarted run would. The restart-safety precondition on
+/// [`spawn_supervised_blocking`] therefore applies unchanged to anything you
+/// cancel — with the addition that the cancelling side usually wants to reset
+/// the state the task was writing once [`stopped`](Self::stopped) has resolved,
+/// rather than leave a half-finished snapshot on screen.
+///
+/// # Dropping is not cancelling
+///
+/// Dropping every clone leaves the supervisor running, deliberately: see this
+/// module's "Extending this API" note for why this type must stay inert on drop
+/// (and un-`#[must_use]`). Fire-and-forget callers should use
+/// [`spawn_supervised`] and say so.
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    /// Flipped to `true` by [`SupervisorHandle::cancel`]; watched by
+    /// [`supervise_runs`]. Behind an `Arc` so a clone cannot resurrect a
+    /// dropped sender, and so dropping clones is observably different from
+    /// cancelling.
+    cancel: Arc<watch::Sender<bool>>,
+    /// Paired with a sender the supervision loop owns and drops on its way out,
+    /// which is what [`SupervisorHandle::stopped`] waits for.
+    stopped: watch::Receiver<()>,
+}
+
+impl std::fmt::Debug for SupervisorHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupervisorHandle")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl SupervisorHandle {
+    /// Ask the supervisor to stop. Returns immediately — the teardown it
+    /// triggers is asynchronous; await [`stopped`](Self::stopped) to observe
+    /// its completion. Idempotent.
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
+
+    /// Whether [`cancel`](Self::cancel) has been called on this handle or any
+    /// of its clones. Says nothing about whether the supervisor has finished
+    /// unwinding yet — that is [`stopped`](Self::stopped).
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    /// Resolve once the supervisor has stopped and released its
+    /// [`crate::health`] row.
+    ///
+    /// Not cancellation-specific: it also resolves when the supervised task
+    /// completed cleanly on its own (`Ok(())`, which the supervisor takes at
+    /// face value and does not restart), so it doubles as "await this task's
+    /// completion". Resolves immediately if the supervisor has already stopped.
+    ///
+    /// After a [`cancel`](Self::cancel) this waits for the aborted run to
+    /// unwind, and a run only reaches its abort at an `await`: a run that never
+    /// yields — a tight CPU loop with no `await` in it — cannot be aborted, and
+    /// this waits for it as long as it takes. Callers that cannot block on a
+    /// misbehaving task should wrap this in a `tokio::time::timeout`.
+    pub async fn stopped(&self) {
+        let mut stopped = self.stopped.clone();
+        // `changed()` errors once the loop's sender is dropped, which is
+        // exactly the event being waited for. Nothing is ever *sent* on this
+        // channel; the drop is the whole message.
+        while stopped.changed().await.is_ok() {}
+    }
+}
+
+/// The supervision loop's half of a [`SupervisorHandle`].
+struct Stop {
+    /// Reads `true` once some handle has cancelled.
+    cancel: watch::Receiver<bool>,
+    /// Never sent on — dropped when the loop returns, which is what
+    /// [`SupervisorHandle::stopped`] observes.
+    _stopped: watch::Sender<()>,
+}
+
+/// Spawn a supervised task that can be stopped again.
+///
+/// Identical to [`spawn_supervised`] in every respect that matters at runtime —
+/// same factory contract, same capped exponential backoff, same restart-on-panic
+/// and stop-on-clean-completion rules, same [`crate::health`] publishing,
+/// because it is literally the same loop — except that it hands back a
+/// [`SupervisorHandle`] with which the task can later be torn down.
+///
+/// Use it only where teardown is a real requirement: the shell's long-lived
+/// service tasks should stay on [`spawn_supervised`], whose lack of a handle is
+/// an accurate statement that nothing stops them. The case this exists for is
+/// swapping one implementation of a service for another at runtime — the Wi-Fi
+/// service moving between iwd and `NetworkManager` (#633) — where the outgoing
+/// backend's watcher must stop writing the shared state before the incoming
+/// one starts.
+///
+/// There is no blocking twin, and that is not an oversight: a
+/// `spawn_blocking` closure cannot be aborted once it has started running
+/// (tokio's `JoinHandle::abort` can only stop a blocking task that has not yet
+/// been picked up by a pool thread), so a cancellable
+/// `spawn_supervised_blocking` could promise far less than this one does. A
+/// blocking task that needs to stop should poll for it itself.
+#[must_use]
+pub fn spawn_supervised_handle<F, Fut>(name: &'static str, factory: F) -> SupervisorHandle
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    supervise_runs(name, move || runtime::handle().spawn(factory()), cfg).await;
+    spawn_supervised_handle_with(name, factory, Backoff::default())
+}
+
+/// [`spawn_supervised_handle`] with an injectable backoff schedule, so the
+/// hermetic tests can drive the cancel paths without wall-clock sleeps — the
+/// same seam [`supervise`] is split out for.
+fn spawn_supervised_handle_with<F, Fut>(
+    name: &'static str,
+    factory: F,
+    cfg: Backoff,
+) -> SupervisorHandle
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (stopped_tx, stopped_rx) = watch::channel(());
+    let stop = Stop {
+        cancel: cancel_rx,
+        _stopped: stopped_tx,
+    };
+    runtime::handle().spawn(supervise(name, factory, cfg, Some(stop)));
+    SupervisorHandle {
+        cancel: Arc::new(cancel_tx),
+        stopped: stopped_rx,
+    }
+}
+
+/// Resolve once the supervisor has been asked to stop — and **never** in any
+/// other circumstance.
+///
+/// Two of those circumstances are worth naming, because both would be bugs if
+/// they resolved: an un-cancellable supervisor (`stop` is `None`, i.e. one of
+/// the two handle-less entry points) and a cancellable one whose every
+/// [`SupervisorHandle`] clone was dropped without cancelling. The second is
+/// what makes "dropping is not cancelling" true rather than aspirational —
+/// once the sender is gone `changed()` starts erroring, and reading that as
+/// cancellation would stop every supervisor whose handle the caller let fall
+/// out of scope.
+async fn cancel_requested(stop: &mut Option<Stop>) {
+    let Some(stop) = stop.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    // Read-then-drop the borrow: a `watch::Ref` held across the await below
+    // would not be `Send`, and the supervisor future has to be.
+    let already = *stop.cancel.borrow_and_update();
+    if already {
+        return;
+    }
+    while stop.cancel.changed().await.is_ok() {
+        if *stop.cancel.borrow_and_update() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Whether a cancel has landed, without waiting for one.
+fn cancel_pending(stop: Option<&Stop>) -> bool {
+    stop.is_some_and(|stop| *stop.cancel.borrow())
+}
+
+/// Wind a cancelled supervisor down: release its health row and say so.
+///
+/// The health call is the load-bearing half. Entries there are live, not
+/// historical (see [`crate::health`]'s module docs), and a cancel path that
+/// skipped this would leak one row per teardown — for #633's backend switch,
+/// one per switch, forever.
+fn finish_cancelled(name: &'static str, id: health::TaskId) {
+    health::stopped(id);
+    tracing::debug!(
+        service = name,
+        "supervised task cancelled via its handle; supervisor stopped"
+    );
+}
+
+/// The async supervision loop. Split out from [`spawn_supervised`] so the
+/// backoff schedule is injectable for hermetic tests (a zero-delay `Backoff`
+/// keeps the retry-path test fast and non-flaky).
+async fn supervise<F, Fut>(name: &'static str, factory: F, cfg: Backoff, stop: Option<Stop>)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    supervise_runs(name, move || runtime::handle().spawn(factory()), cfg, stop).await;
 }
 
 /// The blocking supervision loop — [`supervise`]'s twin, likewise split out so
@@ -197,17 +430,27 @@ where
             runtime::handle().spawn_blocking(move || task())
         },
         cfg,
+        // Always uncancellable: a blocking run cannot be aborted once a pool
+        // thread has picked it up, so there is no cancellable blocking entry
+        // point to pass a `Stop` in from. See [`spawn_supervised_handle`].
+        None,
     )
     .await;
 }
 
-/// The one supervision loop both variants run.
+/// The one supervision loop all three entry points run.
 ///
 /// `spawn_run` starts a single run and hands back its `JoinHandle`; everything
 /// above it — restart policy, backoff schedule, log lines, [`crate::health`]
-/// bookkeeping — is shared, which is what keeps the async and blocking
-/// supervisors from drifting apart.
-async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff)
+/// bookkeeping, cancellation — is shared, which is what keeps the async,
+/// blocking and cancellable supervisors from drifting apart.
+///
+/// `stop` is `Some` only for [`spawn_supervised_handle`]. It is consulted at
+/// each of the three points where this loop can be *between* useful work — before
+/// starting a run, while awaiting one, and while sleeping out a backoff — so a
+/// cancel is never left waiting on a 30 s backoff or on a run that has no reason
+/// to end.
+async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff, mut stop: Option<Stop>)
 where
     S: Fn() -> JoinHandle<()> + Send + 'static,
 {
@@ -217,13 +460,42 @@ where
     let id = health::register(name);
     let mut delay = cfg.initial;
     loop {
+        // A cancel that landed while the previous run was ending must not be
+        // overtaken by the next one. This is also the *only* thing that can
+        // stop a zero-backoff restart loop, which never reaches the sleep
+        // below.
+        if cancel_pending(stop.as_ref()) {
+            finish_cancelled(name, id);
+            return;
+        }
+
         let started = Instant::now();
         health::run_started(id);
         // Spawn onto the shared runtime so tokio catches a panic and surfaces
         // it as `JoinError::is_panic()` on the handle we await here.
-        let join = spawn_run();
+        let mut join = spawn_run();
 
-        match join.await {
+        let finished = tokio::select! {
+            // Cancellation first, so a cancel and a completion racing resolve
+            // as a cancellation — the caller asked for teardown either way, and
+            // a deterministic answer is what makes the tests non-flaky.
+            biased;
+            () = cancel_requested(&mut stop) => None,
+            res = &mut join => Some(res),
+        };
+
+        let Some(outcome) = finished else {
+            // Cancelled mid-run. Abort, then *wait for the abort to land*: a
+            // supervisor that returned here while its run was still unwinding
+            // would resolve `SupervisorHandle::stopped` on a task that is still
+            // writing the state the canceller is about to reset.
+            join.abort();
+            let _aborted = join.await;
+            finish_cancelled(name, id);
+            return;
+        };
+
+        match outcome {
             // The task returned on its own — it finished its job. Do not
             // restart (restarting a completed task is the caller's bug, not a
             // failure to recover from).
@@ -253,7 +525,20 @@ where
                     "supervised task panicked; restarting after backoff"
                 );
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    let slept = tokio::select! {
+                        biased;
+                        () = cancel_requested(&mut stop) => false,
+                        () = tokio::time::sleep(delay) => true,
+                    };
+                    if !slept {
+                        // Cancelled while backing off. There is no run in
+                        // flight to abort, so this is the cheap path — and the
+                        // one that matters most in practice, since a flapping
+                        // task spends nearly all of its time here, up to 30 s
+                        // per restart at the backoff cap.
+                        finish_cancelled(name, id);
+                        return;
+                    }
                 }
                 delay = delay.saturating_mul(2).min(cfg.max);
             }
@@ -348,6 +633,15 @@ mod tests {
         initial: Duration::ZERO,
         max: Duration::ZERO,
         reset_after: Duration::ZERO,
+    };
+
+    /// A backoff whose first delay is far longer than any test will wait, so a
+    /// cancelled supervisor that stops *promptly* can only have done so by
+    /// cutting the sleep short rather than sitting it out.
+    const SLOW_BACKOFF: Backoff = Backoff {
+        initial: Duration::from_hours(1),
+        max: Duration::from_hours(1),
+        reset_after: Duration::MAX,
     };
 
     /// Zero-delay like [`ZERO_BACKOFF`], but with a `reset_after` no run can
@@ -477,6 +771,7 @@ mod tests {
                     }
                 },
                 ZERO_BACKOFF,
+                None,
             )
             .await;
         });
@@ -503,6 +798,7 @@ mod tests {
                     }
                 },
                 Backoff::default(),
+                None,
             )
             .await;
         });
@@ -634,6 +930,249 @@ mod tests {
             !health::snapshot().iter().any(|task| task.name == NAME),
             "the entry is dropped when the supervisor stops"
         );
+    }
+
+    // ── Cancellation (#633) ───────────────────────────────────────────────
+    //
+    // These drive `spawn_supervised_handle_with` rather than the public
+    // `spawn_supervised_handle` for the same reason `supervise` is split out:
+    // the shipped `Backoff::default()` would put a wall-clock second between
+    // restarts, and two of these tests are about what the loop does *while*
+    // backing off.
+
+    /// Poll until `f` holds, or fail the test. A poll rather than a
+    /// notification because what is being waited for is a counter the
+    /// supervised runs bump, and the run that bumps it is often about to panic.
+    async fn until(label: &str, f: impl Fn() -> bool) {
+        let polled = tokio::time::timeout(Duration::from_secs(5), async {
+            while !f() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(polled.is_ok(), "timed out waiting for {label}");
+    }
+
+    /// The supervisor must stop within a generous bound. Every use of this is
+    /// really an assertion that some cancel path fires: without it the waits
+    /// below are unbounded.
+    async fn expect_stopped(handle: &SupervisorHandle) {
+        let stopped = tokio::time::timeout(Duration::from_secs(5), handle.stopped()).await;
+        assert!(stopped.is_ok(), "the supervisor did not stop after cancel");
+    }
+
+    /// Whether `health` still carries a row for `name`.
+    fn health_row_exists(name: &str) -> bool {
+        health::snapshot().iter().any(|task| task.name == name)
+    }
+
+    /// Cancelling a supervisor whose run never ends on its own must abort that
+    /// run, decline to start another, and give the health row back.
+    ///
+    /// The health assertion is not incidental. Entries there are live, not
+    /// historical, so a cancel path that forgot to release one would leak a row
+    /// per teardown — and the case this primitive exists for (#633's Wi-Fi
+    /// backend switch) tears down once per switch, for the life of the session.
+    #[test]
+    fn cancel_aborts_the_run_in_flight_and_releases_the_health_row() {
+        const NAME: &str = "test-cancel-running";
+
+        install_error_counter();
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_factory = Arc::clone(&runs);
+
+        runtime::handle().block_on(async move {
+            let handle = spawn_supervised_handle_with(
+                NAME,
+                move || {
+                    let runs = Arc::clone(&runs_factory);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        // Never completes on its own: only cancellation can end
+                        // this run, which is the point.
+                        std::future::pending::<()>().await;
+                    }
+                },
+                ZERO_BACKOFF,
+            );
+
+            until("the first run to start", || {
+                runs.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            assert!(!handle.is_cancelled());
+            assert!(health_row_exists(NAME), "a live supervisor publishes a row");
+
+            handle.cancel();
+            handle.cancel(); // idempotent
+            assert!(handle.is_cancelled());
+            expect_stopped(&handle).await;
+
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                1,
+                "a cancelled supervisor does not resurrect the task"
+            );
+            assert!(
+                !health_row_exists(NAME),
+                "the health row is released on the cancel path, not leaked"
+            );
+        });
+    }
+
+    /// A flapping task spends nearly all its time asleep between restarts — up
+    /// to 30 s at the shipped backoff cap — so a cancel that only took effect
+    /// at the next run would be useless in exactly the case teardown is wanted.
+    ///
+    /// `SLOW_BACKOFF` puts the next run an hour away, so returning at all is
+    /// the assertion.
+    #[test]
+    fn cancel_interrupts_a_restart_backoff_instead_of_waiting_it_out() {
+        const NAME: &str = "test-cancel-backoff";
+
+        install_error_counter();
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_factory = Arc::clone(&runs);
+
+        runtime::handle().block_on(async move {
+            let handle = spawn_supervised_handle_with(
+                NAME,
+                move || {
+                    let runs = Arc::clone(&runs_factory);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        panic!("cancel-backoff test panics every run");
+                    }
+                },
+                SLOW_BACKOFF,
+            );
+
+            until("the first run to panic", || {
+                runs.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            handle.cancel();
+            expect_stopped(&handle).await;
+
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                1,
+                "the backoff was abandoned, not slept through into another run"
+            );
+            assert!(!health_row_exists(NAME));
+        });
+    }
+
+    /// With a zero-length backoff there is no sleep to interrupt: the loop goes
+    /// straight from a panic into the next run. The check at the top of each
+    /// iteration is then the only thing that can ever stop it, so this is that
+    /// check's test — without it, `stopped()` below never resolves.
+    #[test]
+    fn cancel_stops_a_zero_backoff_restart_loop() {
+        const NAME: &str = "test-cancel-hot-loop";
+
+        install_error_counter();
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_factory = Arc::clone(&runs);
+
+        runtime::handle().block_on(async move {
+            let handle = spawn_supervised_handle_with(
+                NAME,
+                move || {
+                    let runs = Arc::clone(&runs_factory);
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        panic!("cancel-hot-loop test panics every run");
+                    }
+                },
+                ZERO_BACKOFF,
+            );
+
+            until("the loop to be restarting", || {
+                runs.load(Ordering::SeqCst) >= 2
+            })
+            .await;
+            handle.cancel();
+            expect_stopped(&handle).await;
+
+            // `stopped()` resolving means the loop has returned, so the count
+            // is final by construction — no sleep-and-recheck needed.
+            assert!(
+                runs.load(Ordering::SeqCst) >= 2,
+                "sanity: the loop really was restarting"
+            );
+            assert!(!health_row_exists(NAME));
+        });
+    }
+
+    /// Dropping every handle must leave supervision running.
+    ///
+    /// This is the property that lets [`spawn_supervised`] and
+    /// [`spawn_supervised_blocking`] one day return this same type without
+    /// touching their ~40 statement-position call sites — all of which drop the
+    /// value on the line that produced it. `ExportHandle`'s
+    /// "dropping the last clone stops the task" is the *opposite* choice, and
+    /// adopting it here would silently cancel every supervised task in the
+    /// shell, compiling and linting clean the whole way.
+    #[test]
+    fn dropping_every_handle_leaves_the_supervisor_running() {
+        const NAME: &str = "test-drop-not-cancel";
+
+        install_error_counter();
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_factory = Arc::clone(&runs);
+
+        runtime::handle().block_on(async move {
+            let handle = spawn_supervised_handle_with(
+                NAME,
+                move || {
+                    let runs = Arc::clone(&runs_factory);
+                    async move {
+                        let n = runs.fetch_add(1, Ordering::SeqCst);
+                        assert!(n >= 3, "panic on the first three runs");
+                    }
+                },
+                ZERO_BACKOFF,
+            );
+            let clone = handle.clone();
+            drop(handle);
+            drop(clone);
+
+            // If dropping cancelled, the restarts stop at run 1 and this times
+            // out.
+            until("the supervisor to restart through to its clean run", || {
+                runs.load(Ordering::SeqCst) == 4
+            })
+            .await;
+        });
+    }
+
+    /// `stopped()` is not cancellation-specific: it resolves whenever the
+    /// supervisor is gone, including the clean-completion path that has always
+    /// ended supervision. Calling it again afterwards must return at once
+    /// rather than hang on a channel nobody will ever write to.
+    #[test]
+    fn stopped_also_resolves_on_a_clean_completion() {
+        const NAME: &str = "test-handle-clean";
+
+        install_error_counter();
+
+        runtime::handle().block_on(async move {
+            let handle = spawn_supervised_handle_with(NAME, || async {}, Backoff::default());
+
+            expect_stopped(&handle).await;
+            expect_stopped(&handle).await;
+
+            assert!(
+                !handle.is_cancelled(),
+                "a task that finished its job was not cancelled"
+            );
+            assert!(!health_row_exists(NAME));
+        });
     }
 
     /// The installed hook logs the panic through `tracing` *and* passes it on:

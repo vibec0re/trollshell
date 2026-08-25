@@ -30,11 +30,42 @@
 //! `step`, and layer on a caller-side reset threshold `step`'s callers don't
 //! need. See both constants' docs.
 //!
+//! So one `Policy` type now carries **two shapes**: a budgeted, verdict-weighing
+//! policy (`PROBE_RETRY`, `STARTUP_REFRESH_RETRY`) and an unbounded reconnect
+//! ramp (`RECONNECT_RETRY`) that only borrows the schedule. Which of the two is
+//! meant decides what this module can honestly be compared against — see the
+//! `hytte_bus` bullet below, where the older wording quietly assumed the whole
+//! type was the first shape.
+//!
 //! **Deliberately not folded in** — so nobody re-opens these as oversights:
 //!
-//! - `hytte_bus`'s `Backoff` (`hytte-bus/src/connection.rs`) is a stateful
-//!   cursor with `reset()`/`next()`, no attempt budget and no give-up. Different
-//!   shape, different job; #646 rules it out by name.
+//! - `hytte_bus`'s ramp — `hytte_bus::backoff`'s `FailureStreak` / `delay_for`
+//!   / `RetryStep`, hoisted out of `connection.rs` and `own.rs` by #797 (this
+//!   bullet named `connection.rs`'s since-deleted private `Backoff` until #800).
+//!   It is a stateful cursor over a pure 250 ms → 30 s schedule, with an
+//!   attempt counter driving a log cadence, no attempt budget and no give-up.
+//!   #646 rules it out by name, and #795 records that it is not to be
+//!   relitigated — but the *reason* has to be stated as two halves, because
+//!   only one of the two shapes above is genuinely a different kind of thing:
+//!
+//!   - [`Policy::step`]'s callers ([`crate::wifi::PROBE_RETRY`],
+//!     [`crate::networkd::STARTUP_REFRESH_RETRY`]) weigh a `Result` per attempt
+//!     against a budget that can answer [`Step::GiveUp`]. `hytte_bus`'s ramp has
+//!     neither half — it never sees an outcome and never stops. **This is the
+//!     shape that justifies the crate split.**
+//!   - [`RECONNECT_RETRY`] does not. `max_attempts: None`, no verdict, callers
+//!     that skip `step` for [`Policy::backoff`]: it is an unbounded ramp that
+//!     differs from `hytte_bus`'s only in base delay (500 ms against 250 ms,
+//!     same 30 s ceiling). It is kept here anyway, and not because it is a
+//!     different kind of object: it retries a *subscription* on top of a
+//!     connection `hytte_bus`'s supervisor is separately keeping alive, so
+//!     during an outage both ramps run at once and their ceilings answer
+//!     different questions — worst case for noticing the bus came back, versus
+//!     per-service journal noise. Its companion [`RECONNECT_RESET_AFTER`] has
+//!     no counterpart over there either (`FailureStreak` resets on a success,
+//!     not on a run that stayed up), and `hytte_bus::backoff` is `pub(crate)`,
+//!     so sharing it would mean publishing a transport crate's retry constants
+//!     and dropping one of `SHIPPED`'s three entries.
 //! - `crate::eds_retry` is the EDS worker threads' resilience kit — blocking,
 //!   `std::sync::mpsc`-shaped, and it carries a failure-streak detector rather
 //!   than an attempt budget.
@@ -152,6 +183,14 @@ impl Policy {
 /// callers; delay is [`Policy::backoff`] directly. See `RECONNECT_RESET_AFTER`
 /// for why every caller must also track how long the run that just ended
 /// stayed up.
+///
+/// **This is the one shipped policy that is not a budget.** Unbounded, no
+/// verdict, no give-up — the same object `hytte_bus::backoff` is, at 500 ms
+/// rather than 250 ms and with the same 30 s ceiling. It is kept here anyway,
+/// for reasons that are about layering rather than shape; the module doc's
+/// `hytte_bus` bullet argues it. Do not read the resemblance as an invitation
+/// to merge them (#646, #795), and do not read the module's "different shape"
+/// framing as covering this constant — it does not.
 pub(crate) const RECONNECT_RETRY: Policy = Policy {
     max_attempts: None,
     initial: Duration::from_millis(500),

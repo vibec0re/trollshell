@@ -18,8 +18,43 @@
 //!   crash supervision (`Restart=on-failure`), lifetime
 //!   (`PartOf=graphical-session.target` — a plugin survives a *shell* restart
 //!   but dies with the session), and stop. The shell keeps no runtime plugin
-//!   state; a restarted shell simply finds the previous run's units still
-//!   active and skips them.
+//!   state.
+//!
+//! ## Reconcile, not skip-if-running (#695)
+//!
+//! The launch step is a **convergence** ([`reconcile`]), not a one-shot spawn.
+//! #419 shipped "idempotent = skip any plugin whose unit is already active",
+//! which is only correct while the declared spec never changes — and it does:
+//! a `home-manager switch` that edits `env`, points `package` at a fresh build,
+//! flips `enable`, or adds/removes a plugin rewrites `plugins.json` and cannot
+//! touch the *transient* unit that baked the old values in at spawn (there is
+//! no unit file for activation to diff, and on the NixOS side activation runs
+//! as root with no user bus at all). The result was a plugin running a
+//! configuration — and a store path — the user no longer had declared, silently,
+//! for as long as the session lasted (#695).
+//!
+//! So each launched unit carries a **spec fingerprint** in its `Description=`
+//! ([`unit_description`]), systemd hands it back in the unit list it already
+//! fetches, and [`reconcile`] diffs the live units against the freshly read
+//! state file ([`plan`], pure):
+//!
+//! | declared | live unit                    | action    |
+//! |----------|------------------------------|-----------|
+//! | enabled  | not running                  | launch    |
+//! | enabled  | running, fingerprint matches  | leave     |
+//! | enabled  | running, fingerprint differs  | restart   |
+//! | disabled | running                      | stop      |
+//! | absent   | running, launcher-stamped    | stop      |
+//! | absent   | running, no fingerprint      | leave     |
+//!
+//! That last pair is the legacy-static-unit guard: a unit this launcher never
+//! spawned carries no fingerprint, so reconcile never touches it.
+//!
+//! [`reconcile`] runs at shell startup (so a `systemctl --user restart
+//! trollshell` applies current config — the only path that helps NixOS-module
+//! users, whose activation can't reach the user bus) and on demand via the
+//! `Control.ReloadPlugins` D-Bus method, which the home-manager module calls
+//! from its activation script so a switch fully applies live.
 //!
 //! ## Secret-injection hook (#392)
 //!
@@ -180,11 +215,17 @@ fn candidate_paths(
     out
 }
 
-/// Load + parse + sanitize the declarative plugin state. Missing file = no
-/// declared plugins (inert, not an error). A present-but-broken file logs a
-/// warning and yields empty rather than falling through to a lower-precedence
-/// file — masking a broken user file with a system one would be quiet drift.
-async fn load_declared() -> BTreeMap<String, PluginSpec> {
+/// Load + parse + sanitize the declarative plugin state. Missing file = **no
+/// declared plugins** (inert, not an error) — `Some(empty)`, which is a real
+/// answer: it says every declarative plugin was removed from the config.
+///
+/// `None` means "a state file exists but we couldn't read or parse it" —
+/// deliberately *not* the same as "nothing is declared", because [`reconcile`]
+/// stops plugins that are no longer declared and a typo'd file must never be
+/// read as "stop everything". A broken file also stops the search rather than
+/// falling through to a lower-precedence one: masking a broken user file with a
+/// system one would be quiet drift.
+async fn load_declared() -> Option<BTreeMap<String, PluginSpec>> {
     let paths = candidate_paths(
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
@@ -193,20 +234,96 @@ async fn load_declared() -> BTreeMap<String, PluginSpec> {
     for path in paths {
         match tokio::fs::read_to_string(&path).await {
             Ok(json) => match parse_state(&json) {
-                Ok(plugins) => return sanitize(plugins),
+                Ok(plugins) => return Some(sanitize(plugins)),
                 Err(err) => {
-                    tracing::warn!(path = %path.display(), %err, "plugins.json unparsable; treating as empty");
-                    return BTreeMap::new();
+                    tracing::warn!(path = %path.display(), %err, "plugins.json unparsable; leaving plugins as they are");
+                    return None;
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "plugins.json unreadable; treating as empty");
-                return BTreeMap::new();
+                tracing::warn!(path = %path.display(), %err, "plugins.json unreadable; leaving plugins as they are");
+                return None;
             }
         }
     }
-    BTreeMap::new()
+    Some(BTreeMap::new())
+}
+
+// ── Spec fingerprint (#695) ──────────────────────────────────────────────────
+
+/// Opening delimiter of the spec fingerprint inside a launched unit's
+/// `Description=` — see [`unit_description`].
+const FP_OPEN: &str = "[cfg:";
+/// Closing delimiter of the spec fingerprint.
+const FP_CLOSE: char = ']';
+
+/// FNV-1a 64 offset basis / prime. A **pinned, hand-rolled** hash on purpose:
+/// the digest is written into a unit's description by one shell process and read
+/// back by another (possibly a different build), so it must be stable across
+/// rustc versions — which `std`'s `DefaultHasher` explicitly does not promise.
+/// Not a security primitive: it only has to change when the spec changes.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64 over `bytes`, chained from `hash`.
+fn fnv1a(bytes: &[u8], hash: u64) -> u64 {
+    bytes
+        .iter()
+        .fold(hash, |h, b| (h ^ u64::from(*b)).wrapping_mul(FNV_PRIME))
+}
+
+/// A short stable digest of everything about a spec that a *running* unit baked
+/// in at spawn: the `exec` path (so a rebuilt `package` shows up), the declared
+/// `env` (`BTreeMap`, so iteration order is the sort order — a map with the same
+/// pairs always digests the same), and the `secrets` slot list (adding or
+/// dropping a slot changes which key is injected).
+///
+/// Deliberately **not** covered:
+/// - `enabled` — flipping it stops or starts the plugin, it never restarts one.
+/// - the secret *values* — those come from the keyring, not the state file;
+///   rotation already has its own precise path ([`relaunch_for_secret`], #392),
+///   and keeping values out means a reconcile costs zero keyring reads for
+///   plugins it isn't going to touch. (A key changed *outside* the control-center
+///   while the shell is down therefore doesn't trigger a restart; use the
+///   control-center, or stop/start the plugin.)
+///
+/// Pure, so the fingerprint contract is unit-testable.
+fn spec_fingerprint(spec: &PluginSpec) -> String {
+    // ASCII record (0x1e) / unit (0x1f) / group (0x1d) separators between the
+    // parts, so `{"AB": "C"}` can't digest the same as `{"A": "BC"}`. Only a
+    // value that itself contains one of those control bytes could re-introduce
+    // an ambiguity, and a nix-rendered exec path / env value never does.
+    let mut h = fnv1a(spec.exec.as_bytes(), FNV_OFFSET);
+    for (k, v) in &spec.env {
+        h = fnv1a(b"\x1e", h);
+        h = fnv1a(k.as_bytes(), h);
+        h = fnv1a(b"\x1f", h);
+        h = fnv1a(v.as_bytes(), h);
+    }
+    for slot in &spec.secrets {
+        h = fnv1a(b"\x1d", h);
+        h = fnv1a(slot.as_bytes(), h);
+    }
+    format!("{h:016x}")
+}
+
+/// The `Description=` a launched plugin unit carries: a human-readable label
+/// plus the spec fingerprint, in a form [`parse_fingerprint`] reads back.
+///
+/// Riding in the description is what makes the reconcile diff free — systemd
+/// returns it as the second field of the unit list [`systemd::list_plugin_units`]
+/// already fetches, so no extra property get, per plugin, per reconcile.
+fn unit_description(id: &str, fingerprint: &str) -> String {
+    format!("trollshell plugin: {id} {FP_OPEN}{fingerprint}{FP_CLOSE}")
+}
+
+/// The spec fingerprint stamped into a unit's `Description=`, or `None` for a
+/// description this launcher didn't write — a legacy static unit, or a
+/// transient unit from a pre-#695 shell. Inverse of [`unit_description`]. Pure.
+fn parse_fingerprint(description: &str) -> Option<&str> {
+    let start = description.rfind(FP_OPEN)? + FP_OPEN.len();
+    description[start..].strip_suffix(FP_CLOSE)
 }
 
 // ── systemd-run launch ───────────────────────────────────────────────────────
@@ -223,6 +340,8 @@ async fn load_declared() -> BTreeMap<String, PluginSpec> {
 ///   so plugins die with the session but survive a shell restart.
 /// - `extra_env` comes **after** the spec's env, so an injected secret (#392)
 ///   wins over a stale value declared in the spec.
+/// - `--description=` carries the spec fingerprint (#695) so a later
+///   [`reconcile`] can tell this unit's spec from the currently declared one.
 /// - `--` terminates option parsing before the config-supplied exec path.
 fn systemd_run_args(id: &str, spec: &PluginSpec, extra_env: &[(String, String)]) -> Vec<String> {
     let mut args = vec![
@@ -230,7 +349,10 @@ fn systemd_run_args(id: &str, spec: &PluginSpec, extra_env: &[(String, String)])
         "--quiet".to_owned(),
         "--collect".to_owned(),
         format!("--unit={}", systemd::plugin_unit_name(id)),
-        format!("--description=trollshell plugin: {id}"),
+        format!(
+            "--description={}",
+            unit_description(id, &spec_fingerprint(spec))
+        ),
         "--property=Restart=on-failure".to_owned(),
         "--property=RestartSec=2".to_owned(),
         "--property=PartOf=graphical-session.target".to_owned(),
@@ -295,45 +417,145 @@ fn is_running(active_state: &str) -> bool {
     matches!(active_state, "active" | "activating" | "reloading")
 }
 
-/// Launch every enabled declared plugin that isn't already running. Idempotent
-/// across shell restarts by construction: the transient units of a previous
-/// run are systemd's state, so they show as running and are skipped.
-async fn launch_enabled() {
-    let declared = load_declared().await;
-    if declared.is_empty() {
-        tracing::debug!("no declared plugins (no plugins.json); launcher inert");
-        return;
+// ── Reconcile (#695) ─────────────────────────────────────────────────────────
+
+/// What [`reconcile`] decided to do about one plugin. Ordered as executed —
+/// stops first, so a disabled/removed plugin releases its unit name before
+/// anything else runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Action {
+    /// Running but no longer wanted (declared `enable = false`, or dropped from
+    /// the config entirely) → stop it.
+    Stop,
+    /// Running from a *different* spec than the one now declared (`env`,
+    /// `package`/`exec` or `secrets` changed — or the unit predates the
+    /// fingerprint) → stop, wait for it to go down, relaunch from the new spec.
+    Restart,
+    /// Declared enabled and not running → launch it now.
+    Launch,
+}
+
+/// Diff the declared state against the live units: the whole of the reconcile
+/// decision, pure and systemd-free so every branch is unit-testable.
+///
+/// `declared` is the freshly read state file; `units` is
+/// [`systemd::list_plugin_units`]'s answer. Output is sorted (stops before
+/// restarts before launches, then by id) so execution order is deterministic.
+///
+/// Two deliberate asymmetries:
+/// - A **running unit with no fingerprint** whose id *is* declared is restarted
+///   (we can't prove it matches, and converging is the point) — this is the
+///   one-time recycle when a pre-#695 shell's units meet a #695 shell. An id
+///   that is both declared *and* hand-installed as a static unit lands here on
+///   every reconcile; [`restart`] documents what that does.
+/// - A **running unit with no fingerprint** whose id is *not* declared is left
+///   strictly alone: that is a legacy static unit (or someone else's), and the
+///   launcher has never owned it.
+fn plan(
+    declared: &BTreeMap<String, PluginSpec>,
+    units: &[systemd::PluginUnit],
+) -> Vec<(String, Action)> {
+    let running: BTreeMap<&str, Option<&str>> = units
+        .iter()
+        .filter(|u| is_running(&u.active_state))
+        .map(|u| (u.id.as_str(), parse_fingerprint(&u.description)))
+        .collect();
+    let mut out: Vec<(String, Action)> = Vec::new();
+    for (id, spec) in declared {
+        match (spec.enabled, running.get(id.as_str())) {
+            (true, None) => out.push((id.clone(), Action::Launch)),
+            (true, Some(live)) => {
+                if *live != Some(spec_fingerprint(spec).as_str()) {
+                    out.push((id.clone(), Action::Restart));
+                }
+            }
+            (false, Some(_)) => out.push((id.clone(), Action::Stop)),
+            (false, None) => {}
+        }
     }
+    // Orphans: units this launcher stamped (so it owns them) whose plugin is no
+    // longer declared at all — the `plugins.<id>` entry was removed.
+    for (id, fingerprint) in &running {
+        if fingerprint.is_some() && !declared.contains_key(*id) {
+            out.push(((*id).to_owned(), Action::Stop));
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Converge the running plugins onto the declared state (#695): launch what
+/// should be running and isn't, stop what shouldn't be, and restart anything
+/// running from a superseded spec (changed `env` / `package` / `secrets`).
+/// Called at shell startup ([`launch_at_startup`]) and on demand from the
+/// `Control.ReloadPlugins` handler, which the home-manager activation script
+/// pokes after rewriting `plugins.json`.
+///
+/// Best-effort throughout: every per-plugin failure is logged, never propagated
+/// — one broken plugin must not stop the rest from converging. Serialized on a
+/// process-wide lock, so a reconcile racing another (activation firing twice,
+/// or landing while startup is still running) queues instead of interleaving a
+/// stop with the other's launch; the second then re-reads the state file and
+/// converges on whatever is current.
+pub async fn reconcile() {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+
+    let Some(declared) = load_declared().await else {
+        // Unreadable/unparsable state file — leave the running set alone.
+        return;
+    };
     // One list call up front beats racing systemd-run's "unit already exists"
-    // error per plugin — and keeps the skip loggable as the normal case it is.
-    let running: HashSet<String> = match systemd::list_plugin_units().await {
-        Ok(units) => units
-            .into_iter()
-            .filter(|u| is_running(&u.active_state))
-            .map(|u| u.id)
-            .collect(),
+    // error per plugin — and it carries the fingerprints the diff runs on.
+    let units = match systemd::list_plugin_units().await {
+        Ok(units) => units,
         Err(err) => {
+            // No reachable user manager: fall through with an empty live set,
+            // which can only ever plan launches (each of which surfaces its own
+            // error) — never a stop of something we failed to see.
             tracing::warn!(%err, "listing plugin units failed; launching blind");
-            HashSet::new()
+            Vec::new()
         }
     };
-    for (id, spec) in &declared {
-        if !spec.enabled {
-            tracing::debug!(plugin = %id, "declared disabled; not launching");
-            continue;
-        }
-        if running.contains(id) {
-            tracing::info!(plugin = %id, "already running (systemd owns it); skipping launch");
-            continue;
-        }
-        let extra_env = resolve_secret_env(spec).await;
-        if let Err(err) = launch(id, spec, &extra_env).await {
-            tracing::warn!(plugin = %id, %err, "plugin launch failed");
+    let actions = plan(&declared, &units);
+    if actions.is_empty() {
+        tracing::debug!(
+            declared = declared.len(),
+            "plugins already match the declared state"
+        );
+        return;
+    }
+    for (id, action) in actions {
+        match action {
+            Action::Stop => {
+                tracing::info!(plugin = %id, "no longer declared as enabled; stopping");
+                if let Err(err) = stop(&id).await {
+                    tracing::warn!(plugin = %id, %err, "stopping the plugin failed");
+                }
+            }
+            Action::Restart => {
+                let Some(spec) = declared.get(&id) else {
+                    continue;
+                };
+                tracing::info!(plugin = %id, exec = %spec.exec, "declared spec changed; restarting");
+                if let Err(err) = restart(&id, spec).await {
+                    tracing::warn!(plugin = %id, %err, "restarting the plugin failed");
+                }
+            }
+            Action::Launch => {
+                let Some(spec) = declared.get(&id) else {
+                    continue;
+                };
+                let extra_env = resolve_secret_env(spec).await;
+                if let Err(err) = launch(&id, spec, &extra_env).await {
+                    tracing::warn!(plugin = %id, %err, "plugin launch failed");
+                }
+            }
         }
     }
 }
 
-/// Kick off the startup launch on the shared tokio runtime. Called once from
+/// Kick off the startup reconcile on the shared tokio runtime. Called once from
 /// `main.rs`'s run body; guarded so a re-fired `activate` (a second `trollshell`
 /// invocation remote-activating the primary instance) can't double-launch.
 pub fn launch_at_startup() {
@@ -341,7 +563,7 @@ pub fn launch_at_startup() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    hytte::reactive::runtime::handle().spawn(launch_enabled());
+    hytte::reactive::runtime::handle().spawn(reconcile());
 }
 
 // ── Control surface (the #348 Plugins tab, via control.rs) ───────────────────
@@ -354,7 +576,10 @@ pub fn launch_at_startup() {
 /// `--collect` transient unit vanishes from systemd entirely). Pure merge in
 /// [`merge_declared`].
 pub async fn list() -> Vec<systemd::PluginUnit> {
-    let declared = load_declared().await;
+    // An unreadable state file (`None`) degrades to "nothing declared" here:
+    // listing what systemd knows is still better than an empty tab. Only
+    // `reconcile` treats the distinction as load-bearing.
+    let declared = load_declared().await.unwrap_or_default();
     let units = match systemd::list_plugin_units().await {
         Ok(units) => units,
         Err(err) => {
@@ -378,6 +603,7 @@ fn merge_declared(
                 id: id.clone(),
                 active_state: "inactive".to_owned(),
                 enabled: spec.enabled,
+                description: String::new(),
             });
         }
     }
@@ -392,7 +618,7 @@ fn merge_declared(
 /// # Errors
 /// Unknown/invalid id, a still-running unit, or an unreachable user manager.
 pub async fn start(id: &str) -> anyhow::Result<()> {
-    let declared = load_declared().await;
+    let declared = load_declared().await.unwrap_or_default();
     match declared.get(id) {
         Some(spec) => {
             let extra_env = resolve_secret_env(spec).await;
@@ -420,7 +646,7 @@ pub async fn stop(id: &str) -> anyhow::Result<()> {
 /// # Errors
 /// Invalid id or an unreachable user manager (legacy path only).
 pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
-    let declared = load_declared().await;
+    let declared = load_declared().await.unwrap_or_default();
     if declared.contains_key(id) {
         tracing::info!(
             plugin = %id,
@@ -444,7 +670,7 @@ pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
 /// re-reads the key on its next start, and a static unit gets no injection at
 /// all. Best-effort — each plugin's failure is logged, never propagated.
 pub async fn relaunch_for_secret(slot: &str) {
-    let declared = load_declared().await;
+    let declared = load_declared().await.unwrap_or_default();
     let affected: Vec<(&String, &PluginSpec)> = declared
         .iter()
         .filter(|(_, spec)| spec.secrets.iter().any(|s| s == slot))
@@ -481,11 +707,31 @@ pub async fn relaunch_for_secret(slot: &str) {
 /// its `--collect` unit name frees up), then relaunch it with freshly resolved
 /// secret env. `systemd-run` refuses to replace a live unit, hence the
 /// wait-until-stopped rather than a bare stop→launch.
+///
+/// If the relaunch fails, the plugin is brought back up from its **unit file**
+/// if it has one, so a restart never leaves a plugin simply gone. That is the
+/// one configuration where the transient relaunch is structurally impossible:
+/// systemd refuses to create a transient unit whose name "was already loaded or
+/// has a fragment file", so an id that is *both* declared and hand-installed as
+/// a static unit (`etc/systemd/user/trollshell-plugin-<id>.service`) can only
+/// ever run from the static unit. Pick one or the other — with both, every
+/// reconcile that decides to restart will bounce the plugin through this
+/// fallback and log it.
 async fn restart(id: &str, spec: &PluginSpec) -> anyhow::Result<()> {
     stop(id).await?;
     wait_until_stopped(id).await;
     let extra_env = resolve_secret_env(spec).await;
-    launch(id, spec, &extra_env).await
+    let Err(err) = launch(id, spec, &extra_env).await else {
+        return Ok(());
+    };
+    if systemd::start_plugin(id).await.is_ok() {
+        tracing::warn!(
+            plugin = %id,
+            "transient relaunch failed; brought the plugin back from its unit file \
+             instead (declared *and* hand-installed as a static unit?)"
+        );
+    }
+    Err(err)
 }
 
 /// Poll the plugin's unit until it is no longer running (inactive/failed, or
@@ -589,6 +835,15 @@ mod tests {
         assert!(plugins["demo"].enabled);
     }
 
+    /// A declared spec with env, so a fingerprint test has something to change.
+    fn spec_env(exec: &str, env: &[(&str, &str)]) -> PluginSpec {
+        let mut s = spec(exec, true);
+        for (k, v) in env {
+            s.env.insert((*k).to_owned(), (*v).to_owned());
+        }
+        s
+    }
+
     #[test]
     fn parse_empty_or_missing_plugins_key() {
         assert!(parse_state("{}").unwrap().is_empty());
@@ -668,6 +923,12 @@ mod tests {
             &s,
             &[("PLUGIN_API_KEY".to_owned(), "s3cret".to_owned())],
         );
+        // The description carries the spec fingerprint (#695) so a later
+        // reconcile can diff this unit against the declared spec.
+        let description = format!(
+            "--description={}",
+            unit_description("demo", &spec_fingerprint(&s))
+        );
         assert_eq!(
             args,
             vec![
@@ -675,7 +936,7 @@ mod tests {
                 "--quiet",
                 "--collect",
                 "--unit=trollshell-plugin-demo.service",
-                "--description=trollshell plugin: demo",
+                description.as_str(),
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2",
                 "--property=PartOf=graphical-session.target",
@@ -690,6 +951,96 @@ mod tests {
         );
     }
 
+    // ── spec fingerprint (#695) ──────────────────────────────────────────────
+
+    #[test]
+    fn fingerprint_is_pinned_and_stable() {
+        // The digest crosses process (and build) boundaries — one shell writes
+        // it into a unit description, a later one reads it back — so the exact
+        // value is pinned, not just its properties. Changing the algorithm here
+        // means every running plugin restarts once on upgrade.
+        assert_eq!(
+            spec_fingerprint(&spec("/bin/demo", true)),
+            "963338d3f7f67d63"
+        );
+        assert_eq!(
+            spec_fingerprint(&spec_env("/bin/demo", &[("A", "1")])),
+            "01eabc3f30afe012"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_exec_env_and_secrets() {
+        let base = spec_env("/nix/store/aaa/bin/pet", &[("PET_NAME", "nisse")]);
+        let fp = spec_fingerprint(&base);
+
+        // A rebuilt package (new store path) is the #695 `package` half.
+        let rebuilt = spec_env("/nix/store/bbb/bin/pet", &[("PET_NAME", "nisse")]);
+        assert_ne!(spec_fingerprint(&rebuilt), fp);
+
+        // A changed env value, an added key, and a dropped key all differ.
+        assert_ne!(
+            spec_fingerprint(&spec_env("/nix/store/aaa/bin/pet", &[("PET_NAME", "kat")])),
+            fp
+        );
+        assert_ne!(
+            spec_fingerprint(&spec_env(
+                "/nix/store/aaa/bin/pet",
+                &[("PET_NAME", "nisse"), ("PET_LLM_URL", "http://x")]
+            )),
+            fp
+        );
+        assert_ne!(spec_fingerprint(&spec("/nix/store/aaa/bin/pet", true)), fp);
+
+        // Opting into a secret slot changes which key gets injected at spawn.
+        let mut with_slot = base.clone();
+        with_slot.secrets = vec!["openrouter".to_owned()];
+        assert_ne!(spec_fingerprint(&with_slot), fp);
+    }
+
+    #[test]
+    fn fingerprint_separators_keep_env_pairs_unambiguous() {
+        // Without field separators these two would digest identically.
+        let a = spec_env("/bin/x", &[("AB", "C")]);
+        let b = spec_env("/bin/x", &[("A", "BC")]);
+        assert_ne!(spec_fingerprint(&a), spec_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_ignores_enablement_and_map_order() {
+        // `enabled` drives stop/launch, never a restart.
+        let mut disabled = spec_env("/bin/x", &[("A", "1")]);
+        disabled.enabled = false;
+        assert_eq!(
+            spec_fingerprint(&disabled),
+            spec_fingerprint(&spec_env("/bin/x", &[("A", "1")]))
+        );
+        // The env is a BTreeMap, so insertion order can't perturb the digest.
+        assert_eq!(
+            spec_fingerprint(&spec_env("/bin/x", &[("A", "1"), ("B", "2")])),
+            spec_fingerprint(&spec_env("/bin/x", &[("B", "2"), ("A", "1")]))
+        );
+    }
+
+    #[test]
+    fn description_round_trips_the_fingerprint() {
+        let s = spec_env("/bin/pet", &[("PET_NAME", "nisse")]);
+        let fp = spec_fingerprint(&s);
+        let desc = unit_description("pet", &fp);
+        assert_eq!(desc, format!("trollshell plugin: pet [cfg:{fp}]"));
+        assert_eq!(parse_fingerprint(&desc), Some(fp.as_str()));
+    }
+
+    #[test]
+    fn parse_fingerprint_rejects_foreign_descriptions() {
+        // A legacy static unit, or a transient unit from a pre-#695 shell.
+        assert_eq!(parse_fingerprint("trollshell plugin: pet"), None);
+        assert_eq!(parse_fingerprint("Kaomoji cat widget"), None);
+        assert_eq!(parse_fingerprint(""), None);
+        // Truncated / malformed stamps don't parse as a fingerprint either.
+        assert_eq!(parse_fingerprint("trollshell plugin: pet [cfg:abc"), None);
+    }
+
     // ── merge + running states ───────────────────────────────────────────────
 
     fn unit(id: &str, active: &str, enabled: bool) -> systemd::PluginUnit {
@@ -697,6 +1048,15 @@ mod tests {
             id: id.to_owned(),
             active_state: active.to_owned(),
             enabled,
+            description: String::new(),
+        }
+    }
+
+    /// A live unit as this launcher would have stamped it for `spec`.
+    fn unit_for(id: &str, active: &str, spec: &PluginSpec) -> systemd::PluginUnit {
+        systemd::PluginUnit {
+            description: unit_description(id, &spec_fingerprint(spec)),
+            ..unit(id, active, false)
         }
     }
 
@@ -733,5 +1093,169 @@ mod tests {
         assert!(!is_running("inactive"));
         assert!(!is_running("failed"));
         assert!(!is_running("deactivating"));
+    }
+
+    // ── reconcile diff (#695) ────────────────────────────────────────────────
+    //
+    // The whole convergence decision is `plan`, so every case below is the
+    // reconcile behaviour itself — no systemd, no D-Bus, no `systemd-run`.
+
+    /// `{id: spec}` from pairs, for the diff tests.
+    fn declared(entries: &[(&str, PluginSpec)]) -> BTreeMap<String, PluginSpec> {
+        entries
+            .iter()
+            .map(|(id, spec)| ((*id).to_owned(), spec.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_launches_enabled_plugins_that_are_not_running() {
+        let pet = spec_env("/bin/pet", &[("PET_NAME", "nisse")]);
+        let d = declared(&[("pet", pet)]);
+        // Nothing running at all (fresh session).
+        assert_eq!(plan(&d, &[]), vec![("pet".to_owned(), Action::Launch)]);
+        // A unit systemd still knows but that isn't live — inactive, failed,
+        // or on its way down — is launchable (`--collect` released the name).
+        for state in ["inactive", "failed", "deactivating"] {
+            assert_eq!(
+                plan(&d, &[unit("pet", state, false)]),
+                vec![("pet".to_owned(), Action::Launch)],
+                "state {state}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_leaves_a_unit_running_the_declared_spec_alone() {
+        let pet = spec_env("/bin/pet", &[("PET_NAME", "nisse")]);
+        let units = vec![unit_for("pet", "active", &pet)];
+        assert!(plan(&declared(&[("pet", pet)]), &units).is_empty());
+    }
+
+    #[test]
+    fn plan_restarts_when_env_changed() {
+        // The reported #695 case: `env.PET_LLM_URL` added by a switch.
+        let running = spec_env("/bin/pet", &[("PET_NAME", "nisse")]);
+        let now = spec_env(
+            "/bin/pet",
+            &[
+                ("PET_NAME", "nisse"),
+                ("PET_LLM_URL", "http://127.0.0.1:8787"),
+            ],
+        );
+        let units = vec![unit_for("pet", "active", &running)];
+        assert_eq!(
+            plan(&declared(&[("pet", now)]), &units),
+            vec![("pet".to_owned(), Action::Restart)]
+        );
+    }
+
+    #[test]
+    fn plan_restarts_when_the_package_was_rebuilt() {
+        // The worse #695 half: `nix flake update` rewrites every store path.
+        let running = spec_env("/nix/store/old/bin/pet", &[("PET_NAME", "nisse")]);
+        let now = spec_env("/nix/store/new/bin/pet", &[("PET_NAME", "nisse")]);
+        let units = vec![unit_for("pet", "active", &running)];
+        assert_eq!(
+            plan(&declared(&[("pet", now)]), &units),
+            vec![("pet".to_owned(), Action::Restart)]
+        );
+    }
+
+    #[test]
+    fn plan_restarts_a_unit_launched_before_the_fingerprint_existed() {
+        // A pre-#695 shell's transient unit (or a legacy *static* unit for a
+        // declared id): no fingerprint to compare, so converge rather than
+        // guess — a one-time recycle on upgrade.
+        let pet = spec("/bin/pet", true);
+        let units = vec![unit("pet", "active", false)];
+        assert_eq!(
+            plan(&declared(&[("pet", pet)]), &units),
+            vec![("pet".to_owned(), Action::Restart)]
+        );
+    }
+
+    #[test]
+    fn plan_stops_a_plugin_declared_disabled() {
+        let mut pet = spec_env("/bin/pet", &[("PET_NAME", "nisse")]);
+        pet.enabled = false;
+        let units = vec![unit_for("pet", "active", &pet)];
+        assert_eq!(
+            plan(&declared(&[("pet", pet)]), &units),
+            vec![("pet".to_owned(), Action::Stop)]
+        );
+    }
+
+    #[test]
+    fn plan_leaves_a_disabled_stopped_plugin_alone() {
+        let mut pet = spec("/bin/pet", true);
+        pet.enabled = false;
+        assert!(plan(&declared(&[("pet", pet)]), &[]).is_empty());
+    }
+
+    #[test]
+    fn plan_stops_a_launcher_stamped_unit_that_is_no_longer_declared() {
+        // `plugins.pet` removed from the config entirely: the unit carries our
+        // stamp, so the launcher owns it and shuts it down.
+        let gone = spec("/bin/pet", true);
+        let units = vec![unit_for("pet", "active", &gone)];
+        assert_eq!(
+            plan(&BTreeMap::new(), &units),
+            vec![("pet".to_owned(), Action::Stop)]
+        );
+    }
+
+    #[test]
+    fn plan_never_touches_units_it_did_not_launch() {
+        // Legacy static units (#419's manual path) carry no fingerprint and are
+        // not declared — reconcile must not stop them, whatever their state.
+        let units = vec![
+            unit("timer", "active", true),
+            systemd::PluginUnit {
+                description: "Hand-written plugin unit".to_owned(),
+                ..unit("terminal", "active", true)
+            },
+        ];
+        assert!(plan(&BTreeMap::new(), &units).is_empty());
+    }
+
+    #[test]
+    fn plan_orders_stops_before_restarts_before_launches() {
+        let stale = spec_env("/bin/stale", &[("V", "old")]);
+        let fresh = spec_env("/bin/stale", &[("V", "new")]);
+        let mut off = spec("/bin/off", true);
+        off.enabled = false;
+        let d = declared(&[
+            ("stale", fresh),
+            ("off", off.clone()),
+            ("new", spec("/bin/new", true)),
+        ]);
+        let units = vec![
+            unit_for("stale", "active", &stale),
+            unit_for("off", "active", &off),
+            // An orphan (declared entry removed) stops too.
+            unit_for("gone", "active", &spec("/bin/gone", true)),
+        ];
+        assert_eq!(
+            plan(&d, &units),
+            vec![
+                ("gone".to_owned(), Action::Stop),
+                ("off".to_owned(), Action::Stop),
+                ("stale".to_owned(), Action::Restart),
+                ("new".to_owned(), Action::Launch),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_treats_a_stopped_orphan_as_nothing_to_do() {
+        // Only *running* units are candidates; an inactive leftover is already
+        // where reconcile wants it.
+        let gone = spec("/bin/gone", true);
+        let units = vec![systemd::PluginUnit {
+            description: unit_description("gone", &spec_fingerprint(&gone)),
+            ..unit("gone", "inactive", false)
+        }];
+        assert!(plan(&BTreeMap::new(), &units).is_empty());
     }
 }

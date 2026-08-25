@@ -86,6 +86,18 @@ unit per plugin binary on the same pattern.
 > units below keep working as the manual path — the socket doesn't care who
 > spawned the plugin.
 >
+> Since #695 that launch step is a **reconcile**, not a one-shot spawn: at
+> startup (and whenever something calls `Control.ReloadPlugins`) the shell
+> diffs the live units against the state file and starts / stops / restarts to
+> match. It tells them apart by a spec fingerprint stamped into each unit's
+> `Description=`, so `systemctl --user show -p Description
+trollshell-plugin-<id>` shows which config a running plugin was launched
+> from. Units it didn't stamp — the static ones below — are never touched. The
+> **home-manager** module calls `ReloadPlugins` from its activation script, so
+> a `home-manager switch` applies live; the **NixOS** module can't (root
+> activation has no user session bus), so there a changed `env`/`package` lands
+> on the next `systemctl --user restart trollshell` or login.
+>
 > Since #558 each bundled plugin also ships as its own flake package
 > (`hytte-plugin-<id>`), so the declarative path needs no out-of-tree
 > derivation — point `package` straight at it:

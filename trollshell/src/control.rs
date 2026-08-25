@@ -17,7 +17,10 @@
 //! manage the `trollshell-plugin-<id>` **user** units through the declarative
 //! launcher ([`crate::plugin_launcher`], #419): declared plugins run as
 //! *transient* units the host launches via `systemd-run --user`, with a
-//! `StartUnit`/unit-file fallback for legacy static units. The **AI Keys** tab
+//! `StartUnit`/unit-file fallback for legacy static units. `ReloadPlugins`
+//! (#695) is the same launcher's convergence entry point, called from the
+//! home-manager module's activation script so a switch applies to the running
+//! session — no tab of its own, it is machine-facing. The **AI Keys** tab
 //! (#392) adds `ListAiKeys` / `SetAiKey` / `ClearAiKey`, which store the
 //! LLM-backed plugins' API keys in the login keyring ([`crate::secrets`]) and
 //! relaunch the plugins that use them so a rotated key takes effect. Each
@@ -229,6 +232,27 @@ impl ControlIface {
         if let Err(err) = plugin_launcher::set_enabled(&id, enabled).await {
             tracing::warn!(%err, plugin = %id, enabled, "SetPluginEnabled failed");
         }
+    }
+
+    /// Re-read `plugins.json` and converge the running plugins onto it (#695):
+    /// launch newly enabled/added plugins, stop newly disabled/removed ones, and
+    /// restart any whose declared spec changed (`env`, `package`, `secrets`).
+    ///
+    /// This is the hook the home-manager module's activation script pokes after
+    /// rewriting the state file, so a `home-manager switch` actually applies to
+    /// the *running* session — the transient `trollshell-plugin-<id>` units are
+    /// created by the shell at runtime, so activation has no unit file of its own
+    /// to diff or restart. Idempotent, argument-free, and safe to call when
+    /// nothing changed (it then does nothing at all).
+    ///
+    /// Fire-and-forget: the reconcile is spawned onto the shell's runtime and
+    /// this returns immediately, so a caller (`busctl` from an activation script)
+    /// never blocks on a plugin's stop→relaunch wait. Failures are logged
+    /// shell-side; re-query [`list_plugins`](Self::list_plugins) to observe the
+    /// result.
+    async fn reload_plugins(&self) {
+        tracing::info!("ReloadPlugins: reconciling plugins against plugins.json");
+        hytte::reactive::runtime::handle().spawn(plugin_launcher::reconcile());
     }
 
     /// Live per-plugin **runtime** state from the host's in-process plugin

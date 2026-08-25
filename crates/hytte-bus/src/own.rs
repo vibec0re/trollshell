@@ -3,6 +3,7 @@
 //! See spec section 3.1.
 
 use crate::BusError;
+use crate::backoff::{FailureStreak, RetryStep};
 use crate::connection::SharedConnection;
 use futures_signals::signal::Mutable;
 use futures_util::{FutureExt, Stream, StreamExt};
@@ -35,22 +36,6 @@ pub const UNKNOWN_HOLDER: &str = "<unknown>";
 /// How long to wait before re-requesting a name we just lost (or failed to
 /// take) while still below the `permanent_after` threshold.
 const RETRY_AFTER_LOSS: Duration = Duration::from_millis(250);
-
-/// First delay of the acquisition-error ramp (see [`acquire_backoff`]).
-const ACQUIRE_BACKOFF_BASE: Duration = Duration::from_millis(250);
-
-/// Ceiling of that ramp. Deliberately seconds, not minutes: this path has no
-/// event to wake on — a broken bus emits no `NameOwnerChanged` — so the cap is
-/// also the worst-case time to notice the bus came back. Thirty seconds is
-/// three orders of magnitude cheaper than the flat 250 ms it replaces while
-/// still recovering well inside a human's attention span.
-const ACQUIRE_BACKOFF_CAP: Duration = Duration::from_secs(30);
-
-/// A failure streak shorter than this is still consistent with "the bus
-/// blipped", which `connection.rs` already warns about; from here on it is
-/// consistent only with "this is not working", which nothing else reports.
-/// At the [`acquire_backoff`] ramp this is ~4 s of consecutive failures.
-const STREAK_IS_NO_LONGER_A_BLIP: u32 = 5;
 
 /// Lifecycle of an owned name as observed from outside.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,116 +253,15 @@ pub fn own_name_with(shared: &SharedConnection, name: impl Into<String>) -> OwnN
     }
 }
 
-/// Delay before the `attempt`-th consecutive *acquisition error* retry
-/// (1-based): the connection or subscription could not be built, the
-/// `DBusProxy` could not be constructed, or `RequestName` itself errored.
-///
-/// 250 ms doubling, capped at [`ACQUIRE_BACKOFF_CAP`]: 250 ms, 500 ms, 1 s,
-/// 2 s, 4 s, 8 s, 16 s, then 30 s for as long as it keeps failing.
-///
-/// The two constants deliberately match `connection.rs`'s private `Backoff`
-/// (250 ms → 30 s), which supervises reconnects one layer down: two retry
-/// ladders stacked on the same connection should not disagree about how long a
-/// bus outage is worth waiting out. They are *not* shared code — that one is
-/// indexed by duration and has no attempt counter, so it cannot drive
-/// [`logs_at`] — and unifying them is a job for the shared-backoff-helper
-/// cleanup in #646 rather than for this fix.
-///
-/// This is deliberately **not** the contention path. Losing a race for a name
-/// somebody else holds is bounded by `permanent_after` and then by an
-/// event-driven wait on `NameOwnerChanged` (see
-/// [`wait_for_release_or_cooldown`]); it needs no timer ramp because the broker
-/// tells us when the situation changes. An *error* has no such event — a bus
-/// that is down publishes nothing — so it is the one place left in this file
-/// where the retry rate is set by us alone, and before this it was a flat
-/// 250 ms forever, which is the 4 Hz spin of #653 surviving in the arm nobody
-/// looked at.
-fn acquire_backoff(attempt: u32) -> Duration {
-    // `min(16)` keeps the shift in range; 250 ms << 16 is ~4.5 h, already far
-    // past the cap, so clamping there cannot change the answer.
-    let doublings = attempt.saturating_sub(1).min(16);
-    ACQUIRE_BACKOFF_BASE
-        .saturating_mul(1u32 << doublings)
-        .min(ACQUIRE_BACKOFF_CAP)
-}
-
-/// Whether the `attempt`-th consecutive failure earns a log line (1-based).
-///
-/// True at every doubling — 1, 2, 4, 8, 16, … — and nowhere else. Pairing a
-/// geometric log cadence with the geometric delay of [`acquire_backoff`] is
-/// what gives the *logging* a ceiling as well as the retry: a bus that is down
-/// for a day costs ~11 lines rather than one per attempt. Without this the
-/// non-transient arm emitted a `warn!` on every retry forever, which is the
-/// uncapped-retry-logging #646 objects to, and the transient arm emitted
-/// nothing at all, which is the silence #653 objects to.
-fn logs_at(attempt: u32) -> bool {
-    attempt.is_power_of_two()
-}
-
-/// How to react to one failure in a streak: how long to wait, and whether to
-/// say anything about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RetryStep {
-    /// 1-based position in the current streak.
-    attempt: u32,
-    /// How long to wait before the next attempt.
-    delay: Duration,
-    /// Whether this failure earns a log line (see [`logs_at`]).
-    log: bool,
-}
-
-impl RetryStep {
-    /// Whether a streak this long has stopped being explicable as a bus blip.
-    ///
-    /// Below the line it gets `debug!` — `connection.rs` already warns about
-    /// the disconnect itself and a single failure here is only its echo. At or
-    /// above it, the bus is not answering at all: unlike the contended name
-    /// [`log_give_up`] reports, no configuration change fixes this and this
-    /// primitive cannot work around it, so it earns `error!` on its own
-    /// merits rather than by borrowing the give-up's level. That borrowing is
-    /// what #765 undid: three lines in this file were at `error!` only to
-    /// clear the shell's then-`ERROR`-only default filter, which #766 fixed at
-    /// the source. This is one of the two `error!` sites left, and the only one
-    /// on a path that retries.
-    fn is_serious(self) -> bool {
-        self.attempt >= STREAK_IS_NO_LONGER_A_BLIP
-    }
-}
-
-/// A run of consecutive failures on the **acquisition** path.
-///
-/// Lives in `run_ownership` and therefore spans reconnects: a bus that refuses
-/// to connect must not reset its own ramp just because the outer loop went
-/// round again. It is cleared the moment `RequestName` produces a *reply* of
-/// any kind — including "somebody else has it", which proves the broker is
-/// answering and hands the situation over to the contention accounting. That
-/// reset is what keeps the ramp from turning a busy-loop into a stall: a blip
-/// costs at most one extra 250 ms, never the 30 s cap.
-#[derive(Debug, Default)]
-struct FailureStreak {
-    attempts: u32,
-}
-
-impl FailureStreak {
-    /// Record one failure and say how to back off from it.
-    fn record(&mut self) -> RetryStep {
-        self.attempts = self.attempts.saturating_add(1);
-        RetryStep {
-            attempt: self.attempts,
-            delay: acquire_backoff(self.attempts),
-            log: logs_at(self.attempts),
-        }
-    }
-
-    /// Forget the streak — something worked.
-    fn reset(&mut self) {
-        self.attempts = 0;
-    }
-}
-
 /// Emit the log line for one acquisition failure, at the level its streak has
-/// earned (see [`RetryStep::is_serious`]). Shared by all four error arms so they
-/// cannot drift on level, cadence, or wording.
+/// earned (see [`RetryStep::is_serious`]) and only on the attempts its cadence
+/// selects (see [`logs_at`](crate::backoff::logs_at)). Shared by all four error
+/// arms so they cannot drift on level, cadence, or wording.
+///
+/// The `error!` arm is one of the two `error!` sites left in this file after
+/// #765, and the only one on a path that retries: unlike the contended name
+/// [`log_give_up`] reports, no configuration change fixes a bus that is not
+/// answering and this primitive cannot work around it.
 fn log_acquire_failure(name: &str, stage: &str, error: &dyn std::fmt::Display, backoff: RetryStep) {
     if !backoff.log {
         return;
@@ -852,9 +736,9 @@ fn ownership_after(msg: &zbus::Message, name: &str) -> Option<Ownership> {
 /// lines per flap ([`log_release_wake`] on the observed release, then
 /// [`log_recovered`] or [`log_give_up`] on the outcome, plus [`log_give_up`]
 /// again when it takes the name back), and nothing in this file bounds the flap
-/// rate. Note that [`logs_at`]'s geometric cadence does **not** cover this: that
-/// ramp belongs to the acquisition-*error* streak, which a contended name resets
-/// on every `RequestName` reply.
+/// rate. Note that [`logs_at`](crate::backoff::logs_at)'s geometric cadence does
+/// **not** cover this: that ramp belongs to the acquisition-*error* streak,
+/// which a contended name resets on every `RequestName` reply.
 ///
 /// The trade is still worth it, and the new bound is a real one — a *static*
 /// squatter, which is every case this primitive was written for, still costs
@@ -1298,8 +1182,8 @@ where
 /// interval — a later policy install is then picked up without a restart. The
 /// long interval keeps this from becoming the warn-storm / FD-storm a tight
 /// retry would cause, so `AccessDenied` keeps `cooldown` as its delay rather
-/// than joining the [`acquire_backoff`] ramp, which would *shorten* it from 5
-/// minutes to 30 seconds.
+/// than joining the [`backoff`](crate::backoff) ramp, which would *shorten* it
+/// from 5 minutes to 30 seconds.
 ///
 /// Its **level** stays `info!` for the same reason: `enableRecommendedServices
 /// = false` is a supported configuration under which the bluez and iwd agent
@@ -1523,10 +1407,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ACQUIRE_BACKOFF_BASE, ACQUIRE_BACKOFF_CAP, Contention, FailureStreak, NextAttempt,
-        OwnState, Ownership, Wake, acquire_backoff, attributed_holder, closes_a_give_up, logs_at,
-        next_attempt_after, on_request_name_error, ownership_after, record_loss, sleep_draining,
-        wait_for_release_or_cooldown,
+        Contention, FailureStreak, NextAttempt, OwnState, Ownership, Wake, attributed_holder,
+        closes_a_give_up, next_attempt_after, on_request_name_error, ownership_after, record_loss,
+        sleep_draining, wait_for_release_or_cooldown,
     };
     use futures_signals::signal::{Mutable, SignalExt as _};
     use futures_util::StreamExt as _;
@@ -2072,143 +1955,6 @@ mod tests {
         assert!(
             stream.next().await.is_none(),
             "the Denied wait must consume what arrives, not leave it filling the broadcast queue"
-        );
-    }
-
-    // ── #653: the acquisition-error ramp ────────────────────────────────────
-
-    /// The backoff progression, pinned exactly. 250 ms doubling to a 30 s
-    /// ceiling: the flat `Duration::from_millis(250)` this replaces would fail
-    /// every assertion from the second onwards.
-    #[test]
-    fn acquire_backoff_doubles_then_caps() {
-        let expected_ms = [250u64, 500, 1_000, 2_000, 4_000, 8_000, 16_000];
-        for (i, ms) in expected_ms.iter().enumerate() {
-            let attempt = u32::try_from(i).expect("index fits u32") + 1;
-            assert_eq!(
-                acquire_backoff(attempt),
-                Duration::from_millis(*ms),
-                "attempt {attempt} must double the previous delay"
-            );
-        }
-        // Attempt 8 would be 32 s, past the ceiling, and everything after it
-        // pins there rather than growing without bound.
-        for attempt in [8u32, 9, 100, 10_000, u32::MAX] {
-            assert_eq!(
-                acquire_backoff(attempt),
-                ACQUIRE_BACKOFF_CAP,
-                "attempt {attempt} must be clamped to the ceiling"
-            );
-        }
-    }
-
-    /// The ceiling is seconds, not minutes: this path has no `NameOwnerChanged`
-    /// to wake it, so the cap is also the worst case for noticing the bus came
-    /// back. A regression that "fixed" the busy-loop by reaching for the
-    /// 5-minute give-up cooldown would trade #653's spin for the stall the
-    /// issue explicitly does not want.
-    #[test]
-    fn the_ceiling_recovers_within_seconds_not_minutes() {
-        assert!(
-            ACQUIRE_BACKOFF_CAP <= Duration::from_mins(1),
-            "a name that becomes acquirable must be retried within a minute"
-        );
-        assert!(
-            ACQUIRE_BACKOFF_BASE < ACQUIRE_BACKOFF_CAP,
-            "the ramp must actually ramp"
-        );
-    }
-
-    /// The log cadence is geometric, so the *logging* has a ceiling too — not
-    /// just the retry. Before #653 the non-transient arm logged on every
-    /// attempt forever and the transient arm logged nothing at all.
-    #[test]
-    fn logs_only_at_each_doubling() {
-        let logged: Vec<u32> = (1..=1024u32).filter(|a| logs_at(*a)).collect();
-        assert_eq!(logged, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]);
-    }
-
-    /// The whole point of the ramp, stated as the budget it buys: an hour of
-    /// unbroken failure must cost a bounded number of `RequestName` attempts
-    /// and a handful of log lines.
-    ///
-    /// The flat 250 ms retry it replaces would spend 14 400 attempts in the
-    /// same hour, so this fails loudly if `acquire_backoff` is flattened back.
-    #[test]
-    fn an_hour_of_failure_is_bounded_in_attempts_and_lines() {
-        let mut streak = FailureStreak::default();
-        let mut elapsed = Duration::ZERO;
-        let mut attempts = 0u32;
-        let mut lines = 0u32;
-        while elapsed < Duration::from_hours(1) {
-            let backoff = streak.record();
-            attempts += 1;
-            if backoff.log {
-                lines += 1;
-            }
-            elapsed += backoff.delay;
-        }
-        assert!(
-            attempts <= 130,
-            "an hour of failure must not cost more than ~2 attempts a minute, got {attempts}"
-        );
-        assert!(
-            lines <= 8,
-            "an hour of failure must not cost more than a handful of log lines, got {lines}"
-        );
-        // And it must not have gone so quiet that it is no longer retrying.
-        assert!(
-            attempts >= 100,
-            "the 30 s cap implies ~120 attempts an hour"
-        );
-    }
-
-    /// The other half of the trade: anything that works clears the streak, so
-    /// a blip costs one 250 ms wait and never leaves a 30 s delay armed for the
-    /// *next* unrelated failure.
-    #[test]
-    fn a_success_resets_the_ramp_to_the_base_delay() {
-        let mut streak = FailureStreak::default();
-        for _ in 0..12 {
-            let _ = streak.record();
-        }
-        assert_eq!(
-            streak.record().delay,
-            ACQUIRE_BACKOFF_CAP,
-            "a long streak must be at the ceiling before the reset means anything"
-        );
-
-        streak.reset();
-
-        let after = streak.record();
-        assert_eq!(after.attempt, 1);
-        assert_eq!(
-            after.delay, ACQUIRE_BACKOFF_BASE,
-            "a success must put the next failure back at the base delay"
-        );
-        assert!(
-            after.log,
-            "the first failure of a fresh streak is always worth a line"
-        );
-    }
-
-    /// The first few failures stay at `debug!` (a reconnect blip is already
-    /// reported by `connection.rs`); a streak that outlives that explanation
-    /// escalates to `warn!` and stays there.
-    #[test]
-    fn a_streak_escalates_from_blip_to_serious() {
-        let mut streak = FailureStreak::default();
-        let mut first_serious = None;
-        for _ in 0..64 {
-            let backoff = streak.record();
-            if backoff.is_serious() && first_serious.is_none() {
-                first_serious = Some(backoff.attempt);
-            }
-        }
-        let first = first_serious.expect("a 64-failure streak must become serious");
-        assert!(
-            (2..=8).contains(&first),
-            "escalation must happen within seconds, not attempts later; got {first}"
         );
     }
 

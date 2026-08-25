@@ -203,12 +203,17 @@ fn parse_state(json: &str) -> Result<PluginState, serde_json::Error> {
     serde_json::from_str::<PluginState>(json)
 }
 
-/// Whether `target` is usable as the `PartOf=` value on a launched plugin unit,
-/// i.e. whether it is a syntactically valid systemd unit name. The state file is
-/// nix-written so this should never trip; it exists because the value lands
-/// verbatim in a `systemd-run --property=PartOf=…` argument, and a hand-edited
-/// file must degrade to the default rather than to a unit that won't start.
-/// Pure. (Charset per systemd: ASCII alphanumerics plus `:-_.\@`.)
+/// Whether `target` can be used as the `PartOf=` value on a launched plugin
+/// unit: non-empty, within systemd's unit-name length bound, and drawn from
+/// systemd's unit-name charset (ASCII alphanumerics plus `:-_.\@`). A **charset**
+/// guard, not a full unit-name validation — it doesn't insist on a `.target`
+/// suffix, because that would silently swap in the default for a deliberate
+/// `PartOf=` on some other unit type, which systemd itself permits.
+///
+/// The state file is nix-written, so this should never trip; it exists because
+/// the value lands verbatim in a `systemd-run --property=PartOf=…` argument, and
+/// a hand-edited file must degrade to the default rather than to an argument
+/// systemd can't parse. Pure.
 fn is_valid_target(target: &str) -> bool {
     !target.is_empty()
         && target.len() <= 255

@@ -1160,3 +1160,317 @@ mod tests {
         );
     }
 }
+
+// ── Reentrancy regression tests ───────────────────────────────────────────────
+
+/// The `RefCell`-across-a-GTK-call abort class (#674) for this file.
+///
+/// ## Why there is no production change alongside these tests
+///
+/// `rebuild_upcoming_list` is already a private free function taking both
+/// cells, the event slice, and the three date/clock inputs as explicit
+/// parameters — no seam needed to reach it from a colocated test, by module
+/// privacy alone. Nothing was extracted, reordered, or reshaped to make this
+/// module compile; see `rebuild_upcoming_list`'s own comments above for why
+/// both cells are `take()`n rather than `borrow_mut()`-ed (#643).
+///
+/// Unlike `workspaces.rs`'s `update_workspaces`, `rebuild_upcoming_list`
+/// never diffs by identity — every call unconditionally tears down whatever
+/// the last call left in both cells and rebuilds fresh from `evs`. That means
+/// a test doesn't need to change the event set between calls to force a
+/// removal; calling twice with the *same* events still exercises the full
+/// take/remove/rebuild path each time (same shape as `tasks.rs`'s
+/// `rebuild_list`).
+///
+/// ## Why the probe is `destroy`, not `unmap`
+///
+/// `overlays/notifications.rs` (#817) found that a removed widget's `destroy`
+/// can be silently deferred when the widget is still referenced by something
+/// outside the cell under test — with its toast window actually mapped, a
+/// focusable dismiss button kept a card alive past `vbox.remove()`, so
+/// `destroy` never fired *inside* the call and the probe had to switch to
+/// `unmap`.
+///
+/// That trap doesn't apply here: `group` in these tests is a bare
+/// `adw::PreferencesGroup`, never added to any shown window (production only
+/// ever calls `rebuild_upcoming_list` on a group `build_block` has already
+/// mounted; these tests don't need it mounted at all). With no `GtkRoot`
+/// there is no focus-widget chain to retain a removed header, event row, or
+/// placeholder past `group.remove()` — `destroy` fires off pure refcounting,
+/// the same signal `tasks.rs`'s and `workspaces.rs`'s regression tests rest
+/// on. Each test below asserts this rather than assuming it: the anti-vacuity
+/// check on `fired_inside` is what would catch it if it were ever untrue.
+///
+/// ## A hazard investigated and NOT covered: the `on_day_clicked` hit-lookup
+///
+/// `on_day_clicked`'s own `#643` comment (immediately above its
+/// `rows_track.borrow()` call) flags a second hazard: a *shared* borrow held
+/// across `flash_row_highlight`, the same class from the read side. It was
+/// investigated for a test here and dropped — not because it's safe by
+/// construction, but because it cannot be independently falsified with the
+/// current call shape:
+///
+/// `flash_row_highlight`'s only synchronous side effect is
+/// `row.add_css_class(…)` on the "hit" row, which measurably *does* emit
+/// `notify::css-classes` synchronously (GTK4's `gtk_widget_add_css_class`
+/// calls `g_object_notify` on the `css-classes` property before returning).
+/// That would be a usable probe *if* the "hit" row were a widget a test
+/// could attach a handler to beforehand. It isn't: `rebuild_upcoming_list`
+/// never reuses row identity (see above), so the row `flash_row_highlight`
+/// touches is always freshly built by the *same* `on_day_clicked` call,
+/// inside `refresh_upcoming_list`, which runs before the hit-lookup. There is
+/// no point at which an external test can get a handle on that exact widget
+/// and attach a probe to it before `flash_row_highlight` fires — by the time
+/// the widget exists, the call that will flash it has already started.
+/// Reaching this site would need `on_day_clicked` restructured so the
+/// hit-lookup and the flash step are independently callable — a production
+/// change this task deliberately doesn't ask for. Recorded here rather than
+/// silently dropped.
+///
+/// Needs a real display server (`adw::PreferencesGroup`/`adw::ActionRow` have
+/// to be constructible and actually run GTK's dispose machinery), hence the
+/// `system-tests` gate, like the rest of this bug class.
+#[cfg(all(test, feature = "system-tests"))]
+mod reentrancy_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::calendar::CalendarEvent;
+
+    use super::rebuild_upcoming_list;
+
+    type RowsTrack = Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>>;
+    type PlaceholderTrack = Rc<RefCell<Option<adw::ActionRow>>>;
+
+    /// A local-time `DateTime<Local>` for a test's `now`/event boundaries.
+    /// Kept separate from `mod tests::ldt` above: that module isn't gated on
+    /// `system-tests`, this one is, and there's no third module either could
+    /// `use super::` from without pulling the gate along.
+    fn ldt(date: NaiveDate, hour: u32, min: u32, sec: u32) -> DateTime<Local> {
+        Local
+            .from_local_datetime(
+                &date
+                    .and_hms_opt(hour, min, sec)
+                    .expect("valid wall-clock time"),
+            )
+            .single()
+            .expect("unambiguous local time")
+    }
+
+    /// A one-hour event starting 09:00 on `day` — the same shape as `mod
+    /// tests::make_event`, duplicated locally for the reason above.
+    fn evt(uid: &str, day: NaiveDate) -> CalendarEvent {
+        let start = ldt(day, 9, 0, 0);
+        CalendarEvent {
+            uid: uid.to_owned(),
+            summary: uid.to_owned(),
+            start,
+            end: start + Duration::hours(1),
+            location: None,
+            all_day: false,
+            calendar_name: "cal".to_owned(),
+        }
+    }
+
+    /// The two cells `rebuild_upcoming_list` takes, exactly as `build_block`
+    /// builds them, plus a fresh group. No `Monitor`/`App` needed:
+    /// `rebuild_upcoming_list` never touches either.
+    fn fresh() -> (adw::PreferencesGroup, RowsTrack, PlaceholderTrack) {
+        (
+            adw::PreferencesGroup::new(),
+            Rc::new(RefCell::new(Vec::new())),
+            Rc::new(RefCell::new(None)),
+        )
+    }
+
+    /// Cell 1, the rows list: `group.remove(&row)` drops the group's
+    /// reference, and the loop-owned `row` binding drops its own at the end
+    /// of that iteration — the last strong ref, so `GtkWidget::destroy` fires
+    /// **synchronously** from dispose (see the module doc for why no focus
+    /// chain defers it here).
+    ///
+    /// The handler re-enters `rebuild_upcoming_list` on the same two cells.
+    /// Against the pre-#643 `let mut rows = rows_track.borrow_mut();`
+    /// (closing write-back dropped) the inner call hits a live `RefMut` and
+    /// aborts the binary with `BorrowMutError` rather than failing one test —
+    /// #663's SIGABRT, the failure mode #674 exists for. With `take()` the
+    /// cell is free for the whole call, so the inner call simply finds an
+    /// empty `Vec`.
+    #[gtk::test]
+    fn rebuild_upcoming_list_tolerates_a_reentrant_rebuild_from_a_removed_row_destroy() {
+        adw::init().expect("libadwaita init");
+        let (group, rows_track, placeholder_track) = fresh();
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).expect("valid date");
+        let now = ldt(today, 8, 0, 0);
+        let evs = vec![evt("e1", today)];
+
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &evs,
+            today,
+            today,
+            now,
+        );
+        assert_eq!(
+            rows_track.borrow().len(),
+            2,
+            "a day header + one event row must be rendered after the seeding call"
+        );
+
+        // True only while the outer `rebuild_upcoming_list` is on the stack,
+        // so the handler can record whether it ran inside the call or was
+        // deferred.
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        // Arm the event row's (index 1: index 0 is the day header) destroy
+        // to re-enter rebuild_upcoming_list.
+        let row = rows_track.borrow()[1].1.clone();
+        {
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let evs = evs.clone();
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            row.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_upcoming_list(
+                    &group,
+                    &rows_track,
+                    &placeholder_track,
+                    &evs,
+                    today,
+                    today,
+                    now,
+                );
+            });
+        }
+        // Drop our clone before the removing pass: while it lives the row
+        // has a second strong ref, `group.remove()` won't dispose it, and
+        // `destroy` never fires — the test would pass vacuously.
+        drop(row);
+
+        in_outer.set(true);
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &evs,
+            today,
+            today,
+            now,
+        );
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the removed row's `destroy` must fire synchronously inside `rebuild_upcoming_list`; if \
+             GTK ever defers it, or the row outlives the removal loop, this test proves nothing \
+             about the borrow discipline"
+        );
+        assert_eq!(
+            rows_track.borrow().len(),
+            2,
+            "the outer call's write-back must still land: re-entry may not leave the cell holding \
+             the inner call's rows or an empty Vec"
+        );
+    }
+
+    /// Cell 2, the placeholder: an empty event slice renders "No upcoming
+    /// events", torn down and rebuilt on every call that stays empty — there
+    /// is no reuse arm here either. Falsifiable independently of the row-list
+    /// test above: reverting only `placeholder_track`'s `take()` to a held
+    /// `borrow_mut()` makes the abort name `placeholder_track` and no other
+    /// cell.
+    #[gtk::test]
+    fn rebuild_upcoming_list_tolerates_a_reentrant_rebuild_from_a_removed_placeholder_destroy() {
+        adw::init().expect("libadwaita init");
+        let (group, rows_track, placeholder_track) = fresh();
+        let today = NaiveDate::from_ymd_opt(2026, 6, 17).expect("valid date");
+        let now = ldt(today, 8, 0, 0);
+
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &[],
+            today,
+            today,
+            now,
+        );
+        assert!(
+            placeholder_track.borrow().is_some(),
+            "an empty event list must render the placeholder after the seeding call"
+        );
+
+        let in_outer = Rc::new(Cell::new(false));
+        let fired_inside = Rc::new(Cell::new(None::<bool>));
+
+        let placeholder = placeholder_track
+            .borrow()
+            .clone()
+            .expect("just asserted Some above");
+        {
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let in_outer = Rc::clone(&in_outer);
+            let fired_inside = Rc::clone(&fired_inside);
+            let armed = Cell::new(true);
+            placeholder.connect_destroy(move |_| {
+                if !armed.replace(false) {
+                    return;
+                }
+                fired_inside.set(Some(in_outer.get()));
+                rebuild_upcoming_list(
+                    &group,
+                    &rows_track,
+                    &placeholder_track,
+                    &[],
+                    today,
+                    today,
+                    now,
+                );
+            });
+        }
+        // Same reasoning as the row test: a second strong ref would keep it
+        // alive past `group.remove()`.
+        drop(placeholder);
+
+        in_outer.set(true);
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &[],
+            today,
+            today,
+            now,
+        );
+        in_outer.set(false);
+
+        assert_eq!(
+            fired_inside.get(),
+            Some(true),
+            "the retired placeholder's `destroy` must fire synchronously inside \
+             `rebuild_upcoming_list`; if it does not, this test proves nothing about the borrow \
+             discipline"
+        );
+        assert!(
+            placeholder_track.borrow().is_some(),
+            "the outer call's write-back must still land: re-entry may not leave the cell empty or \
+             holding the inner call's placeholder"
+        );
+    }
+}

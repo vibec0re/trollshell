@@ -451,6 +451,7 @@ mod tests {
         UpowerShared, Urgency, WarningLevel, is_critical, on_battery_snapshot, warning_toast,
     };
     use futures_signals::signal::Mutable;
+    use hytte_reactive::test_lock::TEST_LOCK;
     use hytte_reactive::{registry, shared};
 
     /// Everything about the battery-aware cadence snapshot (#505), in **one**
@@ -458,8 +459,20 @@ mod tests {
     /// two `#[test]` fns mutating it would run concurrently on libtest's
     /// thread pool and flake against each other. One test = one thread = a
     /// deterministic sequence.
+    ///
+    /// That only protects this test from *itself*, though — the map is
+    /// process-global, not module-global, so any other crate's tests that
+    /// clear it (e.g. `places::tests` in this same crate, via
+    /// `with_seeded_config`) race this one too unless they take the same
+    /// lock. Hence `TEST_LOCK` (#777): this test used to take no lock at
+    /// all, which is exactly the gap that let it interleave with
+    /// `places::tests`' own (previously private, now retired) lock and
+    /// produce `places.rs`'s `NotRunning` flake in CI.
     #[test]
     fn on_battery_snapshot_contract() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         registry::reset_for_tests();
 
         // ── Degenerate: upower never registered ──────────────────────────

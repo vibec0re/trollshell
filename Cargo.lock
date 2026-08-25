@@ -2868,6 +2868,7 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "hytte-bus",
+ "hytte-config",
  "hytte-reactive",
  "libadwaita",
  "tokio",

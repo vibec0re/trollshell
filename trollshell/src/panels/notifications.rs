@@ -69,7 +69,6 @@ pub fn panel_notifications() -> gtk::Widget {
     scrolled.set_child(Some(&groups_box));
     column.append(&scrolled);
 
-    let groups_for_signal = groups_box.clone();
     // Track the per-app ExpanderRows from the previous bind emission so we can
     // restore each row's `is_expanded()` state across the clear+rebuild —
     // otherwise an arriving notification collapses every open app row.
@@ -81,55 +80,59 @@ pub fn panel_notifications() -> gtk::Widget {
             (entries.clone(), muted.clone())
         }
     };
-    bind(combined, &groups_box, move |_, (entries, muted)| {
-        // Stash prior expand-state keyed by app_name before teardown.
-        let prior_expanded: HashMap<String, bool> = current_rows
-            .borrow()
-            .iter()
-            .map(|(name, row)| (name.clone(), row.is_expanded()))
-            .collect();
-        current_rows.borrow_mut().clear();
-        while let Some(child) = groups_for_signal.first_child() {
-            groups_for_signal.remove(&child);
-        }
-        if entries.is_empty() {
+    bind(
+        combined,
+        &groups_box,
+        move |groups_box, (entries, muted)| {
+            // Stash prior expand-state keyed by app_name before teardown.
+            let prior_expanded: HashMap<String, bool> = current_rows
+                .borrow()
+                .iter()
+                .map(|(name, row)| (name.clone(), row.is_expanded()))
+                .collect();
+            current_rows.borrow_mut().clear();
+            while let Some(child) = groups_box.first_child() {
+                groups_box.remove(&child);
+            }
+            if entries.is_empty() {
+                let group = adw::PreferencesGroup::new();
+                let empty = adw::ActionRow::builder().title("No notifications").build();
+                group.add(&empty);
+                groups_box.append(&group);
+                return;
+            }
+            // Group entries by app_name, preserving newest-first ordering by
+            // walking entries (already newest-first) and pushing into per-app
+            // Vec<&HistoryEntry> on first sighting.
+            let mut order: Vec<String> = Vec::new();
+            let mut buckets: HashMap<String, Vec<&notifications::HistoryEntry>> = HashMap::new();
+            for entry in &entries {
+                // freedesktop spec allows empty `app_name`; substitute "Unknown"
+                // so we don't render a blank ExpanderRow or persist "" to the
+                // muted-apps file when the user toggles its switch.
+                let key = if entry.app_name.trim().is_empty() {
+                    "Unknown".to_string()
+                } else {
+                    entry.app_name.clone()
+                };
+                if !buckets.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                buckets.entry(key).or_default().push(entry);
+            }
             let group = adw::PreferencesGroup::new();
-            let empty = adw::ActionRow::builder().title("No notifications").build();
-            group.add(&empty);
-            groups_for_signal.append(&group);
-            return;
-        }
-        // Group entries by app_name, preserving newest-first ordering by
-        // walking entries (already newest-first) and pushing into per-app
-        // Vec<&HistoryEntry> on first sighting.
-        let mut order: Vec<String> = Vec::new();
-        let mut buckets: HashMap<String, Vec<&notifications::HistoryEntry>> = HashMap::new();
-        for entry in &entries {
-            // freedesktop spec allows empty `app_name`; substitute "Unknown"
-            // so we don't render a blank ExpanderRow or persist "" to the
-            // muted-apps file when the user toggles its switch.
-            let key = if entry.app_name.trim().is_empty() {
-                "Unknown".to_string()
-            } else {
-                entry.app_name.clone()
-            };
-            if !buckets.contains_key(&key) {
-                order.push(key.clone());
+            for app in &order {
+                let bucket = buckets.get(app).expect("bucket present for tracked app");
+                let row = build_history_app_row(app, bucket, &muted);
+                if prior_expanded.get(app).copied().unwrap_or(false) {
+                    row.set_expanded(true);
+                }
+                group.add(&row);
+                current_rows.borrow_mut().insert(app.clone(), row);
             }
-            buckets.entry(key).or_default().push(entry);
-        }
-        let group = adw::PreferencesGroup::new();
-        for app in &order {
-            let bucket = buckets.get(app).expect("bucket present for tracked app");
-            let row = build_history_app_row(app, bucket, &muted);
-            if prior_expanded.get(app).copied().unwrap_or(false) {
-                row.set_expanded(true);
-            }
-            group.add(&row);
-            current_rows.borrow_mut().insert(app.clone(), row);
-        }
-        groups_for_signal.append(&group);
-    });
+            groups_box.append(&group);
+        },
+    );
 
     finish_page(&column)
 }

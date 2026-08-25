@@ -186,9 +186,8 @@ where
 {
     let list = boxed_list();
     let rows: Rc<RefCell<HashMap<String, EndpointRow>>> = Rc::new(RefCell::new(HashMap::new()));
-    let list_for_bind = list.clone();
     let rows_for_bind = rows.clone();
-    bind(signal, &list, move |_, items: Vec<T>| {
+    bind(signal, &list, move |list, items: Vec<T>| {
         let mut rows = rows_for_bind.borrow_mut();
         let new_keys: HashSet<&str> = items.iter().map(Endpoint::name).collect();
         let gone: Vec<String> = rows
@@ -198,7 +197,7 @@ where
             .collect();
         for k in gone {
             if let Some(r) = rows.remove(&k) {
-                list_for_bind.remove(&r.row);
+                list.remove(&r.row);
             }
         }
         for item in &items {
@@ -211,10 +210,79 @@ where
                     set_volume.clone(),
                     set_mute.clone(),
                 );
-                list_for_bind.append(&row.row);
+                list.append(&row.row);
                 rows.insert(item.name().to_string(), row);
             }
         }
     });
     list
+}
+
+/// #831 regression coverage for this file's widget-pinning `bind` call site,
+/// in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&gtk::ListBox` `bind` hands it rather than a strong
+/// clone captured from the enclosing scope, or the binding keeps the list
+/// alive for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+///
+/// Testable because [`build_endpoint_list`] takes both its signal and its
+/// three mutation functions as parameters — a `Mutable` and three no-ops
+/// stand in for pipewire, so no `Registry` is needed. Most of #831's other
+/// sites read a service accessor inline and have no such seam.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use hytte::adw;
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk::{self, prelude::*};
+
+    use super::{Endpoint, build_endpoint_list};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Minimal [`Endpoint`] so the test does not have to construct a real
+    /// pipewire `Sink`/`Source`.
+    #[derive(Clone)]
+    struct FakeEndpoint;
+
+    impl Endpoint for FakeEndpoint {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn description(&self) -> &'static str {
+            "Fake endpoint"
+        }
+        fn volume(&self) -> f64 {
+            0.5
+        }
+        fn muted(&self) -> bool {
+            false
+        }
+        fn is_default(&self) -> bool {
+            true
+        }
+    }
+
+    /// Falsified by reintroducing the `list_for_bind` strong clone the apply
+    /// closure used to capture: with it, `drop(list)` is not the last strong
+    /// ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn endpoint_list_binding_does_not_pin_list() {
+        adw::init().expect("libadwaita init");
+        let items: Mutable<Vec<FakeEndpoint>> = Mutable::new(Vec::new());
+        let list = build_endpoint_list(items.signal_cloned(), |_| {}, |_, _| {}, |_, _| {});
+        let weak = list.downgrade();
+        pump();
+
+        drop(list);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "build_endpoint_list must not pin its ListBox: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&gtk::ListBox` argument from `bind`) \
+             would keep this alive for the life of the binding, defeating #224's WeakRef contract"
+        );
+    }
 }

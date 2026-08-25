@@ -682,12 +682,11 @@ fn build_top_apps_expander(
     // user's manual expand/collapse.  The build-time set_expanded(false) above
     // covers the empty-expander case; this guard fires once on first population.
     let collapsed_once: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let expander_for_bind = expander.clone();
     let rows_for_bind = rows_track.clone();
     let collapsed_once_for_bind = collapsed_once.clone();
-    bind(signal, &expander, move |_, list| {
+    bind(signal, &expander, move |expander, list| {
         rebuild_top_apps(
-            &expander_for_bind,
+            expander,
             &rows_for_bind,
             &meta_cache,
             &collapsed_once_for_bind,
@@ -716,14 +715,14 @@ fn build_top_apps_expander(
 /// reproduce the synchronous re-entry this borrow discipline exists for
 /// (#674).
 ///
-/// `expander` is still fed the captured `expander_for_bind` clone at the call
-/// site, not the `&adw::ExpanderRow` that `bind` hands its apply closure — a
-/// strong capture that pins the expander for the life of the binding and so
-/// defeats `bind`'s `WeakRef` contract (`hytte-reactive/src/bind.rs:16-22`),
-/// the same defect #772 fixed in `panels/connections.rs`. That is a **separate
-/// bug from #674** and is left exactly as it was here: this extract is
-/// strictly behaviour-preserving, and switching the closure to its own
-/// argument would change what the binding keeps alive.
+/// `expander` is fed the `&adw::ExpanderRow` that `bind` hands its apply
+/// closure, **not** a strong clone captured from the enclosing scope. The
+/// captured-clone form pinned the expander for the life of the binding and so
+/// defeated `bind`'s `WeakRef` contract (`hytte-reactive/src/bind.rs:16-22`);
+/// #830 recorded it here as a separate bug from #674 (it had to stay put for
+/// that PR's byte-identical-extract argument to hold), and #831 fixed it here
+/// along with the other eleven sites of the same shape. The colocated
+/// `top_apps_binding_does_not_pin_expander` test is the regression guard.
 fn rebuild_top_apps(
     expander: &adw::ExpanderRow,
     rows_track: &Rc<RefCell<Vec<adw::ActionRow>>>,
@@ -911,9 +910,8 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
     cores_row.set_valign(gtk::Align::Center);
 
     let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
-    let cores_row_for_bind = cores_row.clone();
     let bars_for_bind = core_bars.clone();
-    bind(sensors::cpu(), &cores_row, move |_, c: CpuLoad| {
+    bind(sensors::cpu(), &cores_row, move |cores_row, c: CpuLoad| {
         // Take the bars out for the whole update rather than holding a `RefMut`
         // across it: the pre-#643 binding stayed live past `remove()`,
         // `insert()`, `set_fraction()` and `set_tooltip_text()`, so any
@@ -924,11 +922,11 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
             // Drain by hand: `FlowBox::remove_all` is `v4_12`-gated and gtk4 is
             // pinned without version features. `first_child` yields the
             // implicit `GtkFlowBoxChild`, which is what `remove` wants.
-            while let Some(child) = cores_row_for_bind.first_child() {
-                cores_row_for_bind.remove(&child);
+            while let Some(child) = cores_row.first_child() {
+                cores_row.remove(&child);
             }
             bars.clear();
-            cores_row_for_bind.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
+            cores_row.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
             for _ in 0..c.per_core.len() {
                 let bar = gtk::ProgressBar::new();
                 bar.add_css_class("ts-core-bar");
@@ -940,7 +938,7 @@ fn build_per_core_bars_row() -> gtk::FlowBox {
                 // (This is what the old per-bar `hexpand` wrapper `gtk::Box`
                 // hand-rolled, so it's gone.)
                 bar.set_halign(gtk::Align::Center);
-                cores_row_for_bind.insert(&bar, -1);
+                cores_row.insert(&bar, -1);
                 // `insert` wraps the bar in a `GtkFlowBoxChild`, which is
                 // focusable by default — 64 decorative bars would otherwise add
                 // 64 tab stops to the drawer.
@@ -2259,6 +2257,60 @@ mod reentrancy_tests {
             2,
             "the outer call's write-back must still land: re-entry may not leave the cell holding \
              the inner call's rows or an empty Vec"
+        );
+    }
+}
+
+/// #831 regression coverage for this file's two widget-pinning `bind` call
+/// sites, in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&W` `bind` hands it rather than a strong clone
+/// captured from the enclosing scope, or the binding keeps the widget alive
+/// for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+///
+/// Only `build_top_apps_expander` is reachable from a test: it takes its
+/// signal as a parameter, so a `Mutable` stands in for the service. The other
+/// site in this file, `build_per_core_bars_row`, reads `sensors::cpu()`
+/// inline and would need a registered `Registry` (or an extraction into a
+/// `bind_*` helper, a production restructure this work does not make), so it
+/// is fixed but uncovered — as are the nine sites in the other ten files.
+#[cfg(all(test, feature = "system-tests"))]
+mod pin_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::app_usage::ProcSample;
+
+    use super::build_top_apps_expander;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    fn cpu_value(s: &ProcSample) -> String {
+        format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    /// Falsified by reintroducing the `expander_for_bind` strong clone the
+    /// apply closure used to capture: with it, `drop(expander)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn top_apps_binding_does_not_pin_expander() {
+        adw::init().expect("libadwaita init");
+        let samples: Mutable<Vec<ProcSample>> = Mutable::new(Vec::new());
+        let expander = build_top_apps_expander("Top apps", samples.signal_cloned(), cpu_value);
+        let weak = expander.downgrade();
+        pump();
+
+        drop(expander);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "build_top_apps_expander must not pin its expander: a strong clone captured by the \
+             apply closure (rather than taking the closure's own `&adw::ExpanderRow` argument \
+             from `bind`) would keep this alive for the life of the binding, defeating #224's \
+             WeakRef contract"
         );
     }
 }

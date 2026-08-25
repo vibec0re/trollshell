@@ -363,9 +363,8 @@ fn build_all_links_expander() -> adw::ExpanderRow {
     // we instead remove only links that disappeared, add only new ones, and
     // update survivors in place — leaving their chevron/revealer untouched.
     let cache: Rc<RefCell<HashMap<String, LinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
-    let expander_for_bind = expander.clone();
     let cache_for_bind = cache.clone();
-    bind(networkd::links(), &expander, move |_, links| {
+    bind(networkd::links(), &expander, move |expander, links| {
         let mut named: Vec<&Link> = links.iter().filter(|l| l.name != "lo").collect();
         named.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -376,8 +375,8 @@ fn build_all_links_expander() -> adw::ExpanderRow {
         cache_mut.retain(|name, row| {
             let keep = live.contains(name);
             if !keep {
-                expander_for_bind.remove(&row.action);
-                expander_for_bind.remove(&row.detail_holder);
+                expander.remove(&row.action);
+                expander.remove(&row.detail_holder);
             }
             keep
         });
@@ -388,7 +387,7 @@ fn build_all_links_expander() -> adw::ExpanderRow {
             if let Some(row) = cache_mut.get(&link.name) {
                 update_link_row(row, link);
             } else {
-                let row = build_link_row(&expander_for_bind, link);
+                let row = build_link_row(expander, link);
                 cache_mut.insert(link.name.clone(), row);
                 added_new = true;
             }
@@ -401,13 +400,13 @@ fn build_all_links_expander() -> adw::ExpanderRow {
         // link does not jump or re-collapse on a carrier blip.
         if added_new {
             for row in cache_mut.values() {
-                expander_for_bind.remove(&row.action);
-                expander_for_bind.remove(&row.detail_holder);
+                expander.remove(&row.action);
+                expander.remove(&row.detail_holder);
             }
             for link in &named {
                 if let Some(row) = cache_mut.get(&link.name) {
-                    expander_for_bind.add_row(&row.action);
-                    expander_for_bind.add_row(&row.detail_holder);
+                    expander.add_row(&row.action);
+                    expander.add_row(&row.detail_holder);
                 }
             }
         }

@@ -59,10 +59,9 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // Rc is fine here — bind() drives the closure via spawn_local.
     let button_map: Rc<RefCell<ButtonMap>> = Rc::new(RefCell::new(HashMap::new()));
 
-    let container_for_signal = container.clone();
     let monitor = monitor.clone();
-    bind(tray::items(), &container, move |_, items| {
-        update_tray(&container_for_signal, &button_map, &items, &monitor);
+    bind(tray::items(), &container, move |container, items| {
+        update_tray(container, &button_map, &items, &monitor);
     });
 
     container.upcast()

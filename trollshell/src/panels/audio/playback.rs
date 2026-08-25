@@ -129,20 +129,19 @@ pub(super) fn build_playback_list() -> gtk::ListBox {
     list.append(&placeholder);
     let placeholder_attached = Rc::new(Cell::new(true));
 
-    let list_for_bind = list.clone();
     let rows_for_bind = rows.clone();
     let placeholder_for_bind = placeholder.clone();
     let attached_for_bind = placeholder_attached.clone();
     bind(
         pipewire::playback_streams(),
         &list,
-        move |_, streams: Vec<PlaybackStream>| {
+        move |list, streams: Vec<PlaybackStream>| {
             // Toggle the empty-state placeholder.
             if streams.is_empty() && !attached_for_bind.get() {
-                list_for_bind.append(&placeholder_for_bind);
+                list.append(&placeholder_for_bind);
                 attached_for_bind.set(true);
             } else if !streams.is_empty() && attached_for_bind.get() {
-                list_for_bind.remove(&placeholder_for_bind);
+                list.remove(&placeholder_for_bind);
                 attached_for_bind.set(false);
             }
 
@@ -155,7 +154,7 @@ pub(super) fn build_playback_list() -> gtk::ListBox {
                 .collect();
             for id in gone {
                 if let Some(r) = rows.remove(&id) {
-                    list_for_bind.remove(&r.row);
+                    list.remove(&r.row);
                 }
             }
             for s in &streams {
@@ -163,7 +162,7 @@ pub(super) fn build_playback_list() -> gtk::ListBox {
                     row.update(s);
                 } else {
                     let row = StreamRow::new(s);
-                    list_for_bind.append(&row.row);
+                    list.append(&row.row);
                     rows.insert(s.id, row);
                 }
             }

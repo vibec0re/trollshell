@@ -1251,7 +1251,11 @@ mod reentrancy_tests {
     /// `use super::` from without pulling the gate along.
     fn ldt(date: NaiveDate, hour: u32, min: u32, sec: u32) -> DateTime<Local> {
         Local
-            .from_local_datetime(&date.and_hms_opt(hour, min, sec).expect("valid wall-clock time"))
+            .from_local_datetime(
+                &date
+                    .and_hms_opt(hour, min, sec)
+                    .expect("valid wall-clock time"),
+            )
             .single()
             .expect("unambiguous local time")
     }
@@ -1396,7 +1400,15 @@ mod reentrancy_tests {
         let today = NaiveDate::from_ymd_opt(2026, 6, 17).expect("valid date");
         let now = ldt(today, 8, 0, 0);
 
-        rebuild_upcoming_list(&group, &rows_track, &placeholder_track, &[], today, today, now);
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &[],
+            today,
+            today,
+            now,
+        );
         assert!(
             placeholder_track.borrow().is_some(),
             "an empty event list must render the placeholder after the seeding call"
@@ -1437,7 +1449,15 @@ mod reentrancy_tests {
         drop(placeholder);
 
         in_outer.set(true);
-        rebuild_upcoming_list(&group, &rows_track, &placeholder_track, &[], today, today, now);
+        rebuild_upcoming_list(
+            &group,
+            &rows_track,
+            &placeholder_track,
+            &[],
+            today,
+            today,
+            now,
+        );
         in_outer.set(false);
 
         assert_eq!(

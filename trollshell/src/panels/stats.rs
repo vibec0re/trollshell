@@ -30,11 +30,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gio, glib};
 use hytte::prelude::*;
+use hytte::reactive::health::{self, TaskHealth, TaskState};
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuFreq, CpuLoad};
 use hytte::services::systemd;
@@ -172,7 +174,7 @@ pub fn panel_stats() -> gtk::Widget {
     let memory_card = build_stats_memory_card();
     let gpu_card = build_stats_gpu_card();
     let disks_card = build_stats_disks_card();
-    let services_card = build_stats_services_group();
+    let services_card = build_stats_services_card();
 
     column.append(cpu_card.upcast_ref::<gtk::Widget>());
     column.append(memory_card.upcast_ref::<gtk::Widget>());
@@ -231,7 +233,7 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     let memory_card = build_stats_memory_card();
     let gpu_card = build_stats_gpu_card();
     let disks_card = build_stats_disks_card();
-    let services_card = build_stats_services_group();
+    let services_card = build_stats_services_card();
 
     // CPU spans both columns (#702). It's the one card whose content is a
     // *strip* rather than a stack — the per-core bars — so it's the one that
@@ -408,7 +410,7 @@ pub fn panel_stats_disks() -> gtk::Widget {
 
 /// Services flyout — opened from the services bar chip in `split` layout.
 pub fn panel_stats_services() -> gtk::Widget {
-    single_card_page(build_stats_services_group().upcast_ref::<gtk::Widget>())
+    single_card_page(build_stats_services_card().upcast_ref::<gtk::Widget>())
 }
 
 /// Resolve the [`StatsSection`] pending for `key`'s monitor (if any) against
@@ -1594,15 +1596,36 @@ fn build_history_gpu_temp_row() -> gtk::Box {
     row
 }
 
-/// Services group — flattened per #311: no group description and no
-/// `Failed units` expander wrapper (both duplicated the count already shown
-/// on the bar chip, and the expander hid the one thing this flyout is opened
-/// to see). The failed-unit `ActionRow`s render straight into the group, so
-/// the flyout *is* the list, matching the other stats panels' pattern of
-/// showing their primary content directly rather than behind a titled row.
-/// If every unit recovers while the panel is open, the list just goes empty
-/// (the chip that opens this panel self-hides at zero failed units anyway).
-fn build_stats_services_group() -> adw::PreferencesGroup {
+/// Services card — two boxed lists of "what on this box is broken", stacked:
+/// systemd's failed units ([`build_failed_units_group`]) and the shell's own
+/// flapping supervised tasks ([`build_flapping_tasks_group`], #722).
+///
+/// The flapping list is folded in here rather than given a page — or a
+/// control-center tab — of its own because #721's health table is a
+/// process-global static *inside the shell*: a control-center view would link,
+/// compile, and report zero flapping tasks forever. This card already means
+/// "what on this box is broken", and a shell task that keeps panicking belongs
+/// next to a systemd unit that keeps failing.
+///
+/// Both halves are silent while everything is healthy, so on a healthy box this
+/// card renders as nothing at all — exactly what the failed-units group did on
+/// its own before #722.
+fn build_stats_services_card() -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    card.append(&build_failed_units_group());
+    card.append(&build_flapping_tasks_group());
+    card
+}
+
+/// Failed systemd units — the first half of the Services card, flattened per
+/// #311: no group description and no `Failed units` expander wrapper (both
+/// duplicated the count already shown on the bar chip, and the expander hid the
+/// one thing this flyout is opened to see). The failed-unit `ActionRow`s render
+/// straight into the group, so the flyout *is* the list, matching the other
+/// stats panels' pattern of showing their primary content directly rather than
+/// behind a titled row. If every unit recovers while the panel is open, the
+/// list just goes empty.
+fn build_failed_units_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
 
     reactive_list(
@@ -1637,10 +1660,155 @@ fn build_stats_services_group() -> adw::PreferencesGroup {
     group
 }
 
+/// Flapping supervised tasks — the shell's own half of the Services card
+/// (#722), bound to the health surface `hytte_reactive::health` publishes
+/// (#721). One row per *live* supervisor whose panic streak is non-zero (see
+/// [`is_flapping`]).
+///
+/// Unlike its sibling this group carries a title and hides itself outright
+/// while nothing is flapping. An untitled empty group renders as nothing, but a
+/// *titled* empty one would leave a permanent header sitting on a healthy card;
+/// hiding also keeps the card's own inter-group spacing honest. The title is a
+/// literal, so it needs no [`markup::escape`] — an `AdwPreferencesGroup`'s
+/// title label is hardcoded `use-markup="True"` with no property to flip.
+///
+/// `TaskHealth::name` is explicitly non-unique — `sensors` supervises four
+/// tasks under one label, `upower` three — so a service with two flapping tasks
+/// shows two identically-titled rows, told apart by their numbers. That is
+/// deliberate: `TaskId` has no accessor to disambiguate them with, and
+/// collapsing them onto the name would report one task's restarts as another's.
+///
+/// Entries are live, not historical (#721): a task whose supervisor has stopped
+/// has no row at all, and nothing here survives a shell restart. This answers
+/// "is anything flapping *right now*", which is the question the bar chip that
+/// leads here also answers.
+fn build_flapping_tasks_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Flapping shell tasks")
+        .build();
+
+    bind(
+        flapping_tasks().map(|tasks| !tasks.is_empty()),
+        &group,
+        gtk::prelude::WidgetExt::set_visible,
+    );
+
+    reactive_list(
+        &group,
+        flapping_tasks(),
+        |task: &TaskHealth| {
+            let row = adw::ActionRow::builder()
+                .title(task.name)
+                .activatable(false)
+                .build();
+            // Task labels are `&'static str` literals today and the subtitle is
+            // generated here, but keeping both literal by construction costs one
+            // call and survives a future `name` that interpolates (#753).
+            markup::plain_text(&row);
+            row.set_subtitle(&flapping_subtitle(
+                task.state,
+                task.runs,
+                task.panics,
+                task.consecutive_panics,
+                task.backoff,
+            ));
+
+            let pill = gtk::Label::new(Some("flapping"));
+            pill.set_valign(gtk::Align::Center);
+            pill.add_css_class("ts-pill-error");
+            row.add_suffix(&pill);
+
+            row
+        },
+        None::<fn() -> adw::ActionRow>,
+    );
+
+    group
+}
+
+/// The supervised tasks worth showing, in `health::signal`'s own order (the
+/// order supervision started).
+///
+/// `dedupe_cloned` because the health signal is chatty relative to this view:
+/// it emits on *every* supervisor transition, including the start-up burst of
+/// one event per service task, and almost none of those change the flapping
+/// list. Subscribing twice (visibility + rows) is fine — `signal_cloned` fans
+/// out — and keeps each binding reading the filter it actually cares about.
+fn flapping_tasks() -> impl Signal<Item = Vec<TaskHealth>> {
+    health::signal()
+        .map(|tasks| {
+            tasks
+                .into_iter()
+                .filter(|task| is_flapping(task.consecutive_panics))
+                .collect::<Vec<_>>()
+        })
+        .dedupe_cloned()
+}
+
+/// Whether a supervised task's panic streak makes it worth surfacing (#722).
+///
+/// The field is `TaskHealth::consecutive_panics` — panics since the last run
+/// that stayed up long enough for the supervisor to call it healthy (30 s by
+/// default), so it resets on the very verdict that resets the backoff. Zero
+/// means "not flapping *now*" whatever the lifetime `panics` total says, which
+/// is the whole reason #721 published both numbers: a task that crashed once an
+/// hour ago and has been fine since is not a diagnostic.
+///
+/// Shared with `crate::widgets::services`, whose chip has to appear on exactly
+/// the tasks this group renders: the two predicates drifting apart would leave
+/// the group unreachable in `split` layout, where that chip is the only route
+/// to this card.
+pub(crate) fn is_flapping(consecutive_panics: u32) -> bool {
+    consecutive_panics > 0
+}
+
+/// The subtitle for one flapping task's row: what it is doing now, how hard it
+/// is flapping, and how much of that is recent.
+///
+/// Takes the fields rather than a `&TaskHealth` so it stays testable —
+/// `TaskId`'s inner `u64` is private and it has no constructor, so a
+/// `TaskHealth` cannot be built outside `hytte-reactive` at all (#721 kept that
+/// API deliberately minimal, and #722 is not the reason to widen it).
+///
+/// The lifetime total is spelled out only when it differs from the streak;
+/// otherwise "3 panics in a row · 3 total" says the same thing twice.
+fn flapping_subtitle(
+    state: TaskState,
+    runs: u32,
+    panics: u32,
+    consecutive_panics: u32,
+    backoff: Duration,
+) -> String {
+    let mut parts = Vec::with_capacity(4);
+    parts.push(match state {
+        // `backoff` is the supervisor's live capped-exponential delay (1 s →
+        // 30 s) and reads ZERO while a run is actually in flight, so a
+        // sub-second value has no countdown worth printing.
+        TaskState::Restarting if backoff.as_secs() > 0 => {
+            format!("Restarting in {}s", backoff.as_secs())
+        }
+        TaskState::Restarting => "Restarting".to_owned(),
+        TaskState::Running => "Running".to_owned(),
+    });
+    let panic_word = if consecutive_panics == 1 {
+        "panic"
+    } else {
+        "panics"
+    };
+    parts.push(format!("{consecutive_panics} {panic_word} in a row"));
+    if panics > consecutive_panics {
+        parts.push(format!("{panics} total"));
+    }
+    let run_word = if runs == 1 { "run" } else { "runs" };
+    parts.push(format!("{runs} {run_word}"));
+    parts.join(" \u{00b7} ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_BARS_MAX_PER_LINE, StatsLayout, StatsSection, core_bars_per_line, parse_stats_layout,
+        CORE_BARS_MAX_PER_LINE, Duration, StatsLayout, StatsSection, TaskState, core_bars_per_line,
+        flapping_subtitle, is_flapping, parse_stats_layout,
     };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -1726,6 +1894,66 @@ mod tests {
         assert_eq!(core_bars_per_line(64), 32); // the #702 machine: 2 x 32
         assert_eq!(core_bars_per_line(65), 22); // 3 x 22
         assert_eq!(core_bars_per_line(128), 32); // 4 x 32
+    }
+
+    /// The flapping filter keys on the *streak*, and its boundary is 1, not
+    /// some "enough restarts to be worth mentioning" threshold: the supervisor
+    /// has already applied that judgement by resetting the streak on any run
+    /// that stayed up 30 s. A non-zero streak means the task is panicking now.
+    #[test]
+    fn only_a_live_panic_streak_counts_as_flapping() {
+        assert!(
+            !is_flapping(0),
+            "a task with no panics since its last healthy run is not flapping, whatever its \
+             lifetime total"
+        );
+        assert!(
+            is_flapping(1),
+            "one panic since the last healthy run counts"
+        );
+        assert!(is_flapping(9));
+    }
+
+    /// While restarting, the countdown leads — it is the "when does this come
+    /// back" the row is opened to answer — and doubles as a severity reading
+    /// (the supervisor's delay caps at 30 s).
+    #[test]
+    fn flapping_subtitle_leads_with_the_backoff_while_restarting() {
+        assert_eq!(
+            flapping_subtitle(TaskState::Restarting, 7, 5, 3, Duration::from_secs(4)),
+            "Restarting in 4s \u{00b7} 3 panics in a row \u{00b7} 5 total \u{00b7} 7 runs"
+        );
+    }
+
+    /// A run is in flight, so there is no delay to count down — but the streak
+    /// is still live (the run has not yet lasted long enough to reset it), which
+    /// is precisely why the row is still on screen.
+    #[test]
+    fn flapping_subtitle_says_running_when_a_run_is_in_flight() {
+        assert_eq!(
+            flapping_subtitle(TaskState::Running, 12, 11, 3, Duration::ZERO),
+            "Running \u{00b7} 3 panics in a row \u{00b7} 11 total \u{00b7} 12 runs"
+        );
+    }
+
+    /// A sub-second backoff has no whole second to print; say the state and
+    /// drop the countdown rather than claiming "Restarting in 0s".
+    #[test]
+    fn flapping_subtitle_drops_a_sub_second_countdown() {
+        assert_eq!(
+            flapping_subtitle(TaskState::Restarting, 2, 1, 1, Duration::from_millis(400)),
+            "Restarting \u{00b7} 1 panic in a row \u{00b7} 2 runs"
+        );
+    }
+
+    /// The lifetime total is redundant while every panic is part of the current
+    /// streak — the common case for a task that has only ever flapped.
+    #[test]
+    fn flapping_subtitle_omits_a_total_that_equals_the_streak() {
+        assert_eq!(
+            flapping_subtitle(TaskState::Running, 4, 3, 3, Duration::ZERO),
+            "Running \u{00b7} 3 panics in a row \u{00b7} 4 runs"
+        );
     }
 
     /// Whatever the core count: the cap is honoured, every core has a slot,

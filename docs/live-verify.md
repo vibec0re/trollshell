@@ -146,23 +146,16 @@ range above is a floor, not a ceiling.
       exercise because it needs a live user manager and a live session bus.
       With the shell running and a declared plugin up, change one visible knob:
       `programs.trollshell.plugins.pet.env.PET_NAME = "nisse";` →
-      `home-manager switch`. Without touching anything else: `cat
-    ~/.config/trollshell/plugins.json` shows the new value; the journal
+      `home-manager switch`. Without touching anything else: `cat ~/.config/trollshell/plugins.json` shows the new value; the journal
       (`journalctl --user -u trollshell -f`) logs "declared spec changed;
-      restarting"; `systemctl --user show -p ExecMainStartTimestamp
-    trollshell-plugin-pet` shows a fresh start; and `tr '\0' '\n' <
-    /proc/$(systemctl --user show -p MainPID --value
-    trollshell-plugin-pet)/environ | grep PET_NAME` shows the new value. The
+      restarting"; `systemctl --user show -p ExecMainStartTimestamp trollshell-plugin-pet` shows a fresh start; and `tr '\0' '\n' < /proc/$(systemctl --user show -p MainPID --value trollshell-plugin-pet)/environ | grep PET_NAME` shows the new value. The
       card should re-render with it. Then verify the manual path works with the
-      shell running but no switch: `busctl --user call
-    mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control
-    mov.vibec0re.trollshell.Control ReloadPlugins` is a clean no-op when
+      shell running but no switch: `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control ReloadPlugins` is a clean no-op when
       nothing changed.
 - [ ] **(#707)** Session target — the plugin units now bind `PartOf=` the same
       target the shell does, instead of a hardcoded `graphical-session.target`.
       With `programs.trollshell.systemd.target = "niri-session.target";` (what
-      `etc/` ships), switch and confirm `systemctl --user show -p PartOf
-    trollshell-plugin-<id>` reports `niri-session.target` — matching
+      `etc/` ships), switch and confirm `systemctl --user show -p PartOf trollshell-plugin-<id>` reports `niri-session.target` — matching
       `systemctl --user show -p PartOf trollshell`. Then confirm the recycle:
       the **first** reconcile after upgrading a session that was already using a
       non-default target should restart each plugin exactly once (the old units
@@ -174,9 +167,7 @@ range above is a floor, not a ceiling.
 - [ ] **(#707)** Plugin control errors — `StartPlugin` / `StopPlugin` /
       `SetPluginEnabled` now return a D-Bus error instead of an empty reply on
       failure. Start a plugin that is already running:
-      `busctl --user call mov.vibec0re.trollshell.Control
-    /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control
-    StartPlugin s pet` should now print an error naming the plugin (it printed
+      `busctl --user call mov.vibec0re.trollshell.Control /mov/vibec0re/trollshell/Control mov.vibec0re.trollshell.Control StartPlugin s pet` should now print an error naming the plugin (it printed
       nothing before). A successful call must still print nothing — the wire
       shape is unchanged for the success path, and the control-center's Plugins
       tab must keep working exactly as it did.

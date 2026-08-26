@@ -16,7 +16,7 @@
 //! the glyph set — and three predefined display widgets are built on them:
 //!
 //! - [`dot_matrix`] — a single text line as char cells of round-falloff dots,
-//!   in one of the three [`DisplayStyle`] skins.
+//!   in any [`DisplayStyle`] skin.
 //! - [`Marquee`] — a scrolling [`dot_matrix`] ticker: the message is a
 //!   font-space bitmap sampled onto a **fixed** physical dot grid, stepped one
 //!   whole virtual pixel (one dot) at a time, so the grid never moves with the
@@ -59,6 +59,14 @@
 //! - **`Oled`** — white-blue on true black, a tight per-pixel bloom, and
 //!   **no** ghosting: an off OLED pixel emits nothing (#354, Annika's
 //!   addition).
+//! - **`Crt`** — P31 phosphor green on a near-black tube face, a broad
+//!   phosphor bloom, and the raster itself: a scanline comb phased into the
+//!   seams between dot rows plus a curved-glass vignette, multiplied into the
+//!   lit layer at composite time (a #397 skin). Unlike the other three this is
+//!   a **pass**, not a look for one widget — every kit surface above renders
+//!   through the tube with no code of its own. Screen-space and
+//!   resampling-free by design: curvature reads as a vignette rather than a
+//!   barrel warp, so the fixed-grid discipline below survives it intact.
 //!
 //! # Sizing — the #313 lesson
 //!

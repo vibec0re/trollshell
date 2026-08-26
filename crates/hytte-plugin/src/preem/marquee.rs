@@ -303,7 +303,7 @@ impl MarqueeStrip {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut out, palette.ink);
+        lit.composite(&mut out, palette.ink, palette.mask);
         out
     }
 }
@@ -473,9 +473,22 @@ mod tests {
     /// ghost underneath, same skin passes. A held single glyph puts the
     /// marquee's first cell where `dot_matrix`'s first cell is, so the two
     /// glyph blocks compare pixel for pixel.
+    ///
+    /// Skins carrying a **screen-space** pass are excluded, and have to be: the
+    /// CRT's masks are functions of the pixel's place on *its own screen*
+    /// (#397), so the same dot at the same buffer coordinate is attenuated
+    /// differently in a 96 px window than in a 28 px static frame — by design,
+    /// since the two are different tubes. What this test protects, that a
+    /// marquee dot *is* a `dot_matrix` dot, still holds underneath the pass:
+    /// `style.rs`'s `the_mask_only_attenuates_light_the_skin_already_stamped`
+    /// is where that lands. Filtered rather than listed so a fourth mask-free
+    /// skin joins automatically.
     #[test]
     fn a_lit_dot_matches_the_static_display() {
-        for style in DisplayStyle::ALL {
+        for style in DisplayStyle::ALL
+            .into_iter()
+            .filter(|s| s.palette().mask.is_none())
+        {
             let statik = dot_matrix("A", style);
             let strip = Marquee::new(style).window_px(96).render("A");
             assert!(!strip.scrolls(), "one glyph fits the window");

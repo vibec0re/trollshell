@@ -805,7 +805,7 @@ impl Gauge {
         if let Some(bloom) = palette.bloom {
             emission.bloom(bloom);
         }
-        emission.composite(&mut frame, palette.ink);
+        emission.composite(&mut frame, palette.ink, palette.mask);
 
         frame.upscale(self.scale)
     }

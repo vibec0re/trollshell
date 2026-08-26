@@ -248,11 +248,6 @@ fn main() -> hytte::ui::Result<()> {
                         // their Monitor, so they can't self-terminate) before
                         // re-keying below (#404).
                         fullscreen::close_all();
-                        // Same shape for the centre-slot budget map (#838):
-                        // connector-keyed entries survive the rebuild (their
-                        // subscribers do too), fallback-keyed ones can never be
-                        // looked up again and are dropped.
-                        components::center_budget::prune_stale();
 
                         *bars.borrow_mut() = monitors.iter().map(build_bar).collect();
 
@@ -452,12 +447,6 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             group([widgets::screencast::widget(monitor)]),
         ])
         .show();
-
-    // Publish the centre slot's width budget for this bar (#838). Must run
-    // *after* the bar so the CenterBox and both clusters exist to be measured;
-    // the widgets that consume the budget were built above and are already
-    // subscribed (the per-connector state outlives any single bar).
-    components::center_budget::install(monitor, &bar);
 
     // Install the drawer *after* the bar so its window exists to be measured
     // for the perpendicular (bar-thickness) margin at open time.

@@ -8,11 +8,14 @@
 //! every [`STYLE_SECS`] seconds. Below them a real **oscilloscope**
 //! ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum` push as a
 //! glow-trace waveform over a graticule, with real phosphor decay — a silent
-//! sink flatlines on the axis while the old trail keeps ghosting. Tapping the
-//! clock advances the skin immediately. It doubles as the kit's visual
-//! regression harness and the copy-from reference for plugin authors.
+//! sink flatlines on the axis while the old trail keeps ghosting. Below *that*
+//! a **needle gauge** ([`Gauge`], #397) steps between readings and swings to
+//! each one on a real damped oscillator: the pointer overshoots, bounces once,
+//! and settles, smearing while it moves. Tapping the clock advances the skin
+//! immediately. It doubles as the kit's visual regression harness and the
+//! copy-from reference for plugin authors.
 //!
-//! # The scope is the card's one stateful widget
+//! # The scope and the gauge are the card's two stateful widgets
 //!
 //! Every other widget is a pure function of the snapshot, but the scope carries
 //! a phosphor buffer across frames, so it lives in the model: each host
@@ -22,7 +25,14 @@
 //! sweep; at the demo's 1 Hz heartbeat the lush decay is on full display (you
 //! watch the ghost linger for several seconds).
 //!
-//! # …and so it is the card's one **parked** widget (#422)
+//! The gauge carries *physics* rather than pixels — a deflection and a velocity
+//! — and is advanced the same way, by [`GAUGE_SLOWMO_DT`] of needle time per
+//! heartbeat rather than the full second, so a swing plays out over several
+//! renders instead of completing between two of them. Its target steps through
+//! [`GAUGE_STOPS`] every [`GAUGE_HOLD_SECS`], which is a pure function of the
+//! snapshot clock like everything else here.
+//!
+//! # …and the scope alone is the card's **parked** widget (#422)
 //!
 //! Being stateful is also the only reason this card subscribes
 //! [`SlotVisible`](Input::SlotVisible) at all: the scope is the one widget that
@@ -36,9 +46,15 @@
 //! reopened card starts from a dark screen and re-derives from the next sweep.
 //!
 //! Everything else deliberately keeps running while hidden: the clock, ticker,
-//! marquee and skin rotation are pure functions of the snapshot, so parking them
-//! would buy nothing and would make the reopened card show a *stale time* — the
-//! very failure the scope's park exists to avoid.
+//! marquee, skin rotation **and the gauge** are pure functions of the snapshot,
+//! so parking them would buy nothing and would make the reopened card show a
+//! *stale time* — the very failure the scope's park exists to avoid. The gauge
+//! is the instructive case: it is stateful like the scope, but its input is
+//! derived rather than pushed, so it is the *input*, not the statefulness, that
+//! decides whether a widget must park. ([`Needle::settle`] is there for a gauge
+//! whose reading really does come from outside.)
+//!
+//! [`Needle::settle`]: hytte_plugin::preem::Needle::settle
 //!
 //! # Shape — The Elm Architecture, purely host-driven
 //!
@@ -55,10 +71,10 @@
 //! Every widget is sized via its **buffer dimensions** (a `Pixels` node's
 //! natural size), not shell CSS: the 7seg clock renders 188 px wide, the
 //! 11-char ticker 268 px, the marquee window [`MARQUEE_WINDOW_PX`] wide, the
-//! 22-column ×2 textbox 274 px, and the scope's default 288 px — all inside the
-//! sidebar card's ~296 px content width.
+//! 22-column ×2 textbox 274 px, and the scope's and gauge's defaults 288 px each
+//! — all inside the sidebar card's ~296 px content width.
 
-use hytte_plugin::preem::{DisplayStyle, Marquee, Scope, TextBox, dot_matrix, seven_seg};
+use hytte_plugin::preem::{DisplayStyle, Gauge, Marquee, Scope, TextBox, dot_matrix, seven_seg};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
@@ -73,9 +89,28 @@ const TICKER_ID: &str = "preem-demo-ticker";
 const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
 const SCOPE_ID: &str = "preem-demo-scope";
+const GAUGE_ID: &str = "preem-demo-gauge";
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
+
+/// The readings the showcase gauge steps between, one every
+/// [`GAUGE_HOLD_SECS`]. Deliberately mid-scale: a full-scale slam would peg the
+/// needle against the dial's stop and hide the overshoot the widget exists for.
+const GAUGE_STOPS: [f32; 6] = [10.0, 72.0, 38.0, 90.0, 22.0, 55.0];
+/// Host heartbeats each reading holds before the next one is dialed in — long
+/// enough that the needle has visibly settled before the next step.
+const GAUGE_HOLD_SECS: i64 = 8;
+/// Seconds of needle motion the gauge is advanced per host heartbeat.
+///
+/// **Slow motion, on purpose.** This card has no frame timer — its only cadence
+/// is the shell's ~1 Hz `Clock` snapshot (see the crate docs) — so advancing by
+/// the real elapsed second would land the needle settled every time and the
+/// physics would never be visible. At this rate the eight heartbeats of a hold
+/// window cover the whole 1.3 s response, so successive renders actually show
+/// the kick, the overshoot, the bounce and the settle. A frame-timer plugin
+/// passes its real elapsed seconds instead; the kit owns no clock either way.
+const GAUGE_SLOWMO_DT: f32 = 0.16;
 /// The ticker's marquee message; the view shows a [`TICKER_WINDOW`]-char
 /// window that advances one char per second (wrapping around).
 const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED ~ 7SEG DOT 8BIT ~ ";
@@ -118,6 +153,16 @@ struct PreemDemo {
     /// across frames. Advanced one sweep per host heartbeat with [`Self::bins`]
     /// **while the card is on-screen**, rendered by `view` in the current skin.
     scope: Scope,
+    /// The needle gauge (#397): the card's other stateful widget, and the one
+    /// that carries *physics* rather than a pixel buffer. Its target steps
+    /// through [`GAUGE_STOPS`] on the heartbeat and the needle swings to it —
+    /// overshooting and settling — over the following ticks.
+    ///
+    /// Unlike the scope this deliberately does **not** park (#422): its input is
+    /// a pure function of the snapshot, exactly like the clock and the ticker,
+    /// so keeping it live means a reopened card reads the current value instead
+    /// of replaying a stale swing.
+    gauge: Gauge,
     /// Whether the sidebar (and so this card) is currently shown — the
     /// [`SlotVisible`](Input::SlotVisible) gate for the scope's sweep (#422).
     /// Seeded `false`; the host sends the real value at register.
@@ -173,6 +218,16 @@ impl PreemDemo {
         self.scope.clear();
     }
 
+    /// The reading the gauge is currently dialed to: [`GAUGE_STOPS`] stepped
+    /// once every [`GAUGE_HOLD_SECS`] of host clock. A pure function of the
+    /// snapshot, like the ticker window and the skin rotation.
+    fn gauge_target(&self) -> f32 {
+        let slot = self.unix.div_euclid(GAUGE_HOLD_SECS);
+        let count = i64::try_from(GAUGE_STOPS.len()).unwrap_or(1);
+        let index = usize::try_from(slot.rem_euclid(count)).unwrap_or(0);
+        GAUGE_STOPS[index]
+    }
+
     /// The textbox's line — names the current skin so the rotation is
     /// legible in all three widgets at once.
     fn textbox_line(style: DisplayStyle) -> String {
@@ -212,6 +267,7 @@ impl Plugin for PreemDemo {
             style_bump: 0,
             bins: [0.0; SPECTRUM_BINS],
             scope: Scope::new(),
+            gauge: Gauge::new().range(0.0, 100.0),
             visible: false,
         }
     }
@@ -237,6 +293,12 @@ impl Plugin for PreemDemo {
                 if self.visible {
                     self.scope.advance(&self.bins);
                 }
+                // The gauge's own heartbeat: dial in the current reading and let
+                // the needle move toward it. Ungated on visibility, unlike the
+                // scope — see the field docs — and advanced in slow motion so
+                // the swing is legible at a 1 Hz cadence (`GAUGE_SLOWMO_DT`).
+                self.gauge.set_target(self.gauge_target());
+                self.gauge.advance(GAUGE_SLOWMO_DT);
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
@@ -297,6 +359,9 @@ impl Plugin for PreemDemo {
         // The scope carries its phosphor across frames; `advance` already ran on
         // the heartbeat, so `view` just renders the current trace in this skin.
         let scope = self.scope.render(style);
+        // Likewise the gauge: `update` already moved the needle, so `view` only
+        // draws where it currently points.
+        let gauge = self.gauge.render(style);
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -313,6 +378,7 @@ impl Plugin for PreemDemo {
                 marquee.into_node(Some(MARQUEE_ID), Vec::new()),
                 textbox.into_node(Some(TEXT_ID), Vec::new()),
                 scope.into_node(Some(SCOPE_ID), Vec::new()),
+                gauge.into_node(Some(GAUGE_ID), Vec::new()),
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
@@ -451,7 +517,11 @@ mod tests {
         for step in 0..6 {
             let tree = m.view().tree;
             let bufs = pixels_of(&tree);
-            assert_eq!(bufs.len(), 5, "clock + ticker + marquee + textbox + scope");
+            assert_eq!(
+                bufs.len(),
+                6,
+                "clock + ticker + marquee + textbox + scope + gauge"
+            );
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
                 assert!(w > 0 && h > 0);
@@ -582,6 +652,62 @@ mod tests {
         let _ = m.update(snapshot("2026-07-16T00:00:02+02:00", 3));
         let ghost2 = m.scope.render(DisplayStyle::Vfd);
         assert_ne!(ghost2, ghost, "the ghost keeps fading each heartbeat");
+    }
+
+    /// The gauge steps between readings on the host clock, and the needle
+    /// **overshoots** on the way — the #397 showcase, checked here at the card
+    /// level rather than trusted.
+    #[test]
+    fn the_gauge_steps_readings_and_overshoots_on_the_way() {
+        let mut m = fresh();
+        // The stop table advances once per hold window, and wraps.
+        let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", 0));
+        let first = m.gauge_target();
+        let _ = m.update(snapshot(
+            "2026-07-16T00:00:00+02:00",
+            super::GAUGE_HOLD_SECS,
+        ));
+        assert!(
+            (m.gauge_target() - first).abs() > f32::EPSILON,
+            "a new hold window dials in a new reading"
+        );
+        let lap = i64::try_from(super::GAUGE_STOPS.len()).unwrap() * super::GAUGE_HOLD_SECS;
+        let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", lap));
+        assert!((m.gauge_target() - first).abs() < 1.0e-6, "and wraps");
+
+        // Held on one reading, the needle swings past it before settling — and
+        // does so within the heartbeats the hold window actually gives it.
+        let mut m = fresh();
+        let mut peak = f32::MIN;
+        for second in 0..super::GAUGE_HOLD_SECS {
+            let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", second));
+            peak = peak.max(m.gauge.value());
+        }
+        let target = m.gauge_target();
+        assert!(
+            peak > target + 1.0,
+            "the needle overshot {target} (peaked at {peak}) — physics, not a lerp"
+        );
+        assert!(m.gauge.is_settled(), "and settled inside the hold window");
+    }
+
+    /// The gauge deliberately does **not** park (#422): its reading is derived
+    /// from the snapshot, so a hidden card keeps it current and a reopen shows
+    /// the value rather than replaying a stale swing.
+    #[test]
+    fn a_hidden_card_keeps_the_gauge_current() {
+        let mut m = shown();
+        let _ = m.update(Input::SlotVisible(false));
+        for second in 0..(super::GAUGE_HOLD_SECS * 6) {
+            let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", second));
+        }
+        let target = m.gauge_target();
+        assert!(
+            (m.gauge.value() - target).abs() < 1.0,
+            "a hidden gauge still tracks its reading ({} vs {target})",
+            m.gauge.value()
+        );
+        assert!(m.gauge.is_settled(), "and is not frozen mid-swing");
     }
 
     /// The manifest opts into the clock heartbeat, the audio spectrum, and the

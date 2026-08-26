@@ -131,10 +131,16 @@ fn build_window(app: &adw::Application) {
         .revealed(true)
         .build();
 
+    // The revision footer (#601): the running shell's build git revision,
+    // fetched over `Control.Revision` — see `check_shell_revision` for why this
+    // must never resolve the companion app's own compiled-in `TROLLSHELL_REV`.
+    let (footer, revision_label) = build_revision_footer();
+
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.add_top_bar(&banner);
     toolbar.set_content(Some(&stack));
+    toolbar.add_bottom_bar(&footer);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -159,7 +165,82 @@ fn build_window(app: &adw::Application) {
     });
 
     check_shell_connection(&banner);
+    check_shell_revision(&revision_label);
     window.present();
+}
+
+// ── Revision footer (#601) ────────────────────────────────────────────────────
+
+/// Build the footer bar: a single dim, end-aligned label reporting the running
+/// shell's build revision. Deliberately small and unobtrusive — a footer, not a
+/// tab or dialog — and refreshed once at startup alongside the connection
+/// banner (see [`check_shell_revision`]).
+fn build_revision_footer() -> (gtk::Box, gtk::Label) {
+    let label = gtk::Label::builder()
+        .label("Shell revision: checking…")
+        .halign(gtk::Align::End)
+        .build();
+    label.add_css_class("dim-label");
+    label.add_css_class("caption");
+
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .margin_top(2)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    bar.append(&label);
+    (bar, label)
+}
+
+/// Format the footer label's text from a `Control.Revision` call outcome.
+///
+/// Pure so the shell-not-running fallback and the `"dev"` passthrough are
+/// unit-tested without a live D-Bus call — see the `revision_footer_tests`
+/// module below. `revision` is `None` exactly when the call failed (the shell
+/// isn't running or didn't answer in time); a `"dev"` value — `revision.rs`'s
+/// documented fallback for an unstamped local build — is rendered as-is rather
+/// than special-cased, per #601: a developer seeing `dev` is correct
+/// information, not a state to hide.
+fn format_revision_footer(revision: Option<&str>) -> String {
+    match revision {
+        Some(rev) => format!("Shell revision: {rev}"),
+        None => "Shell revision: unavailable (trollshell not running)".to_owned(),
+    }
+}
+
+/// Probe `Control.Revision` on the shared tokio runtime and set the footer
+/// label from the result. Mirrors [`check_shell_connection`]'s shape (spawn on
+/// the runtime, deliver back over [`spawn_on_runtime`]'s oneshot).
+///
+/// # Why this calls `Control.Revision` and not a local resolver
+///
+/// `trollshell-control-center` is a separate binary from the shell, wrapped by
+/// its own nix slice (`nix/control-center.nix`) with its **own**
+/// `TROLLSHELL_REV` baked in. That value is the *companion app's* build
+/// revision, not the running shell's — normally identical, but they diverge
+/// exactly when it matters (a rebuild that updates one and not the other, a
+/// stale store path, a dev companion against a deployed shell). Reporting the
+/// companion's own revision here would look authoritative while silently
+/// answering the wrong question — the exact failure #601 exists to prevent
+/// (four bug reports — #375, #566, #375 again, #810 — turned on "which commit
+/// is the running shell", not "which commit is the control center"). So this
+/// crate has no `revision` module of its own; the only source of truth is the
+/// D-Bus round trip below.
+fn check_shell_revision(label: &gtk::Label) {
+    let label = label.clone();
+    spawn_on_runtime(revision(), move |res| {
+        label.set_text(&format_revision_footer(res.ok().as_deref()));
+    });
+}
+
+/// `Revision` → the running shell's build git revision (#601). See
+/// [`check_shell_revision`] for why this is a plain `Control` round trip and
+/// not a local resolve.
+async fn revision() -> Result<String, hytte_bus::BusError> {
+    control_call("Revision").await
 }
 
 // ── Plugins tab (#348) · live connected/rendering overlay (#423) ─────────────
@@ -968,8 +1049,8 @@ mod tests {
     use tracing_subscriber::filter::LevelFilter;
 
     use super::{
-        DEFAULT_LOG_LEVEL, PluginRuntime, build_env_filter, is_running, mount_or_unknown,
-        plugin_subtitle, runtime_overlay, seen_suffix, violations_suffix,
+        DEFAULT_LOG_LEVEL, PluginRuntime, build_env_filter, format_revision_footer, is_running,
+        mount_or_unknown, plugin_subtitle, runtime_overlay, seen_suffix, violations_suffix,
     };
 
     /// A connected plugin's runtime state, for the overlay tests.
@@ -1106,5 +1187,51 @@ mod tests {
     fn rust_log_override_still_wins() {
         let filter = build_env_filter(Some("trollshell_control_center=trace"));
         assert_eq!(filter.max_level_hint(), Some(LevelFilter::TRACE));
+    }
+
+    // ── Revision footer (#601) ────────────────────────────────────────────
+
+    #[test]
+    fn footer_renders_a_known_revision() {
+        assert_eq!(
+            format_revision_footer(Some("34e3d96")),
+            "Shell revision: 34e3d96"
+        );
+    }
+
+    #[test]
+    fn footer_renders_a_dirty_tree_hash_unmodified() {
+        assert_eq!(
+            format_revision_footer(Some("34e3d96-dirty")),
+            "Shell revision: 34e3d96-dirty"
+        );
+    }
+
+    // #601: `"dev"` is `trollshell/src/revision.rs`'s documented fallback for
+    // an unstamped local `cargo run`/`cargo build`. It must render as-is, not
+    // get hidden or swapped for a friendlier placeholder — seeing `dev` from a
+    // deployed shell is itself the useful signal ("this wasn't built by nix").
+    #[test]
+    fn footer_renders_the_dev_fallback_honestly() {
+        assert_eq!(format_revision_footer(Some("dev")), "Shell revision: dev");
+    }
+
+    #[test]
+    fn footer_renders_unknown_passthrough() {
+        assert_eq!(
+            format_revision_footer(Some("unknown")),
+            "Shell revision: unknown"
+        );
+    }
+
+    // The shell-not-running case: `None` (the `Control.Revision` call failed)
+    // must render an honest "unavailable" state, not a blank label or a
+    // leftover stale value from a previous connection.
+    #[test]
+    fn footer_falls_back_when_shell_is_not_running() {
+        assert_eq!(
+            format_revision_footer(None),
+            "Shell revision: unavailable (trollshell not running)"
+        );
     }
 }

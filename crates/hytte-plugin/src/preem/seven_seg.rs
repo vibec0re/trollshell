@@ -134,7 +134,7 @@ pub fn seven_seg(text: &str, style: DisplayStyle) -> Frame {
     if let Some(bloom) = palette.bloom {
         lit.bloom(bloom);
     }
-    lit.composite(&mut frame, palette.ink);
+    lit.composite(&mut frame, palette.ink, palette.mask);
     frame
 }
 

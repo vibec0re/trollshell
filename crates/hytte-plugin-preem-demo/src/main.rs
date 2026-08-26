@@ -5,7 +5,10 @@
 //! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
 //! per second, a **scrolling marquee** stepping a message across a fixed dot
 //! grid one whole dot at a time (#839/#843), and an **8bit textbox**, all
-//! rotating VFD → LCD → OLED every [`STYLE_SECS`] seconds. Below them a real
+//! rotating VFD → LCD → OLED → CRT every [`STYLE_SECS`] seconds — the last of
+//! those being the kit's one *pass* rather than a skin, so it puts scanlines
+//! and curved-glass falloff over every widget on the card at once (#397).
+//! Below them a real
 //! **oscilloscope**
 //! ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum` push as a
 //! glow-trace waveform over a graticule, with real phosphor decay — a silent
@@ -147,7 +150,7 @@ const GAUGE_HOLD_SECS: i64 = 8;
 const GAUGE_SLOWMO_DT: f32 = 0.16;
 /// The ticker's marquee message; the view shows a [`TICKER_WINDOW`]-char
 /// window that advances one char per second (wrapping around).
-const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED ~ 7SEG DOT 8BIT ~ ";
+const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED / CRT ~ 7SEG DOT 8BIT ~ ";
 /// Chars of [`TICKER`] visible at once: 11 dot-matrix cells = 268 px, the
 /// widest that fits the ~296 px sidebar card.
 const TICKER_WINDOW: usize = 11;
@@ -564,10 +567,34 @@ mod tests {
         });
         assert!(fx.is_empty(), "the demo asks nothing of the shell");
         assert_ne!(m.style(), base, "a tap advances the skin");
-        // Three slots = a full lap through DisplayStyle::ALL.
+        // One slot per style = a full lap through DisplayStyle::ALL. Off the
+        // list's own length, so adding a skin (#397's CRT was the fourth) can
+        // never leave this asserting a stale lap.
         let lap = m.style();
-        m.unix += STYLE_SECS * 3;
+        m.unix += STYLE_SECS * i64::try_from(DisplayStyle::ALL.len()).unwrap();
         assert_eq!(m.style(), lap);
+    }
+
+    /// The rotation reaches **every** skin, the CRT pass included (#397): a
+    /// full lap of slots visits each of `DisplayStyle::ALL` exactly once, so
+    /// there is no per-skin wiring in the demo that could quietly skip one.
+    #[test]
+    fn the_rotation_visits_every_skin_including_the_crt() {
+        let mut m = fresh();
+        let seen: Vec<DisplayStyle> = (0..DisplayStyle::ALL.len())
+            .map(|_| {
+                let style = m.style();
+                m.unix += STYLE_SECS;
+                style
+            })
+            .collect();
+        for style in DisplayStyle::ALL {
+            assert!(seen.contains(&style), "the rotation never shows {style:?}");
+        }
+        assert!(
+            seen.contains(&DisplayStyle::Crt),
+            "the CRT pass is on the card"
+        );
     }
 
     /// A click on a node we don't own changes nothing.

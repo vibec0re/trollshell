@@ -557,7 +557,7 @@ impl FlipBoard {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut frame, palette.ink);
+        lit.composite(&mut frame, palette.ink, palette.mask);
 
         // The slots, cut over the finished composite: a gap in the fixture is
         // a gap, so it stays visible even where a skin's bloom would have

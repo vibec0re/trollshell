@@ -236,7 +236,7 @@ impl Scope {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut frame, palette.ink);
+        lit.composite(&mut frame, palette.ink, palette.mask);
 
         frame.upscale(self.scale)
     }

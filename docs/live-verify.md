@@ -474,7 +474,7 @@ The kit's own widget skins, which CI can only check as byte patterns. Every
 item below is exercised by `hytte-plugin-preem-demo` (install with
 `cargo install --root /usr/local --path crates/hytte-plugin-preem-demo`, enable
 its unit, open the sidebar) — one card stacking every widget, rotating
-VFD → LCD → OLED every 10 s, and re-skinning immediately when you tap the
+VFD → LCD → OLED → CRT every 10 s, and re-skinning immediately when you tap the
 clock. The two audio-fed preem items live under "Audio & media" above (the
 `#557` scope tile and `#422`'s park), because what needs verifying there is the
 audio feed, not the raster.
@@ -525,6 +525,37 @@ audio feed, not the raster.
      while the card faces / cathode stacks keep their per-skin panel colour.
   7. **The fixture never moves:** bezel, card row and the gaps between cards
      must be rock-steady through every flip — only the cards move.
+- [ ] **(#397)** The **CRT pass** — the fourth skin in the rotation, and the
+      only one that is a _pass_: wait for the whole card to turn P31 green
+      (or tap the clock until it does) and judge **every widget at once**,
+      because the point is that none of them had to be changed for it:
+  1. **Scanlines are there and are not eating the glyphs.** A dark horizontal
+     line every fourth row, threaded through the _gaps_ between dot rows. Text
+     on the ticker, marquee and boards must stay exactly as legible as it is on
+     VFD — if a scan line is running through the middle of the dots, thinning
+     or halving them, the comb's phase has slipped and that is the regression.
+  2. **The whole card is on one tube.** Marquee, scope, gauge, both boards, the
+     7seg clock, the LED strip: all of them scanlined, all of them green. A
+     widget that stayed VFD-cyan or stayed clean is one that stopped routing
+     through the shared composite.
+  3. **Curved glass:** the picture is brightest in the middle and falls off
+     toward the rim, with the **corners** darker than the edges beside them —
+     the ends of the 268 px ticker should be noticeably dimmer than its centre.
+     It must read as light falling away, not as a black border drawn on.
+  4. **Nothing is warped.** This is deliberately a vignette, not a barrel
+     distortion: straight lines stay straight, the dot grid stays square and
+     on-grid, and no glyph edge is blurred or resampled. A bowed graticule or a
+     softened dot means someone added distortion.
+  5. **The phosphor bloom is broader than VFD's** — lit dots wear a soft halo
+     that spills further than the VFD glow does, and the scanline gaps read
+     _through_ that halo rather than being filled in by it.
+  6. **Accent tracking (#376):** change the desktop accent — the CRT's ink
+     follows it like every other skin, while the near-black tube face and the
+     scanlines stay put.
+  7. **No flicker, no crawl.** The pass is stateless: hold still and watch a
+     static widget (the 7seg clock between minutes). The scanlines must be
+     perfectly frozen — they must not creep, shimmer, or breathe between
+     frames. Only the scope's own phosphor trail decays over time.
 
 ## Screen recording
 

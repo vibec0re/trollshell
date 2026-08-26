@@ -206,7 +206,7 @@ impl LedStrip {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut frame, palette.ink);
+        lit.composite(&mut frame, palette.ink, palette.mask);
 
         // Peak-hold dot: a single LED composited toward a brightened cap so it
         // reads distinct from the level even on a glow-free skin.
@@ -217,7 +217,9 @@ impl LedStrip {
             if let Some(bloom) = palette.bloom {
                 dot.bloom(bloom);
             }
-            dot.composite(&mut frame, cap);
+            // The cap is a brighter ink, not a brighter *screen*: the peak dot
+            // is light on the same glass, so it takes the same pass.
+            dot.composite(&mut frame, cap, palette.mask);
         }
 
         frame

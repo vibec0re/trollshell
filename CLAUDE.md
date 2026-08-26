@@ -101,6 +101,19 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   as part of `checks` — before that, `nix flake check` could stay green while
   `nix build .#trollshell` (or the control-center) was broken, because `check`
   only builds what's listed under `checks`, not `packages`.
+- `bind-pins` (#831): a source scan (`nix/lint-bind-pins.py`, run by a
+  `runCommand` — no compile, so it goes red in seconds) that fails the build if
+  a `bind*` call site discards the closure's own widget parameter and uses a
+  captured strong clone of the same widget instead, which pins the widget for
+  the binding's lifetime and defeats the `WeakRef` contract in
+  `crates/hytte-reactive/src/bind.rs` (#224). Not a clippy lint because the
+  pattern is cross-statement and repo-specific; not a unit test because ten of
+  the twelve sites #831 found can't be constructed without a registered
+  `Registry`. Run it by hand from the repo root with
+  `nix shell nixpkgs#python3 --command python3 nix/lint-bind-pins.py`. The
+  script's header documents the deliberate carve-out (capturing a _different_
+  widget is correct) and why it paren/brace-matches instead of using a regex —
+  read it before changing it.
 
 ### Lint — strict, treat as the gate
 

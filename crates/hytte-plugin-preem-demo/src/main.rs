@@ -3,19 +3,24 @@
 //!
 //! One sidebar card cycling every kit widget through every skin: a
 //! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
-//! per second, a **scrolling marquee** panning a pixel window across a
-//! pre-rendered strip, and an **8bit textbox**, all rotating VFD → LCD → OLED
-//! every [`STYLE_SECS`] seconds. Below them a real **oscilloscope**
+//! per second, a **scrolling marquee** stepping a message across a fixed dot
+//! grid one whole dot at a time (#839/#843), and an **8bit textbox**, all
+//! rotating VFD → LCD → OLED every [`STYLE_SECS`] seconds. Below them a real
+//! **oscilloscope**
 //! ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum` push as a
 //! glow-trace waveform over a graticule, with real phosphor decay — a silent
 //! sink flatlines on the axis while the old trail keeps ghosting. Below *that*
 //! a **needle gauge** ([`Gauge`], #397) steps between readings and swings to
 //! each one on a real damped oscillator: the pointer overshoots, bounces once,
-//! and settles, smearing while it moves. Tapping the clock advances the skin
-//! immediately. It doubles as the kit's visual regression harness and the
-//! copy-from reference for plugin authors.
+//! and settles, smearing while it moves. Below *that*, two **`HH:MM:SS`
+//! boards** ([`FlipBoard`], #397) showing the same clock through the kit's two
+//! change mechanisms: a **split-flap** board whose cards hinge down and ripple
+//! left to right, and a **nixie** readout whose outgoing cathode fades under
+//! the incoming one's strike. Tapping the clock advances the skin immediately.
+//! It doubles as the kit's visual regression harness and the copy-from
+//! reference for plugin authors.
 //!
-//! # The scope and the gauge are the card's two stateful widgets
+//! # The scope, the gauge and the two boards are the card's stateful widgets
 //!
 //! Every other widget is a pure function of the snapshot, but the scope carries
 //! a phosphor buffer across frames, so it lives in the model: each host
@@ -45,14 +50,24 @@
 //! visibility and the hide edge [`clear`](Scope::clear)s the phosphor — a
 //! reopened card starts from a dark screen and re-derives from the next sweep.
 //!
+//! The two [`FlipBoard`]s are stateful in the same way the gauge is — they
+//! carry a clock and a per-cell transition, not pixels — and are driven the
+//! same way: [`set_text`](FlipBoard::set_text) with the current time on each
+//! heartbeat, then advanced by [`FLIP_SLOWMO_DT`] of board time rather than the
+//! full second, so a fold plays out over several renders instead of completing
+//! between two of them. That also means the seconds card is *retargeted while
+//! it is still falling* on most beats, which is exactly the case #397's
+//! retarget rule exists for: the card in flight keeps its clock and lands on
+//! the newest target rather than restarting.
+//!
 //! Everything else deliberately keeps running while hidden: the clock, ticker,
-//! marquee, skin rotation **and the gauge** are pure functions of the snapshot,
-//! so parking them would buy nothing and would make the reopened card show a
-//! *stale time* — the very failure the scope's park exists to avoid. The gauge
-//! is the instructive case: it is stateful like the scope, but its input is
-//! derived rather than pushed, so it is the *input*, not the statefulness, that
-//! decides whether a widget must park. ([`Needle::settle`] is there for a gauge
-//! whose reading really does come from outside.)
+//! marquee, boards, skin rotation **and the gauge** are pure functions of the
+//! snapshot, so parking them would buy nothing and would make the reopened card
+//! show a *stale time* — the very failure the scope's park exists to avoid. The
+//! gauge is the instructive case: it is stateful like the scope, but its input
+//! is derived rather than pushed, so it is the *input*, not the statefulness,
+//! that decides whether a widget must park. ([`Needle::settle`] is there for a
+//! gauge whose reading really does come from outside.)
 //!
 //! [`Needle::settle`]: hytte_plugin::preem::Needle::settle
 //!
@@ -71,10 +86,13 @@
 //! Every widget is sized via its **buffer dimensions** (a `Pixels` node's
 //! natural size), not shell CSS: the 7seg clock renders 188 px wide, the
 //! 11-char ticker 268 px, the marquee window [`MARQUEE_WINDOW_PX`] wide, the
-//! 22-column ×2 textbox 274 px, and the scope's and gauge's defaults 288 px each
-//! — all inside the sidebar card's ~296 px content width.
+//! 22-column ×2 textbox 274 px, the scope's and gauge's defaults 288 px each,
+//! and the two 8-cell boards 260 px — all inside the sidebar card's ~296 px
+//! content width.
 
-use hytte_plugin::preem::{DisplayStyle, Gauge, Marquee, Scope, TextBox, dot_matrix, seven_seg};
+use hytte_plugin::preem::{
+    DisplayStyle, FlipBoard, Gauge, Marquee, Mechanism, Scope, TextBox, dot_matrix, seven_seg,
+};
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
@@ -90,9 +108,25 @@ const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
 const SCOPE_ID: &str = "preem-demo-scope";
 const GAUGE_ID: &str = "preem-demo-gauge";
+const FLAP_ID: &str = "preem-demo-flap";
+const NIXIE_ID: &str = "preem-demo-nixie";
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
+
+/// The `HH:MM` placeholder the readout wears until the first snapshot lands.
+const NO_CLOCK: &str = "--:--";
+/// Cells on each [`FlipBoard`]: `HH:MM:SS`, 260 px wide at the kit's defaults.
+const CLOCK_CELLS: usize = 8;
+/// Seconds of board time each [`FlipBoard`] is advanced per host heartbeat.
+///
+/// **Slow motion, on purpose**, for the same reason [`GAUGE_SLOWMO_DT`] is: the
+/// card has no frame timer, only the shell's ~1 Hz `Clock` snapshot, so
+/// advancing by the real elapsed second would land every card between two
+/// renders and the mechanism would never be seen. At this rate a fold spans
+/// three or four heartbeats. A frame-timer plugin passes its real elapsed
+/// seconds instead; the kit owns no clock either way.
+const FLIP_SLOWMO_DT: f32 = 0.12;
 
 /// The readings the showcase gauge steps between, one every
 /// [`GAUGE_HOLD_SECS`]. Deliberately mid-scale: a full-scale slam would peg the
@@ -166,6 +200,14 @@ struct PreemDemo {
     /// so keeping it live means a reopened card reads the current value instead
     /// of replaying a stale swing.
     gauge: Gauge,
+    /// The split-flap board (#397): the same `HH:MM:SS` the 7seg shows, on the
+    /// airport-board mechanism. Stateful like the gauge — a clock plus a
+    /// per-cell transition — and, like it, deliberately **not** parked (#422):
+    /// its content is a pure function of the snapshot.
+    flap: FlipBoard,
+    /// The nixie readout (#397): the same clock again, so the card contrasts
+    /// the two change mechanisms side by side on identical content.
+    nixie: FlipBoard,
     /// Whether the sidebar (and so this card) is currently shown — the
     /// [`SlotVisible`](Input::SlotVisible) gate for the scope's sweep (#422).
     /// Seeded `false`; the host sends the real value at register.
@@ -232,6 +274,17 @@ impl PreemDemo {
         GAUGE_STOPS[index]
     }
 
+    /// The face both [`FlipBoard`]s show: `HH:MM:SS`, its seconds taken from
+    /// the snapshot's unix time so a card changes on every heartbeat — which is
+    /// what puts the retarget rule on display. All dashes until the first
+    /// snapshot lands, matching the 7seg readout's placeholder.
+    fn clock_face(&self) -> String {
+        if self.hhmm == NO_CLOCK {
+            return "--:--:--".to_owned();
+        }
+        format!("{}:{:02}", self.hhmm, self.unix.rem_euclid(60))
+    }
+
     /// The textbox's line — names the current skin so the rotation is
     /// legible in all three widgets at once.
     fn textbox_line(style: DisplayStyle) -> String {
@@ -266,12 +319,14 @@ impl Plugin for PreemDemo {
     /// renders this seed immediately, so the card mounts right away).
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
         Self {
-            hhmm: "--:--".to_owned(),
+            hhmm: NO_CLOCK.to_owned(),
             unix: 0,
             style_bump: 0,
             bins: [0.0; SPECTRUM_BINS],
             scope: Scope::new(),
             gauge: Gauge::new().range(0.0, 100.0),
+            flap: FlipBoard::new(Mechanism::SplitFlap).cells(CLOCK_CELLS),
+            nixie: FlipBoard::new(Mechanism::Nixie).cells(CLOCK_CELLS),
             visible: false,
         }
     }
@@ -303,6 +358,15 @@ impl Plugin for PreemDemo {
                 // the swing is legible at a 1 Hz cadence (`GAUGE_SLOWMO_DT`).
                 self.gauge.set_target(self.gauge_target());
                 self.gauge.advance(GAUGE_SLOWMO_DT);
+                // The boards' heartbeat: re-state the clock (unchanged cards
+                // are untouched, so only the seconds card usually moves) and
+                // advance the mechanism in slow motion (`FLIP_SLOWMO_DT`).
+                // Ungated on visibility for the same reason the gauge is.
+                let face = self.clock_face();
+                self.flap.set_text(&face);
+                self.flap.advance(FLIP_SLOWMO_DT);
+                self.nixie.set_text(&face);
+                self.nixie.advance(FLIP_SLOWMO_DT);
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
@@ -346,7 +410,8 @@ impl Plugin for PreemDemo {
 
     /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
     /// marquee, the textbox — all wearing the same skin — the audio
-    /// oscilloscope, and a dim hint line. Every `Pixels` buffer satisfies the
+    /// oscilloscope, the needle gauge, the split-flap and nixie boards, and a
+    /// dim hint line. Every `Pixels` buffer satisfies the
     /// host's `len == w * h * 4` invariant by kit construction.
     fn view(&self) -> View {
         let style = self.style();
@@ -366,6 +431,10 @@ impl Plugin for PreemDemo {
         // Likewise the gauge: `update` already moved the needle, so `view` only
         // draws where it currently points.
         let gauge = self.gauge.render(style);
+        // …and the two boards: `update` already set their content and advanced
+        // their clocks, so `view` only draws the moment each is in.
+        let flap = self.flap.render(style);
+        let nixie = self.nixie.render(style);
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -383,6 +452,8 @@ impl Plugin for PreemDemo {
                 textbox.into_node(Some(TEXT_ID), Vec::new()),
                 scope.into_node(Some(SCOPE_ID), Vec::new()),
                 gauge.into_node(Some(GAUGE_ID), Vec::new()),
+                flap.into_node(Some(FLAP_ID), Vec::new()),
+                nixie.into_node(Some(NIXIE_ID), Vec::new()),
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
@@ -523,8 +594,8 @@ mod tests {
             let bufs = pixels_of(&tree);
             assert_eq!(
                 bufs.len(),
-                6,
-                "clock + ticker + marquee + textbox + scope + gauge"
+                8,
+                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie"
             );
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
@@ -712,6 +783,75 @@ mod tests {
             m.gauge.value()
         );
         assert!(m.gauge.is_settled(), "and is not frozen mid-swing");
+    }
+
+    /// The boards track the clock face and **animate** getting there: a
+    /// heartbeat that changes the seconds card leaves the board mid-transition
+    /// rather than snapped onto the new time (the `FLIP_SLOWMO_DT` showcase),
+    /// and the unchanged cards are not disturbed.
+    #[test]
+    fn the_boards_step_the_clock_and_animate_getting_there() {
+        let mut m = fresh();
+        assert_eq!(m.clock_face(), "--:--:--", "dashes before the first clock");
+
+        let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
+        assert_eq!(m.clock_face(), "15:49:00");
+        // The whole face was new, so both boards are still on their way.
+        assert!(!m.flap.is_settled() && !m.nixie.is_settled());
+        assert_eq!(m.flap.target(), "15:49:00", "aimed at the current time");
+        assert_eq!(m.nixie.target(), "15:49:00");
+
+        // Hold the same face for a while: re-stating it is inert, so the boards
+        // simply run their clocks out and land.
+        for _ in 0..12 {
+            let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
+        }
+        assert!(m.flap.is_settled(), "a held face lands");
+        let landed = m.view();
+        let _ = m.update(snapshot("2026-07-16T15:49:01+02:00", 1_752_672_541));
+        assert_eq!(m.flap.target(), "15:49:01");
+        assert!(!m.flap.is_settled(), "and the next second is mid-flip");
+        assert_ne!(m.view(), landed, "which the card actually shows");
+    }
+
+    /// The boards deliberately do **not** park (#422), for the gauge's reason:
+    /// their content is a pure function of the snapshot, so a hidden card keeps
+    /// them current and a reopen shows the time rather than a stale flip.
+    #[test]
+    fn a_hidden_card_keeps_the_boards_current() {
+        let mut m = shown();
+        let _ = m.update(Input::SlotVisible(false));
+        for second in 0..30 {
+            let _ = m.update(snapshot(
+                "2026-07-16T15:49:00+02:00",
+                1_752_672_540 + second,
+            ));
+        }
+        assert_eq!(
+            m.flap.target(),
+            m.clock_face(),
+            "a hidden split-flap board still tracks the clock"
+        );
+        assert_eq!(m.nixie.target(), m.clock_face());
+    }
+
+    /// Every char the boards can be asked to show is on the kit's drum, so the
+    /// demo never renders a notdef card — dashes included.
+    #[test]
+    fn the_clock_face_stays_on_the_drum() {
+        use hytte_plugin::preem::CHARSET;
+        let mut m = fresh();
+        let mut faces = vec![m.clock_face()];
+        for second in [0_i64, 7, 59, 1_752_672_540] {
+            let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", second));
+            faces.push(m.clock_face());
+        }
+        for face in faces {
+            assert_eq!(face.chars().count(), super::CLOCK_CELLS, "{face:?}");
+            for c in face.chars() {
+                assert!(CHARSET.contains(c), "clock-face char {c:?} is on the drum");
+            }
+        }
     }
 
     /// The manifest opts into the clock heartbeat, the audio spectrum, and the

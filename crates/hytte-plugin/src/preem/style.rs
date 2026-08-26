@@ -358,14 +358,14 @@ impl Mask {
 /// Measured `--release` on the kit's reference geometry, a 268×36 marquee
 /// window (the #401/#844 precedent, ~105 µs/frame on VFD):
 ///
-/// | stage                                   | ns/frame |
-/// |-----------------------------------------|---------:|
-/// | mask alone, on a fully lit 228×36 grid  |  ~36 000 |
-/// | …the same before these two tables       |  ~64 000 |
-/// | marquee window, VFD (radius-2 bloom)     | ~108 000 |
-/// | marquee window, CRT (radius-3 + pass)    | ~165 000 |
-/// | static `dot_matrix`, VFD                 | ~156 000 |
-/// | static `dot_matrix`, CRT                 | ~172 000 |
+/// | stage                                  | ns/frame |
+/// |----------------------------------------|---------:|
+/// | mask alone, on a fully lit 228×36 grid |  ~36 000 |
+/// | …the same before these two tables      |  ~64 000 |
+/// | marquee window, VFD (radius-2 bloom)   | ~108 000 |
+/// | marquee window, CRT (radius-3 + pass)  | ~165 000 |
+/// | static `dot_matrix`, VFD               | ~156 000 |
+/// | static `dot_matrix`, CRT               | ~172 000 |
 ///
 /// So the pass costs ~28 µs of mask plus ~29 µs of wider bloom on the marquee,
 /// and only ~16 µs all-in on the static matrix — where the CRT's missing ghost

@@ -30,6 +30,10 @@
 //! - [`Scope`] — a glow-trace oscilloscope over a graticule, with real
 //!   phosphor persistence: the beam trail decays exponentially across frames
 //!   rather than redrawing from black (#556, a #397 skin).
+//! - [`Gauge`] — a needle gauge over a swept scale: tick marks, a lit value
+//!   arc filling to the reading, and a tapered pointer driven by a real
+//!   damped-oscillator [`Needle`] that overshoots a step change and settles,
+//!   with a time-sampled motion blur behind it (a #397 skin).
 //!
 //! `hytte-plugin-preem-demo` is the reference consumer: one sidebar card
 //! cycling every widget through every style; `hytte-plugin-audio-widget` is the
@@ -69,6 +73,7 @@ pub mod font;
 
 mod dot_matrix;
 mod frame;
+mod gauge;
 mod led_strip;
 mod marquee;
 mod scope;
@@ -78,6 +83,7 @@ mod textbox;
 
 pub use dot_matrix::dot_matrix;
 pub use frame::{Frame, Rgba};
+pub use gauge::{DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Gauge, Needle, OVERTRAVEL, TRAIL_SPAN_SECS};
 pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;

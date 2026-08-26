@@ -409,6 +409,22 @@ title` in the stderr tail — worth a deliberate look on first run, since
       changes (not on every ~43 Hz `view()` call) — with the sidebar open and
       audio playing, CPU load from the audio-widget process should be
       noticeably lower than before this PR.
+- [ ] **(#840/#845)** Audio-widget y2k rework — the entry #845 could not carry
+      itself (its builder's lane deliberately excluded this file). With a
+      player running:
+  1. **Placement:** the card now sits at the **bottom** of the sidebar (below
+     the departures board; pet keeps the very bottom edge company), not in the
+     top region.
+  2. **Transport row:** prev / play-pause / next buttons under the LED strip —
+     chunky, circular, play-pause accented. The play-pause glyph mirrors the
+     player's real state (it flips when you pause from the _player_, not
+     optimistically on click).
+  3. **Song position:** a fixed-width `MM:SS/MM:SS` dot-matrix readout
+     (`--:--` when the player reports no length). The card must never reflow
+     as digits tick.
+  4. **Power claim:** with the sidebar **closed** and the Media drawer away,
+     `busctl` / journal should show no 250 ms `Position` polling — the poller
+     parks when no consumer is on screen and resumes on sidebar open.
 - [ ] **(#565)** Spectrum tap now activates **only** while a subscriber is
       actually on-screen (sidebar open, or bar-mounted) rather than for the
       whole session — see the `#583` item below for the PipeWire-side check

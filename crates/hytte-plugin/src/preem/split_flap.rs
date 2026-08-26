@@ -192,6 +192,13 @@ const SHADE_FLOOR: f32 = 0.45;
 /// tube's glow is a broad haze around a tight core, so the widget blooms twice:
 /// this wide, weak pass first, then the palette's own on top. `Emission::bloom`
 /// max-combines, so the core never dims.
+///
+/// It is also the widget's whole cost. Measured on the demo's 8-cell,
+/// 260×44 px board: 20 µs/frame for a nixie on the bloom-free LCD skin, 92 µs
+/// with both passes on VFD (the split flap, which blooms once, sits at 36 and
+/// 63 µs). In line with the marquee's disclosed 105 µs at a comparable
+/// geometry, and the lever if it ever matters is #844's bloom bounding rather
+/// than anything here.
 const NIXIE_HALO_RADIUS_BONUS: usize = 3;
 /// Strength of that wide halo pass (of 256).
 const NIXIE_HALO_STRENGTH: u16 = 64;

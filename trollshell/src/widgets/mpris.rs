@@ -35,6 +35,10 @@
 //!   fits  ⇔  full_natural ≤ available  (with hysteresis, see below)
 //! ```
 //!
+//! Playback status is deliberately **not** an input: expand and collapse are
+//! purely about whether there is room on the bar. See the trigger-starvation
+//! note at the end of this doc for why #838 made it look otherwise.
+//!
 //! `available` deliberately excludes *this* widget's own width: it subtracts
 //! only the left and right clusters. Crucially it measures each cluster's
 //! **natural** width, never its current *allocated* width — `GtkCenterBox`
@@ -63,6 +67,37 @@
 //! Recomputation is also deferred to an idle callback (never run inside the
 //! allocate), so a mode change settles on the next frame rather than recursing
 //! within the current layout pass.
+//!
+//! ### Trigger starvation — why the fit only seemed to work while playing (#838)
+//!
+//! The rule above never reads playback status, and yet the chip was reported as
+//! collapsing "only when playing". What playback changes is not the rule but
+//! whether the rule ever *runs*. Re-evaluation has two trigger sources, and a
+//! stopped player starves both:
+//!
+//! 1. **Player-signal traffic.** Every `mpris::active_player()` emission
+//!    re-runs the fit as a side effect. While something plays, the service's
+//!    per-player position poller re-emits on a 250 ms cadence (plus every track
+//!    boundary, seek and status flip), so the fit is recomputed constantly.
+//!    While stopped, nothing emits — zero re-evaluations from this source,
+//!    indefinitely.
+//! 2. **The geometry watchers** ([`watch_neighbours`]). These hook *allocated*
+//!    widths, and their own comment admits the blind spot: the left cluster's
+//!    allocation doesn't move once it is already squeezed to its minimum. The
+//!    decision deliberately reads **natural** widths (to avoid the feedback
+//!    described above), and nothing watches a natural-width change.
+//!
+//! So while playing, a missed geometry edge self-heals within a fraction of a
+//! second because the signal traffic re-runs the fit anyway; while stopped the
+//! miss is permanent and the widget is stranded in whatever mode it last chose
+//! — full, if the playlist ran out while the row still fitted.
+//!
+//! The fix is a *trigger*, not a rule: [`install_geometry_watchers`] also
+//! subscribes to `niri::windows()` / `niri::workspaces()`, the same sources the
+//! window list itself rebuilds from. When the window set or workspace focus
+//! changes, the left cluster's natural width changes — precisely the input
+//! [`available_width`] reads and nothing else watches — so the spatial rule now
+//! runs whenever space actually changes, playing or not.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -71,6 +106,7 @@ use std::rc::Rc;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::mpris::{self, Player};
+use hytte::services::niri;
 
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 
@@ -237,44 +273,49 @@ fn wire_visibility_and_state(
     install_geometry_watchers(monitor, container, &chips, &mode);
 }
 
-/// Recompute the fit and apply the resulting mode. Cheap and idempotent: if
-/// the chosen mode equals the current one, nothing visible changes (so this is
-/// safe to call from a width-notify without oscillating).
+/// Recompute the mode and apply it. Cheap and idempotent: if the chosen mode
+/// equals the current one, nothing visible changes (so this is safe to call
+/// from a width-notify without oscillating).
 fn reevaluate(container: &gtk::Box, chips: &Chips, mode: &ModeState) {
     if !mode.has_player.get() {
         return;
     }
-    let want_full = decide_mode(container, chips, mode.full.get());
-    mode.full.set(want_full);
-    apply_mode(chips, want_full);
+    let full = decide_mode(container, chips, mode.full.get());
+    mode.full.set(full);
+    apply_mode(chips, full);
 }
 
-/// Decide whether the full row fits, given the current mode (for hysteresis).
+/// Read the live bar geometry and decide the mode, given the current mode (for
+/// hysteresis).
 ///
-/// Returns `true` for full mode, `false` for narrow.
+/// Returns `true` for full mode, `false` for narrow. All the GTK reads live
+/// here; the decision itself is [`decide_full`], which is pure and tested.
 ///
 /// `available` is the bar width minus the left and right clusters and a small
-/// gap; `full_natural` is the summed natural width of the full-mode chips.
-/// Neither quantity depends on the mpris widget's *current* mode, so the
-/// decision can't feed back into itself.
+/// gap (`None` until the geometry is realised); `full_natural` is the summed
+/// natural width of the full-mode chips. Neither quantity depends on the mpris
+/// widget's *current* mode, so the decision can't feed back into itself. Nor
+/// does either depend on playback status — the rule is purely spatial (#838).
 fn decide_mode(container: &gtk::Box, chips: &Chips, currently_full: bool) -> bool {
-    let Some(available) = available_width(container) else {
+    let available = available_width(container);
+    let full_natural = full_mode_natural_width(chips);
+    decide_full(available, full_natural, currently_full)
+}
+
+/// The pure mode decision, split out from the GTK geometry reads so the
+/// asymmetric hysteresis band and the not-yet-realised case are unit-testable
+/// without a live widget tree.
+///
+/// `available` is the usable px (bar width minus the neighbour clusters and the
+/// gap), or `None` while the bar geometry isn't realised yet; `full_natural` is
+/// the summed natural width of the full-mode chips; `currently_full` selects
+/// the hysteresis threshold. Returns `true` for full, `false` for narrow.
+fn decide_full(available: Option<i32>, full_natural: i32, currently_full: bool) -> bool {
+    let Some(available) = available else {
         // Geometry not realised yet (no root / zero allocation). Keep the
         // current mode rather than guess; a later width-notify settles it.
         return currently_full;
     };
-    let full_natural = full_mode_natural_width(chips);
-    fits(available, full_natural, currently_full)
-}
-
-/// The pure fit decision with hysteresis, split out from the GTK geometry reads
-/// so the asymmetric threshold band is unit-testable without a live widget tree.
-///
-/// `available` is the usable px (bar width minus the neighbour clusters and the
-/// gap); `full_natural` is the summed natural width of the full-mode chips;
-/// `currently_full` selects the threshold. Returns `true` for full, `false` for
-/// narrow.
-fn fits(available: i32, full_natural: i32, currently_full: bool) -> bool {
     if currently_full {
         // Collapse to narrow only once the full row no longer fits.
         full_natural <= available
@@ -356,8 +397,9 @@ fn apply_mode(chips: &Chips, full: bool) {
 
 /// Watch the geometry inputs and re-evaluate the fit when any changes. We hook
 /// the `width` notify on the bar window, the `CenterBox`, the left cluster, and
-/// the container itself, plus the sidebar's open signal (#324); the decision is
-/// deferred to idle so we never mutate visibility mid-allocate.
+/// the container itself, plus the sidebar's open signal (#324) and the niri
+/// window/workspace signals that drive the left cluster's natural width (#838);
+/// the decision is deferred to idle so we never mutate visibility mid-allocate.
 fn install_geometry_watchers(
     monitor: &Monitor,
     container: &gtk::Box,
@@ -411,6 +453,38 @@ fn install_geometry_watchers(
             container,
             move |_container, _open| schedule(),
         );
+    }
+
+    // Re-evaluate when the *window set* changes (#838). These are the same two
+    // sources `widgets::window_list` rebuilds the left cluster from, so a change
+    // here is exactly a change to that cluster's **natural** width — which is
+    // what `available_width()` reads, and which none of the `width` watchers
+    // above can see: they hook *allocated* widths, and `CenterBox` leaves the
+    // start child's allocation pinned at its minimum precisely in the crowded
+    // case that matters (see `watch_neighbours`).
+    //
+    // Without this, the fit is re-run only on player-signal traffic — which the
+    // position poller supplies about four times a second while something plays,
+    // and not at all while stopped. That asymmetry, not any status rule, is why
+    // the chip appeared to collapse "only when playing": while playing a missed
+    // geometry edge self-heals in milliseconds, while stopped it strands the
+    // widget in its last mode indefinitely.
+    //
+    // The signals fire on the reactive main-thread loop, not inside a layout
+    // pass, and `schedule()` coalesces to a single idle re-evaluation, so a busy
+    // window-open burst still costs one decision. The decision itself is
+    // unchanged and stays purely spatial.
+    {
+        let schedule = schedule.clone();
+        bind(niri::windows(), container, move |_container, _windows| {
+            schedule();
+        });
+    }
+    {
+        let schedule = schedule.clone();
+        bind(niri::workspaces(), container, move |_container, _spaces| {
+            schedule();
+        });
     }
 
     // Defer the bar-window / left-cluster hooks until the widget is realised
@@ -485,7 +559,13 @@ fn apply_player_to_widgets(player: &Player, chips: &Chips) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HYSTERESIS, fits};
+    use super::{HYSTERESIS, decide_full};
+
+    /// The realised-geometry case — the one the live bar spends all its time
+    /// in; `available` is only `None` before the first allocation.
+    fn fits(available: i32, full_natural: i32, currently_full: bool) -> bool {
+        decide_full(Some(available), full_natural, currently_full)
+    }
 
     #[test]
     fn full_holds_until_the_row_no_longer_fits() {
@@ -517,6 +597,36 @@ mod tests {
         assert!(
             !fits(200, 200, false),
             "narrow does not expand at the boundary"
+        );
+    }
+
+    #[test]
+    fn the_rule_is_spatial_at_both_edges() {
+        // #838: with room the row expands, without room it collapses, and
+        // nothing else is consulted — the decision has no other input to
+        // consult. Playback status is not a parameter of this function.
+        assert!(
+            fits(10_000, 100, false),
+            "an empty bar expands a narrow chip"
+        );
+        assert!(
+            !fits(100, 10_000, true),
+            "a crowded bar collapses a full row"
+        );
+    }
+
+    #[test]
+    fn unrealised_geometry_keeps_the_current_mode() {
+        // `available == None` means the bar isn't laid out yet (no root, or a
+        // zero allocation). Guessing a width would flicker, so hold the current
+        // mode; the first width-notify settles it.
+        assert!(
+            decide_full(None, 100, true),
+            "full is kept until the geometry settles"
+        );
+        assert!(
+            !decide_full(None, 100, false),
+            "narrow is kept until the geometry settles"
         );
     }
 }

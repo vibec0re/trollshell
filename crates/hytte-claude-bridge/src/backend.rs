@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use hive_claude::{Attach, Claude, Config, Error as ClaudeError, Sink};
 use serde_json::Value;
@@ -79,52 +79,181 @@ pub trait Conversation {
 #[derive(Debug)]
 pub struct Subscription {
     config: Config,
+    /// Serialises same-title turns (#693).
+    ///
+    /// Claude Code does **not** serialise two concurrent `--resume`s of one
+    /// session — measured, not assumed. Both runs exit 0 with plausible text,
+    /// and the session's JSONL is left with one uuid parenting two divergent
+    /// children: the transcript becomes a tree, and every later resume
+    /// resolves against an ambiguous state. Nothing errors, which is what
+    /// makes it worth a lock rather than a retry.
+    turns: TitleLocks,
 }
 
 impl Subscription {
     /// A subscription backend running `claude` per `config`.
     #[must_use]
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            turns: TitleLocks::default(),
+        }
     }
 }
 
 impl Conversation for Subscription {
     async fn respond(&self, turn: Turn<'_>) -> Result<String, Failure> {
-        // Resume first — always. The session may exist from an earlier turn, an
-        // earlier bridge process, or an identical earlier request; in every one
-        // of those cases it already holds the prefix, so it must receive ONLY
-        // the newest message.
-        let resume_prompt = prompt_for(AttachKind::Resume, turn.transcript, turn.delta);
-        let sink = TextSink::default();
-        match Claude::run(
-            &self.config,
-            &Attach::Resume(turn.title.to_owned()),
-            &resume_prompt,
-            &sink,
-        )
-        .await
-        {
-            Ok(()) => return sink.into_text(),
-            Err(ClaudeError::SessionNotFound) => {
-                tracing::debug!(title = turn.title, "no such session; creating");
+        resume_then_create(turn, &self.turns, |attach, prompt| async move {
+            let sink = TextSink::default();
+            match Claude::run(&self.config, &attach, &prompt, &sink).await {
+                Ok(()) => sink.into_text().map_err(RunError::Failed),
+                Err(ClaudeError::SessionNotFound) => Err(RunError::NoSession),
+                Err(e) => Err(RunError::Failed(map_error(&e))),
             }
-            Err(e) => return Err(map_error(&e)),
-        }
-
-        // Only a session that does not exist yet gets the whole transcript —
-        // there is nothing in it to duplicate.
-        let create_prompt = prompt_for(AttachKind::Create, turn.transcript, turn.delta);
-        let sink = TextSink::default();
-        Claude::run(
-            &self.config,
-            &Attach::Create(turn.title.to_owned()),
-            &create_prompt,
-            &sink,
-        )
+        })
         .await
-        .map_err(|e| map_error(&e))?;
-        sink.into_text()
+    }
+}
+
+/// Why one attach attempt produced no answer.
+///
+/// Only [`RunError::NoSession`] is a *routing* outcome; everything else is
+/// already the status the client should see. It exists so the resume-then-
+/// create sequence can be written once over a seam — spawning a real `claude`
+/// to test a lock would be neither hermetic nor free.
+#[derive(Debug)]
+enum RunError {
+    /// The title resolved to no session; the caller may create it.
+    NoSession,
+    /// Anything else, already mapped for the client.
+    Failed(Failure),
+}
+
+/// Answer one turn under `turn.title`: resume its session, and create one if
+/// there is none — with **both** steps under that title's lock.
+///
+/// The lock spanning the whole sequence rather than just the resume is the
+/// half of #693 that is easy to miss. Two concurrent *first* turns would each
+/// miss the resume and each `Attach::Create`, leaving two session files under
+/// one title — and `hive-claude` picks between those by readdir order, which
+/// it warns about but cannot fix (`store.rs`: "multiple session files share
+/// this title … not deterministic"; `Attach::Create`: "Nothing enforces
+/// uniqueness"). Guarding only the resume would close the transcript fork and
+/// open a rarer, nastier duplicate-session bug in its place.
+///
+/// `run` is the seam: in production it is `Claude::run` plus a [`TextSink`].
+async fn resume_then_create<F, Fut>(
+    turn: Turn<'_>,
+    locks: &TitleLocks,
+    run: F,
+) -> Result<String, Failure>
+where
+    F: Fn(Attach, String) -> Fut,
+    Fut: Future<Output = Result<String, RunError>>,
+{
+    let _serialised = locks.acquire(turn.title).await;
+
+    // Resume first — always. The session may exist from an earlier turn, an
+    // earlier bridge process, or an identical earlier request; in every one
+    // of those cases it already holds the prefix, so it must receive ONLY
+    // the newest message.
+    let resume_prompt = prompt_for(AttachKind::Resume, turn.transcript, turn.delta);
+    match run(Attach::Resume(turn.title.to_owned()), resume_prompt).await {
+        Ok(text) => return Ok(text),
+        Err(RunError::NoSession) => {
+            tracing::debug!(title = turn.title, "no such session; creating");
+        }
+        Err(RunError::Failed(failure)) => return Err(failure),
+    }
+
+    // Only a session that does not exist yet gets the whole transcript —
+    // there is nothing in it to duplicate.
+    let create_prompt = prompt_for(AttachKind::Create, turn.transcript, turn.delta);
+    run(Attach::Create(turn.title.to_owned()), create_prompt)
+        .await
+        .map_err(|e| match e {
+            RunError::NoSession => map_error(&ClaudeError::SessionNotFound),
+            RunError::Failed(failure) => failure,
+        })
+}
+
+/// One async mutex per conversation title, minted on demand and retired when
+/// its last holder releases it.
+///
+/// **Per title, not global.** The title *is* the conversation's identity (see
+/// [`crate::session`]), so a global lock would park the pet's turn behind
+/// caw's for no reason — a latency regression on the common case, in service
+/// of a hazard that only exists when two turns share a title.
+///
+/// The outer `std` mutex is only ever held for one map lookup, never across an
+/// await; the inner `tokio` one is held across a whole turn, which is exactly
+/// why it has to be `tokio`'s.
+#[derive(Debug, Default)]
+struct TitleLocks {
+    by_title: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl TitleLocks {
+    /// Wait for exclusive use of `title`.
+    async fn acquire(&self, title: &str) -> TitleGuard<'_> {
+        let mutex = {
+            let mut by_title = self.by_title.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(by_title.entry(title.to_owned()).or_default())
+        };
+        TitleGuard {
+            locks: self,
+            title: title.to_owned(),
+            // Owned rather than borrowed: the guard outlives the local `Arc`,
+            // and an owned guard keeps its mutex alive by itself.
+            held: Some(mutex.lock_owned().await),
+        }
+    }
+
+    /// How many titles hold a lock right now. Only the invariant that this
+    /// falls back to zero is interesting, which makes it a test's business.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// Exclusive use of one title, released on drop.
+#[derive(Debug)]
+struct TitleGuard<'a> {
+    locks: &'a TitleLocks,
+    title: String,
+    /// An `Option` purely so [`Drop`] can release the mutex *before* deciding
+    /// whether its map entry is still wanted.
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for TitleGuard<'_> {
+    fn drop(&mut self) {
+        // Release first: an owned guard holds a strong reference of its own, so
+        // the count below could never fall to one while this still held it.
+        drop(self.held.take());
+        let mut by_title = self
+            .locks
+            .by_title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // The cleanup race, and why a strong count is the right question: a
+        // task that has already claimed this title holds a reference of its own
+        // — it clones the `Arc` under this same `std` mutex, *before* it starts
+        // waiting — so a count of one proves the map is the sole owner and
+        // nobody can be parked on it. Retiring an entry out from under a waiter
+        // would be worse than leaking it: the waiter would hold a mutex the map
+        // no longer names, and the next arrival would mint a second one and
+        // fail to exclude it.
+        if by_title
+            .get(&self.title)
+            .is_some_and(|mutex| Arc::strong_count(mutex) == 1)
+        {
+            by_title.remove(&self.title);
+        }
     }
 }
 
@@ -423,10 +552,20 @@ pub fn truncate(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Records, TextSink, Turn, map_error, truncate};
+    use super::{Records, RunError, TextSink, TitleLocks, Turn, map_error, truncate};
+    use crate::http::Failure;
     use crate::wire::Message;
-    use hive_claude::{Error as ClaudeError, Sink as _};
+    use hive_claude::{Attach, Error as ClaudeError, Sink as _};
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// How long one fake turn stays inside the seam, in scheduler yields. On a
+    /// current-thread runtime a yield hands control to the other half of the
+    /// race at exactly the points a real subprocess await would, which is what
+    /// makes the races below deterministic rather than hopeful.
+    const YIELDS: usize = 8;
 
     fn msg(role: &str, content: &str) -> Message {
         Message {
@@ -614,5 +753,303 @@ mod tests {
             records.remember(&format!("t{n}"), vec![msg("user", "hi")], "ok");
         }
         assert!(records.by_title.len() <= super::MAX_RECORDS);
+    }
+
+    // ---- #693: same-title turns must not run concurrently ------------------
+
+    /// A stand-in for `Claude::run`: it records what it was asked to attach to,
+    /// keeps its own idea of which sessions exist, and — the point — reports
+    /// how many turns were ever inside it at once.
+    #[derive(Debug, Default)]
+    struct Fake {
+        /// `("resume" | "create", title)`, in the order the fake saw them.
+        calls: Mutex<Vec<(&'static str, String)>>,
+        /// Sessions this fake has created; a resume misses until one exists.
+        sessions: Mutex<HashSet<String>>,
+        inside: AtomicUsize,
+        /// The most turns ever inside the fake at one time. `1` is the whole
+        /// claim of #693.
+        peak: AtomicUsize,
+    }
+
+    impl Fake {
+        /// One fake turn, wide enough for the other racer to get inside it.
+        ///
+        /// The state is read and written *after* the yields on purpose: that is
+        /// what lets two unguarded first turns both observe "no such session"
+        /// before either creates one.
+        async fn run(&self, attach: Attach, _prompt: String) -> Result<String, RunError> {
+            let inside = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(inside, Ordering::SeqCst);
+            // A create replays the whole transcript where a resume sends only
+            // the delta, so it really is the slower of the two. Modelled,
+            // because it is what makes the resume-then-create window
+            // observable at all: a lock covering only the resume lets the
+            // loser's resume run *while* the winner is still inside its
+            // create, and miss. With both arms equally fast the deterministic
+            // interleaving below happens to hide that, which is a property of
+            // the test rather than of the code.
+            let stay = match &attach {
+                Attach::Create(_) => YIELDS * 3,
+                _ => YIELDS,
+            };
+            for _ in 0..stay {
+                tokio::task::yield_now().await;
+            }
+            let outcome = match &attach {
+                Attach::Resume(title) => {
+                    self.record("resume", title);
+                    if self.sessions.lock().expect("sessions").contains(title) {
+                        Ok(format!("resumed {title}"))
+                    } else {
+                        Err(RunError::NoSession)
+                    }
+                }
+                Attach::Create(title) => {
+                    self.record("create", title);
+                    self.sessions
+                        .lock()
+                        .expect("sessions")
+                        .insert(title.to_owned());
+                    Ok(format!("created {title}"))
+                }
+                other => panic!("the subscription path never attaches as {other:?}"),
+            };
+            self.inside.fetch_sub(1, Ordering::SeqCst);
+            outcome
+        }
+
+        fn record(&self, kind: &'static str, title: &str) {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((kind, title.to_owned()));
+        }
+
+        /// How many times the fake was asked to create `title`.
+        fn creates(&self, title: &str) -> usize {
+            self.calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .filter(|(kind, seen)| *kind == "create" && seen == title)
+                .count()
+        }
+    }
+
+    /// Two concurrent turns on one title must not overlap.
+    ///
+    /// This is #693's measured failure: unguarded, both enter `Claude::run`,
+    /// and claude forks the session's transcript into a tree — silently, with
+    /// both callers getting a plausible answer. Both turns here take the
+    /// **resume** arm, the shape that was actually reproduced.
+    #[tokio::test]
+    async fn concurrent_turns_on_one_title_never_overlap() {
+        let locks = TitleLocks::default();
+        let fake = Fake::default();
+        fake.sessions
+            .lock()
+            .expect("sessions")
+            .insert("t".to_owned());
+        let transcript = vec![msg("system", "persona"), msg("user", "hi")];
+
+        let (one, two) = tokio::join!(
+            super::resume_then_create(turn("t", &transcript), &locks, |a, p| fake.run(a, p)),
+            super::resume_then_create(turn("t", &transcript), &locks, |a, p| fake.run(a, p)),
+        );
+
+        assert_eq!(one.expect("answered"), "resumed t");
+        assert_eq!(two.expect("answered"), "resumed t");
+        assert_eq!(
+            fake.peak.load(Ordering::SeqCst),
+            1,
+            "two turns were inside claude at once — the session forks here"
+        );
+        assert_eq!(locks.len(), 0, "the title's lock outlived its holders");
+    }
+
+    /// The half that is easy to miss: two concurrent **first** turns.
+    ///
+    /// Both miss the resume, so a lock covering only the resume would let both
+    /// create — two session files under one title, which `--resume` then picks
+    /// between by readdir order. Exactly one create, and the loser resumes the
+    /// winner's session rather than minting a rival.
+    #[tokio::test]
+    async fn concurrent_first_turns_create_exactly_one_session() {
+        let locks = TitleLocks::default();
+        let fake = Fake::default();
+        let transcript = vec![msg("system", "persona"), msg("user", "hi")];
+
+        let (one, two) = tokio::join!(
+            super::resume_then_create(turn("t", &transcript), &locks, |a, p| fake.run(a, p)),
+            super::resume_then_create(turn("t", &transcript), &locks, |a, p| fake.run(a, p)),
+        );
+
+        one.expect("answered");
+        two.expect("answered");
+        assert_eq!(
+            fake.creates("t"),
+            1,
+            "one title, two sessions on disk — `--resume` would pick by readdir order"
+        );
+        assert_eq!(
+            *fake.calls.lock().expect("calls"),
+            vec![
+                ("resume", "t".to_owned()),
+                ("create", "t".to_owned()),
+                ("resume", "t".to_owned()),
+            ],
+            "the second turn should have joined the first's session"
+        );
+        assert_eq!(fake.sessions.lock().expect("sessions").len(), 1);
+    }
+
+    /// Per title, not global. A global lock would pass both tests above and
+    /// still be wrong: it parks the pet behind caw on every request whose title
+    /// differs, which is the common case.
+    #[tokio::test]
+    async fn turns_on_different_titles_still_run_concurrently() {
+        let locks = TitleLocks::default();
+        let fake = Fake::default();
+        let transcript = vec![msg("user", "hi")];
+
+        let (pet, caw) = tokio::join!(
+            super::resume_then_create(turn("pet", &transcript), &locks, |a, p| fake.run(a, p)),
+            super::resume_then_create(turn("caw", &transcript), &locks, |a, p| fake.run(a, p)),
+        );
+
+        pet.expect("answered");
+        caw.expect("answered");
+        assert_eq!(
+            fake.peak.load(Ordering::SeqCst),
+            2,
+            "unrelated conversations were serialised against each other"
+        );
+    }
+
+    /// The map-entry cleanup race: a release that another task is already
+    /// waiting on must **not** retire the entry.
+    ///
+    /// If it did, the waiter would hold a mutex the map no longer names, and
+    /// the next arrival would mint a second one and not exclude it — the exact
+    /// overlap the lock exists to prevent. The waiter therefore has to still
+    /// find its own entry in the map once it wakes.
+    #[tokio::test]
+    async fn releasing_a_contended_title_keeps_its_entry() {
+        let locks = TitleLocks::default();
+        let seen_by_waiter = Mutex::new(None);
+
+        let holder = async {
+            let guard = locks.acquire("t").await;
+            // Let the waiter reach the wait queue before releasing.
+            for _ in 0..YIELDS {
+                tokio::task::yield_now().await;
+            }
+            drop(guard);
+        };
+        let waiter = async {
+            let guard = locks.acquire("t").await;
+            *seen_by_waiter.lock().expect("seen") = Some(locks.len());
+            drop(guard);
+        };
+        tokio::join!(holder, waiter);
+
+        assert_eq!(
+            *seen_by_waiter.lock().expect("seen"),
+            Some(1),
+            "the waiter's entry was retired out from under it"
+        );
+        assert_eq!(locks.len(), 0, "the entry outlived its last holder");
+    }
+
+    /// The map is a cache of live contention, not a log of every title the
+    /// process has ever answered under.
+    #[tokio::test]
+    async fn the_lock_map_does_not_accumulate_titles() {
+        let locks = TitleLocks::default();
+        for n in 0..200 {
+            let guard = locks.acquire(&format!("t{n}")).await;
+            assert_eq!(locks.len(), 1);
+            drop(guard);
+        }
+        assert_eq!(locks.len(), 0);
+    }
+
+    /// A resume that lands never creates — the delta rule depends on it.
+    #[tokio::test]
+    async fn a_resumed_session_is_not_recreated() {
+        let locks = TitleLocks::default();
+        let fake = Fake::default();
+        fake.sessions
+            .lock()
+            .expect("sessions")
+            .insert("t".to_owned());
+        let transcript = vec![msg("user", "hi")];
+
+        let reply =
+            super::resume_then_create(turn("t", &transcript), &locks, |a, p| fake.run(a, p))
+                .await
+                .expect("answered");
+
+        assert_eq!(reply, "resumed t");
+        assert_eq!(fake.creates("t"), 0);
+    }
+
+    /// A failure that is not `SessionNotFound` is reported, not retried as a
+    /// create: retrying a rate limit or an auth failure that way would mint a
+    /// rival session per failed turn.
+    #[tokio::test]
+    async fn a_non_session_failure_is_not_retried_as_a_create() {
+        let locks = TitleLocks::default();
+        let attempts = AtomicUsize::new(0);
+        let transcript = vec![msg("user", "hi")];
+
+        let out = super::resume_then_create(turn("t", &transcript), &locks, |_attach, _prompt| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(RunError::Failed(Failure::new(429, "rate-limited"))))
+        })
+        .await;
+
+        assert_eq!(out.expect_err("failed").status, 429);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// The tests above pin the interleaving deterministically on a
+    /// current-thread runtime. This one hands it to a real scheduler instead:
+    /// 256 rounds of 4 racers on 4 worker threads — 1024 turns whose ordering
+    /// nobody controls — and both invariants have to hold in every round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_race_stays_closed_on_a_multi_threaded_runtime() {
+        const ROUNDS: usize = 256;
+        const RACERS: usize = 4;
+
+        let locks = Arc::new(TitleLocks::default());
+        let fake = Arc::new(Fake::default());
+        for round in 0..ROUNDS {
+            let title = format!("t{round}");
+            let mut racers = tokio::task::JoinSet::new();
+            for _ in 0..RACERS {
+                let locks = Arc::clone(&locks);
+                let fake = Arc::clone(&fake);
+                let title = title.clone();
+                racers.spawn(async move {
+                    let transcript = vec![msg("user", "hi")];
+                    super::resume_then_create(turn(&title, &transcript), &locks, |a, p| {
+                        fake.run(a, p)
+                    })
+                    .await
+                });
+            }
+            while let Some(joined) = racers.join_next().await {
+                joined.expect("no panic").expect("answered");
+            }
+            assert_eq!(fake.creates(&title), 1, "round {round} created twice");
+        }
+        assert_eq!(
+            fake.peak.load(Ordering::SeqCst),
+            1,
+            "turns on one title overlapped"
+        );
+        assert_eq!(locks.len(), 0);
     }
 }

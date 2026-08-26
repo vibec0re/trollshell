@@ -17,8 +17,10 @@
 //!
 //! - [`dot_matrix`] — a single text line as char cells of round-falloff dots,
 //!   in one of the three [`DisplayStyle`] skins.
-//! - [`Marquee`] — a scrolling [`dot_matrix`] ticker: a fixed-width window
-//!   panned across a pre-rendered strip, one frame-offset step at a time.
+//! - [`Marquee`] — a scrolling [`dot_matrix`] ticker: the message is a
+//!   font-space bitmap sampled onto a **fixed** physical dot grid, stepped one
+//!   whole virtual pixel (one dot) at a time, so the grid never moves with the
+//!   text (#839).
 //! - [`seven_seg`] — a classic seven-segment readout (digits, `:`, `-`,
 //!   space) with the authentic dim ghost segments behind the lit ones.
 //! - [`TextBox`] — the "8bit textbox": wrapped 5×7 pixel-font text on a
@@ -34,6 +36,11 @@
 //!   arc filling to the reading, and a tapered pointer driven by a real
 //!   damped-oscillator [`Needle`] that overshoots a step change and settles,
 //!   with a time-sampled motion blur behind it (a #397 skin).
+//! - [`FlipBoard`] — a fixed row of character cells that *change* by a visible
+//!   mechanism ([`Mechanism`], a #397 skin): the airport board's card hinging
+//!   down over its hinge slot, or a nixie tube's outgoing cathode fading out
+//!   under the incoming one's strike. Closed-form in the elapsed time, like
+//!   the gauge's physics.
 //!
 //! `hytte-plugin-preem-demo` is the reference consumer: one sidebar card
 //! cycling every widget through every style; `hytte-plugin-audio-widget` is the
@@ -78,6 +85,7 @@ mod led_strip;
 mod marquee;
 mod scope;
 mod seven_seg;
+mod split_flap;
 mod style;
 mod textbox;
 
@@ -88,6 +96,10 @@ pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;
 pub use seven_seg::seven_seg;
+pub use split_flap::{
+    CHARSET, DEFAULT_FADE_SECS, DEFAULT_FLIP_SECS, DEFAULT_GLYPH_PX, DEFAULT_STAGGER_SECS,
+    FlipBoard, Mechanism,
+};
 pub use style::DisplayStyle;
 pub use textbox::TextBox;
 

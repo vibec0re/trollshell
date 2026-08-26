@@ -468,6 +468,64 @@ title` in the stderr tail — worth a deliberate look on first run, since
   metadata that way to exercise live; otherwise it's covered by hermetic
   parse tests only.
 
+## Preem raster kit (`hytte-plugin::preem`)
+
+The kit's own widget skins, which CI can only check as byte patterns. Every
+item below is exercised by `hytte-plugin-preem-demo` (install with
+`cargo install --root /usr/local --path crates/hytte-plugin-preem-demo`, enable
+its unit, open the sidebar) — one card stacking every widget, rotating
+VFD → LCD → OLED every 10 s, and re-skinning immediately when you tap the
+clock. The two audio-fed preem items live under "Audio & media" above (the
+`#557` scope tile and `#422`'s park), because what needs verifying there is the
+audio feed, not the raster.
+
+- [ ] **(#843/#839)** Marquee on a fixed dot grid — the entry #843 could not
+      write for itself, since its whole result is visual. With the sidebar open,
+      watch the scrolling marquee row (third widget down):
+  1. **The dots never move.** The unlit dot matrix behind the text is a fixed
+     grid nailed to the buffer: it must sit perfectly still while text passes
+     over it. Before #839 the ghost dots travelled with the message, with the
+     per-char-cell gaps sliding along — if you see the background pattern
+     drifting or breathing, the regression is back.
+  2. **The text steps dot by dot.** Each step should land the message exactly
+     one dot column over — crisp, chunky, on-grid. It must never look smeared,
+     doubled or blurred between two dot positions (the pre-#839 symptom, from
+     panning a pre-rendered strip by 3 px against a 4 px dot pitch).
+  3. **The seam wraps clean.** Let the message loop. The join between its end
+     and its restart should pass through with the same one-dot cadence as the
+     rest — no jump, no stutter, no partial dot at the wrap.
+  4. Worth a look on all three skins: on LCD the ghost grid is at its most
+     visible (so 1 is easiest to judge there), and on VFD/OLED the bloom should
+     glow off the lit dots without dragging the grid with it.
+- [ ] **(#397)** Split-flap and nixie boards (the two bottom rows of the
+      preem-demo card, `HH:MM:SS` on both, deliberately running in slow motion
+      so the mechanisms are legible at the shell's ~1 Hz heartbeat):
+  1. **Split-flap:** the upper card visibly hinges _down_ over the lower one.
+     The outgoing character's top half squashes away, revealing the incoming
+     character's top behind it; then the incoming character's bottom half folds
+     in over the outgoing one. It should read as a card falling — slow at the
+     top, whipping through horizontal — not as a shutter closing at a constant
+     rate, and not as a cross-fade.
+  2. **The hinge slot stays dark on every skin**, including VFD and OLED where
+     the bloom would otherwise fill it in: a hard one-pixel gap straight across
+     each card, cut through the glyph.
+  3. **The ripple:** on a whole-face change (watch the minute or hour roll over,
+     or just after the card first mounts) the cards should start left-to-right
+     in a wave, not all at once.
+  4. **The falling card's leading edge lights up** as it passes horizontal — a
+     bright rule across the full card width — and there is _no_ such edge on a
+     board at rest.
+  5. **Nixie:** the whole row cross-fades **simultaneously** (no ripple). The
+     outgoing digit should linger, then collapse, while the incoming one strikes
+     fast — both visibly alight at once mid-switch, with a broad soft halo over
+     the skin's own glow on VFD/OLED. On LCD there is deliberately no halo (a
+     reflective panel does not bloom) but the fade still runs.
+  6. **Accent tracking:** both boards take the desktop accent like every other
+     kit widget (#376) — change the accent and the lit glyphs should re-tint
+     while the card faces / cathode stacks keep their per-skin panel colour.
+  7. **The fixture never moves:** bezel, card row and the gaps between cards
+     must be rock-steady through every flip — only the cards move.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

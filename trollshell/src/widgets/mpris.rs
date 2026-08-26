@@ -1,46 +1,46 @@
-//! Bar MPRIS chip: prev / play-pause / next plus an "artist – title" label
-//! when the bar has room for them, a single mini icon button when it does not,
-//! and nothing at all when no player is active. Both renditions open the Media
-//! page on click — the label in the full row, the button in the mini one.
+//! Bar MPRIS chip: prev / play-pause / next plus a fixed-width "artist – title"
+//! label when the bar has room for them, a single mini icon button when it does
+//! not, and nothing at all when no player is active. Both renditions open the
+//! Media page on click — the label in the full row, the button in the mini one.
 //!
-//! ## Why this is an `AdwSqueezer` (#838)
+//! ## Why a fixed title width, and why `AdwBreakpointBin` (#838)
 //!
-//! Four iterations tried to decide full-vs-mini in *our* code, and each failed
-//! the same way: the widget measured its neighbours through its parent chain
-//! and froze (its watchers hooked `notify::width`, a property `GtkWidget` does
-//! not have, so none of them ever fired); then it was given live niri triggers
-//! and blinked instead (window *titles* tick several times a second, and the
-//! window list's natural width tracks them); then the whole measurement moved
-//! into a bar-side `center_budget` helper that damped the noise and published
-//! one "this is the space you can have, max" number — which still read the
-//! bar's width before the compositor's configure had landed, so it was wrong
-//! for exactly as long as a sidebar toggle took to round-trip. All three are
-//! one bug: our code was reconstructing, from outside the layout pass, a
-//! number that only exists *inside* it.
+//! Four iterations tried to compute the fit in our own code and each failed the
+//! same way — frozen watchers, then title-driven blinking, then a damped budget
+//! that read the bar's width before the compositor's configure had landed. All
+//! three are one bug: reconstructing, from outside the layout pass, a number
+//! that only exists inside it. A fifth attempt used `AdwSqueezer`, which models
+//! the problem exactly but has been deprecated since libadwaita 1.4.
 //!
-//! [`adw::Squeezer`] is GTK's answer to that — a container query. It holds both
-//! renditions as children and the **layout system** shows the first one that
-//! fits the allocation it was actually given, decided in the allocation pass
-//! where the true available width lives. So there is nothing here to watch, to
-//! damp, or to keep in sync: no trigger can be forgotten (iterations 1 and 2)
-//! and no reading can be stale (iteration 4), because there are no readings.
+//! Annika's call on #838 settled both halves: *"deprecated is deprecated. Keep
+//! things simple. Use fixed title length."* The second sentence is what makes
+//! the supported migration path work. libadwaita points `AdwSqueezer` users at
+//! `AdwBreakpointBin`, whose breakpoints fire on a **constant** `max-width`
+//! condition — previously useless here, because the full row's width moved with
+//! the track title. Pin the label to [`TITLE_CHARS`] and the row's width becomes
+//! a constant, so the threshold becomes a constant too, and the supported widget
+//! fits the problem.
 //!
-//! Two properties make the blink structurally impossible rather than merely
-//! guarded, and both are GTK's to enforce, not ours to remember:
+//! The decision still happens inside GTK's allocation pass, which is the only
+//! place the true available width has ever existed. Nothing here watches, damps
+//! or re-measures anything at runtime: the threshold is measured **once** from
+//! the built row (see [`build_bin`]) and then frozen into the breakpoint.
 //!
-//! - A squeezer's own size *request* is the same whichever child it shows —
-//!   minimum is the smallest child's minimum, natural the largest child's
-//!   natural — so swapping children cannot re-trigger the layout pass that
-//!   chose them. That is the feedback loop from iterations 1–3, gone by
-//!   construction. Its price is that a collapsed chip still *requests* the full
-//!   row's natural width: the space it gives up is not handed back to the
-//!   window list. Handing it back is precisely what would close the loop again,
-//!   so the reserved slot is the design, not an oversight — see
-//!   [`build_squeezer`] for how the visible child is aligned inside it.
-//! - In the crowded regime the window list sits at its minimum, which is stable
-//!   against title noise, so the squeezer's slice is stable too. Only a narrow
-//!   contested band can flip the child, and [`TRANSITION_MS`] of crossfade makes
-//!   that rare flip read as intentional.
+//! ### The one non-obvious part: pinning the child's size request
+//!
+//! A breakpoint that hides the full row would otherwise be a one-way door. With
+//! a plain `GtkBox` holding both renditions, hiding the full row drops the box's
+//! natural width to the mini chip's — so the bar hands the slot only that much
+//! room, the breakpoint stays applied, and the chip can **never** expand again
+//! no matter how much space appears. Measured, that is a fall from `(34, 294)`
+//! to `(34, 34)`: permanently stuck, the iteration-1 failure wearing a new hat.
+//!
+//! [`build_bin`] pins the renditions box with `set_size_request(full_row_width)`,
+//! which raises **both** its minimum and its natural, so the box requests the
+//! same width whichever rendition is visible. The bin's own (smaller) size
+//! request is what lets the bar squeeze the slot below that. Request stability
+//! is exactly what makes the feedback loop impossible, and it is asserted by
+//! `the_request_is_the_same_whichever_rendition_shows`.
 //!
 //! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
@@ -57,13 +57,17 @@ use hytte::services::mpris::{self, Player};
 
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 
-/// Crossfade duration (ms) between the full row and the mini chip.
+/// Width of the "artist – title" label, in characters.
 ///
-/// The squeezer re-decides on every allocation, and in the crowded regime the
-/// inputs hold still, so a flip is rare. Long enough that when one does happen
-/// it reads as a deliberate reflow rather than a glitch; short enough not to
-/// lag a sidebar toggle.
-const TRANSITION_MS: u32 = 150;
+/// Set as **both** `width_chars` and `max_width_chars`, so the label is exactly
+/// this wide whatever the track is called: short titles pad, long ones ellipsize.
+/// That is what makes the full row a constant width, and hence the breakpoint
+/// threshold a constant — see the module doc.
+///
+/// A taste knob: Annika asked for a fixed title length and left the number to
+/// us, so this is a starting value and safe to retune. Changing it changes the
+/// bar width at which the chip collapses, and nothing else.
+const TITLE_CHARS: i32 = 24;
 
 /// The full row's player-driven children, bundled so they can be passed around
 /// without hitting the `too_many_arguments` clippy limit.
@@ -89,93 +93,108 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     full_row.append(&chips.next_btn);
     full_row.append(&chips.label);
 
-    let squeezer = build_squeezer(
+    let bin = build_bin(
         full_row.upcast_ref(),
         build_mini_button(monitor).upcast_ref(),
     );
-    squeezer.add_css_class("ts-mpris");
 
     let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     bind_transport_button(&chips.prev_btn, &current_bus, mpris::previous);
     bind_transport_button(&chips.play_pause_btn, &current_bus, mpris::play_pause);
     bind_transport_button(&chips.next_btn, &current_bus, mpris::next);
 
-    wire_visibility_and_state(&squeezer, chips, &current_bus);
+    wire_visibility_and_state(&bin, chips, &current_bus);
 
-    squeezer.set_visible(false);
-    squeezer.upcast()
+    bin.set_visible(false);
+    bin.upcast()
 }
 
-/// Assemble the squeezer over the two renditions, `full` first (preferred).
+/// Assemble the breakpoint bin over the two renditions.
 ///
-/// Split out from [`widget`] so the geometry contract this whole rewrite rests
-/// on can be asserted against a real widget tree without a service registry —
-/// see the `gtk_tests` module at the bottom of this file.
+/// Split out from [`widget`] so the geometry contract this rewrite rests on can
+/// be asserted against a real widget tree without a service registry — see the
+/// `gtk_tests` module at the bottom of this file.
 ///
-/// The configuration, and why each part of it:
+/// The shape, and why each part of it:
 ///
-/// - **`allow_none(false)`** — never show *nothing*. The mini chip is the floor;
-///   an empty bar slot with an active player would be a worse answer than a
-///   cramped one.
-/// - **`homogeneous(false)`** — the squeezer takes the visible child's height
-///   rather than the tallest child's. (It has no effect along the squeeze axis,
-///   where the request is always min-of-mins / max-of-naturals; that is the
-///   anti-feedback property the module doc describes.)
-/// - **`switch_threshold_policy(Natural)`** — switch as soon as the visible
-///   child cannot get its *natural* size, not merely its minimum. The label
-///   ellipsizes, so its minimum is about one ellipsis wide; under the `Minimum`
-///   policy the full row would "fit" almost any allocation and render three
-///   buttons next to a bare "…", and the mini chip would be unreachable in
-///   practice. `Natural` reproduces the rule the previous four iterations were
-///   all trying to implement — full row only if the whole row genuinely fits —
-///   with GTK doing the measuring. Flip this to `Minimum` if an ellipsized
-///   title is ever preferred over the chip; it is a one-line change.
-/// - **`halign(End)` on both children** — the squeezer's allocation can exceed
-///   the visible child's natural width (see the reserved-slot note in the module
-///   doc), and the squeezer allocates its visible child the full width. Without
-///   this the mini chip would stretch across the whole reserved slot. End-
-///   aligning keeps both renditions snug against the right-hand status cluster
-///   and lets the slack fall into the bar's existing mid gap.
+/// - **Both renditions live in one `GtkBox`**, `full` first, and a single
+///   [`adw::Breakpoint`] flips their `visible` properties. Property setters are
+///   what `AdwBreakpoint` is for, and they are declarative: the breakpoint
+///   restores the previous values itself when it stops applying, so there is no
+///   apply/unapply handler to keep in sync.
+/// - **`hexpand` + `halign(End)` on each rendition** so the visible one is drawn
+///   against the right-hand status cluster. Below the threshold the bar can hand
+///   the bin less than the pinned request; without this the mini chip would sit
+///   at the left of that slot with a gap after it, instead of the gap falling
+///   into the bar's existing mid-space.
+/// - **`set_size_request` on the renditions box** — the load-bearing line. See
+///   the module doc: without it, collapsing drops the natural width and the chip
+///   can never expand again.
+/// - **`set_size_request` on the bin** — required, not optional: libadwaita
+///   documents that *"adding a breakpoint to `AdwBreakpointBin` will result in it
+///   having no minimum size"*, and that `width-request` and `height-request`
+///   must always be set to the smallest size you want to support. Width is the
+///   mini chip's, which is what gives the bar permission to squeeze this slot at
+///   all; height is the taller rendition's. Omitting the height half is not
+///   silent — libadwaita warns on every allocation.
 ///
-/// ## DEPRECATION — the one open question on this rewrite
-///
-/// `AdwSqueezer` is deprecated as of **libadwaita 1.4** (still shipped and
-/// functional in the 1.9.3 we build against), and the `adw` 0.9.1 bindings gate
-/// that deprecation on the `v1_4` feature the workspace enables — so every call
-/// below is a `-D warnings` failure without the `#[expect(deprecated)]` carried
-/// here, on [`wire_visibility_and_state`], and on the two test functions that
-/// drive a squeezer. libadwaita's migration guide points at
-/// `AdwBreakpointBin` + `AdwBreakpoint`, which is **not** an equivalent here: a
-/// breakpoint fires on an explicit `max-width: N px` condition, so it would
-/// reintroduce exactly the hand-tuned pixel constant this rewrite exists to
-/// delete — and N would have to equal the full row's natural width, which moves
-/// with the track title. A squeezer asks "does the preferred child fit?" and
-/// needs no constant at all. There is no non-deprecated widget with that
-/// semantic, in GTK4 or in libadwaita.
-///
-/// So the trade is: a deprecated-but-present widget that models the problem
-/// exactly, versus a supported one that does not. Keeping the suppression means
-/// this chip needs revisiting if libadwaita ever removes the widget (a 2.0
-/// event; none is announced).
-#[expect(
-    deprecated,
-    reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note above"
-)]
-fn build_squeezer(full: &gtk::Widget, mini: &gtk::Widget) -> adw::Squeezer {
-    full.set_halign(gtk::Align::End);
-    mini.set_halign(gtk::Align::End);
+/// The threshold is measured here, once, and frozen into the condition. The
+/// measurement happens after the CSS class and the child tree are in place so
+/// the shell stylesheet's button padding is already included, and it never runs
+/// again — a fixed-width label means there is nothing left that could move it.
+/// Should the runtime row ever exceed the measured width anyway, the label's
+/// end-ellipsize absorbs it, so the failure mode is a slightly shorter title
+/// rather than a clipped or overflowing row.
+fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
+    for w in [full, mini] {
+        w.set_hexpand(true);
+        w.set_halign(gtk::Align::End);
+    }
 
-    let squeezer = adw::Squeezer::new();
-    squeezer.set_homogeneous(false);
-    squeezer.set_allow_none(false);
-    squeezer.set_switch_threshold_policy(adw::FoldThresholdPolicy::Natural);
-    squeezer.set_transition_type(adw::SqueezerTransitionType::Crossfade);
-    squeezer.set_transition_duration(TRANSITION_MS);
+    let renditions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    renditions.append(full);
+    renditions.append(mini);
 
-    // Order is preference order: the squeezer shows the first child that fits.
-    squeezer.add(full);
-    squeezer.add(mini);
-    squeezer
+    let bin = adw::BreakpointBin::new();
+    bin.add_css_class("ts-mpris");
+    bin.set_child(Some(&renditions));
+
+    // Measure before hiding anything, with the tree and the CSS class already
+    // in place. Frozen from here on.
+    let full_px = natural_width(full);
+    let mini_px = natural_width(mini);
+    let height_px = natural_height(full).max(natural_height(mini));
+
+    mini.set_visible(false);
+    renditions.set_size_request(full_px, -1);
+    // Both axes: libadwaita warns at runtime ("does not have a minimum height,
+    // set the 'height-request' property") if only one is given, because the
+    // breakpoint strips the bin's minimum in *both* directions. The bar never
+    // squeezes vertically, so the height floor is simply the taller rendition.
+    bin.set_size_request(mini_px, height_px);
+
+    // Applies at `full_px - 1` and below, i.e. exactly when the full row no
+    // longer fits; an allocation of exactly `full_px` keeps the full row.
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        f64::from(full_px - 1),
+        adw::LengthUnit::Px,
+    ));
+    breakpoint.add_setter(full, "visible", Some(&false.to_value()));
+    breakpoint.add_setter(mini, "visible", Some(&true.to_value()));
+    bin.add_breakpoint(breakpoint);
+
+    bin
+}
+
+/// A widget's natural width.
+fn natural_width(w: &gtk::Widget) -> i32 {
+    w.measure(gtk::Orientation::Horizontal, -1).1
+}
+
+/// A widget's natural height.
+fn natural_height(w: &gtk::Widget) -> i32 {
+    w.measure(gtk::Orientation::Vertical, -1).1
 }
 
 fn icon_button(icon: &str) -> gtk::Button {
@@ -200,10 +219,13 @@ fn build_mini_button(monitor: &Monitor) -> gtk::Button {
     btn
 }
 
+/// The title label, pinned to [`TITLE_CHARS`] wide in both directions so its
+/// width never moves with the track name.
 fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
     let label = gtk::Label::new(None);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_max_width_chars(60);
+    label.set_width_chars(TITLE_CHARS);
+    label.set_max_width_chars(TITLE_CHARS);
 
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gdk::BUTTON_PRIMARY);
@@ -223,17 +245,12 @@ fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
 /// - **No player** → hidden; `current_bus` cleared.
 /// - **Player** → visible; transport sensitivity, play/pause glyph and label
 ///   text refreshed. Which rendition is shown is not decided here — that is the
-///   squeezer's job, every allocation pass.
+///   breakpoint's job, every allocation pass.
 ///
 /// The full row's chips stay current even while the mini chip is the visible
 /// rendition, so the transport controls work the instant there is room again.
-#[expect(
-    deprecated,
-    reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note on \
-              build_squeezer"
-)]
 fn wire_visibility_and_state(
-    squeezer: &adw::Squeezer,
+    bin: &adw::BreakpointBin,
     chips: Chips,
     current_bus: &Rc<RefCell<Option<String>>>,
 ) {
@@ -241,16 +258,16 @@ fn wire_visibility_and_state(
     let current_bus = current_bus.clone();
     bind(
         mpris::active_player(),
-        squeezer,
-        move |squeezer, maybe_player: Option<Player>| match maybe_player {
+        bin,
+        move |bin, maybe_player: Option<Player>| match maybe_player {
             None => {
-                squeezer.set_visible(false);
+                bin.set_visible(false);
                 *current_bus.borrow_mut() = None;
             }
             Some(player) => {
                 *current_bus.borrow_mut() = Some(player.bus_name.clone());
                 apply_player_to_widgets(&player, &chips);
-                squeezer.set_visible(true);
+                bin.set_visible(true);
             }
         },
     );
@@ -275,21 +292,20 @@ fn apply_player_to_widgets(player: &Player, chips: &Chips) {
     }
 }
 
-/// The squeezer's geometry contract, asserted rather than believed (#838).
+/// The geometry contract, asserted rather than believed (#838).
 ///
-/// The pure `decide_full` / `fits` unit tests this replaces are gone with the
-/// machinery they tested: there is no longer a decision function to test,
-/// because the decision is GTK's. What is worth testing instead is that the
-/// hand-off to GTK is the one the module doc claims — that the squeezer's
-/// minimum really is the mini chip's (so the chip, not the full row, is what
-/// sets the bar's floor), and that a genuinely tight allocation really does
-/// select the mini child.
+/// The pure `decide_full` unit tests this replaces are gone with the machinery
+/// they tested: there is no longer a decision function, because the decision is
+/// GTK's. What is worth testing instead is that the hand-off to GTK is the one
+/// the module doc claims — that the title width really is fixed, that the
+/// request really is rendition-independent (the anti-stuck property), and that
+/// a crowded bar really does flip the rendition.
 ///
 /// Gated behind `system-tests` because instantiating widgets needs a display
 /// (`xvfb-run`).
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use super::{build_squeezer, icon_button};
+    use super::{TITLE_CHARS, build_bin, icon_button, natural_width};
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
 
@@ -299,20 +315,25 @@ mod gtk_tests {
         while gtk::glib::MainContext::default().iteration(false) {}
     }
 
+    /// A title label built exactly as [`super::build_clickable_label`] builds
+    /// it, minus the click gesture (which needs a live `Monitor`).
+    fn title_label(text: &str) -> gtk::Label {
+        let label = gtk::Label::new(Some(text));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_width_chars(TITLE_CHARS);
+        label.set_max_width_chars(TITLE_CHARS);
+        label
+    }
+
     /// The two renditions, minus everything that needs a live `Monitor` and the
-    /// service registry (the click gestures and the player bindings). Geometry
-    /// is what is under test, and geometry does not depend on either.
-    fn renditions() -> (gtk::Box, gtk::Button) {
+    /// service registry. Geometry is what is under test, and geometry does not
+    /// depend on either.
+    fn renditions(title: &str) -> (gtk::Box, gtk::Button) {
         let full = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         full.append(&icon_button("media-skip-backward-symbolic"));
         full.append(&icon_button("media-playback-start-symbolic"));
         full.append(&icon_button("media-skip-forward-symbolic"));
-        let label = gtk::Label::new(Some(
-            "A Very Long Artist Name \u{2013} An Equally Long Track Title",
-        ));
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        label.set_max_width_chars(60);
-        full.append(&label);
+        full.append(&title_label(title));
 
         let mini = gtk::Button::new();
         mini.set_child(Some(&gtk::Image::from_icon_name(
@@ -321,119 +342,134 @@ mod gtk_tests {
         (full, mini)
     }
 
-    fn width_request(w: &impl IsA<gtk::Widget>) -> (i32, i32) {
-        let (min, nat, _, _) = w.as_ref().measure(gtk::Orientation::Horizontal, -1);
-        (min, nat)
+    /// Which rendition the bin is currently showing: the `GtkBox` full row or
+    /// the `GtkButton` mini chip.
+    fn shown(bin: &adw::BreakpointBin) -> gtk::Widget {
+        let renditions = bin
+            .child()
+            .and_downcast::<gtk::Box>()
+            .expect("bin child is the renditions box");
+        let mut child = renditions.first_child();
+        while let Some(w) = child {
+            if w.is_visible() {
+                return w;
+            }
+            child = w.next_sibling();
+        }
+        panic!("no rendition is visible");
     }
 
-    /// The bar-side contract from #838's item 4: the squeezer's **minimum** is
-    /// the mini chip's minimum, not the full row's. That is what lets the bar
-    /// squeeze this slot at all — if the floor were the full row, the chip
-    /// would be reserving room it may not have and the squeezer could never be
-    /// squeezed. Its **natural** stays the full row's, which is the
-    /// anti-feedback property: it does not change when the shown child does.
+    /// Annika's actual ask on #838: *"Use fixed title length."* The label is
+    /// pinned in both directions, so a one-word track and a paragraph-length one
+    /// produce the same row width. That constancy is the whole reason a single
+    /// frozen breakpoint threshold is correct — if this fails, the threshold is
+    /// measuring one title and being applied to another.
     #[gtk::test]
-    fn the_floor_is_the_mini_chip_and_the_ceiling_is_the_full_row() {
+    fn the_row_width_does_not_move_with_the_title() {
         adw::init().expect("libadwaita init");
-        let (full, mini) = renditions();
-        let (full_min, full_nat) = width_request(&full);
-        let (mini_min, _) = width_request(&mini);
-        let squeezer = build_squeezer(full.upcast_ref(), mini.upcast_ref());
-        let (sq_min, sq_nat) = width_request(&squeezer);
-
-        assert!(
-            full_min > mini_min,
-            "test setup: the full row must genuinely be the wider rendition \
-             (full_min={full_min}, mini_min={mini_min})"
+        let short = natural_width(renditions("Hi").0.upcast_ref());
+        let long = natural_width(
+            renditions("An Extremely Long Artist Name \u{2013} And A Longer Track Title Still")
+                .0
+                .upcast_ref(),
         );
         assert_eq!(
-            sq_min, mini_min,
-            "the squeezer's minimum must be the mini chip's, so the bar can squeeze this slot"
-        );
-        assert_eq!(
-            sq_nat, full_nat,
-            "the squeezer's natural must be the full row's, so it asks for the room the full \
-             rendition needs"
+            short, long,
+            "the full row must be the same width whatever the title says"
         );
     }
 
-    /// The decision itself, made by GTK: give the squeezer an allocation that
-    /// cannot hold the full row and it shows the mini chip; give it room and it
-    /// shows the full row. This is the assertion the previous four iterations
-    /// each tried to make true with watchers, budgets and hysteresis.
-    #[gtk::test]
-    fn a_tight_allocation_selects_the_mini_child() {
-        adw::init().expect("libadwaita init");
-        let (probe_full, probe_mini) = renditions();
-        let (mini_min, _) = width_request(&probe_mini);
-        let (_, full_nat) = width_request(&probe_full);
-
-        let narrow = visible_child_at(mini_min + 8);
-        assert!(
-            narrow.is::<gtk::Button>(),
-            "an allocation too small for the full row must select the mini chip, got a {}",
-            narrow.type_()
-        );
-
-        let wide = visible_child_at(full_nat + 200);
-        assert!(
-            wide.is::<gtk::Box>(),
-            "an allocation with room to spare must select the full row, got a {}",
-            wide.type_()
-        );
-    }
-
-    /// Put a fresh squeezer in a fresh window `width` px wide, let GTK allocate
-    /// it, and report which rendition GTK chose.
+    /// The anti-stuck property, and the reason the renditions box carries a
+    /// `set_size_request`. The bin must report the same size request whichever
+    /// rendition is visible: minimum the mini chip's width (so the bar may
+    /// squeeze the slot), natural the full row's (so the bar keeps offering
+    /// enough room to expand back into).
     ///
-    /// A window per case on purpose: `set_default_size` only takes effect
+    /// Falsified by deleting the `set_size_request` on the renditions box: the
+    /// collapsed natural then drops to the mini chip's width, the bar stops
+    /// offering more, and the breakpoint can never unapply. Measured, that is
+    /// `(34, 294)` becoming `(34, 34)`.
+    #[gtk::test]
+    fn the_request_is_the_same_whichever_rendition_shows() {
+        adw::init().expect("libadwaita init");
+        let (full, mini) = renditions("Artist \u{2013} Title");
+        let full_px = natural_width(full.upcast_ref());
+        let mini_px = natural_width(mini.clone().upcast_ref());
+        let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
+
+        let expanded = (
+            bin.measure(gtk::Orientation::Horizontal, -1).0,
+            bin.measure(gtk::Orientation::Horizontal, -1).1,
+        );
+        assert_eq!(
+            expanded,
+            (mini_px, full_px),
+            "the bin's floor must be the mini chip and its ceiling the full row"
+        );
+
+        // Force the collapsed configuration the breakpoint would produce.
+        full.set_visible(false);
+        mini.set_visible(true);
+        let collapsed = (
+            bin.measure(gtk::Orientation::Horizontal, -1).0,
+            bin.measure(gtk::Orientation::Horizontal, -1).1,
+        );
+        assert_eq!(
+            collapsed, expanded,
+            "the request must not change when the rendition does — a natural width that drops \
+             on collapse means the chip can never expand again (#838)"
+        );
+    }
+
+    /// The decision itself, made by GTK: an allocation that cannot hold the
+    /// full row shows the mini chip; one with room shows the full row.
+    #[gtk::test]
+    fn a_tight_allocation_selects_the_mini_chip() {
+        adw::init().expect("libadwaita init");
+        let full_px = natural_width(renditions("Artist \u{2013} Title").0.upcast_ref());
+
+        assert!(
+            shown(&bin_at(full_px / 2)).is::<gtk::Button>(),
+            "an allocation too small for the full row must select the mini chip"
+        );
+        assert!(
+            shown(&bin_at(full_px + 100)).is::<gtk::Box>(),
+            "an allocation with room to spare must select the full row"
+        );
+    }
+
+    /// Put a fresh bin in a fresh window `width` px wide and let GTK allocate
+    /// it. A window per case on purpose: `set_default_size` only takes effect
     /// before the window is mapped, so resizing one already-presented window
     /// silently measures the first size twice.
-    #[expect(
-        deprecated,
-        reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note on \
-                  build_squeezer"
-    )]
-    fn visible_child_at(width: i32) -> gtk::Widget {
-        let (full, mini) = renditions();
-        let squeezer = build_squeezer(full.upcast_ref(), mini.upcast_ref());
-        // No transition, so `visible_child` is settled the moment the
-        // allocation is; the crossfade is a presentation detail and would
-        // otherwise leave the outgoing child visible mid-animation.
-        squeezer.set_transition_type(adw::SqueezerTransitionType::None);
-
+    fn bin_at(width: i32) -> adw::BreakpointBin {
+        let (full, mini) = renditions("Artist \u{2013} Title");
+        let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
         let window = gtk::Window::new();
-        window.set_child(Some(&squeezer));
+        window.set_child(Some(&bin));
         window.set_default_size(width, 40);
         window.present();
         pump();
-
-        let chosen = squeezer.visible_child().expect("allow_none(false)");
+        window.set_child(None::<&gtk::Widget>);
         window.destroy();
-        chosen
+        bin
     }
 
-    /// The placebo check (#838, review item 4): the *bar's own shape* has to be
-    /// able to squeeze this slot, or none of the above matters.
+    /// The placebo check (#838): the *bar's own shape* has to be able to
+    /// squeeze this slot, or none of the above matters.
     ///
     /// `hytte_ui::Bar` builds `CenterBox[left, end_pair[centre, right]]` with
     /// **no centre child** — the "centre" group rides the end widget
     /// (`crates/hytte-ui/src/bar.rs`). A reasonable worry is that such a shape
     /// always hands `end_pair` its natural width and starves the start child
-    /// instead, in which case the squeezer would never see a tight allocation.
-    /// It does not: `GtkCenterBox` gives each child its minimum and then
+    /// instead, in which case the bin would never see a tight allocation. It
+    /// does not: `GtkCenterBox` gives each child its minimum and then
     /// distributes what is left toward the naturals, so an over-subscribed bar
-    /// shortens *both* sides and the squeezer's slice falls below the full
-    /// row's natural width.
+    /// shortens both sides.
     ///
-    /// Asserted at both ends so it cannot pass by being stuck: a bar with room
-    /// to spare shows the full row, the same bar narrowed shows the chip.
+    /// Asserted at both ends so it cannot pass by being stuck — which, given
+    /// stuck is this widget's oldest failure mode, is the point.
     #[gtk::test]
-    #[expect(
-        deprecated,
-        reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note on \
-                  build_squeezer"
-    )]
     fn the_bar_shape_can_actually_squeeze_the_slot() {
         adw::init().expect("libadwaita init");
 
@@ -454,17 +490,17 @@ mod gtk_tests {
             }
             left.append(&btn);
 
-            let (full, mini) = renditions();
-            // The bar's label caps at 60 chars; trim it here so the whole tree
-            // still fits the display in the roomy case.
+            let (full, mini) = renditions("Artist \u{2013} Title");
+            // The real label is TITLE_CHARS wide; trim it here so the whole
+            // tree still fits the display in the roomy case.
             if let Some(label) = full.last_child().and_downcast::<gtk::Label>() {
+                label.set_width_chars(8);
                 label.set_max_width_chars(8);
             }
-            let squeezer = build_squeezer(full.upcast_ref(), mini.upcast_ref());
-            squeezer.set_transition_type(adw::SqueezerTransitionType::None);
+            let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
 
             let middle = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            middle.append(&squeezer);
+            middle.append(&bin);
             let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             for _ in 0..2 {
                 right.append(&icon_button("audio-volume-high-symbolic"));
@@ -477,20 +513,20 @@ mod gtk_tests {
             let center_box = gtk::CenterBox::new();
             center_box.set_start_widget(Some(&left));
             center_box.set_end_widget(Some(&end_pair));
-            (center_box, squeezer)
+            (center_box, bin)
         };
 
         // Returns the chosen rendition *and* the width the bar actually got, so
         // a display too small to honour the request fails loudly rather than
         // masquerading as a crowded bar.
         let chosen_at = |bar_width: i32| {
-            let (center_box, squeezer) = build_bar();
+            let (center_box, bin) = build_bar();
             let window = gtk::Window::new();
             window.set_child(Some(&center_box));
             window.set_default_size(bar_width, 40);
             window.present();
             pump();
-            let chosen = squeezer.visible_child().expect("allow_none(false)");
+            let chosen = shown(&bin);
             let got = center_box.width();
             window.destroy();
             (chosen, got)
@@ -498,7 +534,8 @@ mod gtk_tests {
 
         let (bar_min, bar_nat) = {
             let (center_box, _) = build_bar();
-            width_request(&center_box)
+            let (min, nat, _, _) = center_box.measure(gtk::Orientation::Horizontal, -1);
+            (min, nat)
         };
         assert!(
             bar_nat > bar_min,
@@ -524,7 +561,7 @@ mod gtk_tests {
         assert!(
             crowded.is::<gtk::Button>(),
             "a crowded bar must squeeze this slot down to the mini chip — if this fails the \
-             squeezer is never squeezed and the widget is a placebo (#838 item 4); \
+             bin is never squeezed and the widget is a placebo (#838); \
              bar min={bar_min}, natural={bar_nat}, allocated={crowded_width}, got a {}",
             crowded.type_()
         );

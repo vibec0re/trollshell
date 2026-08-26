@@ -1,145 +1,200 @@
-//! Center-of-bar MPRIS media controls widget.
+//! Bar MPRIS chip: prev / play-pause / next plus a fixed-width "artist – title"
+//! label when the bar has room for them, a single mini icon button when it does
+//! not, and nothing at all when no player is active. Both renditions open the
+//! Media page on click — the label in the full row, the button in the mini one.
 //!
-//! Shows prev / play-pause / next icon buttons and an "artist – title" label.
-//! Hidden when no player is active. Buttons disable when the player's
-//! corresponding `can_*` flag is false. The play/pause button icon toggles
-//! based on the player's playback status.
+//! ## Why a fixed title width, and why `AdwBreakpointBin` (#838)
 //!
-//! Clicking the label (not the transport buttons) toggles the Media page in
-//! the modal panel.
+//! Four iterations tried to compute the fit in our own code and each failed the
+//! same way — frozen watchers, then title-driven blinking, then a damped budget
+//! that read the bar's width before the compositor's configure had landed. All
+//! three are one bug: reconstructing, from outside the layout pass, a number
+//! that only exists inside it. A fifth attempt used `AdwSqueezer`, which models
+//! the problem exactly but has been deprecated since libadwaita 1.4.
 //!
-//! ## Three visual states
+//! Annika's call on #838 settled both halves: *"deprecated is deprecated. Keep
+//! things simple. Use fixed title length."* The second sentence is what makes
+//! the supported migration path work. libadwaita points `AdwSqueezer` users at
+//! `AdwBreakpointBin`, whose breakpoints fire on a **constant** `max-width`
+//! condition — previously useless here, because the full row's width moved with
+//! the track title. Pin the label to [`TITLE_CHARS`] and the row's width becomes
+//! a constant, so the threshold becomes a constant too, and the supported widget
+//! fits the problem.
 //!
-//! - **No player** — container hidden entirely.
-//! - **Player, full row doesn't fit** — *narrow mode*: show only the `mini`
-//!   icon button; all transport controls and the title label are hidden.
-//!   Clicking `mini` opens the Media panel.
-//! - **Player, full row fits** — *full mode*: show transport controls and
-//!   title label; `mini` is hidden.
+//! The decision still happens inside GTK's allocation pass, which is the only
+//! place the true available width has ever existed. Nothing here watches, damps
+//! or re-measures anything at runtime: the threshold is measured **once** from
+//! the built row (see [`build_bin`]) and then frozen into the breakpoint.
 //!
-//! ## How "fits" is decided (the narrow-vs-full trigger)
+//! ### The one non-obvious part: pinning the child's size request
 //!
-//! The widget is told how much room it may take and renders to it. It measures
-//! **itself** and nothing else:
+//! A breakpoint that hides the full row would otherwise be a one-way door. With
+//! a plain `GtkBox` holding both renditions, hiding the full row drops the box's
+//! natural width to the mini chip's — so the bar hands the slot only that much
+//! room, the breakpoint stays applied, and the chip can **never** expand again
+//! no matter how much space appears. Measured, that is a fall from `(34, 294)`
+//! to `(34, 34)`: permanently stuck, the iteration-1 failure wearing a new hat.
 //!
-//! ```text
-//!   budget       = components::center_budget::signal(monitor)   ← flows in
-//!   full_natural = Σ natural widths of the full-mode chips (prev/play/next/label)
-//!   full  ⇔  full_natural ≤ budget      (+ EXPAND_HEADROOM when expanding)
-//! ```
+//! [`build_bin`] pins the renditions box with `set_size_request(full_row_width)`,
+//! which raises **both** its minimum and its natural, so the box requests the
+//! same width whichever rendition is visible. The bin's own (smaller) size
+//! request is what lets the bar squeeze the slot below that. Request stability
+//! is exactly what makes the feedback loop impossible, and it is asserted by
+//! `the_request_is_the_same_whichever_rendition_shows`.
 //!
-//! Playback status is deliberately **not** an input: expand and collapse are
+//! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
-//! on #838). Nor is anything about the widget's neighbours, its parent chain, or
-//! the bar window — all of that moved to `components::center_budget`, which owns
-//! every geometry observation and publishes one damped number.
-//!
-//! ### Why this is not the old feedback loop (#838, three iterations)
-//!
-//! The pre-#838 widget measured its neighbours from inside its own layout
-//! reaction, which is a loop, and the two failures were the two ways a loop can
-//! fail: it froze (the watchers hooked allocated widths that stop moving once
-//! `CenterBox` has squeezed the start child), then — once #842 fed it live niri
-//! triggers — it blinked, because those triggers fire on every window *title*
-//! change and title noise moved the measurement across the fit boundary several
-//! times a second. Both were fixed by deleting the loop, not by adding a third
-//! guard on top of it.
-//!
-//! What is left here is a pure function of two inputs, and **neither input can
-//! be moved by this widget's own output**:
-//!
-//! - `budget` is computed from the bar allocation and the neighbour clusters'
-//!   *natural* widths, none of which depend on what the centre slot renders, and
-//!   it is damped at the source so sub-threshold jitter never arrives.
-//! - `full_natural` is a self-measurement, and self-measurement is not feedback.
-//!   It is summed from the individual chips' own `measure()` results, which are
-//!   **independent of the chip's current `visible` flag** — `gtk_widget_measure`
-//!   reports a widget's own size request whether or not its parent is currently
-//!   laying it out. That invariant is what lets us compute the would-be full
-//!   width while narrow mode has those chips hidden, and it is load-bearing: if
-//!   it ever stopped holding, collapsing would shrink `full_natural`, which
-//!   *would* be a loop. Keep it in mind before making the chips measure through
-//!   their container.
-//!
-//! With both inputs mode-independent, applying the rule twice with the same
-//! inputs gives the same answer, so the mode cannot ping-pong on its own.
-//!
-//! ### Expand headroom
-//!
-//! [`EXPAND_HEADROOM`] (the same single `center_budget::JITTER_PX` tunable, in
-//! its second documented role) keeps the collapse and expand thresholds from
-//! coinciding: we collapse as soon as the row no longer fits, but expand only
-//! with that much room to spare.
-//!
-//! The source damping makes this unnecessary for *budget* movement — that noise
-//! is already gone before it arrives. It is kept for the one input damping does
-//! not cover: `full_natural` moves with the **title text** (the label is capped
-//! at `max_width_chars`, but within the cap it tracks the string). A title whose
-//! full row lands within a pixel of the budget would otherwise flip the mode on
-//! every track change. That is one flip per genuine input change, not the #838
-//! self-sustaining blink — but it is still visible churn for no gain, and the
-//! cost of suppressing it is being narrow when up to `EXPAND_HEADROOM` px of
-//! unused room was available.
+//! on #838). The container's visibility follows `mpris::active_player()` and
+//! nothing else.
 
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hytte::gtk::{self, gdk, prelude::*};
+use hytte::adw::{self, prelude::*};
+use hytte::gtk::{self, gdk};
 use hytte::prelude::*;
 use hytte::services::mpris::{self, Player};
 
-use crate::components::center_budget;
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 
-/// Headroom (px) required to expand narrow→full, beyond the bare full natural
-/// width. Collapsing full→narrow needs no headroom; the asymmetry is what keeps
-/// a row parked at the boundary from flipping on every title change.
+/// Width of the "artist – title" label, in characters.
 ///
-/// Deliberately the *same* number as the budget's republish threshold rather
-/// than a second knob: both encode "widths this close are not meaningfully
-/// different", one applied to the neighbours' widths and one to our own. See the
-/// "Expand headroom" section above for why this survives the source damping.
-const EXPAND_HEADROOM: i32 = center_budget::JITTER_PX;
+/// Set as **both** `width_chars` and `max_width_chars`, so the label is exactly
+/// this wide whatever the track is called: short titles pad, long ones ellipsize.
+/// That is what makes the full row a constant width, and hence the breakpoint
+/// threshold a constant — see the module doc.
+///
+/// A taste knob: Annika asked for a fixed title length and left the number to
+/// us, so this is a starting value and safe to retune. Changing it changes the
+/// bar width at which the chip collapses, and nothing else.
+const TITLE_CHARS: i32 = 24;
 
-/// All child widgets of the MPRIS container, bundled so they can be passed
-/// around without hitting the `too_many_arguments` clippy limit.
+/// The full row's player-driven children, bundled so they can be passed around
+/// without hitting the `too_many_arguments` clippy limit.
 struct Chips {
     prev_btn: gtk::Button,
     play_pause_btn: gtk::Button,
     next_btn: gtk::Button,
     label: gtk::Label,
-    mini: gtk::Button,
 }
 
-/// Build the MPRIS center-cluster widget.
+/// Build the MPRIS bar chip.
 pub fn widget(monitor: &Monitor) -> gtk::Widget {
-    let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    container.add_css_class("ts-mpris");
-
     let chips = Chips {
         prev_btn: icon_button("media-skip-backward-symbolic"),
         play_pause_btn: icon_button("media-playback-start-symbolic"),
         next_btn: icon_button("media-skip-forward-symbolic"),
         label: build_clickable_label(monitor),
-        mini: build_mini_button(monitor),
     };
 
-    container.append(&chips.prev_btn);
-    container.append(&chips.play_pause_btn);
-    container.append(&chips.next_btn);
-    container.append(&chips.label);
-    container.append(&chips.mini);
+    let full_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    full_row.append(&chips.prev_btn);
+    full_row.append(&chips.play_pause_btn);
+    full_row.append(&chips.next_btn);
+    full_row.append(&chips.label);
+
+    let bin = build_bin(
+        full_row.upcast_ref(),
+        build_mini_button(monitor).upcast_ref(),
+    );
 
     let current_bus: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     bind_transport_button(&chips.prev_btn, &current_bus, mpris::previous);
     bind_transport_button(&chips.play_pause_btn, &current_bus, mpris::play_pause);
     bind_transport_button(&chips.next_btn, &current_bus, mpris::next);
 
-    wire_visibility_and_state(monitor, &container, chips, &current_bus);
+    wire_visibility_and_state(&bin, chips, &current_bus);
 
-    container.set_visible(false);
-    container.upcast()
+    bin.set_visible(false);
+    bin.upcast()
+}
+
+/// Assemble the breakpoint bin over the two renditions.
+///
+/// Split out from [`widget`] so the geometry contract this rewrite rests on can
+/// be asserted against a real widget tree without a service registry — see the
+/// `gtk_tests` module at the bottom of this file.
+///
+/// The shape, and why each part of it:
+///
+/// - **Both renditions live in one `GtkBox`**, `full` first, and a single
+///   [`adw::Breakpoint`] flips their `visible` properties. Property setters are
+///   what `AdwBreakpoint` is for, and they are declarative: the breakpoint
+///   restores the previous values itself when it stops applying, so there is no
+///   apply/unapply handler to keep in sync.
+/// - **`hexpand` + `halign(End)` on each rendition** so the visible one is drawn
+///   against the right-hand status cluster. Below the threshold the bar can hand
+///   the bin less than the pinned request; without this the mini chip would sit
+///   at the left of that slot with a gap after it, instead of the gap falling
+///   into the bar's existing mid-space.
+/// - **`set_size_request` on the renditions box** — the load-bearing line. See
+///   the module doc: without it, collapsing drops the natural width and the chip
+///   can never expand again.
+/// - **`set_size_request` on the bin** — required, not optional: libadwaita
+///   documents that *"adding a breakpoint to `AdwBreakpointBin` will result in it
+///   having no minimum size"*, and that `width-request` and `height-request`
+///   must always be set to the smallest size you want to support. Width is the
+///   mini chip's, which is what gives the bar permission to squeeze this slot at
+///   all; height is the taller rendition's. Omitting the height half is not
+///   silent — libadwaita warns on every allocation.
+///
+/// The threshold is measured here, once, and frozen into the condition. The
+/// measurement happens after the CSS class and the child tree are in place so
+/// the shell stylesheet's button padding is already included, and it never runs
+/// again — a fixed-width label means there is nothing left that could move it.
+/// Should the runtime row ever exceed the measured width anyway, the label's
+/// end-ellipsize absorbs it, so the failure mode is a slightly shorter title
+/// rather than a clipped or overflowing row.
+fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
+    for w in [full, mini] {
+        w.set_hexpand(true);
+        w.set_halign(gtk::Align::End);
+    }
+
+    let renditions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    renditions.append(full);
+    renditions.append(mini);
+
+    let bin = adw::BreakpointBin::new();
+    bin.add_css_class("ts-mpris");
+    bin.set_child(Some(&renditions));
+
+    // Measure before hiding anything, with the tree and the CSS class already
+    // in place. Frozen from here on.
+    let full_px = natural_width(full);
+    let mini_px = natural_width(mini);
+    let height_px = natural_height(full).max(natural_height(mini));
+
+    mini.set_visible(false);
+    renditions.set_size_request(full_px, -1);
+    // Both axes: libadwaita warns at runtime ("does not have a minimum height,
+    // set the 'height-request' property") if only one is given, because the
+    // breakpoint strips the bin's minimum in *both* directions. The bar never
+    // squeezes vertically, so the height floor is simply the taller rendition.
+    bin.set_size_request(mini_px, height_px);
+
+    // Applies at `full_px - 1` and below, i.e. exactly when the full row no
+    // longer fits; an allocation of exactly `full_px` keeps the full row.
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        f64::from(full_px - 1),
+        adw::LengthUnit::Px,
+    ));
+    breakpoint.add_setter(full, "visible", Some(&false.to_value()));
+    breakpoint.add_setter(mini, "visible", Some(&true.to_value()));
+    bin.add_breakpoint(breakpoint);
+
+    bin
+}
+
+/// A widget's natural width.
+fn natural_width(w: &gtk::Widget) -> i32 {
+    w.measure(gtk::Orientation::Horizontal, -1).1
+}
+
+/// A widget's natural height.
+fn natural_height(w: &gtk::Widget) -> i32 {
+    w.measure(gtk::Orientation::Vertical, -1).1
 }
 
 fn icon_button(icon: &str) -> gtk::Button {
@@ -148,9 +203,9 @@ fn icon_button(icon: &str) -> gtk::Button {
     btn
 }
 
-/// A compact single-icon button shown in *narrow* mode (no room for the full
-/// row). Clicking it opens the Media panel — same destination as the
-/// full-mode label.
+/// A compact single-icon button — the rendition shown when the full row does
+/// not fit. Clicking it opens the Media panel, the same destination as the
+/// full row's label.
 fn build_mini_button(monitor: &Monitor) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("ts-mpris-mini");
@@ -164,10 +219,13 @@ fn build_mini_button(monitor: &Monitor) -> gtk::Button {
     btn
 }
 
+/// The title label, pinned to [`TITLE_CHARS`] wide in both directions so its
+/// width never moves with the track name.
 fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
     let label = gtk::Label::new(None);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_max_width_chars(60);
+    label.set_width_chars(TITLE_CHARS);
+    label.set_max_width_chars(TITLE_CHARS);
 
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gdk::BUTTON_PRIMARY);
@@ -181,161 +239,38 @@ fn build_clickable_label(monitor: &Monitor) -> gtk::Label {
     label
 }
 
-/// Mode bookkeeping shared between the two subscriptions that can change the
-/// presentation (the player signal and the budget signal), so each has the
-/// other's latest input and the current mode when it re-decides.
-#[derive(Clone)]
-struct ModeState {
-    /// `true` ⇒ full row shown, `false` ⇒ narrow (mini) shown.
-    full: Rc<Cell<bool>>,
-    /// `true` while a player exists (i.e. the widget is not hidden).
-    has_player: Rc<Cell<bool>>,
-    /// Latest centre-slot budget from `components::center_budget`, or `None`
-    /// while the bar geometry is unrealised. Cached rather than re-read because
-    /// the player signal re-decides too, and it has no budget of its own.
-    budget: Rc<Cell<Option<i32>>>,
-}
-
-impl ModeState {
-    fn new() -> Self {
-        Self {
-            full: Rc::new(Cell::new(true)),
-            has_player: Rc::new(Cell::new(false)),
-            budget: Rc::new(Cell::new(None)),
-        }
-    }
-}
-
-/// Drives the three-state MPRIS presentation:
+/// Drive the two things that are still ours to drive: whether the chip is on
+/// the bar at all, and what the full row says.
 ///
-/// - **No player** → container hidden; `current_bus` cleared.
-/// - **Player, full row doesn't fit** (narrow) → container visible; only
-///   `mini` shown; transport controls and label hidden. `current_bus` and
-///   player state are still kept current so the full-mode controls work
-///   immediately when there is room again.
-/// - **Player, full row fits** (full) → container visible; transport controls
-///   and label shown; `mini` hidden.
+/// - **No player** → hidden; `current_bus` cleared.
+/// - **Player** → visible; transport sensitivity, play/pause glyph and label
+///   text refreshed. Which rendition is shown is not decided here — that is the
+///   breakpoint's job, every allocation pass.
+///
+/// The full row's chips stay current even while the mini chip is the visible
+/// rendition, so the transport controls work the instant there is room again.
 fn wire_visibility_and_state(
-    monitor: &Monitor,
-    container: &gtk::Box,
+    bin: &adw::BreakpointBin,
     chips: Chips,
     current_bus: &Rc<RefCell<Option<String>>>,
 ) {
     let chips = Rc::new(chips);
-    let mode = ModeState::new();
     let current_bus = current_bus.clone();
-
-    // Re-evaluate the fit on every player change and apply the chosen mode.
-    {
-        let chips = chips.clone();
-        let mode = mode.clone();
-        let current_bus = current_bus.clone();
-        bind(
-            mpris::active_player(),
-            container,
-            move |container, maybe_player: Option<Player>| match maybe_player {
-                None => {
-                    mode.has_player.set(false);
-                    container.set_visible(false);
-                    *current_bus.borrow_mut() = None;
-                }
-                Some(player) => {
-                    mode.has_player.set(true);
-                    *current_bus.borrow_mut() = Some(player.bus_name.clone());
-                    apply_player_to_widgets(&player, &chips);
-                    container.set_visible(true);
-                    // The label text just changed, which is the one input to
-                    // `full_mode_natural_width` that moves at runtime.
-                    reevaluate(&chips, &mode);
-                }
-            },
-        );
-    }
-
-    // The hint: "this is the space you can have, max" (#838). Every geometry
-    // observation that used to live in this widget — bar width, the neighbour
-    // clusters, the sidebar toggle, the niri window/workspace triggers — now
-    // lives in `components::center_budget`, which damps the result before it
-    // gets here. We just re-render to whatever number arrives.
-    {
-        let chips = chips.clone();
-        let mode = mode.clone();
-        bind(
-            center_budget::signal(monitor),
-            container,
-            move |_container, budget: Option<i32>| {
-                mode.budget.set(budget);
-                reevaluate(&chips, &mode);
-            },
-        );
-    }
-}
-
-/// Recompute the mode and apply it. Cheap and idempotent: if the chosen mode
-/// equals the current one, nothing visible changes.
-fn reevaluate(chips: &Chips, mode: &ModeState) {
-    if !mode.has_player.get() {
-        return;
-    }
-    let full = decide_full(
-        mode.budget.get(),
-        full_mode_natural_width(chips),
-        mode.full.get(),
+    bind(
+        mpris::active_player(),
+        bin,
+        move |bin, maybe_player: Option<Player>| match maybe_player {
+            None => {
+                bin.set_visible(false);
+                *current_bus.borrow_mut() = None;
+            }
+            Some(player) => {
+                *current_bus.borrow_mut() = Some(player.bus_name.clone());
+                apply_player_to_widgets(&player, &chips);
+                bin.set_visible(true);
+            }
+        },
     );
-    mode.full.set(full);
-    apply_mode(chips, full);
-}
-
-/// The pure mode decision, split out from the one GTK read it needs so the
-/// threshold asymmetry and the not-yet-realised case are unit-testable without
-/// a live widget tree.
-///
-/// `budget` is the centre slot's max width in px, or `None` while the bar
-/// geometry isn't realised yet; `full_natural` is the summed natural width of
-/// the full-mode chips; `currently_full` selects the threshold. Returns `true`
-/// for full, `false` for narrow.
-///
-/// Neither input depends on the mode this returns (see the module doc), and
-/// neither depends on playback status — the rule is purely spatial (#838).
-fn decide_full(budget: Option<i32>, full_natural: i32, currently_full: bool) -> bool {
-    let Some(budget) = budget else {
-        // No budget published yet (the bar isn't laid out). Keep the current
-        // mode rather than guess; the first real budget settles it.
-        return currently_full;
-    };
-    if currently_full {
-        // Collapse to narrow only once the full row no longer fits.
-        full_natural <= budget
-    } else {
-        // Expand back to full only with headroom beyond the bare fit, so a row
-        // parked at the boundary doesn't flip on every title change.
-        full_natural + EXPAND_HEADROOM <= budget
-    }
-}
-
-/// Summed natural width of the full-mode chips (prev/play/next/label),
-/// independent of their current `visible` flag — so we can compute the
-/// would-be full width even while narrow mode has them hidden.
-///
-/// That independence is an invariant of `gtk_widget_measure`, and it is the
-/// reason self-measurement here is not feedback: hiding the chips must not
-/// change what they measure, or collapsing would shrink the very number that
-/// decided to collapse. See the module doc.
-fn full_mode_natural_width(chips: &Chips) -> i32 {
-    let nat = |w: &gtk::Widget| w.measure(gtk::Orientation::Horizontal, -1).1;
-    nat(chips.prev_btn.upcast_ref())
-        + nat(chips.play_pause_btn.upcast_ref())
-        + nat(chips.next_btn.upcast_ref())
-        + nat(chips.label.upcast_ref())
-}
-
-/// Show the chips for the chosen mode. Idempotent.
-fn apply_mode(chips: &Chips, full: bool) {
-    chips.prev_btn.set_visible(full);
-    chips.play_pause_btn.set_visible(full);
-    chips.next_btn.set_visible(full);
-    chips.label.set_visible(full);
-    chips.mini.set_visible(!full);
 }
 
 fn apply_player_to_widgets(player: &Player, chips: &Chips) {
@@ -357,100 +292,278 @@ fn apply_player_to_widgets(player: &Player, chips: &Chips) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{EXPAND_HEADROOM, decide_full};
+/// The geometry contract, asserted rather than believed (#838).
+///
+/// The pure `decide_full` unit tests this replaces are gone with the machinery
+/// they tested: there is no longer a decision function, because the decision is
+/// GTK's. What is worth testing instead is that the hand-off to GTK is the one
+/// the module doc claims — that the title width really is fixed, that the
+/// request really is rendition-independent (the anti-stuck property), and that
+/// a crowded bar really does flip the rendition.
+///
+/// Gated behind `system-tests` because instantiating widgets needs a display
+/// (`xvfb-run`).
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{TITLE_CHARS, build_bin, icon_button, natural_width};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
 
-    /// The published-budget case — the one the live bar spends all its time in;
-    /// the budget is only `None` before the bar's first allocation.
-    fn fits(budget: i32, full_natural: i32, currently_full: bool) -> bool {
-        decide_full(Some(budget), full_natural, currently_full)
+    /// Run the GTK main loop until it has nothing left to dispatch, so a
+    /// queued resize/allocation actually happens.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
     }
 
-    #[test]
-    fn full_holds_until_the_row_no_longer_fits() {
-        // In full mode we collapse only once the row exceeds the budget.
-        assert!(fits(100, 100, true), "an exact fit stays full");
-        assert!(fits(100, 99, true), "room to spare stays full");
-        assert!(!fits(100, 101, true), "one px over collapses to narrow");
+    /// A title label built exactly as [`super::build_clickable_label`] builds
+    /// it, minus the click gesture (which needs a live `Monitor`).
+    fn title_label(text: &str) -> gtk::Label {
+        let label = gtk::Label::new(Some(text));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_width_chars(TITLE_CHARS);
+        label.set_max_width_chars(TITLE_CHARS);
+        label
     }
 
-    #[test]
-    fn narrow_expands_only_with_headroom() {
-        // From narrow we need EXPAND_HEADROOM px of room beyond the bare fit.
-        assert!(!fits(100, 100, false), "a bare fit is not enough to expand");
-        assert!(
-            !fits(100, 100 - EXPAND_HEADROOM + 1, false),
-            "one px short of the headroom stays narrow"
-        );
-        assert!(
-            fits(100, 100 - EXPAND_HEADROOM, false),
-            "exactly EXPAND_HEADROOM of room expands to full"
-        );
+    /// The two renditions, minus everything that needs a live `Monitor` and the
+    /// service registry. Geometry is what is under test, and geometry does not
+    /// depend on either.
+    fn renditions(title: &str) -> (gtk::Box, gtk::Button) {
+        let full = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        full.append(&icon_button("media-skip-backward-symbolic"));
+        full.append(&icon_button("media-playback-start-symbolic"));
+        full.append(&icon_button("media-skip-forward-symbolic"));
+        full.append(&title_label(title));
+
+        let mini = gtk::Button::new();
+        mini.set_child(Some(&gtk::Image::from_icon_name(
+            "audio-x-generic-symbolic",
+        )));
+        (full, mini)
     }
 
-    #[test]
-    fn a_row_at_the_boundary_does_not_ping_pong() {
-        // With budget == full_natural the asymmetric thresholds keep the current
-        // mode: full stays full, narrow stays narrow. The budget no longer moves
-        // in response to this answer (see the module doc), so this is
-        // belt-and-braces against title-driven `full_natural` movement, not
-        // against a feedback loop.
-        assert!(fits(200, 200, true), "full holds at the boundary");
-        assert!(
-            !fits(200, 200, false),
-            "narrow does not expand at the boundary"
-        );
-    }
-
-    #[test]
-    fn the_rule_is_spatial_at_both_edges() {
-        // #838: with room the row expands, without room it collapses, and
-        // nothing else is consulted — the decision has no other input to
-        // consult. Playback status is not a parameter of this function.
-        assert!(
-            fits(10_000, 100, false),
-            "a generous budget expands a narrow chip"
-        );
-        assert!(
-            !fits(100, 10_000, true),
-            "a tight budget collapses a full row"
-        );
-    }
-
-    #[test]
-    fn applying_the_rule_twice_is_a_fixed_point() {
-        // The anti-blink property, stated as a test: with the inputs held still
-        // the mode settles after one application and stays there. #842's failure
-        // was that the inputs did *not* hold still — title noise moved them
-        // several times a second — which is why the damping now lives upstream
-        // in `components::center_budget` instead of being re-guarded here.
-        for (budget, natural) in [(400, 100), (100, 400), (200, 200), (100, 100)] {
-            for start in [true, false] {
-                let once = fits(budget, natural, start);
-                let twice = fits(budget, natural, once);
-                assert_eq!(
-                    once, twice,
-                    "budget={budget} natural={natural} start={start}"
-                );
+    /// Which rendition the bin is currently showing: the `GtkBox` full row or
+    /// the `GtkButton` mini chip.
+    fn shown(bin: &adw::BreakpointBin) -> gtk::Widget {
+        let renditions = bin
+            .child()
+            .and_downcast::<gtk::Box>()
+            .expect("bin child is the renditions box");
+        let mut child = renditions.first_child();
+        while let Some(w) = child {
+            if w.is_visible() {
+                return w;
             }
+            child = w.next_sibling();
         }
+        panic!("no rendition is visible");
     }
 
-    #[test]
-    fn no_budget_yet_keeps_the_current_mode() {
-        // `budget == None` means nothing has been published for this bar yet (it
-        // isn't laid out). Guessing a width would flicker, so hold the current
-        // mode; the first real budget settles it. `center_budget` also never
-        // publishes `None` over a real budget, so this state is only ever the
-        // initial one.
+    /// Annika's actual ask on #838: *"Use fixed title length."* The label is
+    /// pinned in both directions, so a one-word track and a paragraph-length one
+    /// produce the same row width. That constancy is the whole reason a single
+    /// frozen breakpoint threshold is correct — if this fails, the threshold is
+    /// measuring one title and being applied to another.
+    #[gtk::test]
+    fn the_row_width_does_not_move_with_the_title() {
+        adw::init().expect("libadwaita init");
+        let short = natural_width(renditions("Hi").0.upcast_ref());
+        let long = natural_width(
+            renditions("An Extremely Long Artist Name \u{2013} And A Longer Track Title Still")
+                .0
+                .upcast_ref(),
+        );
+        assert_eq!(
+            short, long,
+            "the full row must be the same width whatever the title says"
+        );
+    }
+
+    /// The anti-stuck property, and the reason the renditions box carries a
+    /// `set_size_request`. The bin must report the same size request whichever
+    /// rendition is visible: minimum the mini chip's width (so the bar may
+    /// squeeze the slot), natural the full row's (so the bar keeps offering
+    /// enough room to expand back into).
+    ///
+    /// Falsified by deleting the `set_size_request` on the renditions box: the
+    /// collapsed natural then drops to the mini chip's width, the bar stops
+    /// offering more, and the breakpoint can never unapply. Measured, that is
+    /// `(34, 294)` becoming `(34, 34)`.
+    #[gtk::test]
+    fn the_request_is_the_same_whichever_rendition_shows() {
+        adw::init().expect("libadwaita init");
+        let (full, mini) = renditions("Artist \u{2013} Title");
+        let full_px = natural_width(full.upcast_ref());
+        let mini_px = natural_width(mini.clone().upcast_ref());
+        let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
+
+        let expanded = (
+            bin.measure(gtk::Orientation::Horizontal, -1).0,
+            bin.measure(gtk::Orientation::Horizontal, -1).1,
+        );
+        assert_eq!(
+            expanded,
+            (mini_px, full_px),
+            "the bin's floor must be the mini chip and its ceiling the full row"
+        );
+
+        // Force the collapsed configuration the breakpoint would produce.
+        full.set_visible(false);
+        mini.set_visible(true);
+        let collapsed = (
+            bin.measure(gtk::Orientation::Horizontal, -1).0,
+            bin.measure(gtk::Orientation::Horizontal, -1).1,
+        );
+        assert_eq!(
+            collapsed, expanded,
+            "the request must not change when the rendition does — a natural width that drops \
+             on collapse means the chip can never expand again (#838)"
+        );
+    }
+
+    /// The decision itself, made by GTK: an allocation that cannot hold the
+    /// full row shows the mini chip; one with room shows the full row.
+    #[gtk::test]
+    fn a_tight_allocation_selects_the_mini_chip() {
+        adw::init().expect("libadwaita init");
+        let full_px = natural_width(renditions("Artist \u{2013} Title").0.upcast_ref());
+
         assert!(
-            decide_full(None, 100, true),
-            "full is kept until a budget arrives"
+            shown(&bin_at(full_px / 2)).is::<gtk::Button>(),
+            "an allocation too small for the full row must select the mini chip"
         );
         assert!(
-            !decide_full(None, 100, false),
-            "narrow is kept until a budget arrives"
+            shown(&bin_at(full_px + 100)).is::<gtk::Box>(),
+            "an allocation with room to spare must select the full row"
+        );
+    }
+
+    /// Put a fresh bin in a fresh window `width` px wide and let GTK allocate
+    /// it. A window per case on purpose: `set_default_size` only takes effect
+    /// before the window is mapped, so resizing one already-presented window
+    /// silently measures the first size twice.
+    fn bin_at(width: i32) -> adw::BreakpointBin {
+        let (full, mini) = renditions("Artist \u{2013} Title");
+        let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
+        let window = gtk::Window::new();
+        window.set_child(Some(&bin));
+        window.set_default_size(width, 40);
+        window.present();
+        pump();
+        window.set_child(None::<&gtk::Widget>);
+        window.destroy();
+        bin
+    }
+
+    /// The placebo check (#838): the *bar's own shape* has to be able to
+    /// squeeze this slot, or none of the above matters.
+    ///
+    /// `hytte_ui::Bar` builds `CenterBox[left, end_pair[centre, right]]` with
+    /// **no centre child** — the "centre" group rides the end widget
+    /// (`crates/hytte-ui/src/bar.rs`). A reasonable worry is that such a shape
+    /// always hands `end_pair` its natural width and starves the start child
+    /// instead, in which case the bin would never see a tight allocation. It
+    /// does not: `GtkCenterBox` gives each child its minimum and then
+    /// distributes what is left toward the naturals, so an over-subscribed bar
+    /// shortens both sides.
+    ///
+    /// Asserted at both ends so it cannot pass by being stuck — which, given
+    /// stuck is this widget's oldest failure mode, is the point.
+    #[gtk::test]
+    fn the_bar_shape_can_actually_squeeze_the_slot() {
+        adw::init().expect("libadwaita init");
+
+        // `hytte_ui::Bar::show()`'s tree, with deliberately tiny stand-ins for
+        // the two clusters. The roomy case needs a window wider than the whole
+        // tree's natural width, and the test harness' virtual display is only
+        // 640 px (`xvfb-run -a` with no `-screen`, which is what `nix flake
+        // check` uses too) — anything bigger gets clamped, and a clamped window
+        // would measure as "crowded" in every case and pass the crowded
+        // assertion for the wrong reason. The `roomy_width` check below turns
+        // that into a loud failure if it ever happens anyway.
+        let build_bar = || {
+            let left = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let btn = gtk::Button::with_label("a window title");
+            if let Some(l) = btn.child().and_downcast::<gtk::Label>() {
+                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                l.set_max_width_chars(6);
+            }
+            left.append(&btn);
+
+            let (full, mini) = renditions("Artist \u{2013} Title");
+            // The real label is TITLE_CHARS wide; trim it here so the whole
+            // tree still fits the display in the roomy case.
+            if let Some(label) = full.last_child().and_downcast::<gtk::Label>() {
+                label.set_width_chars(8);
+                label.set_max_width_chars(8);
+            }
+            let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
+
+            let middle = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            middle.append(&bin);
+            let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            for _ in 0..2 {
+                right.append(&icon_button("audio-volume-high-symbolic"));
+            }
+
+            let end_pair = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            end_pair.append(&middle);
+            end_pair.append(&right);
+
+            let center_box = gtk::CenterBox::new();
+            center_box.set_start_widget(Some(&left));
+            center_box.set_end_widget(Some(&end_pair));
+            (center_box, bin)
+        };
+
+        // Returns the chosen rendition *and* the width the bar actually got, so
+        // a display too small to honour the request fails loudly rather than
+        // masquerading as a crowded bar.
+        let chosen_at = |bar_width: i32| {
+            let (center_box, bin) = build_bar();
+            let window = gtk::Window::new();
+            window.set_child(Some(&center_box));
+            window.set_default_size(bar_width, 40);
+            window.present();
+            pump();
+            let chosen = shown(&bin);
+            let got = center_box.width();
+            window.destroy();
+            (chosen, got)
+        };
+
+        let (bar_min, bar_nat) = {
+            let (center_box, _) = build_bar();
+            let (min, nat, _, _) = center_box.measure(gtk::Orientation::Horizontal, -1);
+            (min, nat)
+        };
+        assert!(
+            bar_nat > bar_min,
+            "test setup: the bar tree must have room to be squeezed at all \
+             (min={bar_min}, natural={bar_nat})"
+        );
+
+        let (roomy, roomy_width) = chosen_at(bar_nat + 200);
+        assert!(
+            roomy_width >= bar_nat,
+            "test setup: the display clamped the roomy bar to {roomy_width} px, below the \
+             {bar_nat} px this tree wants — the roomy case cannot be measured here"
+        );
+        assert!(
+            roomy.is::<gtk::Box>(),
+            "a bar wider than everything's natural width must show the full row, got a {}",
+            roomy.type_()
+        );
+
+        // A bar squeezed to just above its own minimum: every cluster is
+        // fighting for room, which is exactly Annika's crowded-workspace case.
+        let (crowded, crowded_width) = chosen_at(bar_min + 40);
+        assert!(
+            crowded.is::<gtk::Button>(),
+            "a crowded bar must squeeze this slot down to the mini chip — if this fails the \
+             bin is never squeezed and the widget is a placebo (#838); \
+             bar min={bar_min}, natural={bar_nat}, allocated={crowded_width}, got a {}",
+            crowded.type_()
         );
     }
 }

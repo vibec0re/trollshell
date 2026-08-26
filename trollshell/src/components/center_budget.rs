@@ -10,10 +10,11 @@
 //! observing the layout it is itself part of — and it was guarded twice and bit
 //! twice:
 //!
-//! - **Stuck.** The watchers hooked *allocated* widths, which stop moving once
-//!   `CenterBox` has squeezed the start child to its minimum. While a player was
-//!   stopped nothing else re-ran the decision, so the chip froze in whatever mode
-//!   it last picked.
+//! - **Stuck.** The watchers hooked `notify::width` on plain widgets — a
+//!   property GTK4's `GtkWidget` does not have, so none of them ever fired at
+//!   all (#838; see the surface hook in [`install`] for the full autopsy). While
+//!   a player was stopped nothing else re-ran the decision, so the chip froze in
+//!   whatever mode it last picked.
 //! - **Blinking.** #842 fixed the freeze by adding `niri::windows()` /
 //!   `niri::workspaces()` as triggers. But `windows()` re-emits on every **window
 //!   title change** — terminal and browser titles tick constantly — and the
@@ -45,7 +46,10 @@
 //!   it is independent of what any bar widget chooses to render. The sidebar
 //!   needs no term of its own: it is a `Layer::Top` surface whose left exclusive
 //!   zone shrinks this exclusive bar on open, so the allocation *already* dropped
-//!   by the sidebar width (#324) — subtracting again would double-count.
+//!   by the sidebar width (#324) — subtracting again would double-count. It has
+//!   only dropped once the compositor's configure has landed, though, which is an
+//!   async round-trip after the toggle: *when* to take this reading is the whole
+//!   subject of [`install`]'s surface hook.
 //! - The clusters are measured by **natural** width, never allocated width.
 //!   `CenterBox` squeezes the start child toward its minimum when the end pair is
 //!   wide, so the left cluster's *allocation* depends on what the centre slot
@@ -94,7 +98,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
-use hytte::gtk::{self, glib, prelude::*};
+use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
 
@@ -150,22 +154,23 @@ pub(crate) fn signal(monitor: &Monitor) -> impl Signal<Item = Option<i32>> + 'st
 /// Observe `bar`'s geometry and publish the centre-slot budget for `monitor`.
 ///
 /// Call once per bar, immediately after `Bar::show()`. Every geometry input the
-/// mpris widget used to read for itself is hooked here instead:
+/// mpris widget used to read for itself is hooked here instead — and since #838
+/// every hook is one that can actually fire:
 ///
-/// - the `CenterBox`'s own `width` (the bar content allocation — the one input
-///   that reliably moves when the sidebar's exclusive zone pushes the bar, #324),
-/// - the bar window's `default-width` (monitor resize),
-/// - the left cluster's `width`,
-/// - the sidebar's open signal (#324): the resize is an async compositor
-///   round-trip the width watchers alone can miss,
+/// - the bar window's **`gdk::Surface` `width`/`height`**: the compositor
+///   configure itself, so it fires exactly when a resize *lands*, sidebar
+///   exclusive-zone push included. This is the settle path, and the only watcher
+///   of bar geometry there is; the long comment at the hook is the autopsy of the
+///   three widget-side watchers it replaces, none of which ever fired.
+/// - the sidebar's open signal (#324): the earliest *notice* of a toggle, one
+///   compositor round-trip before the bar has actually shrunk.
 /// - `niri::windows()` / `niri::workspaces()` (#842): the two sources
 ///   `widgets::window_list` rebuilds from, so a change here is exactly a change
-///   to the left cluster's *natural* width — which no `width` watcher can see,
-///   because they hook allocated widths and `CenterBox` leaves the start child
-///   pinned at its minimum in precisely the crowded case that matters.
+///   to the left cluster's *natural* width — which no geometry watcher can see,
+///   because the bar itself does not resize when a window title changes.
 ///
-/// These are the same inputs as before, at the same fidelity — including the
-/// noisy one. What changed is where the noise stops: [`damp`], once, here.
+/// The noisy input (`windows()`) is still hooked at full fidelity. What changed
+/// in #847 is where the noise stops: [`damp`], once, here.
 ///
 /// All emissions coalesce into a single idle-scheduled measurement, so a busy
 /// window-open burst costs one publish, and no measurement is ever taken from
@@ -203,40 +208,78 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
         }
     };
 
-    // The bar content allocation. Also the input that moves on a sidebar push.
+    // ── The compositor configure — the bar-geometry watcher (#838) ──────────
+    //
+    // Watch the bar window's `gdk::Surface`, not any widget. GTK4's `GtkWidget`
+    // has **no `width` property** — only `width-request` — so
+    // `connect_notify_local(Some("width"), …)` on a plain widget is a connection
+    // to a detail of a property that does not exist: silently legal, and
+    // permanently dead. Nothing emits it, ever. Verified against the gtk4-rs
+    // 0.11.2 bindings: `gtk::Widget` has no `connect_width_notify`, while
+    // `gdk::Surface` does (`gdk4-0.11.2/src/auto/surface.rs:563`, and
+    // `connect_height_notify` at `:458`).
+    //
+    // Two such watchers used to sit here (`CenterBox` and the left cluster), and
+    // the pre-#847 mpris widget carried three before that, so the "settle after
+    // an async resize" path #324 describes has never once run — not in this
+    // module, and not in the widget it grew out of. That is the bug Annika saw
+    // as "calculation seems still slightly off when sidebar open": the sidebar's
+    // open signal (below) recomputes at once, but the bar's shrink is a
+    // compositor round-trip that has not landed yet, so it reads the *pre-shrink*
+    // width; the correcting re-measure was supposed to come from the `CenterBox`
+    // width watcher, and never came. The stale budget then stood until unrelated
+    // niri traffic happened to remeasure. All three of this module's bar-geometry
+    // watchers are deleted rather than fixed:
+    //
+    // - `CenterBox` `width` and the left cluster's `width` — dead, as above.
+    // - the window's `default-width` — a *real* `GtkWindow` property, but it is
+    //   the app's requested default size. Nothing in this shell ever sets it and
+    //   a layer-shell configure never writes back to it, so it was dead in
+    //   practice too. The surface hook covers the case it was there for (monitor
+    //   resize) properly: a mode change reconfigures the layer surface.
+    //
+    // **Do not reintroduce a `notify::width` on a widget.** It compiles, it
+    // connects, and it can never fire.
+    //
+    // Lifetimes: the window owns its surface, so a handler on the surface must
+    // not hold the widget tree strongly — window → surface → handler → window
+    // would outlive the bar. Walking back up (the shape the deleted handlers
+    // used) is impossible here because a `GdkSurface` has no widget pointer, so
+    // the handler carries a `WeakRef` to the `CenterBox` instead — the same #224
+    // discipline as the `bind` call sites below.
+    //
+    // Hooked once immediately (`Bar::show()` has already called `present()`, so
+    // the window is realised and `connect_realize` will not fire again) and on
+    // every subsequent realise. A hide/show cycle destroys the surface — taking
+    // its handlers with it — and realises a *new* one, so re-hooking is both
+    // required and incapable of double-hooking the same surface.
     {
         let schedule = schedule.clone();
-        center_box.connect_notify_local(Some("width"), move |center_box, _| schedule(center_box));
-    }
-
-    // The bar window's size (monitor resize / exclusive-zone change). Reached
-    // back through `window.child()` rather than a captured clone, so the handler
-    // adds no strong reference into the widget tree it is attached to.
-    {
-        let schedule = schedule.clone();
-        bar.window()
-            .connect_notify_local(Some("default-width"), move |win, _| {
-                if let Some(center_box) = win.child().and_downcast::<gtk::CenterBox>() {
+        let weak_center_box = center_box.downgrade();
+        let hook_surface = move |win: &gtk::Window| {
+            let Some(surface) = win.surface() else {
+                return;
+            };
+            let schedule = schedule.clone();
+            let weak_center_box = weak_center_box.clone();
+            let remeasure = move |_: &gdk::Surface| {
+                if let Some(center_box) = weak_center_box.upgrade() {
                     schedule(&center_box);
                 }
-            });
+            };
+            surface.connect_width_notify(remeasure.clone());
+            surface.connect_height_notify(remeasure);
+        };
+        hook_surface(bar.window());
+        bar.window().connect_realize(hook_surface);
     }
 
-    // Left cluster allocation (windows opening/closing). Same no-capture shape:
-    // the handler walks back up to its own parent instead of holding the
-    // `CenterBox`, which would be a reference cycle (parent → child → handler →
-    // parent) that outlives the bar.
-    if let Some(left) = center_box.start_widget() {
-        let schedule = schedule.clone();
-        left.connect_notify_local(Some("width"), move |left, _| {
-            if let Some(center_box) = left.parent().and_downcast::<gtk::CenterBox>() {
-                schedule(&center_box);
-            }
-        });
-    }
-
-    // Sidebar toggle (#324). The bar has already shrunk by the exclusive zone by
-    // the time this settles; we only need to *re-measure*, never to subtract.
+    // Sidebar toggle (#324). This is the *request*, not the result: it fires a
+    // round-trip before the bar has shrunk, so on its own it re-measures the
+    // pre-shrink geometry. Harmless — that reading equals the standing budget,
+    // so [`damp`] drops it — and the surface hook above publishes the real
+    // change when the configure lands. Never *subtract* the sidebar width here;
+    // the exclusive zone is already in the bar allocation (see the module doc).
     {
         let schedule = schedule.clone();
         bind(
@@ -246,7 +289,9 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
         );
     }
 
-    // Window set / workspace focus (#842) — the left cluster's natural width.
+    // Window set / workspace focus (#842) — the left cluster's natural width,
+    // which no geometry watcher sees: the bar does not resize when a window
+    // opens or a title changes, only the cluster's own natural does.
     {
         let schedule = schedule.clone();
         bind(niri::windows(), &center_box, move |center_box, _windows| {
@@ -262,12 +307,12 @@ pub fn install(monitor: &Monitor, bar: &BarHandle) {
         );
     }
 
-    // Settle the first value. The old widget-side watchers deferred their hooks
-    // to `connect_realize` because the parent chain did not exist until then;
-    // here the whole tree exists already (we run after `Bar::show()`), so the
-    // hooks go on immediately and realise is only a good moment to *measure*.
-    // Both paths are kept because `present()` may already have realised the
-    // window, in which case `connect_realize` never fires again.
+    // Settle the first value. The signal hooks above go on immediately — we run
+    // after `Bar::show()`, so the whole tree exists — and the only one that has
+    // to be re-armed on realise is the surface hook, because the surface is what
+    // realise creates. Realise is still a good moment to *measure*, and both
+    // paths are kept because `present()` has usually realised the window
+    // already, in which case `connect_realize` never fires again.
     center_box.connect_realize(schedule.clone());
     schedule(&center_box);
 }
@@ -433,6 +478,40 @@ mod tests {
             published(&[Some(800), None, None, Some(805)]),
             vec![800],
             "a transient zero allocation is not a budget change"
+        );
+    }
+}
+
+/// The one fact about GTK that [`install`]'s watcher choice rests on, asserted
+/// rather than believed (#838).
+///
+/// Gated behind `system-tests` because instantiating a widget needs a display.
+/// The `gdk::Surface` half of the claim needs no test: [`install`] calls the
+/// typed `connect_width_notify`/`connect_height_notify` bindings, so the
+/// compiler checks it on every build. It is the widget half — where the dead
+/// watchers lived, and where the stringly-typed API accepts anything — that has
+/// nothing checking it.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use hytte::gtk::{self, prelude::*};
+
+    /// A `GtkWidget` has no `width` property, so `notify::width` on one can
+    /// never fire — the whole reason two watchers in this module (and three more
+    /// in the pre-#847 mpris widget) were dead from the day they were written.
+    /// `connect_notify_local` takes the detail as a string and does not validate
+    /// it, so nothing else in the toolchain will ever say so.
+    #[gtk::test]
+    fn a_widget_has_no_width_property_to_watch() {
+        let center_box = gtk::CenterBox::new();
+        assert!(
+            center_box.find_property("width").is_none(),
+            "GtkWidget grew a `width` property: `connect_notify_local(Some(\"width\"), …)` \
+             is no longer dead, and this module's surface hook deserves a re-think"
+        );
+        assert!(
+            center_box.find_property("width-request").is_some(),
+            "`width-request` is the property that does exist — the request, not the \
+             result, and the one `width` gets mistaken for"
         );
     }
 }

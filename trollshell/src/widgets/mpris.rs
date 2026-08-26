@@ -362,11 +362,6 @@ mod gtk_tests {
     /// shows the full row. This is the assertion the previous four iterations
     /// each tried to make true with watchers, budgets and hysteresis.
     #[gtk::test]
-    #[expect(
-        deprecated,
-        reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note on \
-                  build_squeezer"
-    )]
     fn a_tight_allocation_selects_the_mini_child() {
         adw::init().expect("libadwaita init");
         let (probe_full, probe_mini) = renditions();
@@ -416,5 +411,122 @@ mod gtk_tests {
         let chosen = squeezer.visible_child().expect("allow_none(false)");
         window.destroy();
         chosen
+    }
+
+    /// The placebo check (#838, review item 4): the *bar's own shape* has to be
+    /// able to squeeze this slot, or none of the above matters.
+    ///
+    /// `hytte_ui::Bar` builds `CenterBox[left, end_pair[centre, right]]` with
+    /// **no centre child** — the "centre" group rides the end widget
+    /// (`crates/hytte-ui/src/bar.rs`). A reasonable worry is that such a shape
+    /// always hands `end_pair` its natural width and starves the start child
+    /// instead, in which case the squeezer would never see a tight allocation.
+    /// It does not: `GtkCenterBox` gives each child its minimum and then
+    /// distributes what is left toward the naturals, so an over-subscribed bar
+    /// shortens *both* sides and the squeezer's slice falls below the full
+    /// row's natural width.
+    ///
+    /// Asserted at both ends so it cannot pass by being stuck: a bar with room
+    /// to spare shows the full row, the same bar narrowed shows the chip.
+    #[gtk::test]
+    #[expect(
+        deprecated,
+        reason = "AdwSqueezer is deprecated since libadwaita 1.4; see the DEPRECATION note on \
+                  build_squeezer"
+    )]
+    fn the_bar_shape_can_actually_squeeze_the_slot() {
+        adw::init().expect("libadwaita init");
+
+        // `hytte_ui::Bar::show()`'s tree, with deliberately tiny stand-ins for
+        // the two clusters. The roomy case needs a window wider than the whole
+        // tree's natural width, and the test harness' virtual display is only
+        // 640 px (`xvfb-run -a` with no `-screen`, which is what `nix flake
+        // check` uses too) — anything bigger gets clamped, and a clamped window
+        // would measure as "crowded" in every case and pass the crowded
+        // assertion for the wrong reason. The `roomy_width` check below turns
+        // that into a loud failure if it ever happens anyway.
+        let build_bar = || {
+            let left = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let btn = gtk::Button::with_label("a window title");
+            if let Some(l) = btn.child().and_downcast::<gtk::Label>() {
+                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                l.set_max_width_chars(6);
+            }
+            left.append(&btn);
+
+            let (full, mini) = renditions();
+            // The bar's label caps at 60 chars; trim it here so the whole tree
+            // still fits the display in the roomy case.
+            if let Some(label) = full.last_child().and_downcast::<gtk::Label>() {
+                label.set_max_width_chars(8);
+            }
+            let squeezer = build_squeezer(full.upcast_ref(), mini.upcast_ref());
+            squeezer.set_transition_type(adw::SqueezerTransitionType::None);
+
+            let middle = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            middle.append(&squeezer);
+            let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            for _ in 0..2 {
+                right.append(&icon_button("audio-volume-high-symbolic"));
+            }
+
+            let end_pair = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            end_pair.append(&middle);
+            end_pair.append(&right);
+
+            let center_box = gtk::CenterBox::new();
+            center_box.set_start_widget(Some(&left));
+            center_box.set_end_widget(Some(&end_pair));
+            (center_box, squeezer)
+        };
+
+        // Returns the chosen rendition *and* the width the bar actually got, so
+        // a display too small to honour the request fails loudly rather than
+        // masquerading as a crowded bar.
+        let chosen_at = |bar_width: i32| {
+            let (center_box, squeezer) = build_bar();
+            let window = gtk::Window::new();
+            window.set_child(Some(&center_box));
+            window.set_default_size(bar_width, 40);
+            window.present();
+            pump();
+            let chosen = squeezer.visible_child().expect("allow_none(false)");
+            let got = center_box.width();
+            window.destroy();
+            (chosen, got)
+        };
+
+        let (bar_min, bar_nat) = {
+            let (center_box, _) = build_bar();
+            width_request(&center_box)
+        };
+        assert!(
+            bar_nat > bar_min,
+            "test setup: the bar tree must have room to be squeezed at all \
+             (min={bar_min}, natural={bar_nat})"
+        );
+
+        let (roomy, roomy_width) = chosen_at(bar_nat + 200);
+        assert!(
+            roomy_width >= bar_nat,
+            "test setup: the display clamped the roomy bar to {roomy_width} px, below the \
+             {bar_nat} px this tree wants — the roomy case cannot be measured here"
+        );
+        assert!(
+            roomy.is::<gtk::Box>(),
+            "a bar wider than everything's natural width must show the full row, got a {}",
+            roomy.type_()
+        );
+
+        // A bar squeezed to just above its own minimum: every cluster is
+        // fighting for room, which is exactly Annika's crowded-workspace case.
+        let (crowded, crowded_width) = chosen_at(bar_min + 40);
+        assert!(
+            crowded.is::<gtk::Button>(),
+            "a crowded bar must squeeze this slot down to the mini chip — if this fails the \
+             squeezer is never squeezed and the widget is a placebo (#838 item 4); \
+             bar min={bar_min}, natural={bar_nat}, allocated={crowded_width}, got a {}",
+            crowded.type_()
+        );
     }
 }

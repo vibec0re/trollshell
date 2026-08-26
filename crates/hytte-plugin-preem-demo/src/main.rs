@@ -125,10 +125,13 @@ const MARQUEE_MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
 /// The marquee window width in pixels — a wide bar-chip ticker that stays
 /// within the ~296 px sidebar card.
 const MARQUEE_WINDOW_PX: usize = 268;
-/// Pixels the marquee pans per host snapshot. The shell re-snapshots ~1 Hz, so
-/// the demo steps once a second; a frame-timer plugin would bump the offset
-/// every frame for a smooth scroll (the kit owns no clock).
-const MARQUEE_STEP_PX: usize = 6;
+/// **Virtual pixels** (dots) the marquee pans per host snapshot — the unit the
+/// marquee scrolls in, where a sub-dot step is not expressible (#839). The
+/// shell re-snapshots ~1 Hz, so the demo steps twice a second's worth of dots
+/// once a second (about the pre-#839 pace, now landed on whole grid columns);
+/// a frame-timer plugin would bump the offset a dot per frame for a smooth
+/// scroll (the kit owns no clock).
+const MARQUEE_STEP_DOTS: usize = 2;
 /// The textbox wrap width: 22 columns at ×2 scale = 274 px.
 const TEXT_COLS: usize = 22;
 
@@ -198,14 +201,15 @@ impl PreemDemo {
         chars.iter().cycle().skip(off).take(TICKER_WINDOW).collect()
     }
 
-    /// The marquee's scroll offset, panning [`MARQUEE_STEP_PX`] px per second.
+    /// The marquee's scroll offset, panning [`MARQUEE_STEP_DOTS`] dots per
+    /// second.
     /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window) wraps
     /// this modulo the strip period, so the raw (unbounded) counter is fine.
     fn marquee_offset(&self) -> usize {
         // Bound the seconds before scaling so the multiply can never overflow;
         // the window's own modulo makes the absolute value irrelevant.
         let secs = usize::try_from(self.unix.rem_euclid(1_000_000)).unwrap_or(0);
-        secs.saturating_mul(MARQUEE_STEP_PX)
+        secs.saturating_mul(MARQUEE_STEP_DOTS)
     }
 
     /// Park the scope (#422): forget the last bands and wipe the phosphor, so a
@@ -571,7 +575,7 @@ mod tests {
         let o0 = m.marquee_offset();
         let _ = m.update(snapshot("2026-07-16T00:00:04+02:00", 301));
         let o1 = m.marquee_offset();
-        assert_eq!(o1 - o0, super::MARQUEE_STEP_PX, "one second, one step");
+        assert_eq!(o1 - o0, super::MARQUEE_STEP_DOTS, "one second, one step");
 
         let strip = Marquee::new(m.style())
             .window_px(super::MARQUEE_WINDOW_PX)

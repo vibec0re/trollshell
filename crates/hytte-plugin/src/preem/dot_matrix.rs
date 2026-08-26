@@ -8,6 +8,19 @@
 //! showing through, exactly like the hardware — and glowing styles bleed a
 //! halo off the lit dots. Single line by design: it's a ticker, not a
 //! paragraph — wrapped text is [`TextBox`](super::TextBox)'s job.
+//!
+//! # The static display's grid is per **character cell**
+//!
+//! [`dot_matrix`] models a fixed row of char cells: the ghost pass paints the
+//! `GLYPH_W`×`GLYPH_H` dots of each cell, and the spacing column between two
+//! cells carries no dots — the hardware has none there either. That cell
+//! structure is right for a *static* readout and deliberately wrong for a
+//! *scrolling* one, where a travelling cell structure is exactly what can't
+//! be scrolled smoothly (#839). [`Marquee`](super::Marquee) therefore does
+//! **not** scroll a `dot_matrix` render: it owns its own continuous grid and
+//! reuses this module's dot *hardware* — the [`DOT`] pitch, the [`PAD`]
+//! bezel, and the [`ghost_dot`]/[`lit_dot`] painters — so a marquee dot is
+//! pixel-for-pixel the dot you see here.
 
 use super::font;
 use super::frame::{Frame, Rgba};
@@ -16,10 +29,14 @@ use super::style::{DisplayStyle, Emission, mix};
 /// Edge length of one dot cell in buffer pixels: every font pixel becomes a
 /// `DOT`×`DOT` round dot. At 4 px a char cell advances 24 px, so ~11 chars
 /// fill a ~296 px sidebar card (see the `preem` docs on sizing).
-const DOT: usize = 4;
+///
+/// This is the kit's **virtual pixel**: the physical dot pitch of every
+/// dot-matrix surface. [`Marquee`](super::Marquee) scrolls in whole units of
+/// it, never in buffer pixels (#839).
+pub(super) const DOT: usize = 4;
 
 /// Field padding around the dot grid, one dot cell on every side.
-const PAD: usize = DOT;
+pub(super) const PAD: usize = DOT;
 
 /// The radial falloff of one dot: intensity per pixel of the `DOT`×`DOT`
 /// cell (0..=255), bright 2×2 core, dim rim, near-dark corners — what makes
@@ -87,8 +104,10 @@ pub fn dot_matrix(text: &str, style: DisplayStyle) -> Frame {
 }
 
 /// Paint one unlit ghost dot flat into the frame: the falloff shape, mixed
-/// from the field toward the ghost color.
-fn ghost_dot(frame: &mut Frame, x: usize, y: usize, ghost: Rgba) {
+/// from the field toward the ghost color. `x`/`y` are the top-left buffer
+/// pixel of the `DOT`×`DOT` cell. Shared with [`Marquee`](super::Marquee) so
+/// both surfaces show the *same* unlit matrix.
+pub(super) fn ghost_dot(frame: &mut Frame, x: usize, y: usize, ghost: Rgba) {
     for (j, row) in FALLOFF.iter().enumerate() {
         for (i, &t) in row.iter().enumerate() {
             let under = frame.at(x + i, y + j);
@@ -97,8 +116,11 @@ fn ghost_dot(frame: &mut Frame, x: usize, y: usize, ghost: Rgba) {
     }
 }
 
-/// Stamp one lit dot's falloff into the emission grid.
-fn lit_dot(lit: &mut Emission, x: usize, y: usize) {
+/// Stamp one lit dot's falloff into the emission grid. `x`/`y` are the
+/// top-left buffer pixel of the `DOT`×`DOT` cell. Shared with
+/// [`Marquee`](super::Marquee) so a scrolled dot lights exactly like a
+/// static one.
+pub(super) fn lit_dot(lit: &mut Emission, x: usize, y: usize) {
     for (j, row) in FALLOFF.iter().enumerate() {
         for (i, &t) in row.iter().enumerate() {
             lit.add(x + i, y + j, t);

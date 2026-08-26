@@ -91,8 +91,13 @@ const TICK: Duration = Duration::from_millis(50);
 
 /// The marquee window width in px — a wide ticker inside the ~296 px card.
 const MARQUEE_WINDOW_PX: usize = 268;
-/// Pixels the marquee pans per frame tick (≈60 px/s at 20 Hz).
-const MARQUEE_STEP: usize = 3;
+/// **Virtual pixels** (dots) the marquee pans per frame tick — one, the
+/// smallest step the display has: ≈20 dots/s at the 20 Hz [`TICK`], which
+/// reads as a classic ticker. The unit is the dot, not the buffer pixel
+/// (#839): a step that isn't a whole dot is not expressible, which is what
+/// keeps the text stepping grid-column to grid-column instead of smearing
+/// across dot positions the way the pre-#839 3-px step did.
+const MARQUEE_STEP: usize = 1;
 
 /// Per-tick release (fall) rates, in level units — the meters' ballistics.
 /// The spectrum bars fall in ~1 s, the LED bar in ~0.4 s (a snappy VU release),
@@ -124,9 +129,10 @@ enum Msg {
 /// The rasterized marquee strip, cached by the exact text it was drawn from.
 ///
 /// The preem [`Marquee`] API is render-**once**, then [`window`](MarqueeStrip::window)
-/// a slice per frame (`crates/hytte-plugin/src/preem/marquee.rs`): `render` runs
-/// the full dot-matrix pipeline (per-glyph ghost + lit + bloom passes), while
-/// `window` is a cheap sub-rect blit. But the SDK calls [`view`](AudioWidget::view)
+/// per frame (`crates/hytte-plugin/src/preem/marquee.rs`): `render` rasterizes the
+/// message into its font-space bitmap and paints the window's fixed ghost matrix
+/// once, while `window` only clones that backdrop and lights the dots the offset
+/// selects. But the SDK calls [`view`](AudioWidget::view)
 /// on every input — ~43×/s while visible (the 20 Hz tick + ~23 Hz spectrum
 /// push) — for marquee text that changes only when the track or the idle/active
 /// state flips (#560). So the strip is rasterized once per distinct text and
@@ -271,7 +277,8 @@ impl AudioWidget {
         }
     }
 
-    /// The marquee scroll offset. [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window)
+    /// The marquee scroll offset, in whole dots.
+    /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window)
     /// wraps it modulo the strip period, so the raw counter is fine; bound it
     /// before the multiply so the product can never overflow.
     fn marquee_offset(&self) -> usize {

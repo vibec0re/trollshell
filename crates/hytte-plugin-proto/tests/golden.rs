@@ -480,6 +480,8 @@ fn host_msgs() -> Vec<HostMsg> {
                 title: "Chrome Rain".into(),
                 artist: "Choom".into(),
                 playing: true,
+                position_us: 83_000_000,
+                length_us: 296_000_000,
             },
         },
         HostMsg::NowPlaying {

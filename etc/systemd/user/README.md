@@ -269,18 +269,27 @@ The agent-facing skill folder lives at
 environment variables to set.
 
 `trollshell-plugin-audio-widget.service` is the audio-reactive sidebar card
-(#506): a `Mount::SidebarTop` card composing three `hytte_plugin::preem` raster
-widgets off the `StateKey::AudioSpectrum` push (#405) — a dot-matrix marquee, a
-16-band spectrum scope, and the LED peak/level strip this issue adds to the kit
-(a row of discrete LEDs lighting with the overall level, topped by a peak-hold
-dot that floats and decays). It runs its own ~20 Hz frame timer for the
-animation and parks it while the sidebar is closed (`StateKey::SlotVisible`).
-The shell only runs the PipeWire monitor tap while at least one spectrum
-subscriber is connected, so an idle desktop with this plugin off pays nothing.
-The marquee scrolls the current track (`title — artist`) off the
-`StateKey::NowPlaying` push (#528, projecting `hytte_services::mpris` the way
-#405 did for the spectrum), falling back to a decorative banner when nothing
-is playing. No environment variables to set.
+(#506), reworked into a y2k USB-MP3-player face plate by #840: a
+`Mount::SidebarBottom` card (`order = 1`, so it sits below pet and departures)
+composing four `hytte_plugin::preem` raster widgets off the
+`StateKey::AudioSpectrum` push (#405) — a dot-matrix marquee, a `MM:SS/MM:SS`
+time readout, a 16-band spectrum scope, and the LED peak/level strip #506 adds
+to the kit (a row of discrete LEDs lighting with the overall level, topped by a
+peak-hold dot that floats and decays) — over a prev / play-pause / next
+transport row. It runs its own ~20 Hz frame timer for the animation and parks it
+while the sidebar is closed (`StateKey::SlotVisible`). The shell only runs the
+PipeWire monitor tap while at least one spectrum subscriber is connected, so an
+idle desktop with this plugin off pays nothing. The marquee scrolls the current
+track (`title — artist`) off the `StateKey::NowPlaying` push (#528, projecting
+`hytte_services::mpris` the way #405 did for the spectrum), falling back to a
+decorative banner when nothing is playing; the readout comes off that same
+push's `position_us`/`length_us` (#840). The transport row needs
+`Capability::Media` — the buttons emit `Effect::Media`, which the shell's broker
+routes to whichever player is active (#648), so the card never names a player.
+Because the card consumes `position_us`, an open sidebar also un-parks the
+shell's 250 ms mpris position poller (#228's gate is the OR of that and the
+Media drawer page); closing the sidebar parks it again. No environment variables
+to set.
 
 ## The Claude bridge (`trollshell-claude-bridge.service`)
 

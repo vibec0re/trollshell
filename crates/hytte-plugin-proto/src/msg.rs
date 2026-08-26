@@ -313,7 +313,8 @@ mod tests {
         }
     }
 
-    /// The #528 now-playing push round-trips (playing and idle).
+    /// The #528 now-playing push round-trips (playing and idle), timing fields
+    /// (#840) included — both a track the player timed and one it didn't.
     #[test]
     fn now_playing_push_round_trips() {
         use crate::state::NowPlaying;
@@ -322,6 +323,15 @@ mod tests {
                 title: "Chrome Rain".into(),
                 artist: "Choom".into(),
                 playing: true,
+                position_us: 83_000_000,
+                length_us: 296_000_000,
+            },
+            NowPlaying {
+                title: "Some Stream".into(),
+                artist: String::new(),
+                playing: true,
+                position_us: 83_000_000,
+                length_us: 0,
             },
             NowPlaying::default(),
         ] {

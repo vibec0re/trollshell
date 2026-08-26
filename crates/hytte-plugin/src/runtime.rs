@@ -1496,6 +1496,8 @@ mod tests {
                         title: "Chrome Rain".to_owned(),
                         artist: "Choom".to_owned(),
                         playing: true,
+                        position_us: 83_000_000,
+                        length_us: 296_000_000,
                     },
                 },
             )

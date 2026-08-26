@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
+use hytte::futures_signals::signal::Mutable;
 use hytte::gtk::{self, prelude::*};
 use hytte::reactive::registry;
 use hytte::services::calendar::CalendarEvent;
@@ -148,13 +149,18 @@ pub(super) fn to_upcoming_events(events: &[CalendarEvent], now_unix: i64) -> Vec
 
 /// Project the mpris active [`Player`] onto the GTK-free wire [`NowPlaying`]
 /// digest (#528): title/artist off its metadata, `playing` iff the player is
-/// actually playing (paused/stopped/absent all read as not playing). `None`
-/// (no active player) is the empty, not-playing default. Pure.
+/// actually playing (paused/stopped/absent all read as not playing), plus the
+/// track timing (#840) — `position_us` as the position poller last sampled it
+/// and `length_us` off `mpris:length`, both already microseconds on the service
+/// side and both `0` when unknown, which is exactly the digest's own "unknown"
+/// encoding. `None` (no active player) is the empty, not-playing default. Pure.
 pub(super) fn to_now_playing(player: Option<&Player>) -> NowPlaying {
     player.map_or_else(NowPlaying::default, |p| NowPlaying {
         title: p.title.clone(),
         artist: p.artists.clone(),
         playing: p.status == PlaybackStatus::Playing,
+        position_us: p.position_us,
+        length_us: p.length_us,
     })
 }
 
@@ -215,6 +221,22 @@ thread_local! {
     /// [`forget_sidebar_visibility`] (hot-unplug).
     static SLOT_VISIBILITY_BY_MONITOR: RefCell<HashMap<String, bool>> =
         RefCell::new(HashMap::new());
+
+    /// The same aggregate as a GTK-side `Mutable`, so the *binary* can gate its
+    /// own pollers on plugin-card visibility the way a plugin gates its own
+    /// (#840). The wire push travels by `watch` to the tokio per-conn tasks;
+    /// this mirror travels by signal to `main.rs`, which needs the value as an
+    /// `impl Signal` to fold into the mpris position gate. Written only by
+    /// [`publish_visibility`], so the two can't disagree.
+    static SLOT_VISIBLE: Mutable<bool> = Mutable::new(false);
+}
+
+/// The slot-visibility aggregate as an owned [`Mutable`] — `true` while any
+/// monitor's sidebar is open. Owned (not an `impl Signal` accessor) for the
+/// reason [`crate::components::visibility_gate::GateRegistry::mutable`] spells
+/// out: a `&self`-free `'static` signal is what the wiring site needs.
+pub(super) fn slot_visible_mutable() -> Mutable<bool> {
+    SLOT_VISIBLE.with(Clone::clone)
 }
 
 /// A plugin's card is visible iff **any** monitor's sidebar is open — the card
@@ -262,7 +284,15 @@ pub fn forget_sidebar_visibility(monitor_key: &str) {
 /// published value (`send_if_modified`) — so redundant open/close churn on one
 /// monitor while another stays open doesn't wake the per-conn tasks. Latest-wins
 /// is fine either way (it's state, not a one-shot event).
+///
+/// Also updates the [`SLOT_VISIBLE`] GTK-side mirror, on the same
+/// only-when-changed rule and from this one place, so the binary's own gate
+/// (#840) can never disagree with what the plugins were told.
 fn publish_visibility(visible: bool) {
+    let mirror = slot_visible_mutable();
+    if mirror.get() != visible {
+        mirror.set(visible);
+    }
     registry::with(|r| {
         r.get::<PluginHandles>()
             .expect("plugins::service() not registered")

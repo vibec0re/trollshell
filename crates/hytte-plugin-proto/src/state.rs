@@ -99,6 +99,18 @@ pub struct UpcomingEvent {
 /// [`HostMsg::NowPlaying`](crate::msg::HostMsg::NowPlaying). The motivating
 /// consumer is the audio widget's dot-matrix marquee, which scrolls the live
 /// title/artist while something plays and falls back to its own banner otherwise.
+///
+/// # Push rate (#840)
+///
+/// Before the timing fields this digest only changed on *metadata* — a track
+/// swap or a play/pause — so the host's dedup made it a rare push. With
+/// [`position_us`](Self::position_us) it moves as fast as the host's mpris
+/// position poller (4 Hz), so a subscriber sees roughly one push per 250 ms
+/// **while that poller runs**. It is gated: the shell parks the poller when no
+/// consumer is on screen, and a parked poller stops changing `position_us`, so
+/// the dedup collapses the push back to metadata-only. A consumer that only
+/// wants the title should still just ignore the timing fields — the extra
+/// pushes carry the same title and its own render dedup absorbs them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NowPlaying {
     /// The track title (`xesam:title`), or empty when nothing is playing.
@@ -109,4 +121,19 @@ pub struct NowPlaying {
     /// stopped / absent). A consumer keys its "show the track vs the fallback"
     /// choice off this.
     pub playing: bool,
+    /// Elapsed playback position in **microseconds**, or `0` when unknown (#840).
+    ///
+    /// Sampled by the host's mpris `Position` poller, so it only advances while
+    /// that poller is unparked (see the push-rate note above) — a consumer must
+    /// treat a frozen value as "no fresh sample", never as "playback stopped".
+    /// `0` is deliberately both "at the start" and "unknown": the distinction
+    /// isn't renderable and MPRIS itself doesn't draw it.
+    #[serde(default)]
+    pub position_us: u64,
+    /// Track length in **microseconds** (`mpris:length`), or `0` when the player
+    /// reports none (#840) — live streams and many web players never do, so a
+    /// consumer must render an unknown duration rather than a bogus `00:00`
+    /// total.
+    #[serde(default)]
+    pub length_us: u64,
 }

@@ -1,17 +1,34 @@
 //! `hytte-plugin-audio-widget` — an audio-reactive trollshell sidebar card 🎚️
 //! (issue #506, "preem extra audio widget").
 //!
-//! An out-of-process widget plugin on the `hytte-plugin` SDK that composes three
+//! An out-of-process widget plugin on the `hytte-plugin` SDK that composes four
 //! preem raster widgets off the host's [`StateKey::AudioSpectrum`] push (#405,
-//! perceptual-dBFS levels since #504) into one sidebar card:
+//! perceptual-dBFS levels since #504) into one sidebar card, over a transport
+//! row — the front panel of a y2k USB MP3 player (#840):
 //!
 //! - a **dot-matrix marquee** (a scrolling ticker banner, see the dot-matrix
 //!   note below on why it isn't the track title yet),
+//! - the **time readout** — a second, static dot-matrix line showing
+//!   `elapsed/total` off the [`NowPlaying`] digest's timing fields (#840),
 //! - a **16-band spectrum scope** (`spectrum::scope_tile`, mirroring the
-//!   preem-demo's tile), and
+//!   preem-demo's tile),
 //! - the **LED peak/level strip** ([`hytte_plugin::preem::LedStrip`], the kit
 //!   widget this issue adds): a row of discrete LEDs lighting with the overall
-//!   level, topped by a peak-hold dot that floats and decays.
+//!   level, topped by a peak-hold dot that floats and decays, and
+//! - the **transport row** (#840): chunky prev / play-pause / next buttons that
+//!   drive the host's *active* player.
+//!
+//! # Transport — zero new protocol (#840)
+//!
+//! The card was display-only until #840; the controls needed nothing new on the
+//! wire. [`Effect::Media`] and its three [`MediaAction`]s already existed and the
+//! host's effect broker already resolves them onto the active player the same way
+//! the bar chip does (#648) — the wire vocabulary is deliberately
+//! player-agnostic, so the card names no player and can't name the wrong one. All
+//! this plugin adds is [`Capability::Media`] in the manifest (the grant the host
+//! enforces the effects against), three [`Node::Button`]s, and a click match. The
+//! play-pause glyph mirrors [`NowPlaying::playing`], so the button shows what the
+//! *player* is doing, not what was last clicked.
 //!
 //! # Shape — TEA, self-driven frame timer
 //!
@@ -25,6 +42,15 @@
 //! own when the audio stops — the display never freezes mid-bar. The two LED
 //! values are both [`PeakHold`]s: a fast-releasing one for the bar level and a
 //! slow-releasing one for the dot.
+//!
+//! # The time readout parks the host's poller too (#840)
+//!
+//! `position_us` is sampled by a 250 ms `Position` poller in the shell's mpris
+//! service, gated since #228 on "is a consumer on screen". This card is now a
+//! second consumer, so the shell ORs the sidebar-open aggregate into that gate
+//! (`trollshell/src/main.rs`) — the sidebar's own [`SlotVisible`] signal, the
+//! same one this card parks on below. Closing the sidebar therefore parks both
+//! ends at once: no polling, and no digest pushes to render.
 //!
 //! # `SlotVisible` gating (#288/#422)
 //!
@@ -64,9 +90,12 @@ mod spectrum;
 use std::cell::RefCell;
 use std::time::Duration;
 
-use hytte_plugin::preem::{DisplayStyle, Frame, LedStrip, Marquee, MarqueeStrip, PeakHold};
+use hytte_plugin::preem::{
+    DisplayStyle, Frame, LedStrip, Marquee, MarqueeStrip, PeakHold, dot_matrix,
+};
 use hytte_plugin::proto::{
-    Capability, Dir, Effect, Manifest, Mount, Node, NowPlaying, SPECTRUM_BINS, StateKey,
+    Capability, Dir, Effect, EventKind, Manifest, MediaAction, Mount, Node, NowPlaying,
+    SPECTRUM_BINS, StateKey,
 };
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
@@ -77,8 +106,23 @@ const PLUGIN_ID: &str = "audio-widget";
 // instead of rebuilding the widget.
 const ROOT_ID: &str = "audio-widget-root";
 const MARQUEE_ID: &str = "audio-widget-marquee";
+const READOUT_ID: &str = "audio-widget-readout";
 const SCOPE_ID: &str = "audio-widget-scope";
 const LEDS_ID: &str = "audio-widget-leds";
+const TRANSPORT_ID: &str = "audio-widget-transport";
+// The three transport buttons. `Node::Button` requires an id — it *is* the click
+// event target, and these are what [`transport_action`] matches on.
+const PREV_ID: &str = "audio-widget-prev";
+const PLAY_ID: &str = "audio-widget-play";
+const NEXT_ID: &str = "audio-widget-next";
+
+/// Transport glyphs — Adwaita's standard symbolic media icons, so the row
+/// themes with the rest of the shell (the bar's own mpris chip draws the same
+/// three) and recolors with the icon theme instead of shipping bespoke art.
+const ICON_PREV: &str = "media-skip-backward-symbolic";
+const ICON_PLAY: &str = "media-playback-start-symbolic";
+const ICON_PAUSE: &str = "media-playback-pause-symbolic";
+const ICON_NEXT: &str = "media-skip-forward-symbolic";
 
 /// The skin every widget wears. VFD (cyan glow on near-black) reads like a hi-fi
 /// display; its lit ink is accent-tinted by the SDK (#376) so the card matches
@@ -117,6 +161,16 @@ const ACTIVE_THRESHOLD: f32 = 0.03;
 const ACTIVE_MSG: &str = "~ NOW VIBING ~ TROLLSHELL AUDIO ~ ";
 /// The banner while silent (fits the window, so it holds static).
 const IDLE_MSG: &str = "- SILENCE -";
+
+/// The time readout's stand-in for a duration the player doesn't report (#840):
+/// `mpris:length` is absent on live streams and plenty of web players, and a
+/// `00:00` total would read as a zero-length track rather than an unknown one.
+const UNKNOWN_TIME: &str = "--:--";
+/// What [`mmss`] shows past its two-digit minute field — a saturation, not a
+/// wrap, so an over-long track reads as "at least this much" instead of
+/// restarting from `00:00`. The field stays two digits so the readout keeps a
+/// fixed 11-char width and the card never reflows mid-track.
+const MAX_TIME: &str = "99:59";
 
 /// The plugin's own message: a single ~20 Hz heartbeat from [`Plugin::sources`].
 /// `Clone` is required by [`tick_stream`], which emits a clone each period.
@@ -170,6 +224,56 @@ impl MarqueeCache {
             .expect("populated above")
             .1
             .window(offset)
+    }
+}
+
+/// A microsecond duration as `MM:SS` (#840).
+///
+/// Minutes are **not** rolled over into hours: an hour-long track reads `65:00`,
+/// which is what a y2k player's five-cell time field does and what keeps the
+/// readout a fixed width. Past the two-digit field it saturates at [`MAX_TIME`]
+/// rather than widening to `100:00` (which would reflow the card) or wrapping to
+/// `00:00` (which would lie about the direction of travel).
+fn mmss(us: u64) -> String {
+    let secs = us / 1_000_000;
+    let mins = secs / 60;
+    if mins > 99 {
+        return MAX_TIME.to_owned();
+    }
+    let rem = secs % 60;
+    format!("{mins:02}:{rem:02}")
+}
+
+/// The [`MediaAction`] a click on `node` asks for, or `None` for any other node
+/// (the card's displays are all click-inert). Pure, so the button-id → action
+/// mapping is testable without a session.
+fn transport_action(node: &str) -> Option<MediaAction> {
+    match node {
+        PREV_ID => Some(MediaAction::Previous),
+        PLAY_ID => Some(MediaAction::PlayPause),
+        NEXT_ID => Some(MediaAction::Next),
+        _ => None,
+    }
+}
+
+/// One transport button: an id'd [`Node::Button`] wrapping a symbolic icon.
+///
+/// `primary` picks the play-pause button's treatment — libadwaita's own
+/// `suggested-action` fill against the other two's `flat`, so the big lit button
+/// sits between two quiet ones the way a player's face plate does. Both wear
+/// `circular`; every class here is a stock libadwaita/GTK token, since a plugin
+/// cannot ship CSS of its own and an unmatched token is simply inert.
+fn transport_button(id: &str, icon: &str, primary: bool) -> Node {
+    let mut classes = vec!["circular".to_owned()];
+    classes.push(if primary { "suggested-action" } else { "flat" }.to_owned());
+    Node::Button {
+        id: id.to_owned(),
+        classes,
+        child: Box::new(Node::Icon {
+            id: None,
+            name: icon.to_owned(),
+            classes: Vec::new(),
+        }),
     }
 }
 
@@ -277,6 +381,34 @@ impl AudioWidget {
         }
     }
 
+    /// The time readout's text (#840): `elapsed/total`, with [`UNKNOWN_TIME`]
+    /// standing in for a duration the player doesn't report.
+    ///
+    /// Always both fields, always 11 chars — 268 px of dot matrix, the same
+    /// width as the marquee window above it, and a width that never changes as a
+    /// track plays or a duration arrives late. The separator is a bare `/`
+    /// rather than a spaced ` / ` for exactly that budget: the spaced form is 13
+    /// chars, 316 px, past the ~296 px sidebar card.
+    fn readout_text(&self) -> String {
+        let total = if self.now_playing.length_us == 0 {
+            UNKNOWN_TIME.to_owned()
+        } else {
+            mmss(self.now_playing.length_us)
+        };
+        format!("{}/{total}", mmss(self.now_playing.position_us))
+    }
+
+    /// The play-pause button's glyph — pause while the host reports a *playing*
+    /// player, play otherwise. Mirrors the player's state, not the last click,
+    /// so a track paused from the bar chip or a keyboard key flips this too.
+    fn play_icon(&self) -> &'static str {
+        if self.now_playing.playing {
+            ICON_PAUSE
+        } else {
+            ICON_PLAY
+        }
+    }
+
     /// The marquee scroll offset, in whole dots.
     /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window)
     /// wraps it modulo the strip period, so the raw counter is fine; bound it
@@ -289,23 +421,29 @@ impl AudioWidget {
 
 impl Plugin for AudioWidget {
     type Msg = Msg;
-    /// Purely display: no I/O of its own, no commands.
+    /// No I/O of its own: the transport row rides the render frame's effects, so
+    /// nothing needs the async command lane.
     type Cmd = std::convert::Infallible;
 
-    /// Mounts [`Mount::SidebarTop`] (`order = 2`, so it sorts below the clock /
-    /// preem demos if co-mounted). Subscribes [`StateKey::AudioSpectrum`] (the
-    /// data), [`StateKey::SlotVisible`] (the park gate), and
-    /// [`StateKey::NowPlaying`] (the marquee track, #528) — the last paired with
-    /// [`Capability::NowPlaying`], the capability the host requires on top of the
-    /// subscription. The SDK adds the accent subscription (#376) on its behalf.
+    /// Mounts [`Mount::SidebarBottom`] at `order = 1` (#840): the host sorts a
+    /// region by `(order, id)` ascending, so the deck sits below the pet (`-1`)
+    /// and the departures board (`0`), at the foot of the sidebar where Annika
+    /// asked for it. Subscribes [`StateKey::AudioSpectrum`] (the meters),
+    /// [`StateKey::SlotVisible`] (the park gate), and [`StateKey::NowPlaying`]
+    /// (the marquee track and the time readout, #528/#840) — the last paired
+    /// with [`Capability::NowPlaying`], the capability the host requires on top
+    /// of the subscription. [`Capability::Media`] is the grant for the transport
+    /// row's effects (#840); the host drops a `Media` effect from a plugin that
+    /// didn't declare it. The SDK adds the accent subscription (#376) on its
+    /// behalf.
     fn manifest() -> Manifest {
-        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(2);
+        let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarBottom).with_order(1);
         m.subscribes = vec![
             StateKey::AudioSpectrum,
             StateKey::SlotVisible,
             StateKey::NowPlaying,
         ];
-        m.capabilities = vec![Capability::NowPlaying];
+        m.capabilities = vec![Capability::NowPlaying, Capability::Media];
         m
     }
 
@@ -362,19 +500,33 @@ impl Plugin for AudioWidget {
                     self.tick();
                 }
             }
-            // The now-playing push (#528): adopt it while visible so the marquee
-            // shows the live track; ignore it while parked (the card re-derives
-            // from the next push on reopen, like the spectrum).
+            // The now-playing push (#528, timing since #840): adopt it while
+            // visible so the marquee shows the live track and the readout the
+            // live position; ignore it while parked (the card re-derives from
+            // the next push on reopen, like the spectrum).
             Input::NowPlaying(np) => {
                 if self.visible {
                     self.now_playing = np;
                 }
             }
-            // No Clock subscription (empty snapshot), no interactive nodes, no
-            // commands or consent, and the other domain pushes aren't subscribed —
-            // all no-ops.
+            // A transport click (#840). Deliberately **not** visibility-gated:
+            // a click can only arrive from a card the user can see and is
+            // pointing at, so gating it could only ever drop a real one on a
+            // stale `visible` — and unlike the pushes there is nothing to
+            // re-derive later. The card holds no optimistic playing/paused
+            // state either: the effect goes to the player, and the glyph
+            // follows on the next `NowPlaying` push, so the button can never
+            // disagree with the player.
+            Input::Event { node, kind } => {
+                if matches!(kind, EventKind::Click)
+                    && let Some(action) = transport_action(&node)
+                {
+                    return vec![Effect::Media(action)];
+                }
+            }
+            // No Clock subscription (empty snapshot), no commands or consent,
+            // and the other domain pushes aren't subscribed — all no-ops.
             Input::Snapshot(_)
-            | Input::Event { .. }
             | Input::EffectResult { .. }
             | Input::ConsentDecision { .. }
             | Input::CalendarUpcoming(_)
@@ -385,11 +537,12 @@ impl Plugin for AudioWidget {
         Vec::new()
     }
 
-    /// One vertical card: the dot-matrix marquee, the spectrum scope, and the LED
-    /// peak/level strip — all in the VFD skin. Every `Pixels` buffer satisfies the
-    /// host's `len == w * h * 4` invariant by kit construction, and every widget
-    /// fits the ~296 px sidebar content width. No `.card`/`.ts-plugin-*` class —
-    /// the host's region wrapper supplies the card chrome.
+    /// One vertical card: the dot-matrix marquee, the time readout, the spectrum
+    /// scope and the LED peak/level strip — all in the VFD skin — over the
+    /// transport row. Every `Pixels` buffer satisfies the host's
+    /// `len == w * h * 4` invariant by kit construction, and every widget fits
+    /// the ~296 px sidebar content width. No `.card`/`.ts-plugin-*` class — the
+    /// host's region wrapper supplies the card chrome.
     fn view(&self) -> View {
         // Render the marquee strip once per distinct text, then window it per
         // frame (#560) — see [`MarqueeCache`]. `borrow_mut` is uncontended: the
@@ -398,8 +551,30 @@ impl Plugin for AudioWidget {
             .marquee_cache
             .borrow_mut()
             .frame(&self.marquee_text(), self.marquee_offset());
+        // Deliberately *not* cached the way the marquee is (#560): `dot_matrix`
+        // rasterizes one short fixed-width line with no font-space bitmap behind
+        // it, so it costs a fraction of the scope tile and the LED strip this
+        // same `view` already re-renders unconditionally every frame.
+        let readout = dot_matrix(&self.readout_text(), STYLE);
         let scope = spectrum::scope_tile(&self.bins);
         let leds = LedStrip::new(STYLE).render(self.level.value(), self.peak.value());
+        // Spacer-flanked so the three buttons centre under the displays whatever
+        // the card's width — `Node::Box` (not `Node::Row`) for the `spacing`
+        // field, which is what keeps the circular buttons from butting together.
+        let transport = Node::Box {
+            id: Some(TRANSPORT_ID.to_owned()),
+            dir: Dir::Horizontal,
+            spacing: 6,
+            scroll: false,
+            classes: Vec::new(),
+            children: vec![
+                Node::Spacer,
+                transport_button(PREV_ID, ICON_PREV, false),
+                transport_button(PLAY_ID, self.play_icon(), true),
+                transport_button(NEXT_ID, ICON_NEXT, false),
+                Node::Spacer,
+            ],
+        };
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -408,8 +583,10 @@ impl Plugin for AudioWidget {
             classes: Vec::new(),
             children: vec![
                 marquee.into_node(Some(MARQUEE_ID), Vec::new()),
+                readout.into_node(Some(READOUT_ID), Vec::new()),
                 scope.into_node(Some(SCOPE_ID), Vec::new()),
                 leds.into_node(Some(LEDS_ID), Vec::new()),
+                transport,
             ],
         }
         .into()
@@ -422,12 +599,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTIVE_MSG, AudioWidget, IDLE_MSG, MARQUEE_STEP, Msg, PLUGIN_ID};
+    use super::{
+        ACTIVE_MSG, AudioWidget, ICON_PAUSE, ICON_PLAY, IDLE_MSG, MARQUEE_STEP, MAX_TIME, Msg,
+        NEXT_ID, PLAY_ID, PLUGIN_ID, PREV_ID, UNKNOWN_TIME, mmss, transport_action,
+    };
     use hytte_plugin::preem::font;
     use hytte_plugin::proto::{
-        AudioSpectrum, Mount, Node, PluginMsg, SPECTRUM_BINS, StateKey, decode, encode,
+        AudioSpectrum, Effect, EventKind, MediaAction, Mount, Node, PluginMsg, SPECTRUM_BINS,
+        StateKey, decode, encode,
     };
     use hytte_plugin::{Input, Plugin};
+
+    /// One second in microseconds — the unit `NowPlaying`'s timing fields carry.
+    const SEC: u64 = 1_000_000;
 
     fn fresh() -> AudioWidget {
         AudioWidget::init(hytte_plugin::cmd_channel().0)
@@ -473,14 +657,19 @@ mod tests {
     }
 
     /// The manifest opts into the spectrum, the visibility gate, and the
-    /// now-playing track (#528, paired with its capability), and mounts a sidebar
-    /// card.
+    /// now-playing track (#528, paired with its capability), holds the transport
+    /// grant (#840), and mounts at the foot of the sidebar below pet (`-1`) and
+    /// departures (`0`).
     #[test]
     fn manifest_subscribes_spectrum_and_visibility() {
         use hytte_plugin::proto::Capability;
         let m = AudioWidget::manifest();
         assert_eq!(m.id, PLUGIN_ID);
-        assert_eq!(m.mount, Mount::SidebarTop);
+        assert_eq!(m.mount, Mount::SidebarBottom, "the deck sits at the bottom");
+        assert!(
+            m.order.is_some_and(|o| o > 0),
+            "sorts below departures (0) and pet (-1), which sort ascending"
+        );
         assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
         assert!(m.subscribes.contains(&StateKey::SlotVisible));
         assert!(
@@ -489,8 +678,9 @@ mod tests {
         );
         assert_eq!(
             m.capabilities,
-            vec![Capability::NowPlaying],
-            "the now-playing push is capability-gated on top of the subscription"
+            vec![Capability::NowPlaying, Capability::Media],
+            "the now-playing push is capability-gated on top of the subscription, \
+             and the transport row's effects need the Media grant (#840)"
         );
         m.check_proto()
             .expect("stamped with the current proto version");
@@ -622,40 +812,50 @@ mod tests {
         assert!(strip.scrolls(), "the active banner scrolls");
     }
 
+    /// A now-playing push with no timing — the pre-#840 shape, which the timing
+    /// fields' `0` default still spells.
+    fn track(title: &str, artist: &str, playing: bool) -> Input<Msg> {
+        timed_track(title, artist, playing, 0, 0)
+    }
+
+    /// A now-playing push carrying a position and a length (#840).
+    fn timed_track(
+        title: &str,
+        artist: &str,
+        playing: bool,
+        position_us: u64,
+        length_us: u64,
+    ) -> Input<Msg> {
+        Input::NowPlaying(hytte_plugin::proto::NowPlaying {
+            title: title.to_owned(),
+            artist: artist.to_owned(),
+            playing,
+            position_us,
+            length_us,
+        })
+    }
+
     /// The now-playing push (#528) takes over the marquee while playing — title
     /// and artist — and releases back to the banner when it stops.
     #[test]
     fn now_playing_drives_the_marquee_over_the_banner() {
-        use hytte_plugin::proto::NowPlaying;
         let mut m = shown();
         // A loud push would otherwise pick the active banner…
         let _ = m.update(spectrum(0.9, 0, 0.9));
         assert_eq!(m.marquee_text(), ACTIVE_MSG);
         // …but a playing track wins.
-        m.update(Input::NowPlaying(NowPlaying {
-            title: "Chrome Rain".to_owned(),
-            artist: "Choom".to_owned(),
-            playing: true,
-        }));
+        m.update(track("Chrome Rain", "Choom", true));
         assert!(
             m.marquee_text().starts_with("Chrome Rain — Choom"),
             "playing track scrolls title — artist: {}",
             m.marquee_text()
         );
         // Title only (no artist).
-        m.update(Input::NowPlaying(NowPlaying {
-            title: "Untitled".to_owned(),
-            artist: String::new(),
-            playing: true,
-        }));
+        m.update(track("Untitled", "", true));
         assert!(m.marquee_text().starts_with("Untitled"));
         assert!(!m.marquee_text().contains('—'), "no dash without an artist");
         // Paused → back to the banner off the peak level.
-        m.update(Input::NowPlaying(NowPlaying {
-            title: "Chrome Rain".to_owned(),
-            artist: "Choom".to_owned(),
-            playing: false,
-        }));
+        m.update(track("Chrome Rain", "Choom", false));
         assert_eq!(
             m.marquee_text(),
             ACTIVE_MSG,
@@ -667,19 +867,149 @@ mod tests {
     /// the spectrum push.
     #[test]
     fn a_hidden_card_ignores_now_playing() {
-        use hytte_plugin::proto::NowPlaying;
         let mut m = fresh(); // never shown → parked
         let before = m.view();
-        m.update(Input::NowPlaying(NowPlaying {
-            title: "Chrome Rain".to_owned(),
-            artist: "Choom".to_owned(),
-            playing: true,
-        }));
+        m.update(track("Chrome Rain", "Choom", true));
         assert_eq!(
             m.view(),
             before,
             "a parked card ignores the now-playing push"
         );
+    }
+
+    /// `MM:SS` zero-pads both fields, counts an hour-plus track in plain minutes
+    /// rather than rolling into an hours field, and saturates instead of widening
+    /// or wrapping past the two-digit minute field (#840).
+    #[test]
+    fn mmss_pads_rolls_over_and_saturates() {
+        assert_eq!(mmss(0), "00:00", "the start of a track");
+        assert_eq!(mmss(9 * SEC), "00:09", "seconds zero-pad");
+        assert_eq!(mmss(65 * SEC), "01:05", "minutes zero-pad");
+        assert_eq!(mmss(599 * SEC), "09:59");
+        // An hour-long track keeps counting minutes — no hours field.
+        assert_eq!(mmss(3600 * SEC), "60:00", "an hour reads as 60 minutes");
+        assert_eq!(mmss(3661 * SEC), "61:01");
+        assert_eq!(mmss(5999 * SEC), "99:59", "the last exact value");
+        // Past two digits it saturates, so the field never widens or wraps.
+        assert_eq!(mmss(6000 * SEC), MAX_TIME, "100 minutes saturates");
+        assert_eq!(mmss(u64::MAX), MAX_TIME, "and so does anything absurd");
+        // Sub-second remainders truncate down, never round up into the next tick.
+        assert_eq!(mmss(SEC - 1), "00:00");
+        assert_eq!(mmss(2 * SEC - 1), "00:01");
+    }
+
+    /// The readout shows `elapsed/total`, stands `--:--` in for a duration the
+    /// player doesn't report, and holds one fixed width either way — 11 chars, so
+    /// the dot matrix is 268 px and the card never reflows (#840).
+    #[test]
+    fn the_readout_shows_elapsed_over_total() {
+        let mut m = shown();
+        assert_eq!(
+            m.readout_text(),
+            format!("00:00/{UNKNOWN_TIME}"),
+            "an idle card reads zero over an unknown total"
+        );
+
+        // A player that reports no length keeps the placeholder while counting.
+        m.update(timed_track("Chrome Rain", "Choom", true, 83 * SEC, 0));
+        assert_eq!(m.readout_text(), format!("01:23/{UNKNOWN_TIME}"));
+
+        // With a length, both halves are real times.
+        m.update(timed_track(
+            "Chrome Rain",
+            "Choom",
+            true,
+            83 * SEC,
+            296 * SEC,
+        ));
+        assert_eq!(m.readout_text(), "01:23/04:56");
+
+        // Every state is the same width, which is what keeps the layout still.
+        for (pos, len) in [
+            (0, 0),
+            (83 * SEC, 0),
+            (83 * SEC, 296 * SEC),
+            (u64::MAX, u64::MAX),
+        ] {
+            m.update(timed_track("t", "a", true, pos, len));
+            assert_eq!(
+                m.readout_text().chars().count(),
+                11,
+                "readout {:?} must stay 11 chars wide",
+                m.readout_text()
+            );
+        }
+    }
+
+    /// Every char the readout can emit is font-covered — no notdef boxes in the
+    /// time field (the digits, the `:`, the `/`, and the `--:--` placeholder).
+    #[test]
+    fn readout_chars_are_font_covered() {
+        for c in "0123456789:/-".chars() {
+            assert!(font::glyph(c).is_some(), "readout char {c:?} has a glyph");
+        }
+    }
+
+    /// A click on a transport button asks the host to drive the active player
+    /// (#840) — one `Effect::Media` per button, and nothing at all for a click on
+    /// anything else or for a non-click event on a button.
+    #[test]
+    fn a_transport_click_asks_the_host_to_drive_the_player() {
+        let mut m = shown();
+        for (id, action) in [
+            (PREV_ID, MediaAction::Previous),
+            (PLAY_ID, MediaAction::PlayPause),
+            (NEXT_ID, MediaAction::Next),
+        ] {
+            let fx = m.update(Input::Event {
+                node: id.to_owned(),
+                kind: EventKind::Click,
+            });
+            assert_eq!(fx, vec![Effect::Media(action)], "{id} drives {action:?}");
+        }
+        // The displays are click-inert…
+        assert!(
+            m.update(Input::Event {
+                node: super::SCOPE_ID.to_owned(),
+                kind: EventKind::Click,
+            })
+            .is_empty(),
+            "a click on the scope asks for nothing"
+        );
+        // …and a non-click event on a button is not a press.
+        assert!(
+            m.update(Input::Event {
+                node: PLAY_ID.to_owned(),
+                kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
+            })
+            .is_empty(),
+            "scrolling the play button is not a press"
+        );
+        // The mapping itself is total and refuses unknown ids.
+        assert!(transport_action("nope").is_none());
+    }
+
+    /// The play-pause glyph mirrors the *player*, not the last click (#840): a
+    /// push that says "playing" shows pause, and pausing from anywhere else
+    /// flips it straight back.
+    #[test]
+    fn the_play_button_mirrors_the_player() {
+        let mut m = shown();
+        assert_eq!(m.play_icon(), ICON_PLAY, "nothing playing yet");
+        m.update(track("Chrome Rain", "Choom", true));
+        assert_eq!(m.play_icon(), ICON_PAUSE, "a playing track offers pause");
+        // Clicking play-pause changes nothing on its own — the player answers.
+        let _ = m.update(Input::Event {
+            node: PLAY_ID.to_owned(),
+            kind: EventKind::Click,
+        });
+        assert_eq!(
+            m.play_icon(),
+            ICON_PAUSE,
+            "no optimistic flip: the glyph waits for the player"
+        );
+        m.update(track("Chrome Rain", "Choom", false));
+        assert_eq!(m.play_icon(), ICON_PLAY, "and follows it when it pauses");
     }
 
     /// The scroll offset advances one step per frame tick and wraps the counter.
@@ -762,7 +1092,7 @@ mod tests {
         let mut m = shown();
         for _ in 0..4 {
             let bufs = pixels_of(&m.view().tree);
-            assert_eq!(bufs.len(), 3, "marquee + scope + LED strip");
+            assert_eq!(bufs.len(), 4, "marquee + readout + scope + LED strip");
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
                 assert!(w > 0 && h > 0);

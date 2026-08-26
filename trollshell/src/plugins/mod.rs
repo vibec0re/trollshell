@@ -134,7 +134,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hytte::adw;
-use hytte::futures_signals::signal::Mutable;
+use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
@@ -163,6 +163,21 @@ pub use region::{
     bar_center_slot, bar_left_slot, bar_right_slot, plugin_panel_slot, set_active_panel,
     sidebar_bottom_slot, sidebar_lead_slot, sidebar_top_slot,
 };
+
+/// Signal that emits `true` while **some** monitor's sidebar is open — the same
+/// aggregate the host pushes to plugins as
+/// [`HostMsg::SlotVisibility`](hytte_plugin_proto::HostMsg::SlotVisibility)
+/// (#288), surfaced to the binary so it can gate its own pollers on "a sidebar
+/// card can see this" (#840).
+///
+/// Sidebar-scoped on purpose: a *bar*-mounted plugin is always visible (see
+/// [`Mount::is_bar`](hytte_plugin_proto::Mount::is_bar)), so this would be a
+/// constant `true` for one and gate nothing. Today's only consumer is the mpris
+/// position gate in `main.rs`, whose plugin-side consumer (the audio widget's
+/// transport readout) is a sidebar card.
+pub fn slot_visible_signal() -> impl Signal<Item = bool> + 'static {
+    pump::slot_visible_mutable().signal()
+}
 
 // ── Live runtime mirror (#423) ───────────────────────────────────────────────
 //

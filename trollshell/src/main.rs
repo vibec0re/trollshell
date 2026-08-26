@@ -21,6 +21,7 @@ mod widgets;
 
 use std::cell::RefCell;
 
+use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk;
 use hytte::gtk::{gdk, gio, glib, prelude::*};
@@ -338,17 +339,36 @@ fn main() -> hytte::ui::Result<()> {
                 },
             ));
 
-            // Gate mpris's per-player 250ms `Position` pollers on Media-drawer
-            // visibility (#228): it's the only consumer of `position_us`, so
-            // park all the pollers whenever that page isn't on-screen. Same
-            // global-signal / single-subscription shape as the netconn/
-            // app_usage gates above.
-            glib::MainContext::default().spawn_local(modal::media_visible_signal().for_each(
-                |visible| {
-                    mpris::set_active(visible);
+            // Gate mpris's per-player 250ms `Position` pollers on the union of
+            // its consumers (#228, widened by #840). Same global-signal /
+            // single-subscription shape as the netconn/app_usage gates above,
+            // but two sources rather than one:
+            //
+            //   - the Media drawer page's seek bar (#228), and
+            //   - an open sidebar, where the audio widget plugin renders the
+            //     position off the `NowPlaying` digest (#840).
+            //
+            // **OR, folded here rather than two subscriptions.** `set_active`
+            // takes a plain bool, so two independent subscriptions would each
+            // publish its own answer and the loser would clobber the winner —
+            // closing the drawer while the sidebar is open would park a poller
+            // the sidebar still needs. `map_ref!` makes the rule one value with
+            // one writer: **poll iff any consumer is on screen**, park only once
+            // every consumer is gone (sidebar closed *and* drawer away). Adding
+            // a third consumer means another arm here, never another
+            // subscription.
+            glib::MainContext::default().spawn_local(
+                map_ref! {
+                    let media = modal::media_visible_signal(),
+                    let sidebar = plugins::slot_visible_signal() =>
+                    *media || *sidebar
+                }
+                .dedupe()
+                .for_each(|active| {
+                    mpris::set_active(active);
                     std::future::ready(())
-                },
-            ));
+                }),
+            );
 
             // Post a plain "Screenshot saved" toast whenever niri reports a
             // completed capture. Single global subscription — see

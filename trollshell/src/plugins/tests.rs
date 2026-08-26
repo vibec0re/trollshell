@@ -1523,8 +1523,8 @@ fn to_upcoming_events_windows_caps_and_maps() {
     assert_eq!(out[0].calendar, "Work");
 }
 
-/// `to_now_playing` projects the active player (title/artist/playing) and maps
-/// `None` to the empty, not-playing default.
+/// `to_now_playing` projects the active player (title/artist/playing, plus the
+/// #840 timing) and maps `None` to the empty, not-playing default.
 #[test]
 fn to_now_playing_projects_the_active_player() {
     use hytte::services::mpris::{PlaybackStatus, Player};
@@ -1534,18 +1534,33 @@ fn to_now_playing_projects_the_active_player() {
         title: "Chrome Rain".to_owned(),
         artists: "Choom".to_owned(),
         status: PlaybackStatus::Playing,
+        position_us: 83_000_000,
+        length_us: 296_000_000,
         ..Player::default()
     };
     let np = to_now_playing(Some(&playing));
     assert_eq!(np.title, "Chrome Rain");
     assert_eq!(np.artist, "Choom");
     assert!(np.playing);
+    // The timing rides across verbatim — both already microseconds (#840).
+    assert_eq!(np.position_us, 83_000_000);
+    assert_eq!(np.length_us, 296_000_000);
     // Paused / stopped read as not playing.
     let paused = Player {
         status: PlaybackStatus::Paused,
         ..playing.clone()
     };
     assert!(!to_now_playing(Some(&paused)).playing);
+    // A player reporting no `mpris:length` projects `0` — the digest's own
+    // "unknown", not a zero-length track (live streams, most web players).
+    let untimed = Player {
+        length_us: 0,
+        position_us: 0,
+        ..playing.clone()
+    };
+    let np = to_now_playing(Some(&untimed));
+    assert_eq!(np.length_us, 0, "an untimed player stays unknown");
+    assert_eq!(np.position_us, 0);
 }
 
 /// #436 item 2, end to end through `handle_conn`: a second connection that
@@ -2419,6 +2434,8 @@ async fn now_playing_is_reseeded_on_the_unpark_edge() {
         title: "Chrome Rain".to_owned(),
         artist: "Choom".to_owned(),
         playing: true,
+        position_us: 83_000_000,
+        length_us: 296_000_000,
     };
     np_tx.send_replace(track.clone());
 
@@ -2489,6 +2506,8 @@ async fn now_playing_reseed_only_fires_on_the_rising_edge() {
         title: "Neon".to_owned(),
         artist: "Choom".to_owned(),
         playing: true,
+        position_us: 0,
+        length_us: 0,
     };
     np_tx.send_replace(track.clone());
 
@@ -2538,6 +2557,8 @@ async fn now_playing_reseed_only_fires_on_the_rising_edge() {
         title: "Rain".to_owned(),
         artist: "Choom".to_owned(),
         playing: true,
+        position_us: 0,
+        length_us: 0,
     };
     np_tx.send_replace(next.clone());
     match recv(&mut prd).await {

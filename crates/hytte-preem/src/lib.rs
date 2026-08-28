@@ -36,6 +36,12 @@
 //! - [`LedStrip`] — a row of discrete LEDs lighting with a `0.0..=1.0` level,
 //!   topped by a peak-hold dot that floats and decays ([`PeakHold`]) — the VU
 //!   meter (#506).
+//! - [`LedMatrix`] — the strip's 2-D sibling: a **grid** of LEDs each lit to
+//!   its own brightness, for N independent readings rather than one level
+//!   ("Blinken Lichten", #857). Shapeable (explicit `(cols, rows)` or a
+//!   near-square [`rect`](LedMatrix::rect)), with a [`Fill`] policy for the
+//!   slots a ragged last row leaves over, and the kit's one consumer of the
+//!   [`ColorMap`] axis below.
 //! - [`Scope`] — a glow-trace oscilloscope over a graticule, with real
 //!   phosphor persistence: the beam trail decays exponentially across frames
 //!   rather than redrawing from black (#556, a #397 skin).
@@ -75,6 +81,17 @@
 //!   resampling-free by design: curvature reads as a vignette rather than a
 //!   barrel warp, so the fixed-grid discipline below survives it intact.
 //!
+//! # Colour — a second axis, not more styles (#857)
+//!
+//! [`ColorMap`] answers "what colour is *this cell*?", which is a different
+//! question from [`DisplayStyle`]'s "what device is this?". A style contributes
+//! one accent-tinted ink plus the panel's physical character; a map turns that
+//! single ink into a per-cell one — a heat ramp, a hue sweep, a flag, a fixed
+//! colour. They are deliberately orthogonal, so a heat-mapped panel still gets
+//! the CRT pass's scanlines instead of choosing between them. The default
+//! ([`ColorMap::Style`]) *is* the single ink, so every surface that does not
+//! ask for a map renders exactly as it did before the axis existed.
+//!
 //! # Sizing — the #313 lesson
 //!
 //! Size a widget via its **buffer dimensions**: a `Pixels` node's natural
@@ -93,9 +110,11 @@
 
 pub mod font;
 
+mod color_map;
 mod dot_matrix;
 mod frame;
 mod gauge;
+mod led_matrix;
 mod led_strip;
 mod marquee;
 mod scope;
@@ -104,9 +123,11 @@ mod split_flap;
 mod style;
 mod textbox;
 
+pub use color_map::ColorMap;
 pub use dot_matrix::dot_matrix;
 pub use frame::{Frame, Rgba};
 pub use gauge::{DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Gauge, Needle, OVERTRAVEL, TRAIL_SPAN_SECS};
+pub use led_matrix::{Fill, LedMatrix};
 pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};
 pub use scope::Scope;

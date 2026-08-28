@@ -566,6 +566,43 @@ impl Emission {
     /// Every skin routes its lit layer through here, so passing the palette's
     /// mask along is all a skin ever does about the CRT.
     pub(crate) fn composite(&self, frame: &mut Frame, ink: Rgba, mask: Option<Mask>) {
+        self.composite_with(frame, mask, |_, _| ink);
+    }
+
+    /// [`composite`](Self::composite) with the ink resolved **per pixel** — the
+    /// colour axis (#857).
+    ///
+    /// This is the single generalisation the axis needed. `composite` is not a
+    /// second implementation of this loop; it *is* this loop, called with a
+    /// closure that ignores its coordinates and returns the one palette ink, so
+    /// the single-ink path every other kit widget takes — marquee, scope,
+    /// gauge, seven-seg, split-flap, dot-matrix, LED strip — is unchanged down
+    /// to the byte.
+    ///
+    /// That claim is pinned by `tests/single_ink_golden.rs`, whose digests were
+    /// captured from the tree *before* this split and are the only thing that
+    /// can prove it: asserting here that `composite` and `composite_with` agree
+    /// would be a tautology the compiler already enforces, while those digests
+    /// are a function of the whole path (ghost pass, stamp, bloom, mask, `mix`
+    /// rounding, palette) and move if any part of it changes.
+    ///
+    /// Because the generalisation lands *here*, on the shared path, per-cell
+    /// colour **composes** with everything the path already does rather than
+    /// bypassing it: the [`Bloom`] has already been folded into the emission
+    /// before this runs, and the CRT [`Mask`]'s comb and vignette still
+    /// attenuate every pixel on the way through. A heat-mapped panel is a
+    /// heat-mapped panel *with* scanlines, which is the point of keeping
+    /// [`ColorMap`](super::ColorMap) off [`DisplayStyle`].
+    ///
+    /// `ink_at` is consulted only for pixels that survive both the "is it lit"
+    /// and "did the mask extinguish it" tests, so an unlit surface costs
+    /// nothing extra and the map never runs on a pixel it cannot colour.
+    pub(crate) fn composite_with(
+        &self,
+        frame: &mut Frame,
+        mask: Option<Mask>,
+        ink_at: impl Fn(usize, usize) -> Rgba,
+    ) {
         // Resolve the mask for this geometry once, before either loop.
         let cols = mask.map(|m| m.columns(self.width, self.height));
         for y in 0..self.height {
@@ -584,7 +621,7 @@ impl Emission {
                     continue;
                 }
                 let under = frame.at(x, y);
-                frame.set(x, y, mix(under, ink, i));
+                frame.set(x, y, mix(under, ink_at(x, y), i));
             }
         }
     }

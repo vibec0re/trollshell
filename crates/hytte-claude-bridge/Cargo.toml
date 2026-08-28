@@ -50,3 +50,11 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 # `json` is the feature pair every other ureq consumer here already resolves, so
 # this adds no lock entries.
 ureq = { workspace = true, features = ["json", "rustls"] }
+
+[dev-dependencies]
+# The retired-session map (#855) is a real file, so its round-trip and its
+# corruption tolerance are tested against a real directory. Already in
+# `Cargo.lock` (hytte-bus, hytte-config, hytte-ecal, hytte-services all use it
+# for exactly this), so it adds no lock entry, and being a dev-dependency it
+# links nothing into the shipped daemon.
+tempfile.workspace = true

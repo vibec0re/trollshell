@@ -69,6 +69,12 @@
 //! Generation 0 renders with **no suffix**, so every session already on disk
 //! keeps resolving to the title it was created under.
 //!
+//! The retirement itself **outlives the process** (#855): it is written to the
+//! bridge's state dir by [`crate::retired`], because a restart that forgot it
+//! would resolve the conversation back to the session that had overflowed and
+//! spend a whole turn rediscovering that. Only that map is persisted — the
+//! prefix cache is not, and [`Titles`] says why.
+//!
 //! # The hash
 //!
 //! **FNV-1a 64**, hand-rolled. `std::collections::hash_map::DefaultHasher` is
@@ -82,8 +88,10 @@
 //! and the failure is a confused reply rather than data loss.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
 use crate::http::Failure;
+use crate::retired;
 use crate::wire::Message;
 
 /// Prefix on every session title the bridge mints, so a human running
@@ -111,7 +119,11 @@ const USER_MARKER: &str = "u-";
 const USER_DOMAIN: &str = "identity";
 
 /// Width of the hex digest in a title, fixed by the `{:016x}` in [`title_for`].
-const KEY_HEX_LEN: usize = 16;
+///
+/// `pub` because [`crate::retired`] stores a digest as exactly these characters
+/// and validates a loaded one against the same width, rather than keeping a
+/// second copy of the number that would be free to drift.
+pub const KEY_HEX_LEN: usize = 16;
 
 /// The status [`crate::backend::map_error`] gives `hive_claude::Error::PromptTooLong`
 /// — i.e. the one failure a rotation can fix.
@@ -476,6 +488,21 @@ impl Bounded {
         }
     }
 
+    /// Every live entry, **oldest first** — i.e. in the order this map would
+    /// evict them.
+    ///
+    /// Walks `order` rather than `by_key` because a `HashMap`'s iteration order
+    /// is arbitrary, and the order is exactly what makes a persisted map
+    /// (#855) reload into a smaller one the same way the live map would have
+    /// shrunk. `order` holds each key once — `insert` only pushes a key that
+    /// was not already present — so no entry is yielded twice, and the lookup
+    /// picks up the value of the *latest* insert.
+    fn iter(&self) -> impl Iterator<Item = (Key, &str)> {
+        self.order
+            .iter()
+            .filter_map(|key| Some((*key, self.by_key.get(key)?.as_str())))
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.by_key.len()
@@ -499,20 +526,49 @@ impl Bounded {
 /// `retired` therefore wins on lookup: it is the only entry that records that a
 /// session must never be resumed again, and a stale `by_prefix` entry pointing
 /// at a retired session would overflow on every turn.
+///
+/// That same asymmetry is why **`retired` alone is persisted** (#855, see
+/// [`crate::retired`]): a lost `by_prefix` entry costs a fresh session, which
+/// is correct behaviour, while a lost retirement sends the conversation back to
+/// the session that had already overflowed and costs a visibly failed turn.
+/// `store` is where it is kept; `None` (the default from [`Titles::new`]) is an
+/// in-memory-only map, which is what the tests and the pure-logic paths want.
 #[derive(Debug)]
 pub struct Titles {
     by_prefix: Bounded,
     retired: Bounded,
+    store: Option<PathBuf>,
 }
 
 impl Titles {
-    /// A map holding at most `cap` conversations.
+    /// A map holding at most `cap` conversations, kept only in memory.
     #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
             by_prefix: Bounded::new(cap),
             retired: Bounded::new(cap),
+            store: None,
         }
+    }
+
+    /// [`Titles::new`], plus the retirements the last run recorded at `store`
+    /// — and every later retirement written back there (#855).
+    ///
+    /// A `store` that is missing or unreadable is *not* an error: this degrades
+    /// to exactly [`Titles::new`], which is the behaviour that shipped before
+    /// the file existed. See [`crate::retired`] for why that has to be total.
+    ///
+    /// Loading goes through the same `Bounded::insert` every live retirement
+    /// does, so `cap` binds a file written by a build with a larger capacity as
+    /// firmly as it binds the running map.
+    #[must_use]
+    pub fn persisted(cap: usize, store: PathBuf) -> Self {
+        let mut titles = Self::new(cap);
+        for (key, title) in retired::load(&store, cap) {
+            titles.retired.insert(key, &title);
+        }
+        titles.store = Some(store);
+        titles
     }
 
     /// The title for this request: the successor of a session this
@@ -574,8 +630,37 @@ impl Titles {
     /// For a caller with an explicit identity (#704) that stable thing is the
     /// identity instead, which is what [`identity_key`] returns; the retirement
     /// is recorded in that space and read back from it.
+    ///
+    /// Persisted where a store was given (#855) — the whole map, synchronously,
+    /// before this returns. `Bridge::retire`'s docs explain why the retirement
+    /// has to be durable *before* the replacement turn runs rather than on its
+    /// success; the same reasoning is why the disk write is not deferred to
+    /// some later flush. It costs one small `fsync`ed write about once per
+    /// context window.
     pub fn rotate_to(&mut self, messages: &[Message], user: Option<&str>, title: &str) {
         self.retired.insert(identity_key(messages, user), title);
+        self.persist();
+    }
+
+    /// Write the retired map out, if this one has a store.
+    ///
+    /// Best-effort by design: a failure is a `warn` and the retirement stays in
+    /// memory, so the running process is unaffected and only a restart loses
+    /// it — precisely the pre-#855 behaviour. Refusing the rotation over an
+    /// unwritable cache file would turn a degradation into an outage.
+    fn persist(&self) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        let entries: Vec<(Key, &str)> = self.retired.iter().collect();
+        if let Err(e) = retired::save(store, &entries) {
+            tracing::warn!(
+                path = %store.display(),
+                error = %e,
+                "could not persist the retired-session map; this rotation will be replayed as a \
+                 failed turn if the bridge restarts",
+            );
+        }
     }
 
     /// How many prefixes and retirements are currently mapped. Test-only: the
@@ -935,6 +1020,160 @@ mod tests {
             titles.rotate_to(&convo, None, &next);
         }
         assert!(titles.len() <= 8, "map grew to {}", titles.len());
+    }
+
+    /// **The #855 bug.** A conversation that had already rotated must resume in
+    /// its replacement after the bridge restarts, not in the session that
+    /// overflowed.
+    ///
+    /// The second `Titles` shares nothing with the first but the file, which is
+    /// exactly what a `systemctl --user restart` leaves behind. Before #855 it
+    /// answered `generation 0` here, the next turn 413'd, and the conversation
+    /// self-healed one visibly failed turn later.
+    ///
+    /// Both identity spaces, because #704's explicit identity is what turned
+    /// rotation from a formality into the expected path — and because a
+    /// persisted key read back in the *wrong* space would resolve to nothing
+    /// and look exactly like the bug being fixed.
+    #[test]
+    fn a_rotation_survives_a_restart() {
+        for user in [None, Some("pet")] {
+            let dir = tempfile::tempdir().expect("a tempdir");
+            let store = dir.path().join(crate::retired::FILE);
+            let convo = vec![msg("system", "persona"), msg("user", "poke")];
+
+            let generation_0 = Titles::new(64).resolve(&convo, user);
+            let Rotation::To(next) =
+                rotation_for(&Failure::new(OVERFLOW_STATUS, "x"), &generation_0)
+            else {
+                panic!("not rotated");
+            };
+            {
+                let mut titles = Titles::persisted(64, store.clone());
+                titles.rotate_to(&convo, user, &next);
+            }
+
+            let restarted = Titles::persisted(64, store);
+            assert_eq!(
+                restarted.resolve(&convo, user),
+                next,
+                "a restart resolved {user:?} back to the overflowed session",
+            );
+            assert_ne!(restarted.resolve(&convo, user), generation_0);
+        }
+    }
+
+    /// The retirement is durable the moment it is recorded, not on some later
+    /// flush — `Bridge::retire` records it *before* the replacement turn runs
+    /// precisely so a request whose budget expires mid-retry still leaves the
+    /// next one pointed at the fresh session.
+    #[test]
+    fn a_rotation_is_on_disk_before_rotate_to_returns() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let store = dir.path().join(crate::retired::FILE);
+        let convo = vec![msg("user", "poke")];
+        let mut titles = Titles::persisted(64, store.clone());
+        assert!(
+            !store.exists(),
+            "nothing should be written before a rotation"
+        );
+
+        let next = format!("{}-g1", titles.resolve(&convo, None));
+        titles.rotate_to(&convo, None, &next);
+
+        assert_eq!(Titles::persisted(64, store).resolve(&convo, None), next);
+    }
+
+    /// The prefix cache is deliberately **not** persisted: it is written twice
+    /// per answered turn, and a miss costs a fresh session rather than a wrong
+    /// answer. Nothing may put that on the disk hot path.
+    #[test]
+    fn remembering_a_prefix_writes_nothing_to_disk() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let store = dir.path().join(crate::retired::FILE);
+        let convo = vec![msg("user", "poke")];
+        let mut titles = Titles::persisted(64, store.clone());
+        let title = titles.resolve(&convo, None);
+
+        for n in 0..20 {
+            let turn = vec![msg("user", &format!("poke {n}"))];
+            titles.remember(&title, &turn, None, "quip");
+        }
+        assert!(!store.exists(), "the prefix cache reached the disk");
+        // And a restart therefore mints a fresh title for a remembered prefix,
+        // which is the documented degraded-never-wrong outcome.
+        let echoed = vec![msg("user", "poke 0"), Message::assistant("quip")];
+        assert_eq!(titles.resolve(&echoed, None), title);
+        assert_eq!(
+            Titles::persisted(64, store).resolve(&echoed, None),
+            hash_title(&echoed),
+        );
+    }
+
+    /// Reloading must not resurrect a retirement the cap already evicted: the
+    /// file is the live map, not a log of everything that ever happened.
+    #[test]
+    fn a_reload_does_not_resurrect_an_evicted_retirement() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let store = dir.path().join(crate::retired::FILE);
+        let convos: Vec<Vec<Message>> = (0..5)
+            .map(|n| vec![msg("user", &format!("conversation {n}"))])
+            .collect();
+
+        let mut titles = Titles::persisted(2, store.clone());
+        let replacements: Vec<String> = convos
+            .iter()
+            .map(|convo| {
+                let next = format!("{}-g1", titles.resolve(convo, None));
+                titles.rotate_to(convo, None, &next);
+                next
+            })
+            .collect();
+
+        let restarted = Titles::persisted(2, store);
+        assert_eq!(
+            restarted.resolve(&convos[0], None),
+            hash_title(&convos[0]),
+            "an evicted retirement came back from the dead",
+        );
+        for (convo, next) in convos.iter().zip(&replacements).skip(3) {
+            assert_eq!(restarted.resolve(convo, None), *next);
+        }
+    }
+
+    /// A damaged store is never fatal — it degrades to an empty map, and the
+    /// next rotation rewrites the file whole rather than leaving it damaged.
+    #[test]
+    fn a_corrupt_store_degrades_to_an_empty_map_and_then_heals() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let store = dir.path().join(crate::retired::FILE);
+        std::fs::write(&store, "{ not json at all").expect("a writable tempdir");
+        let convo = vec![msg("user", "poke")];
+
+        let mut titles = Titles::persisted(64, store.clone());
+        assert!(titles.is_empty());
+        assert_eq!(titles.resolve(&convo, None), hash_title(&convo));
+
+        let next = format!("{}-g1", titles.resolve(&convo, None));
+        titles.rotate_to(&convo, None, &next);
+        assert_eq!(Titles::persisted(64, store).resolve(&convo, None), next);
+    }
+
+    /// An unwritable store costs the *next* run's knowledge, never this run's
+    /// rotation: the in-memory map is still authoritative, and a rotation that
+    /// refused to happen because a cache file would not open would be a worse
+    /// bug than the one #855 fixes.
+    #[test]
+    fn an_unwritable_store_still_rotates_in_memory() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").expect("a writable tempdir");
+        let convo = vec![msg("user", "poke")];
+
+        let mut titles = Titles::persisted(64, blocker.join(crate::retired::FILE));
+        let next = format!("{}-g1", titles.resolve(&convo, None));
+        titles.rotate_to(&convo, None, &next);
+        assert_eq!(titles.resolve(&convo, None), next);
     }
 
     /// `render_transcript` labels every role and separates turns.

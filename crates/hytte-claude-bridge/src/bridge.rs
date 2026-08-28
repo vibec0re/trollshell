@@ -2,6 +2,7 @@
 //! that ties the two backends to one conversation identity.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -52,11 +53,21 @@ impl Bridge {
     /// (`hytte-ai-providers` uses 10s), so a slow turn reaches the caller as a
     /// clean 504 it can fall back from rather than as a connection-level
     /// failure mid-read.
+    ///
+    /// `retired_store` is where the session retirements survive a restart
+    /// (#855) — `None` keeps the whole title map in memory, which is what the
+    /// tests below want and what the pre-#855 bridge did. It is passed in
+    /// rather than resolved here so the state dir stays `main`'s single
+    /// decision (`CLAUDE_BRIDGE_STATE_DIR`), and so nothing in this module has
+    /// to reach for the environment to be testable.
     #[must_use]
-    pub fn new(backend: Backend, budget: Duration) -> Self {
+    pub fn new(backend: Backend, budget: Duration, retired_store: Option<PathBuf>) -> Self {
         Self {
             backend,
-            titles: Mutex::new(Titles::new(TITLE_CAPACITY)),
+            titles: Mutex::new(match retired_store {
+                Some(store) => Titles::persisted(TITLE_CAPACITY, store),
+                None => Titles::new(TITLE_CAPACITY),
+            }),
             permits: Semaphore::new(PERMITS),
             inflight: Mutex::new(HashMap::new()),
             rotation: tokio::sync::Mutex::new(()),
@@ -418,10 +429,14 @@ mod tests {
 
     /// A bridge whose backend is never reached — every test below short-circuits
     /// before any `claude` spawn.
+    ///
+    /// `None` for the retired store: these tests touch no disk, and the store's
+    /// own behaviour is pinned in `crate::retired` and `crate::session`.
     fn bridge() -> Bridge {
         Bridge::new(
             Backend::Reprompt(Reprompt::new(hive_claude::Config::default())),
             Duration::from_secs(8),
+            None,
         )
     }
 

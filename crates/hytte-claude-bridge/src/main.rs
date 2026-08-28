@@ -63,6 +63,13 @@
 //! rotation is the one event that explains a cache-hit rate falling off a cliff,
 //! and the old session is left on disk rather than deleted.
 //!
+//! The retirement survives a restart (#855): it is recorded in
+//! `CLAUDE_BRIDGE_STATE_DIR`/[`retired::FILE`], because a bridge that forgot it
+//! would resolve an already-rotated conversation back to the session that had
+//! overflowed and spend one visibly failed turn rediscovering that — on every
+//! `systemctl --user restart`. A missing or damaged file is never fatal; see
+//! [`retired`].
+//!
 //! # Environment
 //!
 //! | variable | default | meaning |
@@ -71,7 +78,7 @@
 //! | `CLAUDE_BRIDGE_MODEL` | unset | the model; empty leaves claude's own default, or [`messages::DEFAULT_MODEL`] in `api` mode |
 //! | `CLAUDE_BRIDGE_MODE` | `subscription` | `subscription` (persisted session), `reprompt`, or `api` (#730) |
 //! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; must stay under the client's 10s |
-//! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only) |
+//! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only), and where the retired-session map is kept (#855) |
 //! | `CLAUDE_BRIDGE_THINKING` | `disabled` | `api` mode only: `disabled`, `adaptive`, or `auto` — see [`messages::Thinking`] |
 //! | `ANTHROPIC_API_KEY` | unset | `api` mode only, and a **development** override: it outranks `~/.config/trollshell/anthropic.key`, but the shipped unit scrubs it with `UnsetEnvironment=`, so under systemd the file is the only source that works (#752). In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
 //!
@@ -85,6 +92,7 @@ mod bridge;
 mod envguard;
 mod http;
 mod messages;
+mod retired;
 mod session;
 mod wire;
 
@@ -291,7 +299,9 @@ async fn main() -> ExitCode {
             tracing::error!("{}", envguard::refusal(&offenders));
             return ExitCode::FAILURE;
         }
-        // The state dir is the child's cwd; nothing else reads it.
+        // The state dir is the child's cwd, and holds the retired-session map
+        // (#855) — which creates the dir itself when it writes, so this is
+        // still only needed for the child.
         if let Err(e) = std::fs::create_dir_all(&settings.state_dir) {
             tracing::error!(dir = %settings.state_dir.display(), error = %e, "could not create the state dir");
             return ExitCode::FAILURE;
@@ -317,7 +327,16 @@ async fn main() -> ExitCode {
             )))
         }
     };
-    let bridge = Arc::new(Bridge::new(backend, settings.budget));
+    // The retired-session map lives beside the child's sessions, in the same
+    // state dir, and is loaded here so a conversation that had already rotated
+    // resumes where it left off rather than replaying its overflow (#855).
+    // Passed in every mode: only the subscription backend ever *rotates*, so
+    // the other two simply never write it.
+    let bridge = Arc::new(Bridge::new(
+        backend,
+        settings.budget,
+        Some(settings.state_dir.join(retired::FILE)),
+    ));
 
     let addr = bind_addr(settings.port);
     let listener = match tokio::net::TcpListener::bind(addr).await {

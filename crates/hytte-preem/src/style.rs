@@ -45,8 +45,10 @@ fn unpack_accent(packed: u32) -> Option<Rgba> {
 
 /// Install the host-resolved desktop accent as the kit's default widget tint
 /// (#376), or clear it with `None` (older host / resolution failed, keeping the
-/// hard-coded per-style default). Called by the SDK runtime; not plugin-facing.
-pub(crate) fn set_accent(color: Option<Rgba>) {
+/// hard-coded per-style default). Called by the SDK runtime (and by any other
+/// host embedding the kit); not plugin-facing. `pub` only so the crate root can
+/// re-export it — `style` itself is a private module.
+pub fn set_accent(color: Option<Rgba>) {
     ACCENT.store(pack_accent(color), Ordering::Relaxed);
 }
 

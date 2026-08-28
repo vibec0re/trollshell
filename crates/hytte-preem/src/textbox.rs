@@ -25,7 +25,7 @@ enum WidthSpec {
 /// builder is a value, not a one-shot.
 ///
 /// ```
-/// use hytte_plugin::preem::TextBox;
+/// use hytte_preem::TextBox;
 ///
 /// let frame = TextBox::new().cols(10).scale(2).render("mrrp!");
 /// assert_eq!(frame.data().len(), frame.width() * frame.height() * 4);

@@ -183,7 +183,7 @@ enum Msg {
 /// The rasterized marquee strip, cached by the exact text it was drawn from.
 ///
 /// The preem [`Marquee`] API is render-**once**, then [`window`](MarqueeStrip::window)
-/// per frame (`crates/hytte-plugin/src/preem/marquee.rs`): `render` rasterizes the
+/// per frame (`crates/hytte-preem/src/marquee.rs`): `render` rasterizes the
 /// message into its font-space bitmap and paints the window's fixed ghost matrix
 /// once, while `window` only clones that backdrop and lights the dots the offset
 /// selects. But the SDK calls [`view`](AudioWidget::view)

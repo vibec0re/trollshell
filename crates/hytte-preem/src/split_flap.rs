@@ -107,7 +107,7 @@
 //! cathodes stacked**, which is what you see in an unlit tube.
 //!
 //! ```
-//! use hytte_plugin::preem::{DisplayStyle, FlipBoard, Mechanism};
+//! use hytte_preem::{DisplayStyle, FlipBoard, Mechanism};
 //!
 //! let mut board = FlipBoard::new(Mechanism::SplitFlap).cells(5);
 //! board.set_text("12:34");

@@ -43,7 +43,7 @@
 //! same pixel columns.
 //!
 //! ```
-//! use hytte_plugin::preem::{DisplayStyle, Marquee};
+//! use hytte_preem::{DisplayStyle, Marquee};
 //!
 //! let strip = Marquee::new(DisplayStyle::Vfd).window_px(96).render("BREAKING NEWS");
 //! // Bump the offset by whole dots each frame; the window wraps seamlessly

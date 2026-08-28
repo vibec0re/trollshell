@@ -1,8 +1,15 @@
-//! `preem` — the SDK's GTK-free **retro raster kit** (issue #356; the #354
-//! whimsy umbrella).
+//! `preem` — the GTK-free **retro raster kit** (issue #356; the #354 whimsy
+//! umbrella).
+//!
+//! A leaf crate with no toolkit of its own: it draws retro displays into
+//! plain byte buffers and hands them back, so both sides of the plugin
+//! boundary can use it — a plugin ships the buffer over the wire as
+//! [`Node::Pixels`](hytte_plugin_proto::Node::Pixels), while the shell can
+//! rasterize one straight into a `PixelSurface`. `hytte-plugin` re-exports the
+//! whole kit as `hytte_plugin::preem`, which is how every plugin reaches it.
 //!
 //! Everything here renders into plain CPU-side RGBA8 buffers destined for
-//! [`Node::Pixels`](crate::proto::Node::Pixels): row-major (row 0 first),
+//! [`Node::Pixels`](hytte_plugin_proto::Node::Pixels): row-major (row 0 first),
 //! 4 bytes per pixel in `[R, G, B, A]` order with straight (non-premultiplied)
 //! alpha, and `len == width * height * 4` — the invariant the host validates
 //! before it draws anything. The host upscales the buffer **nearest-neighbor**,
@@ -80,9 +87,9 @@
 //! # Timing
 //!
 //! The kit renders *frames*; it owns no clock. Animation cadence (ticker
-//! steps, blink cycles, style rotation) belongs to the plugin's own
-//! [`sources`](crate::Plugin::sources) stream or its snapshot flow, exactly
-//! as the pet already does.
+//! steps, blink cycles, style rotation) belongs to whoever is driving the
+//! redraw — a plugin's own `Plugin::sources` stream or its snapshot flow,
+//! exactly as the pet already does.
 
 pub mod font;
 
@@ -112,7 +119,10 @@ pub use style::DisplayStyle;
 pub use textbox::TextBox;
 
 /// Install the host-resolved desktop accent as the kit's default widget tint
-/// (#376). Crate-internal: the SDK transport runtime calls it from the
-/// [`HostMsg::Accent`](hytte_plugin_proto::HostMsg::Accent) frame; a plugin
-/// author never does (an explicit palette still wins).
-pub(crate) use style::set_accent;
+/// (#376). Host-facing, not author-facing: the SDK transport runtime calls it
+/// from the [`HostMsg::Accent`](hytte_plugin_proto::HostMsg::Accent) frame and
+/// a shell drawing the kit in-process would call it once from wherever it
+/// resolves the accent; a plugin author never does (an explicit palette still
+/// wins). It was `pub(crate)` while the kit lived inside the SDK — the caller
+/// is simply on the far side of a crate boundary now.
+pub use style::set_accent;

@@ -44,7 +44,7 @@
 //! running trace without dropping its phosphor.
 //!
 //! ```
-//! use hytte_plugin::preem::{DisplayStyle, Scope};
+//! use hytte_preem::{DisplayStyle, Scope};
 //!
 //! let mut scope = Scope::new();
 //! scope.advance(&[0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0]); // one frame of samples
@@ -259,7 +259,7 @@ impl Scope {
     /// [`persistence`](Self::persistence) configuration.
     ///
     /// ```
-    /// use hytte_plugin::preem::{DisplayStyle, Scope};
+    /// use hytte_preem::{DisplayStyle, Scope};
     ///
     /// let mut scope = Scope::new();
     /// let dark = scope.render(DisplayStyle::Vfd);

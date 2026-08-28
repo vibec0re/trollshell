@@ -318,7 +318,12 @@ use hytte_plugin_proto::{
     Node, NodeId, NowPlaying, StateSnapshot, UpcomingEvent,
 };
 
-pub mod preem;
+/// The retro raster kit (#356), its own GTK-free leaf crate since #859 so the
+/// shell can rasterize with it without linking this client SDK. Re-exported
+/// here under its historical module name: a plugin still depends on
+/// `hytte-plugin` alone, and every `hytte_plugin::preem::…` path keeps
+/// resolving to the same items.
+pub use hytte_preem as preem;
 
 mod runtime;
 

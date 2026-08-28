@@ -15,6 +15,12 @@ workspace = true
 # the *Rust runtime* over that language-neutral schema: a plugin binary
 # depends on `hytte-plugin` alone (the proto vocabulary is re-exported).
 hytte-plugin-proto = { path = "../hytte-plugin-proto", features = ["tokio"] }
+# The retro raster kit (#356), a GTK-free leaf crate since #859 so the shell
+# can draw with it without linking this SDK. Re-exported from `lib.rs` under
+# its historical name (`pub use hytte_preem as preem;`), so a plugin still
+# depends on `hytte-plugin` alone and every `hytte_plugin::preem::…` path it
+# already wrote keeps resolving.
+hytte-preem = { path = "../hytte-preem" }
 tokio = { workspace = true, default-features = false, features = [
   "rt",
   "macros",

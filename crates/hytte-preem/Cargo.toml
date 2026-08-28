@@ -1,0 +1,21 @@
+[package]
+name = "hytte-preem"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GTK-free retro raster kit (issue #356): CPU-side RGBA8 dot-matrix, seven-segment, marquee, gauge, scope, LED-strip, split-flap and pixel-font renderers"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The kit's ONLY dependency, and only for `Frame::into_node` — the single
+# method that hands a finished buffer to the plugin wire as `Node::Pixels`
+# (whose `Cls` class tokens come along for the ride). Everything else here is
+# pure `std`: no gtk/adw/glib/cairo, no serde, no async, no clock. Note the
+# absence of `features = ["tokio"]`, which `hytte-plugin` asks for — the
+# proto's optional framed read/write helpers are the SDK transport's business,
+# never the raster kit's.
+hytte-plugin-proto = { path = "../hytte-plugin-proto" }

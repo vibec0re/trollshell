@@ -189,6 +189,7 @@ hytte-claude-bridge → standalone GTK-free daemon (#666/#584); links nothing in
 
 — plugin side (#35 frontend B; out-of-process, NEVER links the shell):
 hytte-plugin-proto → GTK-free wire protocol (node vocab, manifest, MessagePack framing, socket_path); language-neutral schema anchor, tokio optional
+hytte-preem        → GTK-free leaf: the retro raster kit (#356) — dot_matrix, marquee, seven_seg, textbox, led_strip, scope, gauge, split_flap, font, Frame, DisplayStyle. Pure `std` plus one `hytte-plugin-proto` dep for `Frame::into_node`. Lived inside `hytte-plugin` until #859; extracted for the `hytte-config` reason — the shell wants to rasterise with it too (#857) and should not have to link the plugin *client* SDK to do it. `hytte-plugin` re-exports it (`pub use hytte_preem as preem;`), so every `hytte_plugin::preem::…` path a plugin already wrote still resolves
 hytte-plugin       → the Rust plugin runtime SDK over the proto: TEA `Plugin` trait + `run()` (dial/backoff, Register handshake, session loop, render dedup). A plugin binary deps THIS crate alone
 hytte-plugin-clock-demo → the reference plugin: pure manifest/init/update/view + one-line main
 hytte-plugin-pet   → the kaomoji cat (#276): clock-driven moods, pokeable, optional llama-server brain (thin ureq client; canned fallback)

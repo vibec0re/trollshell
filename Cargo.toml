@@ -11,6 +11,7 @@ members = [
   "crates/hytte-ai-providers",
   "crates/hytte-claude-bridge",
   "crates/hytte-plugin-proto",
+  "crates/hytte-preem",
   "crates/hytte-plugin",
   "crates/hytte-plugin-clock-demo",
   "crates/hytte-plugin-bar-clock-demo",

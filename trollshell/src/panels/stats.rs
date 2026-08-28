@@ -40,7 +40,8 @@ use hytte::reactive::health::{self, TaskHealth, TaskState};
 use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuFreq, CpuLoad};
 use hytte::services::systemd;
-use hytte::ui::MultiSparkline;
+use hytte::ui::{MultiSparkline, PixelSurface};
+use hytte_preem::{ColorMap, DisplayStyle, Fill, LedMatrix};
 
 use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
@@ -468,7 +469,7 @@ fn scroll_card_to_top_when_ready(
 }
 
 /// Wrap a bare full-width widget — a history-sparkline `gtk::Box`, or the
-/// per-core bar `gtk::FlowBox` — in a `gtk::ListBoxRow` so it joins an
+/// per-core LED panel's `gtk::Box` — in a `gtk::ListBoxRow` so it joins an
 /// `AdwPreferencesGroup`'s boxed-list in source order with the standard
 /// separators. A non-`GtkListBoxRow` child added to a group otherwise renders
 /// *below* the boxed-list and out of order (cf. the adw-routing gotcha; the
@@ -490,7 +491,7 @@ fn build_stats_cpu_card() -> adw::PreferencesGroup {
 
     group.add(&build_live_cpu_row());
     group.add(&build_live_per_core_row());
-    group.add(&history_row_wrapper(&build_per_core_bars_row()));
+    group.add(&history_row_wrapper(&build_per_core_leds_row()));
     group.add(&build_live_processes_row());
     group.add(&build_expandable_cpu_history_row());
     group.add(&build_expandable_cpu_clock_row());
@@ -847,11 +848,11 @@ fn build_live_cpu_row() -> adw::ActionRow {
     row
 }
 
-/// Per-core header row: title and live core count only. The bar strip is a
-/// *separate* full-width row ([`build_per_core_bars_row`]) rather than this
-/// row's suffix, because a suffix cannot be shrunk below its minimum and the
-/// strip's minimum grows with the core count — see that function for the
-/// numbers (#702).
+/// Per-core header row: title and live core count only. The LED panel is a
+/// *separate* full-width row ([`build_per_core_leds_row`]) rather than this
+/// row's suffix, because a suffix cannot be shrunk below its minimum — the
+/// original sin behind #702, and the reason the panel stays out of a suffix
+/// even though its own minimum is now 0 px.
 fn build_live_per_core_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder().title("Per-core").build();
     row.set_activatable(false);
@@ -864,107 +865,355 @@ fn build_live_per_core_row() -> adw::ActionRow {
     row
 }
 
-/// Soft cap on how many core bars a single [`gtk::FlowBox`] line may hold.
-///
-/// Raised 16 → 32 with the full-width CPU card (#702). A `GtkFlowBox` never
-/// puts more children on a line than `max-children-per-line`, so the cap — not
-/// the available width — is what decides the line count on a many-core box: at
-/// 16 a 64-core machine sat on 4 lines at *every* card width, and spanning the
-/// card across both grid columns spent all that extra width on gaps between
-/// fixed-8px bars instead of on fewer lines (~28px cells → ~61px cells). At 32
-/// the same 64 cores fold onto 2 lines at roughly the old cell pitch. The
-/// `FlowBox` still wraps earlier when the card is genuinely narrow, so this only
-/// bites where there's room for more bars. Accepted side effect (#702): a
-/// 17–32 core machine now fits on one line again instead of two.
-const CORE_BARS_MAX_PER_LINE: u32 = 32;
+// ── The per-core LED panel's look (#857) ─────────────────────────────────────
 
-/// How many core bars to allow per `FlowBox` line for `cores` cores.
+/// How the per-core LED panel is dressed this session (#857).
 ///
-/// A `GtkFlowBox` packs each line right up to `max-children-per-line`, so a
-/// flat cap leaves a ragged tail (40 cores → 32 + 8). Instead take the fewest
-/// lines that keep every line at or under [`CORE_BARS_MAX_PER_LINE`], then
-/// spread the cores evenly over them (40 → 20 + 20, 64 → 2 × 32). The result
-/// is a *maximum*: a narrow card still wraps earlier, it just never packs more
-/// than this many bars into one line. Never returns 0 — `min-children-per-line`
-/// is 1 and a 0 maximum would make the two bounds inconsistent.
-fn core_bars_per_line(cores: usize) -> u32 {
-    let cores = u32::try_from(cores).unwrap_or(u32::MAX);
-    let lines = cores.div_ceil(CORE_BARS_MAX_PER_LINE).max(1);
-    cores.div_ceil(lines).max(1)
+/// Four session env vars rather than four hard-coded constants, for the same
+/// reason `TROLLSHELL_STATS_LAYOUT` is one (#508): this is a pure look-and-feel
+/// choice with no right answer, CI cannot judge it, and the shell has no config
+/// DSL to put it in. Annika's issue asked for a shape, a fill and a colour
+/// option; an env var each lets all of `vfd|lcd|oled|crt` × `style|heat|
+/// rainbow|transpride|#rrggbb` be tried on real glass by restarting the shell
+/// instead of rebuilding it.
+///
+/// The skin and the colour map are **independent axes** (see the `hytte-preem`
+/// `color_map` docs): `…_STYLE=crt` with `…_COLOR=heat` gives heat-mapped lamps
+/// *through* the tube's scanlines, not one instead of the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CoreLeds {
+    /// The kit skin — the panel's physical character.
+    style: DisplayStyle,
+    /// The colour axis — what colour each lamp lights in.
+    color: ColorMap,
+    /// A pinned row count, or `None` for the near-square `rect` shape.
+    rows: Option<usize>,
+    /// What a ragged last row's leftover slots look like.
+    fill: Fill,
 }
 
-/// The per-core strip: one vertical `ProgressBar` per core, in a **wrapping**
-/// `gtk::FlowBox`.
-///
-/// Every bar carries a hard `min-width: 8px` CSS floor, so in the old
-/// single-line `gtk::Box` the strip's *minimum* width was `n·8 + (n−1)·4` —
-/// 764 px at 64 cores, which no container could negotiate down. Hung off the
-/// `AdwActionRow` suffix that made the title/subtitle the only shrinkable
-/// thing in the row (hence the one-glyph-per-line ladder), and via
-/// `page_grid`'s homogeneous columns it doubled the whole drawer's minimum
-/// width. A `FlowBox` with `min-children-per-line = 1` has a one-bar minimum
-/// and reflows the rest onto further lines instead (#702).
-fn build_per_core_bars_row() -> gtk::FlowBox {
-    let cores_row = gtk::FlowBox::new();
-    cores_row.add_css_class("ts-cores-row");
-    cores_row.set_selection_mode(gtk::SelectionMode::None);
-    cores_row.set_homogeneous(true);
-    cores_row.set_min_children_per_line(1);
-    cores_row.set_max_children_per_line(CORE_BARS_MAX_PER_LINE);
-    cores_row.set_row_spacing(4);
-    cores_row.set_column_spacing(4);
-    cores_row.set_hexpand(true);
-    cores_row.set_valign(gtk::Align::Center);
+impl Default for CoreLeds {
+    fn default() -> Self {
+        Self {
+            // VFD: near-black field with a phosphor halo off every lit lamp —
+            // the "blinken lichten" look, and the skin whose glow reads best
+            // against the drawer's dark card.
+            style: DisplayStyle::Vfd,
+            // Heat: the panel's whole job is "which core is busy", and a
+            // level-driven ramp answers that at a glance in a way a single ink
+            // cannot. `style` is one env var away for anyone who wants the
+            // accent-tinted single ink back.
+            color: ColorMap::Heat,
+            rows: None,
+            fill: Fill::Spare,
+        }
+    }
+}
 
-    let core_bars: Rc<RefCell<Vec<gtk::ProgressBar>>> = Rc::new(RefCell::new(Vec::new()));
-    let bars_for_bind = core_bars.clone();
-    bind(sensors::cpu(), &cores_row, move |cores_row, c: CpuLoad| {
-        // Take the bars out for the whole update rather than holding a `RefMut`
-        // across it: the pre-#643 binding stayed live past `remove()`,
-        // `insert()`, `set_fraction()` and `set_tooltip_text()`, so any
-        // synchronous emission re-entering this cell would panic — fatally,
-        // from inside a glib callback. Stored back at the end.
-        let mut bars = bars_for_bind.take();
-        if bars.len() != c.per_core.len() {
-            // Drain by hand: `FlowBox::remove_all` is `v4_12`-gated and gtk4 is
-            // pinned without version features. `first_child` yields the
-            // implicit `GtkFlowBoxChild`, which is what `remove` wants.
-            while let Some(child) = cores_row.first_child() {
-                cores_row.remove(&child);
-            }
-            bars.clear();
-            cores_row.set_max_children_per_line(core_bars_per_line(c.per_core.len()));
-            for _ in 0..c.per_core.len() {
-                let bar = gtk::ProgressBar::new();
-                bar.add_css_class("ts-core-bar");
-                bar.set_orientation(gtk::Orientation::Vertical);
-                bar.set_inverted(true);
-                bar.set_valign(gtk::Align::End);
-                // The FlowBox is homogeneous, so each cell is already an equal
-                // share of the width; centre the fixed-width bar inside it.
-                // (This is what the old per-bar `hexpand` wrapper `gtk::Box`
-                // hand-rolled, so it's gone.)
-                bar.set_halign(gtk::Align::Center);
-                cores_row.insert(&bar, -1);
-                // `insert` wraps the bar in a `GtkFlowBoxChild`, which is
-                // focusable by default — 64 decorative bars would otherwise add
-                // 64 tab stops to the drawer.
-                if let Some(cell) = bar.parent() {
-                    cell.set_focusable(false);
-                }
-                bars.push(bar);
-            }
+/// Parse `TROLLSHELL_CORE_LEDS_STYLE`. `None`/unset is the default skin;
+/// an unrecognized value returns `Err(other)` so the caller can warn once.
+fn parse_core_leds_style(raw: Option<&str>) -> Result<DisplayStyle, &str> {
+    match raw {
+        None => Ok(CoreLeds::default().style),
+        Some(v) => DisplayStyle::ALL
+            .into_iter()
+            .find(|s| s.name() == v)
+            .ok_or(v),
+    }
+}
+
+/// Parse `TROLLSHELL_CORE_LEDS_COLOR`: one of the kit's named maps, or an
+/// `#rrggbb` / `rrggbb` literal for Annika's `(r, g, b)` option.
+fn parse_core_leds_color(raw: Option<&str>) -> Result<ColorMap, &str> {
+    let Some(v) = raw else {
+        return Ok(CoreLeds::default().color);
+    };
+    if let Some(map) = ColorMap::ALL.into_iter().find(|m| m.name() == v) {
+        return Ok(map);
+    }
+    parse_hex_rgb(v).ok_or(v)
+}
+
+/// `#rrggbb` or bare `rrggbb` → an [`ColorMap::Rgb`]. Case-insensitive; any
+/// other length or a non-hex digit is `None`.
+fn parse_hex_rgb(raw: &str) -> Option<ColorMap> {
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    Some(ColorMap::Rgb(byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// Parse `TROLLSHELL_CORE_LEDS_ROWS`: `rect` (or unset) for the near-square
+/// shape, or a positive row count. `0` is rejected rather than silently
+/// clamped — it is a typo, not an intent.
+fn parse_core_leds_rows(raw: Option<&str>) -> Result<Option<usize>, &str> {
+    match raw {
+        None | Some("rect") => Ok(None),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => Err(v),
+        },
+    }
+}
+
+/// Parse `TROLLSHELL_CORE_LEDS_FILL`: `spare` (unset default) or `blank`.
+fn parse_core_leds_fill(raw: Option<&str>) -> Result<Fill, &str> {
+    match raw {
+        None | Some("spare") => Ok(Fill::Spare),
+        Some("blank") => Ok(Fill::Blank),
+        Some(other) => Err(other),
+    }
+}
+
+/// Resolve one env var through its parser, warning once on an unrecognized
+/// value and falling back to `fallback`.
+///
+/// Split out so all four knobs warn in the same shape, and so the parsers
+/// themselves stay pure (and testable) functions of a `&str`.
+fn core_leds_var<T>(
+    name: &str,
+    parse: impl FnOnce(Option<&str>) -> Result<T, &str>,
+    expected: &str,
+    fallback: T,
+) -> T {
+    let raw = std::env::var(name).ok();
+    match parse(raw.as_deref()) {
+        Ok(v) => v,
+        Err(other) => {
+            tracing::warn!(
+                var = %name,
+                value = %other,
+                expected = %expected,
+                "per-core LED panel option unrecognized; using the default",
+            );
+            fallback
         }
-        for (bar, load) in bars.iter().zip(c.per_core.iter()) {
-            bar.set_fraction(load.clamp(0.0, 1.0));
-            bar.set_tooltip_text(Some(&format!("{:.0}%", load * 100.0)));
+    }
+}
+
+/// The per-core LED panel's dressing for this process, read once from the
+/// environment and cached — the [`stats_layout`] pattern, for the same reason
+/// (a session env var is process-constant, so re-reading it per redraw would
+/// buy nothing and cost a `getenv` a second).
+fn core_leds() -> CoreLeds {
+    use std::sync::OnceLock;
+    static LEDS: OnceLock<CoreLeds> = OnceLock::new();
+    *LEDS.get_or_init(|| {
+        let default = CoreLeds::default();
+        CoreLeds {
+            style: core_leds_var(
+                "TROLLSHELL_CORE_LEDS_STYLE",
+                parse_core_leds_style,
+                "vfd/lcd/oled/crt",
+                default.style,
+            ),
+            color: core_leds_var(
+                "TROLLSHELL_CORE_LEDS_COLOR",
+                parse_core_leds_color,
+                "style/rainbow/transpride/heat/#rrggbb",
+                default.color,
+            ),
+            rows: core_leds_var(
+                "TROLLSHELL_CORE_LEDS_ROWS",
+                parse_core_leds_rows,
+                "rect or a positive row count",
+                default.rows,
+            ),
+            fill: core_leds_var(
+                "TROLLSHELL_CORE_LEDS_FILL",
+                parse_core_leds_fill,
+                "spare/blank",
+                default.fill,
+            ),
         }
-        // The cell holds the empty `Vec` `take()` left behind, so this
-        // assignment drops nothing inside the borrow.
-        *bars_for_bind.borrow_mut() = bars;
+    })
+}
+
+/// The largest on-screen box the per-core LED panel may occupy, in logical px
+/// (#857).
+///
+/// The panel is rasterised at its own small buffer size and blown up by a whole
+/// integer factor, so this is a *budget*, not a size: [`core_panel_scale`]
+/// picks the biggest factor that still fits inside it. Both bounds earn their
+/// keep — the height stops a small-core box from filling the CPU card with
+/// lamps, and the width stops a deliberately wide shape (a `…_ROWS=3` strip on
+/// a 64-core box is 245 px at 1×) from being scaled past the card and then
+/// letterboxed back down, which would resample the fixed dot grid the kit
+/// exists to keep whole (#839/#843).
+const CORE_PANEL_MAX_W: usize = 280;
+/// Height half of [`CORE_PANEL_MAX_W`]'s budget box.
+const CORE_PANEL_MAX_H: usize = 104;
+
+/// The integer upscale factor for a `buf_w`×`buf_h` LED-panel buffer: the
+/// largest whole factor whose result still fits the
+/// [`CORE_PANEL_MAX_W`]×[`CORE_PANEL_MAX_H`] budget, and never less than 1.
+///
+/// Whole factors only, because `PixelSurface` paints nearest-neighbour: a
+/// fractional blow-up would duplicate some lamp rows and not others, and the
+/// panel would shimmer as the core count changed. Across the shapes
+/// [`core_led_matrix`] produces this lands every machine in a ~70–105 px band
+/// (1 core → 96 px, 4 → 90, 8 → 76, 16 → 104, 32 → 71, 64 → 93) rather than
+/// letting a 4-core box render a 30 px postage stamp next to a 64-core box's
+/// 93 px panel.
+fn core_panel_scale(buf_w: usize, buf_h: usize) -> u32 {
+    // An empty buffer has nothing to scale — and `MAX / 1` would otherwise
+    // hand back a nonsense factor of 104 for a surface that renders nothing.
+    if buf_w == 0 || buf_h == 0 {
+        return 1;
+    }
+    let by_w = CORE_PANEL_MAX_W / buf_w;
+    let by_h = CORE_PANEL_MAX_H / buf_h;
+    u32::try_from(by_w.min(by_h).max(1)).unwrap_or(1)
+}
+
+/// Build the [`LedMatrix`] for `cores` lamps, in the session's configured skin,
+/// colour map and fill ([`core_leds`]).
+///
+/// The shape is the near-square [`LedMatrix::rect`] unless
+/// `TROLLSHELL_CORE_LEDS_ROWS` pinned a row count, in which case the columns
+/// fall out of it — which is where [`Fill`] starts to matter, since 64 lamps on
+/// 3 rows needs 22 columns and leaves the last row two slots short.
+fn core_led_matrix(cores: usize) -> LedMatrix {
+    let cfg = core_leds();
+    let base = match cfg.rows {
+        Some(rows) => LedMatrix::new(cfg.style, cores.max(1).div_ceil(rows), rows),
+        None => LedMatrix::rect(cfg.style, cores),
+    };
+    base.color(cfg.color).fill(cfg.fill)
+}
+
+/// The hover readout for the LED panel.
+///
+/// The `FlowBox` this replaced put a bare `"42%"` tooltip on each bar, which
+/// could say *how* busy a bar was but never *which core* it was — you had to
+/// count bars. One panel-wide summary that names the busiest core is strictly
+/// more informative in aggregate, at the cost of the per-lamp readout; a
+/// pointer-precise per-lamp tooltip would need the inverse of
+/// `PixelSurface`'s letterbox transform and is left as a follow-up.
+fn core_panel_tooltip(per_core: &[f64]) -> String {
+    if per_core.is_empty() {
+        return "No per-core data".to_string();
+    }
+    let sum: f64 = per_core.iter().sum();
+    let cores = u64::try_from(per_core.len()).unwrap_or(u64::MAX);
+    let avg = sum / cast::u64_to_f64(cores) * 100.0;
+    // `partial_cmp` rather than `total_cmp` would have to handle NaN; the
+    // fold below simply never adopts a NaN as the new maximum, so a garbage
+    // sample can't win the "busiest" title.
+    let (busiest, peak) =
+        per_core
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            });
+    format!(
+        "{} cores \u{00b7} avg {avg:.0}% \u{00b7} max {:.0}% (core {busiest})",
+        per_core.len(),
+        peak.max(0.0) * 100.0,
+    )
+}
+
+/// The row container the LED panel sits in.
+///
+/// The `gtk::Box` carries the row's padding, not the surface: `PixelSurface`
+/// computes its letterbox against the widget allocation rather than the CSS
+/// content box, so CSS padding set on the surface itself would be painted over.
+///
+/// Split out from [`build_per_core_leds_row`] so `led_panel_layout_tests` can
+/// measure the **real** arrangement rather than a copy of it — that function
+/// binds `sensors::cpu()` inline and needs a registered `Registry` to run.
+fn core_panel_row() -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("ts-cores-row");
+    // The *box* centres, and the surface inside it does not expand. Both
+    // halves matter, and getting either wrong inflates the CPU card:
+    // `GtkBoxLayout`'s opposite-orientation measure hands an **expanding**
+    // child all the space it is measuring for, and an aspect-locked
+    // height-for-width surface handed 400 px of width answers "then I am 400 px
+    // tall". Centring at the box level instead means the box asks its child for
+    // a natural 93 px, gets a 93 px height back, and spends the slack on
+    // centring — which is what `a_wide_card_cannot_inflate_the_row_height`
+    // pins. (Measured: with `hexpand` on the surface, a 400 px card produced a
+    // 400 px-tall row.)
+    row.set_halign(gtk::Align::Center);
+    row.set_hexpand(true);
+    row
+}
+
+/// The raster surface the LED panel draws into, configured but not yet bound.
+///
+/// **Never expanding**, for the reason [`core_panel_row`] spells out: an
+/// expanding `PixelSurface` is handed the card's whole width at measure time
+/// and, being aspect-locked, answers with a matching height. It asks for its
+/// natural buffer size and nothing more; [`core_panel_row`] does the centring.
+///
+/// See [`core_panel_row`] for why this is a separate constructor.
+fn core_panel_surface() -> PixelSurface {
+    let panel = PixelSurface::new();
+    panel.set_halign(gtk::Align::Center);
+    panel.set_valign(gtk::Align::Center);
+    panel
+}
+
+/// The per-core strip: an LED panel — one lamp per core, each lit to that
+/// core's load ("Blinken Lichten", #857).
+///
+/// # It cannot repeat #702
+///
+/// The `gtk::FlowBox` of 64 vertical `ProgressBar`s this replaced was the
+/// second answer to #702, whose first answer — a single-line `gtk::Box` — had a
+/// *minimum* width of `n·8 + (n−1)·4` = **764 px at 64 cores**, because every
+/// bar carried a hard `min-width: 8px` CSS floor and 64 floors add up. No
+/// container could negotiate that down, and through `page_grid`'s homogeneous
+/// columns it doubled the whole drawer's minimum width.
+///
+/// The panel's minimum width at 64 cores is **0 px**, on any core count, for
+/// two independent reasons:
+///
+/// 1. It is **one widget**, not `n`. There are no per-child floors to add up —
+///    the lamps are pixels in a buffer, not widgets in a container.
+/// 2. `PixelSurface::measure` returns `(0, natural, -1, -1)`: its minimum is
+///    hard-coded to `0` on both axes so CSS/layout can shrink it freely, and
+///    its *natural* size (93 px at 64 cores in the default near-square shape,
+///    times [`core_panel_scale`]) is only ever a request. The `ts-cores-row`
+///    wrapper carries the row's padding and a `min-height`, deliberately never
+///    a `min-width`.
+///
+/// Under-allocated, the surface letterboxes the buffer down rather than forcing
+/// the container wider — so the failure mode is a smaller panel, not a wider
+/// drawer.
+///
+/// # Redraw
+///
+/// Signal-driven, no animation timer: `sensors::cpu()` ticks once a second and
+/// each tick rasterises one frame (~116 µs on VFD at 64 cores, measured
+/// `--release`) and swaps the texture. Same-size swaps take
+/// `PixelSurface`'s `queue_draw` path rather than `queue_resize`.
+fn build_per_core_leds_row() -> gtk::Box {
+    let row = core_panel_row();
+    let panel = core_panel_surface();
+    row.append(&panel);
+
+    bind(sensors::cpu(), &panel, move |panel, c: CpuLoad| {
+        let levels: Vec<f32> = c
+            .per_core
+            .iter()
+            .map(|&load| cast::f64_to_f32(load))
+            .collect();
+        let frame = core_led_matrix(levels.len()).render(&levels);
+        panel.set_scale(core_panel_scale(frame.width(), frame.height()));
+        panel.set_pixels(
+            u32::try_from(frame.width()).unwrap_or(0),
+            u32::try_from(frame.height()).unwrap_or(0),
+            frame.data(),
+        );
+        panel.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
     });
 
-    cores_row
+    row
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -1855,8 +2104,10 @@ fn flapping_subtitle(
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_BARS_MAX_PER_LINE, Duration, StatsLayout, StatsSection, TaskState, core_bars_per_line,
-        flapping_subtitle, is_flapping, parse_stats_layout,
+        CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, ColorMap, CoreLeds, DisplayStyle, Duration, Fill,
+        LedMatrix, StatsLayout, StatsSection, TaskState, core_panel_scale, core_panel_tooltip,
+        flapping_subtitle, is_flapping, parse_core_leds_color, parse_core_leds_fill,
+        parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb, parse_stats_layout,
     };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -1910,38 +2161,173 @@ mod tests {
         assert_eq!(parse_stats_layout(Some("")), Err(""));
     }
 
-    /// `min-children-per-line` is 1, so the maximum handed to the `FlowBox`
-    /// must never be 0 — including on the degenerate zero-cores path, which is
-    /// what a `sensors::cpu()` sample carrying no per-core loads would produce.
+    // ── The per-core LED panel (#857) ────────────────────────────────────────
+
+    /// **The #702 non-regression, stated as a number.** The panel the drawer
+    /// actually asks for at 64 cores is 93 × 1 = **93 px** wide, against the
+    /// 764 px hard minimum the pre-#702 bar strip had — and unlike that strip
+    /// this is a *natural* size, not a floor: `PixelSurface::measure` hard-codes
+    /// its minimum to 0.
+    ///
+    /// Falsified by growing the kit's cell metrics (`CELL`/`GAP`/`PAD`) or by
+    /// letting `core_panel_scale` blow the panel past the budget box.
     #[test]
-    fn core_bars_per_line_is_never_zero() {
-        assert_eq!(core_bars_per_line(0), 1);
-        assert_eq!(core_bars_per_line(1), 1);
+    fn the_panel_is_93px_at_64_cores() {
+        let m = LedMatrix::rect(DisplayStyle::Vfd, 64);
+        assert_eq!((m.cols(), m.rows()), (8, 8), "64 cores is an 8x8 panel");
+        assert_eq!((m.width(), m.height()), (93, 93));
+        assert_eq!(core_panel_scale(m.width(), m.height()), 1);
+        assert!(
+            m.width() < 764 / 4,
+            "the panel must stay a small fraction of #702's 764 px strip"
+        );
     }
 
-    /// Anything that fits under the cap stays on one line — the small-machine
-    /// case must look exactly like the pre-#702 single-row strip. Since the cap
-    /// went 16 → 32 for the full-width CPU card, that band now reaches 32: a
-    /// 17–32 core machine is back on one line (the side effect annikahannig
-    /// accepted when she picked S1 on #702).
+    /// Whatever the core count and whatever the shape, the *requested* panel
+    /// fits the budget box — so no machine can make the CPU card demand a
+    /// width or height the drawer has to grow to.
+    ///
+    /// Falsified by taking the max instead of the min of the two scale bounds,
+    /// or by dropping either bound.
     #[test]
-    fn core_bars_per_line_keeps_small_counts_on_one_line() {
-        for cores in 1..=CORE_BARS_MAX_PER_LINE {
-            let n = usize::try_from(cores).expect("u32 fits usize");
-            assert_eq!(core_bars_per_line(n), cores, "{cores} cores");
+    fn every_core_count_fits_the_budget_box() {
+        for cores in 1..=512usize {
+            for shape in [None, Some(1usize), Some(2), Some(3)] {
+                let m = match shape {
+                    Some(rows) => LedMatrix::new(DisplayStyle::Vfd, cores.div_ceil(rows), rows),
+                    None => LedMatrix::rect(DisplayStyle::Vfd, cores),
+                };
+                let scale = usize::try_from(core_panel_scale(m.width(), m.height()))
+                    .expect("u32 fits usize");
+                assert!(scale >= 1, "{cores}/{shape:?} scaled to nothing");
+                // A 1x panel that is *already* wider than the budget is fine —
+                // its minimum is still 0 and it letterboxes down. What must
+                // never happen is the scale making it worse.
+                if scale > 1 {
+                    assert!(
+                        m.width() * scale <= CORE_PANEL_MAX_W
+                            && m.height() * scale <= CORE_PANEL_MAX_H,
+                        "{cores} cores / rows {shape:?}: {}x{} at {scale}x escapes the budget",
+                        m.width(),
+                        m.height()
+                    );
+                }
+            }
         }
     }
 
-    /// Past the cap the wrap is *balanced*, not ragged: a flat cap would give
-    /// 40 cores a 32 + 8 split, which looks broken next to 20 + 20.
+    /// The scale never *shrinks* the buffer — a fractional or sub-1 factor
+    /// would resample the fixed dot grid, which is the one thing #839/#843 buy
+    /// us. A panel too big for the budget stays at 1x and letterboxes instead.
+    ///
+    /// Falsified by dropping the `.max(1)`.
     #[test]
-    fn core_bars_per_line_balances_the_wrap() {
-        assert_eq!(core_bars_per_line(33), 17); // 17 + 16, not 32 + 1
-        assert_eq!(core_bars_per_line(40), 20); // 20 + 20, not 32 + 8
-        assert_eq!(core_bars_per_line(48), 24); // 24 + 24
-        assert_eq!(core_bars_per_line(64), 32); // the #702 machine: 2 x 32
-        assert_eq!(core_bars_per_line(65), 22); // 3 x 22
-        assert_eq!(core_bars_per_line(128), 32); // 4 x 32
+    fn the_scale_never_shrinks_the_panel() {
+        assert_eq!(
+            core_panel_scale(1000, 1000),
+            1,
+            "an oversized panel stays 1x"
+        );
+        assert_eq!(core_panel_scale(0, 0), 1, "a degenerate buffer stays 1x");
+        // The small-machine shapes get the blow-up that keeps them legible.
+        assert!(core_panel_scale(16, 16) > 1, "a 1-core panel is blown up");
+        assert!(core_panel_scale(30, 30) > 1, "a 4-core panel is blown up");
+    }
+
+    /// The hover readout names the core count, the average and the busiest
+    /// core — the thing the per-bar `"42%"` tooltip could never say.
+    ///
+    /// Falsified by folding on `>=` instead of `>` (the busiest index becomes
+    /// the last tied core, not the first) or by summing instead of averaging.
+    #[test]
+    fn the_tooltip_names_the_busiest_core() {
+        assert_eq!(core_panel_tooltip(&[]), "No per-core data");
+        assert_eq!(
+            core_panel_tooltip(&[0.0, 0.5, 1.0, 0.5]),
+            "4 cores \u{00b7} avg 50% \u{00b7} max 100% (core 2)"
+        );
+        assert_eq!(
+            core_panel_tooltip(&[0.02]),
+            "1 cores \u{00b7} avg 2% \u{00b7} max 2% (core 0)"
+        );
+        // A garbage sample can't win the "busiest" title or produce a negative
+        // reading — the panel is fed straight off /proc and has been wrong
+        // before.
+        let odd = core_panel_tooltip(&[f64::NAN, 0.3]);
+        assert!(odd.contains("(core 1)"), "NaN took the busiest slot: {odd}");
+        assert!(
+            core_panel_tooltip(&[-1.0]).contains("max 0%"),
+            "a negative load reported below zero"
+        );
+    }
+
+    /// The env knobs resolve to the documented defaults when unset, accept
+    /// every value the warning text advertises, and reject anything else so
+    /// `core_leds_var` can warn rather than silently pick something.
+    #[test]
+    fn the_led_panel_env_knobs_parse() {
+        let default = CoreLeds::default();
+        // Unset is the default, silently — the `TROLLSHELL_STATS_LAYOUT` rule.
+        assert_eq!(parse_core_leds_style(None), Ok(default.style));
+        assert_eq!(parse_core_leds_color(None), Ok(default.color));
+        assert_eq!(parse_core_leds_rows(None), Ok(default.rows));
+        assert_eq!(parse_core_leds_fill(None), Ok(default.fill));
+
+        // Every skin the warning names, by the kit's own `name()` vocabulary.
+        for style in DisplayStyle::ALL {
+            assert_eq!(parse_core_leds_style(Some(style.name())), Ok(style));
+        }
+        assert_eq!(parse_core_leds_style(Some("plasma")), Err("plasma"));
+
+        // Every named map, plus the `#rrggbb` literal.
+        for map in ColorMap::ALL {
+            assert_eq!(parse_core_leds_color(Some(map.name())), Ok(map));
+        }
+        assert_eq!(
+            parse_core_leds_color(Some("#9b59b6")),
+            Ok(ColorMap::Rgb(0x9b, 0x59, 0xb6))
+        );
+        assert_eq!(parse_core_leds_color(Some("puce")), Err("puce"));
+        // `rgb` is `ColorMap::name`'s output but not an input: it carries no
+        // components, so accepting it would mean inventing a colour.
+        assert_eq!(parse_core_leds_color(Some("rgb")), Err("rgb"));
+
+        assert_eq!(parse_core_leds_rows(Some("rect")), Ok(None));
+        assert_eq!(parse_core_leds_rows(Some("3")), Ok(Some(3)));
+        assert_eq!(
+            parse_core_leds_rows(Some("0")),
+            Err("0"),
+            "0 rows is a typo"
+        );
+        assert_eq!(parse_core_leds_rows(Some("-2")), Err("-2"));
+        assert_eq!(parse_core_leds_rows(Some("many")), Err("many"));
+
+        assert_eq!(parse_core_leds_fill(Some("spare")), Ok(Fill::Spare));
+        assert_eq!(parse_core_leds_fill(Some("blank")), Ok(Fill::Blank));
+        assert_eq!(parse_core_leds_fill(Some("none")), Err("none"));
+    }
+
+    /// The `#rrggbb` literal: with or without the hash, either case, and
+    /// nothing else — a short, long or non-hex string is rejected rather than
+    /// silently truncated.
+    #[test]
+    fn hex_colours_parse_both_ways() {
+        assert_eq!(
+            parse_hex_rgb("#ff8800"),
+            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            parse_hex_rgb("ff8800"),
+            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(
+            parse_hex_rgb("FF8800"),
+            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(parse_hex_rgb("#f80"), None, "short hex is not accepted");
+        assert_eq!(parse_hex_rgb("#ff8800ff"), None, "alpha is not accepted");
+        assert_eq!(parse_hex_rgb("#gg8800"), None);
+        assert_eq!(parse_hex_rgb(""), None);
     }
 
     /// The flapping filter keys on the *streak*, and its boundary is 1, not
@@ -2004,23 +2390,25 @@ mod tests {
         );
     }
 
-    /// Whatever the core count: the cap is honoured, every core has a slot,
-    /// and balancing never costs an extra line versus a flat cap.
+    /// Whatever the core count, the near-square panel has a lamp for every
+    /// core and no wholly empty column — the shape contract the CPU card
+    /// depends on, checked from the shell side of the boundary too so a kit
+    /// change that lost lamps would fail here as well as in `hytte-preem`.
     #[test]
-    fn core_bars_per_line_respects_cap_and_covers_every_core() {
-        let cap = usize::try_from(CORE_BARS_MAX_PER_LINE).expect("u32 fits usize");
-        for cores in 0..=512usize {
-            let per_line_u32 = core_bars_per_line(cores);
+    fn the_panel_has_a_lamp_for_every_core() {
+        for cores in 1..=512usize {
+            let m = LedMatrix::rect(DisplayStyle::Vfd, cores);
             assert!(
-                (1..=CORE_BARS_MAX_PER_LINE).contains(&per_line_u32),
-                "{cores} cores gave {per_line_u32} per line"
+                m.cols() * m.rows() >= cores,
+                "{cores} cores lost lamps in a {}x{} panel",
+                m.cols(),
+                m.rows()
             );
-            let per_line = usize::try_from(per_line_u32).expect("u32 fits usize");
-            let lines = cores.div_ceil(per_line);
-            assert!(lines * per_line >= cores, "{cores} cores do not all fit");
             assert!(
-                lines <= cores.div_ceil(cap).max(1),
-                "{cores} cores wrapped onto {lines} lines, more than a flat cap would"
+                (m.cols() - 1) * m.rows() < cores,
+                "{cores} cores left a spare column in a {}x{} panel",
+                m.cols(),
+                m.rows()
             );
         }
     }
@@ -2396,6 +2784,80 @@ mod pin_tests {
              apply closure (rather than taking the closure's own `&adw::ExpanderRow` argument \
              from `bind`) would keep this alive for the life of the binding, defeating #224's \
              WeakRef contract"
+        );
+    }
+}
+
+/// The per-core LED panel's **layout** contract (#857), which is pure GTK
+/// geometry and therefore needs a display server.
+///
+/// [`build_per_core_leds_row`] itself binds `sensors::cpu()` inline and would
+/// need a registered `Registry` to run (the same limitation `pin_tests`
+/// documents), so these drive its two constructors — [`core_panel_row`] and
+/// [`core_panel_surface`] — directly. That is the point of the split: the
+/// arrangement under test is the arrangement that ships, not a copy of it that
+/// can drift.
+///
+/// Two properties, both of which a plain unit test cannot reach because both
+/// are answers GTK gives, not arithmetic this file does:
+///
+/// 1. the row's **minimum width is 0** with a 64-core panel in it — the #702
+///    non-regression, measured rather than asserted in prose;
+/// 2. an over-wide card cannot inflate the row's **height** request, which an
+///    aspect-locked height-for-width raster widget absolutely can do if it is
+///    allowed to fill.
+#[cfg(all(test, feature = "system-tests"))]
+mod led_panel_layout_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::ui::PixelSurface;
+
+    use super::{CORE_PANEL_MAX_H, core_panel_row, core_panel_surface};
+
+    /// A surface holding the 93×93 buffer a 64-core near-square panel
+    /// rasterises to, arranged exactly as the shipping row arranges it.
+    fn panel_64() -> PixelSurface {
+        let panel = core_panel_surface();
+        panel.set_pixels(93, 93, &vec![0xff_u8; 93 * 93 * 4]);
+        panel
+    }
+
+    /// **The #702 non-regression, measured.** The row holding a 64-core panel
+    /// reports a minimum width of **0 px** — against the 764 px the pre-#702
+    /// bar strip demanded — so no container is ever forced wider by it, while
+    /// the row still *wants* the panel's natural 93 px.
+    ///
+    /// Falsified by putting a CSS `min-width` back on `.ts-cores-row`, or by
+    /// giving the surface a `set_size_request`.
+    #[gtk::test]
+    fn the_panel_row_has_no_minimum_width() {
+        adw::init().expect("libadwaita init");
+        let row = core_panel_row();
+        row.append(&panel_64());
+        let (min_w, nat_w, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
+        assert_eq!(min_w, 0, "the LED panel row grew a minimum width");
+        assert!(
+            nat_w >= 93,
+            "the row should still want the panel's 93 px, got {nat_w}"
+        );
+    }
+
+    /// A card far wider than the panel must not make the row taller: a filling
+    /// surface would request `400 * 93 / 93` = 400 px of height and swallow the
+    /// CPU card.
+    ///
+    /// Falsified by putting `set_hexpand(true)` back on the surface — which is
+    /// how this was first written, and measured 400 px.
+    #[gtk::test]
+    fn a_wide_card_cannot_inflate_the_row_height() {
+        adw::init().expect("libadwaita init");
+        let budget = i32::try_from(CORE_PANEL_MAX_H).expect("the budget fits i32");
+        let row = core_panel_row();
+        row.append(&panel_64());
+        let (_, nat_h, _, _) = row.measure(gtk::Orientation::Vertical, 400);
+        assert!(
+            nat_h <= budget,
+            "a 400 px card stretched the 93 px panel to {nat_h} px tall"
         );
     }
 }

@@ -30,6 +30,13 @@ hytte = { path = "../crates/hytte" }
 hytte-plugin-proto = { path = "../crates/hytte-plugin-proto", features = [
   "tokio",
 ] }
+# The retro raster kit (#857), for the per-core LED panel in the Stats drawer.
+# This is the *kit*, not the plugin SDK: `hytte-preem` is a GTK-free leaf whose
+# only dependency is `hytte-plugin-proto`, which this crate already links —
+# which is exactly why #859/#860 extracted it out of `hytte-plugin`. The shell
+# rasterises into a `hytte::ui::PixelSurface` in-process; it does not, and must
+# not, link the plugin client runtime to do so.
+hytte-preem = { path = "../crates/hytte-preem" }
 # AI-key store (#392): reads/writes API keys in the login keyring (Secret
 # Service / gnome-keyring) for `secrets.rs` — the launcher injects them at
 # plugin spawn, the control endpoint sets/clears them for the control-center's

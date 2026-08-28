@@ -110,11 +110,11 @@ struct Cfg {
     llm_timeout: Duration,
     /// `$PET_PERSONA` — a style/tone clause spliced into [`persona`]'s
     /// `Style:` line, replacing the default `"playful, a little sassy"`.
-    /// The `{name}`/`{hour}`/`{mood}` interpolation and the trailing
-    /// `Format:` rules (including [`PROMPT_MAX_WORDS`]) are **not**
-    /// overridable through this knob — see [`persona`]'s doc comment for
-    /// why. Default: `None` (the built-in style clause). Unset, empty, or
-    /// whitespace-only all resolve to `None`.
+    /// The `{name}` interpolation and the trailing `Format:` rules
+    /// (including [`PROMPT_MAX_WORDS`]) are **not** overridable through this
+    /// knob — see [`persona`]'s doc comment for why. Default: `None` (the
+    /// built-in style clause). Unset, empty, or whitespace-only all resolve
+    /// to `None`.
     persona: Option<String>,
 }
 
@@ -185,6 +185,27 @@ fn persona_or_none(raw: Option<&str>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// The identity the pet sends as `OpenAI`'s `user` (#704), and the id it
+/// registers under. One constant for both on purpose: the property the bridge
+/// needs is that this string is stable across restarts and distinct from every
+/// other caller's, and the manifest id is already exactly that.
+///
+/// It reaches `hytte-claude-bridge` as the conversation handle, so the pet's
+/// session can never be the one caw is talking in — see [`Provider::user`].
+/// Endpoints that are not the bridge treat it as the abuse-tracking hint the
+/// spec describes, or ignore it.
+///
+/// **Must stay distinct from `hytte_plugin_caw::briefing::PLUGIN_ID`.** Two
+/// plugins sharing an identity share one `claude` session, which is precisely
+/// the cross-caller bleed the identity exists to prevent. No test can enforce
+/// that: the two consts live in separate crates that do not depend on each
+/// other, so each side can only assert against a hardcoded copy of the other's
+/// value. Changing either one is a two-file change.
+///
+/// Changing it also orphans the pet's existing on-disk session — the bridge's
+/// title is a digest of exactly this string.
+pub const PLUGIN_ID: &str = "pet";
+
 /// Resolve the pet's [`Provider`] from its env inputs. `url_env` is the raw
 /// `$PET_LLM_URL` (`None` = unset, `Some("")` = set-but-empty = model
 /// disabled). With no explicit URL, the default is **`OpenRouter`** (the pet's
@@ -208,6 +229,7 @@ fn resolve_provider(
             base_url: url.to_owned(),
             api_key: key,
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
         // No URL → the OpenRouter cloud default, but ONLY with a key. Keyless →
         // `None` (canned-only): the call would just 401, so skip it (#438).
@@ -215,6 +237,7 @@ fn resolve_provider(
             base_url: "https://openrouter.ai/api".to_owned(),
             api_key: Some(key),
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
     }
 }
@@ -295,10 +318,7 @@ fn ask_llm(
     timeout: Duration,
     persona_style: Option<&str>,
 ) -> Result<String, String> {
-    let messages = [
-        Message::system(persona(name, owner, req, persona_style)),
-        Message::user(event(name, owner, req)),
-    ];
+    let messages = prompt_messages(name, owner, req, persona_style);
     let opts = ChatOpts {
         max_tokens: 32,
         temperature: 0.9,
@@ -313,6 +333,25 @@ fn ask_llm(
     }
 }
 
+/// The exact pair of messages one request carries: the standing
+/// [`persona`] as the system message, the current [`event`] as the user one.
+///
+/// Split out of [`ask_llm`] so a test can assert on the pair a request would
+/// actually send — specifically that the **system** half does not move when
+/// the hour or the mood does, which is the property a resumed bridge session
+/// depends on (see [`persona`]).
+fn prompt_messages(
+    name: &str,
+    owner: &str,
+    req: ThinkReq,
+    persona_style: Option<&str>,
+) -> [Message; 2] {
+    [
+        Message::system(persona(name, owner, persona_style)),
+        Message::user(event(name, owner, req)),
+    ]
+}
+
 /// The pet's standing persona, tuned live against MiniCPM5-1B: short,
 /// concrete, format stated as rules. The word budget is [`PROMPT_MAX_WORDS`],
 /// which is derived from the [`MAX_LINE`] clamp — asking for more words than
@@ -320,8 +359,8 @@ fn ask_llm(
 ///
 /// `style` is `$PET_PERSONA` (see [`Cfg::persona`]) — it splices in as the
 /// `Style:` clause only, replacing the default `"playful, a little sassy"`.
-/// The `{name}`/`{hour}`/`{mood}` interpolation and the trailing `Format:`
-/// rules stay fixed regardless of `style`: they're what keeps a reply inside
+/// The `{name}` interpolation and the trailing `Format:` rules stay fixed
+/// regardless of `style`: they're what keeps a reply inside
 /// [`PROMPT_MAX_WORDS`], and a persona that could drop them would silently
 /// produce lines [`sanitize`] then chops mid-word (#698's decision — a
 /// full-template override was considered and rejected for exactly this).
@@ -330,16 +369,25 @@ fn ask_llm(
 /// `$TROLLSHELL_OWNER` via the shared [`hytte_ai_providers::owner`] (see
 /// [`Cfg::owner`]). It used to be hardcoded here as `"Annika's Linux
 /// desktop"` — not every deployment's owner is named Annika (#696).
-fn persona(name: &str, owner: &str, req: ThinkReq, style: Option<&str>) -> String {
+///
+/// **Nothing time-varying may live here.** The hour and the mood used to be
+/// interpolated into this string, and that was load-bearing by accident: it
+/// changed the system message every tick, which changed the conversation key
+/// `hytte-claude-bridge` derives from the prefix, which minted a fresh session
+/// and re-sent the whole transcript. Once a caller names its own session
+/// (#704, [`PLUGIN_ID`]) the key is constant, so every turn after the first
+/// **resumes** and sends only the newest message — the system message is
+/// whatever the session was created with, forever. Anything the model must be
+/// told *again each turn* belongs in [`event`], which is the message that is
+/// actually re-sent. The same holds for the bridge's reprompt backend, whose
+/// `Records::compose` head-pins the first system message it ever recorded.
+fn persona(name: &str, owner: &str, style: Option<&str>) -> String {
     let style = style.unwrap_or("playful, a little sassy");
     format!(
         "You are {name}, a tiny cat who lives in the sidebar of {owner}'s Linux \
-         desktop. It is around {hour}:00 and you feel {mood}. Always \
-         answer as {name} the cat. Style: {style}. Format: exactly one \
-         line, at most {words} words, plain text, no quotes, no emoji.",
-        hour = req.hour,
-        mood = req.mood,
-        words = PROMPT_MAX_WORDS,
+         desktop. Always answer as {name} the cat. Style: {style}. Format: \
+         exactly one line, at most {PROMPT_MAX_WORDS} words, plain text, no \
+         quotes, no emoji."
     )
 }
 
@@ -352,16 +400,27 @@ fn persona(name: &str, owner: &str, req: ThinkReq, style: Option<&str>) -> Strin
 /// [`hytte_ai_providers::owner`] resolver landed. Above [`GRUMPY_AT`] the
 /// stimulus counts pokes instead and mentions nobody — the bug only ever
 /// showed on the first few clicks.
+///
+/// Being the message that is re-sent every turn is also why the **hour and the
+/// mood** open it. They used to sit in [`persona`], where a resumed session
+/// freezes them at whatever they were when it was created (see that function's
+/// note); here they are the scene the stimulus happens in, restated on every
+/// request, so `mood` — a headline feature (#284) — actually reaches the model
+/// each tick. They lead rather than trail because the format anchor has to keep
+/// the tail.
 fn event(name: &str, owner: &str, req: ThinkReq) -> String {
     let stim = match req.kind {
         ThinkKind::Poke if req.pokes >= GRUMPY_AT => format!("*poke #{} in a row*", req.pokes),
         ThinkKind::Poke => format!("*{owner} pokes you*"),
-        ThinkKind::Idle if req.mood == "sleepy" => {
-            "(late night, everything is quiet, you are sleepy)".to_owned()
-        }
+        ThinkKind::Idle if req.mood == "sleepy" => "(late night, everything is quiet)".to_owned(),
         ThinkKind::Idle => "(a quiet moment; share one tiny cat thought)".to_owned(),
     };
-    format!("{stim} — say your one line now, as {name}:")
+    format!(
+        "It is around {hour}:00 and you feel {mood}. {stim} — say your one \
+         line now, as {name}:",
+        hour = req.hour,
+        mood = req.mood,
+    )
 }
 
 /// Force whatever the model said into one clean bubble line: first
@@ -527,25 +586,14 @@ mod tests {
 
     /// #698: with no override the prompt keeps the built-in style clause;
     /// with one set, that clause — and only that clause — changes. The
-    /// `{name}`/`{hour}`/`{mood}` interpolation and the `Format:` rules
-    /// (including the derived [`PROMPT_MAX_WORDS`]) must survive either way.
+    /// `{name}` interpolation and the `Format:` rules (including the derived
+    /// [`PROMPT_MAX_WORDS`]) must survive either way.
     #[test]
     fn persona_splices_style_but_keeps_format_rules_fixed() {
-        let req = ThinkReq {
-            kind: ThinkKind::Idle,
-            hour: 9,
-            mood: "happy",
-            pokes: 0,
-        };
-        let default_prompt = persona("nisse", DEFAULT_OWNER, req, None);
+        let default_prompt = persona("nisse", DEFAULT_OWNER, None);
         assert!(default_prompt.contains("Style: playful, a little sassy."));
 
-        let custom_prompt = persona(
-            "nisse",
-            DEFAULT_OWNER,
-            req,
-            Some("gentle and philosophical"),
-        );
+        let custom_prompt = persona("nisse", DEFAULT_OWNER, Some("gentle and philosophical"));
         assert!(custom_prompt.contains("Style: gentle and philosophical."));
         assert!(
             !custom_prompt.contains("playful, a little sassy"),
@@ -574,21 +622,74 @@ mod tests {
     /// and the neutral default names nobody in particular.
     #[test]
     fn persona_embeds_the_resolved_owner_and_never_a_hardcoded_name() {
-        let req = ThinkReq {
-            kind: ThinkKind::Idle,
-            hour: 9,
-            mood: "happy",
-            pokes: 0,
-        };
-        assert!(
-            persona("nisse", "kaesaecracker", req, None).contains("kaesaecracker's Linux desktop"),
-        );
-        let neutral = persona("nisse", DEFAULT_OWNER, req, None);
+        assert!(persona("nisse", "kaesaecracker", None).contains("kaesaecracker's Linux desktop"));
+        let neutral = persona("nisse", DEFAULT_OWNER, None);
         assert!(neutral.contains("your human's Linux desktop"), "{neutral}");
         assert!(
             !neutral.to_lowercase().contains("annika"),
             "the default persona must not name a specific person: {neutral}",
         );
+    }
+
+    /// **The freeze regression.** The system message must not move when the
+    /// hour or the mood does; the user message must.
+    ///
+    /// Since #704 the pet names its own session ([`PLUGIN_ID`]), so
+    /// `hytte-claude-bridge` derives a constant title for it and every turn
+    /// after the first **resumes**, re-sending only the newest message. A
+    /// system message that carried `{hour}`/`{mood}` would therefore be frozen
+    /// at session-creation time forever — start the bridge at 03:00 and the pet
+    /// still believes it is 03:00 and sleepy next week. (Before #704 it worked
+    /// only by accident: the changing system message churned the content hash,
+    /// which minted a new session and re-rendered the transcript.) The same
+    /// applies to the bridge's reprompt backend, whose `Records::compose`
+    /// head-pins the first system message it recorded.
+    ///
+    /// This test fails the moment either value migrates back up.
+    #[test]
+    fn only_the_user_message_moves_with_the_hour_and_the_mood() {
+        let at = |hour, mood| ThinkReq {
+            kind: ThinkKind::Idle,
+            hour,
+            mood,
+            pokes: 0,
+        };
+        let three_am = prompt_messages("nisse", "kaesaecracker", at(3, "sleepy"), None);
+        let noon = prompt_messages("nisse", "kaesaecracker", at(12, "happy"), None);
+
+        assert_eq!(three_am[0].role, "system");
+        assert_eq!(three_am[1].role, "user");
+        assert_eq!(
+            three_am[0].content, noon[0].content,
+            "the system message must be byte-identical across hours and moods — \
+             a resumed session only ever hears the one it was created with",
+        );
+        assert_ne!(
+            three_am[1].content, noon[1].content,
+            "the user message is the only half re-sent on a resume, so it is \
+             where the time-varying state has to live",
+        );
+
+        // Named explicitly, so a partial migration back is caught too.
+        for frozen in ["3:00", "12:00", "sleepy", "happy"] {
+            assert!(
+                !three_am[0].content.contains(frozen) && !noon[0].content.contains(frozen),
+                "the persona still carries {frozen:?}: {}",
+                three_am[0].content,
+            );
+        }
+        assert!(
+            three_am[1].content.contains("3:00"),
+            "{}",
+            three_am[1].content
+        );
+        assert!(
+            three_am[1].content.contains("sleepy"),
+            "{}",
+            three_am[1].content
+        );
+        assert!(noon[1].content.contains("12:00"), "{}", noon[1].content);
+        assert!(noon[1].content.contains("happy"), "{}", noon[1].content);
     }
 
     /// #696, the half [`persona`]'s test could never have caught: the poke
@@ -657,17 +758,7 @@ mod tests {
     /// an obedient model's reply is truncated with an ellipsis every time.
     #[test]
     fn prompt_word_budget_fits_the_line_clamp() {
-        let prompt = persona(
-            "nisse",
-            DEFAULT_OWNER,
-            ThinkReq {
-                kind: ThinkKind::Idle,
-                hour: 9,
-                mood: "happy",
-                pokes: 0,
-            },
-            None,
-        );
+        let prompt = persona("nisse", DEFAULT_OWNER, None);
         assert!(
             prompt.contains(&format!("at most {PROMPT_MAX_WORDS} words")),
             "the prompt states the derived budget: {prompt}",
@@ -781,6 +872,23 @@ mod tests {
         let p = resolve_provider(Some("http://host:2"), Some("k".to_owned()), None).unwrap();
         assert_eq!(p.base_url, "http://host:2");
         assert_eq!(p.api_key.as_deref(), Some("k"));
+    }
+
+    /// Whichever backend it resolves to, the pet names itself (#704) — the
+    /// bridge keys the conversation on this, so a provider that lost it would
+    /// silently fall back to sharing a session by transcript luck.
+    #[test]
+    fn every_resolved_provider_carries_the_plugin_identity() {
+        for p in [
+            resolve_provider(Some("http://host:1"), None, None),
+            resolve_provider(None, Some("sk-1".to_owned()), None),
+        ] {
+            assert_eq!(
+                p.expect("resolves").user.as_deref(),
+                Some(PLUGIN_ID),
+                "the provider must carry the pet's identity",
+            );
+        }
     }
 
     /// A one-shot fake OpenAI-compatible server that answers with `body`.

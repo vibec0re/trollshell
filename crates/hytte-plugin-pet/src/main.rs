@@ -237,7 +237,7 @@ impl Plugin for Pet {
         // SidebarBottom, `order = -1`: the pet perches *above* the departures
         // board, which mounts the same region with no order (sorts as 0) — the
         // region sorts `(order, id)` ascending, lower renders higher (#303).
-        let mut m = Manifest::new("pet", Mount::SidebarBottom).with_order(-1);
+        let mut m = Manifest::new(brain::PLUGIN_ID, Mount::SidebarBottom).with_order(-1);
         m.subscribes = vec![StateKey::Clock];
         m
     }

@@ -247,7 +247,7 @@ impl Plugin for Caw {
         // `SessionLocked` (fire on first unlock), each paired with its gating
         // capability (#484). `Notify` (#406) mirrors the briefing as a toast, so
         // the news lands even with the sidebar closed.
-        let mut m = Manifest::new("caw", Mount::SidebarTop);
+        let mut m = Manifest::new(briefing::PLUGIN_ID, Mount::SidebarTop);
         m.subscribes = vec![StateKey::CalendarUpcoming, StateKey::SessionLocked];
         m.capabilities = vec![
             Capability::Notify,

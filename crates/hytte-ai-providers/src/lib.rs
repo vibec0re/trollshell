@@ -64,6 +64,21 @@ pub struct Provider {
     /// endpoints (`OpenRouter`); a local `llama-server` ignores it (uses its
     /// loaded model), so it's optional there.
     pub model: Option<String>,
+    /// A stable identifier for *this caller*, sent as `OpenAI`'s `user` field
+    /// when `Some` and omitted entirely when `None` (#704).
+    ///
+    /// The spec defines it as an end-user identifier, and most endpoints treat
+    /// it as an abuse-tracking hint they may ignore. `hytte-claude-bridge` puts
+    /// it to work: without it the bridge has to *guess* which conversation a
+    /// request continues by hashing the transcript, so two plugins whose
+    /// prompts happen to agree land in one `claude` session — which #693
+    /// measured forking silently under concurrent use. With it, each plugin
+    /// names itself and gets its own.
+    ///
+    /// Set it to something stable and distinct per caller; the plugin id is the
+    /// natural choice (unique, and it survives a restart). Leaving it `None`
+    /// keeps the pre-#704 behaviour exactly.
+    pub user: Option<String>,
 }
 
 impl Provider {
@@ -77,6 +92,7 @@ impl Provider {
             base_url: "https://openrouter.ai/api".to_owned(),
             api_key: load_key("openrouter"),
             model: Some(model.into()),
+            user: None,
         }
     }
 
@@ -88,7 +104,16 @@ impl Provider {
             base_url: base_url.into(),
             api_key: None,
             model: None,
+            user: None,
         }
+    }
+
+    /// Name this caller, so the endpoint can tell its conversation from
+    /// anyone else's (#704). See [`Provider::user`].
+    #[must_use]
+    pub fn as_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
     }
 }
 
@@ -165,6 +190,11 @@ struct ChatRequest<'a> {
     /// servers whose templates don't know it simply ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<TemplateKwargs>,
+    /// `OpenAI`'s caller identifier, from [`Provider::user`] (#704). Omitted
+    /// from the wire entirely when unset, so a request from a caller that has
+    /// not opted in is byte-identical to what this crate sent before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -194,7 +224,9 @@ struct ChatChoiceMessage {
 /// Auth and the llama-only reasoning hint follow the provider's key:
 /// `Authorization: Bearer …` + `X-Title: trollshell` when `api_key` is `Some`;
 /// the `enable_thinking:false` template kwarg only when it's `None` (local
-/// `llama-server`). `provider.model` is sent in the body when set.
+/// `llama-server`). `provider.model` is sent in the body when set, and
+/// `provider.user` likewise (#704) — both are omitted from the wire when
+/// unset, never sent as null.
 ///
 /// Blocking — run it on a `spawn_blocking` thread. 2s connect timeout; the
 /// whole round trip is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
@@ -221,6 +253,7 @@ pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Resul
         chat_template_kwargs: provider.api_key.is_none().then_some(TemplateKwargs {
             enable_thinking: false,
         }),
+        user: provider.user.as_deref(),
     };
     let mut builder = agent.post(&url);
     if let Some(key) = &provider.api_key {
@@ -448,6 +481,7 @@ mod tests {
             base_url: base,
             api_key: Some("sk-x".to_owned()),
             model: Some("google/nope".to_owned()),
+            user: None,
         };
         let err = chat(&provider, &[Message::user("hi")], &ChatOpts::default())
             .expect_err("a non-2xx is an error");
@@ -468,6 +502,7 @@ mod tests {
             base_url: format!("{base}/"),
             api_key: Some("sk-test-123".to_owned()),
             model: Some("google/gemini".to_owned()),
+            user: None,
         };
         let msgs = [Message::system("be brief"), Message::user("hey")];
         let out = chat(
@@ -533,6 +568,53 @@ mod tests {
             json["chat_template_kwargs"]["enable_thinking"], false,
             "local → the reasoning-off kwarg is sent: {json}"
         );
+        assert!(
+            json.get("user").is_none(),
+            "no identity → no `user` on the wire at all (#704): {json}"
+        );
+    }
+
+    /// A caller that has not named itself must send a body byte-identical to
+    /// the pre-#704 one: `user` **absent**, not `null`. `hytte-claude-bridge`
+    /// reads an absent field as "fall back to the content hash", and a `null`
+    /// would parse the same way here but is a needless wire change that a
+    /// stricter `OpenAI`-compatible endpoint could reject (#704).
+    #[test]
+    fn chat_omits_the_user_field_entirely_when_unset() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (base, handle) = fake_server(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        chat(
+            &Provider::llama(base),
+            &[Message::user("hey")],
+            &ChatOpts::default(),
+        )
+        .expect("chat succeeds");
+
+        let raw = handle.join().expect("server thread");
+        let (_head, body) = split_request(&raw);
+        assert!(
+            !body.contains("user\":"),
+            "the key must not appear at all, null included: {body}"
+        );
+    }
+
+    /// …and a caller that *has* named itself sends it verbatim, which is the
+    /// only thing carrying the identity to the bridge (#704).
+    #[test]
+    fn chat_sends_the_user_field_when_set() {
+        let _guard = TEST_SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (base, handle) = fake_server(r#"{"choices":[{"message":{"content":"ok"}}]}"#);
+        chat(
+            &Provider::llama(base).as_user("pet"),
+            &[Message::user("hey")],
+            &ChatOpts::default(),
+        )
+        .expect("chat succeeds");
+
+        let raw = handle.join().expect("server thread");
+        let (_head, body) = split_request(&raw);
+        let json: serde_json::Value = serde_json::from_str(body).expect("body is json");
+        assert_eq!(json["user"], "pet");
     }
 
     #[test]

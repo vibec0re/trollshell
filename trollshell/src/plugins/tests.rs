@@ -21,7 +21,10 @@ use super::datasource::DatasourceRouter;
 use super::effects::broker_effect;
 use super::effects::{PageAction, map_page, map_page_for_layout, resolve_open_page};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
-use super::pump::{any_sidebar_open, apply_forget, apply_open, to_now_playing, to_upcoming_events};
+use super::pump::{
+    any_sidebar_open, apply_forget, apply_open, tint_in_process_surfaces, to_now_playing,
+    to_upcoming_events,
+};
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
     EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
@@ -2568,4 +2571,54 @@ async fn now_playing_reseed_only_fires_on_the_rising_edge() {
         ),
         other => panic!("the falling edge must not re-seed now-playing: {other:?}"),
     }
+}
+
+/// The shell's own preem surfaces follow the desktop accent (#862).
+///
+/// #857 made the shell rasterise `hytte-preem` in-process (the stats drawer's
+/// per-core LED panel), and the kit resolves palette ink from a **process
+/// global** that only `hytte_preem::set_accent` writes. Nothing in the shell
+/// wrote it, so a shell-side surface asking for palette ink rendered the kit
+/// default while every out-of-process plugin correctly followed the session
+/// accent.
+///
+/// Rendering is the only way to observe this: the kit exposes no accent
+/// getter, deliberately — the accent is an input to `palette()`, not state a
+/// caller reads back. So this drives a real widget and looks at its pixels.
+///
+/// **Deletion check:** removing the `set_accent` call from
+/// [`tint_in_process_surfaces`] turns all three assertions red. The remaining
+/// seam — `publish_accent` calling it — needs a registered `PluginHandles` and
+/// is not covered here.
+///
+/// Touches process-global state and restores `None` before returning; if a
+/// second test ever reads the accent, the two must not run concurrently.
+#[test]
+fn the_accent_reaches_the_shells_own_preem_surfaces() {
+    let lit_pixels = |accent: Option<[u8; 4]>| {
+        tint_in_process_surfaces(accent);
+        hytte_preem::dot_matrix("8", hytte_preem::DisplayStyle::Vfd)
+            .data()
+            .to_vec()
+    };
+
+    let plain = lit_pixels(None);
+    let teal = lit_pixels(Some([0x11, 0x99, 0xaa, 0xff]));
+    let rose = lit_pixels(Some([0xdd, 0x22, 0x66, 0xff]));
+    tint_in_process_surfaces(None);
+
+    assert_ne!(
+        plain, teal,
+        "setting an accent must change what a palette-ink widget renders (#862)"
+    );
+    assert_ne!(
+        teal, rose,
+        "two different accents must render differently, so the first assertion cannot pass \
+         merely because any call at all perturbs the output"
+    );
+    assert!(
+        teal.chunks_exact(4)
+            .any(|px| px == [0x11, 0x99, 0xaa, 0xff]),
+        "a fully-lit dot should carry the accent exactly, not merely something derived from it"
+    );
 }

@@ -35,8 +35,32 @@ pub(super) fn set_clock(cs: ClockState) {
     });
 }
 
-/// Publish the resolved desktop accent to the per-conn accent tasks (#376).
+/// Tint the shell's **own** in-process `hytte-preem` surfaces to the desktop
+/// accent (#862).
+///
+/// Out-of-process plugins learn the accent from [`publish_accent`]'s watch
+/// channel and apply it inside their own process. Since #857 the shell
+/// rasterises preem surfaces too — the stats drawer's per-core LED panel — and
+/// those live in *this* process, where the kit reads a process-global set by
+/// `hytte_preem::set_accent`. Nothing was setting it, so a shell-side surface
+/// asking for palette ink got the kit default instead of the session accent.
+///
+/// A separate function from [`publish_accent`] only so it is reachable from a
+/// test without a registered `PluginHandles` — the same reason
+/// [`super::wire_map::pixels_len_ok`] and friends are split out.
+///
+/// `hytte_preem::Rgba` **is** `[u8; 4]`, so the quad crosses unconverted; the
+/// kit forces alpha opaque on its own (a preem frame is a screen).
+pub(super) fn tint_in_process_surfaces(accent: Option<[u8; 4]>) {
+    hytte_preem::set_accent(accent);
+}
+
+/// Publish the resolved desktop accent to the per-conn accent tasks (#376) and
+/// to the shell's own preem surfaces (#862).
 pub(super) fn publish_accent(accent: Option<[u8; 4]>) {
+    // Before the channel send, so an in-process surface redrawn by a plugin
+    // waking on the accent push already sees the new ink.
+    tint_in_process_surfaces(accent);
     registry::with(|r| {
         r.get::<PluginHandles>()
             .expect("plugins::service() not registered")

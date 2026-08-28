@@ -484,6 +484,59 @@ title` in the stderr tail — worth a deliberate look on first run, since
   metadata that way to exercise live; otherwise it's covered by hermetic
   parse tests only.
 
+- [ ] **(#838/#851/#854)** The bar's media control picking full-row vs mini
+      chip. **Six** fixes shipped against this one bug and five of them
+      failed, so walk all of it rather than glancing at the bar. The shape on
+      `main` pins the title label to `TITLE_CHARS = 24` in both directions,
+      which makes the full transport row's natural width a constant, and hands
+      the full-vs-mini decision to an `AdwBreakpointBin` whose single
+      `max-width` breakpoint is measured once from the built row and then
+      frozen. Nothing measures neighbours at runtime any more —
+      `components/center_budget.rs` is deleted. What to check: 0. **First, confirm you are running #854.** Between #851 and #854 the mini
+      chip was allocated outside the bin's `GTK_OVERFLOW_HIDDEN` clip rect and
+      was drawn nowhere at all — the centre slot went _empty_, leaving a dead
+      ~250-290 px hole with nothing to click. If you see that, you are on a
+      pre-#854 build and the rest of this list will mislead you: an absent chip
+      is the old breakage, a _mispositioned_ or _flickering_ one would be new.
+      `journalctl --user -u trollshell | grep "exceeds AdwBreakpointBin"`
+      prints one line per allocation on a pre-#854 build and nothing after.
+  1. **The original bug.** With a player **stopped** (not merely paused —
+     stopped, so there is no position to show), the centre slot must show the
+     **mini chip**, not the full transport row, and must not crowd the
+     app-switcher buttons beside it. This is the symptom the issue was filed
+     on. The chip sits at the **left** edge of the centre slot when collapsed
+     (`halign: Start`), while the full row hugs the right-hand cluster when
+     there is room — that asymmetry is deliberate, and is what keeps the chip
+     inside the rectangle the bin paints.
+  2. **Sidebar open/close — the case that failed twice.** Open and close the
+     sidebar while a track plays. The centre slot must settle into the right
+     rendition **immediately and stay there**. Iterations 2 and 4 both failed
+     the same way: they published a slot width computed from the bar's size
+     _before_ the compositor's configure had landed, so the widget sat in the
+     wrong rendition until unrelated niri traffic (a window-title tick)
+     happened to trigger a remeasure. If the right answer arrives only after
+     you click around, that class is back.
+  3. **No blinking.** Play a track with the screen full of windows whose
+     titles change often (a browser tab, or a terminal running something
+     chatty) and watch the centre slot for a while. It must never flip
+     between full row and mini chip on its own. Iteration 3's failure was
+     exactly this: the fit was recomputed off the window list's natural
+     width, which tracks live window titles, so the chip blinked several
+     times a second.
+  4. **Title truncation is deliberate.** Track titles now ellipsize at 24
+     characters and the row no longer grows with a long title. That is the
+     mechanism rather than a regression — a constant row width is what makes
+     the frozen breakpoint threshold correct. `TITLE_CHARS` in
+     `trollshell/src/widgets/mpris.rs` is a one-line taste knob if 24 reads
+     as too tight or too wide.
+  5. **One expected regression, disclosed.** The mini chip still _requests_
+     the full row's width — that request-stability is what makes the blink
+     loop structurally impossible — so the space it gives up falls into the
+     bar's mid-gap rather than back to the window list. Long **window**
+     titles therefore ellipsize slightly sooner than before #851. Tunable,
+     but only by re-coupling the widget to its neighbours, which is the thing
+     that failed four times.
+
 ## Preem raster kit (`hytte-plugin::preem`)
 
 The kit's own widget skins, which CI can only check as byte patterns. Every

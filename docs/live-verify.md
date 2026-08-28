@@ -764,6 +764,49 @@ audio feed, not the raster.
       faked to return `None`), confirm the multicolumn grid's row 2 has no
       visible hole — Disks should slide into column 0 when the GPU card hides
       itself.
+- [ ] **(#857)** **Blinken Lichten** — the CPU card's per-core row is now an
+      LED **panel** (one lamp per core, each lit to that core's load) instead
+      of a `GtkFlowBox` of vertical progress bars. This is a look-and-feel
+      feature: CI can only check byte patterns, so everything below wants
+      eyes.
+  - Open the Stats drawer's CPU card. Expect a near-square grid of glowing
+    lamps that visibly breathes with load — hammer a core (`yes >/dev/null`,
+    one per core you want lit) and watch that lamp go from blue toward red on
+    the default `heat` map. The panel is centred in its row and should be
+    roughly 70–105 px tall on any machine.
+  - **The #702 check.** Drag the drawer / shrink the output as narrow as it
+    goes. The panel must **letterbox down**, never force the drawer wider. Its
+    reported minimum width is 0 px at any core count (one `PixelSurface`, whose
+    `measure` hard-codes a 0 minimum, replaces 64 bars each with an 8 px CSS
+    floor). If the drawer's minimum width grew, this regressed.
+  - **The colour axis is orthogonal to the skin.** Set
+    `TROLLSHELL_CORE_LEDS_STYLE=crt` **and** `TROLLSHELL_CORE_LEDS_COLOR=heat`
+    and restart the shell: expect heat-coloured lamps _through_ the CRT's
+    scanline comb and curved-glass vignette — both at once, not one instead of
+    the other. That composition is the whole design claim of #857 and the
+    single most valuable thing to eyeball.
+  - Sweep the four knobs (each takes effect on shell restart; an unrecognized
+    value logs one `tracing::warn` and falls back):
+    - `TROLLSHELL_CORE_LEDS_STYLE` = `vfd` (default) / `lcd` / `oled` / `crt`
+    - `TROLLSHELL_CORE_LEDS_COLOR` = `heat` (default) / `style` / `rainbow` /
+      `transpride` / `#rrggbb`. `style` should give the plain single-ink panel
+      — the pre-#857 look, and the guarantee the byte-identity tests pin.
+    - `TROLLSHELL_CORE_LEDS_ROWS` = `rect` (default, near-square) or a row
+      count. `=3` on a many-core box makes a wide, short strip — check it does
+      not push the drawer wider (it is 245 px at 1× on a 64-core box, and the
+      scale deliberately refuses to blow it up past the budget).
+    - `TROLLSHELL_CORE_LEDS_FILL` = `spare` (default) / `blank` — only visible
+      when the last row is ragged **and** the skin ghosts, so pair it with
+      `…_ROWS=3` and `…_STYLE=lcd` (or `vfd`). `spare` shows unlit lamps
+      filling the tail, `blank` leaves the gap bare. On `oled`/`crt` the two
+      are identical by construction (no ghost to differ on).
+  - Hover the panel: the tooltip should read
+    `N cores · avg X% · max Y% (core K)`. This **replaces** the old per-bar
+    `"42%"` tooltip — the per-lamp readout is gone (a pointer-precise version
+    needs the inverse of `PixelSurface`'s letterbox transform; noted as a
+    follow-up).
+  - Sanity: on a 1-core VM / container the panel is a single blown-up lamp,
+    not an empty row. Verified only against synthetic level slices in tests.
 
 ## Weather & location
 

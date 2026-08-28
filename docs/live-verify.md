@@ -484,20 +484,30 @@ title` in the stderr tail — worth a deliberate look on first run, since
   metadata that way to exercise live; otherwise it's covered by hermetic
   parse tests only.
 
-- [ ] **(#838/#851)** The bar's media control picking full-row vs mini chip.
-      Five fixes shipped against this one bug and four of them failed on real
-      glass, so it is worth walking all of it rather than glancing at the bar.
-      The final shape (#851) pins the title label to `TITLE_CHARS = 24` in
-      both directions, which makes the full transport row's natural width a
-      constant, and hands the full-vs-mini decision to an `AdwBreakpointBin`
-      whose single `max-width` breakpoint is measured once from the built row
-      and then frozen. Nothing measures neighbours at runtime any more —
-      `components/center_budget.rs` is deleted. What to check:
+- [ ] **(#838/#851/#854)** The bar's media control picking full-row vs mini
+      chip. **Six** fixes shipped against this one bug and five of them
+      failed, so walk all of it rather than glancing at the bar. The shape on
+      `main` pins the title label to `TITLE_CHARS = 24` in both directions,
+      which makes the full transport row's natural width a constant, and hands
+      the full-vs-mini decision to an `AdwBreakpointBin` whose single
+      `max-width` breakpoint is measured once from the built row and then
+      frozen. Nothing measures neighbours at runtime any more —
+      `components/center_budget.rs` is deleted. What to check: 0. **First, confirm you are running #854.** Between #851 and #854 the mini
+      chip was allocated outside the bin's `GTK_OVERFLOW_HIDDEN` clip rect and
+      was drawn nowhere at all — the centre slot went _empty_, leaving a dead
+      ~250-290 px hole with nothing to click. If you see that, you are on a
+      pre-#854 build and the rest of this list will mislead you: an absent chip
+      is the old breakage, a _mispositioned_ or _flickering_ one would be new.
+      `journalctl --user -u trollshell | grep "exceeds AdwBreakpointBin"`
+      prints one line per allocation on a pre-#854 build and nothing after.
   1. **The original bug.** With a player **stopped** (not merely paused —
      stopped, so there is no position to show), the centre slot must show the
      **mini chip**, not the full transport row, and must not crowd the
      app-switcher buttons beside it. This is the symptom the issue was filed
-     on.
+     on. The chip sits at the **left** edge of the centre slot when collapsed
+     (`halign: Start`), while the full row hugs the right-hand cluster when
+     there is room — that asymmetry is deliberate, and is what keeps the chip
+     inside the rectangle the bin paints.
   2. **Sidebar open/close — the case that failed twice.** Open and close the
      sidebar while a track plays. The centre slot must settle into the right
      rendition **immediately and stay there**. Iterations 2 and 4 both failed

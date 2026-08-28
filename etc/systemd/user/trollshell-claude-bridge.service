@@ -81,8 +81,15 @@ RestartSec=5
 #   Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=8           # must stay under 10
 #   Environment=CLAUDE_BRIDGE_PORT=8787
 #   Environment=CLAUDE_BRIDGE_STATE_DIR=%h/.local/state/hytte-claude-bridge
-#       # `claude` modes only — it is the child's cwd, which is what scopes
-#       # claude's on-disk sessions. api mode spawns no child and ignores it.
+#       # Two things live here. The `claude` modes run the child with this as
+#       # its cwd, which is what scopes claude's on-disk sessions; api mode
+#       # spawns no child and ignores that half. All three read
+#       # retired-sessions.json — the map of "this conversation's session
+#       # overflowed, it continues as this other title" — so a restart resumes
+#       # an already-rotated conversation where it left off instead of
+#       # replaying the overflow as one failed turn (#855). Only the
+#       # subscription mode ever rotates, so only it writes that file, and
+#       # deleting it costs at most one failed turn per rotated conversation.
 
 # ── CLAUDE_BRIDGE_MODE=api: the key goes in a FILE, not the environment ───────
 # api mode holds a real Anthropic API key and bills metered credits, so it is

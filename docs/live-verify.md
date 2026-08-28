@@ -274,6 +274,19 @@ title` in the stderr tail — worth a deliberate look on first run, since
      under 10, or point caw at a faster model via `CLAUDE_BRIDGE_MODEL`), not
      a regression to file.
 
+- [ ] **(#855)** A session rotation now survives a bridge restart. Nothing in
+      CI can drive a real overflow (no `claude` binary, and a genuine one takes
+      ~10³ turns), so this is the half only a live session can show. After the
+      journal has logged a rotation
+      (`claude session is past the context window: retiring it`), confirm
+      `~/.local/state/hytte-claude-bridge/retired-sessions.json` exists and
+      names the `-g1` title. Then restart the unit and check the journal for
+      `restored the retired-session map` at startup. The next turn of that
+      conversation must answer normally — **not** 413 and rotate again, which
+      is exactly the failed turn (a canned fallback line on glass) this
+      removes. Deleting the file by hand must also be harmless: the bridge
+      starts clean and costs at most that one turn back.
+
 ## Caw (morning briefing)
 
 - [ ] **(#483)** Poke caw and confirm the taller 8-row briefing bubble renders

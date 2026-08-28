@@ -3,9 +3,11 @@
 //!
 //! **Requests** accept exactly what `hytte_ai_providers::chat` sends
 //! (`crates/hytte-ai-providers/src/lib.rs`): `model`, `messages`, `max_tokens`,
-//! `temperature`, and llama's `chat_template_kwargs.enable_thinking`. Unknown
-//! fields are tolerated and ignored (serde's default), so a slightly different
-//! `OpenAI` client still gets an answer rather than a 400.
+//! `temperature`, llama's `chat_template_kwargs.enable_thinking`, and — since
+//! #704 — the spec's own `user`, which is the one field here that changes what
+//! the bridge *does* rather than merely being tolerated. Unknown fields are
+//! tolerated and ignored (serde's default), so a slightly different `OpenAI`
+//! client still gets an answer rather than a 400.
 //!
 //! **Responses** return exactly what that `chat()` parses back: the first
 //! choice's `message.content`. The rest of the envelope (`id`, `object`,
@@ -60,6 +62,17 @@ pub struct ChatRequest {
     /// exact client this exists for.
     #[serde(default)]
     pub chat_template_kwargs: Option<TemplateKwargs>,
+    /// Caller-supplied session identity (#704) — `OpenAI`'s own `user` field,
+    /// which the spec already defines as a stable per-caller identifier, put
+    /// to work here as the conversation handle the bridge otherwise has to
+    /// *guess* from the transcript.
+    ///
+    /// Absent → the content-hash fallback in [`crate::session`], which is what
+    /// every pre-#704 client does and what this crate did before #704. Present
+    /// → the title is derived from it instead, in a namespace disjoint from
+    /// the hash-derived one (see [`crate::session::Key`]).
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// The llama-only template kwargs object. Parsed so it can be *ignored*
@@ -163,6 +176,28 @@ mod tests {
         assert_eq!(req.messages[1].content, "poke");
         assert_eq!(req.max_tokens, Some(256));
         assert!(req.chat_template_kwargs.is_some());
+        // The body a pre-#704 client sends carries no identity at all.
+        assert_eq!(req.user, None);
+    }
+
+    /// A client that opts in to #704 sends `user`, and it must survive the
+    /// parse — this is the only thing that carries the identity into
+    /// `session.rs`.
+    #[test]
+    fn an_explicit_user_identity_is_parsed() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}],"user":"pet"}"#;
+        let req: ChatRequest = serde_json::from_slice(body).expect("parses");
+        assert_eq!(req.user.as_deref(), Some("pet"));
+    }
+
+    /// An absent `user` deserialises to `None` rather than failing the request:
+    /// the field is additive, so every body written before #704 must still
+    /// parse (#704).
+    #[test]
+    fn an_absent_user_deserialises_to_none() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: ChatRequest = serde_json::from_slice(body).expect("parses");
+        assert_eq!(req.user, None);
     }
 
     /// A keyed provider sends `model` and no template kwargs.

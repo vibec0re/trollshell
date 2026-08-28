@@ -144,6 +144,13 @@ pub(crate) fn parse_time(raw: Option<&str>) -> Option<u16> {
 /// local/self-hosted backend (keyless OK); no URL defaults to `OpenRouter`
 /// **only when a key exists** (a keyless cloud call would just 401, so it
 /// short-circuits to the plain path instead of a doomed round-trip).
+/// The identity caw sends as `OpenAI`'s `user` (#704), and the id she
+/// registers under — the pet's `PLUGIN_ID` arrangement verbatim, and distinct
+/// from it, which is the whole point: two plugins that name themselves can
+/// never share a `claude` session however alike their prompts get. See
+/// [`Provider::user`].
+pub const PLUGIN_ID: &str = "caw";
+
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
@@ -155,11 +162,13 @@ fn resolve_provider(
             base_url: url.to_owned(),
             api_key: key,
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
         None => key.map(|key| Provider {
             base_url: "https://openrouter.ai/api".to_owned(),
             api_key: Some(key),
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
     }
 }
@@ -485,6 +494,20 @@ mod tests {
         // No URL, no key → plain-only; no doomed 401 round-trips (#438/#472).
         assert!(resolve_provider(None, None, None).is_none());
         assert!(resolve_provider(None, None, Some("m".to_owned())).is_none());
+    }
+
+    /// caw names herself on every backend (#704), and as somebody other than
+    /// the pet — the distinctness is what keeps the two out of one `claude`
+    /// session, so it is worth asserting rather than assuming.
+    #[test]
+    fn every_resolved_provider_carries_the_plugin_identity() {
+        for p in [
+            resolve_provider(Some("http://host:1"), None, None),
+            resolve_provider(None, Some("sk-1".to_owned()), None),
+        ] {
+            assert_eq!(p.expect("resolves").user.as_deref(), Some(PLUGIN_ID));
+        }
+        assert_ne!(PLUGIN_ID, "pet");
     }
 
     #[test]

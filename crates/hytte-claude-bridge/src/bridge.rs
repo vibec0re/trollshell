@@ -10,7 +10,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::backend::{Backend, Conversation as _, Turn};
 use crate::http::{self, Failure, Head};
-use crate::session::{self, Rotation, Titles};
+use crate::session::{self, Key, Rotation, Titles};
 use crate::wire::{ChatRequest, ChatResponse, ErrorBody, Message};
 
 /// Concurrent `claude` turns. Two, because this is one person's desktop and a
@@ -28,7 +28,7 @@ pub struct Bridge {
     backend: Backend,
     titles: Mutex<Titles>,
     permits: Semaphore,
-    inflight: Mutex<HashMap<u64, watch::Receiver<Shared>>>,
+    inflight: Mutex<HashMap<Key, watch::Receiver<Shared>>>,
     /// Serialises the session-rotation path (#667) — the decision **and** the
     /// turn that mints the replacement.
     ///
@@ -100,10 +100,14 @@ impl Bridge {
             max_tokens = ?req.max_tokens,
             temperature = ?req.temperature,
             enable_thinking = ?req.chat_template_kwargs.and_then(|k| k.enable_thinking),
+            user = ?req.user,
             "accepted the sampling knobs",
         );
 
-        match self.complete(&req.messages, req.max_tokens).await {
+        match self
+            .complete(&req.messages, req.user.as_deref(), req.max_tokens)
+            .await
+        {
             Ok(text) => ok_response(text, req.model, &req.messages),
             Err(f) => {
                 tracing::warn!(status = f.status, message = %f.message, "request failed");
@@ -118,15 +122,20 @@ impl Bridge {
     /// paying twice for the same answer is pure waste — of a subscription that
     /// is rate-limited, and, on the API backend, of real money.
     ///
-    /// The key is the transcript alone, deliberately: `max_tokens` is a cap on
-    /// the answer, not part of the question, and keying on it would split two
-    /// otherwise-identical in-flight requests into two paid turns.
+    /// The key is the transcript **and the caller's identity**, deliberately:
+    /// `max_tokens` is a cap on the answer, not part of the question, and keying
+    /// on it would split two otherwise-identical in-flight requests into two
+    /// paid turns — while two *different* callers (#704) are two conversations
+    /// in two sessions, so sharing one answer between them would undo at the
+    /// reply what the identity separated at the session. A request with no
+    /// `user` keys exactly as it did before #704.
     async fn complete(
         &self,
         messages: &[Message],
+        user: Option<&str>,
         max_tokens: Option<u32>,
     ) -> Result<String, Failure> {
-        let key = session::transcript_key(messages);
+        let key = session::flight_key(messages, user);
         let leader = {
             let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(rx) = inflight.get(&key) {
@@ -146,7 +155,7 @@ impl Bridge {
                     inflight: &self.inflight,
                     key,
                 };
-                let outcome = self.run_turn(messages, max_tokens).await;
+                let outcome = self.run_turn(messages, user, max_tokens).await;
                 let _ = tx.send(Some(Arc::new(outcome.clone())));
                 outcome
             }
@@ -157,6 +166,7 @@ impl Bridge {
     async fn run_turn(
         &self,
         messages: &[Message],
+        user: Option<&str>,
         max_tokens: Option<u32>,
     ) -> Result<String, Failure> {
         let Ok(_permit) = self.permits.try_acquire() else {
@@ -172,14 +182,14 @@ impl Bridge {
             .titles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .resolve(messages);
+            .resolve(messages, user);
         tracing::debug!(title = %title, turns = messages.len(), "answering");
 
         // ONE budget for the whole request, rotation included: the client's own
         // global timeout does not restart just because the bridge retried.
         match tokio::time::timeout(
             self.budget,
-            self.answer(messages, delta, &title, max_tokens),
+            self.answer(messages, delta, &title, user, max_tokens),
         )
         .await
         {
@@ -226,10 +236,11 @@ impl Bridge {
         messages: &[Message],
         delta: &Message,
         title: &str,
+        user: Option<&str>,
         max_tokens: Option<u32>,
     ) -> Result<String, Failure> {
         let failure = match self.respond(messages, delta, title, max_tokens).await {
-            Ok(reply) => return Ok(self.record(title, messages, reply)),
+            Ok(reply) => return Ok(self.record(title, messages, user, reply)),
             Err(f) => f,
         };
         if !self.backend.is_persisted() {
@@ -252,11 +263,11 @@ impl Bridge {
         // Held across the replacement's first turn, not merely across the
         // decision — see the field docs. Only ever reached on an overflow.
         let _rotating = self.rotation.lock().await;
-        let Some(next) = self.retire(messages, title) else {
+        let Some(next) = self.retire(messages, user, title) else {
             return Err(failure);
         };
         let reply = self.respond(messages, delta, &next, max_tokens).await?;
-        Ok(self.record(&next, messages, reply))
+        Ok(self.record(&next, messages, user, reply))
     }
 
     /// One backend turn under `title`.
@@ -288,12 +299,12 @@ impl Bridge {
     /// leaves the *next* request pointed at the fresh session instead of back
     /// at the full one. A rotation that only became durable on success would
     /// leave the bridge exactly as stuck as it is today.
-    fn retire(&self, messages: &[Message], title: &str) -> Option<String> {
+    fn retire(&self, messages: &[Message], user: Option<&str>, title: &str) -> Option<String> {
         let mut titles = self.titles.lock().unwrap_or_else(PoisonError::into_inner);
         // Re-resolve under the lock: a request that raced us into the same
         // overflow may already have retired this session, and riding its
         // replacement is exactly what stops us minting a rival.
-        let current = titles.resolve(messages);
+        let current = titles.resolve(messages, user);
         if current != title {
             tracing::info!(
                 from = %title,
@@ -303,7 +314,7 @@ impl Bridge {
             return Some(current);
         }
         let next = session::next_title(&current)?;
-        titles.rotate_to(messages, &next);
+        titles.rotate_to(messages, user, &next);
         tracing::warn!(
             from = %title,
             to = %next,
@@ -316,19 +327,25 @@ impl Bridge {
 
     /// Remember the title this conversation answered under, so its next turn
     /// resolves to the same session.
-    fn record(&self, title: &str, messages: &[Message], reply: String) -> String {
+    fn record(
+        &self,
+        title: &str,
+        messages: &[Message],
+        user: Option<&str>,
+        reply: String,
+    ) -> String {
         self.titles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remember(title, messages, &reply);
+            .remember(title, messages, user, &reply);
         reply
     }
 }
 
 /// Removes an in-flight entry on drop, cancellation included.
 struct FlightGuard<'a> {
-    inflight: &'a Mutex<HashMap<u64, watch::Receiver<Shared>>>,
-    key: u64,
+    inflight: &'a Mutex<HashMap<Key, watch::Receiver<Shared>>>,
+    key: Key,
 }
 
 impl Drop for FlightGuard<'_> {
@@ -468,16 +485,67 @@ mod tests {
     fn retiring_a_full_session_points_the_conversation_at_a_successor() {
         let bridge = bridge();
         let convo = vec![msg("system", "you are a cat"), msg("user", "poke")];
-        let title = bridge.titles.lock().expect("unpoisoned").resolve(&convo);
+        let title = bridge
+            .titles
+            .lock()
+            .expect("unpoisoned")
+            .resolve(&convo, None);
 
-        let next = bridge.retire(&convo, &title).expect("rotatable");
+        let next = bridge.retire(&convo, None, &title).expect("rotatable");
         assert_eq!(next, format!("{title}-g1"));
         // The next poke — a different newest message, same conversation — must
         // land in the replacement rather than back in the session that just
         // overflowed.
         let later = vec![msg("system", "you are a cat"), msg("user", "poke again")];
         assert_eq!(
-            bridge.titles.lock().expect("unpoisoned").resolve(&later),
+            bridge
+                .titles
+                .lock()
+                .expect("unpoisoned")
+                .resolve(&later, None),
+            next
+        );
+    }
+
+    /// The same recovery must work for a conversation that named itself (#704):
+    /// an identity title fills up exactly like a hash-derived one, so if it
+    /// could not rotate, opting in would trade a silent collision for a
+    /// permanent 413.
+    #[test]
+    fn an_identified_conversation_retires_to_a_successor_too() {
+        let bridge = bridge();
+        let convo = vec![msg("system", "you are a cat"), msg("user", "poke")];
+        let user = Some("pet");
+        let title = bridge
+            .titles
+            .lock()
+            .expect("unpoisoned")
+            .resolve(&convo, user);
+
+        let next = bridge.retire(&convo, user, &title).expect("rotatable");
+        assert_eq!(next, format!("{title}-g1"));
+        // A wholly different transcript under the same identity is the same
+        // conversation, and must land in the replacement.
+        let later = vec![
+            msg("system", "you are a cat"),
+            msg("user", "something else"),
+        ];
+        assert_eq!(
+            bridge
+                .titles
+                .lock()
+                .expect("unpoisoned")
+                .resolve(&later, user),
+            next
+        );
+        // …and the identity-less conversation with that same transcript is
+        // untouched by any of it.
+        assert_ne!(
+            bridge
+                .titles
+                .lock()
+                .expect("unpoisoned")
+                .resolve(&convo, None),
             next
         );
     }
@@ -491,14 +559,22 @@ mod tests {
     fn a_concurrent_retirement_joins_the_replacement_instead_of_minting_a_rival() {
         let bridge = bridge();
         let convo = vec![msg("system", "persona"), msg("user", "one")];
-        let title = bridge.titles.lock().expect("unpoisoned").resolve(&convo);
+        let title = bridge
+            .titles
+            .lock()
+            .expect("unpoisoned")
+            .resolve(&convo, None);
 
-        let first = bridge.retire(&convo, &title).expect("rotatable");
+        let first = bridge.retire(&convo, None, &title).expect("rotatable");
         // The loser of the race still holds the pre-rotation title.
-        let second = bridge.retire(&convo, &title).expect("rotatable");
+        let second = bridge.retire(&convo, None, &title).expect("rotatable");
         assert_eq!(second, first, "the race minted a second session");
         assert_eq!(
-            bridge.titles.lock().expect("unpoisoned").resolve(&convo),
+            bridge
+                .titles
+                .lock()
+                .expect("unpoisoned")
+                .resolve(&convo, None),
             first
         );
     }

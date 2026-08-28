@@ -194,6 +194,17 @@ fn persona_or_none(raw: Option<&str>) -> Option<String> {
 /// explicit `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a
 /// `llama-server`, which needs no key) as the base, with any `key`/`model`
 /// layered on.
+/// The identity the pet sends as `OpenAI`'s `user` (#704), and the id it
+/// registers under. One constant for both on purpose: the property the bridge
+/// needs is that this string is stable across restarts and distinct from every
+/// other caller's, and the manifest id is already exactly that.
+///
+/// It reaches `hytte-claude-bridge` as the conversation handle, so the pet's
+/// session can never be the one caw is talking in — see [`Provider::user`].
+/// Endpoints that are not the bridge treat it as the abuse-tracking hint the
+/// spec describes, or ignore it.
+pub const PLUGIN_ID: &str = "pet";
+
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
@@ -208,6 +219,7 @@ fn resolve_provider(
             base_url: url.to_owned(),
             api_key: key,
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
         // No URL → the OpenRouter cloud default, but ONLY with a key. Keyless →
         // `None` (canned-only): the call would just 401, so skip it (#438).
@@ -215,6 +227,7 @@ fn resolve_provider(
             base_url: "https://openrouter.ai/api".to_owned(),
             api_key: Some(key),
             model,
+            user: Some(PLUGIN_ID.to_owned()),
         }),
     }
 }
@@ -781,6 +794,23 @@ mod tests {
         let p = resolve_provider(Some("http://host:2"), Some("k".to_owned()), None).unwrap();
         assert_eq!(p.base_url, "http://host:2");
         assert_eq!(p.api_key.as_deref(), Some("k"));
+    }
+
+    /// Whichever backend it resolves to, the pet names itself (#704) — the
+    /// bridge keys the conversation on this, so a provider that lost it would
+    /// silently fall back to sharing a session by transcript luck.
+    #[test]
+    fn every_resolved_provider_carries_the_plugin_identity() {
+        for p in [
+            resolve_provider(Some("http://host:1"), None, None),
+            resolve_provider(None, Some("sk-1".to_owned()), None),
+        ] {
+            assert_eq!(
+                p.expect("resolves").user.as_deref(),
+                Some(PLUGIN_ID),
+                "the provider must carry the pet's identity",
+            );
+        }
     }
 
     /// A one-shot fake OpenAI-compatible server that answers with `body`.

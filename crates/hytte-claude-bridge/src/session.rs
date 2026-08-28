@@ -22,6 +22,26 @@
 //! client that rewrites history, or a bridge restart, simply misses the map and
 //! starts a new session — degraded, never wrong.
 //!
+//! # Explicit identity (#704)
+//!
+//! That derivation is a *fallback*, and it is only ever as good as its luck:
+//! two plugins whose transcripts happen to agree land on one title, and #693
+//! measured what that costs — concurrent `claude --resume` calls do not
+//! serialise, they fork the session, silently. So a client may instead **say
+//! who it is**, in `OpenAI`'s own `user` field ([`crate::wire::ChatRequest`]),
+//! and the title is derived from that rather than from the transcript.
+//!
+//! The two derivations live in **disjoint** title spaces, and the disjointness
+//! is structural rather than probabilistic — see [`Key`]. That distinction is
+//! the point: a caller picks its own `user` string, so were the spaces merely
+//! adjacent it could name itself into another conversation's session. It
+//! cannot, at any string it is able to pick.
+//!
+//! **An absent `user` is byte-identical to the pre-#704 behaviour** — every
+//! function below reduces to exactly what it computed before, which is what
+//! makes this safe to land ahead of any client opting in, and is pinned by
+//! `an_absent_identity_is_byte_identical_to_the_hash_path`.
+//!
 //! # The constraint that must not regress
 //!
 //! On the subscription path the prompt sent into a **resumed** session is
@@ -73,6 +93,22 @@ pub const TITLE_PREFIX: &str = "hytte-bridge-";
 /// Separator between a title's base and its generation (see the module docs).
 /// A hex digest never contains it, so the split is unambiguous.
 const GENERATION_SEP: &str = "-g";
+
+/// Marks a title whose digest came from a caller-supplied identity rather than
+/// from a transcript (#704). Sits between [`TITLE_PREFIX`] and the digest, so
+/// an identity title reads `hytte-bridge-u-<16 hex>`.
+///
+/// `u` is not a hex digit, which is the whole mechanism: a hash-derived title
+/// has exactly [`KEY_HEX_LEN`] hex characters after the prefix, so no
+/// transcript can ever produce a string starting `u-` there and no identity
+/// title can ever be mistaken for one. See [`Key`].
+const USER_MARKER: &str = "u-";
+
+/// Domain tag folded in ahead of a caller-supplied identity, so the digest of
+/// the identity `"pet"` is not the digest of anything else that happens to
+/// hash one field. Belt to [`USER_MARKER`]'s braces: the marker already makes
+/// the two title spaces disjoint, and this makes their *digests* differ too.
+const USER_DOMAIN: &str = "identity";
 
 /// Width of the hex digest in a title, fixed by the `{:016x}` in [`title_for`].
 const KEY_HEX_LEN: usize = 16;
@@ -135,6 +171,38 @@ fn fnv1a_field(hash: u64, field: &str) -> u64 {
     fnv1a(hash, field.as_bytes())
 }
 
+/// A digest **paired with the space it was computed in** (#704).
+///
+/// The bridge derives conversation identity two ways — from the transcript, or
+/// from a caller-supplied `user` — and the two must never be confused, because
+/// the caller controls one of them and not the other. Carrying the space in the
+/// type rather than in a naming convention means the separation is enforced by
+/// construction at every point it matters:
+///
+/// - **In a title.** [`title_for`] renders `Transcript` as `hytte-bridge-<hex>`
+///   and `User` as `hytte-bridge-u-<hex>`. A hash title's digest is exactly
+///   [`KEY_HEX_LEN`] *hex* characters, and `u` is not one, so the two renderings
+///   cannot coincide — for *any* identity string, not merely for likely ones.
+///   This is the security-relevant half: titles are the on-disk names that
+///   `claude --resume` resolves against, shared with the human's own sessions.
+/// - **In the maps.** [`Titles`]' two [`Bounded`] maps are keyed on `Key`, so a
+///   64-bit collision between an identity digest and a transcript digest is not
+///   a lookup hit — the variants differ, and `Eq` compares them.
+///
+/// Note what this deliberately does *not* claim: two different `user` strings
+/// still share one space, and collide on a genuine 64-bit FNV collision, same
+/// as two transcripts do. That is not a weakness worth closing here, because a
+/// caller who wants another caller's session can simply *send its `user`
+/// string* — identity is asserted, never authenticated, exactly as it is in the
+/// `OpenAI` field this borrows. The bridge listens on loopback only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Key {
+    /// Derived from the conversation's transcript — the pre-#704 fallback.
+    Transcript(u64),
+    /// Derived from the caller's own `user` identity (#704).
+    User(u64),
+}
+
 /// A restart-stable digest of an exact message sequence.
 #[must_use]
 pub fn transcript_key(messages: &[Message]) -> u64 {
@@ -162,10 +230,66 @@ pub fn conversation_key(messages: &[Message]) -> u64 {
     }
 }
 
-/// The session title for a conversation key — generation 0, no suffix.
+/// A restart-stable digest of a caller-supplied identity (#704).
+///
+/// Hashed rather than embedded verbatim, for three reasons: a title must be a
+/// bounded, well-behaved string whatever the caller sends; an identity
+/// containing [`GENERATION_SEP`] would otherwise be indistinguishable from
+/// another identity's *rotated* title (the caller `"pet-g1"` would land on the
+/// second generation of `"pet"`); and a fixed-width digest keeps
+/// [`split_generation`] the same strict shape check for both spaces.
 #[must_use]
-pub fn title_for(key: u64) -> String {
-    format!("{TITLE_PREFIX}{key:016x}")
+pub fn user_key(user: &str) -> u64 {
+    fnv1a_field(fnv1a_field(FNV_OFFSET, USER_DOMAIN), user)
+}
+
+/// **The identity decision.** Which conversation a request belongs to: the one
+/// it named, else the one its transcript implies (#704).
+///
+/// With `user` absent this is exactly [`conversation_key`] in a `Transcript`
+/// wrapper — the pre-#704 value, unchanged.
+#[must_use]
+pub fn identity_key(messages: &[Message], user: Option<&str>) -> Key {
+    match user {
+        Some(user) => Key::User(user_key(user)),
+        None => Key::Transcript(conversation_key(messages)),
+    }
+}
+
+/// The key one *turn* collapses onto for single-flight (`Bridge::complete`).
+///
+/// Distinct from [`identity_key`]: that names the conversation across turns,
+/// this names one exact prompt within it, so two different questions from one
+/// identity are still two turns. It folds **both**, because sharing a turn is
+/// sharing an answer — and after #704 two callers with the same transcript are
+/// two conversations in two sessions, so handing one the other's reply would
+/// reintroduce, at the answer, precisely the cross-caller bleed the identity
+/// removed at the session.
+///
+/// With `user` absent this is exactly [`transcript_key`], as before #704.
+/// (Its `Key::User` digests share a variant with [`identity_key`]'s but never a
+/// map — `inflight` and [`Titles`] are separate — so the two never meet.)
+#[must_use]
+pub fn flight_key(messages: &[Message], user: Option<&str>) -> Key {
+    match user {
+        Some(user) => Key::User(fnv1a(
+            user_key(user),
+            &transcript_key(messages).to_le_bytes(),
+        )),
+        None => Key::Transcript(transcript_key(messages)),
+    }
+}
+
+/// The session title for a conversation key — generation 0, no suffix.
+///
+/// The two [`Key`] variants render into disjoint spaces; see that type for why
+/// the disjointness is structural and why it has to be.
+#[must_use]
+pub fn title_for(key: Key) -> String {
+    match key {
+        Key::Transcript(key) => format!("{TITLE_PREFIX}{key:016x}"),
+        Key::User(key) => format!("{TITLE_PREFIX}{USER_MARKER}{key:016x}"),
+    }
 }
 
 /// What to do with a conversation whose turn just failed.
@@ -218,11 +342,22 @@ pub fn next_title(title: &str) -> Option<String> {
     ))
 }
 
-/// Split a bridge title into its base (`hytte-bridge-<16 hex>`) and generation.
-/// Strict: anything that is not exactly the shape [`title_for`] and
+/// Split a bridge title into its base (`hytte-bridge-[u-]<16 hex>`) and
+/// generation. Strict: anything that is not exactly the shape [`title_for`] and
 /// [`next_title`] mint is rejected rather than guessed at.
+///
+/// Both spaces are accepted, deliberately. A title carrying an explicit
+/// identity fills up exactly like a hash-derived one, and #667's rotation is
+/// the only thing standing between a long-lived session and a permanent
+/// `PromptTooLong`; refusing to rotate the identity space would have made
+/// opting in to #704 a downgrade.
 fn split_generation(title: &str) -> Option<(&str, u32)> {
     let rest = title.strip_prefix(TITLE_PREFIX)?;
+    // `u` is not a hex digit, so this never strips part of a hash digest.
+    let (marker, rest) = match rest.strip_prefix(USER_MARKER) {
+        Some(after) => (USER_MARKER.len(), after),
+        None => (0, rest),
+    };
     let (hex, generation) = match rest.split_once(GENERATION_SEP) {
         Some((hex, suffix)) => (hex, suffix.parse::<u32>().ok()?),
         None => (rest, 0),
@@ -230,7 +365,10 @@ fn split_generation(title: &str) -> Option<(&str, u32)> {
     if hex.len() != KEY_HEX_LEN || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some((&title[..TITLE_PREFIX.len() + KEY_HEX_LEN], generation))
+    Some((
+        &title[..TITLE_PREFIX.len() + marker + KEY_HEX_LEN],
+        generation,
+    ))
 }
 
 /// Split a transcript into `(prefix, newest)`. `None` for an empty transcript —
@@ -278,16 +416,19 @@ pub fn prompt_for(attach: AttachKind, transcript: &[Message], delta: &Message) -
     }
 }
 
-/// A bounded, insertion-ordered `u64 → title` map.
+/// A bounded, insertion-ordered [`Key`] → title map.
 ///
 /// Not a true LRU: the working set is a handful of desktop plugin
 /// conversations, and evicting the oldest simply means the next turn of a
 /// long-dormant conversation starts a fresh session.
+///
+/// Keyed on [`Key`] rather than a bare `u64` (#704) so an entry written in one
+/// identity space can never be *read* from the other, whatever the digests do.
 #[derive(Debug)]
 struct Bounded {
     cap: usize,
-    by_key: HashMap<u64, String>,
-    order: VecDeque<u64>,
+    by_key: HashMap<Key, String>,
+    order: VecDeque<Key>,
 }
 
 impl Bounded {
@@ -299,11 +440,11 @@ impl Bounded {
         }
     }
 
-    fn get(&self, key: u64) -> Option<&String> {
+    fn get(&self, key: Key) -> Option<&String> {
         self.by_key.get(&key)
     }
 
-    fn insert(&mut self, key: u64, title: &str) {
+    fn insert(&mut self, key: Key, title: &str) {
         if self.by_key.insert(key, title.to_owned()).is_none() {
             self.order.push_back(key);
         }
@@ -355,10 +496,14 @@ impl Titles {
 
     /// The title for this request: the successor of a session this
     /// conversation retired, else the one already minted for the conversation
-    /// it continues, else a fresh one derived from its own prefix.
+    /// it continues, else a fresh one derived from its own identity.
+    ///
+    /// `user` is the caller's `OpenAI` identity when it sent one (#704). With
+    /// `None` this is the pre-#704 function exactly: the prefix hash, the same
+    /// two lookups, the same minting.
     #[must_use]
-    pub fn resolve(&self, messages: &[Message]) -> String {
-        let key = conversation_key(messages);
+    pub fn resolve(&self, messages: &[Message], user: Option<&str>) -> String {
+        let key = identity_key(messages, user);
         self.retired
             .get(key)
             .or_else(|| self.by_prefix.get(key))
@@ -373,11 +518,25 @@ impl Titles {
     /// - `messages ++ assistant(reply)` — the standard `OpenAI` loop, which
     ///   echoes the assistant turn back;
     /// - `messages` — a client that appends only its own next user message.
-    pub fn remember(&mut self, title: &str, messages: &[Message], reply: &str) {
+    ///
+    /// A caller that supplied its own identity (#704) needs none of this and
+    /// writes nothing: its next turn resolves from the identity alone, so there
+    /// is no minted title to recover. Writing the prefixes anyway would be
+    /// worse than redundant — a later request from a *different*, identity-less
+    /// caller presenting the same transcript would find this entry and inherit
+    /// this conversation's session, which is exactly the cross-caller bleed the
+    /// identity was sent to prevent, and would break the no-op guarantee for
+    /// clients that never opted in.
+    pub fn remember(&mut self, title: &str, messages: &[Message], user: Option<&str>, reply: &str) {
+        if user.is_some() {
+            return;
+        }
         let mut echoed = messages.to_vec();
         echoed.push(Message::assistant(reply));
-        self.by_prefix.insert(transcript_key(&echoed), title);
-        self.by_prefix.insert(transcript_key(messages), title);
+        self.by_prefix
+            .insert(Key::Transcript(transcript_key(&echoed)), title);
+        self.by_prefix
+            .insert(Key::Transcript(transcript_key(messages)), title);
     }
 
     /// Record that this conversation's session has been retired and that it now
@@ -387,8 +546,12 @@ impl Titles {
     /// like pet re-sends the same persona prefix with a different newest
     /// message every turn, so the conversation key is the only thing about it
     /// that is stable — and it is exactly what [`Titles::resolve`] looks up.
-    pub fn rotate_to(&mut self, messages: &[Message], title: &str) {
-        self.retired.insert(conversation_key(messages), title);
+    ///
+    /// For a caller with an explicit identity (#704) that stable thing is the
+    /// identity instead, which is what [`identity_key`] returns; the retirement
+    /// is recorded in that space and read back from it.
+    pub fn rotate_to(&mut self, messages: &[Message], user: Option<&str>, title: &str) {
+        self.retired.insert(identity_key(messages, user), title);
     }
 
     /// How many prefixes and retirements are currently mapped. Test-only: the
@@ -409,8 +572,9 @@ impl Titles {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachKind, OVERFLOW_STATUS, Rotation, TITLE_PREFIX, Titles, conversation_key, next_title,
-        prompt_for, render_transcript, rotation_for, split_delta, title_for, transcript_key,
+        AttachKind, Key, OVERFLOW_STATUS, Rotation, TITLE_PREFIX, Titles, USER_MARKER,
+        conversation_key, flight_key, identity_key, next_title, prompt_for, render_transcript,
+        rotation_for, split_delta, title_for, transcript_key, user_key,
     };
     use crate::http::Failure;
     use crate::wire::Message;
@@ -422,6 +586,12 @@ mod tests {
         }
     }
 
+    /// The generation-0 title a transcript-derived conversation mints — i.e.
+    /// the whole of the pre-#704 derivation, spelled once.
+    fn hash_title(messages: &[Message]) -> String {
+        title_for(Key::Transcript(conversation_key(messages)))
+    }
+
     /// The hash must be stable across *builds and restarts*, not merely within
     /// one process — a title that moves orphans every on-disk claude session.
     /// This literal is the regression pin: swapping in `DefaultHasher` (whose
@@ -430,10 +600,7 @@ mod tests {
     #[test]
     fn title_derivation_is_pinned_to_a_literal() {
         let transcript = [msg("system", "you are a cat"), msg("user", "poke")];
-        assert_eq!(
-            title_for(conversation_key(&transcript)),
-            "hytte-bridge-5a36669b9a22d7cc"
-        );
+        assert_eq!(hash_title(&transcript), "hytte-bridge-5a36669b9a22d7cc");
     }
 
     /// Same prefix ⇒ same title, run after run.
@@ -443,7 +610,7 @@ mod tests {
         let b = [msg("system", "persona"), msg("user", "two")];
         // Different newest message, identical prefix — same conversation.
         assert_eq!(conversation_key(&a), conversation_key(&b));
-        assert!(title_for(conversation_key(&a)).starts_with(TITLE_PREFIX));
+        assert!(hash_title(&a).starts_with(TITLE_PREFIX));
     }
 
     /// A changed prefix is a different conversation.
@@ -545,20 +712,20 @@ mod tests {
         let mut titles = Titles::new(64);
 
         let turn1 = vec![msg("system", "persona"), msg("user", "hello")];
-        let root = titles.resolve(&turn1);
-        titles.remember(&root, &turn1, "hi there");
+        let root = titles.resolve(&turn1, None);
+        titles.remember(&root, &turn1, None, "hi there");
 
         // Standard OpenAI loop: the client echoes the assistant reply back.
         let mut turn2 = turn1.clone();
         turn2.push(msg("assistant", "hi there"));
         turn2.push(msg("user", "again"));
-        assert_eq!(titles.resolve(&turn2), root);
+        assert_eq!(titles.resolve(&turn2, None), root);
 
-        titles.remember(&root, &turn2, "sure");
+        titles.remember(&root, &turn2, None, "sure");
         let mut turn3 = turn2.clone();
         turn3.push(msg("assistant", "sure"));
         turn3.push(msg("user", "and again"));
-        assert_eq!(titles.resolve(&turn3), root);
+        assert_eq!(titles.resolve(&turn3, None), root);
     }
 
     /// A client that appends its next user message *without* echoing the
@@ -567,12 +734,12 @@ mod tests {
     fn continuation_without_an_echoed_reply_still_resolves() {
         let mut titles = Titles::new(64);
         let turn1 = vec![msg("system", "persona"), msg("user", "hello")];
-        let root = titles.resolve(&turn1);
-        titles.remember(&root, &turn1, "hi there");
+        let root = titles.resolve(&turn1, None);
+        titles.remember(&root, &turn1, None, "hi there");
 
         let mut turn2 = turn1.clone();
         turn2.push(msg("user", "again"));
-        assert_eq!(titles.resolve(&turn2), root);
+        assert_eq!(titles.resolve(&turn2, None), root);
     }
 
     /// A rewritten history is a different conversation — degraded (a fresh
@@ -581,8 +748,8 @@ mod tests {
     fn rewritten_history_forks_a_new_conversation() {
         let mut titles = Titles::new(64);
         let turn1 = vec![msg("system", "persona"), msg("user", "hello")];
-        let root = titles.resolve(&turn1);
-        titles.remember(&root, &turn1, "hi there");
+        let root = titles.resolve(&turn1, None);
+        titles.remember(&root, &turn1, None, "hi there");
 
         let forked = vec![
             msg("system", "persona"),
@@ -590,7 +757,7 @@ mod tests {
             msg("assistant", "SOMETHING ELSE ENTIRELY"),
             msg("user", "again"),
         ];
-        assert_ne!(titles.resolve(&forked), root);
+        assert_ne!(titles.resolve(&forked, None), root);
     }
 
     /// An unmapped request mints its title deterministically rather than
@@ -600,7 +767,7 @@ mod tests {
     fn an_unknown_prefix_mints_deterministically() {
         let titles = Titles::new(4);
         let convo = vec![msg("system", "persona"), msg("user", "hello")];
-        assert_eq!(titles.resolve(&convo), titles.resolve(&convo));
+        assert_eq!(titles.resolve(&convo, None), titles.resolve(&convo, None));
         assert!(titles.is_empty());
     }
 
@@ -610,8 +777,8 @@ mod tests {
         let mut titles = Titles::new(4);
         for n in 0..50 {
             let convo = vec![msg("user", &format!("conversation {n}"))];
-            let title = titles.resolve(&convo);
-            titles.remember(&title, &convo, "ok");
+            let title = titles.resolve(&convo, None);
+            titles.remember(&title, &convo, None, "ok");
         }
         assert!(titles.len() <= 4, "map grew to {}", titles.len());
     }
@@ -623,7 +790,7 @@ mod tests {
     /// so getting it wrong would retire a healthy session on the first blip.
     #[test]
     fn a_non_overflow_failure_does_not_rotate() {
-        let title = title_for(conversation_key(&[msg("system", "persona")]));
+        let title = hash_title(&[msg("system", "persona")]);
         for status in [429, 502, 503, 504, 400] {
             assert_eq!(
                 rotation_for(&Failure::new(status, "nope"), &title),
@@ -637,7 +804,7 @@ mod tests {
     #[test]
     fn an_overflow_retires_the_session_to_the_next_generation() {
         let key = conversation_key(&[msg("system", "you are a cat"), msg("user", "poke")]);
-        let title = title_for(key);
+        let title = title_for(Key::Transcript(key));
         assert_eq!(
             rotation_for(&Failure::new(OVERFLOW_STATUS, "too long"), &title),
             Rotation::To(format!("{title}-g1"))
@@ -648,7 +815,7 @@ mod tests {
     /// than bouncing back to the generation-0 title that is already full.
     #[test]
     fn rotation_chains_across_generations() {
-        let base = title_for(conversation_key(&[msg("system", "persona")]));
+        let base = hash_title(&[msg("system", "persona")]);
         let mut title = base.clone();
         for generation in 1..=4u32 {
             let Rotation::To(next) = rotation_for(&Failure::new(OVERFLOW_STATUS, "x"), &title)
@@ -664,7 +831,7 @@ mod tests {
     /// with the generation-0 title it replaced.
     #[test]
     fn a_rotated_title_is_distinct_and_still_bridge_owned() {
-        let title = title_for(conversation_key(&[msg("user", "hello")]));
+        let title = hash_title(&[msg("user", "hello")]);
         let next = next_title(&title).expect("rotatable");
         assert_ne!(next, title);
         assert!(next.starts_with(TITLE_PREFIX));
@@ -702,17 +869,17 @@ mod tests {
     fn a_retired_conversation_resolves_to_its_replacement() {
         let mut titles = Titles::new(64);
         let convo = vec![msg("system", "persona"), msg("user", "poke")];
-        let title = titles.resolve(&convo);
+        let title = titles.resolve(&convo, None);
         let Rotation::To(next) = rotation_for(&Failure::new(OVERFLOW_STATUS, "x"), &title) else {
             panic!("not rotated");
         };
-        titles.rotate_to(&convo, &next);
+        titles.rotate_to(&convo, None, &next);
 
-        assert_eq!(titles.resolve(&convo), next);
+        assert_eq!(titles.resolve(&convo, None), next);
         // A *different* newest message is the same conversation, so it must
         // land in the replacement too.
         let later = vec![msg("system", "persona"), msg("user", "poke again")];
-        assert_eq!(titles.resolve(&later), next);
+        assert_eq!(titles.resolve(&later, None), next);
     }
 
     /// A retirement must outlive the traffic that follows it. `remember`
@@ -723,14 +890,14 @@ mod tests {
     fn a_retirement_survives_the_churn_of_later_turns() {
         let mut titles = Titles::new(8);
         let convo = vec![msg("system", "persona"), msg("user", "poke")];
-        let retired = format!("{}-g1", titles.resolve(&convo));
-        titles.rotate_to(&convo, &retired);
+        let retired = format!("{}-g1", titles.resolve(&convo, None));
+        titles.rotate_to(&convo, None, &retired);
 
         for n in 0..200 {
             let other = vec![msg("system", "persona"), msg("user", &format!("poke {n}"))];
-            titles.remember(&retired, &other, "quip");
+            titles.remember(&retired, &other, None, "quip");
         }
-        assert_eq!(titles.resolve(&convo), retired);
+        assert_eq!(titles.resolve(&convo, None), retired);
     }
 
     /// Retirements are bounded like everything else — a client that forks a new
@@ -740,8 +907,8 @@ mod tests {
         let mut titles = Titles::new(4);
         for n in 0..50 {
             let convo = vec![msg("user", &format!("conversation {n}"))];
-            let next = format!("{}-g1", titles.resolve(&convo));
-            titles.rotate_to(&convo, &next);
+            let next = format!("{}-g1", titles.resolve(&convo, None));
+            titles.rotate_to(&convo, None, &next);
         }
         assert!(titles.len() <= 8, "map grew to {}", titles.len());
     }
@@ -751,5 +918,246 @@ mod tests {
     fn transcript_rendering_is_labelled() {
         let rendered = render_transcript(&[msg("system", "s"), msg("user", "u")]);
         assert_eq!(rendered, "[system]\ns\n\n[user]\nu");
+    }
+
+    // ── explicit identity (#704) ───────────────────────────────────────────
+
+    /// Whether `title` lives in the **transcript** space — the space every
+    /// pre-#704 session on disk was minted into, and the one a caller must
+    /// never be able to reach.
+    fn in_transcript_space(title: &str) -> bool {
+        title
+            .strip_prefix(TITLE_PREFIX)
+            .is_some_and(|rest| !rest.starts_with(USER_MARKER))
+    }
+
+    /// **The backward-compatibility pin.** With no `user`, every part of the
+    /// derivation must produce exactly the pre-#704 value — not merely an
+    /// equivalent one.
+    ///
+    /// This is the test the whole change rests on: it is what makes #704 safe
+    /// to land before any client opts in, because it says in one place that a
+    /// client which never sends `user` cannot tell the difference. The title
+    /// literal is the same one `title_derivation_is_pinned_to_a_literal`
+    /// carries, repeated here deliberately: if a future refactor namespaces the
+    /// *fallback* too, both fail and the orphaning is caught before it ships.
+    #[test]
+    fn an_absent_identity_is_byte_identical_to_the_hash_path() {
+        let convo = [msg("system", "you are a cat"), msg("user", "poke")];
+
+        // The minted title, byte for byte.
+        assert_eq!(
+            Titles::new(64).resolve(&convo, None),
+            "hytte-bridge-5a36669b9a22d7cc"
+        );
+        // The identity key is the conversation key, in the transcript space.
+        assert_eq!(
+            identity_key(&convo, None),
+            Key::Transcript(conversation_key(&convo))
+        );
+        // The single-flight key is the transcript key, unchanged.
+        assert_eq!(
+            flight_key(&convo, None),
+            Key::Transcript(transcript_key(&convo))
+        );
+        // And the whole multi-turn continuation still lands on the root title.
+        let mut titles = Titles::new(64);
+        let root = titles.resolve(&convo, None);
+        titles.remember(&root, &convo, None, "mrrp");
+        let mut turn2 = convo.to_vec();
+        turn2.push(msg("assistant", "mrrp"));
+        turn2.push(msg("user", "poke again"));
+        assert_eq!(titles.resolve(&turn2, None), root);
+    }
+
+    /// A caller that names itself gets a title derived from the name, in the
+    /// identity namespace — and it is stable across turns whose transcripts
+    /// have nothing whatever in common, which is the entire point.
+    #[test]
+    fn an_explicit_identity_derives_a_namespaced_title() {
+        let titles = Titles::new(64);
+        let title = titles.resolve(&[msg("user", "hello")], Some("pet"));
+
+        assert!(
+            title.starts_with(&format!("{TITLE_PREFIX}{USER_MARKER}")),
+            "not namespaced: {title}"
+        );
+        assert!(!in_transcript_space(&title), "leaked into the hash space");
+        // Same identity, unrelated transcript → the same conversation.
+        assert_eq!(
+            titles.resolve(
+                &[msg("system", "wholly"), msg("user", "different")],
+                Some("pet")
+            ),
+            title
+        );
+        // A different identity is a different conversation.
+        assert_ne!(titles.resolve(&[msg("user", "hello")], Some("caw")), title);
+    }
+
+    /// **The security-relevant case.** A caller picks its own `user` string, so
+    /// it will try to pick one that lands on somebody else's session. It must
+    /// not be able to — not for the obvious imitations below, and not for any
+    /// string at all, which is what the second assertion states: the marker
+    /// makes the identity space *structurally* unreachable from the transcript
+    /// space rather than merely improbable to hit.
+    #[test]
+    fn an_adversarial_identity_cannot_imitate_a_hash_derived_title() {
+        let convo = [msg("system", "you are a cat"), msg("user", "poke")];
+        let real = hash_title(&convo);
+        assert_eq!(real, "hytte-bridge-5a36669b9a22d7cc");
+        let titles = Titles::new(64);
+
+        for imitation in [
+            // The whole title, verbatim.
+            "hytte-bridge-5a36669b9a22d7cc",
+            // The bare digest — what a naive `PREFIX + user` would concatenate
+            // straight back into a valid hash-derived title.
+            "5a36669b9a22d7cc",
+            // A rotated generation of it (#667).
+            "hytte-bridge-5a36669b9a22d7cc-g1",
+            "5a36669b9a22d7cc-g1",
+            // The marker, re-supplied, in case it could be doubled or stripped.
+            "u-5a36669b9a22d7cc",
+            "hytte-bridge-u-5a36669b9a22d7cc",
+            // Some other conversation's digest shape.
+            "0000000000000000",
+            "ffffffffffffffff",
+        ] {
+            let claimed = titles.resolve(&convo, Some(imitation));
+            assert_ne!(claimed, real, "identity {imitation:?} stole the hash title");
+            assert!(
+                !in_transcript_space(&claimed),
+                "identity {imitation:?} minted into the transcript space: {claimed}"
+            );
+        }
+    }
+
+    /// The two spaces are disjoint at the digest as well as at the rendering:
+    /// the same string hashed as an identity and as a transcript field is not
+    /// the same number, so nothing rests on the marker alone.
+    #[test]
+    fn the_identity_digest_is_domain_separated() {
+        assert_ne!(user_key("pet"), transcript_key(&[msg("user", "pet")]));
+        assert_ne!(user_key("pet"), user_key("caw"));
+        // Stable across runs and builds, like every other digest here.
+        assert_eq!(user_key("pet"), user_key("pet"));
+    }
+
+    /// One transcript sent with and without an identity is two conversations,
+    /// and — the subtler half — answering the identified one must not leave a
+    /// prefix entry that the identity-less one would later inherit. That leak
+    /// would be a cross-caller session bleed *and* a break of the no-op
+    /// guarantee, arriving one turn late.
+    #[test]
+    fn an_identified_turn_leaves_no_trail_for_an_anonymous_one() {
+        let mut titles = Titles::new(64);
+        let convo = vec![msg("system", "persona"), msg("user", "hello")];
+
+        let identified = titles.resolve(&convo, Some("pet"));
+        titles.remember(&identified, &convo, Some("pet"), "hi there");
+
+        // The turn an anonymous client would present next, had it been the one
+        // talking: prefix = the transcript just answered.
+        let mut next = convo.clone();
+        next.push(msg("assistant", "hi there"));
+        next.push(msg("user", "again"));
+
+        let anonymous = titles.resolve(&next, None);
+        assert_ne!(
+            anonymous, identified,
+            "the anonymous turn inherited pet's session"
+        );
+        assert!(in_transcript_space(&anonymous));
+        // The anonymous conversation resolves exactly as if pet had never run.
+        assert_eq!(anonymous, Titles::new(64).resolve(&next, None));
+    }
+
+    /// Single-flight collapses a *turn*, so it must not collapse two callers.
+    /// Sharing an answer between identities would put back at the reply the
+    /// cross-caller bleed the identity removed at the session.
+    #[test]
+    fn single_flight_does_not_merge_two_identities() {
+        let convo = [msg("system", "persona"), msg("user", "same question")];
+
+        assert_ne!(
+            flight_key(&convo, Some("pet")),
+            flight_key(&convo, Some("caw"))
+        );
+        assert_ne!(flight_key(&convo, Some("pet")), flight_key(&convo, None));
+        // …while one identity asking two different things is still two turns.
+        let other = [msg("system", "persona"), msg("user", "other question")];
+        assert_ne!(
+            flight_key(&convo, Some("pet")),
+            flight_key(&other, Some("pet"))
+        );
+        // …and asking the same thing twice is still one.
+        assert_eq!(
+            flight_key(&convo, Some("pet")),
+            flight_key(&convo, Some("pet"))
+        );
+    }
+
+    /// An identity title fills up like any other, so #667's rotation has to
+    /// reach it — otherwise opting in to #704 would trade a rare silent
+    /// collision for a guaranteed permanent 413.
+    #[test]
+    fn an_identity_title_rotates_and_stays_in_its_namespace() {
+        let base = Titles::new(64).resolve(&[msg("user", "hello")], Some("pet"));
+        let mut title = base.clone();
+        for generation in 1..=3u32 {
+            let Rotation::To(next) = rotation_for(&Failure::new(OVERFLOW_STATUS, "x"), &title)
+            else {
+                panic!("generation {generation} refused to rotate");
+            };
+            assert_eq!(next, format!("{base}-g{generation}"));
+            assert!(
+                !in_transcript_space(&next),
+                "rotation changed space: {next}"
+            );
+            title = next;
+        }
+    }
+
+    /// A retirement in the identity space is read back from it — and does not
+    /// touch the transcript-space conversation that happens to share a
+    /// transcript.
+    #[test]
+    fn a_retired_identity_resolves_to_its_replacement() {
+        let mut titles = Titles::new(64);
+        let convo = vec![msg("system", "persona"), msg("user", "poke")];
+        let user = Some("pet");
+        let next = format!("{}-g1", titles.resolve(&convo, user));
+        titles.rotate_to(&convo, user, &next);
+
+        assert_eq!(titles.resolve(&convo, user), next);
+        // A different transcript under the same identity is the same
+        // conversation, so it lands in the replacement too.
+        assert_eq!(titles.resolve(&[msg("user", "unrelated")], user), next);
+        // The anonymous conversation is untouched.
+        assert_ne!(titles.resolve(&convo, None), next);
+        assert_eq!(titles.resolve(&convo, None), hash_title(&convo));
+    }
+
+    /// A malformed identity title is as foreign as a malformed hash one — the
+    /// marker widens the accepted shape, it does not loosen it.
+    #[test]
+    fn a_malformed_identity_title_cannot_be_rotated() {
+        for foreign in [
+            "hytte-bridge-u-",
+            "hytte-bridge-u",
+            "hytte-bridge-u-nothex0123456789",
+            "hytte-bridge-u-5a36669b9a22d7c",   // 15 hex digits
+            "hytte-bridge-u-5a36669b9a22d7cc0", // 17
+            "hytte-bridge-u-5a36669b9a22d7cc-gx",
+            "hytte-bridge-u-u-5a36669b9a22d7cc",
+        ] {
+            assert_eq!(next_title(foreign), None, "{foreign} was rotated");
+            assert_eq!(
+                rotation_for(&Failure::new(OVERFLOW_STATUS, "x"), foreign),
+                Rotation::Stuck,
+                "{foreign}"
+            );
+        }
     }
 }

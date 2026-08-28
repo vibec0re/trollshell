@@ -70,7 +70,7 @@
 //! mechanical stop looks like.
 //!
 //! ```
-//! use hytte_plugin::preem::{DisplayStyle, Gauge};
+//! use hytte_preem::{DisplayStyle, Gauge};
 //!
 //! let mut gauge = Gauge::new().range(0.0, 100.0);
 //! gauge.set_target(72.0);
@@ -660,7 +660,7 @@ impl Gauge {
     /// configuration a rebuilt [`new`](Self::new) would have thrown away.
     ///
     /// ```
-    /// use hytte_plugin::preem::{DisplayStyle, Gauge};
+    /// use hytte_preem::{DisplayStyle, Gauge};
     ///
     /// let mut gauge = Gauge::new();
     /// let rest = gauge.render(DisplayStyle::Vfd);

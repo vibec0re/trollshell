@@ -1176,6 +1176,7 @@ name = "hytte-plugin"
 version = "0.1.0"
 dependencies = [
  "hytte-plugin-proto",
+ "hytte-preem",
  "tokio",
  "tokio-stream",
 ]
@@ -1305,6 +1306,13 @@ dependencies = [
  "tokio-stream",
  "ureq",
  "zbus",
+]
+
+[[package]]
+name = "hytte-preem"
+version = "0.1.0"
+dependencies = [
+ "hytte-plugin-proto",
 ]
 
 [[package]]

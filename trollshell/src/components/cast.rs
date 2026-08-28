@@ -71,6 +71,19 @@ pub(crate) fn f64_to_i32_round(v: f64) -> i32 {
     v.round() as i32
 }
 
+/// Narrow an `f64` load fraction to the `f32` the `hytte-preem` raster kit
+/// takes (#857).
+///
+/// **Truncation:** `f32` has a 24-bit mantissa against `f64`'s 53, so this
+/// drops precision — deliberately. The values are `0.0..=1.0` load fractions
+/// heading for an 8-bit LED brightness, where a rounding difference below
+/// `1/255` is invisible by construction. A non-finite `f64` stays non-finite,
+/// which the kit's renderers already document as "lights nothing".
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn f64_to_f32(v: f64) -> f32 {
+    v as f32
+}
+
 /// Convert a non-negative `i32` pixel width to `usize` for stride calculation.
 ///
 /// SNI icon widths come from the D-Bus pixmap tuple `(w: i32, h: i32, …)`.
@@ -119,6 +132,19 @@ mod tests {
         assert_eq!(f64_to_i32_round(15.6), 16_i32);
         assert_eq!(f64_to_i32_round(15.4), 15_i32);
         assert_eq!(f64_to_i32_round(-2.5), -3_i32);
+    }
+
+    #[test]
+    fn f64_to_f32_keeps_load_fractions() {
+        // Exactly-representable fractions round-trip; `to_bits` sidesteps the
+        // pedantic `float_cmp` lint the way the tests above do.
+        assert_eq!(f64_to_f32(0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(f64_to_f32(0.5).to_bits(), 0.5_f32.to_bits());
+        assert_eq!(f64_to_f32(1.0).to_bits(), 1.0_f32.to_bits());
+        // A load fraction stays well inside 1/255 of its `f64` original.
+        assert!((f64::from(f64_to_f32(0.123_456_789)) - 0.123_456_789).abs() < 1.0 / 255.0);
+        // Non-finite input stays non-finite (the kit reads that as "dark").
+        assert!(f64_to_f32(f64::NAN).is_nan());
     }
 
     #[test]

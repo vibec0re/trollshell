@@ -19,6 +19,12 @@ pub use error::{Error, Result};
 pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window, on_surface_ready};
 pub use monitor::Monitor;
 pub use multi_sparkline::MultiSparkline;
+// Exported for the shell as well as for the plugin reconciler (#857): a shell
+// that rasterises a `hytte-preem` surface in-process needs the same
+// nearest-neighbor raster widget the reconciler mounts for `Node::Pixels`, and
+// reimplementing it against `gtk::Picture` would blur exactly the chunky pixels
+// this subclass exists to keep crisp.
+pub use pixels::PixelSurface;
 pub use popup::{Popup, PopupBuilder, Position as PopupPosition, attach_dismiss_catcher};
 pub use sparkline::Sparkline;
 pub use widget_tree::{Dir, EventKind, Node, NodeId, Reconciler};

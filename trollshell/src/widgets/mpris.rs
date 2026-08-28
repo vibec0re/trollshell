@@ -42,6 +42,50 @@
 //! is exactly what makes the feedback loop impossible, and it is asserted by
 //! `the_request_is_the_same_whichever_rendition_shows`.
 //!
+//! ### Its consequence: why the two renditions align differently
+//!
+//! Pinning the child uses `AdwBreakpointBin` against its own contract, and the
+//! bin does not bend. In libadwaita 1.9.3 (`src/adw-breakpoint-bin.c`):
+//!
+//! - `adw_breakpoint_bin_measure()` zeroes the **bin's** minimum once it has a
+//!   breakpoint — `if (priv->breakpoints->len > 0) min = 0;` (lines 375–376).
+//!   The child's own minimum is not touched.
+//! - `allocate_child()` measures the child fresh (line 223), and when the bin's
+//!   slot is narrower does `width = MAX (width, min_width)` before
+//!   `gtk_widget_allocate` (lines 256–259): the child gets the pinned `full_px`
+//!   however narrow the bin's own slot happens to be.
+//! - `adw_breakpoint_bin_init()` calls
+//!   `gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_HIDDEN)`
+//!   (line 657), so the bin clips to its own allocation.
+//!
+//! "Collapsed" means, by the breakpoint's own condition, a bin width
+//! `A <= full_px - 1` — i.e. **always** strictly below the pinned child
+//! minimum. So in the one state this widget exists to produce, the renditions
+//! box is laid out `full_px` wide from the bin's left edge and then clipped at
+//! `A`. An `End`-aligned mini chip lands at `x = full_px - mini_px`, past the
+//! clip, and is neither drawn nor hit-testable. That is what #851 shipped;
+//! measured, a 34 px chip at `x = 260..294` inside a 147 px bin.
+//!
+//! Hence the asymmetry: the **full row keeps `halign: End`**, so it still sits
+//! against the right-hand status cluster when there is room, while the **mini
+//! chip takes `halign: Start`**, putting it at `x = 0` — which the bin's own
+//! `set_size_request(mini_px, …)` floor guarantees is inside the clipped area
+//! at every allocation. The cost is that the collapsed chip hugs the left of
+//! its slot instead of the right; a chip in a slightly wrong place beats one
+//! that is not there at all. The clean fix would be libadwaita's own
+//! `adw_breakpoint_bin_set_natural_size()`, but it is private
+//! (`adw-breakpoint-bin-private.h`) and absent from the Rust bindings.
+//!
+//! libadwaita still warns on steady-state collapsed allocations (`… exceeds
+//! AdwBreakpointBin width: requested N px, A px available`, line 247). Its
+//! condition is `min_width > width` — the child's measured minimum against the
+//! bin's allocated width — and `adw-breakpoint-bin.c` reads neither `halign`
+//! nor `valign` anywhere, so the alignment cannot trigger or suppress it. It is
+//! the **pin** libadwaita is objecting to, and the pin cannot go. (The bin sets
+//! `block_warnings` around the first allocation and the breakpoint-transition
+//! pass, which is why a test that presents one window and allocates once sees
+//! no warning while a long-lived bar sees one per allocation.)
+//!
 //! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
 //! on #838). The container's visibility follows `mpris::active_player()` and
@@ -122,11 +166,15 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 ///   what `AdwBreakpoint` is for, and they are declarative: the breakpoint
 ///   restores the previous values itself when it stops applying, so there is no
 ///   apply/unapply handler to keep in sync.
-/// - **`hexpand` + `halign(End)` on each rendition** so the visible one is drawn
-///   against the right-hand status cluster. Below the threshold the bar can hand
-///   the bin less than the pinned request; without this the mini chip would sit
-///   at the left of that slot with a gap after it, instead of the gap falling
-///   into the bar's existing mid-space.
+/// - **`hexpand` on both renditions, but `halign(End)` on the full row and
+///   `halign(Start)` on the mini chip.** The full row is end-aligned so it is
+///   drawn against the right-hand status cluster, with the space it gives up
+///   falling into the bar's existing mid-gap. The mini chip is *deliberately*
+///   start-aligned instead: collapsed, the pinned box is laid out wider than
+///   the bin and clipped to it, so an end-aligned chip is clipped away
+///   entirely (#838). This asymmetry is load-bearing — see the module doc's
+///   "why the two renditions align differently" — and is asserted by
+///   `the_collapsed_chip_is_drawn_inside_the_bin`.
 /// - **`set_size_request` on the renditions box** — the load-bearing line. See
 ///   the module doc: without it, collapsing drops the natural width and the chip
 ///   can never expand again.
@@ -148,8 +196,15 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
     for w in [full, mini] {
         w.set_hexpand(true);
-        w.set_halign(gtk::Align::End);
     }
+    // The alignments differ on purpose; this is not a typo, and "tidying" the
+    // two back into one loop reintroduces #838. `End` keeps the full row against
+    // the right-hand status cluster. `Start` is the only thing that keeps the
+    // mini chip inside the bin's clip rectangle, because collapsed the pinned
+    // box is allocated `full_px` from the bin's left edge and clipped to the
+    // bin's narrower slot. See the module doc.
+    full.set_halign(gtk::Align::End);
+    mini.set_halign(gtk::Align::Start);
 
     let renditions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     renditions.append(full);
@@ -564,6 +619,81 @@ mod gtk_tests {
              bin is never squeezed and the widget is a placebo (#838); \
              bar min={bar_min}, natural={bar_nat}, allocated={crowded_width}, got a {}",
             crowded.type_()
+        );
+    }
+
+    /// The bug the three tests above could not see (#838).
+    ///
+    /// [`shown`] reads `is_visible()`, and GTK's `visible` is orthogonal to
+    /// *position* and to *clipping*: a widget can be `visible`, correctly
+    /// selected by the breakpoint, and still be laid out entirely outside the
+    /// rectangle its parent paints. That is precisely what shipped — the mini
+    /// chip was `visible` on every crowded bar and drawn nowhere, because
+    /// `AdwBreakpointBin`
+    ///
+    /// - zeroes its **own** minimum once it has a breakpoint
+    ///   (`adw_breakpoint_bin_measure`: `if (priv->breakpoints->len > 0) min = 0;`)
+    ///   but never the child's,
+    /// - allocates the child `MAX (width, min_width)` regardless of its own
+    ///   slot (`allocate_child`), and
+    /// - clips to its own allocation (`adw_breakpoint_bin_init`:
+    ///   `gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_HIDDEN)`).
+    ///
+    /// So assert the rectangle, not the flag: at a tight allocation the shown
+    /// rendition's bounds must lie inside the bin's own, and a click at its
+    /// centre must actually land on it.
+    #[gtk::test]
+    fn the_collapsed_chip_is_drawn_inside_the_bin() {
+        adw::init().expect("libadwaita init");
+        let full_px = natural_width(renditions("Artist \u{2013} Title").0.upcast_ref());
+
+        let (full, mini) = renditions("Artist \u{2013} Title");
+        let bin = build_bin(full.upcast_ref(), mini.upcast_ref());
+        let window = gtk::Window::new();
+        window.set_child(Some(&bin));
+        window.set_default_size(full_px / 2, 40);
+        window.present();
+        pump();
+
+        let chip = shown(&bin);
+        let collapsed = chip.is::<gtk::Button>();
+        let bounds = chip
+            .compute_bounds(&bin)
+            .expect("the shown rendition is a descendant of the bin");
+        let (bin_w, bin_h) = (f64::from(bin.width()), f64::from(bin.height()));
+        let (left, top) = (f64::from(bounds.x()), f64::from(bounds.y()));
+        let (right, bottom) = (
+            f64::from(bounds.x() + bounds.width()),
+            f64::from(bounds.y() + bounds.height()),
+        );
+        let picked = bin.pick(
+            f64::midpoint(left, right),
+            f64::midpoint(top, bottom),
+            gtk::PickFlags::DEFAULT,
+        );
+        let hit = picked
+            .as_ref()
+            .is_some_and(|w| *w == chip || w.is_ancestor(&chip));
+        let picked_desc = picked.map_or_else(|| "nothing".to_owned(), |w| w.type_().to_string());
+
+        window.set_child(None::<&gtk::Widget>);
+        window.destroy();
+
+        assert!(
+            collapsed,
+            "test setup: an allocation of {} px must select the mini chip",
+            full_px / 2
+        );
+        assert!(
+            left >= 0.0 && top >= 0.0 && right <= bin_w && bottom <= bin_h,
+            "the shown rendition is drawn outside the bin that clips it, so it is invisible and \
+             unclickable on a crowded bar (#838): chip bounds x={left}..{right}, \
+             y={top}..{bottom}, bin is {bin_w}x{bin_h}"
+        );
+        assert!(
+            hit,
+            "a click at the centre of the shown rendition must land on it, got {picked_desc} \
+             (chip bounds x={left}..{right} in a {bin_w} px bin)"
         );
     }
 }

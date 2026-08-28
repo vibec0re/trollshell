@@ -71,8 +71,36 @@ pub struct ChatRequest {
     /// every pre-#704 client does and what this crate did before #704. Present
     /// → the title is derived from it instead, in a namespace disjoint from
     /// the hash-derived one (see [`crate::session::Key`]).
-    #[serde(default)]
+    ///
+    /// Deserialised through [`lenient_user`], so a client that puts a number or
+    /// an object here is ignored rather than rejected — see that function.
+    #[serde(default, deserialize_with = "lenient_user")]
     pub user: Option<String>,
+}
+
+/// Deserialise `user` the way the module doc promises the rest of this shape
+/// behaves: a JSON **string** is the identity, and anything else — a number, an
+/// object, an array, a bool, an explicit `null` — is `None`.
+///
+/// The spec says `user` is a string, but the field is only ever a *hint* to a
+/// conforming endpoint, and before #704 this bridge ignored whatever was in it
+/// (serde skipped the unknown field entirely). Turning a mistyped `user` into a
+/// hard 400 would regress a client that used to get an answer, and contradict
+/// this module's stated contract that "a slightly different `OpenAI` client
+/// still gets an answer rather than a 400". Falling back to `None` puts such a
+/// client exactly where a pre-#704 one sits: on the content-hash path.
+///
+/// Blankness is deliberately *not* handled here — that is an identity question,
+/// and [`crate::session::identity`] owns it for every caller, not just the ones
+/// arriving over HTTP.
+fn lenient_user<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(de)? {
+        Some(serde_json::Value::String(user)) => Ok(Some(user)),
+        _ => Ok(None),
+    }
 }
 
 /// The llama-only template kwargs object. Parsed so it can be *ignored*
@@ -198,6 +226,34 @@ mod tests {
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
         let req: ChatRequest = serde_json::from_slice(body).expect("parses");
         assert_eq!(req.user, None);
+    }
+
+    /// A `user` that is not a string must be **ignored**, not a 400.
+    ///
+    /// Every one of these bodies parsed fine before #704 (serde skipped the
+    /// unknown field) and would have got an answer; typing the field turned
+    /// them into `invalid type: integer 12345, expected a string`, which
+    /// contradicts this module's own contract that a slightly different
+    /// `OpenAI` client still gets an answer. They land on the content-hash
+    /// path instead, exactly where a pre-#704 client sits.
+    #[test]
+    fn a_non_string_user_is_ignored_rather_than_rejected() {
+        for weird in [
+            "12345",
+            r#"{"id":"pet"}"#,
+            r#"["a"]"#,
+            "true",
+            "null",
+            "1.5",
+        ] {
+            let body =
+                format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"user":{weird}}}"#);
+            let req: ChatRequest = serde_json::from_str(&body)
+                .unwrap_or_else(|e| panic!("`user`: {weird} must still parse: {e}"));
+            assert_eq!(req.user, None, "`user`: {weird} must be ignored");
+            // The rest of the request still arrives intact.
+            assert_eq!(req.messages.len(), 1);
+        }
     }
 
     /// A keyed provider sends `model` and no template kwargs.

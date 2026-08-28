@@ -243,14 +243,34 @@ pub fn user_key(user: &str) -> u64 {
     fnv1a_field(fnv1a_field(FNV_OFFSET, USER_DOMAIN), user)
 }
 
+/// Normalise a caller-supplied identity: **blank is absent.**
+///
+/// `Some("")` and `Some("   ")` are not identities, they are a client filling
+/// the field in without meaning anything by it — and taking them at face value
+/// would be worse than the hash fallback they displace, because *every* such
+/// client would share one session. That is the cross-caller bleed #704 exists
+/// to close, arriving through the front door.
+///
+/// Blank ≡ absent is the idiom everywhere else in this tree: `env_nonempty`,
+/// the plugins' `resolve_provider` (`Some("")` = unset), `owner_or`'s trim.
+///
+/// A non-blank identity is passed through **untrimmed**: whitespace inside or
+/// around it is part of the string the caller chose, and trimming would quietly
+/// merge `"pet"` with `" pet"` — two callers who did not ask to be one.
+#[must_use]
+pub fn identity(user: Option<&str>) -> Option<&str> {
+    user.filter(|u| !u.trim().is_empty())
+}
+
 /// **The identity decision.** Which conversation a request belongs to: the one
 /// it named, else the one its transcript implies (#704).
 ///
-/// With `user` absent this is exactly [`conversation_key`] in a `Transcript`
-/// wrapper — the pre-#704 value, unchanged.
+/// With `user` absent — or blank, which [`identity`] treats the same — this is
+/// exactly [`conversation_key`] in a `Transcript` wrapper: the pre-#704 value,
+/// unchanged.
 #[must_use]
 pub fn identity_key(messages: &[Message], user: Option<&str>) -> Key {
-    match user {
+    match identity(user) {
         Some(user) => Key::User(user_key(user)),
         None => Key::Transcript(conversation_key(messages)),
     }
@@ -266,12 +286,13 @@ pub fn identity_key(messages: &[Message], user: Option<&str>) -> Key {
 /// reintroduce, at the answer, precisely the cross-caller bleed the identity
 /// removed at the session.
 ///
-/// With `user` absent this is exactly [`transcript_key`], as before #704.
-/// (Its `Key::User` digests share a variant with [`identity_key`]'s but never a
-/// map — `inflight` and [`Titles`] are separate — so the two never meet.)
+/// With `user` absent — or blank, per [`identity`] — this is exactly
+/// [`transcript_key`], as before #704. (Its `Key::User` digests share a variant
+/// with [`identity_key`]'s but never a map — `inflight` and [`Titles`] are
+/// separate — so the two never meet.)
 #[must_use]
 pub fn flight_key(messages: &[Message], user: Option<&str>) -> Key {
-    match user {
+    match identity(user) {
         Some(user) => Key::User(fnv1a(
             user_key(user),
             &transcript_key(messages).to_le_bytes(),
@@ -528,7 +549,10 @@ impl Titles {
     /// identity was sent to prevent, and would break the no-op guarantee for
     /// clients that never opted in.
     pub fn remember(&mut self, title: &str, messages: &[Message], user: Option<&str>, reply: &str) {
-        if user.is_some() {
+        // [`identity`], not `user.is_some()`: a blank `user` resolved in the
+        // transcript space, so it must leave the forward prefixes that space
+        // needs — otherwise it would mint a fresh title every single turn.
+        if identity(user).is_some() {
             return;
         }
         let mut echoed = messages.to_vec();
@@ -573,8 +597,8 @@ impl Titles {
 mod tests {
     use super::{
         AttachKind, Key, OVERFLOW_STATUS, Rotation, TITLE_PREFIX, Titles, USER_MARKER,
-        conversation_key, flight_key, identity_key, next_title, prompt_for, render_transcript,
-        rotation_for, split_delta, title_for, transcript_key, user_key,
+        conversation_key, flight_key, identity, identity_key, next_title, prompt_for,
+        render_transcript, rotation_for, split_delta, title_for, transcript_key, user_key,
     };
     use crate::http::Failure;
     use crate::wire::Message;
@@ -1040,8 +1064,73 @@ mod tests {
     fn the_identity_digest_is_domain_separated() {
         assert_ne!(user_key("pet"), transcript_key(&[msg("user", "pet")]));
         assert_ne!(user_key("pet"), user_key("caw"));
-        // Stable across runs and builds, like every other digest here.
-        assert_eq!(user_key("pet"), user_key("pet"));
+        // Stability across runs and builds is pinned by
+        // `identity_title_derivation_is_pinned_to_a_literal` below. It cannot be
+        // shown here: `user_key` is a pure function, so comparing it to itself
+        // in one process holds for every possible implementation.
+    }
+
+    /// The identity space's answer to
+    /// `title_derivation_is_pinned_to_a_literal` — and it needs one for the
+    /// same reason, since the title is the on-disk name `claude --resume`
+    /// resolves against. Without this literal, mutating [`USER_MARKER`],
+    /// `USER_DOMAIN`, or the order of the two `fnv1a_field` folds in
+    /// [`user_key`] leaves the whole suite green while silently orphaning every
+    /// deployed plugin's session. (Verified by mutation: flipping
+    /// `USER_MARKER` to `"v-"` turns this test — and only this test — red.)
+    ///
+    /// Spelled as the finished title rather than the raw digest so it pins the
+    /// *rendering* too: the prefix, the marker and the `{:016x}` width are all
+    /// inside the literal. Driven through [`identity_key`] with a real
+    /// transcript, so it also pins that no byte of the transcript reaches an
+    /// identity title.
+    #[test]
+    fn identity_title_derivation_is_pinned_to_a_literal() {
+        let convo = [msg("system", "you are a cat"), msg("user", "poke")];
+        assert_eq!(
+            title_for(identity_key(&convo, Some("pet"))),
+            "hytte-bridge-u-fbbad4ae7d47bf01"
+        );
+        // The same literal reached the other way, through the raw digest, so
+        // the pin survives whichever of the two entry points a refactor keeps.
+        assert_eq!(
+            title_for(Key::User(user_key("pet"))),
+            "hytte-bridge-u-fbbad4ae7d47bf01"
+        );
+    }
+
+    /// A blank identity is no identity (#704 review): `Some("")` and a
+    /// whitespace-only string behave in **every** respect as `None` does, or
+    /// each client that fills the field in without meaning anything by it would
+    /// land in one shared session — a cross-caller bleed strictly worse than
+    /// the hash fallback it displaced.
+    #[test]
+    fn a_blank_identity_is_exactly_an_absent_one() {
+        let convo = [msg("system", "you are a cat"), msg("user", "poke")];
+
+        for blank in [Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(identity(blank), None, "{blank:?}");
+            assert_eq!(identity_key(&convo, blank), identity_key(&convo, None));
+            assert_eq!(flight_key(&convo, blank), flight_key(&convo, None));
+            assert_eq!(
+                Titles::new(64).resolve(&convo, blank),
+                Titles::new(64).resolve(&convo, None),
+            );
+
+            // The forward prefixes an identity-less turn needs are still
+            // written, so the next turn resolves to the same session rather
+            // than minting a new one every time.
+            let mut titles = Titles::new(64);
+            let title = titles.resolve(&convo, blank);
+            titles.remember(&title, &convo, blank, "meow");
+            assert!(!titles.is_empty(), "{blank:?} left no forward prefix");
+        }
+
+        // A non-blank identity is untouched — including one with surrounding
+        // whitespace, which is the caller's own string, not ours to trim.
+        assert_eq!(identity(Some("pet")), Some("pet"));
+        assert_eq!(identity(Some(" pet ")), Some(" pet "));
+        assert_ne!(user_key(" pet "), user_key("pet"));
     }
 
     /// One transcript sent with and without an identity is two conversations,

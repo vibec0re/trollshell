@@ -139,18 +139,29 @@ pub(crate) fn parse_time(raw: Option<&str>) -> Option<u16> {
     }
 }
 
-/// Resolve caw's briefing [`Provider`] — the pet's #438 semantics verbatim:
-/// an explicitly empty `$CAW_LLM_URL` disables the model; an explicit URL is a
-/// local/self-hosted backend (keyless OK); no URL defaults to `OpenRouter`
-/// **only when a key exists** (a keyless cloud call would just 401, so it
-/// short-circuits to the plain path instead of a doomed round-trip).
 /// The identity caw sends as `OpenAI`'s `user` (#704), and the id she
 /// registers under — the pet's `PLUGIN_ID` arrangement verbatim, and distinct
 /// from it, which is the whole point: two plugins that name themselves can
 /// never share a `claude` session however alike their prompts get. See
 /// [`Provider::user`].
+///
+/// **Must stay distinct from `hytte_plugin_pet::brain::PLUGIN_ID`.** Sharing an
+/// identity would put caw and the pet in one `claude` session — the exact
+/// cross-caller bleed the identity exists to prevent. No test can enforce it:
+/// the two consts live in separate crates that do not depend on each other, so
+/// `every_resolved_provider_carries_the_plugin_identity`'s `assert_ne!` against
+/// a hardcoded `"pet"` is one-directional by necessity. Changing either one is
+/// a two-file change.
+///
+/// Changing it also orphans caw's existing on-disk session — the bridge's title
+/// is a digest of exactly this string.
 pub const PLUGIN_ID: &str = "caw";
 
+/// Resolve caw's briefing [`Provider`] — the pet's #438 semantics verbatim:
+/// an explicitly empty `$CAW_LLM_URL` disables the model; an explicit URL is a
+/// local/self-hosted backend (keyless OK); no URL defaults to `OpenRouter`
+/// **only when a key exists** (a keyless cloud call would just 401, so it
+/// short-circuits to the plain path instead of a doomed round-trip).
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,

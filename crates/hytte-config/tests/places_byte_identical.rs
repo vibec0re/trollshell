@@ -18,6 +18,8 @@
 //! it pins the surface the control center actually links against rather than
 //! internals it cannot see.
 
+use std::fmt::Write as _;
+
 use hytte_config::places::{self, Place};
 
 /// A file with everything the format-preserving writer promises to keep: a
@@ -130,7 +132,10 @@ fn report() -> String {
                 places::validate(&dup).err(),
             ]
             .iter()
-            .map(|e| e.as_ref().map_or_else(|| "ok".to_string(), ToString::to_string))
+            .map(|e| {
+                e.as_ref()
+                    .map_or_else(|| "ok".to_string(), ToString::to_string)
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         ),
@@ -149,7 +154,7 @@ fn report() -> String {
 
     let mut out = String::new();
     for (name, body) in sections {
-        out.push_str(&format!("═══ {name} ═══\n{body}\n"));
+        writeln!(out, "═══ {name} ═══\n{body}").expect("writing to a String cannot fail");
     }
     out
 }
@@ -157,7 +162,7 @@ fn report() -> String {
 /// The report as `origin/main` at `970dd20` produced it — captured *before*
 /// #868's production code existed, then re-run against the tree that carries
 /// it. Every byte here is observed, not authored.
-const GOLDEN: &str = r##"═══ parse ═══
+const GOLDEN: &str = r#"═══ parse ═══
 [Place { name: "Office", lat: 52.5, lon: 13.4, radius_km: 8.0, ssids: ["office-wifi", "neighbour-ap"], match_min: 1, station: Some("900110001"), walk_minutes: 0, lines: [], directions: [] }, Place { name: "Cabin", lat: 60.1, lon: 10.7, radius_km: 25.0, ssids: [], match_min: 2, station: None, walk_minutes: 0, lines: [], directions: [] }]
 ═══ identity-render ═══
 # A hand-annotated places.toml.
@@ -350,7 +355,7 @@ Some("/golden/home/.config/trollshell/places.toml")
 true
 ═══ builtin-default-matches-parse ═══
 true
-"##;
+"#;
 
 /// The whole public `places` surface, pinned byte for byte.
 ///

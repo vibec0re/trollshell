@@ -211,8 +211,9 @@ pub fn panel_stats() -> gtk::Widget {
 }
 
 /// The multicolumn stats flyout (#508) — the same five cards as [`panel_stats`]
-/// laid out in a 2-column [`page_grid`]: CPU spanning both columns on the first
-/// row, GPU | Disks on the second, and Memory | Services on the third (#702).
+/// laid out in a 2-column [`page_grid`]: CPU | Memory, GPU | Disks, then
+/// Services spanning the last row. See [`attach_stats_cards`] for why that is
+/// the arrangement.
 /// Opened from the resource chips when `TROLLSHELL_STATS_LAYOUT` is
 /// `multicolumn` (default) or unset; the chips still target the single
 /// `Page::Stats` (this replaces [`panel_stats`] for that page in multicolumn
@@ -236,48 +237,19 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     let disks_card = build_stats_disks_card();
     let services_card = build_stats_services_card();
 
-    // CPU spans both columns (#702). It's the one card whose content is a
-    // *strip* rather than a stack — the per-core bars — so it's the one that
-    // actually wants the page width; everything else is fine half-width. When
-    // CPU vacates column 1, Memory is the orphan and Services is the card that
-    // was only spanning for want of a partner, so they pair up and the grid
-    // stays **three** rows: the drawer gets no taller than the pre-#702 layout.
-    // Reading order therefore becomes CPU, GPU, Disks, Memory, Services rather
-    // than #582's bar-chip order — a deliberate trade annikahannig picked on
-    // #702 (option A), not drift; the chip deep-links are coordinate-based
-    // (`apply_scroll`) so they follow the cards wherever they sit.
-    grid.attach(cpu_card.upcast_ref::<gtk::Widget>(), 0, 0, 2, 1);
-    grid.attach(gpu_card.upcast_ref::<gtk::Widget>(), 0, 1, 1, 1);
-    grid.attach(disks_card.upcast_ref::<gtk::Widget>(), 1, 1, 1, 1);
-    grid.attach(memory_card.upcast_ref::<gtk::Widget>(), 0, 2, 1, 1);
-    grid.attach(services_card.upcast_ref::<gtk::Widget>(), 1, 2, 1, 1);
-
-    // GPU can self-hide entirely when no GPU is present (`build_stats_gpu_card`'s
-    // own bind to `sensors::gpu()`'s presence signal). Left as the fixed attach
-    // above, that self-hide would leave row 1's column 0 empty with Disks
-    // stranded in column 1 — the grid is column-homogeneous and rows 0 and 2
-    // still occupy column 0, so the gap doesn't collapse, it just sits there as
-    // a hole (#571). Reflow Disks into column 0 whenever GPU is hidden, and back to
-    // column 1 when it reappears, by moving its `GtkGridLayoutChild` rather
-    // than re-attaching. Tracks the GPU card's own `visible` property directly
-    // (rather than re-deriving the same condition from `sensors::gpu()`) so
-    // this can never drift from whatever actually controls the card's
-    // presence; applied once immediately for the first render, then kept live
-    // via `notify::visible`. Deliberately only ever touches the *column* —
-    // never `set_row` — so it needs nothing from #702's row renumbering: all it
-    // requires is that GPU and Disks share a row in columns 0 and 1, whichever
-    // row that happens to be.
-    let disks_layout_child = grid
-        .layout_manager()
-        .expect("gtk::Grid always installs a GtkGridLayout")
-        .layout_child(disks_card.upcast_ref::<gtk::Widget>())
-        .downcast::<gtk::GridLayoutChild>()
-        .expect("a GtkGrid's layout children are GtkGridLayoutChild");
-    let reflow_disks_column = move |gpu_visible: bool| {
-        disks_layout_child.set_column(i32::from(gpu_visible));
-    };
-    reflow_disks_column(gpu_card.is_visible());
-    gpu_card.connect_visible_notify(move |gpu| reflow_disks_column(gpu.is_visible()));
+    attach_stats_cards(
+        &grid,
+        cpu_card.upcast_ref::<gtk::Widget>(),
+        memory_card.upcast_ref::<gtk::Widget>(),
+        gpu_card.upcast_ref::<gtk::Widget>(),
+        disks_card.upcast_ref::<gtk::Widget>(),
+        services_card.upcast_ref::<gtk::Widget>(),
+    );
+    install_gpu_hidden_reflow(
+        &grid,
+        gpu_card.upcast_ref::<gtk::Widget>(),
+        disks_card.upcast_ref::<gtk::Widget>(),
+    );
 
     // Same live per-monitor cap as the combined page (#701) — see
     // [`panel_stats`]. Two columns roughly halve the stacked height, so on any
@@ -299,6 +271,91 @@ pub fn panel_stats_multicolumn() -> gtk::Widget {
     let page = finish_page_clamped(&scrolled, DRAWER_MAX_WIDTH_WIDE);
     install_stats_actions(&page, &scrolled, grid.upcast_ref::<gtk::Widget>(), sections);
     page
+}
+
+/// Attach the five Stats cards to the multicolumn grid, in the plain
+/// two-column flow: `CPU | Memory`, `GPU | Disks`, then Services alone across
+/// the last row.
+///
+/// ## Why the CPU span is gone again (#857)
+///
+/// #702 gave CPU a two-column span on one premise, recorded in its own comment:
+/// CPU was "the one card whose content is a *strip* rather than a stack — the
+/// per-core bars — so it's the one that actually wants the page width". That
+/// premise died with #861, which replaced the 64-progressbar strip with a
+/// single compact LED panel. A card whose widest content is now a ~180 px
+/// surface does not want 1080 px, and annikahannig saw the result on glass:
+/// "default looks weird now. Too much free space. I guess this can now be
+/// regular two column flexbox".
+///
+/// Un-spanning restores **#582's bar-chip reading order** — CPU, Memory, GPU,
+/// Disks, Services, left-to-right then down — which is the order the bar's
+/// always-visible resource chips render in (`main.rs`'s resource `group`) and
+/// which `stats_section_declaration_order_matches_bar` pins on the enum. #702
+/// had traded that order away knowingly ("a deliberate trade annikahannig
+/// picked on #702 (option A)"); with the span's reason gone, the trade has
+/// nothing left to buy, so the order comes back rather than staying as drift.
+/// These are the exact coordinates #582 landed, restored verbatim.
+///
+/// Services keeps the last row to itself for the reason #582 gave it: the
+/// failed-units list can grow tall and has no natural column partner. The grid
+/// stays **three** rows either way, so the drawer gets no taller than the
+/// spanning layout it replaces.
+///
+/// Split out from [`panel_stats_multicolumn`] so `stats_grid_tests` can assert
+/// the **real** coordinates rather than a copy of them — the shipping builder
+/// binds every card to a `sensors::*` signal and so needs a registered
+/// `Registry` to run, while five bare widgets need nothing.
+fn attach_stats_cards(
+    grid: &gtk::Grid,
+    cpu: &gtk::Widget,
+    memory: &gtk::Widget,
+    gpu: &gtk::Widget,
+    disks: &gtk::Widget,
+    services: &gtk::Widget,
+) {
+    grid.attach(cpu, 0, 0, 1, 1);
+    grid.attach(memory, 1, 0, 1, 1);
+    grid.attach(gpu, 0, 1, 1, 1);
+    grid.attach(disks, 1, 1, 1, 1);
+    grid.attach(services, 0, 2, 2, 1);
+}
+
+/// Keep Disks out of column 1 while the GPU card is hidden (#571).
+///
+/// GPU is the only one of the five cards that self-hides *as a card* — its own
+/// bind to `sensors::gpu()`'s presence signal, in [`build_stats_gpu_card`].
+/// (Services never hides; only its "Flapping shell tasks" subgroup does, which
+/// shrinks the card rather than vacating a cell.) Left at the fixed attach,
+/// that self-hide would empty row 1's column 0 and strand Disks in column 1 —
+/// and the gap would not collapse, because the grid is column-homogeneous and
+/// rows 0 and 2 still occupy column 0. It would simply sit there as a hole.
+///
+/// **The reflow survives the #857 rearrangement unchanged**, for the reason
+/// #702 already recorded: it only ever touches the *column*, never `set_row`.
+/// All it requires is that GPU and Disks share a row in columns 0 and 1 —
+/// whichever row that happens to be — and they still do (row 1, as under both
+/// #582 and #702). What it needs from the *rest* of the grid is that column 0
+/// stay occupied in some other row so the column keeps its width, and both
+/// rows 0 (CPU) and 2 (Services' span) do that.
+///
+/// Tracks the GPU card's own `visible` property directly rather than
+/// re-deriving the same condition from `sensors::gpu()`, so this can never
+/// drift from whatever actually controls the card's presence; applied once
+/// immediately for the first render, then kept live via `notify::visible`.
+/// Moves the `GtkGridLayoutChild` rather than re-attaching.
+fn install_gpu_hidden_reflow(grid: &gtk::Grid, gpu: &gtk::Widget, disks: &gtk::Widget) {
+    let disks_layout_child = grid
+        .layout_manager()
+        .expect("gtk::Grid always installs a GtkGridLayout")
+        .layout_child(disks)
+        .downcast::<gtk::GridLayoutChild>()
+        .expect("a GtkGrid's layout children are GtkGridLayoutChild");
+    let reflow_disks_column = move |gpu_visible: bool| {
+        disks_layout_child.set_column(i32::from(gpu_visible));
+    };
+    reflow_disks_column(gpu.is_visible());
+    gpu.connect_visible_notify(move |gpu| reflow_disks_column(gpu.is_visible()));
 }
 
 /// The vertically-scrolling wrapper shared by the combined and multicolumn
@@ -886,7 +943,7 @@ struct CoreLeds {
     style: DisplayStyle,
     /// The colour axis — what colour each lamp lights in.
     color: ColorMap,
-    /// A pinned row count, or `None` for the near-square `rect` shape.
+    /// A pinned row count, or `None` for the automatic `rect` shape.
     rows: Option<usize>,
     /// What a ragged last row's leftover slots look like.
     fill: Fill,
@@ -945,9 +1002,16 @@ fn parse_hex_rgb(raw: &str) -> Option<ColorMap> {
     Some(ColorMap::Rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
-/// Parse `TROLLSHELL_CORE_LEDS_ROWS`: `rect` (or unset) for the near-square
+/// Parse `TROLLSHELL_CORE_LEDS_ROWS`: `rect` (or unset) for the automatic
 /// shape, or a positive row count. `0` is rejected rather than silently
 /// clamped — it is a typo, not an intent.
+///
+/// `rect` is Annika's word for it from #857, and since her second pass on the
+/// same issue ("rectangle for led view would be still more preem tho") it now
+/// keeps its promise: the automatic shape is [`LedMatrix::wide`]'s wide
+/// rectangle rather than the near-square panel #861 shipped. Still automatic
+/// rather than a pinned default row count, because a fixed `rows = 4` reads
+/// well at 64 cores and absurdly at 4 — see [`LedMatrix::wide`].
 fn parse_core_leds_rows(raw: Option<&str>) -> Result<Option<usize>, &str> {
     match raw {
         None | Some("rect") => Ok(None),
@@ -1039,7 +1103,7 @@ fn core_leds() -> CoreLeds {
 /// picks the biggest factor that still fits inside it. Both bounds earn their
 /// keep — the height stops a small-core box from filling the CPU card with
 /// lamps, and the width stops a deliberately wide shape (a `…_ROWS=3` strip on
-/// a 64-core box is 245 px at 1×) from being scaled past the card and then
+/// a 64-core box is 247 px at 1×) from being scaled past the card and then
 /// letterboxed back down, which would resample the fixed dot grid the kit
 /// exists to keep whole (#839/#843).
 const CORE_PANEL_MAX_W: usize = 280;
@@ -1053,10 +1117,16 @@ const CORE_PANEL_MAX_H: usize = 104;
 /// Whole factors only, because `PixelSurface` paints nearest-neighbour: a
 /// fractional blow-up would duplicate some lamp rows and not others, and the
 /// panel would shimmer as the core count changed. Across the shapes
-/// [`core_led_matrix`] produces this lands every machine in a ~70–105 px band
-/// (1 core → 96 px, 4 → 90, 8 → 76, 16 → 104, 32 → 71, 64 → 93) rather than
-/// letting a 4-core box render a 30 px postage stamp next to a 64-core box's
-/// 93 px panel.
+/// [`core_led_matrix`] produces it keeps every machine's panel a comparable
+/// on-glass size rather than letting a 4-core box render a postage stamp next
+/// to a 64-core box's full panel — with the #857 rectangle default the widths
+/// land in a 96–279 px band (1 core → 96, 4 → 245, 8 → 147, 16 → 279, 32 →
+/// 252, 64 → 181, 128 → 247) and the heights in a 49–96 px one.
+///
+/// The heights are shorter than the near-square panel's used to be, and that is
+/// the point of the change rather than a side effect: a rectangle is short, and
+/// the CPU card was showing "too much free space" as a tall square in a card
+/// that no longer needs the page width.
 fn core_panel_scale(buf_w: usize, buf_h: usize) -> u32 {
     // An empty buffer has nothing to scale — and `MAX / 1` would otherwise
     // hand back a nonsense factor of 104 for a surface that renders nothing.
@@ -1071,15 +1141,25 @@ fn core_panel_scale(buf_w: usize, buf_h: usize) -> u32 {
 /// Build the [`LedMatrix`] for `cores` lamps, in the session's configured skin,
 /// colour map and fill ([`core_leds`]).
 ///
-/// The shape is the near-square [`LedMatrix::rect`] unless
+/// The shape is the wide-rectangle [`LedMatrix::wide`] unless
 /// `TROLLSHELL_CORE_LEDS_ROWS` pinned a row count, in which case the columns
 /// fall out of it — which is where [`Fill`] starts to matter, since 64 lamps on
 /// 3 rows needs 22 columns and leaves the last row two slots short.
 fn core_led_matrix(cores: usize) -> LedMatrix {
-    let cfg = core_leds();
+    core_led_matrix_for(core_leds(), cores)
+}
+
+/// [`core_led_matrix`] with the dressing passed in rather than read from the
+/// environment.
+///
+/// Split out so the shape choice is testable at all: [`core_leds`] resolves
+/// four env vars into a process-wide `OnceLock`, so a test that drove it would
+/// depend on the ambient environment *and* on which test ran first. A `CoreLeds`
+/// value has neither problem.
+fn core_led_matrix_for(cfg: CoreLeds, cores: usize) -> LedMatrix {
     let base = match cfg.rows {
         Some(rows) => LedMatrix::new(cfg.style, cores.max(1).div_ceil(rows), rows),
-        None => LedMatrix::rect(cfg.style, cores),
+        None => LedMatrix::wide(cfg.style, cores),
     };
     base.color(cfg.color).fill(cfg.fill)
 }
@@ -1177,7 +1257,7 @@ fn core_panel_surface() -> PixelSurface {
 ///    the lamps are pixels in a buffer, not widgets in a container.
 /// 2. `PixelSurface::measure` returns `(0, natural, -1, -1)`: its minimum is
 ///    hard-coded to `0` on both axes so CSS/layout can shrink it freely, and
-///    its *natural* size (93 px at 64 cores in the default near-square shape,
+///    its *natural* size (181×49 px at 64 cores in the default rectangle,
 ///    times [`core_panel_scale`]) is only ever a request. The `ts-cores-row`
 ///    wrapper carries the row's padding and a `min-height`, deliberately never
 ///    a `min-width`.
@@ -2105,9 +2185,10 @@ fn flapping_subtitle(
 mod tests {
     use super::{
         CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, ColorMap, CoreLeds, DisplayStyle, Duration, Fill,
-        LedMatrix, StatsLayout, StatsSection, TaskState, core_panel_scale, core_panel_tooltip,
-        flapping_subtitle, is_flapping, parse_core_leds_color, parse_core_leds_fill,
-        parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb, parse_stats_layout,
+        StatsLayout, StatsSection, TaskState, core_led_matrix_for, core_panel_scale,
+        core_panel_tooltip, flapping_subtitle, is_flapping, parse_core_leds_color,
+        parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb,
+        parse_stats_layout,
     };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -2172,14 +2253,96 @@ mod tests {
     /// Falsified by growing the kit's cell metrics (`CELL`/`GAP`/`PAD`) or by
     /// letting `core_panel_scale` blow the panel past the budget box.
     #[test]
-    fn the_panel_is_93px_at_64_cores() {
-        let m = LedMatrix::rect(DisplayStyle::Vfd, 64);
-        assert_eq!((m.cols(), m.rows()), (8, 8), "64 cores is an 8x8 panel");
-        assert_eq!((m.width(), m.height()), (93, 93));
+    fn the_panel_is_a_rectangle_at_64_cores() {
+        let m = core_led_matrix_for(CoreLeds::default(), 64);
+        assert_eq!((m.cols(), m.rows()), (16, 4), "64 cores is a 16x4 panel");
+        assert_eq!((m.width(), m.height()), (181, 49));
         assert_eq!(core_panel_scale(m.width(), m.height()), 1);
+        assert!(
+            m.width() > m.height(),
+            "the default shape must be a rectangle, not #861's square"
+        );
         assert!(
             m.width() < 764 / 4,
             "the panel must stay a small fraction of #702's 764 px strip"
+        );
+    }
+
+    /// The rectangle default holds across **every** core count the shell can
+    /// meet, not just the 64-thread box that motivated it — this is the table
+    /// in the #857 PR body, checked rather than claimed.
+    ///
+    /// The invariant that matters is `cols > rows`: a pinned `rows = 4` would
+    /// satisfy it at 64 and fail it at 4 (a 1×4 column), which is exactly why
+    /// the shape is computed rather than configured. One lamp is the only count
+    /// with no rectangle available.
+    ///
+    /// Falsified by pointing [`core_led_matrix_for`]'s `None` arm back at
+    /// `LedMatrix::rect` — 4, 16 and 64 cores all go square.
+    #[test]
+    fn every_core_count_gets_a_rectangle() {
+        // (cores, cols, rows) — the shipping table.
+        let table = [
+            (1usize, 1usize, 1usize),
+            (2, 2, 1),
+            (4, 4, 1),
+            (8, 4, 2),
+            (12, 6, 2),
+            (16, 8, 2),
+            (32, 11, 3),
+            (64, 16, 4),
+            (128, 22, 6),
+        ];
+        for (cores, cols, rows) in table {
+            let m = core_led_matrix_for(CoreLeds::default(), cores);
+            assert_eq!(
+                (m.cols(), m.rows()),
+                (cols, rows),
+                "{cores} cores drifted off the shipping shape"
+            );
+            assert!(
+                m.cols() * m.rows() >= cores,
+                "{cores} cores lost a lamp in a {cols}x{rows} panel"
+            );
+            if cores >= 2 {
+                assert!(
+                    m.cols() > m.rows(),
+                    "{cores} cores: {cols}x{rows} is not wider than it is tall"
+                );
+                assert!(
+                    m.width() > m.height(),
+                    "{cores} cores: the {cols}x{rows} buffer is not a rectangle"
+                );
+            }
+        }
+    }
+
+    /// A pinned `TROLLSHELL_CORE_LEDS_ROWS` still overrides the automatic
+    /// shape — including into a shape that is *worse* than the default, which
+    /// is the user's call to make.
+    ///
+    /// Falsified by dropping [`core_led_matrix_for`]'s `Some(rows)` arm: the
+    /// override silently becomes a no-op and 4 cores stay 4x1.
+    #[test]
+    fn a_pinned_row_count_beats_the_automatic_shape() {
+        let pinned = CoreLeds {
+            rows: Some(4),
+            ..CoreLeds::default()
+        };
+        assert_eq!(
+            {
+                let m = core_led_matrix_for(pinned, 4);
+                (m.cols(), m.rows())
+            },
+            (1, 4),
+            "the pinned row count must win, even at 1x4"
+        );
+        assert_eq!(
+            {
+                let m = core_led_matrix_for(pinned, 64);
+                (m.cols(), m.rows())
+            },
+            (16, 4)
         );
     }
 
@@ -2193,10 +2356,13 @@ mod tests {
     fn every_core_count_fits_the_budget_box() {
         for cores in 1..=512usize {
             for shape in [None, Some(1usize), Some(2), Some(3)] {
-                let m = match shape {
-                    Some(rows) => LedMatrix::new(DisplayStyle::Vfd, cores.div_ceil(rows), rows),
-                    None => LedMatrix::rect(DisplayStyle::Vfd, cores),
-                };
+                let m = core_led_matrix_for(
+                    CoreLeds {
+                        rows: shape,
+                        ..CoreLeds::default()
+                    },
+                    cores,
+                );
                 let scale = usize::try_from(core_panel_scale(m.width(), m.height()))
                     .expect("u32 fits usize");
                 assert!(scale >= 1, "{cores}/{shape:?} scaled to nothing");
@@ -2390,14 +2556,14 @@ mod tests {
         );
     }
 
-    /// Whatever the core count, the near-square panel has a lamp for every
-    /// core and no wholly empty column — the shape contract the CPU card
+    /// Whatever the core count, the rectangular panel has a lamp for every
+    /// core and no wholly empty row — the shape contract the CPU card
     /// depends on, checked from the shell side of the boundary too so a kit
     /// change that lost lamps would fail here as well as in `hytte-preem`.
     #[test]
     fn the_panel_has_a_lamp_for_every_core() {
         for cores in 1..=512usize {
-            let m = LedMatrix::rect(DisplayStyle::Vfd, cores);
+            let m = core_led_matrix_for(CoreLeds::default(), cores);
             assert!(
                 m.cols() * m.rows() >= cores,
                 "{cores} cores lost lamps in a {}x{} panel",
@@ -2405,8 +2571,8 @@ mod tests {
                 m.rows()
             );
             assert!(
-                (m.cols() - 1) * m.rows() < cores,
-                "{cores} cores left a spare column in a {}x{} panel",
+                (m.rows() - 1) * m.cols() < cores,
+                "{cores} cores left a spare row in a {}x{} panel",
                 m.cols(),
                 m.rows()
             );
@@ -2814,11 +2980,17 @@ mod led_panel_layout_tests {
 
     use super::{CORE_PANEL_MAX_H, core_panel_row, core_panel_surface};
 
-    /// A surface holding the 93×93 buffer a 64-core near-square panel
+    /// The buffer dimensions a 64-core panel rasterises to under the #857
+    /// rectangle default — a 16×4 grid.
+    const PANEL_64: (u32, u32) = (181, 49);
+
+    /// A surface holding the 181×49 buffer a 64-core rectangular panel
     /// rasterises to, arranged exactly as the shipping row arranges it.
     fn panel_64() -> PixelSurface {
+        let (w, h) = PANEL_64;
+        let len = usize::try_from(w * h * 4).expect("the 64-core buffer fits usize");
         let panel = core_panel_surface();
-        panel.set_pixels(93, 93, &vec![0xff_u8; 93 * 93 * 4]);
+        panel.set_pixels(w, h, &vec![0xff_u8; len]);
         panel
     }
 
@@ -2836,14 +3008,15 @@ mod led_panel_layout_tests {
         row.append(&panel_64());
         let (min_w, nat_w, _, _) = row.measure(gtk::Orientation::Horizontal, -1);
         assert_eq!(min_w, 0, "the LED panel row grew a minimum width");
+        let want = i32::try_from(PANEL_64.0).expect("the buffer width fits i32");
         assert!(
-            nat_w >= 93,
-            "the row should still want the panel's 93 px, got {nat_w}"
+            nat_w >= want,
+            "the row should still want the panel's {want} px, got {nat_w}"
         );
     }
 
     /// A card far wider than the panel must not make the row taller: a filling
-    /// surface would request `400 * 93 / 93` = 400 px of height and swallow the
+    /// surface would request `400 * 49 / 181` px of height and swallow the
     /// CPU card.
     ///
     /// Falsified by putting `set_hexpand(true)` back on the surface — which is
@@ -2857,7 +3030,162 @@ mod led_panel_layout_tests {
         let (_, nat_h, _, _) = row.measure(gtk::Orientation::Vertical, 400);
         assert!(
             nat_h <= budget,
-            "a 400 px card stretched the 93 px panel to {nat_h} px tall"
+            "a 400 px card stretched the 181x49 panel to {nat_h} px tall"
         );
+    }
+}
+
+/// The multicolumn grid's arrangement (#857): the two-column flow that replaced
+/// #702's spanning CPU card, and the #571 GPU-hidden reflow that has to keep
+/// working underneath it.
+///
+/// Gated on `system-tests` because `gtk::Grid`'s layout children only exist
+/// once GTK is initialised. Drives [`attach_stats_cards`] and
+/// [`install_gpu_hidden_reflow`] — the real production functions — over five
+/// bare `gtk::Label`s, so the shipping coordinates are what gets asserted
+/// rather than a second copy of them that can drift.
+#[cfg(all(test, feature = "system-tests"))]
+mod stats_grid_tests {
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+
+    use super::{StatsSection, attach_stats_cards, install_gpu_hidden_reflow};
+
+    /// A grid wired by the shipping attach function, plus the five widgets in
+    /// [`StatsSection`] declaration order.
+    fn stats_grid() -> (gtk::Grid, [gtk::Widget; 5]) {
+        let grid = gtk::Grid::new();
+        grid.set_column_homogeneous(true);
+        let cards: [gtk::Widget; 5] =
+            std::array::from_fn(|i| gtk::Label::new(Some(&i.to_string())).upcast());
+        let [cpu, memory, gpu, disks, services] = &cards;
+        attach_stats_cards(&grid, cpu, memory, gpu, disks, services);
+        (grid, cards)
+    }
+
+    /// `(column, row, column_span, row_span)` of `w` in `grid`.
+    fn cell(grid: &gtk::Grid, w: &gtk::Widget) -> (i32, i32, i32, i32) {
+        let lc = grid
+            .layout_manager()
+            .expect("gtk::Grid always installs a GtkGridLayout")
+            .layout_child(w)
+            .downcast::<gtk::GridLayoutChild>()
+            .expect("a GtkGrid's layout children are GtkGridLayoutChild");
+        (lc.column(), lc.row(), lc.column_span(), lc.row_span())
+    }
+
+    /// The columns occupied in `row` by the currently-visible cards.
+    fn occupied(grid: &gtk::Grid, cards: &[gtk::Widget; 5], row: i32) -> Vec<i32> {
+        let mut cols: Vec<i32> = cards
+            .iter()
+            .filter(|w| w.is_visible())
+            .map(|w| cell(grid, w))
+            .filter(|(_, r, _, _)| *r == row)
+            .flat_map(|(c, _, span, _)| c..c + span)
+            .collect();
+        cols.sort_unstable();
+        cols
+    }
+
+    /// **The #857 ask, pinned.** CPU no longer spans both columns, and the grid
+    /// reads left-to-right then down in #582's bar-chip order — CPU, Memory,
+    /// GPU, Disks, Services — which is the order the bar's own resource chips
+    /// render in and the order `StatsSection` declares.
+    ///
+    /// Falsified by any one of the five `grid.attach` lines: restoring #702's
+    /// `(0, 0, 2, 1)` CPU span breaks the span assertion *and* reshuffles the
+    /// reading order to CPU, GPU, Disks, Memory, Services.
+    #[gtk::test]
+    fn the_grid_is_a_two_column_flow_in_bar_chip_order() {
+        adw::init().expect("libadwaita init");
+        let (grid, cards) = stats_grid();
+        let [cpu, memory, gpu, disks, services] = &cards;
+
+        assert_eq!(cell(&grid, cpu), (0, 0, 1, 1), "CPU must not span (#857)");
+        assert_eq!(cell(&grid, memory), (1, 0, 1, 1));
+        assert_eq!(cell(&grid, gpu), (0, 1, 1, 1));
+        assert_eq!(cell(&grid, disks), (1, 1, 1, 1));
+        assert_eq!(
+            cell(&grid, services),
+            (0, 2, 2, 1),
+            "Services keeps the last row to itself (#582)"
+        );
+
+        // Reading order is row-major over the cells, and must equal the
+        // `StatsSection` declaration order that
+        // `stats_section_declaration_order_matches_bar` pins to the bar.
+        let sections = [
+            StatsSection::Cpu,
+            StatsSection::Memory,
+            StatsSection::Gpu,
+            StatsSection::Disks,
+            StatsSection::Services,
+        ];
+        let mut by_position: Vec<(i32, i32, StatsSection)> = cards
+            .iter()
+            .zip(sections)
+            .map(|(w, s)| {
+                let (col, row, _, _) = cell(&grid, w);
+                (row, col, s)
+            })
+            .collect();
+        by_position.sort_by_key(|(row, col, _)| (*row, *col));
+        let reading_order: Vec<StatsSection> = by_position.into_iter().map(|(_, _, s)| s).collect();
+        assert_eq!(
+            reading_order,
+            sections.to_vec(),
+            "the grid must read in bar-chip order"
+        );
+    }
+
+    /// **The #571 reflow, still intact under #857's arrangement.** With every
+    /// card shown, both columns of every row are occupied. When the GPU card
+    /// self-hides, Disks moves into the column GPU vacated rather than being
+    /// stranded in column 1 with a hole to its left.
+    ///
+    /// The invariant is stated as *"every row's occupied columns form a
+    /// prefix"* rather than as Disks' column number, because that is the thing
+    /// the reflow exists to protect: a gap is only a hole when something sits
+    /// to the right of it. A trailing empty cell (row 1's column 1, once Disks
+    /// has moved left) is not a hole.
+    ///
+    /// Falsified by deleting either the immediate `reflow_disks_column(...)`
+    /// call in [`install_gpu_hidden_reflow`] or its `connect_visible_notify`.
+    #[gtk::test]
+    fn hiding_the_gpu_card_leaves_no_hole() {
+        adw::init().expect("libadwaita init");
+        let (grid, cards) = stats_grid();
+        let [_, _, gpu, disks, _] = &cards;
+        install_gpu_hidden_reflow(&grid, gpu, disks);
+
+        assert_eq!(occupied(&grid, &cards, 0), vec![0, 1], "row 0 full");
+        assert_eq!(occupied(&grid, &cards, 1), vec![0, 1], "row 1 full");
+        assert_eq!(occupied(&grid, &cards, 2), vec![0, 1], "Services spans");
+
+        gpu.set_visible(false);
+        assert_eq!(
+            cell(&grid, disks).0,
+            0,
+            "Disks must reflow into the column GPU vacated"
+        );
+        for row in 0..=2 {
+            let cols = occupied(&grid, &cards, row);
+            let prefix: Vec<i32> =
+                (0..i32::try_from(cols.len()).expect("at most two columns")).collect();
+            assert_eq!(
+                cols, prefix,
+                "row {row} has a hole with the GPU card hidden"
+            );
+        }
+        // Column 0 stays occupied in the rows either side of the reflowed
+        // Disks, which is what keeps the column-homogeneous grid's column 0
+        // width meaningful.
+        assert!(occupied(&grid, &cards, 0).contains(&0));
+        assert!(occupied(&grid, &cards, 2).contains(&0));
+
+        // And it reverses when a GPU appears.
+        gpu.set_visible(true);
+        assert_eq!(cell(&grid, disks).0, 1, "Disks must return to column 1");
+        assert_eq!(occupied(&grid, &cards, 1), vec![0, 1]);
     }
 }

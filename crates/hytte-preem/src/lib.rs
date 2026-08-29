@@ -38,8 +38,9 @@
 //!   meter (#506).
 //! - [`LedMatrix`] — the strip's 2-D sibling: a **grid** of LEDs each lit to
 //!   its own brightness, for N independent readings rather than one level
-//!   ("Blinken Lichten", #857). Shapeable (explicit `(cols, rows)` or a
-//!   near-square [`rect`](LedMatrix::rect)), with a [`Fill`] policy for the
+//!   ("Blinken Lichten", #857). Shapeable — explicit `(cols, rows)`, the
+//!   near-square [`rect`](LedMatrix::rect), or the wide-rectangle
+//!   [`wide`](LedMatrix::wide) — with a [`Fill`] policy for the
 //!   slots a ragged last row leaves over, and the kit's one consumer of the
 //!   [`ColorMap`] axis below.
 //! - [`Scope`] — a glow-trace oscilloscope over a graticule, with real

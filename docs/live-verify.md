@@ -769,11 +769,11 @@ audio feed, not the raster.
       of a `GtkFlowBox` of vertical progress bars. This is a look-and-feel
       feature: CI can only check byte patterns, so everything below wants
       eyes.
-  - Open the Stats drawer's CPU card. Expect a near-square grid of glowing
-    lamps that visibly breathes with load — hammer a core (`yes >/dev/null`,
-    one per core you want lit) and watch that lamp go from blue toward red on
-    the default `heat` map. The panel is centred in its row and should be
-    roughly 70–105 px tall on any machine.
+  - Open the Stats drawer's CPU card. Expect a grid of glowing lamps that
+    visibly breathes with load — hammer a core (`yes >/dev/null`, one per core
+    you want lit) and watch that lamp go from blue toward red on the default
+    `heat` map. The panel is centred in its row. **Its shape changed after the
+    first pass** — see the #857 rectangle entry below.
   - **The #702 check.** Drag the drawer / shrink the output as narrow as it
     goes. The panel must **letterbox down**, never force the drawer wider. Its
     reported minimum width is 0 px at any core count (one `PixelSurface`, whose
@@ -791,9 +791,10 @@ audio feed, not the raster.
     - `TROLLSHELL_CORE_LEDS_COLOR` = `heat` (default) / `style` / `rainbow` /
       `transpride` / `#rrggbb`. `style` should give the plain single-ink panel
       — the pre-#857 look, and the guarantee the byte-identity tests pin.
-    - `TROLLSHELL_CORE_LEDS_ROWS` = `rect` (default, near-square) or a row
+    - `TROLLSHELL_CORE_LEDS_ROWS` = `rect` (default — a **wide rectangle**
+      since the second #857 pass, near-square before it) or a row
       count. `=3` on a many-core box makes a wide, short strip — check it does
-      not push the drawer wider (it is 245 px at 1× on a 64-core box, and the
+      not push the drawer wider (it is 247 px at 1× on a 64-core box, and the
       scale deliberately refuses to blow it up past the budget).
     - `TROLLSHELL_CORE_LEDS_FILL` = `spare` (default) / `blank` — only visible
       when the last row is ragged **and** the skin ghosts, so pair it with
@@ -807,6 +808,39 @@ audio feed, not the raster.
     follow-up).
   - Sanity: on a 1-core VM / container the panel is a single blown-up lamp,
     not an empty row. Verified only against synthetic level slices in tests.
+- [ ] **(#857, second pass)** **Two-column Stats grid + a rectangular LED
+      panel.** Annika's on-glass verdict on the first pass was "default looks
+      weird now. Too much free space. I guess this can now be regular two
+      column flexbox. no need for stretched cpu anymore. rectangle for led view
+      would be still more preem tho." Both halves are look-and-feel, so both
+      want eyes.
+  - **The grid.** Open the Stats drawer (multicolumn is the default layout).
+    The CPU card must **no longer span both columns**: expect `CPU | Memory`
+    on the first row, `GPU | Disks` on the second, and Services alone across
+    the third — #582's bar-chip reading order, restored. The empty space to
+    the right of the LED panel that prompted the complaint should be gone. The
+    drawer should be **no taller** than before (still three rows).
+  - **The GPU-hidden reflow, again.** This is the same check as the #582 entry
+    above and it is worth redoing, because the arrangement it protects moved.
+    On GPU-less hardware (or with `sensors::gpu()` returning `None`), the GPU
+    card hides and **Disks must slide left into column 0**, leaving the empty
+    cell at the _right_ edge of that row rather than as a hole between CPU and
+    Disks. `hiding_the_gpu_card_leaves_no_hole` asserts this headlessly, but
+    only the eye can confirm the column widths still look right.
+  - **The rectangle.** The panel is now meaningfully wider than tall at every
+    core count — 16×4 on a 64-thread box (181×49 px at 1×), 8×2 at 16 cores,
+    4×1 at 4. It is picked automatically from the core count, so on a machine
+    with a different core count than the one that shipped this, confirm it
+    still reads as a rectangle rather than a square or a hairline. Heights now
+    run 49–96 px (they used to run 70–105) — shorter is the point.
+  - Deep-links still follow the cards: click each of the five bar chips in
+    turn and confirm each lands on **its own** card at the top of the
+    viewport. The scroll is coordinate-based (`compute_bounds`), so it should
+    be indifferent to the rearrangement — this check exists to prove that,
+    not because a break is expected.
+  - `TROLLSHELL_CORE_LEDS_ROWS=8` still overrides the automatic shape (and on
+    a 64-core box gives back roughly #861's square). `=rect` or unset is the
+    new rectangle.
 
 ## Weather & location
 

@@ -25,8 +25,9 @@
 //! # Sizing — the #313 lesson
 //!
 //! Sized via its **buffer dimensions**, like the rest of the kit: a CSS minimum
-//! below the buffer size is a silent no-op. The panel is small — a 64-cell
-//! near-square grid is 93×93 px — so a host that wants it bigger should upscale
+//! below the buffer size is a silent no-op. The panel is small — 64 cells is
+//! 93×93 px as a near-square [`LedMatrix::rect`], 181×49 as a wide
+//! [`LedMatrix::wide`] — so a host that wants it bigger should upscale
 //! (integer, nearest-neighbour) rather than stretch.
 
 use super::color_map::ColorMap;
@@ -95,21 +96,49 @@ impl LedMatrix {
     }
 
     /// A panel shaped to hold `cells` lamps in as near a **square** as an
-    /// integer grid allows — Annika's `rect` shape (#857).
+    /// integer grid allows.
     ///
     /// Takes the fewest columns whose square covers `cells`
     /// (`cols = ⌈√cells⌉`), then the fewest rows that fit
     /// (`rows = ⌈cells / cols⌉`). The result is never taller than it is wide,
     /// never more than one row off square, and never has a wholly empty
     /// trailing column — 1 → 1×1, 4 → 2×2, 8 → 3×3, 16 → 4×4, 64 → 8×8.
+    ///
+    /// Its **rectangle** sibling is [`wide`](Self::wide): same coverage and
+    /// minimality guarantees, but biased to a panel several times wider than it
+    /// is tall. Despite the name this constructor is the *square* one — it is
+    /// what the shell shipped on #861 and what every golden digest in this
+    /// file's tests is taken against.
     #[must_use]
     pub fn rect(style: DisplayStyle, cells: usize) -> Self {
         let (cols, rows) = near_square(cells);
         Self::new(style, cols, rows)
     }
 
+    /// A panel shaped to hold `cells` lamps in a **wide rectangle** — the shape
+    /// Annika asked for on the second pass of #857 ("rectangle for led view
+    /// would be still more preem tho").
+    ///
+    /// Takes the fewest rows whose [`WIDE_ASPECT`]-times-wider grid still covers
+    /// `cells` (`rows = ⌈√cells / √WIDE_ASPECT⌉`), then the fewest columns that
+    /// fit (`cols = ⌈cells / rows⌉`). Like [`rect`](Self::rect) it never loses a
+    /// lamp and never leaves a wholly empty trailing row; unlike it, the result
+    /// is **strictly wider than tall** for every `cells >= 2`, and its aspect
+    /// ratio never falls below 3:2 — 1 → 1×1, 4 → 4×1, 8 → 4×2, 16 → 8×2,
+    /// 64 → 16×4, 128 → 22×6.
+    ///
+    /// Deliberately *not* a pinned row count. `rows = 4` reads well at 64 lamps
+    /// and absurdly at 4 (a 1×4 column: taller than wide, the opposite of what
+    /// was asked). The row count has to follow the lamp count for the shape to
+    /// hold across the whole plausible range.
+    #[must_use]
+    pub fn wide(style: DisplayStyle, cells: usize) -> Self {
+        let (cols, rows) = near_wide(cells);
+        Self::new(style, cols, rows)
+    }
+
     /// Set the grid shape explicitly (each clamped to at least 1) — Annika's
-    /// `rows = N` shape: `LedMatrix::rect(style, n).shape(n.div_ceil(3), 3)`
+    /// `rows = N` shape: `LedMatrix::wide(style, n).shape(n.div_ceil(3), 3)`
     /// for a three-row panel, or build it with [`new`](Self::new) directly.
     #[must_use]
     pub fn shape(mut self, cols: usize, rows: usize) -> Self {
@@ -241,6 +270,23 @@ fn span(n: usize) -> usize {
     2 * PAD + n * CELL + (n - 1) * GAP
 }
 
+/// How many times wider than tall a [`LedMatrix::wide`] panel aims to be.
+///
+/// Must be a **perfect square**: [`near_wide`] divides by its integer root, so
+/// a non-square value would silently round the target aspect down to the next
+/// square below it. 4 is the value that keeps the whole plausible range
+/// readable, and the neighbouring squares are both worse — `1` degenerates to
+/// [`near_square`] (64 lamps go back to 8×8), while `9` flattens 8 lamps to an
+/// 8×1 hairline.
+const WIDE_ASPECT: usize = 4;
+
+/// `⌈√n⌉` without touching floats: `isqrt` truncates, so bump it unless `n` is
+/// a perfect square.
+fn ceil_sqrt(n: usize) -> usize {
+    let root = n.isqrt();
+    if root * root < n { root + 1 } else { root }
+}
+
 /// The near-square `(cols, rows)` grid holding `cells` lamps — see
 /// [`LedMatrix::rect`]. `0` cells still yields a `1×1` grid, so no caller can
 /// produce a zero-dimension buffer.
@@ -248,11 +294,28 @@ fn near_square(cells: usize) -> (usize, usize) {
     if cells <= 1 {
         return (1, 1);
     }
-    // `⌈√cells⌉` without touching floats: `isqrt` truncates, so bump it unless
-    // `cells` is a perfect square.
-    let root = cells.isqrt();
-    let cols = if root * root < cells { root + 1 } else { root };
+    let cols = ceil_sqrt(cells);
     (cols, cells.div_ceil(cols))
+}
+
+/// The wide-rectangle `(cols, rows)` grid holding `cells` lamps — see
+/// [`LedMatrix::wide`]. `0` cells still yields a `1×1` grid.
+///
+/// `rows` is defined as **the fewest rows `r` for which a
+/// [`WIDE_ASPECT`]-times-wider grid still covers `cells`** — the smallest `r`
+/// with `WIDE_ASPECT * r * r >= cells`. Solving that inequality gives the
+/// closed form used here, `r = ⌈√cells / √WIDE_ASPECT⌉`, and since
+/// `⌈⌈x⌉ / m⌉ == ⌈x / m⌉` for any integer `m`, [`ceil_sqrt`] composes with
+/// `div_ceil` exactly rather than approximately. The test
+/// `the_closed_form_agrees_with_the_search` pins that equivalence against a
+/// counting-up reference, so the algebra is checked rather than asserted in
+/// prose.
+fn near_wide(cells: usize) -> (usize, usize) {
+    if cells <= 1 {
+        return (1, 1);
+    }
+    let rows = ceil_sqrt(cells).div_ceil(WIDE_ASPECT.isqrt()).max(1);
+    (cells.div_ceil(rows), rows)
 }
 
 /// A lamp's normalized position along the panel's colour sweep — its row-major
@@ -359,8 +422,8 @@ fn stamp_cell(lit: &mut Emission, col: usize, row: usize, amount: u16) {
 mod tests {
     use super::super::{ColorMap, DisplayStyle, Frame};
     use super::{
-        CELL, Fill, GAP, LedMatrix, PAD, cell_x0, cell_y0, index_table, intensity, near_square,
-        span, sweep_pos,
+        CELL, Fill, GAP, LedMatrix, PAD, WIDE_ASPECT, cell_x0, cell_y0, index_table, intensity,
+        near_square, near_wide, span, sweep_pos,
     };
 
     /// Coordinates of every pixel where two same-shaped frames differ.
@@ -480,6 +543,96 @@ mod tests {
         assert_eq!(near_square(64), (8, 8));
         // Degenerate input can't produce a zero-dimension buffer.
         assert_eq!(near_square(0), (1, 1));
+    }
+
+    /// The `wide` shape is a **rectangle** at every plausible lamp count: it
+    /// covers every lamp, is strictly wider than tall from two lamps up, never
+    /// squashes below a 3:2 aspect, and never leaves a wholly empty trailing
+    /// row.
+    ///
+    /// The strict-width bound is the one that matters — it is the whole ask
+    /// ("rectangle for led view"), and it is what a pinned `rows = 4` would
+    /// fail at 4 lamps and what [`near_square`] fails everywhere. Falsified by
+    /// dropping the `div_ceil` in [`near_wide`] (rows stops shrinking, 64 goes
+    /// back to 8×8 square) or by swapping the returned pair (every count goes
+    /// taller than wide).
+    #[test]
+    fn wide_picks_a_rectangular_grid() {
+        for cells in 2..=4096usize {
+            let (cols, rows) = near_wide(cells);
+            assert!(cols * rows >= cells, "{cells}: {cols}×{rows} loses lamps");
+            assert!(
+                cols > rows,
+                "{cells}: {cols}×{rows} is not wider than it is tall"
+            );
+            // 3:2 in integers, so no float creeps into the bound.
+            assert!(
+                2 * cols >= 3 * rows,
+                "{cells}: {cols}×{rows} is squashed below a 3:2 rectangle"
+            );
+            assert!(
+                (rows - 1) * cols < cells,
+                "{cells}: {cols}×{rows} has a row to spare"
+            );
+        }
+        // One lamp is the only shape that cannot be a rectangle.
+        assert_eq!(near_wide(1), (1, 1));
+        assert_eq!(near_wide(0), (1, 1));
+        // The core counts the shell actually meets, pinned exactly — this is
+        // the table in the PR body.
+        assert_eq!(near_wide(2), (2, 1));
+        assert_eq!(near_wide(4), (4, 1));
+        assert_eq!(near_wide(8), (4, 2));
+        assert_eq!(near_wide(12), (6, 2));
+        assert_eq!(near_wide(16), (8, 2));
+        assert_eq!(near_wide(32), (11, 3));
+        assert_eq!(near_wide(64), (16, 4));
+        assert_eq!(near_wide(128), (22, 6));
+    }
+
+    /// [`near_wide`]'s closed form is only a shortcut for a **search**: the
+    /// fewest rows `r` with `WIDE_ASPECT * r * r >= cells`. This pins the
+    /// shortcut against that definition by counting up, so the `⌈√cells⌉` and
+    /// `div_ceil(√WIDE_ASPECT)` algebra is verified rather than trusted.
+    ///
+    /// Falsified by any change to the divisor (a `/ 2` in place of the
+    /// `div_ceil(2)` breaks at 5; dividing by `WIDE_ASPECT` instead of its root
+    /// breaks at 8).
+    #[test]
+    fn the_closed_form_agrees_with_the_search() {
+        for cells in 2..=4096usize {
+            // Bounded at `cells` rather than an open `(1..)`: `r = cells`
+            // always satisfies the predicate, so the bound cannot hide a
+            // solution, and an unbounded range trips `maybe_infinite_iter`.
+            let searched = (1..=cells)
+                .find(|r| WIDE_ASPECT * r * r >= cells)
+                .expect("r = cells always covers cells lamps");
+            assert_eq!(
+                near_wide(cells).1,
+                searched,
+                "{cells}: closed form picked {} rows, the search wants {searched}",
+                near_wide(cells).1
+            );
+        }
+    }
+
+    /// The `wide` constructor is the `near_wide` shape, and the panel it builds
+    /// is the wide buffer rather than #861's square one.
+    ///
+    /// Falsified by pointing [`LedMatrix::wide`] at `near_square`.
+    #[test]
+    fn wide_builds_the_rectangular_panel() {
+        let w = LedMatrix::wide(DisplayStyle::Vfd, 64);
+        assert_eq!((w.cols(), w.rows()), (16, 4));
+        assert_eq!((w.width(), w.height()), (span(16), span(4)));
+        assert_eq!((w.width(), w.height()), (181, 49));
+        // The square sibling is untouched — #861's goldens still describe it.
+        let r = LedMatrix::rect(DisplayStyle::Vfd, 64);
+        assert_eq!((r.cols(), r.rows()), (8, 8));
+        assert!(
+            w.width() > w.height() && r.width() == r.height(),
+            "wide must be a rectangle where rect is a square"
+        );
     }
 
     /// The explicit `(cols, rows)` shape is what gets rendered, both dimensions

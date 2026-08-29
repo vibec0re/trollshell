@@ -125,6 +125,14 @@ oo7 = { version = "0.5", default-features = false, features = [
   "native_crypto",
 ] }
 serde = { version = "1", features = ["derive"] }
+# The "unknown keys warn, never fail" half of #868's merge rules. A serde
+# `Deserializer` adapter that reports every key the target type ignored, as a
+# dotted path — so `hytte-config` gets exact unknown-key detection from the
+# schema type itself rather than from a hand-maintained key list that would
+# silently rot, or a serialize-round-trip diff that false-positives on any
+# `skip_serializing_if`. Its only dependency is `serde`, which is already here:
+# see the `Cargo.lock` diff on #868, which adds exactly one package.
+serde_ignored = "0.1.14"
 serde_json = "1"
 tempfile = "3"
 # Drift this centralizes: 1.40 (plugin side) vs 1.52.1 (shell side) — the

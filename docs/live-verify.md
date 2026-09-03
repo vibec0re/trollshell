@@ -389,6 +389,16 @@ title` in the stderr tail — worth a deliberate look on first run, since
       unconditional) — `osd::install` skips any monitor with no connector
       name by design, so no OSD card is ever expected to appear there, on
       either side of this fix.
+- [ ] **(#737)** The sidebar reserves the width it actually paints rather
+      than a flat 320. `exclusive_zone` was committed as the `SIDEBAR_WIDTH`
+      constant while the surface itself is `em`-sized (`.ts-sidebar`'s padding
+      and every child card grow with the font) and `set_size_request` sets a
+      _minimum_, not a width — so at a larger font the sidebar painted wider
+      than it reserved and tiled windows ran underneath it. **Raise
+      `gtk-font-name`'s point size well up**, open the sidebar, and confirm
+      tiled windows are pushed fully clear with neither overlap nor a dead
+      gap; then lower the font again and confirm the reserved strip shrinks
+      back to match instead of leaving a gap.
 
 ## Audio & media
 
@@ -851,6 +861,26 @@ audio feed, not the raster.
       re-tint funnel, so startup and live re-tint are covered by the same call.
       Compare against a plugin board (e.g. the preem demo's), which has always
       tracked — the two should now agree.
+- [ ] **(#722)** Flapping supervised tasks appear in the **Stats → Services**
+      card. Make a user unit restart-loop (a `Restart=always` unit whose
+      `ExecStart` exits non-zero will do) and confirm **both** halves, since
+      the fix deliberately shipped them together: a second group lists the
+      task with its consecutive-panic count, **and the bar's services chip
+      becomes visible even though no unit is in the `failed` state** — the
+      chip's predicate widened from "no failed units" to "no failed units
+      _and_ no flapping tasks", so before this a flapping-only system showed
+      nothing at all. Stop the loop and confirm both the entry and the chip
+      disappear again.
+- [ ] **(#701)** The Stats drawer scrolls only when it genuinely runs out of
+      screen. Both scrolling layouts used to cap their viewport at a hardcoded
+      560 design-baseline px, which `scale()` could not rescue — the page
+      content rides the same font factor, so the ratio was font-invariant and
+      the drawer scrolled even on a tall monitor with room to spare. On a
+      **tall** output the Stats page should now show its content with no
+      scrollbar; on a **short** one it must still scroll rather than overflow.
+      Worth checking at two font sizes, and on a second output of a different
+      height if you have one — the cap is derived per live monitor now, so it
+      should differ between them.
 
 ## Weather & location
 
@@ -1172,9 +1202,9 @@ audio feed, not the raster.
       within ~2 s the badge flips to "Active but not connected" without
       reopening the tab. A plugin that trips the effect rate cap shows a
       "· N dropped" violation count.
-- [ ] **(#616)** Build revision reachable at runtime (refs #601, which stays
-      **open** — only the surface-agnostic plumbing landed, the UI-surface
-      decision is still pending):
+- [ ] **(#616)** Build revision reachable at runtime — the D-Bus half of
+      #601. (#836 later added the UI surface and closed the issue; the
+      footer entry below is that half.)
 
   ```sh
   busctl --user call mov.vibec0re.trollshell.Control \
@@ -1194,6 +1224,31 @@ audio feed, not the raster.
   `gio::AppInfo::launch_default_for_uri`, or the plugin `RunCommand` effect)
   — a shell descended from trollshell reports the **deployed** revision, not
   `dev`, even from a dev `cargo run` run inside it.
+
+- [ ] **(#640/#703)** Control-center **Places** tab: add, edit and remove a
+      location row, and confirm each change reaches
+      `~/.config/trollshell/places.toml` and that the running shell picks it
+      up (the shell mtime-polls the file — there is deliberately no new D-Bus
+      surface for this). The write path is format-preserving, so the thing to
+      check on glass is what a plain re-render would have destroyed:
+      **hand-edit the file first** — put a comment above a place, reorder some
+      keys — then make an edit in the tab and confirm your comment, key order
+      and preamble all survive. The editor must also work with the shell
+      **stopped**, since it writes the file directly rather than asking the
+      shell to.
+- [ ] **(#601/#836)** The control-center's **footer** reports the running
+      _shell's_ revision, not its own. The companion app is a separate binary
+      with its **own** `TROLLSHELL_REV` baked in by `nix/control-center.nix`,
+      so a local read would report the wrong build in exactly the case #601
+      exists to catch. Get the two to **diverge** — rebuild the shell only
+      (`nix flake update trollshell` + rebuild), leaving the companion on its
+      old store path — then open the control-center: the footer must show the
+      **shell's** hash, cross-checkable against the `Control.Revision` busctl
+      call above, which is the same source. With the shell **stopped** the
+      footer must read `Shell revision: unavailable (trollshell not running)`
+      rather than silently falling back to the companion's own hash. A `dev`
+      value is rendered as-is on purpose — an unstamped local build is correct
+      information, not a state to hide.
 
 ## Documentation site (GitHub Pages)
 

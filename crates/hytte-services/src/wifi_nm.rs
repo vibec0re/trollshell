@@ -880,6 +880,11 @@ fn wifi_network_from_ap_props(
         // One AP per row at this stage; `collapse_by_ssid` raises it when a
         // group merges.
         ap_count: 1,
+        // Pre-merge, this AP *is* the whole row, so its own signal is the
+        // associated one iff it is the active BSSID. `collapse_by_ssid`
+        // carries the surviving `Some` onto the merged row, where it is the
+        // only field still describing the AP we are actually on (#874).
+        active_signal_dbm: connected.then_some(signal_dbm),
     })
 }
 
@@ -924,6 +929,13 @@ fn collapse_by_ssid(networks: Vec<WifiNetwork>) -> Vec<WifiNetwork> {
             let row = &mut merged[i];
             row.ap_count += 1;
             row.connected |= net.connected;
+            // At most one member of a group can be connected (`connected` is
+            // `ap_path == active_ap_path`), so at most one carries a `Some`
+            // here and `or` keeps it whichever order NM enumerated the group
+            // in — deliberately *not* folded into the representative swap
+            // below, since the associated AP is usually not the strongest one
+            // (#874).
+            row.active_signal_dbm = row.active_signal_dbm.or(net.active_signal_dbm);
             // Strictly greater, so the first-seen AP wins a tie and the result
             // is deterministic for a given NM enumeration order.
             if net.signal_dbm > row.signal_dbm {
@@ -1948,6 +1960,34 @@ mod tests {
         assert_eq!(net.known_network_path, None);
     }
 
+    #[test]
+    fn active_signal_is_populated_only_for_the_active_bssid() {
+        // The pre-merge half of #874: `collapse_by_ssid` can only carry a value
+        // that was set here, so the invariant "`Some` exactly when `connected`"
+        // starts at this call site.
+        let mut props = ap_props_with_ssid(b"FRITZ!Box");
+        props.insert("Strength".to_string(), val(60u8));
+        let saved: HashMap<String, String> = HashMap::new();
+
+        let active = wifi_network_from_ap_props("/ap/0", &props, "/ap/0", &saved)
+            .expect("non-empty SSID yields a network");
+        assert!(active.connected);
+        assert_eq!(active.signal_dbm, -70);
+        assert_eq!(
+            active.active_signal_dbm,
+            Some(-70),
+            "the active BSSID must carry its own signal for the connected readout",
+        );
+
+        let idle = wifi_network_from_ap_props("/ap/1", &props, "/ap/0", &saved)
+            .expect("non-empty SSID yields a network");
+        assert!(!idle.connected);
+        assert_eq!(
+            idle.active_signal_dbm, None,
+            "a non-active AP must not claim to be the associated one",
+        );
+    }
+
     // -- collapse_by_ssid: one row per SSID, not per BSSID (#871) -------------
 
     /// A pre-merge row as `wifi_network_from_ap_props` would have produced it:
@@ -1962,6 +2002,9 @@ mod tests {
             signal_dbm,
             known_network_path: None,
             ap_count: 1,
+            // Mirrors `wifi_network_from_ap_props`: pre-merge, an AP's own
+            // signal is the associated one iff it is the active BSSID.
+            active_signal_dbm: connected.then_some(signal_dbm),
         }
     }
 
@@ -2079,6 +2122,86 @@ mod tests {
     #[test]
     fn empty_input_collapses_to_nothing() {
         assert!(collapse_by_ssid(Vec::new()).is_empty());
+    }
+
+    // -- active_signal_dbm: the associated AP, alongside the max (#874) -------
+    //
+    // `signal_dbm` stays the group max (sort position + icon + subtitle agree
+    // on it); `active_signal_dbm` is the one field that describes the radio we
+    // are actually associated to, so the card's readout can stop claiming a
+    // strength that belongs to a different AP.
+    //
+    // Both enumeration orders are separate tests for the same reason #873 split
+    // its `connected` pair: with the connected AP seen *first* the merged row
+    // already holds the value, so a dropped merge survives that ordering, and
+    // with it seen *last* an overwriting merge survives instead. Neither order
+    // alone pins the rule.
+
+    #[test]
+    fn active_signal_is_the_associated_ap_when_it_is_seen_last() {
+        // The reporter's train mesh: associated to the -74 dBm carriage AP
+        // while a -53 dBm one is further down the train, strongest enumerated
+        // first.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -53, false),
+            ap_row("/ap/1", "WIFI@DB", -74, true),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].signal_dbm, -53,
+            "the row itself still carries the group max — it sorts and draws its icon on this",
+        );
+        assert_eq!(
+            merged[0].active_signal_dbm,
+            Some(-74),
+            "the associated AP's own signal must survive the merge, not the max",
+        );
+    }
+
+    #[test]
+    fn active_signal_is_the_associated_ap_when_it_is_seen_first() {
+        // Same group, opposite enumeration order: the representative swap to
+        // the stronger AP must not drag `active_signal_dbm` along with the
+        // path/signal it legitimately replaces.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -74, true),
+            ap_row("/ap/1", "WIFI@DB", -53, false),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].signal_dbm, -53, "still the group max");
+        assert_eq!(
+            merged[0].active_signal_dbm,
+            Some(-74),
+            "the stronger representative must not overwrite the associated AP's signal",
+        );
+    }
+
+    #[test]
+    fn active_signal_equals_the_max_when_the_associated_ap_is_strongest() {
+        // The ordinary case — the two meanings coincide, and the readout is
+        // unchanged from pre-#871 behaviour. Still worth pinning: it is the
+        // half of the rule that says the field is *populated at all* on a
+        // connected row rather than only when it differs.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -45, true),
+            ap_row("/ap/1", "WIFI@DB", -70, false),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].signal_dbm, -45);
+        assert_eq!(merged[0].active_signal_dbm, Some(-45));
+    }
+
+    #[test]
+    fn active_signal_stays_none_when_no_member_is_connected() {
+        // A group we are not on has no associated AP, so the field must stay
+        // absent — the card's readout only ever reads the connected row, and
+        // the fallback to `signal_dbm` must not be triggered by a stale value.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -53, false),
+            ap_row("/ap/1", "WIFI@DB", -74, false),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].active_signal_dbm, None);
     }
 
     // -- new_wifi_connection_settings -----------------------------------------

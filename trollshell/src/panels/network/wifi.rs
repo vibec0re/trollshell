@@ -175,11 +175,8 @@ fn wifi_description_text(
         wifi::StationState::Connected => {
             if let Some(ssid) = &st.connected_ssid {
                 if let Some(n) = networks.iter().find(|n| n.connected) {
-                    format!(
-                        "{ssid} \u{00b7} {} dBm ({})",
-                        n.signal_dbm,
-                        dbm_label(n.signal_dbm)
-                    )
+                    let dbm = connected_readout_dbm(n);
+                    format!("{ssid} \u{00b7} {dbm} dBm ({})", dbm_label(dbm))
                 } else {
                     ssid.clone()
                 }
@@ -189,6 +186,24 @@ fn wifi_description_text(
         }
         _ => "Disconnected".to_string(),
     }
+}
+
+/// The dBm the card's connected readout should name (#874).
+///
+/// After #871's SSID collapse a merged row's `signal_dbm` is the **max** across
+/// the group, which is right for the row itself — it is what the list sorts on,
+/// what the signal icon draws and what the subtitle prints, and those three
+/// must agree. It is wrong for the description line, which claims to describe
+/// *this link*: on a mesh you can be associated at −74 dBm (`ok`) while a
+/// −53 dBm radio (`good`) is in range, and the max would report that stranger's
+/// strength as this connection's.
+///
+/// So the readout — and **only** the readout — prefers the associated AP's own
+/// signal. `None` (no backend populated it, or an older snapshot) falls back to
+/// `signal_dbm`, which is the pre-#871 behaviour and exactly right for a
+/// single-AP row where the two coincide anyway.
+fn connected_readout_dbm(net: &wifi::WifiNetwork) -> i16 {
+    net.active_signal_dbm.unwrap_or(net.signal_dbm)
 }
 
 /// Subtitle tail naming how many access points a row collapsed (#871), or an
@@ -350,7 +365,7 @@ fn signal_icon(dbm: i16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::ap_count_suffix;
+    use super::{ap_count_suffix, wifi, wifi_description_text};
 
     #[test]
     fn single_ap_gets_no_badge() {
@@ -367,5 +382,86 @@ mod tests {
     fn merged_row_names_its_ap_count() {
         assert_eq!(ap_count_suffix(2), " \u{00b7} 2 APs");
         assert_eq!(ap_count_suffix(4), " \u{00b7} 4 APs");
+    }
+
+    // -- the connected readout names the AP we are on (#874) ------------------
+
+    fn powered_adapter() -> wifi::Adapter {
+        wifi::Adapter {
+            path: "/adapter/0".to_string(),
+            powered: true,
+            name: "wlan0".to_string(),
+        }
+    }
+
+    fn connected_station(ssid: &str) -> wifi::Station {
+        wifi::Station {
+            path: "/station/0".to_string(),
+            state: wifi::StationState::Connected,
+            scanning: false,
+            connected_network: None,
+            connected_ssid: Some(ssid.to_string()),
+        }
+    }
+
+    /// A connected row as the NM backend produces it post-#871: `signal_dbm` is
+    /// the group max, `active_signal_dbm` the AP we are associated to.
+    fn connected_row(
+        ssid: &str,
+        signal_dbm: i16,
+        active_signal_dbm: Option<i16>,
+    ) -> wifi::WifiNetwork {
+        wifi::WifiNetwork {
+            path: "/ap/0".to_string(),
+            ssid: ssid.to_string(),
+            security: "psk".to_string(),
+            known: true,
+            connected: true,
+            signal_dbm,
+            known_network_path: None,
+            ap_count: 3,
+            active_signal_dbm,
+        }
+    }
+
+    #[test]
+    fn readout_names_the_associated_ap_not_the_group_max() {
+        // The reporter's train mesh: on the -74 dBm carriage AP with a -53 dBm
+        // one in the group. Reading the max would claim "excellent" over a
+        // mediocre link.
+        let nets = vec![connected_row("WIFI@DB", -53, Some(-74))];
+        let text = wifi_description_text(
+            Some(&powered_adapter()),
+            Some(&connected_station("WIFI@DB")),
+            &nets,
+        );
+        assert_eq!(text, "WIFI@DB \u{00b7} -74 dBm (ok)");
+    }
+
+    #[test]
+    fn readout_falls_back_to_the_row_signal_when_no_active_signal_is_known() {
+        // `None` is the pre-#874 shape (and any row a backend leaves
+        // unpopulated): the readout must stay exactly as it was rather than
+        // going blank or zero.
+        let nets = vec![connected_row("WIFI@DB", -53, None)];
+        let text = wifi_description_text(
+            Some(&powered_adapter()),
+            Some(&connected_station("WIFI@DB")),
+            &nets,
+        );
+        assert_eq!(text, "WIFI@DB \u{00b7} -53 dBm (good)");
+    }
+
+    #[test]
+    fn readout_is_unchanged_when_the_associated_ap_is_the_strongest() {
+        // The two values coincide — the overwhelmingly common single-AP /
+        // strongest-member case must read identically either way.
+        let nets = vec![connected_row("FRITZ!Box", -45, Some(-45))];
+        let text = wifi_description_text(
+            Some(&powered_adapter()),
+            Some(&connected_station("FRITZ!Box")),
+            &nets,
+        );
+        assert_eq!(text, "FRITZ!Box \u{00b7} -45 dBm (excellent)");
     }
 }

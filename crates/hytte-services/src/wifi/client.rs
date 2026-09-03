@@ -100,6 +100,10 @@ pub(super) async fn read_networks(
             connected,
             signal_dbm,
             known_network_path,
+            // iwd's Network objects are per-SSID by construction — it has
+            // already collapsed a mesh for us, so there is never a group to
+            // count and the panel never shows the badge on this backend.
+            ap_count: 1,
         });
     }
 

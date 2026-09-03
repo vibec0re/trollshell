@@ -191,6 +191,16 @@ fn wifi_description_text(
     }
 }
 
+/// Subtitle tail naming how many access points a row collapsed (#871), or an
+/// empty string for the single-AP case.
+fn ap_count_suffix(ap_count: usize) -> String {
+    if ap_count >= 2 {
+        format!(" \u{00b7} {ap_count} APs")
+    } else {
+        String::new()
+    }
+}
+
 fn dbm_label(dbm: i16) -> &'static str {
     if dbm >= -50 {
         "excellent"
@@ -204,10 +214,17 @@ fn dbm_label(dbm: i16) -> &'static str {
 }
 
 fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
+    // #871: a mesh / dual-band SSID collapses into one row, so say how many
+    // radios folded in — it distinguishes "far from the only AP" from "far
+    // from the nearest of many". Only at >= 2, since it would be noise on the
+    // ~90% of rows that are a single AP (and always on the iwd backend, whose
+    // rows are per-SSID already). Delete this one binding and the `{ap_count}`
+    // it fills to go back to plain rows.
+    let ap_count = ap_count_suffix(net.ap_count);
     let row = adw::ActionRow::builder()
         .title(&net.ssid)
         .subtitle(format!(
-            "{} dBm \u{00b7} {}",
+            "{} dBm \u{00b7} {}{ap_count}",
             net.signal_dbm,
             security_label(&net.security)
         ))
@@ -326,5 +343,29 @@ fn signal_icon(dbm: i16) -> &'static str {
         "network-wireless-signal-ok-symbolic"
     } else {
         "network-wireless-signal-weak-symbolic"
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::ap_count_suffix;
+
+    #[test]
+    fn single_ap_gets_no_badge() {
+        assert_eq!(ap_count_suffix(1), "");
+    }
+
+    #[test]
+    fn zero_is_treated_as_single() {
+        // Defensive: no backend produces 0, and it must never render "0 APs".
+        assert_eq!(ap_count_suffix(0), "");
+    }
+
+    #[test]
+    fn merged_row_names_its_ap_count() {
+        assert_eq!(ap_count_suffix(2), " \u{00b7} 2 APs");
+        assert_eq!(ap_count_suffix(4), " \u{00b7} 4 APs");
     }
 }

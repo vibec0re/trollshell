@@ -877,7 +877,67 @@ fn wifi_network_from_ap_props(
         connected,
         signal_dbm,
         known_network_path,
+        // One AP per row at this stage; `collapse_by_ssid` raises it when a
+        // group merges.
+        ap_count: 1,
     })
+}
+
+/// Collapse a per-AP list into one row per SSID.
+///
+/// `NetworkManager` publishes one `AccessPoint` object per **BSSID**, so a mesh,
+/// a repeater, or a plain dual-band router advertising one SSID on 2.4 and
+/// 5 GHz gets a row per radio — the panel showed `WIFI@DB` three times and its
+/// header counted APs rather than networks (#871). `wifiscan.rs`'s CLI path
+/// already collapses by SSID (see its `by_ssid` map); this is the panel's
+/// equivalent, with the extra per-field rules the panel's richer row needs.
+///
+/// Per SSID group:
+///
+/// * `path`, `security` — the **strongest** AP's. `path` is what
+///   [`crate::wifi::connect_network`] associates to, so the merged row must
+///   carry the radio you would actually want to join; per-AP security flags
+///   could in principle differ within one SSID, so they follow the same
+///   representative rather than being guessed.
+/// * `signal_dbm` — the max across the group.
+/// * `connected` — the **OR** across the group. `connected` is
+///   `ap_path == active_ap_path`, true for exactly one BSSID, and that BSSID
+///   is not necessarily the strongest one; the merged row must still read as
+///   connected.
+/// * `known` / `known_network_path` — already derived per-SSID from the
+///   saved-connection map in [`wifi_network_from_ap_props`], so every member
+///   of a group agrees and the first-seen value is correct.
+/// * `ap_count` — the group size, which the panel renders as a badge once it
+///   reaches 2.
+///
+/// Empty SSIDs are dropped upstream in [`wifi_network_from_ap_props`], so
+/// hidden APs never all collapse into a single blank row.
+///
+/// Groups keep first-seen order; the caller re-sorts by signal afterwards.
+fn collapse_by_ssid(networks: Vec<WifiNetwork>) -> Vec<WifiNetwork> {
+    let mut merged: Vec<WifiNetwork> = Vec::with_capacity(networks.len());
+    // SSID → index into `merged`.
+    let mut index: HashMap<String, usize> = HashMap::new();
+
+    for net in networks {
+        if let Some(&i) = index.get(&net.ssid) {
+            let row = &mut merged[i];
+            row.ap_count += 1;
+            row.connected |= net.connected;
+            // Strictly greater, so the first-seen AP wins a tie and the result
+            // is deterministic for a given NM enumeration order.
+            if net.signal_dbm > row.signal_dbm {
+                row.signal_dbm = net.signal_dbm;
+                row.path = net.path;
+                row.security = net.security;
+            }
+        } else {
+            index.insert(net.ssid.clone(), merged.len());
+            merged.push(net);
+        }
+    }
+
+    merged
 }
 
 /// Read all APs for `device_path` and return the network list.
@@ -912,6 +972,9 @@ async fn read_nm_networks(
             }
         }
     }
+
+    // One row per SSID, not per BSSID (#871).
+    let mut networks = collapse_by_ssid(networks);
 
     // Sort by signal strength descending (strongest first).
     networks.sort_by_key(|n| Reverse(n.signal_dbm));
@@ -1883,6 +1946,139 @@ mod tests {
             .expect("non-empty SSID yields a network");
         assert!(!net.known);
         assert_eq!(net.known_network_path, None);
+    }
+
+    // -- collapse_by_ssid: one row per SSID, not per BSSID (#871) -------------
+
+    /// A pre-merge row as `wifi_network_from_ap_props` would have produced it:
+    /// one AP, `known` already resolved per-SSID upstream.
+    fn ap_row(path: &str, ssid: &str, signal_dbm: i16, connected: bool) -> WifiNetwork {
+        WifiNetwork {
+            path: path.to_string(),
+            ssid: ssid.to_string(),
+            security: "psk".to_string(),
+            known: false,
+            connected,
+            signal_dbm,
+            known_network_path: None,
+            ap_count: 1,
+        }
+    }
+
+    #[test]
+    fn mesh_collapses_to_one_row_with_the_strongest_ap() {
+        // The reporter's case: one SSID, three APs (a train mesh).
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -55, false),
+            ap_row("/ap/1", "WIFI@DB", -53, false),
+            ap_row("/ap/2", "WIFI@DB", -74, false),
+        ]);
+        assert_eq!(merged.len(), 1, "one row per SSID");
+        assert_eq!(merged[0].signal_dbm, -53, "max signal across the group");
+        assert_eq!(
+            merged[0].path, "/ap/1",
+            "path must be the strongest AP's — connect_network() associates to it",
+        );
+        assert_eq!(merged[0].ap_count, 3);
+    }
+
+    // `connected` is `ap_path == active_ap_path`, true for exactly one BSSID —
+    // and a roaming client is not always on the loudest radio, so the merged
+    // row must stay connected while its `path` points at the strongest AP.
+    //
+    // Both enumeration orders matter and each kills a different bug, so they
+    // are two tests: with the connected AP seen *first* the OR is trivially
+    // satisfied by the base row (that ordering alone lets a missing `|=` pass),
+    // and with it seen *last* the first-seen row alone would read disconnected.
+
+    #[test]
+    fn connected_survives_when_the_weaker_active_ap_is_seen_last() {
+        // Strongest first, connected-but-weaker second: only the OR can carry
+        // `connected` onto the already-established row.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -50, false),
+            ap_row("/ap/1", "WIFI@DB", -70, true),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].connected,
+            "connected must OR across the group, not stay at the first AP's value",
+        );
+        assert_eq!(merged[0].path, "/ap/0", "still the strongest AP's path");
+        assert_eq!(merged[0].signal_dbm, -50);
+        assert_eq!(merged[0].ap_count, 2);
+    }
+
+    #[test]
+    fn connected_survives_when_the_weaker_active_ap_is_seen_first() {
+        // Connected-but-weaker first, strongest second: taking the stronger AP
+        // as the representative must not overwrite `connected` along with the
+        // path/signal it legitimately replaces.
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "WIFI@DB", -70, true),
+            ap_row("/ap/1", "WIFI@DB", -50, false),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].connected,
+            "the representative swap must not clear connected",
+        );
+        assert_eq!(merged[0].path, "/ap/1", "still the strongest AP's path");
+        assert_eq!(merged[0].signal_dbm, -50);
+        assert_eq!(merged[0].ap_count, 2);
+    }
+
+    #[test]
+    fn distinct_ssids_do_not_merge() {
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "FRITZ!Box", -40, false),
+            ap_row("/ap/1", "WIFI@DB", -60, false),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].ssid, "FRITZ!Box");
+        assert_eq!(merged[1].ssid, "WIFI@DB");
+        assert!(
+            merged.iter().all(|n| n.ap_count == 1),
+            "a lone AP stays at ap_count 1 so the panel hides the badge",
+        );
+    }
+
+    #[test]
+    fn ap_count_tracks_group_size() {
+        let merged = collapse_by_ssid(vec![
+            ap_row("/ap/0", "Mesh", -60, false),
+            ap_row("/ap/1", "Solo", -65, false),
+            ap_row("/ap/2", "Mesh", -55, false),
+            ap_row("/ap/3", "Mesh", -80, false),
+        ]);
+        let mesh = merged
+            .iter()
+            .find(|n| n.ssid == "Mesh")
+            .expect("Mesh row present");
+        let solo = merged
+            .iter()
+            .find(|n| n.ssid == "Solo")
+            .expect("Solo row present");
+        assert_eq!(mesh.ap_count, 3);
+        assert_eq!(solo.ap_count, 1);
+    }
+
+    #[test]
+    fn security_follows_the_strongest_ap() {
+        // Per-AP flags could in principle differ within one SSID; the merged
+        // row must describe the radio its `path` points at.
+        let mut weak = ap_row("/ap/0", "Mixed", -70, false);
+        weak.security = "open".to_string();
+        let strong = ap_row("/ap/1", "Mixed", -45, false);
+        let merged = collapse_by_ssid(vec![weak, strong]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].path, "/ap/1");
+        assert_eq!(merged[0].security, "psk");
+    }
+
+    #[test]
+    fn empty_input_collapses_to_nothing() {
+        assert!(collapse_by_ssid(Vec::new()).is_empty());
     }
 
     // -- new_wifi_connection_settings -----------------------------------------

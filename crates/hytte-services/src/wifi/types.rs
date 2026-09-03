@@ -53,6 +53,16 @@ pub struct WifiNetwork {
     /// `None` otherwise. Used by `forget()` to call
     /// `net.connman.iwd.KnownNetwork.Forget()`.
     pub known_network_path: Option<String>,
+    /// How many access points this row collapsed (#871). `1` for a plain
+    /// single-radio network; higher on a mesh, a repeater, or a dual-band
+    /// router advertising one SSID on both 2.4 and 5 GHz.
+    ///
+    /// Only the `NetworkManager` backend can ever exceed `1`: NM publishes one
+    /// `org.freedesktop.NetworkManager.AccessPoint` object per **BSSID**, so
+    /// `wifi_nm` merges them per SSID and records the group size here. iwd
+    /// enumerates `net.connman.iwd.Network` objects, which are per-SSID by
+    /// construction, so its rows are always `1`.
+    pub ap_count: usize,
 }
 
 // ── Prompt request ────────────────────────────────────────────────────────────

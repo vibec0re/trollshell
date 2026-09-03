@@ -104,6 +104,11 @@ pub(super) async fn read_networks(
             // already collapsed a mesh for us, so there is never a group to
             // count and the panel never shows the badge on this backend.
             ap_count: 1,
+            // Same reason: with one row per SSID there is no group max to
+            // diverge from, so the associated AP's signal is just this row's
+            // own — but the connected readout reads this field (#874), so it
+            // still has to be populated rather than left `None`.
+            active_signal_dbm: connected.then_some(signal_dbm),
         });
     }
 

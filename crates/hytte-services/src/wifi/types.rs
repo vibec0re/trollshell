@@ -63,6 +63,24 @@ pub struct WifiNetwork {
     /// enumerates `net.connman.iwd.Network` objects, which are per-SSID by
     /// construction, so its rows are always `1`.
     pub ap_count: usize,
+    /// Signal strength in dBm of the access point this machine is **actually
+    /// associated to**, or `None` when this row is not the connected one
+    /// (#874).
+    ///
+    /// [`WifiNetwork::signal_dbm`] is the **max** across the collapsed group,
+    /// and deliberately so: it drives the row's sort position, its signal icon
+    /// and its subtitle, and those three must agree with each other. But the
+    /// Wi-Fi card's description line names the connected network's strength,
+    /// and there the honest number is the associated AP's own — a mesh can
+    /// have you on a −74 dBm radio while a −53 dBm one is in range, and the
+    /// group max would advertise that stranger's strength as this link's. One
+    /// field cannot serve both meanings, so the associated AP's signal rides
+    /// alongside the max rather than replacing it.
+    ///
+    /// Invariant: `Some` exactly when [`WifiNetwork::connected`] is `true`.
+    /// On the iwd backend the two values always coincide (its `Network`
+    /// objects are per-SSID, so there is no group to take a max over).
+    pub active_signal_dbm: Option<i16>,
 }
 
 // ── Prompt request ────────────────────────────────────────────────────────────

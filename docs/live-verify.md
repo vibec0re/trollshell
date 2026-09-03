@@ -841,6 +841,16 @@ audio feed, not the raster.
   - `TROLLSHELL_CORE_LEDS_ROWS=8` still overrides the automatic shape (and on
     a 64-core box gives back roughly #861's square). `=rect` or unset is the
     new rectangle.
+- [ ] **(#862)** **Accent tracking for the shell's own preem surfaces** — the
+      Stats drawer's per-core LED panel is rasterised in-process, and until
+      #864 nothing called `hytte_preem::set_accent`, so it drew with the kit
+      default while every out-of-process plugin board correctly followed the
+      desktop accent. Open the Stats drawer and change the desktop accent: the
+      LED panel's lit lamps should re-tint to match, live, without a shell
+      restart — the fix sits in `publish_accent`, which is also #396's live
+      re-tint funnel, so startup and live re-tint are covered by the same call.
+      Compare against a plugin board (e.g. the preem demo's), which has always
+      tracked — the two should now agree.
 
 ## Weather & location
 
@@ -1067,6 +1077,27 @@ audio feed, not the raster.
   `rt.block_on` on the GTK main thread, so a slow bus blocked the entire
   shell for the probe's duration (~10 s with the socket down, up to ~50 s
   against a wedged peer).
+
+- [ ] **(#873)** In range of a **multi-AP SSID** (a mesh, a repeater, or a
+      plain dual-band router advertising one name on 2.4 and 5 GHz), the
+      Wi-Fi panel's scan list should show **exactly one row** for it, not one
+      per BSSID, and the expander header should count networks rather than
+      APs. The row must carry the **strongest** member throughout: its sort
+      position, its signal icon and its `-NN dBm` subtitle all read that same
+      number, and the subtitle gains a `· N APs` tail naming the group size.
+      Cross-check against `nmcli -f SSID,BSSID,SIGNAL device wifi list`.
+      Hidden APs (blank SSID) must still not appear at all, rather than
+      collapsing into one blank row.
+- [ ] **(#874)** While associated to a **non-strongest** member of such a
+      group, the Wi-Fi card's description line must name the AP you are
+      actually on. The concrete case: associated at −74 dBm with a −53 dBm
+      member of the same SSID in range — the card must read `−74 dBm (ok)`,
+      not `−53 dBm (good)`. The row itself is unchanged and must stay that
+      way: it still sorts on −53 and still draws the −53 icon and subtitle.
+      Confirm the associated BSSID with `iw dev <iface> link` (or
+      `nmcli -f active,bssid,signal device wifi list`) rather than trusting
+      the panel. On a single-AP network, or when you happen to be on the
+      strongest member, nothing should look different from before.
 
 ## Night light
 

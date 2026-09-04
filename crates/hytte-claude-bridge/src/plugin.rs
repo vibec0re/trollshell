@@ -149,14 +149,32 @@ fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
+/// The widest count the chip will print before switching to `999+`.
+///
+/// A bar chip has to keep a fixed-ish width — this one sits in a shared region
+/// with every other chip — and a long-lived bridge answering a pet tick a minute
+/// reaches five digits inside a day, which would quietly push its neighbours
+/// around. Past a thousand the exact number is not what anyone is reading the
+/// chip for anyway; the journal has it.
+const COUNT_CAP: u64 = 999;
+
 /// The coarse counts, `<2xx>/<not-2xx>` — or an empty string before anything has
 /// been served, which the caller renders as *no label at all* rather than a
-/// misleading `0/0`.
+/// misleading `0/0`. Each side saturates at [`COUNT_CAP`] so the chip's width
+/// stops growing.
 fn counts_label(ok: u64, errors: u64) -> String {
     if ok == 0 && errors == 0 {
-        String::new()
+        return String::new();
+    }
+    format!("{}/{}", capped(ok), capped(errors))
+}
+
+/// One count, rendered at most four characters wide.
+fn capped(n: u64) -> String {
+    if n > COUNT_CAP {
+        format!("{COUNT_CAP}+")
     } else {
-        format!("{ok}/{errors}")
+        n.to_string()
     }
 }
 
@@ -229,7 +247,7 @@ pub fn run() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeChip, Tick, chip, counts_label, health_icon, mode_label};
+    use super::{BridgeChip, Tick, capped, chip, counts_label, health_icon, mode_label};
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
     use hytte_plugin::proto::{Manifest, Mount, Node, PluginMsg, decode, encode};
@@ -366,6 +384,20 @@ mod tests {
         assert_eq!(counts_label(1, 0), "1/0");
         assert_eq!(counts_label(0, 1), "0/1");
         assert_eq!(counts_label(9, 4), "9/4");
+    }
+
+    /// The chip's width stops growing: a bridge that has answered a pet tick a
+    /// minute for a day would otherwise print five digits and shove its
+    /// neighbours along the bar.
+    #[test]
+    fn counts_saturate_so_the_chip_cannot_widen_without_bound() {
+        assert_eq!(counts_label(999, 0), "999/0", "the cap itself prints exactly");
+        assert_eq!(counts_label(1_000, 2), "999+/2");
+        assert_eq!(counts_label(86_400, 12_345), "999+/999+");
+        // Four characters is the widest either side can ever be.
+        for n in [0, 1, 999, 1_000, u64::MAX] {
+            assert!(capped(n).len() <= 4, "{n} rendered as {}", capped(n));
+        }
     }
 
     /// The frames this plugin puts on the wire are valid: the `Register`

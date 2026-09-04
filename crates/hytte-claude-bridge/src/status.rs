@@ -78,8 +78,14 @@ pub struct Startup {
     pub keyed: bool,
 }
 
-/// Everything the chip renders, read in one go so the numbers on it agree with
-/// each other.
+/// Everything the chip renders.
+///
+/// **Not a consistent snapshot**, and it does not need to be: [`snapshot`] reads
+/// four independent relaxed atomics, so a request landing mid-read can leave
+/// `last` ahead of the counter it belongs to for one 5s tick. Nothing here is a
+/// number anyone adds up — it is a glanceable health readout, and paying for
+/// consistency (a lock on the request path) to make a chip 5 seconds fresher
+/// would be the wrong trade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
     /// The startup facts, or `None` before `main` has published them (the window

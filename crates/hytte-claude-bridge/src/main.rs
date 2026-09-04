@@ -403,9 +403,29 @@ async fn start(settings: &Settings) -> Option<Serving> {
     })
 }
 
+/// Watch the accept loop and **take the process down if it ever ends**.
+///
+/// [`accept_loop`] is an infinite loop, so joining it at all means it panicked
+/// (a poisoned lock, an allocator failure) or the runtime tore it down. Without
+/// this the process would keep running with a healthy-looking bar chip and a
+/// dead HTTP endpoint — every pet and caw turn a connection refused, and nothing
+/// to restart because the unit is still `active`. Exiting non-zero is what makes
+/// the transient unit's `Restart=on-failure` mean something.
+async fn supervise_http(http: tokio::task::JoinHandle<()>) {
+    match http.await {
+        Err(e) if e.is_panic() => {
+            tracing::error!(error = %e, "the HTTP accept loop panicked; exiting so the unit restarts");
+        }
+        Err(e) => tracing::error!(error = %e, "the HTTP accept loop was cancelled; exiting"),
+        Ok(()) => tracing::error!("the HTTP accept loop returned; exiting so the unit restarts"),
+    }
+    std::process::exit(1);
+}
+
 /// Answer connections forever. Spawned on the HTTP runtime by `main`, so it
 /// keeps serving whatever the plugin face is doing — including while the shell
-/// is down and the SDK is sitting in its dial backoff.
+/// is down and the SDK is sitting in its dial backoff. If it ever *stops*,
+/// [`supervise_http`] ends the process.
 async fn accept_loop(listener: tokio::net::TcpListener, bridge: Arc<Bridge>) {
     loop {
         match listener.accept().await {
@@ -460,18 +480,21 @@ fn main() -> ExitCode {
         mode: settings.mode,
         keyed: serving.keyed,
     });
-    rt.spawn(accept_loop(serving.listener, serving.bridge));
+    let http = rt.spawn(accept_loop(serving.listener, serving.bridge));
+    rt.spawn(supervise_http(http));
 
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
     // socket to dial *ever*, and the SDK would exit the process over it — which
     // would take the API down with it. Park on the HTTP runtime instead.
     if plugin::host_socket_available() {
-        plugin::run();
+        // Diverges: the SDK owns this thread for the rest of the process.
+        plugin::run()
+    } else {
+        tracing::warn!(
+            "XDG_RUNTIME_DIR unset; no trollshell host socket to dial — serving HTTP with no bar chip"
+        );
+        rt.block_on(std::future::pending::<ExitCode>())
     }
-    tracing::warn!(
-        "XDG_RUNTIME_DIR unset; no trollshell host socket to dial — serving HTTP with no bar chip"
-    );
-    rt.block_on(std::future::pending::<ExitCode>())
 }
 
 #[cfg(test)]

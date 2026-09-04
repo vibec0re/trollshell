@@ -18,11 +18,11 @@
 use hytte_plugin_proto::{
     AccentRole, Cls, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig,
     GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS,
-    MAX_LEDS, MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_TEXT_LEN, Manifest, MarqueeConfig, MarqueeState,
-    Mechanism, Mount, Node, PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig,
-    ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState,
-    TextBoxWidth, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem,
-    preem_id, preem_styled,
+    MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_RASTER_PIXELS, MAX_SCALE, MAX_SCOPE_SAMPLES,
+    MAX_STRIP_DIM, MAX_TEXT_LEN, Manifest, MarqueeConfig, MarqueeState, Mechanism, Mount, Node,
+    PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig, ScopeState, SevenSegConfig,
+    SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, VOCAB,
+    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem, preem_id, preem_styled,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ fn preem_constructors_set_identity_and_classes() {
         Node::Preem {
             id: None,
             classes: vec![],
-            widget: widget.clone(),
+            widget: Box::new(widget.clone()),
         }
     );
     assert_eq!(
@@ -228,7 +228,7 @@ fn preem_constructors_set_identity_and_classes() {
         Node::Preem {
             id: Some("clock".into()),
             classes: vec![],
-            widget: widget.clone(),
+            widget: Box::new(widget.clone()),
         }
     );
     assert_eq!(
@@ -236,7 +236,7 @@ fn preem_constructors_set_identity_and_classes() {
         Node::Preem {
             id: Some("clock".into()),
             classes: vec!["a".into()],
-            widget,
+            widget: Box::new(widget),
         }
     );
 }
@@ -287,10 +287,117 @@ fn omitted_config_keys_decode_to_kit_defaults() {
     );
 }
 
-/// The defaults this vocabulary documents are the kit's own
-/// (`crates/hytte-preem/src/*`), pinned so a drift in either direction is loud.
+/// The same guarantee for the two **nested** config structs, which are the ones
+/// it used to be false for: without a container-level `#[serde(default)]` on
+/// [`GaugeRange`] and [`PeakHoldConfig`], a partial `range` (only `low`) or a
+/// `peak_hold` with no `rate` was a hard decode failure while the module doc
+/// promised every omitted field defaults. Doc and code now agree.
 #[test]
-fn documented_defaults_match_the_kit() {
+fn omitted_nested_config_keys_decode_to_defaults() {
+    // {"Gauge": {"config": {"range": {"low": -20.0}}, "state": {}}} — `high`
+    // absent, and every other config key absent too.
+    let partial_range = rmp_serde::to_vec_named(&SparseGauge {
+        gauge: SparseGaugeBody {
+            config: OnlyRange {
+                range: OnlyLow { low: -20.0 },
+            },
+            state: Empty {},
+        },
+    })
+    .expect("sparse gauge encodes");
+
+    let back = decode_body::<PreemWidget>(&partial_range).expect("a partial range still decodes");
+    assert_eq!(
+        back,
+        PreemWidget::Gauge {
+            config: GaugeConfig {
+                range: GaugeRange {
+                    low: -20.0,
+                    high: 1.0, // the default, not a decode error
+                },
+                ..GaugeConfig::default()
+            },
+            state: GaugeState::default(),
+        }
+    );
+
+    // {"LedStrip": {"config": {"peak_hold": {}}, "state": {}}} — `rate` absent.
+    let bare_peak_hold = rmp_serde::to_vec_named(&SparseStrip {
+        led_strip: SparseStripBody {
+            config: OnlyPeakHold {
+                peak_hold: Empty {},
+            },
+            state: Empty {},
+        },
+    })
+    .expect("sparse strip encodes");
+
+    let back =
+        decode_body::<PreemWidget>(&bare_peak_hold).expect("a rate-less peak_hold still decodes");
+    assert_eq!(
+        back,
+        PreemWidget::LedStrip {
+            config: LedStripConfig {
+                peak_hold: Some(PeakHoldConfig { rate: 0.0 }),
+                ..LedStripConfig::default()
+            },
+            state: LedStripState::default(),
+        }
+    );
+}
+
+/// The one compat cell the rest of this suite doesn't cover: an **old decoder
+/// meeting a new frame**.
+///
+/// Everything else here proves new-decodes-old. This proves the other
+/// direction fails *cleanly* — `Node::Preem` and `HostMsg::Hello` hit a
+/// pre-#882 enum shape as an `unknown variant` error, not as a misparse into
+/// some neighbouring variant. That distinction is what makes the negotiation
+/// safe to reason about: a mis-behaved plugin that emits `Preem` past a
+/// non-advertising host produces one loud decode failure, never a silently
+/// wrong widget.
+#[test]
+fn a_pre_882_decoder_rejects_the_new_variants_cleanly() {
+    let preem_frame = encode_body(&preem_id("g", all_widgets()[0].clone()));
+    let err = rmp_serde::from_slice::<LegacyNode>(&preem_frame)
+        .expect_err("a pre-#882 Node must not decode a Preem frame");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown variant") && msg.contains("Preem"),
+        "expected a clean unknown-variant error naming Preem, got: {msg}"
+    );
+
+    let hello_frame = encode_body(&HostMsg::Hello { vocab: VOCAB });
+    let err = rmp_serde::from_slice::<LegacyHostMsg>(&hello_frame)
+        .expect_err("a pre-#882 HostMsg must not decode a Hello frame");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown variant") && msg.contains("Hello"),
+        "expected a clean unknown-variant error naming Hello, got: {msg}"
+    );
+
+    // …and the same decoder still reads a frame it *does* know, so the failures
+    // above are about the new variants, not a broken mirror.
+    let label = encode_body(&Node::Label {
+        id: None,
+        text: "hi".into(),
+        classes: vec![],
+    });
+    rmp_serde::from_slice::<LegacyNode>(&label).expect("the legacy mirror still decodes a Label");
+}
+
+/// Pins the **wire** defaults against the values this module's docs claim the
+/// kit uses.
+///
+/// Named for what it can actually check. It cannot see kit drift: this crate is
+/// the language-neutral schema anchor and deliberately does not depend on
+/// `hytte-preem`, so if someone changes `TextBox::new`'s 16 columns tomorrow,
+/// this test stays green and the *doc* becomes the lie. The citations on each
+/// case are the manual link. A real cross-check has to live on the kit side
+/// (a `hytte-preem` test asserting its constructors against these numbers) —
+/// out of lane for a proto-only PR; noted as a #884-era follow-up.
+#[test]
+fn wire_defaults_match_the_documented_kit_values() {
     assert_eq!(
         TextBoxConfig::default(),
         TextBoxConfig {
@@ -402,9 +509,15 @@ fn style_accessor_covers_every_variant() {
 /// exists to prevent.
 #[test]
 fn text_cap_truncates_on_a_char_boundary() {
-    // 3-byte chars, so MAX_TEXT_LEN (4096) lands *inside* a codepoint:
-    // 4096 = 3 * 1365 + 1.
-    let long = "☃".repeat(2000);
+    // 3-byte chars, so the cap lands *inside* a codepoint whenever
+    // MAX_TEXT_LEN isn't a multiple of 3 (it isn't: 2048 = 3*682 + 2).
+    let whole_chars = MAX_TEXT_LEN / 3;
+    let want_len = whole_chars * 3;
+    assert_ne!(
+        want_len, MAX_TEXT_LEN,
+        "this test needs a cap that splits a 3-byte codepoint"
+    );
+    let long = "☃".repeat(MAX_TEXT_LEN);
     assert!(long.len() > MAX_TEXT_LEN);
 
     let clamped = PreemWidget::DotMatrix {
@@ -417,7 +530,7 @@ fn text_cap_truncates_on_a_char_boundary() {
         panic!("clamped() must not change the variant");
     };
     assert!(state.text.len() <= MAX_TEXT_LEN, "text cap not enforced");
-    assert_eq!(state.text.len(), 3 * 1365, "must cut at the char boundary");
+    assert_eq!(state.text.len(), want_len, "must cut at the char boundary");
     assert!(state.text.chars().all(|c| c == '☃'), "no split codepoint");
 }
 
@@ -489,6 +602,7 @@ fn scope_samples_are_capped_per_update() {
 /// The allocation-sizing knobs clamp into their documented ranges from **both**
 /// directions: an absurd count is capped, and a zero is raised to the minimum
 /// the kit needs (a 0×0 buffer or a 0× scale is not a widget).
+#[allow(clippy::too_many_lines)]
 #[test]
 fn geometry_knobs_clamp_from_both_directions() {
     let huge = PreemWidget::Scope {
@@ -505,6 +619,30 @@ fn geometry_knobs_clamp_from_both_directions() {
         panic!("variant changed")
     };
     assert_eq!((config.cols, config.rows), (MAX_BUFFER_DIM, MAX_BUFFER_DIM));
+    // Not MAX_SCALE: the buffer is already at the dimension cap, so the scaled
+    // dimension rule pulls the upscale all the way down to 1. This is the whole
+    // point of the B1 fix — capping the dimension and the multiplier
+    // independently would have allowed 2048×8 = 16384 px per axis.
+    assert_eq!(
+        config.scale, 1,
+        "a max-dimension buffer must not also get a max upscale"
+    );
+
+    // …and a *small* buffer still gets the full upscale, so the rule bounds the
+    // product without flattening ordinary configs.
+    let small = PreemWidget::Scope {
+        config: ScopeConfig {
+            cols: 16,
+            rows: 16,
+            scale: u32::MAX,
+            ..ScopeConfig::default()
+        },
+        state: ScopeState::default(),
+    }
+    .clamped();
+    let PreemWidget::Scope { config, .. } = small else {
+        panic!("variant changed")
+    };
     assert_eq!(config.scale, MAX_SCALE);
 
     let zero = PreemWidget::Gauge {
@@ -568,7 +706,7 @@ fn geometry_knobs_clamp_from_both_directions() {
         panic!("variant changed")
     };
     assert_eq!(config.window_px, MAX_BUFFER_DIM);
-    assert_eq!(config.gap_dots, MAX_BUFFER_DIM);
+    assert_eq!(config.gap_dots, MAX_GAP_DOTS);
 
     let boxed = PreemWidget::TextBox {
         config: TextBoxConfig {
@@ -585,6 +723,247 @@ fn geometry_knobs_clamp_from_both_directions() {
     };
     assert_eq!(config.width, TextBoxWidth::Cols(1));
     assert_eq!((config.max_lines, config.scale), (1, 1));
+}
+
+/// **The B1 invariant**: after [`PreemWidget::clamped`], no widget — at *any*
+/// config a plugin can put on the wire — asks the shell to rasterise more than
+/// [`MAX_RASTER_PIXELS`], on either axis or in area.
+///
+/// Per-field caps are not the property that matters; their product is. Before
+/// the fix each field was capped independently, which bounded nothing useful:
+/// `cols = rows = 4096` with `scale = 8` was a *legal* config describing a
+/// 32768×32768 buffer — a **4.00 GiB** allocation demand from about thirty
+/// bytes of wire, an amplification of ~10⁸:1. `TextBox`'s `pad` (added to both
+/// dimensions) reached ~17 GB around an empty string.
+///
+/// The footprints below are computed from the **kit's real geometry**
+/// (`hytte-preem`'s font metrics and cell pitches, cited per case) rather than
+/// from the proto's own estimate constants, so a wrong estimate in
+/// `fit_scale`'s helpers fails here instead of silently under-bounding.
+// A worst-case case per widget; the length is the vocabulary size.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn preem_worst_case_footprint_is_bounded() {
+    // Kit geometry (crates/hytte-preem/src/*), mirrored here so this test is an
+    // independent check of the proto's caps rather than a restatement of them.
+    const GLYPH_W: u32 = 5; // font.rs:31
+    const GLYPH_H: u32 = 7; // font.rs:33
+    const SPACING: u32 = 1; // font.rs:35
+    const LINE_GAP: u32 = 2; // font.rs:37
+    const STRIP_PAD: u32 = 4; // led_strip.rs:45
+    const STRIP_CELL_W: u32 = 8; // led_strip.rs:39
+    const STRIP_CELL_H: u32 = 16; // led_strip.rs:41
+    const STRIP_GAP: u32 = 3; // led_strip.rs:43
+
+    /// `(final_width, final_height)` a clamped config would rasterise to.
+    fn footprint(w: &PreemWidget) -> (u32, u32) {
+        match w {
+            // Static text: bounded by MAX_TEXT_LEN glyphs on one line. (Two
+            // arms, not one alternation — the two state structs are distinct
+            // types by design, so a binding can't span them.)
+            PreemWidget::DotMatrix { state, .. } => {
+                let cols = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
+                (cols * (GLYPH_W + SPACING), GLYPH_H)
+            }
+            PreemWidget::SevenSeg { state, .. } => {
+                let cols = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
+                (cols * (GLYPH_W + SPACING), GLYPH_H)
+            }
+            PreemWidget::TextBox { config, state: _ } => {
+                let cols = match config.width {
+                    TextBoxWidth::Cols(n) => n,
+                    // A FitPx budget resolves to at most that many pixels.
+                    TextBoxWidth::FitPx(px) => px / (GLYPH_W + SPACING),
+                };
+                let w = (2 * config.pad + cols * (GLYPH_W + SPACING)) * config.scale;
+                let h = (2 * config.pad
+                    + config.max_lines * GLYPH_H
+                    + config.max_lines.saturating_sub(1) * LINE_GAP)
+                    * config.scale;
+                (w, h)
+            }
+            PreemWidget::LedStrip { config, .. } => (
+                2 * STRIP_PAD
+                    + config.leds * STRIP_CELL_W
+                    + config.leds.saturating_sub(1) * STRIP_GAP,
+                2 * STRIP_PAD + STRIP_CELL_H,
+            ),
+            // window_px is already the final width; the height is fixed.
+            PreemWidget::Marquee { config, .. } => (config.window_px, 2 * 2 + GLYPH_H * 2),
+            PreemWidget::Scope { config, .. } => {
+                (config.cols * config.scale, config.rows * config.scale)
+            }
+            PreemWidget::Gauge { config, .. } => {
+                (config.cols * config.scale, config.rows * config.scale)
+            }
+            PreemWidget::FlipBoard { config, .. } => {
+                // (glyph + 2*card pad + inter-card gap) per cell, + bezel, all
+                // in font pixels, times glyph_px times scale (split_flap.rs).
+                let per_cell = GLYPH_W + 2 + 1;
+                let w = (config.cells * per_cell + 2) * config.glyph_px * config.scale;
+                let h = (GLYPH_H + 4) * config.glyph_px * config.scale;
+                (w, h)
+            }
+        }
+    }
+
+    // Every knob pinned to its most expensive legal value.
+    let worst: Vec<PreemWidget> = vec![
+        PreemWidget::DotMatrix {
+            config: DotMatrixConfig::default(),
+            state: DotMatrixState {
+                text: "8".repeat(MAX_TEXT_LEN * 4),
+            },
+        },
+        PreemWidget::TextBox {
+            config: TextBoxConfig {
+                width: TextBoxWidth::Cols(u32::MAX),
+                max_lines: u32::MAX,
+                pad: u32::MAX,
+                corner: u32::MAX,
+                scale: u32::MAX,
+                ..TextBoxConfig::default()
+            },
+            state: TextBoxState {
+                text: "x".repeat(MAX_TEXT_LEN * 4),
+            },
+        },
+        PreemWidget::LedStrip {
+            config: LedStripConfig {
+                leds: u32::MAX,
+                ..LedStripConfig::default()
+            },
+            state: LedStripState::default(),
+        },
+        PreemWidget::Marquee {
+            config: MarqueeConfig {
+                window_px: u32::MAX,
+                gap_dots: u32::MAX,
+                speed_dots_per_sec: f32::INFINITY,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState::default(),
+        },
+        PreemWidget::Scope {
+            config: ScopeConfig {
+                cols: u32::MAX,
+                rows: u32::MAX,
+                scale: u32::MAX,
+                ..ScopeConfig::default()
+            },
+            state: ScopeState::default(),
+        },
+        PreemWidget::Gauge {
+            config: GaugeConfig {
+                cols: u32::MAX,
+                rows: u32::MAX,
+                scale: u32::MAX,
+                divisions: u32::MAX,
+                subdivisions: u32::MAX,
+                ..GaugeConfig::default()
+            },
+            state: GaugeState::default(),
+        },
+        PreemWidget::FlipBoard {
+            config: FlipBoardConfig {
+                cells: u32::MAX,
+                glyph_px: u32::MAX,
+                scale: u32::MAX,
+                ..FlipBoardConfig::default()
+            },
+            state: FlipBoardState::default(),
+        },
+    ];
+
+    for widget in worst {
+        let kind = widget.kind();
+        // A single-line strip is a few px tall and as wide as its message, so
+        // the square-ish MAX_BUFFER_DIM is the wrong per-axis rule for it; what
+        // binds there is texture upload (MAX_STRIP_DIM). Area binds everything.
+        let is_strip = matches!(
+            widget,
+            PreemWidget::DotMatrix { .. }
+                | PreemWidget::SevenSeg { .. }
+                | PreemWidget::LedStrip { .. }
+        );
+        let clamped = widget.clamped();
+        let (w, h) = footprint(&clamped);
+        let area = u64::from(w) * u64::from(h);
+
+        let axis_cap = if is_strip {
+            MAX_STRIP_DIM
+        } else {
+            MAX_BUFFER_DIM
+        };
+        assert!(
+            w <= axis_cap && h <= axis_cap,
+            "{kind}: worst-case footprint {w}×{h} exceeds its per-axis cap \
+             ({axis_cap}) — the caps bound the fields but not the buffer"
+        );
+        assert!(
+            area <= u64::from(MAX_RASTER_PIXELS),
+            "{kind}: worst-case area {area} px exceeds MAX_RASTER_PIXELS \
+             ({MAX_RASTER_PIXELS}) — a preem node must never demand more than one \
+             Node::Pixels frame could have carried"
+        );
+    }
+}
+
+/// The gauge's per-frame *CPU* cost is bounded too — no buffer cap can see it,
+/// because `divisions * subdivisions` ticks are rasterised at any buffer size
+/// (`gauge.rs`'s `tick_marks`). Independently capped 4096s would be 16.7M line
+/// draws per frame.
+#[test]
+fn gauge_tick_count_is_bounded() {
+    let clamped = PreemWidget::Gauge {
+        config: GaugeConfig {
+            divisions: u32::MAX,
+            subdivisions: u32::MAX,
+            ..GaugeConfig::default()
+        },
+        state: GaugeState::default(),
+    }
+    .clamped();
+    let PreemWidget::Gauge { config, .. } = clamped else {
+        panic!("variant changed")
+    };
+    let ticks = u64::from(config.divisions) * u64::from(config.subdivisions);
+    assert!(
+        ticks <= 2048,
+        "gauge would rasterise {ticks} ticks per frame"
+    );
+}
+
+/// `speed_dots_per_sec` is the one float with no kit clamp behind it, so
+/// `clamped()` owns it: a non-finite speed parks the marquee rather than
+/// poisoning the shell's offset integrator, and the magnitude is capped.
+#[test]
+fn marquee_speed_is_clamped_including_non_finite() {
+    for (input, want) in [
+        (f32::NAN, 0.0_f32),
+        (f32::INFINITY, 0.0),
+        (f32::NEG_INFINITY, 0.0),
+        (1.0e9, MAX_MARQUEE_SPEED_DPS),
+        (-1.0e9, -MAX_MARQUEE_SPEED_DPS),
+        (20.0, 20.0),
+    ] {
+        let clamped = PreemWidget::Marquee {
+            config: MarqueeConfig {
+                speed_dots_per_sec: input,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState::default(),
+        }
+        .clamped();
+        let PreemWidget::Marquee { config, .. } = clamped else {
+            panic!("variant changed")
+        };
+        assert!(
+            (config.speed_dots_per_sec - want).abs() < f32::EPSILON,
+            "speed {input} clamped to {}, want {want}",
+            config.speed_dots_per_sec
+        );
+    }
 }
 
 /// Clamping an already-legal widget is the identity — the caps must not quietly
@@ -860,6 +1239,92 @@ struct SparseBody {
 struct SparseTextBox {
     #[serde(rename = "TextBox")]
     text_box: SparseBody,
+}
+
+#[derive(serde::Serialize)]
+struct OnlyLow {
+    low: f32,
+}
+
+#[derive(serde::Serialize)]
+struct OnlyRange {
+    range: OnlyLow,
+}
+
+#[derive(serde::Serialize)]
+struct SparseGaugeBody {
+    config: OnlyRange,
+    state: Empty,
+}
+
+/// A hand-rolled `{"Gauge": {"config": {"range": {"low": …}}, "state": {}}}`.
+#[derive(serde::Serialize)]
+struct SparseGauge {
+    #[serde(rename = "Gauge")]
+    gauge: SparseGaugeBody,
+}
+
+#[derive(serde::Serialize)]
+struct OnlyPeakHold {
+    peak_hold: Empty,
+}
+
+#[derive(serde::Serialize)]
+struct SparseStripBody {
+    config: OnlyPeakHold,
+    state: Empty,
+}
+
+/// A hand-rolled `{"LedStrip": {"config": {"peak_hold": {}}, "state": {}}}`.
+#[derive(serde::Serialize)]
+struct SparseStrip {
+    #[serde(rename = "LedStrip")]
+    led_strip: SparseStripBody,
+}
+
+/// The `Node` vocabulary as it stood **before** #882 — every variant this crate
+/// shipped at `VOCAB = 1`, minus `Preem`. Only the variant *names* matter (the
+/// encoding is externally name-tagged), so the bodies are `serde_json`-style
+/// catch-alls rather than faithful field lists.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+enum LegacyNode {
+    Box(serde::de::IgnoredAny),
+    Row(serde::de::IgnoredAny),
+    ListBox(serde::de::IgnoredAny),
+    Label(serde::de::IgnoredAny),
+    Text(serde::de::IgnoredAny),
+    Icon(serde::de::IgnoredAny),
+    Pixels(serde::de::IgnoredAny),
+    Button(serde::de::IgnoredAny),
+    Progress(serde::de::IgnoredAny),
+    Slider(serde::de::IgnoredAny),
+    Revealer(serde::de::IgnoredAny),
+    Separator(serde::de::IgnoredAny),
+    Spacer,
+    Expander(serde::de::IgnoredAny),
+    Entry(serde::de::IgnoredAny),
+}
+
+/// The `HostMsg` set as it stood **before** #882 — every push this crate sent at
+/// `VOCAB = 1`, minus `Hello`.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+enum LegacyHostMsg {
+    StateSnapshot(serde::de::IgnoredAny),
+    Event(serde::de::IgnoredAny),
+    EffectResult(serde::de::IgnoredAny),
+    SlotVisibility(serde::de::IgnoredAny),
+    Accent(serde::de::IgnoredAny),
+    AudioSpectrum(serde::de::IgnoredAny),
+    ConsentDecision(serde::de::IgnoredAny),
+    CalendarUpcoming(serde::de::IgnoredAny),
+    SessionLocked(serde::de::IgnoredAny),
+    NowPlaying(serde::de::IgnoredAny),
+    DatasourceQuery(serde::de::IgnoredAny),
+    DatasourceResult(serde::de::IgnoredAny),
+    Ping(serde::de::IgnoredAny),
+    Shutdown,
 }
 
 /// The `Manifest` as it was **before** #882 added `vocab_max`: same field names,

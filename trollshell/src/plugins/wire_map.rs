@@ -6,6 +6,12 @@
 
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::wire;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Latch for the "this shell doesn't speak preem yet" warning, so a plugin that
+/// keeps re-rendering `Node::Preem` logs once per session instead of once per
+/// node per frame (#882; the renderer lands in #883).
+static PREEM_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
@@ -192,7 +198,11 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             placeholder: placeholder.clone(),
             classes: classes.clone(),
         },
-        wire::Node::Preem { id, classes, .. } => {
+        wire::Node::Preem {
+            id,
+            classes,
+            widget,
+        } => {
             // #882's typed preem vocabulary. The renderers that turn a
             // `PreemWidget` into pixels — and the per-node renderer instances
             // that own the phosphor, needle, flip clocks and scroll offset —
@@ -200,20 +210,37 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             // exhaustive (which is the point of writing it exhaustively) until
             // then.
             //
-            // Reaching it means a plugin sent a node this host never asked for:
-            // the shell does not advertise `PREEM_VOCAB` in `HostMsg::Hello`
-            // yet, and the negotiation contract says a plugin emits `Preem`
-            // only above that advertisement (rasterising to `Node::Pixels`
-            // otherwise). So this is the misbehaving-plugin path, and it takes
-            // the same posture as the malformed-buffer seam above: degrade to a
-            // nothing-rendered surface, keep `id` and `classes` so CSS chrome
-            // stays and a later valid frame updates in place, and warn — never
-            // drop the connection.
-            tracing::warn!(
-                node = ?id,
-                "plugin sent a Node::Preem, but this shell does not advertise the \
-                 preem vocabulary (#883); rendering nothing"
-            );
+            // **`clamped()` is mandatory and must stay the first thing that
+            // happens here.** It is the wire-limit enforcement seam — the preem
+            // analogue of the `pixels_len_ok`/`clamp_pixels_scale` checks in the
+            // arm above — and it is what stops a hostile config (a 32768×32768
+            // scaled buffer, a 16.7M-tick gauge face) from reaching a renderer.
+            // #883 replaces the empty surface below with a real rasterisation,
+            // and must rasterise *this* value, never the raw `widget`.
+            let widget = widget.as_ref().clone().clamped();
+
+            // Reaching this arm at all means a plugin sent a node this host
+            // never asked for: the shell does not advertise `PREEM_VOCAB` in
+            // `HostMsg::Hello` yet, and the negotiation contract says a plugin
+            // emits `Preem` only above that advertisement (rasterising to
+            // `Node::Pixels` otherwise). So this is the misbehaving-plugin path,
+            // and it takes the same posture as the malformed-buffer seam above:
+            // degrade to a nothing-rendered surface, keep `id` and `classes` so
+            // CSS chrome stays and a later valid frame updates in place, and
+            // warn — never drop the connection.
+            //
+            // Latched to once per session: this runs per node per render, so a
+            // plugin with eight preem nodes on the 20 Hz pump would otherwise
+            // push 160 identical lines a second into the journal.
+            if !PREEM_UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    node = ?id,
+                    kind = widget.kind(),
+                    "plugin sent a Node::Preem, but this shell does not advertise the \
+                     preem vocabulary (#883); rendering nothing (further occurrences \
+                     are silenced)"
+                );
+            }
             UiNode::Pixels {
                 id: id.clone(),
                 width: 0,

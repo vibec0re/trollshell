@@ -431,9 +431,15 @@ pub enum Node {
     /// It does grow the vocabulary, so it bumps [`VOCAB`](crate::VOCAB) — but
     /// **not** [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL), because the
     /// negotiation above means an old host can never receive it.
+    /// `widget` is boxed so one preem node — [`Gauge`](crate::preem::PreemWidget::Gauge)
+    /// alone carries eleven scalars — doesn't set the size of *every* [`Node`],
+    /// including the `Label`s and `Row`s a tree is mostly made of. `Box<T>`
+    /// serializes transparently as `T`, so the boxing is invisible on the wire
+    /// (pinned by the `plugin_render_preem_v1` golden fixture, which did not
+    /// move when it was introduced).
     Preem {
         id: Option<NodeId>,
         classes: Vec<Cls>,
-        widget: PreemWidget,
+        widget: Box<PreemWidget>,
     },
 }

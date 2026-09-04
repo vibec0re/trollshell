@@ -72,10 +72,23 @@
 //!
 //! Every field the shell would size an allocation from is capped, in the same
 //! spirit as `Node::Pixels`'s `len == w * h * 4` invariant: a malformed or
-//! hostile plugin must never be able to crash or wedge the shell. See
-//! [`MAX_TEXT_LEN`], [`MAX_SCOPE_SAMPLES`], [`MAX_BUFFER_DIM`], [`MAX_SCALE`],
-//! [`MAX_LEDS`] and [`MAX_CELLS`], and [`PreemWidget::clamped`] — the shared
-//! enforcement both ends use so the host never hand-rolls it.
+//! hostile plugin must never be able to crash or wedge the shell.
+//!
+//! The invariant that matters is the **product**, not the fields:
+//! [`MAX_RASTER_PIXELS`] bounds a widget's rasterised buffer at
+//! [`MAX_BUFFER_DIM`]² = `MAX_FRAME_LEN / 4`, so a preem node can never demand
+//! more than one legacy `Pixels` frame could have carried. Per-field caps
+//! ([`MAX_TEXT_LEN`], [`MAX_SCOPE_SAMPLES`], [`MAX_SCALE`], [`MAX_TEXT_COLS`],
+//! [`MAX_TEXT_LINES`], [`MAX_PAD`], [`MAX_CORNER`], [`MAX_DIVISIONS`],
+//! [`MAX_SUBDIVISIONS`], [`MAX_GAP_DOTS`], [`MAX_MARQUEE_SPEED_DPS`],
+//! [`MAX_LEDS`], [`MAX_CELLS`], [`MAX_STRIP_DIM`]) exist to make that product hold — a dimension
+//! and its multiplier capped independently bound nothing, which is why
+//! [`PreemWidget::clamped`] fits `scale` to the buffer rather than just
+//! ceiling it.
+//!
+//! [`PreemWidget::clamped`] is the shared enforcement both ends use so the host
+//! never hand-rolls it, and it is **mandatory before any renderer sees a
+//! widget**.
 
 use serde::{Deserialize, Serialize};
 
@@ -96,56 +109,160 @@ pub const PREEM_VOCAB: u16 = 2;
 
 /// Cap on every text field in this module, in **bytes** of UTF-8.
 ///
-/// Generous — every widget here truncates or wraps long text on its own terms
-/// (the [`TextBox`](PreemWidget::TextBox) ellipsises past
+/// This is **not** a decode bound — decoding is already bounded by
+/// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN), and truncation here happens
+/// *after* the frame is decoded. What it bounds is what the shell will go on
+/// to **rasterise and retain**: every widget here wraps or truncates long text
+/// on its own terms (the [`TextBox`](PreemWidget::TextBox) ellipsises past
 /// [`TextBoxConfig::max_lines`], the [`FlipBoard`](PreemWidget::FlipBoard)
-/// ignores anything past its last cell) — so this is not a layout knob but the
-/// allocation bound: it is what stops a plugin sending a 100 MB string the
-/// shell would have to rasterise. [`PreemWidget::clamped`] truncates to the
-/// nearest char boundary at or below this length, never mid-codepoint.
-pub const MAX_TEXT_LEN: usize = 4096;
+/// ignores anything past its last cell), but the
+/// [`Marquee`](PreemWidget::Marquee) rasterises the *whole* message into a
+/// scrolling strip, so its buffer grows with the text — this is the number that
+/// bounds it. [`PreemWidget::clamped`] truncates to the nearest char boundary
+/// at or below this length, never mid-codepoint.
+///
+/// 2048 is sized off that marquee/dot-matrix case: those rasterise one glyph
+/// cell (6 px) per character on a **single line**, so the text length *is* a
+/// buffer dimension — 2048 characters is a 12288 px strip, which still fits
+/// [`MAX_STRIP_DIM`]. A longer cap would produce a buffer no GPU would upload.
+pub const MAX_TEXT_LEN: usize = 2048;
+
+/// Cap on the long axis of a **single-line strip** — the dot matrix, the seven
+/// segment readout, and the marquee's internal scrolling strip.
+///
+/// These are the one shape where [`MAX_BUFFER_DIM`] is the wrong bound: a strip
+/// is a few pixels tall and as wide as its message, so it can be far wider than
+/// a square widget while allocating far less. What actually constrains it is
+/// texture upload — 16384 px is the common maximum texture edge, and it is the
+/// same number the shell's legacy `Pixels` path already uses for its scaled
+/// dimension (`wire_map.rs`'s `MAX_PIXELS_SCALED_DIM`).
+///
+/// The *area* of a strip stays bounded by [`MAX_RASTER_PIXELS`] like everything
+/// else; this only relaxes the per-axis rule where the geometry justifies it.
+/// It is not a knob a plugin sets — it falls out of [`MAX_TEXT_LEN`] and the
+/// font's 6 px cell pitch, and
+/// `preem_worst_case_footprint_is_bounded` checks the arithmetic.
+pub const MAX_STRIP_DIM: u32 = 16_384;
 
 /// Cap on [`ScopeState::samples`] **per update**.
 ///
-/// The scope stamps a polyline across [`ScopeConfig::cols`] columns (144 by
-/// default), so anything past a few hundred samples per batch is already
-/// oversampled into invisibility; 4096 leaves a wide margin for a plugin
-/// feeding a raw audio block while keeping one update's decode bounded to
-/// ~16 KiB.
+/// Like [`MAX_TEXT_LEN`] this bounds what the shell **retains and draws**, not
+/// what it will decode — [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) is the decode
+/// bound, and this truncation runs after it. The scope stamps a polyline across
+/// [`ScopeConfig::cols`] columns (144 by default), so anything past a few
+/// hundred samples per batch is already oversampled into invisibility; 4096
+/// leaves a wide margin for a plugin feeding a raw audio block.
 pub const MAX_SCOPE_SAMPLES: usize = 4096;
 
-/// Cap on any single **logical buffer dimension** — [`ScopeConfig::cols`] /
-/// [`rows`](ScopeConfig::rows), [`GaugeConfig::cols`] /
-/// [`rows`](GaugeConfig::rows), [`MarqueeConfig::window_px`].
+/// Cap on any buffer dimension — **both** the logical (pre-upscale) value a
+/// config states and the final (post-upscale) size the shell rasterises.
 ///
-/// The shell allocates `cols * rows * scale²  * 4` bytes to draw one of these,
-/// so the dimensions are exactly the numbers a hostile plugin would inflate.
-/// The kit's own widgets target a ~296 px sidebar card; 4096 is far past any
-/// real surface and still bounds the allocation.
-pub const MAX_BUFFER_DIM: u32 = 4096;
+/// Enforcing it on the *scaled* dimension is the load-bearing half, and mirrors
+/// what the legacy [`Pixels`](crate::wire::Node::Pixels) path already does
+/// (`wire_map.rs`'s `clamp_pixels_scale`). Capping the logical dimension and
+/// the scale factor **independently** would not bound anything useful: at
+/// 4096 logical and 8× that is a 32768×32768 buffer — a 4 GiB allocation
+/// demand from about thirty bytes of wire config.
+///
+/// 2048 is not arbitrary. `2048 * 2048 * 4 B` is exactly
+/// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) (see [`MAX_RASTER_PIXELS`]), so a
+/// preem node can never ask the shell to rasterise more than a single
+/// `Node::Pixels` frame could have carried in the first place. The typed
+/// vocabulary is a bandwidth win, never an amplification primitive. The kit's
+/// own widgets target a ~296 px sidebar card, so this is still ~7× past any
+/// real surface.
+pub const MAX_BUFFER_DIM: u32 = 2048;
+
+/// The resulting ceiling on a single preem widget's rasterised buffer, in
+/// pixels: [`MAX_BUFFER_DIM`]², i.e. [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN)`/4`
+/// RGBA8 pixels (4 194 304 px = 16 MiB).
+///
+/// Stated as its own constant because it is the invariant that actually
+/// matters — every per-field cap below exists only to make *this* product
+/// hold, and `preem_worst_case_footprint_is_bounded` in `tests/preem.rs`
+/// checks it against the kit's real geometry for all eight widgets.
+pub const MAX_RASTER_PIXELS: u32 = MAX_BUFFER_DIM * MAX_BUFFER_DIM;
 
 /// Cap on any integer upscale factor (`scale` on
 /// [`TextBox`](TextBoxConfig::scale) / [`Scope`](ScopeConfig::scale) /
 /// [`Gauge`](GaugeConfig::scale) / [`FlipBoard`](FlipBoardConfig::scale)).
 ///
-/// Scale multiplies **both** buffer dimensions, so it is quadratic in the
-/// allocation and needs a much tighter cap than [`MAX_BUFFER_DIM`]. The kit's
-/// own defaults are 1× and 2×; 8× is already a chunkier pixel than any skin
-/// reads well at.
+/// A ceiling on the knob itself; the *binding* constraint is the scaled-dimension
+/// rule above, which pulls `scale` down further whenever the logical buffer is
+/// already large. The kit's own defaults are 1× and 2×; 8× is already a
+/// chunkier pixel than any skin reads well at.
 pub const MAX_SCALE: u32 = 8;
+
+/// Cap on [`TextBoxConfig::width`] in glyph cells (and on the `FitPx` budget,
+/// which is in pixels and so is capped by [`MAX_BUFFER_DIM`] instead).
+///
+/// The kit's default is 16 cells and the widest real use is the pet's ~268 px
+/// bubble (~44 cells). At the font's 6 px cell pitch, 256 cells is a 1536 px
+/// line — generous, and it keeps the scaled width inside [`MAX_BUFFER_DIM`].
+pub const MAX_TEXT_COLS: u32 = 256;
+
+/// Cap on [`TextBoxConfig::max_lines`]. Kit default 3; 64 wrapped lines is far
+/// past anything a sidebar card shows and keeps the box's height bounded.
+pub const MAX_TEXT_LINES: u32 = 64;
+
+/// Cap on [`TextBoxConfig::pad`], in pre-scale pixels.
+///
+/// Small on purpose: padding is added to **both** dimensions (`textbox.rs`'s
+/// `buf_w = 2*pad + …`, `buf_h = 2*pad + …`), so an uncapped `pad` inflates the
+/// buffer quadratically all on its own — 4096 padding at 8× is a ~17 GB box
+/// around an empty string. Kit default 3; 64 is ~21× that.
+pub const MAX_PAD: u32 = 64;
+
+/// Cap on [`TextBoxConfig::corner`], the rounded-corner cut radius in pre-scale
+/// pixels. Kit default 2. It does not change the buffer size, but it drives a
+/// per-pixel corner test, so it is bounded for the same reason as [`MAX_PAD`].
+pub const MAX_CORNER: u32 = 64;
+
+/// Cap on [`GaugeConfig::divisions`]. Kit default 4.
+pub const MAX_DIVISIONS: u32 = 64;
+
+/// Cap on [`GaugeConfig::subdivisions`]. Kit default 5.
+///
+/// Capped **as a product** with [`MAX_DIVISIONS`], not just individually: the
+/// gauge rasterises `divisions * subdivisions` tick marks every frame
+/// (`gauge.rs`'s `tick_marks`), so two independently "reasonable" 4096s are
+/// 16.7M line draws per frame at any buffer size — a CPU denial-of-service that
+/// no buffer cap can see. 64 × 32 = 2048 ticks is already ~100× the kit's
+/// default 20 and stays cheap.
+pub const MAX_SUBDIVISIONS: u32 = 32;
+
+/// Cap on [`MarqueeConfig::gap_dots`], the blank seam before the message loops.
+/// It extends the rasterised strip, so it is bounded like a dimension. Kit
+/// default 6.
+pub const MAX_GAP_DOTS: u32 = 1024;
+
+/// Cap on the magnitude of [`MarqueeConfig::speed_dots_per_sec`].
+///
+/// The one float in this vocabulary with **no kit clamp behind it** — the kit's
+/// `Marquee` has no speed at all (`MarqueeStrip::window(offset)` is
+/// caller-driven), so #882 invented the field and therefore owes it a bound.
+/// At 1000 dots/s a message crosses a 268 px window about four times a second,
+/// which is already unreadable. [`PreemWidget::clamped`] also maps a non-finite
+/// speed to `0.0` (parked) rather than letting a `NaN` reach the shell's pump
+/// integrator.
+pub const MAX_MARQUEE_SPEED_DPS: f32 = 1000.0;
 
 /// Cap on [`LedStripConfig::leds`].
 ///
 /// The strip's rendered width grows linearly with the segment count
-/// (`2*PAD + n*CELL_W + (n-1)*GAP` px), and the kit's default is 24 across a
-/// ~296 px card, so 256 segments is already many times any real surface.
-pub const MAX_LEDS: u32 = 256;
+/// (`2*PAD + n*CELL_W + (n-1)*GAP` = `8 + 11n - 3` px), and the kit's default
+/// is 24 across a ~296 px card. 128 segments is a 1413 px strip — over 5× the
+/// default and still inside [`MAX_BUFFER_DIM`].
+pub const MAX_LEDS: u32 = 128;
 
 /// Cap on [`FlipBoardConfig::cells`].
 ///
-/// A board's width grows linearly with the cell count, and its default is 8
-/// (`HH:MM:SS`). 128 cells is far past a departure board's longest row.
-pub const MAX_CELLS: u32 = 128;
+/// A board's width grows linearly with the cell count *times*
+/// [`FlipBoardConfig::glyph_px`] times `scale`, which is why
+/// [`PreemWidget::clamped`] pulls those two multipliers down when a wide board
+/// would otherwise overflow [`MAX_BUFFER_DIM`]. Kit default 8 (`HH:MM:SS`); 64
+/// is past a departure board's longest row.
+pub const MAX_CELLS: u32 = 64;
 
 // ── style reference ─────────────────────────────────────────────────────────
 
@@ -321,17 +438,23 @@ pub struct TextBoxConfig {
     /// The skin to draw in.
     pub style: StyleRef,
     /// How the wrap width is chosen. Default: [`TextBoxWidth::Cols(16)`](TextBoxWidth::Cols).
+    /// Cells are capped at [`MAX_TEXT_COLS`], a pixel budget at
+    /// [`MAX_BUFFER_DIM`].
     pub width: TextBoxWidth,
     /// Hard cap on wrapped lines; overflow truncates with a trailing `…`.
-    /// Default `3`, clamped by the kit to at least 1.
+    /// Default `3`, clamped to `1..=`[`MAX_TEXT_LINES`].
     pub max_lines: u32,
-    /// Field padding around the text block, in pre-scale pixels. Default `3`.
+    /// Field padding around the text block, in pre-scale pixels. Default `3`,
+    /// capped at [`MAX_PAD`] — it is added to **both** dimensions, so it
+    /// inflates the buffer quadratically if left unbounded.
     pub pad: u32,
     /// Radius of the rounded-corner cut (to transparent), in pre-scale pixels;
-    /// `0` keeps square corners. Default `2`.
+    /// `0` keeps square corners. Default `2`, capped at [`MAX_CORNER`].
     pub corner: u32,
     /// Integer upscale baked into the buffer. Default `1`; capped at
-    /// [`MAX_SCALE`], and `0` reads as `1`.
+    /// [`MAX_SCALE`] and pulled lower whenever the box's own width or height
+    /// would otherwise push the scaled buffer past [`MAX_BUFFER_DIM`]. `0`
+    /// reads as `1`.
     pub scale: u32,
     /// `true` renders the full wrap width even for short text, so the box never
     /// resizes with the message; `false` (the default) hugs the longest line.
@@ -370,10 +493,21 @@ pub struct TextBoxState {
 /// [`LedStripState::level`] into the held value and decays it on its own pump,
 /// so a plugin that has nothing new to say sends nothing at all.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PeakHoldConfig {
     /// Fall per animation tick, in fractions of full scale. The kit clamps a
-    /// negative rate to `0.0` (a dot that never falls).
+    /// negative rate to `0.0` (a dot that never falls) — which is also the
+    /// default here, so an omitted `rate` gives a peak dot that holds forever
+    /// rather than a decode error.
     pub rate: f32,
+}
+
+impl Default for PeakHoldConfig {
+    /// `0.0` — the kit's "never falls" rate, matching `PeakHold::new`'s
+    /// clamp-negative-to-zero behaviour.
+    fn default() -> Self {
+        Self { rate: 0.0 }
+    }
 }
 
 /// **Config** for [`PreemWidget::LedStrip`] — a change rebuilds the renderer
@@ -486,7 +620,8 @@ pub struct ScopeConfig {
     /// `1..=`[`MAX_BUFFER_DIM`].
     pub rows: u32,
     /// Integer upscale baked into the output. Default `2`, clamped to
-    /// `1..=`[`MAX_SCALE`].
+    /// `1..=`[`MAX_SCALE`] and pulled lower whenever `cols`/`rows` would
+    /// otherwise push the scaled buffer past [`MAX_BUFFER_DIM`].
     pub scale: u32,
     /// Phosphor persistence: 256ths of beam intensity **retained** per tick.
     /// Default `184` (≈0.72); `256` never fades, `0` clears every tick. The kit
@@ -531,10 +666,11 @@ pub struct ScopeState {
 /// constants never need re-tuning for a new range. The kit rejects a degenerate
 /// (`high <= low`) or non-finite range and keeps the previous one.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GaugeRange {
-    /// The value at the low end of the dial.
+    /// The value at the low end of the dial. Default `0.0`.
     pub low: f32,
-    /// The value at the high end of the dial.
+    /// The value at the high end of the dial. Default `1.0`.
     pub high: f32,
 }
 
@@ -566,15 +702,19 @@ pub struct GaugeConfig {
     /// `1..=`[`MAX_BUFFER_DIM`].
     pub rows: u32,
     /// Integer upscale baked into the output. Default `2`, clamped to
-    /// `1..=`[`MAX_SCALE`].
+    /// `1..=`[`MAX_SCALE`] and pulled lower whenever `cols`/`rows` would
+    /// otherwise push the scaled buffer past [`MAX_BUFFER_DIM`].
     pub scale: u32,
     /// Total sweep of the scale, in **degrees**. Default `150.0`; the kit
     /// clamps to `10.0..=180.0`.
     pub sweep_deg: f32,
-    /// Major divisions (intervals between long ticks). Default `4`, kit-clamped
-    /// to at least 1.
+    /// Major divisions (intervals between long ticks). Default `4`, clamped to
+    /// `1..=`[`MAX_DIVISIONS`].
     pub divisions: u32,
-    /// Minor ticks per major division. Default `5`, kit-clamped to at least 1.
+    /// Minor ticks per major division. Default `5`, clamped to
+    /// `1..=`[`MAX_SUBDIVISIONS`]. The gauge rasterises `divisions *
+    /// subdivisions` ticks **per frame**, so the two caps are chosen as a
+    /// product — see [`MAX_SUBDIVISIONS`].
     pub subdivisions: u32,
     /// The value scale the caller reads in. Default `0.0..=1.0`.
     pub range: GaugeRange,
@@ -671,7 +811,8 @@ pub struct FlipBoardConfig {
     /// boundary for even values).
     pub glyph_px: u32,
     /// Integer upscale baked into the output. Default `2`, clamped to
-    /// `1..=`[`MAX_SCALE`].
+    /// `1..=`[`MAX_SCALE`] and pulled lower whenever `cols`/`rows` would
+    /// otherwise push the scaled buffer past [`MAX_BUFFER_DIM`].
     pub scale: u32,
     /// Per-cell transition length in seconds, or `None` for the
     /// **mechanism's own** default (`0.38` for a split flap, `0.30` for a
@@ -847,57 +988,131 @@ impl PreemWidget {
     /// range — so a bad frame renders a sane widget instead of dropping the
     /// session.
     ///
-    /// Floating-point *readings* (`level`, `target`, `speed_dots_per_sec`, the
-    /// spring constants, the range) are deliberately **not** touched here: the
-    /// kit already clamps or ignores out-of-range and non-finite values at every
-    /// entry point, and no float on the wire sizes an allocation. This method
-    /// bounds what the shell would *allocate*; the kit bounds what it draws.
+    /// Floating-point *readings* — `level`, `peak`, `target`, the spring
+    /// constants, the range — are deliberately **not** touched: the kit already
+    /// clamps or ignores out-of-range and non-finite values at every entry
+    /// point, and none of them sizes an allocation. This method bounds what the
+    /// shell would *allocate*; the kit bounds what it draws.
+    ///
+    /// [`MarqueeConfig::speed_dots_per_sec`] is the one exception, and it is
+    /// clamped here ([`MAX_MARQUEE_SPEED_DPS`], with a non-finite value mapped
+    /// to `0.0`) precisely *because* it has no kit behind it: #882 invented the
+    /// field, the kit's `Marquee` has no speed at all, so nothing downstream
+    /// would catch a `NaN` before it reached the shell's offset integrator.
     #[must_use]
     pub fn clamped(mut self) -> Self {
         match &mut self {
             Self::DotMatrix { state, .. } => clamp_text(&mut state.text),
             Self::SevenSeg { state, .. } => clamp_text(&mut state.text),
             Self::TextBox { config, state } => {
+                config.pad = config.pad.min(MAX_PAD);
+                config.corner = config.corner.min(MAX_CORNER);
+                config.max_lines = config.max_lines.clamp(1, MAX_TEXT_LINES);
                 config.width = match config.width {
-                    TextBoxWidth::Cols(n) => TextBoxWidth::Cols(n.clamp(1, MAX_BUFFER_DIM)),
+                    TextBoxWidth::Cols(n) => TextBoxWidth::Cols(n.clamp(1, MAX_TEXT_COLS)),
                     TextBoxWidth::FitPx(px) => TextBoxWidth::FitPx(px.clamp(1, MAX_BUFFER_DIM)),
                 };
-                config.max_lines = config.max_lines.clamp(1, MAX_BUFFER_DIM);
-                config.pad = config.pad.min(MAX_BUFFER_DIM);
-                config.corner = config.corner.min(MAX_BUFFER_DIM);
-                config.scale = config.scale.clamp(1, MAX_SCALE);
+                // The box's logical width is `2*pad + cols*CELL_PITCH`; fit the
+                // upscale to it so the *final* buffer stays inside the cap.
+                let logical_w = match config.width {
+                    TextBoxWidth::Cols(n) => 2 * config.pad + n * TEXT_CELL_PITCH_PX,
+                    // A `FitPx` budget is already stated in final pixels, so it
+                    // bounds itself — but the padding still rides on top of it.
+                    TextBoxWidth::FitPx(px) => px + 2 * config.pad,
+                };
+                let logical_h = 2 * config.pad + config.max_lines * TEXT_LINE_PITCH_PX;
+                config.scale = fit_scale(logical_w.max(logical_h), config.scale);
                 clamp_text(&mut state.text);
             }
             Self::LedStrip { config, .. } => {
                 config.leds = config.leds.clamp(1, MAX_LEDS);
             }
             Self::Marquee { config, state } => {
+                // `window_px` is already the *final* buffer width (the kit takes
+                // it in post-scale pixels and the marquee carries no `scale`),
+                // so capping it directly is the whole bound on this axis.
                 config.window_px = config.window_px.clamp(1, MAX_BUFFER_DIM);
-                config.gap_dots = config.gap_dots.min(MAX_BUFFER_DIM);
+                config.gap_dots = config.gap_dots.min(MAX_GAP_DOTS);
+                config.speed_dots_per_sec = if config.speed_dots_per_sec.is_finite() {
+                    config
+                        .speed_dots_per_sec
+                        .clamp(-MAX_MARQUEE_SPEED_DPS, MAX_MARQUEE_SPEED_DPS)
+                } else {
+                    // A NaN/inf speed would poison the shell's offset
+                    // integrator; park the message instead.
+                    0.0
+                };
                 clamp_text(&mut state.text);
             }
             Self::Scope { config, state } => {
                 config.cols = config.cols.clamp(1, MAX_BUFFER_DIM);
                 config.rows = config.rows.clamp(1, MAX_BUFFER_DIM);
-                config.scale = config.scale.clamp(1, MAX_SCALE);
+                config.scale = fit_scale(config.cols.max(config.rows), config.scale);
                 state.samples.truncate(MAX_SCOPE_SAMPLES);
             }
             Self::Gauge { config, .. } => {
                 config.cols = config.cols.clamp(1, MAX_BUFFER_DIM);
                 config.rows = config.rows.clamp(1, MAX_BUFFER_DIM);
-                config.scale = config.scale.clamp(1, MAX_SCALE);
-                config.divisions = config.divisions.clamp(1, MAX_BUFFER_DIM);
-                config.subdivisions = config.subdivisions.clamp(1, MAX_BUFFER_DIM);
+                config.scale = fit_scale(config.cols.max(config.rows), config.scale);
+                config.divisions = config.divisions.clamp(1, MAX_DIVISIONS);
+                config.subdivisions = config.subdivisions.clamp(1, MAX_SUBDIVISIONS);
             }
             Self::FlipBoard { config, state } => {
                 config.cells = config.cells.clamp(1, MAX_CELLS);
-                config.glyph_px = config.glyph_px.clamp(2, 16);
-                config.scale = config.scale.clamp(1, MAX_SCALE);
+                // A board's width is `(cells*CARD_PITCH + BEZEL) * glyph_px *
+                // scale` — two multipliers stacked on a count, so both have to
+                // come down for a wide board. `glyph_px` first (it has a hard
+                // floor of 2 and must stay even, so it can only absorb so much),
+                // then `scale` against whatever width that left.
+                let board_fontpx = config.cells * FLIP_CARD_PITCH_FPX + FLIP_BEZEL_FPX;
+                let glyph_ceiling = (MAX_BUFFER_DIM / board_fontpx.max(1)).clamp(2, 16);
+                config.glyph_px = config.glyph_px.clamp(2, 16).min(glyph_ceiling) / 2 * 2;
+                config.scale = fit_scale(board_fontpx * config.glyph_px, config.scale);
                 clamp_text(&mut state.text);
             }
         }
         self
     }
+}
+
+/// Font cell pitch in the kit's 5×7 bitmap font: `GLYPH_W + SPACING`. Used only
+/// to bound a [`TextBox`](PreemWidget::TextBox)'s width — see [`fit_scale`].
+const TEXT_CELL_PITCH_PX: u32 = 6;
+/// Wrapped-line pitch: `GLYPH_H + LINE_GAP`.
+const TEXT_LINE_PITCH_PX: u32 = 9;
+/// A [`FlipBoard`](PreemWidget::FlipBoard) card's horizontal pitch in **font
+/// pixels**: the glyph plus its card padding and inter-card gap.
+const FLIP_CARD_PITCH_FPX: u32 = 8;
+/// The board's bezel, in font pixels (both edges).
+const FLIP_BEZEL_FPX: u32 = 2;
+
+/// Clamp an upscale factor to **both** rules at once: at most [`MAX_SCALE`],
+/// and small enough that `logical_dim * scale` stays within
+/// [`MAX_BUFFER_DIM`]. At least `1`.
+///
+/// Both, not either — that is the whole lesson of the bug this replaced.
+/// Applying only the dimension rule lets a 16×16 buffer take a 128× upscale;
+/// applying only [`MAX_SCALE`] lets a 2048×2048 buffer take an 8× one. Neither
+/// alone bounds the product.
+///
+/// The preem counterpart of the shell's `clamp_pixels_scale` for
+/// [`Node::Pixels`](crate::wire::Node::Pixels) — the same shape for the same
+/// reason: capping a dimension and its multiplier independently bounds neither.
+///
+/// The geometry constants it is used with (`TEXT_CELL_PITCH_PX` and friends)
+/// mirror the kit's published font/card metrics. They are **upper-bound
+/// estimates for allocation safety only**, not a layout model: this crate can't
+/// depend on `hytte-preem` (it is the language-neutral schema anchor), so the
+/// renderer in #883 still does the exact sizing against the real kit. Getting
+/// these slightly wrong costs a widget that clamps a little early or late; it
+/// cannot reintroduce the unbounded case, because [`MAX_BUFFER_DIM`] is applied
+/// to the result either way.
+fn fit_scale(logical_dim: u32, scale: u32) -> u32 {
+    if logical_dim == 0 {
+        return 1;
+    }
+    let by_dimension = (MAX_BUFFER_DIM / logical_dim).max(1);
+    scale.clamp(1, MAX_SCALE.min(by_dimension))
 }
 
 /// Truncate `text` to at most [`MAX_TEXT_LEN`] bytes, cutting at the nearest
@@ -921,7 +1136,7 @@ pub fn preem(widget: PreemWidget) -> crate::wire::Node {
     crate::wire::Node::Preem {
         id: None,
         classes: Vec::new(),
-        widget,
+        widget: Box::new(widget),
     }
 }
 
@@ -937,7 +1152,7 @@ pub fn preem_id(id: impl Into<NodeId>, widget: PreemWidget) -> crate::wire::Node
     crate::wire::Node::Preem {
         id: Some(id.into()),
         classes: Vec::new(),
-        widget,
+        widget: Box::new(widget),
     }
 }
 
@@ -952,6 +1167,6 @@ pub fn preem_styled(
     crate::wire::Node::Preem {
         id: Some(id.into()),
         classes,
-        widget,
+        widget: Box::new(widget),
     }
 }

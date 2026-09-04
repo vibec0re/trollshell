@@ -209,11 +209,12 @@ pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use preem::{
     AccentRole, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig,
-    GaugeRange, GaugeState, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS, MAX_LEDS,
-    MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_TEXT_LEN, MarqueeConfig, MarqueeState, Mechanism,
-    PREEM_VOCAB, PeakHoldConfig, PreemWidget, ScopeConfig, ScopeState, SevenSegConfig,
-    SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, preem, preem_id,
-    preem_styled,
+    GaugeRange, GaugeState, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS, MAX_CORNER,
+    MAX_DIVISIONS, MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PAD, MAX_RASTER_PIXELS,
+    MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SUBDIVISIONS, MAX_TEXT_COLS, MAX_TEXT_LEN,
+    MAX_TEXT_LINES, MarqueeConfig, MarqueeState, Mechanism, PREEM_VOCAB, PeakHoldConfig,
+    PreemWidget, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef,
+    TextBoxConfig, TextBoxState, TextBoxWidth, preem, preem_id, preem_styled,
 };
 pub use state::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, SPECTRUM_BINS, StateSnapshot,

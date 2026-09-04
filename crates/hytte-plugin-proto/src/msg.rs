@@ -228,6 +228,15 @@ pub enum HostMsg {
     /// argument rather than a new [`StateKey`](crate::manifest::StateKey): the
     /// opt-in is the declaration itself, so nothing new is subscribable.
     ///
+    /// **The send-gate is load-bearing, not a nicety.** A host that sends
+    /// `Hello` unconditionally puts every pre-#882 plugin into the exact #437
+    /// failure it was built to prevent: the plugin's `rmp-serde` cannot decode
+    /// the unknown variant, its session dies, the SDK redials and meets the same
+    /// frame again — a silent, permanent crash-loop that the `PROTO_VERSION`
+    /// exact-match cannot catch, because both sides are the same version. Gate
+    /// every send on
+    /// [`Manifest::negotiates_vocab`](crate::manifest::Manifest::negotiates_vocab).
+    ///
     /// **A plugin that receives no `Hello` must assume no negotiated features.**
     /// Silence is the legacy answer, not an error: an old host simply never
     /// sends one, and the plugin runs its fallback path — which is exactly what

@@ -713,7 +713,7 @@ fn preem_is_a_negotiated_generation_not_an_unconditional_one() {
          unconditional ceiling stays where it was. Raising this would make every \
          rebuilt plugin fail an older shell's check_vocab instead of degrading."
     );
-    assert!(VOCAB_UNCONDITIONAL <= VOCAB);
+    const { assert!(VOCAB_UNCONDITIONAL <= VOCAB) }
 }
 
 /// A plugin built against this proto still clears an **older** host's
@@ -721,11 +721,14 @@ fn preem_is_a_negotiated_generation_not_an_unconditional_one() {
 /// number a pre-#882 host would compare against (`VOCAB` was 1 there).
 #[test]
 fn a_new_plugin_clears_an_old_hosts_vocab_check() {
+    /// What a pre-#882 host's own `VOCAB` was, i.e. the number it would
+    /// exact-check a registering plugin against.
+    const OLD_HOST_VOCAB: u16 = 1;
+
     let manifest = Manifest::new("preem-plugin", Mount::SidebarTop);
     assert_eq!(manifest.vocab, VOCAB_UNCONDITIONAL);
     assert_eq!(manifest.vocab_max, Some(VOCAB));
 
-    const OLD_HOST_VOCAB: u16 = 1;
     assert!(
         manifest.vocab <= OLD_HOST_VOCAB,
         "a preem-capable plugin must not be refused by a pre-#882 shell"

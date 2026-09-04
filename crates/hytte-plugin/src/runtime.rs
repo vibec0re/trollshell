@@ -288,6 +288,21 @@ where
                     crate::preem::set_accent(color);
                     Step::Rerender
                 }
+                Some(Ok(HostMsg::Hello { vocab: _ })) => {
+                    // #882: the host's vocabulary advertisement, sent because
+                    // `Manifest::new` declares a `vocab_max`. Runtime plumbing
+                    // like `Accent` — never surfaced to the TEA model.
+                    //
+                    // Accepted and ignored here on purpose: this SDK has no
+                    // negotiated emit path yet, so there is nothing to gate.
+                    // #884 is where the generation gets held and consulted, so
+                    // `view` can emit `Node::Preem` above `PREEM_VOCAB` and
+                    // CPU-rasterise to `Node::Pixels` below it. Handling the
+                    // frame now (rather than after #884) is what keeps a
+                    // current plugin from dying on an unmatched variant the
+                    // moment a host starts advertising.
+                    continue;
+                }
                 Some(Ok(HostMsg::Ping { seq })) => {
                     // Liveness is runtime plumbing: answer, don't surface.
                     if let Err(e) = write_frame(&mut wr, &PluginMsg::Pong { seq }).await {

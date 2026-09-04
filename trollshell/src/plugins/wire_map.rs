@@ -192,6 +192,37 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             placeholder: placeholder.clone(),
             classes: classes.clone(),
         },
+        wire::Node::Preem { id, classes, .. } => {
+            // #882's typed preem vocabulary. The renderers that turn a
+            // `PreemWidget` into pixels — and the per-node renderer instances
+            // that own the phosphor, needle, flip clocks and scroll offset —
+            // are #883; this arm is the placeholder that keeps the mapping
+            // exhaustive (which is the point of writing it exhaustively) until
+            // then.
+            //
+            // Reaching it means a plugin sent a node this host never asked for:
+            // the shell does not advertise `PREEM_VOCAB` in `HostMsg::Hello`
+            // yet, and the negotiation contract says a plugin emits `Preem`
+            // only above that advertisement (rasterising to `Node::Pixels`
+            // otherwise). So this is the misbehaving-plugin path, and it takes
+            // the same posture as the malformed-buffer seam above: degrade to a
+            // nothing-rendered surface, keep `id` and `classes` so CSS chrome
+            // stays and a later valid frame updates in place, and warn — never
+            // drop the connection.
+            tracing::warn!(
+                node = ?id,
+                "plugin sent a Node::Preem, but this shell does not advertise the \
+                 preem vocabulary (#883); rendering nothing"
+            );
+            UiNode::Pixels {
+                id: id.clone(),
+                width: 0,
+                height: 0,
+                data: Vec::new(),
+                scale: 1,
+                classes: classes.clone(),
+            }
+        }
     }
 }
 

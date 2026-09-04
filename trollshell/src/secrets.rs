@@ -91,9 +91,20 @@ pub fn is_valid_slot(slot: &str) -> bool {
 ///
 /// `Keyring::new()` only resolves the Secret Service and its default collection
 /// (`oo7-0.5.0/src/keyring.rs`'s `new_inner`: `Service::new` →
-/// `default_collection`); it raises no prompt and touches no secret. Every path
-/// that needs a *value* goes through [`keyring`] instead — [`probe`] is the one
-/// caller that must not, and the reason is in its own docs.
+/// `default_collection`); on any system that has ever had its login keyring
+/// unlocked once, this raises no prompt and touches no secret.
+///
+/// **One narrow exception (#879):** `default_collection`'s
+/// `with_alias_or_create` (`oo7-0.5.0/src/dbus/service.rs:128-139`) falls
+/// through to `create_collection` — which *does* carry a prompt path
+/// (`Prompt::new` → `receive_completed` → `Prompt.Prompt("")`) — when
+/// `ReadAlias("default")` finds no default collection at all (no login
+/// keyring was ever created, or it was deleted). That's an acceptable trade
+/// for [`keyring`]'s callers: a human is already waiting on the control-center
+/// AI Keys tab or a plugin launch, so a one-time "create a keyring?" prompt is
+/// in the same spirit as the unlock prompt [`keyring`] already allows. It is
+/// **not** acceptable for [`probe`], which polls every 30s with nobody
+/// watching — see [`default_collection_no_create`], which it uses instead.
 async fn keyring_no_prompt() -> anyhow::Result<Keyring> {
     tokio::time::timeout(OP_TIMEOUT, Keyring::new())
         .await
@@ -202,11 +213,14 @@ pub enum SecretProbe {
 /// twice a minute for the life of the session — turning the feature into the
 /// worst bug in this PR.
 ///
-/// So the probe opens the collection with [`keyring_no_prompt`] and asks three
-/// prompt-free questions instead: `SearchItems` (a collection method that works
-/// on a locked collection and does not unlock — `oo7-0.5.0`'s
-/// `dbus::Collection::search_items`), the item's `Locked` **property**, and only
-/// then `GetSecret`, which is reached only once `Locked` is false.
+/// So the probe opens the collection with [`default_collection_no_create`] —
+/// **not** [`keyring_no_prompt`], which can itself fall through to a
+/// collection-creating prompt when no default collection alias exists yet
+/// (#879; see that function's docs) — and asks three prompt-free questions
+/// instead: `SearchItems` (a collection method that works on a locked
+/// collection and does not unlock — `oo7-0.5.0`'s
+/// `dbus::Collection::search_items`), the item's `Locked` **property**, and
+/// only then `GetSecret`, which is reached only once `Locked` is false.
 ///
 /// One deliberate imprecision: a Secret Service implementation that hides items
 /// under a locked collection would make this answer [`SecretProbe::Absent`]
@@ -223,11 +237,45 @@ pub async fn probe(slot: &str) -> SecretProbe {
     }
 }
 
+/// Open the default collection for [`probe`] — reading the `"default"` alias
+/// only, **never creating one**.
+///
+/// This is [`probe`]'s exclusive opener; [`keyring`]/[`keyring_no_prompt`]'s
+/// callers should keep going through [`Keyring::new`] instead. Where
+/// `Keyring::new` resolves the default collection via
+/// `Service::default_collection` → `with_alias_or_create`
+/// (`oo7-0.5.0/src/dbus/service.rs:128-139`), which falls through to
+/// `create_collection` — a prompt path — when no `"default"` alias exists at
+/// all, this goes one level down to [`oo7::dbus::Service::new`] +
+/// [`oo7::dbus::Service::with_alias`], which only *reads* the alias via
+/// `ReadAlias` and never creates. `Ok(None)` — no default collection exists —
+/// is handled by [`probe_inner`] exactly like a locked one: keep waiting, no
+/// create, no prompt (#879).
+async fn default_collection_no_create() -> anyhow::Result<Option<oo7::dbus::Collection<'static>>> {
+    let service = tokio::time::timeout(OP_TIMEOUT, oo7::dbus::Service::new())
+        .await
+        .context("opening the secret service timed out")?
+        .context("opening the secret service")?;
+    tokio::time::timeout(
+        OP_TIMEOUT,
+        service.with_alias(oo7::dbus::Service::DEFAULT_COLLECTION),
+    )
+    .await
+    .context("reading the default collection alias timed out")?
+    .context("reading the default collection alias")
+}
+
 /// Fallible core of [`probe`]. Every step is time-bounded, and none of them can
 /// prompt.
 async fn probe_inner(slot: &str) -> anyhow::Result<SecretProbe> {
-    let kr = keyring_no_prompt().await?;
-    let items = tokio::time::timeout(OP_TIMEOUT, kr.search_items(&slot_attrs(slot)))
+    let Some(collection) = default_collection_no_create().await? else {
+        // No default collection exists yet at all — nothing has ever been
+        // stored, or created via `keyring()`'s create-capable path. Same
+        // "keep waiting" answer as a locked collection; see this function's
+        // docs.
+        return Ok(SecretProbe::Locked);
+    };
+    let items = tokio::time::timeout(OP_TIMEOUT, collection.search_items(&slot_attrs(slot)))
         .await
         .context("searching the keyring timed out")?
         .context("searching the keyring")?;
@@ -324,14 +372,17 @@ mod tests {
     /// worth injecting, held identical to [`read`]'s definition of "unset".
     ///
     /// **Measured negative, stated rather than faked:** the property that
-    /// actually matters about `probe` — that it never raises an unlock prompt —
-    /// is not assertable here. It is a claim about which D-Bus methods are
-    /// called against a *live* Secret Service, and this workspace's
-    /// `system-tests` bucket spawns a bare `dbus-daemon` with no
-    /// `org.freedesktop.secrets` implementation on it, so there is nothing for a
-    /// hermetic test to observe. The guarantee rests on [`keyring_no_prompt`]
-    /// being the only opener `probe_inner` uses (`unlock()` is what prompts, and
-    /// it is not on that path) plus the on-glass check in the PR: watch
+    /// actually matters about `probe` — that it never raises an unlock prompt,
+    /// nor a collection-creation prompt (#879) — is not assertable here. It is
+    /// a claim about which D-Bus methods are called against a *live* Secret
+    /// Service, and this workspace's `system-tests` bucket spawns a bare
+    /// `dbus-daemon` with no `org.freedesktop.secrets` implementation on it, so
+    /// there is nothing for a hermetic test to observe. The guarantee rests on
+    /// [`default_collection_no_create`] being the only opener `probe_inner`
+    /// uses — it reads the `"default"` alias via `Service::with_alias` and
+    /// never falls through to `create_collection` the way `Keyring::new`'s
+    /// `with_alias_or_create` does, and `unlock()` (the other prompt source)
+    /// is not on this path either — plus the on-glass check in the PR: watch
     /// `journalctl --user -u trollshell` through a locked-ring session and
     /// confirm no gcr dialog appears.
     #[test]

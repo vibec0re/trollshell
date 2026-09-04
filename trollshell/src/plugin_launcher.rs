@@ -2109,7 +2109,7 @@ mod tests {
             )]
         );
         assert!(
-            out.get("anthropic").is_none(),
+            !out.contains_key("anthropic"),
             "dropped rather than kept under watch for another pass"
         );
         assert!(
@@ -2153,7 +2153,10 @@ mod tests {
                 "openrouter",
                 &[("pet".to_owned(), "connection refused".to_owned())],
             );
-            assert!(dropped.is_empty(), "the reset streak is still under the cap");
+            assert!(
+                dropped.is_empty(),
+                "the reset streak is still under the cap"
+            );
         }
         assert_eq!(
             failures[&("openrouter".to_owned(), "pet".to_owned())],

@@ -217,7 +217,13 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             // scaled buffer, a 16.7M-tick gauge face) from reaching a renderer.
             // #883 replaces the empty surface below with a real rasterisation,
             // and must rasterise *this* value, never the raw `widget`.
-            let widget = widget.as_ref().clone().clamped();
+            //
+            // `clamp_in_place` on an owned clone rather than the consuming
+            // `clamped()`: once #883 renders for real this sits on the
+            // per-frame path, where the owning form would clone every
+            // String/Vec in the config again just to feed the clamp.
+            let mut widget = widget.as_ref().clone();
+            widget.clamp_in_place();
 
             // Reaching this arm at all means a plugin sent a node this host
             // never asked for: the shell does not advertise `PREEM_VOCAB` in

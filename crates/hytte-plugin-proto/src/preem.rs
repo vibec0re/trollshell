@@ -112,23 +112,31 @@ pub const PREEM_VOCAB: u16 = 2;
 /// This is **not** a decode bound — decoding is already bounded by
 /// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN), and truncation here happens
 /// *after* the frame is decoded. What it bounds is what the shell will go on
-/// to **rasterise and retain**: every widget here wraps or truncates long text
-/// on its own terms (the [`TextBox`](PreemWidget::TextBox) ellipsises past
-/// [`TextBoxConfig::max_lines`], the [`FlipBoard`](PreemWidget::FlipBoard)
-/// ignores anything past its last cell), but the
-/// [`Marquee`](PreemWidget::Marquee) rasterises the *whole* message into a
-/// scrolling strip, so its buffer grows with the text — this is the number that
-/// bounds it. [`PreemWidget::clamped`] truncates to the nearest char boundary
-/// at or below this length, never mid-codepoint.
+/// to **rasterise and retain**.
 ///
-/// 2048 is sized off that marquee/dot-matrix case: those rasterise one glyph
-/// cell (6 px) per character on a **single line**, so the text length *is* a
-/// buffer dimension — 2048 characters is a 12288 px strip, which still fits
-/// [`MAX_STRIP_DIM`]. A longer cap would produce a buffer no GPU would upload.
+/// It is a *byte* cap and deliberately generous, because most widgets here
+/// bound their own text geometrically: the [`TextBox`](PreemWidget::TextBox)
+/// wraps to [`max_lines`](TextBoxConfig::max_lines), the
+/// [`FlipBoard`](PreemWidget::FlipBoard) ignores anything past its last cell,
+/// and the [`Marquee`](PreemWidget::Marquee) allocates only its window
+/// (`marquee.rs:190` fills a `window_px`-wide frame; the scrolling strip is a
+/// column bitmap, not a frame), so [`MarqueeConfig::window_px`] alone bounds
+/// it.
+///
+/// The two that do **not** bound themselves — [`DotMatrix`](PreemWidget::DotMatrix)
+/// and [`SevenSeg`](PreemWidget::SevenSeg), which lay the whole message out on
+/// one line — get a second, *character*-count cap against their own pitch; see
+/// `clamp_strip_text` and [`MAX_STRIP_DIM`]. Do not try to make this byte cap
+/// carry that job: the two strips have different pitches (24 px and 40 px per
+/// character), so no single byte number bounds both without crippling the
+/// widgets that wrap.
+///
+/// [`PreemWidget::clamped`] truncates to the nearest char boundary at or below
+/// this length, never mid-codepoint.
 pub const MAX_TEXT_LEN: usize = 2048;
 
-/// Cap on the long axis of a **single-line strip** — the dot matrix, the seven
-/// segment readout, and the marquee's internal scrolling strip.
+/// Cap on the long axis of a **single-line strip** — exactly two widgets, the
+/// [`DotMatrix`](PreemWidget::DotMatrix) and the [`SevenSeg`](PreemWidget::SevenSeg).
 ///
 /// These are the one shape where [`MAX_BUFFER_DIM`] is the wrong bound: a strip
 /// is a few pixels tall and as wide as its message, so it can be far wider than
@@ -137,11 +145,20 @@ pub const MAX_TEXT_LEN: usize = 2048;
 /// same number the shell's legacy `Pixels` path already uses for its scaled
 /// dimension (`wire_map.rs`'s `MAX_PIXELS_SCALED_DIM`).
 ///
+/// Two widgets, not three or four. The [`Marquee`](PreemWidget::Marquee) is
+/// *not* on this list — it allocates only its window (`marquee.rs:190`), so
+/// [`MAX_BUFFER_DIM`] via [`window_px`](MarqueeConfig::window_px) already
+/// bounds it — and neither is the [`LedStrip`](PreemWidget::LedStrip), whose
+/// worst case is 1413 px, well inside [`MAX_BUFFER_DIM`]. Exempting a widget
+/// that does not need it silently widens what the bound accepts.
+///
 /// The *area* of a strip stays bounded by [`MAX_RASTER_PIXELS`] like everything
 /// else; this only relaxes the per-axis rule where the geometry justifies it.
-/// It is not a knob a plugin sets — it falls out of [`MAX_TEXT_LEN`] and the
-/// font's 6 px cell pitch, and
-/// `preem_worst_case_footprint_is_bounded` checks the arithmetic.
+/// It is not a knob a plugin sets — `clamp_strip_text` derives each strip's
+/// character budget from it and that widget's own pitch
+/// ([`DOT_MATRIX_PITCH_PX`] / [`SEVEN_SEG_PITCH_PX`]), and
+/// `preem_worst_case_footprint_is_bounded` checks the arithmetic against the
+/// kit's real geometry.
 pub const MAX_STRIP_DIM: u32 = 16_384;
 
 /// Cap on [`ScopeState::samples`] **per update**.
@@ -1001,9 +1018,27 @@ impl PreemWidget {
     /// would catch a `NaN` before it reached the shell's offset integrator.
     #[must_use]
     pub fn clamped(mut self) -> Self {
-        match &mut self {
-            Self::DotMatrix { state, .. } => clamp_text(&mut state.text),
-            Self::SevenSeg { state, .. } => clamp_text(&mut state.text),
+        self.clamp_in_place();
+        self
+    }
+
+    /// [`clamped`](Self::clamped) in place, for a caller that already owns the
+    /// widget mutably.
+    ///
+    /// The render path wants this one: once #883 rasterises real widgets, the
+    /// owning form would cost a clone of every `String`/`Vec` in the config on
+    /// **every frame**, purely to hand the clamp something to consume.
+    pub fn clamp_in_place(&mut self) {
+        match self {
+            // A dot-matrix / seven-segment readout lays its whole message out
+            // on one line, so the *character count* is a buffer dimension and
+            // MAX_TEXT_LEN alone does not bound it — see `clamp_strip_text`.
+            Self::DotMatrix { state, .. } => {
+                clamp_strip_text(&mut state.text, DOT_MATRIX_PITCH_PX);
+            }
+            Self::SevenSeg { state, .. } => {
+                clamp_strip_text(&mut state.text, SEVEN_SEG_PITCH_PX);
+            }
             Self::TextBox { config, state } => {
                 config.pad = config.pad.min(MAX_PAD);
                 config.corner = config.corner.min(MAX_CORNER);
@@ -1064,14 +1099,19 @@ impl PreemWidget {
                 // come down for a wide board. `glyph_px` first (it has a hard
                 // floor of 2 and must stay even, so it can only absorb so much),
                 // then `scale` against whatever width that left.
-                let board_fontpx = config.cells * FLIP_CARD_PITCH_FPX + FLIP_BEZEL_FPX;
+                //
+                // Fit on the **larger** of the two axes, not just width: a
+                // one-cell board is 10 font-px wide but 11 tall, so a
+                // width-only fit leaves the height unchecked and correct only
+                // by accident of aspect ratio.
+                let board_w_fpx = config.cells * FLIP_CARD_PITCH_FPX + FLIP_BEZEL_FPX;
+                let board_fontpx = board_w_fpx.max(FLIP_BOARD_HEIGHT_FPX);
                 let glyph_ceiling = (MAX_BUFFER_DIM / board_fontpx.max(1)).clamp(2, 16);
                 config.glyph_px = config.glyph_px.clamp(2, 16).min(glyph_ceiling) / 2 * 2;
                 config.scale = fit_scale(board_fontpx * config.glyph_px, config.scale);
                 clamp_text(&mut state.text);
             }
         }
-        self
     }
 }
 
@@ -1085,6 +1125,52 @@ const TEXT_LINE_PITCH_PX: u32 = 9;
 const FLIP_CARD_PITCH_FPX: u32 = 8;
 /// The board's bezel, in font pixels (both edges).
 const FLIP_BEZEL_FPX: u32 = 2;
+/// The board's height in font pixels: the glyph plus card padding and bezel.
+/// A short board is taller than it is wide, so the fit has to see this axis.
+const FLIP_BOARD_HEIGHT_FPX: u32 = 11;
+
+/// Per-character horizontal advance of a [`DotMatrix`](PreemWidget::DotMatrix),
+/// in **buffer pixels**.
+///
+/// `(GLYPH_W + SPACING) * DOT` = 6 × 4 = 24. The `DOT` factor is the trap: the
+/// kit does not render one buffer pixel per font pixel — every font pixel
+/// becomes a `DOT`×`DOT` round dot (`dot_matrix.rs:30-31`), so reasoning at the
+/// bare 6 px font pitch under-counts a strip's width by **4×**.
+const DOT_MATRIX_PITCH_PX: u32 = 24;
+
+/// Per-character horizontal advance of a [`SevenSeg`](PreemWidget::SevenSeg),
+/// in **buffer pixels**.
+///
+/// `DIGIT_W + GAP` = 30 + 10 (`seven_seg.rs:26,32`). A seven-segment readout
+/// shares *nothing* with the font grid — not the cell size, not the padding,
+/// not the height — so it needs its own number rather than a font-derived one.
+/// The digit is the widest cell, so this is the worst-case pitch.
+const SEVEN_SEG_PITCH_PX: u32 = 40;
+
+/// Truncate a **single-line strip**'s text so its rendered width stays inside
+/// [`MAX_STRIP_DIM`], on top of the [`MAX_TEXT_LEN`] byte cap.
+///
+/// [`MAX_TEXT_LEN`] alone cannot bound these: a dot matrix and a seven-segment
+/// readout lay the entire message out on one line, so the *character count* is
+/// a buffer dimension. At 2048 characters that is a 49 156 px dot-matrix strip
+/// and an 81 926 × 70 seven-segment one — the latter 1.37× past
+/// [`MAX_RASTER_PIXELS`], i.e. ~2 KB of wire becoming ~23 MB of RGBA.
+///
+/// Capping *here* rather than lowering [`MAX_TEXT_LEN`] keeps the byte cap
+/// generous for the widgets that wrap or truncate on their own terms (the
+/// [`TextBox`](PreemWidget::TextBox) wraps to `max_lines`, the
+/// [`FlipBoard`](PreemWidget::FlipBoard) ignores anything past its last cell).
+fn clamp_strip_text(text: &mut String, pitch_px: u32) {
+    clamp_text(text);
+    let max_chars = usize::try_from(MAX_STRIP_DIM / pitch_px).unwrap_or(usize::MAX);
+    if text.chars().count() > max_chars {
+        let end = text
+            .char_indices()
+            .nth(max_chars)
+            .map_or(text.len(), |(i, _)| i);
+        text.truncate(end);
+    }
+}
 
 /// Clamp an upscale factor to **both** rules at once: at most [`MAX_SCALE`],
 /// and small enough that `logical_dim * scale` stays within

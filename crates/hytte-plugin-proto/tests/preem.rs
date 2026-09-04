@@ -750,6 +750,14 @@ fn preem_worst_case_footprint_is_bounded() {
     const GLYPH_H: u32 = 7; // font.rs:33
     const SPACING: u32 = 1; // font.rs:35
     const LINE_GAP: u32 = 2; // font.rs:37
+    // The dot-matrix "virtual pixel": every font pixel is a DOT×DOT dot.
+    const DOT: u32 = 4; // dot_matrix.rs:31
+    const DOT_PAD: u32 = 4; // dot_matrix.rs:34 (= DOT)
+    // Seven-segment metrics — its own grid, unrelated to the font's.
+    const SEG_DIGIT_W: u32 = 30; // seven_seg.rs:26
+    const SEG_DIGIT_H: u32 = 54; // seven_seg.rs:28
+    const SEG_GAP: u32 = 10; // seven_seg.rs:32
+    const SEG_PAD: u32 = 8; // seven_seg.rs:34
     const STRIP_PAD: u32 = 4; // led_strip.rs:45
     const STRIP_CELL_W: u32 = 8; // led_strip.rs:39
     const STRIP_CELL_H: u32 = 16; // led_strip.rs:41
@@ -758,16 +766,37 @@ fn preem_worst_case_footprint_is_bounded() {
     /// `(final_width, final_height)` a clamped config would rasterise to.
     fn footprint(w: &PreemWidget) -> (u32, u32) {
         match w {
-            // Static text: bounded by MAX_TEXT_LEN glyphs on one line. (Two
-            // arms, not one alternation — the two state structs are distinct
-            // types by design, so a binding can't span them.)
+            // **The trap, and why this arm is spelled out.** A dot matrix does
+            // NOT render one buffer pixel per font pixel: every font pixel
+            // becomes a `DOT`×`DOT` round dot, so a char cell advances
+            // `(GLYPH_W + SPACING) * DOT` = **24 px**, not 6
+            // (dot_matrix.rs:30-31 and :62-68). Reasoning at the bare font
+            // pitch under-counts the width by 4× — which is exactly the error
+            // that shipped in the first version of this test, where both strip
+            // arms were `(chars * 6, 7)` and so validated the model against
+            // itself.
             PreemWidget::DotMatrix { state, .. } => {
-                let cols = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
-                (cols * (GLYPH_W + SPACING), GLYPH_H)
+                let n = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
+                let advance = (GLYPH_W + SPACING) * DOT; // 24
+                let w = if n == 0 {
+                    2 * DOT_PAD
+                } else {
+                    2 * DOT_PAD + n * advance - SPACING * DOT // 24n + 4
+                };
+                (w, 2 * DOT_PAD + GLYPH_H * DOT) // 36 high
             }
+            // A seven-segment readout shares *nothing* with the font grid — it
+            // has its own cell metrics entirely (seven_seg.rs:24-34). The
+            // widest cell is a digit, so the worst-case pitch is
+            // `DIGIT_W + GAP` = 40 px/char and the width is `40n + 6`.
             PreemWidget::SevenSeg { state, .. } => {
-                let cols = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
-                (cols * (GLYPH_W + SPACING), GLYPH_H)
+                let n = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
+                let w = if n == 0 {
+                    2 * SEG_PAD
+                } else {
+                    2 * SEG_PAD + n * (SEG_DIGIT_W + SEG_GAP) - SEG_GAP // 40n + 6
+                };
+                (w, 2 * SEG_PAD + SEG_DIGIT_H) // 70 high
             }
             PreemWidget::TextBox { config, state: _ } => {
                 let cols = match config.width {
@@ -812,6 +841,14 @@ fn preem_worst_case_footprint_is_bounded() {
         PreemWidget::DotMatrix {
             config: DotMatrixConfig::default(),
             state: DotMatrixState {
+                text: "8".repeat(MAX_TEXT_LEN * 4),
+            },
+        },
+        // Was missing entirely, which is half of why the seven-seg overflow
+        // went unseen: an unexercised variant can't fail a bound.
+        PreemWidget::SevenSeg {
+            config: SevenSegConfig::default(),
+            state: SevenSegState {
                 text: "8".repeat(MAX_TEXT_LEN * 4),
             },
         },
@@ -873,18 +910,37 @@ fn preem_worst_case_footprint_is_bounded() {
             },
             state: FlipBoardState::default(),
         },
+        // The *narrow* board, which is the only shape where a flip board is
+        // taller than it is wide (10 font-px across, 11 down). Without it the
+        // wide case above passes on width alone and the height axis is never
+        // exercised — the fit would be correct only by aspect ratio.
+        PreemWidget::FlipBoard {
+            config: FlipBoardConfig {
+                cells: 1,
+                glyph_px: u32::MAX,
+                scale: u32::MAX,
+                ..FlipBoardConfig::default()
+            },
+            state: FlipBoardState::default(),
+        },
     ];
 
+    let mut violations: Vec<String> = Vec::new();
     for widget in worst {
         let kind = widget.kind();
         // A single-line strip is a few px tall and as wide as its message, so
         // the square-ish MAX_BUFFER_DIM is the wrong per-axis rule for it; what
         // binds there is texture upload (MAX_STRIP_DIM). Area binds everything.
+        //
+        // Exactly the two text strips — matching MAX_STRIP_DIM's own doc.
+        // `LedStrip` used to be listed here and never needed it (its real
+        // worst case is 1413 px, inside MAX_BUFFER_DIM), so the exemption was
+        // dead code that quietly widened what this test would accept.
+        // `Marquee` never needed it either: the kit allocates only the window
+        // (marquee.rs:190), so `window_px` alone bounds it.
         let is_strip = matches!(
             widget,
-            PreemWidget::DotMatrix { .. }
-                | PreemWidget::SevenSeg { .. }
-                | PreemWidget::LedStrip { .. }
+            PreemWidget::DotMatrix { .. } | PreemWidget::SevenSeg { .. }
         );
         let clamped = widget.clamped();
         let (w, h) = footprint(&clamped);
@@ -895,18 +951,32 @@ fn preem_worst_case_footprint_is_bounded() {
         } else {
             MAX_BUFFER_DIM
         };
-        assert!(
-            w <= axis_cap && h <= axis_cap,
-            "{kind}: worst-case footprint {w}×{h} exceeds its per-axis cap \
-             ({axis_cap}) — the caps bound the fields but not the buffer"
-        );
-        assert!(
-            area <= u64::from(MAX_RASTER_PIXELS),
-            "{kind}: worst-case area {area} px exceeds MAX_RASTER_PIXELS \
-             ({MAX_RASTER_PIXELS}) — a preem node must never demand more than one \
-             Node::Pixels frame could have carried"
-        );
+        // Collected rather than asserted per-iteration: a per-widget `assert!`
+        // aborts at the first violation, so a second unbounded widget stays
+        // invisible until the first is fixed. Report every one.
+        if w > axis_cap || h > axis_cap {
+            violations.push(format!(
+                "{kind}: footprint {w}×{h} exceeds its per-axis cap ({axis_cap})"
+            ));
+        }
+        if area > u64::from(MAX_RASTER_PIXELS) {
+            // Ratio in integer hundredths — `u64 as f64` loses precision above
+            // 2^53 and the lint is right to say so.
+            let hundredths = area * 100 / u64::from(MAX_RASTER_PIXELS);
+            violations.push(format!(
+                "{kind}: area {area} px exceeds MAX_RASTER_PIXELS ({MAX_RASTER_PIXELS}) \
+                 — {}.{:02}× over",
+                hundredths / 100,
+                hundredths % 100
+            ));
+        }
     }
+
+    assert!(
+        violations.is_empty(),
+        "the caps bound the fields but not the buffer:\n  {}",
+        violations.join("\n  ")
+    );
 }
 
 /// The gauge's per-frame *CPU* cost is bounded too — no buffer cap can see it,

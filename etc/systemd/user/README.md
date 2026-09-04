@@ -23,8 +23,10 @@ niri-session.target                   (this directory's umbrella target)
         │ pulls in (WantedBy)
         ├── trollshell.service        (bar + drawer + screensaver
         │                              + idle manager + bluetooth-audio
-        │                              + … all in-process)
-        ├── trollshell-plugin-clock-demo.service  (out-of-process widget plugin)
+        │                              + … all in-process; also launches each
+        │                              declared plugin as a transient
+        │                              trollshell-plugin-<id>.service — see
+        │                              "Out-of-process widget plugins" below)
         ├── swaybg.service            (wallpaper)
         └── polkit-gnome-authentication-agent-1.service  (polkit prompts)
 ```
@@ -59,33 +61,40 @@ own unit; wrapping it in trollshell would just add a supervisor we don't need.
 
 ## Out-of-process widget plugins
 
-`trollshell-plugin-clock-demo.service` is the **reference plugin** for the
-"frontend B" plugin architecture (#35). Unlike everything above, a plugin is a
-_separate_ process that links **no GTK** — it speaks a small MessagePack wire
-protocol (`hytte-plugin-proto`) to trollshell over the same-user socket
-`$XDG_RUNTIME_DIR/trollshell/plugin.sock`. trollshell is the host: it renders
-the plugin's declarative widget tree, brokers its effects, and pushes back a
-subscribed subset of shell state. The demo mounts a clock in the sidebar's top
-slot and opens the power menu when its button is clicked.
+A widget plugin is a _separate_ process that links **no GTK** — it speaks a
+small MessagePack wire protocol (`hytte-plugin-proto`) to trollshell over the
+same-user socket `$XDG_RUNTIME_DIR/trollshell/plugin.sock`. trollshell is the
+host: it renders the plugin's declarative widget tree, brokers its effects,
+and pushes back a subscribed subset of shell state. `hytte-plugin-clock-demo`
+is the **reference plugin** for the "frontend B" plugin architecture (#35): it
+mounts a clock in the sidebar's top slot and opens the power menu when its
+button is clicked.
 
-"Enable a plugin" is just "enable its unit" — the host discovers plugins by who
-connects, not by scanning a directory. The unit is ordered `After=`
-`trollshell.service` so the host socket is usually up first, but the plugin
-also dials with a bounded backoff, so a host that isn't up yet (or a host
-restart) is ridden out in-process rather than crash-looping; systemd's
-`Restart=on-failure` is the outer supervisor. Run more plugins by shipping one
-unit per plugin binary on the same pattern.
+**The declarative launcher is the path plugins run through (#872).** This
+directory does not ship a unit per plugin. Instead: `programs.trollshell.plugins`
+(home-manager/NixOS) renders a small state file
+(`~/.config/trollshell/plugins.json` or `/etc/xdg/…`), and the running shell
+launches each enabled entry itself as a **transient** user unit named
+`trollshell-plugin-<id>.service`, via `systemd-run --user`
+(`trollshell/src/plugin_launcher.rs`). Supervision is still systemd's
+(`Restart=on-failure`, `PartOf=` the session target) — only the unit's origin
+changed. The host discovers a plugin by who connects to the socket, not by
+scanning a directory, so "enable a plugin" is just "declare it enabled and let
+the shell (re)launch it."
 
-> **Nix-managed sessions** don't hand-install these units: since #419 the
-> `programs.trollshell.plugins` option renders to a declarative state file
-> (`~/.config/trollshell/plugins.json` or `/etc/xdg/…`), and the running shell
-> launches each enabled plugin itself as a **transient** user unit of the same
-> `trollshell-plugin-<id>.service` name via `systemd-run --user`
-> (`trollshell/src/plugin_launcher.rs`). Supervision is still systemd's
-> (`Restart=on-failure`, and `PartOf=` the session target), and the static
-> units below keep working as the manual path — the socket doesn't care who
-> spawned the plugin.
->
+Without nix, the same state file is hand-editable: add a `plugins.json` entry
+(`exec`, `env`, `enabled`, …) and either restart trollshell or poke
+`Control.ReloadPlugins` (below) to converge, or drive a plugin at runtime from
+the control-center's Plugins tab (start/stop — a runtime action, not a
+declaration). A hand-written static unit still works too, as long as its id
+isn't _also_ declared in `plugins.json`: the launcher's reconcile fingerprints
+only the units it spawns, and deliberately leaves alone any running unit that
+carries no fingerprint and isn't declared
+(`trollshell/src/plugin_launcher.rs:565-597`,
+`plan_never_touches_units_it_did_not_launch`) — but the repo no longer ships
+templates for one; the 11 that used to live in this directory were retired in
+#872.
+
 > Since #707 that `PartOf=` is the state file's top-level `"target"`, which
 > home-manager renders from `programs.trollshell.systemd.target` — **the same
 > target the shell's own unit binds to**. It used to be hardcoded to
@@ -120,8 +129,8 @@ unit per plugin binary on the same pattern.
 > 4. **the diff runs on a fingerprint** stamped into each unit's `Description=`
 >    at spawn, covering `exec` + `env` + `secrets` + a non-default `target`.
 >    `systemctl --user show -p Description trollshell-plugin-pet` reads it
->    back; a unit the shell never stamped — the static ones below — is never
->    touched.
+>    back; a unit the shell never stamped (a hand-written static unit whose id
+>    isn't declared in `plugins.json`) is never touched.
 >
 > So: **under home-manager a `switch` applies live.** Under the NixOS module,
 > or if the shell wasn't running when you switched, a changed `env`/`package`
@@ -147,10 +156,11 @@ unit per plugin binary on the same pattern.
 > (`hytte-plugin-<id>`), so the declarative path needs no out-of-tree
 > derivation — point `package` straight at it:
 > `programs.trollshell.plugins.pet.package =
-trollshell.packages.${system}.hytte-plugin-pet;`. The static units below
-> remain the legacy fallback (they exec hand-copied binaries, not a nix path).
+trollshell.packages.${system}.hytte-plugin-pet;`. Outside nix, point `exec`
+> in a hand-edited `plugins.json` at wherever you installed the binary; there
+> is no static-unit fallback to fall back to (#872).
 
-`trollshell-plugin-pet.service` is the second in-tree plugin (#276): a
+The **pet** plugin (`hytte-plugin-pet`, #276) is the second in-tree plugin: a
 kaomoji cat in the sidebar's top slot — poke it by clicking. It shares the
 `SidebarTop` mount with the clock demo, but since #274 that mount is a
 **region** holding N plugin cards (sorted by each plugin's manifest `order`),
@@ -163,40 +173,43 @@ function beyond variety. Under home-manager that unit is
 ["The declarative path"](#the-declarative-path-home-manager) below, which covers
 it alongside the Claude bridge — the other backend `PET_LLM_URL` can point at.
 
-`trollshell-plugin-weather.service` is the weather card, migrated
+The **weather** plugin (`hytte-plugin-weather`) is the weather card, migrated
 out-of-process (#290): it mounts `SidebarLead` — the leading region above the
 built-in cards, rendering above calendar/tasks (the after-tasks `SidebarTop`
 region can't reach that high) — where the native card used to anchor. It
 geolocates via geoclue2 (system bus) and, when geoclue is unavailable/denied,
 forward-geocodes `$TROLLSHELL_WEATHER_CITY` — the same env var the retired
-in-shell card honored (see the unit's commented `Environment=` line). Being a
-separate process it links **no GTK**: it talks D-Bus over its own `zbus`
-connection and fetches open-meteo directly. **Click the card to refresh now.**
-The native card is gone — its widget mount and open-edge refresh call were
-removed in the #290 follow-up — so bringing up weather is just enabling this
-unit.
+in-shell card honored (set it via the plugin's declared `env`, e.g.
+`programs.trollshell.plugins.weather.env.TROLLSHELL_WEATHER_CITY` or the
+matching `plugins.json` entry). Being a separate process it links **no GTK**:
+it talks D-Bus over its own `zbus` connection and fetches open-meteo directly.
+**Click the card to refresh now.** The native card is gone — its widget mount
+and open-edge refresh call were removed in the #290 follow-up — so bringing up
+weather is just enabling the plugin.
 
-`trollshell-plugin-departures.service` is the departures board, migrated
-out-of-process (#289): it mounts `SidebarBottom` — where the native board used
-to anchor — and renders the same S-Bahn list. It reads its station from the
-same `~/.config/trollshell/places.toml` the shell already writes, and it is
-**visibility-gated**: the poller parks (no HTTP) while the sidebar is closed
-and does an immediate refresh on open, matching the retired native board's
-poll-only-while-open energy behavior. The native board is gone — its widget
-mount and open-edge refresh wiring were removed in the #289 follow-up — so
-bringing up departures is just enabling this unit.
+The **departures** plugin (`hytte-plugin-departures`) is the departures
+board, migrated out-of-process (#289): it mounts `SidebarBottom` — where the
+native board used to anchor — and renders the same S-Bahn list. It reads its
+station from the same `~/.config/trollshell/places.toml` the shell already
+writes, and it is **visibility-gated**: the poller parks (no HTTP) while the
+sidebar is closed and does an immediate refresh on open, matching the retired
+native board's poll-only-while-open energy behavior. The native board is
+gone — its widget mount and open-edge refresh wiring were removed in the #289
+follow-up — so bringing up departures is just enabling the plugin.
 
-`trollshell-plugin-usage.service` is the Claude usage-limits monitor (#320): a
-`SidebarTop` card that renders how much of a spend budget has been **burned
-within a window** as an accent-tinted gauge — a slow, **visibility-gated**
-`ureq` poll (60 s, parked while the sidebar is closed) of the exponentials
-Grafana **public dashboard**. The metric is honestly _spend_, not rolling
-rate-limit headroom (Claude Code's OTEL surface exports `claude_code.cost.usage`
-/ `token.usage`, not the `/usage` window percentages), so the card reads
-"burned ÷ a budget you set". **The dashboard URL is configuration, not a build
-input**: with none set the card renders a calm "no dashboard configured" empty
-state and makes zero network calls — set `TROLLSHELL_USAGE_DASHBOARD_URL` (the
-`…/public-dashboards/<token>` link, a secret kept in the unit) to go live.
+The **usage** plugin (`hytte-plugin-usage`) is the Claude usage-limits
+monitor (#320): a `SidebarTop` card that renders how much of a spend budget
+has been **burned within a window** as an accent-tinted gauge — a slow,
+**visibility-gated** `ureq` poll (60 s, parked while the sidebar is closed) of
+the exponentials Grafana **public dashboard**. The metric is honestly
+_spend_, not rolling rate-limit headroom (Claude Code's OTEL surface exports
+`claude_code.cost.usage` / `token.usage`, not the `/usage` window
+percentages), so the card reads "burned ÷ a budget you set". **The dashboard
+URL is configuration, not a build input**: with none set the card renders a
+calm "no dashboard configured" empty state and makes zero network calls — set
+`TROLLSHELL_USAGE_DASHBOARD_URL` (the `…/public-dashboards/<token>` link, a
+secret kept in the plugin's declared env, not in a nix store path) to go
+live.
 `TROLLSHELL_USAGE_BUDGET` is the optional gauge denominator; `_PANEL` pins the
 panel id (else the first value panel is discovered); `_WINDOW` sets the range
 (default `now-5h`). All four also read from `~/.config/trollshell/usage.toml`
@@ -204,7 +217,7 @@ panel id (else the first value panel is discovered); `_WINDOW` sets the range
 the card opens its own drawer panel (the gauge + the window figures +
 last-updated). It links no GTK and asks the host for nothing but `OpenPage`.
 
-`trollshell-plugin-preem-demo.service` is the showcase for the
+The **preem-demo** plugin (`hytte-plugin-preem-demo`) is the showcase for the
 `hytte_plugin::preem` raster kit (#356): a sidebar card cycling the retro
 display widgets — a 7-seg HH:MM clock, a dot-matrix ticker, and an 8-bit
 textbox — through the VFD / LCD / OLED skins (rotating every 10 s; click the
@@ -213,8 +226,9 @@ animation frame derives from the Clock snapshots the host already pushes. It
 mounts `SidebarTop` alongside the clock demo and the pet, and doubles as the
 visual reference for kit consumers.
 
-`trollshell-plugin-terminal.service` is the micro-terminal demo (#357): a
-sidebar card composing the two pieces the preem-widgets breakout landed — the
+The **terminal** plugin (`hytte-plugin-terminal`) is the micro-terminal demo
+(#357): a sidebar card composing the two pieces the preem-widgets breakout
+landed — the
 `Node::Entry` text input and the `hytte_plugin::preem` raster kit — into a
 retro VFD "screen" of scrollback over a single entry line. Type a line, press
 Enter and it is echoed onto the screen behind a `> ` prompt (scrolling when the
@@ -222,7 +236,7 @@ screen fills) and the entry clears. It is **pure local echo**: submitted text is
 only ever painted back — the plugin executes nothing, spawns no process, and
 requests no capabilities. It mounts `SidebarTop` after the preem showcase.
 
-`trollshell-plugin-caw.service` is caw's desktop body (#359): a chunky-pixel
+The **caw** plugin (`hytte-plugin-caw`) is caw's desktop body (#359): a chunky-pixel
 cybercrow mounting `SidebarTop` alongside the clock demo, pet, and terminal
 (order-sorted, so it coexists — no `Conflicts=` needed). Unlike the pet, there
 is **no separate brain service** — caw herself is the brain: the opencaw agent
@@ -232,10 +246,11 @@ procedural LCD corvid face (7 moods, glowing chaos-scaled eyes) plus
 pixel-font speech in her own palette. Poke her for a reaction; she dozes off
 when she hasn't expressed in a while. The expression file path is
 `CAW_EXPRESSION_PATH` (default `~/.local/state/caw/expression.json`) — point
-both this unit and opencaw at the same path if you override it.
+both this plugin and opencaw at the same path if you override it.
 
-`trollshell-plugin-timer.service` is a pomodoro / kitchen timer (#406) and the
-first bundled plugin to mount `Mount::BarRight` — a **bar chip** (a
+The **timer** plugin (`hytte-plugin-timer`) is a pomodoro / kitchen timer
+(#406) and the first bundled plugin to mount `Mount::BarRight` — a **bar
+chip** (a
 seven-segment `MM:SS` countdown) rather than a sidebar card, so there's no
 region to coexist in. Clicking the chip opens its own drawer panel: the big
 readout, a duration entry (`25`, `25m`, `5:00`, `1:30:00`, or `pomo`), the
@@ -247,7 +262,7 @@ payoff, the first customer of that effect) — attributed to the plugin id as
 the app name, no extra unit or D-Bus setup needed. No environment variables to
 set.
 
-`trollshell-plugin-infobroker.service` is the **infobroker** (#487): the
+The **infobroker** plugin (`hytte-plugin-infobroker`, #487) is the
 consent-gated data broker that lets a local AI agent read scoped desktop data.
 Like the timer it's a `Mount::BarRight` bar chip (a shield; a warning triangle +
 badge when an agent is knocking), and clicking it opens its own drawer panel —
@@ -268,8 +283,9 @@ The agent-facing skill folder lives at
 `etc/skills/infobroker/` (`SKILL.md` + a `bin/hytte-infobroker` wrapper). No
 environment variables to set.
 
-`trollshell-plugin-audio-widget.service` is the audio-reactive sidebar card
-(#506), reworked into a y2k USB-MP3-player face plate by #840: a
+The **audio-widget** plugin (`hytte-plugin-audio-widget`) is the
+audio-reactive sidebar card (#506), reworked into a y2k USB-MP3-player face
+plate by #840: a
 `Mount::SidebarBottom` card (`order = 1`, so it sits below pet and departures)
 composing four `hytte_plugin::preem` raster widgets off the
 `StateKey::AudioSpectrum` push (#405) — a dot-matrix marquee, a `MM:SS/MM:SS`
@@ -302,12 +318,15 @@ llama-server; the two are meant to be swappable). Each request spawns
 `claude --print` and returns its answer as `choices[0].message.content`.
 
 **Nothing in pet or caw changed for this.** `hytte_ai_providers::Provider` is
-already just a base URL, so opting a plugin in is one line on _its_ unit:
+already just a base URL, so opting a plugin in is two env vars on _its_
+declared env (`programs.trollshell.plugins.pet.env`, or the matching
+`plugins.json` entry):
 
-```ini
-# in trollshell-plugin-pet.service
-Environment=PET_LLM_URL=http://127.0.0.1:8787
-Environment=OPENROUTER_API_KEY=local-bridge
+```nix
+programs.trollshell.plugins.pet.env = {
+  PET_LLM_URL = "http://127.0.0.1:8787";
+  OPENROUTER_API_KEY = "local-bridge";
+};
 ```
 
 That second line is a **security control, not cosmetics**. The bridge is
@@ -369,8 +388,8 @@ fresh session routinely runs past 10s, so the fix is to raise **both, in that
 order**:
 
 ```ini
-# in trollshell-plugin-pet.service — the client's ceiling goes up first
-Environment=PET_LLM_TIMEOUT_SECS=30
+# on the pet plugin's declared env — the client's ceiling goes up first
+PET_LLM_TIMEOUT_SECS=30
 # in trollshell-claude-bridge.service — then the bridge, still below it
 Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=25
 ```
@@ -474,19 +493,15 @@ ln -sf "$PWD/etc/systemd/user/swaybg.service"     \
        ~/.config/systemd/user/swaybg.service
 ln -sf "$PWD/etc/systemd/user/polkit-gnome-authentication-agent-1.service" \
        ~/.config/systemd/user/polkit-gnome-authentication-agent-1.service
-ln -sf "$PWD/etc/systemd/user/trollshell-plugin-clock-demo.service" \
-       ~/.config/systemd/user/trollshell-plugin-clock-demo.service
 
 systemctl --user daemon-reload
 systemctl --user enable trollshell.service swaybg.service \
-                        polkit-gnome-authentication-agent-1.service \
-                        trollshell-plugin-clock-demo.service
+                        polkit-gnome-authentication-agent-1.service
 ```
 
-The `trollshell-plugin-clock-demo.service` unit's `ExecStart` hardcodes
-`/usr/local/bin/hytte-plugin-clock-demo` (what `cargo install --root
-/usr/local --path crates/hytte-plugin-clock-demo` produces); override it the
-same way as `trollshell.service` (below) to run a dev build.
+This sequence installs no plugin — plugins aren't hand-installed units
+anymore (#872). See "Out-of-process widget plugins" above for how to declare
+one; the shell launches it itself once trollshell.service is up.
 
 `enable` (no `--now`) is correct here — these units start when
 `niri-session.target` is started by niri at session login. Starting them

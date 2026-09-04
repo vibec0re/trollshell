@@ -16,10 +16,11 @@ into your user config directory per the per-feature README.
 | [skills/infobroker](skills/infobroker/SKILL.md)    | Agent skill folder for the #487 data broker CLI      | point an agent at the folder  |
 
 For the entire stack: see [systemd/user/README.md](systemd/user/README.md) for the
-full install sequence. That directory also ships
-`trollshell-plugin-clock-demo.service`, the reference out-of-process widget
-plugin (#35) — a separate, GTK-free binary that dials the shell over a Unix
-socket; see its "Out-of-process widget plugins" section.
+full install sequence. That README's "Out-of-process widget plugins" section
+also covers the widget-plugin architecture (#35) — separate, GTK-free binaries
+that dial the shell over a Unix socket and that trollshell itself launches as
+transient units per `programs.trollshell.plugins` (#872); this directory ships
+no per-plugin unit files.
 
 ## Local AI agent data broker (infobroker)
 
@@ -31,7 +32,8 @@ not an MCP server** — a `SKILL.md` teaching the flow plus a `bin/hytte-infobro
 wrapper the agent shells out to.
 
 The broker itself is an ordinary out-of-process trollshell plugin
-(`trollshell-plugin-infobroker.service`, see
+(`hytte-plugin-infobroker`, launched as a transient `trollshell-plugin-infobroker.service`
+by the declarative launcher — see
 [systemd/user/README.md](systemd/user/README.md)): a bar-chip shield whose drawer
 panel manages the durable **grants** (agent × datasource → allow/deny) and shows
 a live audit trail. An agent authenticates with

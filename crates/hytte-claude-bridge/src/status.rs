@@ -23,7 +23,7 @@
 //! [`crate::messages`].
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::Mode;
 
@@ -146,7 +146,10 @@ mod tests {
 
         record(504);
         let after_err = snapshot();
-        assert!(after_err.errors > after_ok.errors, "a 5xx counts as an error");
+        assert!(
+            after_err.errors > after_ok.errors,
+            "a 5xx counts as an error"
+        );
         assert_eq!(after_err.last, Last::Error);
 
         record(404);

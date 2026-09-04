@@ -1723,7 +1723,12 @@ mod tests {
     #[test]
     fn fold_resolution_ignores_a_resolution_for_an_unwatched_slot() {
         let mut out = Outstanding::new();
-        assert!(!fold_resolution(&mut out, "pet", &[], &slots(&["openrouter"])));
+        assert!(!fold_resolution(
+            &mut out,
+            "pet",
+            &[],
+            &slots(&["openrouter"])
+        ));
         assert!(out.is_empty());
     }
 

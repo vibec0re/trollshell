@@ -440,7 +440,10 @@ fn main() -> ExitCode {
 
     let settings = Settings::from_env();
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = %e, "tokio runtime failed to build");

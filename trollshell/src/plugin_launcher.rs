@@ -111,9 +111,11 @@
 //! waiting**: an external tool can write a key at any time, so the distinction is
 //! logged, never acted on. A slot that comes back available goes to the existing
 //! [`relaunch_for_secret_inner`], and is dropped only for the plugins that
-//! actually came back up ([`settle_slot`]); when nothing is left outstanding the
-//! task stands down, so a session whose keys all resolved at launch polls exactly
-//! zero times.
+//! actually came back up, or that failed to come back
+//! [`MAX_RELAUNCH_FAILURES`] times in a row ([`settle_slot`], #880 — see its
+//! doc comment for why an id can fail on *every* attempt); when nothing is
+//! left outstanding the task stands down, so a session whose keys all
+//! resolved at launch polls exactly zero times.
 //!
 //! **Polling is a choice, not a constraint.** oo7 0.5.0 surfaces no unlock
 //! signal, but the underlying `org.freedesktop.Secret.Collection` does carry a
@@ -590,12 +592,36 @@ async fn resolve_secret_env(id: &str, spec: &PluginSpec) -> Vec<(String, String)
 /// sensibly set.
 const SECRET_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How many consecutive relaunch failures [`settle_slot`] tolerates for one
+/// `(slot, plugin)` pair before giving up on it (#880).
+///
+/// #878's F7 fix re-inserts a slot whose relaunch failed, with no cap, so a
+/// plugin id that can only ever fail bounces every [`SECRET_POLL_INTERVAL`]
+/// for the life of the session, each pass under [`CONVERGE_LOCK`]. That
+/// configuration is reachable: an id both declared in `plugins.json` *and*
+/// hand-installed as a static unit under the same
+/// `trollshell-plugin-<id>.service` name always fails its transient relaunch
+/// (`systemd-run` refuses the taken name — see [`restart`]'s doc comment),
+/// while the static-unit fallback keeps bringing the plugin back up, so
+/// nothing about the failure is transient. A `const`, not an option: no
+/// session makes some other retry count the right answer, same reasoning as
+/// [`SECRET_POLL_INTERVAL`] above.
+const MAX_RELAUNCH_FAILURES: usize = 3;
+
 /// Which declared secret slots are still unresolved, and which plugins are
 /// waiting on each: `slot → {plugin id}`. A slot leaves the map when it becomes
 /// available *and* every plugin waiting on it relaunched, when every waiter has
-/// since launched with it, or when the declaration no longer justifies the wait
-/// ([`prune_undeclared`]).
+/// since launched with it, when the declaration no longer justifies the wait
+/// ([`prune_undeclared`]), or when a waiter's relaunch has failed
+/// [`MAX_RELAUNCH_FAILURES`] times in a row ([`settle_slot`], #880).
 type Outstanding = BTreeMap<String, BTreeSet<String>>;
+
+/// Consecutive relaunch-failure count per `(slot, plugin id)` pair (#880) —
+/// see [`MAX_RELAUNCH_FAILURES`]. A pair is absent until its first failure;
+/// [`settle_slot`] removes the entry again on a success (or a pass where the
+/// id wasn't attempted) and once the cap drops the id, so the map only ever
+/// holds pairs currently mid-streak.
+type FailureCounts = BTreeMap<(String, String), usize>;
 
 /// The watcher's whole state, behind one **synchronous** mutex.
 ///
@@ -610,6 +636,9 @@ type Outstanding = BTreeMap<String, BTreeSet<String>>;
 ///   same lock the arm path checks it under, and `Drop` cannot `.await`.
 struct WatchState {
     outstanding: Outstanding,
+    /// Consecutive relaunch-failure streaks, keyed by `(slot, plugin id)`
+    /// (#880). See [`FailureCounts`] and [`MAX_RELAUNCH_FAILURES`].
+    failures: FailureCounts,
     /// Whether a [`watch_outstanding_secrets`] task is alive.
     ///
     /// Read and written **only while holding this mutex**, which is what makes
@@ -622,6 +651,7 @@ struct WatchState {
 
 static WATCH: std::sync::Mutex<WatchState> = std::sync::Mutex::new(WatchState {
     outstanding: BTreeMap::new(),
+    failures: BTreeMap::new(),
     watching: false,
 });
 
@@ -699,21 +729,59 @@ fn waiters_on(out: &Outstanding, slot: &str) -> Vec<String> {
 }
 
 /// Resolve one slot's watch after a relaunch attempt: everything that was
-/// waiting stops waiting **except** the ids whose relaunch failed, which stay so
-/// the next pass tries again.
+/// waiting stops waiting **except** the ids whose relaunch failed, which stay
+/// so the next pass tries again — up to [`MAX_RELAUNCH_FAILURES`] consecutive
+/// failures per `(slot, id)` pair (#880). Past the cap the id is dropped
+/// instead of retried again, and the returned list says which ids that
+/// happened to (with the attempt count and the triggering relaunch's error),
+/// for the caller to log.
 ///
-/// This is #866's F7 fix. The slot used to be removed *before* the relaunch, so
-/// a transiently failing restart — the unit briefly still up, a wedged user
-/// manager — lost the slot forever and left the plugin keyless with nothing
-/// still watching for it. Writing the failures back is also why this rebuilds
-/// the entry rather than retaining in place: by the time it runs, a successful
-/// [`restart`] has already dropped its own id via [`fold_resolution`], so a
-/// `retain` would have nothing left to keep. Pure.
-fn settle_slot(out: &mut Outstanding, slot: &str, failed: &[String]) {
-    out.remove(slot);
-    if !failed.is_empty() {
-        out.insert(slot.to_owned(), failed.iter().cloned().collect());
+/// This is #866's F7 fix, plus #880's cap. The slot used to be removed
+/// *before* the relaunch, so a transiently failing restart — the unit briefly
+/// still up, a wedged user manager — lost the slot forever and left the
+/// plugin keyless with nothing still watching for it. Writing the failures
+/// back is also why this rebuilds the entry rather than retaining in place:
+/// by the time it runs, a successful [`restart`] has already dropped its own
+/// id via [`fold_resolution`], so a `retain` would have nothing left to keep.
+///
+/// The failure count resets for any `(slot, id)` pair that *isn't* reported
+/// failed this pass — a relaunch that finally succeeded, or an id that was
+/// waiting but wasn't attempted this time — read from `out[slot]`'s contents
+/// **before** this call clears them, i.e. the same waiter set
+/// [`watch_outstanding_secrets`] already relaunched from. Pure.
+fn settle_slot(
+    out: &mut Outstanding,
+    failures: &mut FailureCounts,
+    slot: &str,
+    failed: &[(String, String)],
+) -> Vec<(String, usize, String)> {
+    let previously_waiting = out.get(slot).cloned().unwrap_or_default();
+    for id in &previously_waiting {
+        if !failed.iter().any(|(f, _)| f == id) {
+            failures.remove(&(slot.to_owned(), id.clone()));
+        }
     }
+    out.remove(slot);
+    let mut dropped = Vec::new();
+    let mut retry = BTreeSet::new();
+    for (id, reason) in failed {
+        let key = (slot.to_owned(), id.clone());
+        let count = {
+            let c = failures.entry(key.clone()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if count >= MAX_RELAUNCH_FAILURES {
+            failures.remove(&key);
+            dropped.push((id.clone(), count, reason.clone()));
+        } else {
+            retry.insert(id.clone());
+        }
+    }
+    if !retry.is_empty() {
+        out.insert(slot.to_owned(), retry);
+    }
+    dropped
 }
 
 /// Drop watch entries the declaration no longer justifies: a plugin that was
@@ -821,12 +889,32 @@ fn watch_outstanding_secrets() -> SpawnedTask {
                 );
                 let failed = relaunch_for_secret_inner(&slot).await;
                 let mut w = watch_state();
-                settle_slot(&mut w.outstanding, &slot, &failed);
+                let ws = &mut *w;
+                let dropped = settle_slot(&mut ws.outstanding, &mut ws.failures, &slot, &failed);
+                drop(w);
                 if !failed.is_empty() {
+                    let ids: Vec<&str> = failed.iter().map(|(id, _)| id.as_str()).collect();
                     tracing::warn!(
                         %slot,
-                        plugins = ?failed,
+                        plugins = ?ids,
                         "relaunch failed; keeping the slot under watch for the next pass",
+                    );
+                }
+                // #880: a (slot, id) pair that just hit MAX_RELAUNCH_FAILURES
+                // stops being retried — it would otherwise thrash the plugin
+                // every SECRET_POLL_INTERVAL for the rest of the session.
+                for (id, attempts, error) in dropped {
+                    tracing::warn!(
+                        plugin = %id,
+                        %slot,
+                        attempts,
+                        %error,
+                        "relaunch failed {attempts} times in a row for this secret slot; \
+                         giving up on this plugin for the rest of the session — check for an \
+                         id both declared in plugins.json and hand-installed as a static \
+                         systemd unit (systemd-run then always refuses the name), or rotate \
+                         the key from the control-center; either resolves it, and the next \
+                         launch or reconcile re-arms watching for it",
                     );
                 }
             }
@@ -1122,22 +1210,26 @@ pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
 pub async fn relaunch_for_secret(slot: &str) {
     let failed = relaunch_for_secret_inner(slot).await;
     if !failed.is_empty() {
-        tracing::warn!(%slot, plugins = ?failed, "some plugins did not relaunch after the key change");
+        let ids: Vec<&str> = failed.iter().map(|(id, _)| id.as_str()).collect();
+        tracing::warn!(%slot, plugins = ?ids, "some plugins did not relaunch after the key change");
     }
 }
 
 /// [`relaunch_for_secret`]'s body, reporting **which plugin ids failed to come
-/// back**.
+/// back**, each paired with its relaunch error.
 ///
-/// The watcher needs that list to keep those slots outstanding rather than
-/// dropping them on a transient failure (#866's F7); the two control-center
-/// callers only want the log line, which the public wrapper above writes. Ids
-/// that were simply *not running* are not failures — they pick the key up on
-/// their next start — so they are not reported.
+/// The watcher needs the id list to keep those slots outstanding rather than
+/// dropping them on a transient failure (#866's F7), and the error alongside
+/// each one to log a reason when #880's [`MAX_RELAUNCH_FAILURES`] cap gives up
+/// on a pair; the two control-center callers only want the log line, which the
+/// public wrapper above writes. Ids that were simply *not running* are not
+/// failures — they pick the key up on their next start — so they are not
+/// reported.
 ///
-/// A failure to even list the units reports **every** affected id: nothing was
-/// attempted, so nothing should stop being watched.
-async fn relaunch_for_secret_inner(slot: &str) -> Vec<String> {
+/// A failure to even list the units reports **every** affected id against that
+/// same listing error: nothing was attempted, so nothing should stop being
+/// watched.
+async fn relaunch_for_secret_inner(slot: &str) -> Vec<(String, String)> {
     let _guard = CONVERGE_LOCK.lock().await;
 
     let declared = load_declared().await.unwrap_or_default();
@@ -1158,7 +1250,11 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<String> {
             .collect(),
         Err(err) => {
             tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
-            return affected.into_iter().map(|(id, _)| id.clone()).collect();
+            let reason = err.to_string();
+            return affected
+                .into_iter()
+                .map(|(id, _)| (id.clone(), reason.clone()))
+                .collect();
         }
     };
     let mut failed = Vec::new();
@@ -1169,7 +1265,7 @@ async fn relaunch_for_secret_inner(slot: &str) -> Vec<String> {
         }
         if let Err(err) = restart(id, spec, &declared.target).await {
             tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
-            failed.push(id.clone());
+            failed.push((id.clone(), err.to_string()));
         } else {
             tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
         }
@@ -1937,6 +2033,7 @@ mod tests {
     #[test]
     fn settle_slot_keeps_only_the_plugins_whose_relaunch_failed() {
         let mut out = Outstanding::new();
+        let mut failures = FailureCounts::new();
         fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]);
         fold_resolution(&mut out, "caw", &slots(&["openrouter"]), &[]);
         // `restart` already cleared both ids on its way through resolve_secret_env.
@@ -1947,16 +2044,124 @@ mod tests {
             "the precondition this test is written against"
         );
 
-        settle_slot(&mut out, "openrouter", &slots(&["pet"]));
+        let dropped = settle_slot(
+            &mut out,
+            &mut failures,
+            "openrouter",
+            &[("pet".to_owned(), "boom".to_owned())],
+        );
+        assert!(dropped.is_empty(), "one failure is well under the cap");
         assert_eq!(
             out["openrouter"],
             BTreeSet::from(["pet".to_owned()]),
             "the failed plugin keeps waiting for the next pass"
         );
 
-        // Next pass: pet comes back up. Nothing failed → the slot is gone.
-        settle_slot(&mut out, "openrouter", &[]);
+        // Next pass: pet comes back up. Nothing failed → the slot is gone, and
+        // its failure streak is forgotten with it.
+        let dropped = settle_slot(&mut out, &mut failures, "openrouter", &[]);
+        assert!(dropped.is_empty());
         assert!(out.is_empty());
+        assert!(failures.is_empty(), "a success resets the streak");
+    }
+
+    /// **#880.** A `(slot, id)` pair that fails every attempt is dropped once
+    /// it hits [`MAX_RELAUNCH_FAILURES`] consecutive failures, instead of
+    /// being retried forever — the issue's exact scenario: an id both
+    /// declared in `plugins.json` *and* hand-installed as a static unit under
+    /// the same name can only ever fail its transient relaunch, and pre-#880
+    /// that meant `settle_slot` re-inserted it every `SECRET_POLL_INTERVAL`
+    /// for the life of the session.
+    #[test]
+    fn settle_slot_drops_a_pair_after_max_consecutive_failures() {
+        let mut out = Outstanding::new();
+        let mut failures = FailureCounts::new();
+        let fail = |out: &mut Outstanding, failures: &mut FailureCounts| {
+            settle_slot(
+                out,
+                failures,
+                "anthropic",
+                &[("bridge".to_owned(), "unit already exists".to_owned())],
+            )
+        };
+
+        for attempt in 1..MAX_RELAUNCH_FAILURES {
+            let dropped = fail(&mut out, &mut failures);
+            assert!(
+                dropped.is_empty(),
+                "attempt {attempt} is still under the cap"
+            );
+            assert_eq!(
+                out["anthropic"],
+                BTreeSet::from(["bridge".to_owned()]),
+                "still retried while under the cap (attempt {attempt})"
+            );
+        }
+
+        // The cap-th failure drops it instead of retrying again.
+        let dropped = fail(&mut out, &mut failures);
+        assert_eq!(
+            dropped,
+            vec![(
+                "bridge".to_owned(),
+                MAX_RELAUNCH_FAILURES,
+                "unit already exists".to_owned()
+            )]
+        );
+        assert!(
+            !out.contains_key("anthropic"),
+            "dropped rather than kept under watch for another pass"
+        );
+        assert!(
+            !failures.contains_key(&("anthropic".to_owned(), "bridge".to_owned())),
+            "the streak is forgotten once it triggers the drop"
+        );
+    }
+
+    /// A success partway through a failure streak resets the count — the cap
+    /// is on *consecutive* failures, so an intermittent one never trips it.
+    #[test]
+    fn settle_slot_resets_the_streak_on_a_success() {
+        let mut out = Outstanding::new();
+        let mut failures = FailureCounts::new();
+
+        for _ in 0..MAX_RELAUNCH_FAILURES - 1 {
+            settle_slot(
+                &mut out,
+                &mut failures,
+                "openrouter",
+                &[("pet".to_owned(), "connection refused".to_owned())],
+            );
+        }
+        assert_eq!(
+            failures[&("openrouter".to_owned(), "pet".to_owned())],
+            MAX_RELAUNCH_FAILURES - 1
+        );
+
+        // A pass where pet isn't reported failed — the relaunch succeeded —
+        // resets the streak.
+        settle_slot(&mut out, &mut failures, "openrouter", &[]);
+        assert!(failures.is_empty());
+
+        // A fresh run of failures afterwards starts from zero again, so it
+        // does not trip the cap even though five failures have now happened
+        // in total.
+        for _ in 0..MAX_RELAUNCH_FAILURES - 1 {
+            let dropped = settle_slot(
+                &mut out,
+                &mut failures,
+                "openrouter",
+                &[("pet".to_owned(), "connection refused".to_owned())],
+            );
+            assert!(
+                dropped.is_empty(),
+                "the reset streak is still under the cap"
+            );
+        }
+        assert_eq!(
+            failures[&("openrouter".to_owned(), "pet".to_owned())],
+            MAX_RELAUNCH_FAILURES - 1
+        );
     }
 
     /// **F10.** A plugin dropped from `plugins.json`, or one that no longer

@@ -87,14 +87,30 @@ pub fn is_valid_slot(slot: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
+/// Open the default keyring collection **without unlocking it**.
+///
+/// `Keyring::new()` only resolves the Secret Service and its default collection
+/// (`oo7-0.5.0/src/keyring.rs`'s `new_inner`: `Service::new` →
+/// `default_collection`); it raises no prompt and touches no secret. Every path
+/// that needs a *value* goes through [`keyring`] instead — [`probe`] is the one
+/// caller that must not, and the reason is in its own docs.
+async fn keyring_no_prompt() -> anyhow::Result<Keyring> {
+    tokio::time::timeout(OP_TIMEOUT, Keyring::new())
+        .await
+        .context("opening the secret service timed out")?
+        .context("opening the secret service")
+}
+
 /// Open + unlock the default keyring collection. `unlock` is a no-op when the
 /// collection is already unlocked (gnome-keyring auto-unlocks at login via PAM,
 /// the normal case); it can prompt when locked, which [`OP_TIMEOUT`] bounds.
+///
+/// **Only for paths a human is waiting on** — the control-center's AI Keys tab
+/// and a plugin launch. A prompt raised here is one somebody just asked for, and
+/// [`OP_TIMEOUT`] abandoning it is bounded by that same human's attention. Do
+/// not reach for this from anything periodic; see [`probe`].
 async fn keyring() -> anyhow::Result<Keyring> {
-    let kr = tokio::time::timeout(OP_TIMEOUT, Keyring::new())
-        .await
-        .context("opening the secret service timed out")?
-        .context("opening the secret service")?;
+    let kr = keyring_no_prompt().await?;
     tokio::time::timeout(OP_TIMEOUT, kr.unlock())
         .await
         .context("unlocking the keyring timed out")?
@@ -143,6 +159,105 @@ pub async fn get(slot: &str) -> Option<String> {
             tracing::warn!(slot = %slot, %err, "reading AI key from the keyring failed; treating as unset");
             None
         }
+    }
+}
+
+/// What one slot looks like right now, with the two failures [`get`] collapses
+/// held apart (#866).
+///
+/// [`get`] answers the launch-time question — "is there a key to inject?" — and
+/// fails closed, so "the ring is locked" and "nobody ever stored one" are both
+/// `None` there. A *watcher* needs the distinction: the launcher polls the slots
+/// a plugin launched without, and the log line for a session that started before
+/// gnome-keyring was unlocked ("waiting for the keyring") is a different piece of
+/// information from the one for a slot nobody has filled in yet ("no key
+/// stored"). Both keep waiting — an external tool can add a key at any time —
+/// which is why this only widens the *reporting*, never the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretProbe {
+    /// A non-empty key is stored and readable — injectable right now.
+    Available,
+    /// The keyring answered, and has no key for this slot.
+    Absent,
+    /// The keyring could not be read at all: locked and awaiting an unlock
+    /// prompt, timed out, or no Secret Service on the bus. Says nothing about
+    /// whether a key exists.
+    Locked,
+}
+
+/// Probe `slot` without injecting anything, and — critically — **without ever
+/// raising an unlock prompt**.
+///
+/// Never returns a value and never logs one; the caller learns only which of the
+/// three states the slot is in.
+///
+/// # Why this cannot go through [`get`]
+///
+/// [`get`] → [`read`] → [`keyring`] calls `unlock()`, which on a locked
+/// collection walks oo7's `Service::unlock` → `Prompt.Prompt("")` and **raises
+/// the interactive gcr password dialog**. [`OP_TIMEOUT`] then drops that future
+/// without calling `dismiss()`, abandoning the prompt. The launcher's watcher
+/// polls this every 30s precisely *because* the ring is locked, so routing it
+/// through `get` would put an abandoned password dialog on the user's screen
+/// twice a minute for the life of the session — turning the feature into the
+/// worst bug in this PR.
+///
+/// So the probe opens the collection with [`keyring_no_prompt`] and asks three
+/// prompt-free questions instead: `SearchItems` (a collection method that works
+/// on a locked collection and does not unlock — `oo7-0.5.0`'s
+/// `dbus::Collection::search_items`), the item's `Locked` **property**, and only
+/// then `GetSecret`, which is reached only once `Locked` is false.
+///
+/// One deliberate imprecision: a Secret Service implementation that hides items
+/// under a locked collection would make this answer [`SecretProbe::Absent`]
+/// where gnome-keyring answers [`SecretProbe::Locked`]. Both keep waiting, so
+/// only the log line differs — and no prompt is raised either way, which is the
+/// property that matters.
+pub async fn probe(slot: &str) -> SecretProbe {
+    match probe_inner(slot).await {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::debug!(slot = %slot, %err, "keyring unreadable while probing the slot");
+            SecretProbe::Locked
+        }
+    }
+}
+
+/// Fallible core of [`probe`]. Every step is time-bounded, and none of them can
+/// prompt.
+async fn probe_inner(slot: &str) -> anyhow::Result<SecretProbe> {
+    let kr = keyring_no_prompt().await?;
+    let items = tokio::time::timeout(OP_TIMEOUT, kr.search_items(&slot_attrs(slot)))
+        .await
+        .context("searching the keyring timed out")?
+        .context("searching the keyring")?;
+    let Some(item) = items.first() else {
+        return Ok(SecretProbe::Absent);
+    };
+    // A plain `org.freedesktop.Secret.Item.Locked` property read — this is the
+    // question, asked directly, rather than inferred from a failure.
+    let locked = tokio::time::timeout(OP_TIMEOUT, item.is_locked())
+        .await
+        .context("reading the item's lock state timed out")?
+        .context("reading the item's lock state")?;
+    if locked {
+        return Ok(SecretProbe::Locked);
+    }
+    let secret = tokio::time::timeout(OP_TIMEOUT, item.secret())
+        .await
+        .context("reading the secret timed out")?
+        .context("reading the secret")?;
+    // Same "unset" definition as `read`: a stored-but-empty or non-UTF-8 value
+    // is nothing to inject.
+    Ok(classify_secret_bytes(secret.as_bytes()))
+}
+
+/// Whether some stored bytes are a key worth injecting. Pure, and the one part
+/// of [`probe`] testable without a Secret Service — see the module's test note.
+fn classify_secret_bytes(bytes: &[u8]) -> SecretProbe {
+    match std::str::from_utf8(bytes) {
+        Ok(s) if !s.is_empty() => SecretProbe::Available,
+        _ => SecretProbe::Absent,
     }
 }
 
@@ -203,6 +318,29 @@ mod tests {
         assert_eq!(env_var_for("openrouter"), "OPENROUTER_API_KEY");
         // `-` normalizes to `_` so the result stays a valid env-var name.
         assert_eq!(env_var_for("my-provider"), "MY_PROVIDER_API_KEY");
+    }
+
+    /// The one hermetically testable piece of [`probe`]: what counts as a key
+    /// worth injecting, held identical to [`read`]'s definition of "unset".
+    ///
+    /// **Measured negative, stated rather than faked:** the property that
+    /// actually matters about `probe` — that it never raises an unlock prompt —
+    /// is not assertable here. It is a claim about which D-Bus methods are
+    /// called against a *live* Secret Service, and this workspace's
+    /// `system-tests` bucket spawns a bare `dbus-daemon` with no
+    /// `org.freedesktop.secrets` implementation on it, so there is nothing for a
+    /// hermetic test to observe. The guarantee rests on [`keyring_no_prompt`]
+    /// being the only opener `probe_inner` uses (`unlock()` is what prompts, and
+    /// it is not on that path) plus the on-glass check in the PR: watch
+    /// `journalctl --user -u trollshell` through a locked-ring session and
+    /// confirm no gcr dialog appears.
+    #[test]
+    fn a_stored_secret_counts_as_available_only_when_it_is_a_non_empty_string() {
+        assert_eq!(classify_secret_bytes(b"sk-live"), SecretProbe::Available);
+        // Same as `read`'s filter: stored-but-empty is nothing to inject…
+        assert_eq!(classify_secret_bytes(b""), SecretProbe::Absent);
+        // …and neither is a value that isn't even text.
+        assert_eq!(classify_secret_bytes(&[0xff, 0xfe]), SecretProbe::Absent);
     }
 
     #[test]

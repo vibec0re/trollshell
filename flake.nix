@@ -126,12 +126,15 @@
           };
 
           # The `hytte-claude-bridge` daemon (#584): a keyless loopback shim
-          # putting an OpenAI-compatible face on headless Claude Code. Not a
-          # widget plugin and not driven by `programs.trollshell.plugins` — it's
-          # a standalone daemon behind `etc/systemd/user/trollshell-claude-
-          # bridge.service`, so it's kept out of `bundledPluginNames` for the
-          # same reason `hytte-infobroker` is. GTK-free, so nix/plugin.nix's
-          # unwrapped `cp` is exactly right; no wrapGAppsHook4 needed.
+          # putting an OpenAI-compatible face on headless Claude Code. Since #866
+          # it speaks the plugin protocol too (a status chip) and IS driven by
+          # `programs.trollshell.plugins` — `nix/hm-module.nix` renders the
+          # `claude-bridge` entry from `claudeBridge.*`, so nobody points
+          # `plugins.<id>.package` at this by hand. It still stays out of
+          # `bundledPluginNames`, which is a mechanical `hytte-plugin-<id>` →
+          # package map and this binary is not named that way. GTK-free, so
+          # nix/plugin.nix's unwrapped `cp` is exactly right; no wrapGAppsHook4
+          # needed.
           hytte-claude-bridge = pkgs.callPackage ./nix/plugin.nix {
             inherit workspace;
             name = "hytte-claude-bridge";
@@ -562,28 +565,45 @@
                 # non-default target for the LLM-unit assertions below) — see
                 # hm-module-plugin-target-default.
                 assert pluginsState.target == "niri-session.target";
-                # The two LLM backend units (#694) render, and the bridge keeps
-                # the load-bearing bits of etc/systemd/user/trollshell-claude-
-                # bridge.service: the four-variable scrub that stops `claude`
-                # being silently moved onto metered credits, and the port/model
-                # the options are there to set. Asserted by content, not just by
-                # membership — a unit that renders without UnsetEnvironment is
-                # exactly the regression worth failing the build over.
-                assert units ? trollshell-claude-bridge;
+                # The claude bridge (#866) is a PLUGIN now, not a unit: enabling
+                # it must render `plugins.claude-bridge` into the launch state
+                # and declare no `trollshell-claude-bridge` unit at all. The
+                # negative is the load-bearing half — a stray unit alongside the
+                # plugin entry would run the bridge twice and the second copy
+                # would fail to bind the port.
+                assert !(units ? trollshell-claude-bridge);
+                assert
+                  let
+                    b = pluginsState.plugins.claude-bridge;
+                  in
+                  b.exec == pkgs.lib.getExe stubClaudeBridge
+                  && b.enabled
+                  && b.env.CLAUDE_BRIDGE_PORT == "8787"
+                  && b.env.CLAUDE_BRIDGE_MODEL == "claude-haiku-4-5"
+                  && b.env.CLAUDE_BRIDGE_TIMEOUT_SECS == "15"
+                  # The default mode, i.e. one that spawns `claude`…
+                  && b.env.CLAUDE_BRIDGE_MODE == "subscription"
+                  # …so the `anthropic` slot must NOT be declared: an injected
+                  # ANTHROPIC_API_KEY is a startup refusal there, not a
+                  # credential (#752). The `api` half of this invariant has its
+                  # own fixture, hm-module-claude-bridge-api below.
+                  && b.secrets == [ ]
+                  # THE BILLING SCRUB (#866). The retired unit's
+                  # `UnsetEnvironment=` is re-expressed as four EMPTY env values,
+                  # which is what stops an inherited ANTHROPIC_API_KEY from
+                  # restart-looping the bridge in the default mode. Losing these
+                  # is a silent regression that only bites the users who happen
+                  # to export one, so it is asserted by content.
+                  && b.env.ANTHROPIC_API_KEY == ""
+                  && b.env.ANTHROPIC_AUTH_TOKEN == ""
+                  && b.env.CLAUDE_CODE_USE_BEDROCK == ""
+                  && b.env.CLAUDE_CODE_USE_VERTEX == "";
                 assert units ? trollshell-pet-brain;
                 # `builtins.toString` because home-manager's unitOption merge
                 # hands some of these back list-wrapped (ExecStart below is
                 # `[ "…" ]`, not `"…"`) — toString is identity on a plain string
                 # and space-joins the one-element list, so the assertions hold
                 # whichever shape the merge produces.
-                assert
-                  builtins.toString units.trollshell-claude-bridge.Service.UnsetEnvironment
-                  == "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX";
-                assert builtins.elem "CLAUDE_BRIDGE_PORT=8787" units.trollshell-claude-bridge.Service.Environment;
-                assert builtins.elem "CLAUDE_BRIDGE_MODEL=claude-haiku-4-5"
-                  units.trollshell-claude-bridge.Service.Environment;
-                assert builtins.elem "CLAUDE_BRIDGE_TIMEOUT_SECS=15"
-                  units.trollshell-claude-bridge.Service.Environment;
                 # petBrain.model is a runtime path, so it gates the unit rather
                 # than entering the closure, and lands in llama-server's argv.
                 assert
@@ -655,6 +675,72 @@
                 builtins.deepSeq { inherit pluginsState; } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-plugin-target-default-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #866's mode-conditional secret slot, which the hm-module fixture
+          # above can only ever prove one side of (it runs the default
+          # `subscription` mode, where the slot must be ABSENT). This is the
+          # other side: with `claudeBridge.mode = "api"` the rendered plugin
+          # entry must declare the `anthropic` slot, so the launcher injects the
+          # keyring's key as ANTHROPIC_API_KEY at spawn — the whole point of
+          # moving the bridge onto the launcher, and the one path by which an
+          # `api`-mode bridge gets a key without a file.
+          #
+          # The pair is genuinely two-sided and neither half is decorative:
+          # declaring the slot in a `claude` mode stops the bridge starting at
+          # all (envguard's #752 refusal), and not declaring it in `api` mode
+          # leaves the key file as the only source. A refactor that dropped the
+          # `cb.mode == "api"` guard would keep this check green and break the
+          # other; dropping the slot entirely would do the reverse.
+          hm-module-claude-bridge-api =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      claudeBridge = {
+                        enable = true;
+                        package = stubClaudeBridge;
+                        mode = "api";
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              pluginsState = builtins.fromJSON (
+                builtins.unsafeDiscardStringContext cfg.xdg.configFile."trollshell/plugins.json".text
+              );
+              probe =
+                assert !(cfg.systemd.user.services ? trollshell-claude-bridge);
+                assert
+                  let
+                    b = pluginsState.plugins.claude-bridge;
+                  in
+                  b.env.CLAUDE_BRIDGE_MODE == "api"
+                  && b.secrets == [ "anthropic" ]
+                  # The scrub is unconditional — the same four empty values in
+                  # api mode. That is not a contradiction with the slot above:
+                  # the launcher appends injected secrets AFTER the declared env
+                  # and systemd lets the later assignment win, so the empty value
+                  # is the floor a keyring key overrides (and the key file's
+                  # fallback when there is none).
+                  && b.env.ANTHROPIC_API_KEY == "";
+                builtins.deepSeq { inherit pluginsState; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-claude-bridge-api-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

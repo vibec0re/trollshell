@@ -481,64 +481,74 @@ in
         };
       }
 
-      # hytte-claude-bridge (#584/#694) — the keyless loopback OpenAI-compatible
-      # shim over headless Claude Code. No upstream home-manager module exists,
-      # so a plain user unit mirroring swaybg/wlsunset above. Ported from
-      # etc/systemd/user/trollshell-claude-bridge.service, which stays the
-      # reference for hand-installed (non-home-manager) deployments — keep the
-      # two in sync.
+      # hytte-claude-bridge (#584/#694/#866) — the keyless loopback
+      # OpenAI-compatible shim over headless Claude Code.
       #
-      # PartOf + After but no Requisite, unlike swaybg/wlsunset: that matches the
-      # reference unit, and the bridge is a plain loopback HTTP server with no
-      # Wayland connection, so it has nothing to refuse to start without.
+      # It used to be a hand-declared user unit here, mirroring swaybg/wlsunset.
+      # Since #866 the daemon speaks the widget-plugin protocol itself (it paints
+      # a status chip; crates/hytte-claude-bridge/src/plugin.rs), so it is
+      # declared as a PLUGIN ENTRY instead and the shell's own launcher spawns it
+      # as a transient trollshell-plugin-claude-bridge.service
+      # (trollshell/src/plugin_launcher.rs). That is Annika's call on #866, and it
+      # buys three things a bespoke unit could not: the control-center's Plugins
+      # tab can stop/start it, #695's reconcile applies an edited config to a
+      # running session, and #392's keyring injection covers its API key.
+      #
+      # etc/systemd/user/trollshell-claude-bridge.service stays as the reference
+      # for hand-installed (non-home-manager) deployments — retiring it is a
+      # separate follow-up. It is NOT the same unit name as the transient one the
+      # launcher creates (trollshell-plugin-claude-bridge), so the launcher's
+      # "declared *and* hand-installed" guard does not see the pair: a machine
+      # that both uses this module and has that file installed would run the
+      # bridge twice, and the second copy would fail to bind the port. Pick one.
+      #
+      # Writing into `programs.trollshell.plugins` rather than straight into the
+      # rendered JSON is what keeps the entry overridable: the values below are
+      # `lib.mkDefault`, so `plugins.claude-bridge.env.CLAUDE_BRIDGE_THINKING`
+      # (or a `PATH=` for a `claude` outside the user manager's PATH) is set the
+      # ordinary way, which is the replacement for the pre-#866
+      # `systemd.user.services.…Service.Environment` escape hatch.
+      #
+      # ── SECURITY CONTROL — the billing scrub, carried across ────────────────
+      # The retired unit's `UnsetEnvironment=` listed the four variables that
+      # would silently move `claude` off the subscription and onto metered API
+      # credits (or Bedrock/Vertex). A transient `systemd-run` unit has no
+      # `UnsetEnvironment=`, so the scrub is re-expressed here as four EMPTY
+      # `env` values, which is equivalent for every consumer that reads them:
+      #
+      #   * envguard (crates/hytte-claude-bridge/src/envguard.rs `redirects`)
+      #     treats an empty credential and an empty boolean flag alike as
+      #     NOT a redirect, so the bridge starts;
+      #   * `messages::load_key_from` falls through an empty ANTHROPIC_API_KEY
+      #     to ~/.config/trollshell/anthropic.key, exactly as under the unit;
+      #   * the launcher appends injected secrets as `--setenv`s AFTER the
+      #     spec's env (plugin_launcher.rs's `systemd_run_args`), and systemd
+      #     lets the later assignment win — so api mode's keyring injection
+      #     still overrides the empty value here.
+      #
+      # WITHOUT this, anyone with ANTHROPIC_API_KEY exported in their user
+      # manager's environment gets a bridge that refuses to start in the DEFAULT
+      # mode, restart-loops, and hits systemd's start limit. Do not drop these
+      # four lines. They are also why `secrets` below can be declared in `api`
+      # mode without contradiction: the scrub sets the floor, the injection
+      # overrides it, and in the `claude` modes nothing overrides it.
       (lib.mkIf cb.enable {
-        systemd.user.services.trollshell-claude-bridge = {
-          Unit = {
-            Description = "Keyless loopback OpenAI-compatible bridge to headless Claude Code (#584)";
-            PartOf = [ cfg.systemd.target ];
-            After = [ cfg.systemd.target ];
-          };
-          Service = {
-            Type = "simple";
-            ExecStart = lib.getExe cb.package;
-            Restart = "on-failure";
-            RestartSec = 5;
-
-            # ── SECURITY CONTROL — do not drop this line ──────────────────────
-            # Copied verbatim from the reference unit. These four would silently
-            # move `claude` off the subscription and onto metered API credits (or
-            # Bedrock/Vertex), with nothing in the UI to show for it. The bridge
-            # cannot scrub them itself — `std::env::remove_var` is unsafe under
-            # edition 2024 and this workspace forbids unsafe — so the scrub
-            # happens HERE and the bridge *refuses to start* if it finds any of
-            # them still set: belt and braces, and a loud failure rather than a
-            # quiet bill.
-            #
-            # Deliberately not gated on anything (#752). `UnsetEnvironment=` is
-            # static per-unit, and an inherited key that quietly starts billing is
-            # a worse failure than CLAUDE_BRIDGE_MODE=api having to read its key
-            # from ~/.config/trollshell/anthropic.key.
-            UnsetEnvironment = "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX";
-
-            # No PATH= here, on purpose — the bridge shells out to `claude`, but
-            # `Environment=PATH=…` *replaces* the user manager's PATH rather than
-            # extending it. On NixOS that inherited PATH already covers the system
-            # profile plus the per-user profile, which is where a `claude` in
-            # home.packages lands; hardcoding one would break the layouts it does
-            # not happen to describe (npm-global, ~/.local/bin) while helping
-            # none. A `claude` somewhere else is the override case:
-            #
-            #   systemd.user.services.trollshell-claude-bridge.Service.Environment =
-            #     [ "PATH=%h/.local/bin:/run/current-system/sw/bin" ];
-            #
-            # home-manager concatenates that onto the list below, and systemd
-            # lets the later assignment win. Same escape hatch carries the env
-            # knobs not promoted to options: CLAUDE_BRIDGE_MODE (#730),
-            # CLAUDE_BRIDGE_THINKING, CLAUDE_BRIDGE_STATE_DIR, RUST_LOG.
-            Environment = [
-              "RUST_LOG=hytte_claude_bridge=info"
-              "CLAUDE_BRIDGE_PORT=${toString cb.port}"
-              "CLAUDE_BRIDGE_TIMEOUT_SECS=${toString cb.timeoutSeconds}"
+        programs.trollshell.plugins.claude-bridge = {
+          enable = lib.mkDefault true;
+          package = lib.mkDefault cb.package;
+          env = lib.mapAttrs (_: lib.mkDefault) (
+            {
+              RUST_LOG = "hytte_claude_bridge=info";
+              CLAUDE_BRIDGE_MODE = cb.mode;
+              CLAUDE_BRIDGE_PORT = toString cb.port;
+              CLAUDE_BRIDGE_TIMEOUT_SECS = toString cb.timeoutSeconds;
+              # The billing scrub — see the block comment above. Empty, not
+              # absent: `--setenv=K=` overrides whatever the user manager
+              # inherited, which is the whole job.
+              ANTHROPIC_API_KEY = "";
+              ANTHROPIC_AUTH_TOKEN = "";
+              CLAUDE_CODE_USE_BEDROCK = "";
+              CLAUDE_CODE_USE_VERTEX = "";
               # Belt-and-braces dummy key. Nothing in the bridge reads it (it is
               # keyless and validates no bearer at all); the copy that actually
               # prevents a leak is the one on the CONSUMING plugin, because
@@ -546,11 +556,16 @@ in
               # checks $OPENROUTER_API_KEY before ~/.config/trollshell/
               # openrouter.key. Set it there too:
               # `plugins.pet.env.OPENROUTER_API_KEY = "local-bridge";`.
-              "OPENROUTER_API_KEY=local-bridge"
-            ]
-            ++ lib.optional (cb.model != null) "CLAUDE_BRIDGE_MODEL=${cb.model}";
-          };
-          Install.WantedBy = [ cfg.systemd.target ];
+              OPENROUTER_API_KEY = "local-bridge";
+            }
+            // (lib.optionalAttrs (cb.model != null) { CLAUDE_BRIDGE_MODEL = cb.model; })
+          );
+          # The `api` mode is the only one for which an ANTHROPIC_API_KEY is a
+          # credential rather than a startup refusal — see the block above and
+          # claudeBridge.mode's description. `optionals`, not `mkIf`, because a
+          # listOf definition concatenates: a user adding their own slot to this
+          # plugin keeps it either way.
+          secrets = lib.optionals (cb.mode == "api") [ "anthropic" ];
         };
 
         # See petTimeoutSecs in the `let` above. Only asserted when a `pet` is
@@ -573,6 +588,58 @@ in
               claudeBridge.timeoutSeconds, or raise
               programs.trollshell.plugins.pet.env.PET_LLM_TIMEOUT_SECS above it
               (#699/#711).
+            '';
+          }
+
+          # #866: the pre-#866 escape hatch is now a trap. Overriding the unit's
+          # Environment= was the *documented* way to reach CLAUDE_BRIDGE_MODE and
+          # friends; with no unit rendered here any more, the same expression
+          # defines a BRAND NEW unit with no ExecStart, which home-manager will
+          # happily write and systemd will refuse to start — while the real
+          # bridge runs on whatever the option said, so the setting the user
+          # believes they applied silently does nothing. Catch it at eval.
+          {
+            assertion = !(config.systemd.user.services ? trollshell-claude-bridge);
+            message = ''
+              A systemd.user.services.trollshell-claude-bridge is defined while
+              programs.trollshell.claudeBridge.enable is on, but this module no
+              longer renders that unit: since #866 the bridge is launched by the
+              shell as a transient trollshell-plugin-claude-bridge service, from
+              programs.trollshell.plugins.claude-bridge.
+
+              A leftover definition here does NOT configure the bridge. It
+              creates a separate, ExecStart-less unit that cannot start, while
+              the running bridge keeps whatever the claudeBridge.* options said
+              — so a CLAUDE_BRIDGE_MODE you set this way is silently ignored.
+
+              Move it: env knobs go to
+                programs.trollshell.plugins.claude-bridge.env.<VAR>
+              (the module sets its own values with mkDefault, so yours wins), and
+              CLAUDE_BRIDGE_MODE has a first-class option,
+              programs.trollshell.claudeBridge.mode.
+            '';
+          }
+
+          # #866: mode has two consumers that must agree — the env the bridge
+          # reads, and the `secrets` slot nix decides from it. Desync in the
+          # api -> claude direction is the bad one: the slot stays declared, the
+          # launcher injects ANTHROPIC_API_KEY, and envguard refuses to start on
+          # every attempt (Restart=on-failure -> start limit).
+          {
+            assertion = cfg.plugins.claude-bridge.env.CLAUDE_BRIDGE_MODE == cb.mode;
+            message = ''
+              programs.trollshell.plugins.claude-bridge.env.CLAUDE_BRIDGE_MODE is
+              "${cfg.plugins.claude-bridge.env.CLAUDE_BRIDGE_MODE}", which
+              overrides programs.trollshell.claudeBridge.mode ("${cb.mode}").
+
+              These two cannot disagree. The env var is what the bridge runs on;
+              the option is what nix decides the `anthropic` secret slot from. If
+              the option says "api" and the env says "subscription", the launcher
+              injects ANTHROPIC_API_KEY into a mode where envguard treats it as a
+              billing redirect and refuses to start — a restart loop into
+              systemd's start limit (#752).
+
+              Set the mode in one place: programs.trollshell.claudeBridge.mode.
             '';
           }
         ];

@@ -411,11 +411,17 @@ fn error_response(status: u16, message: &str) -> (u16, Vec<u8>) {
 }
 
 /// Read one request off `stream`, answer it, close.
+///
+/// This is also where the answer is counted for the plugin face's status chip
+/// (#866) — at the connection boundary rather than inside [`Bridge::handle`], so
+/// a malformed request the parser rejects is counted too, and so the unit tests
+/// below (which call `handle` directly) never touch the process-global board.
 pub async fn serve_connection(bridge: &Bridge, mut stream: TcpStream) {
     let (status, body) = match http::read_request(&mut stream).await {
         Ok((head, body)) => bridge.handle(&head, &body).await,
         Err(f) => error_response(f.status, &f.message),
     };
+    crate::status::record(status);
     http::write_response(&mut stream, status, &body).await;
 }
 

@@ -91,6 +91,45 @@
 //! (writing/rotating/deleting the stored key itself) is [`crate::secrets`]
 //! and the control-center's AI Keys tab, not this module.
 //!
+//! ## …and waiting for one that isn't there yet (#866)
+//!
+//! A slot with no readable key is *skipped*, not fatal — the plugin launches
+//! keyless. That is the right call at launch time and the wrong place to stop,
+//! because of one very ordinary session: the shell starts before gnome-keyring
+//! is unlocked, every declared slot reads back empty, and when the ring unlocks
+//! two seconds later nothing goes back to re-inject. The plugin stays keyless for
+//! the rest of the session with nothing on screen to say why.
+//!
+//! So [`resolve_secret_env`] reports what it *couldn't* resolve, and
+//! [`note_resolution`] records those `(slot, plugin)` pairs. While any are
+//! outstanding one background task ([`watch_outstanding_secrets`]) re-probes them
+//! every [`SECRET_POLL_INTERVAL`] with [`crate::secrets::probe`] — which, unlike
+//! the launch-time [`get`](crate::secrets::get), tells "the ring is locked" apart
+//! from "nobody stored one", **and unlike `get` never raises an unlock prompt**
+//! (that distinction is the whole of `probe`'s docs; a poller that prompted every
+//! 30s would be worse than the bug it fixes). **Both non-available states keep
+//! waiting**: an external tool can write a key at any time, so the distinction is
+//! logged, never acted on. A slot that comes back available goes to the existing
+//! [`relaunch_for_secret_inner`], and is dropped only for the plugins that
+//! actually came back up ([`settle_slot`]); when nothing is left outstanding the
+//! task stands down, so a session whose keys all resolved at launch polls exactly
+//! zero times.
+//!
+//! **Polling is a choice, not a constraint.** oo7 0.5.0 surfaces no unlock
+//! signal, but the underlying `org.freedesktop.Secret.Collection` does carry a
+//! `Locked` property, so a `PropertiesChanged` subscription through `hytte-bus`
+//! is buildable. It was not built here because it would mean a second, hand-rolled
+//! Secret Service client living beside oo7 for one edge, and a 30s prompt-free
+//! property read costs nothing. Revisit if the outstanding set ever gets large.
+//!
+//! One case that does poll indefinitely, by design: an `api`-mode claude bridge
+//! configured with its key in `~/.config/trollshell/anthropic.key` and nothing in
+//! the keyring declares the `anthropic` slot, never resolves it, and is therefore
+//! watched for the session. The cost is one property read every 30s and the
+//! payoff is that moving the key into the keyring takes effect without a
+//! relogin; [`prune_undeclared`] still drops it the moment the plugin leaves the
+//! config.
+//!
 //! ## Legacy static units
 //!
 //! Hand-installed static units (`etc/systemd/user/trollshell-plugin-*.service`,
@@ -113,13 +152,16 @@
 //! directly on the D-Bus task, and the startup launch runs on the shared
 //! runtime.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 use hytte::services::systemd;
 use serde::Deserialize;
+
+use crate::secrets::SecretProbe;
 
 /// Relative path of the declarative state file under each XDG config root.
 /// Written by the nix modules (`nix/hm-module.nix` → `$XDG_CONFIG_HOME`,
@@ -514,16 +556,282 @@ async fn launch(
 /// env pair. A slot with no stored key is skipped — the plugin launches keyless
 /// and its own fallback (e.g. the pet's canned lines) applies. Secret values are
 /// never logged (only the slot, and only on the skip path).
-async fn resolve_secret_env(spec: &PluginSpec) -> Vec<(String, String)> {
+///
+/// Every skipped slot is also recorded against `id` so the watcher can pick the
+/// plugin up when the key appears (#866, see the module docs); the ones that
+/// *did* resolve clear any earlier record, so a relaunch that finally got its key
+/// stops being waited on.
+async fn resolve_secret_env(id: &str, spec: &PluginSpec) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(spec.secrets.len());
+    let mut missing = Vec::new();
+    let mut present = Vec::new();
     for slot in &spec.secrets {
         if let Some(value) = crate::secrets::get(slot).await {
             out.push((crate::secrets::env_var_for(slot), value));
+            present.push(slot.clone());
         } else {
             tracing::debug!(slot = %slot, "no stored AI key for slot; launching plugin without it");
+            missing.push(slot.clone());
         }
     }
+    note_resolution(id, &missing, &present);
     out
+}
+
+// ── Waiting for a missing secret to appear (#866) ────────────────────────────
+
+/// How often [`watch_outstanding_secrets`] re-probes the slots a plugin launched
+/// without.
+///
+/// What it is waiting for is a human unlocking a keyring or an external tool
+/// writing a key — minutes-scale events — and each probe is a Secret Service
+/// round trip, so this is deliberately gentle. A `const` and not an option: no
+/// session makes 30s the wrong answer, and a knob here would be one nobody could
+/// sensibly set.
+const SECRET_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Which declared secret slots are still unresolved, and which plugins are
+/// waiting on each: `slot → {plugin id}`. A slot leaves the map when it becomes
+/// available *and* every plugin waiting on it relaunched, when every waiter has
+/// since launched with it, or when the declaration no longer justifies the wait
+/// ([`prune_undeclared`]).
+type Outstanding = BTreeMap<String, BTreeSet<String>>;
+
+/// The watcher's whole state, behind one **synchronous** mutex.
+///
+/// `std::sync::Mutex` rather than tokio's, for two reasons that reinforce each
+/// other:
+///
+/// - Nothing here ever awaits while holding it — and because
+///   [`watch_outstanding_secrets`] is boxed as `dyn Future + Send`, rustc
+///   *enforces* that: a `MutexGuard` (which is `!Send`) held across an `.await`
+///   fails to compile rather than deadlocking in production.
+/// - [`WatchGuard`]'s `Drop` has to clear [`WatchState::watching`] under the
+///   same lock the arm path checks it under, and `Drop` cannot `.await`.
+struct WatchState {
+    outstanding: Outstanding,
+    /// Whether a [`watch_outstanding_secrets`] task is alive.
+    ///
+    /// Read and written **only while holding this mutex**, which is what makes
+    /// "arm a watcher iff none is running" and "stand down when nothing is left"
+    /// race-free against each other. Without that pairing a [`note_resolution`]
+    /// landing between the watcher deciding to exit and clearing the flag would
+    /// record a slot nobody is watching.
+    watching: bool,
+}
+
+static WATCH: std::sync::Mutex<WatchState> = std::sync::Mutex::new(WatchState {
+    outstanding: BTreeMap::new(),
+    watching: false,
+});
+
+/// Lock [`WATCH`], recovering from poisoning rather than propagating a panic.
+///
+/// Nothing in a critical section here can panic on its own, so poisoning would
+/// only ever arrive from a panic elsewhere in the same task — and the correct
+/// answer to that is still to keep the watcher's bookkeeping working, not to
+/// take the shell's plugin launcher down with it.
+fn watch_state() -> std::sync::MutexGuard<'static, WatchState> {
+    WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Clears [`WatchState::watching`] when the watcher task ends **however it
+/// ends** — including a panic or the runtime dropping the future mid-poll.
+///
+/// Without this a task that died anywhere but its own `return` would leave the
+/// flag set, and [`note_resolution`] would never arm a replacement: the feature
+/// would be silently, permanently disarmed for the rest of the session.
+struct WatchGuard {
+    /// Whether this task still owns the flag. The normal-exit path clears the
+    /// flag under the lock and unsets this, so the guard cannot then clear a
+    /// *successor* watcher's flag; on a panic or cancellation it is still set,
+    /// no successor can exist (nothing arms while the flag is true), and the
+    /// guard is the only thing that disarms.
+    owns_flag: bool,
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        if self.owns_flag {
+            watch_state().watching = false;
+        }
+    }
+}
+
+/// Fold one plugin's secret resolution into the outstanding set: record the
+/// slots that came back empty against `id`, and drop `id` from the ones that
+/// resolved (removing a slot entirely once nobody is waiting on it). Returns
+/// whether anything is outstanding afterwards — i.e. whether a watcher is
+/// wanted. Pure, so the whole bookkeeping is unit-testable.
+fn fold_resolution(
+    out: &mut Outstanding,
+    id: &str,
+    missing: &[String],
+    present: &[String],
+) -> bool {
+    for slot in missing {
+        out.entry(slot.clone()).or_default().insert(id.to_owned());
+    }
+    for slot in present {
+        if let Some(waiting) = out.get_mut(slot) {
+            waiting.remove(id);
+            if waiting.is_empty() {
+                out.remove(slot);
+            }
+        }
+    }
+    !out.is_empty()
+}
+
+/// Every slot still being waited on, in a stable order. Pure.
+fn outstanding_slots(out: &Outstanding) -> Vec<String> {
+    out.keys().cloned().collect()
+}
+
+/// The plugin ids currently waiting on `slot`, in a stable order — the log
+/// line's subject, read **without** dropping them (see [`settle_slot`]). Pure.
+fn waiters_on(out: &Outstanding, slot: &str) -> Vec<String> {
+    out.get(slot)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Resolve one slot's watch after a relaunch attempt: everything that was
+/// waiting stops waiting **except** the ids whose relaunch failed, which stay so
+/// the next pass tries again.
+///
+/// This is #866's F7 fix. The slot used to be removed *before* the relaunch, so
+/// a transiently failing restart — the unit briefly still up, a wedged user
+/// manager — lost the slot forever and left the plugin keyless with nothing
+/// still watching for it. Writing the failures back is also why this rebuilds
+/// the entry rather than retaining in place: by the time it runs, a successful
+/// [`restart`] has already dropped its own id via [`fold_resolution`], so a
+/// `retain` would have nothing left to keep. Pure.
+fn settle_slot(out: &mut Outstanding, slot: &str, failed: &[String]) {
+    out.remove(slot);
+    if !failed.is_empty() {
+        out.insert(slot.to_owned(), failed.iter().cloned().collect());
+    }
+}
+
+/// Drop watch entries the declaration no longer justifies: a plugin that was
+/// removed from `plugins.json`, or that no longer lists the slot it was waiting
+/// on. Removes any slot left with no waiters.
+///
+/// #866's F10. Without it a plugin deleted from the config keeps a slot — and
+/// therefore the 30s poll — alive for the rest of the session, waiting on a key
+/// nothing would consume. Pure.
+fn prune_undeclared(out: &mut Outstanding, declared: &BTreeMap<String, PluginSpec>) {
+    out.retain(|slot, waiting| {
+        waiting.retain(|id| {
+            declared
+                .get(id)
+                .is_some_and(|spec| spec.secrets.iter().any(|s| s == slot))
+        });
+        !waiting.is_empty()
+    });
+}
+
+/// Whether a probe means the slot can be injected now — the transition the
+/// watcher acts on.
+///
+/// [`SecretProbe::Locked`] and [`SecretProbe::Absent`] both mean *keep waiting*,
+/// and that is the deliberate part: a locked ring may unlock, and an absent key
+/// may be written by `secret-tool` or the control-center at any moment. The two
+/// are held apart for the log, not for the decision. Pure.
+fn is_now_available(probe: SecretProbe) -> bool {
+    matches!(probe, SecretProbe::Available)
+}
+
+/// Record one plugin's just-resolved secrets, arming the watcher if anything is
+/// still missing. The thin edge over [`fold_resolution`].
+fn note_resolution(id: &str, missing: &[String], present: &[String]) {
+    let mut w = watch_state();
+    if !fold_resolution(&mut w.outstanding, id, missing, present) {
+        return;
+    }
+    // Armed under the same lock the watcher stands down under.
+    if !w.watching {
+        w.watching = true;
+        tracing::info!(
+            slots = ?outstanding_slots(&w.outstanding),
+            interval_s = SECRET_POLL_INTERVAL.as_secs(),
+            "a declared secret was unavailable at launch; watching for it",
+        );
+        hytte::reactive::runtime::handle().spawn(watch_outstanding_secrets());
+    }
+}
+
+/// A spawnable `Send` future — see [`watch_outstanding_secrets`] for why the
+/// watcher needs its type written down rather than inferred.
+type SpawnedTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Re-probe the outstanding slots until each becomes available, relaunching the
+/// plugins that declared it as it does, then stand down. See the module docs.
+///
+/// # Why this returns a boxed future rather than being an `async fn`
+///
+/// The call graph is a **cycle**: this task calls [`relaunch_for_secret_inner`]
+/// → [`restart`] → [`resolve_secret_env`] → [`note_resolution`], which spawns
+/// *this* task. `Handle::spawn` requires `Send`, and rustc cannot *infer* `Send`
+/// around such a cycle — it gives up with "cannot satisfy `impl Future: Send`".
+/// Naming the type asserts `Send` instead of inferring it, which is what breaks
+/// the cycle; the `Box::pin` is simply the price of being able to write the type
+/// down. It also buys the [`WatchState`] invariant a compiler check: a `!Send`
+/// `MutexGuard` held across an `.await` would fail to build.
+fn watch_outstanding_secrets() -> SpawnedTask {
+    Box::pin(async move {
+        let mut guard = WatchGuard { owns_flag: true };
+        loop {
+            tokio::time::sleep(SECRET_POLL_INTERVAL).await;
+            // Forget plugins the config no longer declares (F10) before deciding
+            // whether there is anything left to watch. An unreadable state file
+            // prunes nothing — same stance `reconcile` takes.
+            let declared = load_declared().await;
+            let slots = {
+                let mut w = watch_state();
+                if let Some(declared) = &declared {
+                    prune_undeclared(&mut w.outstanding, &declared.plugins);
+                }
+                if w.outstanding.is_empty() {
+                    // Cleared under the lock, so an arm racing this can't be
+                    // lost; the guard then has nothing left to own.
+                    w.watching = false;
+                    guard.owns_flag = false;
+                    tracing::debug!("no secret slots left outstanding; standing down the watcher");
+                    return;
+                }
+                outstanding_slots(&w.outstanding)
+            };
+            for slot in slots {
+                let probe = crate::secrets::probe(&slot).await;
+                if !is_now_available(probe) {
+                    tracing::debug!(%slot, ?probe, "declared secret still unavailable; still waiting");
+                    continue;
+                }
+                // Read the waiters, do NOT drop them — a failed relaunch has to
+                // stay outstanding (F7). `settle_slot` below decides.
+                let waiting = { waiters_on(&watch_state().outstanding, &slot) };
+                tracing::info!(
+                    %slot,
+                    plugins = ?waiting,
+                    "declared secret became available; relaunching the plugins that declare it",
+                );
+                let failed = relaunch_for_secret_inner(&slot).await;
+                let mut w = watch_state();
+                settle_slot(&mut w.outstanding, &slot, &failed);
+                if !failed.is_empty() {
+                    tracing::warn!(
+                        %slot,
+                        plugins = ?failed,
+                        "relaunch failed; keeping the slot under watch for the next pass",
+                    );
+                }
+            }
+        }
+    })
 }
 
 /// Whether a systemd `ActiveState` means the unit is already running (or on
@@ -533,6 +841,26 @@ fn is_running(active_state: &str) -> bool {
 }
 
 // ── Reconcile (#695) ─────────────────────────────────────────────────────────
+
+/// Serialises every path that drives a plugin's unit through a **multi-step**
+/// transition — [`reconcile`], [`relaunch_for_secret`] and [`start`].
+///
+/// #866's F6. Before this only `reconcile` was serialised, and `relaunch_for_secret`
+/// grew a second caller: the control-center's `SetAiKey`/`ClearAiKey` already
+/// fired one, and the watcher now fires another. Those two collide on the
+/// feature's *happy path* — saving a key in the control-center is exactly what
+/// unlocks the ring, so a Save spawns a relaunch and the watcher's next pass
+/// spawns another within 30s. Two concurrent `stop → wait-until-stopped →
+/// launch` sequences interleave badly: one's `stop` lands between the other's
+/// wait and launch (plugin left down), or both reach `launch` and the loser gets
+/// systemd's "unit already exists" → the static-unit fallback in [`restart`] →
+/// `Err`, i.e. the bridge simply gone for the session.
+///
+/// **Held only at the top-level entry points.** [`restart`] and [`stop`] are
+/// reached from inside those, and a tokio `Mutex` is not reentrant, so taking it
+/// there too would deadlock instantly. `stop` on its own (the Plugins tab's Stop
+/// button) is a single call with no window to interleave and stays outside.
+static CONVERGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What [`reconcile`] decided to do about one plugin. Ordered as executed —
 /// stops first, so a disabled/removed plugin releases its unit name before
@@ -604,14 +932,13 @@ fn plan(declared: &Declared, units: &[systemd::PluginUnit]) -> Vec<(String, Acti
 /// pokes after rewriting `plugins.json`.
 ///
 /// Best-effort throughout: every per-plugin failure is logged, never propagated
-/// — one broken plugin must not stop the rest from converging. Serialized on a
-/// process-wide lock, so a reconcile racing another (activation firing twice,
-/// or landing while startup is still running) queues instead of interleaving a
-/// stop with the other's launch; the second then re-reads the state file and
+/// — one broken plugin must not stop the rest from converging. Serialized on
+/// [`CONVERGE_LOCK`], so a reconcile racing another (activation firing twice, or
+/// landing while startup is still running) queues instead of interleaving a stop
+/// with the other's launch; the second then re-reads the state file and
 /// converges on whatever is current.
 pub async fn reconcile() {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = LOCK.lock().await;
+    let _guard = CONVERGE_LOCK.lock().await;
 
     let Some(declared) = load_declared().await else {
         // Unreadable/unparsable state file — leave the running set alone.
@@ -659,7 +986,7 @@ pub async fn reconcile() {
                 let Some(spec) = declared.plugins.get(&id) else {
                     continue;
                 };
-                let extra_env = resolve_secret_env(spec).await;
+                let extra_env = resolve_secret_env(&id, spec).await;
                 if let Err(err) = launch(&id, spec, &extra_env, &declared.target).await {
                     tracing::warn!(plugin = %id, %err, "plugin launch failed");
                 }
@@ -728,13 +1055,19 @@ fn merge_declared(
 /// unit ([`launch`] — `--collect` already released any failed previous run);
 /// an undeclared id falls back to `StartUnit` for a legacy static unit.
 ///
+/// Takes [`CONVERGE_LOCK`] so a human clicking Start cannot land inside a
+/// concurrent relaunch's stop→launch window and lose the race to systemd's "unit
+/// already exists" (#866's F6). It calls neither `reconcile` nor `restart`, so
+/// there is no reentrancy.
+///
 /// # Errors
 /// Unknown/invalid id, a still-running unit, or an unreachable user manager.
 pub async fn start(id: &str) -> anyhow::Result<()> {
+    let _guard = CONVERGE_LOCK.lock().await;
     let declared = load_declared().await.unwrap_or_default();
     match declared.plugins.get(id) {
         Some(spec) => {
-            let extra_env = resolve_secret_env(spec).await;
+            let extra_env = resolve_secret_env(id, spec).await;
             launch(id, spec, &extra_env, &declared.target).await
         }
         None => systemd::start_plugin(id).await,
@@ -782,7 +1115,31 @@ pub async fn set_enabled(id: &str, enabled: bool) -> anyhow::Result<()> {
 /// Stopped plugins and legacy static units are left alone: a stopped plugin
 /// re-reads the key on its next start, and a static unit gets no injection at
 /// all. Best-effort — each plugin's failure is logged, never propagated.
+///
+/// Serialised on [`CONVERGE_LOCK`] (#866's F6): this now has two callers that
+/// collide on the happy path, and two interleaved `stop → wait → launch`
+/// sequences can leave a plugin down for the session.
 pub async fn relaunch_for_secret(slot: &str) {
+    let failed = relaunch_for_secret_inner(slot).await;
+    if !failed.is_empty() {
+        tracing::warn!(%slot, plugins = ?failed, "some plugins did not relaunch after the key change");
+    }
+}
+
+/// [`relaunch_for_secret`]'s body, reporting **which plugin ids failed to come
+/// back**.
+///
+/// The watcher needs that list to keep those slots outstanding rather than
+/// dropping them on a transient failure (#866's F7); the two control-center
+/// callers only want the log line, which the public wrapper above writes. Ids
+/// that were simply *not running* are not failures — they pick the key up on
+/// their next start — so they are not reported.
+///
+/// A failure to even list the units reports **every** affected id: nothing was
+/// attempted, so nothing should stop being watched.
+async fn relaunch_for_secret_inner(slot: &str) -> Vec<String> {
+    let _guard = CONVERGE_LOCK.lock().await;
+
     let declared = load_declared().await.unwrap_or_default();
     let affected: Vec<(&String, &PluginSpec)> = declared
         .plugins
@@ -791,7 +1148,7 @@ pub async fn relaunch_for_secret(slot: &str) {
         .collect();
     if affected.is_empty() {
         tracing::debug!(%slot, "no declared plugin uses this secret slot; nothing to relaunch");
-        return;
+        return Vec::new();
     }
     let running: HashSet<String> = match systemd::list_plugin_units().await {
         Ok(units) => units
@@ -801,9 +1158,10 @@ pub async fn relaunch_for_secret(slot: &str) {
             .collect(),
         Err(err) => {
             tracing::warn!(%err, %slot, "listing plugin units for relaunch failed; skipping");
-            return;
+            return affected.into_iter().map(|(id, _)| id.clone()).collect();
         }
     };
+    let mut failed = Vec::new();
     for (id, spec) in affected {
         if !running.contains(id) {
             tracing::debug!(plugin = %id, %slot, "not running; new key applies on next start");
@@ -811,10 +1169,12 @@ pub async fn relaunch_for_secret(slot: &str) {
         }
         if let Err(err) = restart(id, spec, &declared.target).await {
             tracing::warn!(plugin = %id, %slot, %err, "relaunch after key change failed");
+            failed.push(id.clone());
         } else {
             tracing::info!(plugin = %id, %slot, "relaunched to apply the changed AI key");
         }
     }
+    failed
 }
 
 /// Stop a declared plugin's transient unit, wait for it to actually go down (so
@@ -834,7 +1194,7 @@ pub async fn relaunch_for_secret(slot: &str) {
 async fn restart(id: &str, spec: &PluginSpec, target: &str) -> anyhow::Result<()> {
     stop(id).await?;
     wait_until_stopped(id).await;
-    let extra_env = resolve_secret_env(spec).await;
+    let extra_env = resolve_secret_env(id, spec).await;
     let Err(err) = launch(id, spec, &extra_env, target).await else {
         return Ok(());
     };
@@ -1483,6 +1843,171 @@ mod tests {
                 ("stale".to_owned(), Action::Restart),
                 ("new".to_owned(), Action::Launch),
             ]
+        );
+    }
+
+    // ── the outstanding-secret watcher (#866) ────────────────────────────────
+
+    fn slots(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A slot that couldn't be resolved is recorded against the plugin that
+    /// wanted it, and that is what arms the watcher.
+    #[test]
+    fn fold_resolution_records_a_missing_slot_against_its_plugin() {
+        let mut out = Outstanding::new();
+        assert!(
+            fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]),
+            "something outstanding → the watcher is wanted"
+        );
+        assert_eq!(outstanding_slots(&out), slots(&["openrouter"]));
+        assert_eq!(out["openrouter"], BTreeSet::from(["pet".to_owned()]));
+    }
+
+    /// The other half: a slot that *did* resolve clears that plugin's record, so
+    /// a relaunch which finally got its key stops being waited on. Only when the
+    /// last waiter drops does the slot itself leave — another plugin still
+    /// missing the same key keeps the watch alive.
+    #[test]
+    fn fold_resolution_drops_a_plugin_that_got_its_key_and_keeps_the_others() {
+        let mut out = Outstanding::new();
+        fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "caw", &slots(&["openrouter"]), &[]);
+        assert_eq!(
+            out["openrouter"],
+            BTreeSet::from(["caw".to_owned(), "pet".to_owned()])
+        );
+
+        // The pet relaunched and got its key; caw still hasn't.
+        assert!(
+            fold_resolution(&mut out, "pet", &[], &slots(&["openrouter"])),
+            "caw is still waiting, so the watcher stays armed"
+        );
+        assert_eq!(out["openrouter"], BTreeSet::from(["caw".to_owned()]));
+
+        // Now caw gets it too — the slot leaves the map entirely and the
+        // watcher is told to stand down.
+        assert!(
+            !fold_resolution(&mut out, "caw", &[], &slots(&["openrouter"])),
+            "nothing outstanding → no watcher wanted"
+        );
+        assert!(out.is_empty(), "an empty slot entry is removed, not kept");
+    }
+
+    /// A plugin resolving a slot it was never waiting on is a no-op, not a
+    /// panic — every launch reports its whole `present` list.
+    #[test]
+    fn fold_resolution_ignores_a_resolution_for_an_unwatched_slot() {
+        let mut out = Outstanding::new();
+        assert!(!fold_resolution(
+            &mut out,
+            "pet",
+            &[],
+            &slots(&["openrouter"])
+        ));
+        assert!(out.is_empty());
+    }
+
+    /// `waiters_on` reports who is waiting **without** dropping them — the
+    /// watcher logs the list before the relaunch, and a relaunch that fails has
+    /// to leave the slot outstanding (F7).
+    #[test]
+    fn waiters_on_reads_the_entry_without_consuming_it() {
+        let mut out = Outstanding::new();
+        fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "caw", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "bridge", &slots(&["anthropic"]), &[]);
+
+        assert_eq!(waiters_on(&out, "openrouter"), slots(&["caw", "pet"]));
+        assert_eq!(
+            outstanding_slots(&out),
+            slots(&["anthropic", "openrouter"]),
+            "reading must not drop the slot"
+        );
+        assert!(waiters_on(&out, "nosuch").is_empty());
+    }
+
+    /// **F7.** A relaunch that fails keeps its plugin under watch; the ones that
+    /// came back stop being watched, and a slot with no failures leaves entirely.
+    ///
+    /// The `pet` id is *re-inserted* here, not retained: by the time `settle_slot`
+    /// runs, a successful `restart` has already dropped every id it resolved via
+    /// `fold_resolution`, so the failures have to be written back explicitly.
+    #[test]
+    fn settle_slot_keeps_only_the_plugins_whose_relaunch_failed() {
+        let mut out = Outstanding::new();
+        fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "caw", &slots(&["openrouter"]), &[]);
+        // `restart` already cleared both ids on its way through resolve_secret_env.
+        fold_resolution(&mut out, "pet", &[], &slots(&["openrouter"]));
+        fold_resolution(&mut out, "caw", &[], &slots(&["openrouter"]));
+        assert!(
+            out.is_empty(),
+            "the precondition this test is written against"
+        );
+
+        settle_slot(&mut out, "openrouter", &slots(&["pet"]));
+        assert_eq!(
+            out["openrouter"],
+            BTreeSet::from(["pet".to_owned()]),
+            "the failed plugin keeps waiting for the next pass"
+        );
+
+        // Next pass: pet comes back up. Nothing failed → the slot is gone.
+        settle_slot(&mut out, "openrouter", &[]);
+        assert!(out.is_empty());
+    }
+
+    /// **F10.** A plugin dropped from `plugins.json`, or one that no longer
+    /// declares the slot, stops being waited on — otherwise it keeps the 30s
+    /// poll alive for a key nothing would consume.
+    #[test]
+    fn prune_undeclared_forgets_plugins_the_config_no_longer_justifies() {
+        let mut out = Outstanding::new();
+        fold_resolution(&mut out, "pet", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "caw", &slots(&["openrouter"]), &[]);
+        fold_resolution(&mut out, "bridge", &slots(&["anthropic"]), &[]);
+
+        // `pet` still declares the slot; `caw` dropped it; `bridge` is gone.
+        let mut with_slot = spec("/bin/pet", true);
+        with_slot.secrets = slots(&["openrouter"]);
+        let declared = BTreeMap::from([
+            ("pet".to_owned(), with_slot),
+            ("caw".to_owned(), spec("/bin/caw", true)),
+        ]);
+        prune_undeclared(&mut out, &declared);
+
+        assert_eq!(
+            outstanding_slots(&out),
+            slots(&["openrouter"]),
+            "the anthropic slot's only waiter is no longer declared"
+        );
+        assert_eq!(
+            out["openrouter"],
+            BTreeSet::from(["pet".to_owned()]),
+            "caw stopped declaring the slot"
+        );
+
+        // …and once the last waiter goes, so does the poll.
+        prune_undeclared(&mut out, &BTreeMap::new());
+        assert!(out.is_empty());
+    }
+
+    /// **The transition rule.** Only `Available` triggers a relaunch; a locked
+    /// ring and an absent key both keep waiting — the distinction exists for the
+    /// log, because either can still turn into a key (the ring unlocks, or
+    /// `secret-tool` writes one).
+    #[test]
+    fn only_an_available_probe_triggers_the_relaunch() {
+        assert!(is_now_available(SecretProbe::Available));
+        assert!(
+            !is_now_available(SecretProbe::Locked),
+            "a locked ring may still unlock"
+        );
+        assert!(
+            !is_now_available(SecretProbe::Absent),
+            "an external tool may still store the key"
         );
     }
 

@@ -22,6 +22,14 @@ path = "src/main.rs"
 # title-addressed `Attach::{Create,Resume}` this bridge's session identity is
 # built on. Apache-2.0; combining it with this MPL-2.0 tree is fine (#584).
 hive-claude.workspace = true
+# The plugin runtime SDK (#866): this daemon also speaks the widget-plugin
+# protocol and paints a status chip, the two-hats shape
+# `hytte-plugin-infobroker` already has. GTK-free — the SDK is proto +
+# hytte-preem + tokio/tokio-stream, all already in `Cargo.lock` — so wearing the
+# second hat drags no GUI closure into a daemon that has no display connection.
+# A `path` dep, matching every other consumer of this SDK in the workspace (it
+# is deliberately not a `[workspace.dependencies]` entry).
+hytte-plugin = { path = "../hytte-plugin" }
 # The whole HTTP server. One route does not justify axum/hyper/tower (~20 new
 # lock entries, none of which are in `Cargo.lock` today); `httparse` already is
 # (via `ureq-proto`), so promoting it to a direct dependency costs nothing.

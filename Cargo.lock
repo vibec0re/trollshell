@@ -1139,6 +1139,7 @@ version = "0.1.0"
 dependencies = [
  "hive-claude",
  "httparse",
+ "hytte-plugin",
  "serde",
  "serde_json",
  "tempfile",

@@ -289,33 +289,65 @@ self:
     # pointing a plugin at http://127.0.0.1:<port> is the whole integration.
     #
     # HOME-MANAGER-ONLY, same reasoning nightlight documents above (#657): the
-    # unit lives in nix/hm-module.nix, and a NixOS-only deployment has no
+    # bridge is rendered by nix/hm-module.nix, and a NixOS-only deployment has no
     # per-user `claude` login state for the bridge to drive. Setting these
     # through the NixOS module alone trips an assertion there rather than
     # silently no-op'ing.
+    #
+    # SINCE #866 THE BRIDGE IS A PLUGIN, NOT A UNIT. The home-manager module no
+    # longer declares systemd.user.services.trollshell-claude-bridge; it renders
+    # `programs.trollshell.plugins.claude-bridge` instead, so the daemon is
+    # launched by the shell's own plugin launcher as a transient
+    # trollshell-plugin-claude-bridge.service. The options below are unchanged
+    # (`mode` is the one addition) and keep meaning exactly what they meant.
     #
     # Option granularity follows @kaesaecracker's rule on #694 — "anything that
     # should be an option should get an option; everything that is not obviously
     # user defined could be overridden in the service cfg". So `port` (two
     # things must agree on one number), `model` and `timeoutSeconds` (both
-    # documented footguns, see below) are first class; the remaining env knobs —
-    # CLAUDE_BRIDGE_MODE, CLAUDE_BRIDGE_THINKING, CLAUDE_BRIDGE_STATE_DIR,
-    # RUST_LOG — stay reachable the ordinary home-manager way:
+    # documented footguns, see below) are first class. `mode` joined them in #866
+    # because it is no longer merely an env knob: it decides whether the rendered
+    # plugin entry may declare the `anthropic` secret slot at all (see below).
+    # The remaining env knobs — CLAUDE_BRIDGE_THINKING, CLAUDE_BRIDGE_STATE_DIR,
+    # RUST_LOG — stay reachable through the plugin entry's own `env`, which is
+    # where every other plugin's knobs live:
     #
-    #   systemd.user.services.trollshell-claude-bridge.Service.Environment =
-    #     [ "CLAUDE_BRIDGE_MODE=reprompt" ];
+    #   programs.trollshell.plugins.claude-bridge.env.CLAUDE_BRIDGE_THINKING = "auto";
     #
-    # (home-manager concatenates that with the list the unit already sets, and
-    # systemd lets the later assignment win.) The full inventory is the table in
-    # crates/hytte-claude-bridge/src/main.rs and the comment block in
-    # etc/systemd/user/trollshell-claude-bridge.service.
+    # (the module sets its own env values with `lib.mkDefault`, so a plain
+    # definition there wins over them). That replaces the pre-#866 escape hatch,
+    # `systemd.user.services.trollshell-claude-bridge.Service.Environment`, which
+    # has nothing left to attach to now that there is no unit — a `PATH=` override
+    # for a `claude` outside the user manager's PATH goes in the same place. The
+    # full inventory is the table in crates/hytte-claude-bridge/src/main.rs and
+    # the comment block in etc/systemd/user/trollshell-claude-bridge.service.
     claudeBridge = {
       enable = lib.mkEnableOption ''
-        the hytte-claude-bridge user service (#584): a keyless loopback
+        the hytte-claude-bridge daemon (#584): a keyless loopback
         OpenAI-compatible shim over headless Claude Code, so the LLM-backed
         plugins (pet, caw) can ride a Claude Code subscription with no code
         change — point one at it with
         `plugins.pet.env.PET_LLM_URL = "http://127.0.0.1:8787"`.
+
+        Since #866 this renders as a **plugin entry**, not a hand-declared
+        systemd unit: enabling it defines `plugins.claude-bridge`, so the shell's
+        launcher spawns it as a transient `trollshell-plugin-claude-bridge`
+        service, the control-center's Plugins tab can stop and start it, and it
+        gets keyring secret injection like any other plugin. The daemon also
+        paints a small status chip on the bar (mode, whether a credential is
+        held, coarse request health).
+
+        **The shell is what starts it.** The retired unit carried
+        `WantedBy = <session target>` and came up on its own; a plugin entry is
+        launched by `trollshell`'s launcher at startup instead, so with the shell
+        disabled or crash-looping nothing brings the bridge up and anything
+        pointed at `127.0.0.1:<port>` gets a connection refused. Once launched it
+        does outlive the shell — the transient unit is `PartOf` the session
+        target, not the shell — so `systemctl --user restart trollshell` leaves
+        the endpoint answering with only the chip gone. If you need the bridge
+        without the shell, run it from
+        `etc/systemd/user/trollshell-claude-bridge.service` by hand and leave
+        this option off; do not do both (see the note under `mode`).
 
         Prerequisites the module cannot provide for you: the `claude` CLI must
         be resolvable on the *systemd user manager's* PATH (on NixOS that is the
@@ -349,6 +381,60 @@ self:
 
           8787, not 8080 — 8080 belongs to `petBrain` below (the llama-server
           brain), and the two backends are meant to be swappable, not exclusive.
+        '';
+      };
+
+      mode = lib.mkOption {
+        type = lib.types.enum [
+          "subscription"
+          "reprompt"
+          "api"
+        ];
+        default = "subscription";
+        example = "api";
+        description = ''
+          Which backend answers (`CLAUDE_BRIDGE_MODE`, #730):
+
+          - `subscription` (the default) — one persisted, title-addressed
+            `claude` session per conversation; resumed turns carry only the
+            delta, which is what keeps the prompt prefix cache warm.
+          - `reprompt` — a fresh one-off `claude` per turn, with the bridge
+            holding the transcript.
+          - `api` — the Anthropic Messages API, **billed per token**. No
+            `claude` child is spawned at all.
+
+          This is a first-class option rather than a plain env line because it
+          decides one thing nix has to get right on your behalf (#866): the
+          `anthropic` **secret slot** is declared on the rendered plugin entry
+          *only* in `api` mode. In the two `claude` modes an `ANTHROPIC_API_KEY`
+          in the environment is a **startup refusal**, not a credential — it
+          would silently move the child off your subscription and onto metered
+          credits, so `crates/hytte-claude-bridge/src/envguard.rs` fails closed
+          on it and names the variable in `systemctl status` (#752). Declaring
+          the slot there would therefore stop the bridge starting the moment you
+          stored a key for anything.
+
+          In `api` mode the key comes from your login keyring (store it in the
+          control-center's AI Keys tab under the `anthropic` slot); the launcher
+          injects it as `ANTHROPIC_API_KEY` at spawn, which the bridge reads
+          before falling back to `~/.config/trollshell/anthropic.key`. That file
+          keeps working, and is still the only source under the hand-installed
+          static unit, which scrubs the variable.
+
+          The retired unit's `UnsetEnvironment=` scrub is carried across, not
+          dropped: a transient unit has no such setting, so the home-manager
+          module renders the same four billing-redirect variables as **empty**
+          entries in the plugin's `env` instead. Empty reads as "not set" to
+          every consumer — envguard does not trip, the key file is still
+          consulted — and the launcher appends injected secrets *after* the
+          declared env, so `api` mode's keyring key still wins. Both layers are
+          therefore intact: the scrub, and the startup refusal behind it.
+
+          One deployment note: `etc/systemd/user/trollshell-claude-bridge.service`
+          is a *different* unit name from the transient
+          `trollshell-plugin-claude-bridge` the launcher creates, so the launcher
+          cannot see the pair. Running both means two bridges and the second
+          failing to bind the port. Pick one.
         '';
       };
 

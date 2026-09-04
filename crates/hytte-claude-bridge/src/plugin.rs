@@ -237,11 +237,7 @@ mod tests {
 
     fn status(mode: Mode, keyed: bool, ok: u64, errors: u64, last: Last) -> Status {
         Status {
-            startup: Some(Startup {
-                mode,
-                keyed,
-                port: 8787,
-            }),
+            startup: Some(Startup { mode, keyed }),
             ok,
             errors,
             last,

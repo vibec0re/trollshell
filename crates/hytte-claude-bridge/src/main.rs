@@ -459,7 +459,6 @@ fn main() -> ExitCode {
     status::publish(status::Startup {
         mode: settings.mode,
         keyed: serving.keyed,
-        port: settings.port,
     });
     rt.spawn(accept_loop(serving.listener, serving.bridge));
 

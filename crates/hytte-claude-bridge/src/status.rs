@@ -34,8 +34,8 @@ static OK: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 /// How the most recent request went, as [`Last`]'s discriminant.
 static LAST: AtomicU8 = AtomicU8::new(LAST_NONE);
-/// What `main` settled at startup: the mode, whether a credential is held, and
-/// the port. Written exactly once, before the listener is spawned.
+/// What `main` settled at startup: the mode and whether a credential is held.
+/// Written exactly once, before the listener is spawned.
 static STARTUP: OnceLock<Startup> = OnceLock::new();
 
 const LAST_NONE: u8 = 0;
@@ -76,8 +76,6 @@ pub struct Startup {
     /// the bridge holds nothing. True only in [`Mode::Api`], where startup has
     /// already refused if no key resolved.
     pub keyed: bool,
-    /// The loopback port the listener bound.
-    pub port: u16,
 }
 
 /// Everything the chip renders, read in one go so the numbers on it agree with

@@ -126,12 +126,15 @@
           };
 
           # The `hytte-claude-bridge` daemon (#584): a keyless loopback shim
-          # putting an OpenAI-compatible face on headless Claude Code. Not a
-          # widget plugin and not driven by `programs.trollshell.plugins` — it's
-          # a standalone daemon behind `etc/systemd/user/trollshell-claude-
-          # bridge.service`, so it's kept out of `bundledPluginNames` for the
-          # same reason `hytte-infobroker` is. GTK-free, so nix/plugin.nix's
-          # unwrapped `cp` is exactly right; no wrapGAppsHook4 needed.
+          # putting an OpenAI-compatible face on headless Claude Code. Since #866
+          # it speaks the plugin protocol too (a status chip) and IS driven by
+          # `programs.trollshell.plugins` — `nix/hm-module.nix` renders the
+          # `claude-bridge` entry from `claudeBridge.*`, so nobody points
+          # `plugins.<id>.package` at this by hand. It still stays out of
+          # `bundledPluginNames`, which is a mechanical `hytte-plugin-<id>` →
+          # package map and this binary is not named that way. GTK-free, so
+          # nix/plugin.nix's unwrapped `cp` is exactly right; no wrapGAppsHook4
+          # needed.
           hytte-claude-bridge = pkgs.callPackage ./nix/plugin.nix {
             inherit workspace;
             name = "hytte-claude-bridge";

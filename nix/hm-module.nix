@@ -496,8 +496,11 @@ in
       #
       # etc/systemd/user/trollshell-claude-bridge.service stays as the reference
       # for hand-installed (non-home-manager) deployments — retiring it is a
-      # separate follow-up, and the launcher deliberately leaves a static unit
-      # of the same name alone.
+      # separate follow-up. It is NOT the same unit name as the transient one the
+      # launcher creates (trollshell-plugin-claude-bridge), so the launcher's
+      # "declared *and* hand-installed" guard does not see the pair: a machine
+      # that both uses this module and has that file installed would run the
+      # bridge twice, and the second copy would fail to bind the port. Pick one.
       #
       # Writing into `programs.trollshell.plugins` rather than straight into the
       # rendered JSON is what keeps the entry overridable: the values below are

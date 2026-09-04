@@ -1,7 +1,7 @@
 //! The plugin manifest, the subscription keys, and the capability model.
 
 use crate::codec::ProtoError;
-use crate::{PROTO_VERSION, VOCAB};
+use crate::{PROTO_VERSION, VOCAB, VOCAB_UNCONDITIONAL};
 use serde::{Deserialize, Serialize};
 
 /// A host-state key a plugin can subscribe to. The set is additive (appending a
@@ -260,12 +260,21 @@ pub struct Manifest {
     pub id: String,
     /// The [`PROTO_VERSION`] the plugin was built against — exact-matched.
     pub proto: u16,
-    /// The [`VOCAB`] (wire-vocabulary generation, #437) the plugin was built
-    /// against — the host refuses a `Register` whose `vocab` exceeds its own
+    /// The wire-vocabulary generation (#437) the plugin may put on the wire
+    /// **unconditionally** — [`VOCAB_UNCONDITIONAL`], not [`VOCAB`]. The host
+    /// refuses a `Register` whose `vocab` exceeds its own
     /// ([`Manifest::check_vocab`]), catching a plugin that can render a wire
     /// variant this host can't decode (the plugin→host counterpart to the #305
     /// opt-in that guards host→plugin pushes). Stamped automatically by
     /// [`Manifest::new`], never set by a plugin author.
+    ///
+    /// Since #882 this is deliberately the **unconditional** ceiling rather than
+    /// the census counter: a negotiated variant (one a plugin emits only after
+    /// the host advertised it — see [`vocab_max`](Manifest::vocab_max)) can never
+    /// reach a host that can't decode it, so declaring it here would refuse
+    /// handshakes the negotiation already makes safe. See
+    /// [`VOCAB_UNCONDITIONAL`] for the rule on which of the two counters a new
+    /// variant bumps.
     ///
     /// Additive under the crate's compat rules — same [`PROTO_VERSION`], and
     /// `#[serde(default)]` so an older, pre-`vocab` manifest that omits the key
@@ -275,6 +284,31 @@ pub struct Manifest {
     /// the wire, so a host can always read the generation a plugin declares.
     #[serde(default)]
     pub vocab: u16,
+    /// The **highest** wire-vocabulary generation this plugin can speak if the
+    /// host advertises it (#882) — as opposed to [`vocab`](Manifest::vocab),
+    /// which is what it will emit with no advertisement at all.
+    ///
+    /// This is the plugin's half of the vocabulary negotiation. Declaring it is
+    /// also, structurally, the #305 opt-in for the host's half
+    /// ([`HostMsg::Hello`](crate::msg::HostMsg::Hello)): a plugin can only *set*
+    /// this field if it was built against a proto that carries it — which is the
+    /// same proto that carries `Hello` — so a host sending `Hello` exactly when
+    /// this field is present can never push a variant the receiver can't decode.
+    /// The same "opt-in by vocabulary" argument as
+    /// [`EventKind::ValueChanged`](crate::wire::EventKind::ValueChanged), and it
+    /// needs no new [`StateKey`] or [`Capability`].
+    ///
+    /// `None` — the default, and what every pre-#882 manifest decodes to — means
+    /// "does not negotiate": the host sends no `Hello` and the plugin sticks to
+    /// its unconditional [`vocab`](Manifest::vocab). Stamped automatically by
+    /// [`Manifest::new`], never set by a plugin author.
+    ///
+    /// Additive under the crate's compat rules — same [`PROTO_VERSION`],
+    /// `#[serde(default)]` for backward decode, and `skip_serializing_if` so a
+    /// non-negotiating manifest stays byte-identical on the wire to a pre-#882
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocab_max: Option<u16>,
     /// The host-state subset the plugin wants pushed to it.
     pub subscribes: Vec<StateKey>,
     /// The shell capabilities the plugin requests.
@@ -310,12 +344,20 @@ pub struct Manifest {
 impl Manifest {
     /// A manifest stamped with the current [`PROTO_VERSION`] and no
     /// subscriptions/capabilities yet.
+    ///
+    /// The two vocabulary numbers are stamped for the plugin: `vocab` at
+    /// [`VOCAB_UNCONDITIONAL`] (what it may emit with no advertisement) and
+    /// [`vocab_max`](Manifest::vocab_max) at [`VOCAB`] (what it can speak if the
+    /// host asks for it). That pairing is what lets a plugin built against the
+    /// newest proto still clear an old host's [`check_vocab`](Manifest::check_vocab)
+    /// and degrade, rather than being refused at the handshake.
     #[must_use]
     pub fn new(id: impl Into<String>, mount: Mount) -> Self {
         Self {
             id: id.into(),
             proto: PROTO_VERSION,
-            vocab: VOCAB,
+            vocab: VOCAB_UNCONDITIONAL,
+            vocab_max: Some(VOCAB),
             subscribes: Vec::new(),
             capabilities: Vec::new(),
             mount,
@@ -364,5 +406,33 @@ impl Manifest {
                 theirs: self.vocab,
             })
         }
+    }
+
+    /// Whether this plugin negotiates its vocabulary at all (#882) — i.e.
+    /// whether it declared a [`vocab_max`](Manifest::vocab_max).
+    ///
+    /// This is the host's gate for sending
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello): send it exactly when this
+    /// is `true`, and a plugin too old to decode `Hello` never receives one.
+    #[must_use]
+    pub fn negotiates_vocab(&self) -> bool {
+        self.vocab_max.is_some()
+    }
+
+    /// The vocabulary generation both ends actually agreed on, given the
+    /// `host_vocab` the host advertised (its own [`VOCAB`]).
+    ///
+    /// The minimum of what the plugin can speak
+    /// ([`vocab_max`](Manifest::vocab_max), falling back to its unconditional
+    /// [`vocab`](Manifest::vocab) when it does not negotiate) and what the host
+    /// offered. Both ends compute the same number from the same two inputs, so
+    /// neither has to trust the other's arithmetic.
+    ///
+    /// Compare it against a feature's own generation marker — e.g.
+    /// [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB) — to decide whether to use
+    /// that feature or fall back.
+    #[must_use]
+    pub fn negotiated_vocab(&self, host_vocab: u16) -> u16 {
+        self.vocab_max.unwrap_or(self.vocab).min(host_vocab)
     }
 }

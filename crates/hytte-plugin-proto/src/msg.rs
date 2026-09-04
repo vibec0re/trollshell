@@ -203,6 +203,36 @@ pub enum HostMsg {
     /// exiting: plugin units run `Restart=on-failure`, so a clean exit would
     /// strand the plugin across a host restart.)
     Shutdown,
+    /// The host's own wire-vocabulary generation (#882) — the **advertisement**
+    /// half of the vocabulary negotiation. Despite sitting last in this enum
+    /// (appended, per the crate's compat rules — position is declaration order,
+    /// not send order), it is the *first* frame the host sends after accepting a
+    /// [`Register`](PluginMsg::Register), before any state snapshot.
+    ///
+    /// `vocab` is the host's [`VOCAB`](crate::VOCAB): the newest generation it
+    /// can decode. The plugin resolves the agreed generation with
+    /// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
+    /// and enables the negotiated features at or below it — today that means
+    /// emitting [`Node::Preem`](crate::wire::Node::Preem) once the agreed
+    /// generation reaches [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB), and
+    /// CPU-rasterising to [`Node::Pixels`](crate::wire::Node::Pixels) otherwise.
+    ///
+    /// **Opt-in (#305) — structural, by vocabulary.** The host sends this
+    /// *only* to a plugin whose manifest carries a
+    /// [`vocab_max`](crate::manifest::Manifest::vocab_max)
+    /// ([`negotiates_vocab`](crate::manifest::Manifest::negotiates_vocab)). A
+    /// plugin can only set that field if it was built against the proto that
+    /// added it — the same proto that added this variant — so a pre-#882 binary
+    /// never meets a `Hello` it couldn't decode. That is the
+    /// [`EventKind::ValueChanged`](crate::wire::EventKind::ValueChanged)
+    /// argument rather than a new [`StateKey`](crate::manifest::StateKey): the
+    /// opt-in is the declaration itself, so nothing new is subscribable.
+    ///
+    /// **A plugin that receives no `Hello` must assume no negotiated features.**
+    /// Silence is the legacy answer, not an error: an old host simply never
+    /// sends one, and the plugin runs its fallback path — which is exactly what
+    /// it did before #882.
+    Hello { vocab: u16 },
 }
 
 /// Severity for [`PluginMsg::Log`]. Mirrors the host's `tracing` levels.

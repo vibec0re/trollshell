@@ -335,8 +335,19 @@ self:
         service, the control-center's Plugins tab can stop and start it, and it
         gets keyring secret injection like any other plugin. The daemon also
         paints a small status chip on the bar (mode, whether a credential is
-        held, coarse request health); the HTTP endpoint is bound before the chip
-        connects and stays up across shell restarts.
+        held, coarse request health).
+
+        **The shell is what starts it.** The retired unit carried
+        `WantedBy = <session target>` and came up on its own; a plugin entry is
+        launched by `trollshell`'s launcher at startup instead, so with the shell
+        disabled or crash-looping nothing brings the bridge up and anything
+        pointed at `127.0.0.1:<port>` gets a connection refused. Once launched it
+        does outlive the shell — the transient unit is `PartOf` the session
+        target, not the shell — so `systemctl --user restart trollshell` leaves
+        the endpoint answering with only the chip gone. If you need the bridge
+        without the shell, run it from
+        `etc/systemd/user/trollshell-claude-bridge.service` by hand and leave
+        this option off; do not do both (see the note under `mode`).
 
         Prerequisites the module cannot provide for you: the `claude` CLI must
         be resolvable on the *systemd user manager's* PATH (on NixOS that is the
@@ -410,9 +421,20 @@ self:
           keeps working, and is still the only source under the hand-installed
           static unit, which scrubs the variable.
 
-          Note the scrub itself does not exist on the launcher path: a transient
-          unit has no `UnsetEnvironment=`. The protection in the `claude` modes
-          is the startup refusal above — one loud layer instead of two.
+          The retired unit's `UnsetEnvironment=` scrub is carried across, not
+          dropped: a transient unit has no such setting, so the home-manager
+          module renders the same four billing-redirect variables as **empty**
+          entries in the plugin's `env` instead. Empty reads as "not set" to
+          every consumer — envguard does not trip, the key file is still
+          consulted — and the launcher appends injected secrets *after* the
+          declared env, so `api` mode's keyring key still wins. Both layers are
+          therefore intact: the scrub, and the startup refusal behind it.
+
+          One deployment note: `etc/systemd/user/trollshell-claude-bridge.service`
+          is a *different* unit name from the transient
+          `trollshell-plugin-claude-bridge` the launcher creates, so the launcher
+          cannot see the pair. Running both means two bridges and the second
+          failing to bind the port. Pick one.
         '';
       };
 

@@ -587,7 +587,17 @@
                   # ANTHROPIC_API_KEY is a startup refusal there, not a
                   # credential (#752). The `api` half of this invariant has its
                   # own fixture, hm-module-claude-bridge-api below.
-                  && b.secrets == [ ];
+                  && b.secrets == [ ]
+                  # THE BILLING SCRUB (#866). The retired unit's
+                  # `UnsetEnvironment=` is re-expressed as four EMPTY env values,
+                  # which is what stops an inherited ANTHROPIC_API_KEY from
+                  # restart-looping the bridge in the default mode. Losing these
+                  # is a silent regression that only bites the users who happen
+                  # to export one, so it is asserted by content.
+                  && b.env.ANTHROPIC_API_KEY == ""
+                  && b.env.ANTHROPIC_AUTH_TOKEN == ""
+                  && b.env.CLAUDE_CODE_USE_BEDROCK == ""
+                  && b.env.CLAUDE_CODE_USE_VERTEX == "";
                 assert units ? trollshell-pet-brain;
                 # `builtins.toString` because home-manager's unitOption merge
                 # hands some of these back list-wrapped (ExecStart below is
@@ -719,7 +729,15 @@
                   let
                     b = pluginsState.plugins.claude-bridge;
                   in
-                  b.env.CLAUDE_BRIDGE_MODE == "api" && b.secrets == [ "anthropic" ];
+                  b.env.CLAUDE_BRIDGE_MODE == "api"
+                  && b.secrets == [ "anthropic" ]
+                  # The scrub is unconditional — the same four empty values in
+                  # api mode. That is not a contradiction with the slot above:
+                  # the launcher appends injected secrets AFTER the declared env
+                  # and systemd lets the later assignment win, so the empty value
+                  # is the floor a keyring key overrides (and the key file's
+                  # fallback when there is none).
+                  && b.env.ANTHROPIC_API_KEY == "";
                 builtins.deepSeq { inherit pluginsState; } "ok";
             in
             pkgs.runCommand "trollshell-hm-module-claude-bridge-api-check" { inherit probe; } ''

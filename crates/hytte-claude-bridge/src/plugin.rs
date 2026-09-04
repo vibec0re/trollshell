@@ -391,7 +391,11 @@ mod tests {
     /// neighbours along the bar.
     #[test]
     fn counts_saturate_so_the_chip_cannot_widen_without_bound() {
-        assert_eq!(counts_label(999, 0), "999/0", "the cap itself prints exactly");
+        assert_eq!(
+            counts_label(999, 0),
+            "999/0",
+            "the cap itself prints exactly"
+        );
         assert_eq!(counts_label(1_000, 2), "999+/2");
         assert_eq!(counts_label(86_400, 12_345), "999+/999+");
         // Four characters is the widest either side can ever be.

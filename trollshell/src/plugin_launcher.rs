@@ -632,7 +632,9 @@ static WATCH: std::sync::Mutex<WatchState> = std::sync::Mutex::new(WatchState {
 /// answer to that is still to keep the watcher's bookkeeping working, not to
 /// take the shell's plugin launcher down with it.
 fn watch_state() -> std::sync::MutexGuard<'static, WatchState> {
-    WATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Clears [`WatchState::watching`] when the watcher task ends **however it
@@ -691,7 +693,9 @@ fn outstanding_slots(out: &Outstanding) -> Vec<String> {
 /// The plugin ids currently waiting on `slot`, in a stable order — the log
 /// line's subject, read **without** dropping them (see [`settle_slot`]). Pure.
 fn waiters_on(out: &Outstanding, slot: &str) -> Vec<String> {
-    out.get(slot).map(|ids| ids.iter().cloned().collect()).unwrap_or_default()
+    out.get(slot)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Resolve one slot's watch after a relaunch attempt: everything that was
@@ -1938,7 +1942,10 @@ mod tests {
         // `restart` already cleared both ids on its way through resolve_secret_env.
         fold_resolution(&mut out, "pet", &[], &slots(&["openrouter"]));
         fold_resolution(&mut out, "caw", &[], &slots(&["openrouter"]));
-        assert!(out.is_empty(), "the precondition this test is written against");
+        assert!(
+            out.is_empty(),
+            "the precondition this test is written against"
+        );
 
         settle_slot(&mut out, "openrouter", &slots(&["pet"]));
         assert_eq!(

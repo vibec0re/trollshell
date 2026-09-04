@@ -3,10 +3,20 @@
 //! subscription **with zero changes to pet or caw** (`Provider` is already just
 //! a base URL). Issue #584.
 //!
-//! It links nothing from this tree and is linked by nothing: one route,
-//! `POST /v1/chat/completions`, bound to `127.0.0.1:8787` — loopback only,
-//! never `0.0.0.0`, because this runs on somebody's personal credentials.
+//! One route, `POST /v1/chat/completions`, bound to `127.0.0.1:8787` — loopback
+//! only, never `0.0.0.0`, because this runs on somebody's personal credentials.
 //! (Port 8080 belongs to `trollshell-pet-brain.service`'s llama-server.)
+//!
+//! # It is also a hytte plugin (#866)
+//!
+//! Since #866 the daemon wears a second hat: it speaks the widget-plugin
+//! protocol and paints a small status chip on the bar, following
+//! `hytte-plugin-infobroker`'s two-hats-in-one-binary shape. That is what lets
+//! it ride `programs.trollshell.plugins` — the launcher, the control-center's
+//! Plugins tab, and #392's keyring injection — instead of needing its own
+//! hand-declared systemd unit. See [`plugin`] for the chip and for **why the
+//! HTTP listener is bound and spawned before the SDK loop is entered**: the API
+//! is the primary duty and must not depend on the shell being up.
 //!
 //! # The INBOUND side is KEYLESS — and that is a correctness requirement
 //!
@@ -80,20 +90,34 @@
 //! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; must stay under the client's 10s |
 //! | `CLAUDE_BRIDGE_STATE_DIR` | `$XDG_STATE_HOME/hytte-claude-bridge` | the child's cwd, which is what scopes claude's on-disk sessions (`claude` modes only), and where the retired-session map is kept (#855) |
 //! | `CLAUDE_BRIDGE_THINKING` | `disabled` | `api` mode only: `disabled`, `adaptive`, or `auto` — see [`messages::Thinking`] |
-//! | `ANTHROPIC_API_KEY` | unset | `api` mode only, and a **development** override: it outranks `~/.config/trollshell/anthropic.key`, but the shipped unit scrubs it with `UnsetEnvironment=`, so under systemd the file is the only source that works (#752). In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
+//! | `ANTHROPIC_API_KEY` | unset | `api` mode only: it outranks `~/.config/trollshell/anthropic.key`. In the `claude` modes it is a **startup refusal** (see [`envguard`]) |
 //!
-//! The key itself is **not** an environment knob under the shipped unit — see
-//! `etc/systemd/user/trollshell-claude-bridge.service`, which documents
-//! `~/.config/trollshell/anthropic.key` as the configuration surface for `api`
-//! mode and says why the variable is stripped there.
+//! # Where `ANTHROPIC_API_KEY` comes from, after #866
+//!
+//! Under the **static unit** (`etc/systemd/user/trollshell-claude-bridge.service`,
+//! still the reference for hand-installed deployments) the variable is scrubbed
+//! by `UnsetEnvironment=`, so `~/.config/trollshell/anthropic.key` is the only
+//! source that works there (#752).
+//!
+//! Under the **launcher** the shape is different by design. A transient unit
+//! spawned by `systemd-run` carries no `UnsetEnvironment=`, so that scrub does
+//! not exist on this path; what remains is [`envguard`]'s startup refusal, which
+//! names the offending variable in `systemctl status`. The home-manager module
+//! therefore declares the `anthropic` secret slot **only** when the configured
+//! mode is `api` — in the two `claude` modes an injected key is a refusal, not a
+//! credential — and the launcher then injects the keyring's key as
+//! `ANTHROPIC_API_KEY`, which the env-first precedence above picks up. The key
+//! file keeps working unchanged behind it.
 
 mod backend;
 mod bridge;
 mod envguard;
 mod http;
 mod messages;
+mod plugin;
 mod retired;
 mod session;
+mod status;
 mod wire;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -276,17 +300,22 @@ fn bind_addr(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hytte_claude_bridge=info")),
-        )
-        .init();
+/// Everything that has to succeed before the bridge can answer a request: the
+/// backend, the retired-session map, and the bound loopback listener.
+struct Serving {
+    listener: tokio::net::TcpListener,
+    bridge: Arc<Bridge>,
+    /// Whether the bridge holds an outbound credential of its own — true only in
+    /// [`Mode::Api`], which has already refused to start if no key resolved. The
+    /// value the chip paints its key glyph from; the key itself never leaves
+    /// [`messages`].
+    keyed: bool,
+}
 
-    let settings = Settings::from_env();
-
+/// Bring the HTTP half up: run the billing guard where it applies, build the
+/// backend, and bind the loopback listener. `None` on any failure — each one is
+/// logged here, and `main` turns it into [`ExitCode::FAILURE`].
+async fn start(settings: &Settings) -> Option<Serving> {
     // Fail closed before anything else — but only where the guard means
     // anything. It exists to stop the `claude` **child** being redirected onto
     // metered credits behind the operator's back; in `api` mode there is no
@@ -297,17 +326,18 @@ async fn main() -> ExitCode {
         let offenders = envguard::offenders_in_env();
         if !offenders.is_empty() {
             tracing::error!("{}", envguard::refusal(&offenders));
-            return ExitCode::FAILURE;
+            return None;
         }
         // The state dir is the child's cwd, and holds the retired-session map
         // (#855) — which creates the dir itself when it writes, so this is
         // still only needed for the child.
         if let Err(e) = std::fs::create_dir_all(&settings.state_dir) {
             tracing::error!(dir = %settings.state_dir.display(), error = %e, "could not create the state dir");
-            return ExitCode::FAILURE;
+            return None;
         }
     }
 
+    let mut keyed = false;
     let backend = match settings.mode {
         Mode::Subscription => Backend::Subscription(Subscription::new(settings.claude_config())),
         Mode::Reprompt => Backend::Reprompt(Reprompt::new(settings.claude_config())),
@@ -317,8 +347,9 @@ async fn main() -> ExitCode {
             // come back a 502 that looks like the plugin's fault.
             let Some(key) = messages::load_key() else {
                 tracing::error!("{}", messages::missing_key_refusal());
-                return ExitCode::FAILURE;
+                return None;
             };
+            keyed = true;
             Backend::Reprompt(Reprompt::with_api(messages::Client::new(
                 key,
                 settings.api_model(),
@@ -343,7 +374,7 @@ async fn main() -> ExitCode {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!(%addr, error = %e, "could not bind");
-            return ExitCode::FAILURE;
+            return None;
         }
     };
     let billing = if settings.mode.spawns_claude() {
@@ -365,6 +396,17 @@ async fn main() -> ExitCode {
         "hytte-claude-bridge listening (no inbound auth; loopback only)",
     );
 
+    Some(Serving {
+        listener,
+        bridge,
+        keyed,
+    })
+}
+
+/// Answer connections forever. Spawned on the HTTP runtime by `main`, so it
+/// keeps serving whatever the plugin face is doing — including while the shell
+/// is down and the SDK is sitting in its dial backoff.
+async fn accept_loop(listener: tokio::net::TcpListener, bridge: Arc<Bridge>) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
@@ -377,6 +419,57 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// The process's two duties, in priority order (#866).
+///
+/// `main` is **not** `#[tokio::main]` any more, and that is load-bearing:
+/// [`hytte_plugin::run`] builds a current-thread runtime of its own and
+/// `block_on`s it forever, which cannot happen from inside another runtime's
+/// context. So this owns the HTTP runtime explicitly, gets the listener serving
+/// on it, and only then hands the main thread to the SDK. `rt` is never dropped
+/// (both tail paths diverge), so its worker threads — and the accept loop on
+/// them — outlive every plugin session.
+fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hytte_claude_bridge=info")),
+        )
+        .init();
+
+    let settings = Settings::from_env();
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "tokio runtime failed to build");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let Some(serving) = rt.block_on(start(&settings)) else {
+        return ExitCode::FAILURE;
+    };
+    // Publish before the listener can record anything, so the chip never shows
+    // counts against an unknown mode.
+    status::publish(status::Startup {
+        mode: settings.mode,
+        keyed: serving.keyed,
+        port: settings.port,
+    });
+    rt.spawn(accept_loop(serving.listener, serving.bridge));
+
+    // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
+    // socket to dial *ever*, and the SDK would exit the process over it — which
+    // would take the API down with it. Park on the HTTP runtime instead.
+    if plugin::host_socket_available() {
+        plugin::run();
+    }
+    tracing::warn!(
+        "XDG_RUNTIME_DIR unset; no trollshell host socket to dial — serving HTTP with no bar chip"
+    );
+    rt.block_on(std::future::pending::<ExitCode>())
 }
 
 #[cfg(test)]

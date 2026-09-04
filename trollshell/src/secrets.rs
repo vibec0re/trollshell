@@ -146,6 +146,44 @@ pub async fn get(slot: &str) -> Option<String> {
     }
 }
 
+/// What one slot looks like right now, with the two failures [`get`] collapses
+/// held apart (#866).
+///
+/// [`get`] answers the launch-time question — "is there a key to inject?" — and
+/// fails closed, so "the ring is locked" and "nobody ever stored one" are both
+/// `None` there. A *watcher* needs the distinction: the launcher polls the slots
+/// a plugin launched without, and the log line for a session that started before
+/// gnome-keyring was unlocked ("waiting for the keyring") is a different piece of
+/// information from the one for a slot nobody has filled in yet ("no key
+/// stored"). Both keep waiting — an external tool can add a key at any time —
+/// which is why this only widens the *reporting*, never the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretProbe {
+    /// A non-empty key is stored and readable — injectable right now.
+    Available,
+    /// The keyring answered, and has no key for this slot.
+    Absent,
+    /// The keyring could not be read at all: locked and awaiting an unlock
+    /// prompt, timed out, or no Secret Service on the bus. Says nothing about
+    /// whether a key exists.
+    Locked,
+}
+
+/// Probe `slot` without injecting anything — [`get`]'s read, reported in full.
+///
+/// Never returns a value and never logs one; the caller learns only which of the
+/// three states the slot is in.
+pub async fn probe(slot: &str) -> SecretProbe {
+    match read(slot).await {
+        Ok(Some(_)) => SecretProbe::Available,
+        Ok(None) => SecretProbe::Absent,
+        Err(err) => {
+            tracing::debug!(slot = %slot, %err, "keyring unreadable while probing the slot");
+            SecretProbe::Locked
+        }
+    }
+}
+
 /// Fallible core of [`get`]: `Ok(None)` = genuinely unset, `Err` = a keyring
 /// problem the caller downgrades to unset.
 async fn read(slot: &str) -> anyhow::Result<Option<String>> {

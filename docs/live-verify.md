@@ -258,10 +258,11 @@ range above is a floor, not a ceiling.
 title` in the stderr tail — worth a deliberate look on first run, since
      a silent drift here would read as "the bridge is broken" rather than
      naming the actual cause.
-  6. **pet end-to-end:** add
-     `Environment=PET_LLM_URL=http://127.0.0.1:8787` and
-     `Environment=OPENROUTER_API_KEY=local-bridge` to
-     `trollshell-plugin-pet.service`, restart, poke the cat. Confirm via
+  6. **pet end-to-end:** set `PET_LLM_URL=http://127.0.0.1:8787` and
+     `OPENROUTER_API_KEY=local-bridge` on the `pet` plugin's declared env
+     (`programs.trollshell.plugins.pet.env`, or the matching entry in
+     `~/.config/trollshell/plugins.json` plus `Control.ReloadPlugins`) and
+     poke the cat. Confirm via
      `journalctl` that the pet never sends the real OpenRouter key — the
      dummy env var winning is the whole point (`load_key_from` checks the
      `OPENROUTER_API_KEY` env override before

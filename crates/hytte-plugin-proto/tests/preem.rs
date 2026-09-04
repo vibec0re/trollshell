@@ -173,7 +173,12 @@ fn every_preem_widget_round_trips() {
             widget.clone(),
         );
         let back = decode::<Node>(&encode(&node)).expect("node decodes");
-        assert_eq!(back, node, "Node::Preem({}) did not round-trip", widget.kind());
+        assert_eq!(
+            back,
+            node,
+            "Node::Preem({}) did not round-trip",
+            widget.kind()
+        );
     }
 }
 

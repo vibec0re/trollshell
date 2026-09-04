@@ -43,14 +43,14 @@
 
 use hytte_plugin_proto::{
     AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
-    DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState, Effect, EffectOutcome,
-    EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange, GaugeState, HostMsg,
-    LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState, Mechanism,
-    MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page, PeakHoldConfig,
-    PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig, ScopeState,
-    SevenSegConfig, SevenSegState, StateKey, StateSnapshot, StyleName, StyleRef, TextBoxConfig,
-    TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL, decode, encode, preem,
-    preem_id, preem_styled,
+    DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState, Effect,
+    EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange, GaugeState,
+    HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState,
+    Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
+    PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
+    ScopeState, SevenSegConfig, SevenSegState, StateKey, StateSnapshot, StyleName, StyleRef,
+    TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL, decode,
+    encode, preem, preem_id, preem_styled,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;

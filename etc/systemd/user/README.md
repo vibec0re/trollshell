@@ -307,15 +307,34 @@ shell's 250 ms mpris position poller (#228's gate is the OR of that and the
 Media drawer page); closing the sidebar parks it again. No environment variables
 to set.
 
-## The Claude bridge (`trollshell-claude-bridge.service`)
+## The Claude bridge (`hytte-claude-bridge`)
 
-`trollshell-claude-bridge.service` is **not** a plugin — it's a small daemon
-that puts an OpenAI-compatible face on headless Claude Code (#584), so the
-LLM-backed plugins can ride a Claude Code subscription instead of a metered
-cloud key. It serves exactly one route, `POST /v1/chat/completions`, on
-**`127.0.0.1:8787` — loopback only** (8080 is `trollshell-pet-brain.service`'s
-llama-server; the two are meant to be swappable). Each request spawns
-`claude --print` and returns its answer as `choices[0].message.content`.
+`hytte-claude-bridge` is a small daemon that puts an OpenAI-compatible face on
+headless Claude Code (#584), so the LLM-backed plugins can ride a Claude Code
+subscription instead of a metered cloud key. It serves exactly one route,
+`POST /v1/chat/completions`, on **`127.0.0.1:8787` — loopback only** (8080 is
+`trollshell-pet-brain.service`'s llama-server; the two are meant to be
+swappable). Each `claude`-backed request spawns `claude --print` and returns
+its answer as `choices[0].message.content`.
+
+Since #866 it also wears the widget-plugin protocol's hat: it links
+`hytte-plugin` and paints a small `BarRight` status chip (health glyph, mode,
+a key glyph only when a credential is actually held, coarse 2xx/non-2xx
+counts) — a readout, no panel, no capabilities. That's what let #878 retire
+this directory's old `trollshell-claude-bridge.service`: **the supported path
+is now `programs.trollshell.claudeBridge.enable`**, which renders a
+`plugins.claude-bridge` entry, and the shell's own launcher spawns it — same as
+every other bundled plugin — as a transient `trollshell-plugin-claude-bridge.service`
+via `systemd-run --user`. There is no unit to hand-install here any more; a
+hand-installed (non-home-manager) deployment adds a `plugins.claude-bridge`
+entry to `~/.config/trollshell/plugins.json` instead (`exec`, `env`, `enabled`
+— see "Out-of-process widget plugins" above), and either restarts trollshell or
+pokes `Control.ReloadPlugins` to converge. **The shell is what starts it now** —
+the retired unit carried `WantedBy=`; a plugin entry only comes up once
+`trollshell.service` launches it, so with the shell down or crash-looping
+nothing brings the bridge up. It does outlive a shell restart on its own
+(`PartOf=` the session target, not the shell), so `systemctl --user restart
+trollshell` briefly drops only the chip, not the endpoint.
 
 **Nothing in pet or caw changed for this.** `hytte_ai_providers::Provider` is
 already just a base URL, so opting a plugin in is two env vars on _its_
@@ -338,21 +357,35 @@ so the dummy value is what stops the real cloud key being shipped to a loopback
 port. With no auth, reachability is the authorization boundary — hence the
 loopback bind.
 
-The bridge's own unit carries
-`UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX`,
-because any of those would move billing off the subscription with nothing
-visible to show for it. In the two `claude` modes the binary **refuses to
-start** if it still finds one set (it can't scrub them itself:
-`std::env::remove_var` is unsafe under edition 2024 and this workspace forbids
-unsafe). If the unit fails with "refusing to start", that message names the
-variable to unset. The refusal is **mode-scoped** (#730): it guards the `claude`
-child, and `api` mode spawns none — see below.
+**The billing scrub, carried across, not dropped.** The retired unit's
+`UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX`
+existed because any of those four would silently move `claude` off the
+subscription and onto metered API credits (or Bedrock/Vertex), with nothing
+visible in the UI to show for it. A transient `systemd-run` unit has no
+`UnsetEnvironment=`, so the rendered plugin entry now carries those same four
+variables as **empty** `env` values instead — empty is equivalent to unset for
+every consumer here: envguard's `redirects` check treats an empty credential
+the same as an absent one, `load_key_from` falls through an empty
+`ANTHROPIC_API_KEY` to the key file exactly as before, and the launcher appends
+injected secrets _after_ the declared env, so `api` mode's keyring key still
+wins over the empty placeholder.
 
-Prerequisite: the `claude` CLI on the user manager's `PATH`, already logged in
-(`api` mode excepted — it spawns no `claude` at all). Optional knobs —
-`CLAUDE_BRIDGE_{MODEL,MODE,PORT,TIMEOUT_SECS,STATE_DIR,THINKING}` — are
-documented in the unit's comments. `CLAUDE_BRIDGE_MODE` picks between **three**
-backends:
+In the two `claude` modes (`subscription`, `reprompt`) the binary still
+**refuses to start** if it finds `ANTHROPIC_API_KEY` (or the other three) set —
+it can't scrub them itself (`std::env::remove_var` is unsafe under edition 2024
+and this workspace forbids unsafe). **That refusal is the guard doing its
+job, not a bug**: if you hit it, something upstream of the plugin entry (a
+shell profile, an imported systemd user-manager environment) is exporting one
+of the four variables — find and unset it there rather than working around the
+refusal. `journalctl --user -u trollshell-plugin-claude-bridge` names the
+offending variable. The refusal is **mode-scoped** (#730): it guards the
+`claude` child, and `api` mode spawns none — see below.
+
+Prerequisite: the `claude` CLI on the PATH the shell's launcher spawns against,
+already logged in (`api` mode excepted — it spawns no `claude` at all).
+Optional knobs — `CLAUDE_BRIDGE_{MODEL,MODE,PORT,TIMEOUT_SECS,STATE_DIR,THINKING}`
+— are documented in `crates/hytte-claude-bridge/src/main.rs` and set as `env`
+on the plugin entry. `CLAUDE_BRIDGE_MODE` picks between **three** backends:
 
 | `CLAUDE_BRIDGE_MODE`               | what it runs                                                                                                             |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -360,23 +393,24 @@ backends:
 | `reprompt`                         | a one-off `claude` session per turn, with the bridge holding the transcript and nothing persisted to disk                |
 | `api` (also `api-key`, `messages`) | no `claude` child at all: `POST /v1/messages` against the Anthropic API, **billed per token** (#730/#751)                |
 
-`api` mode is the reason the `UnsetEnvironment=` line above is worth
-understanding rather than just keeping. That mode needs an Anthropic key, and
-the shipped unit strips `ANTHROPIC_API_KEY` from its environment — deliberately
-(#752): an inherited key that quietly starts billing is a worse failure than a
-mode that has to read its key from a file. So under this unit the **only** place
-the key can come from is
+`api` mode is the one mode where reaching the loopback port spends money, and
+it's the reason the empty-env scrub above matters. That mode needs a real
+Anthropic key, and on the declarative path the only source is the login
+keyring's `anthropic` secret (store it in the control-center's AI Keys tab):
+`secrets = [ "anthropic" ]` is declared on the plugin entry **only** when `api`
+mode is configured, and the launcher injects it as `ANTHROPIC_API_KEY` at spawn
+time — after the empty scrub, so it wins. Hand-editing `plugins.json` instead
+of going through the keyring still works with the pre-#866 convention of a key
+file:
 
 ```
 ~/.config/trollshell/anthropic.key      # chmod 600; trimmed, empty == unset
 ```
 
-Adding `Environment=ANTHROPIC_API_KEY=…` to the unit is a no-op — the scrub runs
-after it, the bridge finds no key, and refuses to start. The env override exists
-for `cargo run`, not for systemd. `CLAUDE_BRIDGE_THINKING` (`disabled` by
-default, or `adaptive` / `auto`) is `api`-mode-only and load-bearing there:
-`max_tokens` bounds thinking _plus_ answer text, and these consumers ask for
-only a couple of hundred tokens of kaomoji.
+`CLAUDE_BRIDGE_THINKING` (`disabled` by default, or `adaptive` / `auto`) is
+`api`-mode-only and load-bearing there: `max_tokens` bounds thinking _plus_
+answer text, and these consumers ask for only a couple of hundred tokens of
+kaomoji.
 
 **Two timeouts, and their order matters.** `CLAUDE_BRIDGE_TIMEOUT_SECS` (8s by
 default) is the bridge's per-request budget; the _client_'s budget is the pet's
@@ -387,11 +421,11 @@ instead of a clean 504 it can fall back from. A cold `claude --print` turn on a
 fresh session routinely runs past 10s, so the fix is to raise **both, in that
 order**:
 
-```ini
-# on the pet plugin's declared env — the client's ceiling goes up first
-PET_LLM_TIMEOUT_SECS=30
-# in trollshell-claude-bridge.service — then the bridge, still below it
-Environment=CLAUDE_BRIDGE_TIMEOUT_SECS=25
+```nix
+# the client's ceiling goes up first, on the pet plugin's declared env
+programs.trollshell.plugins.pet.env.PET_LLM_TIMEOUT_SECS = "30";
+# then the bridge, still below it
+programs.trollshell.claudeBridge.timeoutSeconds = 25;
 ```
 
 When it's down, the plugins degrade to their canned output — the same failure
@@ -399,8 +433,9 @@ mode as a missing llama-server — with the cause only in the journal.
 
 ### The declarative path (home-manager)
 
-Since #694 both this unit and `trollshell-pet-brain.service` have a module
-surface, so home-manager users don't hand-install either:
+Since #694 (#866 for the launcher-based path) both the bridge and
+`trollshell-pet-brain.service` have a module surface, so home-manager users
+don't hand-write either:
 
 ```nix
 programs.trollshell.claudeBridge = {
@@ -409,8 +444,10 @@ programs.trollshell.claudeBridge = {
   # picks — usually Opus — which routinely overruns the 8s budget below and
   # comes back to the plugin as a 504.
   model = "claude-haiku-4-5";
-  # port = 8787;          # default; must match the plugin's *_LLM_URL
-  # timeoutSeconds = 8;   # default; see "Two timeouts" above
+  # port = 8787;           # default; must match the plugin's *_LLM_URL
+  # timeoutSeconds = 8;    # default; see "Two timeouts" above
+  # mode = "subscription"; # default; "api" is the one that declares the
+                            # anthropic secret slot
 };
 
 # The client half, on the plugin that talks to it.
@@ -420,11 +457,17 @@ programs.trollshell.plugins.pet.env = {
 };
 ```
 
-The generated unit carries the same `UnsetEnvironment=` scrub as the file in
-this directory, and the module **asserts the two-timeout ordering** at
-evaluation time whenever both halves are declared — so a `timeoutSeconds` that
-isn't strictly below the pet's `PET_LLM_TIMEOUT_SECS` fails the build instead of
-the request.
+This renders `programs.trollshell.plugins.claude-bridge` with the same
+empty-env billing scrub described above, and the module **asserts the
+two-timeout ordering** at evaluation time whenever both halves are declared —
+so a `timeoutSeconds` that isn't strictly below the pet's
+`PET_LLM_TIMEOUT_SECS` fails the build instead of the request. It also asserts
+against the pre-#866 escape hatch: a stray
+`systemd.user.services.trollshell-claude-bridge` definition no longer
+configures anything — it would create a separate, `ExecStart`-less unit that
+can never start, while the real bridge keeps running on whatever
+`claudeBridge.*` said — so the module fails the build on that combination
+rather than let it go unnoticed.
 
 `programs.trollshell.petBrain.{enable,package,port,model,extraArgs}` is the same
 deal for the llama-server brain. Its `model` is the path to a GGUF you fetch
@@ -432,19 +475,26 @@ yourself (the option's description carries the download snippet); the unit is
 `ConditionPathExists`-gated on it, so declaring it before downloading is inert
 rather than a crash loop.
 
-Anything not promoted to an option stays reachable the ordinary home-manager
-way — the list is concatenated onto the one the module already sets, and
-systemd lets the later assignment win:
+Anything not promoted to a `claudeBridge.*` option stays reachable the
+ordinary way, on the plugin entry itself — that's the escape hatch now, in
+place of the pre-#866 `Service.Environment` override:
 
 ```nix
-systemd.user.services.trollshell-claude-bridge.Service.Environment = [
-  "CLAUDE_BRIDGE_MODE=reprompt"
-  # …and PATH, if your `claude` lives somewhere the systemd user manager's PATH
-  # doesn't reach. The module deliberately sets no PATH= of its own: it would
-  # *replace* the inherited one, which on NixOS already covers the system and
-  # per-user profiles.
-];
+programs.trollshell.plugins.claude-bridge.env = {
+  CLAUDE_BRIDGE_STATE_DIR = "/mnt/big-disk/claude-bridge-state";
+  PATH = "/run/current-system/sw/bin"; # if your `claude` lives somewhere the
+    # systemd user manager's PATH doesn't reach. The module deliberately sets
+    # no PATH= of its own: it would *replace* the inherited one, which on
+    # NixOS already covers the system and per-user profiles.
+};
 ```
+
+The module sets its own `env` values with `lib.mkDefault`, so a plain
+assignment like the above already wins. `CLAUDE_BRIDGE_MODE` is the one
+exception: it's set from `claudeBridge.mode` and a build-time assertion
+requires the two to agree, so overriding it here directly (rather than
+through `claudeBridge.mode`) fails the build instead of silently desyncing —
+set `claudeBridge.mode` for that one.
 
 llama-server reads no environment configuration at all, so `petBrain.extraArgs`
 (rather than a `Service.Environment` override) is that unit's escape hatch.
@@ -452,8 +502,11 @@ llama-server reads no environment configuration at all, so `petBrain.extraArgs`
 Both option groups are **home-manager only**, the same call `nightlight` made in
 #657: a NixOS-only deployment has no per-user `claude` login — or per-user model
 download — for these to drive, so the NixOS module asserts rather than accepting
-the setting and starting nothing. The static units in this directory remain the
-supported path for a hand-installed (non-home-manager) deployment.
+the setting and starting nothing. `trollshell-pet-brain.service`'s static unit
+in this directory remains the supported hand-installed path for the brain; the
+bridge's hand-installed path is a `plugins.claude-bridge` entry in
+`plugins.json` (above), not a unit — the repo ships no unit for it any more
+(#872/#889).
 
 ## Required packages
 

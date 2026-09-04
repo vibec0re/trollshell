@@ -227,13 +227,7 @@ range above is a floor, not a ceiling.
       change on _its own_ unit. This is a brand-new service nobody has run
       live yet, so every check below is genuinely first-run, not a
       regression check.
-  1. **Starts and refuses correctly.**
-     `systemctl --user start trollshell-claude-bridge`, then
-     `journalctl --user -u trollshell-claude-bridge` — expect
-     `hytte-claude-bridge listening (keyless by design; loopback only)`. Then
-     run it by hand with `ANTHROPIC_API_KEY=x hytte-claude-bridge` — expect a
-     refusal naming the offending variable, exit 1 (the billing guard that
-     stops metered credits leaking in from an inherited env).
+  1. **Starts and refuses correctly.** With `plugins.claude-bridge` enabled (or a hand-written `plugins.json` entry), restart it via the control-center's Plugins tab, or the `Control.ReloadPlugins` D-Bus call (see `etc/systemd/user/README.md`'s "How a config change reaches a running plugin" section), then check `journalctl --user -u trollshell-plugin-claude-bridge` — expect `hytte-claude-bridge listening (keyless by design; loopback only)`. Then run it by hand with `ANTHROPIC_API_KEY=x hytte-claude-bridge` — expect a refusal naming the offending variable, exit 1 (the billing guard that stops metered credits leaking in from an inherited env).
   2. **A round trip:**
      `curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"system","content":"you are a cat"},{"role":"user","content":"say hi"}]}'`
      — expect a `chat.completion` body with text in

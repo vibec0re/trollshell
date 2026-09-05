@@ -165,7 +165,14 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             classes,
         } => UiNode::Progress {
             id: id.clone(),
-            fraction: *fraction,
+            // The float seam for this arm (#904), the `f64` analogue of the
+            // `Preem` arm's mandatory `clamp_in_place` below: a `NaN` here is
+            // stored verbatim by `gtk_progress_bar_set_fraction` and then cast
+            // into an `int` allocation width. Mapping runs once per monitor per
+            // frame, so the per-field form is used rather than cloning the node
+            // to call `wire::Node::clamp_in_place` — the two share one
+            // implementation, so they cannot drift.
+            fraction: wire::sane_fraction(*fraction),
             classes: classes.clone(),
         },
         wire::Node::Slider {
@@ -176,15 +183,23 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             step,
             enabled,
             classes,
-        } => UiNode::Slider {
-            id: id.clone(),
-            min: *min,
-            max: *max,
-            value: *value,
-            step: *step,
-            enabled: *enabled,
-            classes: classes.clone(),
-        },
+        } => {
+            // Same seam (#904). This one is not merely dedup hygiene: a
+            // degenerate range reaches `gtk::Adjustment::new`, whose
+            // `lower + page_size <= upper` guard returns NULL for `max < min`
+            // or a `NaN` end — a null the gtk4 binding then wraps, which is a
+            // debug-build panic and release-build UB in the shell.
+            let sane = wire::sane_slider_floats(*min, *max, *value, *step);
+            UiNode::Slider {
+                id: id.clone(),
+                min: sane.min,
+                max: sane.max,
+                value: sane.value,
+                step: sane.step,
+                enabled: *enabled,
+                classes: classes.clone(),
+            }
+        }
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
             id: id.clone(),
             open: *open,

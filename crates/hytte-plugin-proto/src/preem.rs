@@ -118,12 +118,15 @@
 //! that never changes. Both loops are unbounded in time, and both end at this
 //! one seam.
 //!
-//! The claim stops at [`Node::Preem`](crate::wire::Node::Preem), deliberately:
+//! The claim no longer stops at [`Node::Preem`](crate::wire::Node::Preem).
 //! [`Node::Progress`](crate::wire::Node::Progress) and
-//! [`Node::Slider`](crate::wire::Node::Slider) carry `f64`s that nothing
-//! sanitises, so a `NaN` in one of *those* still spins the same two loops.
-//! Closing that is #904 — a different seam (there is no `Node::clamped`) with
-//! its own drawing code to derive a mapping from, not a copy of this one.
+//! [`Node::Slider`](crate::wire::Node::Slider) carry `f64`s that used to spin
+//! the same two loops; #904 gave them their own seam,
+//! [`Node::clamp_in_place`](crate::wire::Node::clamp_in_place), with a mapping
+//! derived from *their* drawing code (GTK, not the kit) rather than a copy of
+//! this one — and that seam delegates a `Preem` child straight back to
+//! [`PreemWidget::clamp_in_place`], so one call over a render tree leaves every
+//! float in it finite.
 
 use serde::{Deserialize, Serialize};
 

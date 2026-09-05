@@ -3,10 +3,12 @@
 //! sockets, no display — pure encode/decode.
 
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, ConsentDecision, DatasourceError, DatasourceOutcome, Dir,
-    Effect, EffectOutcome, EventKind, HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction,
-    Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, ProtoError, ProvidedDatasource,
-    StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
+    AudioAction, Capability, ClockState, ConsentDecision, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN,
+    DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
+    EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN, Manifest,
+    MediaAction, Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError,
+    ProvidedDatasource, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode,
+    decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1385,4 +1387,698 @@ fn backward_compat_missing_optional_field_defaults() {
     let empty = std::collections::BTreeMap::<String, i32>::new();
     let snapshot: StateSnapshot = decode_body(&encode_body(&empty)).expect("default missing field");
     assert_eq!(snapshot, StateSnapshot { clock: None });
+}
+
+// ── Float sanitisation (#904) ────────────────────────────────────────────────
+//
+// `Node` derives `PartialEq`, and both ends of the wire use that derive as
+// their "did anything change?" test — so a `NaN` in a `Progress`/`Slider` float
+// made a tree unequal to an identical copy of itself and spun both render-dedup
+// loops forever. `Node::clamp_in_place` closes that; the mapping on its rustdoc
+// is contract, and the tests below pin every row of it plus the four
+// invariants: (a) finite and in range, (b) equal to itself, (c) a fixpoint,
+// (d) valid input untouched.
+
+/// A poison of the same class as `poison`, as an `f32` — for the preem child,
+/// whose floats are `f32`. Spelled out rather than cast so the tests stay clear
+/// of a lossy `f64 as f32`.
+fn f32_poison(poison: f64) -> f32 {
+    if poison.is_nan() {
+        f32::NAN
+    } else if poison.is_sign_positive() {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+fn poisoned_progress(id: &str, poison: f64) -> Node {
+    Node::Progress {
+        id: Some(id.into()),
+        fraction: poison,
+        classes: vec![],
+    }
+}
+
+fn poisoned_slider(id: &str, poison: f64) -> Node {
+    Node::Slider {
+        id: id.into(),
+        min: poison,
+        max: poison,
+        value: poison,
+        step: poison,
+        enabled: true,
+        classes: vec![],
+    }
+}
+
+fn poisoned_led_strip(poison: f64) -> PreemWidget {
+    let level = f32_poison(poison);
+    PreemWidget::LedStrip {
+        config: LedStripConfig::default(),
+        state: LedStripState {
+            level,
+            peak: Some(level),
+        },
+    }
+}
+
+/// `inner` wrapped in every container the walker has to recurse through,
+/// labelled — so a forgotten arm names itself instead of hiding behind a
+/// sibling that happened to be visited.
+fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
+    vec![
+        ("bare", inner.clone()),
+        (
+            "box",
+            Node::Box {
+                id: None,
+                dir: Dir::Vertical,
+                spacing: 0,
+                scroll: false,
+                classes: vec![],
+                children: vec![inner.clone()],
+            },
+        ),
+        (
+            "row",
+            Node::Row {
+                id: None,
+                classes: vec![],
+                children: vec![inner.clone()],
+            },
+        ),
+        (
+            "list-box",
+            Node::ListBox {
+                id: None,
+                classes: vec![],
+                children: vec![inner.clone()],
+            },
+        ),
+        (
+            "button",
+            Node::Button {
+                id: "btn".into(),
+                classes: vec![],
+                child: Box::new(inner.clone()),
+            },
+        ),
+        (
+            "revealer",
+            Node::Revealer {
+                id: None,
+                open: true,
+                child: Box::new(inner.clone()),
+            },
+        ),
+        (
+            "expander-header",
+            Node::Expander {
+                id: "exp".into(),
+                header: Box::new(inner.clone()),
+                children: vec![],
+                expanded: true,
+                classes: vec![],
+            },
+        ),
+        (
+            "expander-child",
+            Node::Expander {
+                id: "exp".into(),
+                header: Box::new(Node::Spacer),
+                children: vec![inner],
+                expanded: true,
+                classes: vec![],
+            },
+        ),
+    ]
+}
+
+/// A tree carrying `poison` in **every** float it has — a `Progress` and a
+/// `Slider` under each container, a poisoned preem child, and the float-less,
+/// child-less variants for good measure. Every non-float field is legal, so a
+/// failure below can only be about floats.
+fn tree_with_every_float_poisoned(poison: f64) -> Node {
+    let mut children: Vec<Node> = containers_burying(poisoned_progress("prog", poison))
+        .into_iter()
+        .chain(containers_burying(poisoned_slider("slide", poison)))
+        .map(|(_, node)| node)
+        .collect();
+    children.push(Node::Preem {
+        id: Some("led".into()),
+        classes: vec![],
+        widget: Box::new(poisoned_led_strip(poison)),
+    });
+    // The float-less, child-less variants, so the walker's inert arms are
+    // exercised by every test below rather than only by the ones looking for
+    // them.
+    children.extend([
+        Node::Label {
+            id: None,
+            text: "hi".into(),
+            classes: vec![],
+        },
+        Node::Text {
+            id: None,
+            text: "hi".into(),
+            max_width_chars: None,
+            ellipsize: false,
+            classes: vec![],
+        },
+        Node::Icon {
+            id: None,
+            name: "weather-clear-symbolic".into(),
+            classes: vec![],
+        },
+        Node::Pixels {
+            id: None,
+            width: 1,
+            height: 1,
+            data: vec![0, 0, 0, 0],
+            scale: 1,
+            classes: vec![],
+        },
+        Node::Separator { classes: vec![] },
+        Node::Spacer,
+        Node::Entry {
+            id: "entry".into(),
+            text: String::new(),
+            placeholder: String::new(),
+            classes: vec![],
+        },
+    ]);
+    Node::Box {
+        id: Some("root".into()),
+        dir: Dir::Vertical,
+        spacing: 6,
+        scroll: false,
+        classes: vec![],
+        children,
+    }
+}
+
+/// Exact float equality by bit pattern — stricter than `==` (which would let a
+/// `-0.0` → `0.0` rewrite pass) and lint-clean, unlike a bare float compare.
+#[track_caller]
+fn assert_f64_bits(got: f64, want: f64, what: &str) {
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "{what}: got {got}, want {want}"
+    );
+}
+
+#[track_caller]
+fn assert_finite_in(value: f64, lo: f64, hi: f64, what: &str) {
+    assert!(value.is_finite(), "{what} is not finite: {value}");
+    assert!(
+        value >= lo && value <= hi,
+        "{what} = {value}, want {lo}..={hi}"
+    );
+}
+
+/// Invariant (a) for the `f64`s this vocabulary owns: recurse the tree and
+/// check every `Progress`/`Slider` float against its documented bounds. A
+/// `Preem` child's `f32`s have their own invariant, their own mapping and their
+/// own tests (`tests/preem.rs`); the delegation to them is pinned separately
+/// below.
+#[track_caller]
+fn assert_node_floats_are_sane(node: &Node) {
+    match node {
+        Node::Progress { fraction, .. } => assert_finite_in(*fraction, 0.0, 1.0, "fraction"),
+        Node::Slider {
+            min,
+            max,
+            value,
+            step,
+            ..
+        } => {
+            assert!(min.is_finite() && max.is_finite(), "range {min}..={max}");
+            assert!(max > min, "degenerate range {min}..={max}");
+            assert!(
+                (max - min).is_finite(),
+                "range span overflows: {min}..={max}"
+            );
+            assert_finite_in(*value, *min, *max, "value");
+            assert!(
+                step.is_finite() && *step > 0.0,
+                "step is not finite and positive: {step}"
+            );
+            assert!(
+                *step <= max - min,
+                "step {step} is wider than the span {}",
+                max - min
+            );
+        }
+        Node::Box { children, .. }
+        | Node::Row { children, .. }
+        | Node::ListBox { children, .. } => {
+            for child in children {
+                assert_node_floats_are_sane(child);
+            }
+        }
+        Node::Button { child, .. } | Node::Revealer { child, .. } => {
+            assert_node_floats_are_sane(child);
+        }
+        Node::Expander {
+            header, children, ..
+        } => {
+            assert_node_floats_are_sane(header);
+            for child in children {
+                assert_node_floats_are_sane(child);
+            }
+        }
+        Node::Label { .. }
+        | Node::Text { .. }
+        | Node::Icon { .. }
+        | Node::Pixels { .. }
+        | Node::Separator { .. }
+        | Node::Spacer
+        | Node::Entry { .. }
+        | Node::Preem { .. } => {}
+    }
+}
+
+/// Every `f64` in a tree, as bit patterns, in walk order — for the identity
+/// check below, which wants *exact* comparison rather than `==`.
+fn node_float_bits(node: &Node) -> Vec<u64> {
+    match node {
+        Node::Progress { fraction, .. } => vec![fraction.to_bits()],
+        Node::Slider {
+            min,
+            max,
+            value,
+            step,
+            ..
+        } => vec![
+            min.to_bits(),
+            max.to_bits(),
+            value.to_bits(),
+            step.to_bits(),
+        ],
+        Node::Box { children, .. }
+        | Node::Row { children, .. }
+        | Node::ListBox { children, .. } => children.iter().flat_map(node_float_bits).collect(),
+        Node::Button { child, .. } | Node::Revealer { child, .. } => node_float_bits(child),
+        Node::Expander {
+            header, children, ..
+        } => node_float_bits(header)
+            .into_iter()
+            .chain(children.iter().flat_map(node_float_bits))
+            .collect(),
+        Node::Label { .. }
+        | Node::Text { .. }
+        | Node::Icon { .. }
+        | Node::Pixels { .. }
+        | Node::Separator { .. }
+        | Node::Spacer
+        | Node::Entry { .. }
+        | Node::Preem { .. } => Vec::new(),
+    }
+}
+
+/// The probe is real: an **unclamped** tree carrying a `NaN` is not equal to
+/// itself, which is exactly the defect the clamp exists to close. Without this,
+/// a clamp that silently did nothing could still pass the equality tests below
+/// on a tree that never carried a `NaN`.
+#[test]
+fn an_unclamped_nan_node_is_not_equal_to_itself() {
+    let tree = tree_with_every_float_poisoned(f64::NAN);
+    assert_ne!(
+        tree.clone(),
+        tree,
+        "the poison probe reached no float at all"
+    );
+    let progress = poisoned_progress("prog", f64::NAN);
+    assert_ne!(
+        progress.clone(),
+        progress,
+        "Progress carries no NaN — the probe missed its field"
+    );
+    let slider = poisoned_slider("slide", f64::NAN);
+    assert_ne!(
+        slider.clone(),
+        slider,
+        "Slider carries no NaN — the probe missed its fields"
+    );
+}
+
+/// Invariant (a): after clamping, every float of every node is finite and
+/// inside its bounds — even when the input carried a `NaN` or an infinity in
+/// *every* float field it has.
+#[test]
+fn poisoned_node_floats_are_finite_and_in_range_after_clamping() {
+    for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_node_floats_are_sane(&tree_with_every_float_poisoned(poison).clamped());
+    }
+}
+
+/// The walk is total: a poisoned node buried in **any** container comes back
+/// sanitised, so a forgotten recursion arm fails here (naming the container)
+/// rather than passing because a sibling happened to be visited.
+#[test]
+fn the_clamp_reaches_a_node_buried_in_every_container() {
+    for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for inner in [
+            poisoned_progress("prog", poison),
+            poisoned_slider("slide", poison),
+        ] {
+            for (label, node) in containers_burying(inner.clone()) {
+                let clamped = node.clone().clamped();
+                assert_eq!(
+                    clamped.clone(),
+                    node.clamped(),
+                    "a poisoned node under a {label} is not equal to itself after clamping"
+                );
+                assert_node_floats_are_sane(&clamped);
+            }
+        }
+    }
+}
+
+/// Invariant (b): a clamped tree compares equal to itself, however poisoned the
+/// input was. This is the property both ends' render dedup rests on — the SDK's
+/// `view != last_view` and the host reconciler's node diff.
+#[test]
+fn a_clamped_node_compares_equal_to_itself() {
+    for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let tree = tree_with_every_float_poisoned(poison);
+        assert_eq!(
+            tree.clone().clamped(),
+            tree.clamped(),
+            "a clamped tree does not compare equal to itself"
+        );
+    }
+}
+
+/// Invariant (c): clamping is a **fixpoint**, so a host that clamps a tree the
+/// SDK already clamped must not see it move — or the equality gates would fire
+/// on the second pass instead of the first.
+#[test]
+fn clamping_a_node_is_a_fixpoint_even_when_poisoned() {
+    for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let once = tree_with_every_float_poisoned(poison).clamped();
+        assert_eq!(
+            once.clone().clamped(),
+            once,
+            "clamping twice is not the same as clamping once"
+        );
+    }
+}
+
+/// Invariant (d): the sanitiser must not perturb valid input. Bit-exact, which
+/// is stricter than `==` — the latter would let a `-0.0` → `0.0` rewrite
+/// through.
+#[test]
+fn clamping_a_legal_node_is_bit_identical() {
+    let tree = sample_tree();
+    let clamped = tree.clone().clamped();
+    assert_eq!(
+        node_float_bits(&clamped),
+        node_float_bits(&tree),
+        "a legal tree's floats moved"
+    );
+    assert_eq!(clamped, tree, "a legal tree was mutated by clamped()");
+    // …and a legal preem child, whose floats this walker delegates rather than
+    // owns (`tests/preem.rs` pins the bit-identity of those).
+    let preem = Node::Preem {
+        id: Some("led".into()),
+        classes: vec![],
+        widget: Box::new(PreemWidget::LedStrip {
+            config: LedStripConfig::default(),
+            state: LedStripState {
+                level: 0.5,
+                peak: Some(0.75),
+            },
+        }),
+    };
+    assert_eq!(
+        preem.clone().clamped(),
+        preem,
+        "a legal preem child was mutated"
+    );
+}
+
+/// The `Progress::fraction` row of the mapping table: `±inf` saturates exactly
+/// as `GtkProgressBar`'s own `CLAMP` does (`gtkprogressbar.c:781`), a finite
+/// out-of-range fraction clamps the same way, and `NaN` — the one input that
+/// `CLAMP` passes straight through, leaving GTK to multiply it into an `int`
+/// allocation — takes the empty bar.
+#[test]
+fn non_finite_progress_fractions_map_to_their_documented_replacements() {
+    assert_f64_bits(sane_fraction(f64::NAN), 0.0, "NaN fraction");
+    assert_f64_bits(sane_fraction(f64::INFINITY), 1.0, "+inf fraction");
+    assert_f64_bits(sane_fraction(f64::NEG_INFINITY), 0.0, "-inf fraction");
+    assert_f64_bits(sane_fraction(2.5), 1.0, "over-range fraction");
+    assert_f64_bits(sane_fraction(-2.5), 0.0, "under-range fraction");
+    assert_f64_bits(sane_fraction(0.42), 0.42, "a legal fraction");
+    // …and through the node seam, not only the free function.
+    let Node::Progress { fraction, .. } = poisoned_progress("prog", f64::NAN).clamped() else {
+        panic!("clamping changed the variant")
+    };
+    assert_f64_bits(fraction, 0.0, "NaN fraction through Node::clamped");
+}
+
+/// The `Slider::value` and `Slider::step` rows, against a legal **non-default**
+/// scale so a row that quietly fell back to the unit range would fail here
+/// rather than pass by coincidence.
+#[test]
+fn non_finite_slider_floats_map_to_their_documented_replacements() {
+    let (min, max) = (-20.0_f64, 40.0_f64);
+    let span = max - min;
+    for (poison, want) in [
+        (f64::NAN, min),
+        (f64::INFINITY, max),
+        (f64::NEG_INFINITY, min),
+    ] {
+        let sane = sane_slider_floats(min, max, poison, 1.0);
+        assert_f64_bits(sane.min, min, "min beside a poisoned value");
+        assert_f64_bits(sane.max, max, "max beside a poisoned value");
+        assert_f64_bits(sane.value, want, "value");
+        assert_f64_bits(sane.step, 1.0, "step beside a poisoned value");
+    }
+    // A finite out-of-range value clamps to the end — parity with
+    // `gtk_adjustment_sanitize_value` (`gtkadjustment.c:365`-`:372`).
+    assert_f64_bits(
+        sane_slider_floats(min, max, 100.0, 1.0).value,
+        max,
+        "over-range value",
+    );
+    assert_f64_bits(
+        sane_slider_floats(min, max, -100.0, 1.0).value,
+        min,
+        "under-range value",
+    );
+    // Every unusable step takes the documented fraction of the span — the
+    // non-finite ones GTK refuses, and the non-positive ones it accepts but
+    // which leave the arrow keys dead (`0.0`) or inverted (`< 0.0`).
+    let want_step = span * DEFAULT_SLIDER_STEP_FRACTION;
+    for bad in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -0.0,
+        -1.0,
+        -1e300,
+    ] {
+        assert_f64_bits(
+            sane_slider_floats(min, max, 0.0, bad).step,
+            want_step,
+            "fallback step",
+        );
+    }
+    // …a legal one is untouched, and one wider than the span caps to it.
+    assert_f64_bits(
+        sane_slider_floats(min, max, 0.0, 2.5).step,
+        2.5,
+        "a legal step",
+    );
+    assert_f64_bits(
+        sane_slider_floats(min, max, 0.0, 1e9).step,
+        span,
+        "an over-wide step",
+    );
+    // …and through the node seam, not only the free function.
+    let Node::Slider {
+        min: got_min,
+        max: got_max,
+        value,
+        step,
+        ..
+    } = poisoned_slider("slide", f64::NAN).clamped()
+    else {
+        panic!("clamping changed the variant")
+    };
+    assert_f64_bits(got_min, DEFAULT_SLIDER_MIN, "min through Node::clamped");
+    assert_f64_bits(got_max, DEFAULT_SLIDER_MAX, "max through Node::clamped");
+    assert_f64_bits(value, DEFAULT_SLIDER_MIN, "value through Node::clamped");
+    assert_f64_bits(
+        step,
+        (DEFAULT_SLIDER_MAX - DEFAULT_SLIDER_MIN) * DEFAULT_SLIDER_STEP_FRACTION,
+        "step through Node::clamped",
+    );
+}
+
+/// The `Slider::min`/`max` row: every degenerate shape falls back to the unit
+/// scale, **both ends as a unit**, and an inverted range is never silently
+/// swapped.
+#[test]
+fn a_degenerate_slider_range_falls_back_to_the_unit_scale() {
+    let degenerate = [
+        ("NaN min", f64::NAN, 1.0),
+        ("NaN max", 0.0, f64::NAN),
+        ("+inf max", 0.0, f64::INFINITY),
+        ("-inf min", f64::NEG_INFINITY, 1.0),
+        ("both infinite", f64::NEG_INFINITY, f64::INFINITY),
+        ("inverted", 10.0, 5.0),
+        ("empty", 5.0, 5.0),
+        ("overflowing span", -f64::MAX, f64::MAX),
+    ];
+    for (what, min, max) in degenerate {
+        let sane = sane_slider_floats(min, max, 0.7, 0.05);
+        assert_f64_bits(sane.min, DEFAULT_SLIDER_MIN, &format!("{what}: min"));
+        assert_f64_bits(sane.max, DEFAULT_SLIDER_MAX, &format!("{what}: max"));
+        // The range is replaced as a unit; the value and the step survive here
+        // only because both are legal against the fallback scale.
+        assert_f64_bits(sane.value, 0.7, &format!("{what}: value"));
+        assert_f64_bits(sane.step, 0.05, &format!("{what}: step"));
+    }
+    // Never swapped: `10.0..=5.0` does not become `5.0..=10.0`, so a plugin's
+    // transposed arguments cannot turn into a working-but-backwards slider.
+    let inverted = sane_slider_floats(10.0, 5.0, 7.0, 1.0);
+    assert_f64_bits(inverted.min, DEFAULT_SLIDER_MIN, "an inverted range's min");
+    assert_f64_bits(inverted.max, DEFAULT_SLIDER_MAX, "an inverted range's max");
+    assert_f64_bits(
+        inverted.value,
+        DEFAULT_SLIDER_MAX,
+        "a value above the fallback scale clamps to its top",
+    );
+    // A legal range — including a negative one — is left exactly alone.
+    assert_eq!(
+        sane_slider_floats(-20.0, 40.0, 0.0, 1.0),
+        SliderFloats {
+            min: -20.0,
+            max: 40.0,
+            value: 0.0,
+            step: 1.0,
+        },
+        "a legal range moved"
+    );
+}
+
+/// The `step` bound holds for every combination, including the subnormal spans
+/// where one percent of the span underflows to zero.
+#[test]
+fn a_sanitised_step_is_always_positive_finite_and_within_the_span() {
+    let ranges = [
+        (0.0, 1.0),
+        (-20.0, 40.0),
+        (f64::NAN, 1.0),
+        (10.0, 5.0),
+        (0.0, f64::MIN_POSITIVE),
+        // The smallest subnormal span: `span * 0.01` rounds to zero here.
+        (0.0, f64::from_bits(1)),
+        (-f64::MAX, f64::MAX),
+    ];
+    let steps = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -1.0,
+        1e300,
+        f64::MIN_POSITIVE,
+        0.5,
+    ];
+    for (min, max) in ranges {
+        for step in steps {
+            let sane = sane_slider_floats(min, max, 0.0, step);
+            assert!(
+                sane.step.is_finite() && sane.step > 0.0,
+                "{min}..={max} step {step} gave a non-positive/non-finite {}",
+                sane.step
+            );
+            assert!(
+                sane.step <= sane.max - sane.min,
+                "{min}..={max} step {step} gave {} beyond the span {}",
+                sane.step,
+                sane.max - sane.min
+            );
+        }
+    }
+}
+
+/// The `Preem` arm delegates rather than reimplements: the node clamp's answer
+/// for a preem child is **exactly** `PreemWidget::clamped`'s, so the two
+/// mappings cannot drift.
+#[test]
+fn the_node_clamp_delegates_a_preem_child_to_the_widget_clamp() {
+    for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let widget = poisoned_led_strip(poison);
+        let node = Node::Preem {
+            id: Some("led".into()),
+            classes: vec![],
+            widget: Box::new(widget.clone()),
+        };
+        let Node::Preem {
+            widget: clamped, ..
+        } = node.clamped()
+        else {
+            panic!("clamping changed the variant")
+        };
+        assert_eq!(
+            *clamped,
+            widget.clamped(),
+            "the node clamp is not the widget clamp"
+        );
+    }
+}
+
+/// Wire compatibility: sanitisation happens **after** decode, never inside
+/// serde. `NaN` and `±inf` are legal `MessagePack` floats, so a poisoned frame
+/// must still decode — and decode must hand the poison through untouched, or
+/// the decoder would be silently rewriting the wire.
+#[test]
+fn a_poisoned_node_round_trips_unsanitised_and_the_clamp_fixes_it_after_decode() {
+    let tree = Node::Box {
+        id: None,
+        dir: Dir::Horizontal,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            poisoned_progress("prog", f64::NAN),
+            poisoned_slider("slide", f64::INFINITY),
+        ],
+    };
+    let frame = PluginMsg::Render {
+        tree,
+        panel: None,
+        effects: vec![],
+    };
+    let back: PluginMsg = decode(&encode(&frame)).expect("a poisoned frame still decodes");
+    let PluginMsg::Render { tree: decoded, .. } = back else {
+        panic!("not a Render")
+    };
+    let Node::Box { children, .. } = &decoded else {
+        panic!("not a Box")
+    };
+    let Node::Progress { fraction, .. } = &children[0] else {
+        panic!("not a Progress")
+    };
+    assert!(
+        fraction.is_nan(),
+        "decode must not sanitise — that is the clamp's job, after decode"
+    );
+    let Node::Slider { min, .. } = &children[1] else {
+        panic!("not a Slider")
+    };
+    assert!(
+        min.is_infinite(),
+        "decode must not sanitise — that is the clamp's job, after decode"
+    );
+    // …and the clamp, applied after decode, is what makes it harmless.
+    assert_node_floats_are_sane(&decoded.clamped());
 }

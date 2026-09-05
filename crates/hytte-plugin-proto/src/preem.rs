@@ -65,12 +65,14 @@
 //! re-tints every preem widget on screen with zero plugin involvement and zero
 //! frames on the wire.
 //!
-//! There is exactly one way to put a resolved color on the wire —
-//! [`StyleRef::ink`], the explicit pin — and taking it costs precisely that
-//! payoff: a pinned widget keeps its ink while the desktop re-tints around it.
-//! It is ink-only (the skin still owns field, ghost, bloom and the CRT pass) and
-//! it is the exception, for a color that *is* the meaning and that no role
-//! names.
+//! Resolved colors do reach the wire, through three optional pins —
+//! [`StyleRef::ink`], [`StyleRef::field`] and (`TextBox` only)
+//! [`TextBoxConfig::notdef`] — and taking any of them costs precisely that
+//! payoff: a pinned slot keeps its color while the desktop re-tints around it.
+//! Everything a pin does not name stays the skin's (the ghost, the bloom and the
+//! CRT pass have no pin at all), and they are the exception, for a color that
+//! *is* the meaning and that no role names — a plugin whose widget has to match
+//! a hand-drawn face beside it (#884's `pet` and `caw` bubbles).
 //!
 //! # Compat contract
 //!
@@ -463,7 +465,8 @@ impl StyleName {
 /// byte travels for symmetry with `HostMsg::Accent`; a preem frame is a
 /// *screen*, so the kit draws ink opaque either way.)
 ///
-/// Reaching for one is the exception, not the path — see [`StyleRef::ink`].
+/// Reaching for one is the exception, not the path — see [`StyleRef::ink`] and
+/// [`StyleRef::field`].
 pub type Rgba = [u8; 4];
 
 /// A **semantic** ink role, resolved shell-side against the live theme.
@@ -497,12 +500,13 @@ pub enum AccentRole {
 }
 
 /// How a preem widget asks to be skinned: a [`StyleName`], a semantic
-/// [`AccentRole`], and — the escape hatch — an explicit [`ink`](Self::ink).
+/// [`AccentRole`], and — the escape hatch — an explicit palette pin
+/// ([`ink`](Self::ink) and/or [`field`](Self::field)).
 ///
 /// The first two are the path (#885): the shell resolves the role against the
 /// live theme on every render, so changing the desktop accent re-tints every
-/// widget on screen with no wire traffic and no plugin restart. The third pins
-/// one widget's ink and **opts it out of that**.
+/// widget on screen with no wire traffic and no plugin restart. The pins name
+/// one widget's colors outright and **opt it out of that**.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StyleRef {
@@ -526,13 +530,19 @@ pub struct StyleRef {
     /// for [`AccentRole`] for everything else, including anything that means
     /// "good", "warn" or "broken".
     ///
-    /// # Ink only
+    /// # The lit ink, and only that
     ///
-    /// It replaces the accent-tinted part — the lit ink — and nothing else. The
-    /// skin still supplies the field, the ghost, the bloom and the CRT pass, so
-    /// a pinned widget still reads as the same device. (Widening this to a whole
-    /// palette override is a deliberate non-goal here; the skin *is* the
-    /// vocabulary for the panel's physical character.)
+    /// It replaces the accent-tinted part — the lit ink — and nothing else.
+    /// [`field`](Self::field) is the separate pin for the panel's background;
+    /// the ghost, the bloom and the CRT pass have no pin at all and stay the
+    /// skin's, so even a fully pinned widget still reads as the same device.
+    ///
+    /// (An earlier revision of this doc called widening the override past the
+    /// ink a deliberate non-goal. Annika settled the opposite on #885 — "should
+    /// still be possible to override with rgb(a)" — once #884 measured the two
+    /// consumers that need it: the `pet` and `caw` speech bubbles set a field, an
+    /// ink *and* a notdef, so an ink-only pin left both stranded on the raster
+    /// escape hatch. `field` and [`TextBoxConfig::notdef`] are that widening.)
     ///
     /// # Pin a color that does not move
     ///
@@ -547,17 +557,45 @@ pub struct StyleRef {
     /// once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ink: Option<Rgba>,
+    /// An explicit **field** — the panel background every widget floods before
+    /// it draws — overriding the skin's own. `None`, the default and what a
+    /// frame omitting the key decodes to, leaves the skin in charge.
+    ///
+    /// # The same discouraged path [`ink`](Self::ink) is, for the same reason
+    ///
+    /// Pinning the field opts the widget out of the live re-tint exactly as
+    /// pinning the ink does, and it is a bigger opt-out: the field is most of
+    /// the widget's area. Reach for it when the color *is* the meaning and the
+    /// widget has to match something the skins cannot express — the `pet` and
+    /// `caw` speech bubbles, whose lilac has to match a hand-drawn face beside
+    /// it. Everything else wants a [`StyleName`].
+    ///
+    /// # Field only
+    ///
+    /// It replaces the flooded background and nothing else. The ghost, the
+    /// bloom and the CRT pass stay the skin's, so a pinned widget keeps the
+    /// panel's physical character; the ink is [`ink`](Self::ink)'s slot, and
+    /// a [`TextBox`](PreemWidget::TextBox)'s third color is
+    /// [`TextBoxConfig::notdef`].
+    ///
+    /// # Pin a color that does not move
+    ///
+    /// Config, like [`ink`](Self::ink) — see that field's note. *Changing* a pin
+    /// rebuilds the shell's renderer and loses the animation state it owned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<Rgba>,
 }
 
 impl StyleRef {
-    /// A style reference with no accent role and no pinned ink — the host's
-    /// default ink for the skin.
+    /// A style reference with no accent role and nothing pinned — the host's
+    /// default palette for the skin.
     #[must_use]
     pub fn new(style: StyleName) -> Self {
         Self {
             style,
             accent: None,
             ink: None,
+            field: None,
         }
     }
 
@@ -574,6 +612,14 @@ impl StyleRef {
     #[must_use]
     pub fn with_ink(mut self, ink: Rgba) -> Self {
         self.ink = Some(ink);
+        self
+    }
+
+    /// The same skin with an explicit **field** pinned, opting the widget out of
+    /// the live re-tint — see [`field`](Self::field) before reaching for it.
+    #[must_use]
+    pub fn with_field(mut self, field: Rgba) -> Self {
+        self.field = Some(field);
         self
     }
 }
@@ -645,11 +691,12 @@ impl Default for TextBoxWidth {
 
 /// **Config** for [`PreemWidget::TextBox`] — a change rebuilds the renderer.
 ///
-/// Mirrors the kit's `TextBox` builder, minus its `colors()` escape hatch: an
-/// explicit RGBA palette becomes a semantic [`StyleRef::accent`] here, so a live
-/// re-tint reaches this widget like every other — or, where a color really is
-/// the meaning, a one-color pin through [`StyleRef::ink`]. Defaults match the
-/// kit's.
+/// Mirrors the kit's `TextBox` builder, including — since #885's palette
+/// widening — every color its `colors()` escape hatch sets: the field and the
+/// ink through [`StyleRef::field`] / [`StyleRef::ink`], and this box's third
+/// color through [`notdef`](Self::notdef). Stating none of them is the path: a
+/// semantic [`StyleRef::accent`] lets a live re-tint reach this widget like
+/// every other. Defaults match the kit's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TextBoxConfig {
@@ -677,6 +724,25 @@ pub struct TextBoxConfig {
     /// `true` renders the full wrap width even for short text, so the box never
     /// resizes with the message; `false` (the default) hugs the longest line.
     pub fixed_width: bool,
+    /// An explicit color for the hollow `.notdef` box an *uncovered* char draws
+    /// (an emoji, say). `None` — the default, and what a frame omitting the key
+    /// decodes to — leaves it to the skin, which is the ghost color where the
+    /// skin has one and a dim mix of field and ink where it does not.
+    ///
+    /// # Why this is not on [`StyleRef`]
+    ///
+    /// It is a **`TextBox`-only** slot. No other kit widget draws a notdef box,
+    /// and the kit's own palette has no such entry — `TextBox::styled` derives
+    /// it. Putting it in the shared style reference would add a key that seven
+    /// of the eight widgets could never honor; putting it here says exactly
+    /// where it applies.
+    ///
+    /// Same pinning rules as [`StyleRef::ink`]: stating it opts this color out
+    /// of the live re-tint, and it is config, so *changing* it rebuilds the
+    /// renderer. Reach for it only when the whole palette is pinned — the `pet`
+    /// and `caw` bubbles, whose notdef has to sit inside a hand-picked lilac.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notdef: Option<Rgba>,
 }
 
 impl Default for TextBoxConfig {
@@ -689,6 +755,7 @@ impl Default for TextBoxConfig {
             corner: 2,
             scale: 1,
             fixed_width: false,
+            notdef: None,
         }
     }
 }
@@ -1294,9 +1361,10 @@ impl PreemWidget {
     ///
     /// [`StyleRef`] is the one config field with nothing to enforce: a
     /// [`StyleName`] and an [`AccentRole`] are closed enums, and an
-    /// [`ink`](StyleRef::ink) is four `u8`s where every bit pattern is already a
-    /// color. It passes through untouched, and cannot make `clamped(w)` differ
-    /// from `clamped(w)`.
+    /// [`ink`](StyleRef::ink) or [`field`](StyleRef::field) is four `u8`s where
+    /// every bit pattern is already a color. It passes through untouched, and
+    /// cannot make `clamped(w)` differ from `clamped(w)`. The same holds for
+    /// [`TextBoxConfig::notdef`], for the same reason.
     ///
     /// It also **sanitises every float**, config and state alike: after this
     /// runs, every `f32` a renderer can reach is finite and inside its

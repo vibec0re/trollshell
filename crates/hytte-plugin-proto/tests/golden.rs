@@ -571,6 +571,7 @@ fn preem_tree() -> Node {
                         corner: 3,
                         scale: 2,
                         fixed_width: true,
+                        notdef: None,
                     },
                     state: TextBoxState {
                         text: "mrrp!".into(),

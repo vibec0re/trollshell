@@ -82,10 +82,12 @@
 //!   resampling-free by design: curvature reads as a vignette rather than a
 //!   barrel warp, so the fixed-grid discipline below survives it intact.
 //!
-//! The **ink** each skin lights up with is the one part of a palette a host may
-//! move: [`set_accent`] answers it once per process (what a plugin gets), and
-//! [`with_ink`] answers it per render (what a shell drawing many plugins'
-//! widgets needs, #885). Field, ghost, bloom and the CRT pass are the panel's
+//! The **ink** each skin lights up with is the part of a palette a host moves
+//! routinely: [`set_accent`] answers it once per process (what a plugin gets),
+//! and [`with_ink`] answers it per render (what a shell drawing many plugins'
+//! widgets needs, #885). [`with_pins`] widens that scope by one slot — the
+//! **field** — for the case #884 measured, a widget whose ground has to match
+//! something hand-drawn beside it. Ghost, bloom and the CRT pass are the panel's
 //! physical character and are never overridden — that is what keeps a re-tinted
 //! widget still reading as the same device.
 //!
@@ -156,9 +158,12 @@ pub use textbox::TextBox;
 /// is simply on the far side of a crate boundary now.
 pub use style::set_accent;
 
-/// Scope one render to an explicit ink (#885) — host-facing like
+/// Scope one render to an explicit palette (#885) — host-facing like
 /// [`set_accent`], and the *per-render* answer where that one is the
 /// *per-process* answer. A shell rasterising many plugins' widgets in one
-/// process resolves each widget's own semantic role (or its pinned color)
+/// process resolves each widget's own semantic role (or its pinned colors)
 /// around the call that draws it; a plugin never touches either.
-pub use style::{Ink, with_ink};
+///
+/// [`with_pins`] names the ink and, optionally, the field; [`with_ink`] is the
+/// one-slot form, kept because most callers pin exactly one color.
+pub use style::{Ink, Pins, with_ink, with_pins};

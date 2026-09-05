@@ -82,6 +82,7 @@ fn all_widgets() -> Vec<PreemWidget> {
                 corner: 3,
                 scale: 2,
                 fixed_width: true,
+                notdef: None,
             },
             state: TextBoxState {
                 text: "mrrp! the cat has opinions".into(),
@@ -414,8 +415,9 @@ fn wire_defaults_match_the_documented_kit_values() {
             corner: 2,
             scale: 1,
             fixed_width: false,
+            notdef: None,
         },
-        "textbox.rs:55-67"
+        "textbox.rs:55-67 (`notdef` unset = the skin's, #885's palette widening)"
     );
     assert_eq!(
         LedStripConfig::default(),
@@ -693,6 +695,292 @@ fn clamping_leaves_a_pinned_ink_untouched_and_stays_reflexive() {
                 widget.kind()
             );
         }
+    }
+}
+
+// ── the palette widening: field + notdef (#885, for #884's two bubbles) ──────
+//
+// The three claims below mirror the three above, one field at a time. #912
+// shipped `StyleRef::ink` as an ink-only pin and documented widening it as a
+// non-goal; #884 then measured the only two plugins that need a pin at all (the
+// `pet` and `caw` speech bubbles) and found each sets a field, an ink *and* a
+// notdef, so ink alone stranded both on the raster escape hatch. Annika settled
+// the widening on #885. Same wire *field list*, two more optional keys, no
+// vocabulary bump — and the same three things have to hold for each of them.
+
+/// Pin `field` into a widget's style reference, whatever variant it is — the
+/// field twin of [`pin_ink`].
+fn pin_field(widget: &mut PreemWidget, field: hytte_plugin_proto::preem::Rgba) {
+    let style = match widget {
+        PreemWidget::DotMatrix { config, .. } => &mut config.style,
+        PreemWidget::SevenSeg { config, .. } => &mut config.style,
+        PreemWidget::TextBox { config, .. } => &mut config.style,
+        PreemWidget::LedStrip { config, .. } => &mut config.style,
+        PreemWidget::Marquee { config, .. } => &mut config.style,
+        PreemWidget::Scope { config, .. } => &mut config.style,
+        PreemWidget::Gauge { config, .. } => &mut config.style,
+        PreemWidget::FlipBoard { config, .. } => &mut config.style,
+    };
+    style.field = Some(field);
+}
+
+/// A frame written by a peer that predates [`StyleRef::field`] — the key simply
+/// absent — decodes with no field pin, so it renders on the skin's own ground
+/// exactly as it did before the key existed.
+///
+/// The pre-change shape here carries `ink`, unlike [`PreInkStyleRef`]: this is
+/// the encoder as `a9dc9d4` (#912) shipped it, so what the test measures is
+/// *this* change's compatibility rather than the previous one's all over again.
+///
+/// **Falsified** by giving `field` a `#[serde(default = …)]` that returns a
+/// color: the decode then invents a ground nobody asked for and both assertions
+/// go red.
+#[test]
+fn a_style_ref_written_before_the_field_key_decodes_unpinned() {
+    let violet = [0x9b, 0x59, 0xb6, 0xff];
+    for (pre, want) in [
+        (
+            PreFieldStyleRef {
+                style: StyleName::Lcd,
+                accent: Some(AccentRole::Warning),
+                ink: None,
+            },
+            StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Warning),
+        ),
+        (
+            PreFieldStyleRef {
+                style: StyleName::Vfd,
+                accent: None,
+                ink: Some(violet),
+            },
+            StyleRef::new(StyleName::Vfd).with_ink(violet),
+        ),
+    ] {
+        let bytes = rmp_serde::to_vec_named(&pre).expect("the pre-widening shape encodes");
+        let back = decode_body::<StyleRef>(&bytes).expect("a pre-widening style ref still decodes");
+        assert_eq!(back, want);
+        assert_eq!(back.field, None, "an absent key is not a pin");
+    }
+}
+
+/// The same, for the `TextBox`-only [`TextBoxConfig::notdef`] slot: a config map
+/// written without the key decodes with the notdef left to the skin, and every
+/// other knob intact.
+///
+/// **Falsified** by giving `notdef` a `#[serde(default = …)]` that returns a
+/// color.
+#[test]
+fn a_text_box_config_written_before_the_notdef_key_decodes_unset() {
+    let pre = PreNotdefTextBoxConfig {
+        style: StyleRef::new(StyleName::Oled).with_accent(AccentRole::Accent),
+        width: TextBoxWidth::FitPx(268),
+        max_lines: 4,
+        pad: 4,
+        corner: 3,
+        scale: 2,
+        fixed_width: true,
+    };
+    let bytes = rmp_serde::to_vec_named(&pre).expect("the pre-widening shape encodes");
+    let back = decode_body::<TextBoxConfig>(&bytes).expect("a pre-widening config still decodes");
+    assert_eq!(back.notdef, None, "an absent key is not a pin");
+    assert_eq!(
+        back,
+        TextBoxConfig {
+            style: StyleRef::new(StyleName::Oled).with_accent(AccentRole::Accent),
+            width: TextBoxWidth::FitPx(268),
+            max_lines: 4,
+            pad: 4,
+            corner: 3,
+            scale: 2,
+            fixed_width: true,
+            notdef: None,
+        },
+        "…and nothing else moved",
+    );
+}
+
+/// Neither new key reaches the wire unless it is set, so a plugin built against
+/// the pre-widening proto and a shell built against this one exchange identical
+/// frames — the other half of "compatible addition", and the reason
+/// `golden_bytes_are_pinned` was not regenerated for this change.
+///
+/// Anchored on the encoded *keys* (`\xa5field`, `\xa6notdef`) rather than on a
+/// loose substring, for the reason
+/// [`an_unpinned_style_ref_is_byte_identical_to_the_pre_change_form`] gives
+/// about `ink`: a state string containing "battlefield" must not trip it. Each
+/// scan carries its own positive control, so an anchor that matches nothing
+/// cannot pass for the wrong reason.
+///
+/// **Falsified** by dropping `skip_serializing_if` from either new field: the
+/// unpinned form starts writing an explicit `nil` and the matching absence scan
+/// goes red (as does `golden_bytes_are_pinned`).
+#[test]
+fn an_unpinned_palette_adds_no_key_to_the_wire() {
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+
+    let field_key: &[u8] = b"\xa5field";
+    let notdef_key: &[u8] = b"\xa6notdef";
+    let carries =
+        |widget: &PreemWidget, key: &[u8]| encode(widget).windows(key.len()).any(|w| w == key);
+
+    for widget in all_widgets() {
+        assert!(
+            !carries(&widget, field_key),
+            "{}'s unpinned encoding must not carry a `field` key",
+            widget.kind()
+        );
+        let mut pinned = widget.clone();
+        pin_field(&mut pinned, lilac);
+        assert!(
+            carries(&pinned, field_key),
+            "{}'s field-pinned encoding must carry exactly that key, or the check above is blind",
+            widget.kind()
+        );
+
+        // `notdef` is a TextBox-only slot, so its absence has to hold on every
+        // widget while the positive control exists on exactly one of them.
+        assert!(
+            !carries(&widget, notdef_key),
+            "{}'s unpinned encoding must not carry a `notdef` key",
+            widget.kind()
+        );
+    }
+
+    let notdef_pinned = PreemWidget::TextBox {
+        config: TextBoxConfig {
+            notdef: Some(lilac),
+            ..TextBoxConfig::default()
+        },
+        state: TextBoxState::default(),
+    };
+    assert!(
+        carries(&notdef_pinned, notdef_key),
+        "a notdef-pinned TextBox must carry exactly that key, or the checks above are blind",
+    );
+
+    // And the whole-struct byte claim, against the encoder #912 shipped.
+    for now in [
+        StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Warning),
+        StyleRef::new(StyleName::Vfd),
+        StyleRef::new(StyleName::Crt).with_ink(lilac),
+    ] {
+        let before = PreFieldStyleRef {
+            style: now.style,
+            accent: now.accent,
+            ink: now.ink,
+        };
+        assert_eq!(
+            encode_body(&now),
+            rmp_serde::to_vec_named(&before).expect("the pre-widening shape encodes"),
+            "an unpinned-field {now:?} must not add a byte to the wire"
+        );
+    }
+}
+
+/// The pins do travel, survive the codec, and reach the far side as the exact
+/// colors that were set — the claim `pet`'s and `caw`'s migration rests on, and
+/// the one an ink-only override could not make.
+///
+/// The values are the two bubbles' real ones (`3a2250` field, `6c4e86` notdef —
+/// byte-identical between them, which is why one shape carries both).
+#[test]
+fn a_pinned_palette_travels_on_the_wire() {
+    let field = [0x3a, 0x22, 0x50, 0xff];
+    let ink = [0xf0, 0xe0, 0xf8, 0xff];
+    let notdef = [0x6c, 0x4e, 0x86, 0xff];
+
+    for widget in all_widgets() {
+        let mut pinned = widget.clone();
+        pin_field(&mut pinned, field);
+        pin_ink(&mut pinned, ink);
+        assert_ne!(pinned, widget, "pinning changed the widget");
+
+        let back = decode::<PreemWidget>(&encode(&pinned)).expect("a pinned widget decodes");
+        assert_eq!(back, pinned, "{} did not round-trip pinned", widget.kind());
+        assert_eq!(
+            (back.style().field, back.style().ink),
+            (Some(field), Some(ink)),
+            "{} lost a pinned color",
+            widget.kind()
+        );
+    }
+
+    // The third slot lives on the one widget that has it.
+    let boxed = PreemWidget::TextBox {
+        config: TextBoxConfig {
+            style: StyleRef::new(StyleName::Lcd)
+                .with_field(field)
+                .with_ink(ink),
+            notdef: Some(notdef),
+            ..TextBoxConfig::default()
+        },
+        state: TextBoxState {
+            text: "mrrp!".into(),
+        },
+    };
+    let back = decode::<PreemWidget>(&encode(&boxed)).expect("a fully pinned TextBox decodes");
+    assert_eq!(back, boxed, "the whole palette round-trips");
+    let PreemWidget::TextBox { config, .. } = back else {
+        panic!("variant changed")
+    };
+    assert_eq!(
+        config.notdef,
+        Some(notdef),
+        "the notdef reached the far side"
+    );
+}
+
+/// [`PreemWidget::clamped`] has nothing to enforce on either new pin, for
+/// exactly the reason it has nothing to enforce on `ink`: four `u8`s are four
+/// `u8`s. So both survive clamping byte for byte and reflexivity still holds.
+///
+/// **Falsified** by having `clamp_in_place` clear or normalize `style.field` or
+/// the `TextBox` arm's `config.notdef`.
+#[test]
+fn clamping_leaves_a_pinned_palette_untouched_and_stays_reflexive() {
+    for color in [
+        [0x3a, 0x22, 0x50, 0xff],
+        [0x00, 0x00, 0x00, 0x00],
+        [0xff, 0xff, 0xff, 0xff],
+    ] {
+        for widget in all_widgets() {
+            let mut pinned = widget.clone();
+            pin_field(&mut pinned, color);
+            let clamped = pinned.clone().clamped();
+            assert_eq!(
+                clamped.style().field,
+                Some(color),
+                "{}: clamping is not allowed to touch a field pin",
+                widget.kind()
+            );
+            assert_eq!(
+                clamped,
+                pinned.clamped(),
+                "{}: clamped(w) == clamped(w) with a field pin present",
+                widget.kind()
+            );
+        }
+
+        let boxed = PreemWidget::TextBox {
+            config: TextBoxConfig {
+                notdef: Some(color),
+                // Over-cap knobs beside it, so the clamp definitely *ran* on
+                // this widget rather than passing it through untouched.
+                max_lines: u32::MAX,
+                ..TextBoxConfig::default()
+            },
+            state: TextBoxState::default(),
+        }
+        .clamped();
+        let PreemWidget::TextBox { config, .. } = boxed else {
+            panic!("clamped() must not change the variant")
+        };
+        assert_eq!(
+            config.notdef,
+            Some(color),
+            "clamping is not allowed to touch a notdef pin"
+        );
+        assert!(config.max_lines < u32::MAX, "…but it did clamp this widget");
     }
 }
 
@@ -2191,6 +2479,31 @@ struct PreInkStyleRef {
     style: StyleName,
     #[serde(skip_serializing_if = "Option::is_none")]
     accent: Option<AccentRole>,
+}
+
+/// A [`StyleRef`] as `a9dc9d4` (#912) encoded it — after the `ink` pin, before
+/// #885's palette widening added `field`. Same deliberate copy of the shipped
+/// field list and attributes, one revision later, so the widening's compat
+/// claim is measured against the encoder it actually has to interoperate with.
+#[derive(Debug, serde::Serialize)]
+struct PreFieldStyleRef {
+    style: StyleName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accent: Option<AccentRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ink: Option<hytte_plugin_proto::preem::Rgba>,
+}
+
+/// A [`TextBoxConfig`] as it was encoded before `notdef` existed.
+#[derive(Debug, serde::Serialize)]
+struct PreNotdefTextBoxConfig {
+    style: StyleRef,
+    width: TextBoxWidth,
+    max_lines: u32,
+    pad: u32,
+    corner: u32,
+    scale: u32,
+    fixed_width: bool,
 }
 
 #[derive(serde::Serialize)]

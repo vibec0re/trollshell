@@ -141,6 +141,22 @@ impl TextBox {
         self
     }
 
+    /// Just the `.notdef` box color, leaving the field and the ink as they are.
+    ///
+    /// The third of [`colors`](Self::colors)'s three slots, split out because
+    /// it is the one a *host* has to be able to set on its own: the field and
+    /// the ink reach a [`styled`](Self::styled) box through the per-render
+    /// palette scope (`style::with_pins`, #885), which every kit widget reads,
+    /// but no kit palette carries a notdef — [`styled`](Self::styled) derives it
+    /// from the ghost. A wire pin for this box's third color
+    /// (`hytte_plugin_proto::preem::TextBoxConfig::notdef`) therefore lands
+    /// here, after the palette, rather than in the scope.
+    #[must_use]
+    pub fn notdef(mut self, notdef: Rgba) -> Self {
+        self.notdef = notdef;
+        self
+    }
+
     /// Render `text` into a fresh [`Frame`]. Valid for **every** input —
     /// the empty string, uncovered chars, overlong words — the buffer
     /// always satisfies the host's `len == w * h * 4` invariant.

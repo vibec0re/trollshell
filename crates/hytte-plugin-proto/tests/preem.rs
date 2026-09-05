@@ -1710,13 +1710,24 @@ fn non_finite_flip_timings_drop_to_none() {
     assert_bits(config.stagger_secs.expect("kept"), 0.0, "stagger_secs");
 }
 
-/// The structural half of the parity rule: for every field the kit guards with
-/// `is_finite` — the scope's samples and the gauge's three spring knobs — the
-/// three non-finite inputs must map to the **same** value, because the kit
-/// cannot tell them apart (it keeps the current value for all three). A future
-/// edit that "helpfully" saturates the infinities on one of these fields breaks
-/// raster/state parity, and breaks here.
+/// The structural half of the parity rule: for **every** field the mapping
+/// table on [`PreemWidget::clamp_in_place`] marks "guarded" — the scope's
+/// samples, the gauge's three spring knobs, `GaugeRange`'s two ends, and
+/// `FlipBoardConfig`'s two optional timings — the three non-finite inputs
+/// must map to the **same** value, because the kit cannot tell them apart (a
+/// guard is stateful keep-previous, which a stateless clamp reproduces with
+/// one constant for all three poisons; see the table for what that constant
+/// is per field). A future edit that "helpfully" saturates the infinities on
+/// one of these fields breaks raster/state parity, and breaks here.
+///
+/// [`GaugeState::target`] is the documented exception — the one guarded field
+/// the table says diverges (it draws `range.low` for `NaN`/`-inf` and
+/// `range.high` for `+inf`, rather than one constant for all three) — and is
+/// deliberately **not** enumerated here; see
+/// `non_finite_gauge_floats_map_to_their_documented_replacements` for that
+/// row's own coverage.
 #[test]
+#[allow(clippy::too_many_lines)] // four fields' worth of poison enumeration, not complexity
 fn kit_guarded_fields_treat_every_non_finite_input_alike() {
     let poisons = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
 
@@ -1768,6 +1779,77 @@ fn kit_guarded_fields_treat_every_non_finite_input_alike() {
     assert_eq!(
         knobs[0], default_knobs,
         "gauge knobs must keep the defaults"
+    );
+
+    // `FlipBoardConfig::duration_secs` / `stagger_secs`: the table's row for
+    // both says `None` for every one of the three poisons — the mechanism's
+    // own default, which is what this vocabulary spells as `None`.
+    let flip_timings: Vec<[Option<u32>; 2]> = poisons
+        .iter()
+        .map(|poison| {
+            let clamped = PreemWidget::FlipBoard {
+                config: FlipBoardConfig {
+                    duration_secs: Some(*poison),
+                    stagger_secs: Some(*poison),
+                    ..FlipBoardConfig::default()
+                },
+                state: FlipBoardState::default(),
+            }
+            .clamped();
+            let PreemWidget::FlipBoard { config, .. } = clamped else {
+                panic!("variant changed")
+            };
+            [
+                config.duration_secs.map(f32::to_bits),
+                config.stagger_secs.map(f32::to_bits),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        flip_timings[0], flip_timings[1],
+        "flip board timings: NaN and +inf must agree"
+    );
+    assert_eq!(
+        flip_timings[0], flip_timings[2],
+        "flip board timings: NaN and -inf must agree"
+    );
+    assert_eq!(
+        flip_timings[0],
+        [None, None],
+        "flip board timings must drop to None, matching the mapping table"
+    );
+
+    // `GaugeRange::low` / `high`: the table says a non-finite end replaces the
+    // *whole* range with `GaugeRange::default()` (`0.0..=1.0`) as a unit, for
+    // all three poisons alike — driven through `low` here, with `high` held at
+    // a value the default does not already share, so a pass-through low would
+    // show up as a range that isn't `0.0..=1.0`.
+    let ranges: Vec<[u32; 2]> = poisons
+        .iter()
+        .map(|poison| {
+            let clamped = PreemWidget::Gauge {
+                config: GaugeConfig {
+                    range: GaugeRange {
+                        low: *poison,
+                        high: 40.0,
+                    },
+                    ..GaugeConfig::default()
+                },
+                state: GaugeState::default(),
+            }
+            .clamped();
+            let PreemWidget::Gauge { config, .. } = clamped else {
+                panic!("variant changed")
+            };
+            [config.range.low.to_bits(), config.range.high.to_bits()]
+        })
+        .collect();
+    assert_eq!(ranges[0], ranges[1], "gauge range: NaN and +inf must agree");
+    assert_eq!(ranges[0], ranges[2], "gauge range: NaN and -inf must agree");
+    assert_eq!(
+        ranges[0],
+        [0.0_f32.to_bits(), 1.0_f32.to_bits()],
+        "a non-finite range end must fall back to the default 0.0..=1.0 scale, as a unit"
     );
 }
 

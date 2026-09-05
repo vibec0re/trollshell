@@ -830,9 +830,16 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             classes,
         } => {
             // Build via an explicit `Adjustment` (not `Scale::with_range`, which
-            // asserts `min < max` and `step != 0`) so an ill-formed plugin range
-            // can never trip a GTK critical / NULL return. `page_size = 0`: a
-            // scale is a point selector, so the whole `min..=max` is reachable.
+            // asserts `min < max` and `step != 0` itself) — but that swap alone
+            // does not make an ill-formed range safe: `gtk_adjustment_new` carries
+            // its own `g_return_val_if_fail (lower + page_size <= upper, NULL)`
+            // (gtkadjustment.c:395), and the #910 review reproduced the resulting
+            // `!ptr.is_null()` panic on main for both `max < min` and `NaN`. What
+            // actually holds here is the wire seam: `wire_map`'s `Slider` arm runs
+            // `wire::sane_slider_floats` (#904) before a `Node` ever reaches
+            // `build_node`, so by the time this call is made `min <= max` and every
+            // float is finite. `page_size = 0`: a scale is a point selector, so the
+            // whole `min..=max` is reachable.
             let adj = gtk::Adjustment::new(*value, *min, *max, *step, *step, 0.0);
             let scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&adj));
             scale.set_draw_value(false);

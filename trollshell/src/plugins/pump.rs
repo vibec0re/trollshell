@@ -330,13 +330,18 @@ pub(super) fn install_preem_clock() {
 ///
 /// A nudge is not free downstream, and it is not free for the *other* plugins in
 /// the region either. `Reconciler::render` has no descriptor-equality
-/// short-circuit and `hytte-ui`'s `PixelSurface::set_pixels` unconditionally
-/// builds a fresh `glib::Bytes` + `gdk::MemoryTexture` and `queue_draw`s — there
-/// is no comparison against the previous buffer anywhere on that path. So
-/// nudging every bar mailbox because *something somewhere* animated would
-/// re-upload a texture for every `Pixels` node of every plugin chip on every
-/// monitor at 20 Hz, legacy self-rasterising plugins included. At the wire's
-/// buffer cap that is hundreds of MB/s of memcpy for one animating widget.
+/// short-circuit, so every `Pixels` node in a re-mapped mailbox reaches
+/// `hytte-ui`'s `PixelSurface::set_pixels` on every nudge. Since #907
+/// `set_pixels` itself compares against the last accepted frame and skips the
+/// `glib::Bytes` + `gdk::MemoryTexture` + `queue_draw` when the bytes are
+/// unchanged, but that guard is per-surface and per-call — it does not stop the
+/// call from happening, only its GTK cost when nothing moved. This per-scope
+/// targeting is the guard that stops the call from happening at all: without
+/// it, nudging every bar mailbox because *something somewhere* animated would
+/// still walk and compare a full frame for every `Pixels` node of every plugin
+/// chip on every monitor at 20 Hz, legacy self-rasterising plugins included —
+/// cheaper than an unconditional re-upload, but not free at the wire's buffer
+/// cap and instance count.
 ///
 /// [`preem_render::advance_all`] therefore names the scopes that moved, and a
 /// mailbox is nudged only when it actually carries one of their plugins.
@@ -548,3 +553,15 @@ fn publish_visibility(visible: bool) {
             });
     });
 }
+
+// ── #906 item 1: `request_preem_repaint` end-to-end, not just its predicate ──
+
+/// Colocated with this module (via `#[path]`, so the file sits beside
+/// `pump.rs` as `pump_tests.rs` rather than under a `pump/` subdirectory —
+/// the default resolution for a `mod` declared from a non-`mod.rs` file)
+/// rather than folded into `super::tests`: [`request_preem_repaint`] is
+/// private to this module, and `super::tests` is a different builder's lane
+/// while #906 is split across two PRs.
+#[cfg(test)]
+#[path = "pump_tests.rs"]
+mod pump_tests;

@@ -6,7 +6,7 @@ use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentDecision, DatasourceError, DatasourceOutcome, Dir,
     Effect, EffectOutcome, EventKind, HostMsg, LogLevel, MAX_FRAME_LEN, Manifest, MediaAction,
     Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, ProtoError, ProvidedDatasource,
-    StateKey, StateSnapshot, VOCAB, decode, decode_body, encode, encode_body,
+    StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -15,7 +15,8 @@ fn sample_manifest() -> Manifest {
     Manifest {
         id: "vibectl".into(),
         proto: PROTO_VERSION,
-        vocab: VOCAB,
+        vocab: VOCAB_UNCONDITIONAL,
+        vocab_max: Some(VOCAB),
         subscribes: vec![StateKey::Clock],
         capabilities: vec![Capability::OpenPage, Capability::RunCommand],
         mount: Mount::SidebarTop,
@@ -1168,11 +1169,13 @@ fn forward_compat_extra_field_is_skipped() {
     };
 
     let decoded: Manifest = decode_body(&encode_body(&future)).expect("skip extra field");
-    // Its map also predates `vocab`, so that field defaults to generation 0.
+    // Its map also predates `vocab` and `vocab_max`, so those default to
+    // generation 0 and "does not negotiate" respectively.
     assert_eq!(
         decoded,
         Manifest {
             vocab: 0,
+            vocab_max: None,
             ..sample_manifest()
         }
     );
@@ -1210,14 +1213,16 @@ fn manifest_without_order_decodes_old_plugin_compat() {
         "absent order stays off the wire"
     );
     let decoded: Manifest = decode_body(&body).expect("decode old field-less manifest");
-    // The same old map also predates `vocab`, which defaults to generation 0.
+    // The same old map also predates `vocab` and `vocab_max`, which default to
+    // generation 0 and "does not negotiate".
     assert_eq!(
         decoded,
         Manifest {
             vocab: 0,
+            vocab_max: None,
             ..sample_manifest()
         },
-        "order defaults to None and vocab to generation 0",
+        "order defaults to None, vocab to generation 0, vocab_max to non-negotiating",
     );
     assert_eq!(decoded.order, None);
 }
@@ -1270,12 +1275,28 @@ fn manifest_without_vocab_decodes_to_generation_zero() {
 
 #[test]
 fn manifest_vocab_is_stamped_and_rides_the_wire() {
-    // `Manifest::new` stamps the build's VOCAB automatically, like `proto` — a
-    // plugin author never sets it. Unlike `order`/`provides` it carries no
-    // `skip_serializing_if`, so it is always on the wire (a host can always read
-    // the generation a plugin declares). A non-zero value round-trips intact.
+    // `Manifest::new` stamps the vocabulary generations automatically, like
+    // `proto` — a plugin author never sets them. Unlike `order`/`provides`,
+    // `vocab` carries no `skip_serializing_if`, so it is always on the wire (a
+    // host can always read the generation a plugin declares). A non-zero value
+    // round-trips intact.
+    //
+    // Since #882 the stamped `vocab` is `VOCAB_UNCONDITIONAL`, **not** `VOCAB`:
+    // it is the generation the plugin may emit with no host advertisement, and
+    // it is what an older host exact-checks. The census `VOCAB` goes in
+    // `vocab_max`, which is the negotiated ceiling — see `VOCAB_UNCONDITIONAL`'s
+    // docs for why collapsing the two would make every rebuilt plugin fail an
+    // older shell's `check_vocab` instead of degrading to `Node::Pixels`.
     let m = Manifest::new("caw", Mount::SidebarTop);
-    assert_eq!(m.vocab, VOCAB, "new() stamps the current VOCAB");
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "new() stamps the unconditional generation"
+    );
+    assert_eq!(
+        m.vocab_max,
+        Some(VOCAB),
+        "new() stamps the negotiated ceiling"
+    );
     assert!(
         contains(&encode_body(&m), b"vocab"),
         "vocab is always serialized (no skip_serializing_if)",

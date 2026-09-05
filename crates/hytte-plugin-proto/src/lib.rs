@@ -113,11 +113,32 @@
 //! `HostMsg` push — is already covered by the #305 opt-in, but bumping [`VOCAB`]
 //! for it too keeps the counter a faithful census of the whole vocabulary and
 //! costs nothing.)
+//!
+//! ### A *negotiated* variant degrades instead of being refused (#882)
+//!
+//! Refusal is the right answer for a variant a plugin emits on sight, because
+//! the host has no other way to stop it. It is the wrong answer when the plugin
+//! is willing to ask first. #882's preem vocabulary is the first of those: the
+//! host advertises its own generation in [`HostMsg::Hello`](msg::HostMsg::Hello)
+//! (sent only to a plugin that declared a
+//! [`vocab_max`](manifest::Manifest::vocab_max), which is the #305 opt-in), and
+//! the plugin emits [`Node::Preem`](wire::Node::Preem) only if that
+//! advertisement reached [`PREEM_VOCAB`](preem::PREEM_VOCAB) — otherwise it
+//! CPU-rasterises to [`Node::Pixels`](wire::Node::Pixels), exactly as it did
+//! before. An old host therefore *cannot* receive the variant it can't decode,
+//! so refusing the handshake would only break a plugin that was already safe.
+//!
+//! That is why there are two counters. [`VOCAB`] stays the census and is bumped
+//! for every appended variant; [`VOCAB_UNCONDITIONAL`] is the subset a plugin
+//! may emit unprompted, is what [`Manifest::new`](manifest::Manifest::new)
+//! stamps, and is what a host exact-checks. See [`VOCAB_UNCONDITIONAL`] for
+//! which of the two a new variant bumps.
 
 pub mod codec;
 pub mod effect;
 pub mod manifest;
 pub mod msg;
+pub mod preem;
 pub mod state;
 pub mod topology;
 pub mod wire;
@@ -141,10 +162,43 @@ pub const PROTO_VERSION: u16 = 1;
 /// **Bump this by 1 whenever you append a wire variant** — a [`Node`](wire::Node),
 /// [`EventKind`](wire::EventKind), [`Effect`](effect::Effect),
 /// [`StateKey`](manifest::StateKey), or [`HostMsg`](msg::HostMsg) case. The counter
-/// starts at `1` (this PR); generation `0` is reserved for an older, pre-`vocab`
+/// started at `1`; generation `0` is reserved for an older, pre-`vocab`
 /// manifest, which decodes to `0` (`#[serde(default)]`) and so always clears a
 /// host's check — a pre-counter plugin is treated as the oldest generation.
-pub const VOCAB: u16 = 1;
+///
+/// Generation `2` is #882's preem vocabulary
+/// ([`Node::Preem`](wire::Node::Preem) + [`HostMsg::Hello`](msg::HostMsg::Hello)),
+/// which is **negotiated** — see [`VOCAB_UNCONDITIONAL`].
+pub const VOCAB: u16 = 2;
+
+/// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
+/// **without the host first advertising support** (#882).
+///
+/// [`VOCAB`] is a faithful census of the whole vocabulary; this is the subset a
+/// plugin can use on sight, and it is what
+/// [`Manifest::new`](manifest::Manifest::new) stamps into
+/// [`Manifest::vocab`](manifest::Manifest::vocab) — the number an older host
+/// exact-checks at the handshake.
+///
+/// The two diverge because #882 added a *negotiated* generation. A plugin emits
+/// [`Node::Preem`](wire::Node::Preem) only after the host advertised
+/// [`PREEM_VOCAB`](preem::PREEM_VOCAB) in [`HostMsg::Hello`](msg::HostMsg::Hello),
+/// so an old host — which never advertises — can never receive one, and the
+/// #437 crash-loop hazard the counter exists to catch cannot occur. Declaring
+/// generation 2 as unconditional would therefore buy no safety and cost the
+/// whole compat story: every plugin rebuilt on the new SDK would be *refused* by
+/// an older shell instead of quietly falling back to
+/// [`Node::Pixels`](wire::Node::Pixels).
+///
+/// **The rule for a new variant:**
+///
+/// - Always bump [`VOCAB`] (the census).
+/// - Bump this **too** only if a plugin may emit the variant with no
+///   advertisement. If it is gated behind a `Hello` generation check, leave this
+///   alone — and give the feature its own generation marker const (as
+///   [`PREEM_VOCAB`](preem::PREEM_VOCAB) does) so both ends compare against one
+///   number.
+pub const VOCAB_UNCONDITIONAL: u16 = 1;
 
 pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_body};
 pub use effect::{
@@ -153,6 +207,15 @@ pub use effect::{
 };
 pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};
+pub use preem::{
+    AccentRole, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig,
+    GaugeRange, GaugeState, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS, MAX_CORNER,
+    MAX_DIVISIONS, MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PAD, MAX_RASTER_PIXELS,
+    MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SUBDIVISIONS, MAX_TEXT_COLS, MAX_TEXT_LEN,
+    MAX_TEXT_LINES, MarqueeConfig, MarqueeState, Mechanism, PREEM_VOCAB, PeakHoldConfig,
+    PreemWidget, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef,
+    TextBoxConfig, TextBoxState, TextBoxWidth, preem, preem_id, preem_styled,
+};
 pub use state::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, SPECTRUM_BINS, StateSnapshot,
     UpcomingEvent,

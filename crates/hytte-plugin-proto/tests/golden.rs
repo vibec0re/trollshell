@@ -13,7 +13,8 @@
 //!
 //! - [`golden_bytes_are_pinned`] walks a table of representative messages
 //!   (a `Register` handshake, a `Render` carrying the full [`Node`]
-//!   vocabulary incl. [`Node::Pixels`], every [`Effect`] variant, every
+//!   vocabulary incl. [`Node::Pixels`], a second `Render` carrying every
+//!   [`PreemWidget`] (#882), every [`Effect`] variant, every
 //!   [`StateKey`]/[`Capability`], and the full [`HostMsg`] push set) and
 //!   checks, for each entry, that:
 //!   1. `encode()` of the current Rust value is byte-identical to the
@@ -41,11 +42,15 @@
 //! the wire break this suite exists to catch.
 
 use hytte_plugin_proto::{
-    AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision, DatasourceError,
-    DatasourceOutcome, Dir, Effect, EffectOutcome, EventKind, HostMsg, LogLevel, Manifest,
-    MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page, PluginMsg,
-    ProvidedDatasource, SPECTRUM_BINS, StateKey, StateSnapshot, UpcomingEvent, VOCAB, decode,
-    encode,
+    AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
+    DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState, Effect,
+    EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange, GaugeState,
+    HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState,
+    Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
+    PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
+    ScopeState, SevenSegConfig, SevenSegState, StateKey, StateSnapshot, StyleName, StyleRef,
+    TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL, decode,
+    encode, preem, preem_id, preem_styled,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -128,7 +133,11 @@ fn full_manifest() -> Manifest {
     Manifest {
         id: "vibectl".into(),
         proto: PROTO_VERSION,
-        vocab: VOCAB,
+        // The pair a real plugin declares since #882: the unconditional ceiling
+        // an older host exact-checks, plus the negotiated ceiling that opts it
+        // into `HostMsg::Hello`.
+        vocab: VOCAB_UNCONDITIONAL,
+        vocab_max: Some(VOCAB),
         subscribes: vec![
             StateKey::Clock,
             StateKey::SlotVisible,
@@ -506,7 +515,150 @@ fn host_msgs() -> Vec<HostMsg> {
         },
         HostMsg::Ping { seq: 1 },
         HostMsg::Shutdown,
+        // #882's vocabulary advertisement — the host half of the negotiation.
+        HostMsg::Hello { vocab: VOCAB },
     ]
+}
+
+/// A tree of **every** [`PreemWidget`] variant (#882), each with non-default
+/// config and state, wrapped in the [`Node::Preem`] nodes they ride in — the
+/// "preem vocabulary" entry.
+///
+/// Pinned separately from [`node_tree`] on purpose: keeping the pre-#882 render
+/// fixture byte-identical is itself part of the evidence that appending
+/// [`Node::Preem`] moved no existing encoding.
+// A flat data table of every variant; splitting it into helpers gains nothing.
+#[allow(clippy::too_many_lines)]
+fn preem_tree() -> Node {
+    Node::Box {
+        id: Some("preem-root".into()),
+        dir: Dir::Vertical,
+        spacing: 4,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            preem_id(
+                "dm",
+                PreemWidget::DotMatrix {
+                    config: DotMatrixConfig {
+                        style: StyleRef::new(StyleName::Vfd),
+                    },
+                    state: DotMatrixState {
+                        text: "12:34".into(),
+                    },
+                },
+            ),
+            preem_id(
+                "seg",
+                PreemWidget::SevenSeg {
+                    config: SevenSegConfig {
+                        style: StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Warning),
+                    },
+                    state: SevenSegState {
+                        text: "88.8".into(),
+                    },
+                },
+            ),
+            preem_styled(
+                "box",
+                vec!["ts-preem".into()],
+                PreemWidget::TextBox {
+                    config: TextBoxConfig {
+                        style: StyleRef::new(StyleName::Oled).with_accent(AccentRole::Accent),
+                        width: TextBoxWidth::FitPx(268),
+                        max_lines: 4,
+                        pad: 4,
+                        corner: 3,
+                        scale: 2,
+                        fixed_width: true,
+                    },
+                    state: TextBoxState {
+                        text: "mrrp!".into(),
+                    },
+                },
+            ),
+            preem_id(
+                "vu",
+                PreemWidget::LedStrip {
+                    config: LedStripConfig {
+                        style: StyleRef::new(StyleName::Crt),
+                        leds: 32,
+                        peak_hold: Some(PeakHoldConfig { rate: 0.02 }),
+                    },
+                    state: LedStripState {
+                        level: 0.62,
+                        peak: Some(0.9),
+                    },
+                },
+            ),
+            preem_id(
+                "ticker",
+                PreemWidget::Marquee {
+                    config: MarqueeConfig {
+                        style: StyleRef::new(StyleName::Vfd).with_accent(AccentRole::Neutral),
+                        window_px: 268,
+                        gap_dots: 8,
+                        speed_dots_per_sec: 24.5,
+                    },
+                    state: MarqueeState {
+                        text: "Roygbiv".into(),
+                    },
+                },
+            ),
+            preem_id(
+                "scope",
+                PreemWidget::Scope {
+                    config: ScopeConfig {
+                        style: StyleRef::new(StyleName::Crt),
+                        cols: 128,
+                        rows: 40,
+                        scale: 3,
+                        persistence: 200,
+                    },
+                    state: ScopeState {
+                        samples: vec![0.0, 0.5, -0.5, 1.0, -1.0],
+                    },
+                },
+            ),
+            preem_id(
+                "gauge",
+                PreemWidget::Gauge {
+                    config: GaugeConfig {
+                        style: StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Error),
+                        cols: 160,
+                        rows: 72,
+                        scale: 1,
+                        sweep_deg: 120.0,
+                        divisions: 6,
+                        subdivisions: 4,
+                        range: GaugeRange {
+                            low: -20.0,
+                            high: 40.0,
+                        },
+                        frequency_hz: 3.5,
+                        damping: 0.7,
+                    },
+                    state: GaugeState { target: 21.5 },
+                },
+            ),
+            // The anonymous constructor, and the `None` config options, both
+            // exercised once.
+            preem(PreemWidget::FlipBoard {
+                config: FlipBoardConfig {
+                    style: StyleRef::new(StyleName::Oled),
+                    mechanism: Mechanism::Nixie,
+                    cells: 12,
+                    glyph_px: 4,
+                    scale: 1,
+                    duration_secs: None,
+                    stagger_secs: None,
+                },
+                state: FlipBoardState {
+                    text: "SPANDAU 12".into(),
+                },
+            }),
+        ],
+    }
 }
 
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
@@ -524,6 +676,14 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: node_tree(),
                 panel: Some(panel_tree()),
                 effects: effect_table(),
+            }),
+        ),
+        (
+            "plugin_render_preem_v1",
+            Box::new(PluginMsg::Render {
+                tree: preem_tree(),
+                panel: None,
+                effects: vec![],
             }),
         ),
         ("plugin_control_msgs_v1", Box::new(plugin_control_msgs())),

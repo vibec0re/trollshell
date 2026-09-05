@@ -14,6 +14,7 @@
 //! older host must be able to detect and refuse it at the handshake rather than
 //! silently failing to decode the render frame.
 
+use crate::preem::PreemWidget;
 use serde::{Deserialize, Serialize};
 
 /// Stable, plugin-meaningful node identity. Doubles as the diff key and the
@@ -396,5 +397,49 @@ pub enum Node {
         /// Greyed hint text shown while the entry is empty; `""` for none.
         placeholder: String,
         classes: Vec<Cls>,
+    },
+    /// A **preem retro-display widget** rendered shell-side from typed state
+    /// rather than shipped as pixels (#882, epic #881) — see the
+    /// [`preem`](crate::preem) module for the whole vocabulary, the
+    /// config-vs-state contract, and the animation-ownership rules.
+    ///
+    /// One wrapper variant carrying a [`PreemWidget`], not eight flat `Node`
+    /// variants: the preem vocabulary then versions as a single unit, the host
+    /// dispatches to its renderers from one arm here, and appending a ninth
+    /// widget never touches this enum again.
+    ///
+    /// `id` keys the node for diffing exactly as elsewhere — and it matters more
+    /// here than anywhere else in this enum: the host holds a *renderer
+    /// instance* per node (phosphor buffer, needle velocity, flip clocks,
+    /// scroll offset), and only a stably-identified node keeps the same
+    /// instance across renders. A positionally-matched preem node whose
+    /// siblings shift can be rebuilt, and a rebuild restarts the animation. Use
+    /// [`preem_id`](crate::preem::preem_id) rather than
+    /// [`preem`](crate::preem::preem) for anything that moves.
+    ///
+    /// **Negotiated, not unconditional.** Unlike every other variant here, a
+    /// plugin must not emit this one on sight: it emits it only once the host
+    /// has advertised [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB) or better in
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello), and rasterises to
+    /// [`Pixels`](Node::Pixels) otherwise. That is what makes a preem-capable
+    /// plugin work unchanged against a shell that has never heard of preem
+    /// nodes — see the [`preem` module docs](crate::preem#compat-contract) for
+    /// the full compat matrix.
+    ///
+    /// Additive: a brand-new name-tagged variant, so every existing frame
+    /// decodes unchanged and [`PROTO_VERSION`](crate::PROTO_VERSION) stays put.
+    /// It does grow the vocabulary, so it bumps [`VOCAB`](crate::VOCAB) — but
+    /// **not** [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL), because the
+    /// negotiation above means an old host can never receive it.
+    /// `widget` is boxed so one preem node — [`Gauge`](crate::preem::PreemWidget::Gauge)
+    /// alone carries eleven scalars — doesn't set the size of *every* [`Node`],
+    /// including the `Label`s and `Row`s a tree is mostly made of. `Box<T>`
+    /// serializes transparently as `T`, so the boxing is invisible on the wire
+    /// (pinned by the `plugin_render_preem_v1` golden fixture, which did not
+    /// move when it was introduced).
+    Preem {
+        id: Option<NodeId>,
+        classes: Vec<Cls>,
+        widget: Box<PreemWidget>,
     },
 }

@@ -314,6 +314,11 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             // hand-rolled (non-Rust-SDK) client harder to write for no safety
             // gained.
 
+            // `id` is the reconciliation key for the renderer instance (and
+            // #900 makes it the contract, not an optimisation), but a missing
+            // one is handled *there*, not here: `map_widget` warns once per
+            // scope and falls back to a positional key, so a hand-rolled plugin
+            // degrades rather than losing the widget.
             preem_render::map_widget(scope, id.as_deref(), classes, &widget)
         }
     }

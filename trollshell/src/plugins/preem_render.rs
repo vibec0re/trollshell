@@ -37,24 +37,35 @@
 //! one needle. [`Scope`] is that namespace — the plugin id plus the tree role —
 //! and it is also the unit [`forget_scope`] drops on teardown.
 //!
-//! Within a scope the key is the node's `id` when it has one. A node **without**
-//! an id is keyed by its **ordinal among the un-id'd preem nodes** of that tree,
-//! in traversal order (the tradeoff React's index keys make).
+//! Within a scope the key is the node's **`id`, and the id is the contract**
+//! (#900): a preem node is required to carry one, because the animation state
+//! this module owns is exactly the state a frame cannot re-derive, so the id is
+//! the only thing that can tie an instance to the node it belongs to. The SDK's
+//! `display` wrappers stamp it from the widget key they already take
+//! (`display::gauge::node("cpu")` → `id: Some("cpu")`), so every bundled plugin
+//! and every `display`-based plugin satisfies it for free.
 //!
-//! That key is stable only while those nodes keep their order and their count.
-//! **Insert or remove an anonymous sibling and the ones after it shift down a
-//! slot**, inheriting the animation state of the node that used to hold it: two
-//! interchangeable gauges have identical configs by construction, so
-//! [`same_config`] agrees, the survivor is *updated in place*, and it renders
-//! the removed node's needle before springing to its own target. For a `Scope`
-//! a whole phosphor history moves onto another signal. A variable-length list of
-//! anonymous widgets — per-core gauges, per-sink strips — glitches on every
-//! insert and remove.
+//! An anonymous node is a **fallback, not a supported shape**. It is keyed by
+//! its **ordinal among the un-id'd preem nodes** of that tree, in traversal
+//! order (the tradeoff React's index keys make), and [`map_widget`] logs one
+//! `warn` per scope the first time it sees one. It falls back rather than
+//! refusing to draw so a hand-rolled (non-Rust-SDK) plugin degrades to the
+//! pre-#900 behaviour instead of losing the widget.
 //!
-//! Giving an animated widget an id (`preem_id`) avoids all of it, and is what
-//! the SDK emits, which is why nothing shows on glass today. The real fix is a
-//! structural key (the parent chain's child indices) that survives a sibling
-//! insert; it is tracked as a follow-up rather than done here.
+//! What that fallback costs, and why the warning exists: the ordinal is stable
+//! only while those nodes keep their order and their count. **Insert or remove
+//! an anonymous sibling and the ones after it shift down a slot**, inheriting
+//! the animation state of the node that used to hold it — two interchangeable
+//! gauges have identical configs by construction, so [`same_config`] agrees, the
+//! survivor is *updated in place*, and it renders the removed node's needle
+//! before springing to its own target. For a `Scope` a whole phosphor history
+//! moves onto another signal. A variable-length list of anonymous widgets —
+//! per-core gauges, per-sink strips — glitches on every insert and remove.
+//!
+//! A structural key (the parent chain's child indices) would narrow that, but it
+//! would still be positional and it would still transplant across a *reorder*;
+//! #900 settled the policy at "require the id" instead, which makes the failure
+//! diagnosable (one journal line naming the plugin) rather than silent.
 //!
 //! ## Idempotence — the multi-monitor requirement
 //!
@@ -207,6 +218,20 @@ fn scope_settle_steps(persistence: u16) -> u32 {
 /// instead of once per node per frame (the #895 pattern — at 20 Hz with eight
 /// nodes that would be 160 identical journal lines a second).
 static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// How many "preem node without an id" warnings [`map_widget`] has emitted
+/// (#900).
+///
+/// The assertion seam for "warns **once per scope**, not once per frame". This
+/// crate has no `tracing` subscriber harness — nothing in `plugins/tests.rs`
+/// installs a collector — so the tests count the emissions at the emitting call
+/// site rather than capturing the event; the counter is bumped inside the one
+/// `if` that logs, immediately beside the `warn!`, so the two cannot drift.
+///
+/// Process-global, so a test reads it as a **delta** around the operation under
+/// test (every preem test already serialises on the ink lock).
+#[cfg(test)]
+static ANONYMOUS_WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Which of a plugin's two independent node trees a preem node came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -417,6 +442,19 @@ struct ScopeState {
     touched: HashSet<String>,
     /// Ordinal of the next un-id'd preem node in the in-flight pass.
     ordinal: usize,
+    /// Latch for the "preem node without an id" warning (#900), so a plugin
+    /// rendering an anonymous preem node logs **once for this scope** rather
+    /// than once per node per frame — at 20 Hz with four anonymous nodes that
+    /// would be eighty identical journal lines a second (the [`UNSUPPORTED_WARNED`]
+    /// pattern, per-scope rather than per-process because the message names the
+    /// plugin and every plugin deserves to hear about its own tree).
+    ///
+    /// Deliberately **not** reset by [`begin_pass`]: a pass is a frame, and this
+    /// must outlive frames. It dies with the [`ScopeState`], i.e. when the
+    /// plugin's tree stops holding any preem node at all ([`end_pass`]) or the
+    /// card/panel goes away ([`forget_scope`]) — which is the "once per plugin
+    /// session" the policy asks for.
+    anonymous_warned: bool,
 }
 
 thread_local! {
@@ -477,6 +515,12 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// chrome stays and a later valid frame updates the same surface in place (the
 /// posture the malformed-`Pixels` seam takes).
 ///
+/// **A node with no `id` warns once per scope and falls back to an ordinal key**
+/// (#900) — see the module docs for what that costs. The fallback is deliberate:
+/// `id` is required by contract, but refusing to draw would only make a
+/// hand-rolled client harder to write, so the node renders and the journal says
+/// why it may misbehave.
+///
 /// **Two preem nodes in one tree sharing an explicit `id` silently collapse onto
 /// one renderer instance**, applying both widgets to it every pass — two targets
 /// fighting one needle. The reconciler's own node keying has the same shape, so
@@ -488,11 +532,13 @@ pub(super) fn map_widget(
     classes: &[String],
     widget: &vocab::PreemWidget,
 ) -> UiNode {
-    let (width, height, data, supported) = STORE.with_borrow_mut(|store| {
+    let (width, height, data, supported, warn_anonymous) = STORE.with_borrow_mut(|store| {
         let state = store.entry(scope.clone()).or_default();
+        let mut warn_anonymous = false;
         let key = if let Some(id) = id {
             format!("id\u{1}{id}")
         } else {
+            warn_anonymous = !std::mem::replace(&mut state.anonymous_warned, true);
             let ordinal = state.ordinal;
             state.ordinal += 1;
             format!("#{ordinal}")
@@ -511,8 +557,23 @@ pub(super) fn map_widget(
         apply(instance, widget);
         let supported = instance.renderer.is_some();
         let (width, height, data) = instance.frame();
-        (width, height, data, supported)
+        (width, height, data, supported, warn_anonymous)
     });
+
+    // Outside the `STORE` borrow: a `tracing` subscriber is arbitrary code, and
+    // the table is thread-local and re-entered by every mapping pass.
+    if warn_anonymous {
+        #[cfg(test)]
+        ANONYMOUS_WARNINGS.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            kind = widget.kind(),
+            "preem node without an id — animation state cannot be tracked across reorders; \
+             the node falls back to a positional key and may inherit a sibling's phosphor, \
+             needle or flip clocks (further occurrences in this tree are silenced)",
+        );
+    }
 
     if !supported && !UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
@@ -612,11 +673,19 @@ impl Instance {
 /// The return type is a scope list rather than a `bool` because the fan-out is
 /// otherwise global: collapsing every instance into one flag made a single
 /// animating marquee in one plugin's drawer panel re-map every plugin's whole
-/// tree in every bar region on every monitor, 20× a second — and each
-/// `Node::Pixels` node on those trees re-uploads a GPU texture on the way
-/// through (`hytte-ui`'s `PixelSurface::set_pixels` has no data-equality
-/// short-circuit). Naming the movers lets `pump::request_preem_repaint` nudge
-/// only the mailboxes that actually hold one.
+/// tree in every bar region on every monitor, 20× a second.
+///
+/// **This is the second guard, not the only one.** Since #907 the surface holds
+/// the last accepted buffer and compares before it uploads (`hytte-ui`'s
+/// `PixelSurface::set_pixels`), so a blanket nudge no longer costs a
+/// `glib::Bytes` + `gdk::MemoryTexture` + `queue_draw` per unchanged
+/// `Node::Pixels` node it walks past. What a blanket nudge still costs is
+/// everything *upstream* of that compare — re-running `reconcile_region` over
+/// every plugin's whole tree, re-mapping every wire node, cloning each preem
+/// instance's cached RGBA frame out of the store on the way through
+/// ([`Instance::frame`]), and then the byte compare itself, per surface, per
+/// monitor, 20× a second. Naming the movers lets `pump::request_preem_repaint`
+/// nudge only the mailboxes that actually hold one and skip all of it.
 pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
     STORE.with_borrow_mut(|store| {
         let mut moved = Vec::new();
@@ -1471,6 +1540,13 @@ pub(super) fn probe(scope: &Scope, id: Option<&str>) -> Option<(u32, u32)> {
             .and_then(|state| state.instances.get(&key))
             .map(|instance| (instance.builds, instance.applies))
     })
+}
+
+/// How many "preem node without an id" warnings have been emitted so far
+/// ([`ANONYMOUS_WARNINGS`]). Read as a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn anonymous_warnings() -> u32 {
+    ANONYMOUS_WARNINGS.load(Ordering::Relaxed)
 }
 
 /// How many renderer instances `scope` holds — `0` once the scope itself has

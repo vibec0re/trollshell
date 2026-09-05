@@ -425,14 +425,36 @@ pub enum Node {
     /// dispatches to its renderers from one arm here, and appending a ninth
     /// widget never touches this enum again.
     ///
-    /// `id` keys the node for diffing exactly as elsewhere — and it matters more
-    /// here than anywhere else in this enum: the host holds a *renderer
-    /// instance* per node (phosphor buffer, needle velocity, flip clocks,
-    /// scroll offset), and only a stably-identified node keeps the same
-    /// instance across renders. A positionally-matched preem node whose
-    /// siblings shift can be rebuilt, and a rebuild restarts the animation. Use
+    /// # `id` is **required** on this variant (#900)
+    ///
+    /// Everywhere else in this enum an `id` is an optimisation: it keys the node
+    /// for diffing and reordering, and going without it costs at worst a widget
+    /// rebuilt where it could have been updated. Here it is the contract,
+    /// because the host holds a *renderer instance* per node — phosphor buffer,
+    /// needle velocity, flip clocks, scroll offset, held peak — and the id is
+    /// the only thing that ties an instance to the node it belongs to. State the
+    /// vocabulary deliberately keeps off the wire cannot be re-derived from a
+    /// frame, so a mis-keyed node does not merely restart: it inherits
+    /// **another widget's** animation.
+    ///
+    /// The type stays `Option` for wire compatibility (the field is optional in
+    /// every other variant and a hand-rolled client can omit it), so the host
+    /// degrades rather than refusing: an anonymous preem node is keyed by its
+    /// **ordinal among the un-id'd preem nodes** of that tree, the host logs one
+    /// warning per plugin session, and the node still renders. That fallback is
+    /// only stable while those nodes keep their order *and* their count —
+    /// inserting or removing an anonymous sibling shifts every later one down a
+    /// slot, and because interchangeable widgets have identical configs by
+    /// construction the host cannot tell the difference and updates the survivor
+    /// in place: the third gauge renders the second's needle, a phosphor history
+    /// moves onto another signal, a variable-length row of per-core meters
+    /// glitches on every insert.
+    ///
+    /// The Rust SDK's `display` wrappers stamp the id from the widget key they
+    /// already take (`display::gauge::node("cpu")`), so a plugin built on them
+    /// never reaches the fallback. A hand-rolled client should do the same. Use
     /// [`preem_id`](crate::preem::preem_id) rather than
-    /// [`preem`](crate::preem::preem) for anything that moves.
+    /// [`preem`](crate::preem::preem) when constructing a node by hand.
     ///
     /// **Negotiated, not unconditional.** Unlike every other variant here, a
     /// plugin must not emit this one on sight: it emits it only once the host
@@ -455,6 +477,10 @@ pub enum Node {
     /// (pinned by the `plugin_render_preem_v1` golden fixture, which did not
     /// move when it was introduced).
     Preem {
+        /// The reconciliation key — **required in practice**, `Option` only for
+        /// wire shape. See the variant docs: without it the host falls back to
+        /// an ordinal key, warns once per session, and animation state moves
+        /// between siblings on any insert or removal.
         id: Option<NodeId>,
         classes: Vec<Cls>,
         widget: Box<PreemWidget>,

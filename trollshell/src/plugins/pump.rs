@@ -260,7 +260,8 @@ pub(super) fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
 /// reconcile would run every animation at N× speed. This drives them once with
 /// the *real* elapsed time and then asks the affected reconcilers to re-map.
 ///
-/// It idles cheaply. [`preem_render::any_animating`] is a handful of enum
+/// Its per-tick *work* idles to nothing (the wakeup itself does not — see "The
+/// standing cost" below). [`preem_render::any_animating`] is a handful of enum
 /// matches, and with no preem widget on screen — the state of every session
 /// until a plugin built on the new SDK dials in — the callback does nothing but
 /// re-stamp its baseline.
@@ -277,6 +278,22 @@ pub(super) fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
 /// mid-swing rather than settled. What that costs is one 20 Hz timer callback
 /// while an animation is live but off-screen — the CPU-expensive half
 /// (rasterising, and the reconcile pass) is what the gate above actually stops.
+///
+/// ## The standing cost, stated plainly
+///
+/// The timer is armed once here and never breaks, so **every** session pays 20
+/// timer wakeups a second — including one with no plugins installed at all,
+/// where the callback finds an empty instance table and returns. The work per
+/// wakeup is negligible; the wakeup itself is not free on battery, and calling
+/// that "idles cheaply" would only be true of the CPU half.
+///
+/// Parking it is possible and cheap — break out of the timer when
+/// [`preem_render::any_animating`] goes false and re-arm from the mapping pass,
+/// which is the only place an instance can *start* animating — and is
+/// deliberately left out of this PR: the timer's arm/break behaviour is the one
+/// part of this module no hermetic test can observe (there is no GTK main loop
+/// under `cargo test`), so getting it wrong would freeze every preem animation
+/// with CI still green. It belongs in a follow-up that can be verified on glass.
 pub(super) fn install_preem_clock() {
     let last = Cell::new(Instant::now());
     glib::timeout_add_local(

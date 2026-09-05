@@ -1123,14 +1123,33 @@ mod tests {
     /// no field, so every pre-widening call site (the SDK's raster arm, the
     /// shell's role resolution) resolves to the same palette it always did.
     ///
-    /// This is what lets #912's tests above stand unchanged as the evidence that
-    /// the ink rule did not move.
+    /// This test is the **sole** guard on that equivalence — a point worth
+    /// stating, because the obvious candidate is not. #912's ten
+    /// `palette_with(Ink::…)` assertions above cannot constrain it: both sides
+    /// of every one of them goes through `Ink::…​.into()`, so a field smuggled
+    /// into [`Pins::ink`] would cancel out and leave them all green.
     ///
-    /// **Falsified** by giving `Pins::ink` any field but `None` — the equality
-    /// goes red on every skin whose field that is not.
+    /// Both directions matter, and the second is the one review found unmeasured
+    /// at `3b13ce32`:
+    ///
+    /// 1. `with_ink` must not *add* a field. **Falsified** by giving
+    ///    [`Pins::ink`] any field but `None` — the equality goes red on every
+    ///    skin whose field that is not.
+    /// 2. `with_ink` must not *inherit* one. A scope **replaces**; it does not
+    ///    merge with the scope it nests inside. The docs on [`with_pins`] say
+    ///    "the inner scope wins for its duration", and before this assertion
+    ///    existed, changing `with_ink` to pass `field: scoped_pins().field` was
+    ///    invisible to the whole 193-test kit suite. **Falsified** by exactly
+    ///    that change.
+    ///
+    /// Nothing in the tree nests the two today (the shell and the SDK call
+    /// `with_pins` exclusively, and `with_ink` survives as the one-slot
+    /// spelling), which is precisely why the guarantee needs a test rather than
+    /// a call site.
     #[test]
     fn with_ink_is_with_pins_and_no_field() {
         let pinned = [0x1a, 0xc0, 0x77, 0xff];
+        let outer_field = [0x3a, 0x22, 0x50, 0xff];
         for style in DisplayStyle::ALL {
             for ink in [Ink::Default, Ink::Base, Ink::Fixed(pinned)] {
                 let via_ink = with_ink(ink, || style.palette());
@@ -1142,8 +1161,105 @@ mod tests {
                     style.base_palette().bg,
                     "{style:?} {ink:?}: an ink-only scope leaves the skin's field alone",
                 );
+
+                // …and the same inside an enclosing field scope: `with_ink`
+                // replaces it with "no field" rather than inheriting it.
+                let nested = with_pins(
+                    Pins {
+                        ink: Ink::Default,
+                        field: Some(outer_field),
+                    },
+                    || {
+                        let outer = style.palette().bg;
+                        let inner = with_ink(ink, || style.palette().bg);
+                        let resumed = style.palette().bg;
+                        (outer, inner, resumed)
+                    },
+                );
+                assert_eq!(
+                    nested.0, outer_field,
+                    "{style:?} {ink:?}: the enclosing scope's field is in force around it",
+                );
+                assert_eq!(
+                    nested.1,
+                    style.base_palette().bg,
+                    "{style:?} {ink:?}: an inner `with_ink` replaces the field, it does not inherit",
+                );
+                assert_eq!(
+                    nested.2, outer_field,
+                    "{style:?} {ink:?}: …and the enclosing field resumes when it returns",
+                );
             }
         }
+    }
+
+    /// The three pins disagree about the alpha byte, on purpose, and this is
+    /// where that is written down as behaviour rather than prose.
+    ///
+    /// [`Pins::field`] and [`Ink::Fixed`] are **palette** slots and a kit palette
+    /// is opaque by construction (a preem widget is a screen, not a sprite), so
+    /// both force `0xff`. `TextBox::notdef` is not a palette slot — no palette
+    /// carries a notdef — so it writes the quad through unchanged, exactly as
+    /// the `colors()` hatch it mirrors always has, and a translucent value
+    /// really does punch holes where an uncovered char draws.
+    ///
+    /// Both arms of the SDK seam take the same path for each slot, so this
+    /// asymmetry costs no parity; it is a footgun worth measuring, not a bug.
+    /// Review at `3b13ce32` found it undocumented and unmeasured, with
+    /// `Rgba`'s own rustdoc claiming the opposite general rule.
+    ///
+    /// **Falsified** three ways: dropping the `0xff` from `palette_with`'s field
+    /// arm or its `Ink::Fixed` arm reds the first two assertions, and forcing
+    /// `TextBox::notdef` opaque reds the third.
+    #[test]
+    fn the_two_palette_pins_force_opaque_and_the_notdef_slot_does_not() {
+        let translucent = [0x3a, 0x22, 0x50, 0x00];
+        let p = DisplayStyle::Vfd.palette_with(
+            Pins {
+                ink: Ink::Fixed(translucent),
+                field: Some(translucent),
+            },
+            None,
+        );
+        assert_eq!(p.bg[3], 0xff, "a pinned field is drawn opaque");
+        assert_eq!(p.ink[3], 0xff, "…and so is a pinned ink");
+
+        // The notdef box is the counterexample: an uncovered char draws it, and
+        // the alpha it was given is the alpha in the buffer. `TextBox::new`'s
+        // own defaults are white-on-black, so both boxes below differ *only* in
+        // how their third color was set.
+        let uncovered = "\u{1F63A}";
+        let by_slot = crate::TextBox::new()
+            .cols(4)
+            .notdef(translucent)
+            .render(uncovered);
+        let holes = by_slot
+            .data()
+            .chunks_exact(4)
+            .filter(|px| px[3] == 0x00 && px[..3] == translucent[..3])
+            .count();
+        assert!(
+            holes > 0,
+            "a translucent notdef reaches the buffer unchanged — {holes} see-through pixels",
+        );
+
+        // …and the same value through the kit's own hatch does the same thing,
+        // which is the point: the wire pin mirrors `colors()` rather than the
+        // palette. (The first two args are `TextBox::new`'s defaults, so the
+        // only difference between the two boxes is the setter.)
+        let by_hatch = crate::TextBox::new()
+            .cols(4)
+            .colors(
+                [0x00, 0x00, 0x00, 0xff],
+                [0xff, 0xff, 0xff, 0xff],
+                translucent,
+            )
+            .render(uncovered);
+        assert_eq!(
+            by_slot.data(),
+            by_hatch.data(),
+            "`notdef()` and `colors()`'s third slot must stay the same slot",
+        );
     }
 
     /// The end-to-end claim for the field, on a real widget: two renders of the

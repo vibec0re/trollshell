@@ -461,12 +461,30 @@ impl StyleName {
 /// Deliberately `u8` channels rather than floats: there is nothing to sanitise
 /// — every bit pattern is a valid color, so
 /// [`PreemWidget::clamp_in_place`] has no rule to apply to it and
-/// `clamped(w) == clamped(w)` stays reflexive with one in the widget. (The alpha
-/// byte travels for symmetry with `HostMsg::Accent`; a preem frame is a
-/// *screen*, so the kit draws ink opaque either way.)
+/// `clamped(w) == clamped(w)` stays reflexive with one in the widget.
 ///
-/// Reaching for one is the exception, not the path — see [`StyleRef::ink`] and
-/// [`StyleRef::field`].
+/// # The alpha byte, per slot
+///
+/// It travels for symmetry with [`HostMsg::Accent`](crate::msg::HostMsg::Accent)
+/// and **each slot decides for itself what it means**, so there is no one rule
+/// here — read the slot's own doc:
+///
+/// - [`StyleRef::ink`] and [`StyleRef::field`] are *palette* slots, and a kit
+///   palette is opaque by construction (a preem widget is a **screen**, not a
+///   sprite). The alpha byte is discarded and the color is drawn opaque.
+/// - [`TextBoxConfig::notdef`] is **not** a palette slot — no kit palette
+///   carries a notdef — so it mirrors the kit's `TextBox::colors()` hatch
+///   exactly and its alpha *is* honored. A translucent notdef punches
+///   see-through holes where an uncovered char draws, which is what the same
+///   value handed to `colors()` has always done.
+///
+/// The asymmetry is deliberate and measured (`hytte-preem`'s
+/// `the_two_palette_pins_force_opaque_and_the_notdef_slot_does_not`), because
+/// the first two go through the palette and the third goes around it — which is
+/// the same reason the third lives on `TextBoxConfig` and not here.
+///
+/// Reaching for any of them is the exception, not the path — see
+/// [`StyleRef::ink`] and [`StyleRef::field`].
 pub type Rgba = [u8; 4];
 
 /// A **semantic** ink role, resolved shell-side against the live theme.
@@ -570,13 +588,19 @@ pub struct StyleRef {
     /// `caw` speech bubbles, whose lilac has to match a hand-drawn face beside
     /// it. Everything else wants a [`StyleName`].
     ///
-    /// # Field only
+    /// # Field only, and opaque
     ///
     /// It replaces the flooded background and nothing else. The ghost, the
     /// bloom and the CRT pass stay the skin's, so a pinned widget keeps the
     /// panel's physical character; the ink is [`ink`](Self::ink)'s slot, and
     /// a [`TextBox`](PreemWidget::TextBox)'s third color is
     /// [`TextBoxConfig::notdef`].
+    ///
+    /// The **alpha byte is discarded** — the field is drawn opaque, exactly as
+    /// [`ink`](Self::ink) is, because both are palette slots and a preem widget
+    /// is a screen rather than a sprite. Writing `[r, g, b, 0x80]` here gets you
+    /// `[r, g, b, 0xff]`, silently and on both arms. `TextBoxConfig::notdef` is
+    /// the one pin that does *not* work this way; see [`Rgba`].
     ///
     /// # Pin a color that does not move
     ///
@@ -741,6 +765,17 @@ pub struct TextBoxConfig {
     /// of the live re-tint, and it is config, so *changing* it rebuilds the
     /// renderer. Reach for it only when the whole palette is pinned — the `pet`
     /// and `caw` bubbles, whose notdef has to sit inside a hand-picked lilac.
+    ///
+    /// # Its alpha is honored — unlike the two palette pins
+    ///
+    /// [`StyleRef::ink`] and [`StyleRef::field`] go through the kit's palette,
+    /// which is opaque by construction, so their alpha byte is discarded. This
+    /// one does not go through the palette (that is *why* it lives here rather
+    /// than on [`StyleRef`]), so it reaches `TextBox::colors()`'s third slot
+    /// unchanged and a translucent value punches see-through holes wherever an
+    /// uncovered char draws — exactly what the same value has always done
+    /// through the kit hatch this mirrors. Both arms honor it identically, so
+    /// parity is unaffected either way. See [`Rgba`] for the per-slot rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notdef: Option<Rgba>,
 }

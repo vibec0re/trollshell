@@ -2502,8 +2502,14 @@ mod tests {
     /// finite stand-in before the value is compared.
     ///
     /// **Falsified** by dropping `.clamped()` from `lower`'s state arm: every
-    /// row here goes red (and nothing else in this module's suite does, which is
-    /// what makes it *this* test's claim).
+    /// row here goes red — and so does the pre-existing
+    /// [`the_state_arm_clamps_before_it_emits`], so that mutation reds **two**
+    /// tests, not one. (An earlier draft of this comment claimed the isolation;
+    /// review measured 57 passed / 2 failed and it does not hold.) What this
+    /// test adds is the input *class*, not the mutation: the older test drives a
+    /// state float and an over-cap knob, neither of which reaches a config
+    /// `f32`, so without these rows nothing would say the eight config floats
+    /// were covered.
     #[test]
     fn a_non_finite_config_float_does_not_defeat_dedup_in_state_mode() {
         let state = RenderMode::State;

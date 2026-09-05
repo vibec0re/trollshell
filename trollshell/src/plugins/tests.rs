@@ -5519,6 +5519,194 @@ fn a_fully_pinned_text_box_reproduces_the_plugins_own_palette() {
     );
 }
 
+/// The **second** palette scope: `Renderer::update`'s marquee arm, which
+/// re-rasterises the strip in place on a *text* change.
+///
+/// This is the one path where a state change re-runs a constructor that **bakes**
+/// its palette. `Marquee::render` floods the strip's backdrop from
+/// `palette().bg` (`marquee.rs:179`) and only re-resolves the lit ink per
+/// `window()` call, so a strip built outside the widget's pins keeps the skin's
+/// ground for the rest of the session. `build()` never runs here: a new message
+/// leaves `same_config` agreeing, which is exactly why the scope has to be
+/// repeated on this line rather than inherited from construction.
+///
+/// The `builds == 1` assertion is load-bearing — without it a rebuild would
+/// satisfy the flood assertion and this would silently be a second test of
+/// `build()`'s scope instead of `update`'s.
+///
+/// Found by review at `3b13ce32`: narrowing this one scope back to
+/// `kit::with_ink(ink_for(…))` left the whole 339-test shell suite green, while
+/// the same narrowing in `build()` reds
+/// `a_fully_pinned_text_box_reproduces_the_plugins_own_palette`. The code was
+/// already right; nothing measured it.
+///
+/// **Deletion check:** narrow `Renderer::update`'s marquee arm to `with_ink`
+/// and this goes red at *"…and the strip `update` re-rasterises must keep it"*,
+/// with `builds == 1` still holding.
+#[test]
+fn a_pinned_field_survives_a_marquee_text_change() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let scope = Scope::detached("885-marquee-field");
+    let node = |text: &str| {
+        preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd).with_field(lilac),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: 20.0,
+                },
+                state: vocab::MarqueeState { text: text.into() },
+            },
+        )
+    };
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+
+    let first = mapped_pixels(&scope, &node("ONE LONG SCROLLING MESSAGE"));
+    // A text change only: `same_config` still agrees, so this takes the
+    // in-place `update` path and re-rasterises the strip there.
+    let after = mapped_pixels(&scope, &node("ANOTHER LONG SCROLLING MESSAGE"));
+    let builds = preem_render::probe(&scope, Some("mq"));
+    preem_render::forget_scope(&scope);
+
+    assert_eq!(
+        builds.map(|(b, _)| b),
+        Some(1),
+        "the text change must be an in-place update, not a rebuild — or this measures `build`",
+    );
+    assert!(floods(&first), "the pin reaches the strip built by `build`");
+    assert!(
+        floods(&after),
+        "…and the strip `update` re-rasterises must keep it",
+    );
+}
+
+/// One `PreemWidget` of `kind`, its style reference carried in, in state
+/// variant `b` or `a` — the two states
+/// [`a_pinned_field_survives_a_state_change_on_every_widget`] drives through the
+/// in-place `Renderer::update` path.
+///
+/// Split out of the test purely so neither function is 160 lines; the pairs
+/// differ in **state only**, which is the property that makes `same_config`
+/// agree and `apply` take `update` instead of rebuilding.
+fn state_pair_of(kind: &str, style: vocab::StyleRef, b: bool) -> vocab::PreemWidget {
+    let text = if b { "BBBB" } else { "AAAA" }.to_owned();
+    match kind {
+        "dm" => vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig { style },
+            state: vocab::DotMatrixState { text },
+        },
+        "seg" => vocab::PreemWidget::SevenSeg {
+            config: vocab::SevenSegConfig { style },
+            state: vocab::SevenSegState { text },
+        },
+        "tb" => vocab::PreemWidget::TextBox {
+            config: vocab::TextBoxConfig {
+                style,
+                ..vocab::TextBoxConfig::default()
+            },
+            state: vocab::TextBoxState { text },
+        },
+        "led" => vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style,
+                ..vocab::LedStripConfig::default()
+            },
+            state: vocab::LedStripState {
+                level: if b { 0.8 } else { 0.2 },
+                peak: b.then_some(0.9),
+            },
+        },
+        "mq" => vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style,
+                ..vocab::MarqueeConfig::default()
+            },
+            state: vocab::MarqueeState {
+                text: format!("{text} LONG SCROLLING MESSAGE"),
+            },
+        },
+        "sc" => vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style,
+                ..vocab::ScopeConfig::default()
+            },
+            state: vocab::ScopeState {
+                samples: if b {
+                    vec![1.0, -1.0, 0.25]
+                } else {
+                    vec![0.0, 0.5, -0.5]
+                },
+            },
+        },
+        "ga" => vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig {
+                style,
+                ..vocab::GaugeConfig::default()
+            },
+            state: vocab::GaugeState {
+                target: if b { 0.8 } else { 0.2 },
+            },
+        },
+        "fb" => vocab::PreemWidget::FlipBoard {
+            config: vocab::FlipBoardConfig {
+                style,
+                ..vocab::FlipBoardConfig::default()
+            },
+            state: vocab::FlipBoardState { text },
+        },
+        other => panic!("no such widget kind: {other}"),
+    }
+}
+
+/// …and the same claim for **every** widget kind, over a state change that
+/// takes the in-place `Renderer::update` path.
+///
+/// The marquee test above closes the one arm that re-rasterises. This one is the
+/// enumeration behind "and no other arm can": rather than arguing it in prose,
+/// it drives a state change through all eight and asserts the pinned ground is
+/// still flooded afterwards, with `builds == 1` proving none of them rebuilt.
+///
+/// The kit side of the argument, re-derived here rather than taken from #912's
+/// list: exactly two non-test functions in `hytte-preem` read `palette()`
+/// outside a `render`/`window` call — `TextBox::styled` (`textbox.rs:74`) and
+/// `Marquee::render` (`marquee.rs:179`). Those are the only two that can bake.
+/// `TextBox`'s update arm copies text and does not rebuild the box; `Scope`
+/// stores a sample batch; `Gauge::set_target`, `FlipBoard::set_text` and the LED
+/// strip's level/peak/hold all touch state a later `render(style)` reads inside
+/// `Instance::frame`'s scope. So the marquee arm is the whole exposure, and this
+/// test is what will notice if a future arm joins it.
+///
+/// **Deletion check:** narrowing `Renderer::update`'s marquee scope to
+/// `with_ink` reds the `mq` row; making `pins_for` drop the field reds every
+/// row.
+#[test]
+fn a_pinned_field_survives_a_state_change_on_every_widget() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd).with_field(lilac);
+    let scope = Scope::detached("885-field-every-widget");
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+
+    for id in ["dm", "seg", "tb", "led", "mq", "sc", "ga", "fb"] {
+        let before = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, false)));
+        let after = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, true)));
+        assert_eq!(
+            preem_render::probe(&scope, Some(id)).map(|(b, _)| b),
+            Some(1),
+            "{id}: a state change must not rebuild, or this proves nothing about `update`",
+        );
+        assert!(floods(&before), "{id}: the pin reaches the first render");
+        assert!(
+            floods(&after),
+            "{id}: …and survives the in-place state change",
+        );
+    }
+    preem_render::forget_scope(&scope);
+}
+
 /// The memoized role colors are dropped when the theme moves — which is what
 /// makes #396 true for `Success`/`Warning`/`Error` and not just for the accent.
 ///

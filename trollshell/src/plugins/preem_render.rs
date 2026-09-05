@@ -1674,6 +1674,15 @@ impl Renderer {
                     // palette widening the field is a pin too, and the strip
                     // does bake *that* — so the scope has to be the widened one
                     // here, not just an ink.
+                    //
+                    // This is the **second** palette scope, and the only one a
+                    // *state* change reaches: a new message leaves `same_config`
+                    // agreeing, so `build` never runs and cannot cover it.
+                    // `a_pinned_field_survives_a_marquee_text_change` is what
+                    // measures it — before that test, narrowing this one line
+                    // back to `with_ink` left the whole shell suite green.
+                    // `a_pinned_field_survives_a_state_change_on_every_widget`
+                    // is the enumeration behind "and no other arm bakes".
                     *strip = kit::with_pins(pins_for(config.style), || {
                         marquee_strip(*config, display_style(config.style), &state.text)
                     });

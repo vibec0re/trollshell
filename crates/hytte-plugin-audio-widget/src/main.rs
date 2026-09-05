@@ -628,7 +628,7 @@ mod tests {
     // the *kit* `Marquee`/`LedStrip` by hand, and the model holds the *display*
     // wrappers of the same names — `kit::` keeps which is which unmissable.
     use hytte_plugin::preem::{self as kit, DisplayStyle, font};
-    use hytte_plugin::proto::preem::PreemWidget;
+    use hytte_plugin::proto::preem::{AccentRole, PreemWidget};
     use hytte_plugin::proto::{
         AudioSpectrum, Effect, EventKind, MediaAction, Mount, Node, PluginMsg, SPECTRUM_BINS,
         StateKey, decode, encode,
@@ -1207,6 +1207,29 @@ mod tests {
             matches!(children[2], Node::Pixels { .. }),
             "the hand-drawn scope tile is the escape hatch",
         );
+
+        // #914 LOW: the three `assert_eq!(config.style.style, …)` rows above
+        // pin the *skin* and say nothing about the ink, so `.neutral()` — or a
+        // pinned color — could be added to any of them and this whole test
+        // would stay green while the card quietly stopped following the desktop
+        // accent on glass. Nothing else in this binary can see that.
+        for (what, widget) in [
+            ("marquee", preem(&children[0], MARQUEE_ID)),
+            ("readout", preem(&children[1], READOUT_ID)),
+            ("led strip", preem(&children[3], LEDS_ID)),
+        ] {
+            let style = widget.style();
+            assert_eq!(
+                style.accent,
+                Some(AccentRole::Accent),
+                "{what} follows the desktop accent (#396), and says so on the wire",
+            );
+            assert_eq!(
+                (style.ink, style.field),
+                (None, None),
+                "{what} pins no color of its own",
+            );
+        }
     }
 
     /// The scroll the shell will own and the scroll the plugin runs are the same

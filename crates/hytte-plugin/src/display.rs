@@ -140,20 +140,27 @@
 //! own ink while the desktop re-tints around it, or
 //! [`accent_role`](Gauge::accent_role) for `Success`/`Warning`/`Error`.
 //!
-//! ## …and the one escape hatch: [`ink`](Gauge::ink)
+//! ## …and the escape hatch: [`ink`](Gauge::ink), [`field`](Gauge::field),
+//! [`notdef`](TextBox::notdef)
 //!
-//! [`StyleRef::ink`] pins a literal color, and a pinned widget is **excluded
-//! from the live re-tint** — that is what pinning means, and it is the cost of
-//! taking this path. Reach for it only when the color *is* the meaning and no
-//! role names it (a brand color, a plugin's signature tint); reach for a role
-//! for anything that means "good", "warn" or "broken".
+//! These pin literal colors, and a pinned widget is **excluded from the live
+//! re-tint** — that is what pinning means, and it is the cost of taking this
+//! path. Reach for them only when the color *is* the meaning and no role names
+//! it (a brand color, a plugin's signature tint, a widget that has to match
+//! something hand-drawn beside it); reach for a role for anything that means
+//! "good", "warn" or "broken".
 //!
-//! It overrides the **ink only**: the skin still supplies the field, the ghost,
-//! the bloom and the CRT pass, so a pinned widget still reads as the same
-//! device. Both arms honor it — the raster arm resolves it locally with
-//! [`preem::with_ink`](crate::preem::with_ink), so a pin looks the same against
-//! a shell that speaks preem and one that does not (see [`raster_ink`] for the
-//! one part of role resolution a plugin process cannot do).
+//! Between them they cover the kit `TextBox::colors()` hatch's three slots and
+//! no more: the ghost, the bloom and the CRT pass have no pin at all and stay
+//! the skin's, so a pinned widget still reads as the same device. Both arms
+//! honor all three — the raster arm resolves the palette locally with
+//! [`preem::with_pins`](crate::preem::with_pins), so a pin looks the same
+//! against a shell that speaks preem and one that does not (see [`raster_ink`]
+//! for the one part of role resolution a plugin process cannot do).
+//!
+//! #912 shipped the ink alone and called widening it a non-goal; #884 measured
+//! the two plugins that actually reach for a pin (the `pet` and `caw` speech
+//! bubbles, three colors each) and Annika settled the widening on #885.
 //!
 //! # The escape hatch
 //!
@@ -161,7 +168,8 @@
 //! keeps calling the kit directly and shipping
 //! [`Frame::into_node`](crate::preem::Frame::into_node) — that is the
 //! `Node::Pixels` escape hatch, unchanged, and it is the right answer for
-//! drawing the vocabulary has no word for (the pet's face, caw's speech bubble).
+//! drawing the vocabulary has no word for (the pet's and caw's hand-drawn
+//! faces; their *bubbles* are `display::TextBox` since #884's palette pins).
 
 use hytte_plugin_proto::preem::{
     DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange,
@@ -356,6 +364,20 @@ fn raster_ink(style: StyleRef) -> kit::Ink {
     }
 }
 
+/// The kit palette scope the **raster** arm renders a [`StyleRef`] with:
+/// [`raster_ink`]'s answer plus the pinned [`StyleRef::field`].
+///
+/// The field needs no theme either — it is a literal color or it is absent — so
+/// the raster arm honors it in full, and a widget that pins its ground looks the
+/// same against an old shell as against a new one. Same rule, same reason, as
+/// the ink pin.
+fn raster_pins(style: StyleRef) -> kit::Pins {
+    kit::Pins {
+        ink: raster_ink(style),
+        field: style.field,
+    }
+}
+
 // ── the shared lowering seam ────────────────────────────────────────────────
 
 /// Lower one widget into the node the host will receive.
@@ -379,11 +401,13 @@ fn raster_ink(style: StyleRef) -> kit::Ink {
 /// Nothing hostile reaches this arm: the config is the plugin's own, and it is
 /// the plugin's own address space that pays for it.
 ///
-/// It does resolve the widget's **ink** ([`raster_ink`]) around the kit call, so
-/// a pinned color or a `neutral()` opt-out survives the fallback instead of
-/// being a state-mode-only feature. That is one scope in one place rather than
-/// eight wrapped closures, and it is why `style` is a parameter here: every
-/// caller already has it, and none of them can forget it.
+/// It does resolve the widget's **palette** ([`raster_pins`]) around the kit
+/// call, so a pinned ink or field, or a `neutral()` opt-out, survives the
+/// fallback instead of being a state-mode-only feature. That is one scope in one
+/// place rather than eight wrapped closures, and it is why `style` is a
+/// parameter here: every caller already has it, and none of them can forget it.
+/// (A `TextBox`'s `notdef` is not in the scope — no kit palette has that slot —
+/// so it rides [`TextBox::kit`]'s builder chain on both arms instead.)
 fn lower(
     mode: RenderMode,
     style: StyleRef,
@@ -398,7 +422,9 @@ fn lower(
             classes,
             widget: Box::new(widget().clamped()),
         },
-        RenderMode::Raster => kit::with_ink(raster_ink(style), raster).into_node(Some(id), classes),
+        RenderMode::Raster => {
+            kit::with_pins(raster_pins(style), raster).into_node(Some(id), classes)
+        }
     }
 }
 
@@ -592,6 +618,22 @@ impl DotMatrix {
         self
     }
 
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
+        self
+    }
+
     /// The node for `text`, in whichever mode this session negotiated.
     #[must_use]
     pub fn node(&self, id: &str, text: &str) -> Node {
@@ -673,6 +715,22 @@ impl SevenSeg {
         self
     }
 
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
+        self
+    }
+
     /// The node for `text`, in whichever mode this session negotiated.
     #[must_use]
     pub fn node(&self, id: &str, text: &str) -> Node {
@@ -708,9 +766,11 @@ impl SevenSeg {
 
 /// Wrapped pixel-font text on a rounded field — the "8bit textbox". Pure.
 ///
-/// The kit's RGBA `colors()` escape hatch has no wire form on purpose: an
-/// explicit palette becomes a semantic [`AccentRole`] here, so a live re-tint
-/// reaches this widget like every other one.
+/// The kit's RGBA `colors()` hatch has a wire form here since #885's palette
+/// widening, spread across three optional pins — [`field`](Self::field),
+/// [`ink`](Self::ink), [`notdef`](Self::notdef) — but stating none of them is
+/// still the path: an unpinned box takes a semantic [`AccentRole`], so a live
+/// re-tint reaches it like every other widget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextBox {
     config: TextBoxConfig,
@@ -777,6 +837,21 @@ impl TextBox {
         self
     }
 
+    /// Pin the color of the hollow `.notdef` box an **uncovered** char draws —
+    /// the third of the kit `colors()` hatch's three slots, and the one that is
+    /// not a palette slot (nothing else in the kit has a notdef). See
+    /// [`TextBoxConfig::notdef`].
+    ///
+    /// Only worth setting when [`field`](Self::field) and [`ink`](Self::ink) are
+    /// pinned too: on its own it drops one hand-picked color into a skin's
+    /// palette. A **config** change, so *changing* it rebuilds the shell's
+    /// renderer.
+    #[must_use]
+    pub fn notdef(mut self, notdef: Rgba) -> Self {
+        self.config.notdef = Some(notdef);
+        self
+    }
+
     /// Switch the skin (a **config** change).
     pub fn style(&mut self, style: StyleName) {
         self.config.style.style = style;
@@ -804,6 +879,22 @@ impl TextBox {
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
+        self
+    }
+
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
         self
     }
 
@@ -838,17 +929,29 @@ impl TextBox {
     }
 
     /// The kit builder this config describes.
+    ///
+    /// Call it inside the widget's palette scope (`lower`'s raster arm does):
+    /// `TextBox::styled` resolves the field and the ink through
+    /// `DisplayStyle::palette` at *construction*, so that is how a pin reaches
+    /// them. [`notdef`](Self::notdef) is the exception — no kit palette carries
+    /// one — and is applied after `styled`, over the color it derived from the
+    /// skin's ghost.
     fn kit(&self) -> kit::TextBox {
         let mut b = kit::TextBox::styled(display_style(self.config.style.style));
         b = match self.config.width {
             TextBoxWidth::Cols(cols) => b.cols(dim(cols)),
             TextBoxWidth::FitPx(px) => b.fit_px(dim(px)),
         };
-        b.max_lines(dim(self.config.max_lines))
+        b = b
+            .max_lines(dim(self.config.max_lines))
             .pad(dim(self.config.pad))
             .corner(dim(self.config.corner))
             .scale(dim(self.config.scale))
-            .fixed_width(self.config.fixed_width)
+            .fixed_width(self.config.fixed_width);
+        match self.config.notdef {
+            Some(notdef) => b.notdef(notdef),
+            None => b,
+        }
     }
 }
 
@@ -930,6 +1033,22 @@ impl Marquee {
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
+        self
+    }
+
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
         self
     }
 
@@ -1091,6 +1210,22 @@ impl LedStrip {
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
+        self
+    }
+
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
         self
     }
 
@@ -1270,6 +1405,22 @@ impl Scope {
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
+        self
+    }
+
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
         self
     }
 
@@ -1474,6 +1625,22 @@ impl Gauge {
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
+        self
+    }
+
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
         self
     }
 
@@ -1729,6 +1896,22 @@ impl FlipBoard {
         self
     }
 
+    /// Pin an explicit color as this widget's **field** — the panel background
+    /// it floods before drawing anything — opting that slot out of the live
+    /// re-tint the same way [`ink`](Self::ink) opts the glyphs out. See
+    /// [`StyleRef::field`], and reach for a [`StyleName`] first: the field is
+    /// most of the widget's area, so pinning it is the larger opt-out of the
+    /// two.
+    ///
+    /// A **config** change, exactly like [`ink`](Self::ink): *changing* the pin
+    /// rebuilds the shell's renderer and loses the animation state it owned. Set
+    /// it once; don't drive it from a reading.
+    #[must_use]
+    pub fn field(mut self, field: Rgba) -> Self {
+        self.config.style.field = Some(field);
+        self
+    }
+
     /// Flip toward `text`. Always takes effect; re-stating the current content
     /// is inert, so unchanged cells are never disturbed.
     pub fn set_text(&mut self, text: &str) {
@@ -1856,7 +2039,7 @@ mod tests {
     use super::{
         AccentRole, DotMatrix, FlipBoard, Gauge, LedStrip, Marquee, Mechanism, RenderMode, Scope,
         SevenSeg, StyleName, StyleRef, TextBox, display_style, host_speaks_preem, negotiated_vocab,
-        raster_ink, render_mode, set_negotiated, style_name,
+        raster_ink, raster_pins, render_mode, set_negotiated, style_name,
     };
     use hytte_plugin_proto::preem::{MAX_TEXT_LEN, PREEM_VOCAB, PreemWidget};
     use hytte_plugin_proto::wire::Node;
@@ -2303,6 +2486,69 @@ mod tests {
         }
     }
 
+    /// The same claim for every non-finite float a **config** builder can carry
+    /// — the eight holes #898's review left open and #899's proto clamp closed
+    /// (#884's first follow-up item, pinned here rather than left as a claim).
+    ///
+    /// The test above drives *state* floats (a reading, a level, a sample
+    /// batch), each of which the SDK sanitises at its own setter. A config float
+    /// has no setter rule: `sweep_deg(NAN)` is stored as written, travels in
+    /// `config`, and `PreemWidget` derives `PartialEq` — so before the clamp,
+    /// a widget configured with one was never equal to itself and shipped a
+    /// `Render` per heartbeat forever, exactly like the state case.
+    ///
+    /// Nothing in the SDK closes it. The single [`PreemWidget::clamped`] call in
+    /// [`lower`]'s state arm does, by folding every non-finite onto a canonical
+    /// finite stand-in before the value is compared.
+    ///
+    /// **Falsified** by dropping `.clamped()` from `lower`'s state arm: every
+    /// row here goes red — and so does the pre-existing
+    /// [`the_state_arm_clamps_before_it_emits`], so that mutation reds **two**
+    /// tests, not one. (An earlier draft of this comment claimed the isolation;
+    /// review measured 57 passed / 2 failed and it does not hold.) What this
+    /// test adds is the input *class*, not the mutation: the older test drives a
+    /// state float and an over-cap knob, neither of which reaches a config
+    /// `f32`, so without these rows nothing would say the eight config floats
+    /// were covered.
+    #[test]
+    fn a_non_finite_config_float_does_not_defeat_dedup_in_state_mode() {
+        let state = RenderMode::State;
+        let no_cls = Vec::new;
+        for bad in NON_FINITE {
+            // Each entry is a widget whose *only* non-finite value is in config;
+            // the closure re-renders it with unchanged state, which is what the
+            // runtime's dedup compares.
+            let marquee = Marquee::new(StyleName::Vfd).speed_dots_per_sec(bad);
+            let leds = LedStrip::new(StyleName::Vfd).leds(16).peak_hold(bad);
+            let range = Gauge::new(StyleName::Vfd).range(bad, bad);
+            let sweep = Gauge::new(StyleName::Vfd).sweep_deg(bad);
+            let freq = Gauge::new(StyleName::Vfd).frequency(bad);
+            let damping = Gauge::new(StyleName::Vfd).damping(bad);
+            let duration = FlipBoard::new(StyleName::Vfd, Mechanism::SplitFlap).duration_secs(bad);
+            let stagger = FlipBoard::new(StyleName::Vfd, Mechanism::SplitFlap).stagger_secs(bad);
+
+            let rows: [(&str, &dyn Fn() -> Node); 8] = [
+                ("marquee speed", &|| {
+                    marquee.node_in(state, "mq", no_cls(), "TICKER")
+                }),
+                ("peak-hold rate", &|| leds.node_in(state, "led", no_cls())),
+                ("gauge range", &|| range.node_in(state, "ga", no_cls())),
+                ("gauge sweep", &|| sweep.node_in(state, "ga", no_cls())),
+                ("gauge frequency", &|| freq.node_in(state, "ga", no_cls())),
+                ("gauge damping", &|| damping.node_in(state, "ga", no_cls())),
+                ("flip duration", &|| duration.node_in(state, "fb", no_cls())),
+                ("flip stagger", &|| stagger.node_in(state, "fb", no_cls())),
+            ];
+
+            for (what, render) in rows {
+                let first = render();
+                for beat in 0..BEATS {
+                    assert_eq!(render(), first, "{what}, {bad}, beat {beat}");
+                }
+            }
+        }
+    }
+
     /// …and sanitising must not have moved a single pixel: the raster arm fed a
     /// non-finite reading is still byte-identical to the raw kit fed the same
     /// one (#898 review R1).
@@ -2647,6 +2893,105 @@ mod tests {
                     .cols(12)
                     .node_in(raster, "tb", no_cls(), "pinned"),
             "text box: a pin must change the pixels",
+        );
+    }
+
+    // ── the palette widening: field + notdef (#885, for #884's two bubbles) ──
+
+    /// [`raster_pins`] carries the field pin beside [`raster_ink`]'s answer, and
+    /// carries it under *every* role — a role decides the ink and has nothing to
+    /// say about the ground, so the two must not interfere.
+    ///
+    /// **Falsified** by returning `field: None` from `raster_pins`: every
+    /// "carries the field" row goes red.
+    #[test]
+    fn the_raster_arm_carries_a_pinned_field_under_every_role() {
+        let lilac = [0x3a, 0x22, 0x50, 0xff];
+        let violet = [0x9b, 0x59, 0xb6, 0xff];
+        let vfd = || StyleRef::new(StyleName::Vfd);
+
+        assert_eq!(
+            raster_pins(vfd()).field,
+            None,
+            "nothing pinned, nothing set"
+        );
+        assert_eq!(
+            raster_pins(vfd().with_field(lilac)).field,
+            Some(lilac),
+            "a bare field pin reaches the scope"
+        );
+        for role in [
+            AccentRole::Accent,
+            AccentRole::Neutral,
+            AccentRole::Success,
+            AccentRole::Warning,
+            AccentRole::Error,
+        ] {
+            let pins = raster_pins(vfd().with_accent(role).with_field(lilac));
+            assert_eq!(pins.field, Some(lilac), "{role:?} carries the field");
+            assert_eq!(
+                pins.ink,
+                raster_ink(vfd().with_accent(role)),
+                "{role:?}: a field pin must not disturb the ink",
+            );
+        }
+        let both = raster_pins(vfd().with_field(lilac).with_ink(violet));
+        assert_eq!(
+            (both.field, both.ink),
+            (Some(lilac), kit::Ink::Fixed(violet)),
+            "the two pins compose",
+        );
+    }
+
+    /// The #898 parity rule at its widest: a `TextBox` with **all three** colors
+    /// pinned rasterises byte-for-byte to the kit's `colors(bg, ink, notdef)`
+    /// hatch. That is the exact claim `pet`'s and `caw`'s migration rests on —
+    /// each was `TextBox::new().colors(…)` before #884, and each must still
+    /// produce those bytes against a shell that does not speak preem.
+    ///
+    /// The three assertions after it are what keep the first from being vacuous:
+    /// dropping any one pin has to change the pixels, or the parity above would
+    /// hold for a wiring that ignored that pin entirely. The emoji in the text is
+    /// deliberate — it is the only input that reaches the `notdef` slot.
+    ///
+    /// **Falsified** by dropping `kit::with_pins` from `lower`'s raster arm (the
+    /// field and ink go missing), and — independently — by dropping the `notdef`
+    /// arm from [`TextBox::kit`].
+    #[test]
+    fn the_raster_arm_is_byte_identical_for_a_fully_pinned_text_box() {
+        let field = [0x3a, 0x22, 0x50, 0xff];
+        let ink = [0xf0, 0xe0, 0xf8, 0xff];
+        let notdef = [0x6c, 0x4e, 0x86, 0xff];
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+        let text = "mrrp 💕";
+
+        let sdk = |b: TextBox| b.cols(10).scale(2).node_in(raster, "tb", no_cls(), text);
+        let all = TextBox::new(StyleName::Lcd)
+            .field(field)
+            .ink(ink)
+            .notdef(notdef);
+
+        assert!(
+            sdk(all.clone())
+                == kit::TextBox::new()
+                    .cols(10)
+                    .scale(2)
+                    .colors(field, ink, notdef)
+                    .render(text)
+                    .into_node(Some("tb"), no_cls()),
+            "a fully pinned text box is the kit's `colors()` hatch, byte for byte",
+        );
+
+        let dropped_field = sdk(TextBox::new(StyleName::Lcd).ink(ink).notdef(notdef));
+        let dropped_ink = sdk(TextBox::new(StyleName::Lcd).field(field).notdef(notdef));
+        let dropped_notdef = sdk(TextBox::new(StyleName::Lcd).field(field).ink(ink));
+        let full = sdk(all);
+        assert!(full != dropped_field, "the field pin must move pixels");
+        assert!(full != dropped_ink, "the ink pin must move pixels");
+        assert!(
+            full != dropped_notdef,
+            "the notdef pin must move pixels — the emoji is what reaches it",
         );
     }
 

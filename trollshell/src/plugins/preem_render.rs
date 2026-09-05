@@ -147,12 +147,18 @@
 //! every plugin's widgets.
 //!
 //! The **[`vocab::AccentRole`]** and the optional pinned
-//! [`ink`](vocab::StyleRef::ink) become one `kit::Ink` ([`ink_for`]), scoped
-//! around the rasterisation with `hytte_preem::with_ink`. That is the piece the
-//! kit did not have before #885: `hytte_preem::set_accent` is a *process*
-//! global, which is exactly right in a plugin (one process, one plugin, one
-//! session tint) and not enough in a shell, which rasterises many plugins'
-//! widgets — each with its own role — in this one process.
+//! [`ink`](vocab::StyleRef::ink) become one `kit::Ink` ([`ink_for`]), which
+//! [`pins_for`] carries — beside the optional pinned
+//! [`field`](vocab::StyleRef::field) — into one `kit::Pins`, scoped around the
+//! rasterisation with `hytte_preem::with_pins`. That is the piece the kit did
+//! not have before #885: `hytte_preem::set_accent` is a *process* global, which
+//! is exactly right in a plugin (one process, one plugin, one session tint) and
+//! not enough in a shell, which rasterises many plugins' widgets — each with its
+//! own role — in this one process.
+//!
+//! A `TextBox`'s third color, [`notdef`](vocab::TextBoxConfig::notdef), is not a
+//! palette slot (no other widget has one), so it rides the kit builder in
+//! [`text_box`] instead of the scope.
 //!
 //! `Success`/`Warning`/`Error` resolve against the live theme ([`role_inks`],
 //! `@success_color` and friends, memoized until the theme moves); `Accent` and a
@@ -163,17 +169,17 @@
 //!
 //! # …and what makes it *live* (#396)
 //!
-//! Nothing here is baked into an instance. Every rasterisation resolves the ink
-//! afresh, so a desktop accent or color-scheme change only has to drop the
-//! cached frames — which is what [`invalidate_cached_frames`] already does on
-//! the accent path, and where the memoized role colors are dropped too. The next
-//! mapping pass re-renders every widget in the new theme with no plugin
+//! Nothing here is baked into an instance. Every rasterisation resolves the
+//! palette afresh, so a desktop accent or color-scheme change only has to drop
+//! the cached frames — which is what [`invalidate_cached_frames`] already does
+//! on the accent path, and where the memoized role colors are dropped too. The
+//! next mapping pass re-renders every widget in the new theme with no plugin
 //! involvement and no wire traffic.
 //!
-//! The one deliberate exception is a **pinned** ink: a `StyleRef` carrying an
-//! explicit color re-rasterises like everything else and produces byte-identical
-//! pixels, because the color it was pinned to did not change. That is what
-//! pinning means, and the wire docs say so.
+//! The one deliberate exception is a **pin**: a `StyleRef` carrying an explicit
+//! ink or field (or a `TextBox` carrying a notdef) re-rasterises like everything
+//! else and produces byte-identical pixels, because the colors it was pinned to
+//! did not change. That is what pinning means, and the wire docs say so.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -997,15 +1003,15 @@ impl Instance {
             return cached.clone();
         }
         let style = display_style(self.applied.style());
-        // The ink is resolved here, per rasterisation, never baked into the
+        // The palette is resolved here, per rasterisation, never baked into the
         // instance — which is what makes a theme change a cache drop rather than
-        // a rebuild (#396). A pinned ink resolves to the same color every time,
-        // so a pinned widget re-rasterises to identical bytes.
-        let ink = ink_for(self.applied.style());
+        // a rebuild (#396). A pin resolves to the same colors every time, so a
+        // pinned widget re-rasterises to identical bytes.
+        let pins = pins_for(self.applied.style());
         let rendered = self.renderer.as_ref().map_or_else(
             || (0, 0, Vec::new()),
             |renderer| {
-                let frame = kit::with_ink(ink, || renderer.render(style));
+                let frame = kit::with_pins(pins, || renderer.render(style));
                 // Both dimensions or neither: a lone `unwrap_or(0)` could pair a
                 // zero dimension with a non-empty buffer and break the
                 // `len == w * h * 4` invariant every `Node::Pixels` consumer
@@ -1098,9 +1104,10 @@ pub(super) fn any_animating() -> bool {
 /// Since #885 the same call is the theme seam for the semantic roles: a color
 /// scheme flip moves `@success_color` and friends exactly as it can move
 /// `@accent_color`, so [`role_inks`]'s memo is dropped here rather than kept for
-/// the session. A **pinned** ink is the deliberate exception on the way out —
-/// the frames are dropped like everyone's, and the re-render reproduces them
-/// byte for byte, because the color that widget asked for did not change.
+/// the session. A **pin** is the deliberate exception on the way out — an ink, a
+/// field or a `TextBox`'s notdef — the frames are dropped like everyone's, and
+/// the re-render reproduces them byte for byte, because the colors that widget
+/// asked for did not change.
 ///
 /// `TextBox` is the one kit widget that resolves its palette at **construction**
 /// (`TextBox::styled` bakes bg/ink/notdef into the builder) rather than at
@@ -1426,6 +1433,23 @@ fn ink_for(style: vocab::StyleRef) -> kit::Ink {
     }
 }
 
+/// The kit palette scope a widget's style reference asks for: [`ink_for`]'s
+/// answer, plus the optional pinned [`field`](vocab::StyleRef::field).
+///
+/// The field has no role vocabulary and no accent behind it — there is exactly
+/// one way for it to move, and that is a plugin naming it — so this is the whole
+/// of its resolution. That asymmetry is the design (#885): the ink is the
+/// semantic slot the desktop re-tints, the field is the ground, and a plugin
+/// reaches for the ground only when it has to match something the skins cannot
+/// express (#884's `pet` and `caw` bubbles, whose lilac sits beside a hand-drawn
+/// face).
+fn pins_for(style: vocab::StyleRef) -> kit::Pins {
+    kit::Pins {
+        ink: ink_for(style),
+        field: style.field,
+    }
+}
+
 // ── construction / update / advance / render ─────────────────────────────────
 
 /// `u32` → `usize` for a value the wire caps well below either type's range.
@@ -1453,13 +1477,13 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
         return None;
     }
     let style = display_style(widget.style());
-    // The whole build runs inside the widget's ink scope, because `TextBox` is
-    // the one kit widget that resolves its palette at *construction* — see
+    // The whole build runs inside the widget's palette scope, because `TextBox`
+    // is the one kit widget that resolves its palette at *construction* — see
     // `invalidate_cached_frames`. Every other arm resolves at render time and is
     // unaffected by the scope being open here, so scoping the build wholesale
     // costs nothing and cannot miss a future widget that bakes.
-    let ink = ink_for(widget.style());
-    Some(kit::with_ink(ink, || match widget {
+    let pins = pins_for(widget.style());
+    Some(kit::with_pins(pins, || match widget {
         W::DotMatrix { state, .. } => Renderer::DotMatrix {
             text: state.text.clone(),
         },
@@ -1531,18 +1555,29 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
 /// parity tests can build the *same* box the renderer does without re-stating
 /// the builder chain (a duplicated chain is an oracle that agrees with the code
 /// by construction, which is no oracle at all).
+///
+/// **Call it inside the widget's palette scope** ([`pins_for`] /
+/// `kit::with_pins`), the way [`build`] does: `TextBox::styled` reads
+/// `DisplayStyle::palette` here and now, so an ink or field pin reaches the box
+/// through that scope and nothing else. The one color that does *not* is
+/// [`notdef`](vocab::TextBoxConfig::notdef) — the kit's palette has no such slot
+/// — so it is applied after `styled`, over whatever the skin's ghost derived.
 fn text_box(config: vocab::TextBoxConfig, style: kit::DisplayStyle) -> kit::TextBox {
     let boxed = kit::TextBox::styled(style);
     let boxed = match config.width {
         vocab::TextBoxWidth::Cols(cols) => boxed.cols(dim(cols)),
         vocab::TextBoxWidth::FitPx(px) => boxed.fit_px(dim(px)),
     };
-    boxed
+    let boxed = boxed
         .max_lines(dim(config.max_lines))
         .pad(dim(config.pad))
         .corner(dim(config.corner))
         .scale(dim(config.scale))
-        .fixed_width(config.fixed_width)
+        .fixed_width(config.fixed_width);
+    match config.notdef {
+        Some(notdef) => boxed.notdef(notdef),
+        None => boxed,
+    }
 }
 
 /// The kit `MarqueeStrip` a [`vocab::MarqueeConfig`] + message describe.
@@ -1635,8 +1670,20 @@ impl Renderer {
                     // Scoped like `build`'s: the strip bakes the skin's field and
                     // ghost, and while today it re-resolves the *ink* per
                     // `window()` call, that is the kit's business and not a
-                    // contract this call site should depend on.
-                    *strip = kit::with_ink(ink_for(config.style), || {
+                    // contract this call site should depend on. Since #885's
+                    // palette widening the field is a pin too, and the strip
+                    // does bake *that* — so the scope has to be the widened one
+                    // here, not just an ink.
+                    //
+                    // This is the **second** palette scope, and the only one a
+                    // *state* change reaches: a new message leaves `same_config`
+                    // agreeing, so `build` never runs and cannot cover it.
+                    // `a_pinned_field_survives_a_marquee_text_change` is what
+                    // measures it — before that test, narrowing this one line
+                    // back to `with_ink` left the whole shell suite green.
+                    // `a_pinned_field_survives_a_state_change_on_every_widget`
+                    // is the enumeration behind "and no other arm bakes".
+                    *strip = kit::with_pins(pins_for(config.style), || {
                         marquee_strip(*config, display_style(config.style), &state.text)
                     });
                     text.clone_from(&state.text);

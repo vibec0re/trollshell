@@ -403,7 +403,7 @@ mod tests {
     };
     use hytte_plugin::display::{RenderMode, StyleName, testing::with_render_mode};
     use hytte_plugin::preem::{DisplayStyle, seven_seg};
-    use hytte_plugin::proto::preem::PreemWidget;
+    use hytte_plugin::proto::preem::{AccentRole, PreemWidget};
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Node, Page, PluginMsg, decode, encode,
     };
@@ -670,6 +670,21 @@ mod tests {
                             config.style.style,
                             StyleName::Vfd,
                             "the skin travels as a name, never as colors",
+                        );
+                        // #914 LOW: without this, `.neutral()` (or any other
+                        // role, or a pinned color) could be added to the
+                        // readouts and every assertion here would stay green —
+                        // the readout would just stop following the desktop
+                        // accent on glass, which no test could see.
+                        assert_eq!(
+                            config.style.accent,
+                            Some(AccentRole::Accent),
+                            "the readout follows the desktop accent (#396), and says so on the wire",
+                        );
+                        assert_eq!(
+                            (config.style.ink, config.style.field),
+                            (None, None),
+                            "…so it pins no color of its own",
                         );
                     }
                     other => panic!("expected a seven-seg widget, got {other:?}"),

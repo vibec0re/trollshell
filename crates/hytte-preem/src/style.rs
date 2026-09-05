@@ -57,7 +57,7 @@ fn accent() -> Option<Rgba> {
     unpack_accent(ACCENT.load(Ordering::Relaxed))
 }
 
-// ── per-render ink (#885) ────────────────────────────────────────────────────
+// ── per-render palette (#885) ────────────────────────────────────────────────
 
 /// Which ink a render should use, for a host that decides **per render** rather
 /// than per process.
@@ -67,12 +67,12 @@ fn accent() -> Option<Rgba> {
 /// widget in it wants the same session tint. A *shell* drawing the kit is the
 /// other case: it renders many plugins' widgets in one process, each of which
 /// asked for its own semantic role, and one of which may have pinned an explicit
-/// color (`hytte_plugin_proto::preem::StyleRef`). [`with_ink`] is that
-/// per-render answer.
+/// color (`hytte_plugin_proto::preem::StyleRef`). [`with_pins`] is that
+/// per-render answer, and this is its ink half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Ink {
     /// The session default: the [`set_accent`] accent if one is installed,
-    /// otherwise the skin's own ink. Exactly what a render outside [`with_ink`]
+    /// otherwise the skin's own ink. Exactly what a render outside [`with_pins`]
     /// gets, so a caller with nothing to say can name it.
     #[default]
     Default,
@@ -85,53 +85,105 @@ pub enum Ink {
     Fixed(Rgba),
 }
 
-thread_local! {
-    /// The ink [`with_ink`] is currently scoping, for **this thread**.
-    ///
-    /// Thread-local and scoped rather than global and sticky, which is the
-    /// difference that matters against [`ACCENT`]: a host renders one widget at
-    /// a time on its UI thread, so "the ink for the render in progress" is a
-    /// well-defined per-thread value, while "the ink for the process" is not
-    /// once more than one widget is in play. A thread that never calls
-    /// [`with_ink`] — every plugin, and the kit's own tests — sees
-    /// [`Ink::Default`] and behaves exactly as it did before this existed.
-    static SCOPED_INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(Ink::Default) };
+/// The palette slots a host can pin for the duration of one render — the widened
+/// form of [`Ink`] that #885 settled on.
+///
+/// [`with_ink`] shipped first and pinned only the lit ink, on the reading that
+/// the skin *is* the vocabulary for everything else. #884 then measured the two
+/// plugins that actually needed a pin (the `pet` and `caw` speech bubbles) and
+/// found each sets three colors — a field, an ink and a `.notdef` box — so an
+/// ink-only scope could not carry either. Annika settled the widening on #885.
+///
+/// [`field`](Self::field) is the panel background every widget floods first, so
+/// it belongs here, with the ink, where all eight widgets can honor it. A
+/// `TextBox`'s third color does **not**: nothing else draws a notdef box, so it
+/// is a builder knob on that widget ([`TextBox::notdef`](super::TextBox::notdef))
+/// rather than a palette slot.
+///
+/// What is deliberately *not* pinnable, and stays the skin's on every widget:
+/// the ghost, the bloom and the CRT mask. Those are the panel's physical
+/// character, and a pinned widget is still meant to read as the same device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Pins {
+    /// The lit ink — see [`Ink`].
+    pub ink: Ink,
+    /// The screen field, or `None` to leave it to the skin. Forced opaque, like
+    /// [`Ink::Fixed`]: the field is the opaque ground a widget floods before it
+    /// draws anything.
+    pub field: Option<Rgba>,
 }
 
-/// Restores the enclosing [`SCOPED_INK`] on the way out — including on an
-/// unwind, which is why this is a guard and not a pair of `set` calls around the
-/// closure.
-struct InkGuard(Ink);
-
-impl Drop for InkGuard {
-    fn drop(&mut self) {
-        SCOPED_INK.set(self.0);
+impl Pins {
+    /// The scope [`with_ink`] opens: one ink, the skin's own field.
+    const fn ink(ink: Ink) -> Self {
+        Self { ink, field: None }
     }
 }
 
-/// Render `body` with `ink` as the lit ink of every kit widget it draws,
-/// restoring the previous scope afterwards.
+impl From<Ink> for Pins {
+    fn from(ink: Ink) -> Self {
+        Self::ink(ink)
+    }
+}
+
+thread_local! {
+    /// The palette [`with_pins`] is currently scoping, for **this thread**.
+    ///
+    /// Thread-local and scoped rather than global and sticky, which is the
+    /// difference that matters against [`ACCENT`]: a host renders one widget at
+    /// a time on its UI thread, so "the palette for the render in progress" is a
+    /// well-defined per-thread value, while "the palette for the process" is not
+    /// once more than one widget is in play. A thread that never calls
+    /// [`with_pins`] — every plugin, and the kit's own tests — sees
+    /// [`Pins::default`] ([`Ink::Default`], no field) and behaves exactly as it
+    /// did before this existed.
+    static SCOPED_PINS: std::cell::Cell<Pins> =
+        const { std::cell::Cell::new(Pins::ink(Ink::Default)) };
+}
+
+/// Restores the enclosing [`SCOPED_PINS`] on the way out — including on an
+/// unwind, which is why this is a guard and not a pair of `set` calls around the
+/// closure.
+struct PinGuard(Pins);
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        SCOPED_PINS.set(self.0);
+    }
+}
+
+/// Render `body` with `pins` overriding the palette of every kit widget it
+/// draws, restoring the previous scope afterwards.
 ///
 /// Host-facing, like [`set_accent`]: a plugin author never calls it (the kit
 /// widget entry points take a [`DisplayStyle`] and nothing else, deliberately —
 /// see the module docs). A **shell** calls it once around each widget's
-/// rasterisation to resolve that widget's own semantic role or pinned color.
+/// rasterisation to resolve that widget's own semantic role or pinned colors.
 ///
-/// Only the lit **ink** moves. The field, the ghost, the bloom and the CRT pass
-/// are the panel's physical character and stay per-skin, exactly as they do
-/// under [`set_accent`].
+/// Only the slots [`Pins`] names move. The ghost, the bloom and the CRT pass are
+/// the panel's physical character and stay per-skin, exactly as they do under
+/// [`set_accent`].
 ///
 /// Nesting is well-defined (the inner scope wins for its duration, the outer one
 /// resumes), and the scope is per-thread, so a background thread rasterising in
 /// parallel is unaffected by — and does not disturb — this one.
-pub fn with_ink<T>(ink: Ink, body: impl FnOnce() -> T) -> T {
-    let _guard = InkGuard(SCOPED_INK.replace(ink));
+pub fn with_pins<T>(pins: Pins, body: impl FnOnce() -> T) -> T {
+    let _guard = PinGuard(SCOPED_PINS.replace(pins));
     body()
 }
 
-/// The ink scope in force on this thread.
-fn scoped_ink() -> Ink {
-    SCOPED_INK.get()
+/// [`with_pins`] with only the ink named — the pre-#885-widening entry point,
+/// kept because it is the honest signature for every caller that pins one color
+/// (the SDK's `neutral()`, a role the shell resolved) and because it makes the
+/// widening provably additive: it is exactly `with_pins` with no field, so every
+/// call site and test written against it renders the same bytes.
+pub fn with_ink<T>(ink: Ink, body: impl FnOnce() -> T) -> T {
+    with_pins(Pins::ink(ink), body)
+}
+
+/// The palette scope in force on this thread.
+fn scoped_pins() -> Pins {
+    SCOPED_PINS.get()
 }
 
 /// The retro display skin a kit widget renders in. Palettes + post-passes
@@ -187,26 +239,30 @@ impl DisplayStyle {
     /// ([`TextBox::colors`](super::TextBox::colors), a hand-built
     /// [`Frame`]) never routes through here, so it always wins.
     ///
-    /// A host that decides the ink **per render** rather than per session
-    /// ([`with_ink`], #885) overrides the accent for the duration of that
-    /// render — the same one field, and the same
-    /// everything-else-stays-per-skin rule.
+    /// A host that decides the palette **per render** rather than per session
+    /// ([`with_pins`], #885) overrides the accent for the duration of that
+    /// render — the ink, optionally the field, and nothing else. That is the
+    /// route a *wire* palette pin takes: it reaches the same two slots the
+    /// `colors()` hatch sets, without stepping outside `palette()` the way the
+    /// hatch does.
     pub(crate) fn palette(self) -> Palette {
-        self.palette_with(scoped_ink(), accent())
+        self.palette_with(scoped_pins(), accent())
     }
 
     /// [`palette`](Self::palette) with **both** of its inputs passed explicitly:
-    /// the per-render scope ([`with_ink`]) and the process accent
+    /// the per-render scope ([`with_pins`]) and the process accent
     /// ([`set_accent`]) — split out so the resolution is unit-testable without
     /// touching either global.
     ///
     /// The precedence is the whole rule, in one place: an explicit per-render
     /// ink beats the session accent, which beats the skin's own — and
-    /// [`Ink::Base`] is how a render says "not even the accent". Only
-    /// [`Palette::ink`] is ever touched.
-    fn palette_with(self, ink: Ink, accent: Option<Rgba>) -> Palette {
+    /// [`Ink::Base`] is how a render says "not even the accent". The field is
+    /// orthogonal: nothing else can move it (there is no field accent), so a
+    /// pin either replaces it or the skin keeps it. [`Palette::ghost`],
+    /// [`Palette::bloom`] and [`Palette::mask`] are never touched.
+    fn palette_with(self, pins: Pins, accent: Option<Rgba>) -> Palette {
         let mut palette = self.base_palette();
-        match ink {
+        match pins.ink {
             Ink::Default => {
                 if let Some(accent) = accent {
                     palette.ink = accent;
@@ -214,6 +270,9 @@ impl DisplayStyle {
             }
             Ink::Base => {}
             Ink::Fixed([r, g, b, _]) => palette.ink = [r, g, b, 0xff],
+        }
+        if let Some([r, g, b, _]) = pins.field {
+            palette.bg = [r, g, b, 0xff];
         }
         palette
     }
@@ -752,7 +811,9 @@ fn box_blur(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bloom, DisplayStyle, Emission, Frame, Ink, mix, scoped_ink, with_ink};
+    use super::{
+        Bloom, DisplayStyle, Emission, Frame, Ink, Pins, mix, scoped_pins, with_ink, with_pins,
+    };
 
     #[test]
     fn mix_hits_both_endpoints_exactly() {
@@ -839,14 +900,14 @@ mod tests {
     fn accent_tints_ink_but_leaves_the_panel_character() {
         let accent = [0x9b, 0x59, 0xb6, 0xff];
         for style in DisplayStyle::ALL {
-            let base = style.palette_with(Ink::Default, None);
+            let base = style.palette_with(Ink::Default.into(), None);
             assert_eq!(
                 base.ink,
                 style.base_palette().ink,
                 "{style:?}: no accent keeps the hard-coded ink"
             );
 
-            let tinted = style.palette_with(Ink::Default, Some(accent));
+            let tinted = style.palette_with(Ink::Default.into(), Some(accent));
             assert_eq!(tinted.ink, accent, "{style:?}: accent becomes the ink");
             assert_eq!(tinted.bg, base.bg, "{style:?}: field is per-style");
             assert_eq!(tinted.ghost, base.ghost, "{style:?}: ghost is per-style");
@@ -894,27 +955,29 @@ mod tests {
         for style in DisplayStyle::ALL {
             let base = style.base_palette().ink;
             assert_eq!(
-                style.palette_with(Ink::Default, Some(accent)).ink,
+                style.palette_with(Ink::Default.into(), Some(accent)).ink,
                 accent,
                 "{style:?}: no scope is the accent"
             );
             assert_eq!(
-                style.palette_with(Ink::Default, None).ink,
+                style.palette_with(Ink::Default.into(), None).ink,
                 base,
                 "{style:?}: no scope and no accent is the skin's own ink"
             );
             assert_eq!(
-                style.palette_with(Ink::Base, Some(accent)).ink,
+                style.palette_with(Ink::Base.into(), Some(accent)).ink,
                 base,
                 "{style:?}: Base ignores the accent"
             );
             assert_eq!(
-                style.palette_with(Ink::Fixed(pinned), Some(accent)).ink,
+                style
+                    .palette_with(Ink::Fixed(pinned).into(), Some(accent))
+                    .ink,
                 pinned,
                 "{style:?}: a pinned ink beats the accent"
             );
             assert_eq!(
-                style.palette_with(Ink::Fixed(pinned), None).ink,
+                style.palette_with(Ink::Fixed(pinned).into(), None).ink,
                 pinned,
                 "{style:?}: …and stands in for one that was never installed"
             );
@@ -930,8 +993,8 @@ mod tests {
     #[test]
     fn a_per_render_ink_moves_the_ink_and_nothing_else() {
         for style in DisplayStyle::ALL {
-            let base = style.palette_with(Ink::Default, None);
-            let pinned = style.palette_with(Ink::Fixed([0x12, 0x34, 0x56, 0x00]), None);
+            let base = style.palette_with(Ink::Default.into(), None);
+            let pinned = style.palette_with(Ink::Fixed([0x12, 0x34, 0x56, 0x00]).into(), None);
             assert_eq!(
                 pinned.ink,
                 [0x12, 0x34, 0x56, 0xff],
@@ -956,13 +1019,13 @@ mod tests {
     /// and leaves nothing behind. Uses the thread-local directly rather than the
     /// process accent, so it is safe against every other test in this binary.
     ///
-    /// **Falsified** by dropping the `InkGuard` restore (`with_ink` setting the
+    /// **Falsified** by dropping the `PinGuard` restore (`with_pins` setting the
     /// cell and returning): the post-scope assertion goes red.
     #[test]
     fn with_ink_scopes_and_nests_and_restores() {
         let outer = [0x11, 0x22, 0x33, 0xff];
         let inner = [0x44, 0x55, 0x66, 0xff];
-        assert_eq!(scoped_ink(), Ink::Default, "no scope by default");
+        assert_eq!(scoped_pins(), Pins::default(), "no scope by default");
 
         let (seen_outer, seen_inner) = with_ink(Ink::Fixed(outer), || {
             let seen_outer = DisplayStyle::Vfd.palette().ink;
@@ -978,9 +1041,250 @@ mod tests {
         assert_eq!(seen_outer, outer, "a render inside the scope uses its ink");
         assert_eq!(seen_inner, inner, "the inner scope wins while it is open");
         assert_eq!(
-            scoped_ink(),
-            Ink::Default,
+            scoped_pins(),
+            Pins::default(),
             "the scope is gone once `with_ink` returns"
+        );
+    }
+
+    // ── the palette widening (#885, settled on #884's two consumers) ─────────
+
+    /// A per-render **field** moves only [`Palette::bg`]: the ink stays whatever
+    /// the ink rule said, and the ghost, the bloom and the CRT pass stay the
+    /// skin's. Alpha is forced opaque, like the ink's — the field is the ground
+    /// a widget floods, and a screen is not a sprite.
+    ///
+    /// **Falsified** by dropping the `pins.field` arm from `palette_with` (the
+    /// "a pinned field becomes the ground" assertion goes red), and — the other
+    /// direction — by having that arm also assign `palette.ink`, which turns
+    /// "the ink is untouched by a field pin" red.
+    #[test]
+    fn a_per_render_field_moves_the_ground_and_nothing_else() {
+        let field = [0x3a, 0x22, 0x50, 0x00];
+        let accent = [0x9b, 0x59, 0xb6, 0xff];
+        for style in DisplayStyle::ALL {
+            let base = style.palette_with(Pins::default(), Some(accent));
+            let pinned = style.palette_with(
+                Pins {
+                    ink: Ink::Default,
+                    field: Some(field),
+                },
+                Some(accent),
+            );
+            assert_eq!(
+                pinned.bg,
+                [0x3a, 0x22, 0x50, 0xff],
+                "{style:?}: a pinned field becomes the ground, opaque"
+            );
+            assert_ne!(
+                pinned.bg, base.bg,
+                "{style:?}: …and it actually moved, or the assertion above is vacuous"
+            );
+            assert_eq!(
+                pinned.ink, base.ink,
+                "{style:?}: the ink is untouched by a field pin"
+            );
+            assert_eq!(pinned.ghost, base.ghost, "{style:?}: ghost is per-skin");
+            assert_eq!(
+                pinned.bloom.is_some(),
+                base.bloom.is_some(),
+                "{style:?}: bloom is per-skin"
+            );
+            assert_eq!(
+                pinned.mask.is_some(),
+                base.mask.is_some(),
+                "{style:?}: the CRT pass is per-skin"
+            );
+        }
+    }
+
+    /// The two pins are independent: naming both moves both, and naming both is
+    /// what #884's speech bubbles need (a lilac field under a bright-lilac ink,
+    /// neither of which any skin has).
+    #[test]
+    fn the_two_pins_compose() {
+        let field = [0x3a, 0x22, 0x50, 0xff];
+        let ink = [0xf0, 0xe0, 0xf8, 0xff];
+        let pins = Pins {
+            ink: Ink::Fixed(ink),
+            field: Some(field),
+        };
+        for style in DisplayStyle::ALL {
+            let p = style.palette_with(pins, Some([0x9b, 0x59, 0xb6, 0xff]));
+            assert_eq!(p.bg, field, "{style:?}: the field pin holds");
+            assert_eq!(
+                p.ink, ink,
+                "{style:?}: …beside the ink pin, over the accent"
+            );
+        }
+    }
+
+    /// The widening is **additive**: [`with_ink`] is exactly [`with_pins`] with
+    /// no field, so every pre-widening call site (the SDK's raster arm, the
+    /// shell's role resolution) resolves to the same palette it always did.
+    ///
+    /// This test is the **sole** guard on that equivalence — a point worth
+    /// stating, because the obvious candidate is not. #912's ten
+    /// `palette_with(Ink::…)` assertions above cannot constrain it: both sides
+    /// of every one of them goes through `Ink::…​.into()`, so a field smuggled
+    /// into [`Pins::ink`] would cancel out and leave them all green.
+    ///
+    /// Both directions matter, and the second is the one review found unmeasured
+    /// at `3b13ce32`:
+    ///
+    /// 1. `with_ink` must not *add* a field. **Falsified** by giving
+    ///    [`Pins::ink`] any field but `None` — the equality goes red on every
+    ///    skin whose field that is not.
+    /// 2. `with_ink` must not *inherit* one. A scope **replaces**; it does not
+    ///    merge with the scope it nests inside. The docs on [`with_pins`] say
+    ///    "the inner scope wins for its duration", and before this assertion
+    ///    existed, changing `with_ink` to pass `field: scoped_pins().field` was
+    ///    invisible to the whole 193-test kit suite. **Falsified** by exactly
+    ///    that change.
+    ///
+    /// Nothing in the tree nests the two today (the shell and the SDK call
+    /// `with_pins` exclusively, and `with_ink` survives as the one-slot
+    /// spelling), which is precisely why the guarantee needs a test rather than
+    /// a call site.
+    #[test]
+    fn with_ink_is_with_pins_and_no_field() {
+        let pinned = [0x1a, 0xc0, 0x77, 0xff];
+        let outer_field = [0x3a, 0x22, 0x50, 0xff];
+        for style in DisplayStyle::ALL {
+            for ink in [Ink::Default, Ink::Base, Ink::Fixed(pinned)] {
+                let via_ink = with_ink(ink, || style.palette());
+                let via_pins = with_pins(Pins { ink, field: None }, || style.palette());
+                assert_eq!(via_ink.ink, via_pins.ink, "{style:?} {ink:?}: ink");
+                assert_eq!(via_ink.bg, via_pins.bg, "{style:?} {ink:?}: field");
+                assert_eq!(
+                    via_ink.bg,
+                    style.base_palette().bg,
+                    "{style:?} {ink:?}: an ink-only scope leaves the skin's field alone",
+                );
+
+                // …and the same inside an enclosing field scope: `with_ink`
+                // replaces it with "no field" rather than inheriting it.
+                let nested = with_pins(
+                    Pins {
+                        ink: Ink::Default,
+                        field: Some(outer_field),
+                    },
+                    || {
+                        let outer = style.palette().bg;
+                        let inner = with_ink(ink, || style.palette().bg);
+                        let resumed = style.palette().bg;
+                        (outer, inner, resumed)
+                    },
+                );
+                assert_eq!(
+                    nested.0, outer_field,
+                    "{style:?} {ink:?}: the enclosing scope's field is in force around it",
+                );
+                assert_eq!(
+                    nested.1,
+                    style.base_palette().bg,
+                    "{style:?} {ink:?}: an inner `with_ink` replaces the field, it does not inherit",
+                );
+                assert_eq!(
+                    nested.2, outer_field,
+                    "{style:?} {ink:?}: …and the enclosing field resumes when it returns",
+                );
+            }
+        }
+    }
+
+    /// The three pins disagree about the alpha byte, on purpose, and this is
+    /// where that is written down as behaviour rather than prose.
+    ///
+    /// [`Pins::field`] and [`Ink::Fixed`] are **palette** slots and a kit palette
+    /// is opaque by construction (a preem widget is a screen, not a sprite), so
+    /// both force `0xff`. `TextBox::notdef` is not a palette slot — no palette
+    /// carries a notdef — so it writes the quad through unchanged, exactly as
+    /// the `colors()` hatch it mirrors always has, and a translucent value
+    /// really does punch holes where an uncovered char draws.
+    ///
+    /// Both arms of the SDK seam take the same path for each slot, so this
+    /// asymmetry costs no parity; it is a footgun worth measuring, not a bug.
+    /// Review at `3b13ce32` found it undocumented and unmeasured, with
+    /// `Rgba`'s own rustdoc claiming the opposite general rule.
+    ///
+    /// **Falsified** three ways: dropping the `0xff` from `palette_with`'s field
+    /// arm or its `Ink::Fixed` arm reds the first two assertions, and forcing
+    /// `TextBox::notdef` opaque reds the third.
+    #[test]
+    fn the_two_palette_pins_force_opaque_and_the_notdef_slot_does_not() {
+        let translucent = [0x3a, 0x22, 0x50, 0x00];
+        let p = DisplayStyle::Vfd.palette_with(
+            Pins {
+                ink: Ink::Fixed(translucent),
+                field: Some(translucent),
+            },
+            None,
+        );
+        assert_eq!(p.bg[3], 0xff, "a pinned field is drawn opaque");
+        assert_eq!(p.ink[3], 0xff, "…and so is a pinned ink");
+
+        // The notdef box is the counterexample: an uncovered char draws it, and
+        // the alpha it was given is the alpha in the buffer. `TextBox::new`'s
+        // own defaults are white-on-black, so both boxes below differ *only* in
+        // how their third color was set.
+        let uncovered = "\u{1F63A}";
+        let by_slot = crate::TextBox::new()
+            .cols(4)
+            .notdef(translucent)
+            .render(uncovered);
+        let holes = by_slot
+            .data()
+            .chunks_exact(4)
+            .filter(|px| px[3] == 0x00 && px[..3] == translucent[..3])
+            .count();
+        assert!(
+            holes > 0,
+            "a translucent notdef reaches the buffer unchanged — {holes} see-through pixels",
+        );
+
+        // …and the same value through the kit's own hatch does the same thing,
+        // which is the point: the wire pin mirrors `colors()` rather than the
+        // palette. (The first two args are `TextBox::new`'s defaults, so the
+        // only difference between the two boxes is the setter.)
+        let by_hatch = crate::TextBox::new()
+            .cols(4)
+            .colors(
+                [0x00, 0x00, 0x00, 0xff],
+                [0xff, 0xff, 0xff, 0xff],
+                translucent,
+            )
+            .render(uncovered);
+        assert_eq!(
+            by_slot.data(),
+            by_hatch.data(),
+            "`notdef()` and `colors()`'s third slot must stay the same slot",
+        );
+    }
+
+    /// The end-to-end claim for the field, on a real widget: two renders of the
+    /// same dot-matrix strip under two pinned fields differ, and the pinned one
+    /// floods that exact color. The ink is held at [`Ink::Base`] so the process
+    /// accent (which another test in this binary may have installed) cannot be
+    /// what the difference measures.
+    #[test]
+    fn two_pinned_fields_render_differently() {
+        let lilac = [0x3a, 0x22, 0x50, 0xff];
+        let olive = [0xa9, 0xb4, 0x7e, 0xff];
+        let flooded = |field| {
+            with_pins(
+                Pins {
+                    ink: Ink::Base,
+                    field: Some(field),
+                },
+                || dot_matrix("8", DisplayStyle::Oled),
+            )
+        };
+        let (l, o) = (flooded(lilac), flooded(olive));
+        assert_ne!(l, o, "two pinned fields must not render the same");
+        assert!(
+            l.data().chunks_exact(4).any(|px| px == lilac),
+            "an unlit pixel carries the pinned field exactly, not something derived from it"
         );
     }
 

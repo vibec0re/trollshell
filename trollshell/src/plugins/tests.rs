@@ -2934,6 +2934,7 @@ fn text_box_renders_at_parity_with_the_kit() {
         corner: 3,
         scale: 2,
         fixed_width: true,
+        notdef: None,
     };
     let text = "the quick brown fox jumps";
     let node = preem_node(
@@ -5342,6 +5343,368 @@ fn a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction() {
         "a pinned TextBox must draw its pinned color",
     );
     assert_eq!(teal, rose, "…and survive a theme change byte-identically");
+}
+
+// ── #885's palette widening: field + notdef (#884's two speech bubbles) ──────
+
+/// A pinned **field** floods the ground the widget draws on, and — like a pinned
+/// ink — is deliberately excluded from the live re-tint.
+///
+/// The ground is where most of a widget's pixels are, so this is the pin that
+/// actually made `pet`'s and `caw`'s bubbles migratable: #912's ink-only
+/// override would have left both boxes standing on the skin's own field.
+///
+/// The two pins are **independent**, and the middle assertion says so out loud:
+/// a widget that pins only its field still re-tints its *ink* with the desktop,
+/// so it is not byte-frozen. Only when both slots are spoken for — here by
+/// `Neutral`, which is the ink saying "not even the accent" — is the whole
+/// widget still. Getting that wrong in the obvious direction (asserting the
+/// field-only widget is frozen) is what this test caught while it was written.
+///
+/// The unpinned control is what keeps the flooding claim from being vacuous.
+///
+/// **Deletion check:** making `pins_for` drop `StyleRef::field` (returning
+/// `field: None`) leaves the rest of the shell suite green and turns "a pinned
+/// field must flood the widget's ground" red.
+#[test]
+fn a_pinned_field_floods_the_ground_and_survives_a_theme_change() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let scope = Scope::detached("885-field");
+    let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd);
+    let pinned = ink_probe("field", vfd.with_field(lilac));
+    let plain = ink_probe("plain", vfd);
+    let still = ink_probe(
+        "still",
+        vfd.with_field(lilac)
+            .with_accent(vocab::AccentRole::Neutral),
+    );
+
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let pinned_teal = mapped_pixels(&scope, &pinned);
+    let plain_teal = mapped_pixels(&scope, &plain);
+    let still_teal = mapped_pixels(&scope, &still);
+
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let pinned_rose = mapped_pixels(&scope, &pinned);
+    let still_rose = mapped_pixels(&scope, &still);
+
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+    assert!(
+        floods(&pinned_teal),
+        "a pinned field must flood the widget's ground, exactly, not something derived from it",
+    );
+    assert!(
+        !floods(&plain_teal),
+        "…and the same widget without the pin must not, or the check above is vacuous",
+    );
+    assert!(
+        floods(&pinned_rose),
+        "the ground is excluded from the re-tint — the accent moved and the field did not",
+    );
+    assert_ne!(
+        pinned_teal, pinned_rose,
+        "…while its *ink* still follows the desktop: the two pins are independent",
+    );
+    assert_eq!(
+        still_teal, still_rose,
+        "and with both slots spoken for the whole widget is byte-identical across the change",
+    );
+}
+
+/// The whole point of the widening, end to end on the state path: a `TextBox`
+/// carrying all three pins renders **byte-identically** to the kit call `pet`
+/// made before it migrated (`TextBox::new().…​.colors(field, ink, notdef)`).
+///
+/// This is the shell's half of #884's compat promise. The plugin's half — that
+/// its *raster* arm still produces those same bytes against an old shell — is
+/// pinned in `hytte-plugin-pet` and `hytte-plugin-caw`; together they say the
+/// bubbles look the same on both shells and on both arms.
+///
+/// The config is `pet`'s real one, down to the emoji: an uncovered char is the
+/// only input that reaches the `notdef` slot, which is the color the palette
+/// scope structurally *cannot* carry (no kit palette has one) and so the one a
+/// wrong wiring drops silently.
+///
+/// **Deletion check:** making `text_box` ignore `config.notdef` leaves the rest
+/// of the shell suite green and turns the oracle comparison red; so does making
+/// `pins_for` drop the field. The three "…must move pixels" controls below say
+/// which pin each failure is about.
+#[test]
+fn a_fully_pinned_text_box_reproduces_the_plugins_own_palette() {
+    let _ink = preem_ink_lock();
+    let field = [0x3a, 0x22, 0x50, 0xff];
+    let ink = [0xf0, 0xe0, 0xf8, 0xff];
+    let notdef = [0x6c, 0x4e, 0x86, 0xff];
+    let text = "mrrp 💕";
+    let scope = Scope::detached("885-palette");
+
+    let config = |field, ink, notdef| vocab::TextBoxConfig {
+        style: {
+            let base = vocab::StyleRef::new(vocab::StyleName::Lcd);
+            let base = match field {
+                Some(f) => base.with_field(f),
+                None => base,
+            };
+            match ink {
+                Some(i) => base.with_ink(i),
+                None => base,
+            }
+        },
+        width: vocab::TextBoxWidth::FitPx(126),
+        max_lines: 3,
+        pad: 3,
+        corner: 2,
+        scale: 2,
+        fixed_width: true,
+        notdef,
+    };
+    let node = |id: &'static str, config| {
+        preem_node(
+            Some(id),
+            vocab::PreemWidget::TextBox {
+                config,
+                state: vocab::TextBoxState { text: text.into() },
+            },
+        )
+    };
+
+    // An accent is installed throughout: a pin that quietly fell through to the
+    // session tint would then differ from the oracle rather than coincide with it.
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let all = mapped_pixels(
+        &scope,
+        &node("all", config(Some(field), Some(ink), Some(notdef))),
+    );
+    let no_field = mapped_pixels(&scope, &node("nf", config(None, Some(ink), Some(notdef))));
+    let no_ink = mapped_pixels(&scope, &node("ni", config(Some(field), None, Some(notdef))));
+    let no_notdef = mapped_pixels(&scope, &node("nn", config(Some(field), Some(ink), None)));
+
+    // …and it survives the theme moving, like every pin.
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let all_again = mapped_pixels(
+        &scope,
+        &node("all", config(Some(field), Some(ink), Some(notdef))),
+    );
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    // The oracle is the pre-#884 kit call, written out rather than derived from
+    // `text_box`: an oracle built from the code under test agrees by construction.
+    let oracle = kit::TextBox::new()
+        .fit_px(126)
+        .max_lines(3)
+        .pad(3)
+        .corner(2)
+        .scale(2)
+        .fixed_width(true)
+        .colors(field, ink, notdef);
+    assert_eq!(
+        all,
+        kit_pixels(&oracle.render(text)),
+        "a fully pinned TextBox must reproduce the plugin's own `colors()` bytes",
+    );
+    assert_eq!(
+        all, all_again,
+        "…and survive a theme change byte-identically"
+    );
+    assert_ne!(all, no_field, "the field pin must move pixels");
+    assert_ne!(all, no_ink, "the ink pin must move pixels");
+    assert_ne!(
+        all, no_notdef,
+        "the notdef pin must move pixels — the emoji is what reaches it",
+    );
+}
+
+/// The **second** palette scope: `Renderer::update`'s marquee arm, which
+/// re-rasterises the strip in place on a *text* change.
+///
+/// This is the one path where a state change re-runs a constructor that **bakes**
+/// its palette. `Marquee::render` floods the strip's backdrop from
+/// `palette().bg` (`marquee.rs:179`) and only re-resolves the lit ink per
+/// `window()` call, so a strip built outside the widget's pins keeps the skin's
+/// ground for the rest of the session. `build()` never runs here: a new message
+/// leaves `same_config` agreeing, which is exactly why the scope has to be
+/// repeated on this line rather than inherited from construction.
+///
+/// The `builds == 1` assertion is load-bearing — without it a rebuild would
+/// satisfy the flood assertion and this would silently be a second test of
+/// `build()`'s scope instead of `update`'s.
+///
+/// Found by review at `3b13ce32`: narrowing this one scope back to
+/// `kit::with_ink(ink_for(…))` left the whole 339-test shell suite green, while
+/// the same narrowing in `build()` reds
+/// `a_fully_pinned_text_box_reproduces_the_plugins_own_palette`. The code was
+/// already right; nothing measured it.
+///
+/// **Deletion check:** narrow `Renderer::update`'s marquee arm to `with_ink`
+/// and this goes red at *"…and the strip `update` re-rasterises must keep it"*,
+/// with `builds == 1` still holding.
+#[test]
+fn a_pinned_field_survives_a_marquee_text_change() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let scope = Scope::detached("885-marquee-field");
+    let node = |text: &str| {
+        preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd).with_field(lilac),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: 20.0,
+                },
+                state: vocab::MarqueeState { text: text.into() },
+            },
+        )
+    };
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+
+    let first = mapped_pixels(&scope, &node("ONE LONG SCROLLING MESSAGE"));
+    // A text change only: `same_config` still agrees, so this takes the
+    // in-place `update` path and re-rasterises the strip there.
+    let after = mapped_pixels(&scope, &node("ANOTHER LONG SCROLLING MESSAGE"));
+    let builds = preem_render::probe(&scope, Some("mq"));
+    preem_render::forget_scope(&scope);
+
+    assert_eq!(
+        builds.map(|(b, _)| b),
+        Some(1),
+        "the text change must be an in-place update, not a rebuild — or this measures `build`",
+    );
+    assert!(floods(&first), "the pin reaches the strip built by `build`");
+    assert!(
+        floods(&after),
+        "…and the strip `update` re-rasterises must keep it",
+    );
+}
+
+/// One `PreemWidget` of `kind`, its style reference carried in, in state
+/// variant `b` or `a` — the two states
+/// [`a_pinned_field_survives_a_state_change_on_every_widget`] drives through the
+/// in-place `Renderer::update` path.
+///
+/// Split out of the test purely so neither function is 160 lines; the pairs
+/// differ in **state only**, which is the property that makes `same_config`
+/// agree and `apply` take `update` instead of rebuilding.
+fn state_pair_of(kind: &str, style: vocab::StyleRef, b: bool) -> vocab::PreemWidget {
+    let text = if b { "BBBB" } else { "AAAA" }.to_owned();
+    match kind {
+        "dm" => vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig { style },
+            state: vocab::DotMatrixState { text },
+        },
+        "seg" => vocab::PreemWidget::SevenSeg {
+            config: vocab::SevenSegConfig { style },
+            state: vocab::SevenSegState { text },
+        },
+        "tb" => vocab::PreemWidget::TextBox {
+            config: vocab::TextBoxConfig {
+                style,
+                ..vocab::TextBoxConfig::default()
+            },
+            state: vocab::TextBoxState { text },
+        },
+        "led" => vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style,
+                ..vocab::LedStripConfig::default()
+            },
+            state: vocab::LedStripState {
+                level: if b { 0.8 } else { 0.2 },
+                peak: b.then_some(0.9),
+            },
+        },
+        "mq" => vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style,
+                ..vocab::MarqueeConfig::default()
+            },
+            state: vocab::MarqueeState {
+                text: format!("{text} LONG SCROLLING MESSAGE"),
+            },
+        },
+        "sc" => vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style,
+                ..vocab::ScopeConfig::default()
+            },
+            state: vocab::ScopeState {
+                samples: if b {
+                    vec![1.0, -1.0, 0.25]
+                } else {
+                    vec![0.0, 0.5, -0.5]
+                },
+            },
+        },
+        "ga" => vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig {
+                style,
+                ..vocab::GaugeConfig::default()
+            },
+            state: vocab::GaugeState {
+                target: if b { 0.8 } else { 0.2 },
+            },
+        },
+        "fb" => vocab::PreemWidget::FlipBoard {
+            config: vocab::FlipBoardConfig {
+                style,
+                ..vocab::FlipBoardConfig::default()
+            },
+            state: vocab::FlipBoardState { text },
+        },
+        other => panic!("no such widget kind: {other}"),
+    }
+}
+
+/// …and the same claim for **every** widget kind, over a state change that
+/// takes the in-place `Renderer::update` path.
+///
+/// The marquee test above closes the one arm that re-rasterises. This one is the
+/// enumeration behind "and no other arm can": rather than arguing it in prose,
+/// it drives a state change through all eight and asserts the pinned ground is
+/// still flooded afterwards, with `builds == 1` proving none of them rebuilt.
+///
+/// The kit side of the argument, re-derived here rather than taken from #912's
+/// list: exactly two non-test functions in `hytte-preem` read `palette()`
+/// outside a `render`/`window` call — `TextBox::styled` (`textbox.rs:74`) and
+/// `Marquee::render` (`marquee.rs:179`). Those are the only two that can bake.
+/// `TextBox`'s update arm copies text and does not rebuild the box; `Scope`
+/// stores a sample batch; `Gauge::set_target`, `FlipBoard::set_text` and the LED
+/// strip's level/peak/hold all touch state a later `render(style)` reads inside
+/// `Instance::frame`'s scope. So the marquee arm is the whole exposure, and this
+/// test is what will notice if a future arm joins it.
+///
+/// **Deletion check:** narrowing `Renderer::update`'s marquee scope to
+/// `with_ink` reds the `mq` row; making `pins_for` drop the field reds every
+/// row.
+#[test]
+fn a_pinned_field_survives_a_state_change_on_every_widget() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd).with_field(lilac);
+    let scope = Scope::detached("885-field-every-widget");
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+
+    for id in ["dm", "seg", "tb", "led", "mq", "sc", "ga", "fb"] {
+        let before = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, false)));
+        let after = mapped_pixels(&scope, &preem_node(Some(id), state_pair_of(id, vfd, true)));
+        assert_eq!(
+            preem_render::probe(&scope, Some(id)).map(|(b, _)| b),
+            Some(1),
+            "{id}: a state change must not rebuild, or this proves nothing about `update`",
+        );
+        assert!(floods(&before), "{id}: the pin reaches the first render");
+        assert!(
+            floods(&after),
+            "{id}: …and survives the in-place state change",
+        );
+    }
+    preem_render::forget_scope(&scope);
 }
 
 /// The memoized role colors are dropped when the theme moves — which is what

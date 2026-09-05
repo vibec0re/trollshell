@@ -106,8 +106,9 @@
 //! become the config the shell sizes from), not shell CSS: the 7seg clock
 //! renders 188 px wide, the 11-char ticker 268 px, the marquee window
 //! [`MARQUEE_WINDOW_PX`] wide, the 22-column ×2 textbox 274 px, the scope's and
-//! gauge's defaults 288 px each, and the two 8-cell boards 260 px — all inside
-//! the sidebar card's ~296 px content width.
+//! gauge's defaults 288 px each, the two 8-cell boards 260 px, and the
+//! `ROLE`/`PIN.`/`FLD` palette row 100 + 100 + 76 px plus two 8 px gaps = 292 px
+//! — all inside the sidebar card's ~296 px content width.
 
 use hytte_plugin::display::{
     AccentRole, DotMatrix, FlipBoard, Gauge, Marquee, Mechanism, Scope, SevenSeg, StyleName,
@@ -135,6 +136,7 @@ const FLAP_ID: &str = "preem-demo-flap";
 const NIXIE_ID: &str = "preem-demo-nixie";
 const ROLE_ID: &str = "preem-demo-role";
 const PIN_ID: &str = "preem-demo-pin";
+const FIELD_ID: &str = "preem-demo-field";
 
 /// The pinned widget's ink (#885) — a color no theme resolves to, so "did it
 /// re-tint?" is answerable on glass at a glance rather than by pixel-peeping.
@@ -143,10 +145,21 @@ const PIN_ID: &str = "preem-demo-pin";
 /// desktop accent moves one of them and not the other.
 const PIN_INK: [u8; 4] = [0xff, 0x2d, 0x95, 0xff];
 
-/// What the two ink probes read. Four cells each, so the pair fits the ~296 px
-/// card side by side.
+/// The **field** pin (#884/#885's palette widening) — the ground the third probe
+/// floods, where [`PIN_INK`] is the ink the second one lights.
+///
+/// This exact lilac is `pet`'s and `caw`'s bubble field, which is the whole
+/// reason the override had to widen past the ink; putting it on the demo card
+/// means a broken field pin and a broken *bubble* are two observations rather
+/// than one. It is also none of the four skins' fields (`040a0e` / `a9b47e` /
+/// `000000` / `030705`), so "did the ground move?" is answerable at a glance.
+const FIELD_PIN: [u8; 4] = [0x3a, 0x22, 0x50, 0xff];
+
+/// What the three palette probes read. 4 + 4 + 3 cells — 100 + 100 + 76 px plus
+/// two 8 px gaps = 292 px, so the row fits the ~296 px card side by side.
 const ROLE_TEXT: &str = "ROLE";
 const PIN_TEXT: &str = "PIN.";
+const FIELD_TEXT: &str = "FLD";
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
@@ -275,11 +288,19 @@ struct PreemDemo {
     /// and it re-tints the moment the desktop accent or color scheme moves — no
     /// restart, no frame on the wire.
     role: DotMatrix,
-    /// The **pinned** half: the same widget with an explicit
+    /// The **ink-pinned** third: the same widget with an explicit
     /// [`PIN_INK`](crate::PIN_INK), which is deliberately excluded from that
-    /// re-tint. Side by side with `role` these two *are* the demo of #885: change
-    /// the accent with the card open and exactly one of them moves.
+    /// re-tint.
     pin: DotMatrix,
+    /// The **field-pinned** third (#884/#885): the same widget again, with its
+    /// *ground* pinned to [`FIELD_PIN`](crate::FIELD_PIN) and its ink left on
+    /// the accent path.
+    ///
+    /// Deliberately half-pinned, because that is the property the palette
+    /// widening actually has and the one worth showing: the two pins are
+    /// independent, so on an accent change this cell's glyphs move while its
+    /// ground does not. Pinning both would just be a second `pin` cell.
+    field_pin: DotMatrix,
     /// Whether the sidebar (and so this card) is currently shown — the
     /// [`SlotVisible`](Input::SlotVisible) gate for the scope's sweep (#422).
     /// Seeded `false`; the host sends the real value at register.
@@ -326,6 +347,7 @@ impl PreemDemo {
         self.nixie.style(style);
         self.role.style(style);
         self.pin.style(style);
+        self.field_pin.style(style);
     }
 
     /// The ticker's visible window, advanced one char per second.
@@ -434,6 +456,7 @@ impl Plugin for PreemDemo {
             nixie: FlipBoard::new(style, Mechanism::Nixie).cells(CLOCK_CELLS),
             role: DotMatrix::new(style).accent_role(AccentRole::Success),
             pin: DotMatrix::new(style).ink(PIN_INK),
+            field_pin: DotMatrix::new(style).field(FIELD_PIN),
             visible: false,
         }
     }
@@ -556,10 +579,14 @@ impl Plugin for PreemDemo {
                 self.gauge.node(GAUGE_ID),
                 self.flap.node(FLAP_ID),
                 self.nixie.node(NIXIE_ID),
-                // #885, on glass: same widget, same skin, two ink sources. The
-                // left one names a semantic role and follows the theme; the
-                // right one pins `PIN_INK` and does not. Change the desktop
-                // accent with this card open and exactly one of them moves.
+                // #885, on glass: same widget, same skin, three palette sources.
+                // `ROLE` names a semantic role and follows the theme; `PIN.`
+                // pins an ink and does not; `FLD` (#884's widening) pins its
+                // *ground* and leaves its ink on the accent path. Change the
+                // desktop accent with this card open: `ROLE` re-tints wholly,
+                // `PIN.` not at all, and `FLD`'s glyphs move while its lilac
+                // ground stays — which is the palette override's actual claim,
+                // that the two pins are independent.
                 Node::Box {
                     id: None,
                     dir: Dir::Horizontal,
@@ -569,6 +596,7 @@ impl Plugin for PreemDemo {
                     children: vec![
                         self.role.node(ROLE_ID, ROLE_TEXT),
                         self.pin.node(PIN_ID, PIN_TEXT),
+                        self.field_pin.node(FIELD_ID, FIELD_TEXT),
                     ],
                 },
                 Node::Label {
@@ -591,7 +619,7 @@ mod tests {
     use super::{CYCLE_BTN, PreemDemo, STYLE_SECS, parse_hhmm};
     use hytte_plugin::display::testing::with_render_mode;
     use hytte_plugin::display::{Marquee, RenderMode, StyleName, display_style};
-    use hytte_plugin::proto::preem::PreemWidget;
+    use hytte_plugin::proto::preem::{AccentRole, PreemWidget};
     use hytte_plugin::proto::{
         ClockState, EventKind, Node, PluginMsg, StateKey, StateSnapshot, decode, encode,
     };
@@ -758,8 +786,9 @@ mod tests {
             let bufs = pixels_of(&tree);
             assert_eq!(
                 bufs.len(),
-                10,
-                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie + the ink pair"
+                11,
+                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie \
+                 + the ROLE/PIN./FLD palette row"
             );
             assert!(
                 preem_of(&tree).is_empty(),
@@ -798,9 +827,10 @@ mod tests {
             vec![
                 // `pixels_of`/`preem_of` walk depth-first off a stack, so the
                 // card's children come back reversed — the assertion is on the
-                // set and the ids, not on paint order. The ink pair is the last
-                // row and so comes back first, its own two children reversed
-                // with it.
+                // set and the ids, not on paint order. The palette row is the
+                // last row and so comes back first, its own three children
+                // reversed with it.
+                ("preem-demo-field".to_owned(), "dot-matrix"),
                 ("preem-demo-pin".to_owned(), "dot-matrix"),
                 ("preem-demo-role".to_owned(), "dot-matrix"),
                 ("preem-demo-nixie".to_owned(), "flip-board"),
@@ -855,6 +885,63 @@ mod tests {
             }
         }
         assert!(seen_seg && seen_gauge, "both widgets were on the card");
+    }
+
+    /// The palette row is the card's whole on-glass proof of #885, so its three
+    /// cells must actually carry three *different* palette sources — otherwise
+    /// the "change the accent and watch" instruction in the module docs is
+    /// checking something that is not there.
+    ///
+    /// `FLD` is the one #884's widening added, and the assertion that matters is
+    /// the pair: a pinned field **and** no pinned ink. Pin both and the cell is
+    /// a duplicate of `PIN.`; pin neither and it is a duplicate of `ROLE`.
+    ///
+    /// **Falsified** by dropping `.field(FIELD_PIN)` from the `field_pin`
+    /// construction, or by adding `.ink(PIN_INK)` beside it.
+    #[test]
+    fn the_palette_row_shows_three_different_sources() {
+        let m = fresh();
+        let tree = with_render_mode(RenderMode::State, || m.view().tree);
+
+        let mut styles = std::collections::HashMap::new();
+        let mut stack = vec![&tree];
+        while let Some(n) = stack.pop() {
+            match n {
+                Node::Preem { id, widget, .. } => {
+                    if let Some(id) = id.as_deref() {
+                        styles.insert(id.to_owned(), widget.style());
+                    }
+                }
+                Node::Box { children, .. } => stack.extend(children.iter()),
+                Node::Button { child, .. } => stack.push(child),
+                _ => {}
+            }
+        }
+
+        let role = styles[super::ROLE_ID];
+        let pin = styles[super::PIN_ID];
+        let field = styles[super::FIELD_ID];
+
+        assert_eq!(
+            (role.accent, role.ink, role.field),
+            (Some(AccentRole::Success), None, None),
+            "ROLE follows the theme and pins nothing",
+        );
+        assert_eq!(
+            (pin.ink, pin.field),
+            (Some(super::PIN_INK), None),
+            "PIN. pins an ink and nothing else",
+        );
+        assert_eq!(
+            (field.field, field.ink),
+            (Some(super::FIELD_PIN), None),
+            "FLD pins the ground and leaves its ink on the accent path",
+        );
+        assert_eq!(
+            (role.style, pin.style, field.style),
+            (m.style(), m.style(), m.style()),
+            "all three wear the card's current skin, so only the palette differs",
+        );
     }
 
     /// The view is a pure function of the model, and each skin renders a

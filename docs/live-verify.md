@@ -802,6 +802,75 @@ session.
      near any of these caps, so none of these lines should appear against
      an unpatched plugin set.
 
+- [ ] **(#921/#923)** Merged as `bf2b266`. Preem renderer scopes were
+      released from places tied to a monitor's widgets: with zero live
+      regions (every output unplugged) a departing plugin's card scope
+      stayed resident forever, and destroying one of two monitors' drawer
+      children dropped the shared panel scope out from under a sibling
+      still painting it. Both releases now ride a monitor-independent
+      watcher of the live plugin set instead.
+  1. **Every output unplugged, with an animating plugin.** Start a plugin
+     with a scrolling marquee or phosphor scope on a bar mount. Unplug —
+     or `niri msg output … off` — **every** output, stop the plugin's
+     unit while the session is output-less, then replug. The chip must
+     come back with fresh animation state and no stale instances behind
+     it; before this fix the scope stayed resident for the rest of the
+     session.
+  2. **Two monitors, one drawer closed.** Open the same plugin's drawer
+     panel on both outputs, then close/destroy one monitor's drawer: the
+     surviving monitor's panel must keep painting and keep animating, not
+     go blank or freeze. Close the last one too and the panel's animation
+     should restart from rest on the next open — the pre-existing #883
+     trade, unchanged.
+  3. **A documented residual, not expected to reproduce.** The panel
+     refcount's rustdoc notes one theoretical gap: a `shown` cell that
+     outlived its plugin's departure, released only after a _later_
+     session of the same plugin id took a hold, would decrement that new
+     session's count instead. Today's wiring makes it unreachable — every
+     live child blanks on the departure emission, and the releaser runs
+     before any drawer child exists — so there is nothing to chase on
+     glass, just don't be alarmed if you go looking for it in the code.
+- [ ] **(#884/#885/#924)** Merged as `f5168c8`. The workspace's last
+      two `.colors()` consumers move onto the state path: `pet`'s and
+      `caw`'s speech bubbles now pin a full palette (field + ink +
+      notdef) instead of only an ink. Against a **rebuilt** shell (behind
+      #896):
+  1. **`pet`.** Open the sidebar: the bubble beside the face should look
+     exactly as it does today — same lilac field, same bright-lilac
+     glyphs, same fixed-width slot that wraps _down_ rather than
+     sideways. The journal should show no "does not advertise" warning
+     for `trollshell-plugin-pet`, and a socket trace should carry the
+     _message_ rather than a `Pixels` buffer when the cat speaks. Poke
+     it: the bubble text changes, the colors do not.
+  2. **`caw`.** Same check beneath her face, plus the once-a-day briefing
+     box (or force one): taller, same violet, same wrap. A short caw
+     should still hug into a compact chip.
+  3. **The point of the whole change: change the desktop accent** while
+     either bubble is on screen. Neither may move — they are pinned, and
+     pinning excludes them from the re-tint. Anything else on screen that
+     is _not_ pinned (`preem-demo`'s `ROLE` cell, `timer`'s readout)
+     should re-tint in the same instant, which is what says the shell is
+     re-rendering rather than sitting on a cache.
+  4. **`preem-demo`'s palette row** — `ROLE` / `PIN.` / `FLD` side by
+     side — is the one-glance version of the above and needs no bubbles:
+     on an accent change `ROLE` re-tints wholly, `PIN.` not at all, and
+     `FLD`'s glyphs move while its lilac ground (the bubbles' own
+     `3a2250`) stays put. That last one is the field pin doing its job.
+  5. **Both faces** (`pet`'s and `caw`'s hand-drawn `Frame`) must be
+     pixel-unchanged throughout — they never left the `Pixels` escape
+     hatch.
+  6. **Against a shell that predates #896**, both plugins should render
+     unchanged, byte for byte, exactly as before either PR existed — the
+     raster-parity tests pin this, so any difference here would mean the
+     kit call and the state-arm pin have drifted apart.
+
+     One thing to know rather than chase: `field` and `ink` are forced
+     fully opaque like every kit palette slot, but `notdef` is not — a
+     translucent `notdef` pin punches see-through holes where an
+     uncovered glyph falls back to the box. `pet` and `caw` both pin
+     `notdef` fully opaque, so this alpha difference has no visible
+     effect on the bundled plugins as shipped.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

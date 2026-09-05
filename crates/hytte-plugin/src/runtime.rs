@@ -1822,8 +1822,19 @@ mod tests {
     }
 
     /// Read the next frame, requiring it to be a `Render`, and return its tree.
+    ///
+    /// **Bounded**, unlike the plain [`next_plugin_frame`] the older session
+    /// tests use, and the falsification round is why: breaking the
+    /// emit-vs-rasterise decision so the SDK always emits state makes the frame
+    /// `a_hello_below_the_preem_generation_still_rasterises` is waiting for
+    /// dedup away entirely, and an unbounded read then **hangs** — a regression
+    /// that stalls CI on a timeout instead of naming itself in a failure line.
+    /// Five seconds is ~1000× what a duplex round trip takes.
     async fn next_render<R: AsyncRead + Unpin>(rd: &mut R) -> Node {
-        match next_plugin_frame(rd).await {
+        let frame = tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(rd))
+            .await
+            .expect("a Render frame within 5 s — an unsent frame is a bug, not a slow test");
+        match frame {
             PluginMsg::Render { tree, .. } => tree,
             PluginMsg::Pong { seq } => panic!("expected a Render frame, got Pong {seq}"),
             PluginMsg::Log { msg, .. } => panic!("expected a Render frame, got Log {msg:?}"),
@@ -1834,7 +1845,10 @@ mod tests {
     /// Run one whole `Scroller` session against a host closure.
     async fn scroller_session<F, Fut>(host: F)
     where
-        F: FnOnce(tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>) -> Fut,
+        F: FnOnce(
+            tokio::io::ReadHalf<tokio::io::DuplexStream>,
+            tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        ) -> Fut,
         Fut: Future<Output = ()>,
     {
         let (plugin_end, host_end) = duplex(64 * 1024);
@@ -1859,7 +1873,8 @@ mod tests {
         );
         assert_eq!(m.vocab_max, Some(VOCAB), "…and the negotiated one is VOCAB");
         assert!(m.negotiates_vocab(), "so the host knows to send Hello");
-        m.check_vocab().expect("an old host's handshake still accepts us");
+        m.check_vocab()
+            .expect("an old host's handshake still accepts us");
 
         // Both ends compute the same number from the same two inputs.
         assert_eq!(m.negotiated_vocab(VOCAB_UNCONDITIONAL), VOCAB_UNCONDITIONAL);

@@ -42,6 +42,14 @@
 //! no [`Frame`](crate::preem::Frame) is allocated, and no needle/phosphor math
 //! runs — which is the CPU half of the win, next to the wire half.
 //!
+//! The physics **getters** follow the same rule rather than reporting the
+//! stopped local animation: [`Gauge::value`] is the stated target and
+//! [`Gauge::is_settled`] / [`FlipBoard::is_settled`] are `true` while the host
+//! speaks preem, because there is no local motion left to advance. A plugin
+//! that gates work on "has the needle arrived yet?" therefore keeps working
+//! instead of waiting forever on a tick that is a no-op. Each has an `_in`
+//! twin that states the mode explicitly, for tests.
+//!
 //! # Negotiation
 //!
 //! [`Manifest::new`](crate::proto::Manifest::new) stamps `vocab_max`, which is the
@@ -113,8 +121,6 @@
 //! `Node::Pixels` escape hatch, unchanged, and it is the right answer for
 //! drawing the vocabulary has no word for (the pet's face, caw's speech bubble).
 
-use hytte_preem as kit;
-use hytte_preem::{DisplayStyle, Frame};
 use hytte_plugin_proto::preem::{
     DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange,
     GaugeState, LedStripConfig, LedStripState, MarqueeConfig, MarqueeState, PREEM_VOCAB,
@@ -122,6 +128,8 @@ use hytte_plugin_proto::preem::{
     TextBoxConfig, TextBoxState,
 };
 use hytte_plugin_proto::wire::{Cls, Node};
+use hytte_preem as kit;
+use hytte_preem::{DisplayStyle, Frame};
 
 pub use hytte_plugin_proto::preem::{AccentRole, Mechanism, StyleName, StyleRef, TextBoxWidth};
 
@@ -193,6 +201,49 @@ pub fn render_mode() -> RenderMode {
     }
 }
 
+/// Test seams for plugins that assert **both** wire shapes.
+///
+/// A migrated plugin's `view()` produces a typed state tree or a rasterised one
+/// depending on what the host advertised, and both are worth pinning — the state
+/// tree because it is what the shell will draw, the raster tree because it is
+/// the compat promise. Neither is reachable from a unit test without a live
+/// session, so this module provides the seam.
+///
+/// `hytte-plugin-preem-demo` is the reference consumer.
+pub mod testing {
+    use super::{NEGOTIATED, RenderMode};
+    use hytte_plugin_proto::preem::PREEM_VOCAB;
+
+    /// Puts the previous generation back however `f` returns — including by
+    /// panic, which is the normal way a failing assertion leaves.
+    struct Restore(u16);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NEGOTIATED.with(|v| v.set(self.0));
+        }
+    }
+
+    /// Call `f` with the render mode forced, then restore the session's real
+    /// negotiated generation.
+    ///
+    /// **Tests only.** Forcing [`RenderMode::State`] inside a *running* plugin
+    /// would emit a [`Node::Preem`](crate::proto::Node::Preem) at a host that
+    /// never advertised it — which cannot decode the frame, drops the session,
+    /// and leaves the plugin in exactly the #437 redial crash-loop the whole
+    /// negotiation exists to prevent. That is why there is no plain setter.
+    pub fn with_render_mode<T>(mode: RenderMode, f: impl FnOnce() -> T) -> T {
+        let _restore = Restore(super::negotiated_vocab());
+        NEGOTIATED.with(|v| {
+            v.set(match mode {
+                RenderMode::State => PREEM_VOCAB,
+                RenderMode::Raster => 0,
+            });
+        });
+        f()
+    }
+}
+
 // ── style conversion ────────────────────────────────────────────────────────
 
 /// The wire [`StyleName`] for a kit [`DisplayStyle`] — the migration helper for
@@ -238,6 +289,15 @@ fn style_ref(style: StyleName) -> StyleRef {
 /// too — it must, it cannot trust a plugin — but clamping here as well means the
 /// value the runtime *dedups on* is the value the shell will actually draw, so
 /// two over-cap states that clamp to the same thing send one frame, not two.
+///
+/// The raster arm deliberately does **not** clamp. It is exactly the kit call a
+/// plugin author writes by hand behind [`Frame::into_node`], and holding it to
+/// that byte for byte is this seam's whole compat promise (see the
+/// `the_raster_arm_is_byte_identical_*` tests) — so an
+/// out-of-range config allocates locally here just as it does today, rather
+/// than rendering one size against an old shell and another against a new one.
+/// Nothing hostile reaches this arm: the config is the plugin's own, and it is
+/// the plugin's own address space that pays for it.
 fn lower(
     mode: RenderMode,
     id: &str,
@@ -764,10 +824,10 @@ impl LedStrip {
     /// [`set_level`](Self::set_level) with the mode stated explicitly.
     pub fn set_level_in(&mut self, mode: RenderMode, level: f32) {
         self.state.level = level;
-        if mode == RenderMode::Raster {
-            if let Some(hold) = self.hold.as_mut() {
-                hold.push(level);
-            }
+        if mode == RenderMode::Raster
+            && let Some(hold) = self.hold.as_mut()
+        {
+            hold.push(level);
         }
     }
 
@@ -787,10 +847,10 @@ impl LedStrip {
 
     /// [`advance`](Self::advance) with the mode stated explicitly.
     pub fn advance_in(&mut self, mode: RenderMode) {
-        if mode == RenderMode::Raster {
-            if let Some(hold) = self.hold.as_mut() {
-                hold.decay();
-            }
+        if mode == RenderMode::Raster
+            && let Some(hold) = self.hold.as_mut()
+        {
+            hold.decay();
         }
     }
 
@@ -1104,11 +1164,27 @@ impl Gauge {
         self.kit.settle();
     }
 
-    /// The reading the needle is currently at, in the configured range —
-    /// plugin-side physics, so `target` while the host speaks preem.
+    /// The reading the needle is currently at, in the configured range.
+    ///
+    /// Plugin-side physics in raster mode. Once the host speaks preem this is
+    /// [`target`](Self::target): [`advance`](Self::advance) is a no-op there, so
+    /// the local needle would otherwise sit frozen wherever the last raster tick
+    /// left it — a value that is neither where the shell is drawing the pointer
+    /// nor where it is heading, and the one number a plugin reading this getter
+    /// would least expect. The shell lands the needle on the target, so that is
+    /// the honest answer.
     #[must_use]
     pub fn value(&self) -> f32 {
-        self.kit.value()
+        self.value_in(render_mode())
+    }
+
+    /// [`value`](Self::value) with the mode stated explicitly.
+    #[must_use]
+    pub fn value_in(&self, mode: RenderMode) -> f32 {
+        match mode {
+            RenderMode::Raster => self.kit.value(),
+            RenderMode::State => self.state.target,
+        }
     }
 
     /// The reading the needle is heading for.
@@ -1117,10 +1193,22 @@ impl Gauge {
         self.state.target
     }
 
-    /// Whether the plugin-side needle has come to rest.
+    /// Whether the plugin-side needle has come to rest — i.e. whether there is
+    /// any local motion left to [`advance`](Self::advance).
+    ///
+    /// **`true` while the host speaks preem**, always: the shell owns the
+    /// spring there and the plugin has nothing left to run. Reporting the
+    /// frozen local needle instead would leave a plugin that gates work on
+    /// "settled yet?" waiting forever for a tick that is a no-op.
     #[must_use]
     pub fn is_settled(&self) -> bool {
-        self.kit.is_settled()
+        self.is_settled_in(render_mode())
+    }
+
+    /// [`is_settled`](Self::is_settled) with the mode stated explicitly.
+    #[must_use]
+    pub fn is_settled_in(&self, mode: RenderMode) -> bool {
+        mode == RenderMode::State || self.kit.is_settled()
     }
 
     /// The node, in whichever mode this session negotiated.
@@ -1294,10 +1382,21 @@ impl FlipBoard {
         self.kit.target()
     }
 
-    /// Whether every plugin-side card has landed.
+    /// Whether every plugin-side card has landed — i.e. whether there is any
+    /// local motion left to [`advance`](Self::advance).
+    ///
+    /// **`true` while the host speaks preem**, for [`Gauge::is_settled`]'s
+    /// reason: the shell runs the flip clocks there, so a board whose cards
+    /// were still turning locally would never report landing again.
     #[must_use]
     pub fn is_settled(&self) -> bool {
-        self.kit.is_settled()
+        self.is_settled_in(render_mode())
+    }
+
+    /// [`is_settled`](Self::is_settled) with the mode stated explicitly.
+    #[must_use]
+    pub fn is_settled_in(&self, mode: RenderMode) -> bool {
+        mode == RenderMode::State || self.kit.is_settled()
     }
 
     /// The node, in whichever mode this session negotiated.
@@ -1382,6 +1481,8 @@ mod tests {
     use hytte_plugin_proto::preem::{MAX_TEXT_LEN, PREEM_VOCAB, PreemWidget};
     use hytte_plugin_proto::wire::Node;
     use hytte_plugin_proto::{decode, encode};
+    use hytte_preem as kit;
+    use hytte_preem::DisplayStyle;
 
     /// The widget a `Node::Preem` carries, or a panic naming what came instead —
     /// the assertion every state-mode test funnels through.
@@ -1539,6 +1640,208 @@ mod tests {
         }
     }
 
+    // ── the escape hatch and the seam must not drift ─────────────────────────
+
+    /// The raster arm is **byte-identical** to rasterising by hand with the kit
+    /// and shipping [`Frame::into_node`] — the `Node::Pixels` escape hatch #884
+    /// keeps, and the whole of its compat promise stated as an equation.
+    ///
+    /// Everything under a `lower()` raster closure is a config→kit-builder
+    /// translation. A wrapper that quietly drops a knob, or defaults one
+    /// differently from the kit, still produces a perfectly valid buffer:
+    /// `assert_pixels` passes, `every_widget_rasterises_or_emits_state_by_mode`
+    /// passes, and an old shell renders something subtly different from what the
+    /// same plugin drew before it migrated. Only comparing the bytes catches it.
+    ///
+    /// The right-hand side is deliberately written the way a **pre-#884 plugin
+    /// author** wrote it — raw `hytte_preem` calls, no wrapper internals — so
+    /// the two sides are free to drift and this test is the thing that notices.
+    /// Compared with `==` rather than `assert_eq!` throughout: these are
+    /// `Node::Pixels`, whose `Debug` would dump the whole RGBA buffer into a
+    /// failure message.
+    ///
+    /// Split three ways — the stateless widgets here, then the *sampled* ones
+    /// (a stream of values drives them) and the *physics* ones (a simulation
+    /// does) below — because each stateful widget needs its own driving
+    /// sequence on both sides and one function of all eight runs well past the
+    /// workspace's `too_many_lines` ceiling.
+    #[test]
+    fn the_raster_arm_is_byte_identical_for_the_stateless_widgets() {
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+
+        assert!(
+            DotMatrix::new(StyleName::Vfd).node_in(raster, "dm", no_cls(), "HELLO")
+                == kit::dot_matrix("HELLO", DisplayStyle::Vfd).into_node(Some("dm"), no_cls()),
+            "dot matrix",
+        );
+        assert!(
+            SevenSeg::new(StyleName::Crt).node_in(raster, "ss", no_cls(), "12:34")
+                == kit::seven_seg("12:34", DisplayStyle::Crt).into_node(Some("ss"), no_cls()),
+            "seven segment",
+        );
+        assert!(
+            TextBox::new(StyleName::Lcd)
+                .cols(22)
+                .max_lines(2)
+                .pad(4)
+                .corner(3)
+                .scale(2)
+                .fixed_width(true)
+                .node_in(raster, "tb", no_cls(), "wrapped demo copy")
+                == kit::TextBox::styled(DisplayStyle::Lcd)
+                    .cols(22)
+                    .max_lines(2)
+                    .pad(4)
+                    .corner(3)
+                    .scale(2)
+                    .fixed_width(true)
+                    .render("wrapped demo copy")
+                    .into_node(Some("tb"), no_cls()),
+            "text box",
+        );
+    }
+
+    /// The **sampled** widgets — a marquee's dot accumulator, a level meter's
+    /// peak-hold, a scope's stamped batches. Same claim as
+    /// `the_raster_arm_is_byte_identical_for_the_stateless_widgets`; each side
+    /// is driven through the same sequence, so a dropped knob shows up as a
+    /// different buffer rather than as a compile error.
+    #[test]
+    fn the_raster_arm_is_byte_identical_for_the_sampled_widgets() {
+        const MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+
+        // — the marquee: the SDK's dot accumulator must land on the same whole
+        //   window offset the author passed to `MarqueeStrip::window` by hand —
+        let mut mq = Marquee::new(StyleName::Vfd)
+            .window_px(268)
+            .gap_dots(4)
+            .speed_dots_per_sec(20.0);
+        mq.advance_in(raster, 0.5);
+        mq.advance_in(raster, 0.5);
+        assert_eq!(mq.scroll_dots(), 20, "one second at 20 dots/s");
+        assert!(
+            mq.node_in(raster, "mq", no_cls(), MSG)
+                == kit::Marquee::new(DisplayStyle::Vfd)
+                    .window_px(268)
+                    .gap_dots(4)
+                    .render(MSG)
+                    .window(20)
+                    .into_node(Some("mq"), no_cls()),
+            "marquee",
+        );
+
+        // — the led strip: the same push/decay sequence through the same
+        //   `PeakHold`, and the dot the strip renders comes from it —
+        let mut led = LedStrip::new(StyleName::Oled).leds(16).peak_hold(0.02);
+        let mut hold = kit::PeakHold::new(0.02);
+        for level in [0.8_f32, 0.3] {
+            led.set_level_in(raster, level);
+            led.advance_in(raster);
+            hold.push(level);
+            hold.decay();
+        }
+        assert!(
+            led.node_in(raster, "led", no_cls())
+                == kit::LedStrip::new(DisplayStyle::Oled)
+                    .leds(16)
+                    .render(0.3, hold.value())
+                    .into_node(Some("led"), no_cls()),
+            "led strip",
+        );
+
+        // — the scope: two stamped batches over a live phosphor —
+        let batches: [&[f32]; 2] = [&[0.0, 0.5, -0.5, 0.25], &[0.9, -0.9, 0.1, 0.0]];
+        let mut sc = Scope::with_size(StyleName::Crt, 96, 32)
+            .scale(2)
+            .persistence(200);
+        let mut sc_kit = kit::Scope::with_size(96, 32).scale(2).persistence(200);
+        for batch in batches {
+            sc.push_in(raster, batch);
+            sc_kit.advance(batch);
+        }
+        assert!(
+            sc.node_in(raster, "sc", no_cls())
+                == sc_kit
+                    .render(DisplayStyle::Crt)
+                    .into_node(Some("sc"), no_cls()),
+            "scope",
+        );
+    }
+
+    /// The **physics** widgets — a damped-spring needle and per-cell flip
+    /// clocks. Same claim again; both are caught mid-motion, so the frequency,
+    /// damping, sweep, duration and stagger all have to survive the config→kit
+    /// translation to land on the same pixels.
+    #[test]
+    fn the_raster_arm_is_byte_identical_for_the_physics_widgets() {
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+
+        // — the gauge: the spring has to be integrated identically —
+        let mut ga = Gauge::with_size(StyleName::Lcd, 120, 60)
+            .scale(2)
+            .range(0.0, 100.0)
+            .sweep_deg(240.0)
+            .ticks(5, 4)
+            .frequency(2.0)
+            .damping(0.5);
+        let mut ga_kit = kit::Gauge::with_size(120, 60)
+            .scale(2)
+            .sweep_deg(240.0)
+            .ticks(5, 4)
+            .frequency(2.0)
+            .damping(0.5)
+            .range(0.0, 100.0);
+        ga.set_target(42.0);
+        ga_kit.set_target(42.0);
+        for _ in 0..3 {
+            ga.advance_in(raster, 0.1);
+            ga_kit.advance(0.1);
+        }
+        assert!(
+            ga.node_in(raster, "ga", no_cls())
+                == ga_kit
+                    .render(DisplayStyle::Lcd)
+                    .into_node(Some("ga"), no_cls()),
+            "gauge",
+        );
+
+        // — the flip board: per-cell clocks mid-fold, so the stagger and the
+        //   duration have to survive the translation too —
+        let mut fb = FlipBoard::new(StyleName::Oled, Mechanism::SplitFlap)
+            .cells(6)
+            .glyph_px(2)
+            .scale(2)
+            .duration_secs(0.4)
+            .stagger_secs(0.05);
+        let mut fb_kit = kit::FlipBoard::new(kit::Mechanism::SplitFlap)
+            .cells(6)
+            .glyph_px(2)
+            .scale(2)
+            .duration_secs(0.4)
+            .stagger_secs(0.05);
+        fb.set_text("12:34");
+        fb_kit.set_text("12:34");
+        for _ in 0..2 {
+            fb.advance_in(raster, 0.1);
+            fb_kit.advance(0.1);
+        }
+        assert!(
+            !fb.is_settled_in(raster),
+            "caught mid-fold, or the comparison proves nothing about the clocks",
+        );
+        assert!(
+            fb.node_in(raster, "fb", no_cls())
+                == fb_kit
+                    .render(DisplayStyle::Oled)
+                    .into_node(Some("fb"), no_cls()),
+            "flip board",
+        );
+    }
+
     /// The SDK defaults the semantic role to `Accent` so a state-mode widget
     /// keeps the tint the raster kit already applies from `HostMsg::Accent`
     /// (#376) — see the module docs. `neutral()` opts back out.
@@ -1547,9 +1850,12 @@ mod tests {
         let node = DotMatrix::new(StyleName::Vfd).node_in(RenderMode::State, "dm", Vec::new(), "X");
         assert_eq!(preem_of(&node).style().accent, Some(AccentRole::Accent));
 
-        let node = DotMatrix::new(StyleName::Vfd)
-            .neutral()
-            .node_in(RenderMode::State, "dm", Vec::new(), "X");
+        let node = DotMatrix::new(StyleName::Vfd).neutral().node_in(
+            RenderMode::State,
+            "dm",
+            Vec::new(),
+            "X",
+        );
         assert_eq!(preem_of(&node).style().accent, Some(AccentRole::Neutral));
     }
 
@@ -1719,7 +2025,10 @@ mod tests {
         let first = raster.node_in(RenderMode::Raster, "sc", Vec::new());
         raster.push_in(RenderMode::Raster, &QUIET);
         assert!(
-            differ(&raster.node_in(RenderMode::Raster, "sc", Vec::new()), &first),
+            differ(
+                &raster.node_in(RenderMode::Raster, "sc", Vec::new()),
+                &first
+            ),
             "the loud trace kept fading, so the raster buffer really did change",
         );
     }
@@ -1759,6 +2068,56 @@ mod tests {
         assert_ne!(strip.node_in(RenderMode::State, "led", Vec::new()), a);
     }
 
+    /// The plugin-side physics getters must not report the **frozen** local
+    /// animation once the shell owns it.
+    ///
+    /// This is the trap `advance` being a no-op sets: the needle and the flip
+    /// clocks stop where the last raster tick left them, so `value()` would
+    /// answer with a deflection that is neither where the shell is drawing the
+    /// pointer nor where it is heading, and `is_settled()` would answer `false`
+    /// forever — stalling any plugin that gates work on "has it arrived yet?".
+    /// In state mode there is no local motion left to run, so the honest
+    /// answers are the target and `true`.
+    #[test]
+    fn the_physics_getters_do_not_report_a_frozen_needle_in_state_mode() {
+        let mut gauge = Gauge::new(StyleName::Vfd).range(0.0, 100.0);
+        gauge.set_target(80.0);
+
+        // Raster: the local needle really is still down at the low end and
+        // really has not arrived — that is the pre-#884 behaviour, unchanged.
+        assert!(
+            gauge.value_in(RenderMode::Raster) < 1.0,
+            "the local needle has not moved without an advance",
+        );
+        assert!(!gauge.is_settled_in(RenderMode::Raster));
+
+        // State: the shell owns the spring, so the plugin reports the reading
+        // it stated and nothing outstanding.
+        assert!((gauge.value_in(RenderMode::State) - 80.0).abs() < f32::EPSILON);
+        assert!((gauge.value_in(RenderMode::State) - gauge.target()).abs() < f32::EPSILON);
+        assert!(gauge.is_settled_in(RenderMode::State));
+
+        let mut board = FlipBoard::new(StyleName::Vfd, Mechanism::SplitFlap).cells(8);
+        board.set_text("12:34:56");
+        assert!(
+            !board.is_settled_in(RenderMode::Raster),
+            "locally the cards are mid-fold",
+        );
+        assert!(
+            board.is_settled_in(RenderMode::State),
+            "…but there is nothing for this plugin to advance",
+        );
+
+        // …and the ambient getters route through `render_mode()`, or the two
+        // `_in` assertions above would be proving nothing about `is_settled()`.
+        set_negotiated(PREEM_VOCAB);
+        assert!(gauge.is_settled() && board.is_settled());
+        assert!((gauge.value() - 80.0).abs() < f32::EPSILON);
+        set_negotiated(0);
+        assert!(!gauge.is_settled() && !board.is_settled());
+        assert!(gauge.value() < 1.0);
+    }
+
     // ── the raster path is untouched ────────────────────────────────────────
 
     /// Raster mode still ticks everything the plugin used to tick itself, so an
@@ -1770,18 +2129,21 @@ mod tests {
         let mut peak = f32::MIN;
         for _ in 0..120 {
             gauge.advance_in(RenderMode::Raster, 0.016);
-            peak = peak.max(gauge.value());
+            peak = peak.max(gauge.value_in(RenderMode::Raster));
         }
         assert!(peak > 80.0, "the needle overshot (peaked at {peak})");
-        assert!(gauge.is_settled(), "and settled");
+        assert!(gauge.is_settled_in(RenderMode::Raster), "and settled");
 
         let mut board = FlipBoard::new(StyleName::Vfd, Mechanism::SplitFlap).cells(8);
         board.set_text("12:34:56");
-        assert!(!board.is_settled(), "a fresh face is mid-flip");
+        assert!(
+            !board.is_settled_in(RenderMode::Raster),
+            "a fresh face is mid-flip",
+        );
         for _ in 0..60 {
             board.advance_in(RenderMode::Raster, 0.05);
         }
-        assert!(board.is_settled(), "and lands");
+        assert!(board.is_settled_in(RenderMode::Raster), "and lands");
 
         let mut scope = Scope::new(StyleName::Vfd);
         let dark = scope.node_in(RenderMode::Raster, "sc", Vec::new());
@@ -1814,7 +2176,10 @@ mod tests {
             led.advance_in(RenderMode::Raster);
         }
         assert!(
-            differ(&led.node_in(RenderMode::Raster, "led", Vec::new()), &dropped),
+            differ(
+                &led.node_in(RenderMode::Raster, "led", Vec::new()),
+                &dropped
+            ),
             "and the dot fell",
         );
     }

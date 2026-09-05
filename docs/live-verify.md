@@ -644,6 +644,114 @@ audio feed, not the raster.
      perfectly frozen — they must not creep, shimmer, or breathe between
      frames. Only the scope's own phosphor trail decays over time.
 
+## Preem state over the wire
+
+The pivot epic (#881): a plugin stops rasterising its own preem widgets and
+sends typed `Node::Preem` state instead — the shell owns the kit instance,
+the animation clock, and (feeding into it) style resolution. None of the
+handshake, the frame timing, the multi-monitor render path, the
+texture-upload optimisation, or a colour judgement can be proven from a
+hermetic test; each needs a real plugin over a real socket in a real Niri
+session.
+
+- [ ] **(#883/#896)** The shell-side renderer and its 20 Hz animation clock:
+  1. **The `Hello` handshake against a plugin binary built before #895.** Any
+     bundled plugin you haven't rebuilt (or a stale deployed unit) declares
+     no `vocab_max`, so it must never receive a `Hello` frame at all. Restart
+     the shell and that plugin together and watch
+     `journalctl --user -u 'trollshell-plugin-*'` for a while: a MessagePack
+     decode failure, or a unit stuck restart-looping, means the negotiation
+     gate leaked and re-created the #437 crash loop on every deployed plugin
+     at once.
+  2. **Motion, not steps.** Open `hytte-plugin-preem-demo`'s card: the
+     marquee scroll, needle swing and phosphor decay should run at the
+     shell's own frame rate, not step once per the plugin's old ~1 Hz
+     heartbeat. Judge this knowing the clock has a known, deliberately
+     unfixed cost meanwhile — it never parks when nothing is animating
+     (#897 tracks that follow-up) — so idle battery drain is expected today,
+     not a new regression.
+  3. **Two real outputs, not one thread mapping the same tree twice.** With
+     two monitors attached and an animating preem widget on screen, confirm
+     it neither runs at double speed nor decays its phosphor twice as fast —
+     each output gets its own reconciler and frame clock, the case a
+     hermetic idempotence test cannot cover.
+  4. **The timer arm itself under load**, not just the functions it calls —
+     there is no GTK main loop under `cargo test`, so `install_preem_clock`'s
+     `dt` measurement and repaint request are never exercised by CI. With
+     several plugin panels animating at once, motion should stay smooth
+     rather than the step drifting into visible jitter, and resuming from a
+     stall (e.g. suspend) should catch up smoothly rather than snapping.
+- [ ] **(#884/#898)** The SDK's display seam, against a shell carrying #896:
+  1. Start (or restart) `hytte-plugin-preem-demo` and
+     `hytte-plugin-bar-clock-demo`. The card's eight widgets and the bar
+     chip's seven-segment clock should render through the shell's own kit;
+     check the journal for **no** "plugin sent a `Node::Preem`, but this
+     shell does not advertise…" warning, which would mean the negotiation
+     gate leaked the other way from the #896 check above.
+  2. **The one-frame swap at plugin start.** Both demos render one `Pixels`
+     frame before the shell's `Hello` arrives, then switch to `Preem` in
+     place. Watch closely for a flash or reflow, and — the easiest thing to
+     miss — a scroll jump or needle snap: the plugin has already advanced
+     its own marquee offset / gauge deflection by then, and the shell starts
+     animating from its own resting state instead.
+  3. **The wire goes quiet.** With the card on screen and nothing changing,
+     `RUST_LOG=trollshell=debug` (or a socket trace) should show no `Render`
+     frames between state changes — the old rasterising path sent one per
+     widget on every heartbeat regardless.
+  4. **Against a shell that predates #896**, run both demos unchanged:
+     `Node::Pixels` throughout, looking exactly as they did before either PR
+     existed.
+- [ ] **(#902/#907 — lands with that PR, open at the time of writing)**
+      `PixelSurface`'s texture-upload equality guard. Put an animating preem
+      widget (the preem-demo marquee, or caw's face) in the same bar/sidebar
+      region as a **static** `Pixels` chip — `hytte-plugin-pet` idle, or the
+      Stats drawer's per-core LED panel — and watch `trollshell`'s CPU with
+      `top -p "$(pgrep -x trollshell)"` or
+      `perf top -p "$(pgrep -x trollshell)"`. Before this lands, the static
+      chip's texture re-uploads on every one of the animating widget's ~20
+      ticks a second; after, it uploads once and then nothing until its own
+      pixels actually change. Nothing on screen should look different — same
+      picture, same crispness; a chip visibly freezing on a stale frame, or a
+      resize snapping late, would mean the guard is over-eager.
+- [ ] **(#903/#908)** Hot-plugging a monitor with a plugin panel open:
+  1. Open a plugin panel with a moving preem widget (`preem-demo`, or `pet`)
+     in the drawer, then hot-plug — unplug/replug the second output, or
+     force a kanshi profile switch. The drawer should close with the
+     rebuild as before; reopening that panel afterward should show its
+     animations starting **from rest** (needle at zero, phosphor dark, flip
+     boards blank) rather than resuming mid-swing, which is the panel's
+     preem scope having actually been released rather than leaked.
+  2. Repeat the hot-plug several times with the drawer **closed** and that
+     panel never reopened: nothing should accumulate —
+     `RUST_LOG=trollshell=debug` should show no growth in per-emission
+     render work across cycles.
+  3. **Layout regression check**, since the fix mounts each panel's content
+     in a new inner box: reopen a few different plugin panels and confirm
+     each still fills the drawer card exactly as before — no new gap at the
+     top, no collapsed-height panel, and a panel using its own boxed-list
+     still renders flat on the drawer surface rather than nested inside a
+     second card.
+- [ ] **(#885/#912 — lands with that PR, open at the time of writing)**
+      Shell-side styling, with `hytte-plugin-preem-demo`'s sidebar card open
+      (it grows a `ROLE` and a `PIN.` cell alongside the original eight):
+  1. Change the desktop accent (Settings → Appearance) with the plugin still
+     running: every widget on the card — the seven-segment clock, ticker,
+     marquee, textbox, scope, gauge, both boards, and `ROLE` — should
+     re-tint immediately, with **no plugin restart**. `PIN.` must stay hot
+     pink through this; that difference is the whole #396 feature.
+  2. Flip the system between light and dark: same expectation, since both
+     the accent and the success colour can resolve differently per scheme.
+  3. `ROLE` should read as the theme's own success colour, not the desktop
+     accent — under a non-green accent the two should look visibly
+     different side by side.
+  4. Tap the seven-segment clock (or wait ~10 s) to cycle skins (#397):
+     every widget including the two new cells should change skin together —
+     `PIN.` changes its field/ghost/bloom with the rest but keeps its pink
+     ink, which is the "ink only" rule on glass.
+  5. Against a shell that predates #896/#883 (or with `Hello` otherwise
+     suppressed), `PIN.` should still render pink — the raster (`Pixels`)
+     arm honours the pin too, not only the state arm.
+
 ## Screen recording
 
 - [ ] **(#458)** Rebuild the NixOS/home-manager config with `wf-recorder` +

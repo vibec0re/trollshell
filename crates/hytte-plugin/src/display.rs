@@ -58,12 +58,23 @@
 //!
 //! # Non-finite readings
 //!
-//! Every state setter takes its value through the same rule the kit applies to
-//! it, so `NaN`/`±inf` cannot make the two arms disagree — and, just as
-//! importantly, cannot defeat the runtime's render dedup, which compares
-//! `Node`s and would find a `NaN` unequal to itself forever. See the
+//! Every **state** setter takes its value through the same rule the kit applies
+//! to it, so a `NaN`/`±inf` reading cannot make the two arms disagree — and,
+//! just as importantly, cannot defeat the runtime's render dedup, which
+//! compares `Node`s and would find a `NaN` unequal to itself forever. See the
 //! `level_reading` / `sample_reading` block below for the per-widget rules and
 //! why each is the kit's output unchanged rather than an improvement on it.
+//!
+//! **Config** floats are the other half, and they are not sanitised here: a
+//! `NaN` handed to [`FlipBoard::duration_secs`], [`Gauge::range`],
+//! [`Gauge::sweep_deg`] and the rest is stored as given. It reaches the wire
+//! through [`PreemWidget::clamped`], which `lower`'s state arm already calls on
+//! every emission, so extending the proto's sanitiser over those fields (#899)
+//! closes all of them with no change on this side — and until it lands, a
+//! non-finite *config* float still defeats dedup the way a state one used to.
+//! The split is deliberate: the state rules have to mirror the kit per widget
+//! and so belong next to the widgets, while the config caps are the wire's
+//! safety contract and belong with the wire.
 //!
 //! # Negotiation
 //!
@@ -402,6 +413,28 @@ fn sample_reading(sample: f32) -> f32 {
         sample.clamp(-1.0, 1.0)
     } else {
         0.0
+    }
+}
+
+/// The dial scale the kit will actually read on, given a stated range.
+///
+/// `Needle::range` (`gauge.rs`) **rejects** a degenerate, inverted or
+/// non-finite range and keeps its default `0.0..=1.0` rather than dividing by a
+/// zero span — so a wrapper that folded a target through `config.range`
+/// unconditionally would answer on a scale the kit refused. `range(5.0, 5.0)`
+/// with a target of `7.0` read `1.0` from the raster arm and `5.0` from the
+/// state arm before this existed (#898 re-check).
+///
+/// The same guard, character for character, so the two arms resolve one scale.
+fn effective_range(range: GaugeRange) -> GaugeRange {
+    let GaugeRange { low, high } = range;
+    if low.is_finite() && high.is_finite() && high > low {
+        range
+    } else {
+        GaugeRange {
+            low: 0.0,
+            high: 1.0,
+        }
     }
 }
 
@@ -1047,9 +1080,11 @@ impl LedStrip {
 /// The phosphor buffer is **shell-owned** in state mode. [`push`](Self::push)
 /// states the batch in both modes; it stamps the plugin-side phosphor only in
 /// raster mode.
-/// `PartialEq` but not `Eq`, matching the kit's own `Scope` — `ScopeState`
-/// carries a `Vec<f32>`, and `f32` is not `Eq`. Every other bound the kit's
-/// type derives is here (#898 review R3).
+/// `PartialEq` but **not** `Eq`, which is one bound *short* of the kit's own
+/// `Scope` — that one derives `Eq` because its phosphor is a `Vec<u16>`, while
+/// this wrapper additionally holds the wire `ScopeState`, whose
+/// `samples: Vec<f32>` cannot be. `PartialEq` is the bound a plugin model
+/// actually needs, and it is here (#898 review R3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
     config: ScopeConfig,
@@ -1356,8 +1391,11 @@ impl Gauge {
     /// the state arm did not, until #898's review (R2) caught it. The state arm
     /// below is `Needle::set_target`'s normalisation followed by
     /// `Needle::value`, i.e. the kit's own two lines, so the modes cannot drift.
-    /// A degenerate range reproduces whatever the kit would do with it, for the
-    /// same reason.
+    /// A degenerate range is resolved through [`effective_range`] first, for the
+    /// same reason: the kit **rejects** one rather than dividing by its zero
+    /// span, so the raster needle is reading on the default `0.0..=1.0` scale
+    /// whatever the config says, and the state arm has to read on that same
+    /// scale to agree.
     #[must_use]
     pub fn value(&self) -> f32 {
         self.value_in(render_mode())
@@ -1369,7 +1407,7 @@ impl Gauge {
         match mode {
             RenderMode::Raster => self.kit.value(),
             RenderMode::State => {
-                let GaugeRange { low, high } = self.config.range;
+                let GaugeRange { low, high } = effective_range(self.config.range);
                 let span = high - low;
                 low + ((self.state.target - low) / span).clamp(0.0, 1.0) * span
             }
@@ -2232,6 +2270,35 @@ mod tests {
             assert!(
                 (ga.target() - 37.0).abs() < f32::EPSILON,
                 "…and so did target()"
+            );
+        }
+
+        // A range the kit *rejects* — degenerate, inverted, non-finite — is the
+        // case the two arms parted company on (#898 re-check): `Needle::range`
+        // keeps its default `0.0..=1.0` rather than dividing by a zero span, so
+        // the raster needle reads on that scale while the state arm was reading
+        // on one the kit never accepted. `range(5.0, 5.0)` with a target of
+        // `7.0` gave raster 1.0, state 5.0.
+        for (low, high) in [
+            (5.0_f32, 5.0_f32),
+            (100.0, 0.0),
+            (f32::NAN, 1.0),
+            (0.0, f32::INFINITY),
+        ] {
+            let mut ga = Gauge::new(StyleName::Vfd).range(low, high);
+            ga.set_target(7.0);
+            ga.settle();
+            let (raster, state) = (
+                ga.value_in(RenderMode::Raster),
+                ga.value_in(RenderMode::State),
+            );
+            assert!(
+                (raster - state).abs() < 1e-3,
+                "range({low}, {high}): raster={raster} state={state}",
+            );
+            assert!(
+                state.is_finite(),
+                "range({low}, {high}) must not divide by a zero span",
             );
         }
     }

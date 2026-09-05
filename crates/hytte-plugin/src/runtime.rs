@@ -186,7 +186,7 @@ where
     // every (re)connect is what makes a reconnect to an older shell degrade
     // instead of carrying the previous session's advertisement forward.
     //
-    // Floored at `VOCAB_UNCONDITIONAL` rather than trusted from the manifest
+    // Capped at `VOCAB_UNCONDITIONAL` rather than trusted from the manifest
     // (#898 review N2): `Manifest`'s fields are `pub`, so a plugin can hand-set
     // `vocab` above `PREEM_VOCAB`, and seeding from that would put the *seed*
     // render on the state arm — a `Node::Preem` at a host that has advertised

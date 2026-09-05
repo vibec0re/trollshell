@@ -6,12 +6,23 @@
 
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::wire;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Latch for the "this shell doesn't speak preem yet" warning, so a plugin that
-/// keeps re-rendering `Node::Preem` logs once per session instead of once per
-/// node per frame (#882; the renderer lands in #883).
-static PREEM_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
+use super::preem_render::{self, Scope};
+
+/// Map a plugin's whole node tree onto the reconciler's `hytte_ui::Node`,
+/// within `scope` — the namespace its preem renderer instances live in (one per
+/// plugin per tree; see [`preem_render`]).
+///
+/// This is the entry point every caller uses; the recursion itself is
+/// [`map_node`]. Wrapping it is what gives the preem instances a mapping-pass
+/// boundary: the un-id'd node ordinal is reset here, and an instance whose node
+/// disappeared from the tree is dropped when the pass closes.
+pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
+    preem_render::begin_pass(scope);
+    let mapped = map_node(scope, node);
+    preem_render::end_pass(scope);
+    mapped
+}
 
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
@@ -20,7 +31,7 @@ static PREEM_UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 // One exhaustive arm per node variant — the length is the vocabulary size, not
 // complexity.
 #[allow(clippy::too_many_lines)]
-pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
+fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
     match node {
         wire::Node::Box {
             id,
@@ -35,7 +46,10 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             spacing: *spacing,
             scroll: *scroll,
             classes: classes.clone(),
-            children: children.iter().map(to_ui_node).collect(),
+            children: children
+                .iter()
+                .map(|child| map_node(scope, child))
+                .collect(),
         },
         wire::Node::Row {
             id,
@@ -44,7 +58,10 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
         } => UiNode::Row {
             id: id.clone(),
             classes: classes.clone(),
-            children: children.iter().map(to_ui_node).collect(),
+            children: children
+                .iter()
+                .map(|child| map_node(scope, child))
+                .collect(),
         },
         wire::Node::ListBox {
             id,
@@ -53,7 +70,10 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
         } => UiNode::ListBox {
             id: id.clone(),
             classes: classes.clone(),
-            children: children.iter().map(to_ui_node).collect(),
+            children: children
+                .iter()
+                .map(|child| map_node(scope, child))
+                .collect(),
         },
         wire::Node::Label { id, text, classes } => UiNode::Label {
             id: id.clone(),
@@ -137,7 +157,7 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
         wire::Node::Button { id, classes, child } => UiNode::Button {
             id: id.clone(),
             classes: classes.clone(),
-            child: Box::new(to_ui_node(child)),
+            child: Box::new(map_node(scope, child)),
         },
         wire::Node::Progress {
             id,
@@ -168,7 +188,7 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
             id: id.clone(),
             open: *open,
-            child: Box::new(to_ui_node(child)),
+            child: Box::new(map_node(scope, child)),
         },
         wire::Node::Separator { classes } => UiNode::Separator {
             classes: classes.clone(),
@@ -182,8 +202,11 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             classes,
         } => UiNode::Expander {
             id: id.clone(),
-            header: Box::new(to_ui_node(header)),
-            children: children.iter().map(to_ui_node).collect(),
+            header: Box::new(map_node(scope, header)),
+            children: children
+                .iter()
+                .map(|child| map_node(scope, child))
+                .collect(),
             expanded: *expanded,
             classes: classes.clone(),
         },
@@ -203,58 +226,37 @@ pub(super) fn to_ui_node(node: &wire::Node) -> UiNode {
             classes,
             widget,
         } => {
-            // #882's typed preem vocabulary. The renderers that turn a
-            // `PreemWidget` into pixels — and the per-node renderer instances
-            // that own the phosphor, needle, flip clocks and scroll offset —
-            // are #883; this arm is the placeholder that keeps the mapping
-            // exhaustive (which is the point of writing it exhaustively) until
-            // then.
+            // #882's typed preem vocabulary, rendered in-process by #883's
+            // renderer instances (`preem_render`).
             //
             // **`clamped()` is mandatory and must stay the first thing that
             // happens here.** It is the wire-limit enforcement seam — the preem
             // analogue of the `pixels_len_ok`/`clamp_pixels_scale` checks in the
             // arm above — and it is what stops a hostile config (a 32768×32768
             // scaled buffer, a 16.7M-tick gauge face) from reaching a renderer.
-            // #883 replaces the empty surface below with a real rasterisation,
-            // and must rasterise *this* value, never the raw `widget`.
+            // The renderer below rasterises **this** value, never the raw
+            // `widget`, and nothing downstream re-derives geometry from the
+            // unclamped one.
             //
             // `clamp_in_place` on an owned clone rather than the consuming
-            // `clamped()`: once #883 renders for real this sits on the
-            // per-frame path, where the owning form would clone every
-            // String/Vec in the config again just to feed the clamp.
+            // `clamped()`: this sits on the per-frame path, where the owning
+            // form would clone every String/Vec in the config again just to feed
+            // the clamp.
             let mut widget = widget.as_ref().clone();
             widget.clamp_in_place();
 
-            // Reaching this arm at all means a plugin sent a node this host
-            // never asked for: the shell does not advertise `PREEM_VOCAB` in
-            // `HostMsg::Hello` yet, and the negotiation contract says a plugin
-            // emits `Preem` only above that advertisement (rasterising to
-            // `Node::Pixels` otherwise). So this is the misbehaving-plugin path,
-            // and it takes the same posture as the malformed-buffer seam above:
-            // degrade to a nothing-rendered surface, keep `id` and `classes` so
-            // CSS chrome stays and a later valid frame updates in place, and
-            // warn — never drop the connection.
-            //
-            // Latched to once per session: this runs per node per render, so a
-            // plugin with eight preem nodes on the 20 Hz pump would otherwise
-            // push 160 identical lines a second into the journal.
-            if !PREEM_UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    node = ?id,
-                    kind = widget.kind(),
-                    "plugin sent a Node::Preem, but this shell does not advertise the \
-                     preem vocabulary (#883); rendering nothing (further occurrences \
-                     are silenced)"
-                );
-            }
-            UiNode::Pixels {
-                id: id.clone(),
-                width: 0,
-                height: 0,
-                data: Vec::new(),
-                scale: 1,
-                classes: classes.clone(),
-            }
+            // **Rendered whether or not the plugin negotiated the vocabulary.**
+            // The contract says a plugin emits `Node::Preem` only above the
+            // generation the host advertised in `HostMsg::Hello`, but this arm
+            // does not re-check `negotiates_vocab()` — a plugin that sends one
+            // anyway is drawn. That is deliberate: the value is clamped above
+            // and the negotiation exists so a plugin knows what the *host* can
+            // decode, not as an authorisation gate. Refusing to draw a
+            // well-formed node the host understands would only make a
+            // hand-rolled (non-Rust-SDK) client harder to write for no safety
+            // gained.
+
+            preem_render::map_widget(scope, id.as_deref(), classes, &widget)
         }
     }
 }

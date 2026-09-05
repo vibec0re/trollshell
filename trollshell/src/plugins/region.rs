@@ -20,6 +20,7 @@ use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, 
 use hytte_plugin_proto::HostMsg;
 use tokio::sync::mpsc;
 
+use super::preem_render::{self, Scope};
 use super::wire_map::{to_ui_node, to_wire_event};
 use super::{PluginHandles, SlotRender};
 
@@ -157,6 +158,10 @@ pub fn bar_right_slot() -> gtk::Widget {
 /// siblings. GTK-main-thread-only.
 struct MountedCard {
     plugin_id: String,
+    /// The namespace this card's preem renderer instances live in (#883).
+    /// Cached rather than re-derived per render because it is also what the
+    /// removal path below hands [`preem_render::forget_scope`].
+    preem_scope: Scope,
     root: gtk::Box,
     reconciler: Reconciler,
     /// Outbound of the connection currently owning this plugin's card, swapped
@@ -237,6 +242,13 @@ fn reconcile_region(
         let keep = present.contains(card.plugin_id.as_str());
         if !keep {
             container.remove(&card.root);
+            // Release the plugin's preem renderer instances — its phosphor
+            // buffers, needles and flip boards (#883) — rather than parking them
+            // for the session. The render list is shared across monitors, so a
+            // plugin absent from it has left every region: another monitor's
+            // reconcile forgetting the same scope is a harmless no-op, and no
+            // monitor still wants it.
+            preem_render::forget_scope(&card.preem_scope);
         }
         keep
     });
@@ -245,7 +257,8 @@ fn reconcile_region(
     //    to match. `prev` walks the intended sibling order.
     let mut prev: Option<gtk::Widget> = None;
     for render in renders {
-        let ui_tree = to_ui_node(&render.tree);
+        let preem_scope = Scope::card(&render.plugin_id);
+        let ui_tree = to_ui_node(&preem_scope, &render.tree);
         if let Some(idx) = cards.iter().position(|c| c.plugin_id == render.plugin_id) {
             let card = &mut cards[idx];
             // Swap in the live connection's outbound, then re-render its tree.
@@ -277,6 +290,7 @@ fn reconcile_region(
             prev = Some(root.clone().upcast());
             cards.push(MountedCard {
                 plugin_id: render.plugin_id.clone(),
+                preem_scope,
                 root,
                 reconciler,
                 outbound,
@@ -374,17 +388,14 @@ pub fn plugin_panel_slot() -> gtk::Widget {
         }
     };
 
+    // The panel scope currently on screen (#883), so a switch away from a plugin
+    // — or the drawer closing — releases its panel's preem renderer instances
+    // instead of parking them for the session. A panel tree gets its own scope
+    // (never the card's): the two trees are independent and may reuse node ids.
+    let shown_scope: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+
     let handle = glib::MainContext::default().spawn_local(active.for_each(move |slot| {
-        if let Some(render) = slot.as_ref().filter(|r| r.panel.is_some()) {
-            // Swap in the active connection's outbound, then render its panel.
-            *outbound.borrow_mut() = Some(render.outbound.clone());
-            reconciler.render(&to_ui_node(render.panel.as_ref().expect("filtered Some")));
-        } else {
-            // No active plugin (or it left / has no panel): blank the page and
-            // drop any stale outbound so no event can reach a gone connection.
-            *outbound.borrow_mut() = None;
-            reconciler.render(&empty_panel());
-        }
+        render_active_panel(&mut reconciler, &outbound, &shown_scope, slot.as_ref());
         std::future::ready(())
     }));
 
@@ -392,6 +403,65 @@ pub fn plugin_panel_slot() -> gtk::Widget {
     // destroyed (a per-monitor drawer rebuild on hot-plug).
     root.connect_destroy(move |_| handle.abort());
     root.upcast()
+}
+
+/// Render whatever the drawer's plugin child should be showing now: `slot`'s
+/// panel tree, or the blank page when nothing is active (or the active plugin
+/// left / has no panel).
+///
+/// Extracted from [`plugin_panel_slot`]'s subscription closure so the preem
+/// scope lifecycle it drives is reachable from a test — a `Reconciler` and two
+/// `Rc`s are constructible; a `spawn_local`'d `for_each` over a `map_ref!` of
+/// two registry-backed signals is not. `gtk_tests` at the bottom of this file is
+/// what that buys.
+fn render_active_panel(
+    reconciler: &mut Reconciler,
+    outbound: &Rc<RefCell<Option<mpsc::Sender<HostMsg>>>>,
+    shown_scope: &Rc<RefCell<Option<Scope>>>,
+    slot: Option<&SlotRender>,
+) {
+    if let Some(render) = slot.filter(|r| r.panel.is_some()) {
+        // Swap in the active connection's outbound, then render its panel.
+        *outbound.borrow_mut() = Some(render.outbound.clone());
+        let scope = Scope::panel(&render.plugin_id);
+        forget_previous_panel_scope(shown_scope, Some(&scope));
+        reconciler.render(&to_ui_node(
+            &scope,
+            render.panel.as_ref().expect("filtered Some"),
+        ));
+    } else {
+        // No active plugin (or it left / has no panel): blank the page and drop
+        // any stale outbound so no event can reach a gone connection.
+        *outbound.borrow_mut() = None;
+        forget_previous_panel_scope(shown_scope, None);
+        reconciler.render(&empty_panel());
+    }
+}
+
+/// Record which panel scope the drawer child is about to show, dropping the
+/// preem renderer instances of the one it was showing before (#883) — unless it
+/// is the same scope, in which case a re-render must *keep* the animation state
+/// it is mid-way through.
+///
+/// `active_panel_id` is a single shared handle, so every monitor's drawer child
+/// switches together and a second child forgetting the same scope is a no-op.
+///
+/// **Closing the drawer counts as leaving**, not only switching plugins:
+/// `modal.rs` clears `active_panel_id` on close, which lands here as `None`. So
+/// a close/reopen cycle starts the panel's animations over — needles at rest,
+/// phosphor dark, flip boards blank — rather than resuming mid-swing. That is
+/// the deliberate trade (a closed drawer should not hold a phosphor buffer per
+/// plugin for the session), but it is a visible behaviour on glass, not just a
+/// teardown detail.
+fn forget_previous_panel_scope(shown: &Rc<RefCell<Option<Scope>>>, next: Option<&Scope>) {
+    let mut shown = shown.borrow_mut();
+    if shown.as_ref() == next {
+        return;
+    }
+    if let Some(previous) = shown.take() {
+        preem_render::forget_scope(&previous);
+    }
+    *shown = next.cloned();
 }
 
 /// Insert-or-replace `render`'s plugin card in its mount region, latest-wins per
@@ -438,5 +508,179 @@ pub(super) fn clear_region_if_owned(
         .position(|c| c.plugin_id == plugin_id && c.generation == generation)
     {
         cards.remove(pos);
+    }
+}
+
+// ── GTK integration tests (need a display → gated to `system-tests`) ─────────
+
+/// The preem **scope lifecycle** this module drives (#883): a plugin card
+/// leaving its region, and the drawer panel switching away or closing, must each
+/// release that tree's renderer instances.
+///
+/// These live here rather than in `plugins::tests` because the functions they
+/// drive — [`reconcile_region`] and [`render_active_panel`] — are private to this
+/// module and need a real GTK container and `Reconciler`. They are the tests the
+/// review found missing: `instances_are_swept_when_their_node_leaves_the_tree`
+/// calls `preem_render::forget_scope` **directly**, which proves the function and
+/// not that this file calls it — all three call sites could be deleted with the
+/// whole binary suite still green.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{
+        MountedCard, Scope, SlotRender, forget_previous_panel_scope, preem_render,
+        reconcile_region, render_active_panel,
+    };
+    use hytte::adw;
+    use hytte::gtk;
+    use hytte::ui::{EventKind as UiEventKind, NodeId, Reconciler};
+    use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tokio::sync::mpsc;
+
+    /// A tree of one preem node, so a scope's instance count is a non-zero
+    /// number to watch fall to zero.
+    fn preem_tree(id: &str) -> wire::Node {
+        wire::Node::Preem {
+            id: Some(id.to_owned()),
+            classes: vec![],
+            widget: Box::new(vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig::default(),
+                state: vocab::DotMatrixState { text: id.into() },
+            }),
+        }
+    }
+
+    fn render_of(plugin_id: &str, tx: &mpsc::Sender<HostMsg>) -> SlotRender {
+        SlotRender {
+            plugin_id: plugin_id.to_owned(),
+            order: 0,
+            generation: 1,
+            tree: preem_tree("chip"),
+            panel: Some(preem_tree("panel")),
+            outbound: tx.clone(),
+        }
+    }
+
+    /// A card leaving its region releases its preem renderer instances.
+    ///
+    /// **Deletion check:** removing the `preem_render::forget_scope` call from
+    /// `reconcile_region`'s retain loop turns the final assertion red
+    /// (`left: 1, right: 0`).
+    #[gtk::test]
+    fn card_leaving_its_region_releases_its_preem_scope() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let scope = Scope::card("leaver");
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_of("leaver", &tx)],
+            "ts-plugin-chip",
+        );
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            1,
+            "the mounted card's preem node must have a live renderer instance",
+        );
+
+        // The plugin disconnects: its render leaves the region's mailbox.
+        reconcile_region(&container, &cards, &[], "ts-plugin-chip");
+        assert!(cards.borrow().is_empty(), "the card itself must be gone");
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "a card leaving its region must release the tree's renderer instances, \
+             not park them for the session",
+        );
+    }
+
+    /// Switching the drawer to another plugin's panel — and closing the drawer —
+    /// each release the panel scope that was on screen.
+    ///
+    /// **Deletion check:** removing either `forget_previous_panel_scope` call
+    /// from `render_active_panel` turns one of the two assertions red.
+    #[gtk::test]
+    fn panel_switch_and_close_release_the_previous_panels_preem_scope() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut reconciler = Reconciler::new(&root, |_: NodeId, _: UiEventKind| {});
+        let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> = Rc::new(RefCell::new(None));
+        let shown: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+        let (first, second) = (Scope::panel("first"), Scope::panel("second"));
+
+        render_active_panel(
+            &mut reconciler,
+            &outbound,
+            &shown,
+            Some(&render_of("first", &tx)),
+        );
+        assert_eq!(preem_render::instance_count(&first), 1);
+
+        // Switch to another plugin's panel: the first one's instances go.
+        render_active_panel(
+            &mut reconciler,
+            &outbound,
+            &shown,
+            Some(&render_of("second", &tx)),
+        );
+        assert_eq!(
+            preem_render::instance_count(&first),
+            0,
+            "switching panels must release the outgoing panel's renderer instances",
+        );
+        assert_eq!(preem_render::instance_count(&second), 1);
+
+        // Close the drawer: `modal.rs` clears the selection, which arrives here
+        // as `None`.
+        render_active_panel(&mut reconciler, &outbound, &shown, None);
+        assert_eq!(
+            preem_render::instance_count(&second),
+            0,
+            "closing the drawer must release the shown panel's renderer instances",
+        );
+    }
+
+    /// Re-rendering the **same** panel keeps its instances — a plugin pushing a
+    /// new frame must not restart the animation it is mid-way through.
+    #[gtk::test]
+    fn re_rendering_the_same_panel_keeps_its_preem_scope() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut reconciler = Reconciler::new(&root, |_: NodeId, _: UiEventKind| {});
+        let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> = Rc::new(RefCell::new(None));
+        let shown: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+        let scope = Scope::panel("steady");
+
+        let render = render_of("steady", &tx);
+        render_active_panel(&mut reconciler, &outbound, &shown, Some(&render));
+        let built = preem_render::probe(&scope, Some("panel"));
+        assert!(built.is_some(), "the panel's preem node must have mapped");
+        render_active_panel(&mut reconciler, &outbound, &shown, Some(&render));
+        assert_eq!(
+            preem_render::probe(&scope, Some("panel")),
+            built,
+            "the same panel re-rendering must neither rebuild nor re-apply",
+        );
+    }
+
+    /// The helper itself is idempotent: a second drawer child re-showing the
+    /// scope it is already on must not drop a live panel's instances.
+    #[gtk::test]
+    fn forgetting_the_scope_already_shown_is_a_no_op() {
+        adw::init().expect("libadwaita init");
+        let scope = Scope::panel("shared");
+        let shown: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(Some(scope.clone())));
+        forget_previous_panel_scope(&shown, Some(&scope));
+        assert_eq!(
+            shown.borrow().as_ref(),
+            Some(&scope),
+            "showing the same scope again must keep it, so the animation continues",
+        );
     }
 }

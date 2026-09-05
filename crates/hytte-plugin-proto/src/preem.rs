@@ -509,6 +509,18 @@ pub struct StyleRef {
     /// a pinned widget still reads as the same device. (Widening this to a whole
     /// palette override is a deliberate non-goal here; the skin *is* the
     /// vocabulary for the panel's physical character.)
+    ///
+    /// # Pin a color that does not move
+    ///
+    /// This lives in the **config**, so the module's config rule applies to it
+    /// like any other field: *changing* it rebuilds the shell's renderer, and a
+    /// rebuild loses the animation state that renderer owned — a needle back at
+    /// rest, a cleared phosphor, a blanked flip board, a marquee snapped to
+    /// offset 0. A steady pin costs nothing (an unchanged config is compared,
+    /// not rebuilt), but driving one from a reading — `ink(RED)` above a
+    /// threshold — resets the animation on every crossing. That case wants an
+    /// [`AccentRole`], which has the same problem and the same answer: state it
+    /// once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ink: Option<Rgba>,
 }

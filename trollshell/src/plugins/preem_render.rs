@@ -980,10 +980,15 @@ fn ink_for(style: vocab::StyleRef) -> kit::Ink {
     }
     match style.accent {
         Some(vocab::AccentRole::Neutral) => kit::Ink::Base,
+        // Named before the memo, not through it: [`RoleInks`] deliberately does
+        // not carry the accent, so resolving one for `Accent` would build a
+        // throwaway probe widget and do three `lookup_color`s on the first
+        // render after every theme change — in a session where nothing asks for
+        // a status role at all — only to throw the answer away.
+        Some(vocab::AccentRole::Accent) | None => kit::Ink::Default,
         Some(role) => role_inks()
             .get(role)
             .map_or(kit::Ink::Default, kit::Ink::Fixed),
-        None => kit::Ink::Default,
     }
 }
 

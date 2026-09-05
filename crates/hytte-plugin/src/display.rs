@@ -582,6 +582,10 @@ impl DotMatrix {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -659,6 +663,10 @@ impl SevenSeg {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -789,6 +797,10 @@ impl TextBox {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -911,6 +923,10 @@ impl Marquee {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -1068,6 +1084,10 @@ impl LedStrip {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -1243,6 +1263,10 @@ impl Scope {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -1443,6 +1467,10 @@ impl Gauge {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);
@@ -1691,6 +1719,10 @@ impl FlipBoard {
 
     /// Pin an explicit color as this widget's ink, opting it **out** of the live
     /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    ///
+    /// A **config** change, so *changing* the pin rebuilds the shell's renderer
+    /// and loses the animation state it owned. Set it once; don't drive it from
+    /// a reading.
     #[must_use]
     pub fn ink(mut self, ink: Rgba) -> Self {
         self.config.style.ink = Some(ink);

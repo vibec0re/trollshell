@@ -607,11 +607,30 @@ fn an_unpinned_style_ref_is_byte_identical_to_the_pre_change_form() {
 
     // …and the same claim where it actually matters: inside a whole widget, the
     // key must not appear at all.
+    //
+    // Matched as the encoded *key* (`0xa3` = MessagePack fixstr of length 3,
+    // then `ink`) rather than as the substring "ink" anywhere in the frame: a
+    // widget whose state text happened to contain "PINK" or "thinking" would
+    // trip a loose scan. It could only ever false-*fail*, never false-pass, but
+    // a test that a future fixture can break for the wrong reason is worth four
+    // more bytes of precision.
+    let ink_key: &[u8] = b"\xa3ink";
+    let carries_key =
+        |widget: &PreemWidget| encode(widget).windows(ink_key.len()).any(|w| w == ink_key);
     for widget in all_widgets() {
-        let hay = String::from_utf8_lossy(&encode(&widget)).into_owned();
         assert!(
-            !hay.contains("ink"),
+            !carries_key(&widget),
             "{}'s unpinned encoding must not carry an `ink` key",
+            widget.kind()
+        );
+        // The positive control: an anchored needle that never matches anything
+        // would satisfy the assertion above for the wrong reason. Pin the same
+        // widget and the key must appear.
+        let mut pinned = widget.clone();
+        pin_ink(&mut pinned, [0x11, 0x22, 0x33, 0xff]);
+        assert!(
+            carries_key(&pinned),
+            "{}'s pinned encoding must carry exactly that key, or the absence check above is blind",
             widget.kind()
         );
     }

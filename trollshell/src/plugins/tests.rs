@@ -4202,3 +4202,98 @@ fn a_status_role_resolves_to_the_theme_color_not_the_accent() {
         "…and lands exactly where the same skin lands with no accent installed at all",
     );
 }
+
+/// The pin survives a theme change on the one widget that resolves its palette
+/// at **construction** rather than at render — which is the widget
+/// [`invalidate_cached_frames`](preem_render) *rebuilds* on that change, and so
+/// the one where the ink scope has to cover `build()` and not just
+/// `Instance::frame`.
+///
+/// `an_accent_change_re_tints_a_role_widget_and_leaves_a_pinned_one_alone` above
+/// cannot see this: its `DotMatrix` resolves per render, so the frame-side scope
+/// alone keeps it green. `TextBox` (and `Marquee`'s strip) is the case that needs
+/// the build-side one.
+///
+/// **Deletion check:** dropping the `kit::with_ink` wrapper in `build()` leaves
+/// the whole rest of the shell suite green and turns *this* red at "a pinned
+/// `TextBox` must draw its pinned color" — the review probe that found the gap.
+#[test]
+fn a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction() {
+    let _ink = preem_ink_lock();
+    let violet = [0x9b, 0x59, 0xb6, 0xff];
+    let scope = Scope::detached("885-pinned-textbox");
+    let node = preem_node(
+        Some("tb"),
+        vocab::PreemWidget::TextBox {
+            config: vocab::TextBoxConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Lcd).with_ink(violet),
+                ..vocab::TextBoxConfig::default()
+            },
+            state: vocab::TextBoxState { text: "pin".into() },
+        },
+    );
+
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let teal = mapped_pixels(&scope, &node);
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let rose = mapped_pixels(&scope, &node);
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    assert!(
+        teal.2.chunks_exact(4).any(|px| px == violet),
+        "a pinned TextBox must draw its pinned color",
+    );
+    assert_eq!(teal, rose, "…and survive a theme change byte-identically");
+}
+
+/// The memoized role colors are dropped when the theme moves — which is what
+/// makes #396 true for `Success`/`Warning`/`Error` and not just for the accent.
+///
+/// A color-scheme flip moves `@success_color` exactly as it can move
+/// `@accent_color`. Without the drop, a status widget would keep the previous
+/// scheme's green for the rest of the session, since nothing else invalidates a
+/// memo that is only read on a cold cache.
+///
+/// The observation is indirect by necessity — the hermetic binary has no theme
+/// to re-resolve against — but it is exact: after the second theme change the
+/// memo is cold, `resolve_role_inks` returns the "no GTK" answer, and the role
+/// degrades to the accent. A *surviving* memo would still be carrying `green`.
+///
+/// **Deletion check:** removing `ROLE_INKS.set(None)` from
+/// `invalidate_cached_frames` leaves the rest of the shell suite green and turns
+/// this red at "the memo must be dropped on a theme change…".
+#[test]
+fn a_theme_change_drops_the_memoized_role_colors() {
+    let _ink = preem_ink_lock();
+    let green = [0x2e, 0xc2, 0x7e, 0xff];
+    let scope = Scope::detached("885-role-memo");
+    let ok = ink_probe(
+        "ok",
+        vocab::StyleRef::new(vocab::StyleName::Vfd).with_accent(vocab::AccentRole::Success),
+    );
+
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    preem_render::set_role_inks(preem_render::RoleInks {
+        success: Some(green),
+        warning: None,
+        error: None,
+    });
+    let first = mapped_pixels(&scope, &ok);
+
+    // The theme moved and nothing re-injects, so a dropped memo re-resolves to
+    // the hermetic "no theme" answer and the role degrades to the accent.
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let second = mapped_pixels(&scope, &ok);
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    assert!(
+        first.2.chunks_exact(4).any(|px| px == green),
+        "the injected role color must reach the first render",
+    );
+    assert!(
+        !second.2.chunks_exact(4).any(|px| px == green),
+        "the memo must be dropped on a theme change, so the stale role color cannot survive it",
+    );
+}

@@ -4065,3 +4065,140 @@ fn advance_all_names_only_the_scopes_that_moved() {
         "and the fan-out must be able to read the plugin id back off it",
     );
 }
+
+// ── #885: per-widget ink — roles, pins, and the live re-tint ─────────────────
+
+/// A dot-matrix node in `style` — the smallest widget whose ink is visible.
+fn ink_probe(id: &str, style: vocab::StyleRef) -> wire::Node {
+    preem_node(
+        Some(id),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig { style },
+            state: vocab::DotMatrixState { text: "88".into() },
+        },
+    )
+}
+
+/// #396, end to end through the shell's real accent path: changing the desktop
+/// accent re-renders every **role-tinted** preem widget on screen, and leaves
+/// every **pinned** one exactly as it was.
+///
+/// `tint_in_process_surfaces` is the shell's own accent seam (`pump`), so this
+/// drives the same call the `StyleManager` listener makes — installing the kit
+/// accent and dropping the cached frames — rather than a test-only shortcut.
+///
+/// **Deletion check:** making `ink_for` ignore `StyleRef::ink` (returning
+/// `Ink::Default` for a pin) turns the two pinned assertions red while the
+/// re-tinting one stays green — so the pin is what they measure, not the
+/// invalidation.
+#[test]
+fn an_accent_change_re_tints_a_role_widget_and_leaves_a_pinned_one_alone() {
+    let _ink = preem_ink_lock();
+    let violet = [0x9b, 0x59, 0xb6, 0xff];
+    let scope = Scope::detached("885-re-tint");
+    let role = ink_probe("role", vocab::StyleRef::new(vocab::StyleName::Vfd));
+    let pinned = ink_probe(
+        "pinned",
+        vocab::StyleRef::new(vocab::StyleName::Vfd).with_ink(violet),
+    );
+
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let role_teal = mapped_pixels(&scope, &role);
+    let pinned_teal = mapped_pixels(&scope, &pinned);
+
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let role_rose = mapped_pixels(&scope, &role);
+    let pinned_rose = mapped_pixels(&scope, &pinned);
+
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    assert_ne!(
+        role_teal, role_rose,
+        "a role-tinted widget must re-render in the new accent with no plugin involvement (#396)",
+    );
+    assert_eq!(
+        pinned_teal, pinned_rose,
+        "a pinned widget is deliberately excluded from the re-tint — that is what pinning means",
+    );
+    assert!(
+        pinned_teal.2.chunks_exact(4).any(|px| px == violet),
+        "…and it is excluded *at its pinned color*, not merely frozen at whatever it first drew",
+    );
+    assert_ne!(
+        role_teal, pinned_teal,
+        "the two must differ under one accent, or the equality above is vacuous",
+    );
+}
+
+/// A semantic role other than `Accent` resolves to the **theme's** color for
+/// that role, not to the accent — the per-widget resolution the kit's one
+/// process-global could not express.
+///
+/// The role colors are injected rather than looked up: the hermetic test binary
+/// has no GTK display, so `resolve_role_inks` returns every color unset and each
+/// role would (correctly, by its documented fallback) degrade to the accent —
+/// proving nothing about resolution.
+///
+/// **Deletion check:** collapsing every role onto `Ink::Default` in `ink_for`
+/// turns the first three assertions red.
+#[test]
+fn a_status_role_resolves_to_the_theme_color_not_the_accent() {
+    let _ink = preem_ink_lock();
+    let green = [0x2e, 0xc2, 0x7e, 0xff];
+    let amber = [0xe5, 0xa5, 0x0a, 0xff];
+    let scope = Scope::detached("885-roles");
+    let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd);
+    let with = |role| vfd.with_accent(role);
+
+    // Order matters: the tint call clears the memo, so the injection goes last.
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    preem_render::set_role_inks(preem_render::RoleInks {
+        success: Some(green),
+        warning: Some(amber),
+        error: None,
+    });
+
+    let accent = mapped_pixels(
+        &scope,
+        &ink_probe("accent", with(vocab::AccentRole::Accent)),
+    );
+    let success = mapped_pixels(&scope, &ink_probe("ok", with(vocab::AccentRole::Success)));
+    let warning = mapped_pixels(&scope, &ink_probe("warn", with(vocab::AccentRole::Warning)));
+    let error = mapped_pixels(&scope, &ink_probe("err", with(vocab::AccentRole::Error)));
+    let neutral = mapped_pixels(
+        &scope,
+        &ink_probe("plain", with(vocab::AccentRole::Neutral)),
+    );
+
+    // The same accent-role widget again, with no accent installed at all: the
+    // kit's own hard-coded ink, which is where `Neutral` should have landed.
+    tint_in_process_surfaces(None);
+    let unaccented = mapped_pixels(
+        &scope,
+        &ink_probe("accent", with(vocab::AccentRole::Accent)),
+    );
+    preem_render::forget_scope(&scope);
+
+    assert_ne!(
+        success, accent,
+        "Success must resolve to @success_color, not to the desktop accent",
+    );
+    assert_ne!(warning, success, "…and each role to its own color");
+    assert!(
+        success.2.chunks_exact(4).any(|px| px == green),
+        "a fully-lit dot carries the role's color exactly, not something derived from it",
+    );
+    assert_eq!(
+        error, accent,
+        "a role this theme does not define falls back to the accent rather than inventing a color",
+    );
+    assert_ne!(
+        neutral, accent,
+        "Neutral refuses the accent — the opt-out the wire documents",
+    );
+    assert_eq!(
+        neutral, unaccented,
+        "…and lands exactly where the same skin lands with no accent installed at all",
+    );
+}

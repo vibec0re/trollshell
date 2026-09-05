@@ -126,18 +126,34 @@
 //!
 //! # Style is a reference
 //!
-//! [`StyleRef`] carries a [`StyleName`] plus a semantic [`AccentRole`], never
-//! resolved colors, so the shell can re-tint every live widget when the desktop
-//! accent changes with no wire traffic at all.
+//! [`StyleRef`] carries a [`StyleName`] plus a semantic [`AccentRole`], so the
+//! shell can re-tint every live widget when the desktop accent changes with no
+//! wire traffic at all (#396) — say what a reading *means* and let the shell
+//! decide what that looks like in the current theme.
 //!
 //! Every constructor here defaults the role to [`AccentRole::Accent`] rather
-//! than to the wire default of `None`. That is what preserves today's look: the
-//! raster kit already tints its ink with the host-pushed accent
-//! ([`preem::set_accent`](crate::preem::set_accent), #376), so a widget that
-//! asked for `None` — "the skin's own hard-coded ink" — would *lose* the accent
-//! on the way to the state path. Reach for [`neutral`](Gauge::neutral) to pin a
-//! widget to the skin's own ink, or [`accent_role`](Gauge::accent_role) for
-//! `Success`/`Warning`/`Error`.
+//! than to the wire default of `None`. That is a **stated** intent rather than a
+//! borrowed one: the raster kit tints its ink with the host-pushed accent
+//! ([`preem::set_accent`](crate::preem::set_accent), #376), and a widget that
+//! names the role gets that tint from any host, whatever it resolves an unstated
+//! role to. Reach for [`neutral`](Gauge::neutral) to hold a widget at the skin's
+//! own ink while the desktop re-tints around it, or
+//! [`accent_role`](Gauge::accent_role) for `Success`/`Warning`/`Error`.
+//!
+//! ## …and the one escape hatch: [`ink`](Gauge::ink)
+//!
+//! [`StyleRef::ink`] pins a literal color, and a pinned widget is **excluded
+//! from the live re-tint** — that is what pinning means, and it is the cost of
+//! taking this path. Reach for it only when the color *is* the meaning and no
+//! role names it (a brand color, a plugin's signature tint); reach for a role
+//! for anything that means "good", "warn" or "broken".
+//!
+//! It overrides the **ink only**: the skin still supplies the field, the ghost,
+//! the bloom and the CRT pass, so a pinned widget still reads as the same
+//! device. Both arms honor it — the raster arm resolves it locally with
+//! [`preem::with_ink`](crate::preem::with_ink), so a pin looks the same against
+//! a shell that speaks preem and one that does not (see [`raster_ink`] for the
+//! one part of role resolution a plugin process cannot do).
 //!
 //! # The escape hatch
 //!
@@ -157,7 +173,9 @@ use hytte_plugin_proto::wire::{Cls, Node};
 use hytte_preem as kit;
 use hytte_preem::{DisplayStyle, Frame};
 
-pub use hytte_plugin_proto::preem::{AccentRole, Mechanism, StyleName, StyleRef, TextBoxWidth};
+pub use hytte_plugin_proto::preem::{
+    AccentRole, Mechanism, Rgba, StyleName, StyleRef, TextBoxWidth,
+};
 
 // ── negotiation state ───────────────────────────────────────────────────────
 
@@ -316,6 +334,28 @@ fn style_ref(style: StyleName) -> StyleRef {
     StyleRef::new(style).with_accent(AccentRole::Accent)
 }
 
+/// The kit ink the **raster** arm renders a [`StyleRef`] with — as much of the
+/// shell's resolution as a plugin process can honestly do.
+///
+/// A pinned [`StyleRef::ink`] and [`AccentRole::Neutral`] are both fully
+/// resolvable here: one is a literal color, the other is "no tint at all", and
+/// neither needs a theme. So the raster arm honors both, and a widget that pins
+/// its ink looks the same against an old shell as against a new one — which is
+/// the whole point of the seam ([`lower`]).
+///
+/// `Success`/`Warning`/`Error` are the ones that cannot be: `@success_color`
+/// lives in the shell's GTK theme, which a plugin process has no access to (and
+/// the wire carries no theme). They fall back to [`kit::Ink::Default`] — the
+/// session accent the host pushed — exactly as they rendered before the roles
+/// existed, rather than to a locally invented approximation.
+fn raster_ink(style: StyleRef) -> kit::Ink {
+    match (style.ink, style.accent) {
+        (Some(ink), _) => kit::Ink::Fixed(ink),
+        (None, Some(AccentRole::Neutral)) => kit::Ink::Base,
+        (None, _) => kit::Ink::Default,
+    }
+}
+
 // ── the shared lowering seam ────────────────────────────────────────────────
 
 /// Lower one widget into the node the host will receive.
@@ -338,8 +378,15 @@ fn style_ref(style: StyleName) -> StyleRef {
 /// than rendering one size against an old shell and another against a new one.
 /// Nothing hostile reaches this arm: the config is the plugin's own, and it is
 /// the plugin's own address space that pays for it.
+///
+/// It does resolve the widget's **ink** ([`raster_ink`]) around the kit call, so
+/// a pinned color or a `neutral()` opt-out survives the fallback instead of
+/// being a state-mode-only feature. That is one scope in one place rather than
+/// eight wrapped closures, and it is why `style` is a parameter here: every
+/// caller already has it, and none of them can forget it.
 fn lower(
     mode: RenderMode,
+    style: StyleRef,
     id: &str,
     classes: Vec<Cls>,
     widget: impl FnOnce() -> PreemWidget,
@@ -351,7 +398,7 @@ fn lower(
             classes,
             widget: Box::new(widget().clamped()),
         },
-        RenderMode::Raster => raster().into_node(Some(id), classes),
+        RenderMode::Raster => kit::with_ink(raster_ink(style), raster).into_node(Some(id), classes),
     }
 }
 
@@ -533,6 +580,14 @@ impl DotMatrix {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// The node for `text`, in whichever mode this session negotiated.
     #[must_use]
     pub fn node(&self, id: &str, text: &str) -> Node {
@@ -551,6 +606,7 @@ impl DotMatrix {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::DotMatrix {
@@ -601,6 +657,14 @@ impl SevenSeg {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// The node for `text`, in whichever mode this session negotiated.
     #[must_use]
     pub fn node(&self, id: &str, text: &str) -> Node {
@@ -618,6 +682,7 @@ impl SevenSeg {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::SevenSeg {
@@ -722,6 +787,14 @@ impl TextBox {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// The node for `text`, in whichever mode this session negotiated.
     #[must_use]
     pub fn node(&self, id: &str, text: &str) -> Node {
@@ -739,6 +812,7 @@ impl TextBox {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::TextBox {
@@ -835,6 +909,14 @@ impl Marquee {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// Advance the **plugin-side** scroll by `dt` seconds at the configured
     /// speed. A no-op while the host speaks preem — the shell's pump owns the
     /// offset there — so this is safe (and correct) to call unconditionally.
@@ -899,6 +981,7 @@ impl Marquee {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>, text: &str) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::Marquee {
@@ -983,6 +1066,14 @@ impl LedStrip {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// Set the level to light, in `0.0..=1.0`. Always takes effect; also folds
     /// into the plugin-side peak-hold when one is declared and the host does not
     /// speak preem.
@@ -1050,6 +1141,7 @@ impl LedStrip {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::LedStrip {
@@ -1149,6 +1241,14 @@ impl Scope {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// State a fresh sample batch (a normalized `-1.0..=1.0` signal). Always
     /// recorded; stamps the plugin-side phosphor only in raster mode.
     ///
@@ -1208,6 +1308,7 @@ impl Scope {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::Scope {
@@ -1340,6 +1441,14 @@ impl Gauge {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// Point the needle at a new reading. Takes effect in either mode — it is
     /// the one thing the plugin has to say.
     ///
@@ -1455,6 +1564,7 @@ impl Gauge {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::Gauge {
@@ -1579,6 +1689,14 @@ impl FlipBoard {
         self.accent_role(AccentRole::Neutral)
     }
 
+    /// Pin an explicit color as this widget's ink, opting it **out** of the live
+    /// re-tint — the escape hatch, not the path. See [`StyleRef::ink`].
+    #[must_use]
+    pub fn ink(mut self, ink: Rgba) -> Self {
+        self.config.style.ink = Some(ink);
+        self
+    }
+
     /// Flip toward `text`. Always takes effect; re-stating the current content
     /// is inert, so unchanged cells are never disturbed.
     pub fn set_text(&mut self, text: &str) {
@@ -1645,6 +1763,7 @@ impl FlipBoard {
     pub fn node_in(&self, mode: RenderMode, id: &str, classes: Vec<Cls>) -> Node {
         lower(
             mode,
+            self.config.style,
             id,
             classes,
             || PreemWidget::FlipBoard {
@@ -1704,8 +1823,8 @@ impl MechanismKit for FlipBoardConfig {
 mod tests {
     use super::{
         AccentRole, DotMatrix, FlipBoard, Gauge, LedStrip, Marquee, Mechanism, RenderMode, Scope,
-        SevenSeg, StyleName, TextBox, display_style, host_speaks_preem, negotiated_vocab,
-        render_mode, set_negotiated, style_name,
+        SevenSeg, StyleName, StyleRef, TextBox, display_style, host_speaks_preem, negotiated_vocab,
+        raster_ink, render_mode, set_negotiated, style_name,
     };
     use hytte_plugin_proto::preem::{MAX_TEXT_LEN, PREEM_VOCAB, PreemWidget};
     use hytte_plugin_proto::wire::Node;
@@ -2343,6 +2462,160 @@ mod tests {
             "X",
         );
         assert_eq!(preem_of(&node).style().accent, Some(AccentRole::Neutral));
+    }
+
+    // ── the explicit ink pin (#885) ─────────────────────────────────────────
+
+    /// A widget nobody pinned emits **exactly** the style reference it emitted
+    /// before the field existed — same skin, same role, no pin — so #885 costs
+    /// an unpinned plugin nothing at all, on the wire or in behavior.
+    ///
+    /// **Falsified** by defaulting `style_ref` to a pinned ink: the `ink: None`
+    /// assertion goes red for every widget.
+    #[test]
+    fn an_unpinned_widget_emits_the_style_ref_it_always_did() {
+        for node in every_widget(RenderMode::State) {
+            let style = preem_of(&node).style();
+            assert_eq!(
+                style.ink,
+                None,
+                "{}: nothing pinned it, so nothing may be pinned",
+                preem_of(&node).kind()
+            );
+            assert_eq!(
+                style,
+                StyleRef::new(style.style).with_accent(AccentRole::Accent),
+                "{}: the SDK's unpinned reference is skin + Accent, unchanged",
+                preem_of(&node).kind()
+            );
+        }
+    }
+
+    /// `.ink(…)` puts that exact color on the wire and it survives the codec —
+    /// the state half of the pin, which is what makes the shell exclude the
+    /// widget from the live re-tint.
+    #[test]
+    fn a_pinned_ink_reaches_the_host_through_the_state_arm() {
+        let violet = [0x9b, 0x59, 0xb6, 0xff];
+        let node = DotMatrix::new(StyleName::Vfd).ink(violet).node_in(
+            RenderMode::State,
+            "dm",
+            Vec::new(),
+            "X",
+        );
+        assert_eq!(preem_of(&node).style().ink, Some(violet));
+        assert_eq!(
+            preem_of(&node).style().accent,
+            Some(AccentRole::Accent),
+            "a pin does not clear the role it overrides — the host decides which wins"
+        );
+
+        let back: Node = decode(&encode(&node)).expect("a pinned node decodes");
+        assert_eq!(preem_of(&back).style().ink, Some(violet));
+    }
+
+    /// [`raster_ink`] is the whole of what a *plugin process* can resolve: a
+    /// literal color and "no tint" need no theme, the three status roles do, and
+    /// an unstated role is the session accent. Stated as a table so a collapsed
+    /// arm is a failure rather than a silent behavior change.
+    ///
+    /// **Falsified** by returning `Ink::Default` for `Neutral`: the neutral row
+    /// goes red — which is the whole reason the raster arm gained a scope.
+    #[test]
+    fn the_raster_arm_resolves_what_a_plugin_can_and_defers_what_it_cannot() {
+        let violet = [0x9b, 0x59, 0xb6, 0xff];
+        let vfd = || StyleRef::new(StyleName::Vfd);
+        assert_eq!(raster_ink(vfd()), kit::Ink::Default, "no role stated");
+        assert_eq!(
+            raster_ink(vfd().with_accent(AccentRole::Accent)),
+            kit::Ink::Default,
+            "the accent is what the kit already applies"
+        );
+        assert_eq!(
+            raster_ink(vfd().with_accent(AccentRole::Neutral)),
+            kit::Ink::Base,
+            "neutral needs no theme, so the raster arm honors it"
+        );
+        for role in [AccentRole::Success, AccentRole::Warning, AccentRole::Error] {
+            assert_eq!(
+                raster_ink(vfd().with_accent(role)),
+                kit::Ink::Default,
+                "{role:?} lives in the shell's theme; a plugin defers to the accent"
+            );
+        }
+        // A pin beats every one of them — including the role it sits next to.
+        assert_eq!(
+            raster_ink(vfd().with_ink(violet)),
+            kit::Ink::Fixed(violet),
+            "a pin is resolvable anywhere"
+        );
+        assert_eq!(
+            raster_ink(vfd().with_accent(AccentRole::Neutral).with_ink(violet)),
+            kit::Ink::Fixed(violet),
+            "…and outranks a role"
+        );
+    }
+
+    /// The #898 parity rule, extended to the pin: the raster arm is byte-for-byte
+    /// the kit call a plugin author would write by hand — now including the ink
+    /// scope. Pinning is **not** a state-mode-only feature, so a widget looks the
+    /// same against a shell that speaks preem and one that does not.
+    ///
+    /// The second assertion is what keeps the first from being vacuous: without
+    /// the scope in `lower`, the pinned render is simply the unpinned one and
+    /// both sides of an "== kit call without a scope" comparison would agree.
+    ///
+    /// **Falsified** by dropping the `kit::with_ink` wrapper from `lower`'s
+    /// raster arm: parity goes red for both widgets.
+    #[test]
+    fn the_raster_arm_is_byte_identical_for_a_pinned_widget() {
+        let violet = [0x9b, 0x59, 0xb6, 0xff];
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+
+        let pinned =
+            DotMatrix::new(StyleName::Vfd)
+                .ink(violet)
+                .node_in(raster, "dm", no_cls(), "HELLO");
+        assert!(
+            pinned
+                == kit::with_ink(kit::Ink::Fixed(violet), || kit::dot_matrix(
+                    "HELLO",
+                    DisplayStyle::Vfd
+                ))
+                .into_node(Some("dm"), no_cls()),
+            "dot matrix, pinned",
+        );
+        assert!(
+            pinned != DotMatrix::new(StyleName::Vfd).node_in(raster, "dm", no_cls(), "HELLO"),
+            "a pinned raster must differ from the unpinned one, or the parity above proves nothing",
+        );
+
+        // …and a widget that bakes its palette at construction rather than at
+        // render, which is the arm a scope around only the kit call would miss.
+        let pinned = TextBox::new(StyleName::Lcd).ink(violet).cols(12).node_in(
+            raster,
+            "tb",
+            no_cls(),
+            "pinned",
+        );
+        assert!(
+            pinned
+                == kit::with_ink(kit::Ink::Fixed(violet), || kit::TextBox::styled(
+                    DisplayStyle::Lcd
+                )
+                .cols(12)
+                .render("pinned"))
+                .into_node(Some("tb"), no_cls()),
+            "text box, pinned",
+        );
+        assert!(
+            pinned
+                != TextBox::new(StyleName::Lcd)
+                    .cols(12)
+                    .node_in(raster, "tb", no_cls(), "pinned"),
+            "text box: a pin must change the pixels",
+        );
     }
 
     /// The two style vocabularies map 1:1 in both directions, so a plugin

@@ -82,6 +82,13 @@
 //!   resampling-free by design: curvature reads as a vignette rather than a
 //!   barrel warp, so the fixed-grid discipline below survives it intact.
 //!
+//! The **ink** each skin lights up with is the one part of a palette a host may
+//! move: [`set_accent`] answers it once per process (what a plugin gets), and
+//! [`with_ink`] answers it per render (what a shell drawing many plugins'
+//! widgets needs, #885). Field, ghost, bloom and the CRT pass are the panel's
+//! physical character and are never overridden — that is what keeps a re-tinted
+//! widget still reading as the same device.
+//!
 //! # Colour — a second axis, not more styles (#857)
 //!
 //! [`ColorMap`] answers "what colour is *this cell*?", which is a different
@@ -148,3 +155,10 @@ pub use textbox::TextBox;
 /// wins). It was `pub(crate)` while the kit lived inside the SDK — the caller
 /// is simply on the far side of a crate boundary now.
 pub use style::set_accent;
+
+/// Scope one render to an explicit ink (#885) — host-facing like
+/// [`set_accent`], and the *per-render* answer where that one is the
+/// *per-process* answer. A shell rasterising many plugins' widgets in one
+/// process resolves each widget's own semantic role (or its pinned color)
+/// around the call that draws it; a plugin never touches either.
+pub use style::{Ink, with_ink};

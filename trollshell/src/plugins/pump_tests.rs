@@ -241,7 +241,7 @@ fn step(releaser: &mut std::pin::Pin<&mut impl Future<Output = ()>>) {
 /// then the plugin exiting); this one covers the part that shape cannot show —
 /// that the departure is read off *all seven* mailboxes, so the id has to leave
 /// the panel list as well as its region before anything is forgotten, which is
-/// exactly the order `session.rs:812-824`'s teardown writes them in.
+/// exactly the order `session.rs:815-824`'s teardown writes them in.
 ///
 /// **Deletion check:** dropping the `forget_scope` loop from
 /// [`drive_scope_releaser`] turns the **final** card assertion red with
@@ -280,7 +280,7 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
     step(&mut releaser);
     assert_eq!(preem_render::instance_count(&card), 1);
 
-    // Teardown's order (`session.rs:812-824`): the six regions first…
+    // Teardown's order (`session.rs:815-824`): the six regions first…
     bar_left.set(Vec::new());
     step(&mut releaser);
     assert_eq!(

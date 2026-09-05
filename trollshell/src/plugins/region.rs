@@ -682,6 +682,57 @@ fn release_panel_scope(scope: &Scope) -> bool {
     })
 }
 
+/// Release a **departed** plugin's panel scope: drop its renderer instances and
+/// its [`PANEL_SCOPE_HOLDERS`] entry together, so the two cannot diverge.
+///
+/// This is what `pump::drive_scope_releaser` calls instead of reaching for
+/// `preem_render::forget_scope` itself (`pump` cannot see this module's private
+/// map anyway). The release is deliberately **unconditional** — it does not go
+/// through [`release_panel_scope`] — because routing it through the refcount
+/// would re-open #921 exactly: a plugin that exits while a drawer child is
+/// still holding its panel would keep its instances resident until that child
+/// happened to blank, which with no monitors left never happens. "The plugin is
+/// gone" outranks "someone is still showing it"; every live child is about to
+/// be told `None` by the same mailbox emission and will render blank.
+///
+/// Dropping the map entry alongside is what keeps the two bookkeepings from
+/// disagreeing (the #921 review's MEDIUM-2, probe R2B): a count left at 1 over
+/// an empty store is a hold nothing will ever pair a release with, and it makes
+/// every later release of that scope answer "not the last holder" — a leak that
+/// survives the plugin it came from.
+///
+/// The residual, stated: a `shown` cell that outlived the departure *and* is
+/// released only after a **later** session of the same plugin id took a hold
+/// would decrement that new session's count. Not reachable through today's
+/// wiring — every live child is woken by the departure emission and blanks
+/// through [`forget_previous_panel_scope`] (the review enumerated the paths),
+/// and `install_scope_releaser` is spawned from `plugins::install` before any
+/// drawer child exists, so on that shared emission the releaser runs first and
+/// the children release into an already-empty map.
+pub(super) fn forget_departed_panel_scope(scope: &Scope) {
+    PANEL_SCOPE_HOLDERS.with_borrow_mut(|holders| {
+        holders.remove(scope);
+    });
+    preem_render::forget_scope(scope);
+}
+
+/// How many drawer panel children are currently holding `scope` — the refcount
+/// [`forget_previous_panel_scope`] maintains, exposed so a test can assert the
+/// *bookkeeping* rather than only its visible effect on `instance_count`.
+///
+/// Without this, `forget_departed_panel_scope`'s map drop has no deletion
+/// check: an instance count of zero is satisfied by both the honest spelling
+/// and the divergent one.
+///
+/// Gated on `system-tests` rather than plain `test` because its only callers
+/// are in [`gtk_tests`], which carries that gate — a bare `#[cfg(test)]` here
+/// is `dead_code` in the hermetic bucket that `cargo test --workspace` and the
+/// package build's `doCheck` run.
+#[cfg(all(test, feature = "system-tests"))]
+pub(super) fn panel_scope_holders(scope: &Scope) -> usize {
+    PANEL_SCOPE_HOLDERS.with_borrow(|holders| holders.get(scope).copied().unwrap_or(0))
+}
+
 /// Record which panel scope the drawer child is about to show, dropping the
 /// preem renderer instances of the one it was showing before (#883) — unless it
 /// is the same scope, in which case a re-render must *keep* the animation state
@@ -1338,12 +1389,22 @@ mod gtk_tests {
     /// through `hytte::reactive::bind`, so its loop is the library's, checked by
     /// `nix/lint-bind-pins.py` at the call site.
     ///
-    /// **Deletion check:** `break` → `continue` leaves the task parked on its
-    /// signal forever instead of completing — `finished` stays `false` and the
-    /// first assertion goes red. Without this test that mutation is silently
-    /// green across the whole suite (the review measured it: 12 passed, exit 0).
-    /// Dropping the `forget_previous_panel_scope` from that branch turns the
-    /// second assertion red.
+    /// **Deletion checks**, all three measured (#920's, plus #921 review
+    /// MEDIUM-1's — the sibling hold below is what makes the last two possible;
+    /// before it, the only thing asserted after the break was
+    /// `instance_count == 0`, which every spelling of the release satisfies):
+    ///
+    /// | mutation on the weak-break leg | red assertion | measured |
+    /// | --- | --- | --- |
+    /// | `break` → `continue` (the task parks forever) | `finished` | `false` |
+    /// | the release deleted outright | the holders one | `left: 2, right: 1` |
+    /// | `forget_previous_panel_scope` → a bare `preem_render::forget_scope` on the taken cell — the pre-#921 spelling, unconditional and never decrementing | the instance one | `left: 0, right: 1` |
+    ///
+    /// That third row is the point of the sibling: it was **fully green** here
+    /// before (17 passed, exit 0), and the mutant it admitted is precisely probe
+    /// P5 — a weak break blanking a sibling monitor's panel, plus a holder stuck
+    /// at 1 that makes every later release of that scope answer "not the last
+    /// holder" forever.
     #[gtk::test]
     fn the_panel_loop_exits_once_its_root_is_gone() {
         adw::init().expect("libadwaita init");
@@ -1365,6 +1426,18 @@ mod gtk_tests {
             preem_render::instance_count(&scope),
             1,
             "the panel must have a live renderer instance for the leg to release",
+        );
+
+        // A **sibling monitor's** drawer child showing the same panel: a second
+        // hold on the scope, taken through the same helper production takes it
+        // through. Without it the weak leg's release is indistinguishable from
+        // an unconditional `forget_scope`, which is the mutant this pins.
+        let sibling: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+        forget_previous_panel_scope(&sibling, Some(&scope));
+        assert_eq!(
+            super::panel_scope_holders(&scope),
+            2,
+            "two children must be holding the scope before the weak break",
         );
 
         // A root that is already gone: nothing parents it, so dropping the only
@@ -1402,33 +1475,139 @@ mod gtk_tests {
         );
         assert_eq!(
             preem_render::instance_count(&scope),
-            0,
-            "…and release the panel scope on the way out, on the one path the \
-             `connect_destroy` abort cannot see",
+            1,
+            "…dropping its own hold on the way out, not the instances: this leg \
+             is a monitor's drawer child going away like any other, so it must \
+             not blank the sibling monitor still painting the same panel (#921)",
         );
+        assert_eq!(
+            super::panel_scope_holders(&scope),
+            1,
+            "…and the sibling's hold must be the one that is left, not a count \
+             stuck at 2 that never releases",
+        );
+
+        // The sibling goes too: now it really is the last holder.
+        forget_previous_panel_scope(&sibling, None);
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "…and the panel scope is still released once nothing shows it, on \
+             the one path the `connect_destroy` abort cannot see",
+        );
+        assert_eq!(super::panel_scope_holders(&scope), 0);
         handle.abort();
     }
 
+    /// A **departed** plugin's panel release drops its refcount entry as well as
+    /// its renderer instances, so the store and [`super::PANEL_SCOPE_HOLDERS`]
+    /// cannot diverge (#921 review MEDIUM-2).
+    ///
+    /// The releaser's panel release is deliberately unconditional — gating it on
+    /// the refcount would re-open #921 (a plugin exiting with a drawer child
+    /// still holding its panel would keep its instances until that child
+    /// blanked, which with no monitors left never happens). Unconditional means
+    /// it writes *past* the refcount, so it has to maintain it: a count left at
+    /// 1 over an empty store is a hold nothing will ever pair a release with,
+    /// and it makes every later release of that scope answer "not the last
+    /// holder" — a leak that outlives the plugin it came from.
+    ///
+    /// **Deletion check:** dropping the `PANEL_SCOPE_HOLDERS.remove` from
+    /// [`super::forget_departed_panel_scope`] (leaving the bare
+    /// `preem_render::forget_scope`) turns the holders assertion red with
+    /// `left: 1, right: 0` — probe R2B's stale state, made observable. The run
+    /// stops there; the new-session assertion below is what that stale count
+    /// would go on to cost (a first child arriving as the scope's *second*
+    /// holder, behind a ghost), asserted in the same test so no narrower repair
+    /// can satisfy one and leave the other.
+    #[gtk::test]
+    fn a_departed_plugins_panel_release_drops_its_refcount_entry_too() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let scope = Scope::panel("panel-departed");
+
+        // A monitor's drawer child showing the panel: one instance, one hold.
+        let canvas = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut reconciler = Reconciler::new(&canvas, |_: NodeId, _: UiEventKind| {});
+        let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> = Rc::new(RefCell::new(None));
+        let shown: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+        render_active_panel(
+            &mut reconciler,
+            &outbound,
+            &shown,
+            Some(&render_of("panel-departed", &tx)),
+        );
+        assert_eq!(preem_render::instance_count(&scope), 1);
+        assert_eq!(super::panel_scope_holders(&scope), 1);
+
+        // The plugin leaves every mailbox while that child still holds it.
+        let panels = Mutable::new(vec![render_of("panel-departed", &tx)]);
+        let releaser = spawn_releaser_over_panels(&panels);
+        pump();
+        panels.set(Vec::new());
+        pump();
+
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "a departed plugin's panel scope must be released whoever is \
+             holding it — gating this on the refcount would re-open #921",
+        );
+        assert_eq!(
+            super::panel_scope_holders(&scope),
+            0,
+            "…and its refcount entry must go with it: a count over an empty \
+             store is a hold nothing will ever release",
+        );
+
+        // A later session of the same plugin id starts from one hold, not two.
+        let next_session: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+        forget_previous_panel_scope(&next_session, Some(&scope));
+        assert_eq!(
+            super::panel_scope_holders(&scope),
+            1,
+            "a new session's first drawer child must be the scope's only \
+             holder, not the second one behind a ghost",
+        );
+        forget_previous_panel_scope(&next_session, None);
+        assert_eq!(super::panel_scope_holders(&scope), 0);
+
+        releaser.abort();
+    }
+
     /// Spawn the monitor-independent scope releaser (#921) over seven mailboxes
-    /// of which only `bar_left` carries anything — the shape
+    /// of which only the one at `slot` carries anything — the shape
     /// `plugins::install` wires up, minus the registry a `#[gtk::test]` has no
     /// booted `App` to provide.
+    ///
+    /// `slot` indexes `live_plugin_ids_signal`'s array in `PluginHandles` field
+    /// order: 0-2 the sidebar regions, 3-5 the bar regions, 6 the shared panel
+    /// list.
     ///
     /// Returns the task handle so the test can abort it: `#[gtk::test]` funnels
     /// every test in this binary onto one main context, and a parked
     /// subscription would otherwise keep polling through later tests' `pump()`s.
-    fn spawn_releaser_over_bar_left(renders: &Mutable<Vec<SlotRender>>) -> glib::JoinHandle<()> {
-        let mailboxes = [
-            Mutable::new(Vec::new()), // sidebar_lead
-            Mutable::new(Vec::new()), // sidebar_top
-            Mutable::new(Vec::new()), // sidebar_bottom
-            renders.clone(),          // bar_left — the mount these tests build
-            Mutable::new(Vec::new()), // bar_center
-            Mutable::new(Vec::new()), // bar_right
-            Mutable::new(Vec::new()), // panels
-        ];
+    fn spawn_releaser_over(
+        slot: usize,
+        mailbox: &Mutable<Vec<SlotRender>>,
+    ) -> glib::JoinHandle<()> {
+        let mut mailboxes: [Mutable<Vec<SlotRender>>; 7] =
+            std::array::from_fn(|_| Mutable::new(Vec::new()));
+        mailboxes[slot] = mailbox.clone();
         glib::MainContext::default()
             .spawn_local(drive_scope_releaser(live_plugin_ids_signal(mailboxes)))
+    }
+
+    /// [`spawn_releaser_over`] the `bar_left` region — where the chip mounts
+    /// these tests build would land.
+    fn spawn_releaser_over_bar_left(renders: &Mutable<Vec<SlotRender>>) -> glib::JoinHandle<()> {
+        spawn_releaser_over(3, renders)
+    }
+
+    /// [`spawn_releaser_over`] the shared `panels` mailbox — the one a drawer
+    /// child reads.
+    fn spawn_releaser_over_panels(panels: &Mutable<Vec<SlotRender>>) -> glib::JoinHandle<()> {
+        spawn_releaser_over(6, panels)
     }
 
     /// A plugin leaving while **no region is alive** must still release its card

@@ -324,17 +324,24 @@ pub(super) fn install_preem_clock() {
 
 /// The number of render mailboxes a plugin id can appear in: the six mount
 /// regions (`sidebar_{lead,top,bottom}` + `bar_{left,center,right}`) plus the
-/// single shared `panels` list. A fixed-size array rather than a slice so a new
-/// mailbox is a compile error at every call site, instead of a union that
-/// silently stops covering it — which would look exactly like the defect this
-/// module is fixing.
+/// single shared `panels` list.
+///
+/// A fixed-size array rather than a slice so *changing the count* is a compile
+/// error at every call site. On its own that is **not** enough to stop a union
+/// that silently stops covering a mailbox — which would look exactly like the
+/// defect this module is fixing, and is M4's failure mode: an eighth
+/// `Mutable<Vec<SlotRender>>` field on [`PluginHandles`] leaves this const, the
+/// destructuring below and every `handles.<field>` compiling untouched. The
+/// guard that actually holds is the **exhaustive** `PluginHandles` pattern in
+/// [`install_scope_releaser`] (every field named, no `..`), which turns a new
+/// field into a compile error there and forces a decision about it.
 pub(super) const RENDER_MAILBOXES: usize = 7;
 
 /// The set of plugin ids **any** render mailbox currently holds.
 ///
 /// This is the host's answer to "which plugins are still here", and it is the
 /// one [`drive_scope_releaser`] watches. A connection's teardown clears its
-/// entry from all seven mailboxes (`session.rs:812-824`), so an id leaving this
+/// entry from all seven mailboxes (`session.rs:815-824`), so an id leaving this
 /// union is exactly "the plugin left" — the same event
 /// `region::reconcile_region`'s retain loop reacts to, read from a place that
 /// does not need a region (or a monitor, or any widget) to exist.
@@ -345,10 +352,19 @@ pub(super) const RENDER_MAILBOXES: usize = 7;
 /// plugin's whole `wire::Node` tree — and the union is `dedupe_cloned`d. That
 /// matters because these mailboxes are *deliberately* re-emitted with unchanged
 /// contents up to 20 times a second: [`request_remap`] nudges them to drive the
-/// preem animation clock's repaints. Without the dedupe this subscriber would
-/// recompute a set and find no difference 20 times a second forever; with it,
-/// the nudge wakes the projection, the id list compares equal, and nothing
-/// downstream runs.
+/// preem animation clock's repaints.
+///
+/// The dedupe stops the **subscriber's body**, not the projection, and it is
+/// worth being precise about what still runs per nudge: the nudged mailbox's
+/// `signal_ref` (one `String` clone per plugin in it) plus `map_ref!`'s
+/// combine, which builds a fresh `HashSet<String>` cloning every id in **all
+/// seven** mailboxes before `dedupe_cloned` compares it against the last one
+/// and drops it. Measured (test profile, so an upper bound): **6.5 µs** per
+/// nudge for the realistic shape — 10 ids in one mailbox, six empty — which at
+/// a worst-case 140 nudges/s is 0.91 ms/s, ~0.09 % of a core. Negligible, but
+/// linear in total plugin count × nudge rate rather than free. What the dedupe
+/// buys is that the *release* pass — the set difference and the `forget_scope`
+/// calls — never runs on a nudge, only on a real membership change.
 pub(super) fn live_plugin_ids_signal(
     mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES],
 ) -> impl Signal<Item = HashSet<String>> {
@@ -438,6 +454,12 @@ fn mailbox_ids(mailbox: &Mutable<Vec<SlotRender>>) -> impl Signal<Item = Vec<Str
 /// forget the same `Scope::card`. [`preem_render::forget_scope`] is a
 /// `HashMap::remove`, so the second is a miss — asserted, not assumed, by
 /// `the_releaser_and_a_live_regions_retain_loop_may_both_release_one_scope`.
+///
+/// The panel half is *not* symmetric with the card half, which is why it is
+/// spelled differently below: `region` refcounts panel scopes across monitors,
+/// so releasing one has to drop that count with it. Hence
+/// [`region::forget_departed_panel_scope`](super::region::forget_departed_panel_scope)
+/// rather than a bare `forget_scope`.
 pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String>>) {
     // What the previous emission said was here. Starts empty rather than seeded
     // from the first emission, so the first emission — which lands at install
@@ -449,9 +471,15 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
             // Both of the plugin's trees. A plugin that never opened its panel
             // has no `Scope::panel` instances, and forgetting a scope that holds
             // none is a `HashMap` miss — cheaper than asking first.
-            for scope in [Scope::card(gone), Scope::panel(gone)] {
-                preem_render::forget_scope(&scope);
-            }
+            preem_render::forget_scope(&Scope::card(gone));
+            // The panel scope goes through `region`, not straight to
+            // `preem_render`: releasing it has to drop the per-monitor refcount
+            // entry `region` keeps for it as well, or the store and the count
+            // become two sources of truth with only one writer maintaining both
+            // (#921 review MEDIUM-2). Still an unconditional release — see
+            // `forget_departed_panel_scope` for why it must not be gated on the
+            // refcount.
+            super::region::forget_departed_panel_scope(&Scope::panel(gone));
         }
         resident = next;
     }
@@ -463,24 +491,52 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
 /// animating scope corrupts.
 ///
 /// The authoritative "plugin left" site is the connection teardown in
-/// `session.rs:812-824`, which runs on a **tokio** task — `preem_render`'s
+/// `session.rs:815-824`, which runs on a **tokio** task — `preem_render`'s
 /// `STORE` is a GTK-thread `thread_local!`, so it cannot forget anything from
 /// there. Riding the render mailboxes instead is the marshalling: the teardown
 /// already writes them (that is how the regions learn), and this loop reads them
 /// where the store lives.
 pub(super) fn install_scope_releaser() {
     let live = registry::with(|r| {
-        let handles = r
+        // Destructured **exhaustively** — every field named, no `..` — on
+        // purpose, and this is the load-bearing half of the "the union covers
+        // every mailbox" claim (see [`RENDER_MAILBOXES`], which does not by
+        // itself provide it). A new `Mutable<Vec<SlotRender>>` field on
+        // `PluginHandles` is a compile error *here*, so whoever adds a mount
+        // has to decide whether its plugins are covered rather than silently
+        // finding out they are not — which is M4's failure mode, and #921's
+        // defect all over again. The non-mailbox fields are bound to `_` for
+        // the same reason a wildcard is refused: adding one should also land
+        // here, briefly.
+        let PluginHandles {
+            sidebar_lead,
+            sidebar_top,
+            sidebar_bottom,
+            bar_left,
+            bar_center,
+            bar_right,
+            panels,
+            active_panel_id: _,
+            clock_tx: _,
+            visibility_tx: _,
+            accent_tx: _,
+            spectrum_tx: _,
+            calendar_tx: _,
+            now_playing_tx: _,
+            locked_tx: _,
+            effects_rx: _,
+            datasource: _,
+        } = r
             .get::<PluginHandles>()
             .expect("plugins::service() not registered");
         live_plugin_ids_signal([
-            handles.sidebar_lead.clone(),
-            handles.sidebar_top.clone(),
-            handles.sidebar_bottom.clone(),
-            handles.bar_left.clone(),
-            handles.bar_center.clone(),
-            handles.bar_right.clone(),
-            handles.panels.clone(),
+            sidebar_lead.clone(),
+            sidebar_top.clone(),
+            sidebar_bottom.clone(),
+            bar_left.clone(),
+            bar_center.clone(),
+            bar_right.clone(),
+            panels.clone(),
         ])
     });
     glib::MainContext::default().spawn_local(drive_scope_releaser(live));

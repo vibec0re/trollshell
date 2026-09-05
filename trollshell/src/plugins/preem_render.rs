@@ -38,11 +38,23 @@
 //! and it is also the unit [`forget_scope`] drops on teardown.
 //!
 //! Within a scope the key is the node's `id` when it has one. A node **without**
-//! an id is keyed by its **ordinal** among the preem nodes of that tree, in
-//! traversal order (the tradeoff React's index keys make): stable while the
-//! tree's preem nodes keep their order, and migrating state between them if the
-//! plugin reorders. Giving an animated widget an id (`preem_id`) is the fix, and
-//! is what the SDK emits.
+//! an id is keyed by its **ordinal among the un-id'd preem nodes** of that tree,
+//! in traversal order (the tradeoff React's index keys make).
+//!
+//! That key is stable only while those nodes keep their order and their count.
+//! **Insert or remove an anonymous sibling and the ones after it shift down a
+//! slot**, inheriting the animation state of the node that used to hold it: two
+//! interchangeable gauges have identical configs by construction, so
+//! [`same_config`] agrees, the survivor is *updated in place*, and it renders
+//! the removed node's needle before springing to its own target. For a `Scope`
+//! a whole phosphor history moves onto another signal. A variable-length list of
+//! anonymous widgets — per-core gauges, per-sink strips — glitches on every
+//! insert and remove.
+//!
+//! Giving an animated widget an id (`preem_id`) avoids all of it, and is what
+//! the SDK emits, which is why nothing shows on glass today. The real fix is a
+//! structural key (the parent chain's child indices) that survives a sibling
+//! insert; it is tracked as a follow-up rather than done here.
 //!
 //! ## Idempotence — the multi-monitor requirement
 //!
@@ -55,11 +67,11 @@
 //! for the same reason — the second monitor's mapping pass re-uses the bytes the
 //! first one produced.
 //!
-//! (The equality that gates this is `PreemWidget`'s derived `PartialEq`, so a
-//! widget carrying a `NaN` reading compares unequal to itself and is re-applied
-//! every pass. Harmless for every widget whose apply is a plain assignment; for
-//! a scope it costs one extra stamp per extra monitor. The kit reads `NaN`
-//! samples as `0.0`, so the picture is unaffected either way.)
+//! The equality that gates this is [`same_widget`], **not** `PreemWidget`'s
+//! derived `PartialEq`. The derived one is not reflexive over a `NaN`, and a
+//! short-circuit that never fires is not a missed optimisation here: for a
+//! `Scope` it re-arms `pending` and zeroes `idle` every pass, which pins the
+//! animation clock at 20 Hz forever. See [`canonicalize_non_finite`].
 //!
 //! # Clamping
 //!
@@ -114,14 +126,58 @@ pub(super) const ANIM_STEP_SECS: f32 = 1.0 / 20.0;
 /// catches the trail up to "fully faded" and moves on.
 pub(super) const MAX_CATCHUP_STEPS: u32 = 8;
 
+/// A phosphor cell's maximum intensity in the kit's persistence buffer
+/// (`hytte-preem/src/scope.rs`: "one intensity (`0..=255`) per logical pixel").
+/// The brightest a freshly-stamped beam can be, and so the value whose fade
+/// takes longest — which is what [`scope_settle_steps`] measures.
+const MAX_PHOSPHOR_INTENSITY: u32 = 255;
+
+/// The kit's persistence ceiling: `256/256 = 1.0`, an infinite-persistence
+/// phosphor. `kit::Scope::persistence` clamps to this, so the wire's `u16` must
+/// be clamped the same way before any reasoning about decay.
+const KIT_MAX_PERSISTENCE: u16 = 256;
+
+/// Hard ceiling on [`scope_settle_steps`], so a pathological persistence cannot
+/// make the settle loop long. At `255` (the slowest fade that still fades) the
+/// true answer is 255 steps, so this is a safety rail rather than a cap the
+/// arithmetic ever reaches.
+const MAX_SCOPE_SETTLE_STEPS: u32 = 512;
+
 /// Idle animation steps after which a [`Scope`](vocab::PreemWidget::Scope) with
-/// no new samples stops asking for repaints.
+/// no new samples has nothing left to fade, so it stops asking for repaints.
 ///
-/// The kit's decay is `(v * retained) >> 8` per step, which reaches zero from a
-/// full-intensity `255` in ~17 steps at the default persistence of `184`, and
-/// faster at lower ones. 64 leaves a wide margin for a persistence just under
-/// the never-fades ceiling while still parking the clock inside a few seconds.
-const SCOPE_SETTLE_STEPS: u32 = 64;
+/// **Derived from the configured persistence, not a constant.** The kit's decay
+/// is `(v * retained) >> 8` per step (`hytte-preem/src/scope.rs`'s `decayed`),
+/// so the number of steps a full-intensity trail needs to reach zero is a
+/// function of `retained` — and a constant is wrong in *both* directions:
+///
+/// - Too low for a long phosphor. At `persistence = 255` the decay is exactly
+///   `v - 1` per step, so a full trail needs 255 steps. The old constant of 64
+///   stopped advancing at ~191/255 and `animates()` then went false, freezing
+///   the ghost on screen **permanently** — the opposite of a fade. Anything
+///   from roughly `persistence >= 240` had this.
+/// - Too high for the default. At `184` the trail is gone in 17 steps, but the
+///   old bound kept setting `moved = true` for 64, spending ~47 pixel-identical
+///   global repaints (~2.3 s) after every scope went quiet.
+///
+/// Computed once per renderer build by replaying the kit's own integer decay
+/// rather than by a floating-point log, so it agrees with the kit exactly
+/// instead of approximately.
+fn scope_settle_steps(persistence: u16) -> u32 {
+    let retained = u32::from(persistence.min(KIT_MAX_PERSISTENCE));
+    // `256` retains everything: the trail never fades, and the caller's `fades`
+    // flag short-circuits before this bound is ever consulted.
+    if retained >= u32::from(KIT_MAX_PERSISTENCE) {
+        return 0;
+    }
+    let mut intensity = MAX_PHOSPHOR_INTENSITY;
+    let mut steps = 0;
+    while intensity > 0 && steps < MAX_SCOPE_SETTLE_STEPS {
+        intensity = (intensity * retained) >> 8;
+        steps += 1;
+    }
+    steps
+}
 
 /// Latch for the "this shell can't render that preem widget" warning, so a
 /// plugin that keeps re-rendering an unsupported widget logs once per session
@@ -129,24 +185,52 @@ const SCOPE_SETTLE_STEPS: u32 = 64;
 /// nodes that would be 160 identical journal lines a second).
 static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Which of a plugin's two independent node trees a preem node came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Role {
+    /// The chip/card tree a mount region reconciles.
+    Card,
+    /// The drawer panel tree (#349 PR2).
+    Panel,
+    /// A tree with no plugin behind it — see [`Scope::detached`].
+    #[cfg(test)]
+    Detached,
+}
+
 /// The namespace a plugin's preem nodes live in: its id plus which of its two
 /// trees the node came from. See the module docs on why a bare node id is not a
 /// key.
+///
+/// The two halves are kept as **fields** rather than concatenated into one
+/// string so the repaint fan-out can ask a moved scope which plugin and which
+/// tree it belongs to, and nudge only the mailboxes that actually hold it — see
+/// [`advance_all`] and `pump::request_preem_repaint`. (The previous spelling
+/// joined them with `\u{1}` and justified it by claiming a plugin id cannot
+/// contain that byte; `session.rs` validates only that the id is non-empty, so
+/// the stated reason was wrong even though the scheme was injective. Fields
+/// moot the question.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct Scope(String);
+pub(super) struct Scope {
+    plugin: String,
+    role: Role,
+}
 
 impl Scope {
     /// The scope of `plugin_id`'s chip/card tree (the one a mount region
-    /// reconciles). `\u{1}` separates the two halves because it cannot occur in
-    /// a plugin id (`Manifest::id` is a unit-name-shaped string) and so can't be
-    /// spoofed into a collision with the panel scope.
+    /// reconciles).
     pub(super) fn card(plugin_id: &str) -> Self {
-        Self(format!("{plugin_id}\u{1}card"))
+        Self {
+            plugin: plugin_id.to_owned(),
+            role: Role::Card,
+        }
     }
 
     /// The scope of `plugin_id`'s drawer panel tree (#349 PR2).
     pub(super) fn panel(plugin_id: &str) -> Self {
-        Self(format!("{plugin_id}\u{1}panel"))
+        Self {
+            plugin: plugin_id.to_owned(),
+            role: Role::Panel,
+        }
     }
 
     /// A scope for a tree with no plugin behind it — what the unit tests hand
@@ -156,7 +240,21 @@ impl Scope {
     /// renders straight into the reconciler without mapping at all.
     #[cfg(test)]
     pub(super) fn detached(label: &str) -> Self {
-        Self(format!("\u{1}detached\u{1}{label}"))
+        Self {
+            plugin: label.to_owned(),
+            role: Role::Detached,
+        }
+    }
+
+    /// The plugin whose tree this scope namespaces — what the repaint fan-out
+    /// matches against a mailbox's `SlotRender::plugin_id`.
+    pub(super) fn plugin_id(&self) -> &str {
+        &self.plugin
+    }
+
+    /// Which of the plugin's two trees this scope covers.
+    pub(super) fn role(&self) -> Role {
+        self.role
     }
 }
 
@@ -247,6 +345,12 @@ enum Renderer {
         /// `256` never fades, so a scope at that persistence is static once its
         /// pending batch is stamped.
         fades: bool,
+        /// Idle steps this trail needs to reach black, from the configured
+        /// persistence — see [`scope_settle_steps`]. Per instance, because it is
+        /// a function of the config: a constant was both too low (freezing a
+        /// long phosphor mid-fade, permanently) and too high (dozens of
+        /// pixel-identical repaints after a default one went quiet).
+        settle_steps: u32,
         steps: Steps,
     },
     Gauge {
@@ -349,6 +453,12 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// with a latched warning — `id` and `classes` are kept either way, so CSS
 /// chrome stays and a later valid frame updates the same surface in place (the
 /// posture the malformed-`Pixels` seam takes).
+///
+/// **Two preem nodes in one tree sharing an explicit `id` silently collapse onto
+/// one renderer instance**, applying both widgets to it every pass — two targets
+/// fighting one needle. The reconciler's own node keying has the same shape, so
+/// this is not a new hazard, but it is undiagnosed: warning once per session on a
+/// key already touched in this pass is the follow-up.
 pub(super) fn map_widget(
     scope: &Scope,
     id: Option<&str>,
@@ -407,7 +517,10 @@ pub(super) fn map_widget(
 /// update state otherwise, and no-op when nothing moved (the multi-monitor
 /// case).
 fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
-    if instance.renderer.is_some() && instance.applied == *widget {
+    // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
+    // non-finite float, and a short-circuit that never fires is a permanent
+    // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.
+    if instance.renderer.is_some() && same_widget(&instance.applied, widget) {
         return;
     }
     let rebuild = instance
@@ -439,11 +552,19 @@ impl Instance {
             || (0, 0, Vec::new()),
             |renderer| {
                 let frame = renderer.render(style);
-                (
-                    u32::try_from(frame.width()).unwrap_or(0),
-                    u32::try_from(frame.height()).unwrap_or(0),
-                    frame.data().to_vec(),
-                )
+                // Both dimensions or neither: a lone `unwrap_or(0)` could pair a
+                // zero dimension with a non-empty buffer and break the
+                // `len == w * h * 4` invariant every `Node::Pixels` consumer
+                // (and `mapped_pixels`) relies on. The wire caps put this far
+                // out of reach; the seam is here so it cannot be reached at all.
+                match (
+                    u32::try_from(frame.width()),
+                    u32::try_from(frame.height()),
+                    u32::try_from(frame.data().len()),
+                ) {
+                    (Ok(width), Ok(height), Ok(_)) => (width, height, frame.data().to_vec()),
+                    _ => (0, 0, Vec::new()),
+                }
             },
         );
         self.cached = Some(rendered.clone());
@@ -453,23 +574,36 @@ impl Instance {
 
 // ── the animation clock's half ───────────────────────────────────────────────
 
-/// Advance every live renderer by `dt` seconds, returning `true` if any of them
-/// changed and so needs a repaint.
+/// Advance every live renderer by `dt` seconds, returning **which scopes**
+/// changed and so need a repaint.
 ///
 /// Called once per animation tick from `pump::install_preem_clock`, **not** per
 /// monitor: the instance table is shared across monitors, so advancing it from
 /// each monitor's reconcile would run every animation at N× speed.
-pub(super) fn advance_all(dt: f32) -> bool {
+///
+/// The return type is a scope list rather than a `bool` because the fan-out is
+/// otherwise global: collapsing every instance into one flag made a single
+/// animating marquee in one plugin's drawer panel re-map every plugin's whole
+/// tree in every bar region on every monitor, 20× a second — and each
+/// `Node::Pixels` node on those trees re-uploads a GPU texture on the way
+/// through (`hytte-ui`'s `PixelSurface::set_pixels` has no data-equality
+/// short-circuit). Naming the movers lets `pump::request_preem_repaint` nudge
+/// only the mailboxes that actually hold one.
+pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
     STORE.with_borrow_mut(|store| {
-        let mut moved = false;
-        for state in store.values_mut() {
+        let mut moved = Vec::new();
+        for (scope, state) in store.iter_mut() {
+            let mut scope_moved = false;
             for instance in state.instances.values_mut() {
                 if let Some(renderer) = instance.renderer.as_mut()
                     && renderer.advance(dt)
                 {
                     instance.cached = None;
-                    moved = true;
+                    scope_moved = true;
                 }
+            }
+            if scope_moved {
+                moved.push(scope.clone());
             }
         }
         moved
@@ -517,12 +651,142 @@ pub(super) fn invalidate_cached_frames() {
     });
 }
 
+// ── reflexive equality over non-finite floats ────────────────────────────────
+
+/// Fold every non-finite (`NaN`/`±inf`) float in a widget onto one canonical
+/// finite stand-in, in place — **for comparison only**.
+///
+/// # The bug this closes
+///
+/// `vocab::PreemWidget` derives `PartialEq`, and IEEE `NaN != NaN`. A widget
+/// carrying one is therefore **never equal to itself**, which defeats the two
+/// gates this whole module rests on:
+///
+/// - [`apply`]'s short-circuit never fires, so a `Scope` re-arms `pending` and
+///   zeroes `idle` on every mapping pass. `animates()` stays true, `advance`
+///   always has a batch to stamp, the clock reports movement, the fan-out
+///   re-maps, and the re-map re-arms it again: a **permanent 20 Hz re-map plus
+///   re-rasterisation loop** for as long as the plugin keeps sending that
+///   frame. One `sum / count` with `count == 0` — the shape of every meter — is
+///   enough to pin the shell there, and it makes #897's "park the clock when
+///   nothing animates" unreachable.
+/// - [`same_config`] never agrees either, so a non-finite **config** float
+///   rebuilds the renderer on every pass: the needle returns to rest, the
+///   phosphor clears and the board blanks 20× a second per monitor, and the
+///   widget can never animate at all.
+///
+/// # This is not the boundary sanitiser
+///
+/// Scrubbing non-finite floats *at the wire* belongs in
+/// `PreemWidget::clamp_in_place`, which already special-cases
+/// `MarqueeConfig::speed_dots_per_sec` for exactly this reason ("a NaN/inf
+/// speed would poison the shell's offset integrator") and simply never carried
+/// the reasoning to the other twelve float fields. That fix is proto-side, on
+/// `fix/preem-clamp-non-finite`, so `clamped(w) == clamped(w)` holds for every
+/// consumer of the vocabulary — the SDK included, which has the same class of
+/// bug. It is deliberately **not** duplicated here: the same scrubbing logic in
+/// two crates would drift.
+///
+/// What stays here is the host's own robustness. This function never touches a
+/// widget the renderer will draw; it only produces a throwaway canonical form
+/// so [`same_widget`]/[`same_config`] stay reflexive even if an unsanitised
+/// widget ever reaches this module — a proto older than that fix, a future
+/// caller that skips the clamp, a test.
+///
+/// # The canonical form
+///
+/// Every non-finite float folds to `0.0`, and every non-finite `Option<f32>` to
+/// `None`. It does not have to agree with whatever substitutions the proto
+/// clamp settles on: nothing renders from this, and both sides of a comparison
+/// go through it. The one thing it gives up is telling `NaN` from `+inf` — two
+/// equally unrenderable readings compare equal, so a transition between them
+/// does not churn the renderer. That is the conservative direction.
+fn canonicalize_non_finite(widget: &mut vocab::PreemWidget) {
+    use vocab::PreemWidget as W;
+    match widget {
+        // No floats at all: the text widgets carry only strings and integers.
+        W::DotMatrix { .. } | W::SevenSeg { .. } | W::TextBox { .. } => {}
+        W::LedStrip { config, state } => {
+            if let Some(hold) = config.peak_hold.as_mut() {
+                hold.rate = finite_or_zero(hold.rate);
+            }
+            state.level = finite_or_zero(state.level);
+            state.peak = state.peak.filter(|peak| peak.is_finite());
+        }
+        W::Marquee { config, .. } => {
+            config.speed_dots_per_sec = finite_or_zero(config.speed_dots_per_sec);
+        }
+        W::Scope { state, .. } => {
+            for sample in &mut state.samples {
+                *sample = finite_or_zero(*sample);
+            }
+        }
+        W::Gauge { config, state } => {
+            config.sweep_deg = finite_or_zero(config.sweep_deg);
+            config.frequency_hz = finite_or_zero(config.frequency_hz);
+            config.damping = finite_or_zero(config.damping);
+            config.range.low = finite_or_zero(config.range.low);
+            config.range.high = finite_or_zero(config.range.high);
+            state.target = finite_or_zero(state.target);
+        }
+        W::FlipBoard { config, .. } => {
+            config.duration_secs = config.duration_secs.filter(|secs| secs.is_finite());
+            config.stagger_secs = config.stagger_secs.filter(|secs| secs.is_finite());
+        }
+    }
+}
+
+/// `value` when it is finite, `0.0` otherwise.
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// Reflexive equality for two widgets, whatever their floats.
+///
+/// The fast path is the derived `PartialEq`, which is what runs for every
+/// finite widget — i.e. every widget, once the wire clamp scrubs non-finite
+/// floats. The slow path canonicalises both sides
+/// ([`canonicalize_non_finite`]), so a pair of widgets differing only in
+/// non-finite floats still compares equal and [`apply`] still short-circuits.
+///
+/// Deliberately built on the derived comparison of a canonicalised clone rather
+/// than on a hand-written field-by-field walk: a hand-written one can *forget* a
+/// field, and a forgotten field means a state change silently dropped — a worse
+/// failure than the one being fixed. This spelling cannot miss a field, and its
+/// clone only runs on a pass where the fast path already said "different".
+fn same_widget(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
+    if a == b {
+        return true;
+    }
+    let (mut a, mut b) = (a.clone(), b.clone());
+    canonicalize_non_finite(&mut a);
+    canonicalize_non_finite(&mut b);
+    a == b
+}
+
 // ── config / kind identity ───────────────────────────────────────────────────
 
 /// Whether two widgets are the same kind **and** carry the same config — the
 /// "update in place" predicate. A `false` here rebuilds the renderer, which is
 /// what the vocabulary's per-config docs promise.
+///
+/// Non-finite-tolerant on the slow path for the same reason as [`same_widget`]:
+/// a `NaN` in a `GaugeConfig` (four floats), a `FlipBoardConfig` (two) or a
+/// `PeakHoldConfig` (one) would otherwise make a config unequal to itself and
+/// rebuild the renderer on every mapping pass, freezing the widget at rest
+/// while allocating a fresh kit object 20× a second per monitor.
 fn same_config(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
+    if config_eq(a, b) {
+        return true;
+    }
+    let (mut a, mut b) = (a.clone(), b.clone());
+    canonicalize_non_finite(&mut a);
+    canonicalize_non_finite(&mut b);
+    config_eq(&a, &b)
+}
+
+/// [`same_config`]'s comparison proper, over the values as given.
+fn config_eq(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
     use vocab::PreemWidget as W;
     match (a, b) {
         (W::DotMatrix { config: x, .. }, W::DotMatrix { config: y, .. }) => x == y,
@@ -628,7 +892,8 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 scope,
                 pending: None,
                 idle: 0,
-                fades: config.persistence < 256,
+                fades: config.persistence < KIT_MAX_PERSISTENCE,
+                settle_steps: scope_settle_steps(config.persistence),
                 steps: Steps::default(),
             }
         }
@@ -788,7 +1053,12 @@ impl Renderer {
     fn advance(&mut self, dt: f32) -> bool {
         match self {
             Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
-            Self::LedStrip { hold, steps, .. } => {
+            Self::LedStrip {
+                hold,
+                steps,
+                explicit_peak,
+                ..
+            } => {
                 let owed = steps.owed(dt);
                 let Some(hold) = hold.as_mut() else {
                     return false;
@@ -796,6 +1066,17 @@ impl Renderer {
                 let before = hold.value();
                 for _ in 0..owed {
                     hold.decay();
+                }
+                // The decay runs either way — the held value has to be current
+                // the moment the plugin stops sending an explicit peak — but it
+                // only *shows* when there is no explicit peak to mask it
+                // (`peak_for`). Reporting movement while one is set would fan a
+                // pixel-identical repaint out at 20 Hz for as long as the plugin
+                // sends both, which the vocabulary explicitly blesses ("the
+                // explicit peak wins for the render it arrives on and never
+                // disturbs `hold`").
+                if explicit_peak.is_some() {
+                    return false;
                 }
                 changed(before, hold.value())
             }
@@ -817,9 +1098,24 @@ impl Renderer {
                 let before = dots(*offset, period);
                 #[allow(clippy::cast_precision_loss)]
                 let modulus = period as f32;
-                // `rem_euclid` so a negative speed (the wire permits one: the
-                // cap is on magnitude) scrolls the other way instead of
-                // saturating an unsigned offset at zero.
+                // **The sign convention, which is a two-ended contract.** The
+                // kit takes an unsigned `window(offset)` and has no signed API
+                // to inherit from, so the direction lives entirely in whoever
+                // integrates the offset — here, and in the SDK's raster path
+                // (#884/#898). `window` reads source column `(offset + col) %
+                // period`, so a *rising* offset walks the message leftwards past
+                // the grid: the kit's documented "any monotonically increasing
+                // frame counter loops seamlessly", and the conventional ticker
+                // direction. A **positive** speed therefore raises the offset
+                // and scrolls left; a **negative** speed lowers it and scrolls
+                // right. The wire permits a negative speed (the cap is on
+                // magnitude) and the proto does not spell the direction out, so
+                // `marquee_scroll_direction_follows_the_speeds_sign` pins it
+                // against the kit — if the two ends disagree, a plugin's ticker
+                // reverses the day the host flips from raster to state.
+                //
+                // `rem_euclid` rather than `%` so the negative case wraps into
+                // `0.0..period` instead of saturating an unsigned offset at zero.
                 *offset = (*offset + *speed_dots_per_sec * dt).rem_euclid(modulus);
                 before != dots(*offset, period)
             }
@@ -828,6 +1124,7 @@ impl Renderer {
                 pending,
                 idle,
                 fades,
+                settle_steps,
                 steps,
             } => {
                 let owed = steps.owed(dt);
@@ -837,7 +1134,7 @@ impl Renderer {
                     // Nothing pending and nothing left to fade: stop, so a
                     // settled trace doesn't keep the clock (and the reconcilers)
                     // awake.
-                    if batch.is_none() && (!*fades || *idle >= SCOPE_SETTLE_STEPS) {
+                    if batch.is_none() && (!*fades || *idle >= *settle_steps) {
                         break;
                     }
                     // An empty batch flatlines on the axis while the existing
@@ -876,13 +1173,19 @@ impl Renderer {
     fn animates(&self) -> bool {
         match self {
             Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
-            // A peak dot only moves while it is above the floor *and* has a
-            // fall rate: the kit clamps a negative or non-finite rate to `0.0`
-            // ("never falls"), which must not keep the clock awake.
+            // A peak dot only moves while it is above the floor, has a fall
+            // rate, and is actually the value being drawn: the kit clamps a
+            // negative or non-finite rate to `0.0` ("never falls"), and an
+            // explicit peak masks the held one at render time — neither must
+            // keep the clock awake.
             Self::LedStrip {
-                hold, hold_rate, ..
+                hold,
+                hold_rate,
+                explicit_peak,
+                ..
             } => {
-                hold_rate.is_finite()
+                explicit_peak.is_none()
+                    && hold_rate.is_finite()
                     && *hold_rate > 0.0
                     && hold.as_ref().is_some_and(|hold| hold.value() > 0.0)
             }
@@ -895,8 +1198,9 @@ impl Renderer {
                 pending,
                 idle,
                 fades,
+                settle_steps,
                 ..
-            } => pending.is_some() || (*fades && *idle < SCOPE_SETTLE_STEPS),
+            } => pending.is_some() || (*fades && *idle < *settle_steps),
             Self::Gauge { gauge } => !gauge.is_settled(),
             Self::FlipBoard { board } => !board.is_settled(),
         }

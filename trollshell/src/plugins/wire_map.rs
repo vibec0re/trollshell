@@ -245,6 +245,17 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             let mut widget = widget.as_ref().clone();
             widget.clamp_in_place();
 
+            // **Rendered whether or not the plugin negotiated the vocabulary.**
+            // The contract says a plugin emits `Node::Preem` only above the
+            // generation the host advertised in `HostMsg::Hello`, but this arm
+            // does not re-check `negotiates_vocab()` — a plugin that sends one
+            // anyway is drawn. That is deliberate: the value is clamped above
+            // and the negotiation exists so a plugin knows what the *host* can
+            // decode, not as an authorisation gate. Refusing to draw a
+            // well-formed node the host understands would only make a
+            // hand-rolled (non-Rust-SDK) client harder to write for no safety
+            // gained.
+
             preem_render::map_widget(scope, id.as_deref(), classes, &widget)
         }
     }

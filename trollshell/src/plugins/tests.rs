@@ -24,8 +24,8 @@ use super::effects::{PageAction, map_page, map_page_for_layout, resolve_open_pag
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
 use super::preem_render::{self, Scope};
 use super::pump::{
-    any_sidebar_open, apply_forget, apply_open, request_remap, tint_in_process_surfaces,
-    to_now_playing, to_upcoming_events,
+    any_sidebar_open, apply_forget, apply_open, request_remap, request_remap_holding,
+    tint_in_process_surfaces, to_now_playing, to_upcoming_events,
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
@@ -2665,6 +2665,15 @@ fn preem_ink_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Advance every live renderer by `dt` and answer "did anything move".
+///
+/// [`preem_render::advance_all`] names the scopes that moved (so the repaint
+/// fan-out can nudge only the mailboxes holding them); the tests below only care
+/// whether the tick did anything, and say so once here.
+fn advanced(dt: f32) -> bool {
+    !preem_render::advance_all(dt).is_empty()
+}
+
 /// A `Node::Preem` carrying `widget`, with one CSS class so the mapping's
 /// class passthrough is asserted on every parity case rather than once.
 fn preem_node(id: Option<&str>, widget: vocab::PreemWidget) -> wire::Node {
@@ -2962,7 +2971,7 @@ fn marquee_renders_at_parity_with_the_kit_before_and_after_a_scroll() {
     // Half a second at 20 dots/s is exactly ten whole dots — the offset the kit
     // would have been handed by a plugin stepping one dot per 20 Hz beat.
     assert!(
-        preem_render::advance_all(0.5),
+        advanced(0.5),
         "advancing a scrolling marquee must report that it moved",
     );
     assert_eq!(
@@ -3006,7 +3015,7 @@ fn scope_renders_at_parity_with_the_kit_before_and_after_a_decay() {
     // One animation step with nothing new to stamp: the trail decays, exactly
     // as an empty batch does in the kit.
     assert!(
-        preem_render::advance_all(preem_render::ANIM_STEP_SECS),
+        advanced(preem_render::ANIM_STEP_SECS),
         "a fading phosphor trail must report that it moved",
     );
     oracle.advance(&[]);
@@ -3060,7 +3069,7 @@ fn gauge_renders_at_parity_with_the_kit_before_and_after_a_swing() {
     );
 
     assert!(
-        preem_render::advance_all(preem_render::ANIM_STEP_SECS),
+        advanced(preem_render::ANIM_STEP_SECS),
         "an un-settled needle must report that it moved",
     );
     oracle.advance(preem_render::ANIM_STEP_SECS);
@@ -3107,7 +3116,7 @@ fn flip_board_renders_at_parity_with_the_kit_before_and_after_a_flip() {
     );
 
     assert!(
-        preem_render::advance_all(0.1),
+        advanced(0.1),
         "cards still in motion must report that they moved",
     );
     oracle.advance(0.1);
@@ -3441,7 +3450,7 @@ fn only_animated_widgets_keep_the_clock_awake() {
         "a parked speed stops asking for ticks",
     );
     assert!(
-        !preem_render::advance_all(1.0),
+        !advanced(1.0),
         "and advancing a parked marquee reports no movement",
     );
 }
@@ -3473,9 +3482,7 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
 
     let three = Scope::detached("steps-three");
     let _ = to_ui_node(&three, &node);
-    assert!(preem_render::advance_all(
-        preem_render::ANIM_STEP_SECS * 3.0
-    ));
+    assert!(advanced(preem_render::ANIM_STEP_SECS * 3.0));
     let mut oracle = kit::PeakHold::new(0.05);
     oracle.push(1.0);
     for _ in 0..3 {
@@ -3490,7 +3497,7 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
     let stalled = Scope::detached("steps-stalled");
     let _ = to_ui_node(&stalled, &node);
     // A resume-from-suspend sized `dt`: hundreds of steps' worth.
-    assert!(preem_render::advance_all(30.0));
+    assert!(advanced(30.0));
     let mut capped = kit::PeakHold::new(0.05);
     capped.push(1.0);
     for _ in 0..preem_render::MAX_CATCHUP_STEPS {
@@ -3600,6 +3607,12 @@ async fn a_negotiating_plugin_is_told_the_hosts_vocabulary_first() {
 /// `SlotVisible` on a bar mount so the host is guaranteed to send *something* —
 /// making "no Hello" an assertion about the frame that did arrive rather than
 /// about silence.
+///
+/// **What it does not prove**, despite the name: the fixture is a *current*
+/// `Manifest` with the flag off, not one decoded from a pre-#882 encoder's
+/// frame. It pins the gate (deleting it turns this red — see the PR's
+/// falsification record) but not that a real old binary's `Register` decodes to
+/// `vocab_max: None` rather than failing outright. That is live-verify.
 #[tokio::test]
 async fn a_legacy_plugin_is_never_sent_the_vocabulary_advertisement() {
     let (_clock_tx, clock_rx) = watch::channel(None);
@@ -3629,5 +3642,426 @@ async fn a_legacy_plugin_is_never_sent_the_vocabulary_advertisement() {
         matches!(first, HostMsg::SlotVisibility { visible: true }),
         "a legacy plugin's first frame must be the state it subscribed to, never a Hello — got \
          {first:?}",
+    );
+}
+
+// ── #883 review round: the repaint economy the epic exists to buy ────────────
+
+/// How many mapping passes a widget takes to stop doing work, simulating the
+/// real feedback loop the animation clock closes: advance, then re-map the
+/// **same** wire node (which is what a repaint request makes every monitor's
+/// reconciler do).
+///
+/// Returns the instance's `(builds, applies)` after `ticks` rounds. A widget
+/// whose idempotence gate works settles — the counts stop climbing. A widget
+/// that defeats it climbs one per tick, forever.
+fn pump_rounds(scope: &Scope, node: &wire::Node, ticks: u32) -> (u32, u32) {
+    for _ in 0..ticks {
+        let _ = advanced(preem_render::ANIM_STEP_SECS);
+        let _ = to_ui_node(scope, node);
+    }
+    preem_render::probe(scope, Some("w")).expect("the node keeps its instance")
+}
+
+/// A non-finite float in a widget's **state** must not defeat the idempotence
+/// gate.
+///
+/// `PreemWidget` derives `PartialEq` and IEEE `NaN != NaN`, so a widget carrying
+/// one is never equal to itself. With a bare `==` in `apply` the short-circuit
+/// never fires: a `Scope` re-arms `pending` and zeroes `idle` on every mapping
+/// pass, `animates()` never goes false, and the clock re-maps and re-rasterises
+/// a six-figure buffer at 20 Hz for as long as the plugin keeps sending that
+/// frame. One `sum / count` with `count == 0` — the shape of every meter — is
+/// enough. It also makes #897's "park the clock when nothing animates"
+/// unreachable.
+///
+/// The control is the same widget with finite samples: it must settle, or the
+/// assertion below could pass for the wrong reason.
+///
+/// The boundary scrub for this lands proto-side (`clamp_in_place`, on
+/// `fix/preem-clamp-non-finite`) so every consumer of the vocabulary gets it.
+/// This test feeds the renderer **directly**, bypassing the clamp, because the
+/// host must stay stable even if an unsanitised widget ever reaches it.
+#[test]
+fn a_non_finite_sample_does_not_pin_the_animation_clock() {
+    const TICKS: u32 = 200;
+
+    let _ink = preem_ink_lock();
+    let scoped = |samples: Vec<f32>| {
+        preem_node(
+            Some("w"),
+            vocab::PreemWidget::Scope {
+                config: vocab::ScopeConfig::default(),
+                state: vocab::ScopeState { samples },
+            },
+        )
+    };
+
+    let control = Scope::detached("nan-state-control");
+    let (_, finite_applies) = pump_rounds(&control, &scoped(vec![0.25; 32]), TICKS);
+    assert!(
+        finite_applies < TICKS,
+        "the control must settle, or this test proves nothing — got {finite_applies} applies \
+         over {TICKS} ticks",
+    );
+
+    let poisoned = Scope::detached("nan-state");
+    let mut samples = vec![0.25; 32];
+    samples[7] = f32::NAN;
+    let (_, applies) = pump_rounds(&poisoned, &scoped(samples), TICKS);
+    assert!(
+        applies < TICKS,
+        "a NaN sample must still settle like the finite control ({finite_applies} applies); \
+         got {applies} over {TICKS} ticks, i.e. one per tick forever",
+    );
+    assert!(
+        !preem_render::any_animating(),
+        "and it must stop asking the animation clock for ticks",
+    );
+}
+
+/// A non-finite float in a widget's **config** must not rebuild the renderer on
+/// every pass.
+///
+/// `same_config` is the "update in place vs rebuild" predicate; a `NaN` in one
+/// of `GaugeConfig`'s four floats makes a config unequal to itself, so the
+/// needle returns to rest and a fresh kit object is allocated on every pass —
+/// 20× a second, per monitor, and the widget can never animate at all.
+///
+/// The **state has to move** for this to bite, which is what a real plugin does:
+/// with an unchanging widget `apply`'s own short-circuit answers first and
+/// `same_config` is never consulted. So each pass here carries a new target, the
+/// way a live gauge would.
+#[test]
+fn a_non_finite_config_float_does_not_rebuild_every_pass() {
+    let _ink = preem_ink_lock();
+    let gauge = |damping: f32, target: f32| {
+        preem_node(
+            Some("w"),
+            vocab::PreemWidget::Gauge {
+                config: vocab::GaugeConfig {
+                    damping,
+                    ..vocab::GaugeConfig::default()
+                },
+                state: vocab::GaugeState { target },
+            },
+        )
+    };
+    let targets = [0.1_f32, 0.2, 0.3, 0.4, 0.5];
+
+    // The control: a finite config, a moving target. One build, N applies.
+    let control = Scope::detached("nan-config-control");
+    for target in targets {
+        let _ = to_ui_node(&control, &gauge(0.7, target));
+    }
+    assert_eq!(
+        preem_render::probe(&control, Some("w")),
+        Some((1, targets.len().try_into().expect("fits u32"))),
+        "the control must build once and update per target, or this test proves nothing",
+    );
+
+    // The same, with a NaN in the config: it must behave identically.
+    let scope = Scope::detached("nan-config");
+    for target in targets {
+        let _ = to_ui_node(&scope, &gauge(f32::NAN, target));
+    }
+    assert_eq!(
+        preem_render::probe(&scope, Some("w")).map(|(builds, _)| builds),
+        Some(1),
+        "a moving gauge must build its renderer exactly once whatever its config's floats — \
+         a rebuild per pass rests the needle every frame, so it never animates",
+    );
+
+    // A genuine config change must still rebuild — the tolerance above must not
+    // have been bought by making every config compare equal.
+    let _ = to_ui_node(&scope, &gauge(0.9, 0.5));
+    assert_eq!(
+        preem_render::probe(&scope, Some("w")).map(|(builds, _)| builds),
+        Some(2),
+        "a real config change must still rebuild",
+    );
+}
+
+/// An explicit peak masks the shell-held one at render time, so a decaying hold
+/// must not report movement while one is set.
+///
+/// The vocabulary blesses sending both ("the explicit peak wins for the render
+/// it arrives on and never disturbs `hold`"), so this is a supported
+/// configuration — and before the fix it fanned a **pixel-identical** repaint
+/// out to every bar mailbox on every monitor, 20× a second, for as long as the
+/// plugin sent both.
+#[test]
+fn a_masked_peak_hold_does_not_ask_for_pixel_identical_repaints() {
+    let _ink = preem_ink_lock();
+    let strip = |peak: Option<f32>| {
+        preem_node(
+            Some("vu"),
+            vocab::PreemWidget::LedStrip {
+                config: vocab::LedStripConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    leds: 16,
+                    peak_hold: Some(vocab::PeakHoldConfig { rate: 0.05 }),
+                },
+                state: vocab::LedStripState { level: 1.0, peak },
+            },
+        )
+    };
+
+    let scope = Scope::detached("masked-peak");
+    let masked = strip(Some(0.9));
+    let before = mapped_pixels(&scope, &masked);
+    assert!(
+        !preem_render::any_animating(),
+        "a hold nothing draws must not keep the animation clock awake",
+    );
+    assert!(
+        !advanced(preem_render::ANIM_STEP_SECS * 4.0),
+        "a hold masked by an explicit peak must report no movement",
+    );
+    assert_eq!(
+        mapped_pixels(&scope, &masked),
+        before,
+        "the fixture must be pixel-identical across the advance, or the assertion above is \
+         asserting the wrong thing",
+    );
+
+    // Drop the explicit peak and the hold is what gets drawn again: it must
+    // resume reporting movement, and it must have kept decaying meanwhile.
+    let _ = to_ui_node(&scope, &strip(None));
+    assert!(
+        preem_render::any_animating(),
+        "with no explicit peak the hold is the drawn value, so it animates again",
+    );
+    assert!(
+        advanced(preem_render::ANIM_STEP_SECS),
+        "and advancing it now reports movement",
+    );
+}
+
+/// The phosphor settle bound is derived from the configured persistence, in both
+/// directions.
+///
+/// The kit's decay is `(v * retained) >> 8`, so the steps a full-intensity trail
+/// needs to reach black is a function of `retained` — and the constant `64` this
+/// replaced was wrong twice over: a `persistence >= 240` trail froze part-way
+/// down **permanently** (the bound ran out before the fade did, and `animates()`
+/// then went false), while a default `184` trail was long gone after ~17 steps
+/// but kept asking for repaints for 64.
+#[test]
+fn the_phosphor_settle_bound_follows_the_configured_persistence() {
+    let _ink = preem_ink_lock();
+    let traced = |persistence: u16| {
+        preem_node(
+            Some("w"),
+            vocab::PreemWidget::Scope {
+                config: vocab::ScopeConfig {
+                    persistence,
+                    ..vocab::ScopeConfig::default()
+                },
+                state: vocab::ScopeState {
+                    samples: vec![0.9; 32],
+                },
+            },
+        )
+    };
+
+    // 1. A long phosphor must fade all the way to black rather than freezing.
+    let slow = Scope::detached("settle-slow");
+    let slow_node = traced(255);
+    let _ = to_ui_node(&slow, &slow_node);
+    let lit = mapped_pixels(&slow, &slow_node);
+    // 64 steps: where the old constant stopped. The trail must still be moving.
+    for _ in 0..64 {
+        let _ = advanced(preem_render::ANIM_STEP_SECS);
+    }
+    assert!(
+        preem_render::any_animating(),
+        "a persistence-255 trail needs ~255 steps to reach black, so it must still be fading \
+         after 64 — the old constant froze it here, permanently",
+    );
+    // Run it out. At `v -> (v*255)>>8`, i.e. `v - 1`, 255 steps clears 255.
+    for _ in 0..256 {
+        let _ = advanced(preem_render::ANIM_STEP_SECS);
+    }
+    let faded = mapped_pixels(&slow, &slow_node);
+    assert_ne!(
+        faded, lit,
+        "and it must actually have faded, not merely stopped being asked to",
+    );
+    assert!(
+        !preem_render::any_animating(),
+        "once black it must stop asking for ticks",
+    );
+
+    // 2. The default fades in ~17 steps and must stop asking soon after — well
+    //    inside the 64 the old constant spent on pixel-identical repaints.
+    let quick = Scope::detached("settle-quick");
+    let quick_node = traced(184);
+    let _ = to_ui_node(&quick, &quick_node);
+    let mut spent = 0;
+    while preem_render::any_animating() && spent < 64 {
+        let _ = advanced(preem_render::ANIM_STEP_SECS);
+        spent += 1;
+    }
+    assert!(
+        spent < 32,
+        "a default-persistence trail is gone in ~17 steps, so it must stop asking well before \
+         the old constant's 64 — took {spent}",
+    );
+}
+
+/// The animation clock's fan-out only wakes the mailboxes that actually hold an
+/// advanced plugin's render.
+///
+/// A blanket nudge re-runs `reconcile_region` over every plugin's whole tree,
+/// and `hytte-ui`'s `PixelSurface::set_pixels` re-uploads a texture for every
+/// `Pixels` node it touches with no data-equality short-circuit — so one
+/// animating marquee would re-upload every other plugin's chips, 20× a second,
+/// legacy self-rasterising plugins included.
+#[test]
+fn a_repaint_request_skips_mailboxes_holding_no_mover() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let mailbox: Mutable<Vec<SlotRender>> =
+        Mutable::new(vec![render_of("resident", 0, 1, "c", &tx)]);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut signal = pin!(mailbox.signal_cloned());
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Pending
+    ));
+
+    let elsewhere: HashSet<&str> = ["mover"].into_iter().collect();
+    request_remap_holding(&mailbox, &elsewhere);
+    assert!(
+        matches!(signal.as_mut().poll_change(&mut cx), Poll::Pending),
+        "a mailbox holding none of the movers must not be woken",
+    );
+
+    let here: HashSet<&str> = ["resident"].into_iter().collect();
+    request_remap_holding(&mailbox, &here);
+    assert!(
+        matches!(signal.as_mut().poll_change(&mut cx), Poll::Ready(Some(_))),
+        "a mailbox holding a mover must be woken",
+    );
+}
+
+/// A negative `speed_dots_per_sec` scrolls the **opposite** way to a positive
+/// one of the same magnitude, and the positive direction is the kit's.
+///
+/// This is a two-ended contract with no single owner: `MarqueeStrip::window`
+/// takes an *unsigned* offset, so the kit has no signed semantics for the shell
+/// to inherit, and the proto documents only that `0.0` and non-finite park the
+/// message. The direction lives in whoever integrates the offset — this
+/// renderer, and the SDK's raster path (#884/#898) — so if the two ends disagree
+/// a plugin's ticker reverses the day the host flips from raster to state.
+///
+/// Both sides are asserted against the kit rather than against each other:
+/// `window` reads source column `(offset + col) % period`, so a rising offset
+/// walks the message leftwards ("any monotonically increasing frame counter
+/// loops seamlessly"). Half a second at ±20 dots/s is ±10 whole dots, so the
+/// negative case must land on `period - 10`.
+#[test]
+fn marquee_scroll_direction_follows_the_speeds_sign() {
+    let _ink = preem_ink_lock();
+    let text = "SCROLLING MARQUEE TEST";
+    let node = |speed: f32| {
+        preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: speed,
+                },
+                state: vocab::MarqueeState { text: text.into() },
+            },
+        )
+    };
+    let oracle = kit::Marquee::new(kit::DisplayStyle::Vfd)
+        .window_px(192)
+        .gap_dots(6)
+        .render(text);
+    let period = oracle.period();
+    assert!(
+        oracle.scrolls() && period > 10,
+        "the fixture must scroll and be longer than the step, or the two directions coincide",
+    );
+
+    let forward = Scope::detached("marquee-forward");
+    let _ = to_ui_node(&forward, &node(20.0));
+    assert!(advanced(0.5));
+    assert_eq!(
+        mapped_pixels(&forward, &node(20.0)),
+        kit_pixels(&oracle.window(10)),
+        "a positive speed raises the offset, which is the kit's own \
+         monotonically-increasing-counter direction",
+    );
+
+    let backward = Scope::detached("marquee-backward");
+    let _ = to_ui_node(&backward, &node(-20.0));
+    assert!(advanced(0.5));
+    assert_eq!(
+        mapped_pixels(&backward, &node(-20.0)),
+        kit_pixels(&oracle.window(period - 10)),
+        "a negative speed of the same magnitude must scroll the other way, wrapping to \
+         `period - 10` rather than parking at zero",
+    );
+}
+
+/// `advance_all` names the scopes that moved, and only those — the input the
+/// targeting above runs on.
+#[test]
+fn advance_all_names_only_the_scopes_that_moved() {
+    let _ink = preem_ink_lock();
+    let animated = Scope::card("scroller");
+    let still = Scope::card("static");
+    let _ = to_ui_node(
+        &animated,
+        &preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: 20.0,
+                },
+                state: vocab::MarqueeState {
+                    text: "A LONG SCROLLING MESSAGE".into(),
+                },
+            },
+        ),
+    );
+    let _ = to_ui_node(
+        &still,
+        &preem_node(
+            Some("dm"),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig::default(),
+                state: vocab::DotMatrixState {
+                    text: "STATIC".into(),
+                },
+            },
+        ),
+    );
+
+    let moved = preem_render::advance_all(0.5);
+    assert_eq!(
+        moved,
+        vec![animated],
+        "only the scrolling marquee's scope moved, so only it may be named",
+    );
+    assert_eq!(
+        moved[0].plugin_id(),
+        "scroller",
+        "and the fan-out must be able to read the plugin id back off it",
     );
 }

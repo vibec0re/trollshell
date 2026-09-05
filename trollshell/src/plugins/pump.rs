@@ -9,7 +9,7 @@
 //! reconcilers to repaint. See [`install_preem_clock`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -23,7 +23,7 @@ use hytte_plugin_proto::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, UpcomingEvent,
 };
 
-use super::preem_render;
+use super::preem_render::{self, Role, Scope};
 use super::{PluginHandles, SlotRender};
 
 /// The upcoming-calendar digest window (#484): events starting within the next
@@ -79,8 +79,10 @@ pub(super) fn publish_accent(accent: Option<[u8; 4]>) {
             .send_replace(accent);
     });
     // A shell-rendered preem widget has no plugin to wake it: the re-tint only
-    // reaches the screen once its reconciler re-maps the tree (#883).
-    request_preem_repaint();
+    // reaches the screen once its reconciler re-maps the tree (#883). Every
+    // cached frame was dropped, so this is the one path that wants the whole
+    // fan-out rather than the animation clock's per-scope targeting.
+    request_preem_repaint_all();
 }
 
 /// Publish the latest audio spectrum to the per-conn spectrum tasks (#405).
@@ -268,10 +270,14 @@ pub(super) fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
 ///
 /// ## Visibility gating, and the tradeoff that is *not* gated
 ///
-/// The **repaint** is gated on the two visibility signals the host already
-/// keeps: a sidebar region is only re-mapped while some monitor's sidebar is
-/// open (#288's aggregate), and the drawer panel only while a plugin panel is
-/// active. Bar chips have no such signal and are always re-mapped.
+/// The **repaint** is gated twice over. First on *which scopes moved*: only a
+/// mailbox actually holding an advanced plugin's render is nudged, so one
+/// animating widget no longer re-uploads a texture for every other plugin's
+/// chips (see [`request_preem_repaint`]). Then on the two visibility signals the
+/// host already keeps: a sidebar region only while some monitor's sidebar is
+/// open (#288's aggregate), the drawer panel only while that plugin's panel is
+/// the active one. Bar chips have no visibility signal and rely on the scope
+/// gate alone.
 ///
 /// The **advance** is deliberately not gated: it is a few floating-point
 /// operations per instance, and skipping it would make a hidden gauge resume
@@ -305,27 +311,92 @@ pub(super) fn install_preem_clock() {
             // preem widget never walks the instance table's mutable half — and
             // the baseline is re-stamped either way, so the tick that *does*
             // find work carries one frame's `dt`, not the idle period's.
-            if preem_render::any_animating() && preem_render::advance_all(dt) {
-                request_preem_repaint();
+            if preem_render::any_animating() {
+                request_preem_repaint(&preem_render::advance_all(dt));
             }
             glib::ControlFlow::Continue
         },
     );
 }
 
-/// Ask the mount reconcilers to re-map their current trees, which is how an
-/// advanced (or re-tinted) preem renderer reaches the screen.
+/// Ask the mount reconcilers holding one of `moved`'s scopes to re-map their
+/// current trees, which is how an advanced preem renderer reaches the screen.
 ///
 /// A render mailbox is a `Mutable<Vec<SlotRender>>` and the regions subscribe to
 /// it, so nudging it re-runs `reconcile_region` over the *same* trees —
-/// `to_ui_node` then rasterises the preem nodes from their advanced instances
-/// while every other node diffs to a no-op. That is the same work a plugin
-/// pushing 20 frames a second already costs today, minus the socket traffic, and
-/// it only happens while something is actually animating.
+/// `to_ui_node` then rasterises the preem nodes from their advanced instances.
 ///
-/// Empty mailboxes are skipped, and so are the ones nobody can see (see
-/// [`install_preem_clock`]).
-fn request_preem_repaint() {
+/// ## Why this is per-scope and not a blanket nudge
+///
+/// A nudge is not free downstream, and it is not free for the *other* plugins in
+/// the region either. `Reconciler::render` has no descriptor-equality
+/// short-circuit and `hytte-ui`'s `PixelSurface::set_pixels` unconditionally
+/// builds a fresh `glib::Bytes` + `gdk::MemoryTexture` and `queue_draw`s — there
+/// is no comparison against the previous buffer anywhere on that path. So
+/// nudging every bar mailbox because *something somewhere* animated would
+/// re-upload a texture for every `Pixels` node of every plugin chip on every
+/// monitor at 20 Hz, legacy self-rasterising plugins included. At the wire's
+/// buffer cap that is hundreds of MB/s of memcpy for one animating widget.
+///
+/// [`preem_render::advance_all`] therefore names the scopes that moved, and a
+/// mailbox is nudged only when it actually carries one of their plugins.
+/// Visibility still gates on top of that: a sidebar region only while some
+/// monitor's sidebar is open (#288's aggregate), the panel mailbox only when the
+/// moved panel belongs to the plugin whose panel is on screen.
+///
+/// The remaining over-repaint is within a region: a nudge re-maps every card in
+/// the mailbox, not just the mover's. Splitting that needs a per-plugin mailbox
+/// or a descriptor diff in `hytte-ui`, neither of which is this PR.
+fn request_preem_repaint(moved: &[Scope]) {
+    if moved.is_empty() {
+        return;
+    }
+    let cards: HashSet<&str> = moved
+        .iter()
+        .filter(|scope| scope.role() == Role::Card)
+        .map(Scope::plugin_id)
+        .collect();
+    let sidebar_visible = slot_visible_mutable().get();
+    registry::with(|r| {
+        let handles = r
+            .get::<PluginHandles>()
+            .expect("plugins::service() not registered");
+        if !cards.is_empty() {
+            for mailbox in [&handles.bar_left, &handles.bar_center, &handles.bar_right] {
+                request_remap_holding(mailbox, &cards);
+            }
+            if sidebar_visible {
+                for mailbox in [
+                    &handles.sidebar_lead,
+                    &handles.sidebar_top,
+                    &handles.sidebar_bottom,
+                ] {
+                    request_remap_holding(mailbox, &cards);
+                }
+            }
+        }
+        // The panel mailbox carries every plugin's panel tree but only the
+        // active one is on screen, so a moved panel scope for any other plugin
+        // would repaint nothing. Read the selection out and drop its guard
+        // before taking the mailbox's write lock.
+        let active = handles.active_panel_id.lock_ref().clone();
+        if let Some(active) = active
+            && moved
+                .iter()
+                .any(|scope| scope.role() == Role::Panel && scope.plugin_id() == active)
+        {
+            request_remap(&handles.panels);
+        }
+    });
+}
+
+/// Re-map every mount mailbox, whoever is in it — the accent path.
+///
+/// A skin change re-tints *every* shell-rendered preem surface at once
+/// ([`tint_in_process_surfaces`] drops all the cached frames), so there is no
+/// subset to narrow to and the per-scope targeting above would only cost a
+/// comparison. Rare (an accent or color-scheme change), unlike the 20 Hz clock.
+fn request_preem_repaint_all() {
     let sidebar_visible = slot_visible_mutable().get();
     registry::with(|r| {
         let handles = r
@@ -347,6 +418,21 @@ fn request_preem_repaint() {
             request_remap(&handles.panels);
         }
     });
+}
+
+/// [`request_remap`], but only if `mailbox` actually holds a render for one of
+/// `movers` — the plugins whose renderer instances just advanced.
+pub(super) fn request_remap_holding(mailbox: &Mutable<Vec<SlotRender>>, movers: &HashSet<&str>) {
+    let holds = {
+        let list = mailbox.lock_ref();
+        list.iter()
+            .any(|render| movers.contains(render.plugin_id.as_str()))
+    };
+    if !holds {
+        return;
+    }
+    let mut guard = mailbox.lock_mut();
+    let _ = guard.as_mut_slice();
 }
 
 /// Notify a render mailbox's subscribers without changing its contents.

@@ -96,20 +96,34 @@
 //! too: a `NaN` or an infinity — a `sum / count` with `count == 0`, a `-inf` dB
 //! fold, an unread sensor — is replaced with a finite, in-range value before
 //! any renderer sees it, and an out-of-range finite value clamps to the same
-//! bound the kit would have used. The per-field mapping is listed on
+//! bound the kit would have used. The rule is **parity with the kit**: every
+//! non-finite value takes the image the kit's own entry point gives it — `±inf`
+//! saturating where the kit clamps outright, the kept default where the kit
+//! guards on `is_finite` — and a documented per-field constant stands in only
+//! where the kit's answer is a *stateful* keep-previous a stateless clamp
+//! cannot reach. The per-field mapping, with the
+//! `hytte-preem` line each row is derived from, is on
 //! [`PreemWidget::clamp_in_place`] and is **contract**, not an implementation
 //! detail.
 //!
 //! This is not decoration on top of the allocation caps. It is what makes the
-//! derived `PartialEq` on [`PreemWidget`] — and so on
-//! [`Node`](crate::wire::Node) — a usable *did anything change?* test, because
-//! `NaN` never compares equal to itself: one poisoned reading makes a widget
-//! unequal to an identical copy of itself, and that defeats the render dedup at
-//! **both** ends at once. The plugin SDK's `view != last_view` stays true
-//! forever, so it emits one `Render` per heartbeat; the host's
-//! `applied == widget` gate never short-circuits, so it rebuilds or
-//! re-rasterises the widget on every mapping pass — for a picture that never
-//! changes. Both loops are unbounded in time, and both end at this one seam.
+//! derived `PartialEq` on [`PreemWidget`] — and so on a
+//! [`Node::Preem`](crate::wire::Node::Preem) carrying one — a usable *did
+//! anything change?* test, because `NaN` never compares equal to itself: one
+//! poisoned reading makes a widget unequal to an identical copy of itself, and
+//! that defeats the render dedup at **both** ends at once. The plugin SDK's
+//! `view != last_view` stays true forever, so it emits one `Render` per
+//! heartbeat; the host's `applied == widget` gate never short-circuits, so it
+//! rebuilds or re-rasterises the widget on every mapping pass — for a picture
+//! that never changes. Both loops are unbounded in time, and both end at this
+//! one seam.
+//!
+//! The claim stops at [`Node::Preem`](crate::wire::Node::Preem), deliberately:
+//! [`Node::Progress`](crate::wire::Node::Progress) and
+//! [`Node::Slider`](crate::wire::Node::Slider) carry `f64`s that nothing
+//! sanitises, so a `NaN` in one of *those* still spins the same two loops.
+//! Closing that is #904 — a different seam (there is no `Node::clamped`) with
+//! its own drawing code to derive a mapping from, not a copy of this one.
 
 use serde::{Deserialize, Serialize};
 
@@ -603,8 +617,12 @@ pub struct PeakHoldConfig {
     /// rather than a decode error.
     ///
     /// [`PreemWidget::clamp_in_place`] clamps it to
-    /// `0.0..=`[`MAX_PEAK_HOLD_RATE`]; `NaN` and `-inf` become `0.0`, `+inf`
-    /// becomes [`MAX_PEAK_HOLD_RATE`].
+    /// `0.0..=`[`MAX_PEAK_HOLD_RATE`], matching the kit's own `rate.max(0.0)`
+    /// (`crates/hytte-preem/src/led_strip.rs:108`): `NaN` becomes `0.0` because
+    /// `f32::max` returns the non-`NaN` side, `-inf` becomes `0.0` for the same
+    /// reason, and `+inf` becomes [`MAX_PEAK_HOLD_RATE`] — which decays a hold
+    /// identically, since `decay` is `(value - rate).max(0.0)` over a value in
+    /// `0.0..=1.0` (`led_strip.rs:127`).
     pub rate: f32,
 }
 
@@ -650,7 +668,11 @@ pub struct LedStripState {
     /// and reads a `NaN` as rest.
     ///
     /// [`PreemWidget::clamp_in_place`] does the same before the kit ever sees
-    /// it: `NaN` and `-inf` become `0.0` (rest), `+inf` becomes `1.0`.
+    /// it, matching `lit_count` (`crates/hytte-preem/src/led_strip.rs:65`,
+    /// `level.clamp(0.0, 1.0)` with no guard in front of it): `+inf` becomes
+    /// `1.0` (full strip), `-inf` becomes `0.0`, and `NaN` becomes `0.0` —
+    /// which is what the kit lights for a `NaN` too, via the saturating
+    /// `as usize` cast.
     pub level: f32,
     /// An **explicit** peak-dot position in `0.0..=1.0`, for a plugin that
     /// computes its own peak (a true inter-frame peak off a raw audio block,
@@ -660,10 +682,13 @@ pub struct LedStripState {
     /// [`LedStripConfig::peak_hold`]; when both are set the explicit value
     /// wins for that render, and the held value is *not* disturbed by it.
     ///
-    /// [`PreemWidget::clamp_in_place`] clamps a finite value to `0.0..=1.0` and
-    /// maps a **non-finite one to `None`** — `None` already means "no explicit
-    /// peak, use the held one", which is the closest thing to *ignore this* a
-    /// stateless clamp can say.
+    /// [`PreemWidget::clamp_in_place`] clamps this into `0.0..=1.0` and leaves
+    /// it `Some`, matching `peak_led` (`crates/hytte-preem/src/led_strip.rs:80`):
+    /// `+inf` becomes `1.0` (the top LED), while `NaN` and `-inf` become `0.0`,
+    /// for which the kit draws **no dot** — `Some(0.0)` is how the wire says
+    /// that. It is deliberately **not** mapped to `None`: `None` means "no
+    /// explicit peak, draw the shell-held decaying one", a different render the
+    /// kit would never produce for these inputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak: Option<f32>,
 }
@@ -691,9 +716,12 @@ pub struct MarqueeConfig {
     /// time, so the scroll runs at the same visual speed whatever the frame
     /// rate, and a plugin no longer owns a timer to keep it moving. Default
     /// `20.0`, matching the rate the kit's own consumers already scroll at.
-    /// `0.0` parks the message, and so does **any** non-finite value —
-    /// infinities included, unlike every other float here, which maps `±inf` to
-    /// the nearer bound. Parked is the safe neutral for an integrator, and this
+    /// `0.0` parks the message, and so does **any** non-finite value,
+    /// infinities included. This is the one float in the vocabulary with **no
+    /// kit behaviour to match** — the kit's `Marquee` has no speed at all
+    /// (`MarqueeStrip::window(offset)` is caller-driven), so #882 invented the
+    /// field and owes it a rule of its own: parked is the safe neutral for an
+    /// integrator, rather than a full-speed scroll nobody asked for. This
     /// mapping shipped with #895; see [`PreemWidget::clamp_in_place`].
     pub speed_dots_per_sec: f32,
 }
@@ -773,9 +801,13 @@ pub struct ScopeState {
     /// update.
     ///
     /// [`PreemWidget::clamp_in_place`] sanitises the batch element-wise before
-    /// the kit sees it: `NaN` becomes `0.0` (the axis), `+inf` becomes `1.0`,
-    /// `-inf` becomes `-1.0`. A single poisoned sample would otherwise make the
-    /// whole widget unequal to itself — see the module docs.
+    /// the kit sees it, reproducing the kit's own `sanitize`
+    /// (`crates/hytte-preem/src/scope.rs:386`) exactly: **every** non-finite
+    /// sample — `NaN` and both infinities — becomes `0.0`, the axis, and finite
+    /// samples clamp to `-1.0..=1.0`. Note the infinities do *not* go to the
+    /// rails: `sanitize` is a guard, not a bare clamp. A single poisoned sample
+    /// would otherwise make the whole widget unequal to itself — see the module
+    /// docs.
     pub samples: Vec<f32>,
 }
 
@@ -788,11 +820,12 @@ pub struct ScopeState {
 /// constants never need re-tuning for a new range. The kit rejects a degenerate
 /// (`high <= low`) or non-finite range and keeps the previous one.
 ///
-/// A clamp has no "previous one" to keep, so [`PreemWidget::clamp_in_place`]
-/// replaces a range that is degenerate (`high <= low`, either end non-finite,
-/// or a span so wide it overflows to infinity) with
-/// [`GaugeRange::default`] — `0.0..=1.0`, which is exactly what a freshly built
-/// kit gauge would be reading in after it rejected the range. The two ends are
+/// [`PreemWidget::clamp_in_place`] reproduces that: a range that is degenerate
+/// (`high <= low`, either end non-finite, or a span so wide it overflows to
+/// infinity) is replaced with [`GaugeRange::default`] — `0.0..=1.0`, which is
+/// exactly what the kit keeps after rejecting it, since the shell builds a
+/// fresh `Needle` per config and that is the value its constructor left there
+/// (`crates/hytte-preem/src/gauge.rs:171`, guard at `:210`). The two ends are
 /// replaced **as a unit**: mixing a caller's `low` with a default `high` would
 /// invent a scale nobody asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -836,10 +869,12 @@ pub struct GaugeConfig {
     /// otherwise push the scaled buffer past [`MAX_BUFFER_DIM`].
     pub scale: u32,
     /// Total sweep of the scale, in **degrees**. Default `150.0`; the kit
-    /// clamps to [`MIN_SWEEP_DEG`]`..=`[`MAX_SWEEP_DEG`], and so does
-    /// [`PreemWidget::clamp_in_place`], which additionally maps a `NaN` to the
-    /// default (an unreadably narrow dial is a worse guess than the default
-    /// one).
+    /// clamps to [`MIN_SWEEP_DEG`]`..=`[`MAX_SWEEP_DEG`] behind an
+    /// `is_finite` guard (`crates/hytte-preem/src/gauge.rs:598`), so **any**
+    /// non-finite sweep keeps the value already there — the kit default on the
+    /// fresh builder the shell constructs per config.
+    /// [`PreemWidget::clamp_in_place`] reproduces exactly that: finite values
+    /// clamp, and `NaN`, `+inf` and `-inf` all resolve to `150.0`.
     pub sweep_deg: f32,
     /// Major divisions (intervals between long ticks). Default `4`, clamped to
     /// `1..=`[`MAX_DIVISIONS`].
@@ -852,14 +887,18 @@ pub struct GaugeConfig {
     /// The value scale the caller reads in. Default `0.0..=1.0`.
     pub range: GaugeRange,
     /// Undamped natural frequency in Hz — how *fast* the needle swings. Default
-    /// `2.0`; the kit clamps to [`MIN_FREQUENCY_HZ`]`..=`[`MAX_FREQUENCY_HZ`],
-    /// and so does [`PreemWidget::clamp_in_place`], which maps a `NaN` to the
-    /// default.
+    /// `2.0`; the kit clamps to [`MIN_FREQUENCY_HZ`]`..=`[`MAX_FREQUENCY_HZ`]
+    /// behind an `is_finite` guard (`crates/hytte-preem/src/gauge.rs:181`), so
+    /// every non-finite value keeps the default.
+    /// [`PreemWidget::clamp_in_place`] reproduces it: `NaN`, `+inf` and `-inf`
+    /// all resolve to `2.0`.
     pub frequency_hz: f32,
     /// Damping ratio `ζ` — how much the needle *overshoots*. Default `0.5`
     /// (half critical: one obvious kick past the reading, then settle); the kit
-    /// clamps to [`MIN_DAMPING`]`..=`[`MAX_DAMPING`], and so does
-    /// [`PreemWidget::clamp_in_place`], which maps a `NaN` to the default.
+    /// clamps to [`MIN_DAMPING`]`..=`[`MAX_DAMPING`] behind an `is_finite`
+    /// guard (`crates/hytte-preem/src/gauge.rs:195`), so every non-finite value
+    /// keeps the default. [`PreemWidget::clamp_in_place`] reproduces it: `NaN`,
+    /// `+inf` and `-inf` all resolve to `0.5`.
     pub damping: f32,
 }
 
@@ -892,14 +931,23 @@ pub struct GaugeState {
     /// Where the needle should head, in [`GaugeConfig::range`].
     ///
     /// [`PreemWidget::clamp_in_place`] clamps an out-of-range value to the
-    /// nearer end of the (already sanitised) range, and **replaces** a `NaN`
-    /// with `range.low`. Note the difference from the kit, whose
-    /// `Needle::set_target` *ignores* a non-finite target and keeps the needle's
-    /// current one: a stateless clamp has no current one to keep, so a plugin
-    /// that hand-writes this frame with a `NaN` gets the needle parked at the
-    /// bottom of the scale, drawn. (The `hytte-plugin` SDK keeps the
-    /// keep-previous behaviour in its own setters; this is the wire's floor,
-    /// not a replacement for it.)
+    /// nearer end of the (already sanitised) range, saturates `+inf` to
+    /// `range.high` and `-inf` to `range.low`, and **replaces** a `NaN` with
+    /// `range.low`.
+    ///
+    /// This is the vocabulary's **one documented divergence** from the kit.
+    /// `Needle::set_target` (`crates/hytte-preem/src/gauge.rs:223`) ignores
+    /// `NaN`, `+inf` and `-inf` alike — it draws no distinction between them —
+    /// and keeps the *live needle's* current target: genuinely stateful, and
+    /// the only guarded kit entry point whose kept value a stateless clamp
+    /// cannot reconstruct (the config knobs' kept value is just their default).
+    /// So this row picks its own images rather than matching the kit: the
+    /// infinities saturate to the ends of the range and `NaN` takes the low
+    /// end, because a stateless clamp has to name *some* finite value. A plugin
+    /// that hand-writes a `NaN` here gets the needle parked at the bottom of
+    /// the scale, drawn. (The `hytte-plugin` SDK keeps the kit's keep-previous
+    /// behaviour in its own setters; this is the wire's floor, not a
+    /// replacement for it.)
     pub target: f32,
 }
 
@@ -966,17 +1014,21 @@ pub struct FlipBoardConfig {
     /// constant — it depends on [`mechanism`](FlipBoardConfig::mechanism), which
     /// a struct-level default cannot see. That is also why
     /// [`PreemWidget::clamp_in_place`] maps a non-finite duration back to
-    /// `None`: the mechanism's own default is the only sane finite answer, and
-    /// `None` is how this field spells it.
+    /// `None`: the kit clamps behind an `is_finite` guard
+    /// (`crates/hytte-preem/src/split_flap.rs:368`), so a non-finite value
+    /// leaves the mechanism's own default in place — and `None` is exactly how
+    /// this field spells that default, which makes the mapping a match rather
+    /// than an approximation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<f32>,
     /// Per-cell left-to-right stagger in seconds, or `None` for the
     /// **mechanism's own** default (`0.055` for a split flap; `0.0` for a
     /// nixie, whose tubes are wired in parallel and switch together). `0.0`
     /// makes the whole row move as one. The kit clamps to
-    /// `0.0..=`[`MAX_FLIP_STAGGER_SECS`], and so does
-    /// [`PreemWidget::clamp_in_place`], which maps a non-finite stagger back to
-    /// `None` for the same reason as [`duration_secs`](FlipBoardConfig::duration_secs).
+    /// `0.0..=`[`MAX_FLIP_STAGGER_SECS`] behind the same `is_finite` guard
+    /// (`crates/hytte-preem/src/split_flap.rs:380`), and
+    /// [`PreemWidget::clamp_in_place`] maps a non-finite stagger back to `None`
+    /// for the same reason as [`duration_secs`](FlipBoardConfig::duration_secs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stagger_secs: Option<f32>,
 }
@@ -1170,48 +1222,78 @@ impl PreemWidget {
     ///
     /// # The mapping — contract, not implementation detail
     ///
-    /// A clamp is *stateless*, so it cannot do what the kit does and **ignore**
-    /// a non-finite value in favour of the previous one — there is no previous
-    /// one here. It **replaces**, and a plugin that hand-writes a frame with a
-    /// `NaN` in it gets the replacement *drawn*. (Plugins built on the
-    /// `hytte-plugin` SDK keep the kit's keep-previous behaviour in the SDK's
-    /// own setters; this is the wire's floor underneath that, for every peer in
-    /// every language.) A non-finite `Option<f32>` becomes `None`, because
-    /// `None` already means "no explicit value, use the default or the one the
-    /// shell is holding" — the nearest thing to *ignore this* the wire can
-    /// spell.
+    /// **The rule: `±inf` saturates exactly as the kit's own clamp would,
+    /// because the kit's clamp is total on `±inf`; `NaN` alone gets the
+    /// documented per-field constant (or `None`), because the kit's `NaN`
+    /// behaviour — where it is keep-previous — is stateful and unreachable from
+    /// a stateless clamp.** Where the kit is total on `NaN` too, the constant
+    /// **is** the kit's value rather than an invention of this crate.
     ///
-    /// | field | bounds | `NaN` | `+inf` | `-inf` |
-    /// |---|---|---|---|---|
-    /// | [`PeakHoldConfig::rate`] | `0.0..=`[`MAX_PEAK_HOLD_RATE`] | `0.0` | [`MAX_PEAK_HOLD_RATE`] | `0.0` |
-    /// | [`LedStripState::level`] | `0.0..=1.0` | `0.0` | `1.0` | `0.0` |
-    /// | [`LedStripState::peak`] | `0.0..=1.0` | `None` | `None` | `None` |
-    /// | [`MarqueeConfig::speed_dots_per_sec`] | `±`[`MAX_MARQUEE_SPEED_DPS`] | `0.0` | `0.0` | `0.0` |
-    /// | [`ScopeState::samples`] (each) | `-1.0..=1.0` | `0.0` | `1.0` | `-1.0` |
-    /// | [`GaugeRange::low`] / [`high`](GaugeRange::high) | `high > low`, finite span | [`GaugeRange::default`], both ends as a unit | same | same |
-    /// | [`GaugeConfig::sweep_deg`] | [`MIN_SWEEP_DEG`]`..=`[`MAX_SWEEP_DEG`] | `150.0` (the default) | [`MAX_SWEEP_DEG`] | [`MIN_SWEEP_DEG`] |
-    /// | [`GaugeConfig::frequency_hz`] | [`MIN_FREQUENCY_HZ`]`..=`[`MAX_FREQUENCY_HZ`] | `2.0` (the default) | [`MAX_FREQUENCY_HZ`] | [`MIN_FREQUENCY_HZ`] |
-    /// | [`GaugeConfig::damping`] | [`MIN_DAMPING`]`..=`[`MAX_DAMPING`] | `0.5` (the default) | [`MAX_DAMPING`] | [`MIN_DAMPING`] |
-    /// | [`GaugeState::target`] | the sanitised [`GaugeConfig::range`] | `range.low` | `range.high` | `range.low` |
-    /// | [`FlipBoardConfig::duration_secs`] | [`MIN_FLIP_DURATION_SECS`]`..=`[`MAX_FLIP_DURATION_SECS`] | `None` | `None` | `None` |
-    /// | [`FlipBoardConfig::stagger_secs`] | `0.0..=`[`MAX_FLIP_STAGGER_SECS`] | `None` | `None` | `None` |
+    /// The consequence is parity: a plugin rasterising through the kit (the
+    /// `Raster` arm, an older shell) and a plugin stating the same widget on the
+    /// wire (the `Preem` arm) agree on every input the kit defines a value for.
     ///
-    /// Two rows do not follow the "`±inf` goes to the nearer bound" rule, and
-    /// both are deliberate:
+    /// Some kit entry points are not a bare `clamp` but a guard —
+    /// `if value.is_finite() { … }`, which keeps the *current* value for every
+    /// non-finite input, infinities included. For a **config** field that is
+    /// still reachable: the shell builds a fresh kit renderer from the config,
+    /// so "the current value" is that field's kit default, and this clamp
+    /// reproduces it exactly. The one place it is **not** reachable is
+    /// [`GaugeState::target`] — the kit keeps a *live needle's* target
+    /// (`crates/hytte-preem/src/gauge.rs:223`), which no stateless clamp can
+    /// see. That single row is the documented divergence, and it is worth being
+    /// exact about what diverges: the kit ignores `+inf` and `-inf` there
+    /// **exactly** as it ignores `NaN`, drawing no distinction between the
+    /// three. Saturating the infinities to the ends of the range is therefore
+    /// this vocabulary's own rule, chosen because a stateless clamp has to name
+    /// *some* finite value and the ends are the least surprising ones — not a
+    /// parity claim.
     ///
-    /// - [`MarqueeConfig::speed_dots_per_sec`] parks (`0.0`) on **any**
-    ///   non-finite value. It is an integrator input with no kit behind it, so
-    ///   parked is the safe neutral rather than a full-speed scroll nobody
-    ///   asked for — and this mapping shipped with #895.
-    /// - The `NaN` image of the three gauge knobs is the field's **default**,
-    ///   not the range floor: a 10° dial, a 0.05 Hz needle and a `ζ = 0.05`
-    ///   oscillation are all legal but pathological, and a caller who wrote a
-    ///   `NaN` there said nothing about what they wanted — which is what a
-    ///   default is for.
+    /// Wherever the replacement is drawn rather than ignored, it really is
+    /// drawn — a plugin that hand-writes a `NaN` gets the replacement on glass.
+    /// (Plugins built on the `hytte-plugin` SDK keep the kit's keep-previous
+    /// behaviour in the SDK's own setters; this is the wire's floor underneath
+    /// that, for peers in every language.)
+    ///
+    /// | field | kit behaviour (`crates/hytte-preem/…`) | bounds | `NaN` | `+inf` | `-inf` |
+    /// |---|---|---|---|---|---|
+    /// | [`PeakHoldConfig::rate`] | `led_strip.rs:108` `rate.max(0.0)` — total | `0.0..=`[`MAX_PEAK_HOLD_RATE`] | `0.0` (`f32::max` returns the non-`NaN` side) | [`MAX_PEAK_HOLD_RATE`] | `0.0` |
+    /// | [`LedStripState::level`] | `led_strip.rs:65` `lit_count` — total | `0.0..=1.0` | `0.0` (the kit lights nothing) | `1.0` | `0.0` |
+    /// | [`LedStripState::peak`] | `led_strip.rs:80` `peak_led` — total | `0.0..=1.0`, stays `Some` | `Some(0.0)` (no dot) | `Some(1.0)` (top LED) | `Some(0.0)` (no dot) |
+    /// | [`MarqueeConfig::speed_dots_per_sec`] | none — the kit has no speed | `±`[`MAX_MARQUEE_SPEED_DPS`] | `0.0` | `0.0` | `0.0` |
+    /// | [`ScopeState::samples`] (each) | `scope.rs:386` `sanitize` — guarded | `-1.0..=1.0` | `0.0` (the axis) | `0.0` | `0.0` |
+    /// | [`GaugeRange::low`] / [`high`](GaugeRange::high) | `gauge.rs:210` `Needle::range` — guarded | `high > low`, finite span | [`GaugeRange::default`], both ends as a unit | same | same |
+    /// | [`GaugeConfig::sweep_deg`] | `gauge.rs:598` — guarded | [`MIN_SWEEP_DEG`]`..=`[`MAX_SWEEP_DEG`] | `150.0` (the kit default) | `150.0` | `150.0` |
+    /// | [`GaugeConfig::frequency_hz`] | `gauge.rs:181` — guarded | [`MIN_FREQUENCY_HZ`]`..=`[`MAX_FREQUENCY_HZ`] | `2.0` (the kit default) | `2.0` | `2.0` |
+    /// | [`GaugeConfig::damping`] | `gauge.rs:195` — guarded | [`MIN_DAMPING`]`..=`[`MAX_DAMPING`] | `0.5` (the kit default) | `0.5` | `0.5` |
+    /// | [`GaugeState::target`] | `gauge.rs:223` `set_target` — guarded, **stateful** | the sanitised [`GaugeConfig::range`] | `range.low` | `range.high` | `range.low` |
+    /// | [`FlipBoardConfig::duration_secs`] | `split_flap.rs:368` — guarded | [`MIN_FLIP_DURATION_SECS`]`..=`[`MAX_FLIP_DURATION_SECS`] | `None` | `None` | `None` |
+    /// | [`FlipBoardConfig::stagger_secs`] | `split_flap.rs:380` — guarded | `0.0..=`[`MAX_FLIP_STAGGER_SECS`] | `None` | `None` | `None` |
+    ///
+    /// Four rows deserve their reasoning spelled out:
+    ///
+    /// - [`LedStripState::peak`] never becomes `None`. `None` means *no
+    ///   explicit peak — draw the shell-held decaying one*, a different render
+    ///   the kit would never produce for these inputs; `peak_led` draws no dot
+    ///   for a `NaN` or a non-positive peak, and `Some(0.0)` is how the wire
+    ///   says "no dot".
+    /// - [`ScopeState::samples`] reads `±inf` as `0.0`, not as the rails: the
+    ///   kit's `sanitize` is a guard, not a clamp, and maps every non-finite
+    ///   sample to the axis.
+    /// - [`MarqueeConfig::speed_dots_per_sec`] parks on **any** non-finite
+    ///   value. There is no kit behaviour to match — the kit's `Marquee` has no
+    ///   speed at all, #882 invented the field — so the rule has nothing to say
+    ///   here, and parked is the safe neutral for an integrator rather than a
+    ///   full-speed scroll nobody asked for. This mapping shipped with #895.
+    /// - [`FlipBoardConfig::duration_secs`] / [`stagger_secs`](FlipBoardConfig::stagger_secs)
+    ///   go to `None` because the kit keeps the *mechanism's* default for a
+    ///   non-finite input, and `None` is precisely how this vocabulary spells
+    ///   that default — matching the kit rather than approximating it.
     ///
     /// Order matters in one place: [`GaugeConfig::range`] is sanitised
     /// **before** [`GaugeState::target`] is clamped into it, so the target can
-    /// never be clamped against a `NaN` bound.
+    /// never be clamped against a `NaN` bound (which also keeps `f32::clamp`
+    /// from ever seeing `lo > hi`).
     pub fn clamp_in_place(&mut self) {
         match self {
             // A dot-matrix / seven-segment readout lays its whole message out
@@ -1249,7 +1331,10 @@ impl PreemWidget {
                     hold.rate = clamp_reading(hold.rate, 0.0, MAX_PEAK_HOLD_RATE, 0.0);
                 }
                 state.level = clamp_reading(state.level, 0.0, 1.0, 0.0);
-                state.peak = clamp_optional_reading(state.peak, 0.0, 1.0);
+                // An explicit peak stays *explicit*: `None` would hand the
+                // render to the shell-held decaying peak, which is not what the
+                // kit draws for any of these inputs.
+                state.peak = state.peak.map(|peak| clamp_reading(peak, 0.0, 1.0, 0.0));
             }
             Self::Marquee { config, state } => {
                 // `window_px` is already the *final* buffer width (the kit takes
@@ -1274,7 +1359,7 @@ impl PreemWidget {
                 config.scale = fit_scale(config.cols.max(config.rows), config.scale);
                 state.samples.truncate(MAX_SCOPE_SAMPLES);
                 for sample in &mut state.samples {
-                    *sample = clamp_reading(*sample, -1.0, 1.0, 0.0);
+                    *sample = clamp_guarded(*sample, -1.0, 1.0, 0.0);
                 }
             }
             Self::Gauge { config, state } => {
@@ -1283,20 +1368,20 @@ impl PreemWidget {
                 config.scale = fit_scale(config.cols.max(config.rows), config.scale);
                 config.divisions = config.divisions.clamp(1, MAX_DIVISIONS);
                 config.subdivisions = config.subdivisions.clamp(1, MAX_SUBDIVISIONS);
-                config.sweep_deg = clamp_reading(
+                config.sweep_deg = clamp_guarded(
                     config.sweep_deg,
                     MIN_SWEEP_DEG,
                     MAX_SWEEP_DEG,
                     DEFAULT_SWEEP_DEG,
                 );
-                config.frequency_hz = clamp_reading(
+                config.frequency_hz = clamp_guarded(
                     config.frequency_hz,
                     MIN_FREQUENCY_HZ,
                     MAX_FREQUENCY_HZ,
                     DEFAULT_FREQUENCY_HZ,
                 );
                 config.damping =
-                    clamp_reading(config.damping, MIN_DAMPING, MAX_DAMPING, DEFAULT_DAMPING);
+                    clamp_guarded(config.damping, MIN_DAMPING, MAX_DAMPING, DEFAULT_DAMPING);
                 // The range first: a target is only meaningful against a scale,
                 // and clamping against a `NaN` bound would just re-poison it.
                 config.range = sane_range(config.range);
@@ -1437,12 +1522,14 @@ fn clamp_text(text: &mut String) {
     text.truncate(end);
 }
 
-/// Sanitise one float **reading** into `lo..=hi`.
+/// Sanitise a float the kit clamps **totally**, i.e. hands straight to
+/// `f32::clamp` with no `is_finite` guard in front of it.
 ///
-/// `f32::clamp` already maps `+inf` to `hi` and `-inf` to `lo`; what it cannot
-/// do is `NaN`, which it passes straight through — hence the explicit `on_nan`
-/// replacement. A stateless clamp has no previous value to fall back on, so
-/// every caller has to name the constant it wants drawn; see the table on
+/// `f32::clamp` is already total on the infinities — `+inf` gives `hi`, `-inf`
+/// gives `lo` — so passing them through it reproduces the kit's own answer
+/// exactly. `NaN` is the one input `clamp` does not decide (it passes it
+/// through), so the caller names its image; where the kit is total on `NaN`
+/// too, `on_nan` is the kit's value, not an invention. See the table on
 /// [`PreemWidget::clamp_in_place`].
 fn clamp_reading(value: f32, lo: f32, hi: f32, on_nan: f32) -> f32 {
     if value.is_nan() {
@@ -1452,12 +1539,33 @@ fn clamp_reading(value: f32, lo: f32, hi: f32, on_nan: f32) -> f32 {
     }
 }
 
-/// [`clamp_reading`] for an optional field: a finite value clamps into
-/// `lo..=hi`, and **any** non-finite one becomes `None`.
+/// Sanitise a float the kit **guards** — `if value.is_finite() { … }`, keeping
+/// its current value for every non-finite input, infinities included.
 ///
-/// `None` is the honest answer for these — it already means "no explicit value,
-/// use the default or whatever the shell is holding", which is as close to the
-/// kit's ignore-and-keep-the-previous-one as a stateless clamp can get.
+/// A finite value clamps; all three non-finite ones take `on_non_finite`, which
+/// is what "keep the current one" resolves to for this field on the fresh
+/// builder the shell constructs from a config. Reproducing that keeps the state
+/// path and the raster path in step; saturating instead would make the two
+/// disagree on the same input.
+///
+/// With `(-1.0, 1.0, 0.0)` this *is* the kit's `sanitize`
+/// (`crates/hytte-preem/src/scope.rs:386`), byte for byte.
+fn clamp_guarded(value: f32, lo: f32, hi: f32, on_non_finite: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(lo, hi)
+    } else {
+        on_non_finite
+    }
+}
+
+/// [`clamp_guarded`] for an optional field whose "keep the current one" is
+/// spelled `None` on the wire.
+///
+/// The flip-board timings are the only fields shaped this way: the kit keeps
+/// the *mechanism's* default for a non-finite input
+/// (`crates/hytte-preem/src/split_flap.rs:368`, `:380`), and `None` is exactly
+/// how this vocabulary spells that default — so the mapping matches the kit
+/// rather than approximating it.
 fn clamp_optional_reading(value: Option<f32>, lo: f32, hi: f32) -> Option<f32> {
     value.filter(|v| v.is_finite()).map(|v| v.clamp(lo, hi))
 }

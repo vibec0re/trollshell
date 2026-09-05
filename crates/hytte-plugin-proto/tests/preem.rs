@@ -1339,14 +1339,19 @@ fn clamping_is_a_fixpoint_even_on_a_poisoned_widget() {
 /// `marquee_speed_is_clamped_including_non_finite`, and is the one row that
 /// maps `±inf` to `0.0` rather than to the nearer bound.)
 ///
-/// `LedStrip`: level → rest/full/rest, an explicit peak drops to `None`, the
-/// peak-hold rate → never-falls/cap/never-falls.
+/// `LedStrip`, all three fields against the kit's *total* clamps
+/// (`led_strip.rs:65` `lit_count`, `:80` `peak_led`, `:108` `PeakHold::new`):
+/// level → rest/full/rest, the peak-hold rate → never-falls/cap/never-falls,
+/// and an explicit peak stays **`Some`** — `Some(0.0)` is how the wire says
+/// "no dot", which is what the kit draws for a `NaN` or a non-positive peak;
+/// `None` would mean "use the shell-held decaying peak" instead, a different
+/// render.
 #[test]
 fn non_finite_led_strip_readings_map_to_their_documented_replacements() {
-    for (poison, want_level, want_rate) in [
-        (f32::NAN, 0.0_f32, 0.0_f32),
-        (f32::INFINITY, 1.0, MAX_PEAK_HOLD_RATE),
-        (f32::NEG_INFINITY, 0.0, 0.0),
+    for (poison, want_level, want_rate, want_peak) in [
+        (f32::NAN, 0.0_f32, 0.0_f32, 0.0_f32),
+        (f32::INFINITY, 1.0, MAX_PEAK_HOLD_RATE, 1.0),
+        (f32::NEG_INFINITY, 0.0, 0.0, 0.0),
     ] {
         let clamped = PreemWidget::LedStrip {
             config: LedStripConfig {
@@ -1363,10 +1368,12 @@ fn non_finite_led_strip_readings_map_to_their_documented_replacements() {
             panic!("variant changed")
         };
         assert_bits(state.level, want_level, "level");
-        assert!(
-            state.peak.is_none(),
-            "a non-finite explicit peak must drop to None, got {:?}",
-            state.peak
+        assert_bits(
+            state
+                .peak
+                .expect("an explicit peak stays explicit — never None"),
+            want_peak,
+            "peak",
         );
         assert_bits(
             config.peak_hold.expect("peak_hold survives").rate,
@@ -1376,8 +1383,10 @@ fn non_finite_led_strip_readings_map_to_their_documented_replacements() {
     }
 }
 
-/// `Scope`: each sample independently, `NaN` to the axis and the infinities to
-/// the rails, with the finite ones clamped and untouched respectively.
+/// `Scope`: each sample independently. The kit's `sanitize`
+/// (`scope.rs:386`) is a **guard**, not a bare clamp, so `NaN` *and* both
+/// infinities read as `0.0` — the axis — while finite samples clamp to the
+/// rails and in-range ones pass through untouched.
 #[test]
 fn non_finite_scope_samples_map_to_their_documented_replacements() {
     let clamped = PreemWidget::Scope {
@@ -1394,32 +1403,25 @@ fn non_finite_scope_samples_map_to_their_documented_replacements() {
     for (got, want) in state
         .samples
         .iter()
-        .zip([0.0_f32, 1.0, -1.0, 1.0, -1.0, 0.25])
+        .zip([0.0_f32, 0.0, 0.0, 1.0, -1.0, 0.25])
     {
         assert_bits(*got, want, "sample");
     }
 }
 
-/// `Gauge`: the three spring knobs fall back to their *defaults* on `NaN` and
-/// to the bounds on the infinities; the target follows the sanitised range.
+/// `Gauge`: the three spring knobs sit behind the kit's `is_finite` guards
+/// (`gauge.rs:598`, `:181`, `:195`), which keep the value already in the
+/// builder for **every** non-finite input — the kit default, on the fresh
+/// builder the shell constructs per config — so all three poisons resolve to
+/// the same defaults rather than saturating. The target is the one row that
+/// saturates, because its kept value is a *live needle's* (`gauge.rs:223`) and
+/// no stateless clamp can see it.
 #[test]
 fn non_finite_gauge_floats_map_to_their_documented_replacements() {
     for (poison, want_sweep, want_freq, want_damping, want_target) in [
         (f32::NAN, 150.0_f32, 2.0_f32, 0.5_f32, 0.0_f32),
-        (
-            f32::INFINITY,
-            MAX_SWEEP_DEG,
-            MAX_FREQUENCY_HZ,
-            MAX_DAMPING,
-            1.0,
-        ),
-        (
-            f32::NEG_INFINITY,
-            MIN_SWEEP_DEG,
-            MIN_FREQUENCY_HZ,
-            MIN_DAMPING,
-            0.0,
-        ),
+        (f32::INFINITY, 150.0, 2.0, 0.5, 1.0),
+        (f32::NEG_INFINITY, 150.0, 2.0, 0.5, 0.0),
     ] {
         let clamped = PreemWidget::Gauge {
             config: GaugeConfig {
@@ -1517,6 +1519,67 @@ fn non_finite_flip_timings_drop_to_none() {
         "duration_secs",
     );
     assert_bits(config.stagger_secs.expect("kept"), 0.0, "stagger_secs");
+}
+
+/// The structural half of the parity rule: for every field the kit guards with
+/// `is_finite` — the scope's samples and the gauge's three spring knobs — the
+/// three non-finite inputs must map to the **same** value, because the kit
+/// cannot tell them apart (it keeps the current value for all three). A future
+/// edit that "helpfully" saturates the infinities on one of these fields breaks
+/// raster/state parity, and breaks here.
+#[test]
+fn kit_guarded_fields_treat_every_non_finite_input_alike() {
+    let poisons = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+    let scoped: Vec<Vec<u32>> = poisons
+        .iter()
+        .map(|poison| {
+            let clamped = PreemWidget::Scope {
+                config: ScopeConfig::default(),
+                state: ScopeState {
+                    samples: vec![*poison],
+                },
+            }
+            .clamped();
+            float_bits(&clamped)
+        })
+        .collect();
+    assert_eq!(scoped[0], scoped[1], "scope: NaN and +inf must agree");
+    assert_eq!(scoped[0], scoped[2], "scope: NaN and -inf must agree");
+
+    // The gauge's *config* knobs only — the target is the documented
+    // divergence, so compare the three knobs rather than the whole widget.
+    let knobs: Vec<[u32; 3]> = poisons
+        .iter()
+        .map(|poison| {
+            let clamped = PreemWidget::Gauge {
+                config: GaugeConfig {
+                    sweep_deg: *poison,
+                    frequency_hz: *poison,
+                    damping: *poison,
+                    ..GaugeConfig::default()
+                },
+                state: GaugeState::default(),
+            }
+            .clamped();
+            let PreemWidget::Gauge { config, .. } = clamped else {
+                panic!("variant changed")
+            };
+            [
+                config.sweep_deg.to_bits(),
+                config.frequency_hz.to_bits(),
+                config.damping.to_bits(),
+            ]
+        })
+        .collect();
+    assert_eq!(knobs[0], knobs[1], "gauge knobs: NaN and +inf must agree");
+    assert_eq!(knobs[0], knobs[2], "gauge knobs: NaN and -inf must agree");
+    // …and they agree on the kit's defaults, not on a bound.
+    let default_knobs = [150.0_f32.to_bits(), 2.0_f32.to_bits(), 0.5_f32.to_bits()];
+    assert_eq!(
+        knobs[0], default_knobs,
+        "gauge knobs must keep the defaults"
+    );
 }
 
 /// A degenerate [`GaugeRange`] — inverted, empty, non-finite, or with a span

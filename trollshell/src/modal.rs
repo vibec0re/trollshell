@@ -1164,6 +1164,15 @@ pub fn close_all() {
     // A monitor teardown that held the open plugin panel must clear the
     // selection too, so the v1 "hot-unplug just closes the plugin page with the
     // drawer" default holds (#349 PR2).
+    //
+    // This clears the *selection*; it is no longer also the thing that releases
+    // the panel's preem renderer instances (#903). It cannot be: the destroys
+    // above have already aborted every drawer child's render subscription, and a
+    // `Mutable::set` here only wakes a task for the next `glib::MainContext`
+    // iteration — reached after this function has returned — so nothing is left
+    // to receive the `None`, whichever side of the destroys it is broadcast from.
+    // `plugins::region`'s panel child now releases its scope from its own
+    // `connect_destroy` instead, which is independent of who is subscribed.
     crate::plugins::set_active_panel(None);
     // No panels left → no netconn/stats page visible; park the pollers.
     recompute_gates();

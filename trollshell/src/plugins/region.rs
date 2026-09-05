@@ -214,6 +214,25 @@ fn build_region(
     // Best-effort teardown: abort the render subscription when the region widget
     // is destroyed (a sidebar rebuild on hot-plug), so it stops rendering into a
     // detached container and drops its captured handles.
+    //
+    // **This handler does not currently fire**, for the same reason the drawer
+    // panel child's did not before #903: the subscription above owns
+    // `container_for_signal` — a strong clone of this very container — plus every
+    // `MountedCard`'s `root` and `Reconciler`, and the only thing that aborts it
+    // is this destroy handler. The container therefore pins itself, and a
+    // hot-plug strands one live region per monitor per mount.
+    //
+    // It is left as-is deliberately, because the *consequence* differs from the
+    // panel's and is not a preem-scope leak. A card's scope
+    // (`Scope::card(plugin_id)`) is shared by every monitor's copy of that card,
+    // and it is released by [`reconcile_region`]'s retain loop when the plugin
+    // leaves the render list — a global event every stranded region observes too.
+    // So a stranded region re-does work rather than holding a scope nothing can
+    // free. Unpinning it needs the same inner-canvas split the panel child got,
+    // but `container` is also the widget [`reconcile_region`] inserts, reorders,
+    // removes and `set_visible`s cards on, and `.ts-plugin-region` carries the
+    // bar row's inter-chip spacing — so it is a wider change than #903's, and it
+    // belongs to its own issue rather than riding this one.
     container.connect_destroy(move |_| handle.abort());
 
     container.upcast()
@@ -359,14 +378,59 @@ fn empty_panel() -> UiNode {
 /// dangling send.
 #[must_use]
 pub fn plugin_panel_slot() -> gtk::Widget {
+    build_panel_child(panels_render_signal(), active_panel_signal())
+}
+
+/// [`plugin_panel_slot`]'s body, with the two registry-backed signals taken as
+/// parameters.
+///
+/// The split exists for the same reason `panels/connections.rs` splits
+/// `rebuild_connections` out of its bind: the production accessors
+/// [`panels_render_signal`] / [`active_panel_signal`] `.expect()` a registered
+/// `PluginHandles` out of the thread-local registry, which a `#[gtk::test]` has
+/// no booted `App` to provide. Handing the child two plain `Mutable` signals
+/// instead lets `gtk_tests` drive the **real** mount — its subscription, its
+/// `connect_destroy`, its scope bookkeeping — rather than a hand-rolled replica
+/// of it, which is what the #903 teardown ordering needed to be reproducible.
+fn build_panel_child(
+    panels: impl Signal<Item = Vec<SlotRender>> + 'static,
+    active_id: impl Signal<Item = Option<String>> + 'static,
+) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("ts-plugin-panel");
+
+    // The reconciler mounts into an inner box rather than into `root` itself,
+    // and that one level of indirection is what makes this child **destroyable**
+    // (#903).
+    //
+    // `Reconciler` keeps a *strong* `gtk::Box` clone of whatever it is built over
+    // (`crates/hytte-ui/src/widget_tree.rs:355`), and the reconciler is moved
+    // into the render subscription below. Built over `root`, that closes a loop:
+    // the task owns a strong ref to `root`, and the only thing that aborts the
+    // task is `root`'s own `destroy` handler — so `root` can never reach refcount
+    // zero, `destroy` never fires, and nothing about this child is ever torn
+    // down. Measured before the split: a child whose window had been destroyed
+    // still upgraded from a `WeakRef`, and still mapped preem nodes for the next
+    // panel that went active — one stranded, fully-live drawer child per monitor
+    // per hot-plug, reconciling into a detached widget tree for the session.
+    //
+    // Over an inner `canvas` the strong ref points *down* the tree instead of
+    // back at `root`, so `root`'s only holder is its parent (the drawer stack).
+    // It disposes with the drawer, `destroy` fires, the subscription is aborted,
+    // and the closure — with the reconciler and `canvas` inside it — drops.
+    //
+    // Invisible to CSS: `.ts-plugin-panel` styles `root` and reaches the plugin's
+    // tree through a *descendant* selector (`assets/trollshell/style.css:570`),
+    // never a child one. The box is plain (vertical, spacing 0, no margins) and
+    // propagates its child's expand flags, so it adds no geometry either.
+    let canvas = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&canvas);
 
     // The active connection's outbound, swapped on each render so panel events
     // reach whichever plugin is active now (mirrors the region card pattern).
     let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> = Rc::new(RefCell::new(None));
     let ev_outbound = outbound.clone();
-    let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
+    let mut reconciler = Reconciler::new(&canvas, move |id: NodeId, kind: UiEventKind| {
         if let Some(tx) = ev_outbound.borrow().as_ref() {
             // Non-blocking (#435): drop the panel event if the plugin's outbound
             // queue is full rather than block the GTK thread.
@@ -380,8 +444,8 @@ pub fn plugin_panel_slot() -> gtk::Widget {
     // Derived signal: the active plugin's current panel `SlotRender` (or `None`
     // when nothing is active or the active plugin has no panel entry).
     let active = map_ref! {
-        let panels = panels_render_signal(),
-        let active_id = active_panel_signal() => {
+        let panels = panels,
+        let active_id = active_id => {
             active_id
                 .as_ref()
                 .and_then(|id| panels.iter().find(|r| &r.plugin_id == id).cloned())
@@ -393,15 +457,47 @@ pub fn plugin_panel_slot() -> gtk::Widget {
     // instead of parking them for the session. A panel tree gets its own scope
     // (never the card's): the two trees are independent and may reuse node ids.
     let shown_scope: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+    // Cloned out before the subscription takes ownership, so the destroy handler
+    // below reads and clears the *same* cell the renders write.
+    let shown_at_destroy = shown_scope.clone();
 
     let handle = glib::MainContext::default().spawn_local(active.for_each(move |slot| {
         render_active_panel(&mut reconciler, &outbound, &shown_scope, slot.as_ref());
         std::future::ready(())
     }));
 
-    // Best-effort teardown: abort the subscription when the drawer child is
-    // destroyed (a per-monitor drawer rebuild on hot-plug).
-    root.connect_destroy(move |_| handle.abort());
+    // Teardown: abort the render subscription when the drawer child is destroyed
+    // (a per-monitor drawer rebuild on hot-plug), and release the panel scope it
+    // was showing on the way out.
+    //
+    // Releasing it *here* rather than leaving it to `modal::close_all`'s
+    // `set_active_panel(None)` is the #903 fix. `close_all` destroys every drawer
+    // window before it broadcasts (`modal.rs`'s `close_all`), so by the time the
+    // `None` is published this handler has already aborted the only subscription
+    // that could have acted on it. Reordering the broadcast ahead of the destroys
+    // would not have saved it either: `Mutable::set` only *wakes* this task, and
+    // it is polled on the next `glib::MainContext` iteration — reached long after
+    // `close_all` has returned and the abort has happened. Teardown that depends
+    // on someone still being subscribed is not teardown.
+    //
+    // Captures no widget — only the `JoinHandle` and an `Rc` of the scope cell —
+    // matching the contract `hytte-reactive`'s `abort_on_destroy` spells out
+    // (`crates/hytte-reactive/src/bind.rs:49-56`). A strong widget clone here
+    // would re-pin precisely what the `canvas` split above unpins.
+    //
+    // No sibling-monitor hazard. `active_panel_id` is one global selection, and
+    // the only two things that destroy a drawer window are `modal::close_all`
+    // (`modal.rs:1161`) and `overlays::sidebar::close_all`
+    // (`overlays/sidebar.rs:772`) — both driven from the same `monitors_changed`
+    // emission (`main.rs:240-241`), which tears every monitor's surfaces down
+    // together. There is no partial teardown that could drop a scope another
+    // monitor is still showing. And this is idempotent regardless:
+    // `forget_previous_panel_scope` no-ops on an already-cleared cell, and
+    // `preem_render::forget_scope` is a `HashMap::remove`.
+    root.connect_destroy(move |_| {
+        handle.abort();
+        forget_previous_panel_scope(&shown_at_destroy, None);
+    });
     root.upcast()
 }
 
@@ -527,16 +623,42 @@ pub(super) fn clear_region_if_owned(
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{
-        MountedCard, Scope, SlotRender, forget_previous_panel_scope, preem_render,
-        reconcile_region, render_active_panel,
+        MountedCard, Scope, SlotRender, build_panel_child, forget_previous_panel_scope,
+        preem_render, reconcile_region, render_active_panel,
     };
     use hytte::adw;
-    use hytte::gtk;
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk::{self, glib, prelude::*};
     use hytte::ui::{EventKind as UiEventKind, NodeId, Reconciler};
     use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::sync::mpsc;
+
+    /// Run the GTK main loop until it has nothing left to dispatch, so the panel
+    /// child's `spawn_local`'d subscription is actually polled.
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Mount a real drawer plugin child on `panels`/`active`, inside a window,
+    /// dropping every *local* strong reference to the child.
+    ///
+    /// That ownership mirrors `modal.rs` exactly: `build_stack` passes
+    /// `plugin_panel_slot()` straight into `stack.add_named` as a temporary, so
+    /// the drawer's widget tree holds the only reference and destroying the
+    /// window really does dispose the child. A test that kept a handle would
+    /// keep the child alive and never see its `connect_destroy` run at all.
+    fn mount_panel_child(
+        panels: &Mutable<Vec<SlotRender>>,
+        active: &Mutable<Option<String>>,
+    ) -> gtk::Window {
+        let child = build_panel_child(panels.signal_cloned(), active.signal_cloned());
+        let window = gtk::Window::new();
+        window.set_child(Some(&child));
+        drop(child);
+        window
+    }
 
     /// A tree of one preem node, so a scope's instance count is a non-zero
     /// number to watch fall to zero.
@@ -666,6 +788,135 @@ mod gtk_tests {
             preem_render::probe(&scope, Some("panel")),
             built,
             "the same panel re-rendering must neither rebuild nor re-apply",
+        );
+    }
+
+    /// The drawer plugin child must be **freeable** — nothing the mount spawns
+    /// may hold its own root alive (#903, the `hytte-reactive` `bind` contract at
+    /// `crates/hytte-reactive/src/bind.rs:16-30` applied to a hand-rolled
+    /// subscription).
+    ///
+    /// **Deletion check:** building the `Reconciler` over `root` instead of the
+    /// inner `canvas` turns every assertion below red at once — the widget stays
+    /// upgradeable, `destroy` never fires, and the stranded child goes on mapping
+    /// preem nodes for whatever panel is activated next. That is the state `main`
+    /// shipped, and it is why the destroy-time release this file now performs
+    /// could not have worked as a fix on its own.
+    #[gtk::test]
+    fn a_destroyed_drawer_child_is_freed_and_stops_rendering() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let panels = Mutable::new(vec![render_of("stranded", &tx)]);
+        let active = Mutable::new(Some("stranded".to_owned()));
+
+        let child = build_panel_child(panels.signal_cloned(), active.signal_cloned());
+        let child_weak = child.downgrade();
+        let window = gtk::Window::new();
+        window.set_child(Some(&child));
+        // The drawer stack holds the only reference in production, so the test
+        // must too — see [`mount_panel_child`].
+        drop(child);
+        pump();
+
+        window.destroy();
+        drop(window);
+        pump();
+
+        assert!(
+            child_weak.upgrade().is_none(),
+            "the drawer child must be freed with its window: a `Reconciler` built \
+             over `root` keeps a strong clone of it inside the very subscription \
+             `root`'s `destroy` handler is supposed to abort, so the widget pins \
+             itself and hot-plug strands one live child per monitor forever",
+        );
+
+        // A stranded child would still be subscribed, and would map this newly
+        // active panel's preem nodes into a widget tree nobody can see.
+        panels.set(vec![render_of("next", &tx)]);
+        active.set(Some("next".to_owned()));
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&Scope::panel("next")),
+            0,
+            "a destroyed drawer child must stop rendering: an orphan still \
+             building renderer instances is what keeps their kit buffers \
+             resident and `any_animating()` true (#897)",
+        );
+    }
+
+    /// A monitor hot-plug — `modal::close_all` destroying every drawer window
+    /// and *then* broadcasting `set_active_panel(None)` — must still release the
+    /// open plugin panel's preem renderer instances (#903).
+    ///
+    /// **Deletion check:** dropping `forget_previous_panel_scope` from
+    /// [`build_panel_child`]'s `connect_destroy` handler turns the final
+    /// assertion red (`left: 1, right: 0`) — which is exactly the state `main`
+    /// shipped: the child's `handle.abort()` kills the only subscription that
+    /// could have acted on the `None`, and the `None` is delivered a
+    /// main-context iteration *later* than `close_all` returns, so reordering
+    /// the broadcast ahead of the destroys would not have saved it either.
+    #[gtk::test]
+    fn close_all_ordering_releases_the_open_panels_preem_scope() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let panels = Mutable::new(vec![render_of("hotplug", &tx)]);
+        let active = Mutable::new(Some("hotplug".to_owned()));
+        let scope = Scope::panel("hotplug");
+
+        let window = mount_panel_child(&panels, &active);
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            1,
+            "the open plugin panel must have a live renderer instance to leak",
+        );
+
+        // `modal::close_all`, in its real order: every drawer window destroyed
+        // first (the child's `connect_destroy` runs inside `destroy()`), then
+        // the selection cleared.
+        window.destroy();
+        drop(window);
+        active.set(None);
+        // The `None` reaches a subscriber only on the *next* main-context
+        // iteration — later than `close_all` returns — so pumping here is more
+        // generous than production ever is.
+        pump();
+
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "a hot-plug teardown must release the open panel's renderer instances \
+             rather than park them for the session: they hold their kit buffers, \
+             and a mid-animation one keeps `any_animating()` true forever (#903)",
+        );
+    }
+
+    /// The **class** the fix closes, not just `close_all`'s instance: a drawer
+    /// child that is destroyed releases the panel scope it was showing even when
+    /// no selection change ever arrives. Teardown does not depend on anyone
+    /// still being subscribed.
+    #[gtk::test]
+    fn a_destroyed_drawer_child_releases_its_panel_scope() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let panels = Mutable::new(vec![render_of("orphan", &tx)]);
+        let active = Mutable::new(Some("orphan".to_owned()));
+        let scope = Scope::panel("orphan");
+
+        let window = mount_panel_child(&panels, &active);
+        pump();
+        assert_eq!(preem_render::instance_count(&scope), 1);
+
+        // No broadcast at all — just the mount going away.
+        window.destroy();
+        drop(window);
+        pump();
+
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "a destroyed drawer child must drop its panel scope on its own, with \
+             no `set_active_panel(None)` to prompt it",
         );
     }
 

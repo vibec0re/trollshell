@@ -8,14 +8,28 @@
 //! behind the one-line `main`; systemd's `Restart=on-failure` is the outer
 //! supervisor.
 //!
-//! # The face — `preem::seven_seg` (#356/#376)
+//! # The face — `display::SevenSeg` (#356/#376, on the #884 seam)
 //!
-//! The countdown is a seven-segment `MM:SS` readout, rendered into a
-//! [`Node::Pixels`] the host paints crisp (nearest-neighbor) and aspect-locked.
-//! The SDK auto-subscribes the desktop accent (#376), so the lit digits tint to
-//! the shell accent out of the box. The bar **chip** wraps that readout in a
-//! clickable button; clicking it opens the plugin's own drawer **panel** (#349
-//! PR2) which holds the entry, the presets, and pause/reset.
+//! The countdown is a seven-segment `MM:SS` readout. The bar **chip** wraps it
+//! in a clickable button; clicking it opens the plugin's own drawer **panel**
+//! (#349 PR2), which holds a second, identical readout above the entry, the
+//! presets, and pause/reset. The SDK auto-subscribes the desktop accent (#376),
+//! so the lit segments tint to the shell accent out of the box.
+//!
+//! Since #884 both readouts go through [`hytte_plugin::display::SevenSeg`]
+//! instead of calling the raster kit by hand. One code path, two hosts: against
+//! a shell that advertises the preem vocabulary in `HostMsg::Hello` the readout
+//! ships as a typed `Node::Preem` the shell draws itself; against one that
+//! doesn't it CPU-rasterises to exactly the [`Node::Pixels`] that
+//! `preem::seven_seg(…).into_node(…)` produced before — byte for byte, which
+//! the tests below pin.
+//!
+//! Nothing in `view` branches on which host is on the other end, and this
+//! plugin has no `advance` to call at all: a seven-segment readout is pure, so
+//! its whole state is the `MM:SS` string handed to
+//! [`node`](hytte_plugin::display::SevenSeg::node). The countdown itself stays
+//! the plugin's own — it is *data*, not animation, so it travels as the
+//! widget's state on every change rather than as something the shell integrates.
 //!
 //! # The clock lives in the plugin — the host stays stateless
 //!
@@ -41,7 +55,7 @@
 
 use std::time::Duration;
 
-use hytte_plugin::preem::{DisplayStyle, seven_seg};
+use hytte_plugin::display::{SevenSeg, StyleName};
 use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page};
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio_stream::StreamExt as _;
@@ -77,8 +91,10 @@ const LONG_BREAK_SECS: u32 = 15 * 60;
 /// the readout or the tick math. 24 h is far past any real kitchen timer.
 const MAX_SECS: u32 = 24 * 60 * 60;
 /// The 7seg skin. Its lit ink is accent-tinted by the SDK (#376); the near-black
-/// VFD field reads well as a small bar chip.
-const STYLE: DisplayStyle = DisplayStyle::Vfd;
+/// VFD field reads well as a small bar chip. A wire [`StyleName`] since #884 —
+/// the skin travels to a preem-speaking shell as a *name*, never as resolved
+/// colors, which is what lets the shell re-tint the readout live (#396).
+const STYLE: StyleName = StyleName::Vfd;
 
 /// The timer's own message: a single 1 Hz heartbeat from [`Plugin::sources`].
 #[derive(Debug)]
@@ -99,6 +115,12 @@ struct Timer {
     total: u32,
     /// Whether the countdown is advancing.
     running: bool,
+    /// The `MM:SS` readout the chip and the panel both draw (#884). Config
+    /// only — a seven-segment strip is pure, so this carries no animation state
+    /// and needs no `advance`; the reading is handed to `node` at render time.
+    /// One instance for both call sites: the two nodes differ in nothing but
+    /// their id, which is what keys each to its own renderer host-side.
+    seg: SevenSeg,
 }
 
 /// Format a whole-second count as a `MM:SS` (or wider) readout for the 7seg.
@@ -273,6 +295,7 @@ impl Plugin for Timer {
             remaining: POMODORO_SECS,
             total: POMODORO_SECS,
             running: false,
+            seg: SevenSeg::new(STYLE),
         }
     }
 
@@ -309,11 +332,17 @@ impl Plugin for Timer {
 
     /// The rendered [`View`] (#349). The bar **chip**: a clickable button
     /// wrapping the `MM:SS` 7seg readout — the host wraps it in its own
-    /// `.ts-plugin-chip` pill and paints the `Pixels` aspect-locked, so the
-    /// readout fits the bar without a CSS px rule; a click opens the panel.
-    /// The drawer **panel**: the big readout, the duration entry, the preset
-    /// row (25 / 5 / 15), and the pause/reset row. Its root carries no
+    /// `.ts-plugin-chip` pill and sizes the readout aspect-locked, so it fits
+    /// the bar without a CSS px rule; a click opens the panel. The drawer
+    /// **panel**: the big readout, the duration entry, the preset row
+    /// (25 / 5 / 15), and the pause/reset row. Its root carries no
     /// `.card`/`.ts-plugin-*` class — the drawer supplies the chrome.
+    ///
+    /// The two [`SevenSeg::node`](hytte_plugin::display::SevenSeg::node) calls
+    /// are the whole #884 seam: each lands as a typed `Node::Preem` or a
+    /// rasterised `Node::Pixels` depending on what the host advertised, with no
+    /// branch here. Neither carries a CSS class — a pixel readout brings its own
+    /// font, and in state mode the shell resolves the skin from the style name.
     fn view(&self) -> View {
         let chip = Node::Box {
             id: Some(ROOT_ID.to_owned()),
@@ -324,10 +353,10 @@ impl Plugin for Timer {
             children: vec![Node::Button {
                 id: CHIP_BTN.to_owned(),
                 classes: vec!["flat".to_owned()],
-                child: Box::new(seven_seg(&self.mmss(), STYLE).into_node(Some(SEG_ID), Vec::new())),
+                child: Box::new(self.seg.node(SEG_ID, &self.mmss())),
             }],
         };
-        let readout = seven_seg(&self.mmss(), STYLE).into_node(Some(PANEL_SEG_ID), Vec::new());
+        let readout = self.seg.node(PANEL_SEG_ID, &self.mmss());
         let entry = Node::Entry {
             id: ENTRY_ID.to_owned(),
             text: String::new(),
@@ -369,9 +398,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHIP_BTN, ENTRY_ID, LONG_BREAK_SECS, PLUGIN_ID, POMODORO_SECS, PRESET_5, PRESET_25,
-        SHORT_BREAK_SECS, Timer, parse_duration,
+        CHIP_BTN, ENTRY_ID, LONG_BREAK_SECS, PANEL_SEG_ID, PLUGIN_ID, POMODORO_SECS, PRESET_5,
+        PRESET_25, SEG_ID, SHORT_BREAK_SECS, Timer, parse_duration,
     };
+    use hytte_plugin::display::{RenderMode, StyleName, testing::with_render_mode};
+    use hytte_plugin::preem::{DisplayStyle, seven_seg};
+    use hytte_plugin::proto::preem::PreemWidget;
     use hytte_plugin::proto::{
         Capability, Effect, EventKind, Manifest, Node, Page, PluginMsg, decode, encode,
     };
@@ -585,6 +617,90 @@ mod tests {
             *width as usize * *height as usize * 4,
             "buffer must satisfy the host's len == w*h*4 seam"
         );
+    }
+
+    /// The migration's compat promise (#884): against a shell that does **not**
+    /// advertise the preem vocabulary, both readouts must reach the host as the
+    /// exact same pixels a hand-written `preem::seven_seg(…).into_node(…)`
+    /// produced before the seam existed — chip *and* panel, byte for byte.
+    ///
+    /// Only comparing the buffers proves it, so this compares whole nodes: the
+    /// id, the class list and every one of the RGBA bytes.
+    #[test]
+    fn against_an_old_shell_both_readouts_are_rasterised_seven_segs() {
+        let mut m = fresh();
+        // A face with a digit in every position, so a wrong glyph can't hide.
+        m.start(23 * 60 + 45);
+        let view = with_render_mode(RenderMode::Raster, || m.view());
+
+        let Node::Box { children, .. } = &view.tree else {
+            panic!("root is a box");
+        };
+        let [Node::Button { child, .. }] = children.as_slice() else {
+            panic!("the chip holds exactly the click target");
+        };
+        // `==` rather than `assert_eq!`: these carry a `Node::Pixels`, whose
+        // `Debug` would dump the whole RGBA buffer into the failure output.
+        assert!(
+            **child == seven_seg("23:45", DisplayStyle::Vfd).into_node(Some(SEG_ID), vec![]),
+            "the raster chip must match the kit by hand",
+        );
+
+        let Some(Node::Box { children, .. }) = &view.panel else {
+            panic!("the panel is a box");
+        };
+        assert!(
+            children[0]
+                == seven_seg("23:45", DisplayStyle::Vfd).into_node(Some(PANEL_SEG_ID), vec![]),
+            "the raster panel readout must match the kit by hand",
+        );
+    }
+
+    /// Unwrap one readout and assert it is the seven-seg state the shell will
+    /// draw: the reconciler's key, the plugin's own reading, and the skin as a
+    /// *name* rather than resolved colors.
+    fn assert_seven_seg(node: &Node, want_id: &str, want_text: &str) {
+        match node {
+            Node::Preem { id, widget, .. } => {
+                assert_eq!(id.as_deref(), Some(want_id), "the reconciler's key");
+                match widget.as_ref() {
+                    PreemWidget::SevenSeg { config, state } => {
+                        assert_eq!(state.text, want_text, "the plugin's own reading");
+                        assert_eq!(
+                            config.style.style,
+                            StyleName::Vfd,
+                            "the skin travels as a name, never as colors",
+                        );
+                    }
+                    other => panic!("expected a seven-seg widget, got {other:?}"),
+                }
+            }
+            Node::Pixels { .. } => panic!("a preem-speaking host must not get pixels"),
+            other => panic!("expected Node::Preem, got {other:?}"),
+        }
+    }
+
+    /// …and against a shell that advertises the vocabulary, the *same* `view`
+    /// ships typed state nodes instead — same ids, same reading, the skin as a
+    /// name, and no pixels anywhere in either tree (#884).
+    #[test]
+    fn against_a_preem_shell_both_readouts_are_state_nodes() {
+        let mut m = fresh();
+        m.start(23 * 60 + 45);
+        let view = with_render_mode(RenderMode::State, || m.view());
+
+        let Node::Box { children, .. } = &view.tree else {
+            panic!("root is a box");
+        };
+        let [Node::Button { child, .. }] = children.as_slice() else {
+            panic!("the chip holds exactly the click target");
+        };
+        assert_seven_seg(child, SEG_ID, "23:45");
+
+        let Some(Node::Box { children, .. }) = &view.panel else {
+            panic!("the panel is a box");
+        };
+        assert_seven_seg(&children[0], PANEL_SEG_ID, "23:45");
     }
 
     /// The manifest requests exactly the caps the panel + toast need.

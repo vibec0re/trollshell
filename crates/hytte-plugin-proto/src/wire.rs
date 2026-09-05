@@ -456,11 +456,26 @@ pub enum Node {
     /// once per plugin *session*: a plugin restarted under the same id will not
     /// produce a second line. Check the journal from the top of the shell's run.
     ///
+    /// **Ids must be unique within a tree** (#918). Two preem nodes in one tree
+    /// claiming the same `id` collapse onto one renderer instance, which then
+    /// has both widgets applied to it every pass — two targets fighting one
+    /// needle, or one phosphor, or one flip clock. The host keeps the last
+    /// writer (nothing disappears) and warns once per plugin tree, naming the id
+    /// and both widget kinds. A tree renders both trees' worth of nodes, so the
+    /// namespace to be unique in is the tree, not the plugin: the same `"cpu"`
+    /// in a plugin's chip and in its drawer panel is fine.
+    ///
     /// The Rust SDK's `display` wrappers stamp the id from the widget key they
     /// already take (`display::gauge::node("cpu")`), so a plugin built on them
     /// never reaches the fallback. A hand-rolled client should do the same. Use
     /// [`preem_id`](crate::preem::preem_id) rather than
     /// [`preem`](crate::preem::preem) when constructing a node by hand.
+    ///
+    /// # How many of these a tree may carry (#901)
+    ///
+    /// [`MAX_PREEM_NODES_PER_TREE`] of them, within
+    /// [`MAX_NODES_PER_TREE`] nodes overall — see those constants for the
+    /// numbers, the memory they bound and what the host does past them.
     ///
     /// **Negotiated, not unconditional.** Unlike every other variant here, a
     /// plugin must not emit this one on sight: it emits it only once the host
@@ -492,6 +507,89 @@ pub enum Node {
         widget: Box<PreemWidget>,
     },
 }
+
+// ── tree-shape caps (#901) ───────────────────────────────────────────────────
+//
+// The caps in [`preem`](crate::preem) bound one widget's *geometry*, and the
+// proto enforces them itself in `PreemWidget::clamp_in_place`. These two bound
+// the *shape of a render tree*, and the proto cannot enforce them: it decodes a
+// frame, it never walks one. They are stated here so a plugin author reads the
+// bound in the same crate as everything else on the wire, and the host enforces
+// them where it walks the tree (`trollshell/src/plugins/wire_map.rs`).
+
+/// How many [`Node`]s the host maps out of one render tree, of every kind
+/// together.
+///
+/// A render frame is bounded on the wire only by
+/// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) (16 MiB), and the cheapest node
+/// ([`Node::Spacer`]) encodes to a handful of bytes — so one legal frame can
+/// carry on the order of a million nodes, each of which becomes a GTK widget in
+/// the shell. That is a pre-existing stability hazard rather than a new one (a
+/// plugin is native code running as the user, #881), but it is unbounded, and
+/// nothing about it is diagnosable.
+///
+/// **4096** is [`MAX_SCOPE_SAMPLES`](crate::preem::MAX_SCOPE_SAMPLES) — the
+/// vocabulary's existing "a large but finite count of small things" — and it is
+/// `64 ×` [`MAX_PREEM_NODES_PER_TREE`], keeping the general cap and the preem
+/// one in a stated ratio rather than two independently-chosen numbers. It is
+/// two orders of magnitude above any tree the bundled plugins render (the
+/// largest is a departures panel in the low hundreds), and it cuts the
+/// worst-case widget count by roughly 400×.
+///
+/// **Past the cap the host keeps the mapped prefix and drops the rest**, rather
+/// than refusing the frame: that is the posture the malformed-`Pixels` seam in
+/// the same walk already takes (degrade to something that still renders and say
+/// so, never blank the plugin), and a truncated tree shows the plugin's chrome
+/// and its first nodes, so what is on glass matches the journal line. Refusing
+/// the frame would leave the *previous* frame up, which looks exactly like a
+/// hung plugin. The host warns once per plugin tree for the life of the shell
+/// process, on the same latch as the [`Node::Preem`] keying diagnostics.
+///
+/// Because the walk is depth-first and charges the budget on entry, this also
+/// bounds the depth of the host's recursion over a tree, which was previously
+/// bounded only by the frame length.
+pub const MAX_NODES_PER_TREE: usize = 4096;
+
+/// How many [`Node::Preem`] nodes in one tree the host gives a renderer
+/// instance to.
+///
+/// [`MAX_NODES_PER_TREE`] is the bound; this is the *multiplier* it is applied
+/// to. Every other node kind costs the host a GTK widget; a preem node costs a
+/// widget **and** a renderer instance holding everything the vocabulary keeps
+/// off the wire — phosphor buffer, needle velocity, flip clocks, scroll offset,
+/// held peak, plus the cached RGBA frame. A ~40-byte config on the wire is
+/// therefore a five- to six-order-of-magnitude memory amplifier, which is what
+/// makes preem nodes worth a tighter cap than the tree as a whole.
+///
+/// **64** is the count this vocabulary already uses for "generous, and still a
+/// small number" — [`MAX_CELLS`](crate::preem::MAX_CELLS),
+/// [`MAX_DIVISIONS`](crate::preem::MAX_DIVISIONS),
+/// [`MAX_TEXT_LINES`](crate::preem::MAX_TEXT_LINES),
+/// [`MAX_PAD`](crate::preem::MAX_PAD) and
+/// [`MAX_CORNER`](crate::preem::MAX_CORNER) are all 64. It is far above any
+/// plausible design: a bar chip carries one to three preem nodes and a
+/// dashboard panel a dozen. The shape that would reach it — one widget per CPU
+/// core, per audio sink, per anything — is one the vocabulary already answers
+/// with a single aggregate widget
+/// ([`LedStrip`](crate::preem::PreemWidget::LedStrip) holds
+/// [`MAX_LEDS`](crate::preem::MAX_LEDS) = 128 segments,
+/// [`Scope`](crate::preem::PreemWidget::Scope) holds
+/// [`MAX_SCOPE_SAMPLES`](crate::preem::MAX_SCOPE_SAMPLES) samples), so hitting
+/// this cap is a sign to reach for those rather than a limit to raise.
+///
+/// **The memory this bounds.** An instance's resident cost is dominated by its
+/// cached RGBA frame, capped at
+/// [`MAX_RASTER_PIXELS`](crate::preem::MAX_RASTER_PIXELS) × 4 B = 16 MiB by the
+/// geometry caps, so the adversarial worst case is 64 × ~16 MiB ≈ 1 GiB for a
+/// plugin that also maxes every dimension of every widget — a bound, where
+/// there was none, not a comfortable number. A realistic tree of 64
+/// default-geometry gauges is ~2 MiB.
+///
+/// Past the cap a preem node renders as the host's unknown-widget placeholder
+/// (an empty surface that keeps the node's `id` and classes, so CSS chrome
+/// stays and a later in-cap frame updates it in place), with one warning per
+/// plugin tree for the life of the shell process.
+pub const MAX_PREEM_NODES_PER_TREE: usize = 64;
 
 // ── float sanitisation (#904) ───────────────────────────────────────────────
 

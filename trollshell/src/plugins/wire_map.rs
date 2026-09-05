@@ -4,10 +4,40 @@
 //! reconciler's `hytte_ui` types (and back for events). Each mapping is written
 //! exhaustively so adding a variant to either side is a compile error here.
 
-use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
-use hytte_plugin_proto::wire;
+use std::cell::Cell;
 
-use super::preem_render::{self, Scope};
+use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
+use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE};
+
+use super::preem_render::{self, Scope, Warned};
+
+/// One mapping pass's state: the scope its preem instances live in, plus the
+/// node budget [`MAX_NODES_PER_TREE`] gives the tree (#901).
+struct Walk<'a> {
+    scope: &'a Scope,
+    /// Nodes still mappable. Decremented on **entry** to every node, so it
+    /// bounds nodes *visited*, and therefore also the depth of this recursion —
+    /// which the wire otherwise bounds only by `MAX_FRAME_LEN`.
+    budget: Cell<usize>,
+    /// Whether anything was dropped, i.e. whether the tree on screen is a
+    /// prefix of the tree the plugin sent. Read once, after the walk.
+    truncated: Cell<bool>,
+}
+
+impl Walk<'_> {
+    /// Spend one node of the budget. `false` once the tree is over
+    /// [`MAX_NODES_PER_TREE`] — from then on every remaining node is dropped and
+    /// the pass is marked truncated.
+    fn charge(&self) -> bool {
+        let left = self.budget.get();
+        if left == 0 {
+            self.truncated.set(true);
+            return false;
+        }
+        self.budget.set(left - 1);
+        true
+    }
+}
 
 /// Map a plugin's whole node tree onto the reconciler's `hytte_ui::Node`,
 /// within `scope` — the namespace its preem renderer instances live in (one per
@@ -17,10 +47,54 @@ use super::preem_render::{self, Scope};
 /// [`map_node`]. Wrapping it is what gives the preem instances a mapping-pass
 /// boundary: the un-id'd node ordinal is reset here, and an instance whose node
 /// disappeared from the tree is dropped when the pass closes.
+///
+/// # The node cap (#901)
+///
+/// It is also the boundary the tree-wide node budget is set at. A render frame
+/// is bounded on the wire only by `MAX_FRAME_LEN` (16 MiB), and the cheapest
+/// node encodes to a handful of bytes, so one legal frame can carry ~a million
+/// nodes — each of which becomes a GTK widget here. [`MAX_NODES_PER_TREE`] caps
+/// that, and **past the cap this keeps the mapped prefix and drops the rest**
+/// rather than refusing the frame.
+///
+/// Truncate rather than reject, for the reason the malformed-`Pixels` arm below
+/// degrades instead of dropping the node: this file's posture is *degrade, don't
+/// blank*. A rejected frame would leave the previous frame on screen (or an
+/// empty region), which on glass is indistinguishable from a hung plugin; a
+/// truncated one shows the plugin's chrome and its first nodes, so what an
+/// operator sees matches the journal line they can go and read. It is also the
+/// stable choice: the walk is deterministic, so the same prefix maps every
+/// frame and the reconciler keeps updating it in place instead of rebuilding.
+///
+/// The cost, stated: a truncated container renders with children missing, which
+/// looks like a rendering bug rather than a cap. That is what the warning is
+/// for — once per plugin tree for the life of the shell, on the same latch as
+/// the preem keying diagnostics (`preem_render`'s `WARNED`), since a tree over
+/// the cap is over it on every frame.
 pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
     preem_render::begin_pass(scope);
-    let mapped = map_node(scope, node);
+    let walk = Walk {
+        scope,
+        budget: Cell::new(MAX_NODES_PER_TREE),
+        truncated: Cell::new(false),
+    };
+    // `None` only if the root itself fell past the cap, which needs a chain of
+    // single-child containers deeper than the budget (a container whose one
+    // mandatory child was dropped is dropped with it). A `Spacer` is the
+    // reconciler's cheapest node and keeps the region non-empty.
+    let mapped = map_node(&walk, node).unwrap_or(UiNode::Spacer);
     preem_render::end_pass(scope);
+
+    if walk.truncated.get() && preem_render::warn_once(scope, Warned::NodeCap) {
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            cap = MAX_NODES_PER_TREE,
+            "plugin render tree exceeds the host's node cap; the nodes up to the cap are \
+             rendered and the rest of the tree is dropped, so this widget is missing children \
+             (further occurrences in this tree are silenced for the rest of this shell run)",
+        );
+    }
     mapped
 }
 
@@ -28,11 +102,20 @@ pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
 /// mirror each other field-for-field (#266), so this is a 1:1 recursion — but it
 /// is written exhaustively so adding a node variant to either side is a compile
 /// error here.
+///
+/// `None` means the node fell past [`MAX_NODES_PER_TREE`] and is dropped: a
+/// child list simply loses it, and a container whose *mandatory* child came back
+/// `None` is dropped in turn (`hytte_ui`'s `Button`/`Revealer`/`Expander` header
+/// are not optional), so the mapped tree is never larger than the budget even
+/// though the budget is charged on entry.
 // One exhaustive arm per node variant — the length is the vocabulary size, not
 // complexity.
 #[allow(clippy::too_many_lines)]
-fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
-    match node {
+fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
+    if !walk.charge() {
+        return None;
+    }
+    let mapped = match node {
         wire::Node::Box {
             id,
             dir,
@@ -48,7 +131,7 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             classes: classes.clone(),
             children: children
                 .iter()
-                .map(|child| map_node(scope, child))
+                .filter_map(|child| map_node(walk, child))
                 .collect(),
         },
         wire::Node::Row {
@@ -60,7 +143,7 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             classes: classes.clone(),
             children: children
                 .iter()
-                .map(|child| map_node(scope, child))
+                .filter_map(|child| map_node(walk, child))
                 .collect(),
         },
         wire::Node::ListBox {
@@ -72,7 +155,7 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             classes: classes.clone(),
             children: children
                 .iter()
-                .map(|child| map_node(scope, child))
+                .filter_map(|child| map_node(walk, child))
                 .collect(),
         },
         wire::Node::Label { id, text, classes } => UiNode::Label {
@@ -157,7 +240,7 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
         wire::Node::Button { id, classes, child } => UiNode::Button {
             id: id.clone(),
             classes: classes.clone(),
-            child: Box::new(map_node(scope, child)),
+            child: Box::new(map_node(walk, child)?),
         },
         wire::Node::Progress {
             id,
@@ -246,7 +329,7 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
             id: id.clone(),
             open: *open,
-            child: Box::new(map_node(scope, child)),
+            child: Box::new(map_node(walk, child)?),
         },
         wire::Node::Separator { classes } => UiNode::Separator {
             classes: classes.clone(),
@@ -260,10 +343,10 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             classes,
         } => UiNode::Expander {
             id: id.clone(),
-            header: Box::new(map_node(scope, header)),
+            header: Box::new(map_node(walk, header)?),
             children: children
                 .iter()
-                .map(|child| map_node(scope, child))
+                .filter_map(|child| map_node(walk, child))
                 .collect(),
             expanded: *expanded,
             classes: classes.clone(),
@@ -319,9 +402,10 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             // one is handled *there*, not here: `map_widget` falls back to a
             // positional key and warns at most once per tree per shell run, so
             // a hand-rolled plugin degrades rather than losing the widget.
-            preem_render::map_widget(scope, id.as_deref(), classes, &widget)
+            preem_render::map_widget(walk.scope, id.as_deref(), classes, &widget)
         }
-    }
+    };
+    Some(mapped)
 }
 
 fn to_ui_dir(dir: wire::Dir) -> UiDir {

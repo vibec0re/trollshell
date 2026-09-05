@@ -109,6 +109,15 @@
 //! never hand-rolls it, and it is **mandatory before any renderer sees a
 //! widget**.
 //!
+//! Every cap in this module bounds **one widget**. The number of widgets is
+//! bounded separately, and not here, because the proto decodes a frame but never
+//! walks one: see [`MAX_PREEM_NODES_PER_TREE`](crate::wire::MAX_PREEM_NODES_PER_TREE)
+//! and [`MAX_NODES_PER_TREE`](crate::wire::MAX_NODES_PER_TREE) in
+//! [`wire`](crate::wire), which the host enforces where it maps the tree
+//! (#901). Those two and these are one bound in two halves: the caps here fix
+//! the size of the largest instance, that one fixes how many of it there can
+//! be, and the host's memory ceiling is the product.
+//!
 //! # Non-finite floats are replaced, not passed through
 //!
 //! Every `f32` in this vocabulary is *sanitised* by [`PreemWidget::clamped`]

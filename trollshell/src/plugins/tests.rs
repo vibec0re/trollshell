@@ -3737,6 +3737,426 @@ fn the_anonymous_preem_warning_survives_an_emptied_scope() {
     preem_render::forget_scope(&scope);
 }
 
+// ── #901: bounds on a render tree ────────────────────────────────────────────
+
+/// A `Box` root carrying `children` id'd `Label`s — a tree of exactly
+/// `1 + children` nodes whose mapped prefix can be read straight off the child
+/// ids, so a truncation test can assert *which* nodes survived and not merely
+/// how many.
+fn label_tree(children: usize) -> wire::Node {
+    wire::Node::Box {
+        id: Some("root".into()),
+        dir: wire::Dir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: (0..children)
+            .map(|i| wire::Node::Label {
+                id: Some(format!("n{i}")),
+                text: String::new(),
+                classes: vec![],
+            })
+            .collect(),
+    }
+}
+
+/// The ids of a mapped [`label_tree`]'s children, in order.
+fn mapped_label_ids(scope: &Scope, node: &wire::Node) -> Vec<String> {
+    match to_ui_node(scope, node) {
+        UiNode::Box { children, .. } => children
+            .into_iter()
+            .map(|child| match child {
+                UiNode::Label { id, .. } => id.expect("the fixture ids every label"),
+                other => panic!("expected a Label child, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected the root Box, got {other:?}"),
+    }
+}
+
+/// **#901's acceptance test for the preem cap.** One more preem node than
+/// [`wire::MAX_PREEM_NODES_PER_TREE`]: the nodes inside the cap get renderer
+/// instances and render, the one past it gets the unknown-widget placeholder,
+/// and the tree hears about it exactly once however many frames it renders.
+///
+/// The cap is on **live instances**, not on nodes seen this pass, so the
+/// surviving prefix is stable: the same 64 nodes keep their instances (and their
+/// animation state) frame after frame rather than being rebuilt as the table
+/// churns. That is what the `builds == 1` and the repeated `instance_count`
+/// assertions below are for.
+///
+/// Serialised on the ink lock like every other preem test — here not for the
+/// accent but for the process-global warning counters, which are read as deltas.
+#[test]
+fn preem_nodes_past_the_instance_cap_render_the_placeholder_and_warn_once() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::instance_cap_warnings();
+    let scope = Scope::detached("preem-instance-cap");
+
+    let ids: Vec<String> = (0..=wire::MAX_PREEM_NODES_PER_TREE)
+        .map(|i| format!("g{i}"))
+        .collect();
+    let row = |n: usize| gauge_row(ids.iter().take(n).map(|id| (Some(id.as_str()), 0.5)));
+    let over = row(wire::MAX_PREEM_NODES_PER_TREE + 1);
+
+    let mapped = mapped_row_pixels(&scope, &over);
+    assert_eq!(
+        mapped.len(),
+        wire::MAX_PREEM_NODES_PER_TREE + 1,
+        "every node still maps to a surface — the cap withholds a renderer, not a widget",
+    );
+    for (i, (width, height, data)) in mapped
+        .iter()
+        .take(wire::MAX_PREEM_NODES_PER_TREE)
+        .enumerate()
+    {
+        assert!(
+            *width > 0 && *height > 0 && !data.is_empty(),
+            "node {i} is inside the cap and must render for real",
+        );
+    }
+    assert_eq!(
+        mapped[wire::MAX_PREEM_NODES_PER_TREE],
+        (0, 0, Vec::new()),
+        "the node past the cap renders the unknown-widget placeholder — the same empty \
+         surface an unrenderable kind degrades to, keeping its id and classes",
+    );
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        wire::MAX_PREEM_NODES_PER_TREE,
+        "…and no instance was created for it: the cap is on renderer instances",
+    );
+    assert_eq!(
+        preem_render::instance_cap_warnings() - base,
+        1,
+        "one node past the cap is one journal line",
+    );
+
+    // Two more frames of the same tree: the prefix keeps its instances (an
+    // over-cap tree must not churn the table), and the line does not repeat.
+    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, &over);
+    assert_eq!(
+        preem_render::instance_cap_warnings() - base,
+        1,
+        "three frames of a tree that is over the cap on every one of them are ONE warning",
+    );
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        wire::MAX_PREEM_NODES_PER_TREE,
+        "and the same prefix holds the instances frame after frame",
+    );
+    assert_eq!(
+        preem_render::probe(&scope, Some("g0")).map(|(builds, _)| builds),
+        Some(1),
+        "an in-cap node is never rebuilt because a sibling fell past the cap",
+    );
+
+    // The off-by-one control, in its own scope so the latch above cannot mask
+    // it: a tree of *exactly* the cap is not over it.
+    let at_cap = Scope::detached("preem-instance-cap-exact");
+    let exact = row(wire::MAX_PREEM_NODES_PER_TREE);
+    let mapped = mapped_row_pixels(&at_cap, &exact);
+    assert!(
+        mapped
+            .iter()
+            .all(|(width, _, data)| *width > 0 && !data.is_empty()),
+        "every node of a tree exactly at the cap renders",
+    );
+    assert_eq!(
+        preem_render::instance_count(&at_cap),
+        wire::MAX_PREEM_NODES_PER_TREE,
+        "…with a full set of instances",
+    );
+    assert_eq!(
+        preem_render::instance_cap_warnings() - base,
+        1,
+        "exactly at the cap is not over it — no second line",
+    );
+
+    preem_render::forget_scope(&scope);
+    preem_render::forget_scope(&at_cap);
+}
+
+/// **#901's acceptance test for the general node cap.** A tree one node past
+/// [`wire::MAX_NODES_PER_TREE`] maps its prefix and drops the rest, with one
+/// warning per tree.
+///
+/// Truncate rather than reject: `wire_map`'s posture is *degrade, don't blank*
+/// (the malformed-`Pixels` arm sets it), and a rejected frame would leave the
+/// previous one on screen, which looks exactly like a hung plugin. The prefix is
+/// asserted by **id**, in order, so this measures "kept the prefix" and not just
+/// "kept some nodes".
+#[test]
+fn a_tree_over_the_node_cap_keeps_its_prefix_and_warns_once() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::node_cap_warnings();
+    let scope = Scope::detached("node-cap-over");
+
+    // Root + MAX children = MAX + 1 nodes: exactly one past the cap.
+    let over = label_tree(wire::MAX_NODES_PER_TREE);
+    let ids = mapped_label_ids(&scope, &over);
+    assert_eq!(
+        ids.len(),
+        wire::MAX_NODES_PER_TREE - 1,
+        "the root spends one node of the budget, so a full tree is the root plus MAX-1 children",
+    );
+    assert_eq!(
+        ids[0], "n0",
+        "what survives is the PREFIX, in traversal order"
+    );
+    assert_eq!(
+        ids[ids.len() - 1],
+        format!("n{}", wire::MAX_NODES_PER_TREE - 2),
+        "…up to the last node the budget paid for",
+    );
+    let dropped = format!("n{}", wire::MAX_NODES_PER_TREE - 1);
+    assert!(
+        !ids.contains(&dropped),
+        "…and the node past the cap is gone, not renumbered or substituted",
+    );
+    assert_eq!(
+        preem_render::node_cap_warnings() - base,
+        1,
+        "an over-cap tree is one journal line",
+    );
+
+    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, &over);
+    assert_eq!(
+        preem_render::node_cap_warnings() - base,
+        1,
+        "three frames of a tree that is over the cap on every one of them are ONE warning — \
+         at 20 Hz a per-frame line would be twenty a second",
+    );
+}
+
+/// The off-by-one guard for [`wire::MAX_NODES_PER_TREE`]: a tree of *exactly*
+/// the cap maps whole and says nothing.
+///
+/// A cap that fires one node early would truncate a legal tree and log a
+/// diagnostic about a plugin that did nothing wrong — and the truncation would
+/// be invisible in the over-cap test above, which cannot tell "dropped the node
+/// past the cap" from "dropped the last two".
+#[test]
+fn a_tree_exactly_at_the_node_cap_is_not_truncated() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::node_cap_warnings();
+    let scope = Scope::detached("node-cap-exact");
+
+    // Root + (MAX - 1) children = exactly MAX nodes.
+    let exact = label_tree(wire::MAX_NODES_PER_TREE - 1);
+    let ids = mapped_label_ids(&scope, &exact);
+    assert_eq!(
+        ids.len(),
+        wire::MAX_NODES_PER_TREE - 1,
+        "every child of a tree exactly at the cap is mapped",
+    );
+    assert_eq!(
+        ids[ids.len() - 1],
+        format!("n{}", wire::MAX_NODES_PER_TREE - 2),
+        "…including the very last one, which is the node the off-by-one would eat",
+    );
+    assert_eq!(
+        preem_render::node_cap_warnings() - base,
+        0,
+        "exactly at the cap is not over it, so there is nothing to say",
+    );
+}
+
+// ── #918: two preem nodes sharing an id ──────────────────────────────────────
+
+/// **#918's acceptance test.** Two gauges in one tree claiming the same `id`
+/// collapse onto one renderer instance — and now say so, once per tree.
+///
+/// The collapse itself is *pinned, not fixed*: the last node rendered wins, so
+/// nothing disappears. Refusing the second node would trade a widget that
+/// jitters for a widget that is missing, which is the worse failure and not what
+/// the issue asks for.
+///
+/// The control pair in a second scope is what makes the equality assertion mean
+/// something: two *distinct* ids with the same two targets, advanced the same
+/// four ticks, render **differently**. Without it "the two frames are equal"
+/// would also pass for two separate instances whose needles simply had not moved
+/// yet.
+#[test]
+fn two_preem_nodes_sharing_an_id_collapse_onto_one_instance_and_warn_once() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::duplicate_id_warnings();
+    let shared = Scope::detached("duplicate-id");
+    let distinct = Scope::detached("duplicate-id-control");
+
+    let clash = gauge_row([(Some("g"), 0.15), (Some("g"), 0.85)]);
+    let control = gauge_row([(Some("a"), 0.15), (Some("b"), 0.85)]);
+    let _ = to_ui_node(&shared, &clash);
+    let _ = to_ui_node(&distinct, &control);
+    assert_eq!(
+        preem_render::duplicate_id_warnings() - base,
+        1,
+        "the pair sharing an id warns once; the control pair does not warn at all",
+    );
+    assert_eq!(
+        preem_render::instance_count(&shared),
+        1,
+        "two nodes, ONE renderer instance — the hazard being diagnosed",
+    );
+    assert_eq!(
+        preem_render::instance_count(&distinct),
+        2,
+        "…where two distinct ids get one each",
+    );
+
+    // Let the needles move, or "the two frames are equal" is vacuous.
+    for _ in 0..4 {
+        assert!(advanced(preem_render::ANIM_STEP_SECS));
+    }
+    let both = mapped_row_pixels(&shared, &clash);
+    let apart = mapped_row_pixels(&distinct, &control);
+    assert_ne!(
+        apart[0], apart[1],
+        "the fixture must actually separate two gauges heading for 0.15 and 0.85",
+    );
+    assert_eq!(
+        both[0], both[1],
+        "…so two nodes rendering the SAME frame is the collapse: one instance, one needle, \
+         dragged between both targets every pass",
+    );
+
+    let _ = to_ui_node(&shared, &clash);
+    let _ = to_ui_node(&shared, &clash);
+    assert_eq!(
+        preem_render::duplicate_id_warnings() - base,
+        1,
+        "and however many frames the tree renders, it is one journal line",
+    );
+
+    preem_render::forget_scope(&shared);
+    preem_render::forget_scope(&distinct);
+}
+
+/// A tree whose preem ids are all distinct never trips #918 — including across
+/// **frames** (a second mapping pass re-touches every key, which is the
+/// multi-monitor path and must not read as a duplicate) and across **trees** (a
+/// plugin's chip and its drawer panel are two scopes, so the same `"cpu"` in
+/// both is fine — the namespace to be unique in is the tree).
+#[test]
+fn a_tree_of_distinct_preem_ids_never_warns() {
+    let _ink = preem_ink_lock();
+    let dup_base = preem_render::duplicate_id_warnings();
+    let anon_base = preem_render::anonymous_warnings();
+    let card = Scope::detached("distinct-ids-card");
+    let panel = Scope::detached("distinct-ids-panel");
+
+    let mixed = wire::Node::Box {
+        id: Some("row".into()),
+        dir: wire::Dir::Horizontal,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            preem_node(
+                Some("cpu"),
+                vocab::PreemWidget::Gauge {
+                    config: vocab::GaugeConfig::default(),
+                    state: vocab::GaugeState { target: 0.4 },
+                },
+            ),
+            preem_node(
+                Some("net"),
+                vocab::PreemWidget::DotMatrix {
+                    config: vocab::DotMatrixConfig::default(),
+                    state: vocab::DotMatrixState { text: "NET".into() },
+                },
+            ),
+            preem_node(
+                Some("clock"),
+                vocab::PreemWidget::SevenSeg {
+                    config: vocab::SevenSegConfig::default(),
+                    state: vocab::SevenSegState {
+                        text: "12:34".into(),
+                    },
+                },
+            ),
+        ],
+    };
+
+    let _ = to_ui_node(&card, &mixed);
+    // A second pass over the same tree — what a second monitor does.
+    let _ = to_ui_node(&card, &mixed);
+    // The same ids in the plugin's *other* tree.
+    let _ = to_ui_node(&panel, &mixed);
+
+    assert_eq!(
+        preem_render::instance_count(&card),
+        3,
+        "three distinct ids, three instances",
+    );
+    assert_eq!(
+        preem_render::duplicate_id_warnings() - dup_base,
+        0,
+        "no id is claimed twice in any one pass, so nothing to warn about — not across \
+         frames, and not across the plugin's two trees",
+    );
+    assert_eq!(
+        preem_render::anonymous_warnings() - anon_base,
+        0,
+        "…and every node is id'd, so #900's latch stays untouched too",
+    );
+
+    preem_render::forget_scope(&card);
+    preem_render::forget_scope(&panel);
+}
+
+/// The one-shot diagnostics are keyed by `(Scope, Warned)`, so claiming one does
+/// not silence another in the same tree: an anonymous node beside a duplicate
+/// pair produces **both** lines, each once.
+///
+/// A single per-scope flag would pass every other test in this file and lose one
+/// of the two diagnostics here — the reason [`preem_render`]'s latch is a set of
+/// `(Scope, Warned)` and not a `bool`.
+#[test]
+fn the_anonymous_and_duplicate_preem_warnings_are_independent() {
+    let _ink = preem_ink_lock();
+    let anon_base = preem_render::anonymous_warnings();
+    let dup_base = preem_render::duplicate_id_warnings();
+    let scope = Scope::detached("anon-beside-duplicate");
+
+    // One anonymous node, then a pair sharing "g": both defects, one tree.
+    let tree = gauge_row([(None, 0.2), (Some("g"), 0.4), (Some("g"), 0.6)]);
+    let _ = to_ui_node(&scope, &tree);
+    assert_eq!(
+        preem_render::anonymous_warnings() - anon_base,
+        1,
+        "the anonymous node warns…",
+    );
+    assert_eq!(
+        preem_render::duplicate_id_warnings() - dup_base,
+        1,
+        "…and so does the duplicate pair, in the very same pass",
+    );
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        2,
+        "three nodes, two instances: the anonymous one at its ordinal slot, and the shared \"g\"",
+    );
+
+    for _ in 0..2 {
+        let _ = to_ui_node(&scope, &tree);
+    }
+    assert_eq!(
+        preem_render::anonymous_warnings() - anon_base,
+        1,
+        "each stays latched on its own key across frames…",
+    );
+    assert_eq!(
+        preem_render::duplicate_id_warnings() - dup_base,
+        1,
+        "…independently of the other",
+    );
+
+    preem_render::forget_scope(&scope);
+}
+
 /// A widget kind this build cannot render degrades to a nothing-rendered
 /// surface that keeps its id and classes — the same posture the malformed-
 /// `Pixels` seam takes — and recovers in place once it becomes renderable.

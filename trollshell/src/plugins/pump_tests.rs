@@ -11,10 +11,12 @@
 //! mailboxes exactly as [`super::super::region::reconcile_region`] would (a
 //! `to_ui_node` mapping pass per plugin, same as a real chip mount), one
 //! carrying an always-scrolling marquee and the other a plain label that can
-//! never animate. Advancing the real animation clock (`preem_render::advance_all`)
-//! and feeding its output straight into `request_preem_repaint` — the actual
-//! function `install_preem_clock` calls every tick — must wake only the
-//! mailbox holding the mover.
+//! never animate. Advancing every live renderer — `preem_render::advance_all`,
+//! which since #897 is the test-only sibling of the per-mount `advance_scopes`
+//! a mount's frame clock actually drives, and takes an explicit `dt` rather than
+//! a frame timestamp — and feeding its output straight into
+//! `request_preem_repaint`, the function every animation tick calls, must wake
+//! only the mailbox holding the mover.
 //!
 //! Everything here is GTK-free (`to_ui_node` only builds `hytte_ui::Node`
 //! data, never a widget), so this runs as a plain hermetic `#[test]`, not a
@@ -132,10 +134,10 @@ fn fixture_handles(
 /// animates) mounted in `bar_left`, `mover` (a scrolling marquee) mounted in
 /// `bar_center` — mapped through [`super::super::wire_map::to_ui_node`]
 /// exactly as [`super::super::region::reconcile_region`] would map a real
-/// chip's tree on join. Advancing the real animation clock reports only
+/// chip's tree on join. Advancing every live renderer reports only
 /// `mover`'s scope as moved; feeding that straight into
-/// [`request_preem_repaint`] — the function `install_preem_clock` calls every
-/// tick — must wake `bar_center`'s subscribers and leave `bar_left`'s alone,
+/// [`request_preem_repaint`] — the function every animation tick calls —
+/// must wake `bar_center`'s subscribers and leave `bar_left`'s alone,
 /// even though `request_preem_repaint` probes *both* mailboxes (it does not
 /// know in advance which region a moved plugin's card lives in).
 ///
@@ -186,8 +188,11 @@ fn an_animating_plugin_does_not_wake_a_static_bar_left_subscriber() {
         Poll::Ready(Some(_))
     ));
 
-    // The real pump tick: advance every live renderer, then fan the result out
-    // exactly as `install_preem_clock`'s callback does.
+    // The tick's own two halves: advance, then fan the result out exactly as
+    // `Animator`'s tick callback does. `advance_all` rather than
+    // `advance_scopes` deliberately — this test is about the *fan-out* given a
+    // moved list, so it wants the sibling that takes a plain `dt` and does not
+    // need a mount's frame-time baseline (#897).
     let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
     assert_eq!(
         moved,

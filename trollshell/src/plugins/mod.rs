@@ -622,12 +622,18 @@ pub fn install() {
         pump::publish_accent(pump::resolve_accent_color());
     });
 
-    // Preem animation clock (#883): the single timer that advances every
-    // shell-side preem renderer (marquee scroll, phosphor decay, needle
-    // physics, flip clocks, peak-hold fall) and asks the affected reconcilers to
-    // re-map. Installed unconditionally — it idles to a couple of enum matches
-    // per tick while no preem widget is on screen.
-    pump::install_preem_clock();
+    // Preem animation (#883, #897) installs **nothing here**, deliberately.
+    //
+    // What used to sit on this line was one 20 Hz `glib::timeout_add_local` that
+    // advanced every shell-side preem renderer (marquee scroll, phosphor decay,
+    // needle physics, flip clocks, peak-hold fall) for the life of the process —
+    // armed unconditionally, never broken, so a session with no plugins at all
+    // still paid 20 timer wakeups a second. Since #897 the animation rides each
+    // *mount's* GTK frame clock instead (`pump::Animator`, armed from
+    // `region.rs`'s mapping passes), which runs it at the display's refresh
+    // while something is moving and costs nothing at all when nothing is — and
+    // nothing when the mount is unmapped either. There is no process-wide clock
+    // left to install, which is the point.
 
     // Monitor-independent preem scope release (#921): forget a departed
     // plugin's renderer instances from a subscriber to the render mailboxes
@@ -636,10 +642,10 @@ pub fn install() {
     // (`Scope::card` / `Scope::panel`, keyed without a connector) is not. With
     // every output unplugged there is no region left to observe the leave, so
     // before this the plugin's instances stayed resident for the session, and
-    // an animating one kept `any_animating()` — the predicate the clock above
-    // gates on, and #897's parking rests on — true forever.
+    // an animating one kept the "still animating" predicate — the one every
+    // mount's frame clock now parks on (#897) — true forever.
     //
-    // Wired here, beside the clock, because this is the one install path that
+    // Wired here because this is the one install path that
     // runs regardless of how many monitors exist (or whether any do). Not
     // `hytte::reactive::bind`: every `bind*` scopes its subscription to a
     // widget's life, which is precisely the monitor-shaped lifetime being fixed

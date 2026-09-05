@@ -25,7 +25,7 @@ use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
 use super::preem_render::{self, Scope};
 use super::pump::{
     any_sidebar_open, apply_forget, apply_open, request_remap, request_remap_holding,
-    tint_in_process_surfaces, to_now_playing, to_upcoming_events,
+    tick_decision, tint_in_process_surfaces, to_now_playing, to_upcoming_events,
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
@@ -5161,6 +5161,412 @@ fn advance_all_names_only_the_scopes_that_moved() {
         moved[0].plugin_id(),
         "scroller",
         "and the fan-out must be able to read the plugin id back off it",
+    );
+}
+
+// ── #897: the per-mount frame-clock tick decision ────────────────────────────
+
+/// A scrolling marquee node in the fixture the tick tests share, at `speed`
+/// dots per second.
+///
+/// One shape for all of them so the kit oracle below describes every case: the
+/// only thing that varies between the tests is *when* the ticks arrive.
+fn tick_marquee(speed: f32) -> wire::Node {
+    preem_node(
+        Some("mq"),
+        vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                window_px: 192,
+                gap_dots: 6,
+                speed_dots_per_sec: speed,
+            },
+            state: vocab::MarqueeState {
+                text: "A LONG SCROLLING MESSAGE".into(),
+            },
+        },
+    )
+}
+
+/// The kit's own strip for [`tick_marquee`], so an offset assertion reads
+/// "the strip windowed at N dots" rather than "some pixels".
+fn tick_marquee_oracle() -> kit::MarqueeStrip {
+    kit::Marquee::new(kit::DisplayStyle::Vfd)
+        .window_px(192)
+        .gap_dots(6)
+        .render("A LONG SCROLLING MESSAGE")
+}
+
+/// One animation step in microseconds — the unit the frame-time tests count in.
+///
+/// Derived from the clamp rather than spelled again, and
+/// `the_tick_dt_clamp_is_the_resume_cap` pins the clamp itself against
+/// `ANIM_STEP_SECS`, so a change to either constant reaches every test below.
+fn step_us() -> i64 {
+    preem_render::MAX_TICK_DT_US / i64::from(preem_render::MAX_CATCHUP_STEPS)
+}
+
+/// The dt clamp is **`ANIM_STEP_SECS` × `MAX_CATCHUP_STEPS`** — the resume cap,
+/// not one step.
+///
+/// Its own test because the three constants live apart and are spelled in
+/// different units (`MAX_TICK_DT_US` is an `i64` of microseconds,
+/// `ANIM_STEP_SECS` an `f32` of seconds, `MAX_CATCHUP_STEPS` a `u32` of steps),
+/// and because #897's park-resume argument is stated in *steps* while the code
+/// clamps in *microseconds*.
+///
+/// The first cut of #897 clamped at one step, which is why this is worth a test
+/// rather than a comment: at one step the clamp stops being a catch-up bound and
+/// becomes a **rate** bound, silently slowing every animation under any clock
+/// below 20 Hz — the regression
+/// `a_frame_clock_slower_than_the_step_rate_still_runs_at_the_right_speed`
+/// exists to catch, and which this pins the constant for.
+#[test]
+fn the_tick_dt_clamp_is_the_resume_cap() {
+    assert_eq!(
+        preem_render::MAX_CATCHUP_STEPS,
+        8,
+        "the resume cap must still be the eight steps #897's body asked to keep",
+    );
+    // With the step count pinned above, this is the cap expressed from the other
+    // two constants, in the unit the clamp is spelled in.
+    let cap_us = f64::from(preem_render::ANIM_STEP_SECS) * 8.0 * 1_000_000.0;
+    assert!(
+        (cap_us - 400_000.0).abs() < 1.0,
+        "`ANIM_STEP_SECS` × 8 must be 400 ms — it is {cap_us} µs",
+    );
+    assert_eq!(
+        preem_render::MAX_TICK_DT_US,
+        400_000,
+        "…and the frame-clock dt clamp must be exactly that, not one step: at one step the \
+         clamp stops bounding catch-up and starts bounding the *rate*",
+    );
+    assert_eq!(step_us(), 50_000, "…so one step is 50 ms");
+}
+
+/// A tick that finds every widget in its mount settled says **stop**, and a
+/// state change on a settled instance says **go** again.
+///
+/// The two halves of #897's park, and the pair the old timer could not be
+/// tested on at all: `install_preem_clock` was armed once and never broke, so
+/// there was no decision to assert. `tick_decision` is that decision, lifted out
+/// of the GTK closure so it can be driven with no main loop, no display and no
+/// registered `PluginHandles`.
+///
+/// The re-animating edge is deliberately a **state** change on a *live* gauge
+/// (a new target for the same config), not a config change that would rebuild
+/// the instance: "a state change that gives a settled widget somewhere to go" is
+/// the case #897 names as the only way an instance can start animating, and a
+/// rebuild would pass even if `any_animating_in` were asking about the wrong
+/// scope set.
+#[test]
+fn a_settled_mount_stops_ticking_and_a_state_change_starts_it_again() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::card("tick-park");
+    let gauge = |target: f32| {
+        preem_node(
+            Some("g"),
+            vocab::PreemWidget::Gauge {
+                config: vocab::GaugeConfig::default(),
+                state: vocab::GaugeState { target },
+            },
+        )
+    };
+    let mine = [scope.clone()];
+
+    let _ = to_ui_node(&scope, &gauge(0.9));
+    assert!(
+        tick_decision(&mine, 1_000_000).keep_going,
+        "a needle heading for a new target must keep its mount's clock armed",
+    );
+
+    // Run the spring out. `advance_all` rather than a tick, so the settling is
+    // not itself an assertion about the clamp being tested next door.
+    let mut spent = 0;
+    while preem_render::any_animating() && spent < 4096 {
+        let _ = advanced(preem_render::ANIM_STEP_SECS);
+        spent += 1;
+    }
+    assert!(spent < 4096, "the needle must actually settle");
+
+    let settled = tick_decision(&mine, 2_000_000);
+    assert!(
+        settled.moved.is_empty(),
+        "a settled mount's tick must move nothing",
+    );
+    assert!(
+        !settled.keep_going,
+        "…and must break the tick callback rather than ask for another frame — this is the \
+         park, and there is nothing else in #897 that stops the wakeups",
+    );
+
+    // The state change. Same config, new target: `apply`, not `build`.
+    let _ = to_ui_node(&scope, &gauge(0.1));
+    assert!(
+        tick_decision(&mine, 3_000_000).keep_going,
+        "a new target on a settled needle must re-arm the mount — this is what the mapping \
+         pass's `ensure_armed` is reading, and a mount that never re-arms freezes every preem \
+         animation for the session with CI still green",
+    );
+}
+
+/// A tick only advances the scopes **its own mount** names.
+///
+/// The narrowing the old global `advance_all` did not do, and the reason a
+/// settled bar region can park while an open drawer's gauge still swings.
+#[test]
+fn a_tick_leaves_scopes_its_mount_does_not_name_alone() {
+    let _ink = preem_ink_lock();
+    let mine = Scope::card("tick-mine");
+    let theirs = Scope::card("tick-theirs");
+    let node = tick_marquee(20.0);
+    let _ = to_ui_node(&mine, &node);
+    let _ = to_ui_node(&theirs, &node);
+
+    let only_mine = [mine.clone()];
+    // Baseline tick, then a full step.
+    let _ = tick_decision(&only_mine, 0);
+    let moved = tick_decision(&only_mine, step_us()).moved;
+    assert_eq!(
+        moved,
+        vec![mine.clone()],
+        "only the mount's own scope may be advanced or named",
+    );
+
+    let oracle = tick_marquee_oracle();
+    assert_eq!(
+        mapped_pixels(&mine, &node),
+        kit_pixels(&oracle.window(1)),
+        "the named scope scrolled its one dot",
+    );
+    assert_eq!(
+        mapped_pixels(&theirs, &node),
+        kit_pixels(&oracle.window(0)),
+        "…and the other mount's scope did not move at all",
+    );
+}
+
+/// A tick arriving after a long gap — a resume from suspend, or the first frame
+/// after a park — advances at most the **resume cap**, not the gap.
+///
+/// The `dt` clamp, and the reason `ScopeState::last_advance_us` is deliberately
+/// *not* reset when a mount re-arms: the clamp already bounds the parked
+/// interval, and not resetting is what keeps a second mount from stomping the
+/// baseline of a scope the first one is already driving.
+///
+/// Five seconds at 20 dots/s is 100 whole dots; the cap is 400 ms, so 8. The
+/// fixture's period is asserted to be longer than both so the two cannot alias
+/// onto the same window.
+#[test]
+fn a_tick_after_a_long_gap_advances_the_resume_cap_not_the_gap() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::card("tick-stall");
+    let node = tick_marquee(20.0);
+    let _ = to_ui_node(&scope, &node);
+    let oracle = tick_marquee_oracle();
+    assert!(
+        oracle.scrolls() && oracle.period() > 100,
+        "the fixture must be longer than the unclamped 100-dot answer, or the clamp is \
+         asserted against a wrapped-around alias of itself",
+    );
+    let mine = [scope.clone()];
+
+    // The first tick of a scope has no baseline: it stamps and advances nothing,
+    // which is one dropped frame at the start of a motion and no jump.
+    let first = tick_decision(&mine, 10_000_000);
+    assert!(
+        first.moved.is_empty(),
+        "the first tick must only stamp the baseline",
+    );
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(0)),
+        "…so nothing has scrolled yet",
+    );
+
+    // Five seconds later.
+    let moved = tick_decision(&mine, 15_000_000).moved;
+    assert_eq!(
+        moved,
+        vec![scope.clone()],
+        "the stalled tick still moves it"
+    );
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(8)),
+        "a five-second gap must be worth the 400 ms resume cap — 8 dots — not the 100 it \
+         really spanned: a resume from suspend (or a re-arm minutes after a park) catches up \
+         a bounded amount and moves on",
+    );
+}
+
+/// A frame clock **slower than one animation step** still runs animation at the
+/// right speed.
+///
+/// The regression the #926 review found in #897's first cut, and the reason the
+/// clamp is the resume cap rather than one step. A clamp at 50 ms does not only
+/// bound catch-up — it truncates *every* frame interval longer than itself, so a
+/// sustained sub-20-Hz clock runs everything slow with no diagnostic. Measured
+/// then: a 15 Hz clock advanced a 20 dots/s marquee 15 dots in a second instead
+/// of 20, a silent 25 % rate error.
+///
+/// It is not a corner. #897's own cost note says the shell rasterises on the CPU
+/// per tick per animating widget, so enough widgets push the frame clock below
+/// 20 Hz — and then phosphor fade length, needle settle time and marquee speed
+/// all drift together.
+///
+/// Ten frames of 100 000 µs is **exactly** one second, and every interval is
+/// well under the 400 ms cap, so nothing may be truncated. 10 Hz rather than the
+/// 15 Hz the review measured only because 15 divides a second into a repeating
+/// fraction: 15 × 66 666 µs is 999 990 µs, which floors to 19 dots and would
+/// make the assertion argue with `dots()`'s rounding instead of with the clamp.
+/// A compositor throttling an occluded surface to 10 Hz is the same case, harder.
+#[test]
+fn a_frame_clock_slower_than_the_step_rate_still_runs_at_the_right_speed() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::card("tick-slow-clock");
+    let node = tick_marquee(20.0);
+    let _ = to_ui_node(&scope, &node);
+    let oracle = tick_marquee_oracle();
+    assert!(
+        oracle.period() > 20,
+        "the fixture must be longer than a second's worth of scroll",
+    );
+    let mine = [scope.clone()];
+
+    // The baseline tick, then ten frames at 10 Hz — each one twice the step.
+    let frame_us = 100_000;
+    assert!(
+        frame_us > step_us() && frame_us < preem_render::MAX_TICK_DT_US,
+        "the fixture's frame must be longer than one step (or the old clamp would not have \
+         truncated it) and shorter than the resume cap (or the new one would)",
+    );
+    let _ = tick_decision(&mine, 0);
+    for frame in 1..=10 {
+        let _ = tick_decision(&mine, frame * frame_us);
+    }
+
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(20)),
+        "one second at 20 dots/s is 20 dots at ANY refresh rate: a clamp of one step would \
+         have truncated each 100 ms frame to 50 ms and landed on 10 — a sustained slowdown \
+         no other test would see, because every frame here is a perfectly ordinary one",
+    );
+}
+
+/// One scope shown by **two mounts** advances once per unit of real time, not
+/// once per mount per frame.
+///
+/// The double-mount rule. `Scope::card` is keyed by plugin and tree, never by
+/// output, so the same chip on two monitors' bars is one set of renderer
+/// instances driven by two frame clocks — and a `dt` measured per *mount* would
+/// run every animation on a two-monitor desk at 2× speed, which is the exact
+/// hazard the old single global timer existed to avoid. `advance_scopes` takes a
+/// frame *timestamp* and each scope measures from its own last advance, so the
+/// second mount's tick is worth only the real time since the first one's.
+///
+/// Driven at the nastiest phase rather than the easiest: the two clocks are
+/// interleaved half a frame apart, so neither "same `frame_time` twice" nor
+/// "whole steps each time" could carry the test.
+#[test]
+fn two_mounts_showing_one_scope_advance_it_once_per_frame() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::card("tick-shared");
+    let node = tick_marquee(20.0);
+    let _ = to_ui_node(&scope, &node);
+    let oracle = tick_marquee_oracle();
+    // Two mounts — say the same chip in two monitors' bar-left regions — each
+    // naming the one shared scope, exactly as `Animator`'s scopes closure would.
+    let mount_a = [scope.clone()];
+    let mount_b = [scope.clone()];
+
+    // 100 ms of wall clock, five ticks shared between them, alternating 25 ms
+    // apart: two 40 Hz-equivalent clocks half a frame out of phase, so no single
+    // tick is a whole step and no two ticks share a `frame_time`.
+    let step = step_us();
+    for frame in 0..5 {
+        let mount = if frame % 2 == 0 { &mount_a } else { &mount_b };
+        let _ = tick_decision(mount, frame * step / 2);
+    }
+
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(2)),
+        "100 ms at 20 dots/s is 2 dots however many mounts are watching: a per-mount `dt` \
+         would have advanced it 4 (each tick a full 25 ms from its own mount's last), and a \
+         `frame_time`-equality dedup would have advanced it 0 for the second mount and 4 for \
+         the first, because two monitors' clocks share a time base but not a phase",
+    );
+
+    // …and it is not that motion stopped: the same scope keeps moving on the
+    // next pair of ticks.
+    let _ = tick_decision(&mount_b, 5 * step / 2);
+    let _ = tick_decision(&mount_a, 3 * step);
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(3)),
+        "150 ms is 3 dots — the rate is right, not merely slow",
+    );
+}
+
+/// A tick worth **no elapsed time** reports no motion, for a gauge as well as
+/// for a marquee.
+///
+/// Two ticks carry `dt == 0` on the production path, and both are ordinary:
+/// every scope's **first** tick (the `None` branch of `last_advance_us`, which
+/// stamps a baseline and nothing else) and the **second mount** of a pair whose
+/// clocks happen to be in phase, handing the same `frame_time` twice.
+///
+/// `LedStrip` and `Marquee` compare before against after and `Scope` counts
+/// whole steps, so all three answered correctly already. `Gauge` and `FlipBoard`
+/// took the kit's `advance(dt)` — which itself early-returns on a `dt` that
+/// cannot move anything — and then reported `true` regardless (#926 review L-2,
+/// probes P2/P4). That drops the instance's cached frame and fans a
+/// `request_preem_repaint` out for a **byte-identical** frame, on every mount, on
+/// every such tick: L-3 measured 6 fan-outs where 3 were owed.
+#[test]
+fn a_tick_worth_no_elapsed_time_reports_no_motion() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::card("tick-zero-dt");
+    let gauge = preem_node(
+        Some("g"),
+        vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig::default(),
+            state: vocab::GaugeState { target: 0.9 },
+        },
+    );
+    let _ = to_ui_node(&scope, &gauge);
+    let mine = [scope.clone()];
+    assert!(
+        preem_render::any_animating(),
+        "the fixture must be a needle actually heading somewhere, or every assertion below \
+         passes for the settled reason instead of the dt one",
+    );
+
+    let first = tick_decision(&mine, 7_000_000);
+    assert!(
+        first.moved.is_empty(),
+        "a scope's first tick has no baseline and so advances nothing — it must not report a \
+         repaint for a frame it did not change",
+    );
+    assert!(
+        first.keep_going,
+        "…and must still ask for the next frame, or a gauge would park on its own first tick",
+    );
+
+    // Two mounts, one in-phase `frame_time`: the first advances, the second is
+    // worth nothing.
+    let moved = tick_decision(&mine, 7_000_000 + step_us()).moved;
+    assert_eq!(
+        moved,
+        vec![scope.clone()],
+        "the frame that really elapsed must move the needle",
+    );
+    assert!(
+        tick_decision(&mine, 7_000_000 + step_us()).moved.is_empty(),
+        "a second mount handing the same `frame_time` must not fan a second repaint out for \
+         the identical frame",
     );
 }
 

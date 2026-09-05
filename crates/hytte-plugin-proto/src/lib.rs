@@ -223,7 +223,10 @@ pub use state::{
     UpcomingEvent,
 };
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
-pub use wire::{Cls, Dir, EventKind, Node, NodeId};
+pub use wire::{
+    Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
+    Node, NodeId, SliderFloats, sane_fraction, sane_slider_floats,
+};
 
 #[cfg(feature = "tokio")]
 pub use codec::{read_frame, write_frame};

@@ -660,6 +660,84 @@ fn pixels_scale_is_clamped_at_the_host_seam() {
     assert_eq!(ui_scale(&node(u32::MAX)), 16_384);
 }
 
+/// #904: the `Progress`/`Slider` arms cross the same trust boundary as
+/// `Pixels`, and a non-finite `f64` on either is worse than a bad buffer —
+/// `gtk_progress_bar_set_fraction` stores a `NaN` verbatim and
+/// `gtk::Adjustment::new` returns NULL for a degenerate range, which the gtk4
+/// binding turns into a debug-build panic. The arms therefore run the proto's
+/// sanitiser (`wire::sane_fraction` / `wire::sane_slider_floats`), and a
+/// sanitised node compares equal to itself so the reconciler's diff can
+/// short-circuit again.
+#[test]
+fn progress_and_slider_floats_are_sanitised_at_the_host_seam() {
+    let scope = Scope::detached("floats");
+    let progress = |fraction: f64| wire::Node::Progress {
+        id: Some("bar".into()),
+        fraction,
+        classes: vec![],
+    };
+    let ui_fraction = |n: &wire::Node| match to_ui_node(&scope, n) {
+        UiNode::Progress { fraction, .. } => fraction,
+        other => panic!("expected Progress, got {other:?}"),
+    };
+    assert_eq!(
+        ui_fraction(&progress(f64::NAN)).to_bits(),
+        0.0_f64.to_bits(),
+        "a NaN fraction must never reach gtk::ProgressBar"
+    );
+    assert_eq!(
+        ui_fraction(&progress(f64::INFINITY)).to_bits(),
+        1.0_f64.to_bits()
+    );
+    assert_eq!(ui_fraction(&progress(2.5)).to_bits(), 1.0_f64.to_bits());
+    assert_eq!(
+        ui_fraction(&progress(0.42)).to_bits(),
+        0.42_f64.to_bits(),
+        "a legal fraction passes through untouched"
+    );
+
+    // The inverted range is the crashing case, not merely the churning one.
+    let slider = |min: f64, max: f64, value: f64, step: f64| wire::Node::Slider {
+        id: "sld".into(),
+        min,
+        max,
+        value,
+        step,
+        enabled: true,
+        classes: vec![],
+    };
+    let mapped = to_ui_node(&scope, &slider(10.0, 5.0, f64::NAN, 0.0));
+    let UiNode::Slider {
+        min,
+        max,
+        value,
+        step,
+        ..
+    } = mapped
+    else {
+        panic!("expected Slider")
+    };
+    assert_eq!(min.to_bits(), 0.0_f64.to_bits(), "min: got {min}");
+    assert_eq!(max.to_bits(), 1.0_f64.to_bits(), "max: got {max}");
+    assert_eq!(value.to_bits(), 0.0_f64.to_bits(), "value: got {value}");
+    assert_eq!(step.to_bits(), 0.01_f64.to_bits(), "step: got {step}");
+
+    // A legal slider is left exactly alone, so the seam costs nothing normal.
+    let legal = slider(0.0, 1.0, 0.3, 0.1);
+    assert_eq!(
+        to_ui_node(&scope, &legal),
+        UiNode::Slider {
+            id: "sld".into(),
+            min: 0.0,
+            max: 1.0,
+            value: 0.3,
+            step: 0.1,
+            enabled: true,
+            classes: vec![],
+        }
+    );
+}
+
 /// #277 (preserved under the region model): a plugin's back-to-back frames
 /// coalesce its region card latest-wins, but a one-shot effect bundled on the
 /// superseded frame rides the dedicated **global** non-lossy channel and is

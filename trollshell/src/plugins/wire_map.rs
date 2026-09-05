@@ -163,11 +163,40 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             id,
             fraction,
             classes,
-        } => UiNode::Progress {
-            id: id.clone(),
-            fraction: *fraction,
-            classes: classes.clone(),
-        },
+        } => {
+            // The float seam for this arm (#904), the `f64` analogue of the
+            // `Preem` arm's mandatory `clamp_in_place` below: a `NaN` here is
+            // stored verbatim by `gtk_progress_bar_set_fraction` and then cast
+            // into an `int` allocation width. Mapping runs once per monitor per
+            // frame, so the per-field form is used rather than cloning the node
+            // to call `wire::Node::clamp_in_place` — the two share one
+            // implementation, so they cannot drift. The SDK sanitises the same
+            // tree before sending it; this is the host's own defence, since an
+            // SDK-built plugin is not the only thing that can dial the socket,
+            // and it is free because the sanitiser is a fixpoint.
+            let sane = wire::sane_fraction(*fraction);
+            // Warned, not silent: the same trust-boundary treatment the `Pixels`
+            // arm above gives a malformed buffer, for the same reason — the host
+            // is the layer with `tracing`, and a rewritten value is precisely
+            // what a plugin author needs told. Compared by bit pattern so the
+            // `-0.0` the sanitiser deliberately preserves is not reported as a
+            // change. Like the `Pixels` warns this fires per mapping pass rather
+            // than once; the host keeps no per-node state to remember it in, and
+            // inventing some for a log line is not worth it.
+            if sane.to_bits() != fraction.to_bits() {
+                tracing::warn!(
+                    node = ?id,
+                    fraction = *fraction,
+                    sanitised = sane,
+                    "plugin Progress fraction is non-finite or outside 0.0..=1.0; sanitised"
+                );
+            }
+            UiNode::Progress {
+                id: id.clone(),
+                fraction: sane,
+                classes: classes.clone(),
+            }
+        }
         wire::Node::Slider {
             id,
             min,
@@ -176,15 +205,44 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
             step,
             enabled,
             classes,
-        } => UiNode::Slider {
-            id: id.clone(),
-            min: *min,
-            max: *max,
-            value: *value,
-            step: *step,
-            enabled: *enabled,
-            classes: classes.clone(),
-        },
+        } => {
+            // Same seam (#904). This one is not merely dedup hygiene: a
+            // degenerate range reaches `gtk::Adjustment::new`, whose
+            // `lower + page_size <= upper` guard returns NULL for `max < min`
+            // or a `NaN` end — a null the gtk4 binding then wraps, which is a
+            // debug-build panic and release-build UB in the shell.
+            let sane = wire::sane_slider_floats(*min, *max, *value, *step);
+            // Warned on the same terms as the `Progress` arm above — and this
+            // one replaces the plugin's stated *scale*, which is the thing its
+            // UI is about, so staying silent would be worse here than there.
+            if sane.min.to_bits() != min.to_bits()
+                || sane.max.to_bits() != max.to_bits()
+                || sane.value.to_bits() != value.to_bits()
+                || sane.step.to_bits() != step.to_bits()
+            {
+                tracing::warn!(
+                    node = %id,
+                    min = *min,
+                    max = *max,
+                    value = *value,
+                    step = *step,
+                    sane_min = sane.min,
+                    sane_max = sane.max,
+                    sane_value = sane.value,
+                    sane_step = sane.step,
+                    "plugin Slider floats are non-finite or out of range; sanitised"
+                );
+            }
+            UiNode::Slider {
+                id: id.clone(),
+                min: sane.min,
+                max: sane.max,
+                value: sane.value,
+                step: sane.step,
+                enabled: *enabled,
+                classes: classes.clone(),
+            }
+        }
         wire::Node::Revealer { id, open, child } => UiNode::Revealer {
             id: id.clone(),
             open: *open,

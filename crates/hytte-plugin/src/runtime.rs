@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use crate::{Input, Plugin};
+use crate::{Input, Plugin, View};
 
 /// Reconnect backoff bounds: start small, cap so we never hammer the socket.
 const BACKOFF_BASE: Duration = Duration::from_millis(100);
@@ -33,6 +33,37 @@ const IMMEDIATE_FAILURE: Duration = Duration::from_secs(2);
 /// wire-vocabulary skew), so an otherwise near-silent 5 s crash-loop leaves a
 /// trace a human can act on.
 const SKEW_WARN_AFTER: u32 = 3;
+
+/// Sanitise every float a view carries, before it is compared **or** encoded
+/// (#904).
+///
+/// The SDK half of the wire's float seam. [`Node`](hytte_plugin_proto::Node)
+/// derives `PartialEq` and [`session`]'s dedup is `view != last_view`, so a
+/// single `NaN` in a `Progress`/`Slider` float makes a view unequal to an
+/// identical copy of itself: the compare stays true forever and the plugin
+/// emits one `Render` per inbound event for a picture that never changes,
+/// bounded above only by [`VIEW_MIN_INTERVAL`]'s ~30 fps cap. `NaN != NaN` is
+/// the whole mechanism.
+///
+/// Running it here — once per view, **before** the compare — closes both ends
+/// at once: the compare becomes reflexive, *and* every frame that reaches the
+/// wire carries finite floats, so a host in any language is handed values its
+/// drawing code can actually use. The host still re-sanitises what it receives
+/// (`trollshell`'s `wire_map`), because an SDK-built plugin is not the only
+/// thing that can dial the socket; applying it twice is harmless precisely
+/// because [`Node::clamp_in_place`](hytte_plugin_proto::Node::clamp_in_place)
+/// is a **fixpoint** — the second pass moves nothing, so the host's own gates
+/// cannot fire a frame late.
+///
+/// The per-field mapping — what each `NaN` / `±inf` / out-of-range value
+/// becomes, and the GTK line every row was derived from — is contract, and
+/// lives on `Node::clamp_in_place`.
+fn sanitise_view(view: &mut View) {
+    view.tree.clamp_in_place();
+    if let Some(panel) = view.panel.as_mut() {
+        panel.clamp_in_place();
+    }
+}
 
 /// Minimum interval between full `view()` recomputation + dedup + `write_frame`
 /// passes in the session loop (~33 ms ≈ 30 Hz), the SDK-wide view-rate cap
@@ -216,6 +247,10 @@ where
     // mounts before the first state snapshot lands.
     let mut model = P::init(cmd_tx);
     let mut last_view = model.view();
+    // #904: the seed view is sanitised like every later one — it is both the
+    // first frame on the wire and the baseline every later dedup compares
+    // against, so a `NaN` here would poison both at once.
+    sanitise_view(&mut last_view);
     write_frame(
         &mut wr,
         &PluginMsg::Render {
@@ -381,7 +416,11 @@ where
             Step::Update(input) => model.update(input),
             Step::Rerender | Step::Flush => Vec::new(),
         };
-        let view = model.view();
+        let mut view = model.view();
+        // #904: sanitise before the compare, never after it. A non-finite float
+        // defeats the compare *itself* (`NaN != NaN`), so clamping afterwards
+        // would fix the frame's contents but not the render storm sending it.
+        sanitise_view(&mut view);
         // Dedup is unchanged: the whole `View` compares at once, so a panel
         // change while the chip tree is unchanged (the common case) still counts.
         let changed = view != last_view;
@@ -988,6 +1027,48 @@ mod tests {
 
     // ── Host-side helpers ────────────────────────────────────────────────────
 
+    /// #904: a plugin whose view is **constant** but poisoned — a `NaN`
+    /// `fraction` in the chip's `Progress`, and an inverted range with a `NaN`
+    /// value and a zero step in the panel's `Slider`. Constant, so every
+    /// re-render produces a view that *should* dedup; poisoned, so it only
+    /// does once the SDK sanitises before the compare, since `NaN != NaN`
+    /// defeats the derived `PartialEq` otherwise.
+    struct Poisoned;
+
+    impl Plugin for Poisoned {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("poisoned-test", Mount::SidebarTop)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self
+        }
+
+        fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            View::new(Node::Progress {
+                id: Some("bar".to_owned()),
+                fraction: f64::NAN,
+                classes: Vec::new(),
+            })
+            .panel(Node::Slider {
+                id: "sld".to_owned(),
+                min: 10.0,
+                max: 5.0,
+                value: f64::NAN,
+                step: 0.0,
+                enabled: true,
+                classes: Vec::new(),
+            })
+        }
+    }
+
     fn snapshot(iso: &str) -> HostMsg {
         HostMsg::StateSnapshot {
             snapshot: StateSnapshot {
@@ -1089,6 +1170,98 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+    }
+
+    /// #904, the SDK half. A **constant** view carrying non-finite floats is
+    /// sanitised before the dedup compare, so the plugin emits exactly one
+    /// `Render` (the seed) however many events arrive — and that one frame puts
+    /// only finite floats on the wire.
+    ///
+    /// Both halves are load-bearing. Without the sanitise at the dedup site the
+    /// `NaN` fraction keeps `view != last_view` true forever, so each of the
+    /// three snapshots below emits a `Render` and the `Pong` barrier is never
+    /// the next frame; without it at the seed site the first assertions fail
+    /// instead, because the poison rides the wire.
+    #[tokio::test]
+    async fn a_poisoned_view_is_sanitised_before_the_dedup_and_renders_once() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let PluginMsg::Register { manifest } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            assert_eq!(manifest.id, "poisoned-test");
+            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("second frame must be the greeting Log");
+            };
+            let PluginMsg::Render { tree, panel, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("third frame must be the seed Render");
+            };
+
+            // The wire carries the mapping's documented images, not the poison
+            // the plugin authored — chip tree and panel tree alike.
+            let Node::Progress { fraction, .. } = tree else {
+                panic!("the seed chip must be a Progress")
+            };
+            assert_eq!(
+                fraction.to_bits(),
+                0.0_f64.to_bits(),
+                "a NaN fraction reached the wire"
+            );
+            let Some(Node::Slider {
+                min,
+                max,
+                value,
+                step,
+                ..
+            }) = panel
+            else {
+                panic!("the seed panel must be a Slider")
+            };
+            assert_eq!(
+                min.to_bits(),
+                0.0_f64.to_bits(),
+                "a degenerate min reached the wire"
+            );
+            assert_eq!(
+                max.to_bits(),
+                1.0_f64.to_bits(),
+                "a degenerate max reached the wire"
+            );
+            assert_eq!(
+                value.to_bits(),
+                0.0_f64.to_bits(),
+                "a NaN value reached the wire"
+            );
+            assert_eq!(
+                step.to_bits(),
+                0.01_f64.to_bits(),
+                "a zero step reached the wire"
+            );
+
+            // Three inbound events, none of which changes the model. Each drives
+            // a full update → view → dedup pass, and a sanitised view compares
+            // equal to the last one, so none may produce a Render. The Ping is
+            // the sync barrier: the very next frame must be its Pong.
+            send(&mut hwr, &snapshot("10:00")).await;
+            send(&mut hwr, &snapshot("10:01")).await;
+            send(&mut hwr, &snapshot("10:02")).await;
+            send(&mut hwr, &HostMsg::Ping { seq: 9 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 9 }
+                ),
+                "a poisoned-but-unchanged view must dedup (Pong, not Render, follows)"
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Poisoned, _, _>(prd, pwr), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 

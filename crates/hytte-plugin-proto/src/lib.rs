@@ -215,7 +215,7 @@ pub use preem::{
     MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SUBDIVISIONS, MAX_SWEEP_DEG, MAX_TEXT_COLS,
     MAX_TEXT_LEN, MAX_TEXT_LINES, MIN_DAMPING, MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ,
     MIN_SWEEP_DEG, MarqueeConfig, MarqueeState, Mechanism, PREEM_VOCAB, PeakHoldConfig,
-    PreemWidget, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef,
+    PreemWidget, Rgba, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef,
     TextBoxConfig, TextBoxState, TextBoxWidth, preem, preem_id, preem_styled,
 };
 pub use state::{

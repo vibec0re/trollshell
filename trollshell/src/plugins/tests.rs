@@ -2796,6 +2796,52 @@ fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
     }
 }
 
+/// A horizontal row of **same-config** gauges — the interchangeable-sibling
+/// shape #900 is about, where nothing but the node key can tell two widgets
+/// apart. `None` for an id spells the anonymous fallback.
+fn gauge_row<'a>(gauges: impl IntoIterator<Item = (Option<&'a str>, f32)>) -> wire::Node {
+    wire::Node::Box {
+        id: Some("row".into()),
+        dir: wire::Dir::Horizontal,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: gauges
+            .into_iter()
+            .map(|(id, target)| {
+                preem_node(
+                    id,
+                    vocab::PreemWidget::Gauge {
+                        config: vocab::GaugeConfig::default(),
+                        state: vocab::GaugeState { target },
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The `(width, height, data)` of each `Pixels` child of a mapped row, in order
+/// — how the sibling-keying tests read one node's frame out of a multi-node
+/// render.
+fn mapped_row_pixels(scope: &Scope, node: &wire::Node) -> Vec<(u32, u32, Vec<u8>)> {
+    match to_ui_node(scope, node) {
+        UiNode::Box { children, .. } => children
+            .into_iter()
+            .map(|child| match child {
+                UiNode::Pixels {
+                    width,
+                    height,
+                    data,
+                    ..
+                } => (width, height, data),
+                other => panic!("a preem child must map to Pixels, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected the row's Box, got {other:?}"),
+    }
+}
+
 /// A kit frame in the same `(w, h, bytes)` shape [`mapped_pixels`] returns — the
 /// parity oracle's side of every comparison below.
 fn kit_pixels(frame: &kit::Frame) -> (u32, u32, Vec<u8>) {
@@ -3399,9 +3445,11 @@ fn instances_are_swept_when_their_node_leaves_the_tree() {
     );
 }
 
-/// Lifecycle: a preem node with no `id` is keyed by its ordinal among the
-/// tree's preem nodes, so it still animates across frames — and the ordinal is
-/// reset per mapping pass rather than climbing forever.
+/// Lifecycle: a preem node with no `id` still **renders** — #900 requires the id
+/// but the host degrades rather than dropping the widget, so a hand-rolled
+/// plugin keeps working. It is keyed by its ordinal among the tree's un-id'd
+/// preem nodes, so it animates across frames, and the ordinal is reset per
+/// mapping pass rather than climbing forever.
 #[test]
 fn an_un_idd_preem_node_is_keyed_by_its_ordinal() {
     let _ink = preem_ink_lock();
@@ -3430,6 +3478,263 @@ fn an_un_idd_preem_node_is_keyed_by_its_ordinal() {
         1,
         "the ordinal resets per pass instead of minting a new instance each frame",
     );
+    preem_render::forget_scope(&scope);
+}
+
+/// **#900's acceptance test.** Three same-config gauges in a row; remove the
+/// *first*; the two survivors keep their own needles.
+///
+/// This is the shape the vocabulary makes hazardous: interchangeable widgets
+/// whose configs are identical by construction, so `same_config` agrees and
+/// nothing downstream can tell two of them apart — the node key is the *only*
+/// thing that can. Written against id'd nodes because #900 settled the policy at
+/// "a preem node requires an `id`", and the SDK's `display` wrappers stamp one
+/// from the widget key they already take, so this is what a real plugin emits.
+///
+/// The anonymous spelling of the very same tree still transplants, which is what
+/// [`anonymous_gauges_transplant_a_needle_and_warn_once`] pins — the issue's
+/// original wording ("today it fails by construction") is that test.
+#[test]
+fn id_d_gauges_keep_their_own_needles_when_a_sibling_is_removed() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("keying-id-row");
+    let three = gauge_row([(Some("g0"), 0.15), (Some("g1"), 0.5), (Some("g2"), 0.85)]);
+    let _ = to_ui_node(&scope, &three);
+
+    // A fresh needle rests at the low end whatever its target, so the three are
+    // pixel-identical until they have swung apart. Advance first, or every
+    // assertion below is vacuous.
+    for _ in 0..4 {
+        assert!(
+            advanced(preem_render::ANIM_STEP_SECS),
+            "three un-settled needles must report that they moved",
+        );
+    }
+    let before = mapped_row_pixels(&scope, &three);
+    assert_eq!(before.len(), 3, "three gauges, three surfaces");
+    assert_ne!(
+        before[0], before[1],
+        "the fixture must actually separate the needles",
+    );
+    assert_ne!(before[1], before[2], "…all three of them");
+
+    // Remove the FIRST gauge and re-map with no animation step in between: a
+    // survivor that kept its own renderer instance renders byte-identically,
+    // and one that inherited a sibling's cannot.
+    let two = gauge_row([(Some("g1"), 0.5), (Some("g2"), 0.85)]);
+    let after = mapped_row_pixels(&scope, &two);
+    assert_eq!(after.len(), 2, "two gauges left");
+    assert_eq!(
+        after[0], before[1],
+        "g1 keeps its OWN needle when g0 is removed — not g0's",
+    );
+    assert_eq!(after[1], before[2], "and g2 keeps its own");
+    assert_eq!(
+        preem_render::probe(&scope, Some("g1")).map(|(builds, _)| builds),
+        Some(1),
+        "…without being rebuilt either, which would have reset it to the low end",
+    );
+    assert_eq!(
+        preem_render::probe(&scope, Some("g2")).map(|(builds, _)| builds),
+        Some(1),
+    );
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        2,
+        "the removed node's instance is swept at the end of the pass",
+    );
+    preem_render::forget_scope(&scope);
+}
+
+/// The same row, spelled **anonymously**: the transplant #900 is about, pinned
+/// as the documented cost of the fallback rather than fixed — plus the one
+/// warning that makes it diagnosable.
+///
+/// Every assertion here is "documented, not desired". The host renders the node
+/// instead of refusing it (a hand-rolled client degrades to the pre-#900
+/// behaviour rather than losing its widget), and says once per tree why that
+/// widget may misbehave.
+///
+/// The warning is counted at its emitting call site
+/// (`preem_render::anonymous_warnings`) rather than captured from `tracing`:
+/// nothing in this file installs a subscriber, so there is no capture harness to
+/// read, and the counter is bumped inside the same `if` that logs.
+#[test]
+fn anonymous_gauges_transplant_a_needle_and_warn_once() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("keying-anonymous-row");
+    let warned = preem_render::anonymous_warnings();
+    let three = gauge_row([(None, 0.15), (None, 0.5), (None, 0.85)]);
+    let _ = to_ui_node(&scope, &three);
+    assert_eq!(
+        preem_render::anonymous_warnings() - warned,
+        1,
+        "three anonymous nodes in one tree are ONE warning, not three",
+    );
+
+    for _ in 0..4 {
+        assert!(advanced(preem_render::ANIM_STEP_SECS));
+    }
+    let before = mapped_row_pixels(&scope, &three);
+    assert_ne!(
+        before[0], before[1],
+        "the fixture must actually separate the needles",
+    );
+    assert_ne!(before[1], before[2], "…all three of them");
+
+    let two = gauge_row([(None, 0.5), (None, 0.85)]);
+    let after = mapped_row_pixels(&scope, &two);
+    assert_eq!(
+        after[0], before[0],
+        "the transplant: the second gauge lands on the first's ordinal slot and renders the \
+         REMOVED node's needle. An id avoids this — see \
+         `id_d_gauges_keep_their_own_needles_when_a_sibling_is_removed`",
+    );
+    assert_eq!(
+        after[1], before[1],
+        "and the third inherits the second's, all the way down the row",
+    );
+    assert_eq!(
+        preem_render::anonymous_warnings() - warned,
+        1,
+        "and the warning stays latched for the scope's lifetime — three mapping passes, \
+         one journal line",
+    );
+    preem_render::forget_scope(&scope);
+}
+
+/// The anonymous-node warning is latched **per scope**, not per frame and not
+/// per process: one line for a tree however many frames it renders, a separate
+/// line for the plugin's other tree, and nothing at all for an id'd node.
+///
+/// At 20 Hz a per-frame warning would be twenty identical journal lines a
+/// second, which is the `UNSUPPORTED_WARNED` lesson applied one scope down.
+#[test]
+fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::anonymous_warnings();
+    let widget = || vocab::PreemWidget::DotMatrix {
+        config: vocab::DotMatrixConfig::default(),
+        state: vocab::DotMatrixState {
+            text: "ANON".into(),
+        },
+    };
+    let anon = preem_node(None, widget());
+
+    let card = Scope::detached("anon-warn-card");
+    let _ = to_ui_node(&card, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "the first anonymous node in a scope warns",
+    );
+    let _ = to_ui_node(&card, &anon);
+    let _ = to_ui_node(&card, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "three frames of the same tree are still one warning",
+    );
+
+    // A plugin's two trees are two scopes, and each deserves to hear about its
+    // own: the latch is keyed by `Scope`, not by a process-wide flag.
+    let panel = Scope::detached("anon-warn-panel");
+    let _ = to_ui_node(&panel, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        2,
+        "a different tree gets its own line",
+    );
+
+    // And the contract-honoring spelling is silent.
+    let id_d = Scope::detached("anon-warn-id-d");
+    let _ = to_ui_node(&id_d, &preem_node(Some("dm"), widget()));
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        2,
+        "an id'd node is the contract being met, not something to warn about",
+    );
+
+    preem_render::forget_scope(&card);
+    preem_render::forget_scope(&panel);
+    preem_render::forget_scope(&id_d);
+}
+
+/// The warning survives a frame in which the plugin renders **no preem node at
+/// all** — and survives an explicit scope teardown.
+///
+/// A `ScopeState` is not a plugin session, and this is the regression that
+/// proves the latch does not live on one. `end_pass` drops the whole entry the
+/// moment a mapping pass leaves the scope with zero instances, and
+/// `forget_scope` runs on a drawer *close* as well as on a plugin leaving
+/// (`region.rs`'s `forget_previous_panel_scope` — its own rustdoc says so). With
+/// the latch on the `ScopeState`, both re-armed it:
+///
+/// - a **conditionally-rendered** preem node (a gauge shown only while something
+///   runs) warned again on every appearance — worst case one line every other
+///   render, ~10 a second at a 20 Hz plugin, which is precisely the stream the
+///   latch exists to prevent;
+/// - a **drawer panel** holding an anonymous node warned once per drawer *open*,
+///   deterministically, with no toggling at all.
+///
+/// So the contract is at most once per plugin tree for the shell's run. See
+/// `preem_render`'s `WARNED`.
+#[test]
+fn the_anonymous_preem_warning_survives_an_emptied_scope() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::anonymous_warnings();
+    let scope = Scope::detached("anon-warn-emptied");
+    let anon = preem_node(
+        None,
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "BLINK".into(),
+            },
+        },
+    );
+    // A frame of the same tree carrying no preem node at all — what a plugin
+    // renders while its gauge has nothing to show.
+    let nothing = wire::Node::Label {
+        id: None,
+        text: "idle".into(),
+        classes: vec![],
+    };
+
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "the node's first appearance warns",
+    );
+
+    let _ = to_ui_node(&scope, &nothing);
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        0,
+        "the blank frame must really empty the scope, or this test proves nothing",
+    );
+
+    // Present → absent → present → absent → present: still one line.
+    let _ = to_ui_node(&scope, &anon);
+    let _ = to_ui_node(&scope, &nothing);
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "three appearances across two preem-less frames are ONE warning, not one per appearance",
+    );
+
+    // And an explicit teardown — a card leaving its region, or the drawer
+    // closing on a panel — does not re-arm it either.
+    preem_render::forget_scope(&scope);
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "nor does forget_scope, which fires on a drawer close and not only on a plugin leaving",
+    );
+    preem_render::forget_scope(&scope);
 }
 
 /// A widget kind this build cannot render degrades to a nothing-rendered
@@ -3943,11 +4248,37 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
         )
     };
 
+    // The all-off frame: the same tile with no signal ever traced into it —
+    // graticule on the field plus the flat axis every empty advance re-stamps,
+    // and nothing else lit. Built from the kit directly, so "blank" is an
+    // independent notion rather than the code under test grading its own work
+    // (#906 R8: `faded != lit` only proved the trail had *moved*, which a trail
+    // frozen half-way down also satisfies).
+    //
+    // Geometry read off the same `ScopeConfig::default()` the fixture builds
+    // from, never spelled out: a hardcoded `144 × 48 @ 2` would silently become
+    // a size mismatch the day those defaults move, and this assertion would then
+    // fail reading like a phosphor regression.
+    let all_off = {
+        let defaults = vocab::ScopeConfig::default();
+        let dim = |value: u32| usize::try_from(value).expect("a wire-capped dimension fits usize");
+        let mut off = kit::Scope::with_size(dim(defaults.cols), dim(defaults.rows))
+            .scale(dim(defaults.scale))
+            .persistence(255);
+        off.advance(&[]);
+        kit_pixels(&off.render(kit_style(defaults.style.style)))
+    };
+
     // 1. A long phosphor must fade all the way to black rather than freezing.
     let slow = Scope::detached("settle-slow");
     let slow_node = traced(255);
     let _ = to_ui_node(&slow, &slow_node);
     let lit = mapped_pixels(&slow, &slow_node);
+    assert_ne!(
+        lit, all_off,
+        "the debut batch must actually light the tile, or the blankness assertion below is \
+         vacuous",
+    );
     // 64 steps: where the old constant stopped. The trail must still be moving.
     for _ in 0..64 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
@@ -3957,14 +4288,35 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
         "a persistence-255 trail needs ~255 steps to reach black, so it must still be fading \
          after 64 — the old constant froze it here, permanently",
     );
-    // Run it out. At `v -> (v*255)>>8`, i.e. `v - 1`, 255 steps clears 255.
-    for _ in 0..256 {
+    // Run it out to exactly one step short of the bound. At `v -> (v*255)>>8`,
+    // i.e. `v - 1`, a full-intensity trail needs exactly 255 decays — which is
+    // what `scope_settle_steps(255)` computes and therefore what the renderer
+    // spends. 64 + 190 = 254 of them.
+    for _ in 0..190 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
     }
+    assert_ne!(
+        mapped_pixels(&slow, &slow_node),
+        all_off,
+        "254 decays is one short: the trail must still be on screen, so the step below is \
+         doing the work rather than the bound being loose",
+    );
+    // The 255th decay. Deliberately *not* asserted to have moved: `advanced` is
+    // global, and the assertion that matters is where this lands the tile, not
+    // that something somewhere reported motion.
+    let _ = advanced(preem_render::ANIM_STEP_SECS);
     let faded = mapped_pixels(&slow, &slow_node);
     assert_ne!(
         faded, lit,
-        "and it must actually have faded, not merely stopped being asked to",
+        "it must actually have faded, not merely stopped being asked to",
+    );
+    // …and the strong form, deliberately asserted *after* the weak one so a
+    // mutation shows which of the two catches it (#906 R8): a trail frozen
+    // part-way down satisfies `faded != lit` perfectly well. Blankness is the
+    // property `scope_settle_steps` exists to guarantee.
+    assert_eq!(
+        faded, all_off,
+        "after the bound the tile IS the all-off frame — blank, not merely different from lit",
     );
     assert!(
         !preem_render::any_animating(),
@@ -3991,11 +4343,14 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
 /// The animation clock's fan-out only wakes the mailboxes that actually hold an
 /// advanced plugin's render.
 ///
-/// A blanket nudge re-runs `reconcile_region` over every plugin's whole tree,
-/// and `hytte-ui`'s `PixelSurface::set_pixels` re-uploads a texture for every
-/// `Pixels` node it touches with no data-equality short-circuit — so one
-/// animating marquee would re-upload every other plugin's chips, 20× a second,
-/// legacy self-rasterising plugins included.
+/// A blanket nudge re-runs `reconcile_region` over every plugin's whole tree —
+/// every wire node re-mapped, every preem instance's cached RGBA frame cloned
+/// out of the store — for every plugin, on every monitor, 20× a second, legacy
+/// self-rasterising plugins included. Since #907 the *upload* at the end of that
+/// is no longer part of the bill: `hytte-ui`'s `PixelSurface::set_pixels` keeps
+/// the last accepted buffer and returns without touching GTK when the frame is
+/// identical. This narrowing is the second guard, and it is the one that skips
+/// the walk rather than paying for it and discarding the result.
 #[test]
 fn a_repaint_request_skips_mailboxes_holding_no_mover() {
     use std::pin::pin;

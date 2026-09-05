@@ -45,6 +45,18 @@
 //! would put the animation back on the wire and re-introduce exactly the
 //! per-tick chatter this vocabulary removes.
 //!
+//! ## …which is why a preem node needs an `id` (#900)
+//!
+//! Shell-owned animation state has one consequence the plugin must honor: the
+//! node's `id` is what ties a renderer instance to the widget it belongs to, and
+//! nothing in a frame can re-derive it. So
+//! [`Node::Preem::id`](crate::wire::Node::Preem) is **required in practice** —
+//! see that variant's docs for the exact contract, the ordinal fallback an
+//! anonymous node degrades to, and why a row of interchangeable widgets
+//! transplants its needles without one. Build nodes with [`preem_id`] /
+//! [`preem_styled`], or through the `hytte-plugin` SDK's `display` wrappers,
+//! which stamp the id from the widget key they already take.
+//!
 //! # Style is a *reference*, not colors
 //!
 //! [`StyleRef`] carries the [`StyleName`] (`vfd`/`lcd`/`oled`/`crt`) plus an
@@ -1678,7 +1690,24 @@ fn sane_range(range: GaugeRange) -> GaugeRange {
 }
 
 /// A [`Node::Preem`](crate::wire::Node::Preem) wrapping `widget`, with no id and
-/// no classes — the one-liner a plugin's `view` reaches for.
+/// no classes.
+///
+/// **Prefer [`preem_id`].** An anonymous preem node is keyed by its ordinal
+/// among the un-id'd preem nodes of its tree, which costs a host warning and —
+/// the moment an anonymous sibling is inserted or removed — moves this widget's
+/// phosphor / needle / flip clocks onto a different node (#900). This one-liner
+/// is fine for a lone static readout in a fixed tree and wrong for anything
+/// else; the [`Node::Preem`](crate::wire::Node::Preem) docs spell out why.
+///
+/// # Docs, not `#[deprecated]` — on purpose
+///
+/// #900 makes the `id` a contract, and a `#[deprecated]` here would be the only
+/// place a Rust compiler could say so at build time. It is deliberately not
+/// taken: this constructor stays correct for the fixed-tree case above, the
+/// attribute would fire on that legitimate use too, and it buys a hand-rolled
+/// client in another language exactly nothing — which is the client the fallback
+/// exists for. The enforcement is where it can see the whole tree: the host,
+/// once, in the journal.
 #[must_use]
 pub fn preem(widget: PreemWidget) -> crate::wire::Node {
     crate::wire::Node::Preem {
@@ -1692,9 +1721,11 @@ pub fn preem(widget: PreemWidget) -> crate::wire::Node {
 /// host reconciler keeps the *same* renderer instance across renders — which is
 /// what preserves the phosphor, the needle's momentum, and the flip clocks.
 ///
-/// Prefer this over [`preem`] for anything that animates: a positionally-matched
-/// node whose siblings shift is a node the reconciler may rebuild, and a rebuild
-/// resets the animation.
+/// Prefer this over [`preem`] for **every** preem node, and required for
+/// anything that animates: an anonymous node falls back to a positional key, and
+/// a positional key is not merely rebuilt when the siblings shift — it is
+/// *reused by the wrong node*, so this widget's animation state continues under
+/// another one (#900).
 #[must_use]
 pub fn preem_id(id: impl Into<NodeId>, widget: PreemWidget) -> crate::wire::Node {
     crate::wire::Node::Preem {

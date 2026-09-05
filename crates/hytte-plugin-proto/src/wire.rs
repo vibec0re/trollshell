@@ -473,9 +473,9 @@ pub enum Node {
     ///
     /// # How many of these a tree may carry (#901)
     ///
-    /// [`MAX_PREEM_NODES_PER_TREE`] of them, within
-    /// [`MAX_NODES_PER_TREE`] nodes overall — see those constants for the
-    /// numbers, the memory they bound and what the host does past them.
+    /// [`MAX_PREEM_NODES_PER_TREE`] of them, within [`MAX_NODES_PER_TREE`] nodes
+    /// and [`MAX_TREE_DEPTH`] levels of nesting overall — see those constants
+    /// for the numbers, what they bound and what the host does past them.
     ///
     /// **Negotiated, not unconditional.** Unlike every other variant here, a
     /// plugin must not emit this one on sight: it emits it only once the host
@@ -511,7 +511,7 @@ pub enum Node {
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────
 //
 // The caps in [`preem`](crate::preem) bound one widget's *geometry*, and the
-// proto enforces them itself in `PreemWidget::clamp_in_place`. These two bound
+// proto enforces them itself in `PreemWidget::clamp_in_place`. These three bound
 // the *shape of a render tree*, and the proto cannot enforce them: it decodes a
 // frame, it never walks one. They are stated here so a plugin author reads the
 // bound in the same crate as everything else on the wire, and the host enforces
@@ -545,10 +545,40 @@ pub enum Node {
 /// hung plugin. The host warns once per plugin tree for the life of the shell
 /// process, on the same latch as the [`Node::Preem`] keying diagnostics.
 ///
-/// Because the walk is depth-first and charges the budget on entry, this also
-/// bounds the depth of the host's recursion over a tree, which was previously
-/// bounded only by the frame length.
+/// This caps the tree's **size**, not its shape: 4096 nodes in a single-child
+/// chain are under this cap and 4096 levels deep. Nesting is capped separately
+/// by [`MAX_TREE_DEPTH`], because that one is a stack bound and this one is not
+/// small enough to serve as one.
 pub const MAX_NODES_PER_TREE: usize = 4096;
+
+/// How deeply the host will walk a render tree before it stops descending.
+///
+/// [`MAX_NODES_PER_TREE`] does not imply this. The host maps a tree by
+/// recursing once per node on the **GTK main thread**, so a chain of
+/// single-child containers turns nesting directly into stack frames — and a
+/// 4096-node chain is well inside both the frame limit and the node cap.
+/// Measured on the shipped stack (8 MiB): a mapping frame costs ~1.3 KiB in the
+/// release profile the shell ships and ~6.5 KiB in a debug build, so a
+/// node-cap-sized chain would spend 63 % of the main thread's stack in release
+/// and overflow it outright at roughly a third of the cap in a debug build. Nor
+/// is mapping the only recursion over the tree: the reconciler walks it again to
+/// build and to diff, dropping it is recursive, and GTK measures, allocates and
+/// snapshots the resulting widget nesting.
+///
+/// **64** is the same "generous, and still a small number" the rest of this
+/// vocabulary means by it ([`MAX_CELLS`](crate::preem::MAX_CELLS),
+/// [`MAX_DIVISIONS`](crate::preem::MAX_DIVISIONS),
+/// [`MAX_PREEM_NODES_PER_TREE`]). Real trees nest a handful deep — a panel of
+/// boxes inside rows inside an expander is under ten — so this is roughly six
+/// times any plausible layout, while costing at most ~416 KiB of stack in the
+/// expensive (debug) build: 5 % of the main thread, where the node cap alone
+/// left none of it guaranteed.
+///
+/// Past the cap the host does what it does past [`MAX_NODES_PER_TREE`]: it keeps
+/// what it has mapped, drops everything below, and warns once per plugin tree.
+/// A container whose *only* child was dropped this way is dropped with it, so an
+/// over-deep chain can cost a whole subtree rather than one leaf.
+pub const MAX_TREE_DEPTH: usize = 64;
 
 /// How many [`Node::Preem`] nodes in one tree the host gives a renderer
 /// instance to.
@@ -580,10 +610,16 @@ pub const MAX_NODES_PER_TREE: usize = 4096;
 /// **The memory this bounds.** An instance's resident cost is dominated by its
 /// cached RGBA frame, capped at
 /// [`MAX_RASTER_PIXELS`](crate::preem::MAX_RASTER_PIXELS) × 4 B = 16 MiB by the
-/// geometry caps, so the adversarial worst case is 64 × ~16 MiB ≈ 1 GiB for a
-/// plugin that also maxes every dimension of every widget — a bound, where
-/// there was none, not a comfortable number. A realistic tree of 64
-/// default-geometry gauges is ~2 MiB.
+/// geometry caps, so the adversarial worst case is 64 × ~16 MiB ≈ **1 GiB
+/// resident** for a plugin that also maxes every dimension of every widget — a
+/// bound, where there was none, not a comfortable number.
+///
+/// The **peak** is higher, and it is the number that decides whether the shell
+/// survives: the host hands each frame to its widget tree by value, so a mapping
+/// pass carries one more copy of every widget it maps, per tree per monitor,
+/// until the reconciler has consumed it — ≥2 GiB on one monitor, ≥3 GiB on two,
+/// before the surface takes its own. A realistic tree of 64 default-geometry
+/// gauges is ~2 MiB resident and the same again in flight.
 ///
 /// Past the cap a preem node renders as the host's unknown-widget placeholder
 /// (an empty surface that keeps the node's `id` and classes, so CSS chrome

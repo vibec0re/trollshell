@@ -3964,6 +3964,250 @@ fn a_tree_exactly_at_the_node_cap_is_not_truncated() {
     );
 }
 
+/// **#919 review F1's P4.** One wire frame, mapped once per monitor, must map
+/// the same — including at the instance cap.
+///
+/// A scope sitting at exactly `MAX_PREEM_NODES_PER_TREE` instances is handed a
+/// frame that swaps one node out for a newcomer, still exactly the cap's worth
+/// of nodes. `region.rs` maps that frame once per monitor, and `end_pass` sweeps
+/// between the two passes, so a cap charged against the *carried-over* instance
+/// count answers "refused" for the first monitor and "admitted" for the second:
+/// two screens, one frame, different pixels — the thing this module's
+/// idempotence rule exists to forbid.
+///
+/// Charging against the nodes the pass has admitted makes the verdict a
+/// function of the tree, so both passes agree and neither blanks anything.
+#[test]
+fn the_instance_cap_answers_the_same_for_every_monitor_pass() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("cap-two-monitors");
+
+    let ids: Vec<String> = (0..wire::MAX_PREEM_NODES_PER_TREE)
+        .map(|i| format!("g{i}"))
+        .collect();
+    let full = gauge_row(ids.iter().map(|id| (Some(id.as_str()), 0.5)));
+    let _ = to_ui_node(&scope, &full);
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        wire::MAX_PREEM_NODES_PER_TREE,
+        "the fixture must really start with the scope full, or it proves nothing",
+    );
+
+    // Drop the first node, append a newcomer: still exactly the cap's worth.
+    let swapped: Vec<String> = ids[1..]
+        .iter()
+        .cloned()
+        .chain(std::iter::once("gNEW".to_owned()))
+        .collect();
+    let frame = gauge_row(swapped.iter().map(|id| (Some(id.as_str()), 0.5)));
+
+    let monitor1 = mapped_row_pixels(&scope, &frame);
+    let monitor2 = mapped_row_pixels(&scope, &frame);
+    assert_eq!(
+        monitor1, monitor2,
+        "two monitors map ONE wire frame, so they must map it identically — the cap may not \
+         answer differently on the second pass because the first pass's sweep freed a slot",
+    );
+    assert_ne!(
+        monitor1[wire::MAX_PREEM_NODES_PER_TREE - 1],
+        (0, 0, Vec::new()),
+        "…and neither pass may blank a node in a tree that is AT the cap and never over it",
+    );
+
+    preem_render::forget_scope(&scope);
+}
+
+/// **#919 review F1's P5.** A tree pinned at exactly the cap whose last node's
+/// id changes every frame renders every node, every frame, for ever.
+///
+/// This is the shape a plugin reaches by keying a node on something that moves —
+/// a track id, a unit name, a timestamp. Against the carried-over instance count
+/// it blanked that node on every other frame indefinitely, at a 50 % duty cycle,
+/// without the tree ever being over the cap: the newcomer was refused while the
+/// departing node still held its slot, `end_pass` then freed it, and the cycle
+/// repeated. Four frames is two full cycles of that.
+#[test]
+fn a_tree_at_the_instance_cap_that_rotates_one_id_never_blanks() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::instance_cap_warnings();
+    let scope = Scope::detached("cap-rotating-id");
+
+    let stable: Vec<String> = (0..wire::MAX_PREEM_NODES_PER_TREE - 1)
+        .map(|i| format!("g{i}"))
+        .collect();
+    for frame in 0..4 {
+        let rotating = format!("r{frame}");
+        let ids: Vec<&str> = stable
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(rotating.as_str()))
+            .collect();
+        let row = gauge_row(ids.into_iter().map(|id| (Some(id), 0.5)));
+        let mapped = mapped_row_pixels(&scope, &row);
+        assert_eq!(
+            mapped.len(),
+            wire::MAX_PREEM_NODES_PER_TREE,
+            "frame {frame}: every node still maps to a surface",
+        );
+        assert_ne!(
+            mapped[wire::MAX_PREEM_NODES_PER_TREE - 1],
+            (0, 0, Vec::new()),
+            "frame {frame}: a tree of exactly the cap's worth of nodes is never over the cap, \
+             however often its last id changes",
+        );
+    }
+    assert_eq!(
+        preem_render::instance_cap_warnings() - base,
+        0,
+        "…and a tree that is never over the cap has nothing said about it",
+    );
+
+    preem_render::forget_scope(&scope);
+}
+
+/// A chain of `depth` nested single-child `Box`es, ids `d0` (outermost) …
+/// `d{depth-1}` (innermost) — the shape that turns nesting straight into
+/// `map_node` stack frames.
+fn box_chain(depth: usize) -> wire::Node {
+    let level = |id: usize, children: Vec<wire::Node>| wire::Node::Box {
+        id: Some(format!("d{id}")),
+        dir: wire::Dir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children,
+    };
+    let mut node = level(depth - 1, vec![]);
+    for id in (0..depth - 1).rev() {
+        node = level(id, vec![node]);
+    }
+    node
+}
+
+/// The same chain built from `Button`s, whose child is **mandatory** — so a
+/// level the walk refuses takes every ancestor down with it.
+fn button_chain(depth: usize) -> wire::Node {
+    let mut node = wire::Node::Label {
+        id: Some("leaf".into()),
+        text: String::new(),
+        classes: vec![],
+    };
+    for id in (0..depth).rev() {
+        node = wire::Node::Button {
+            id: format!("b{id}"),
+            classes: vec![],
+            child: Box::new(node),
+        };
+    }
+    node
+}
+
+/// How many nested `Box`es a mapped [`box_chain`] actually has.
+fn mapped_chain_depth(node: &UiNode) -> usize {
+    let mut depth = 0;
+    let mut cursor = node;
+    loop {
+        let UiNode::Box { children, .. } = cursor else {
+            return depth;
+        };
+        depth += 1;
+        match children.first() {
+            Some(child) => cursor = child,
+            None => return depth,
+        }
+    }
+}
+
+/// **#919 review F2's acceptance test.** A tree nested one level past
+/// [`wire::MAX_TREE_DEPTH`] is walked to the cap and no further, with one
+/// warning per tree.
+///
+/// The node cap does not stand in for this: 65 nodes is four thousand under it,
+/// and a chain that *is* at the node cap is 4096 `map_node` frames — measured at
+/// ~6.5 KiB each in a debug build, which overflows the main thread's 8 MiB at
+/// roughly a third of the node cap. So this is the cap that makes the walk's
+/// stack use bounded rather than merely finite.
+#[test]
+fn a_tree_deeper_than_the_depth_cap_is_walked_to_the_cap_and_warns_once() {
+    let _ink = preem_ink_lock();
+    let depth_base = preem_render::depth_cap_warnings();
+    let node_base = preem_render::node_cap_warnings();
+    let scope = Scope::detached("depth-cap-over");
+
+    let over = box_chain(wire::MAX_TREE_DEPTH + 1);
+    let mapped = to_ui_node(&scope, &over);
+    assert_eq!(
+        mapped_chain_depth(&mapped),
+        wire::MAX_TREE_DEPTH,
+        "the walk descends exactly to the cap and stops",
+    );
+    assert_eq!(
+        preem_render::depth_cap_warnings() - depth_base,
+        1,
+        "an over-deep tree is one journal line",
+    );
+    assert_eq!(
+        preem_render::node_cap_warnings() - node_base,
+        0,
+        "…and it is the DEPTH line: 65 nodes is nowhere near the node cap, so a single \
+         merged diagnostic would have told the author to send fewer nodes",
+    );
+
+    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, &over);
+    assert_eq!(
+        preem_render::depth_cap_warnings() - depth_base,
+        1,
+        "three frames of a tree that is over the cap on every one of them are ONE warning",
+    );
+
+    // A chain of *mandatory* children collapses whole rather than truncating,
+    // and takes the root with it — which is the only way `to_ui_node`'s
+    // `unwrap_or(Spacer)` is reachable at all. Its own scope, so the latch above
+    // does not hide its line.
+    let buttons = Scope::detached("depth-cap-buttons");
+    let mapped = to_ui_node(&buttons, &button_chain(wire::MAX_TREE_DEPTH + 1));
+    assert!(
+        matches!(mapped, UiNode::Spacer),
+        "a Button's child is not optional, so the refused level takes every ancestor down \
+         with it and the root itself comes back empty, got {mapped:?}",
+    );
+    assert_eq!(
+        preem_render::depth_cap_warnings() - depth_base,
+        2,
+        "…and that tree gets told too",
+    );
+
+    preem_render::forget_scope(&scope);
+    preem_render::forget_scope(&buttons);
+}
+
+/// The off-by-one guard for [`wire::MAX_TREE_DEPTH`]: a tree nested to *exactly*
+/// the cap is walked whole and says nothing.
+///
+/// A cap that fired one level early would silently drop the innermost widget of
+/// a legal layout and log about a plugin that did nothing wrong — and the
+/// over-cap test above cannot tell "stopped at the cap" from "stopped one short".
+#[test]
+fn a_tree_exactly_at_the_depth_cap_is_walked_whole() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::depth_cap_warnings();
+    let scope = Scope::detached("depth-cap-exact");
+
+    let exact = box_chain(wire::MAX_TREE_DEPTH);
+    let mapped = to_ui_node(&scope, &exact);
+    assert_eq!(
+        mapped_chain_depth(&mapped),
+        wire::MAX_TREE_DEPTH,
+        "every level of a tree exactly at the cap is mapped, innermost included",
+    );
+    assert_eq!(
+        preem_render::depth_cap_warnings() - base,
+        0,
+        "exactly at the cap is not past it, so there is nothing to say",
+    );
+}
+
 // ── #918: two preem nodes sharing an id ──────────────────────────────────────
 
 /// **#918's acceptance test.** Two gauges in one tree claiming the same `id`

@@ -7,35 +7,65 @@
 use std::cell::Cell;
 
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
-use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE};
+use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE, MAX_TREE_DEPTH};
 
 use super::preem_render::{self, Scope, Warned};
 
 /// One mapping pass's state: the scope its preem instances live in, plus the
-/// node budget [`MAX_NODES_PER_TREE`] gives the tree (#901).
+/// two budgets [`MAX_NODES_PER_TREE`] and [`MAX_TREE_DEPTH`] give the tree
+/// (#901).
 struct Walk<'a> {
     scope: &'a Scope,
     /// Nodes still mappable. Decremented on **entry** to every node, so it
-    /// bounds nodes *visited*, and therefore also the depth of this recursion —
-    /// which the wire otherwise bounds only by `MAX_FRAME_LEN`.
+    /// bounds nodes *visited*.
     budget: Cell<usize>,
-    /// Whether anything was dropped, i.e. whether the tree on screen is a
+    /// How many [`map_node`] frames are currently on the stack. Bounded
+    /// separately from `budget`, because a count cap alone is not a depth cap:
+    /// 4096 nodes in a single-child chain are 4096 nested frames, measured at
+    /// ~6.5 KiB each in a debug build against a main thread with 8 MiB.
+    depth: Cell<usize>,
+    /// Whether the count budget ran out, i.e. whether the tree on screen is a
     /// prefix of the tree the plugin sent. Read once, after the walk.
-    truncated: Cell<bool>,
+    over_budget: Cell<bool>,
+    /// Whether anything was dropped for being nested too deep. Separate from
+    /// `over_budget` because they are different mistakes with different fixes,
+    /// and a tree can be both.
+    over_depth: Cell<bool>,
+}
+
+/// The depth accounting for one live [`map_node`] frame: taken on entry,
+/// released when the frame returns — **including** through the `?` a container
+/// whose mandatory child was dropped propagates, which is why it is a guard and
+/// not a pair of `set` calls.
+struct Level<'a>(&'a Cell<usize>);
+
+impl Drop for Level<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 impl Walk<'_> {
-    /// Spend one node of the budget. `false` once the tree is over
-    /// [`MAX_NODES_PER_TREE`] — from then on every remaining node is dropped and
-    /// the pass is marked truncated.
-    fn charge(&self) -> bool {
+    /// Charge one node against the count budget and one level against the depth
+    /// cap, returning the guard that releases the level again.
+    ///
+    /// `None` past either cap: from then on every node at or below that point is
+    /// dropped and the pass is marked. The count is checked first so that a tree
+    /// which is over both is reported as the size problem it primarily is.
+    fn enter(&self) -> Option<Level<'_>> {
         let left = self.budget.get();
         if left == 0 {
-            self.truncated.set(true);
-            return false;
+            self.over_budget.set(true);
+            return None;
+        }
+        let depth = self.depth.get();
+        if depth >= MAX_TREE_DEPTH {
+            self.over_depth.set(true);
+            return None;
         }
         self.budget.set(left - 1);
-        true
+        self.depth.set(depth + 1);
+        Some(Level(&self.depth))
     }
 }
 
@@ -48,51 +78,81 @@ impl Walk<'_> {
 /// boundary: the un-id'd node ordinal is reset here, and an instance whose node
 /// disappeared from the tree is dropped when the pass closes.
 ///
-/// # The node cap (#901)
+/// # The node and depth caps (#901)
 ///
-/// It is also the boundary the tree-wide node budget is set at. A render frame
-/// is bounded on the wire only by `MAX_FRAME_LEN` (16 MiB), and the cheapest
-/// node encodes to a handful of bytes, so one legal frame can carry ~a million
-/// nodes — each of which becomes a GTK widget here. [`MAX_NODES_PER_TREE`] caps
-/// that, and **past the cap this keeps the mapped prefix and drops the rest**
-/// rather than refusing the frame.
+/// It is also the boundary the tree-wide budgets are set at. A render frame is
+/// bounded on the wire only by `MAX_FRAME_LEN` (16 MiB), and the cheapest node
+/// encodes to a handful of bytes, so one legal frame can carry ~a million nodes
+/// — each of which becomes a GTK widget here. [`MAX_NODES_PER_TREE`] caps that.
 ///
-/// Truncate rather than reject, for the reason the malformed-`Pixels` arm below
-/// degrades instead of dropping the node: this file's posture is *degrade, don't
-/// blank*. A rejected frame would leave the previous frame on screen (or an
-/// empty region), which on glass is indistinguishable from a hung plugin; a
-/// truncated one shows the plugin's chrome and its first nodes, so what an
-/// operator sees matches the journal line they can go and read. It is also the
-/// stable choice: the walk is deterministic, so the same prefix maps every
-/// frame and the reconciler keeps updating it in place instead of rebuilding.
+/// [`MAX_TREE_DEPTH`] caps the other axis, and the count cap does **not** stand
+/// in for it. A tree of `MAX_NODES_PER_TREE` single-child containers is under
+/// the count cap and is 4096 nested [`map_node`] frames; those were measured at
+/// **6656 B each in a debug build** and 1296 B in the shipped release profile,
+/// against a main thread with 8 MiB of stack. Release would fit, spending 63 %
+/// of the stack on this one function; a debug build (`cargo run -p trollshell`)
+/// overflows at around 1260 — three times under the count cap. And nothing in a
+/// count cap bounds the *other* recursions over the same tree on the same
+/// thread (`hytte_ui`'s `build_node` and `reconcile_single`, `UiNode`'s
+/// recursive `Drop`, GTK's own measure/allocate/snapshot).
 ///
-/// The cost, stated: a truncated container renders with children missing, which
-/// looks like a rendering bug rather than a cap. That is what the warning is
-/// for — once per plugin tree for the life of the shell, on the same latch as
-/// the preem keying diagnostics (`preem_render`'s `WARNED`), since a tree over
-/// the cap is over it on every frame.
+/// **Past either cap this keeps the mapped prefix and drops the rest** rather
+/// than refusing the frame. Truncate rather than reject, for the reason the
+/// malformed-`Pixels` arm below degrades instead of dropping the node: this
+/// file's posture is *degrade, don't blank*. A rejected frame would leave the
+/// previous frame on screen (or an empty region), which on glass is
+/// indistinguishable from a hung plugin; a truncated one shows the plugin's
+/// chrome and its first nodes, so what an operator sees matches the journal line
+/// they can go and read. It is also the stable choice: the walk is
+/// deterministic, so the same prefix maps every frame and the reconciler keeps
+/// updating it in place instead of rebuilding.
+///
+/// The cost, stated: a truncated tree renders with pieces missing — a container
+/// short of children, or a whole subtree gone where a dropped node was some
+/// container's only child. That looks like a rendering bug rather than a cap,
+/// which is what the two warnings are for — once per plugin tree each for the
+/// life of the shell, on the same latch as the preem keying diagnostics
+/// (`preem_render`'s `WARNED`), since a tree over a cap is over it on every
+/// frame.
 pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
     preem_render::begin_pass(scope);
     let walk = Walk {
         scope,
         budget: Cell::new(MAX_NODES_PER_TREE),
-        truncated: Cell::new(false),
+        depth: Cell::new(0),
+        over_budget: Cell::new(false),
+        over_depth: Cell::new(false),
     };
-    // `None` only if the root itself fell past the cap, which needs a chain of
-    // single-child containers deeper than the budget (a container whose one
-    // mandatory child was dropped is dropped with it). A `Spacer` is the
-    // reconciler's cheapest node and keeps the region non-empty.
+    // `None` if the root itself was refused, which takes a chain of *mandatory*
+    // single-child containers (`Button`/`Revealer`/`Expander` header) past one
+    // of the two caps: the innermost is dropped and every ancestor is dropped
+    // with it. `MAX_TREE_DEPTH` is what makes that reachable in practice —
+    // before it, the chain had to be `MAX_NODES_PER_TREE` long. A `Spacer` is
+    // the reconciler's cheapest node and keeps the region non-empty.
     let mapped = map_node(&walk, node).unwrap_or(UiNode::Spacer);
     preem_render::end_pass(scope);
 
-    if walk.truncated.get() && preem_render::warn_once(scope, Warned::NodeCap) {
+    if walk.over_budget.get() && preem_render::warn_once(scope, Warned::NodeCap) {
         tracing::warn!(
             plugin = scope.plugin_id(),
             tree = ?scope.role(),
             cap = MAX_NODES_PER_TREE,
             "plugin render tree exceeds the host's node cap; the nodes up to the cap are \
-             rendered and the rest of the tree is dropped, so this widget is missing children \
-             (further occurrences in this tree are silenced for the rest of this shell run)",
+             rendered and the rest of the tree is dropped, so part of this plugin's UI is \
+             missing — a container short of children, or a whole subtree gone where the \
+             dropped node was some container's only child (further occurrences in this tree \
+             are silenced for the rest of this shell run)",
+        );
+    }
+    if walk.over_depth.get() && preem_render::warn_once(scope, Warned::DepthCap) {
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            cap = MAX_TREE_DEPTH,
+            "plugin render tree nests deeper than the host will walk; everything below the \
+             cap is dropped. The host recurses once per level on the GTK main thread, so this \
+             is a stack bound rather than a taste one — flatten the tree (further occurrences \
+             in this tree are silenced for the rest of this shell run)",
         );
     }
     mapped
@@ -103,18 +163,18 @@ pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
 /// is written exhaustively so adding a node variant to either side is a compile
 /// error here.
 ///
-/// `None` means the node fell past [`MAX_NODES_PER_TREE`] and is dropped: a
-/// child list simply loses it, and a container whose *mandatory* child came back
-/// `None` is dropped in turn (`hytte_ui`'s `Button`/`Revealer`/`Expander` header
-/// are not optional), so the mapped tree is never larger than the budget even
-/// though the budget is charged on entry.
+/// `None` means the node fell past [`MAX_NODES_PER_TREE`] or [`MAX_TREE_DEPTH`]
+/// and is dropped: a child list simply loses it, and a container whose
+/// *mandatory* child came back `None` is dropped in turn (`hytte_ui`'s
+/// `Button`/`Revealer`/`Expander` header are not optional), so the mapped tree
+/// is never larger than the budget even though the budget is charged on entry.
 // One exhaustive arm per node variant — the length is the vocabulary size, not
 // complexity.
 #[allow(clippy::too_many_lines)]
 fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
-    if !walk.charge() {
-        return None;
-    }
+    // Held for the body of this frame: the guard is what puts the level back
+    // when we return, down every `?` path below as well as the normal one.
+    let _level = walk.enter()?;
     let mapped = match node {
         wire::Node::Box {
             id,

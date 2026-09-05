@@ -69,6 +69,49 @@
 //! #900 settled the policy at "require the id" instead, which makes the failure
 //! diagnosable (one journal line naming the plugin) rather than silent.
 //!
+//! ## Two nodes, one id (#918)
+//!
+//! The other end of the same keying contract: two preem nodes in one tree
+//! claiming the same explicit `id` **collapse onto one renderer instance**, and
+//! every mapping pass applies both widgets to it in turn. One needle is dragged
+//! between two targets, one phosphor accumulates two signals, one flip board is
+//! rewritten twice a frame — permanently, not for one frame the way the ordinal
+//! transplant is. The last node rendered wins, which is what [`map_widget`]
+//! deliberately keeps doing: refusing the second node would make a widget
+//! *disappear* to fix a widget that *jitters*.
+//!
+//! It is diagnosed instead. `state.touched` already knows — it is a per-pass
+//! set, so the second `insert` of a key returns `false` — and that is the whole
+//! detection. One `warn` per tree names the id and both widget kinds.
+//!
+//! ## Bounds (#901)
+//!
+//! An instance is expensive in a way a wire node is not: a ~40-byte config
+//! becomes a phosphor buffer, a needle, flip clocks and a cached RGBA frame. The
+//! node count is the multiplier, so both are capped, and the two caps live on
+//! the wire (`hytte_plugin_proto::wire`) where a plugin author reads them:
+//!
+//! - [`MAX_PREEM_NODES_PER_TREE`] renderer instances per [`Scope`] — a scope is
+//!   exactly one plugin tree, so the wire's per-tree cap *is* this module's
+//!   per-scope instance cap. Past it a node renders as the unknown-widget
+//!   placeholder (the same empty surface a kind this build can't render
+//!   degrades to), with one warning per tree.
+//! - `wire::MAX_NODES_PER_TREE` nodes of every kind together, and
+//!   `wire::MAX_TREE_DEPTH` levels of nesting, both enforced one layer up in
+//!   [`wire_map`](super::wire_map) where the tree is actually walked. The count
+//!   is the bound; this one is the multiplier; the depth is what keeps the walk
+//!   itself off the main thread's stack limit.
+//!
+//! The instance cap is charged against the nodes **this pass admitted**, not
+//! against the live instance count, precisely so it does not violate the
+//! idempotence rule immediately below: `end_pass` sweeps per pass and every
+//! monitor is a pass, so a cap that consulted the surviving instances would
+//! answer differently for the first monitor than for the second. A node that
+//! already holds an instance is admitted either way — otherwise the frame a tree
+//! grew past the cap on would also be the frame its existing widgets lost their
+//! animation state. See [`map_widget`] for what that bounds at rest and in
+//! flight.
+//!
 //! ## Idempotence — the multi-monitor requirement
 //!
 //! `to_ui_node` runs **once per monitor** on every render frame (each monitor
@@ -139,6 +182,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hytte::gtk::{self, prelude::*};
 use hytte::ui::Node as UiNode;
 use hytte_plugin_proto::preem as vocab;
+use hytte_plugin_proto::wire::MAX_PREEM_NODES_PER_TREE;
 use hytte_preem as kit;
 
 /// The cadence the animation clock runs at, in seconds — and, for the two kit
@@ -221,20 +265,39 @@ fn scope_settle_steps(persistence: u16) -> u32 {
 /// nodes that would be 160 identical journal lines a second).
 static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// How many "preem node without an id" warnings [`map_widget`] has emitted
-/// (#900).
+/// How many journal lines each [`Warned`] diagnostic has produced.
 ///
 /// The assertion seam for "warns **at most once per plugin tree**, not once per
 /// frame and not once per appearance". This crate has no `tracing` subscriber
 /// harness — nothing in `plugins/tests.rs` installs a collector — so the tests
-/// count the emissions at the emitting call site rather than capturing the
-/// event; the counter is bumped inside the one `if` that logs, immediately
-/// beside the `warn!`, so the two cannot drift.
+/// count emissions at the one place that decides whether to emit
+/// ([`warn_once`]) rather than capturing the event. The counter is bumped by
+/// `warn_once` itself, on exactly the `true` its every call site turns into one
+/// `warn!`, so a count and a journal line cannot drift.
 ///
-/// Process-global, so a test reads it as a **delta** around the operation under
-/// test (every preem test already serialises on the ink lock).
+/// One counter per variant rather than one per diagnostic site: the latch is
+/// keyed by `(Scope, Warned)`, and a counter keyed by `Warned` is its twin — a
+/// test asserting that two different diagnostics fire *independently* needs to
+/// read them apart.
+///
+/// Process-global, so a test reads a **delta** around the operation under test
+/// (every preem test already serialises on the ink lock).
 #[cfg(test)]
-static ANONYMOUS_WARNINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WARN_COUNTS: [std::sync::atomic::AtomicU32; 5] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+/// `what`'s counter, indexed by the same [`Warned::slot`] that gives it its bit
+/// in the latch — so the count and the latch cannot disagree about which
+/// diagnostic they mean.
+#[cfg(test)]
+fn warn_counter(what: Warned) -> &'static std::sync::atomic::AtomicU32 {
+    &WARN_COUNTS[what.slot() as usize]
+}
 
 /// Which of a plugin's two independent node trees a preem node came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -447,29 +510,70 @@ struct ScopeState {
     ordinal: usize,
 }
 
-/// A one-shot per-tree diagnostic — something wrong with a plugin's node
-/// *keying* that the host works around, tells the journal about once, and then
-/// stops mentioning.
+/// A one-shot per-tree diagnostic — something wrong with the *shape* of a
+/// plugin's node tree that the host works around, tells the journal about once,
+/// and then stops mentioning.
 ///
 /// The latch is keyed by `(Scope, Warned)` rather than being a `bool` field on
 /// [`ScopeState`], for two reasons. It has to **outlive** `ScopeState` (see
-/// [`WARNED`]); and #918 — two preem nodes in one tree claiming the same `id` —
-/// is the next diagnostic of exactly this shape, so it wants a second key here
-/// rather than a second table.
+/// [`WARNED`]); and every diagnostic of this shape wants another key here rather
+/// than a parallel table — which is what #918 and #901 then did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Warned {
+pub(super) enum Warned {
     /// A preem node arrived with no `id` (#900): keyed by ordinal, so its
     /// animation state moves to a sibling on any insert or removal.
     NoId,
     /// Two preem nodes in one tree claimed the same `id` (#918), collapsing
     /// onto one renderer instance — two targets fighting one needle.
     ///
-    /// **Reserved.** Emitting it is #918's work; the variant is here so that
-    /// lands as a `warn_once(scope, Warned::DuplicateId)` call rather than a
-    /// parallel latch. `state.touched.insert(key)` in [`map_widget`] already
-    /// returns `false` on exactly the collision it has to detect.
-    #[allow(dead_code, reason = "#918 is the caller; the latch is built for it")]
+    /// Detected on the `false` that `state.touched.insert(key)` in
+    /// [`map_widget`] already returns for a key touched twice in one pass, which
+    /// is exactly the collision (the touched set is cleared per pass by
+    /// [`begin_pass`], so a second monitor's pass is not a duplicate).
     DuplicateId,
+    /// A tree asked for more than [`MAX_PREEM_NODES_PER_TREE`] renderer
+    /// instances (#901); the nodes past the cap render as the unknown-widget
+    /// placeholder.
+    InstanceCap,
+    /// A tree carried more than
+    /// [`wire::MAX_NODES_PER_TREE`](hytte_plugin_proto::wire::MAX_NODES_PER_TREE)
+    /// nodes of every kind together (#901); the mapped prefix is kept and the
+    /// rest dropped. Raised by `wire_map`, which is where the tree is walked —
+    /// one of the two [`Warned`]s this module does not emit itself.
+    NodeCap,
+    /// A tree nested deeper than
+    /// [`wire::MAX_TREE_DEPTH`](hytte_plugin_proto::wire::MAX_TREE_DEPTH)
+    /// (#901); everything below the cap is dropped.
+    ///
+    /// Its own variant rather than a `NodeCap` with a reason, because the two
+    /// are different mistakes with different fixes — *send fewer nodes* versus
+    /// *stop nesting* — and the latch is keyed per diagnostic, so a tree that is
+    /// both too big and too deep gets told both things once each. Raised by
+    /// `wire_map`.
+    DepthCap,
+}
+
+impl Warned {
+    /// This diagnostic's slot — its bit in [`WARNED`]'s per-scope mask, and its
+    /// index in [`WARN_COUNTS`].
+    ///
+    /// One exhaustive match so a new variant is a compile error here rather than
+    /// an aliased bit *and* an aliased counter. The mask is a `u8`, so it holds
+    /// eight; a ninth variant needs a wider integer, and this is where to look.
+    const fn slot(self) -> u32 {
+        match self {
+            Self::NoId => 0,
+            Self::DuplicateId => 1,
+            Self::InstanceCap => 2,
+            Self::NodeCap => 3,
+            Self::DepthCap => 4,
+        }
+    }
+
+    /// This diagnostic's bit in a scope's mask. See [`slot`](Self::slot).
+    const fn bit(self) -> u8 {
+        1 << self.slot()
+    }
 }
 
 thread_local! {
@@ -506,19 +610,62 @@ thread_local! {
     /// the plugin roster. A plugin reconnecting under a *fresh* id each time
     /// would accumulate entries, but a process that can do that already runs
     /// code as this user.
-    static WARNED: RefCell<HashSet<(Scope, Warned)>> = RefCell::new(HashSet::new());
+    /// Growth is one entry per plugin tree that ever tripped anything: a short
+    /// `String` and a `u8`.
+    ///
+    /// A `HashMap<Scope, u8>` bitmask rather than a `HashSet<(Scope, Warned)>`
+    /// so the hot path can probe with a **borrow**. A set of pairs can only be
+    /// asked `contains(&(scope.clone(), what))`, and since #901 the number of
+    /// asks scales with the plugin's node count — a 4096-node tree past the
+    /// instance cap asks once per refused node per pass per monitor, and every
+    /// one of those after the first claims nothing. The map clones the `Scope`
+    /// only on the insert that actually latches something.
+    static WARNED: RefCell<HashMap<Scope, u8>> = RefCell::new(HashMap::new());
 }
 
 /// Claim the one-shot `what` diagnostic for `scope`: `true` the first time it is
 /// asked for, `false` for the rest of the shell's run. See [`WARNED`].
-fn warn_once(scope: &Scope, what: Warned) -> bool {
-    WARNED.with_borrow_mut(|warned| warned.insert((scope.clone(), what)))
+///
+/// **Every call site is `if warn_once(scope, what) { tracing::warn!(…) }`** and
+/// nothing else — that is what makes the test counter this bumps a count of
+/// journal lines rather than a count of claims. Claiming the latch without
+/// emitting would silence the diagnostic forever and make the counter lie.
+pub(super) fn warn_once(scope: &Scope, what: Warned) -> bool {
+    let bit = what.bit();
+    let claimed = WARNED.with_borrow_mut(|warned| {
+        // The borrow-only path, which is the one a hostile tree takes thousands
+        // of times a pass: look the scope up by reference, and only pay for the
+        // clone when this really is the first time.
+        if let Some(bits) = warned.get_mut(scope) {
+            let first = *bits & bit == 0;
+            *bits |= bit;
+            first
+        } else {
+            warned.insert(scope.clone(), bit);
+            true
+        }
+    });
+    #[cfg(test)]
+    if claimed {
+        warn_counter(what).fetch_add(1, Ordering::Relaxed);
+    }
+    claimed
 }
 
 // ── mapping-pass API (called from `wire_map`) ────────────────────────────────
 
 /// Open a mapping pass for `scope`: reset the un-id'd ordinal counter and the
 /// touched set. Paired with [`end_pass`].
+///
+/// **This is the only place `touched` is cleared**, and deliberately so.
+/// [`end_pass`] used to clear it too, after its last read of it; with both, a
+/// mutation removing either one left the whole suite green, so the property
+/// three comments attribute to *this* line — "a second monitor's pass over the
+/// same tree is not a duplicate" (#918), and since #901 "the cap counts the
+/// nodes this pass admitted" — was pinned by the pair rather than by the line
+/// named. Clearing on the way *in* is also the stronger invariant: it holds at
+/// the point it is relied on, for a pass that begins however the previous one
+/// ended.
 pub(super) fn begin_pass(scope: &Scope) {
     STORE.with_borrow_mut(|store| {
         if let Some(state) = store.get_mut(scope) {
@@ -540,7 +687,8 @@ pub(super) fn end_pass(scope: &Scope) {
             instances, touched, ..
         } = state;
         instances.retain(|key, _| touched.contains(key));
-        touched.clear();
+        // `touched` is deliberately *not* cleared here — see [`begin_pass`],
+        // which owns that and is where the comments say it happens.
         if state.instances.is_empty() {
             store.remove(scope);
         }
@@ -560,6 +708,29 @@ pub(super) fn forget_scope(scope: &Scope) {
     });
 }
 
+/// What one [`map_widget`] call learned inside the [`STORE`] borrow, carried
+/// back out so the `tracing::warn!`s can be emitted with the borrow released (a
+/// subscriber is arbitrary code, and this table is thread-local and re-entered
+/// by every mapping pass).
+struct Mapped {
+    /// The instance's `(width, height, RGBA8)`; `(0, 0, empty)` for the
+    /// placeholder an over-cap or unrenderable node degrades to.
+    frame: (u32, u32, Vec<u8>),
+    /// The widget kind is one this build cannot render — [`build`] returned
+    /// `None`. Latched process-wide, not per tree.
+    unsupported: bool,
+    /// The ordinal key an anonymous node landed in (#900), or `None` for an
+    /// id'd one.
+    anonymous_key: Option<String>,
+    /// The kind of the node that claimed this id first *this pass*, when a
+    /// second node in the pass claimed the same explicit id (#918). The id
+    /// itself is not carried: [`report`] already takes it, and this field is
+    /// built ahead of the latch on every collision on every pass.
+    duplicate_of: Option<&'static str>,
+    /// The node was refused an instance by [`MAX_PREEM_NODES_PER_TREE`] (#901).
+    over_cap: bool,
+}
+
 /// Materialize one **already clamped** [`vocab::PreemWidget`] as the
 /// [`UiNode::Pixels`] the reconciler blits into a `PixelSurface`.
 ///
@@ -577,19 +748,42 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// misbehave. The warning is latched in [`WARNED`], which is **not** per pass and
 /// **not** per [`ScopeState`]: at most once per plugin tree for the shell's run.
 ///
-/// **Two preem nodes in one tree sharing an explicit `id` silently collapse onto
-/// one renderer instance**, applying both widgets to it every pass — two targets
+/// **Two preem nodes in one tree sharing an explicit `id` collapse onto one
+/// renderer instance**, applying both widgets to it every pass — two targets
 /// fighting one needle. The reconciler's own node keying has the same shape, so
-/// this is not a new hazard, but it is undiagnosed: tracked as **#918**, which
-/// reuses this latch ([`Warned::DuplicateId`]) on the `false` that
-/// `state.touched.insert(key)` already returns for a key twice in one pass.
+/// this is not a new hazard, but it used to be undiagnosed; since #918 the
+/// second touch warns once per tree ([`Warned::DuplicateId`]) on the `false`
+/// `state.touched.insert(key)` returns for a key twice in one pass, naming the
+/// id and both widget kinds. The behaviour is deliberately unchanged — last
+/// writer wins, so nothing disappears.
+///
+/// **A tree gets at most [`MAX_PREEM_NODES_PER_TREE`] renderer instances**
+/// (#901). Past that a node renders as the unknown-widget placeholder — the
+/// same empty surface an unrenderable kind degrades to, keeping `id` and
+/// classes — with one warning per tree ([`Warned::InstanceCap`]).
+///
+/// **The verdict is a pure function of the tree.** The cap is charged against
+/// the nodes this *pass* has admitted (`touched`), so the first
+/// `MAX_PREEM_NODES_PER_TREE` preem nodes in document order are admitted and
+/// the rest refused — on every pass, on every monitor, for the same wire frame.
+/// Charging it against the *live* instance count instead would make the answer
+/// depend on what the previous pass's [`end_pass`] happened to sweep, and since
+/// every monitor is a pass, the two monitors would render one frame
+/// differently. A node that already holds an instance is admitted regardless,
+/// which is what keeps a widget from losing its animation state on the frame
+/// its tree reaches the cap.
+///
+/// The bound is therefore `MAX_PREEM_NODES_PER_TREE` instances **at rest**.
+/// Within a pass a scope can transiently hold up to twice that — the incumbents
+/// the plugin has stopped rendering, not yet swept, plus the newcomers this pass
+/// admitted — and [`end_pass`] closes it back down to the touched set.
 pub(super) fn map_widget(
     scope: &Scope,
     id: Option<&str>,
     classes: &[String],
     widget: &vocab::PreemWidget,
 ) -> UiNode {
-    let (width, height, data, supported, anonymous_key) = STORE.with_borrow_mut(|store| {
+    let mapped = STORE.with_borrow_mut(|store| {
         let state = store.entry(scope.clone()).or_default();
         // `None` for an id'd node; for an anonymous one, the ordinal key just
         // minted — the only handle that node has, and so what the warning names.
@@ -603,7 +797,46 @@ pub(super) fn map_widget(
             anonymous_key = Some(ordinal_key.clone());
             ordinal_key
         };
-        state.touched.insert(key.clone());
+
+        // The instance cap (#901), checked before anything is inserted.
+        //
+        // Charged against `touched` — the nodes **this pass has already
+        // admitted** — and deliberately not against `instances.len()`, which is
+        // whatever survived the *previous* pass's `end_pass` sweep. Gating on
+        // the carried-over set makes the verdict a function of history rather
+        // than of the frame, and this module renders every frame once per
+        // monitor: the two monitors would then disagree about the same wire
+        // frame (the newcomer refused on the first pass, admitted on the second
+        // after the sweep freed a slot), which is exactly what the idempotence
+        // rule in the module docs forbids. It also made a tree pinned at
+        // *exactly* the cap with one rotating id blank that node on every other
+        // frame, for ever, without ever being over the cap.
+        //
+        // Against `touched` the answer is a pure function of the tree: the first
+        // `MAX_PREEM_NODES_PER_TREE` preem nodes in document order are admitted,
+        // the rest refused, on every pass and every monitor alike.
+        //
+        // A key that already holds an instance is always let through — that
+        // clause is what keeps a node from losing its animation state on the
+        // frame its tree happened to reach the cap. The ordinal is minted above
+        // regardless, so an over-cap anonymous node does not silently renumber
+        // its in-cap siblings.
+        if !state.instances.contains_key(&key) && state.touched.len() >= MAX_PREEM_NODES_PER_TREE {
+            return Mapped {
+                frame: (0, 0, Vec::new()),
+                unsupported: false,
+                anonymous_key,
+                duplicate_of: None,
+                over_cap: true,
+            };
+        }
+
+        // `false` ⇒ this pass already mapped a node under this key: two nodes in
+        // one tree claiming the same `id` (#918). `begin_pass` clears the set,
+        // so a second monitor's pass over the same tree is not a duplicate, and
+        // an anonymous node cannot trip it — its ordinal is fresh by
+        // construction.
+        let first_touch = state.touched.insert(key.clone());
         let instance = state.instances.entry(key).or_insert_with(|| Instance {
             applied: widget.clone(),
             // No renderer yet: `apply` sees `None` and builds, which is also
@@ -614,21 +847,62 @@ pub(super) fn map_widget(
             builds: 0,
             applies: 0,
         });
+        // Read *before* `apply` overwrites it: this is the kind of the node that
+        // got here first this pass, which is half of what makes the warning
+        // actionable. A duplicate always finds an existing instance (the earlier
+        // touch created it), so this is never the incoming widget's own kind.
+        //
+        // A `&'static str` and not the id: `report` already has the id, and this
+        // sits on the hot path *ahead* of the latch, so a plugin that duplicates
+        // an id would otherwise pay a `String` allocation per duplicate node per
+        // pass per monitor at 20 Hz for ever, for a line printed once.
+        let duplicate_of = match (first_touch, id) {
+            (false, Some(_)) => Some(instance.applied.kind()),
+            // An anonymous node cannot collide: its ordinal is minted fresh.
+            _ => None,
+        };
         apply(instance, widget);
-        let supported = instance.renderer.is_some();
-        let (width, height, data) = instance.frame();
-        (width, height, data, supported, anonymous_key)
+        let unsupported = instance.renderer.is_none();
+        Mapped {
+            frame: instance.frame(),
+            unsupported,
+            anonymous_key,
+            duplicate_of,
+            over_cap: false,
+        }
     });
+    report(scope, id, widget, &mapped);
+    let (width, height, data) = mapped.frame;
 
-    // Outside the `STORE` borrow: a `tracing` subscriber is arbitrary code, and
-    // the table is thread-local and re-entered by every mapping pass. The latch
-    // ([`WARNED`]) is a second thread-local for the same reason it is a separate
-    // table — it must outlive the `ScopeState` this borrow just touched.
-    if let Some(key) = anonymous_key
+    UiNode::Pixels {
+        id: id.map(str::to_owned),
+        width,
+        height,
+        data,
+        // The kit bakes its own upscale into the buffer (`Frame::upscale`, and
+        // every widget's `scale` knob), so the host must not scale again —
+        // exactly what `Frame::into_node` hard-codes for the plugin-side path.
+        scale: 1,
+        classes: classes.to_vec(),
+    }
+}
+
+/// Emit the one-shot journal lines this mapping of `widget` earned.
+///
+/// Split out of [`map_widget`] rather than inlined: it is called with the
+/// [`STORE`] borrow **released**, because a `tracing` subscriber is arbitrary
+/// code and the table is a thread-local that every mapping pass re-enters. The
+/// latch ([`WARNED`]) is a second thread-local for the same reason it is a
+/// separate table — it must outlive the [`ScopeState`] that borrow touched.
+///
+/// Each block is `if <claim the latch> { warn! }` and nothing else, which is
+/// what makes [`warn_once`]'s test counter a count of journal lines. The four
+/// diagnostics are independent: an anonymous node beside a duplicate pair
+/// produces both lines, because the latch is keyed by `(Scope, Warned)`.
+fn report(scope: &Scope, id: Option<&str>, widget: &vocab::PreemWidget, mapped: &Mapped) {
+    if let Some(key) = mapped.anonymous_key.as_deref()
         && warn_once(scope, Warned::NoId)
     {
-        #[cfg(test)]
-        ANONYMOUS_WARNINGS.fetch_add(1, Ordering::Relaxed);
         // `key` is the ordinal slot this node landed in — the only handle it
         // has, since it declined to name itself. It is `#0` in practice (the
         // first un-id'd node of a pass is the one that trips the latch); the
@@ -647,25 +921,44 @@ pub(super) fn map_widget(
         );
     }
 
-    if !supported && !UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
+    if let Some((first_kind, node)) = mapped.duplicate_of.zip(id)
+        && warn_once(scope, Warned::DuplicateId)
+    {
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            node = %node,
+            first_kind,
+            second_kind = widget.kind(),
+            "two preem nodes in this tree share an id — they collapse onto one renderer \
+             instance and both are applied to it every frame, so one widget's needle, \
+             phosphor or flip clocks fight the other's; the last one rendered wins. Give \
+             each preem node an id unique within its tree (further occurrences in this tree \
+             are silenced for the rest of this shell run)",
+        );
+    }
+
+    if mapped.over_cap && warn_once(scope, Warned::InstanceCap) {
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            node = ?id,
+            kind = widget.kind(),
+            cap = MAX_PREEM_NODES_PER_TREE,
+            "this tree asks for more preem renderer instances than the host will hold; the \
+             nodes past the cap render as an empty surface. A per-core/per-sink readout is \
+             one LedStrip or one Scope, not one widget each (further occurrences in this \
+             tree are silenced for the rest of this shell run)",
+        );
+    }
+
+    if mapped.unsupported && !UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             node = ?id,
             kind = widget.kind(),
             "this shell cannot render that preem widget kind; rendering nothing \
              (further occurrences are silenced)",
         );
-    }
-
-    UiNode::Pixels {
-        id: id.map(str::to_owned),
-        width,
-        height,
-        data,
-        // The kit bakes its own upscale into the buffer (`Frame::upscale`, and
-        // every widget's `scale` knob), so the host must not scale again —
-        // exactly what `Frame::into_node` hard-codes for the plugin-side path.
-        scale: 1,
-        classes: classes.to_vec(),
     }
 }
 
@@ -1614,11 +1907,46 @@ pub(super) fn probe(scope: &Scope, id: Option<&str>) -> Option<(u32, u32)> {
     })
 }
 
+/// How many journal lines `what` has produced so far ([`WARN_COUNTS`]). Read as
+/// a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn warnings(what: Warned) -> u32 {
+    warn_counter(what).load(Ordering::Relaxed)
+}
+
 /// How many "preem node without an id" warnings have been emitted so far
-/// ([`ANONYMOUS_WARNINGS`]). Read as a delta across the operation under test.
+/// (#900). Read as a delta across the operation under test.
 #[cfg(test)]
 pub(super) fn anonymous_warnings() -> u32 {
-    ANONYMOUS_WARNINGS.load(Ordering::Relaxed)
+    warnings(Warned::NoId)
+}
+
+/// How many "two preem nodes share an id" warnings have been emitted so far
+/// (#918). Read as a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn duplicate_id_warnings() -> u32 {
+    warnings(Warned::DuplicateId)
+}
+
+/// How many "too many preem nodes in one tree" warnings have been emitted so
+/// far (#901). Read as a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn instance_cap_warnings() -> u32 {
+    warnings(Warned::InstanceCap)
+}
+
+/// How many "too many nodes in one tree" warnings `wire_map` has emitted so far
+/// (#901). Read as a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn node_cap_warnings() -> u32 {
+    warnings(Warned::NodeCap)
+}
+
+/// How many "tree nests too deep" warnings `wire_map` has emitted so far
+/// (#901). Read as a delta across the operation under test.
+#[cfg(test)]
+pub(super) fn depth_cap_warnings() -> u32 {
+    warnings(Warned::DepthCap)
 }
 
 /// How many renderer instances `scope` holds — `0` once the scope itself has

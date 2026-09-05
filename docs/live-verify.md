@@ -751,6 +751,56 @@ session.
   5. Against a shell that predates #896/#883 (or with `Hello` otherwise
      suppressed), `PIN.` should still render pink — the raster (`Pixels`)
      arm honours the pin too, not only the state arm.
+- [ ] **(#909/#920)** A destroyed plugin region now actually releases its
+      reconciler subscription instead of pinning itself against its own
+      teardown — `build_region` used to hold a strong container clone that
+      only its own `destroy` handler could abort, and that handler could
+      never fire. On a two-monitor Niri session, run at least two plugins
+      that mount cards/chips — one in a sidebar region, one in a bar region
+      — preferably with a moving preem widget (`hytte-plugin-preem-demo`,
+      `pet`, `departures`) so a stranded region would keep animating. Open
+      the sidebar on both outputs, then hot-plug (unplug/replug the second
+      monitor, or force a kanshi profile switch) several times: expect **no
+      visible change** — no stranded regions, chips return to the bar in
+      the same order and spacing, sidebar cards come back where they were.
+      The one thing a weak handle could plausibly disturb: since the
+      container's visibility now runs behind a `WeakRef` upgrade inside
+      `bind` rather than a guaranteed strong closure, an emptied region
+      must still hide itself (no phantom 6px gap left in the bar group)
+      and must reappear once it fills again. `RUST_LOG=trollshell=debug`
+      across several hot-plug cycles should show no growth in per-emission
+      render work. Card scopes are still not released once every region
+      for a plugin is gone (an output-less session, or one monitor's panel
+      close dropping a scope a sibling monitor is still painting) —
+      that residual is deliberate and tracked separately as #921, not a
+      regression from this fix.
+- [ ] **(#901/#918/#919)** Merged as `afc152c`. Three new caps on a
+      `Node::Preem` wire tree, none reachable through any bundled plugin
+      today — needs a patched local plugin build (e.g. of
+      `hytte-plugin-preem-demo`) pointed at oversized trees, watched with
+      `journalctl --user -u trollshell -f`:
+  1. **The per-scope instance cap.** A tree of 65 preem nodes: the first 64
+     draw and animate normally, the 65th renders as an empty placeholder
+     that keeps its CSS chrome, and exactly **one** "asks for more preem
+     renderer instances…" line appears — not one per frame.
+  2. **The node-count and depth caps.** A tree of 4097 nodes is walked to
+     4095 and warns once with "…exceeds the host's node cap"; a chain of
+     65 nested boxes is walked to 64 levels and warns once with "…nests
+     deeper than the host will walk" — never both lines for the same tree.
+     A truncated container should read as a container with pieces missing,
+     not as a crash or a frozen frame.
+  3. **Two nodes, one id.** Two preem nodes sharing one explicit id in the
+     same tree collapse onto a single renderer instance: one "two preem
+     nodes in this tree share an id" line naming both widget kinds, and
+     last writer wins — nothing goes missing. The line should not repeat
+     if the pair is closed and reopened, or dropped and brought back.
+
+     Worth one extra check on the instance cap specifically, since it is
+     the one the review round found a real bug in: a tree pinned exactly at
+     the cap with one id rotating every frame must never blank on either
+     output of a two-monitor session. The stock desktop renders nowhere
+     near any of these caps, so none of these lines should appear against
+     an unpatched plugin set.
 
 ## Screen recording
 

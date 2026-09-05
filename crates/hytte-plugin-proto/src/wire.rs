@@ -274,6 +274,23 @@ pub enum Node {
     /// increment. Style via `classes` (e.g. an `.osd`/`.flat` hook) — the host
     /// draws no value label.
     ///
+    /// **The four floats have a contract, and it is enforced** — by
+    /// [`clamp_in_place`](Node::clamp_in_place) / [`sane_slider_floats`], which
+    /// the SDK runs on every view and the host re-runs on every frame it
+    /// receives. `min` and `max` must be finite with a finite, strictly
+    /// positive span; `value` must be finite and inside `min..=max`; `step`
+    /// must be finite and inside `(0.0, max - min]`. Anything else is
+    /// *rewritten*, not rejected: a degenerate range falls back to
+    /// [`DEFAULT_SLIDER_MIN`]`..=`[`DEFAULT_SLIDER_MAX`] with both ends
+    /// replaced together (which relocates `value` with it), a non-finite or
+    /// non-positive `step` becomes [`DEFAULT_SLIDER_STEP_FRACTION`] of the span
+    /// — or the whole span, where a subnormal span makes that underflow to zero
+    /// — and a `step` wider than the span is capped to it. The reason this is
+    /// enforced rather than merely documented is that GTK's own
+    /// `gtk_adjustment_new` returns `NULL` for a degenerate range, which
+    /// **aborts the host**; see the mapping table on
+    /// [`clamp_in_place`](Node::clamp_in_place) for the whole derivation.
+    ///
     /// `enabled` (default `true`) is a **mutable prop** too: `false` renders the
     /// slider **insensitive** — the host calls `set_sensitive(false)`, so it
     /// greys out and stops taking drag/scroll/key input (and thus emits no
@@ -591,14 +608,27 @@ impl Node {
     /// documented bounds, and every [`Preem`](Node::Preem) child satisfies
     /// [`PreemWidget::clamp_in_place`](crate::preem::PreemWidget::clamp_in_place)'s
     /// own invariant. That makes the derived `PartialEq` on [`Node`] a usable
-    /// *did anything change?* test for both ends' render dedup: `NaN != NaN`,
-    /// so before this a single poisoned `fraction` made a tree unequal to an
-    /// identical copy of itself, and both the SDK's `view != last_view`
-    /// (`hytte-plugin`'s `runtime.rs`, one `Render` per heartbeat at the #560
-    /// cap of 30 fps) and the host's reconciler then spun forever. The routine
-    /// is also a **fixpoint**: clamping a clamped tree changes nothing, so an
-    /// SDK that clamps before the host does not make the host's gate fire on
-    /// the second pass.
+    /// *did anything change?* test: `NaN != NaN`, so before this a single
+    /// poisoned `fraction` made a tree unequal to an identical copy of itself,
+    /// and the SDK's `view != last_view` (`hytte-plugin`'s `runtime.rs`, which
+    /// calls this routine on every view for exactly that reason) stayed true
+    /// forever — one `Render` per inbound event for a picture that never
+    /// changes, bounded above only by #560's ~30 fps cap.
+    ///
+    /// The **host** cost is a different one, and worth stating precisely
+    /// because the symmetry is tempting and wrong: `hytte_ui`'s
+    /// `Reconciler::render` has no whole-tree equality gate at all — it
+    /// re-applies every prop on every pass regardless — so there was never a
+    /// host-side `Node` diff for a `NaN` to defeat. What a non-finite float
+    /// costs the host is what the widget does with it (a stored `NaN`
+    /// fraction, or an aborting `gtk_adjustment_new`), which the mapping below
+    /// is derived from. The one host-side equality gate is
+    /// `preem_render::apply`'s `instance.applied == *widget`, and that one is
+    /// preem-only — #899's, not this seam's.
+    ///
+    /// The routine is also a **fixpoint**: clamping a clamped tree changes
+    /// nothing, so a host that re-sanitises what an SDK already sanitised sees
+    /// no movement and its own gates cannot fire a frame late.
     ///
     /// It is the *float* seam, and only that. [`Pixels`](Node::Pixels)'s
     /// `len == w * h * 4` and scale checks stay host-side
@@ -640,8 +670,9 @@ impl Node {
     ///   still: `g_return_val_if_fail (lower + page_size <= upper, NULL)`
     ///   (`:395`) returns `NULL` for `max < min` **or** for a `NaN` end, and
     ///   `gtk4`'s `Adjustment::new` feeds that pointer to `from_glib_none`,
-    ///   whose `debug_assert!(!ptr.is_null())` (`glib-0.22.5/src/object.rs:480`)
-    ///   panics in a debug build and is undefined behaviour in a release one.
+    ///   whose `debug_assert!(!ptr.is_null())` (the `wrapper!`-generated impl
+    ///   for the concrete object type, `glib-0.22.5/src/object.rs:911`) panics
+    ///   in a debug build and is undefined behaviour in a release one.
     ///   A plugin's `Slider { min: 1.0, max: 0.0 }` is therefore not merely
     ///   churn — it is a shell abort, and this seam is what stops it.
     ///
@@ -650,7 +681,7 @@ impl Node {
     /// | [`Progress::fraction`](Node::Progress) | `gtkprogressbar.c:781` `CLAMP (fraction, 0.0, 1.0)` | total on `±inf`, transparent on `NaN` | `0.0..=1.0` | `0.0` | `1.0` | `0.0` | clamp (parity) |
     /// | [`Slider::min`](Node::Slider) / [`max`](Node::Slider) | `gtkadjustment.c:395` `NULL` return; `:622`/`:670` `isfinite` guards | refuse, **stateful** | finite, `max > min`, finite span | [`DEFAULT_SLIDER_MIN`]`..=`[`DEFAULT_SLIDER_MAX`], both ends as a unit | same | same | same fallback when `max <= min` |
     /// | [`Slider::value`](Node::Slider) | `gtkadjustment.c:563` `isfinite` guard, then `:365`-`:372` `CLAMP (value, lower, MAX (lower, upper - page_size))` | refuse, **stateful**; clamp when finite | the sanitised `min..=max` | `min` | `max` | `min` | clamp (parity) |
-    /// | [`Slider::step`](Node::Slider) | `gtkadjustment.c:715`/`:760` `isfinite` guards; `gtkrange.c:1072` validates nothing else | refuse, **stateful**; unbounded when finite | `(0.0, max - min]` | [`DEFAULT_SLIDER_STEP_FRACTION`] of the span | same | same | `<= 0.0` takes the same fallback; `> span` caps to the span |
+    /// | [`Slider::step`](Node::Slider) | `gtkadjustment.c:715`/`:760` `isfinite` guards; `gtkrange.c:1072` validates nothing else | refuse, **stateful**; unbounded when finite | `(0.0, max - min]` | [`DEFAULT_SLIDER_STEP_FRACTION`] of the span, or the **whole span** where that underflows | same | same | `<= 0.0` takes the same fallback; `> span` caps to the span |
     ///
     /// Four rows deserve their reasoning spelled out:
     ///
@@ -670,7 +701,13 @@ impl Node {
     ///   immovable thumb, and `gtk_scale_new_with_range` rejects a zero span
     ///   outright (`gtk/gtkscale.c:989`, `min < max`). The unit scale keeps the
     ///   slider *usable*, and mixing a stated end with a default one would
-    ///   invent a scale nobody asked for.
+    ///   invent a scale nobody asked for. One consequence is worth naming:
+    ///   replacing the scale also **relocates the value**, since the value is
+    ///   then clamped against the fallback — `min: NaN, max: 5.0, value: 3.0`
+    ///   draws a *full* slider, not a 60% one. That is unavoidable once the
+    ///   stated scale is gone (there is nothing left to read `3.0` against),
+    ///   and it is the same trade #899 made for a degenerate
+    ///   [`GaugeRange`](crate::preem::GaugeRange).
     /// - **`value`'s infinities go to the ends, though GTK refuses all three
     ///   non-finite inputs alike.** That is this vocabulary's own rule, not a
     ///   parity claim — stated as such, exactly as #899 stated it for
